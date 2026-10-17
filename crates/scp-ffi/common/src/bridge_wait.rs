@@ -7,8 +7,9 @@
 //! `scripts/check-bridge-block-on.py` fails any other production site in the
 //! `PyO3`, napi and `UniFFI` bridges and in this crate, and every other
 //! thread-blocking call (`std::thread::sleep`, a sync channel's `recv`,
-//! `recv_timeout` or `recv_deadline`, a `Condvar` wait, tokio's `blocking_*`)
-//! outside this file (ADR-049 Decision 7a, "Host threads"). A bridge that must release a
+//! `recv_timeout` or `recv_deadline`, a `Condvar` wait, tokio's `blocking_*`,
+//! a wait on another thread through `JoinHandle::join`, `std::thread::park`
+//! or `std::thread::scope`) outside this file (ADR-049 Decision 7a, "Host threads"). A bridge that must release a
 //! host lock around the wait does so around its call to this helper: `PyO3`
 //! calls [`bridge_block_on_off_thread`] inside `Python::allow_threads`
 //! (`actor_wait::block_on_released`).
@@ -32,6 +33,12 @@
 //!    private current-thread runtime on a scoped thread (the scope lets the
 //!    future borrow the caller's locals) by calling [`bridge_block_on`] there
 //!    in regime 1; it suits a future whose work runs on some other runtime.
+//!
+//! [`bridge_block_on_scoped_thread`] always drives a `Send` future in regime 1
+//! on a fresh scoped thread, for a sync caller that may sit inside a
+//! `block_on` of another runtime (a sync `DidResolver` method called from
+//! inside a bridge wait), where regime 2 would panic and regime 3 would
+//! refuse.
 //!
 //! [`bridge_block_on`] puts no `Send` bound on the future, so a bridge can
 //! wait on a `!Send` future (the custody-migration orchestrator borrows a
@@ -146,17 +153,55 @@ where
         Ok(output) => return Ok(output),
         Err(fut) => fut,
     };
+    on_scoped_thread(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| BridgeBlockOnError::PrivateRuntimeBuild(e.to_string()))?;
+        // A scoped thread has no ambient runtime: regime 1 on `rt`.
+        drive(Regime::NoRuntime, || Ok(&rt), fut)?
+            .map_err(|_| BridgeBlockOnError::CurrentThreadRuntime)
+    })
+}
+
+/// Drives `fut` to completion on a fresh scoped thread, in regime 1.
+///
+/// The scoped thread has no ambient runtime, so the wait takes regime 1 on
+/// the runtime `shared` supplies whatever the calling thread's tokio state.
+/// The scope lets `fut` borrow the
+/// caller's locals; the calling thread blocks until the scoped thread
+/// returns.
+///
+/// # Errors
+///
+/// [`BridgeBlockOnError::SharedRuntimeUnavailable`] when `shared` fails;
+/// [`BridgeBlockOnError::WaitThreadPanicked`] when the scoped thread panics
+/// before it returns the output.
+pub fn bridge_block_on_scoped_thread<'r, F, S>(
+    shared: S,
+    fut: F,
+) -> Result<F::Output, BridgeBlockOnError>
+where
+    F: Future + Send,
+    F::Output: Send,
+    S: FnOnce() -> Result<&'r tokio::runtime::Runtime, String> + Send,
+{
+    on_scoped_thread(|| {
+        drive(Regime::NoRuntime, shared, fut)?.map_err(|_| BridgeBlockOnError::CurrentThreadRuntime)
+    })
+}
+
+/// Runs `work` on a scoped thread and blocks the calling thread until it
+/// returns: the one `std::thread::scope` and `JoinHandle::join` under
+/// `crates/scp-ffi/` (`scripts/check-bridge-block-on.py`).
+fn on_scoped_thread<T, W>(work: W) -> Result<T, BridgeBlockOnError>
+where
+    T: Send,
+    W: FnOnce() -> Result<T, BridgeBlockOnError> + Send,
+{
     std::thread::scope(|scope| {
         scope
-            .spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| BridgeBlockOnError::PrivateRuntimeBuild(e.to_string()))?;
-                // A scoped thread has no ambient runtime: regime 1 on `rt`.
-                drive(Regime::NoRuntime, || Ok(&rt), fut)?
-                    .map_err(|_| BridgeBlockOnError::CurrentThreadRuntime)
-            })
+            .spawn(work)
             .join()
             .map_err(|_| BridgeBlockOnError::WaitThreadPanicked)?
     })
@@ -309,6 +354,51 @@ mod tests {
             bridge_block_on(|| Err("must not be called".to_owned()), async { 1_u8 })
         });
         assert_eq!(out, Err(BridgeBlockOnError::CurrentThreadRuntime));
+        Ok(())
+    }
+
+    /// Inside a current-thread ambient runtime, where `bridge_block_on`
+    /// refuses, the scoped-thread wait still drives the shared runtime, and
+    /// the future may borrow the caller's locals.
+    #[test]
+    fn scoped_thread_drives_the_shared_runtime_from_a_current_thread_runtime()
+    -> Result<(), BridgeBlockOnError> {
+        let rt = shared_rt()?;
+        let ambient = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| BridgeBlockOnError::PrivateRuntimeBuild(e.to_string()))?;
+        let local = 6_u8;
+        let out = ambient.block_on(async {
+            bridge_block_on_scoped_thread(|| Ok(&rt), async {
+                (tokio::runtime::Handle::current().runtime_flavor(), local)
+            })
+        })?;
+        assert_eq!(out, (tokio::runtime::RuntimeFlavor::MultiThread, 6));
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_thread_reports_an_absent_shared_runtime() {
+        let err = bridge_block_on_scoped_thread(|| Err("absent".to_owned()), async { 1_u8 });
+        assert_eq!(
+            err,
+            Err(BridgeBlockOnError::SharedRuntimeUnavailable(
+                "absent".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn scoped_thread_reports_a_panicking_wait() -> Result<(), BridgeBlockOnError> {
+        let rt = shared_rt()?;
+        let err = bridge_block_on_scoped_thread(|| Ok(&rt), async {
+            if rt.metrics().num_workers() > 0 {
+                std::panic::resume_unwind(Box::new("the awaited work panicked"));
+            }
+            1_u8
+        });
+        assert_eq!(err, Err(BridgeBlockOnError::WaitThreadPanicked));
         Ok(())
     }
 }

@@ -35,8 +35,18 @@ thread-blocking call. Anywhere else these fail:
     `wait_timeout_while`;
   - tokio's `blocking_recv`, `blocking_recv_many`, `blocking_send`,
     `blocking_lock`, `blocking_lock_owned`, `blocking_read` and
-    `blocking_write`.
-Such a wait becomes async and goes through the helper.
+    `blocking_write`;
+  - a wait on another thread: `std::thread`'s `JoinHandle::join` (a
+    `.join()` method call with no argument, or a path call `X::join(h)` with
+    one, that no `.await` consumes; `vec.join(",")`, an awaited tokio
+    `JoinHandle` and `JoinSet::join_next().await` pass), and
+    `std::thread::park`, `park_timeout`, `park_timeout_ms` and `scope` (whose
+    end joins every scoped thread), each as a `thread::` path or a `use` that
+    imports it;
+  - a glob `use` of `thread` (`use std::thread::*`), which would let a bare
+    `sleep`, `park` or `scope` past the path rule.
+Such a wait becomes async or goes through the helper. Ordinary std `Mutex`
+and `RwLock` acquisition is outside the gate (the human's ruling).
 
 RULE (an exact caller list)
 ---------------------------------------------------------------------------
@@ -97,7 +107,12 @@ HELPER_FILE = "crates/scp-ffi/common/src/bridge_wait.rs"
 HELPER_FN = "drive"
 NAMES = frozenset({"block_on", "block_in_place"})
 WAIT_NAMES = frozenset(
-    {"bridge_block_on", "bridge_block_on_off_thread", "block_on_shared"}
+    {
+        "bridge_block_on",
+        "bridge_block_on_off_thread",
+        "bridge_block_on_scoped_thread",
+        "block_on_shared",
+    }
 )
 # (file, enclosing function) -> references to a `WAIT_NAMES` function.
 # `<module>` is a reference outside every function (a `use`).
@@ -158,6 +173,15 @@ ALWAYS_BLOCKING = frozenset(
 # These block when called without `.await`: a sync channel's `recv` and a
 # `Condvar`'s (or `Barrier`'s) `wait`. Awaited, they are tokio's async forms.
 UNAWAITED_BLOCKING = frozenset({"recv", "wait"})
+# Blocking functions of `std::thread`, flagged as a `thread::` path or an
+# import from `thread`, with the shape each reports.
+THREAD_FNS = {
+    "sleep": "std::thread::sleep",
+    "park": "std::thread::park",
+    "park_timeout": "std::thread::park_timeout",
+    "park_timeout_ms": "std::thread::park_timeout_ms",
+    "scope": "std::thread::scope",
+}
 # A crate's integration tests; a `tests/` directory under `src/` is not one.
 INTEGRATION_TESTS_RE = re.compile(r"^crates/scp-ffi/(?:napi/|uniffi/|common/)?tests/")
 
@@ -319,6 +343,83 @@ def _in_select_arm(token_tree, source: bytes) -> bool:
     )
 
 
+def _token_tree_args(tree, source: bytes) -> int:
+    """The number of top-level comma-separated arguments in a `( .. )`
+    token tree (nested token trees are single children)."""
+    inner = [
+        c
+        for c in tree.children[1:-1]
+        if c.type not in ("line_comment", "block_comment")
+    ]
+    if not inner:
+        return 0
+    commas = [i for i, c in enumerate(inner) if SCANNER.node_text(c, source) == ","]
+    trailing = 1 if commas and commas[-1] == len(inner) - 1 else 0
+    return len(commas) - trailing + 1
+
+
+def _call_args(call) -> int:
+    args = call.child_by_field_name("arguments")
+    if args is None:
+        return -1
+    return sum(
+        1
+        for c in args.named_children
+        if c.type not in ("line_comment", "block_comment")
+    )
+
+
+def _is_thread_join(node, source: bytes) -> bool:
+    """True when `node` (a `join` identifier) is `std::thread`'s
+    `JoinHandle::join` (or `ScopedJoinHandle::join`): a `.join()` method call
+    with no argument, or a path call `X::join(h)` with exactly one, that no
+    `.await` consumes. Every other `join` takes a separator or a second
+    future (`vec.join(",")`, `Path::join(p, q)`, `future::join(a, b)`), and
+    tokio's `JoinHandle` is awaited, not joined."""
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "token_tree":
+        before, after = _prev_token(node), _next_token(node)
+        if before is None or after is None or after.type != "token_tree":
+            return False
+        if not SCANNER.node_text(after, source).startswith("("):
+            return False
+        sep = SCANNER.node_text(before, source)
+        want = 0 if sep == "." else 1 if sep == "::" else None
+        if want is None or _token_tree_args(after, source) != want:
+            return False
+        dot = _next_token(after)
+        if dot is None or SCANNER.node_text(dot, source) != ".":
+            return True
+        word = _next_token(dot)
+        return word is None or SCANNER.node_text(word, source) != "await"
+    if parent.type == "field_expression":
+        want = 0
+    elif parent.type == "scoped_identifier":
+        want = 1
+    else:
+        return False
+    if not _is_unawaited_call(node, source):
+        return False
+    return _call_args(parent.parent) == want
+
+
+def _is_thread_glob(node, source: bytes) -> bool:
+    """True when `node` is the `thread` of a `use std::thread::*` (or a
+    `use std::{thread::*}`)."""
+    if SCANNER.node_text(node, source) != "thread":
+        return False
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "scoped_identifier":
+        if parent.child_by_field_name("name") != node:
+            return False
+        parent = parent.parent
+    return parent is not None and parent.type == "use_wildcard"
+
+
 def _is_unawaited_call(node, source: bytes) -> bool:
     """True when `node` (an identifier) is the method or path function of a
     call that no `.await` consumes: `rx.recv()` or `Condvar::wait(&cv, g)`.
@@ -365,8 +466,9 @@ def _is_unawaited_call(node, source: bytes) -> bool:
 
 
 def _path_ends_in_thread(node, source: bytes) -> bool:
-    """True when `node` is the `sleep` of a `thread::sleep` path, a
-    `use std::thread::sleep` or a `use std::thread::{sleep, ..}`."""
+    """True when `node` is the last segment of a `thread::<name>` path, a
+    `use std::thread::<name>` or a `use std::thread::{<name>, ..}`, in parsed
+    code or a macro's tokens."""
     parent = node.parent
     if parent is None:
         return False
@@ -413,8 +515,12 @@ def _blocking_shape(node, source: bytes) -> str | None:
         return name
     if name in ALWAYS_BLOCKING:
         return name
-    if name == "sleep" and _path_ends_in_thread(node, source):
-        return "std::thread::sleep"
+    if name in THREAD_FNS and _path_ends_in_thread(node, source):
+        return THREAD_FNS[name]
+    if name == "join" and _is_thread_join(node, source):
+        return "std::thread JoinHandle::join"
+    if _is_thread_glob(node, source):
+        return "glob `use` of std::thread"
     if name in UNAWAITED_BLOCKING and _is_unawaited_call(node, source):
         return f"un-awaited `{name}`"
     return None
@@ -769,6 +875,8 @@ def _real_scan_fixture_trees() -> list[str]:
     sleep_site = (
         "pub fn f() { std::thread::sleep(std::time::Duration::from_millis(1)); }\n"
     )
+    join_site = "pub fn f(h: std::thread::JoinHandle<()>) { let _ = h.join(); }\n"
+    park_site = "pub fn f() { std::thread::park(); }\n"
     extra.update(
         {
             # G1: only a crate root's `tests/` holds integration tests.
@@ -858,12 +966,31 @@ def _real_scan_fixture_trees() -> list[str]:
                 {HELPER_FILE: _HELPER_SRC + sleep_site},
                 0,
             ),
+            "a scoped-thread `join` in the helper file": (
+                {
+                    HELPER_FILE: _HELPER_SRC
+                    + "fn g() { std::thread::scope(|s| { let _ = s.spawn(|| ()).join(); }); }\n"
+                },
+                0,
+            ),
         }
     )
     for bridge, root in BRIDGE_ROOTS.items():
         extra[f"a `std::thread::sleep` in the {bridge} bridge"] = (
             {root + "sleep.rs": sleep_site},
             1,
+        )
+        extra[f"a `JoinHandle::join` in the {bridge} bridge"] = (
+            {root + "join.rs": join_site},
+            1,
+        )
+        extra[f"a `std::thread::park` in the {bridge} bridge"] = (
+            {root + "park.rs": park_site},
+            1,
+        )
+        extra[f"a `vec.join(sep)` in the {bridge} bridge"] = (
+            {root + "strjoin.rs": 'pub fn f(v: &[String]) -> String { v.join(",") }\n'},
+            0,
         )
     for label, (files, expected) in extra.items():
         cases.append((label, {**clean, **files}, expected))

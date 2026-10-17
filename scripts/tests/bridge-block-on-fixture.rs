@@ -181,6 +181,128 @@ fn flag_blocking_lock_in_a_macro(m: &tokio::sync::Mutex<u8>) {
     drop(vec![*m.blocking_lock()]);
 }
 
+// A wait on another thread: `std::thread`'s `JoinHandle::join`.
+fn flag_thread_join(h: std::thread::JoinHandle<()>) {
+    let _ = h.join();
+}
+
+fn flag_ufcs_thread_join(h: std::thread::JoinHandle<()>) {
+    let _ = std::thread::JoinHandle::join(h);
+}
+
+fn flag_thread_join_through_a_renaming_use() {
+    use std::thread::JoinHandle as Worker;
+    let h: Worker<()> = std::thread::spawn(|| ());
+    let _ = Worker::join(h);
+}
+
+fn flag_thread_join_in_a_macro(h: std::thread::JoinHandle<()>) {
+    drop(vec![h.join()]);
+}
+
+fn flag_ufcs_thread_join_in_a_macro(h: std::thread::JoinHandle<()>) {
+    drop(vec![std::thread::JoinHandle::join(h)]);
+}
+
+fn flag_scoped_thread_join() {
+    let _ = std::thread::scope(|s| {
+        s.spawn(|| ())
+            .join()
+    });
+}
+
+fn flag_use_of_thread_scope() {
+    use std::thread::scope;
+}
+
+// A wait on another thread: `std::thread::park` and `park_timeout`.
+fn flag_thread_park() {
+    std::thread::park();
+}
+
+fn flag_thread_park_timeout(d: std::time::Duration) {
+    std::thread::park_timeout(d);
+}
+
+fn flag_thread_park_through_a_module_use() {
+    use std::thread;
+    thread::park();
+}
+
+fn flag_use_of_thread_park() {
+    use std::thread::park;
+}
+
+fn flag_renaming_use_of_thread_park_timeout() {
+    use std::thread::park_timeout as doze;
+}
+
+fn flag_use_list_of_thread_park() {
+    use std::thread::{self, park};
+}
+
+fn flag_thread_park_in_a_macro() {
+    drop(vec![std::thread::park()]);
+}
+
+fn flag_thread_park_timeout_in_a_macro(d: std::time::Duration) {
+    drop(vec![std::thread::park_timeout(d)]);
+}
+
+fn flag_glob_use_of_thread() {
+    use std::thread::*;
+}
+
+fn flag_nested_glob_use_of_thread() {
+    use std::{thread::*};
+}
+
+fn pass_vec_join(v: &[String]) {
+    let _ = v.join(",");
+}
+
+fn pass_vec_join_in_a_macro(v: &[String]) {
+    drop(vec![v.join(",")]);
+}
+
+fn pass_ufcs_slice_join(v: &[String]) {
+    let _ = <[String]>::join(v, ",");
+}
+
+fn pass_path_join() {
+    let _ = std::path::Path::new("a").join("b");
+}
+
+async fn pass_awaited_tokio_join_handle(h: tokio::task::JoinHandle<u8>) {
+    let _ = h.await;
+}
+
+async fn pass_awaited_tokio_join_handle_in_a_macro(h: tokio::task::JoinHandle<u8>) {
+    drop(vec![h.await]);
+}
+
+async fn pass_join_set_join_next(set: &mut tokio::task::JoinSet<u8>) {
+    while let Some(r) = set.join_next().await {
+        drop(r);
+    }
+}
+
+async fn pass_join_set_join_next_in_a_macro(set: &mut tokio::task::JoinSet<u8>) {
+    drop(vec![set.join_next().await]);
+}
+
+async fn pass_tokio_join_macro() {
+    let _ = tokio::join!(async { 1 }, async { 2 });
+}
+
+async fn pass_futures_join() {
+    let _ = futures::future::join(async { 1 }, async { 2 }).await;
+}
+
+fn pass_thread_unpark(t: &std::thread::Thread) {
+    t.unpark();
+}
+
 async fn pass_awaited_recv(rx: &mut tokio::sync::mpsc::Receiver<u8>) {
     let _ = rx.recv().await;
 }
@@ -217,6 +339,12 @@ fn test_cfg_all_test_and_testing(rt: &tokio::runtime::Runtime) {
 #[cfg(test)]
 fn test_cfg_test_fn_blocking_shapes(rx: &std::sync::mpsc::Receiver<u8>) {
     let _ = rx.recv_timeout(std::time::Duration::from_millis(1));
+}
+
+#[cfg(test)]
+fn test_cfg_test_thread_join_and_park(h: std::thread::JoinHandle<()>) {
+    let _ = h.join();
+    std::thread::park();
 }
 
 #[test]
