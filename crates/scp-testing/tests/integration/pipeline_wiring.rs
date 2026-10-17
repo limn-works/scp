@@ -5363,8 +5363,8 @@ fn uniffi_trust_verify_attestation_reads_the_instance_revocation_list() {
 // lease and then a grading permit, grades, commits, and writes the record to the
 // bridge's repository. Each supervisor dispatch reaches the challenger ledger's
 // mailbox, whose Begin and Commit handlers check the attempt. Each bridge's
-// export reaches the shared body, and each bridge's evaluator invoker runs the
-// handler through the shared `invoke_evaluator_outlet`.
+// export reaches the shared body, and each bridge grades through the one
+// `SharedEvaluatorInvoker` over its own `EvaluatorHost`.
 
 #[test]
 fn shared_create_challenge_checks_the_definition_and_signs_in_the_ledger() {
@@ -5752,43 +5752,94 @@ fn shared_evaluator_outlet_spawns_blocking_inside_the_economy_pipeline() {
     );
 }
 
-/// Asserts that `src` holds `impl scp_ffi_common::challenge::EvaluatorInvoker
-/// for {ty}` whose `check_registered` reaches `check_evaluator_registered` and
-/// whose `invoke` reaches `invoke_evaluator_outlet`.
-fn assert_bridge_evaluator_invoker(src: &str, ty: &str) {
-    let header = format!("impl scp_ffi_common::challenge::EvaluatorInvoker for {ty}");
+/// Returns the source text from `header` to the end of `src`, so a body lookup
+/// finds the first `fn` after that impl header rather than an earlier sibling.
+fn from_impl<'a>(src: &'a str, header: &str) -> &'a str {
     let at = src
-        .find(&header)
+        .find(header)
         .unwrap_or_else(|| panic!("`{header}` must exist"));
-    let block = &src[at..];
+    &src[at..]
+}
+
+/// Asserts that a bridge grades through the one shared invoker over its own
+/// evaluator host. `create_fn` and `grade_fn` must each bind `let host = {host}
+/// { bi };` and build `SharedEvaluatorInvoker::new(sup, &host)`, and the host
+/// must implement `EvaluatorHost` by reading the bridge's state: `registry`
+/// reaches `registry_lookup` and `handler` reaches `handler_lookup`.
+/// `SharedEvaluatorInvoker` is a struct, so a bridge cannot supply a check or
+/// an invocation of its own; what a bridge can still get wrong is the host it
+/// passes, and this pins it.
+fn assert_bridge_uses_shared_invoker(
+    src: &str,
+    host: &str,
+    create_fn: &str,
+    grade_fn: &str,
+    registry_lookup: &str,
+    handler_lookup: &str,
+) {
+    let bind = format!("let host = {host} {{ bi }};");
+    let build = "scp_ffi_common::challenge::SharedEvaluatorInvoker::new(sup, &host)";
+    for op in [create_fn, grade_fn] {
+        assert!(
+            fn_body_contains(src, op, &bind) && fn_body_contains(src, op, build),
+            "{op} must build SharedEvaluatorInvoker over `{host} {{ bi }}`"
+        );
+    }
+    let host_impl = from_impl(
+        src,
+        &format!("impl scp_ffi_common::challenge::EvaluatorHost for {host}<'_>"),
+    );
     assert!(
-        fn_body_contains(
-            block,
-            "check_registered",
-            "scp_ffi_common::challenge::check_evaluator_registered("
-        ) && fn_body_contains(
-            block,
-            "invoke",
-            "scp_ffi_common::challenge::invoke_evaluator_outlet("
-        ),
-        "{ty} must check through check_evaluator_registered and invoke through \
-         invoke_evaluator_outlet"
+        fn_body_contains(host_impl, "registry", registry_lookup)
+            && fn_body_contains(host_impl, "handler", handler_lookup),
+        "{host} must read the outlet registry through `{registry_lookup}` and the \
+         handler through `{handler_lookup}`"
     );
 }
 
 #[test]
-fn pyo3_evaluator_invoker_spawns_blocking_and_refuses_without_handler() {
-    assert_bridge_evaluator_invoker(PYO3_TRUST_SRC, "PyEvaluatorInvoker<'_>");
+fn pyo3_grades_through_the_shared_evaluator_invoker() {
+    assert_bridge_uses_shared_invoker(
+        PYO3_TRUST_SRC,
+        "PyEvaluatorHost",
+        "trust_create_challenge_impl",
+        "trust_grade_response_impl",
+        "rt.outlet_registry.clone()",
+        "rt.outlet_handlers.get(outlet_id.as_str())",
+    );
 }
 
 #[test]
-fn napi_evaluator_invoker_spawns_blocking_and_refuses_without_handler() {
-    assert_bridge_evaluator_invoker(NAPI_TRUST_SRC, "NapiEvaluatorInvoker<'_>");
+fn napi_grades_through_the_shared_evaluator_invoker() {
+    assert_bridge_uses_shared_invoker(
+        NAPI_TRUST_SRC,
+        "NapiEvaluatorHost",
+        "trust_create_challenge_on",
+        "trust_grade_response_on",
+        "rt.outlet_registry.clone()",
+        "rt.outlet_handlers.get(outlet_id.as_str())",
+    );
 }
 
 #[test]
-fn uniffi_evaluator_invoker_spawns_blocking_and_refuses_without_handler() {
-    assert_bridge_evaluator_invoker(UNIFFI_BRIDGE_SRC, "UniffiEvaluatorInvoker<'_>");
+fn uniffi_grades_through_the_shared_evaluator_invoker() {
+    assert_bridge_uses_shared_invoker(
+        UNIFFI_BRIDGE_SRC,
+        "UniffiEvaluatorHost",
+        "trust_create_challenge_impl",
+        "trust_grade_response_impl",
+        ".outlet_registry",
+        ".outlet_handlers",
+    );
+    assert!(
+        fn_body_contains(
+            from_impl(UNIFFI_BRIDGE_SRC, "impl UniffiEvaluatorHost<'_>"),
+            "handle",
+            "context_handle_registry(self.bi)"
+        ),
+        "UniffiEvaluatorHost must find the evaluator context's handle in this \
+         instance's context handle registry"
+    );
 }
 
 // ===========================================================================

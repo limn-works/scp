@@ -344,73 +344,35 @@ async fn identity_signer(
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))
 }
 
-/// The evaluator side of `CustomEval` grading on this bridge: the outlet
-/// registry and host handlers of the evaluator context's UCAN state.
-struct NapiEvaluatorInvoker<'a> {
+/// The evaluator state of this bridge: the outlet registry and host
+/// handlers of an evaluator context's UCAN state. A lookup finds nothing when
+/// the context is not open on this bridge, the only failure of
+/// `with_context`.
+struct NapiEvaluatorHost<'a> {
     bi: &'a NapiBridgeInstance,
-    sup: &'a Arc<scp_core::context::supervisor::Supervisor>,
 }
 
-impl NapiEvaluatorInvoker<'_> {
-    /// A snapshot of the evaluator context's registry and the outlet's
-    /// handler; `None` when the context is not open on this bridge, the
-    /// only failure of `with_context`.
-    fn snapshot(
+impl scp_ffi_common::challenge::EvaluatorHost for NapiEvaluatorHost<'_> {
+    fn registry(
         &self,
         evaluator_context_id: &str,
-        outlet_id: &scp_core::context::outlets::OutletId,
-    ) -> Option<(
-        scp_core::context::outlets::OutletRegistry,
-        Option<crate::runtime::OutletHandler>,
-    )> {
+    ) -> Option<scp_core::context::outlets::OutletRegistry> {
         crate::runtime::with_context(self.bi, evaluator_context_id, |rt| {
-            Ok((
-                rt.outlet_registry.clone(),
-                rt.outlet_handlers.get(outlet_id.as_str()).cloned(),
-            ))
+            Ok(rt.outlet_registry.clone())
         })
         .ok()
     }
-}
 
-#[async_trait::async_trait]
-impl scp_ffi_common::challenge::EvaluatorInvoker for NapiEvaluatorInvoker<'_> {
-    async fn check_registered(
+    fn handler(
         &self,
         evaluator_context_id: &str,
         outlet_id: &scp_core::context::outlets::OutletId,
-        challenger: &scp_did::DID,
-    ) -> Result<(), scp_core::trust::TrustError> {
-        let snapshot = self.snapshot(evaluator_context_id, outlet_id);
-        scp_ffi_common::challenge::check_evaluator_registered(
-            self.sup,
-            evaluator_context_id,
-            snapshot.as_ref().map(|(registry, _)| registry),
-            snapshot
-                .as_ref()
-                .is_some_and(|(_, handler)| handler.is_some()),
-            challenger,
-            outlet_id,
-        )
-        .await
-    }
-
-    async fn invoke(
-        &self,
-        call: scp_ffi_common::challenge::EvaluatorCall<'_>,
-    ) -> scp_ffi_common::challenge::EvaluatorOutcome {
-        let (registry, handler) = self
-            .snapshot(call.evaluator_context_id, call.outlet_id)
-            .map_or((None, None), |(registry, handler)| {
-                (Some(registry), handler)
-            });
-        scp_ffi_common::challenge::invoke_evaluator_outlet(
-            self.sup,
-            registry.as_ref(),
-            handler,
-            call,
-        )
-        .await
+    ) -> Option<scp_ffi_common::challenge::EvaluatorHandler> {
+        crate::runtime::with_context(self.bi, evaluator_context_id, |rt| {
+            Ok(rt.outlet_handlers.get(outlet_id.as_str()).cloned())
+        })
+        .ok()
+        .flatten()
     }
 }
 
@@ -444,6 +406,8 @@ pub(crate) async fn trust_create_challenge_on(
     }
     let sup = crate::runtime::supervisor(bi)?;
     let signer = identity_signer(bi, &verifier).await?;
+    let host = NapiEvaluatorHost { bi };
+    let invoker = scp_ffi_common::challenge::SharedEvaluatorInvoker::new(sup, &host);
     let request = scp_ffi_common::challenge::create_challenge(
         sup,
         &signer,
@@ -462,7 +426,7 @@ pub(crate) async fn trust_create_challenge_on(
                 .unwrap_or_default(),
             evaluator_context_id,
         },
-        &NapiEvaluatorInvoker { bi, sup },
+        &invoker,
         &scp_core::trust::ProtocolOnlyDefinitions,
     )
     .await
@@ -534,7 +498,8 @@ pub(crate) async fn trust_grade_response_on(
     let sup = crate::runtime::supervisor(bi)?;
     let signer = identity_signer(bi, &verifier).await?;
     let verifier: scp_did::DID = verifier.into();
-    let invoker = NapiEvaluatorInvoker { bi, sup };
+    let host = NapiEvaluatorHost { bi };
+    let invoker = scp_ffi_common::challenge::SharedEvaluatorInvoker::new(sup, &host);
     let grading = scp_ffi_common::challenge::Grader {
         sup,
         signer: &signer,

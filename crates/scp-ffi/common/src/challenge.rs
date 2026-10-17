@@ -10,9 +10,9 @@
 //! evaluators, and hand each step to the ledger.
 //!
 //! Evaluator outlets are bridge state (the registry and the host
-//! handlers), so each bridge implements [`EvaluatorInvoker`] once over its
-//! state and calls [`check_evaluator_registered`] and
-//! [`invoke_evaluator_outlet`], which hold the shared rules.
+//! handlers), so each bridge implements [`EvaluatorHost`], the lookup of that
+//! state, and grades through [`SharedEvaluatorInvoker`], which holds the
+//! evaluator rules. A bridge cannot supply its own invoker.
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
@@ -322,14 +322,43 @@ pub enum EvaluatorOutcome {
     },
 }
 
-/// The bridge side of a `CustomEval` evaluator.
+/// The bridge side of a `CustomEval` evaluator: the lookup of the outlet
+/// registry and the host handlers the bridge keeps for an evaluator context.
 ///
-/// It owns the outlet registry and the host handlers of the evaluator
-/// context. Each bridge implements it once,
-/// over its own state, by calling [`check_evaluator_registered`] and
-/// [`invoke_evaluator_outlet`].
-#[async_trait::async_trait]
-pub trait EvaluatorInvoker: Send + Sync {
+/// Each bridge implements it once over its own state and passes it to
+/// [`SharedEvaluatorInvoker::new`]; the evaluator rules live only in the
+/// invoker.
+pub trait EvaluatorHost: Send + Sync {
+    /// A snapshot of the evaluator context's outlet registry; `None` when
+    /// the bridge serves no such context.
+    fn registry(&self, evaluator_context_id: &str) -> Option<OutletRegistry>;
+
+    /// The host handler registered for `outlet_id` in the evaluator context;
+    /// `None` when the bridge serves no such context or holds no handler for
+    /// the outlet.
+    fn handler(&self, evaluator_context_id: &str, outlet_id: &OutletId)
+    -> Option<EvaluatorHandler>;
+}
+
+/// The one evaluator invoker every bridge grades through.
+///
+/// It reads the registry and the handler from the bridge's
+/// [`EvaluatorHost`] and applies the shared create-time check and the
+/// shared invocation rules, so no bridge can register, check, or run an
+/// evaluator differently.
+pub struct SharedEvaluatorInvoker<'a> {
+    sup: &'a Arc<Supervisor>,
+    host: &'a dyn EvaluatorHost,
+}
+
+impl<'a> SharedEvaluatorInvoker<'a> {
+    /// An invoker over `host`'s evaluator state, checking membership and
+    /// running evaluators through `sup`.
+    #[must_use]
+    pub fn new(sup: &'a Arc<Supervisor>, host: &'a dyn EvaluatorHost) -> Self {
+        Self { sup, host }
+    }
+
     /// Create-time check: the outlet is registered in the evaluator
     /// context, a host handler is present, and `challenger` is a member
     /// whose role grants the outlet invocation permission.
@@ -338,17 +367,33 @@ pub trait EvaluatorInvoker: Send + Sync {
     ///
     /// [`TrustError::EvaluatorUnavailable`] naming the first check that
     /// fails.
-    async fn check_registered(
+    pub async fn check_registered(
         &self,
         evaluator_context_id: &str,
         outlet_id: &OutletId,
         challenger: &DID,
-    ) -> Result<(), TrustError>;
+    ) -> Result<(), TrustError> {
+        let registry = self.host.registry(evaluator_context_id);
+        let has_handler = self.host.handler(evaluator_context_id, outlet_id).is_some();
+        check_evaluator_registered(
+            self.sup,
+            evaluator_context_id,
+            registry.as_ref(),
+            has_handler,
+            challenger,
+            outlet_id,
+        )
+        .await
+    }
 
     /// Runs the evaluator on `call.input` within `call.remaining`, holding
     /// `call.permit` until the handler returns, and sets `call.started` when
     /// the evaluator starts.
-    async fn invoke(&self, call: EvaluatorCall<'_>) -> EvaluatorOutcome;
+    pub async fn invoke(&self, call: EvaluatorCall<'_>) -> EvaluatorOutcome {
+        let registry = self.host.registry(call.evaluator_context_id);
+        let handler = self.host.handler(call.evaluator_context_id, call.outlet_id);
+        invoke_evaluator_outlet(self.sup, registry.as_ref(), handler, call).await
+    }
 }
 
 /// One evaluator invocation.
@@ -376,7 +421,7 @@ pub struct EvaluatorCall<'a> {
     pub started: Arc<AtomicBool>,
 }
 
-/// The shared body of [`EvaluatorInvoker::check_registered`].
+/// The body of [`SharedEvaluatorInvoker::check_registered`].
 ///
 /// `registry` is the bridge's outlet registry of the evaluator context
 /// (`None` when the bridge serves no such context) and `has_handler`
@@ -386,7 +431,7 @@ pub struct EvaluatorCall<'a> {
 /// # Errors
 ///
 /// [`TrustError::EvaluatorUnavailable`] naming the first check that fails.
-pub async fn check_evaluator_registered(
+async fn check_evaluator_registered(
     sup: &Supervisor,
     evaluator_context_id: &str,
     registry: Option<&OutletRegistry>,
@@ -445,7 +490,7 @@ fn parse_verdict(output: &Value) -> Option<EvaluatorVerdict> {
     })
 }
 
-/// The shared body of [`EvaluatorInvoker::invoke`].
+/// The body of [`SharedEvaluatorInvoker::invoke`].
 ///
 /// It runs `handler` as the executor of
 /// [`Supervisor::invoke_outlet_with_economy`] on a blocking thread that
@@ -476,7 +521,7 @@ fn parse_verdict(output: &Value) -> Option<EvaluatorVerdict> {
 /// them; the task carries it to its settle when the grading budget expires
 /// or the caller is dropped, and a supervisor shutdown waits for that
 /// settle before storage closes.
-pub async fn invoke_evaluator_outlet(
+async fn invoke_evaluator_outlet(
     sup: &Arc<Supervisor>,
     registry: Option<&OutletRegistry>,
     handler: Option<EvaluatorHandler>,
@@ -691,7 +736,7 @@ pub async fn create_challenge(
     sup: &Supervisor,
     signer: &CommandSigner,
     args: CreateChallenge,
-    invoker: &dyn EvaluatorInvoker,
+    invoker: &SharedEvaluatorInvoker<'_>,
     defs: &dyn CapabilityDefinitionSource,
 ) -> Result<ChallengeRequest, ChallengeOpError> {
     signer.require_ed25519()?;
@@ -904,7 +949,7 @@ pub struct Grader<'a, R> {
     /// The instance's DID resolver, which authenticates the response.
     pub resolver: Arc<R>,
     /// The bridge's evaluator invoker, which runs `CustomEval` cases.
-    pub invoker: &'a dyn EvaluatorInvoker,
+    pub invoker: &'a SharedEvaluatorInvoker<'a>,
 }
 
 /// [`grade_response`] with the grading budget as a parameter, so a test
@@ -1075,7 +1120,7 @@ impl CaseVerdicts {
 struct CaseRun<'a> {
     evaluator_context_id: Option<&'a str>,
     challenger: &'a DID,
-    invoker: &'a dyn EvaluatorInvoker,
+    invoker: &'a SharedEvaluatorInvoker<'a>,
     permit: &'a Arc<OwnedSemaphorePermit>,
     deadline: tokio::time::Instant,
 }

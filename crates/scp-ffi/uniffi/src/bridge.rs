@@ -7671,82 +7671,47 @@ fn challenge_op_error(e: scp_ffi_common::challenge::ChallengeOpError) -> ScpErro
     }
 }
 
-/// The evaluator side of `CustomEval` grading on this bridge: the outlet
-/// registry and host handlers of the evaluator context's handle in this
-/// instance's context handle registry.
-struct UniffiEvaluatorInvoker<'a> {
+/// The evaluator state of this bridge: the outlet registry and host
+/// handlers of the evaluator context's handle in this instance's context
+/// handle registry. A lookup finds nothing when no handle for the context is
+/// registered on this instance.
+struct UniffiEvaluatorHost<'a> {
     bi: &'a Arc<crate::runtime::UniffiBridgeInstance>,
-    sup: &'a Arc<scp_core::context::supervisor::Supervisor>,
 }
 
-impl UniffiEvaluatorInvoker<'_> {
-    /// A snapshot of the evaluator context's registry and the outlet's
-    /// handler; `None` when no handle for the context is registered on this
-    /// instance.
-    fn snapshot(
+impl UniffiEvaluatorHost<'_> {
+    fn handle(&self, evaluator_context_id: &str) -> Option<Arc<ContextHandle>> {
+        context_handle_registry(self.bi)
+            .get(evaluator_context_id)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+}
+
+impl scp_ffi_common::challenge::EvaluatorHost for UniffiEvaluatorHost<'_> {
+    fn registry(
         &self,
         evaluator_context_id: &str,
-        outlet_id: &scp_core::context::outlets::OutletId,
-    ) -> Option<(
-        scp_core::context::outlets::OutletRegistry,
-        Option<scp_ffi_common::challenge::EvaluatorHandler>,
-    )> {
-        let handle = context_handle_registry(self.bi)
-            .get(evaluator_context_id)
-            .map(|entry| Arc::clone(entry.value()))?;
+    ) -> Option<scp_core::context::outlets::OutletRegistry> {
+        let handle = self.handle(evaluator_context_id)?;
         let registry = handle
             .outlet_registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let handler = handle
-            .outlet_handlers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(outlet_id.as_str())
-            .cloned();
-        Some((registry, handler))
+        Some(registry)
     }
-}
 
-#[async_trait::async_trait]
-impl scp_ffi_common::challenge::EvaluatorInvoker for UniffiEvaluatorInvoker<'_> {
-    async fn check_registered(
+    fn handler(
         &self,
         evaluator_context_id: &str,
         outlet_id: &scp_core::context::outlets::OutletId,
-        challenger: &scp_did::DID,
-    ) -> Result<(), scp_core::trust::TrustError> {
-        let snapshot = self.snapshot(evaluator_context_id, outlet_id);
-        scp_ffi_common::challenge::check_evaluator_registered(
-            self.sup,
-            evaluator_context_id,
-            snapshot.as_ref().map(|(registry, _)| registry),
-            snapshot
-                .as_ref()
-                .is_some_and(|(_, handler)| handler.is_some()),
-            challenger,
-            outlet_id,
-        )
-        .await
-    }
-
-    async fn invoke(
-        &self,
-        call: scp_ffi_common::challenge::EvaluatorCall<'_>,
-    ) -> scp_ffi_common::challenge::EvaluatorOutcome {
-        let (registry, handler) = self
-            .snapshot(call.evaluator_context_id, call.outlet_id)
-            .map_or((None, None), |(registry, handler)| {
-                (Some(registry), handler)
-            });
-        scp_ffi_common::challenge::invoke_evaluator_outlet(
-            self.sup,
-            registry.as_ref(),
-            handler,
-            call,
-        )
-        .await
+    ) -> Option<scp_ffi_common::challenge::EvaluatorHandler> {
+        let handle = self.handle(evaluator_context_id)?;
+        let handlers = handle
+            .outlet_handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handlers.get(outlet_id.as_str()).cloned()
     }
 }
 
@@ -7773,6 +7738,8 @@ async fn trust_create_challenge_impl(
     }
     let sup = bi.context_manager_expect()?;
     let signer = resolve_identity_signer(verifier).await?;
+    let host = UniffiEvaluatorHost { bi };
+    let invoker = scp_ffi_common::challenge::SharedEvaluatorInvoker::new(sup, &host);
     let request = scp_ffi_common::challenge::create_challenge(
         sup,
         &signer,
@@ -7791,7 +7758,7 @@ async fn trust_create_challenge_impl(
                 .unwrap_or_default(),
             evaluator_context_id,
         },
-        &UniffiEvaluatorInvoker { bi, sup },
+        &invoker,
         &scp_core::trust::ProtocolOnlyDefinitions,
     )
     .await
@@ -7854,7 +7821,8 @@ async fn trust_grade_response_impl(
     let sup = bi.context_manager_expect()?;
     let signer = resolve_identity_signer(verifier).await?;
     let verifier_did: scp_did::DID = verifier.did.as_str().into();
-    let invoker = UniffiEvaluatorInvoker { bi, sup };
+    let host = UniffiEvaluatorHost { bi };
+    let invoker = scp_ffi_common::challenge::SharedEvaluatorInvoker::new(sup, &host);
     let grading = scp_ffi_common::challenge::Grader {
         sup,
         signer: &signer,

@@ -222,41 +222,37 @@ fn passing_handler(calls: &Arc<AtomicUsize>) -> EvaluatorHandler {
     })
 }
 
-/// A bridge invoker over a registry and one handler, through the shared
-/// helpers, as each bridge implements it.
-struct TestInvoker {
-    sup: Arc<Supervisor>,
+/// A bridge's evaluator state: a registry and one handler, served for
+/// every evaluator context.
+struct TestHost {
     registry: Option<OutletRegistry>,
     handler: Option<EvaluatorHandler>,
 }
 
-#[async_trait::async_trait]
-impl EvaluatorInvoker for TestInvoker {
-    async fn check_registered(
-        &self,
-        evaluator_context_id: &str,
-        outlet_id: &OutletId,
-        challenger: &DID,
-    ) -> Result<(), TrustError> {
-        check_evaluator_registered(
-            &self.sup,
-            evaluator_context_id,
-            self.registry.as_ref(),
-            self.handler.is_some(),
-            challenger,
-            outlet_id,
-        )
-        .await
+impl EvaluatorHost for TestHost {
+    fn registry(&self, _evaluator_context_id: &str) -> Option<OutletRegistry> {
+        self.registry.clone()
     }
 
-    async fn invoke(&self, call: EvaluatorCall<'_>) -> EvaluatorOutcome {
-        invoke_evaluator_outlet(
-            &self.sup,
-            self.registry.as_ref(),
-            self.handler.clone(),
-            call,
-        )
-        .await
+    fn handler(
+        &self,
+        _evaluator_context_id: &str,
+        _outlet_id: &OutletId,
+    ) -> Option<EvaluatorHandler> {
+        self.handler.clone()
+    }
+}
+
+/// A [`TestHost`] with the supervisor the shared invoker checks and runs
+/// evaluators through, as each bridge builds it.
+struct TestInvoker {
+    sup: Arc<Supervisor>,
+    host: TestHost,
+}
+
+impl TestInvoker {
+    fn shared(&self) -> SharedEvaluatorInvoker<'_> {
+        SharedEvaluatorInvoker::new(&self.sup, &self.host)
     }
 }
 
@@ -324,8 +320,7 @@ impl Harness {
     ) -> TestInvoker {
         TestInvoker {
             sup: Arc::clone(&self.sup),
-            registry,
-            handler,
+            host: TestHost { registry, handler },
         }
     }
 
@@ -361,7 +356,7 @@ impl Harness {
             &self.sup,
             &signer(challenger),
             Self::args(challenger, 1, evaluator),
-            invoker,
+            &invoker.shared(),
             &ProtocolOnlyDefinitions,
         )
         .await;
@@ -386,7 +381,7 @@ impl Harness {
             &self.sup,
             &signer(1),
             Self::args_for(1, subject, custom, Some(EVAL_CTX)),
-            invoker,
+            &invoker.shared(),
             &ProtocolOnlyDefinitions,
         )
         .await
@@ -409,7 +404,7 @@ impl Harness {
             &self.sup,
             &signer(1),
             args,
-            invoker,
+            &invoker.shared(),
             &ProtocolOnlyDefinitions,
         )
         .await
@@ -460,7 +455,7 @@ impl Harness {
                 sup: &self.sup,
                 signer: &signer(1),
                 resolver: Arc::clone(&self.resolver),
-                invoker,
+                invoker: &invoker.shared(),
             },
             &self.repo,
             &did(1),
@@ -484,7 +479,7 @@ impl Harness {
                 sup: &self.sup,
                 signer: &signer(1),
                 resolver: Arc::clone(&self.resolver),
-                invoker,
+                invoker: &invoker.shared(),
             },
             &self.repo,
             &did(1),
@@ -518,7 +513,7 @@ async fn p256_signer_refused_before_custody() {
         &h.sup,
         &p256,
         Harness::args(1, 0, None),
-        &invoker,
+        &invoker.shared(),
         &ProtocolOnlyDefinitions,
     )
     .await
@@ -546,7 +541,7 @@ async fn p256_signer_refused_before_custody() {
             sup: &h.sup,
             signer: &p256,
             resolver: Arc::clone(&h.resolver),
-            invoker: &invoker,
+            invoker: &invoker.shared(),
         },
         &h.repo,
         &did(1),
@@ -573,9 +568,15 @@ async fn malformed_argument_is_named() {
     let mut args = Harness::args(1, 0, None);
     args.test_cases_json = "{".to_owned();
     named(
-        create_challenge(&h.sup, &signer(1), args, &invoker, &ProtocolOnlyDefinitions)
-            .await
-            .unwrap_err(),
+        create_challenge(
+            &h.sup,
+            &signer(1),
+            args,
+            &invoker.shared(),
+            &ProtocolOnlyDefinitions,
+        )
+        .await
+        .unwrap_err(),
         JsonInput::TestCases,
     );
 
@@ -606,7 +607,7 @@ async fn malformed_argument_is_named() {
                 sup: &h.sup,
                 signer: &signer(1),
                 resolver: Arc::clone(&h.resolver),
-                invoker: &invoker,
+                invoker: &invoker.shared(),
             },
             &h.repo,
             &did(1),
@@ -676,9 +677,15 @@ async fn create_refuses_suite_below_minimum() {
         .collect();
     let mut args = Harness::args(1, 0, None);
     args.test_cases_json = serde_json::to_string(&cases).unwrap();
-    let err = create_challenge(&h.sup, &signer(1), args, &invoker, &ProtocolOnlyDefinitions)
-        .await
-        .unwrap_err();
+    let err = create_challenge(
+        &h.sup,
+        &signer(1),
+        args,
+        &invoker.shared(),
+        &ProtocolOnlyDefinitions,
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(
             err,
@@ -1643,7 +1650,7 @@ async fn oversize_request_refused_before_resolution() {
             sup: &h.sup,
             signer: &signer(1),
             resolver: Arc::clone(&h.resolver),
-            invoker: &invoker,
+            invoker: &invoker.shared(),
         },
         &h.repo,
         &did(1),
@@ -1687,7 +1694,7 @@ async fn grade_at_created_at_is_not_yet_gradable() {
         &h.sup,
         &signer(1),
         Harness::args(1, 0, None),
-        &invoker,
+        &invoker.shared(),
         &ProtocolOnlyDefinitions,
     )
     .await
