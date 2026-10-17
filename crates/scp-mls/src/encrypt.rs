@@ -154,6 +154,12 @@ pub enum DecryptedContent {
         /// lists each leaf this Commit replaced (an Update proposal or the
         /// committer's `UpdatePath`) whose `0xFF01` changed.
         members: crate::admission::MemberLeaves,
+        /// The DID of every occupied leaf before and after this Commit, one
+        /// entry per leaf, keyless leaves included. A receiver passes it to
+        /// [`classify_commit_membership`](scp_protocol::context::pseudonym::classify_commit_membership)
+        /// to count the Commit's membership changes by DID (spec 09 §9.10.4.1
+        /// "Membership-change criterion").
+        leaf_dids: scp_protocol::context::pseudonym::CommitLeafDids,
     },
     /// A Proposal message. openmls does not store it: a received proposal is
     /// stored only through `store_pending_proposal`, which SCP does not call.
@@ -401,6 +407,7 @@ fn decrypt_protocol_message_with_sender_did(
             Ok(DecryptedContent::Commit {
                 sender_did,
                 members: admission.members,
+                leaf_dids: admission.leaf_dids,
             })
         }
         ProcessedMessageContent::ProposalMessage(proposal)
@@ -1332,6 +1339,7 @@ mod tests {
         if let DecryptedContent::Commit {
             sender_did,
             members,
+            ..
         } = &content
         {
             assert!(

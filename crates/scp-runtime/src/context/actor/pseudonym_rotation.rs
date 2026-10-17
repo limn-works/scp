@@ -16,6 +16,7 @@
 //! back.
 
 use scp_protocol::context::params::{PSEUDONYM_ROTATION_GRACE_SECS, PseudonymRotationPolicy};
+use scp_protocol::context::pseudonym::CommitMembershipChange;
 use serde::{Deserialize, Serialize};
 
 use super::state::PerContextState;
@@ -388,6 +389,86 @@ pub(crate) fn note_member_removed(state: &mut PerContextState, local_did: &str, 
     }
 }
 
+/// A Commit another member committed, which the local member processed on
+/// the `DeliverIncoming` path, with its membership changes counted by DID (spec
+/// 09 §9.10.4.1 "Membership-change criterion").
+///
+/// `deliver_incoming` produces it from
+/// [`classify_commit_membership`](scp_protocol::context::pseudonym::classify_commit_membership);
+/// the messaging handler applies it with [`note_processed_commit`] inside a
+/// fail-closed Class-S commit, because the receive view cannot reach Class-S
+/// state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a processed Commit's membership change must reach note_processed_commit, or the rotation trigger and the registry deletion are lost"]
+pub(crate) struct ProcessedCommit {
+    /// The committer's DID from its MLS credential.
+    pub(crate) committer_did: String,
+    /// The `AddMember` and `RemoveMember` DIDs the Commit applies.
+    pub(crate) change: CommitMembershipChange,
+}
+
+/// Applies a processed Commit's membership changes to the local member's
+/// state (spec 09 §9.10.4.1). Call it inside the Class-S commit that persists
+/// them.
+///
+/// - **Record lifetime and removal:** tears down every DID the Commit removes,
+///   other than the local member, as the committer's removal does: its sender
+///   key, its sender-epoch and receive-sequence floors through
+///   `remove_floors`, and, through [`PerContextState::remove_member_state`],
+///   its pseudonym-registry record, so a rejoining member's new epoch sequence
+///   is accepted, and its membership, role state (spec §5.6.1), access key and
+///   read exclusion. Without the floor prune a rejoiner's sender key, which
+///   restarts its epochs, is refused as a rollback.
+/// - **Membership trigger:** when the Commit applies at least one `AddMember` or
+///   `RemoveMember`, records one pending rotation unless the local member is the
+///   committer (it rotates after its own commit) or is removed. A removed local
+///   member discards its grace instead ("Leave, close and expiry during a
+///   grace") and applies no add. [`PseudonymRotationState::note_membership_change`]
+///   records nothing unless the policy sets `on_membership_change`.
+/// - **Addition:** records every DID the Commit adds, other than the local
+///   member, through [`PerContextState::add_member_state`], so the local member
+///   accepts the added member's messages, its announcements included.
+///
+/// # Errors
+///
+/// [`PerContextState::remove_member_sender_key`]'s error on a context
+/// without MLS state, and [`PerContextState::add_member_state`]'s error. The
+/// removals and the trigger are applied before any add, so they stay in
+/// memory for the next persist.
+pub(crate) fn note_processed_commit(
+    state: &mut PerContextState,
+    context_id: &str,
+    local_did: &str,
+    commit: &ProcessedCommit,
+    clock: &dyn scp_clock::Clock,
+    mut remove_floors: impl FnMut(&str),
+) -> Result<(), scp_protocol::context::ContextError> {
+    for did in &commit.change.removed_dids {
+        if did != local_did {
+            state.remove_member_sender_key(did)?;
+            remove_floors(did);
+            state.remove_member_state(context_id, &scp_did::DID::from(did.as_str()));
+        }
+    }
+    if commit.change.removed_dids.iter().any(|d| d == local_did) {
+        state.class_s.pseudonym_rotation.discard_grace();
+        return Ok(());
+    }
+    if commit.committer_did != local_did && !commit.change.is_empty() {
+        let policy = state.handle.params().pseudonym_rotation;
+        state
+            .class_s
+            .pseudonym_rotation
+            .note_membership_change(policy.as_ref());
+    }
+    for did in &commit.change.added_dids {
+        if did != local_did {
+            state.add_member_state(&scp_did::DID::from(did.as_str()), clock)?;
+        }
+    }
+    Ok(())
+}
+
 /// The local member's routing IDs in one context (spec 09 §9.10.4.1), the
 /// answer to [`Supervisor::local_routing_ids`](crate::context::supervisor::supervisor::Supervisor::local_routing_ids).
 ///
@@ -663,6 +744,19 @@ mod tests {
         );
         state.creation_timestamp_secs = T0;
         state.routing.set_local_pseudonym([9; 32]);
+        // A role state with the built-in roles, as a created or joined
+        // context holds, so a processed add can assign `member`.
+        state.role_state = scp_protocol::context::roles::ContextRoleState::new(
+            CTX,
+            LOCAL,
+            scp_protocol::context::roles::CapabilityCeiling::new([
+                scp_protocol::context::roles::Capability::MessagesRead,
+                scp_protocol::context::roles::Capability::MessagesWrite,
+            ]),
+            Vec::new(),
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
         state
     }
 
@@ -751,5 +845,281 @@ mod tests {
             RotationWake::Idle
         );
         assert_eq!(at_t0().wake(None, T0 + 9 * I), RotationWake::Idle);
+    }
+
+    fn processed(committer: &str, added: &[&str], removed: &[&str]) -> ProcessedCommit {
+        ProcessedCommit {
+            committer_did: committer.to_owned(),
+            change: CommitMembershipChange {
+                added_dids: added.iter().map(|d| (*d).to_owned()).collect(),
+                removed_dids: removed.iter().map(|d| (*d).to_owned()).collect(),
+            },
+        }
+    }
+
+    fn record_peer(state: &mut PerContextState, did: &str, epoch: u64) {
+        state.routing.peer_registry_mut().unwrap().insert(
+            scp_did::DID::from(did),
+            scp_protocol::context::pseudonym::PseudonymRecord {
+                routing_id: [7; 32],
+                epoch: Some(epoch),
+            },
+        );
+    }
+
+    fn has_record(state: &PerContextState, did: &str) -> bool {
+        state
+            .routing
+            .peer_registry()
+            .unwrap()
+            .contains_key(&scp_did::DID::from(did))
+    }
+
+    const COMMITTER: &str = "did:dht:committer";
+    const CTX: &str = "ctx-push-030";
+
+    fn apply(state: &mut PerContextState, commit: &ProcessedCommit) {
+        let mut pruned = Vec::new();
+        note_processed_commit(state, CTX, LOCAL, commit, &scp_clock::SystemClock, |did| {
+            pruned.push(did.to_owned());
+        })
+        .unwrap();
+        let removed_peers: Vec<String> = commit
+            .change
+            .removed_dids
+            .iter()
+            .filter(|d| d.as_str() != LOCAL)
+            .cloned()
+            .collect();
+        assert_eq!(
+            pruned, removed_peers,
+            "every removed peer's floors are pruned"
+        );
+    }
+
+    /// A processed add records the added DID in the membership, the
+    /// active-member set and the role state with the `member` role, so its
+    /// messages pass the receive path's membership and `messages:write`
+    /// gates. The local member is not added by a peer's Commit, and a DID
+    /// already a member keeps its role.
+    #[test]
+    fn a_processed_add_records_the_added_member_with_the_member_role() {
+        use scp_protocol::context::roles::Capability;
+        let mut state = context_state(None);
+        state.membership.add_member(
+            scp_did::DID::from(COMMITTER),
+            "admin".to_owned(),
+            Vec::new(),
+        );
+        assert!(!state.membership.contains(PEER));
+        assert!(
+            !state
+                .role_state
+                .member_has_capability(PEER, &Capability::MessagesWrite)
+        );
+
+        apply(
+            &mut state,
+            &processed(COMMITTER, &[PEER, COMMITTER, LOCAL], &[]),
+        );
+        assert!(state.membership.contains(PEER));
+        assert!(state.members.contains(&scp_did::DID::from(PEER)));
+        assert!(state.role_state.members.contains(PEER));
+        assert!(
+            state
+                .role_state
+                .member_has_capability(PEER, &Capability::MessagesWrite)
+        );
+        assert_eq!(
+            state
+                .role_state
+                .assignments
+                .get(PEER)
+                .map(|a| a.role_name.as_str()),
+            Some("member")
+        );
+        assert_eq!(
+            state
+                .membership
+                .get(COMMITTER)
+                .map(|m| m.role_name.as_str()),
+            Some("admin"),
+            "an existing member keeps its role"
+        );
+        assert!(
+            !state.membership.contains(LOCAL),
+            "a peer's Commit never adds the local member"
+        );
+        assert!(state.access.access_key_store.get(CTX, PEER).is_none());
+    }
+
+    /// When the `member` role cannot be assigned, the add fails with
+    /// `MembershipFailed` and leaves the DID out of every membership record,
+    /// while the removal and the rotation trigger applied before it stay.
+    #[test]
+    fn a_processed_add_without_a_member_role_fails_and_records_nothing() {
+        let mut state = context_state(Some(membership_policy()));
+        state.role_state = scp_protocol::context::roles::ContextRoleState::empty_for_test();
+        record_peer(&mut state, COMMITTER, 1);
+        let result = note_processed_commit(
+            &mut state,
+            CTX,
+            LOCAL,
+            &processed("did:dht:other-committer", &[PEER], &[COMMITTER]),
+            &scp_clock::SystemClock,
+            |_| {},
+        );
+        assert!(
+            matches!(
+                result,
+                Err(scp_protocol::context::ContextError::MembershipFailed(_))
+            ),
+            "got {result:?}"
+        );
+        assert!(!state.membership.contains(PEER));
+        assert!(!state.members.contains(&scp_did::DID::from(PEER)));
+        assert!(!state.role_state.members.contains(PEER));
+        assert!(
+            !has_record(&state, COMMITTER),
+            "the removal is applied first"
+        );
+        assert!(
+            state.class_s.pseudonym_rotation.membership_change_pending,
+            "the trigger is applied before the add"
+        );
+    }
+
+    /// "Membership trigger": a peer's Commit that adds or removes a member
+    /// records one pending rotation, and a Commit with several changes still
+    /// records one.
+    #[test]
+    fn a_peers_membership_commit_records_one_pending_rotation() {
+        let mut state = context_state(Some(membership_policy()));
+        apply(&mut state, &processed(COMMITTER, &[PEER], &[]));
+        assert!(state.class_s.pseudonym_rotation.membership_change_pending);
+
+        let mut state = context_state(Some(membership_policy()));
+        apply(
+            &mut state,
+            &processed(COMMITTER, &["did:dht:a", "did:dht:b"], &[PEER]),
+        );
+        assert!(state.class_s.pseudonym_rotation.membership_change_pending);
+        assert_eq!(
+            state
+                .class_s
+                .pseudonym_rotation
+                .due_epoch(Some(&membership_policy()), T0),
+            Some(0)
+        );
+    }
+
+    /// A Commit with no `AddMember` or `RemoveMember` (a device leaf or a key
+    /// update), the local member's own Commit, and a policy without
+    /// `on_membership_change` record nothing.
+    #[test]
+    fn no_rotation_without_a_membership_change_a_peer_committer_or_the_policy() {
+        let mut state = context_state(Some(membership_policy()));
+        apply(&mut state, &processed(COMMITTER, &[], &[]));
+        assert_eq!(state.class_s.pseudonym_rotation, at_t0());
+
+        apply(&mut state, &processed(LOCAL, &[PEER], &[]));
+        assert_eq!(state.class_s.pseudonym_rotation, at_t0());
+
+        let mut state = context_state(Some(interval_policy()));
+        apply(&mut state, &processed(COMMITTER, &[PEER], &[]));
+        assert!(!state.class_s.pseudonym_rotation.membership_change_pending);
+
+        let mut state = context_state(None);
+        apply(&mut state, &processed(COMMITTER, &[PEER], &[]));
+        assert!(!state.class_s.pseudonym_rotation.membership_change_pending);
+    }
+
+    /// "Record lifetime": a processed removal deletes the removed DID's record
+    /// and keeps every other record, even when the local member is the
+    /// committer or the policy sets no rotation.
+    #[test]
+    fn a_processed_removal_deletes_the_removed_dids_record() {
+        let mut state = context_state(None);
+        record_peer(&mut state, PEER, 3);
+        record_peer(&mut state, COMMITTER, 1);
+        apply(&mut state, &processed(LOCAL, &[], &[PEER]));
+        assert!(!has_record(&state, PEER));
+        assert!(has_record(&state, COMMITTER));
+    }
+
+    fn admit(state: &mut PerContextState, did: &str) {
+        state
+            .membership
+            .add_member(scp_did::DID::from(did), "member".to_owned(), Vec::new());
+        state.members.insert(scp_did::DID::from(did));
+        state.role_state.members.insert(did.to_owned());
+        state.role_state.member_capabilities.insert(
+            did.to_owned(),
+            std::iter::once(scp_protocol::context::roles::Capability::MessagesWrite).collect(),
+        );
+        let key = scp_protocol::crypto::access_keys::generate_access_key(CTX, did);
+        state.access.access_key_store.set(CTX, did, key);
+        state
+            .access
+            .read_exclusion_list
+            .insert(scp_did::DID::from(did));
+        record_peer(state, did, 1);
+        state.sequence_tracker.advance(CTX, did, 2, 1);
+    }
+
+    fn admitted(state: &PerContextState, did: &str) -> [bool; 7] {
+        [
+            state.membership.contains(did),
+            state.members.contains(&scp_did::DID::from(did)),
+            state.role_state.member_has_capability(
+                did,
+                &scp_protocol::context::roles::Capability::MessagesWrite,
+            ),
+            state.access.access_key_store.get(CTX, did).is_some(),
+            state
+                .access
+                .read_exclusion_list
+                .contains(&scp_did::DID::from(did)),
+            has_record(state, did),
+            state.sequence_tracker.expected_sequence(CTX, did).is_some(),
+        ]
+    }
+
+    /// A processed removal takes the removed DID out of the membership, the
+    /// role state, the access-key store, the read-exclusion list, the
+    /// pseudonym registry and the sequence tracker, keeps
+    /// every other member, and keeps the local member when it is the one
+    /// removed.
+    #[test]
+    fn a_processed_removal_removes_the_dids_membership_and_keeps_the_rest() {
+        let mut state = context_state(None);
+        for did in [PEER, COMMITTER, LOCAL] {
+            admit(&mut state, did);
+        }
+        apply(&mut state, &processed(COMMITTER, &[], &[PEER]));
+        assert_eq!(admitted(&state, PEER), [false; 7]);
+        assert_eq!(admitted(&state, COMMITTER), [true; 7]);
+        assert_eq!(admitted(&state, LOCAL), [true; 7]);
+
+        apply(&mut state, &processed(COMMITTER, &[], &[LOCAL]));
+        assert_eq!(admitted(&state, LOCAL), [true; 7]);
+    }
+
+    /// A removed member that processes the Commit removing it does not rotate;
+    /// it discards its grace and pending work.
+    #[test]
+    fn the_removed_local_member_does_not_rotate_and_discards_its_grace() {
+        let policy = membership_policy();
+        let mut state = context_state(Some(policy));
+        state
+            .class_s
+            .pseudonym_rotation
+            .record_rotation(0, [1; 32], Some(&policy), T0)
+            .unwrap();
+        apply(&mut state, &processed(COMMITTER, &[PEER], &[LOCAL]));
+        let rotation = &state.class_s.pseudonym_rotation;
+        assert!(!rotation.membership_change_pending);
+        assert_eq!(rotation.previous(), None);
+        assert!(!rotation.announce_pending());
     }
 }

@@ -68,15 +68,27 @@ pub struct OpenedEnvelope {
 
 /// Discriminated result of `NodeMlsFactory::open` (in `scp-runtime`).
 ///
-/// After MLS decryption, the plaintext may be an application message,
-/// an MLS control message, or a management message (e.g., sender key
-/// distribution). The `SCPM` magic prefix distinguishes management
+/// After MLS decryption, the plaintext may be an application message, a
+/// merged MLS Commit, an MLS Proposal, or a management message (e.g., sender
+/// key distribution). The `SCPM` magic prefix distinguishes management
 /// payloads from application payloads.
 #[derive(Debug, Clone)]
 pub enum OpenResult {
     /// Application message containing a verified inner envelope.
     Application(Box<OpenedEnvelope>),
-    /// MLS control message (Commit or Proposal) with no application payload.
+    /// A Commit another member committed, which the local member admitted
+    /// and merged. It carries no application payload; the receiver classifies
+    /// its membership changes from `leaf_dids` (spec 09 §9.10.4.1).
+    Commit {
+        /// The committer's DID from its MLS credential.
+        committer_did: String,
+        /// The DID of every occupied leaf before and after the Commit, the
+        /// input to
+        /// [`classify_commit_membership`](crate::context::pseudonym::classify_commit_membership).
+        leaf_dids: crate::context::pseudonym::CommitLeafDids,
+    },
+    /// An MLS Proposal, which carries no application payload and changes no
+    /// state.
     Control,
     /// MLS-wrapped management message (e.g., sender key distribution).
     Management {

@@ -27,7 +27,7 @@
 //! vectors (`.docs/specs/25-test-vectors.md` §25.19 Vectors 36 and 58) —
 //! changing one is a wire-observable change, not a refactor.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use scp_did::DID;
 use serde::{Deserialize, Serialize};
@@ -418,14 +418,75 @@ pub fn classify_pseudonym_announcement(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Membership-change criterion (§9.10.4.1)
+// ---------------------------------------------------------------------------
+
+/// The DID of every occupied MLS leaf before and after one Commit, one entry
+/// per leaf, as the Commit's admission read the tree (spec 09 §9.10.4.1
+/// "Membership-change criterion").
+///
+/// A DID appears once per leaf it holds, so a DID with two device leaves
+/// appears twice. Order carries no meaning.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitLeafDids {
+    /// One DID per occupied leaf of the tree before the Commit.
+    pub before: Vec<String>,
+    /// One DID per occupied leaf of the tree after the Commit.
+    pub after: Vec<String>,
+}
+
+/// The membership changes one Commit applies, counted by DID (spec 09
+/// §9.10.4.1 "Membership-change criterion"), from
+/// [`classify_commit_membership`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitMembershipChange {
+    /// Each DID that held no leaf before the Commit and holds one after: one
+    /// `AddMember` each. Sorted, without duplicates.
+    pub added_dids: Vec<String>,
+    /// Each DID that held a leaf before the Commit and holds none after: the
+    /// Commit removed its last leaf, one `RemoveMember` each. Sorted, without
+    /// duplicates.
+    pub removed_dids: Vec<String>,
+}
+
+impl CommitMembershipChange {
+    /// `true` when the Commit applies no `AddMember` and no `RemoveMember`, such
+    /// as a key update or a device leaf added to or removed from a DID that
+    /// holds another leaf before and after.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.added_dids.is_empty() && self.removed_dids.is_empty()
+    }
+}
+
+/// Classifies one Commit's membership changes by DID, not by MLS leaf (spec
+/// 09 §9.10.4.1 "Membership-change criterion").
+///
+/// A Commit is an `AddMember` for each DID that held no leaf before it, and a
+/// `RemoveMember` for each DID whose last leaf it removes. A device leaf added
+/// to or removed from a DID that holds another leaf both before and after the
+/// Commit (`26-conformance-suite.md` CONF-005) is neither, so it appears in
+/// neither list.
+#[must_use]
+pub fn classify_commit_membership(leaf_dids: &CommitLeafDids) -> CommitMembershipChange {
+    let before: BTreeSet<&str> = leaf_dids.before.iter().map(String::as_str).collect();
+    let after: BTreeSet<&str> = leaf_dids.after.iter().map(String::as_str).collect();
+    CommitMembershipChange {
+        added_dids: after.difference(&before).map(|d| (*d).to_owned()).collect(),
+        removed_dids: before.difference(&after).map(|d| (*d).to_owned()).collect(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        PSEUDONYM_ANNOUNCEMENT_TAG, PSEUDONYM_ANNOUNCEMENT_V2_TAG, PseudonymAnnouncement,
-        PseudonymAnnouncementDecision, PseudonymAnnouncementV2, PseudonymRecord, REJECT_BROADCAST,
-        REJECT_COLLISION, REJECT_EPOCH, REJECT_RESERVED, REJECT_SENDER_MISMATCH,
-        classify_pseudonym_announcement, is_pseudonym_announcement_payload, is_reserved_pseudonym,
+        CommitLeafDids, PSEUDONYM_ANNOUNCEMENT_TAG, PSEUDONYM_ANNOUNCEMENT_V2_TAG,
+        PseudonymAnnouncement, PseudonymAnnouncementDecision, PseudonymAnnouncementV2,
+        PseudonymRecord, REJECT_BROADCAST, REJECT_COLLISION, REJECT_EPOCH, REJECT_RESERVED,
+        REJECT_SENDER_MISMATCH, classify_commit_membership, classify_pseudonym_announcement,
+        is_pseudonym_announcement_payload, is_reserved_pseudonym,
         pseudonym_collides_with_other_did,
     };
     use scp_did::DID;
@@ -1034,5 +1095,73 @@ mod tests {
         let json = serde_json::json!({ "routing_id": vec![7u8; 32] });
         let record: PseudonymRecord = serde_json::from_value(json).expect("decode");
         assert_eq!(record, v1_record([7u8; 32]));
+    }
+
+    fn leaf_dids(before: &[&str], after: &[&str]) -> CommitLeafDids {
+        CommitLeafDids {
+            before: before.iter().map(|d| (*d).to_owned()).collect(),
+            after: after.iter().map(|d| (*d).to_owned()).collect(),
+        }
+    }
+
+    fn dids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|d| (*d).to_owned()).collect()
+    }
+
+    #[test]
+    fn classify_commit_membership_counts_a_new_did_as_one_add() {
+        let change = classify_commit_membership(&leaf_dids(&["a", "b"], &["a", "b", "c"]));
+        assert_eq!(change.added_dids, dids(&["c"]));
+        assert!(change.removed_dids.is_empty());
+        assert!(!change.is_empty());
+    }
+
+    #[test]
+    fn classify_commit_membership_counts_a_did_losing_its_last_leaf_as_one_remove() {
+        let change = classify_commit_membership(&leaf_dids(&["a", "b", "c"], &["a", "b"]));
+        assert!(change.added_dids.is_empty());
+        assert_eq!(change.removed_dids, dids(&["c"]));
+    }
+
+    #[test]
+    fn classify_commit_membership_ignores_a_device_leaf_added_to_a_held_did() {
+        // CONF-005: c already holds a leaf, so a second device leaf adds no DID.
+        let change =
+            classify_commit_membership(&leaf_dids(&["a", "b", "c"], &["a", "b", "c", "c"]));
+        assert!(change.is_empty(), "{change:?}");
+    }
+
+    #[test]
+    fn classify_commit_membership_ignores_a_device_leaf_removed_from_a_did_keeping_one() {
+        let change = classify_commit_membership(&leaf_dids(&["a", "c", "c"], &["a", "c"]));
+        assert!(change.is_empty(), "{change:?}");
+    }
+
+    #[test]
+    fn classify_commit_membership_counts_a_new_did_with_two_leaves_as_one_add() {
+        let change = classify_commit_membership(&leaf_dids(&["a"], &["a", "c", "c"]));
+        assert_eq!(change.added_dids, dids(&["c"]));
+        assert!(change.removed_dids.is_empty());
+    }
+
+    #[test]
+    fn classify_commit_membership_counts_a_did_losing_both_leaves_as_one_remove() {
+        let change = classify_commit_membership(&leaf_dids(&["a", "c", "c"], &["a"]));
+        assert!(change.added_dids.is_empty());
+        assert_eq!(change.removed_dids, dids(&["c"]));
+    }
+
+    #[test]
+    fn classify_commit_membership_reports_every_change_of_one_commit_sorted() {
+        let change =
+            classify_commit_membership(&leaf_dids(&["a", "e", "b"], &["a", "d", "c", "c"]));
+        assert_eq!(change.added_dids, dids(&["c", "d"]));
+        assert_eq!(change.removed_dids, dids(&["b", "e"]));
+    }
+
+    #[test]
+    fn classify_commit_membership_finds_no_change_in_a_key_update() {
+        let change = classify_commit_membership(&leaf_dids(&["a", "b"], &["b", "a"]));
+        assert!(change.is_empty(), "{change:?}");
     }
 }

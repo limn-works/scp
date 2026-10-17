@@ -1595,6 +1595,76 @@ fn empty_role_state_for_test() -> ContextRoleState {
 }
 
 impl PerContextState {
+    /// Records a member that a processed peer Commit added (spec 09
+    /// §9.10.4.1): the membership entry, the active-member set, and the role
+    /// state with the `member` role, the role a Welcome joiner records for
+    /// itself. The Commit carries no role, so a role the committer chose
+    /// reaches this member only through a later role assignment. A DID the
+    /// membership already holds keeps its entry and role. Returns whether the
+    /// DID was added. No access key is recorded: the committer generated it,
+    /// and this member cannot derive it. Call it inside the fail-closed
+    /// `commit_class_s_keep` that persists the processed Commit (ADR-049 §9).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::MembershipFailed`] when the `member` role cannot be
+    /// assigned (no `member` role, or one outside the ceiling); the DID is then
+    /// left out of the role state's member set.
+    pub(crate) fn add_member_state(
+        &mut self,
+        did: &DID,
+        clock: &dyn Clock,
+    ) -> Result<bool, ContextError> {
+        if self.membership.contains(did.as_ref()) {
+            return Ok(false);
+        }
+        let inserted = self.role_state.members.insert(did.as_ref().to_owned());
+        let tokens = match self
+            .role_state
+            .system_assign_role(did.as_ref(), "member", clock)
+        {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                // `system_assign_role` fails before it writes anything, so
+                // undoing the member-set insert restores the prior state.
+                if inserted {
+                    self.role_state.members.remove(did.as_ref());
+                }
+                return Err(ContextError::MembershipFailed(e.to_string()));
+            }
+        };
+        self.membership
+            .add_member(did.clone(), "member".to_owned(), tokens);
+        self.members.insert(did.clone());
+        Ok(true)
+    }
+
+    /// Tears down every per-DID record of a member that leaves the context
+    /// (spec §5.6.1): the membership entry, all role state, the access key
+    /// (§9.17.2), the read-exclusion entry (§9.17), the pseudonym routing
+    /// record (§9.10.4), and the receive sequence tracker and reorder buffer
+    /// (§9.8.2, §9.8.5), so a rejoiner's sequence, which restarts at 1, is not
+    /// refused as a regression. The committed removal, the committed leave and a
+    /// processed peer Commit all tear down through this one function, so no
+    /// removal path can keep part of a departed member's state. Returns whether
+    /// the membership held `did`. Call it inside the fail-closed
+    /// `commit_class_s_keep` that persists the removal (ADR-049 §9).
+    pub(crate) fn remove_member_state(&mut self, context_id: &str, did: &DID) -> bool {
+        let was_member = self.membership.remove_member(did.as_ref());
+        self.members.remove(did);
+        self.role_state.remove_member(did.as_ref());
+        self.access
+            .access_key_store
+            .remove(context_id, did.as_ref());
+        self.access.read_exclusion_list.remove(did);
+        if let Some(registry) = self.routing.peer_registry_mut() {
+            registry.remove(did);
+        }
+        self.sequence_tracker.reset_sender(context_id, did.as_ref());
+        self.reorder_buffer.clear_sender(context_id, did.as_ref());
+        was_member
+    }
+
     /// Read-only view of the staged cross-context saga slot
     /// (`ClassSState::saga_pending`). A `pub` accessor (the field itself is
     /// `pub(crate)` on the Class-S sub-struct) so the SDK-visible shape
@@ -1969,15 +2039,19 @@ impl ContextCryptoState {
                 })))
             }
             scp_mls::encrypt::DecryptedContent::Commit {
-                sender_did: _,
+                sender_did,
                 members,
+                leaf_dids,
             } => {
                 // `scp-mls` admitted the Commit on its post-commit tree and
                 // merged it. The cache follows that tree: a removed member
                 // leaves it, a rotated key replaces the cached one, and an
                 // uncached DID stays uncached.
                 self.follow_tree(&members, &[]);
-                Ok(OpenResult::Control)
+                Ok(OpenResult::Commit {
+                    committer_did: sender_did,
+                    leaf_dids,
+                })
             }
             scp_mls::encrypt::DecryptedContent::Proposal { sender_did: _ } => {
                 Ok(OpenResult::Control)
@@ -4467,13 +4541,13 @@ mod crypto_ops_golden {
                 .to_bytes()
                 .unwrap();
         match bob_a.open(CTX_STR, &outer).unwrap() {
-            OpenResult::Control => {}
-            other => panic!("expected Control, got {other:?}"),
+            OpenResult::Commit { committer_did, .. } => assert_eq!(committer_did, ALICE),
+            other => panic!("expected a Commit, got {other:?}"),
         }
         assert_eq!(cached_key(&bob_a, ALICE), Some(new_key));
     }
 
-    /// `open` of `commit` by `state`, which must yield a control message.
+    /// `open` of `commit` by `state`, which must yield a Commit.
     fn open_commit(state: &mut PerContextState, ctx: &[u8; 32], commit: Vec<u8>) {
         let outer =
             scp_protocol::envelope::outer::create_outer_envelope(&routing(ctx), None, 300, commit)
@@ -4481,8 +4555,8 @@ mod crypto_ops_golden {
                 .to_bytes()
                 .unwrap();
         match state.open(CTX_STR, &outer).unwrap() {
-            OpenResult::Control => {}
-            other => panic!("expected Control, got {other:?}"),
+            OpenResult::Commit { .. } => {}
+            other => panic!("expected a Commit, got {other:?}"),
         }
     }
 
