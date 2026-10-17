@@ -289,7 +289,10 @@ const NAPI_SCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp
 // checks and its ban on the synchronous trust store, each bridge's respond
 // export, grade repository, and evaluator invoker, the context params reading
 // `capability_requirements`, and the governance leaf's direction choice.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 88;
+// Raised 88 -> 89 when each bridge gained its modify-requirements proposal
+// export: one assertion pins all three to the shared decode and to the
+// bridge's governance propose path.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 89;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -5182,6 +5185,56 @@ fn governance_modify_capability_requirements_chooses_direction_by_delta() {
         tightening.is_some() && keep.is_some() && restore.is_some() && tightening < keep,
         "execute_modify_capability_requirements must choose commit_class_s_keep for a \
          tightening and commit_class_s_restore otherwise"
+    );
+}
+
+/// Every bridge exports a `ModifyCapabilityRequirements` proposal entry point
+/// that decodes the list through the shared validating builder and proposes
+/// the action through the bridge's checked governance path, so governance can
+/// change a context's requirements from every SDK.
+#[test]
+fn every_bridge_exports_modify_capability_requirements() {
+    const DECODE: &str = "scp_ffi_common::context_params::modify_capability_requirements_action(";
+    let pyo3 = |callee| {
+        fn_body_contains(
+            PYO3_CONTEXT_SRC,
+            "governance_modify_capability_requirements",
+            callee,
+        )
+    };
+    let napi = |callee| {
+        fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "context_governance_modify_capability_requirements_on",
+            callee,
+        )
+    };
+    let uniffi = |callee| {
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "governance_modify_capability_requirements",
+            callee,
+        )
+    };
+    assert!(
+        pyo3(DECODE) && pyo3("propose_governance_action("),
+        "PyO3 SCP.governance_modify_capability_requirements must decode the list with \
+         modify_capability_requirements_action and propose it"
+    );
+    assert!(
+        fn_body_contains(
+            NAPI_SCP_SRC,
+            "context_governance_modify_capability_requirements",
+            "context_governance_modify_capability_requirements_on("
+        ) && napi(DECODE)
+            && napi("propose_governance_action_on("),
+        "NAPI Scp.contextGovernanceModifyCapabilityRequirements must reach its _on body, \
+         which decodes the list with modify_capability_requirements_action and proposes it"
+    );
+    assert!(
+        uniffi(DECODE) && uniffi(".propose_governance_action("),
+        "UniFFI Scp::governance_modify_capability_requirements must decode the list with \
+         modify_capability_requirements_action and propose it"
     );
 }
 

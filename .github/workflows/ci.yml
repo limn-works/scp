@@ -1332,6 +1332,36 @@ jobs:
       - name: Real scan
         run: python3.12 scripts/check-doc-citations.py
 
+  # `.docs/specs/25-test-vectors.md` §25 says `scripts/gen-test-vectors-p256.py`
+  # produces every keyed byte it prints. This job regenerates the vectors and fails when
+  # spec 25 or a Rust vector test (`crates/scp-runtime/tests/test_vectors.rs`,
+  # `crates/scp-event-log/tests/test_vectors.rs`) holds a value the generator no longer
+  # emits, or when spec 25 lacks a value the generator emits. It runs on every pull
+  # request, without a paths filter, because the `ci` aggregator counts a skipped job as
+  # a pass.
+  test-vectors:
+    needs: check-draft
+    if: github.event_name != 'push'
+    name: Docs / spec 25 test vectors match the generator
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The generator cross-checks every key and signature through `cryptography` when it
+      # imports, so CI installs it to run the stronger check.
+      - name: Install generator dependencies
+        run: python3.12 -m pip install 'cryptography>=44,<51'
+      # Self-test MUST run first: it plants a changed digit in spec 25 and in a Rust
+      # vector test and asserts the check names each one, so a green real scan means the
+      # check compared the files rather than that it can no longer fail.
+      - name: Self-test vector check
+        run: python3.12 scripts/check-test-vectors-p256.py --self-test
+      - name: Real check
+        run: python3.12 scripts/check-test-vectors-p256.py
+
   # A `[mirror]` site of the identity-substrate plan carries an include directive and
   # the Owner's bytes, and this job re-runs the resolver into a temporary tree and
   # fails where a site's bytes differ from the fragment its directive names. It runs on
@@ -5033,6 +5063,7 @@ jobs:
       - noop-spelling
       - saga-gating-granularity
       - doc-citations
+      - test-vectors
       - doc-includes
       - agent-verdict-criterion
       - deleted-primitives
