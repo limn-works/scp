@@ -147,8 +147,8 @@ impl supervisor::Supervisor {
 
 pub use challenger_ledger_actor::{
     BeginOutcome, ChallengeLedgerError, ChallengerLedgerCommand, ChallengerLedgerHandle,
-    FaultRecorded, GradedAttempt, GradingFault, GradingLease,
-    MAX_CONCURRENT_GRADINGS_PER_CHALLENGER, MAX_OPEN_CHALLENGES_PER_CHALLENGER,
+    ChallengerLedgerShared, GradedAttempt, GradingLease, MAX_CONCURRENT_GRADINGS_PER_CHALLENGER,
+    MAX_OPEN_CHALLENGES_PER_CHALLENGER,
 };
 pub use handle::SupervisorHandle;
 pub use key_package_actor::{

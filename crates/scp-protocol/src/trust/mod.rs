@@ -55,8 +55,8 @@ pub use challenge::{
     ChallengeVerification, ExpectedOutput, GradeOutcome, MAX_CAPABILITY_DESCRIPTION_BYTES,
     MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT, MAX_CHALLENGE_JSON_DEPTH,
     MAX_CHALLENGE_RESPONSE_BYTES, MAX_CHALLENGE_SCHEMA_BYTES, MAX_CHALLENGE_WINDOW_SECS,
-    MAX_GRADING_FAULTS, MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT, MAX_VERIFICATION_VALIDITY_SECS,
-    NewChallenge, OwnedAuthenticatedResponse, PolicyPick, TOTAL_WEIGHT_BPS, TestCase, TestOutput,
+    MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT, MAX_VERIFICATION_VALIDITY_SECS, NewChallenge,
+    OwnedAuthenticatedResponse, PolicyPick, TOTAL_WEIGHT_BPS, TestCase, TestOutput,
     UnsignedChallengeRequest, UnsignedChallengeResponse, UnsignedChallengeVerification,
     authenticate_challenge_response, canonical_challenge_request_bytes,
     canonical_challenge_response_bytes, canonical_challenge_verification_bytes,
@@ -511,19 +511,37 @@ pub enum TrustError {
     },
 
     /// The challenge window `expires_at - created_at` is zero, above
-    /// `MAX_CHALLENGE_WINDOW_SECS`, or overflows (spec 07 §7.3.4 step 1).
-    #[error("challenge window of {window_secs}s is outside 1..={max_secs}s")]
+    /// `MAX_CHALLENGE_WINDOW_SECS`, shorter than the cooldown, or overflows
+    /// (spec 07 §7.3.4 step 1).
+    #[error(
+        "challenge window of {window_secs}s must be positive, at least the cooldown of {cooldown_secs}s and at most {max_secs}s"
+    )]
     ChallengeWindowInvalid {
         /// The requested window, in seconds.
         window_secs: u64,
+        /// The request's `cooldown_secs`, the shortest window allowed.
+        cooldown_secs: u64,
         /// `MAX_CHALLENGE_WINDOW_SECS`.
         max_secs: u64,
+    },
+
+    /// The challenger's last challenge to this subject for this capability
+    /// is still inside its window, closed or not (spec 07 §7.3.4 step 1).
+    /// The caller may create a new one at `expires_at`.
+    #[error(
+        "challenge {challenge_id} to this subject for this capability is open until {expires_at}"
+    )]
+    ChallengeWindowOpen {
+        /// The open challenge (lowercase hex).
+        challenge_id: String,
+        /// Its `expires_at`, the first Unix second a new challenge is accepted.
+        expires_at: u64,
     },
 
     /// The time is outside the challenge window (spec 07 §7.3.4 steps 2 and
     /// 3).
     #[error(
-        "challenge {challenge_id}: now {now} is outside the window {created_at}..={expires_at}"
+        "challenge {challenge_id}: now {now} is not strictly inside the window ({created_at}, {expires_at})"
     )]
     ChallengeExpired {
         /// The challenge id (lowercase hex).
@@ -565,22 +583,14 @@ pub enum TrustError {
         allowed: u64,
     },
 
-    /// The cooldown since the last graded attempt has not passed.
+    /// The cooldown since the later of the last graded attempt and the last
+    /// grading fault has not passed.
     #[error("challenge {challenge_id}: cooldown active, retry at {retry_after}")]
     CooldownActive {
         /// The challenge id (lowercase hex).
         challenge_id: String,
         /// The first Unix second at which the next attempt is accepted.
         retry_after: u64,
-    },
-
-    /// The challenge recorded `MAX_GRADING_FAULTS` faults and closed.
-    #[error("challenge {challenge_id}: closed after {faults} grading faults")]
-    ChallengeFaulted {
-        /// The challenge id (lowercase hex).
-        challenge_id: String,
-        /// The fault count.
-        faults: u32,
     },
 
     /// The response does not answer the request: another `challenge_id` or
@@ -661,7 +671,7 @@ pub enum TrustError {
     /// The record's `timestamp` lies outside its signed challenge window
     /// (spec 07 §7.3.4 step 5(c)).
     #[error(
-        "challenge verification {verification_id}: timestamp {timestamp} outside the challenge window {created_at}..={expires_at}"
+        "challenge verification {verification_id}: timestamp {timestamp} not strictly inside the challenge window ({created_at}, {expires_at})"
     )]
     ChallengeVerificationOutsideWindow {
         /// The record's `verification_id` (lowercase hex).
@@ -772,7 +782,7 @@ impl TrustError {
             | Self::AttemptOutOfOrder { .. }
             | Self::RetriesExhausted { .. }
             | Self::CooldownActive { .. }
-            | Self::ChallengeFaulted { .. }
+            | Self::ChallengeWindowOpen { .. }
             | Self::OutputsMismatch { .. }
             | Self::ResponseTooLarge { .. }
             | Self::ChallengeNotOpen { .. }

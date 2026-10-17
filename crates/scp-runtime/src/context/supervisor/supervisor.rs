@@ -12661,8 +12661,11 @@ impl Supervisor {
     /// Get-or-spawn the attempt-ledger actor of `challenger` (spec 07
     /// §7.3.4), keyed by its canonical identifier so two spellings of one key
     /// can never hold two ledgers. A handle whose actor stopped is replaced;
-    /// the replacement keeps the old grading semaphore, so permits held by
-    /// unfinished gradings still count.
+    /// the replacement keeps the old [`ChallengerLedgerShared`] state, so
+    /// permits held by unfinished gradings still count and no lease id is
+    /// issued twice.
+    ///
+    /// [`ChallengerLedgerShared`]: crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerShared
     ///
     /// # Errors
     ///
@@ -12677,7 +12680,7 @@ impl Supervisor {
         crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
     > {
         use crate::context::supervisor::challenger_ledger_actor::{
-            ChallengerLedgerActor, MAX_CONCURRENT_GRADINGS_PER_CHALLENGER,
+            ChallengerLedgerActor, ChallengerLedgerShared,
         };
         let identity = scp_protocol::trust::CanonicalIdentifier::parse(challenger)?;
         let key = identity.as_str().to_owned();
@@ -12687,17 +12690,14 @@ impl Supervisor {
             return Ok(handle.value().clone());
         }
         let _guard = self.write_lock.lock().await;
-        let semaphore = match self.challenger_ledgers.get(&key) {
+        let shared = match self.challenger_ledgers.get(&key) {
             Some(handle) if !handle.is_closed() => return Ok(handle.value().clone()),
-            Some(handle) => handle.grading_semaphore(),
-            None => Arc::new(tokio::sync::Semaphore::new(
-                MAX_CONCURRENT_GRADINGS_PER_CHALLENGER,
-            )),
+            Some(handle) => handle.shared(),
+            None => ChallengerLedgerShared::new(),
         };
         let deps = self.build_challenger_ledger_deps()?;
         let permit = self.spawn_permit("spawn challenger-ledger actor")?;
-        let (handle, _join) =
-            ChallengerLedgerActor::spawn_through(&permit, identity, deps, semaphore);
+        let (handle, _join) = ChallengerLedgerActor::spawn_through(&permit, identity, deps, shared);
         self.challenger_ledgers.insert(key, handle.clone());
         drop(permit);
         Ok(handle)
@@ -12754,15 +12754,15 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// The ledger's refusal ([`TrustError::ChallengeNotOpen`](scp_protocol::trust::TrustError::ChallengeNotOpen),
+    /// The ledger's refusal ([`TrustError::ChallengeWindowOpen`](scp_protocol::trust::TrustError::ChallengeWindowOpen),
+    /// [`TrustError::ChallengeNotOpen`](scp_protocol::trust::TrustError::ChallengeNotOpen),
     /// a verifier mismatch), a persistence or custody failure, or
-    /// [`ContextError::ActorBusy`].
+    /// [`ContextError::ActorBusy`]. On any error no signed request exists.
     pub async fn dispatch_challenge_create(
         &self,
         challenger: &str,
         unsigned: scp_protocol::trust::UnsignedChallengeRequest,
         answer_key: scp_protocol::trust::AnswerKey,
-        definition: scp_protocol::trust::capability_definition::CapabilityDefinition,
         evaluator_context_id: Option<String>,
         signer: crate::context::actor::signer::CommandSigner,
     ) -> Result<
@@ -12775,7 +12775,6 @@ impl Supervisor {
             .send(|reply| ChallengerLedgerCommand::Create {
                 unsigned: Box::new(unsigned),
                 answer_key,
-                definition: Box::new(definition),
                 evaluator_context_id,
                 signer,
                 reply,
@@ -12784,21 +12783,27 @@ impl Supervisor {
     }
 
     /// Read-only: whether `challenger`'s ledger holds a live challenge with
-    /// this id, request digest and subject (spec 07 §7.3.4 step 3, before
-    /// any resolution). Takes no lease and writes nothing.
+    /// this id, request digest and subject, and, once that challenge is
+    /// closed, an attempt graded from `response` (spec 07 §7.3.4 step 3,
+    /// before any resolution). Takes no lease and writes nothing.
     ///
     /// # Errors
     ///
     /// [`TrustError::UnknownChallenge`](scp_protocol::trust::TrustError::UnknownChallenge)
-    /// when it does not; a non-canonical subject; a load failure or
+    /// when no such challenge exists;
+    /// [`TrustError::ChallengeClosed`](scp_protocol::trust::TrustError::ChallengeClosed)
+    /// when it is closed and `response` is not one it graded; a
+    /// non-canonical subject or an unencodable response; a load failure or
     /// [`ContextError::ActorBusy`].
     pub async fn dispatch_challenge_lookup(
         &self,
         challenger: &str,
         request: &scp_protocol::trust::ChallengeRequest,
+        response: &scp_protocol::trust::ChallengeResponse,
     ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
         use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
         let request_digest = scp_protocol::trust::challenge_request_signing_digest(request)?;
+        let response_digest = scp_protocol::trust::challenge_response_signing_digest(response)?;
         let subject = scp_protocol::trust::CanonicalIdentifier::parse(&request.subject)?;
         let handle = self.challenger_ledger_for(challenger).await?;
         handle
@@ -12806,6 +12811,7 @@ impl Supervisor {
                 challenge_id: request.challenge_id,
                 request_digest,
                 subject,
+                response_digest,
                 reply,
             })
             .await
@@ -12817,13 +12823,11 @@ impl Supervisor {
     /// # Errors
     ///
     /// The ledger's refusal (`UnknownChallenge`, the `check_attempt` errors,
-    /// `GradingInProgress`), a persistence or custody failure, or
-    /// [`ContextError::ActorBusy`].
+    /// `GradingInProgress`), a load failure, or [`ContextError::ActorBusy`].
     pub async fn dispatch_challenge_begin_grade(
         &self,
         challenger: &str,
         auth: Arc<scp_protocol::trust::OwnedAuthenticatedResponse>,
-        signer: crate::context::actor::signer::CommandSigner,
     ) -> Result<
         crate::context::supervisor::challenger_ledger_actor::BeginOutcome,
         crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
@@ -12831,21 +12835,19 @@ impl Supervisor {
         use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
         let handle = self.challenger_ledger_for(challenger).await?;
         handle
-            .send(|reply| ChallengerLedgerCommand::BeginGrade {
-                auth,
-                signer,
-                reply,
-            })
+            .send(|reply| ChallengerLedgerCommand::BeginGrade { auth, reply })
             .await
     }
 
-    /// Records a graded attempt and signs its record (spec 07 §7.3.4 step 4).
+    /// Signs a graded attempt's record and records it (spec 07 §7.3.4 step
+    /// 4).
     ///
     /// # Errors
     ///
     /// `GradingLeaseLost` with nothing written, the `check_attempt` errors at
     /// the commit time, a persistence or custody failure, or
-    /// [`ContextError::ActorBusy`].
+    /// [`ContextError::ActorBusy`]. Every error but the last leaves nothing
+    /// written and the attempt unused.
     pub async fn dispatch_challenge_commit(
         &self,
         challenger: &str,
@@ -12870,28 +12872,27 @@ impl Supervisor {
             .await
     }
 
-    /// Records a challenger fault, which uses no attempt (spec 07 §7.3.4
-    /// step 3).
+    /// Records a challenger fault for the grading of `auth` (spec 07 §7.3.4
+    /// step 3). It uses no attempt and closes nothing; the cooldown restarts
+    /// from it.
     ///
     /// # Errors
     ///
-    /// `GradingLeaseLost` with nothing written, a persistence failure, or
+    /// `GradingLeaseLost` with nothing written when the lease is not live
+    /// for this `(attempt, D_r)`, a persistence failure, or
     /// [`ContextError::ActorBusy`].
     pub async fn dispatch_challenge_fault(
         &self,
         challenger: &str,
-        challenge_id: [u8; 32],
+        auth: Arc<scp_protocol::trust::OwnedAuthenticatedResponse>,
         lease_id: u64,
-        fault: crate::context::supervisor::challenger_ledger_actor::GradingFault,
-    ) -> Result<
-        crate::context::supervisor::challenger_ledger_actor::FaultRecorded,
-        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
-    > {
+        fault: scp_protocol::trust::TrustError,
+    ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
         use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
         let handle = self.challenger_ledger_for(challenger).await?;
         handle
             .send(|reply| ChallengerLedgerCommand::RecordFault {
-                challenge_id,
+                auth,
                 lease_id,
                 fault,
                 reply,

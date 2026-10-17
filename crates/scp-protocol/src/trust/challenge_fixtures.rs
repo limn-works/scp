@@ -255,9 +255,10 @@ impl Fixture {
         Ok(unsigned.with_subject_signature(signature))
     }
 
-    /// A genuine signed record: issue, respond with every answer correct
-    /// (`ExactMatch` cases only), authenticate, grade and sign at the
-    /// clock's time.
+    /// A genuine signed record: issue at the clock's time, respond with every
+    /// answer correct (`ExactMatch` cases only), authenticate, grade and sign
+    /// one second later, the first instant strictly inside the window
+    /// (RULING 5).
     pub fn genuine_record(
         &self,
         uri: &str,
@@ -280,11 +281,8 @@ impl Fixture {
             &self.resolver,
         )?;
         let outcome = grade(&auth, &key, &BTreeMap::new(), &BTreeMap::new());
-        let unsigned = challenge_verification_unsigned(
-            &auth,
-            &outcome,
-            scp_clock::Clock::now_secs(&self.clock),
-        )?;
+        let unsigned =
+            challenge_verification_unsigned(&auth, &outcome, request.created_at.saturating_add(1))?;
         let signature = self.verifier.sign(&unsigned.signing_digest())?;
         Ok(unsigned.with_verifier_signature(signature))
     }

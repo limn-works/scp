@@ -734,7 +734,10 @@ mod tests {
     /// stamped at that now, never in its future, which a verifier rejects.
     /// Its policy fields copy the [`CHALLENGE_URI`] protocol row, so
     /// [`ProtocolOnlyDefinitions`] admits it: the full-credit pass of a
-    /// suite holding exactly the row's minimum case count.
+    /// suite holding exactly the row's minimum case count. Its challenge
+    /// window opens 60 seconds before `timestamp` and closes a cooldown after
+    /// it, so `timestamp` is strictly inside a window no shorter than the
+    /// cooldown (spec 07 §7.3.4.4 step 4(c) and (g)).
     fn unsigned_challenge(
         verifier_key: &ed25519_dalek::SigningKey,
         subject: &str,
@@ -778,7 +781,7 @@ mod tests {
             test_count,
             pass_count: test_count,
             challenge_created_at: timestamp.saturating_sub(60),
-            challenge_expires_at: timestamp.saturating_add(60),
+            challenge_expires_at: timestamp.saturating_add(u64::from(definition.cooldown_secs)),
             timestamp,
             expires_at,
             context_id: record_context.to_owned(),

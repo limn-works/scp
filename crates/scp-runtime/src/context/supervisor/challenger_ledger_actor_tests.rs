@@ -18,10 +18,11 @@ use scp_did::DID;
 use scp_protocol::trust::capability_definition::ProtocolOnlyDefinitions;
 use scp_protocol::trust::{
     ActiveKeyResolver, AnswerKey, CanonicalIdentifier, ChallengeClosure, ChallengePolicy,
-    ChallengeRequest, ChallengeResponse, ExpectedOutput, GradeOutcome, MAX_GRADING_FAULTS,
-    NewChallenge, OwnedAuthenticatedResponse, SchemaVerdict, TestCase, TestOutput, TrustError,
-    authenticate_challenge_response, challenge_request_unsigned, challenge_response_signing_digest,
-    challenge_response_unsigned, challenge_verification_signing_digest, grade,
+    ChallengeRequest, ChallengeResponse, ExpectedOutput, GradeOutcome, NewChallenge,
+    OwnedAuthenticatedResponse, SchemaVerdict, TestCase, TestOutput, TrustError,
+    authenticate_challenge_response, challenge_request_signing_digest, challenge_request_unsigned,
+    challenge_response_signing_digest, challenge_response_unsigned,
+    challenge_verification_signing_digest, grade,
 };
 
 use super::*;
@@ -29,6 +30,8 @@ use crate::crypto::mls::storage_adapter::OpenMlsStorageError;
 
 /// A protocol row: `Total(20)`, 9500, 2 retries, cooldown 300.
 const URI: &str = "scp:capability:schema-validation/v1";
+/// Another protocol row: `Total(15)`, 9500, 2 retries, cooldown 300.
+const OTHER_URI: &str = "scp:capability:outlet-schema-compliance/v1";
 const START: u64 = 1_700_000_000;
 const WINDOW: u64 = 3600;
 const COOLDOWN: u64 = 300;
@@ -45,6 +48,9 @@ struct TestStorage {
     /// Stores still allowed before every store fails; negative is unlimited.
     stores_left: AtomicI64,
     fail_reads: AtomicBool,
+    fail_deletes: AtomicBool,
+    /// Fails every write of the challenger index, and no other write.
+    fail_index_stores: AtomicBool,
 }
 
 impl TestStorage {
@@ -83,6 +89,9 @@ fn injected() -> OpenMlsStorageError {
 #[async_trait]
 impl OpenMlsStorageAdapter for TestStorage {
     async fn store(&self, key: &str, value: &[u8]) -> Result<(), OpenMlsStorageError> {
+        if key.starts_with("scp-challenger-ids/") && self.fail_index_stores.load(Ordering::SeqCst) {
+            return Err(injected());
+        }
         let left = self.stores_left.load(Ordering::SeqCst);
         if left == 0 {
             return Err(injected());
@@ -104,6 +113,9 @@ impl OpenMlsStorageAdapter for TestStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<(), OpenMlsStorageError> {
+        if self.fail_deletes.load(Ordering::SeqCst) {
+            return Err(injected());
+        }
         self.writes.fetch_add(1, Ordering::SeqCst);
         self.kv.remove(key);
         Ok(())
@@ -140,27 +152,34 @@ struct Harness {
 }
 
 fn party(seed: u8) -> (SigningKey, DID) {
-    let key = SigningKey::from_bytes(&[seed; 32]);
+    keyed(SigningKey::from_bytes(&[seed; 32]))
+}
+
+/// The `n`th of many distinct subjects; never equal to a [`party`].
+fn numbered_party(n: u16) -> (SigningKey, DID) {
+    let mut seed = [0x5a_u8; 32];
+    seed[..2].copy_from_slice(&n.to_le_bytes());
+    keyed(SigningKey::from_bytes(&seed))
+}
+
+fn keyed(key: SigningKey) -> (SigningKey, DID) {
     let did = scp_did::did_dht_from_public_key(&key.verifying_key().to_bytes());
     (key, did)
 }
 
+/// Spawns a ledger actor. `shared` is the state a respawn keeps; a fresh
+/// ledger takes `ChallengerLedgerShared::new()`.
 fn spawn(
     identity: &DID,
     storage: &Arc<TestStorage>,
     clock: &Arc<TestClock>,
+    shared: ChallengerLedgerShared,
 ) -> ChallengerLedgerHandle {
     let deps = ChallengerLedgerDeps {
         mls_storage: Arc::clone(storage) as Arc<dyn OpenMlsStorageAdapter>,
         clock: Arc::clone(clock) as Arc<dyn Clock>,
     };
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_GRADINGS_PER_CHALLENGER));
-    ChallengerLedgerActor::spawn(
-        CanonicalIdentifier::parse(identity).unwrap(),
-        deps,
-        semaphore,
-    )
-    .0
+    ChallengerLedgerActor::spawn(CanonicalIdentifier::parse(identity).unwrap(), deps, shared).0
 }
 
 fn harness() -> Harness {
@@ -177,7 +196,7 @@ fn harness() -> Harness {
     );
     let clock = Arc::new(TestClock::new(START));
     let storage = TestStorage::new();
-    let handle = spawn(&verifier, &storage, &clock);
+    let handle = spawn(&verifier, &storage, &clock, ChallengerLedgerShared::new());
     Harness {
         verifier_key,
         verifier,
@@ -218,44 +237,68 @@ impl Harness {
         self.clock.now_secs()
     }
 
+    /// Creates a challenge to the harness subject for `URI`, then advances the
+    /// clock one second, to the first instant strictly inside the window
+    /// (RULING 5), so the challenge is gradable at once.
     async fn create(&self) -> Result<Issued, ChallengeLedgerError> {
-        self.create_with(&self.handle, self.signer()).await
+        let issued = self
+            .create_as(&self.handle, self.signer(), &self.subject, URI)
+            .await?;
+        self.clock.advance(1);
+        Ok(issued)
     }
 
-    async fn create_with(
-        &self,
-        handle: &ChallengerLedgerHandle,
-        signer: CommandSigner,
-    ) -> Result<Issued, ChallengeLedgerError> {
-        let policy = ChallengePolicy::resolve(&ProtocolOnlyDefinitions, URI, None).unwrap();
-        let definition = policy.definition().clone();
-        let (unsigned, key) = challenge_request_unsigned(NewChallenge {
+    /// The unsigned request to `subject` for `uri`, created now, and its
+    /// answer key.
+    fn unsigned_for(&self, subject: &DID, uri: &str) -> (UnsignedChallengeRequest, AnswerKey) {
+        let policy = ChallengePolicy::resolve(&ProtocolOnlyDefinitions, uri, None).unwrap();
+        challenge_request_unsigned(NewChallenge {
             verifier: self.verifier.clone(),
-            subject: self.subject.clone(),
+            subject: subject.clone(),
             test_cases: cases(),
             created_at: self.now(),
             window_secs: WINDOW,
             context_id: "ctx-1".to_owned(),
             policy,
         })
-        .unwrap();
-        let answer_key = key.clone();
-        let request = handle
+        .unwrap()
+    }
+
+    async fn send_create(
+        handle: &ChallengerLedgerHandle,
+        unsigned: UnsignedChallengeRequest,
+        answer_key: AnswerKey,
+        signer: CommandSigner,
+    ) -> Result<ChallengeRequest, ChallengeLedgerError> {
+        handle
             .send(|reply| ChallengerLedgerCommand::Create {
                 unsigned: Box::new(unsigned),
                 answer_key,
-                definition: Box::new(definition),
                 evaluator_context_id: None,
                 signer,
                 reply,
             })
-            .await?;
+            .await
+    }
+
+    /// Creates a challenge to `subject` for `uri` at the clock's time,
+    /// without advancing it.
+    async fn create_as(
+        &self,
+        handle: &ChallengerLedgerHandle,
+        signer: CommandSigner,
+        subject: &DID,
+        uri: &str,
+    ) -> Result<Issued, ChallengeLedgerError> {
+        let (unsigned, key) = self.unsigned_for(subject, uri);
+        let request = Self::send_create(handle, unsigned, key.clone(), signer).await?;
         Ok(Issued { request, key })
     }
 
-    /// The subject's signed response, every answer `answer`.
-    fn respond_response(
+    /// `subject`'s signed response, every answer `answer`.
+    fn response_as(
         &self,
+        (subject_key, subject): &(SigningKey, DID),
         request: &ChallengeRequest,
         attempt: u32,
         answer: &str,
@@ -270,30 +313,70 @@ impl Harness {
             .collect();
         let unsigned = challenge_response_unsigned(
             request,
-            &self.subject,
+            subject,
             attempt,
             outputs,
-            &self.resolver,
+            &self.resolver_with(subject_key, subject),
             self.clock.as_ref(),
         )
         .unwrap();
-        let signature = self.subject_key.sign(&unsigned.signing_digest());
+        let signature = subject_key.sign(&unsigned.signing_digest());
         unsigned.with_subject_signature(signature.to_bytes().to_vec())
     }
 
-    /// The subject's authenticated response, every answer `answer`.
+    /// The verifier's key and `subject`'s.
+    fn resolver_with(&self, subject_key: &SigningKey, subject: &DID) -> Keys {
+        let mut keys = self.resolver.0.clone();
+        keys.insert(
+            subject.0.clone(),
+            subject_key.verifying_key().to_bytes().to_vec(),
+        );
+        Keys(keys)
+    }
+
+    /// `subject`'s authenticated response, every answer `answer`.
+    fn respond_as(
+        &self,
+        subject: &(SigningKey, DID),
+        request: &ChallengeRequest,
+        attempt: u32,
+        answer: &str,
+    ) -> Arc<OwnedAuthenticatedResponse> {
+        let response = self.response_as(subject, request, attempt, answer);
+        Arc::new(
+            authenticate_challenge_response(
+                request,
+                &response,
+                &self.verifier,
+                &self.resolver_with(&subject.0, &subject.1),
+            )
+            .unwrap()
+            .to_owned_response(),
+        )
+    }
+
+    fn me(&self) -> (SigningKey, DID) {
+        (self.subject_key.clone(), self.subject.clone())
+    }
+
+    /// The harness subject's signed response, every answer `answer`.
+    fn respond_response(
+        &self,
+        request: &ChallengeRequest,
+        attempt: u32,
+        answer: &str,
+    ) -> ChallengeResponse {
+        self.response_as(&self.me(), request, attempt, answer)
+    }
+
+    /// The harness subject's authenticated response, every answer `answer`.
     fn respond(
         &self,
         request: &ChallengeRequest,
         attempt: u32,
         answer: &str,
     ) -> Arc<OwnedAuthenticatedResponse> {
-        let response = self.respond_response(request, attempt, answer);
-        Arc::new(
-            authenticate_challenge_response(request, &response, &self.verifier, &self.resolver)
-                .unwrap()
-                .to_owned_response(),
-        )
+        self.respond_as(&self.me(), request, attempt, answer)
     }
 
     /// A subject-signed response at `attempt`, built without the subject-side
@@ -323,20 +406,11 @@ impl Harness {
         &self,
         auth: &Arc<OwnedAuthenticatedResponse>,
     ) -> Result<BeginOutcome, ChallengeLedgerError> {
-        self.handle
-            .send(|reply| ChallengerLedgerCommand::BeginGrade {
-                auth: Arc::clone(auth),
-                signer: self.signer(),
-                reply,
-            })
-            .await
+        begin_on(&self.handle, auth).await
     }
 
     async fn lease(&self, auth: &Arc<OwnedAuthenticatedResponse>) -> GradingLease {
-        match self.begin(auth).await.unwrap() {
-            BeginOutcome::Lease(lease) => lease,
-            BeginOutcome::Stored(_) => panic!("expected a lease, got a stored record"),
-        }
+        lease_on(&self.handle, auth).await
     }
 
     async fn commit_with(
@@ -346,16 +420,7 @@ impl Harness {
         key: &AnswerKey,
         signer: CommandSigner,
     ) -> Result<GradedAttempt, ChallengeLedgerError> {
-        let outcome = outcome(auth, key);
-        self.handle
-            .send(|reply| ChallengerLedgerCommand::Commit {
-                auth: Arc::clone(auth),
-                lease_id,
-                outcome,
-                signer,
-                reply,
-            })
-            .await
+        commit_on(&self.handle, auth, lease_id, key, signer).await
     }
 
     async fn commit(
@@ -378,35 +443,27 @@ impl Harness {
 
     async fn fault(
         &self,
-        challenge_id: [u8; 32],
+        auth: &Arc<OwnedAuthenticatedResponse>,
         lease_id: u64,
-    ) -> Result<FaultRecorded, ChallengeLedgerError> {
-        self.handle
-            .send(|reply| ChallengerLedgerCommand::RecordFault {
-                challenge_id,
-                lease_id,
-                fault: GradingFault::SchemaRejected {
-                    test_id: "t0".to_owned(),
-                    reason: "schema gate".to_owned(),
-                },
-                reply,
-            })
-            .await
+    ) -> Result<(), ChallengeLedgerError> {
+        fault_on(&self.handle, auth, lease_id).await
     }
 
     async fn lookup(
         &self,
         request: &ChallengeRequest,
         subject: &DID,
+        response: &ChallengeResponse,
     ) -> Result<(), ChallengeLedgerError> {
-        let request_digest =
-            scp_protocol::trust::challenge_request_signing_digest(request).unwrap();
+        let request_digest = challenge_request_signing_digest(request).unwrap();
+        let response_digest = challenge_response_signing_digest(response).unwrap();
         let subject = CanonicalIdentifier::parse(subject).unwrap();
         self.handle
             .send(|reply| ChallengerLedgerCommand::Lookup {
                 challenge_id: request.challenge_id,
                 request_digest,
                 subject,
+                response_digest,
                 reply,
             })
             .await
@@ -420,6 +477,100 @@ impl Harness {
             .verify(&digest, &signature)
             .unwrap();
     }
+
+    /// The storage key of `challenge_id`'s entry.
+    fn entry_key(&self, challenge_id: &[u8; 32]) -> String {
+        format!(
+            "scp-challenger/{}/{}",
+            self.verifier.0,
+            hex::encode(challenge_id)
+        )
+    }
+
+    /// The challenge ids the durable index names.
+    fn index_ids(&self) -> Vec<String> {
+        let bytes = self
+            .storage
+            .kv
+            .get(&format!("scp-challenger-ids/{}", self.verifier.0))
+            .map(|v| v.value().clone())
+            .unwrap_or_default();
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        rmp_serde::from_slice(&bytes).unwrap()
+    }
+
+    /// Stops the actor and spawns its replacement with the same shared state,
+    /// as the supervisor does.
+    async fn respawn(&self) -> ChallengerLedgerHandle {
+        self.handle.send_shutdown().await.unwrap();
+        spawn(
+            &self.verifier,
+            &self.storage,
+            &self.clock,
+            self.handle.shared(),
+        )
+    }
+}
+
+async fn begin_on(
+    handle: &ChallengerLedgerHandle,
+    auth: &Arc<OwnedAuthenticatedResponse>,
+) -> Result<BeginOutcome, ChallengeLedgerError> {
+    handle
+        .send(|reply| ChallengerLedgerCommand::BeginGrade {
+            auth: Arc::clone(auth),
+            reply,
+        })
+        .await
+}
+
+async fn lease_on(
+    handle: &ChallengerLedgerHandle,
+    auth: &Arc<OwnedAuthenticatedResponse>,
+) -> GradingLease {
+    match begin_on(handle, auth).await.unwrap() {
+        BeginOutcome::Lease(lease) => lease,
+        BeginOutcome::Stored(_) => panic!("expected a lease, got a stored record"),
+    }
+}
+
+async fn commit_on(
+    handle: &ChallengerLedgerHandle,
+    auth: &Arc<OwnedAuthenticatedResponse>,
+    lease_id: u64,
+    key: &AnswerKey,
+    signer: CommandSigner,
+) -> Result<GradedAttempt, ChallengeLedgerError> {
+    let outcome = outcome(auth, key);
+    handle
+        .send(|reply| ChallengerLedgerCommand::Commit {
+            auth: Arc::clone(auth),
+            lease_id,
+            outcome,
+            signer,
+            reply,
+        })
+        .await
+}
+
+async fn fault_on(
+    handle: &ChallengerLedgerHandle,
+    auth: &Arc<OwnedAuthenticatedResponse>,
+    lease_id: u64,
+) -> Result<(), ChallengeLedgerError> {
+    handle
+        .send(|reply| ChallengerLedgerCommand::RecordFault {
+            auth: Arc::clone(auth),
+            lease_id,
+            fault: TrustError::SchemaRejected {
+                test_id: "t0".to_owned(),
+                reason: "schema gate".to_owned(),
+            },
+            reply,
+        })
+        .await
 }
 
 fn outcome(auth: &OwnedAuthenticatedResponse, key: &AnswerKey) -> GradeOutcome {
@@ -435,60 +586,95 @@ fn trust_err<T: std::fmt::Debug>(result: Result<T, ChallengeLedgerError>) -> Tru
     }
 }
 
+fn is_persistence_failure<T: std::fmt::Debug>(result: &Result<T, ChallengeLedgerError>) -> bool {
+    matches!(
+        result,
+        Err(ChallengeLedgerError::Context(
+            ContextError::PersistenceFailed(_)
+        ))
+    )
+}
+
+/// A signer that reports Ed25519 and always fails.
+struct RefusingSigner;
+
+impl scp_crypto::DynScpSigner for RefusingSigner {
+    fn algorithm(&self) -> scp_crypto::SigAlg {
+        scp_crypto::SigAlg::Ed25519
+    }
+
+    fn public_key(&self) -> Vec<u8> {
+        vec![0; 32]
+    }
+
+    fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> scp_crypto::SignFuture<'a> {
+        Box::pin(async { Err(scp_crypto::SignError::Backend("refused".to_owned())) })
+    }
+}
+
+fn refusing() -> CommandSigner {
+    CommandSigner::new(Arc::new(RefusingSigner))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-/// An opening mismatch is a fault and uses no
-/// attempt; attempt 1 is still the next attempt.
+/// T8: a fault uses no attempt and closes nothing, but restarts the
+/// cooldown: Begin is refused until `fault + cooldown`, then attempt 1
+/// grades.
 #[tokio::test]
-async fn grade_opening_mismatch_is_fault_not_attempt() {
+async fn fault_uses_no_attempt_and_starts_the_cooldown() {
     let h = harness();
     let issued = h.create().await.unwrap();
     let auth = h.respond(&issued.request, 1, "ok");
     let lease = h.lease(&auth).await;
-    let recorded = h
-        .fault(issued.request.challenge_id, lease.lease_id)
-        .await
-        .unwrap();
-    assert_eq!(
-        recorded,
-        FaultRecorded {
-            faults: 1,
-            closed: None
+    let fault_at = h.now();
+    h.fault(&auth, lease.lease_id).await.unwrap();
+    h.clock.advance(COOLDOWN - 1);
+    match trust_err(h.begin(&auth).await) {
+        TrustError::CooldownActive { retry_after, .. } => {
+            assert_eq!(retry_after, fault_at + COOLDOWN);
         }
-    );
-    // The fault released the lease and consumed nothing: attempt 1 grades.
+        other => panic!("expected CooldownActive, got {other:?}"),
+    }
+    h.clock.advance(1);
     let lease = h.lease(&auth).await;
     let graded = h.commit(&auth, lease.lease_id, &issued.key).await.unwrap();
     assert_eq!(graded.record.attempt, 1);
     assert!(graded.record.passed);
 }
 
-/// `MAX_GRADING_FAULTS` faults close the challenge as
-/// `Faulted`, and a later Begin is refused with `ChallengeFaulted`.
+/// T8: four faults leave the challenge open, each restarting the cooldown;
+/// after them attempt 1 still grades, and the cooldown before attempt 2
+/// runs from that attempt, the later event.
 #[tokio::test]
-async fn faults_close_at_max_grading_faults() {
+async fn four_faults_leave_the_challenge_open() {
     let h = harness();
     let issued = h.create().await.unwrap();
-    let auth = h.respond(&issued.request, 1, "ok");
-    for n in 1..=MAX_GRADING_FAULTS {
+    let auth = h.respond(&issued.request, 1, "no");
+    for _ in 0..4 {
         let lease = h.lease(&auth).await;
-        let recorded = h
-            .fault(issued.request.challenge_id, lease.lease_id)
-            .await
-            .unwrap();
-        assert_eq!(recorded.faults, n);
-        let expected = (n == MAX_GRADING_FAULTS).then_some(ChallengeClosure::Faulted);
-        assert_eq!(recorded.closed, expected);
+        h.fault(&auth, lease.lease_id).await.unwrap();
+        assert!(matches!(
+            trust_err(h.begin(&auth).await),
+            TrustError::CooldownActive { .. }
+        ));
+        h.clock.advance(COOLDOWN);
     }
-    assert!(matches!(
-        trust_err(h.begin(&auth).await),
-        TrustError::ChallengeFaulted {
-            faults: MAX_GRADING_FAULTS,
-            ..
+    let lease = h.lease(&auth).await;
+    let graded = h.commit(&auth, lease.lease_id, &issued.key).await.unwrap();
+    assert_eq!(graded.record.attempt, 1);
+    let second = h.respond(&issued.request, 2, "ok");
+    h.clock.advance(COOLDOWN - 1);
+    match trust_err(h.begin(&second).await) {
+        TrustError::CooldownActive { retry_after, .. } => {
+            assert_eq!(retry_after, graded.record.timestamp + COOLDOWN);
         }
-    ));
+        other => panic!("expected CooldownActive, got {other:?}"),
+    }
+    h.clock.advance(1);
+    h.lease(&second).await;
 }
 
 /// A live lease refuses a second Begin up to its deadline
@@ -523,8 +709,8 @@ async fn grading_past_lease_deadline_loses_lease() {
     assert_eq!(graded.record.attempt, 1);
 }
 
-/// Begin runs `check_attempt`, so inside the
-/// cooldown or outside the window it takes no lease.
+/// Begin runs `check_attempt`, so inside the cooldown or at the window's
+/// end (RULING 5: strictly inside) it takes no lease.
 #[tokio::test]
 async fn begin_refuses_inside_cooldown_and_outside_window_without_grading() {
     let h = harness();
@@ -539,10 +725,8 @@ async fn begin_refuses_inside_cooldown_and_outside_window_without_grading() {
     // The refusal took no lease: once the cooldown ends, Begin succeeds.
     h.clock.advance(1);
     let lease = h.lease(&auth).await;
-    h.fault(issued.request.challenge_id, lease.lease_id)
-        .await
-        .unwrap();
-    h.clock.set(issued.request.expires_at + 1);
+    h.fault(&auth, lease.lease_id).await.unwrap();
+    h.clock.set(issued.request.expires_at);
     assert!(matches!(
         trust_err(h.begin(&auth).await),
         TrustError::ChallengeExpired { .. }
@@ -592,12 +776,13 @@ async fn ledger_cooldown_boundary() {
     let h = harness();
     let issued = h.create().await.unwrap();
     h.clock.advance(100);
-    h.graded(&issued, 1, "no").await;
+    let first = h.graded(&issued, 1, "no").await;
     let auth = h.respond(&issued.request, 2, "ok");
     h.clock.advance(COOLDOWN - 1);
     match trust_err(h.begin(&auth).await) {
         TrustError::CooldownActive { retry_after, .. } => {
-            assert_eq!(retry_after, issued.request.created_at + 100 + COOLDOWN);
+            assert_eq!(retry_after, first.record.timestamp + COOLDOWN);
+            assert!(first.record.timestamp > issued.request.created_at + 100);
         }
         other => panic!("expected CooldownActive, got {other:?}"),
     }
@@ -640,7 +825,7 @@ async fn ledger_refuses_replayed_attempt_with_new_digest() {
 }
 
 /// A resubmitted `(attempt, D_r)` returns the stored record
-/// even after the challenge closed, and grades nothing.
+/// even after the challenge closed, and grades and writes nothing.
 #[tokio::test]
 async fn ledger_resubmit_checked_first_returns_stored() {
     let h = harness();
@@ -654,85 +839,277 @@ async fn ledger_resubmit_checked_first_returns_stored() {
         BeginOutcome::Stored(stored) => assert_eq!(*stored, graded),
         BeginOutcome::Lease(_) => panic!("a resubmit must not take a lease"),
     }
-    assert_eq!(
-        h.storage.writes(),
-        writes,
-        "a signed resubmit writes nothing"
-    );
+    assert_eq!(h.storage.writes(), writes, "a resubmit writes nothing");
 }
 
-/// The first write holding an attempt also holds the
+/// The one write that holds an attempt holds its signed record and the
 /// closure it causes.
 #[tokio::test]
-async fn ledger_pending_and_closure_one_write() {
+async fn ledger_signed_attempt_and_closure_one_write() {
     let h = harness();
     let issued = h.create().await.unwrap();
     h.graded(&issued, 1, "ok").await;
     let versions = h.storage.entry_versions();
-    let first_with_attempt = versions
-        .iter()
-        .find(|v| !v.attempts.is_empty())
-        .expect("an entry version holds the attempt");
-    assert!(matches!(
-        first_with_attempt.attempts[0].state,
-        AttemptState::Pending(_)
-    ));
-    assert_eq!(first_with_attempt.closed, Some(ChallengeClosure::Passed));
+    let with_attempt: Vec<&LedgerEntry> =
+        versions.iter().filter(|v| !v.attempts.is_empty()).collect();
+    assert_eq!(with_attempt.len(), 1, "one write records the attempt");
+    h.assert_verifier_signed(&with_attempt[0].attempts[0].record);
+    assert_eq!(with_attempt[0].closed, Some(ChallengeClosure::Passed));
+    // The entry stores the signed request.
+    assert_eq!(versions[0].request, issued.request);
+    assert!(!versions[0].request.verifier_signature.is_empty());
 }
 
-/// A signer that reports Ed25519 and always fails.
-struct RefusingSigner;
-
-impl scp_crypto::DynScpSigner for RefusingSigner {
-    fn algorithm(&self) -> scp_crypto::SigAlg {
-        scp_crypto::SigAlg::Ed25519
-    }
-
-    fn public_key(&self) -> Vec<u8> {
-        vec![0; 32]
-    }
-
-    fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> scp_crypto::SignFuture<'a> {
-        Box::pin(async { Err(scp_crypto::SignError::Backend("refused".to_owned())) })
-    }
-}
-
-/// The record is persisted before it is signed. A sign that
-/// fails leaves a Pending attempt; after a restart, the resubmit re-signs it
-/// with the persisted `timestamp`, so `D_v` is the one first computed.
+/// T9: Create signs before it writes, so a sign failure writes nothing, and
+/// the subject is not blocked by a challenge that does not exist.
 #[tokio::test]
-async fn ledger_restart_resigns_pending_same_digest() {
+async fn create_sign_failure_persists_nothing() {
+    let h = harness();
+    let writes = h.storage.writes();
+    let refused = h.create_as(&h.handle, refusing(), &h.subject, URI).await;
+    assert!(
+        matches!(refused, Err(ChallengeLedgerError::Context(_))),
+        "{refused:?}"
+    );
+    assert_eq!(h.storage.writes(), writes, "a sign failure writes nothing");
+    assert!(h.index_ids().is_empty());
+    h.create_as(&h.handle, h.signer(), &h.subject, URI)
+        .await
+        .unwrap();
+}
+
+/// T9 and TQ5 (index and entry sites): a failed index write or entry write
+/// refuses Create and leaves no challenge, in memory or after a respawn, so
+/// Lookup refuses it and the subject can be challenged again. The next index
+/// write drops the id an entry write failure left behind.
+#[tokio::test]
+async fn create_write_failure_creates_nothing() {
+    let h = harness();
+    h.storage.allow_stores(0);
+    assert!(is_persistence_failure(&h.create().await));
+    h.storage.allow_stores(1);
+    let (unsigned, key) = h.unsigned_for(&h.subject, URI);
+    // Sign a copy as Create would, so the subject can respond to the
+    // request the refused Create would have issued.
+    let signature = h.verifier_key.sign(&unsigned.signing_digest());
+    let request = unsigned
+        .clone()
+        .with_verifier_signature(signature.to_bytes().to_vec());
+    h.clock.advance(1);
+    let response = h.respond_response(&request, 1, "ok");
+    let refused = Harness::send_create(&h.handle, unsigned, key, h.signer()).await;
+    assert!(is_persistence_failure(&refused), "{refused:?}");
+    h.storage.allow_stores(-1);
+    let orphan = hex::encode(request.challenge_id);
+    assert_eq!(h.index_ids(), vec![orphan.clone()], "the index write held");
+    assert!(
+        !h.storage
+            .kv
+            .contains_key(&h.entry_key(&request.challenge_id))
+    );
+    assert!(matches!(
+        trust_err(h.lookup(&request, &h.subject, &response).await),
+        TrustError::UnknownChallenge { .. }
+    ));
+    let restarted = h.respawn().await;
+    let request_digest = challenge_request_signing_digest(&request).unwrap();
+    let response_digest = challenge_response_signing_digest(&response).unwrap();
+    let after_respawn = restarted
+        .send(|reply| ChallengerLedgerCommand::Lookup {
+            challenge_id: request.challenge_id,
+            request_digest,
+            subject: CanonicalIdentifier::parse(&h.subject).unwrap(),
+            response_digest,
+            reply,
+        })
+        .await;
+    assert!(matches!(
+        trust_err(after_respawn),
+        TrustError::UnknownChallenge { .. }
+    ));
+    let issued = h
+        .create_as(&restarted, h.signer(), &h.subject, URI)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.index_ids(),
+        vec![hex::encode(issued.request.challenge_id)]
+    );
+}
+
+/// TQ5 (index site alone): when only the index write fails, Create refuses
+/// before the entry write, so no entry is stored and the subject is not
+/// blocked.
+#[tokio::test]
+async fn create_index_write_failure_alone_creates_nothing() {
+    let h = harness();
+    h.storage.fail_index_stores.store(true, Ordering::SeqCst);
+    let (unsigned, key) = h.unsigned_for(&h.subject, URI);
+    let challenge_id = unsigned.request().challenge_id;
+    let refused = Harness::send_create(&h.handle, unsigned, key, h.signer()).await;
+    assert!(is_persistence_failure(&refused), "{refused:?}");
+    h.storage.fail_index_stores.store(false, Ordering::SeqCst);
+    assert!(!h.storage.kv.contains_key(&h.entry_key(&challenge_id)));
+    h.create_as(&h.handle, h.signer(), &h.subject, URI)
+        .await
+        .unwrap();
+}
+
+/// T9: Commit signs before it writes, so a sign failure writes nothing,
+/// releases the lease and uses no attempt; attempt 1 then grades. After a
+/// respawn the ledger holds no attempt.
+#[tokio::test]
+async fn commit_sign_failure_records_nothing() {
     let h = harness();
     let issued = h.create().await.unwrap();
     let auth = h.respond(&issued.request, 1, "no");
     let lease = h.lease(&auth).await;
-    let graded_at = h.now();
+    let writes = h.storage.writes();
     let refused = h
-        .commit_with(
-            &auth,
-            lease.lease_id,
-            &issued.key,
-            CommandSigner::new(Arc::new(RefusingSigner)),
-        )
+        .commit_with(&auth, lease.lease_id, &issued.key, refusing())
         .await;
     assert!(matches!(refused, Err(ChallengeLedgerError::Context(_))));
-    h.handle.send_shutdown().await.unwrap();
-
-    h.clock.advance(COOLDOWN + 7);
-    let restarted = spawn(&h.verifier, &h.storage, &h.clock);
-    let stored = restarted
-        .send(|reply| ChallengerLedgerCommand::BeginGrade {
-            auth: Arc::clone(&auth),
-            signer: h.signer(),
-            reply,
-        })
+    assert_eq!(h.storage.writes(), writes, "a sign failure writes nothing");
+    let restarted = h.respawn().await;
+    let lease = lease_on(&restarted, &auth).await;
+    let graded = commit_on(&restarted, &auth, lease.lease_id, &issued.key, h.signer())
         .await
         .unwrap();
-    let BeginOutcome::Stored(stored) = stored else {
-        panic!("the Pending attempt must be returned, not graded again");
-    };
-    assert_eq!(stored.record.timestamp, graded_at);
-    h.assert_verifier_signed(&stored.record);
+    assert_eq!(graded.record.attempt, 1);
+    h.assert_verifier_signed(&graded.record);
+}
+
+/// TQ5 (attempt site): a failed attempt write refuses Commit, releases the
+/// lease and uses no attempt.
+#[tokio::test]
+async fn commit_write_failure_records_nothing() {
+    let h = harness();
+    let issued = h.create().await.unwrap();
+    let auth = h.respond(&issued.request, 1, "ok");
+    let lease = h.lease(&auth).await;
+    h.storage.allow_stores(0);
+    assert!(is_persistence_failure(
+        &h.commit(&auth, lease.lease_id, &issued.key).await
+    ));
+    h.storage.allow_stores(-1);
+    let lease = h.lease(&auth).await;
+    let graded = h.commit(&auth, lease.lease_id, &issued.key).await.unwrap();
+    assert_eq!(graded.record.attempt, 1);
+}
+
+/// TQ5 (fault site): a failed fault write refuses `RecordFault` and records
+/// no fault, so a respawned ledger starts no cooldown.
+#[tokio::test]
+async fn fault_write_failure_records_nothing() {
+    let h = harness();
+    let issued = h.create().await.unwrap();
+    let auth = h.respond(&issued.request, 1, "ok");
+    let lease = h.lease(&auth).await;
+    h.storage.allow_stores(0);
+    assert!(is_persistence_failure(
+        &h.fault(&auth, lease.lease_id).await
+    ));
+    h.storage.allow_stores(-1);
+    let restarted = h.respawn().await;
+    lease_on(&restarted, &auth).await;
+}
+
+/// Two challenges such that, at the returned time, the first is past its
+/// prune point and the second is strictly inside its window.
+async fn prunable_and_live(h: &Harness) -> (Issued, Issued, u64) {
+    let stale = h.create().await.unwrap();
+    h.clock.advance(CHALLENGE_CLOCK_SKEW_SECS + 2);
+    let (other_key, other) = party(3);
+    let live = h
+        .create_as(&h.handle, h.signer(), &other, URI)
+        .await
+        .unwrap();
+    let at = stale.request.expires_at + CHALLENGE_CLOCK_SKEW_SECS + 1;
+    assert!(live.request.created_at < at && at < live.request.expires_at);
+    let _ = other_key;
+    (stale, live, at)
+}
+
+/// T10: prune is best-effort. A failing delete refuses no turn: a Commit on
+/// another challenge succeeds, and the expired entry stays until a later
+/// turn deletes it.
+#[tokio::test]
+async fn prune_delete_failure_refuses_no_turn() {
+    let h = harness();
+    let (stale, live, at) = prunable_and_live(&h).await;
+    h.clock.set(at);
+    h.storage.fail_deletes.store(true, Ordering::SeqCst);
+    let other = party(3);
+    let auth = h.respond_as(&other, &live.request, 1, "ok");
+    let lease = h.lease(&auth).await;
+    let graded = h.commit(&auth, lease.lease_id, &live.key).await.unwrap();
+    assert!(graded.record.passed);
+    let stale_key = h.entry_key(&stale.request.challenge_id);
+    assert!(h.storage.kv.contains_key(&stale_key), "the delete failed");
+    h.storage.fail_deletes.store(false, Ordering::SeqCst);
+    h.begin(&auth).await.unwrap();
+    assert!(
+        !h.storage.kv.contains_key(&stale_key),
+        "the next turn prunes"
+    );
+    assert!(
+        !h.index_ids()
+            .contains(&hex::encode(stale.request.challenge_id))
+    );
+}
+
+/// TQ5 (prune site): a failing index rewrite after prune refuses no turn.
+#[tokio::test]
+async fn prune_index_write_failure_refuses_no_turn() {
+    let h = harness();
+    let (stale, live, at) = prunable_and_live(&h).await;
+    h.clock.set(at);
+    h.storage.allow_stores(0);
+    let auth = h.respond_as(&party(3), &live.request, 1, "ok");
+    h.lease(&auth).await;
+    h.storage.allow_stores(-1);
+    assert!(
+        !h.storage
+            .kv
+            .contains_key(&h.entry_key(&stale.request.challenge_id))
+    );
+    assert!(
+        h.index_ids()
+            .contains(&hex::encode(stale.request.challenge_id)),
+        "the index rewrite failed"
+    );
+}
+
+/// T11: lease ids survive a respawn. A stale fault or commit naming a lease
+/// taken before the respawn is refused, even though the new actor issued a
+/// lease for the same response; so is a fault naming another response.
+#[tokio::test]
+async fn stale_lease_from_before_a_respawn_is_lost() {
+    let h = harness();
+    let issued = h.create().await.unwrap();
+    let auth = h.respond(&issued.request, 1, "ok");
+    let stale = h.lease(&auth).await;
+    let restarted = h.respawn().await;
+    let fresh = lease_on(&restarted, &auth).await;
+    assert_ne!(stale.lease_id, fresh.lease_id);
+    let writes = h.storage.writes();
+    assert!(matches!(
+        trust_err(fault_on(&restarted, &auth, stale.lease_id).await),
+        TrustError::GradingLeaseLost { .. }
+    ));
+    assert!(matches!(
+        trust_err(commit_on(&restarted, &auth, stale.lease_id, &issued.key, h.signer()).await),
+        TrustError::GradingLeaseLost { .. }
+    ));
+    let other_response = h.respond(&issued.request, 1, "no");
+    assert!(matches!(
+        trust_err(fault_on(&restarted, &other_response, fresh.lease_id).await),
+        TrustError::GradingLeaseLost { .. }
+    ));
+    assert_eq!(h.storage.writes(), writes, "a lost lease writes nothing");
+    commit_on(&restarted, &auth, fresh.lease_id, &issued.key, h.signer())
+        .await
+        .unwrap();
 }
 
 /// An entry past `expires_at + CHALLENGE_CLOCK_SKEW_SECS` is
@@ -741,44 +1118,135 @@ async fn ledger_restart_resigns_pending_same_digest() {
 async fn ledger_prunes_and_refuses_unknown() {
     let h = harness();
     let issued = h.create().await.unwrap();
+    let response = h.respond_response(&issued.request, 1, "ok");
     let auth = h.respond(&issued.request, 1, "ok");
-    h.lookup(&issued.request, &h.subject).await.unwrap();
+    h.lookup(&issued.request, &h.subject, &response)
+        .await
+        .unwrap();
     h.clock
         .set(issued.request.expires_at + CHALLENGE_CLOCK_SKEW_SECS + 1);
     assert!(matches!(
-        trust_err(h.lookup(&issued.request, &h.subject).await),
+        trust_err(h.lookup(&issued.request, &h.subject, &response).await),
         TrustError::UnknownChallenge { .. }
     ));
     assert!(matches!(
         trust_err(h.begin(&auth).await),
         TrustError::UnknownChallenge { .. }
     ));
-    let entry_key = format!(
-        "scp-challenger/{}/{}",
-        h.verifier.0,
-        hex::encode(issued.request.challenge_id)
-    );
     assert!(
-        !h.storage.kv.contains_key(&entry_key),
+        !h.storage
+            .kv
+            .contains_key(&h.entry_key(&issued.request.challenge_id)),
         "the entry is deleted"
     );
 }
 
-/// The ledger holds at most
-/// `MAX_OPEN_CHALLENGES_PER_CHALLENGER` challenges.
+/// T12 (RED-001): the bound counts open challenges only. 1024 open
+/// challenges refuse the next Create; once all 1024 are closed, Create
+/// succeeds.
 #[tokio::test]
-async fn ledger_index_bound() {
+async fn ledger_bound_counts_open_challenges_only() {
     let h = harness();
-    for _ in 0..MAX_OPEN_CHALLENGES_PER_CHALLENGER {
-        h.create().await.unwrap();
+    let subjects: Vec<(SigningKey, DID)> = (0..=MAX_OPEN_CHALLENGES_PER_CHALLENGER)
+        .map(|n| numbered_party(u16::try_from(n).unwrap()))
+        .collect();
+    let (last, open) = subjects.split_last().unwrap();
+    let mut issued = Vec::with_capacity(open.len());
+    for subject in open {
+        issued.push(
+            h.create_as(&h.handle, h.signer(), &subject.1, URI)
+                .await
+                .unwrap(),
+        );
     }
     assert!(matches!(
-        trust_err(h.create().await),
+        trust_err(h.create_as(&h.handle, h.signer(), &last.1, URI).await),
         TrustError::ChallengeNotOpen {
             open: MAX_OPEN_CHALLENGES_PER_CHALLENGER,
             ..
         }
     ));
+    h.clock.advance(1);
+    for (subject, challenge) in open.iter().zip(&issued) {
+        let auth = h.respond_as(subject, &challenge.request, 1, "ok");
+        let lease = h.lease(&auth).await;
+        let graded = h
+            .commit(&auth, lease.lease_id, &challenge.key)
+            .await
+            .unwrap();
+        assert!(graded.record.passed);
+    }
+    h.create_as(&h.handle, h.signer(), &last.1, URI)
+        .await
+        .unwrap();
+}
+
+/// T6 (RULING 14): Create refuses while the latest challenge to the same
+/// subject (by canonical key, whatever the spelling) for the same capability
+/// is inside its window, across a respawn; another capability or another
+/// subject is not blocked; at `expires_at` the block ends.
+#[tokio::test]
+async fn create_refuses_while_the_latest_window_is_open() {
+    let h = harness();
+    let first = h
+        .create_as(&h.handle, h.signer(), &h.subject, URI)
+        .await
+        .unwrap();
+    let expires_at = first.request.expires_at;
+    h.clock.set(expires_at - 1);
+    let window_open = |e: TrustError| match e {
+        TrustError::ChallengeWindowOpen {
+            challenge_id,
+            expires_at: until,
+        } => {
+            assert_eq!(challenge_id, hex::encode(first.request.challenge_id));
+            assert_eq!(until, expires_at);
+        }
+        other => panic!("expected ChallengeWindowOpen, got {other:?}"),
+    };
+    window_open(trust_err(
+        h.create_as(&h.handle, h.signer(), &h.subject, URI).await,
+    ));
+    h.create_as(&h.handle, h.signer(), &h.subject, OTHER_URI)
+        .await
+        .unwrap();
+    h.create_as(&h.handle, h.signer(), &party(3).1, URI)
+        .await
+        .unwrap();
+    let restarted = h.respawn().await;
+    window_open(trust_err(
+        h.create_as(&restarted, h.signer(), &h.subject, URI).await,
+    ));
+    // The same key spelled as did:key.
+    let did_key = DID::from(format!(
+        "did:key:{}",
+        hex::encode(h.subject_key.verifying_key().to_bytes())
+    ));
+    assert_ne!(did_key, h.subject);
+    window_open(trust_err(
+        h.create_as(&restarted, h.signer(), &did_key, URI).await,
+    ));
+    h.clock.set(expires_at);
+    h.create_as(&restarted, h.signer(), &h.subject, URI)
+        .await
+        .unwrap();
+}
+
+/// T6 (RULING 14): a closed challenge still blocks until its window ends.
+#[tokio::test]
+async fn create_refuses_inside_the_window_after_a_pass() {
+    let h = harness();
+    let issued = h.create().await.unwrap();
+    assert!(h.graded(&issued, 1, "ok").await.record.passed);
+    h.clock.set(issued.request.expires_at - 1);
+    assert!(matches!(
+        trust_err(h.create_as(&h.handle, h.signer(), &h.subject, URI).await),
+        TrustError::ChallengeWindowOpen { .. }
+    ));
+    h.clock.set(issued.request.expires_at);
+    h.create_as(&h.handle, h.signer(), &h.subject, URI)
+        .await
+        .unwrap();
 }
 
 /// Lookup is read-only and needs the id, the request digest and the
@@ -787,20 +1255,41 @@ async fn ledger_index_bound() {
 async fn lookup_refuses_other_digest_or_subject_and_writes_nothing() {
     let h = harness();
     let issued = h.create().await.unwrap();
+    let response = h.respond_response(&issued.request, 1, "ok");
     let writes = h.storage.writes();
-    h.lookup(&issued.request, &h.subject).await.unwrap();
+    h.lookup(&issued.request, &h.subject, &response)
+        .await
+        .unwrap();
     let mut altered = issued.request.clone();
     altered.context_id = "ctx-2".to_owned();
     assert!(matches!(
-        trust_err(h.lookup(&altered, &h.subject).await),
+        trust_err(h.lookup(&altered, &h.subject, &response).await),
         TrustError::UnknownChallenge { .. }
     ));
     let (_, other) = party(3);
     assert!(matches!(
-        trust_err(h.lookup(&issued.request, &other).await),
+        trust_err(h.lookup(&issued.request, &other, &response).await),
         TrustError::UnknownChallenge { .. }
     ));
     assert_eq!(h.storage.writes(), writes);
+}
+
+/// T13 (U-1): Lookup on a closed challenge admits only a resubmit of a
+/// response it graded, so a fresh response costs no resolution.
+#[tokio::test]
+async fn lookup_on_a_closed_challenge_admits_only_a_resubmit() {
+    let h = harness();
+    let issued = h.create().await.unwrap();
+    let graded_response = h.respond_response(&issued.request, 1, "ok");
+    assert!(h.graded(&issued, 1, "ok").await.record.passed);
+    h.lookup(&issued.request, &h.subject, &graded_response)
+        .await
+        .unwrap();
+    let fresh = h.respond_response(&issued.request, 2, "ok");
+    assert!(matches!(
+        trust_err(h.lookup(&issued.request, &h.subject, &fresh).await),
+        TrustError::ChallengeClosed { .. }
+    ));
 }
 
 /// A ledger that cannot load refuses every command instead of serving from
@@ -811,48 +1300,19 @@ async fn unloadable_ledger_refuses_until_it_loads() {
     let issued = h.create().await.unwrap();
     h.handle.send_shutdown().await.unwrap();
     h.storage.fail_reads.store(true, Ordering::SeqCst);
-    let restarted = spawn(&h.verifier, &h.storage, &h.clock);
+    let restarted = spawn(
+        &h.verifier,
+        &h.storage,
+        &h.clock,
+        ChallengerLedgerShared::new(),
+    );
     let auth = h.respond(&issued.request, 1, "ok");
-    let refused = restarted
-        .send(|reply| ChallengerLedgerCommand::BeginGrade {
-            auth: Arc::clone(&auth),
-            signer: h.signer(),
-            reply,
-        })
-        .await;
-    assert!(matches!(
-        refused,
-        Err(ChallengeLedgerError::Context(
-            ContextError::PersistenceFailed(_)
-        ))
-    ));
+    assert!(is_persistence_failure(&begin_on(&restarted, &auth).await));
     h.storage.fail_reads.store(false, Ordering::SeqCst);
-    let begun = restarted
-        .send(|reply| ChallengerLedgerCommand::BeginGrade {
-            auth: Arc::clone(&auth),
-            signer: h.signer(),
-            reply,
-        })
-        .await
-        .unwrap();
-    assert!(matches!(begun, BeginOutcome::Lease(_)));
-}
-
-/// A failed write leaves the turn's state unchanged: Create persists before
-/// it signs, so a refused index write leaves no challenge behind.
-#[tokio::test]
-async fn create_write_failure_creates_nothing() {
-    let h = harness();
-    h.storage.allow_stores(0);
     assert!(matches!(
-        h.create().await,
-        Err(ChallengeLedgerError::Context(
-            ContextError::PersistenceFailed(_)
-        ))
+        begin_on(&restarted, &auth).await.unwrap(),
+        BeginOutcome::Lease(_)
     ));
-    h.storage.allow_stores(-1);
-    let issued = h.create().await.unwrap();
-    h.lookup(&issued.request, &h.subject).await.unwrap();
 }
 
 /// Create refuses a request whose verifier is not this ledger's identity.
@@ -860,9 +1320,9 @@ async fn create_write_failure_creates_nothing() {
 async fn create_refuses_foreign_verifier() {
     let h = harness();
     let (_, other) = party(4);
-    let foreign = spawn(&other, &h.storage, &h.clock);
+    let foreign = spawn(&other, &h.storage, &h.clock, ChallengerLedgerShared::new());
     assert!(matches!(
-        trust_err(h.create_with(&foreign, h.signer()).await),
+        trust_err(h.create_as(&foreign, h.signer(), &h.subject, URI).await),
         TrustError::ChallengeVerifierMismatch { .. }
     ));
 }

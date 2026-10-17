@@ -16,6 +16,7 @@
 package works.limn.scp
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
@@ -273,6 +274,7 @@ class TrustAggregateFfiTest {
             val cases = testCases(20)
 
             val request = scp.trustCreateChallenge(verifier, subject.did(), schemaUri, cases, contextId, 3_600u)
+            pastCreationSecond(request)
             assertEquals(verifier.did(), request.verifier)
             assertEquals(subject.did(), request.subject)
             assertEquals(contextId, request.contextId)
@@ -331,6 +333,7 @@ class TrustAggregateFfiTest {
             val contextId = requiringContext(verifier.did())
             val cases = testCases(20)
             val request = scp.trustCreateChallenge(verifier, subject.did(), schemaUri, cases, contextId, 3_600u)
+            pastCreationSecond(request)
             val response = scp.trustRespondToChallenge(subject, request, passingOutputs(cases), 1u)
             assertFailsWith<ScpException> {
                 scp.trustGradeResponse(
@@ -344,5 +347,15 @@ class TrustAggregateFfiTest {
             assertEquals(1u, graded.record.attempt)
             assertTrue(graded.record.passed)
         }
+    }
+
+/**
+ * Grading is strictly inside the challenge window (spec 07 §7.3.4), so a
+ * grade in the second the challenge was created is refused. This waits that
+ * second out on the wall clock the bridge reads.
+ */
+private suspend fun pastCreationSecond(request: ChallengeRequest) {
+    while (System.currentTimeMillis() < (request.createdAt.toLong() + 1) * 1_000) {
+        delay(50)
     }
 }

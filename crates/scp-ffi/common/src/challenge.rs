@@ -23,7 +23,7 @@ use scp_clock::SystemClock;
 use scp_core::context::ContextError;
 use scp_core::context::actor::signer::CommandSigner;
 use scp_core::context::supervisor::{
-    BeginOutcome, ChallengeLedgerError, GradedAttempt, GradingFault, Supervisor,
+    BeginOutcome, ChallengeLedgerError, GradedAttempt, Supervisor,
 };
 use scp_core::store::ProtocolRepository;
 use scp_did::DID;
@@ -509,7 +509,6 @@ pub async fn create_challenge(
             _ => None,
         })
         .collect();
-    let definition = policy.definition().clone();
     let verifier = args.verifier.clone();
     let (unsigned, answer_key) = challenge_request_unsigned(NewChallenge {
         verifier: args.verifier,
@@ -538,7 +537,6 @@ pub async fn create_challenge(
             verifier.as_ref(),
             unsigned,
             answer_key,
-            definition,
             args.evaluator_context_id,
             signer.clone(),
         )
@@ -621,8 +619,9 @@ pub struct GradeResult {
 /// 1. the signer is Ed25519, and the raw response fits
 ///    [`check_response_bounds`];
 /// 2. the request and response decode;
-/// 3. the ledger holds the challenge with this request digest and subject
-///    (read only, before any resolution);
+/// 3. the ledger holds the challenge with this request digest and subject,
+///    and, once it is closed, an attempt graded from this response (read
+///    only, before any resolution);
 /// 4. [`authenticate_challenge_response`] on a blocking thread, so a forged
 ///    response takes no lease and records no fault;
 /// 5. one of the challenger's grading permits;
@@ -631,9 +630,9 @@ pub struct GradeResult {
 /// 7. the cases run one at a time within `CHALLENGE_GRADING_BUDGET_SECS`
 ///    for the whole attempt; a case the budget cuts off fails with
 ///    `budget_exceeded`;
-/// 8. an answer key that does not open, a stored schema the gate refuses,
-///    or an unavailable evaluator is a fault, which uses no attempt;
-///    otherwise the ledger commits and signs the record;
+/// 8. a stored schema the gate refuses, or an unavailable evaluator, is a
+///    fault, which uses no attempt and restarts the cooldown; otherwise the
+///    ledger signs the record and commits it;
 /// 9. the record is written to `repo`, whose failure is returned as
 ///    [`GradeResult::trust_store_error`].
 ///
@@ -707,7 +706,8 @@ where
     let request: ChallengeRequest = decode!(JsonInput::Challenge, request_json)?;
     let response: ChallengeResponse = decode!(JsonInput::Response, response_json)?;
     let challenger = verifier.as_ref();
-    sup.dispatch_challenge_lookup(challenger, &request).await?;
+    sup.dispatch_challenge_lookup(challenger, &request, &response)
+        .await?;
     let auth = {
         let challenger = challenger.to_owned();
         run_blocking_resolution(move |_scope| {
@@ -719,18 +719,11 @@ where
     let auth = Arc::new(auth);
     let permit = Arc::new(sup.challenge_grading_permit(challenger).await?);
     let lease = match sup
-        .dispatch_challenge_begin_grade(challenger, Arc::clone(&auth), signer.clone())
+        .dispatch_challenge_begin_grade(challenger, Arc::clone(&auth))
         .await?
     {
         BeginOutcome::Stored(stored) => return Ok(store_graded(repo, *stored).await),
         BeginOutcome::Lease(lease) => lease,
-    };
-    let challenge_id = auth.as_authenticated().request().challenge_id;
-    let fault = |fault: GradingFault| async {
-        let error = TrustError::from(fault.clone());
-        sup.dispatch_challenge_fault(challenger, challenge_id, lease.lease_id, fault)
-            .await?;
-        Err::<GradeResult, ChallengeOpError>(error.into())
     };
     let mut evaluated = CaseVerdicts::default();
     let run = async {
@@ -746,8 +739,10 @@ where
     // On expiry the in-flight case and every later one have no verdict, so
     // `grade` fails them with `budget_exceeded`.
     let _ = tokio::time::timeout(budget, run).await;
-    if let Some(f) = evaluated.fault.take() {
-        return fault(f).await;
+    if let Some(fault) = evaluated.fault.take() {
+        sup.dispatch_challenge_fault(challenger, Arc::clone(&auth), lease.lease_id, fault.clone())
+            .await?;
+        return Err(fault.into());
     }
     let outcome = grade(
         &auth.as_authenticated(),
@@ -766,7 +761,8 @@ where
 struct CaseVerdicts {
     evals: BTreeMap<usize, CaseResult>,
     schemas: BTreeMap<usize, SchemaVerdict>,
-    fault: Option<GradingFault>,
+    /// A challenger fault: `SchemaRejected` or `EvaluatorUnavailable`.
+    fault: Option<TrustError>,
 }
 
 /// How one attempt runs its evaluated cases: the evaluator context, the
@@ -790,7 +786,7 @@ async fn schema_case(
     test_id: &str,
     schema: &Value,
     output: &Value,
-) -> Result<SchemaVerdict, GradingFault> {
+) -> Result<SchemaVerdict, TrustError> {
     let (id, schema, output) = (test_id.to_owned(), schema.clone(), output.clone());
     let verdict = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -799,7 +795,7 @@ async fn schema_case(
     .await;
     match verdict {
         Ok(Ok(verdict)) => Ok(verdict),
-        Ok(Err(e)) => Err(GradingFault::SchemaRejected {
+        Ok(Err(e)) => Err(TrustError::SchemaRejected {
             test_id: test_id.to_owned(),
             reason: e.to_string(),
         }),
@@ -848,7 +844,7 @@ async fn evaluate_cases(
                 evaluator_outlet_id,
             } => {
                 let Some(context_id) = evaluator_context_id else {
-                    out.fault = Some(GradingFault::EvaluatorUnavailable {
+                    out.fault = Some(TrustError::EvaluatorUnavailable {
                         context_id: String::new(),
                         outlet_id: evaluator_outlet_id.clone(),
                         reason: "the challenge names no evaluator context".to_owned(),
@@ -895,7 +891,7 @@ async fn evaluate_cases(
                         );
                     }
                     EvaluatorOutcome::Unavailable(reason) => {
-                        out.fault = Some(GradingFault::EvaluatorUnavailable {
+                        out.fault = Some(TrustError::EvaluatorUnavailable {
                             context_id: context_id.to_owned(),
                             outlet_id: evaluator_outlet_id.clone(),
                             reason,

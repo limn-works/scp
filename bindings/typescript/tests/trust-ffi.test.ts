@@ -24,6 +24,17 @@ import { CHALLENGE_SUITE_BELOW_MINIMUM_CODE, encodeCapabilityRequirements } from
 const SCHEMA_URI = "scp:capability:schema-validation/v1";
 
 /** `n` exact-match cases whose weights sum to 10000. */
+/**
+ * Grading is strictly inside the challenge window (spec 07 §7.3.4), so a
+ * grade in the second the challenge was created is refused. This waits that
+ * second out on the wall clock the addon reads.
+ */
+async function pastCreationSecond(request: { createdAt: number }): Promise<void> {
+  while (Date.now() < (request.createdAt + 1) * 1000) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 function testCases(n: number): TestCase[] {
   const weight = Math.floor(10_000 / n);
   return Array.from({ length: n }, (_, i) => ({
@@ -207,6 +218,7 @@ if (scp === null) {
         contextId,
         3_600,
       );
+      await pastCreationSecond(request);
       expect(request.verifier).toBe(verifier.did);
       expect(request.subject).toBe(subject.did);
       expect(request.contextId).toBe(contextId);
@@ -266,6 +278,7 @@ if (scp === null) {
         contextId,
         3_600,
       );
+      await pastCreationSecond(request);
       const response = await live.trustRespondToChallenge(
         subject.did,
         request,

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1463,6 +1464,17 @@ class TestTrustVerifyTyped:
 _SCHEMA_URI = "scp:capability:schema-validation/v1"
 
 
+async def _past_creation_second(request: ChallengeRequest) -> None:
+    """Wait out the second the challenge was created in.
+
+    Grading is strictly inside the challenge window (spec 07 §7.3.4), so a
+    grade in that second is refused. This reads the wall clock the native
+    extension reads.
+    """
+    while time.time() < request.created_at + 1:
+        await asyncio.sleep(0.05)
+
+
 def _schema_cases(n: int) -> list[TestCase]:
     """``n`` exact-match cases whose weights sum to 10000."""
     weight = 10_000 // n
@@ -1846,6 +1858,7 @@ class TestTrustChallengeRealBridge:
         request = await scp.trust_create_challenge(
             verifier.did, subject.did, _SCHEMA_URI, cases, context_id, 3_600
         )
+        await _past_creation_second(request)
         assert request.verifier == verifier.did
         assert request.subject == subject.did
         assert request.context_id == context_id
@@ -1899,6 +1912,7 @@ class TestTrustChallengeRealBridge:
         request = await scp.trust_create_challenge(
             verifier.did, subject.did, _SCHEMA_URI, cases, context_id, 3_600
         )
+        await _past_creation_second(request)
         response = await scp.trust_respond_to_challenge(
             subject.did,
             request,

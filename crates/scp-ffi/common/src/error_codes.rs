@@ -1181,9 +1181,6 @@ pub const VALID_7116: &str = "SCP-VALID-7116";
 // 7117 (`evaluator_failed`) and 7118 (`budget_exceeded`) are reserved for the
 // challenge case-fail reasons of those names; no error carries them, because
 // at grade time each is a per-case result, not a failure of the call.
-/// A challenge's grading faulted `MAX_GRADING_FAULTS` times and closed
-/// ([`TrustError::ChallengeFaulted`](scp_protocol::trust::TrustError::ChallengeFaulted)).
-pub const VALID_7119: &str = "SCP-VALID-7119";
 /// Handle registry lock error.
 pub const VALID_7120: &str = "SCP-VALID-7120";
 /// A required capability has no passing record from a trusted challenger.
@@ -1278,6 +1275,11 @@ pub const VALID_7148: &str = "SCP-VALID-7148";
 /// written
 /// ([`TrustError::GradingLeaseLost`](scp_protocol::trust::TrustError::GradingLeaseLost)).
 pub const VALID_7149: &str = "SCP-VALID-7149";
+/// A challenge to this subject for this capability is inside its window.
+///
+/// Retry at that challenge's `expires_at`
+/// ([`TrustError::ChallengeWindowOpen`](scp_protocol::trust::TrustError::ChallengeWindowOpen)).
+pub const VALID_7151: &str = "SCP-VALID-7151";
 /// Governance vote validation error.
 pub const VALID_7216: &str = "SCP-VALID-7216";
 /// Media validation error.
@@ -1664,7 +1666,6 @@ pub const fn trust_error_code(e: &scp_protocol::trust::TrustError) -> &'static s
         E::UnknownChallenge { .. } => VALID_7107,
         E::OutputsMismatch { .. } => VALID_7108,
         E::EvaluatorUnavailable { .. } => VALID_7109,
-        E::ChallengeFaulted { .. } => VALID_7119,
         E::SelfChallenge { .. } => VALID_7127,
         E::StandardNotGradable { .. } => VALID_7128,
         E::CapabilityDefinitionUnavailable { .. } => VALID_7129,
@@ -1676,6 +1677,7 @@ pub const fn trust_error_code(e: &scp_protocol::trust::TrustError) -> &'static s
         E::GradingCapacityExhausted { .. } => VALID_7146,
         E::NonCanonicalIdentifier { .. } => VALID_7147,
         E::GradingLeaseLost { .. } => VALID_7149,
+        E::ChallengeWindowOpen { .. } => VALID_7151,
         E::NoEventsForSubject { .. }
         | E::EmptyEventLog
         | E::InvalidEventData { .. }

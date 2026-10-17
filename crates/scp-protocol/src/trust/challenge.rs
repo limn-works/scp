@@ -403,8 +403,6 @@ pub const MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT: usize = 32;
 pub const CHALLENGE_GRADING_BUDGET_SECS: u64 = 60;
 /// Added to the budget to form a grading lease deadline.
 pub const CHALLENGE_LEASE_MARGIN_SECS: u64 = 30;
-/// Grading faults after which a challenge closes as faulted.
-pub const MAX_GRADING_FAULTS: u32 = 3;
 /// The largest response a challenger reads.
 pub const MAX_CHALLENGE_RESPONSE_BYTES: usize = 1_048_576;
 /// The largest canonical `SchemaMatch` schema.
@@ -1047,7 +1045,8 @@ pub struct NewChallenge {
 /// 3. the definition's minimum ([`TrustError::ChallengeSuiteBelowMinimum`]);
 /// 4. every `SchemaMatch` schema passes [`SchemaGate::admit`]
 ///    ([`TrustError::SchemaRejected`]);
-/// 5. `0 < window_secs <= MAX_CHALLENGE_WINDOW_SECS`
+/// 5. `0 < window_secs <= MAX_CHALLENGE_WINDOW_SECS` and
+///    `window_secs >= cooldown_secs`, so a retry fits inside the window
 ///    ([`TrustError::ChallengeWindowInvalid`]).
 ///
 /// The challenge id is drawn from the OS random source.
@@ -1073,19 +1072,22 @@ pub fn challenge_request_unsigned(
             SchemaGate::admit(&case.test_id, schema)?;
         }
     }
-    if new.window_secs == 0 || new.window_secs > MAX_CHALLENGE_WINDOW_SECS {
-        return Err(TrustError::ChallengeWindowInvalid {
-            window_secs: new.window_secs,
-            max_secs: MAX_CHALLENGE_WINDOW_SECS,
-        });
+    let cooldown_secs = u64::from(new.policy.cooldown_secs);
+    let window_invalid = TrustError::ChallengeWindowInvalid {
+        window_secs: new.window_secs,
+        cooldown_secs,
+        max_secs: MAX_CHALLENGE_WINDOW_SECS,
+    };
+    if new.window_secs == 0
+        || new.window_secs > MAX_CHALLENGE_WINDOW_SECS
+        || new.window_secs < cooldown_secs
+    {
+        return Err(window_invalid);
     }
-    let expires_at =
-        new.created_at
-            .checked_add(new.window_secs)
-            .ok_or(TrustError::ChallengeWindowInvalid {
-                window_secs: new.window_secs,
-                max_secs: MAX_CHALLENGE_WINDOW_SECS,
-            })?;
+    let expires_at = new
+        .created_at
+        .checked_add(new.window_secs)
+        .ok_or(window_invalid)?;
 
     let challenge_id = random_32()?;
     let mut cases = Vec::with_capacity(new.test_cases.len());
@@ -1636,8 +1638,14 @@ pub enum ChallengeClosure {
     Passed,
     /// The last allowed attempt failed.
     Exhausted,
-    /// `MAX_GRADING_FAULTS` grading faults occurred.
-    Faulted,
+}
+
+/// Whether `t` is strictly inside the window `(created_at, expires_at)`
+/// (spec 07 §7.3.4 steps 3 and 5(c)). The ledger's attempt check, the record
+/// builder and the consumer all use it, so the three cannot disagree on a
+/// boundary.
+const fn grading_time_in_window(created_at: u64, expires_at: u64, t: u64) -> bool {
+    created_at < t && t < expires_at
 }
 
 /// What [`check_attempt`] reads from the challenger's ledger entry.
@@ -1657,29 +1665,29 @@ pub struct AttemptLedgerView {
     pub last_attempt: u32,
     /// When the last attempt was graded.
     pub last_timestamp: Option<u64>,
+    /// When the last grading fault was recorded.
+    pub last_fault_at: Option<u64>,
     /// Set once the challenge closes.
     pub closed: Option<ChallengeClosure>,
-    /// Grading faults so far.
-    pub faults: u32,
 }
 
 /// Decides whether `attempt` may be graded at `now`. Pure, so the ledger's
 /// begin and commit turns run the same check.
 ///
-/// Checks, in order: the window `created_at <= now <= expires_at`
+/// Checks, in order: the window `created_at < now < expires_at`
 /// ([`TrustError::ChallengeExpired`]); not closed
-/// ([`TrustError::ChallengeFaulted`] or [`TrustError::ChallengeClosed`]);
-/// `attempt == last_attempt + 1` ([`TrustError::AttemptOutOfOrder`]);
-/// `attempt <= 1 + max_retries` ([`TrustError::RetriesExhausted`]);
-/// `now >= last_timestamp + cooldown_secs` ([`TrustError::CooldownActive`]);
-/// fewer than `MAX_GRADING_FAULTS` faults ([`TrustError::ChallengeFaulted`]).
+/// ([`TrustError::ChallengeClosed`]); `attempt == last_attempt + 1`
+/// ([`TrustError::AttemptOutOfOrder`]); `attempt <= 1 + max_retries`
+/// ([`TrustError::RetriesExhausted`]); `now >= c + cooldown_secs`, where `c`
+/// is the later of `last_timestamp` and `last_fault_at` and the sum
+/// saturates ([`TrustError::CooldownActive`]).
 ///
 /// # Errors
 ///
 /// The errors above.
 pub fn check_attempt(view: &AttemptLedgerView, attempt: u32, now: u64) -> Result<(), TrustError> {
     let challenge_id = || hex::encode(view.challenge_id);
-    if now < view.created_at || now > view.expires_at {
+    if !grading_time_in_window(view.created_at, view.expires_at, now) {
         return Err(TrustError::ChallengeExpired {
             challenge_id: challenge_id(),
             now,
@@ -1687,19 +1695,10 @@ pub fn check_attempt(view: &AttemptLedgerView, attempt: u32, now: u64) -> Result
             expires_at: view.expires_at,
         });
     }
-    match view.closed {
-        Some(ChallengeClosure::Faulted) => {
-            return Err(TrustError::ChallengeFaulted {
-                challenge_id: challenge_id(),
-                faults: view.faults,
-            });
-        }
-        Some(_) => {
-            return Err(TrustError::ChallengeClosed {
-                challenge_id: challenge_id(),
-            });
-        }
-        None => {}
+    if view.closed.is_some() {
+        return Err(TrustError::ChallengeClosed {
+            challenge_id: challenge_id(),
+        });
     }
     let expected = view.last_attempt.saturating_add(1);
     if attempt != expected {
@@ -1710,7 +1709,7 @@ pub fn check_attempt(view: &AttemptLedgerView, attempt: u32, now: u64) -> Result
         });
     }
     check_attempt_range(&view.challenge_id, attempt, view.max_retries)?;
-    if let Some(last) = view.last_timestamp {
+    if let Some(last) = view.last_timestamp.max(view.last_fault_at) {
         let retry_after = last.saturating_add(u64::from(view.cooldown_secs));
         if now < retry_after {
             return Err(TrustError::CooldownActive {
@@ -1718,12 +1717,6 @@ pub fn check_attempt(view: &AttemptLedgerView, attempt: u32, now: u64) -> Result
                 retry_after,
             });
         }
-    }
-    if view.faults >= MAX_GRADING_FAULTS {
-        return Err(TrustError::ChallengeFaulted {
-            challenge_id: challenge_id(),
-            faults: view.faults,
-        });
     }
     Ok(())
 }
@@ -1737,8 +1730,8 @@ pub fn check_attempt(view: &AttemptLedgerView, attempt: u32, now: u64) -> Result
 ///
 /// # Errors
 ///
-/// [`TrustError::ChallengeVerificationOutsideWindow`] if `timestamp` is
-/// outside the request's window; [`TrustError::ChallengeVerificationInconsistent`]
+/// [`TrustError::ChallengeVerificationOutsideWindow`] if `timestamp` is not
+/// strictly inside the request's window; [`TrustError::ChallengeVerificationInconsistent`]
 /// if `outcome` does not belong to `auth`'s request;
 /// [`TrustError::CanonicalizationFailed`] if encoding fails.
 pub fn challenge_verification_unsigned(
@@ -1756,7 +1749,7 @@ pub fn challenge_verification_unsigned(
         attempt,
         timestamp,
     )?;
-    if timestamp < request.created_at || timestamp > request.expires_at {
+    if !grading_time_in_window(request.created_at, request.expires_at, timestamp) {
         return Err(TrustError::ChallengeVerificationOutsideWindow {
             verification_id: hex::encode(verification_id),
             timestamp,
@@ -1809,8 +1802,8 @@ pub fn challenge_verification_unsigned(
 // ---------------------------------------------------------------------------
 
 /// Checks steps (f) and (g): the attempt is within the signed retries, the
-/// signed policy is within the definition's limits, and the counts meet its
-/// minimum.
+/// signed policy is within the definition's limits, the challenge window is
+/// at least the definition's cooldown, and the counts meet its minimum.
 fn check_record_policy(
     v: &ChallengeVerification,
     defs: &dyn CapabilityDefinitionSource,
@@ -1849,6 +1842,15 @@ fn check_record_policy(
             "cooldown_secs {} is below the definition's {}",
             v.cooldown_secs, def.cooldown_secs
         ))
+    } else if v
+        .challenge_expires_at
+        .saturating_sub(v.challenge_created_at)
+        < u64::from(def.cooldown_secs)
+    {
+        Some(format!(
+            "challenge window {}..{} is shorter than the definition's cooldown_secs {}",
+            v.challenge_created_at, v.challenge_expires_at, def.cooldown_secs
+        ))
     } else if !minimum_met {
         Some(format!(
             "test_count {} / min_category_cases {} below the definition's {:?}",
@@ -1872,14 +1874,15 @@ fn check_record_policy(
 ///   ([`TrustError::ChallengeVerificationSignatureInvalid`]);
 /// - (b) `verification_id` re-derives
 ///   ([`TrustError::ChallengeVerificationIdMismatch`]);
-/// - (c) `challenge_created_at <= timestamp <= challenge_expires_at`
+/// - (c) `challenge_created_at < timestamp < challenge_expires_at`
 ///   ([`TrustError::ChallengeVerificationOutsideWindow`]);
 /// - (d) `timestamp <= now + CHALLENGE_CLOCK_SKEW_SECS`
 ///   ([`TrustError::ChallengeVerificationFromFuture`]);
 /// - (e) `expires_at - timestamp <= MAX_VERIFICATION_VALIDITY_SECS`
 ///   ([`TrustError::ChallengeVerificationValidityTooLong`]);
-/// - (f) and (g) the attempt within the signed retries and the policy
-///   within the definition's limits ([`TrustError::PolicyOutsideDefinition`]; definition errors as
+/// - (f) and (g) the attempt within the signed retries, the policy within
+///   the definition's limits, and the challenge window at least the
+///   definition's cooldown ([`TrustError::PolicyOutsideDefinition`]; definition errors as
 ///   [`ChallengePolicy::resolve`]);
 /// - (h) `passed == (score >= pass_threshold_bps)`, `score <=
 ///   TOTAL_WEIGHT_BPS`, `pass_count <= test_count`
@@ -1931,7 +1934,7 @@ pub fn verify_challenge_verification(
         });
     }
 
-    if v.timestamp < v.challenge_created_at || v.timestamp > v.challenge_expires_at {
+    if !grading_time_in_window(v.challenge_created_at, v.challenge_expires_at, v.timestamp) {
         return Err(TrustError::ChallengeVerificationOutsideWindow {
             verification_id: id_hex,
             timestamp: v.timestamp,
@@ -2566,33 +2569,93 @@ mod tests {
             cooldown_secs: 300,
             last_attempt: 0,
             last_timestamp: None,
+            last_fault_at: None,
             closed: None,
-            faults: 0,
         }
     }
 
-    /// Test 14.
+    /// T5: the window is strict at both ends (RULING 5) in all three checks
+    /// that read it: the ledger's attempt check, the record builder and the
+    /// consumer's step (c). The table is `created`, `created + 1`,
+    /// `expires - 1` and `expires`.
     #[test]
-    fn attempt_rejected_before_created_at() {
-        assert!(matches!(
-            check_attempt(&view(), 1, NOW - 1),
-            Err(TrustError::ChallengeExpired { .. })
-        ));
-        check_attempt(&view(), 1, NOW).unwrap();
+    fn grading_window_is_strict_in_all_three_checks() {
+        let fx = fixture();
+        let (request, key) = fx.issue(FIXTURE_URI, cases(2)).unwrap();
+        let outputs = request
+            .test_cases
+            .iter()
+            .map(|c| TestOutput {
+                test_id: c.test_id.clone(),
+                output: json!("ok"),
+            })
+            .collect();
+        let response = fx.respond(&request, 1, outputs).unwrap();
+        let auth =
+            authenticate_challenge_response(&request, &response, &fx.verifier.did, &fx.resolver)
+                .unwrap();
+        let outcome = grade(&auth, &key, &BTreeMap::new(), &BTreeMap::new());
+        let (created, expires) = (request.created_at, request.expires_at);
+        let ledger = AttemptLedgerView {
+            challenge_id: request.challenge_id,
+            created_at: created,
+            expires_at: expires,
+            max_retries: request.max_retries,
+            cooldown_secs: request.cooldown_secs,
+            ..view()
+        };
+        let genuine = challenge_verification_unsigned(&auth, &outcome, created + 1).unwrap();
+        for (t, inside) in [
+            (created, false),
+            (created + 1, true),
+            (expires - 1, true),
+            (expires, false),
+        ] {
+            let checked = check_attempt(&ledger, 1, t);
+            assert_eq!(checked.is_ok(), inside, "check_attempt at {t}: {checked:?}");
+            assert!(
+                inside || matches!(checked, Err(TrustError::ChallengeExpired { .. })),
+                "{checked:?}"
+            );
+            let built = challenge_verification_unsigned(&auth, &outcome, t);
+            assert_eq!(built.is_ok(), inside, "record builder at {t}");
+            assert!(
+                inside
+                    || matches!(
+                        built,
+                        Err(TrustError::ChallengeVerificationOutsideWindow { .. })
+                    )
+            );
+            // The consumer: the genuine record restamped at `t`, its id
+            // re-derived and re-signed, read at `t`.
+            let mut record = genuine.record().clone();
+            record.timestamp = t;
+            record.expires_at = t + MAX_VERIFICATION_VALIDITY_SECS;
+            record.verification_id = challenge_verification_id(
+                &record.verifier,
+                &record.subject,
+                &record.capability_uri,
+                &record.challenge_id,
+                record.attempt,
+                t,
+            )
+            .unwrap();
+            fx.resign(&mut record).unwrap();
+            fx.clock.set(t);
+            let consumed = verify(&fx, &record);
+            assert_eq!(consumed.is_ok(), inside, "consumer at {t}: {consumed:?}");
+            assert!(
+                inside
+                    || matches!(
+                        consumed,
+                        Err(TrustError::ChallengeVerificationOutsideWindow { .. })
+                    )
+            );
+        }
     }
 
-    /// Test 15.
     #[test]
-    fn attempt_window_boundary() {
-        check_attempt(&view(), 1, NOW + 3600).unwrap();
-        assert!(matches!(
-            check_attempt(&view(), 1, NOW + 3601),
-            Err(TrustError::ChallengeExpired { .. })
-        ));
-    }
-
-    #[test]
-    fn check_attempt_enforces_order_retries_cooldown_closure_and_faults() {
+    fn check_attempt_enforces_order_retries_cooldown_and_closure() {
         let after_one = AttemptLedgerView {
             last_attempt: 1,
             last_timestamp: Some(NOW + 10),
@@ -2615,30 +2678,45 @@ mod tests {
             check_attempt(&after_three, 4, NOW + 1000),
             Err(TrustError::RetriesExhausted { allowed: 3, .. })
         ));
-        for (closure, faulted) in [
-            (ChallengeClosure::Passed, false),
-            (ChallengeClosure::Exhausted, false),
-            (ChallengeClosure::Faulted, true),
-        ] {
+        for closure in [ChallengeClosure::Passed, ChallengeClosure::Exhausted] {
             let closed = AttemptLedgerView {
                 closed: Some(closure),
                 ..view()
             };
-            let err = check_attempt(&closed, 1, NOW).unwrap_err();
-            assert_eq!(
-                matches!(err, TrustError::ChallengeFaulted { .. }),
-                faulted,
-                "{err:?}"
-            );
+            assert!(matches!(
+                check_attempt(&closed, 1, NOW + 1),
+                Err(TrustError::ChallengeClosed { .. })
+            ));
         }
-        let faulty = AttemptLedgerView {
-            faults: MAX_GRADING_FAULTS,
+    }
+
+    /// T8 (design call (i)): a fault starts the cooldown and closes
+    /// nothing, and the cooldown runs from the later of the last attempt and
+    /// the last fault.
+    #[test]
+    fn check_attempt_cooldown_runs_from_the_later_of_attempt_and_fault() {
+        let faulted = AttemptLedgerView {
+            last_fault_at: Some(NOW + 10),
             ..view()
         };
         assert!(matches!(
-            check_attempt(&faulty, 1, NOW),
-            Err(TrustError::ChallengeFaulted { .. })
+            check_attempt(&faulted, 1, NOW + 309),
+            Err(TrustError::CooldownActive { retry_after, .. }) if retry_after == NOW + 310
         ));
+        check_attempt(&faulted, 1, NOW + 310).unwrap();
+        for (attempt_at, fault_at) in [(NOW + 10, NOW + 50), (NOW + 50, NOW + 10)] {
+            let both = AttemptLedgerView {
+                last_attempt: 1,
+                last_timestamp: Some(attempt_at),
+                last_fault_at: Some(fault_at),
+                ..view()
+            };
+            assert!(matches!(
+                check_attempt(&both, 2, NOW + 349),
+                Err(TrustError::CooldownActive { retry_after, .. }) if retry_after == NOW + 350
+            ));
+            check_attempt(&both, 2, NOW + 350).unwrap();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2688,7 +2766,7 @@ mod tests {
         verify(&fx, &v).unwrap();
         assert!(v.passed);
         assert_eq!((v.score, v.test_count, v.pass_count), (10_000, 2, 2));
-        assert_eq!(v.expires_at, NOW + MAX_VERIFICATION_VALIDITY_SECS);
+        assert_eq!(v.expires_at, NOW + 1 + MAX_VERIFICATION_VALIDITY_SECS);
     }
 
     /// Test 16.
@@ -2716,15 +2794,18 @@ mod tests {
     fn verify_rejects_future_timestamp() {
         let fx = fixture();
         let skew = CHALLENGE_CLOCK_SKEW_SECS;
+        // The window stays at least the definition's cooldown (step (g)) and
+        // strictly contains the timestamp (step (c)).
+        let window_end = NOW + skew + u64::from(fixture_definition().cooldown_secs);
         let at_edge = edited(&fx, |v| {
             v.timestamp = NOW + skew;
-            v.challenge_expires_at = NOW + skew + 1;
+            v.challenge_expires_at = window_end;
             v.expires_at = v.timestamp + 1;
         });
         verify(&fx, &at_edge).unwrap();
         let future = edited(&fx, |v| {
             v.timestamp = NOW + skew + 1;
-            v.challenge_expires_at = NOW + skew + 1;
+            v.challenge_expires_at = window_end;
             v.expires_at = v.timestamp + 1;
         });
         assert!(matches!(
@@ -3033,8 +3114,8 @@ mod tests {
             cooldown_secs: u32::MAX,
             last_attempt: u32::MAX - 1,
             last_timestamp: Some(last),
+            last_fault_at: None,
             closed: None,
-            faults: 0,
         };
         assert!(matches!(
             check_attempt(&view, u32::MAX, last + 1),
@@ -3087,6 +3168,7 @@ mod tests {
         // The signed request carries the stricter pick and the threshold.
         let new = NewChallenge {
             policy: strict,
+            window_secs: 7200,
             ..fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap()
         };
         let (unsigned, _) = challenge_request_unsigned(new).unwrap();
@@ -3136,6 +3218,48 @@ mod tests {
             challenge_request_unsigned(new),
             Err(TrustError::ChallengeWindowInvalid { .. })
         ));
+    }
+
+    /// T7 (design call (iii)): a window shorter than the policy's cooldown
+    /// is refused at Create; a window equal to it is accepted.
+    #[test]
+    fn request_rejects_window_shorter_than_cooldown() {
+        let fx = fixture();
+        let template = fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap();
+        let cooldown = u64::from(template.policy.cooldown_secs());
+        let short = NewChallenge {
+            window_secs: cooldown - 1,
+            ..fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap()
+        };
+        assert!(matches!(
+            challenge_request_unsigned(short),
+            Err(TrustError::ChallengeWindowInvalid { window_secs, cooldown_secs, .. })
+                if window_secs == cooldown - 1 && cooldown_secs == cooldown
+        ));
+        let equal = NewChallenge {
+            window_secs: cooldown,
+            ..template
+        };
+        challenge_request_unsigned(equal).unwrap();
+    }
+
+    /// T7 (design call (iii)): consume step (g) refuses a record whose
+    /// challenge window is shorter than the definition's cooldown.
+    #[test]
+    fn verify_rejects_window_shorter_than_definition_cooldown() {
+        let fx = fixture();
+        let cooldown = u64::from(fixture_definition().cooldown_secs);
+        let short = edited(&fx, |v| {
+            v.challenge_expires_at = v.challenge_created_at + cooldown - 1;
+        });
+        assert!(matches!(
+            verify(&fx, &short),
+            Err(TrustError::PolicyOutsideDefinition { .. })
+        ));
+        let equal = edited(&fx, |v| {
+            v.challenge_expires_at = v.challenge_created_at + cooldown;
+        });
+        verify(&fx, &equal).unwrap();
     }
 
     /// Test 24.
@@ -3468,8 +3592,13 @@ mod tests {
             authenticate_challenge_response(&request, &response, &fx.verifier.did, &fx.resolver)
                 .unwrap();
         let outcome = grade(&auth, &key, &BTreeMap::new(), &BTreeMap::new());
-        challenge_verification_unsigned(&auth, &outcome, request.expires_at).unwrap();
-        for timestamp in [request.created_at - 1, request.expires_at + 1] {
+        challenge_verification_unsigned(&auth, &outcome, request.expires_at - 1).unwrap();
+        for timestamp in [
+            request.created_at - 1,
+            request.created_at,
+            request.expires_at,
+            request.expires_at + 1,
+        ] {
             assert!(matches!(
                 challenge_verification_unsigned(&auth, &outcome, timestamp),
                 Err(TrustError::ChallengeVerificationOutsideWindow { .. })

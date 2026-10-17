@@ -2013,6 +2013,20 @@ mod tests {
                 .unwrap();
                 assert_eq!(challenge_id.len(), 64);
                 assert_eq!(challenge_id, challenge_id.to_lowercase());
+                // The window is open strictly after `created_at` (spec 07
+                // §7.3.4), and the bridge reads the wall clock.
+                let created_at = serde_json::from_str::<serde_json::Value>(&request_json).unwrap()
+                    ["created_at"]
+                    .as_u64()
+                    .unwrap();
+                while std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    <= created_at
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
                 let outputs: Vec<scp_core::trust::TestOutput> = (0..20)
                     .map(|i| scp_core::trust::TestOutput {
                         test_id: format!("t{i}"),

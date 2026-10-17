@@ -7,6 +7,7 @@
 use std::sync::atomic::AtomicUsize;
 
 use ed25519_dalek::{SigningKey, Verifier};
+use scp_clock::TestClock;
 use scp_core::context::builder::{ContextCreationError, ContextEventLogProvider};
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::supervisor::MAX_CONCURRENT_GRADINGS_PER_CHALLENGER;
@@ -29,6 +30,10 @@ use super::*;
 const URI: &str = "scp:capability:schema-validation/v1";
 const EVAL_CTX: &str = "ctx-evaluator";
 const JUDGE: &str = "judge";
+/// Seeds of further subjects, for tests that challenge more than one:
+/// RULING 14 refuses a second challenge to one subject inside the first's
+/// window.
+const SUBJECT_SEEDS: std::ops::RangeInclusive<u8> = 10..=18;
 
 // ---------------------------------------------------------------------------
 // Parties
@@ -63,6 +68,7 @@ impl ActiveKeyResolver for SeedResolver {
     fn resolve_active_key(&self, did_str: &str) -> Result<Vec<u8>, TrustError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         (1u8..=3)
+            .chain(SUBJECT_SEEDS)
             .find(|seed| did(*seed).0 == did_str)
             .map(|seed| key(seed).verifying_key().to_bytes().to_vec())
             .ok_or_else(|| TrustError::KeyResolutionUnavailable {
@@ -117,7 +123,7 @@ impl ContextEventLogProvider for NoOpEventLog {
     }
 }
 
-fn supervisor() -> Arc<Supervisor> {
+fn supervisor(clock: &Arc<TestClock>) -> Arc<Supervisor> {
     let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
     let mls_storage: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
         Arc::new(InMemoryStorage::new()),
@@ -130,7 +136,7 @@ fn supervisor() -> Arc<Supervisor> {
         None,
         None,
         None,
-        Some(Arc::new(SystemClock)),
+        Some(Arc::clone(clock) as Arc<dyn scp_clock::Clock>),
         mls_storage,
     )
 }
@@ -277,19 +283,23 @@ fn cases_json(custom: usize) -> String {
 
 struct Harness {
     sup: Arc<Supervisor>,
+    /// The supervisor's clock, started at the wall clock's time.
+    clock: Arc<TestClock>,
     resolver: Arc<SeedResolver>,
     repo: Arc<ProtocolRepository<InMemoryStorage>>,
 }
 
 impl Harness {
     async fn new(params: ContextParams) -> Self {
-        let sup = supervisor();
+        let clock = Arc::new(TestClock::new(scp_clock::Clock::now_secs(&SystemClock)));
+        let sup = supervisor(&clock);
         sup.register_local_did(did(1)).await.unwrap();
         sup.create_context(EVAL_CTX.to_owned(), params, did(1), None)
             .await
             .unwrap();
         Self {
             sup,
+            clock,
             resolver: Arc::new(SeedResolver::default()),
             repo: Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new())),
         }
@@ -308,9 +318,18 @@ impl Harness {
     }
 
     fn args(challenger: u8, custom: usize, evaluator: Option<&str>) -> CreateChallenge {
+        Self::args_for(challenger, 2, custom, evaluator)
+    }
+
+    fn args_for(
+        challenger: u8,
+        subject: u8,
+        custom: usize,
+        evaluator: Option<&str>,
+    ) -> CreateChallenge {
         CreateChallenge {
             verifier: did(challenger),
-            subject: did(2),
+            subject: did(subject),
             capability_uri: URI.to_owned(),
             test_cases_json: cases_json(custom),
             window_secs: 3600,
@@ -326,29 +345,54 @@ impl Harness {
         evaluator: Option<&str>,
         invoker: &TestInvoker,
     ) -> Result<ChallengeRequest, ChallengeOpError> {
-        create_challenge(
+        let created = create_challenge(
             &self.sup,
             &signer(challenger),
             Self::args(challenger, 1, evaluator),
             invoker,
             &ProtocolOnlyDefinitions,
         )
-        .await
+        .await;
+        self.clock.advance(1);
+        created
     }
 
+    /// Creates a challenge to subject 2, then advances the clock one second,
+    /// to the first instant strictly inside the window (spec 07 §7.3.4,
+    /// RULING 5), so the challenge is gradable at once.
     async fn create(&self, custom: usize, invoker: &TestInvoker) -> ChallengeRequest {
-        create_challenge(
+        self.create_for(2, custom, invoker).await
+    }
+
+    async fn create_for(
+        &self,
+        subject: u8,
+        custom: usize,
+        invoker: &TestInvoker,
+    ) -> ChallengeRequest {
+        let request = create_challenge(
             &self.sup,
             &signer(1),
-            Self::args(1, custom, Some(EVAL_CTX)),
+            Self::args_for(1, subject, custom, Some(EVAL_CTX)),
             invoker,
             &ProtocolOnlyDefinitions,
         )
         .await
-        .unwrap()
+        .unwrap();
+        self.clock.advance(1);
+        request
     }
 
     async fn respond(&self, request: &ChallengeRequest, attempt: u32) -> ChallengeResponse {
+        self.respond_as(2, request, attempt).await
+    }
+
+    async fn respond_as(
+        &self,
+        subject: u8,
+        request: &ChallengeRequest,
+        attempt: u32,
+    ) -> ChallengeResponse {
         let outputs: Vec<TestOutput> = request
             .test_cases
             .iter()
@@ -358,9 +402,9 @@ impl Harness {
             })
             .collect();
         respond_to_challenge(
-            &signer(2),
+            &signer(subject),
             Arc::clone(&self.resolver),
-            did(2).0,
+            did(subject).0,
             &serde_json::to_string(request).unwrap(),
             &serde_json::to_string(&outputs).unwrap(),
             attempt,
@@ -688,26 +732,44 @@ async fn grade_signs_and_stores_the_record() {
     );
 }
 
-/// 13: an evaluator outlet missing at grade time is a challenger fault; the
-/// attempt is not used, and the same attempt grades once it is back. Two
-/// faults per challenge, because the third closes it.
+/// 13: an evaluator outlet missing at grade time is a challenger fault: the
+/// attempt is not used and the challenge stays open, but the fault starts
+/// the cooldown (spec 07 §7.3.4 step 3), so a grade inside it is refused.
+/// Once the cooldown ends and the outlet is back, the same attempt grades.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn custom_eval_missing_outlet_is_fault() {
     let h = Harness::new(evaluator_params()).await;
     let calls = Arc::new(AtomicUsize::new(0));
     let ready = h.invoker(Some(registry()), Some(passing_handler(&calls)));
-    for missing in [
+    // Every response is signed before the test clock runs ahead: the subject
+    // side reads the wall clock.
+    let mut challenges = Vec::new();
+    for subject in SUBJECT_SEEDS.take(2) {
+        let request = h.create_for(subject, 1, &ready).await;
+        let response = h.respond_as(subject, &request, 1).await;
+        challenges.push((request, response));
+    }
+    for ((request, response), missing) in challenges.into_iter().zip([
         vec![
             h.invoker(Some(OutletRegistry::new()), Some(passing_handler(&calls))),
             h.invoker(Some(registry()), None),
         ],
         vec![h.invoker(None, Some(passing_handler(&calls)))],
-    ] {
-        let request = h.create(1, &ready).await;
-        let response = h.respond(&request, 1).await;
+    ]) {
+        let cooldown = u64::from(request.cooldown_secs);
         for invoker in &missing {
             let err = h.grade(&request, &response, invoker).await.unwrap_err();
             assert!(is_unavailable(&err), "{err:?}");
+            h.clock.advance(cooldown - 1);
+            let refused = h.grade(&request, &response, &ready).await.unwrap_err();
+            assert!(
+                matches!(
+                    refused,
+                    ChallengeOpError::Trust(TrustError::CooldownActive { .. })
+                ),
+                "{refused:?}"
+            );
+            h.clock.advance(1);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let graded = h.grade(&request, &response, &ready).await.unwrap();
@@ -761,14 +823,43 @@ async fn evaluator_error_and_budget_overrun_fail_the_case() {
     assert_eq!(graded.record.attempt, 1);
 
     let slow = h.invoker(Some(registry()), Some(sleeping_handler(500)));
-    let request = h.create(1, &slow).await;
-    let response = h.respond(&request, 1).await;
+    let subject = *SUBJECT_SEEDS.start();
+    let request = h.create_for(subject, 1, &slow).await;
+    let response = h.respond_as(subject, &request, 1).await;
     let graded = h
         .grade_within(&request, &response, &slow, Duration::from_millis(100))
         .await
         .unwrap();
     assert!(!graded.reasons[19].passed, "{:?}", graded.reasons[19]);
     assert_eq!(graded.record.attempt, 1);
+}
+
+/// T13 (U-1): a fresh response to a passed challenge is refused by the
+/// ledger lookup before any DID resolution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_response_to_a_closed_challenge_resolves_nothing() {
+    let h = Harness::new(evaluator_params()).await;
+    let invoker = h.invoker(None, None);
+    let request = h.create(0, &invoker).await;
+    let first = h.respond(&request, 1).await;
+    assert!(
+        h.grade(&request, &first, &invoker)
+            .await
+            .unwrap()
+            .record
+            .passed
+    );
+    let fresh = h.respond(&request, 2).await;
+    let calls = h.resolver.calls();
+    let err = h.grade(&request, &fresh, &invoker).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ChallengeOpError::Trust(TrustError::ChallengeClosed { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(h.resolver.calls(), calls, "the refusal resolved a DID");
 }
 
 /// 13f: a response signed by anyone but the subject is refused before any
@@ -860,9 +951,9 @@ async fn grading_permits_bound_leaked_threads() {
     };
     let invoker = Arc::new(h.invoker(Some(registry()), Some(blocking)));
     let mut pending = Vec::new();
-    for _ in 0..=MAX_CONCURRENT_GRADINGS_PER_CHALLENGER {
-        let request = h.create(1, &invoker).await;
-        let response = h.respond(&request, 1).await;
+    for subject in SUBJECT_SEEDS.take(MAX_CONCURRENT_GRADINGS_PER_CHALLENGER + 1) {
+        let request = h.create_for(subject, 1, &invoker).await;
+        let response = h.respond_as(subject, &request, 1).await;
         pending.push((request, response));
     }
     let (ninth_request, ninth_response) = pending.pop().unwrap();

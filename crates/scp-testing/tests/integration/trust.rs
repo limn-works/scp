@@ -488,7 +488,9 @@ async fn challenge_request_response() {
 
     let uri = "scp:capability:prompt-injection-resistance/v1";
     let test_cases = injection_cases();
-    let clock = FixedClock(2000);
+    // One second after `created_at`: grading is strictly inside the window
+    // (spec 07 §7.3.4, RULING 5).
+    let clock = FixedClock(2001);
     let (request, answer_key) = issue_challenge(
         NewChallenge {
             verifier: challenger_did.clone(),
@@ -533,7 +535,7 @@ async fn challenge_request_response() {
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
     );
-    let unsigned_record = challenge_verification_unsigned(&auth, &outcome, 2000).unwrap();
+    let unsigned_record = challenge_verification_unsigned(&auth, &outcome, 2001).unwrap();
     let record_digest = unsigned_record.signing_digest();
     let verification = unsigned_record
         .with_verifier_signature(challenger_sk.sign(&record_digest).to_bytes().to_vec());

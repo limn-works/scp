@@ -4,31 +4,39 @@
 //!
 //! # What the ledger decides
 //!
-//! - **Create** persists the open entry (index first, then entry) and signs
-//!   the request digest `D` in the same turn, so no signed request exists
-//!   for a challenge the ledger does not hold.
+//! - **Create** refuses while the latest challenge to the same subject (by
+//!   canonical key) for the same capability is inside its window, closed or
+//!   not (RULING 14), and beyond [`MAX_OPEN_CHALLENGES_PER_CHALLENGER`] open
+//!   challenges. It then signs the request digest `D`, persists the index
+//!   and the entry holding the signed request, and only then inserts the
+//!   entry in memory.
 //! - **Lookup** is read-only. The grading path runs it before any DID
 //!   resolution, so a response naming an unknown challenge, another request
-//!   digest or another subject costs no resolution.
-//! - **Begin** returns a stored record for a resubmitted `(attempt, D_r)`
-//!   (re-signing a Pending one), else checks the entry, runs
-//!   [`check_attempt`] and takes the grading lease.
+//!   digest, another subject, or a closed challenge it did not already
+//!   answer costs no resolution.
+//! - **Begin** returns the stored record for a resubmitted `(attempt, D_r)`,
+//!   else checks the entry, runs [`check_attempt`] and takes the grading
+//!   lease.
 //! - **Commit** checks the lease, reads `t = now` once, re-runs
-//!   [`check_attempt`] at `t`, writes the Pending attempt and any closure in
-//!   one write, signs `D_v` and writes the Signed attempt.
-//! - **`RecordFault`** counts a challenger fault, which uses no attempt, and
-//!   closes the challenge as `Faulted` at [`MAX_GRADING_FAULTS`].
+//!   [`check_attempt`] at `t`, signs `D_v`, and persists the signed attempt
+//!   and any closure in one write.
+//! - **`RecordFault`** records a challenger fault, which uses no attempt and
+//!   closes nothing: it sets `last_fault_at`, so the cooldown runs from the
+//!   later of the last attempt and the last fault.
 //!
 //! # Crash safety (ADR-049 §9, Class S)
 //!
 //! Every write is fail-closed: a turn replies with an error and leaves its
-//! in-memory state unchanged when a write it depends on fails. The record
-//! is persisted as Pending before it is signed, so a crash between the two
-//! leaves a Pending attempt that the next touching turn re-signs: `D_v` is
-//! the same, because the record's `timestamp` was persisted.
+//! in-memory state unchanged when a write it depends on fails. Both
+//! signatures are made before the write that records them, and leave the
+//! actor only after it succeeds, so a failed write or a crash leaves no
+//! signed request or record that the ledger does not hold. A sign failure
+//! writes nothing, so the subject's attempt is not used.
 //!
 //! The grading lease lives in memory only. A restart drops it, which is
-//! safe: no Commit can match a lease that no longer exists.
+//! safe: no Commit can match a lease that no longer exists. Lease ids come
+//! from a counter on the handle that a respawn keeps, so a lease taken
+//! before a respawn never matches one taken after it.
 //!
 //! # ADR-049 7a
 //!
@@ -40,17 +48,16 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use scp_clock::Clock;
 use scp_protocol::context::ContextError;
-use scp_protocol::trust::capability_definition::CapabilityDefinition;
 use scp_protocol::trust::{
     AnswerKey, AttemptLedgerView, CHALLENGE_CLOCK_SKEW_SECS, CHALLENGE_GRADING_BUDGET_SECS,
     CHALLENGE_LEASE_MARGIN_SECS, CanonicalIdentifier, CaseResult, ChallengeClosure,
-    ChallengeRequest, ChallengeVerification, GradeOutcome, MAX_GRADING_FAULTS,
-    OwnedAuthenticatedResponse, TrustError, UnsignedChallengeRequest,
-    challenge_verification_signing_digest, challenge_verification_unsigned, check_attempt,
+    ChallengeRequest, ChallengeVerification, GradeOutcome, OwnedAuthenticatedResponse, TrustError,
+    UnsignedChallengeRequest, challenge_verification_unsigned, check_attempt,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -70,12 +77,17 @@ pub const CHALLENGER_LEDGER_MAILBOX_CAPACITY: usize = 32;
 pub const CHALLENGER_LEDGER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a caller waits for a reply after enqueue before
-/// [`ContextError::ActorBusy`]. A turn signs at most twice, each bounded by
-/// the signer's own timeout.
+/// [`ContextError::ActorBusy`]. A turn signs at most once, bounded by the
+/// signer's own timeout.
 pub const CHALLENGER_LEDGER_REPLY_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// The most challenges one challenger's ledger holds at once (spec 09
-/// §9.18.C). Create refuses beyond it with [`TrustError::ChallengeNotOpen`].
+/// The most open challenges one challenger's ledger holds at once (spec 09
+/// §9.18.C).
+///
+/// An open entry is neither closed nor past its prune point. Create
+/// refuses beyond it with [`TrustError::ChallengeNotOpen`]. Closed entries do
+/// not count; RULING 14 bounds them at one live entry per subject and
+/// capability.
 pub const MAX_OPEN_CHALLENGES_PER_CHALLENGER: usize = 1024;
 
 /// The most gradings one challenger runs at once (spec 09 §9.18.C). A grading
@@ -113,36 +125,24 @@ type Reply<T> = oneshot::Sender<Result<T, ChallengeLedgerError>>;
 // Ledger records
 // ---------------------------------------------------------------------------
 
-/// The state of one graded attempt's record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum AttemptState {
-    /// Persisted, not yet signed. Its `verifier_signature` is empty.
-    Pending(ChallengeVerification),
-    /// Signed.
-    Signed(ChallengeVerification),
-}
-
 /// One graded attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Attempt {
     /// The attempt number.
     n: u32,
-    /// When it was graded (the record's `timestamp`).
-    graded_at: u64,
     /// `D_r` of the response graded.
     #[serde(with = "hex_32")]
     response_digest: [u8; 32],
     /// Per-case results, returned to the caller and never signed.
     reasons: Vec<CaseResult>,
-    /// The record.
-    state: AttemptState,
+    /// The signed record. Its `timestamp` is when the attempt was graded.
+    record: ChallengeVerification,
 }
 
 /// One challenge in the ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LedgerEntry {
-    /// The request, without its signature: the ledger persists it before
-    /// signing, and keys every check on `request_digest`.
+    /// The signed request. Every check keys on `request_digest`.
     request: ChallengeRequest,
     /// `D` of the request.
     #[serde(with = "hex_32")]
@@ -152,14 +152,12 @@ struct LedgerEntry {
     subject_key: [u8; 32],
     /// The answer key.
     answer_key: AnswerKey,
-    /// The definition the request follows.
-    definition: CapabilityDefinition,
     /// The context of the `CustomEval` evaluators, if any case has one.
     evaluator_context_id: Option<String>,
     /// Graded attempts, in order.
     attempts: Vec<Attempt>,
-    /// Grading faults so far.
-    faults: u32,
+    /// When the last grading fault was recorded.
+    last_fault_at: Option<u64>,
     /// Set once the challenge closes.
     closed: Option<ChallengeClosure>,
 }
@@ -174,10 +172,16 @@ impl LedgerEntry {
             max_retries: self.request.max_retries,
             cooldown_secs: self.request.cooldown_secs,
             last_attempt: last.map_or(0, |a| a.n),
-            last_timestamp: last.map(|a| a.graded_at),
+            last_timestamp: last.map(|a| a.record.timestamp),
+            last_fault_at: self.last_fault_at,
             closed: self.closed,
-            faults: self.faults,
         }
+    }
+
+    /// Whether the entry counts against
+    /// [`MAX_OPEN_CHALLENGES_PER_CHALLENGER`] at `now`.
+    const fn is_open(&self, now: u64) -> bool {
+        self.closed.is_none() && !self.is_prunable(now)
     }
 
     /// Whether `now` is past the point the entry can matter to anyone.
@@ -217,48 +221,6 @@ struct Lease {
 // Command payloads
 // ---------------------------------------------------------------------------
 
-/// A challenger fault: it depends only on the challenger, so it uses no
-/// attempt (spec 07 §7.3.4 step 3).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GradingFault {
-    /// A `SchemaMatch` schema the answer key opens no longer passes the
-    /// schema gate, so the challenger cannot grade the case.
-    SchemaRejected {
-        /// The case.
-        test_id: String,
-        /// The gate's refusal.
-        reason: String,
-    },
-    /// An evaluator could not run, or its settlement failed after a verdict.
-    EvaluatorUnavailable {
-        /// The evaluator context.
-        context_id: String,
-        /// The evaluator outlet.
-        outlet_id: String,
-        /// Why.
-        reason: String,
-    },
-}
-
-impl From<GradingFault> for TrustError {
-    fn from(fault: GradingFault) -> Self {
-        match fault {
-            GradingFault::SchemaRejected { test_id, reason } => {
-                Self::SchemaRejected { test_id, reason }
-            }
-            GradingFault::EvaluatorUnavailable {
-                context_id,
-                outlet_id,
-                reason,
-            } => Self::EvaluatorUnavailable {
-                context_id,
-                outlet_id,
-                reason,
-            },
-        }
-    }
-}
-
 /// What a grading needs after Begin took its lease.
 #[derive(Debug, Clone)]
 pub struct GradingLease {
@@ -288,15 +250,6 @@ pub enum BeginOutcome {
     Lease(GradingLease),
 }
 
-/// The result of `RecordFault`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FaultRecorded {
-    /// Faults so far.
-    pub faults: u32,
-    /// `Some(Faulted)` once the challenge closed.
-    pub closed: Option<ChallengeClosure>,
-}
-
 /// A command to a [`ChallengerLedgerActor`].
 pub enum ChallengerLedgerCommand {
     /// Persist a new challenge and sign its request.
@@ -305,8 +258,6 @@ pub enum ChallengerLedgerCommand {
         unsigned: Box<UnsignedChallengeRequest>,
         /// The expected outputs the challenger keeps.
         answer_key: AnswerKey,
-        /// The definition the request follows.
-        definition: Box<CapabilityDefinition>,
         /// The `CustomEval` evaluator context, if any.
         evaluator_context_id: Option<String>,
         /// The verifier's `#active` signer.
@@ -315,7 +266,8 @@ pub enum ChallengerLedgerCommand {
         reply: Reply<ChallengeRequest>,
     },
     /// Read-only: does a live entry with this id, request digest and subject
-    /// exist?
+    /// exist, and, once it is closed, does it hold an attempt for this
+    /// response?
     Lookup {
         /// The challenge.
         challenge_id: [u8; 32],
@@ -323,6 +275,8 @@ pub enum ChallengerLedgerCommand {
         request_digest: [u8; 32],
         /// The request's subject.
         subject: CanonicalIdentifier,
+        /// `D_r` computed from the caller's response.
+        response_digest: [u8; 32],
         /// `Ok(())` when it exists.
         reply: Reply<()>,
     },
@@ -330,8 +284,6 @@ pub enum ChallengerLedgerCommand {
     BeginGrade {
         /// The authenticated response.
         auth: Arc<OwnedAuthenticatedResponse>,
-        /// Re-signs a Pending record found on resubmit.
-        signer: CommandSigner,
         /// The stored record or the lease.
         reply: Reply<BeginOutcome>,
     },
@@ -350,14 +302,14 @@ pub enum ChallengerLedgerCommand {
     },
     /// Record a challenger fault.
     RecordFault {
-        /// The challenge.
-        challenge_id: [u8; 32],
+        /// The authenticated response whose grading faulted.
+        auth: Arc<OwnedAuthenticatedResponse>,
         /// The lease Begin returned.
         lease_id: u64,
-        /// The fault.
-        fault: GradingFault,
-        /// The fault count and closure.
-        reply: Reply<FaultRecorded>,
+        /// The fault: `SchemaRejected` or `EvaluatorUnavailable`.
+        fault: TrustError,
+        /// `Ok(())` once the fault is persisted.
+        reply: Reply<()>,
     },
     /// Stop the actor.
     Shutdown,
@@ -367,15 +319,43 @@ pub enum ChallengerLedgerCommand {
 // Handle
 // ---------------------------------------------------------------------------
 
+/// The state of one challenger that outlives a respawn of its actor.
+///
+/// It holds the grading semaphore, so permits held by unfinished gradings still count,
+/// and the lease counter, so a lease id taken before a respawn is never
+/// issued again after it. Cheap to clone; clones share both.
+#[derive(Clone)]
+pub struct ChallengerLedgerShared {
+    gradings: Arc<Semaphore>,
+    next_lease: Arc<AtomicU64>,
+}
+
+impl ChallengerLedgerShared {
+    /// A fresh semaphore of [`MAX_CONCURRENT_GRADINGS_PER_CHALLENGER`]
+    /// permits and a lease counter at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            gradings: Arc::new(Semaphore::new(MAX_CONCURRENT_GRADINGS_PER_CHALLENGER)),
+            next_lease: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Default for ChallengerLedgerShared {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Caller-side handle of a [`ChallengerLedgerActor`]. Cheap to clone.
 ///
-/// It also owns the challenger's grading semaphore, so the permit count
-/// survives a respawn of the actor: the supervisor hands the old semaphore to
-/// the new handle.
+/// It carries the challenger's [`ChallengerLedgerShared`] state; the
+/// supervisor hands it from a stopped handle to its replacement.
 #[derive(Clone)]
 pub struct ChallengerLedgerHandle {
     inbox: mpsc::Sender<ChallengerLedgerCommand>,
-    gradings: Arc<Semaphore>,
+    shared: ChallengerLedgerShared,
 }
 
 impl ChallengerLedgerHandle {
@@ -388,7 +368,13 @@ impl ChallengerLedgerHandle {
     /// The challenger's grading semaphore.
     #[must_use]
     pub fn grading_semaphore(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.gradings)
+        Arc::clone(&self.shared.gradings)
+    }
+
+    /// The state a replacement actor must keep.
+    #[must_use]
+    pub fn shared(&self) -> ChallengerLedgerShared {
+        self.shared.clone()
     }
 
     /// Submits a command and awaits its reply.
@@ -476,7 +462,8 @@ pub struct ChallengerLedgerActor {
     /// until then, so the actor never serves from an empty ledger.
     entries: Option<HashMap<[u8; 32], LedgerEntry>>,
     leases: HashMap<[u8; 32], Lease>,
-    next_lease: u64,
+    /// Shared with the handle, so it survives a respawn.
+    next_lease: Arc<AtomicU64>,
     inbox: mpsc::Receiver<ChallengerLedgerCommand>,
 }
 
@@ -487,9 +474,9 @@ impl ChallengerLedgerActor {
     pub(in crate::context) fn spawn(
         identity: CanonicalIdentifier,
         deps: ChallengerLedgerDeps,
-        gradings: Arc<Semaphore>,
+        shared: ChallengerLedgerShared,
     ) -> (ChallengerLedgerHandle, tokio::task::JoinHandle<()>) {
-        let (handle, actor) = Self::new(identity, deps, gradings);
+        let (handle, actor) = Self::new(identity, deps, shared);
         (handle, tokio::spawn(actor.run()))
     }
 
@@ -499,16 +486,16 @@ impl ChallengerLedgerActor {
         permit: &super::supervisor::SpawnPermit<'_>,
         identity: CanonicalIdentifier,
         deps: ChallengerLedgerDeps,
-        gradings: Arc<Semaphore>,
+        shared: ChallengerLedgerShared,
     ) -> (ChallengerLedgerHandle, tokio::task::JoinHandle<()>) {
-        let (handle, actor) = Self::new(identity, deps, gradings);
+        let (handle, actor) = Self::new(identity, deps, shared);
         (handle, permit.spawn(actor.run()))
     }
 
     fn new(
         identity: CanonicalIdentifier,
         deps: ChallengerLedgerDeps,
-        gradings: Arc<Semaphore>,
+        shared: ChallengerLedgerShared,
     ) -> (ChallengerLedgerHandle, Self) {
         let (tx, rx) = mpsc::channel(CHALLENGER_LEDGER_MAILBOX_CAPACITY);
         let actor = Self {
@@ -517,16 +504,10 @@ impl ChallengerLedgerActor {
             clock: deps.clock,
             entries: None,
             leases: HashMap::new(),
-            next_lease: 0,
+            next_lease: Arc::clone(&shared.next_lease),
             inbox: rx,
         };
-        (
-            ChallengerLedgerHandle {
-                inbox: tx,
-                gradings,
-            },
-            actor,
-        )
+        (ChallengerLedgerHandle { inbox: tx, shared }, actor)
     }
 
     async fn run(mut self) {
@@ -551,19 +532,12 @@ impl ChallengerLedgerActor {
             ChallengerLedgerCommand::Create {
                 unsigned,
                 answer_key,
-                definition,
                 evaluator_context_id,
                 signer,
                 reply,
             } => {
                 let result = self
-                    .handle_create(
-                        *unsigned,
-                        answer_key,
-                        *definition,
-                        evaluator_context_id,
-                        &signer,
-                    )
+                    .handle_create(*unsigned, answer_key, evaluator_context_id, &signer)
                     .await;
                 let _ = reply.send(result);
             }
@@ -571,19 +545,16 @@ impl ChallengerLedgerActor {
                 challenge_id,
                 request_digest,
                 subject,
+                response_digest,
                 reply,
             } => {
                 let result = self
-                    .handle_lookup(&challenge_id, &request_digest, &subject)
+                    .handle_lookup(&challenge_id, &request_digest, &subject, &response_digest)
                     .await;
                 let _ = reply.send(result);
             }
-            ChallengerLedgerCommand::BeginGrade {
-                auth,
-                signer,
-                reply,
-            } => {
-                let result = self.handle_begin(&auth, &signer).await;
+            ChallengerLedgerCommand::BeginGrade { auth, reply } => {
+                let result = self.handle_begin(&auth).await;
                 let _ = reply.send(result);
             }
             ChallengerLedgerCommand::Commit {
@@ -597,12 +568,12 @@ impl ChallengerLedgerActor {
                 let _ = reply.send(result);
             }
             ChallengerLedgerCommand::RecordFault {
-                challenge_id,
+                auth,
                 lease_id,
                 fault,
                 reply,
             } => {
-                let result = self.handle_fault(&challenge_id, lease_id, fault).await;
+                let result = self.handle_fault(&auth, lease_id, &fault).await;
                 let _ = reply.send(result);
             }
             ChallengerLedgerCommand::Shutdown => {}
@@ -617,7 +588,6 @@ impl ChallengerLedgerActor {
         &mut self,
         unsigned: UnsignedChallengeRequest,
         answer_key: AnswerKey,
-        definition: CapabilityDefinition,
         evaluator_context_id: Option<String>,
         signer: &CommandSigner,
     ) -> Result<ChallengeRequest, ChallengeLedgerError> {
@@ -630,19 +600,34 @@ impl ChallengerLedgerActor {
             }
             .into());
         }
-        let key_cases = answer_key.expected().len();
-        if key_cases != request.test_cases.len()
-            || definition.capability_uri != request.capability_uri
-        {
+        if answer_key.expected().len() != request.test_cases.len() {
             return Err(ContextError::InvalidState(
-                "challenge create: the answer key or definition does not belong to the request"
-                    .to_owned(),
+                "challenge create: the answer key does not belong to the request".to_owned(),
             )
             .into());
         }
         let subject_key = *CanonicalIdentifier::parse(&request.subject)?.key();
         let challenge_id = request.challenge_id;
-        let open = self.entries()?.len();
+        let now = self.clock.now_secs();
+
+        // RULING 14: the latest challenge to this subject for this
+        // capability, closed or not, blocks Create until its window ends.
+        if let Some(latest) = self
+            .entries()?
+            .values()
+            .filter(|e| {
+                e.subject_key == subject_key && e.request.capability_uri == request.capability_uri
+            })
+            .max_by_key(|e| (e.request.created_at, e.request.expires_at))
+            && now < latest.request.expires_at
+        {
+            return Err(TrustError::ChallengeWindowOpen {
+                challenge_id: hex::encode(latest.request.challenge_id),
+                expires_at: latest.request.expires_at,
+            }
+            .into());
+        }
+        let open = self.entries()?.values().filter(|e| e.is_open(now)).count();
         if open >= MAX_OPEN_CHALLENGES_PER_CHALLENGER {
             return Err(TrustError::ChallengeNotOpen {
                 challenger: self.identity.as_str().to_owned(),
@@ -657,33 +642,28 @@ impl ChallengerLedgerActor {
             ))
             .into());
         }
+
+        // Sign first; the signed request leaves the actor only once both
+        // writes hold it.
         let digest = unsigned.signing_digest();
+        let signature = signer.sign_bounded_ed25519(&digest).await?;
+        let issued = unsigned.with_verifier_signature(signature.to_vec());
         let entry = LedgerEntry {
-            request: request.clone(),
+            request: issued.clone(),
             request_digest: digest,
             subject_key,
             answer_key,
-            definition,
             evaluator_context_id,
             attempts: Vec::new(),
-            faults: 0,
+            last_fault_at: None,
             closed: None,
         };
         let mut ids: BTreeSet<[u8; 32]> = self.entries()?.keys().copied().collect();
         ids.insert(challenge_id);
         self.persist_index(&ids).await?;
         self.persist_entry(&entry).await?;
-        let signature = match signer.sign_bounded_ed25519(&digest).await {
-            Ok(signature) => signature,
-            Err(e) => {
-                // No signed request exists, so the entry can never be graded;
-                // removing it keeps it from counting against the bound.
-                self.remove_durable(&challenge_id).await;
-                return Err(e.into());
-            }
-        };
         self.entries_mut()?.insert(challenge_id, entry);
-        Ok(unsigned.with_verifier_signature(signature.to_vec()))
+        Ok(issued)
     }
 
     async fn handle_lookup(
@@ -691,25 +671,37 @@ impl ChallengerLedgerActor {
         challenge_id: &[u8; 32],
         request_digest: &[u8; 32],
         subject: &CanonicalIdentifier,
+        response_digest: &[u8; 32],
     ) -> Result<(), ChallengeLedgerError> {
         self.ensure_loaded().await?;
         let now = self.clock.now_secs();
-        let found = self.entries()?.get(challenge_id).is_some_and(|entry| {
-            !entry.is_prunable(now)
-                && entry.request_digest == *request_digest
-                && entry.subject_key == *subject.key()
-        });
-        if found {
-            Ok(())
-        } else {
-            Err(unknown(challenge_id).into())
+        let entry = self
+            .entries()?
+            .get(challenge_id)
+            .filter(|entry| {
+                !entry.is_prunable(now)
+                    && entry.request_digest == *request_digest
+                    && entry.subject_key == *subject.key()
+            })
+            .ok_or_else(|| unknown(challenge_id))?;
+        // A closed entry serves only a resubmit of a response it graded.
+        if entry.closed.is_some()
+            && !entry
+                .attempts
+                .iter()
+                .any(|x| x.response_digest == *response_digest)
+        {
+            return Err(TrustError::ChallengeClosed {
+                challenge_id: hex::encode(challenge_id),
+            }
+            .into());
         }
+        Ok(())
     }
 
     async fn handle_begin(
         &mut self,
         auth: &OwnedAuthenticatedResponse,
-        signer: &CommandSigner,
     ) -> Result<BeginOutcome, ChallengeLedgerError> {
         self.begin_turn().await?;
         let a = auth.as_authenticated();
@@ -719,17 +711,18 @@ impl ChallengerLedgerActor {
         let entry = self
             .entries()?
             .get(&challenge_id)
-            .cloned()
             .ok_or_else(|| unknown(&challenge_id))?;
 
         // 1. Resubmit: the same (attempt, D_r) returns its stored record.
-        if let Some(index) = entry
+        if let Some(stored) = entry
             .attempts
             .iter()
-            .position(|x| x.n == attempt && x.response_digest == response_digest)
+            .find(|x| x.n == attempt && x.response_digest == response_digest)
         {
-            let graded = self.signed_attempt(entry, index, signer).await?;
-            return Ok(BeginOutcome::Stored(Box::new(graded)));
+            return Ok(BeginOutcome::Stored(Box::new(GradedAttempt {
+                record: stored.record.clone(),
+                reasons: stored.reasons.clone(),
+            })));
         }
 
         // 2. The entry must be the one the response answers.
@@ -742,6 +735,11 @@ impl ChallengerLedgerActor {
         // 3. The attempt must be gradable now.
         let now = self.clock.now_secs();
         check_attempt(&entry.view(), attempt, now)?;
+        let grading = GradingLease {
+            lease_id: 0,
+            answer_key: entry.answer_key.clone(),
+            evaluator_context_id: entry.evaluator_context_id.clone(),
+        };
 
         // 4. The lease.
         if let Some(lease) = self.leases.get(&challenge_id)
@@ -752,9 +750,11 @@ impl ChallengerLedgerActor {
             }
             .into());
         }
-        self.next_lease = self.next_lease.wrapping_add(1);
         let lease = Lease {
-            id: self.next_lease,
+            id: self
+                .next_lease
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1),
             deadline: now.saturating_add(LEASE_SECS),
             attempt,
             response_digest,
@@ -762,8 +762,7 @@ impl ChallengerLedgerActor {
         self.leases.insert(challenge_id, lease);
         Ok(BeginOutcome::Lease(GradingLease {
             lease_id: lease.id,
-            answer_key: entry.answer_key,
-            evaluator_context_id: entry.evaluator_context_id,
+            ..grading
         }))
     }
 
@@ -787,79 +786,82 @@ impl ChallengerLedgerActor {
 
         // 1. The lease must be ours, live, and for this response.
         let t = self.clock.now_secs();
-        self.require_lease(&challenge_id, lease_id, t, Some((attempt, response_digest)))?;
+        self.require_lease(&challenge_id, lease_id, t, attempt, response_digest)?;
         if entry.request_digest != a.request_digest() {
             return Err(unknown(&challenge_id).into());
         }
 
-        // 2-3. One `t`, and the attempt checked again at `t`.
-        if let Err(e) = check_attempt(&entry.view(), attempt, t) {
-            self.leases.remove(&challenge_id);
-            return Err(e.into());
+        // 2-7. Every failure from here releases the lease and writes
+        // nothing, so the attempt is not used.
+        let result = async {
+            // 2-3. One `t`, and the attempt checked again at `t`.
+            check_attempt(&entry.view(), attempt, t)?;
+            // 4-5. Sign the record, then write it and any closure in one
+            // write.
+            let unsigned = challenge_verification_unsigned(&a, outcome, t)?;
+            let signature = signer
+                .sign_bounded_ed25519(&unsigned.signing_digest())
+                .await?;
+            let record = unsigned.with_verifier_signature(signature.to_vec());
+            entry.closed = if outcome.passed {
+                Some(ChallengeClosure::Passed)
+            } else if attempt >= entry.request.max_retries.saturating_add(1) {
+                Some(ChallengeClosure::Exhausted)
+            } else {
+                None
+            };
+            entry.attempts.push(Attempt {
+                n: attempt,
+                response_digest,
+                reasons: outcome.per_case.clone(),
+                record: record.clone(),
+            });
+            self.persist_entry(&entry).await?;
+            Ok::<_, ChallengeLedgerError>(GradedAttempt {
+                record,
+                reasons: outcome.per_case.clone(),
+            })
         }
-
-        // 4-5. The unsigned record and any closure, in one write.
-        let unsigned = challenge_verification_unsigned(&a, outcome, t)?;
-        let record = unsigned.record().clone();
-        let closure = if outcome.passed {
-            Some(ChallengeClosure::Passed)
-        } else if attempt >= entry.request.max_retries.saturating_add(1) {
-            Some(ChallengeClosure::Exhausted)
-        } else {
-            None
-        };
-        entry.attempts.push(Attempt {
-            n: attempt,
-            graded_at: t,
-            response_digest,
-            reasons: outcome.per_case.clone(),
-            state: AttemptState::Pending(record),
-        });
-        entry.closed = closure;
-        self.persist_entry(&entry).await?;
+        .await;
         self.leases.remove(&challenge_id);
-        let index = entry.attempts.len() - 1;
-        self.entries_mut()?.insert(challenge_id, entry.clone());
-
-        // 6-7. Sign and write the Signed attempt.
-        self.signed_attempt(entry, index, signer)
-            .await
-            .map_err(Into::into)
+        let graded = result?;
+        self.entries_mut()?.insert(challenge_id, entry);
+        Ok(graded)
     }
 
     async fn handle_fault(
         &mut self,
-        challenge_id: &[u8; 32],
+        auth: &OwnedAuthenticatedResponse,
         lease_id: u64,
-        fault: GradingFault,
-    ) -> Result<FaultRecorded, ChallengeLedgerError> {
+        fault: &TrustError,
+    ) -> Result<(), ChallengeLedgerError> {
         self.begin_turn().await?;
+        let a = auth.as_authenticated();
+        let challenge_id = a.request().challenge_id;
         let mut entry = self
             .entries()?
-            .get(challenge_id)
+            .get(&challenge_id)
             .cloned()
-            .ok_or_else(|| unknown(challenge_id))?;
+            .ok_or_else(|| unknown(&challenge_id))?;
         let now = self.clock.now_secs();
-        self.require_lease(challenge_id, lease_id, now, None)?;
-        entry.faults = entry.faults.saturating_add(1);
-        if entry.faults >= MAX_GRADING_FAULTS {
-            entry.closed = Some(ChallengeClosure::Faulted);
-        }
+        self.require_lease(
+            &challenge_id,
+            lease_id,
+            now,
+            a.response().attempt,
+            a.response_digest(),
+        )?;
+        entry.last_fault_at = Some(now);
         self.persist_entry(&entry).await?;
-        self.leases.remove(challenge_id);
-        let recorded = FaultRecorded {
-            faults: entry.faults,
-            closed: entry.closed,
-        };
+        self.leases.remove(&challenge_id);
         tracing::warn!(
             actor_kind = "challenger_ledger",
             challenge_id = %hex::encode(challenge_id),
-            faults = recorded.faults,
-            fault = %TrustError::from(fault),
-            "challenger grading fault recorded; no attempt used"
+            fault = %fault,
+            "challenger grading fault recorded; no attempt used, cooldown restarts"
         );
-        self.entries_mut()?.insert(*challenge_id, entry);
-        Ok(recorded)
+        self.entries_mut()?.insert(challenge_id, entry);
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -869,22 +871,25 @@ impl ChallengerLedgerActor {
     /// Loads the ledger if it has not loaded, then prunes.
     async fn begin_turn(&mut self) -> Result<(), ContextError> {
         self.ensure_loaded().await?;
-        self.prune().await
+        self.prune().await;
+        Ok(())
     }
 
     /// Requires the held lease of `challenge_id` to be `lease_id`, live at
-    /// `now`, and, when given, for `(attempt, D_r)`.
+    /// `now`, and for `(attempt, D_r)`.
     fn require_lease(
         &self,
         challenge_id: &[u8; 32],
         lease_id: u64,
         now: u64,
-        response: Option<(u32, [u8; 32])>,
+        attempt: u32,
+        response_digest: [u8; 32],
     ) -> Result<(), TrustError> {
         let held = self.leases.get(challenge_id).is_some_and(|lease| {
             lease.id == lease_id
                 && now <= lease.deadline
-                && response.is_none_or(|(n, d)| lease.attempt == n && lease.response_digest == d)
+                && lease.attempt == attempt
+                && lease.response_digest == response_digest
         });
         if held {
             Ok(())
@@ -893,46 +898,6 @@ impl ChallengerLedgerActor {
                 challenge_id: hex::encode(challenge_id),
             })
         }
-    }
-
-    /// The signed record of attempt `index`, signing and persisting a
-    /// Pending one first.
-    async fn signed_attempt(
-        &mut self,
-        mut entry: LedgerEntry,
-        index: usize,
-        signer: &CommandSigner,
-    ) -> Result<GradedAttempt, ContextError> {
-        let challenge_id = entry.request.challenge_id;
-        let Some(attempt) = entry.attempts.get_mut(index) else {
-            return Err(ContextError::InvalidState(
-                "challenger ledger: attempt index out of range".to_owned(),
-            ));
-        };
-        let reasons = attempt.reasons.clone();
-        let record = match &attempt.state {
-            AttemptState::Signed(record) => {
-                return Ok(GradedAttempt {
-                    record: record.clone(),
-                    reasons,
-                });
-            }
-            AttemptState::Pending(record) => record.clone(),
-        };
-        let digest = challenge_verification_signing_digest(&record)
-            .map_err(|e| ContextError::CryptoFailed(format!("record digest: {e}")))?;
-        let signature = signer.sign_bounded_ed25519(&digest).await?;
-        let signed_record = ChallengeVerification {
-            verifier_signature: signature.to_vec(),
-            ..record
-        };
-        attempt.state = AttemptState::Signed(signed_record.clone());
-        self.persist_entry(&entry).await?;
-        self.entries_mut()?.insert(challenge_id, entry);
-        Ok(GradedAttempt {
-            record: signed_record,
-            reasons,
-        })
     }
 
     fn entries(&self) -> Result<&HashMap<[u8; 32], LedgerEntry>, ContextError> {
@@ -960,8 +925,9 @@ impl ChallengerLedgerActor {
     }
 
     /// Loads the index and every entry it names. An id whose entry is
-    /// missing is a Create that failed between the two writes, and is
-    /// skipped. Any read or decode failure leaves the ledger unloaded.
+    /// missing is a Create whose entry write failed after its index write.
+    /// It is skipped, so it is absent from memory, and the next index write
+    /// drops it. Any read or decode failure leaves the ledger unloaded.
     async fn ensure_loaded(&mut self) -> Result<(), ContextError> {
         if self.entries.is_some() {
             return Ok(());
@@ -1004,33 +970,59 @@ impl ChallengerLedgerActor {
         Ok(())
     }
 
-    /// Drops every entry past `expires_at + CHALLENGE_CLOCK_SKEW_SECS`. The
-    /// entries are deleted first and the index rewritten after, so a failed
+    /// Drops every entry past `expires_at + CHALLENGE_CLOCK_SKEW_SECS`.
+    /// Best-effort: no turn depends on it, so a failure is logged and never
+    /// refuses the turn. An entry whose delete fails stays in memory and in
+    /// the index, prunable, and the next turn retries it; it no longer counts
+    /// as open, and its window has ended, so it blocks nothing. The entries
+    /// are deleted first and the index rewritten after, so a failed index
     /// write leaves the index a superset of the stored entries, which a load
     /// tolerates.
-    async fn prune(&mut self) -> Result<(), ContextError> {
+    async fn prune(&mut self) {
         let now = self.clock.now_secs();
-        let expired: Vec<[u8; 32]> = self
-            .entries()?
+        let Some(entries) = self.entries.as_ref() else {
+            return;
+        };
+        let expired: Vec<[u8; 32]> = entries
             .iter()
             .filter(|(_, entry)| entry.is_prunable(now))
             .map(|(id, _)| *id)
             .collect();
         if expired.is_empty() {
-            return Ok(());
+            return;
         }
+        let mut removed = 0_usize;
         for id in &expired {
-            self.mls_storage
-                .delete(&self.entry_key(id))
-                .await
-                .map_err(|e| {
-                    ContextError::PersistenceFailed(format!("challenger entry delete: {e}"))
-                })?;
-            self.entries_mut()?.remove(id);
+            if let Err(e) = self.mls_storage.delete(&self.entry_key(id)).await {
+                tracing::warn!(
+                    actor_kind = "challenger_ledger",
+                    challenge_id = %hex::encode(id),
+                    error = %e,
+                    "expired challenge entry not deleted; retried on the next turn"
+                );
+                continue;
+            }
+            if let Some(entries) = self.entries.as_mut() {
+                entries.remove(id);
+            }
             self.leases.remove(id);
+            removed += 1;
         }
-        let ids: BTreeSet<[u8; 32]> = self.entries()?.keys().copied().collect();
-        self.persist_index(&ids).await
+        if removed == 0 {
+            return;
+        }
+        let Some(entries) = self.entries.as_ref() else {
+            return;
+        };
+        let ids: BTreeSet<[u8; 32]> = entries.keys().copied().collect();
+        if let Err(e) = self.persist_index(&ids).await {
+            tracing::warn!(
+                actor_kind = "challenger_ledger",
+                identity = %self.identity.as_str(),
+                error = %e,
+                "challenger index not rewritten after prune; it names deleted entries until the next write"
+            );
+        }
     }
 
     async fn persist_index(&self, ids: &BTreeSet<[u8; 32]>) -> Result<(), ContextError> {
@@ -1052,20 +1044,6 @@ impl ChallengerLedgerActor {
             .store(&self.entry_key(&entry.request.challenge_id), &bytes)
             .await
             .map_err(|e| ContextError::PersistenceFailed(format!("challenger entry write: {e}")))
-    }
-
-    /// Removes an entry that was persisted but never signed. A failure is
-    /// logged: the entry holds no signed request, so it cannot be graded,
-    /// and it is pruned at its expiry.
-    async fn remove_durable(&self, challenge_id: &[u8; 32]) {
-        if let Err(e) = self.mls_storage.delete(&self.entry_key(challenge_id)).await {
-            tracing::warn!(
-                actor_kind = "challenger_ledger",
-                challenge_id = %hex::encode(challenge_id),
-                error = %e,
-                "unsigned challenge entry not deleted; it is pruned at expiry"
-            );
-        }
     }
 }
 

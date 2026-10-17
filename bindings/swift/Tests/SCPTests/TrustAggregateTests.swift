@@ -493,6 +493,23 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
         ])
     }
 
+    /// A 3600-second challenge from `verifier` to `subject` for `schemaUri`,
+    /// returned once its creation second has passed. Grading is strictly
+    /// inside the window (spec 07 §7.3.4), so a grade in that second is
+    /// refused; this waits it out on the wall clock the bridge reads.
+    private func gradableChallenge(
+        _ verifier: Identity, _ subject: String, _ cases: [TestCase], _ contextId: String
+    ) async throws -> ChallengeRequest {
+        let request = try await scp.trustCreateChallenge(
+            verifier: verifier, subject: subject, capabilityUri: schemaUri,
+            testCases: cases, contextId: contextId, windowSecs: 3600
+        )
+        while Date().timeIntervalSince1970 < Double(request.createdAt + 1) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return request
+    }
+
     /// An output that passes every case `makeTestCases` writes.
     private func passingOutputs(_ cases: [TestCase]) -> [TestOutput] {
         cases.map { TestOutput(testId: $0.testId, output: ["ok": true]) }
@@ -549,10 +566,7 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
         let contextId = try await requiringContext(verifierDid: verifier.did())
         let cases = makeTestCases(20)
 
-        let request = try await scp.trustCreateChallenge(
-            verifier: verifier, subject: subject.did(), capabilityUri: schemaUri,
-            testCases: cases, contextId: contextId, windowSecs: 3600
-        )
+        let request = try await gradableChallenge(verifier, subject.did(), cases, contextId)
         XCTAssertEqual(request.verifier, verifier.did())
         XCTAssertEqual(request.subject, subject.did())
         XCTAssertEqual(request.contextId, contextId)
@@ -609,10 +623,7 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
         let subject = try await createInMemoryIdentity(scp)
         let contextId = try await requiringContext(verifierDid: verifier.did())
         let cases = makeTestCases(20)
-        let request = try await scp.trustCreateChallenge(
-            verifier: verifier, subject: subject.did(), capabilityUri: schemaUri,
-            testCases: cases, contextId: contextId, windowSecs: 3600
-        )
+        let request = try await gradableChallenge(verifier, subject.did(), cases, contextId)
         let response = try await scp.trustRespondToChallenge(
             subject: subject, request: request, outputs: passingOutputs(cases), attempt: 1
         )

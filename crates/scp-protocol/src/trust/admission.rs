@@ -61,11 +61,17 @@ impl RetryCap {
         fewer_retries && longer_cooldown
     }
 
-    /// Whether a record's signed policy respects this cap.
-    const fn admits(self, record: &ChallengeVerification) -> bool {
+    /// Whether a record's signed policy respects this cap: its retries at
+    /// most `max_retries`, and both its cooldown and its challenge window at
+    /// least `min_cooldown_secs` (spec 07 §7.3.4.4 step 4(e)).
+    fn admits(self, record: &ChallengeVerification) -> bool {
         let retries_within = record.max_retries <= self.max_retries;
         let cooldown_within = self.min_cooldown_secs <= record.cooldown_secs;
-        retries_within && cooldown_within
+        let window = record
+            .challenge_expires_at
+            .saturating_sub(record.challenge_created_at);
+        let window_within = u64::from(self.min_cooldown_secs) <= window;
+        retries_within && cooldown_within && window_within
     }
 }
 
@@ -832,6 +838,36 @@ mod tests {
                 })
             );
         }
+        // T7 (design call (iii)): a record whose signed cooldown meets the
+        // cap but whose challenge window is shorter than the cap's cooldown
+        // is refused. The verifier signs a 7200 s cooldown over the genuine
+        // 3600 s window; step (g) accepts it, since both meet the
+        // definition's 3600.
+        let mut long_cooldown = genuine;
+        long_cooldown.cooldown_secs = 7200;
+        fx.resign(&mut long_cooldown).unwrap();
+        assert_eq!(
+            long_cooldown.challenge_expires_at - long_cooldown.challenge_created_at,
+            3600
+        );
+        admit(
+            &fx,
+            &capped(2, 3600),
+            &[],
+            std::slice::from_ref(&long_cooldown),
+        )
+        .unwrap();
+        assert_eq!(
+            admit(
+                &fx,
+                &capped(2, 7200),
+                &[],
+                std::slice::from_ref(&long_cooldown)
+            ),
+            Err(AdmissionError::RetryCapExceeded {
+                uri: FIXTURE_URI.to_owned()
+            })
+        );
     }
 
     #[test]
