@@ -13,6 +13,7 @@ import uniffi.scp.ContextMode
 import uniffi.scp.ContextParams
 import uniffi.scp.GovernanceModel
 import uniffi.scp.MemoryScope
+import uniffi.scp.PseudonymRotationPolicy
 
 /**
  * Context creation parameters with typed consequence rules, consequence
@@ -29,6 +30,8 @@ import uniffi.scp.MemoryScope
  *   the protocol default.
  * @property capabilityRequirements The admission requirements the context's
  *   governance holds (spec 07 §7.3.4.4); `null` sets none.
+ * @property pseudonymRotation The context's pseudonym rotation policy;
+ *   `null` sets none.
  */
 data class TypedContextParams(
     val mode: ContextMode,
@@ -46,6 +49,7 @@ data class TypedContextParams(
     val consequenceRules: List<ConsequenceRule>?,
     val consequenceConfig: ConsequenceConfig?,
     val capabilityRequirements: List<CapabilityRequirement>? = null,
+    val pseudonymRotation: PseudonymRotationPolicy? = null,
 ) {
     /** The UniFFI record, with each typed value encoded to its JSON wire form. */
     internal fun toContextParams(): ContextParams =
@@ -65,5 +69,6 @@ data class TypedContextParams(
             consequenceRulesJson = consequenceRules?.let { encodeConsequenceRulesJson(it) },
             consequenceConfigJson = consequenceConfig?.let { encodeConsequenceConfigJson(it) },
             capabilityRequirementsJson = capabilityRequirements?.let { encodeCapabilityRequirementsJson(it) },
+            pseudonymRotation = pseudonymRotation,
         )
 }

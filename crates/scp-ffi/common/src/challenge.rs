@@ -574,9 +574,13 @@ async fn invoke_evaluator_outlet(
             }
         }
     };
-    let timeout_ms = u32::try_from(remaining.as_millis())
-        .unwrap_or(u32::MAX)
-        .max(1);
+    // Rounded up, so the pipeline's own timer never fires before the
+    // grading deadline: a call cut short by the budget must reach
+    // `eval_case` at or after the deadline, where it is expired.
+    let remaining_ms = remaining
+        .as_millis()
+        .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+    let timeout_ms = u32::try_from(remaining_ms).unwrap_or(u32::MAX).max(1);
     let spawned = {
         let pipeline_sup = Arc::clone(sup);
         let evaluator_context_id = evaluator_context_id.to_owned();
@@ -1005,13 +1009,14 @@ where
         }
     };
     let mut evaluated = CaseVerdicts::default();
+    let deadline = tokio::time::Instant::now() + budget;
     let run = async {
         let case_run = CaseRun {
             evaluator_context_id: lease.evaluator_context_id.as_deref(),
             challenger: verifier,
             invoker,
             permit: &permit,
-            deadline: tokio::time::Instant::now() + budget,
+            deadline,
         };
         evaluate_cases(&auth, &lease.answer_key, &case_run, &mut evaluated).await;
     };
@@ -1019,7 +1024,12 @@ where
     // `grade` fails it with `budget_exceeded`; so does the in-flight case
     // when its evaluator started. An evaluator that had not started was
     // still in its reserve: challenger state, so a fault.
-    if tokio::time::timeout(budget, run).await.is_err() {
+    //
+    // The budget has one deadline. A case that returns at or after it
+    // stops the run and keeps its in-flight marker, so the expiry does
+    // not depend on whether this timer or the case's own timer is polled
+    // first.
+    if tokio::time::timeout_at(deadline, run).await.is_err() || evaluated.in_flight.is_some() {
         evaluated.expire_in_flight();
     }
     if let Some(cause) = evaluated.capacity.take() {
@@ -1082,7 +1092,8 @@ struct CaseVerdicts {
     fault: Option<TrustError>,
     /// A capacity refusal by an evaluator's reserve.
     capacity: Option<GradingCapacityCause>,
-    /// The evaluator call in progress, cleared when it returns.
+    /// The evaluator call in progress, cleared when it returns before the
+    /// budget's deadline.
     in_flight: Option<InFlight>,
 }
 
@@ -1160,7 +1171,6 @@ async fn evaluate_cases(
     run: &CaseRun<'_>,
     out: &mut CaseVerdicts,
 ) {
-    let permit = run.permit;
     let cases = &auth.request().test_cases;
     let outputs = &auth.response().outputs;
     for (i, ((expected, case), output)) in answer_key
@@ -1172,7 +1182,20 @@ async fn evaluate_cases(
     {
         match expected {
             ExpectedOutput::SchemaMatch { schema } => {
-                match schema_case(Arc::clone(permit), &case.test_id, schema, &output.output).await {
+                let verdict = schema_case(
+                    Arc::clone(run.permit),
+                    &case.test_id,
+                    schema,
+                    &output.output,
+                )
+                .await;
+                // A verdict that arrives at or after the deadline is over
+                // budget: `grade` fails this case and every later one with
+                // `budget_exceeded`.
+                if tokio::time::Instant::now() >= run.deadline {
+                    return;
+                }
+                match verdict {
                     Ok(verdict) => {
                         out.schemas.insert(i, verdict);
                     }
@@ -1252,6 +1275,12 @@ async fn eval_case(
             started,
         })
         .await;
+    // An outcome at or after the deadline is a budget expiry, whatever the
+    // call returned: the in-flight marker stays set and the run stops, and
+    // the grader expires the call.
+    if tokio::time::Instant::now() >= deadline {
+        return ControlFlow::Break(());
+    }
     out.in_flight = None;
     match outcome {
         EvaluatorOutcome::Verdict { passed, reason } => {

@@ -932,6 +932,35 @@ async fn grading_budget_is_total_per_attempt() {
     );
 }
 
+/// The budget's deadline decides expiry, not timer poll order: the only
+/// runtime worker stalls from before the deadline until after the
+/// evaluator, the pipeline's timer and the grading timer have all
+/// finished, so every one of them is ready when the worker resumes. The
+/// second case still fails with `budget_exceeded`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn grading_deadline_decides_expiry_when_the_runtime_stalls() {
+    let h = Harness::new(evaluator_params()).await;
+    let invoker = h.invoker(Some(registry()), Some(sleeping_handler(500)));
+    let request = h.create(2, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    let stall = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        std::thread::sleep(Duration::from_millis(800));
+    });
+    let graded = h
+        .grade_within(&request, &response, &invoker, Duration::from_millis(750))
+        .await
+        .unwrap();
+    stall.await.unwrap();
+    assert!(graded.reasons[18].passed, "{:?}", graded.reasons[18]);
+    assert_eq!(
+        graded.reasons[19].reason.as_deref(),
+        Some("budget_exceeded"),
+        "{:?}",
+        graded.reasons[19]
+    );
+}
+
 /// TQ7: a slow evaluator that started uses the budget up, so its case and
 /// the `SchemaMatch` case after it both fail with `budget_exceeded`, and the
 /// attempt is graded: neither is a fault.
