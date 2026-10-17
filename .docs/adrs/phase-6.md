@@ -4,7 +4,7 @@
 **Phase goal:** Android platform, Kotlin SDK, scale hardening, security audit, advanced governance, offline strategy.
 **Timeline:** Weeks 21+
 
-**Note:** Phase 6 follows Phases 1-5 implementation. All ADRs in this phase — ADR-027 (Android), ADR-028 (Kotlin), ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), ADR-031 (Multi-Admin Governance), ADR-038 (Content Access Key Layer), ADR-043 (Protocol Constants), ADR-044 (Attestation Two-Class Model), and ADR-045 (Fuzzing Infrastructure) — are Decided.
+**Note:** Phase 6 follows Phases 1-5 implementation. All ADRs in this phase — ADR-027 (Android), ADR-028 (Kotlin), ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), ADR-031 (Multi-Admin Governance), ADR-038 (Content Access Key Layer), ADR-043 (Protocol Constants), ADR-044 (Attestation Two-Class Model), ADR-045 (Fuzzing Infrastructure), and ADR-066 (Governance Leaves Ride the MLS Commit) — are Decided.
 
 **Dependencies between ADRs:**
 
@@ -2925,6 +2925,8 @@ However, governance actions that result in membership changes (approved `AddMemb
 3. MLS Commit advances the epoch.
 4. `GovernanceActionExecuted` event appended to event log (records proposal ID, action, executor identifier, resulting epoch).
 
+**Amendment (2026-10-17, ADR-066).** Every executed governance action is now sent as an MLS Commit that carries its event-log leaves in its authenticated data, including an action that changes no membership, which is sent as a Commit with no proposals; a non-committer applies the action only by processing that Commit.
+
 Pending proposals are NOT invalidated by epoch advances. A proposal created at epoch E is valid at epoch E+N — the proposal references a governance action, not an epoch-specific state. The only exception is group state reset (ADR-029 Tier 3), which invalidates pending proposals because the member's relationship to the group has fundamentally changed.
 
 #### 9. Interaction with Checkpointing (ADR-030)
@@ -3884,3 +3886,49 @@ fuzz/                        # Standalone cargo-fuzz crate (not workspace member
 8. All T1/T2 targets use raw bytes (`|data: &[u8]|`). All T3/T4 targets that require semantic structure use `Arbitrary`.
 9. `fuzz/Cargo.lock` is committed (separate from root `Cargo.lock`).
 10. Crash workflow documented: reproduce → minimize (`fuzz tmin`) → file issue → add regression `#[test]`.
+
+---
+
+## ADR-066: Governance Leaves Ride the MLS Commit
+
+**Status:** Decided 2026-10-17, by Alec's ruling of that date.
+**Date:** 2026-10-17
+**Spec:** `07-trust-validation-and-capabilities.md` §7.3.1.1 (wire placement, receiver processing, fail-closed rule, deduplication), `05-contexts.md` §5.9 invariant 3, `09-security-model.md` §9.7.1 (the Commit row of the MLS mapping) and §9.18.10 (size constants).
+**Amends:** ADR-031 §8, ADR-051, ADR-057 T3.
+
+### Context
+
+A context's event log is the source of each member's role and rights (§7.2.2 of the trust spec fills the capability cache from role assignments, and §7.3.1 makes role assignments and governance actions commit-ordered leaves). The runtime appends those leaves at the committer only. A member that did not commit a membership change records no role for the member someone else added, so it rejects that member's messages with `MemberNotFound`, and no existing path delivers the leaf to it: §7.3.2 stated that receive-side replication is dormant.
+
+Delivering the leaf in a message separate from the Commit leaves an ordering gap. The Commit and the leaf can arrive in either order, and a receiver that has processed the Commit but not the leaf either refuses the new member or guesses its role.
+
+A role change by `ChangeRole` has the same gap in a stronger form. ADR-031 §8 sends no Commit for it, so a non-committer has no message from which to learn it.
+
+### Decision
+
+1. **The leaf rides the Commit.** The committer places every event-log leaf it appends for a governance action in the authenticated data of the MLS Commit that executes the action, so every member receives the leaf in the same message as the change. The governance leaves in scope are `GovernanceActionExecuted`, `RoleAssigned`, and every leaf that changes a member's role or capabilities.
+2. **Every executed governance action is committed.** An action that changes no MLS membership is sent as a Commit with no proposals and an UpdatePath. This amends ADR-031 §8, under which only membership changes and key updates produced a Commit. ADR-051 §6 already treats a suspension as "a convergent governance commit" that every member enforces, and this decision makes that true for every governance action. The epoch advance orders the change: a message sent in the new epoch cannot be decrypted before its receiver has processed the Commit.
+3. **The Commit signature authenticates the leaf.** MLS `authenticated_data` is part of `FramedContent`, which the committer's leaf signature covers (RFC 9420 §6.1) and the `PrivateMessage` AEAD covers again. The §9.7.1 KeyPackage attestation binds that leaf signature key to the committer's identifier. The receiver reads the block only from the authenticated data the MLS implementation returns after verification. The leaf's own `signature` field is not relied on for this path; §23.13 governs a leaf that arrives any other way.
+4. **The block is encrypted.** MLS sends `authenticated_data` in the clear (RFC 9420 §6.3), and a relay receives the Commit bytes. §9.10.1 makes roles and governance actions confidential, so the block is AES-128-GCM under a key exported from the sending epoch (`MLS-Exporter("SCP-GOVERNANCE-LEAF-V1", context_id_bytes, 16)`), padded to the §9.10.3 buckets up to 16 KiB, and holds at most 16 leaves.
+5. **The receiver verifies, authorizes, then appends.** Before merge, the receiver verifies the block and each leaf's sequence, chain, actor, and agreement with the Commit's proposals. It then checks, against its own pre-Commit governance state, that the committer may perform each recorded action. Last, it merges the Commit and appends the leaves in one durable step. A Commit that fails either check is rejected before merge.
+6. **Fail closed.** Until a receiver has verified the leaf that grants a member a role, it grants that member nothing, and it never assumes a default role.
+7. **Deduplication by sequence.** A commit-ordered leaf is identified by its context and sequence. A leaf that later reaches a member by replication (ADR-051) or reconciliation (§23.13) and hashes the same as the held leaf is already present and is discarded. One that hashes differently is a fork, handled as §9.9.3 handles equivocation.
+8. **One record of the timestamp.** A Commit carrying a governance leaf block carries no ADR-057 T3 `SCPT` blob, because the leaf's own timestamp field is the committer-assigned value of §7.3.1.
+
+### Rejected Alternatives
+
+- **A role guessed at the receiver.** A non-committer that has processed an add-Commit assigns the new member a default role such as `member`. It costs nothing on the wire and lets the new member be heard at once. It is a fail-open: §5.5.1 gives `member` `messages:write` and outlet invocation, so a context that admitted someone as `observer` would see that member write at every non-committer. It also writes a role into the receiver's state that no signed leaf records, so the receiver's role state and its event log disagree.
+- **Waiting for ADR-051 replication alone.** Receivers learn the leaf only when a later replication path delivers it. That needs no new wire field. But ADR-051 orders application events and defines no delivery of commit-ordered governance leaves, so until such a path exists a non-committer cannot hear a member someone else added. And once it exists, the Commit and the replicated leaf still arrive in either order, which reopens the gap this record closes.
+- **A separate role field in the Commit.** The committer binds the new member's role, and nothing else, into the Commit's authenticated data, as ADR-057 T3 binds a timestamp. That is smaller than a full leaf. But the role is then recorded twice, once in that field and once in the `MemberJoined` or `RoleAssigned` leaf, and the two records can disagree; the receiver would still have to build the leaf from the field, and every further right-changing action would need a field of its own.
+
+### Consequences
+
+- A non-committer holds the same role and membership state, and the same commit-ordered log, as the committer once it has processed the Commit, and its participation facts (§7.3.2) are verifiable against its own Merkle root.
+- Every governance action costs one epoch advance. Each advance also refreshes the group's keys.
+- In a governance model other than `SingleAdmin`, a receiver that lacks the approving votes rejects the Commit and recovers through ADR-029 resynchronization.
+- A member the Commit adds gets the Welcome, not the Commit, so this record does not govern how a joiner learns the roles of earlier members.
+- Broadcast contexts have no MLS group and are out of scope.
+
+### Acceptance Criteria
+
+The story that implements this record lists its criteria in `.docs/prds/main.json` under SCP-328.

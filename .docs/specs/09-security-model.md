@@ -873,7 +873,7 @@ MLS (RFC 9420) provides the group encryption layer for SCP. This section specifi
 | Welcome message | Context join token | HPKE-encrypted to new member's KeyPackage. Contains the group state needed to decrypt future messages. |
 | KeyPackage | Pre-key bundle | Published to relays so others can add the identity to groups even when offline. The leaf node is self-signed by an **ephemeral, context-scoped MLS key**; a **KeyPackage attestation** carried in the leaf (LeafNode extension `scp_keypackage_attestation`) binds that ephemeral key to the identifier and is signed by the Active Signing Key (`#active`) — never by a root member. Single-use. See note below. |
 | Proposal (Add/Remove/Update) | Governance action | MLS membership proposals map to SCP membership changes. |
-| Commit | Governance commit | Finalizes pending proposals and advances the epoch. |
+| Commit | Governance commit | Finalizes pending proposals and advances the epoch. A Commit that executes a governance action carries that action's event-log leaves, encrypted, in its authenticated data, and a receiver verifies and authorizes them before it merges the Commit (`07-trust-validation-and-capabilities.md` §7.3.1.1). |
 | Application message | SCP envelope payload | The encrypted content within an SCP envelope. |
 | Delivery Service (DS) | SCP relay(s) | The untrusted store-and-forward layer. Any transport adapter (native relay, Nostr, Matrix, etc.) serves this role. |
 | Authentication Service (AS) | identity resolution + UCAN validation | SCP's identity layer serves as MLS's AS. No separate trusted server. |
@@ -3036,6 +3036,8 @@ Both seeds go through the `"SCP-PSEUDONYM-P256-V1"` seed-to-scalar step above. T
 | Max hot events | 10,000 | Maximum events retained in hot tier | §11 |
 | Max hot bytes | 52,428,800 (50 MiB) | Maximum bytes retained in hot tier | §11 |
 | Min retention (prune) | 2,592,000s (30d) | Minimum event retention before pruning is allowed | §11 |
+| `MAX_GOVERNANCE_LEAVES_PER_COMMIT` | 16 | Most event-log leaves one Commit's governance leaf block carries. A block with more is malformed, and the receiver rejects the Commit before merge. | `07-trust-validation-and-capabilities.md` §7.3.1.1 |
+| Governance leaf block ciphertext sizes | 272, 1,040, 4,112, or 16,400 bytes | The padded plaintext sizes 256, 1,024, 4,096, and 16,384 bytes (§9.10.3) plus the 16-byte AES-128-GCM tag. Any other `ciphertext_len` is malformed. | `07-trust-validation-and-capabilities.md` §7.3.1.1 |
 
 #### 9.18.11 Transport and Relay
 

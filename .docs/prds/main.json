@@ -309,6 +309,17 @@
         "SCP-317",
         "SCP-318"
       ]
+    },
+    {
+      "id": "gate-gov-commit",
+      "name": "Governance leaves ride the MLS Commit (ADR-066)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-328",
+        "SCP-329",
+        "SCP-330"
+      ]
     }
   ],
   "stories": [
@@ -11842,6 +11853,161 @@
         "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
         "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
       }
+    },
+    {
+      "id": "SCP-328",
+      "title": "Encode, encrypt, and stage the governance leaf block in scp-mls",
+      "gate": "gate-gov-commit",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-mls/src/governance_leaf_block.rs",
+        "crates/scp-mls/src/lib.rs",
+        "crates/scp-mls/src/group.rs",
+        "crates/scp-mls/src/encrypt.rs",
+        "crates/scp-mls/src/error.rs"
+      ],
+      "description": "ADR-066 and §7.3.1.1 of the trust spec move every event-log leaf of an executed governance action into the authenticated data of the MLS Commit that executes it. This story builds the `scp-mls` half: the `GovernanceLeafBlock` codec (magic `SCPG`, version 1, 12-byte nonce, big-endian `ciphertext_len`, AES-128-GCM ciphertext under `MLS-Exporter(\"SCP-GOVERNANCE-LEAF-V1\", context_id_bytes, 16)` from the sending epoch, plaintext a MessagePack array of binary strings each holding one leaf's exact `rmp_serde(Event)` bytes, padded to 256, 1,024, 4,096, or 16,384 bytes with a 4-byte big-endian length suffix per §9.10.3); a committer entry point that sets the block as the Commit's authenticated data for an add, a remove, or a proposal-free UpdatePath Commit; and a two-phase receive that returns the staged Commit together with the decoded leaf bytes read from the verified `ProcessedMessage::aad()`, so the caller can verify and authorize before it merges or discards the staged Commit. The size bounds are `MAX_GOVERNANCE_LEAVES_PER_COMMIT` = 16 and the four padded ciphertext sizes of §9.18.10 of the security spec. A Commit carrying the block carries no ADR-057 T3 `SCPT` blob. The runtime committer side is SCP-329 and the runtime receiver side is SCP-330; this story touches no runtime crate.",
+      "acceptanceCriteria": [
+        "`scp_mls::governance_leaf_block` encodes and decodes the block exactly as §7.3.1.1 lays it out; a round-trip test over 1, 2, and 16 leaves returns each leaf's original bytes in order",
+        "Decoding fails closed with a typed error for each of: wrong magic, unknown version, a `ciphertext_len` that is not 272, 1,040, 4,112, or 16,400, an AEAD tag that does not verify, a length suffix larger than the padded size minus 4, trailing bytes after the MessagePack array, zero leaves, and 17 leaves; one test per case asserts the error variant",
+        "Encoding 17 leaves, or leaves whose MessagePack array exceeds 16,380 bytes, returns a typed error and builds no Commit",
+        "A test exports the key from two members of one group at one epoch and each decrypts the other's block; a block encrypted at epoch N fails to decrypt under the key of epoch N+1",
+        "The committer entry points build an add Commit, a remove Commit, and a proposal-free UpdatePath Commit whose `FramedContent.authenticated_data` equals the encoded block, and a receiving member's two-phase receive returns the same leaf bytes before merge",
+        "A test flips one byte of the block inside a sent Commit, and the receiving member's two-phase receive rejects the frame and returns no leaf bytes",
+        "After the two-phase receive returns, the receiver's epoch is unchanged until the caller merges; after a discard, the group stays at the old epoch and processes the next valid Commit of that epoch",
+        "`cargo clippy -p scp-mls --all-targets -- -D warnings` and `cargo test -p scp-mls` pass"
+      ],
+      "actionItems": [
+        "Add the `governance_leaf_block` module with the codec, padding, exporter key derivation, and size constants",
+        "Add committer entry points that set the block as Commit authenticated data for add, remove, and UpdatePath Commits",
+        "Add a two-phase receive that returns the staged Commit and the decoded leaf bytes before merge, with merge and discard operations",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.1.1 Governance Leaves Carried in the Commit"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-066: Governance Leaves Ride the MLS Commit"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.10 Event Log"
+        }
+      ],
+      "details": {
+        "authentication": "The Commit authenticates the block: `authenticated_data` lies in `FramedContent`, which the committer's leaf signature over `FramedContentTBS` covers (RFC 9420 §6.1), and the `PrivateMessage` AEAD covers it again under `PURE_CIPHERTEXT` (ADR-057 T3). The exporter-key AEAD adds confidentiality, because MLS sends `authenticated_data` in the clear (RFC 9420 §6.3)."
+      }
+    },
+    {
+      "id": "SCP-329",
+      "title": "Commit every executed governance action with its leaves",
+      "gate": "gate-gov-commit",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-runtime/src/context/builder.rs",
+        "crates/scp-runtime/src/crypto/mls/backend.rs",
+        "crates/scp-client/src/client.rs"
+      ],
+      "description": "Per §7.3.1.1 of the trust spec, §5.9 invariant 3 of the contexts spec, and ADR-066 (which amends ADR-031 §8), the member that executes an approved governance action in an encrypted context sends an MLS Commit whose authenticated data carries every commit-ordered leaf it appends for that action. Today `execute_add_member` appends `MemberJoined` after `try_broadcast_commit` and sends no leaf, and `execute_change_role` sends no Commit at all. This story builds each leaf before the Commit, assigns its sequence and `prev_hash` from the committer's log, binds the leaves through the SCP-328 committer entry points, and appends exactly those leaf bytes to the committer's own log, so the committer's log and the block hold identical leaves. An action that changes no MLS membership, such as `ChangeRole`, `SuspendCapability`, or `TransferAdmin`, is sent as a proposal-free UpdatePath Commit. The ADR-057 in-browser client (`scp-client`) binds the block in place of the `SCPT` blob on its add Commit. The receiver side is SCP-330.",
+      "acceptanceCriteria": [
+        "For `AddMember`, `RemoveMember`, `RevokeAccess`, `ResetMember`, `ChangeRole`, `TransferAdmin`, `SuspendCapability`, `SuspendAccess`, `RestoreAccess`, and `ModifyCeiling`, a test executes the action in an encrypted context and decodes the sent Commit's block; the decoded leaves are byte-identical to the leaves the committer appended to its own log, in the same order",
+        "A test executes `ChangeRole` and asserts that the committer's epoch advanced by one and that the sent Commit carries no proposals",
+        "A test asserts that the committer's log head after the action equals the hash of the last leaf in the block",
+        "An action whose leaves would exceed `MAX_GOVERNANCE_LEAVES_PER_COMMIT` or the 16,384-byte padded size returns a typed error and changes neither the MLS group nor the log",
+        "The `scp-client` add Commit carries a governance leaf block and no `SCPT` blob, and the `multi_party_convergence` test passes with the timestamp read from the leaf",
+        "`pipeline_wiring.rs` asserts that `execute_add_member` and `execute_change_role` reach the block-binding commit entry point",
+        "CI-feature `cargo clippy` over `scp-runtime` and `scp-client` and their tests pass"
+      ],
+      "actionItems": [
+        "Build each action's leaves before its Commit and bind them through the SCP-328 entry points",
+        "Send non-membership governance actions as proposal-free UpdatePath Commits",
+        "Append the same leaf bytes to the committer's log",
+        "Replace the `SCPT` blob in the `scp-client` add Commit",
+        "Add the tests and the `pipeline_wiring.rs` assertion"
+      ],
+      "blockedBy": [
+        "SCP-328"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.1.1 Governance Leaves Carried in the Commit"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-066: Governance Leaves Ride the MLS Commit"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "#### 8. Interaction with MLS Epochs"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.9 Governance"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-330",
+      "title": "Verify, authorize, and append a Commit's governance leaves at every receiver",
+      "gate": "gate-gov-commit",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/messaging_helpers.rs",
+        "crates/scp-runtime/src/crypto/mls/backend.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-runtime/src/context/providers/event_log.rs"
+      ],
+      "description": "Per §7.3.1.1 of the trust spec and ADR-066, a member that processes a Commit it did not send verifies the Commit's governance leaf block, checks against its own pre-Commit governance state that the committer may perform each recorded action, then merges the Commit and appends the leaves and applies them to its role and membership state in one durable step. A Commit that fails verification or authorization is rejected before merge. Until a receiver has verified the leaf that grants a member a role, it grants that member nothing and never assumes a default role; this replaces any receiver-side role guess. A leaf that arrives later by replication or reconciliation and hashes the same as the leaf held at its sequence is discarded; one that hashes differently is handled as §9.9.3 equivocation. This story uses the SCP-328 two-phase receive. Its two-node criteria need SCP-329's committer side merged before the story is done. PUSH-030's rejoin criterion depends on this story.",
+      "acceptanceCriteria": [
+        "Two-node test: A adds C as `observer`; B processes A's Commit and then holds C with role `observer`, C's `messages:read` is authorized at B and C's `messages:write` is not, and B's log head equals A's",
+        "Two-node test: A changes C's role from `observer` to `member` by `ChangeRole`; after B processes the Commit, C's `messages:write` is authorized at B",
+        "B rejects before merge, with its epoch, log head, and role state unchanged, a Commit that carries an Add proposal and has any one of: no block; a `MemberJoined` subject other than the added identifier; a leaf whose `actor_did` is not the committer; a leaf whose `sequence` is not B's next sequence; a leaf whose `prev_hash` is not B's log head; one test per case",
+        "B rejects before merge a Commit whose committer lacks `member:invite` in B's role state, and a Commit that assigns a role absent from B's role registry",
+        "In a `Threshold` context, B rejects before merge a Commit that executes a proposal for which B holds no approving quorum",
+        "A test delivers to B an add Commit whose block fails verification and asserts that B's role state holds no entry for C and that C's next message fails with `MemberNotFound`",
+        "Delivering to B a leaf it already holds, through the replication or reconciliation entry point, leaves B's log unchanged; delivering a different leaf at a held sequence produces the §9.9.3 equivocation outcome",
+        "A crash injected between merge and append leaves B, after restart, either at the old epoch with the old log and role state or at the new epoch with the new leaves appended and applied",
+        "CI-feature `cargo clippy` over `scp-runtime` and its tests pass"
+      ],
+      "actionItems": [
+        "Route incoming Commits through the SCP-328 two-phase receive",
+        "Implement the verify and authorize steps against the receiver's pre-Commit state",
+        "Merge, append, and apply in one durable step, and discard on failure",
+        "Delete any receiver-side default-role assignment",
+        "Deduplicate replicated or reconciled leaves by sequence and hash",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [
+        "SCP-328"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.1.1 Governance Leaves Carried in the Commit"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-066: Governance Leaves Ride the MLS Commit"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.9 Governance"
+        }
+      ],
+      "details": {}
     }
   ]
 }
