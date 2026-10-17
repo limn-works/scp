@@ -18,9 +18,12 @@
 //! # Async runtime
 //!
 //! A single tokio `Runtime` is created at module import time and stored in a
-//! [`OnceLock`]. Most async bridge functions use synchronous `#[pyfunction]`
-//! with `py.allow_threads(|| rt.block_on(...))` to run tokio futures while
-//! releasing the Python GIL.
+//! [`OnceLock`]. Every synchronous bridge function waits on a tokio future
+//! through `actor_wait::block_on_released`, which releases the Python GIL for
+//! the whole wait (ADR-049 Decision 7a). `scripts/check-bridge-block-on.py`
+//! fails every `block_on`, `block_in_place` and other thread-blocking call
+//! under `crates/scp-ffi/` outside `scp_ffi_common::bridge_wait`, and every
+//! caller of its waits missing from the gate's `CALLERS` list.
 //!
 //! The exception is `PyMessageReceiver::__anext__`, which returns an
 //! `asyncio.Future` and spawns the recv on the tokio runtime, resolving the
@@ -61,6 +64,7 @@ compile_error!(
      release wheel WITHOUT `testing`. See ADR-049 PR-7 BLACK-P7-5."
 );
 
+pub(crate) mod actor_wait;
 pub mod context;
 pub mod economy;
 
@@ -201,14 +205,29 @@ fn version() -> &'static str {
 /// shut down (or before it was initialized) is a no-op. `timeout_millis`
 /// is retained for API stability and ignored post-demolition.
 #[pyfunction]
-fn shutdown_runtime(_timeout_millis: u64) {
+fn shutdown_runtime(py: Python<'_>, _timeout_millis: u64) {
     // Give in-flight tokio tasks a brief drain window. 100ms is sufficient
-    // for cooperative tasks to observe shutdown; anything longer blocks the
-    // Python GIL unnecessarily.
+    // for cooperative tasks to observe shutdown. The GIL is released for the
+    // drain so a task that calls back into Python can finish. An absent
+    // runtime is a no-op, so this does not go through `block_on_released`,
+    // which fails on an absent runtime.
     if let Some(rt) = RUNTIME.get() {
-        rt.block_on(async {
-            tokio::time::sleep(SHUTDOWN_DRAIN).await;
-        });
+        py.allow_threads(|| drain_runtime(rt));
+    }
+}
+
+/// Sleeps [`SHUTDOWN_DRAIN`] on `rt` from a thread outside any runtime.
+///
+/// The sleep is built inside the `async` block, on the runtime: a
+/// `tokio::time::sleep` built on the calling thread needs a current runtime
+/// and panics on the atexit thread, which has none.
+fn drain_runtime(rt: &tokio::runtime::Runtime) {
+    // The atexit drain sleeps with the GIL released and waits on no context
+    // actor. A refusal (a current-thread ambient runtime) skips the drain.
+    if let Err(e) = scp_ffi_common::bridge_wait::bridge_block_on(|| Ok(rt), async {
+        tokio::time::sleep(SHUTDOWN_DRAIN).await;
+    }) {
+        tracing::warn!("SCP runtime shutdown drain skipped: {e}");
     }
 }
 
@@ -305,6 +324,15 @@ pub use _scp_core::__pyo3_init;
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The atexit drain runs on a thread with no current runtime.
+    #[test]
+    fn drain_runtime_runs_off_a_runtime_thread() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        std::thread::spawn(move || drain_runtime(&rt))
+            .join()
+            .expect("the drain must not panic off a runtime thread");
+    }
 
     #[test]
     fn init_runtime_creates_runtime() {

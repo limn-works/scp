@@ -82,13 +82,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(handle.state(), ContextState::Active);
 
     // 5. Send a message (mock transport captures it).
-    let alice_sk = support::signing_key_for(&alice);
+    let alice_signer = support::command_signer_for(&alice).await?;
     manager
         .send_message(
             &handle,
             &alice,
             b"Hello, context!",
-            MessageSigner::Active(&alice_sk),
+            MessageSigner::Active(&alice_signer),
             None,
             None,
         )

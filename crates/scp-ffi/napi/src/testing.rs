@@ -167,10 +167,10 @@ pub(crate) fn fullstack_create_context_on(
         ..ContextParams::default()
     };
 
-    let rt = crate::runtime();
-    let handle = rt
-        .block_on(node.inner.create_context(&context_id, params))
-        .map_err(|e| {
+    // Testing feature; FullStackNode signs with in-process custody, so no
+    // host callback waits on this thread.
+    let handle =
+        crate::block_on_shared(node.inner.create_context(&context_id, params))?.map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to create context: {e}"),
                 code: codes::CTX_2050.to_owned(),
@@ -197,7 +197,6 @@ pub(crate) fn fullstack_add_member_on(
     member_did: String,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, node);
-    let rt = crate::runtime();
 
     let handle = {
         let handles = node
@@ -212,13 +211,14 @@ pub(crate) fn fullstack_add_member_on(
         })?
     };
 
-    rt.block_on(node.inner.add_member(&handle, &member_did))
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Crypto {
-                message: format!("failed to add member: {e}"),
-                code: codes::CRYPTO_4050.to_owned(),
-            })
+    // Testing feature; FullStackNode signs with in-process custody, so no
+    // host callback waits on this thread.
+    crate::block_on_shared(node.inner.add_member(&handle, &member_did))?.map_err(|e| {
+        napi::Error::from(ScpNapiError::Crypto {
+            message: format!("failed to add member: {e}"),
+            code: codes::CRYPTO_4050.to_owned(),
         })
+    })
 }
 
 /// Per-bridge-instance implementation of [`Scp::fullstack_join_from_welcome`](crate::scp::Scp::fullstack_join_from_welcome).
@@ -236,7 +236,6 @@ pub(crate) fn fullstack_join_from_welcome_on(
     context_id: String,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, node);
-    let rt = crate::runtime();
     // ADR-056: key the shared crypto under the canonical digest via the
     // chokepoint, never the raw routing primitive (which double-hashes a real
     // 64-hex id and would diverge from the creator's deposit slot).
@@ -248,8 +247,9 @@ pub(crate) fn fullstack_join_from_welcome_on(
     // returned `ContextHandle` is stored in the node's handle map so a
     // subsequent `fullstack_send_message` on this joiner resolves it — the
     // joiner is now a bidirectional, send-capable participant.
-    let handle = rt
-        .block_on(node.inner.join_from_welcome(&context_id, &ctx_bytes))
+    // Testing feature; FullStackNode signs with in-process custody, so no
+    // host callback waits on this thread.
+    let handle = crate::block_on_shared(node.inner.join_from_welcome(&context_id, &ctx_bytes))?
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to join from Welcome: {e}"),
@@ -297,7 +297,6 @@ pub(crate) fn fullstack_send_message_on(
     payload: Buffer,
 ) -> napi::Result<Buffer> {
     crate::napi_check_handle!(&bi.core, node);
-    let rt = crate::runtime();
 
     let handle = {
         let handles = node
@@ -312,13 +311,14 @@ pub(crate) fn fullstack_send_message_on(
         })?
     };
 
-    rt.block_on(node.inner.send_message(&handle, &payload))
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Crypto {
-                message: format!("failed to send message: {e}"),
-                code: codes::CRYPTO_4052.to_owned(),
-            })
-        })?;
+    // Testing feature; FullStackNode signs with in-process custody, so no
+    // host callback waits on this thread.
+    crate::block_on_shared(node.inner.send_message(&handle, &payload))?.map_err(|e| {
+        napi::Error::from(ScpNapiError::Crypto {
+            message: format!("failed to send message: {e}"),
+            code: codes::CRYPTO_4052.to_owned(),
+        })
+    })?;
 
     // Retrieve the captured ciphertext from the transport.
     let sent = node.inner.take_sent_ciphertexts();
@@ -348,18 +348,20 @@ pub(crate) fn fullstack_decrypt_message_on(
     // ADR-056: key decryption under the canonical digest via the chokepoint,
     // never the raw routing primitive.
     let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
-    let rt = crate::runtime();
-    let plaintext = rt
-        .block_on(
-            node.inner
-                .decrypt_message(&context_id, &ctx_bytes, &ciphertext, &sender_did),
-        )
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Crypto {
-                message: format!("failed to decrypt message: {e}"),
-                code: codes::CRYPTO_4054.to_owned(),
-            })
-        })?;
+    // Testing feature; FullStackNode signs with in-process custody, so no
+    // host callback waits on this thread.
+    let plaintext = crate::block_on_shared(node.inner.decrypt_message(
+        &context_id,
+        &ctx_bytes,
+        &ciphertext,
+        &sender_did,
+    ))?
+    .map_err(|e| {
+        napi::Error::from(ScpNapiError::Crypto {
+            message: format!("failed to decrypt message: {e}"),
+            code: codes::CRYPTO_4054.to_owned(),
+        })
+    })?;
 
     Ok(Buffer::from(plaintext))
 }
@@ -372,7 +374,6 @@ pub(crate) fn fullstack_remove_member_on(
     member_did: String,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, node);
-    let rt = crate::runtime();
 
     let handle = {
         let handles = node
@@ -387,11 +388,13 @@ pub(crate) fn fullstack_remove_member_on(
         })?
     };
 
-    rt.block_on(node.inner.manager.leave_context(
+    // Testing feature; FullStackNode signs with in-process custody, so no
+    // host callback waits on this thread.
+    crate::block_on_shared(node.inner.manager.leave_context(
         &handle,
         &node.inner.did,
         &scp_did::DID::from(member_did.as_str()),
-    ))
+    ))?
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Context {
             message: format!("failed to remove member: {e}"),
@@ -436,12 +439,13 @@ pub(crate) fn fullstack_seed_peer_pseudonym_on(
     let mut arr = [0u8; 32];
     arr.copy_from_slice(pseudonym_bytes);
 
-    let rt = crate::runtime();
-    rt.block_on(node.inner.manager.seed_peer_pseudonym(
+    // Testing feature; FullStackNode signs with in-process custody, so no
+    // host callback waits on this thread.
+    crate::block_on_shared(node.inner.manager.seed_peer_pseudonym(
         &context_id,
         scp_did::DID::from(peer_did.as_str()),
         arr,
-    ))
+    ))?
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Context {
             message: format!("failed to seed peer pseudonym: {e}"),

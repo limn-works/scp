@@ -1758,7 +1758,7 @@ fn load_ucan_state_blocking(
 ) -> Result<scp_ffi_common::bridge_runtime::UcanContextStateCore, ScpNapiError> {
     let to_error = durable_state_error("rebuild durable UCAN state", context_id);
     scp_ffi_common::ucan_durable_state::block_on_storage(
-        Some(crate::runtime().handle()),
+        Some(crate::runtime()),
         protocol_repository(bi).load_ucan_state(context_id),
     )
     .map_err(to_error)?
@@ -1797,7 +1797,7 @@ pub(crate) fn persist_ucan_revocation_blocking(
     let to_error = durable_state_error("persist UCAN revocation", context_id);
     with_context(bi, context_id, |rt| {
         scp_ffi_common::ucan_durable_state::block_on_storage(
-            Some(crate::runtime().handle()),
+            Some(crate::runtime()),
             protocol_repository(bi)
                 .persist_ucan_revocation_list(context_id, &rt.core.revocation_list),
         )
@@ -1835,7 +1835,7 @@ pub(crate) fn persist_ucan_nonces_blocking(
     let to_error = durable_state_error("persist UCAN nonce state", context_id);
     with_context(bi, context_id, |rt| {
         scp_ffi_common::ucan_durable_state::block_on_storage(
-            Some(crate::runtime().handle()),
+            Some(crate::runtime()),
             protocol_repository(bi).persist_ucan_recorded_nonce(
                 context_id,
                 &rt.core.nonce_tracker,

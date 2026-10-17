@@ -916,6 +916,9 @@ run_step format cargo fmt --all -- --check
 # `examples-typecheck` job: it runs mypy and the TypeScript compiler over the Python and
 # TypeScript sites under `docs/examples/`, `scaffolds/` and `templates/`, compiles no
 # crate, and needs `bun install` run in `bindings/typescript` first.
+# `scripts/check-test-vectors-p256.py` joined with the `test-vectors` job: it runs
+# `scripts/gen-test-vectors-p256.py` with the standard library (and `cryptography` when
+# it imports) and reads spec 25 and two Rust test files.
 GATES=(
     scripts/check-agent-verdict-criterion.sh
     scripts/check-block-in-place.py
@@ -948,6 +951,7 @@ GATES=(
     scripts/check-sdk-coverage.py
     scripts/check-shipped-feature-graph.sh
     scripts/check-test-shard-features.py
+    scripts/check-test-vectors-p256.py
     scripts/check-toolchain-wiring.sh
     scripts/check-vendored-openssl-scope.sh
     scripts/check-wiping-allocator.sh

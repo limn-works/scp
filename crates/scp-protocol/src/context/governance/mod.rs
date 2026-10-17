@@ -51,7 +51,6 @@ pub mod unanimity;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -170,13 +169,21 @@ const VOTE_DOMAIN_SEPARATOR: &[u8] = b"SCP-VOTE-V1:";
 /// replay attacks.
 ///
 /// Length prefixes prevent ambiguity when concatenating variable-length fields.
+///
+/// The voter signs this digest through its signer (ADR-049 Decision 7a), and
+/// [`verify_vote`] checks the signature over it.
+///
+/// # Errors
+///
+/// Returns [`GovernanceError::SerializationFailed`] if the vote type cannot
+/// be serialized.
 #[allow(clippy::similar_names)] // voter_did_bytes vs vote_type_bytes are semantically distinct
-fn compute_vote_hash(
+pub fn vote_signing_digest(
     proposal_id: &ProposalId,
     voter_did: &str,
     vote: &VoteType,
     timestamp: u64,
-) -> Result<Vec<u8>, GovernanceError> {
+) -> Result<[u8; 32], GovernanceError> {
     // RFC 8785 JCS canonical serialization for cross-implementation
     // deterministic vote hashing (§9.5.2). Both vote_type and action_bytes
     // (in compute_proposal_id) use JCS — not MessagePack — for canonical
@@ -201,20 +208,39 @@ fn compute_vote_hash(
     hasher.update(&vote_type_bytes);
     // Timestamp.
     hasher.update(timestamp.to_be_bytes());
-    Ok(hasher.finalize().to_vec())
+    Ok(hasher.finalize().into())
 }
 
-/// Creates a signed vote with a real Ed25519 signature.
+/// Assembles the [`SignedVote`] for a signature the voter produced over
+/// [`vote_signing_digest`] of the proposal id, voter DID, vote and timestamp.
 ///
-/// Computes a canonical hash over `(proposal_id, voter_did, vote, timestamp)`
-/// with a `SCP-VOTE-V1:` domain separator and length-prefixed fields, then
-/// signs it with the provided Ed25519 signing key. The `proposal_id` binds
-/// the signature to a specific proposal, preventing cross-proposal replay.
+/// The engine that records the vote verifies the signature, so a caller
+/// cannot make an engine count a vote by assembling one here.
+#[must_use]
+pub fn signed_vote(
+    vote: &VoteType,
+    voter_did: &DID,
+    timestamp: u64,
+    signature: [u8; 64],
+) -> SignedVote {
+    SignedVote {
+        voter_did: voter_did.clone(),
+        vote: vote.clone(),
+        timestamp,
+        signature: signature.to_vec(),
+    }
+}
+
+/// Creates a signed vote with a local Ed25519 key, for tests.
+///
+/// Production signs [`vote_signing_digest`] through the voter's signer and
+/// assembles the vote with [`signed_vote`].
 ///
 /// # Errors
 ///
 /// Returns [`GovernanceError::SerializationFailed`] if the vote type cannot
 /// be serialized.
+#[cfg(any(test, feature = "testing"))]
 pub fn sign_vote(
     proposal_id: &ProposalId,
     vote: &VoteType,
@@ -222,21 +248,122 @@ pub fn sign_vote(
     timestamp: u64,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<SignedVote, GovernanceError> {
-    let hash = compute_vote_hash(proposal_id, voter_did, vote, timestamp)?;
-    let signature = signing_key.sign(&hash);
-
-    Ok(SignedVote {
-        voter_did: DID::from(voter_did),
-        vote: vote.clone(),
+    let digest = vote_signing_digest(proposal_id, voter_did, vote, timestamp)?;
+    let signature = ed25519_dalek::Signer::sign(signing_key, &digest);
+    Ok(signed_vote(
+        vote,
+        &DID::from(voter_did),
         timestamp,
-        signature: signature.to_bytes().to_vec(),
+        signature.to_bytes(),
+    ))
+}
+
+/// Resolves `did`'s `#active` key, the key every vote verifies against.
+///
+/// Votes resolve `#active` (the human signing key): governance is a
+/// human-accountability surface, and ADR-039 scopes one-DID-one-vote to the
+/// person, not the agent key.
+fn resolve_voter_key(
+    key_resolver: &KeyResolver,
+    did: &DID,
+) -> Result<ed25519_dalek::VerifyingKey, GovernanceError> {
+    key_resolver(did, SigningKeyId::Active).ok_or_else(|| GovernanceError::UnknownVoter {
+        did: did.to_string(),
     })
+}
+
+/// The digest `voter` signs for `vote` at `context.now`.
+///
+/// Resolves the voter's key first, so a voter with no resolvable key fails
+/// with `UnknownVoter` before anyone is asked to sign.
+///
+/// # Errors
+///
+/// `UnknownVoter` when the voter's key does not resolve, or
+/// `SerializationFailed` when the vote type cannot be serialized.
+pub(super) fn vote_sign_digest(
+    key_resolver: &KeyResolver,
+    proposal_id: &ProposalId,
+    voter: &DID,
+    vote: &VoteType,
+    context: &GovernanceContext,
+) -> Result<[u8; 32], GovernanceError> {
+    resolve_voter_key(key_resolver, voter)?;
+    vote_signing_digest(proposal_id, voter.as_ref(), vote, context.now)
+}
+
+/// Checks that `vote` is `voter`'s `expected` vote on `proposal_id`, cast at
+/// `context.now`, and that its signature verifies against the voter's
+/// `#active` key.
+///
+/// # Errors
+///
+/// `InvalidSignature` when the voter, the vote or the timestamp differs from
+/// the call, or when the signature does not verify; `UnknownVoter` when the
+/// voter's key does not resolve.
+pub(super) fn check_signed_vote(
+    key_resolver: &KeyResolver,
+    proposal_id: &ProposalId,
+    voter: &DID,
+    expected: &VoteType,
+    context: &GovernanceContext,
+    vote: &SignedVote,
+) -> Result<(), GovernanceError> {
+    let invalid = || GovernanceError::InvalidSignature {
+        voter_did: voter.to_string(),
+        proposal_id: hex::encode(proposal_id),
+    };
+    if vote.voter_did != *voter || vote.vote != *expected || vote.timestamp != context.now {
+        return Err(invalid());
+    }
+    let key = resolve_voter_key(key_resolver, voter)?;
+    verify_vote(proposal_id, vote, &key).map_err(|_| invalid())
+}
+
+/// Checks that a proposer vote is present exactly when the engine's
+/// [`ProposeIntent`] asks for one, and returns it.
+///
+/// # Errors
+///
+/// `ProposerVoteMismatch` when the presence differs from the intent.
+pub(super) fn proposer_vote_for(
+    intent: &ProposeIntent,
+    proposer_vote: Option<SignedVote>,
+) -> Result<Option<SignedVote>, GovernanceError> {
+    let expected_signed = matches!(intent, ProposeIntent::SignApproval { .. });
+    if expected_signed == proposer_vote.is_some() {
+        Ok(proposer_vote)
+    } else {
+        Err(GovernanceError::ProposerVoteMismatch { expected_signed })
+    }
+}
+
+/// The proposal id for `proposer`'s `action` at `context.now`.
+///
+/// RFC 8785 JCS canonical serialization makes the id deterministic across
+/// every SDK language (§9.5.2); see [`compute_proposal_id`].
+///
+/// # Errors
+///
+/// `SerializationFailed` when the action cannot be serialized.
+pub(super) fn proposal_id_for(
+    proposer: &DID,
+    action: &GovernanceAction,
+    context: &GovernanceContext,
+) -> Result<ProposalId, GovernanceError> {
+    let action_bytes = crate::jcs::to_vec(action).map_err(GovernanceError::SerializationFailed)?;
+    Ok(compute_proposal_id(
+        &context.context_id,
+        proposer,
+        &action_bytes,
+        context.now,
+    ))
 }
 
 /// Verifies the Ed25519 signature on a signed vote.
 ///
 /// Recomputes the canonical hash from the vote's fields using the same
-/// domain separator and layout as [`sign_vote`], then verifies the
+/// domain separator and layout as [`vote_signing_digest`], then verifies the
 /// signature against the provided public key.
 ///
 /// # Errors
@@ -250,7 +377,7 @@ pub fn verify_vote(
     vote: &SignedVote,
     voter_public_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<(), GovernanceError> {
-    let hash = compute_vote_hash(
+    let hash = vote_signing_digest(
         proposal_id,
         vote.voter_did.as_ref(),
         &vote.vote,
@@ -781,6 +908,19 @@ pub enum GovernanceAction {
         /// The new hard rate limit configuration.
         new_config: HardRateLimitConfig,
     },
+    /// Replace the context's capability requirements (spec 07 §7.3.4.4): the
+    /// capabilities an agent must hold, the verification level each needs,
+    /// and the challengers whose records count.
+    ///
+    /// The list is a Class-S governance field (ADR-049 §9). A replacement
+    /// that only restricts admission
+    /// ([`CapabilityRequirements::is_tightening_of`](crate::trust::CapabilityRequirements::is_tightening_of))
+    /// stays in force if its persist fails; any other replacement takes
+    /// effect only once it is durable.
+    ModifyCapabilityRequirements {
+        /// The complete new list. It replaces the current one.
+        requirements: crate::trust::CapabilityRequirements,
+    },
     /// Set, change or remove the context's pseudonym rotation policy
     /// (`ContextParams.pseudonym_rotation`, 09-security-model.md §9.10.4.1;
     /// ADR-031 amendment of 2026-10-12).
@@ -830,6 +970,7 @@ impl GovernanceAction {
             Self::ProposeContextMigration { .. } => "ProposeContextMigration",
             Self::CancelContextMigration => "CancelContextMigration",
             Self::ModifyHardRateLimit { .. } => "ModifyHardRateLimit",
+            Self::ModifyCapabilityRequirements { .. } => "ModifyCapabilityRequirements",
             Self::ModifyPseudonymRotationPolicy { .. } => "ModifyPseudonymRotationPolicy",
         }
     }
@@ -889,6 +1030,7 @@ impl GovernanceAction {
             | Self::ProposeContextMigration { .. }
             | Self::CancelContextMigration
             | Self::ModifyHardRateLimit { .. }
+            | Self::ModifyCapabilityRequirements { .. }
             | Self::ModifyPseudonymRotationPolicy { .. } => false,
         }
     }
@@ -980,6 +1122,7 @@ impl GovernanceAction {
             | Self::ProposeContextMigration { .. }
             | Self::CancelContextMigration
             | Self::ModifyHardRateLimit { .. }
+            | Self::ModifyCapabilityRequirements { .. }
             | Self::ModifyPseudonymRotationPolicy { .. } => None,
         }
     }
@@ -1014,25 +1157,78 @@ pub struct SignedVote {
     pub signature: Ed25519Signature,
 }
 
-/// Outcome of an engine's pre-vote guard checks (`precheck_vote`).
+/// Outcome of an engine's pre-vote guard checks (`guard_vote`).
 ///
 /// The guard checks (eligibility, proposal existence, pending state, deadline,
 /// single-vote dedup) run **before** any signing or signature verification, so
 /// that a double vote is caught as `AlreadyVoted` regardless of which key signed
 /// it. Most engines only ever return [`Proceed`](PrecheckOutcome::Proceed) from
-/// a successful precheck. The majority engine additionally short-circuits a
+/// a successful guard. The majority engine additionally short-circuits a
 /// past-deadline vote by auto-resolving the proposal **without recording a vote
 /// and without signing** — that case is carried by
 /// [`Resolved`](PrecheckOutcome::Resolved) so the caller returns the resolution
 /// directly.
 pub(super) enum PrecheckOutcome {
-    /// Guards passed; the caller should build, sign, and verify the vote,
-    /// then call `push_and_resolve`.
+    /// Guards passed; the vote may be signed, verified and recorded.
     Proceed,
-    /// The proposal was auto-resolved during precheck (majority past-deadline).
+    /// The proposal was auto-resolved during the guard (majority past-deadline).
     /// The caller returns this status and its events directly, recording no
     /// vote and performing no signing or verification.
     Resolved((ProposalStatus, Vec<GovernanceEvent>)),
+}
+
+/// What [`GovernanceEngine::precheck_propose`] asks of the proposer before
+/// [`GovernanceEngine::propose_signed`] records the proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposeIntent {
+    /// The proposer signs `digest`, its implicit approval of `proposal_id` at
+    /// `timestamp`, and passes the [`signed_vote`] to `propose_signed`.
+    /// `SingleAdmin`, `Threshold` and `Unanimity` ask for it.
+    SignApproval {
+        /// The id the proposal will carry.
+        proposal_id: ProposalId,
+        /// The vote's timestamp, the governance context's `now`.
+        timestamp: u64,
+        /// [`vote_signing_digest`] of the proposer's approval.
+        digest: [u8; 32],
+    },
+    /// The proposer casts no vote; `propose_signed` takes `None`. `Majority`
+    /// asks for it.
+    NoSignature {
+        /// The id the proposal will carry.
+        proposal_id: ProposalId,
+    },
+}
+
+impl ProposeIntent {
+    /// The id the proposal will carry.
+    #[must_use]
+    pub const fn proposal_id(&self) -> ProposalId {
+        match self {
+            Self::SignApproval { proposal_id, .. } | Self::NoSignature { proposal_id } => {
+                *proposal_id
+            }
+        }
+    }
+}
+
+/// What [`GovernanceEngine::precheck_vote`] asks of the voter.
+#[derive(Debug, Clone)]
+pub enum VoteIntent {
+    /// The voter signs `digest`, its vote at `timestamp`, and passes the
+    /// [`signed_vote`] to `approve_signed` or `reject_signed`.
+    Sign {
+        /// The vote's timestamp, the governance context's `now`.
+        timestamp: u64,
+        /// [`vote_signing_digest`] of the vote.
+        digest: [u8; 32],
+    },
+    /// The precheck resolved the proposal (`Majority` past its deadline). No
+    /// vote is recorded and nothing is signed; the caller applies this result.
+    Resolved(ProposalStatus, Vec<GovernanceEvent>),
+    /// The vote changes nothing (`SingleAdmin`, where proposing already
+    /// resolved the proposal); nothing is signed.
+    NoOp(ProposalStatus),
 }
 
 // ---------------------------------------------------------------------------
@@ -1298,6 +1494,17 @@ pub enum GovernanceError {
         proposal_id: String,
     },
 
+    /// A proposal arrived with a proposer vote where the governance model
+    /// casts none, or without one where the model casts the proposer's
+    /// implicit approval.
+    #[error(
+        "proposer vote presence does not match the governance model (expected signed: {expected_signed})"
+    )]
+    ProposerVoteMismatch {
+        /// Whether the model expects a signed proposer vote.
+        expected_signed: bool,
+    },
+
     /// The voter's DID could not be resolved to a public key.
     ///
     /// The key resolver returned `None` for this DID, meaning the voter's
@@ -1415,76 +1622,133 @@ pub enum GovernanceEvent {
 ///
 /// # Contract
 ///
-/// - `propose()` creates a new proposal. In single-admin mode, this
-///   simultaneously approves it. In multi-admin modes, it opens voting.
-/// - `approve()` casts an approval vote on a pending proposal.
-/// - `reject()` casts a rejection vote on a pending proposal.
+/// The engine signs nothing (ADR-049 Decision 7a). Each operation that needs
+/// a vote is split in two: a precheck that runs every guard and returns the
+/// digest to sign, and a `*_signed` method that takes the caller's signature
+/// in, re-runs the guards, checks the vote against the call, verifies it, and
+/// records it.
+///
+/// - `precheck_propose()` then `propose_signed()` create a new proposal. In
+///   single-admin mode, this simultaneously approves it. In multi-admin
+///   modes, it opens voting.
+/// - `precheck_vote()` then `approve_signed()` cast an approval vote on a
+///   pending proposal.
+/// - `precheck_vote()` then `reject_signed()` cast a rejection vote on a
+///   pending proposal.
 /// - All methods return the resulting events for Merkle log recording.
 pub trait GovernanceEngine: Send + Sync {
-    /// Submit a new governance proposal. Returns the proposal and events.
+    /// Run every check `propose_signed` runs for `proposer`'s `action`,
+    /// without recording anything, and say whether the proposer signs.
     ///
     /// The proposer must hold `GovernancePropose` capability (UCAN-validated).
-    /// In single-admin mode, the proposal is auto-approved if the proposer is
-    /// the admin. The signing key is used to produce an Ed25519 signature over
-    /// the proposer's implicit approval vote.
+    /// The caller computes `context` once and passes the same value to
+    /// [`propose_signed`](Self::propose_signed): the proposal id and the
+    /// proposer's vote timestamp both bind `context.now`.
     ///
     /// # Errors
     ///
-    /// Returns [`GovernanceError`] if the proposer lacks authority (e.g.,
-    /// `NotAdmin` in single-admin mode) or if serialization fails.
-    fn propose(
+    /// Returns [`GovernanceError`] if the proposer lacks authority (`NotAdmin`
+    /// in single-admin mode, `NotEligible` in the voting modes), the action
+    /// cannot be serialized, the proposal already exists, or the proposer's
+    /// key does not resolve (`UnknownVoter`) where the model asks for a
+    /// signed approval.
+    fn precheck_propose(
+        &self,
+        proposer: &DID,
+        action: &GovernanceAction,
+        context: &GovernanceContext,
+    ) -> Result<ProposeIntent, GovernanceError>;
+
+    /// Record `proposer`'s proposal. Returns the proposal and events.
+    ///
+    /// Re-runs [`precheck_propose`](Self::precheck_propose). `proposer_vote`
+    /// is the proposer's implicit approval, signed over the digest the
+    /// precheck returned; it is `Some` exactly when the precheck returned
+    /// [`ProposeIntent::SignApproval`]. In single-admin mode the proposal is
+    /// approved at once.
+    ///
+    /// # Errors
+    ///
+    /// Every [`precheck_propose`](Self::precheck_propose) error;
+    /// `ProposerVoteMismatch` when the vote's presence differs from the
+    /// model's; `InvalidSignature` when the vote's voter, vote type or
+    /// timestamp differs from the call, or its signature does not verify.
+    fn propose_signed(
         &mut self,
         proposer: &DID,
         action: GovernanceAction,
         context: &GovernanceContext,
-        signing_key: &ed25519_dalek::SigningKey,
+        proposer_vote: Option<SignedVote>,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError>;
 
     /// Refuse a proposer this engine does not let propose, without recording
-    /// anything. `propose` runs this same check before any other, so a caller
-    /// that must refuse an ineligible proposer before validating the action
-    /// payload calls it first.
+    /// anything. `precheck_propose` runs this same check before any other, so
+    /// a caller that must refuse an ineligible proposer before validating the
+    /// action payload calls it first.
     ///
     /// # Errors
     ///
-    /// Returns the error `propose` would return for this proposer: `NotAdmin`
-    /// in single-admin mode, `NotEligible` in the voting modes.
+    /// Returns the error `precheck_propose` would return for this proposer:
+    /// `NotAdmin` in single-admin mode, `NotEligible` in the voting modes.
     fn check_proposer(&self, proposer: &DID) -> Result<(), GovernanceError>;
 
-    /// Cast an approval vote on a pending proposal.
+    /// Run the vote guards for `voter`'s `vote`, and say what the voter signs.
     ///
-    /// The voter must hold `GovernanceVote` capability (UCAN-validated).
-    /// The signing key produces an Ed25519 signature over the vote content.
-    /// Returns the updated proposal status and any events produced.
+    /// The voter must hold `GovernanceVote` capability (UCAN-validated). The
+    /// guards run in the engine's fixed order, and the voter's key resolves
+    /// last, so neither an ineligible nor an unknown voter is asked to sign.
+    /// Takes `&mut self` because a majority vote past the deadline resolves
+    /// the proposal here ([`VoteIntent::Resolved`]).
     ///
     /// # Errors
     ///
-    /// Returns [`GovernanceError`] if the proposal is not found, the voter is
-    /// not eligible, or the voter has already voted.
-    fn approve(
+    /// Returns [`GovernanceError`] if the voter is not eligible, the proposal
+    /// is not found or not pending, the voting window has closed, the voter
+    /// has already voted, or the voter's key does not resolve.
+    fn precheck_vote(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        vote: &VoteType,
+        context: &GovernanceContext,
+    ) -> Result<VoteIntent, GovernanceError>;
+
+    /// Record `voter`'s signed approval of a pending proposal.
+    ///
+    /// Re-runs the vote guards, then checks that `vote` is `voter`'s approval
+    /// at `context.now` and that its signature verifies against the voter's
+    /// key, before the vote counts. Returns the updated proposal status and
+    /// any events produced.
+    ///
+    /// # Errors
+    ///
+    /// Every [`precheck_vote`](Self::precheck_vote) error, and
+    /// `InvalidSignature` when the vote does not match the call or does not
+    /// verify.
+    fn approve_signed(
         &mut self,
         proposal_id: &ProposalId,
         voter: &DID,
         context: &GovernanceContext,
-        signing_key: &ed25519_dalek::SigningKey,
+        vote: SignedVote,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError>;
 
-    /// Cast a rejection vote on a pending proposal.
+    /// Record `voter`'s signed rejection of a pending proposal.
     ///
-    /// The voter must hold `GovernanceVote` capability (UCAN-validated).
-    /// The signing key produces an Ed25519 signature over the vote content.
-    /// Returns the updated proposal status and any events produced.
+    /// The checks match [`approve_signed`](Self::approve_signed), with
+    /// [`VoteType::Reject`] as the expected vote.
     ///
     /// # Errors
     ///
-    /// Returns [`GovernanceError`] if the proposal is not found, the voter is
-    /// not eligible, or the voter has already voted.
-    fn reject(
+    /// Every [`precheck_vote`](Self::precheck_vote) error, and
+    /// `InvalidSignature` when the vote does not match the call or does not
+    /// verify.
+    fn reject_signed(
         &mut self,
         proposal_id: &ProposalId,
         voter: &DID,
         context: &GovernanceContext,
-        signing_key: &ed25519_dalek::SigningKey,
+        vote: SignedVote,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError>;
 
     /// Withdraw a previously cast vote on a pending proposal.
@@ -1645,6 +1909,94 @@ pub trait GovernanceEngine: Send + Sync {
     ) -> Result<CheckpointAttestationStatus, GovernanceError>;
 }
 
+/// Raw-key `propose`, `approve` and `reject` over any [`GovernanceEngine`],
+/// for tests.
+///
+/// Each method runs the engine's precheck, signs the digest it returns with
+/// `signing_key`, and passes the vote to the matching `*_signed` method, so a
+/// test drives the same checks production does. Production signs through a
+/// custody signer in the actor turn and never holds the key (ADR-049
+/// Decision 7a).
+#[cfg(any(test, feature = "testing"))]
+pub trait GovernanceEngineRawKey: GovernanceEngine {
+    /// Propose `action` as `proposer`, signing any approval with `signing_key`.
+    ///
+    /// # Errors
+    ///
+    /// Every [`GovernanceEngine::propose_signed`] error.
+    fn propose(
+        &mut self,
+        proposer: &DID,
+        action: GovernanceAction,
+        context: &GovernanceContext,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
+        let proposer_vote = match self.precheck_propose(proposer, &action, context)? {
+            ProposeIntent::SignApproval {
+                timestamp, digest, ..
+            } => Some(signed_vote(
+                &VoteType::Approve,
+                proposer,
+                timestamp,
+                ed25519_dalek::Signer::sign(signing_key, &digest).to_bytes(),
+            )),
+            ProposeIntent::NoSignature { .. } => None,
+        };
+        self.propose_signed(proposer, action, context, proposer_vote)
+    }
+
+    /// Approve `proposal_id` as `voter`, signing with `signing_key`.
+    ///
+    /// # Errors
+    ///
+    /// Every [`GovernanceEngine::approve_signed`] error.
+    fn approve(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        let vote = VoteType::Approve;
+        match self.precheck_vote(proposal_id, voter, &vote, context)? {
+            VoteIntent::Sign { timestamp, digest } => {
+                let sig = ed25519_dalek::Signer::sign(signing_key, &digest).to_bytes();
+                let signed = signed_vote(&vote, voter, timestamp, sig);
+                self.approve_signed(proposal_id, voter, context, signed)
+            }
+            VoteIntent::Resolved(status, events) => Ok((status, events)),
+            VoteIntent::NoOp(status) => Ok((status, Vec::new())),
+        }
+    }
+
+    /// Reject `proposal_id` as `voter`, signing with `signing_key`.
+    ///
+    /// # Errors
+    ///
+    /// Every [`GovernanceEngine::reject_signed`] error.
+    fn reject(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        context: &GovernanceContext,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        let vote = VoteType::Reject;
+        match self.precheck_vote(proposal_id, voter, &vote, context)? {
+            VoteIntent::Sign { timestamp, digest } => {
+                let sig = ed25519_dalek::Signer::sign(signing_key, &digest).to_bytes();
+                let signed = signed_vote(&vote, voter, timestamp, sig);
+                self.reject_signed(proposal_id, voter, context, signed)
+            }
+            VoteIntent::Resolved(status, events) => Ok((status, events)),
+            VoteIntent::NoOp(status) => Ok((status, Vec::new())),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl<E: GovernanceEngine + ?Sized> GovernanceEngineRawKey for E {}
+
 // ---------------------------------------------------------------------------
 // SingleAdminEngine
 // ---------------------------------------------------------------------------
@@ -1695,62 +2047,94 @@ impl SingleAdminEngine {
     pub fn transfer_admin(&mut self, new_admin: DID) {
         self.admin_did = new_admin;
     }
+
+    /// The vote guards: the proposal exists (`ProposalNotFound`), then only
+    /// the admin may act (`NotEligible`). Returns the proposal's status.
+    fn guard_vote(
+        &self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        let proposal =
+            self.proposals
+                .get(proposal_id)
+                .ok_or_else(|| GovernanceError::ProposalNotFound {
+                    id: hex::encode(proposal_id),
+                })?;
+        if *voter != self.admin_did {
+            return Err(GovernanceError::NotEligible(
+                "only the admin can act in single-admin governance".to_owned(),
+            ));
+        }
+        Ok(proposal.status.clone())
+    }
+
+    /// Single-admin governance asks for no signed vote
+    /// ([`VoteIntent::NoOp`]), so a signed vote is refused after the guards
+    /// rather than ignored.
+    fn refuse_signed_vote(
+        &self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
+        self.guard_vote(proposal_id, voter)?;
+        Err(GovernanceError::OperationNotSupported(
+            "single-admin governance records no signed votes; proposing resolved the proposal"
+                .to_owned(),
+        ))
+    }
 }
 
 impl GovernanceEngine for SingleAdminEngine {
-    fn propose(
+    fn precheck_propose(
+        &self,
+        proposer: &DID,
+        action: &GovernanceAction,
+        context: &GovernanceContext,
+    ) -> Result<ProposeIntent, GovernanceError> {
+        self.check_proposer(proposer)?;
+        let proposal_id = proposal_id_for(proposer, action, context)?;
+        if self.proposals.contains_key(&proposal_id) {
+            return Err(GovernanceError::DuplicateProposal(hex::encode(proposal_id)));
+        }
+        // The admin's implicit approval is signed; its key resolves before
+        // anyone is asked to sign.
+        let digest = vote_sign_digest(
+            &self.key_resolver,
+            &proposal_id,
+            proposer,
+            &VoteType::Approve,
+            context,
+        )?;
+        Ok(ProposeIntent::SignApproval {
+            proposal_id,
+            timestamp: context.now,
+            digest,
+        })
+    }
+
+    fn propose_signed(
         &mut self,
         proposer: &DID,
         action: GovernanceAction,
         context: &GovernanceContext,
-        signing_key: &ed25519_dalek::SigningKey,
+        proposer_vote: Option<SignedVote>,
     ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), GovernanceError> {
-        self.check_proposer(proposer)?;
-
-        // RFC 8785 JCS canonical serialization for cross-implementation
-        // deterministic proposal ID computation (§9.5.2). JCS (not
-        // MessagePack) because GovernanceAction is a complex enum that must
-        // hash identically across all SDK languages. See
-        // compute_proposal_id() doc comment.
-        let action_bytes =
-            crate::jcs::to_vec(&action).map_err(GovernanceError::SerializationFailed)?;
-
-        let proposal_id =
-            compute_proposal_id(&context.context_id, proposer, &action_bytes, context.now);
-
-        // Reject duplicate proposals before constructing events.
-        if self.proposals.contains_key(&proposal_id) {
-            return Err(GovernanceError::DuplicateProposal(hex::encode(proposal_id)));
-        }
-
-        // Sign the proposer's implicit approval vote.
-        let admin_vote = sign_vote(
-            &proposal_id,
-            &VoteType::Approve,
-            proposer.as_ref(),
-            context.now,
-            signing_key,
+        let intent = self.precheck_propose(proposer, &action, context)?;
+        let proposal_id = intent.proposal_id();
+        let admin_vote = proposer_vote_for(&intent, proposer_vote)?.ok_or(
+            GovernanceError::ProposerVoteMismatch {
+                expected_signed: true,
+            },
         )?;
-
-        // Verify the admin's vote signature against their DID-resolved key.
-        // Votes resolve `#active` (the human signing key) today: governance is
-        // a human-accountability surface and ADR-039 scopes one-DID-one-vote to
-        // the person, not the agent key. Per-VM vote signing (`#agent` casting
-        // votes within permission scope) is deferred per ADR-039 §Governance;
-        // when it lands, this and the other vote-resolution sites switch to the
-        // envelope/credential-declared `SigningKeyId`.
-        let resolved_key =
-            (self.key_resolver)(proposer, SigningKeyId::Active).ok_or_else(|| {
-                GovernanceError::UnknownVoter {
-                    did: proposer.to_string(),
-                }
-            })?;
-        verify_vote(&proposal_id, &admin_vote, &resolved_key).map_err(|_| {
-            GovernanceError::InvalidSignature {
-                voter_did: proposer.to_string(),
-                proposal_id: hex::encode(proposal_id),
-            }
-        })?;
+        check_signed_vote(
+            &self.key_resolver,
+            &proposal_id,
+            proposer,
+            &VoteType::Approve,
+            context,
+            &admin_vote,
+        )?;
 
         // In single-admin mode, the proposal is immediately approved.
         let proposal = GovernanceProposal {
@@ -1798,56 +2182,37 @@ impl GovernanceEngine for SingleAdminEngine {
         }
     }
 
-    fn approve(
+    fn precheck_vote(
+        &mut self,
+        proposal_id: &ProposalId,
+        voter: &DID,
+        _vote: &VoteType,
+        _context: &GovernanceContext,
+    ) -> Result<VoteIntent, GovernanceError> {
+        // Proposing already resolved the proposal; a vote changes nothing and
+        // signs nothing.
+        Ok(VoteIntent::NoOp(self.guard_vote(proposal_id, voter)?))
+    }
+
+    fn approve_signed(
         &mut self,
         proposal_id: &ProposalId,
         voter: &DID,
         _context: &GovernanceContext,
-        _signing_key: &ed25519_dalek::SigningKey,
+        _vote: SignedVote,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        let proposal =
-            self.proposals
-                .get(proposal_id)
-                .ok_or_else(|| GovernanceError::ProposalNotFound {
-                    id: hex::encode(proposal_id),
-                })?;
-
-        // In single-admin mode, only the admin can interact.
-        if *voter != self.admin_did {
-            return Err(GovernanceError::NotEligible(
-                "only the admin can act in single-admin governance".to_owned(),
-            ));
-        }
-
-        // Proposal is already resolved; return current status (no-op).
-        Ok((proposal.status.clone(), Vec::new()))
+        self.refuse_signed_vote(proposal_id, voter)
     }
 
-    fn reject(
+    fn reject_signed(
         &mut self,
         proposal_id: &ProposalId,
         voter: &DID,
         _context: &GovernanceContext,
-        _signing_key: &ed25519_dalek::SigningKey,
+        _vote: SignedVote,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
-        let proposal =
-            self.proposals
-                .get(proposal_id)
-                .ok_or_else(|| GovernanceError::ProposalNotFound {
-                    id: hex::encode(proposal_id),
-                })?;
-
-        // In single-admin mode, only the admin can interact.
-        if *voter != self.admin_did {
-            return Err(GovernanceError::NotEligible(
-                "only the admin can act in single-admin governance".to_owned(),
-            ));
-        }
-
-        // Proposal is already resolved; return current status (no-op).
-        Ok((proposal.status.clone(), Vec::new()))
+        self.refuse_signed_vote(proposal_id, voter)
     }
-
     fn model_config(&self) -> GovernanceModelConfig {
         GovernanceModelConfig::SingleAdmin {
             admin_did: self.admin_did.clone(),
@@ -1956,9 +2321,9 @@ pub fn actions_conflict(
     proposer_b: &DID,
 ) -> bool {
     use GovernanceAction::{
-        AddSigner, ChangeRole, ModifyCeiling, ModifyPruningPolicy, ModifyThreshold,
-        ReconfigureGovernance, RemoveMember, RemoveSigner, ResetMember, RestoreAccess,
-        RevokeAccess, RotateContentKeys, SuspendAccess, SuspendCapability,
+        AddSigner, ChangeRole, ModifyCapabilityRequirements, ModifyCeiling, ModifyPruningPolicy,
+        ModifyThreshold, ReconfigureGovernance, RemoveMember, RemoveSigner, ResetMember,
+        RestoreAccess, RevokeAccess, RotateContentKeys, SuspendAccess, SuspendCapability,
     };
 
     // Canonical conflict matrix. The sync module's `actions_conflict`
@@ -1983,6 +2348,7 @@ pub fn actions_conflict(
         (ModifyCeiling { .. }, ModifyCeiling { .. })
         | (ModifyThreshold { .. }, ModifyThreshold { .. })
         | (ModifyPruningPolicy { .. }, ModifyPruningPolicy { .. })
+        | (ModifyCapabilityRequirements { .. }, ModifyCapabilityRequirements { .. })
         | (ReconfigureGovernance { .. }, ReconfigureGovernance { .. })
         // Concurrent context-wide key rotations conflict (global property mutation).
         | (RotateContentKeys { .. }, RotateContentKeys { .. }) => true,
@@ -3787,7 +4153,7 @@ mod tests {
     }
 
     /// §25.5 Vector 7: the vote canonical hash, computed by the production
-    /// `compute_vote_hash` over the spec inputs. The voter is the §25.1
+    /// `vote_signing_digest` over the spec inputs. The voter is the §25.1
     /// fixture identifier voter. The integration test
     /// `vector_7_vote_signature` in `scp-runtime/tests/test_vectors.rs`
     /// asserts the P-256 signature over this hash.
@@ -3798,7 +4164,7 @@ mod tests {
                 .unwrap()
                 .try_into()
                 .unwrap();
-        let hash = compute_vote_hash(
+        let hash = vote_signing_digest(
             &proposal_id,
             "scp:bbxkpyevxkco6odwvddqgluf3ug2a3qj3lacn4olgxtpshuk4a6a",
             &VoteType::Approve,
@@ -3810,5 +4176,520 @@ mod tests {
             "3a0c35742f6ddd8c3a935f924ede5ca85ad905c1312ca99e18eb618223769c67",
             "§25.5 Vector 7 canonical hash drift"
         );
+    }
+
+    /// Signature-in engine contract (ADR-049 Decision 7a), across all four
+    /// governance engines: the precheck guard order, the checks every `*_signed`
+    /// method runs on a caller-signed vote, the proposer-vote presence rule, and
+    /// byte identity between the raw-key test path and the signed path.
+    mod signature_in {
+        use std::sync::Arc;
+
+        use ed25519_dalek::{Signer, SigningKey};
+
+        use crate::context::governance::majority::MajorityVoteEngine;
+        use crate::context::governance::multisig::ThresholdEngine;
+        use crate::context::governance::unanimity::UnanimityEngine;
+        use crate::context::governance::*;
+
+        const NOW: u64 = 1_700_000_000;
+        const WINDOW: u64 = 86_400;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Model {
+            SingleAdmin,
+            Threshold,
+            Majority,
+            Unanimity,
+        }
+
+        const ALL: [Model; 4] = [
+            Model::SingleAdmin,
+            Model::Threshold,
+            Model::Majority,
+            Model::Unanimity,
+        ];
+        const VOTING: [Model; 3] = [Model::Threshold, Model::Majority, Model::Unanimity];
+        const SIGN_APPROVAL: [Model; 3] = [Model::SingleAdmin, Model::Threshold, Model::Unanimity];
+
+        fn did(n: u8) -> DID {
+            DID::from(format!("did:dht:z6MkVoter{n}"))
+        }
+
+        fn sk(n: u8) -> SigningKey {
+            SigningKey::from_bytes(&[n; 32])
+        }
+
+        /// Resolves voters 1 through 4; voter 5 is eligible but has no key.
+        fn resolver() -> KeyResolver {
+            Arc::new(|d: &DID, _kid: SigningKeyId| {
+                (1..=4u8)
+                    .find(|n| did(*n) == *d)
+                    .map(|n| sk(n).verifying_key())
+            })
+        }
+
+        fn voters() -> Vec<DID> {
+            (1..=5u8).map(did).collect()
+        }
+
+        fn ctx(now: u64) -> GovernanceContext {
+            GovernanceContext {
+                context_id: "ctx-signature-in".to_owned(),
+                members: voters()
+                    .into_iter()
+                    .map(|d| (d, "member".to_owned()))
+                    .collect(),
+                admin_dids: vec![did(1)],
+                current_epoch: Some(1),
+                now,
+            }
+        }
+
+        /// Voter 1 administers `SingleAdmin`; the voting models admit voters 1-5.
+        /// Threshold needs 3 approvals and Majority 3 of 5, so one approval leaves a
+        /// proposal pending in every voting model.
+        fn engine(model: Model) -> Box<dyn GovernanceEngine> {
+            match model {
+                Model::SingleAdmin => Box::new(SingleAdminEngine::new(did(1), resolver())),
+                Model::Threshold => {
+                    Box::new(ThresholdEngine::new(voters(), 3, WINDOW, resolver()).unwrap())
+                }
+                Model::Majority => {
+                    Box::new(MajorityVoteEngine::new(voters(), WINDOW, 5000, resolver()).unwrap())
+                }
+                Model::Unanimity => {
+                    Box::new(UnanimityEngine::new(voters(), WINDOW, resolver()).unwrap())
+                }
+            }
+        }
+
+        fn action() -> GovernanceAction {
+            GovernanceAction::AddMember {
+                did: DID::from("did:dht:z6MkNewbie"),
+                role: "member".to_owned(),
+            }
+        }
+
+        /// An action whose canonical bytes would also stand for another number
+        /// is refused before any proposer signs its digest.
+        #[test]
+        fn an_action_number_beyond_2_53_is_refused_before_signing() {
+            let action = GovernanceAction::ExtendTtl {
+                additional_secs: (1u64 << 53) + 1,
+            };
+            for model in ALL {
+                let r = engine(model).precheck_propose(&did(1), &action, &ctx(NOW));
+                assert!(
+                    matches!(&r, Err(GovernanceError::SerializationFailed(m)) if m.contains("2^53")),
+                    "{model:?}: {r:?}"
+                );
+            }
+        }
+
+        fn sign(n: u8, digest: &[u8; 32]) -> [u8; 64] {
+            sk(n).sign(digest).to_bytes()
+        }
+
+        /// Proposes as voter 1 through the signed path; returns the proposal id.
+        fn propose(e: &mut dyn GovernanceEngine) -> ProposalId {
+            let c = ctx(NOW);
+            let vote = match e.precheck_propose(&did(1), &action(), &c).unwrap() {
+                ProposeIntent::SignApproval {
+                    timestamp, digest, ..
+                } => Some(signed_vote(
+                    &VoteType::Approve,
+                    &did(1),
+                    timestamp,
+                    sign(1, &digest),
+                )),
+                ProposeIntent::NoSignature { .. } => None,
+            };
+            e.propose_signed(&did(1), action(), &c, vote)
+                .unwrap()
+                .0
+                .proposal_id
+        }
+
+        /// The vote tallies and status, to show a refused call changed nothing.
+        fn snapshot(e: &dyn GovernanceEngine, pid: &ProposalId) -> (usize, usize, ProposalStatus) {
+            let p = e.get_proposal(pid).unwrap();
+            (p.approvals.len(), p.rejections.len(), p.status.clone())
+        }
+
+        fn assert_invalid_signature(
+            r: &Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError>,
+        ) {
+            assert!(
+                matches!(r, Err(GovernanceError::InvalidSignature { .. })),
+                "expected InvalidSignature, got {r:?}"
+            );
+        }
+
+        /// Voter 2's correct approval digest on `pid` at `NOW`.
+        fn approval_digest(pid: &ProposalId) -> [u8; 32] {
+            vote_signing_digest(pid, did(2).as_ref(), &VoteType::Approve, NOW).unwrap()
+        }
+
+        #[test]
+        fn signed_vote_wrong_voter_rejected() {
+            for model in VOTING {
+                let mut e = engine(model);
+                let pid = propose(e.as_mut());
+                let before = snapshot(e.as_ref(), &pid);
+                // Voter 2 signs an approval naming voter 3 and passes it on its
+                // own call. The signature verifies under voter 2's key, so only
+                // the voter clause rejects it.
+                let d3 =
+                    vote_signing_digest(&pid, did(3).as_ref(), &VoteType::Approve, NOW).unwrap();
+                let vote = signed_vote(&VoteType::Approve, &did(3), NOW, sign(2, &d3));
+                assert_invalid_signature(&e.approve_signed(&pid, &did(2), &ctx(NOW), vote));
+                assert_eq!(snapshot(e.as_ref(), &pid), before, "{model:?}");
+            }
+        }
+
+        #[test]
+        fn signed_vote_wrong_vote_type_rejected() {
+            for model in VOTING {
+                let mut e = engine(model);
+                let pid = propose(e.as_mut());
+                let before = snapshot(e.as_ref(), &pid);
+                // A validly signed rejection passed to approve_signed.
+                let d = vote_signing_digest(&pid, did(2).as_ref(), &VoteType::Reject, NOW).unwrap();
+                let vote = signed_vote(&VoteType::Reject, &did(2), NOW, sign(2, &d));
+                assert_invalid_signature(&e.approve_signed(&pid, &did(2), &ctx(NOW), vote));
+                // A validly signed approval passed to reject_signed.
+                let vote = signed_vote(
+                    &VoteType::Approve,
+                    &did(2),
+                    NOW,
+                    sign(2, &approval_digest(&pid)),
+                );
+                assert_invalid_signature(&e.reject_signed(&pid, &did(2), &ctx(NOW), vote));
+                assert_eq!(snapshot(e.as_ref(), &pid), before, "{model:?}");
+            }
+        }
+
+        #[test]
+        fn signed_vote_wrong_timestamp_rejected() {
+            for model in VOTING {
+                let mut e = engine(model);
+                let pid = propose(e.as_mut());
+                let before = snapshot(e.as_ref(), &pid);
+                // Validly signed at NOW - 1; the call's context says NOW.
+                let d = vote_signing_digest(&pid, did(2).as_ref(), &VoteType::Approve, NOW - 1)
+                    .unwrap();
+                let vote = signed_vote(&VoteType::Approve, &did(2), NOW - 1, sign(2, &d));
+                assert_invalid_signature(&e.approve_signed(&pid, &did(2), &ctx(NOW), vote));
+                assert_eq!(snapshot(e.as_ref(), &pid), before, "{model:?}");
+            }
+        }
+
+        #[test]
+        fn signed_vote_bad_signature_rejected() {
+            for model in VOTING {
+                let mut e = engine(model);
+                let pid = propose(e.as_mut());
+                let before = snapshot(e.as_ref(), &pid);
+                // The right fields, signed by the wrong key.
+                let vote = signed_vote(
+                    &VoteType::Approve,
+                    &did(2),
+                    NOW,
+                    sign(9, &approval_digest(&pid)),
+                );
+                assert_invalid_signature(&e.approve_signed(&pid, &did(2), &ctx(NOW), vote));
+                assert_eq!(snapshot(e.as_ref(), &pid), before, "{model:?}");
+            }
+        }
+
+        #[test]
+        fn propose_signed_rejects_a_mismatched_or_forged_proposer_vote() {
+            let c = ctx(NOW);
+            for model in SIGN_APPROVAL {
+                let ProposeIntent::SignApproval {
+                    proposal_id,
+                    digest,
+                    ..
+                } = engine(model)
+                    .precheck_propose(&did(1), &action(), &c)
+                    .unwrap()
+                else {
+                    panic!("{model:?} asks for a signed approval");
+                };
+                let d_reject =
+                    vote_signing_digest(&proposal_id, did(1).as_ref(), &VoteType::Reject, NOW)
+                        .unwrap();
+                let d_early =
+                    vote_signing_digest(&proposal_id, did(1).as_ref(), &VoteType::Approve, NOW - 1)
+                        .unwrap();
+                let d_other =
+                    vote_signing_digest(&proposal_id, did(2).as_ref(), &VoteType::Approve, NOW)
+                        .unwrap();
+                let bad = [
+                    signed_vote(&VoteType::Approve, &did(2), NOW, sign(2, &d_other)),
+                    signed_vote(&VoteType::Reject, &did(1), NOW, sign(1, &d_reject)),
+                    signed_vote(&VoteType::Approve, &did(1), NOW - 1, sign(1, &d_early)),
+                    signed_vote(&VoteType::Approve, &did(1), NOW, sign(9, &digest)),
+                ];
+                for vote in bad {
+                    let mut e = engine(model);
+                    let r = e.propose_signed(&did(1), action(), &c, Some(vote));
+                    assert!(
+                        matches!(r, Err(GovernanceError::InvalidSignature { .. })),
+                        "{model:?}: {r:?}"
+                    );
+                    // Verification runs before the proposal is inserted.
+                    assert!(e.get_proposal(&proposal_id).is_none(), "{model:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn propose_signed_none_where_signature_required_rejected() {
+            for model in SIGN_APPROVAL {
+                let mut e = engine(model);
+                let r = e.propose_signed(&did(1), action(), &ctx(NOW), None);
+                assert!(
+                    matches!(
+                        r,
+                        Err(GovernanceError::ProposerVoteMismatch {
+                            expected_signed: true
+                        })
+                    ),
+                    "{model:?}: {r:?}"
+                );
+                assert!(e.list_proposals().is_empty(), "{model:?}");
+            }
+        }
+
+        #[test]
+        fn propose_signed_some_where_no_signature_rejected() {
+            let mut e = engine(Model::Majority);
+            let c = ctx(NOW);
+            let ProposeIntent::NoSignature { proposal_id } =
+                e.precheck_propose(&did(1), &action(), &c).unwrap()
+            else {
+                panic!("majority asks for no proposer signature");
+            };
+            let d = vote_signing_digest(&proposal_id, did(1).as_ref(), &VoteType::Approve, NOW)
+                .unwrap();
+            let vote = signed_vote(&VoteType::Approve, &did(1), NOW, sign(1, &d));
+            let r = e.propose_signed(&did(1), action(), &c, Some(vote));
+            assert!(
+                matches!(
+                    r,
+                    Err(GovernanceError::ProposerVoteMismatch {
+                        expected_signed: false
+                    })
+                ),
+                "{r:?}"
+            );
+            assert!(e.list_proposals().is_empty());
+        }
+
+        /// Casts voter `n`'s approval through the signed path.
+        fn approve_as(e: &mut dyn GovernanceEngine, pid: &ProposalId, n: u8, now: u64) {
+            let c = ctx(now);
+            let VoteIntent::Sign { timestamp, digest } = e
+                .precheck_vote(pid, &did(n), &VoteType::Approve, &c)
+                .unwrap()
+            else {
+                panic!("expected a signing intent");
+            };
+            let vote = signed_vote(&VoteType::Approve, &did(n), timestamp, sign(n, &digest));
+            e.approve_signed(pid, &did(n), &c, vote).unwrap();
+        }
+
+        fn kind(r: &Result<VoteIntent, GovernanceError>) -> &'static str {
+            match r {
+                Ok(VoteIntent::Sign { .. }) => "Sign",
+                Ok(VoteIntent::Resolved(..)) => "Resolved",
+                Ok(VoteIntent::NoOp(_)) => "NoOp",
+                Err(GovernanceError::NotEligible(_)) => "NotEligible",
+                Err(GovernanceError::ProposalNotFound { .. }) => "ProposalNotFound",
+                Err(GovernanceError::ProposalNotPending { .. }) => "ProposalNotPending",
+                Err(GovernanceError::VotingWindowExpired { .. }) => "VotingWindowExpired",
+                Err(GovernanceError::AlreadyVoted) => "AlreadyVoted",
+                Err(GovernanceError::UnknownVoter { .. }) => "UnknownVoter",
+                Err(_) => "other",
+            }
+        }
+
+        /// Each case breaks two guards at once where it can, so the case pins which
+        /// one wins; the expected outcomes are the engines' order before the split.
+        #[test]
+        fn precheck_vote_guard_order_matches_today() {
+            let outsider = DID::from("did:dht:z6MkOutsider");
+            let missing: ProposalId = [0xEE; 32];
+            let late = NOW + WINDOW;
+            for model in VOTING {
+                let mut e = engine(model);
+                let pid = propose(e.as_mut());
+                // Voter 3 has voted (voter 1 has too in the signing models).
+                approve_as(e.as_mut(), &pid, 3, NOW);
+                let approve = VoteType::Approve;
+                let mut run = |p: &ProposalId, d: &DID, now: u64| {
+                    kind(&e.precheck_vote(p, d, &approve, &ctx(now)))
+                };
+                // NotEligible outranks ProposalNotFound.
+                assert_eq!(run(&missing, &outsider, NOW), "NotEligible", "{model:?}");
+                // ProposalNotFound outranks UnknownVoter.
+                assert_eq!(run(&missing, &did(5), NOW), "ProposalNotFound", "{model:?}");
+                // AlreadyVoted outranks UnknownVoter's position at the end.
+                assert_eq!(run(&pid, &did(3), NOW), "AlreadyVoted", "{model:?}");
+                // The key resolves last.
+                assert_eq!(run(&pid, &did(5), NOW), "UnknownVoter", "{model:?}");
+                assert_eq!(run(&pid, &did(2), NOW), "Sign", "{model:?}");
+                // Past the deadline, for a voter who already voted.
+                let expected = if model == Model::Majority {
+                    "Resolved"
+                } else {
+                    "VotingWindowExpired"
+                };
+                assert_eq!(run(&pid, &did(3), late), expected, "{model:?}");
+                // The proposal is now terminal (resolved or expired).
+                if model != Model::Majority {
+                    e.resolve(&pid, &ctx(late)).unwrap();
+                }
+                assert_eq!(
+                    kind(&e.precheck_vote(&pid, &did(2), &approve, &ctx(late))),
+                    "ProposalNotPending",
+                    "{model:?}"
+                );
+            }
+
+            // SingleAdmin: ProposalNotFound outranks NotEligible; the admin's vote is
+            // a no-op that signs nothing.
+            let mut e = engine(Model::SingleAdmin);
+            let pid = propose(e.as_mut());
+            let approve = VoteType::Approve;
+            let mut run =
+                |p: &ProposalId, d: &DID| kind(&e.precheck_vote(p, d, &approve, &ctx(NOW)));
+            assert_eq!(run(&missing, &did(2)), "ProposalNotFound");
+            assert_eq!(run(&pid, &did(2)), "NotEligible");
+            assert_eq!(run(&pid, &did(1)), "NoOp");
+        }
+
+        #[test]
+        fn precheck_vote_rejects_before_digest() {
+            for model in VOTING {
+                let mut e = engine(model);
+                let pid = propose(e.as_mut());
+                approve_as(e.as_mut(), &pid, 3, NOW);
+                let before = snapshot(e.as_ref(), &pid);
+                for voter in [DID::from("did:dht:z6MkOutsider"), did(3), did(5)] {
+                    let r = e.precheck_vote(&pid, &voter, &VoteType::Approve, &ctx(NOW));
+                    assert!(r.is_err(), "{model:?} {voter}: {}", kind(&r));
+                }
+                assert_eq!(snapshot(e.as_ref(), &pid), before, "{model:?}");
+            }
+        }
+
+        #[test]
+        fn precheck_unknown_voter_before_digest() {
+            // Voter 5 is eligible everywhere it can be, but its key does not resolve.
+            for model in [Model::Threshold, Model::Unanimity] {
+                let r = engine(model).precheck_propose(&did(5), &action(), &ctx(NOW));
+                assert!(
+                    matches!(r, Err(GovernanceError::UnknownVoter { .. })),
+                    "{model:?}: {r:?}"
+                );
+            }
+            // Majority asks the proposer for no signature, so its key is not needed.
+            assert!(matches!(
+                engine(Model::Majority).precheck_propose(&did(5), &action(), &ctx(NOW)),
+                Ok(ProposeIntent::NoSignature { .. })
+            ));
+            for model in VOTING {
+                let mut e = engine(model);
+                let pid = propose(e.as_mut());
+                let r = e.precheck_vote(&pid, &did(5), &VoteType::Approve, &ctx(NOW));
+                assert!(
+                    matches!(r, Err(GovernanceError::UnknownVoter { .. })),
+                    "{model:?}: {}",
+                    kind(&r)
+                );
+            }
+        }
+
+        #[test]
+        fn majority_past_deadline_precheck_resolves_without_signature() {
+            let mut e = engine(Model::Majority);
+            let pid = propose(e.as_mut());
+            approve_as(e.as_mut(), &pid, 2, NOW);
+            // One approval of five: 2000 bps participation, under the 5000 quorum.
+            let r = e
+                .precheck_vote(&pid, &did(3), &VoteType::Approve, &ctx(NOW + WINDOW))
+                .unwrap();
+            let VoteIntent::Resolved(status, events) = r else {
+                panic!("expected a resolution, got {r:?}");
+            };
+            assert_eq!(
+                status,
+                ProposalStatus::Rejected {
+                    reason: RejectionReason::InsufficientParticipation
+                }
+            );
+            assert!(matches!(
+                events.as_slice(),
+                [GovernanceEvent::ProposalResolved { .. }]
+            ));
+            let p = e.get_proposal(&pid).unwrap();
+            assert_eq!((p.approvals.len(), p.rejections.len()), (1, 0));
+            assert_eq!(p.status, status);
+        }
+
+        #[test]
+        fn raw_key_ext_is_byte_identical_to_signed_path() {
+            for model in ALL {
+                let mut raw = engine(model);
+                let mut signed = engine(model);
+                let c = ctx(NOW);
+                let (raw_p, raw_ev) = raw.propose(&did(1), action(), &c, &sk(1)).unwrap();
+                let pid = propose(signed.as_mut());
+                assert_eq!(raw_p.proposal_id, pid, "{model:?}");
+                if model != Model::SingleAdmin {
+                    raw.approve(&pid, &did(2), &c, &sk(2)).unwrap();
+                    approve_as(signed.as_mut(), &pid, 2, NOW);
+                    raw.reject(&pid, &did(4), &c, &sk(4)).unwrap();
+                    let VoteIntent::Sign { timestamp, digest } = signed
+                        .precheck_vote(&pid, &did(4), &VoteType::Reject, &c)
+                        .unwrap()
+                    else {
+                        panic!("expected a signing intent");
+                    };
+                    let vote = signed_vote(&VoteType::Reject, &did(4), timestamp, sign(4, &digest));
+                    signed.reject_signed(&pid, &did(4), &c, vote).unwrap();
+                }
+                let a = serde_json::to_vec(raw.get_proposal(&pid).unwrap()).unwrap();
+                let b = serde_json::to_vec(signed.get_proposal(&pid).unwrap()).unwrap();
+                assert_eq!(a, b, "{model:?}");
+                assert!(!raw_ev.is_empty(), "{model:?}");
+            }
+        }
+
+        #[test]
+        fn single_admin_signed_vote_is_refused_after_the_guards() {
+            let mut e = engine(Model::SingleAdmin);
+            let pid = propose(e.as_mut());
+            let vote = signed_vote(
+                &VoteType::Approve,
+                &did(1),
+                NOW,
+                sign(
+                    1,
+                    &vote_signing_digest(&pid, did(1).as_ref(), &VoteType::Approve, NOW).unwrap(),
+                ),
+            );
+            let r = e.approve_signed(&pid, &did(1), &ctx(NOW), vote.clone());
+            assert!(
+                matches!(r, Err(GovernanceError::OperationNotSupported(_))),
+                "{r:?}"
+            );
+            let r = e.reject_signed(&pid, &did(2), &ctx(NOW), vote);
+            assert!(matches!(r, Err(GovernanceError::NotEligible(_))), "{r:?}");
+            assert_eq!(e.get_proposal(&pid).unwrap().approvals.len(), 1);
+        }
     }
 }

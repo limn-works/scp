@@ -77,12 +77,15 @@ import type {
   CachedAttestationEnvelope,
   CapabilityRequirement,
   CapabilityValidation,
+  ChallengePolicy,
   ChallengeRequest,
   ChallengeResponse,
   ChallengeVerification,
   ConsequenceRule,
+  CreateChallengeConfig,
   EventLogEntry,
   GovernanceActionResult,
+  GradedChallenge,
   InviteMemberOutcome,
   MemberRole,
   OutletDefinition,
@@ -90,11 +93,16 @@ import type {
   RequireParticipation,
   SagaResult,
   SealedInvitation,
+  TestOutput,
   ThresholdRequirement,
   TrustEvaluation,
 } from "./types";
 import {
   checkProposalResponse,
+  decodeCaseResults,
+  decodeChallengeRequest,
+  decodeChallengeResponse,
+  decodeChallengeVerification,
   encodeAttestation,
   encodeAttestorSets,
   encodeCachedAttestations,
@@ -107,7 +115,10 @@ import {
   encodeMerkleRoot,
   encodeParticipationProfile,
   encodeRequireParticipation,
+  encodeTestCases,
+  encodeTestOutputs,
   encodeThresholdRequirements,
+  evaluatorContextOf,
   governanceActionResultFromBridge,
   memberRoleFromBridge,
 } from "./types";
@@ -203,6 +214,122 @@ function contextHandle(method: string, param: string, value: unknown): BridgeCon
 function identityHandle(method: string, param: string, value: unknown): BridgeIdentityHandle {
   if (!Identity._isIdentity(value)) throw invalidHandleError(method, param, "Identity", value);
   return value._rawHandle;
+}
+
+/** The params field the SDK encodes before `contextCreate` reaches the bridge. */
+const CAPABILITY_REQUIREMENTS_FIELD = "capabilityRequirements";
+
+/** Returns the index of the first non-whitespace character at or after `i`. */
+function skipJsonWhitespace(text: string, i: number): number {
+  let at = i;
+  while (at < text.length && " \t\n\r".includes(text.charAt(at))) at++;
+  return at;
+}
+
+/** Returns the index just past the JSON string whose opening quote is at `i`. */
+function endOfJsonString(text: string, i: number): number {
+  let at = i + 1;
+  while (text.charAt(at) !== '"') at += text.charAt(at) === "\\" ? 2 : 1;
+  return at + 1;
+}
+
+/**
+ * Returns the index just past the JSON value that starts at `i` in `text`,
+ * which the caller has already checked parses. A string ends at its closing
+ * quote; an object or array at its matching bracket; a number or literal at
+ * the next delimiter.
+ */
+function endOfJsonValue(text: string, i: number): number {
+  let depth = 0;
+  let at = i;
+  while (at < text.length) {
+    const ch = text.charAt(at);
+    if (ch === '"') {
+      at = endOfJsonString(text, at);
+      if (depth === 0) return at;
+      continue;
+    }
+    if (ch === "{" || ch === "[") {
+      depth++;
+    } else if (ch === "}" || ch === "]") {
+      if (depth <= 1) return depth === 0 ? at : at + 1;
+      depth--;
+    } else if (depth === 0 && (ch === "," || " \t\n\r".includes(ch))) {
+      return at;
+    }
+    at++;
+  }
+  return at;
+}
+
+/**
+ * Returns the `[start, end)` source span of each value the top-level object
+ * in `text` holds under `key`, comparing keys as `JSON.parse` decodes them.
+ * `text` must already parse as a JSON object.
+ */
+function topLevelValueSpans(text: string, key: string): [number, number][] {
+  const spans: [number, number][] = [];
+  let at = skipJsonWhitespace(text, 0) + 1;
+  for (;;) {
+    at = skipJsonWhitespace(text, at);
+    if (text.charAt(at) === "}") return spans;
+    const keyEnd = endOfJsonValue(text, at);
+    const name: unknown = JSON.parse(text.slice(at, keyEnd));
+    at = skipJsonWhitespace(text, keyEnd) + 1;
+    const valueStart = skipJsonWhitespace(text, at);
+    const valueEnd = endOfJsonValue(text, valueStart);
+    if (name === key) spans.push([valueStart, valueEnd]);
+    at = skipJsonWhitespace(text, valueEnd);
+    if (text.charAt(at) === ",") at++;
+  }
+}
+
+/**
+ * Returns the params JSON `contextCreate` sends to the bridge: `paramsJson`
+ * with the value of its top-level `capabilityRequirements`, a list of typed
+ * {@link CapabilityRequirement}s, replaced by the wire-form JSON string
+ * {@link encodeCapabilityRequirements} returns. Every other byte of
+ * `paramsJson` reaches the bridge as the caller wrote it, so an integer
+ * above 2^53 keeps its value.
+ *
+ * Params JSON that does not parse to an object, or that names no
+ * requirements, goes to the bridge unchanged, so the bridge reports its
+ * other defects with its own codes.
+ *
+ * @throws ValidationError `SCP-VALID-7001` when `capabilityRequirements` is
+ *   not a list, such as a JSON string of the wire form;
+ *   {@link INVALID_REQUIREMENT_CODE} or `SCP-VALID-7001` for an entry
+ *   {@link encodeCapabilityRequirements} refuses.
+ */
+function encodeContextParamsJson(paramsJson: string): string {
+  let params: unknown;
+  try {
+    params = JSON.parse(paramsJson);
+  } catch {
+    return paramsJson;
+  }
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    return paramsJson;
+  }
+  let encoded = paramsJson;
+  // Right to left, so each replacement leaves the earlier spans in place.
+  for (const [start, end] of topLevelValueSpans(
+    paramsJson,
+    CAPABILITY_REQUIREMENTS_FIELD,
+  ).reverse()) {
+    // Only the requirements are parsed: they are typed SDK values, which
+    // encodeCapabilityRequirements reads as JavaScript values.
+    const requirements: unknown = JSON.parse(paramsJson.slice(start, end));
+    if (requirements === null) continue;
+    if (!Array.isArray(requirements)) {
+      throw new ValidationError(
+        `contextCreate() params.capabilityRequirements must be a list of CapabilityRequirement, got ${JSON.stringify(requirements)}`,
+        "SCP-VALID-7001",
+      );
+    }
+    encoded = `${encoded.slice(0, start)}${JSON.stringify(encodeCapabilityRequirements(requirements))}${encoded.slice(end)}`;
+  }
+  return encoded;
 }
 
 /** Returns the bridge handle of a `TransportManager`, or throws `SCP-VALID-7005`. */
@@ -815,17 +942,6 @@ export interface KeyCustodyProvider {
     contextId: Uint8Array,
     pseudonymEpoch: bigint,
   ): Uint8Array;
-  /**
-   * Return the 32 raw Ed25519 private-seed bytes for `keyId`.
-   *
-   * Hardware-bound / sign-only custody that cannot surface raw bytes should
-   * throw. The throw is handled differently per call site: best-effort callers
-   * (the §9.10.4 pseudonym announcement emitted on context join/import) catch it
-   * and silently skip the announcement — peers recover on the next explicit
-   * announcement — whereas callers that strictly require the raw key (governance
-   * vote signing via {@link SCP.identityCreateWithCustody}) surface a hard error.
-   */
-  exportSigningKeyBytes(keyId: string): Uint8Array;
   /** Return `"hardware"`, `"software"`, or `"in_memory"`. */
   custodyType(keyId: string): string;
 }
@@ -1133,10 +1249,10 @@ export class SCP {
       throw custodyRequiredError("identityCreateWithCustody", CUSTODY_PROVIDER_REMEDY);
     }
     // Validate provider completeness up front. The byte-converting adapter
-    // below always supplies all nine closures, so a provider missing a method
+    // below always supplies all eight closures, so a provider missing a method
     // would otherwise surface only later as a cryptic native "oneshot canceled"
     // failure. Checking here makes the returned promise reject early with a
-    // clear, actionable error. Mirrors the nine methods on KeyCustodyProvider.
+    // clear, actionable error. Mirrors the eight methods on KeyCustodyProvider.
     const REQUIRED = [
       "generateKeypair",
       "sign",
@@ -1145,7 +1261,6 @@ export class SCP {
       "dhAgree",
       "derivePseudonym",
       "deriveRotatablePseudonym",
-      "exportSigningKeyBytes",
       "custodyType",
     ] as const;
     for (const method of REQUIRED) {
@@ -1712,12 +1827,27 @@ export class SCP {
   // Domain: Context
   // ───────────────────────────────────────────────────────────────────────
 
+  /**
+   * Creates a context owned by `identity` from `paramsJson`, the JSON of a
+   * {@link ContextParams}.
+   *
+   * The SDK encodes `capabilityRequirements` itself, from the typed
+   * {@link CapabilityRequirement}s, to the bridge's wire form.
+   *
+   * @throws ValidationError `SCP-VALID-7005` when `identity` is not an
+   *   `Identity` this SDK returned; {@link INVALID_REQUIREMENT_CODE} for a
+   *   `ChallengeVerified` requirement with no trusted verifier;
+   *   `SCP-VALID-7001` when `capabilityRequirements` is not a list of typed
+   *   requirements. The bridge refuses other malformed params with its own
+   *   codes.
+   */
   async contextCreate(identity: Identity, paramsJson: string): Promise<Context> {
     const rawIdentity = identityHandle("contextCreate", "identity", identity);
+    const bridgeParamsJson = encodeContextParamsJson(paramsJson);
     try {
       const raw = await (
         this.#native.contextCreate as (id: unknown, p: string) => Promise<unknown>
-      )(rawIdentity, paramsJson);
+      )(rawIdentity, bridgeParamsJson);
       return Context._fromHandle(this, raw as never, identity.did);
     } catch (err) {
       throw mapBridgeError(err);
@@ -2526,6 +2656,45 @@ export class SCP {
     return checkProposalResponse(
       await bridge.contextGovernancePropose(handle, actionJson, proposerDid),
     );
+  }
+
+  /**
+   * Proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4): replaces the
+   * context's admission capability requirements with `requirements`. An
+   * empty list clears them. The SDK encodes the typed list itself.
+   *
+   * @returns The bridge's JSON `{proposal_id, status, reason?, rejector?,
+   *   execution_result}` after {@link checkProposalResponse} checks every name
+   *   in it, as {@link contextGovernancePropose} returns it.
+   * @throws ValidationError {@link INVALID_REQUIREMENT_CODE} for a
+   *   `ChallengeVerified` requirement with no trusted verifier, before any
+   *   bridge call; {@link NON_CANONICAL_IDENTIFIER_CODE} or
+   *   {@link TOO_MANY_CAPABILITY_REQUIREMENTS_CODE} from the bridge.
+   */
+  async contextGovernanceModifyCapabilityRequirements(
+    context: Context,
+    requirements: readonly CapabilityRequirement[],
+    proposerDid: string,
+  ): Promise<string> {
+    const handle = contextHandle(
+      "contextGovernanceModifyCapabilityRequirements",
+      "context",
+      context,
+    );
+    const requirementsJson = encodeCapabilityRequirements(requirements);
+    let raw: string;
+    try {
+      raw = await (
+        this.#native.contextGovernanceModifyCapabilityRequirements as (
+          h: unknown,
+          r: string,
+          p: string,
+        ) => Promise<string>
+      )(handle, requirementsJson, proposerDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+    return checkProposalResponse(raw);
   }
 
   /**
@@ -3827,13 +3996,13 @@ export class SCP {
    * @returns Typed {@link PaymentReceiptVerificationResult} with `allValid`
    *   and per-receipt `results`.
    */
-  economyVerifyPaymentReceipts(
+  async economyVerifyPaymentReceipts(
     receipts: readonly Record<string, unknown>[],
-  ): PaymentReceiptVerificationResult {
+  ): Promise<PaymentReceiptVerificationResult> {
     try {
-      const raw = (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(
-        JSON.stringify(receipts),
-      );
+      const raw = await (
+        this.#native.economyVerifyPaymentReceipts as (r: string) => Promise<string>
+      )(JSON.stringify(receipts));
       // The Rust bridge emits snake_case keys; map to the SDK's camelCase convention.
       const parsed = JSON.parse(raw) as {
         all_valid: boolean;
@@ -3884,43 +4053,178 @@ export class SCP {
    * crossing FFI. A revocation list that cannot be read throws; it never
    * reads as `valid: false`.
    */
-  trustVerifyAttestation(contextId: string, attestation: CachedAttestationEnvelope): unknown {
+  async trustVerifyAttestation(
+    contextId: string,
+    attestation: CachedAttestationEnvelope,
+  ): Promise<unknown> {
     try {
-      return (this.#native.trustVerifyAttestation as (c: string, j: string) => unknown)(
-        contextId,
-        encodeAttestation(attestation),
-      );
-    } catch (err) {
-      throw mapBridgeError(err);
-    }
-  }
-
-  trustCreateChallenge(targetDid: string): unknown {
-    try {
-      return (this.#native.trustCreateChallenge as (d: string) => unknown)(targetDid);
+      return await (
+        this.#native.trustVerifyAttestation as (c: string, j: string) => Promise<unknown>
+      )(contextId, encodeAttestation(attestation));
     } catch (err) {
       throw mapBridgeError(err);
     }
   }
 
   /**
-   * Verify a challenge response against its original challenge request
-   * (ADR-017, §7.3.4).
+   * Issue a challenge request signed by `config.verifier`'s `#active` key
+   * (spec 07 §7.3.4 step 1, ADR-017).
    *
-   * Takes the typed {@link ChallengeRequest} / {@link ChallengeResponse} and
-   * serializes them to the serde wire shapes internally (ADR-058) before
-   * crossing FFI. Returns `true` if the response is valid (correct
-   * responder, within timeout, valid signature), `false` otherwise.
+   * The challenger writes the cases with their answers. The returned request
+   * carries each case's input and never its answer; the challenger's ledger
+   * keeps the answers to grade with. The capability definition for
+   * `config.capabilityUri` sets the pass threshold, the retries and the
+   * cooldown; `config.policy` may only tighten them, on any URI.
+   *
+   * The SDK passes the one evaluator context the `CustomEval` cases name to
+   * the bridge.
+   *
+   * @throws ValidationError `SCP-VALID-7005` when `config.verifier` is not an
+   *   `Identity` this SDK returned; `SCP-VALID-7001` when two `CustomEval`
+   *   cases name different evaluator contexts, before any bridge call;
+   *   `SCP-VALID-7013` for a malformed DID;
+   *   {@link CHALLENGE_SUITE_BELOW_MINIMUM_CODE} for too few cases;
+   *   {@link POLICY_OUTSIDE_DEFINITION_CODE} for a policy looser than the
+   *   definition; {@link NON_CANONICAL_IDENTIFIER_CODE} for a DID that is not
+   *   canonical; {@link CHALLENGE_WINDOW_OPEN_CODE} while the last challenge
+   *   to this subject for this capability is inside its window.
+   * @throws ScpError `SCP-CRYPTO-4006` when the verifier's key is destroyed,
+   *   or another custody failure.
    */
-  trustVerifyResponse(challenge: ChallengeRequest, response: ChallengeResponse): boolean {
+  async trustCreateChallenge(config: CreateChallengeConfig): Promise<ChallengeRequest> {
+    identityHandle("trustCreateChallenge", "config.verifier", config.verifier);
+    const evaluatorContextId = evaluatorContextOf(config.testCases);
+    const testCasesJson = encodeTestCases(config.testCases);
+    let created: { challengeId: string; requestJson: string };
     try {
-      return (this.#native.trustVerifyResponse as (c: string, r: string) => boolean)(
-        encodeChallengeRequest(challenge),
-        encodeChallengeResponse(response),
+      created = await (
+        this.#native.trustCreateChallenge as (
+          v: string,
+          s: string,
+          u: string,
+          t: string,
+          c: string,
+          secs: number,
+          e: string | undefined,
+          p: ChallengePolicy | undefined,
+        ) => Promise<{ challengeId: string; requestJson: string }>
+      )(
+        config.verifier.did,
+        config.subject,
+        config.capabilityUri,
+        testCasesJson,
+        config.contextId,
+        config.windowSecs,
+        evaluatorContextId,
+        config.policy,
       );
     } catch (err) {
       throw mapBridgeError(err);
     }
+    return decodeChallengeRequest(created.requestJson);
+  }
+
+  /**
+   * Answer `request` for attempt `attempt`, signed by `subject`'s `#active`
+   * key (spec 07 §7.3.4 step 2, ADR-017).
+   *
+   * The challenger's signature on `request` is checked against the key this
+   * instance's DID resolver returns before anything is signed.
+   *
+   * @param subject The challenged identity, an identity of this instance;
+   *   its custody signs the response.
+   * @param request The signed request, as the challenger sent it.
+   * @param outputs One output per case.
+   * @param attempt The attempt number, starting at 1.
+   * @throws ValidationError `SCP-VALID-7005` when `subject` is not an
+   *   `Identity` this SDK returned; `SCP-VALID-7013` for a malformed DID; or
+   *   a refusal when the request's signature, subject or window does not
+   *   hold, such as {@link CHALLENGE_EXPIRED_CODE}.
+   * @throws IdentityError `SCP-IDENT-1033` when this instance has no DID
+   *   resolver.
+   */
+  async trustRespondToChallenge(
+    subject: Identity,
+    request: ChallengeRequest,
+    outputs: readonly TestOutput[],
+    attempt: number,
+  ): Promise<ChallengeResponse> {
+    identityHandle("trustRespondToChallenge", "subject", subject);
+    const requestJson = encodeChallengeRequest(request);
+    const outputsJson = encodeTestOutputs(outputs);
+    let responseJson: string;
+    try {
+      responseJson = await (
+        this.#native.trustRespondToChallenge as (
+          s: string,
+          r: string,
+          o: string,
+          a: number,
+        ) => Promise<string>
+      )(subject.did, requestJson, outputsJson, attempt);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+    return decodeChallengeResponse(responseJson);
+  }
+
+  /**
+   * Grade `response` to `request` and return the record, signed by
+   * `verifier`'s `#active` key (spec 07 §7.3.4 steps 3 and 4, ADR-017).
+   *
+   * Both signatures are checked first. The challenger's ledger then checks
+   * the attempt number, the cooldown and the window, grades each case
+   * against its stored answer, and signs a record for the attempt, pass or
+   * fail. The record is also written to this instance's trust store.
+   *
+   * @param verifier The identity that issued `request`, an identity of this
+   *   instance; its custody signs the record.
+   * @param request The signed request.
+   * @param response The subject's signed response.
+   * @throws ValidationError `SCP-VALID-7005` when `verifier` is not an
+   *   `Identity` this SDK returned; `SCP-VALID-7013` for a malformed DID;
+   *   `SCP-VALID-7003` for a response whose signature does not verify; a
+   *   refusal when the attempt does not hold, such as
+   *   {@link COOLDOWN_ACTIVE_CODE}; or {@link GRADING_CAPACITY_EXHAUSTED_CODE},
+   *   {@link GRADING_IN_PROGRESS_CODE} or {@link GRADING_LEASE_LOST_CODE} for a
+   *   grading that used no attempt. {@link isRetryable} tells a refusal worth
+   *   retrying from a final one, and {@link retryAfter} reads when to retry.
+   * @throws IdentityError `SCP-IDENT-1033` when this instance has no DID
+   *   resolver.
+   */
+  async trustGradeResponse(
+    verifier: Identity,
+    request: ChallengeRequest,
+    response: ChallengeResponse,
+  ): Promise<GradedChallenge> {
+    identityHandle("trustGradeResponse", "verifier", verifier);
+    const requestJson = encodeChallengeRequest(request);
+    const responseJson = encodeChallengeResponse(response);
+    let graded: {
+      recordJson: string;
+      reasonsJson: string;
+      trustStoreError?: { code: string; message: string } | null;
+    };
+    try {
+      graded = await (
+        this.#native.trustGradeResponse as (
+          v: string,
+          r: string,
+          s: string,
+        ) => Promise<{
+          recordJson: string;
+          reasonsJson: string;
+          trustStoreError?: { code: string; message: string } | null;
+        }>
+      )(verifier.did, requestJson, responseJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+    return {
+      record: decodeChallengeVerification(graded.recordJson),
+      caseResults: decodeCaseResults(graded.reasonsJson),
+      trustStoreError: graded.trustStoreError ?? null,
+    };
   }
 
   /**
@@ -3958,53 +4262,43 @@ export class SCP {
 
   /**
    * Verify that an agent meets a context's capability requirements for
-   * admission (spec §7.3.4.4).
+   * admission (spec 07 §7.3.4.4).
    *
-   * `subjectDid`/`contextId` bind challenge verifications to the agent and
-   * context being admitted: a `ChallengeVerification` only satisfies a
-   * requirement when its signed `subject_did`/`context_id` equal these values,
-   * closing cross-subject and cross-context attribution.
+   * The requirements are the ones the context's governance holds at the time
+   * of the call, set through {@link ContextParams.capabilityRequirements} or
+   * {@link contextGovernanceModifyCapabilityRequirements}; the caller cannot
+   * supply them. A `ChallengeVerified` requirement is met only
+   * by a passing record signed by one of its trusted verifiers, for this
+   * subject and context, within the requirement's retry cap.
    *
    * Returns normally when all requirements are satisfied; throws on any unmet
    * requirement or malformed JSON.
    *
-   * Security caveat — authenticity is not authorization: a passing
-   * `ChallengeVerified` check proves the verifier's signature is authentic and
-   * bound to this subject/context, not that the verifier is *trusted*. Because
-   * `verifierDid` is self-certifying, a subject can present a genuinely-signed
-   * result from a verifier it controls. Establish verifier legitimacy
-   * separately and do NOT treat success as authorization.
-   *
    * @param contextId The context the agent is being admitted to.
    * @param subjectDid DID of the agent being admitted.
-   * @param requirements Typed {@link CapabilityRequirement} values. Serialized
-   *   internally to the serde wire shape (ADR-058).
    * @param agentCapabilities The agent's self-attested capability URIs.
    * @param challengeVerifications Typed {@link ChallengeVerification} records.
-   *   Serialized internally to the serde wire shape (ADR-058).
+   * @throws ValidationError `SCP-VALID-7076` for an unmet requirement.
    */
-  checkCapabilityRequirements(
+  async checkCapabilityRequirements(
     contextId: string,
     subjectDid: string,
-    requirements: readonly CapabilityRequirement[],
     agentCapabilities: readonly string[],
     challengeVerifications: readonly ChallengeVerification[],
-  ): void {
-    (
-      this.#native.checkCapabilityRequirements as (
-        c: string,
-        s: string,
-        r: string,
-        a: string,
-        v: string,
-      ) => void
-    )(
-      contextId,
-      subjectDid,
-      encodeCapabilityRequirements(requirements),
-      JSON.stringify(agentCapabilities),
-      encodeChallengeVerifications(challengeVerifications),
-    );
+  ): Promise<void> {
+    const recordsJson = encodeChallengeVerifications(challengeVerifications);
+    try {
+      await (
+        this.#native.checkCapabilityRequirements as (
+          c: string,
+          s: string,
+          a: string,
+          v: string,
+        ) => Promise<void>
+      )(contextId, subjectDid, JSON.stringify(agentCapabilities), recordsJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -4242,12 +4536,12 @@ export class SCP {
   ): Promise<BehavioralRecord> {
     let record: BehavioralRecord;
     try {
-      record = (
+      record = await (
         this.#native.participationRecord as (
           ctx: string,
           subj: string,
           ca: string,
-        ) => BehavioralRecord
+        ) => Promise<BehavioralRecord>
       )(contextId, subjectDid, encodeCachedAttestations(cachedAttestations));
     } catch (error) {
       throw mapBridgeError(error);
@@ -4293,7 +4587,7 @@ export class SCP {
    * @param challengeResults Typed {@link ChallengeVerification} records.
    * @returns The aggregated `TrustInput` as a JSON string.
    */
-  aggregateTrustInput(
+  async aggregateTrustInput(
     contextId: string,
     subjectDid: string,
     events: readonly EventLogEntry[],
@@ -4303,9 +4597,9 @@ export class SCP {
     attestorSets: Readonly<Partial<Record<AttestationType, readonly AttestorInfo[]>>> = {},
     cachedAttestations: readonly CachedAttestation[] = [],
     challengeResults: readonly ChallengeVerification[] = [],
-  ): string {
+  ): Promise<string> {
     try {
-      return (
+      return await (
         this.#native.aggregateTrustInput as (
           ctx: string,
           subj: string,
@@ -4316,7 +4610,7 @@ export class SCP {
           as: string,
           ca: string,
           cres: string,
-        ) => string
+        ) => Promise<string>
       )(
         contextId,
         subjectDid,

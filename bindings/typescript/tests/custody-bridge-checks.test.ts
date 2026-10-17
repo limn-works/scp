@@ -24,7 +24,7 @@
  * and never reach the process as an uncaught exception or an unhandled
  * rejection.
  *
- * The secret-wipe tests fail if `dhAgree` or `exportSigningKeyBytes` in
+ * The secret-wipe test fails if `dhAgree` in
  * `src/internal/custody-adapter.ts` stops zero-filling the adapter's copy of
  * the host secret once napi-rs has read it, wipes it before the bridge reads
  * it (the bridge would then return zeros), or writes to the host's buffer.
@@ -148,10 +148,6 @@ class StoreKeychain implements KeyCustodyProvider {
     throw new Error("unused");
   }
 
-  exportSigningKeyBytes(_keyId: string): Uint8Array {
-    throw new Error("unused");
-  }
-
   custodyType(_keyId: string): string {
     return "software";
   }
@@ -237,10 +233,6 @@ class P256Keychain implements KeyCustodyProvider {
   }
 
   deriveRotatablePseudonym(): Uint8Array {
-    throw new Error("unused");
-  }
-
-  exportSigningKeyBytes(): Uint8Array {
     throw new Error("unused");
   }
 
@@ -497,24 +489,19 @@ describe.skipIf(skipReason !== "")("napi callback custody", () => {
     expect(secret.every((b, i) => b === 0xa0 + i)).toBe(true);
   });
 
-  for (const method of ["dhAgree", "exportSigningKeyBytes"] as const) {
-    test(`${method}: the adapter's copy of the host secret is zero after the bridge's synchronous read`, async () => {
-      const secret = Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i);
-      const provider = Object.assign(new StoreKeychain(), {
-        [method]: () => secret,
-      }) as KeyCustodyProvider;
-      const record = toNativeCustodyProvider(provider);
-      const result =
-        method === "dhAgree"
-          ? record.dhAgree(["1", Array.from(Buffer.alloc(32, 1))])
-          : record.exportSigningKeyBytes("1");
-      if (!result.ok) throw new Error(`host call failed: ${result.message}`);
-      const copy = result.value;
-      // What napi-rs copies into Rust as the callback returns.
-      expect(copy).toEqual(Array.from(secret));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(copy).toEqual(new Array(32).fill(0));
-      expect(secret.every((b, i) => b === 0x40 + i)).toBe(true);
-    });
-  }
+  test("dhAgree: the adapter's copy of the host secret is zero after the bridge's synchronous read", async () => {
+    const secret = Uint8Array.from({ length: 32 }, (_, i) => 0x40 + i);
+    const provider = Object.assign(new StoreKeychain(), {
+      dhAgree: () => secret,
+    }) as KeyCustodyProvider;
+    const record = toNativeCustodyProvider(provider);
+    const result = record.dhAgree(["1", Array.from(Buffer.alloc(32, 1))]);
+    if (!result.ok) throw new Error(`host call failed: ${result.message}`);
+    const copy = result.value;
+    // What napi-rs copies into Rust as the callback returns.
+    expect(copy).toEqual(Array.from(secret));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(copy).toEqual(new Array(32).fill(0));
+    expect(secret.every((b, i) => b === 0x40 + i)).toBe(true);
+  });
 });

@@ -721,7 +721,6 @@
       "canonical": "trust_create_challenge",
       "category": "trust",
       "pyo3": [
-        "py_trust_create_challenge",
         "trust_create_challenge"
       ],
       "uniffi": [
@@ -732,17 +731,29 @@
       ]
     },
     {
-      "canonical": "trust_verify_response",
+      "canonical": "trust_respond_to_challenge",
       "category": "trust",
       "pyo3": [
-        "py_trust_verify_response",
-        "trust_verify_response"
+        "trust_respond_to_challenge"
       ],
       "uniffi": [
-        "trust_verify_response"
+        "trust_respond_to_challenge"
       ],
       "napi": [
-        "trust_verify_response"
+        "trust_respond_to_challenge"
+      ]
+    },
+    {
+      "canonical": "trust_grade_response",
+      "category": "trust",
+      "pyo3": [
+        "trust_grade_response"
+      ],
+      "uniffi": [
+        "trust_grade_response"
+      ],
+      "napi": [
+        "trust_grade_response"
       ]
     },
     {
@@ -763,7 +774,6 @@
       "canonical": "check_capability_requirements",
       "category": "trust",
       "pyo3": [
-        "py_check_capability_requirements",
         "check_capability_requirements"
       ],
       "uniffi": [
@@ -1500,6 +1510,19 @@
       ],
       "napi": [
         "context_governance_propose"
+      ]
+    },
+    {
+      "canonical": "context_governance_modify_capability_requirements",
+      "category": "governance",
+      "pyo3": [
+        "governance_modify_capability_requirements"
+      ],
+      "uniffi": [
+        "governance_modify_capability_requirements"
+      ],
+      "napi": [
+        "context_governance_modify_capability_requirements"
       ]
     },
     {

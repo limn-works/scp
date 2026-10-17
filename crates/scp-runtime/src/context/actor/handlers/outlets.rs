@@ -18,11 +18,10 @@
 //!
 //! The cross-context outlet invocation saga (§6.2.4) is produced directly by
 //! [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga) — it does not
-//! cross the actor mailbox because its
-//! [`SagaSigningKeys`](crate::context::supervisor::SagaSigningKeys) are
-//! borrowed (non-`'static`) `&ed25519_dalek::SigningKey` references that
-//! cannot move into a `'static` mailbox message (its executor, by
-//! contrast, is `Send + 'static`). A distinct constraint keeps the
+//! cross the actor mailbox: the FSM drives each phase supervisor-side and
+//! sends each phase to its own context's actor, carrying the
+//! [`SagaSigners`](crate::context::supervisor::SagaSigners) a phase signs
+//! with. A distinct constraint keeps the
 //! outlet-economy executor off the mailbox:
 //! [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
 //! takes a generic non-`Send` executor closure that cannot cross the

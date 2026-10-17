@@ -38,6 +38,7 @@ final class ContextCloseTests: XCTestCase {
             economicPolicy: nil,
             consequenceRulesJson: nil,
             consequenceConfigJson: nil,
+            capabilityRequirementsJson: nil,
             pseudonymRotation: nil
         )
     }

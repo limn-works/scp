@@ -111,9 +111,6 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
         inner.deriveRotatablePseudonym(inner.resolveKeyHandle(keyId), contextId, pseudonymEpoch.toLong())
     }
 
-    override suspend fun exportSigningKeyBytes(keyId: String): ByteArray =
-        bridged { inner.exportSigningKeyBytes(inner.resolveKeyHandle(keyId)) }
-
     /**
      * `"hardware"` for a Keystore key, `"software"` for a software key, and `"unknown"` for an id
      * [inner] does not hold. This member is synchronous and cannot throw to the bridge, which

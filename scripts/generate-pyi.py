@@ -76,6 +76,13 @@ PARSER = Parser(RUST)
 # The PyO3 GIL token parameter (`py: Python<'_>`) is never Python-visible.
 _GIL_TYPE = re.compile(r"^\s*&?\s*Python\b")
 
+# A PyO3 method's receiver can be a typed first parameter instead of `&self`
+# (`slf: PyRef<'_, Self>`, `PyRefMut`, `&Bound<'_, Self>`, `Py<Self>`); PyO3
+# binds it to the instance, so Python never passes it.
+_RECEIVER_TYPE = re.compile(
+    r"^\s*&?\s*(PyRef|PyRefMut|Bound|Py)\s*<[^>]*\bSelf\s*>\s*$"
+)
+
 # Stub symbols that are intentionally NOT one-to-one with a current PyO3
 # export. Each entry is load-bearing and justified; do not extend to paper
 # over real drift (that is the exact failure mode this tool exists to catch).
@@ -213,8 +220,10 @@ def _fn_params(fn: Node, src: bytes) -> list[str]:
     names: list[str] = []
     if params_node is None:
         return names
+    first = True
     for p in params_node.named_children:
         if p.type == "self_parameter":
+            first = False
             continue
         if p.type != "parameter":
             continue
@@ -222,8 +231,11 @@ def _fn_params(fn: Node, src: bytes) -> list[str]:
         typ = p.child_by_field_name("type")
         if pat is None:
             continue
+        is_first, first = first, False
         name = _text(src, pat).strip()
         if name in ("self", "cls"):
+            continue
+        if is_first and typ is not None and _RECEIVER_TYPE.match(_text(src, typ)):
             continue
         if typ is not None and _GIL_TYPE.match(_text(src, typ)):
             continue

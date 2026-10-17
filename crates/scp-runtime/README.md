@@ -88,20 +88,29 @@ assert_eq!(handle.state(), ContextState::Active);
 
 ## Send a message
 
-`send_message` takes a `MessageSigner` that binds the signing key to the
+`send_message` takes a `MessageSigner` that binds a `CommandSigner` to the
 persona stamped on the wire — `Active` for human-originated sends, `Agent`
 for agent-autonomous sends (ADR-039). The single enum prevents the key and
-the persona from ever diverging:
+the persona from ever diverging. A `CommandSigner` signs through the
+identity's key custody; the private key never leaves it (ADR-049 Decision 7a):
 
 ```rust,ignore
+use scp_crypto::SigAlg;
+use scp_platform::CustodySigner;
+use scp_runtime::context::actor::CommandSigner;
 use scp_runtime::context::supervisor::MessageSigner;
+
+// `custody` is the host's `Arc<impl KeyCustody>`; `handle` names the key.
+let signer = CommandSigner::from_custody(
+    CustodySigner::new(custody, handle, SigAlg::Ed25519).await?,
+);
 
 supervisor
     .send_message(
         &handle,
         &"did:dht:z6Mk...sender".into(),
         b"hello world",
-        MessageSigner::Active(&signing_key),  // or MessageSigner::Agent(&key)
+        MessageSigner::Active(&signer),  // or MessageSigner::Agent(&agent_signer)
         None,   // source provenance (cross-context attribution)
         None,   // spending UCAN (paid contexts)
     )

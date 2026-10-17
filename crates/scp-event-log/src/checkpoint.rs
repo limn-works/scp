@@ -970,9 +970,69 @@ async fn generate_checkpoint_at(
     timestamp: u64,
     signer: &(impl EventLogSigner + ?Sized),
 ) -> Result<ConsistencyCheckpoint, EventLogError> {
-    let context_id = log.context_id().to_owned();
-    let event_count = tree::event_count(log);
-    let merkle_root = tree::root(log);
+    sign_checkpoint_snapshot(
+        CheckpointSnapshot::of(log),
+        sender_did,
+        epoch,
+        timestamp,
+        signer,
+    )
+    .await
+}
+
+/// The event-log state a checkpoint commits to, read without signing.
+///
+/// A caller that holds the log behind a lock takes the snapshot under the
+/// lock and signs with [`generate_checkpoint_from_snapshot`] after releasing
+/// it, so a slow or host-mediated signer never runs while the lock is held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointSnapshot {
+    context_id: String,
+    event_count: u64,
+    merkle_root: [u8; 32],
+}
+
+impl CheckpointSnapshot {
+    /// Reads the context ID, event count, and Merkle root of `log`.
+    #[must_use]
+    pub fn of(log: &EventLog) -> Self {
+        Self {
+            context_id: log.context_id().to_owned(),
+            event_count: tree::event_count(log),
+            merkle_root: tree::root(log),
+        }
+    }
+}
+
+/// Signs a checkpoint over a [`CheckpointSnapshot`], stamped with the current
+/// time. Produces the same checkpoint [`generate_checkpoint`] produces for
+/// the log the snapshot was read from.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::Custody`] if the signing operation fails.
+pub async fn generate_checkpoint_from_snapshot(
+    snapshot: CheckpointSnapshot,
+    sender_did: &DID,
+    epoch: u64,
+    signer: &(impl EventLogSigner + ?Sized),
+) -> Result<ConsistencyCheckpoint, EventLogError> {
+    let timestamp = current_timestamp();
+    sign_checkpoint_snapshot(snapshot, sender_did, epoch, timestamp, signer).await
+}
+
+async fn sign_checkpoint_snapshot(
+    snapshot: CheckpointSnapshot,
+    sender_did: &DID,
+    epoch: u64,
+    timestamp: u64,
+    signer: &(impl EventLogSigner + ?Sized),
+) -> Result<ConsistencyCheckpoint, EventLogError> {
+    let CheckpointSnapshot {
+        context_id,
+        event_count,
+        merkle_root,
+    } = snapshot;
 
     let canonical_hash = compute_checkpoint_canonical_hash(
         &context_id,
@@ -1300,6 +1360,42 @@ mod tests {
         let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
 
         verifying_key.verify(&canonical_hash, &signature).unwrap();
+    }
+
+    /// A checkpoint signed from a snapshot commits to the log the snapshot
+    /// was read from, even after the log grows before signing.
+    #[tokio::test]
+    async fn snapshot_checkpoint_commits_to_the_snapshotted_log() {
+        let (mut log, leaves, did) = build_log(10);
+        let signer = TestSigner::new();
+        let snapshot = CheckpointSnapshot::of(&log);
+        let root_at_snapshot = tree::root(&log);
+        log.push_leaf_raw(leaves[0]);
+
+        let checkpoint = generate_checkpoint_from_snapshot(snapshot, &did, 5, &signer)
+            .await
+            .unwrap();
+
+        assert_eq!(checkpoint.context_id, "ctx-checkpoint-test");
+        assert_eq!(checkpoint.event_count, 10);
+        assert_eq!(checkpoint.merkle_root, root_at_snapshot);
+        assert_ne!(checkpoint.merkle_root, tree::root(&log));
+        let canonical_hash = compute_checkpoint_canonical_hash(
+            &checkpoint.context_id,
+            &checkpoint.sender_did,
+            checkpoint.event_count,
+            &checkpoint.merkle_root,
+            checkpoint.epoch,
+            checkpoint.timestamp,
+        );
+        let sig_bytes: [u8; 64] = checkpoint.signature.as_slice().try_into().unwrap();
+        signer
+            .verifying_key()
+            .verify(
+                &canonical_hash,
+                &ed25519_dalek::Signature::from_bytes(&sig_bytes),
+            )
+            .unwrap();
     }
 
     // -------------------------------------------------------------------

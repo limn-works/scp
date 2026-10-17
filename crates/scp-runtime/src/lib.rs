@@ -36,7 +36,6 @@ pub mod crypto;
 pub mod discovery;
 pub mod economy;
 pub mod envelope;
-pub mod event_log;
 pub mod identity;
 pub mod metrics;
 pub mod provenance;

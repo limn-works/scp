@@ -243,6 +243,12 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// Spec 25 Vector 57's identifier in the `03-identity.md` §3.1 text form.
+    const DEFINER: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
+    /// An identifier-scoped capability URI under [`DEFINER`].
+    const SCOPED: &str =
+        "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:custom/v1";
+
     // -----------------------------------------------------------------
     // AC 2: parse_capability_endpoint with Protocol URIs
     // -----------------------------------------------------------------
@@ -259,17 +265,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // AC 3: parse_capability_endpoint with DID-scoped URI
+    // AC 3: parse_capability_endpoint with identifier-scoped URI
     // -----------------------------------------------------------------
 
     #[test]
-    fn parse_capability_endpoint_did_scoped_uri() {
-        let caps =
-            parse_capability_endpoint("scp:capabilities:did:dht:z6Mk123:capability:custom/v1")
-                .unwrap();
+    fn parse_capability_endpoint_identifier_scoped_uri() {
+        assert!(SCOPED.starts_with(DEFINER));
+        let caps = parse_capability_endpoint(&format!("scp:capabilities:{SCOPED}")).unwrap();
         assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0], cap("did:dht:z6Mk123:capability:custom/v1"));
-        assert!(matches!(caps[0], CapabilityUri::DidScoped { .. }));
+        assert_eq!(caps[0], cap(SCOPED));
+        assert!(matches!(caps[0], CapabilityUri::IdentifierScoped { .. }));
+    }
+
+    #[test]
+    fn parse_capability_endpoint_rejects_did_scoped_uri() {
+        let err =
+            parse_capability_endpoint("scp:capabilities:did:dht:z6Mk123:capability:custom/v1")
+                .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DiscoveryError::InvalidCapabilities(msg) if msg.contains("not a canonical identifier")
+            ),
+            "got {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -479,10 +498,7 @@ mod tests {
     fn capability_entry_serializes_uri_strings() {
         let entry = CapabilityEntry {
             did: "did:dht:zTestDid".into(),
-            capabilities: vec![
-                cap("scp:capability:schema-validation/v1"),
-                cap("did:dht:z6Mk123:capability:custom/v1"),
-            ],
+            capabilities: vec![cap("scp:capability:schema-validation/v1"), cap(SCOPED)],
             service_endpoints: vec!["scp:capabilities:scp:capability:schema-validation/v1".into()],
             resolved_at: 1_700_000_000,
         };
@@ -493,10 +509,7 @@ mod tests {
             caps[0].as_str().unwrap(),
             "scp:capability:schema-validation/v1"
         );
-        assert_eq!(
-            caps[1].as_str().unwrap(),
-            "did:dht:z6Mk123:capability:custom/v1"
-        );
+        assert_eq!(caps[1].as_str().unwrap(), SCOPED);
 
         // Round-trip deserialization.
         let deserialized: CapabilityEntry = serde_json::from_value(json).unwrap();
@@ -509,13 +522,13 @@ mod tests {
 
     #[test]
     fn parse_capability_endpoint_mixed_types() {
-        let caps = parse_capability_endpoint(
-            "scp:capabilities:scp:capability:schema-validation/v1,did:dht:z6Mk123:capability:custom/v1,scp:system:relay-operation",
-        )
+        let caps = parse_capability_endpoint(&format!(
+            "scp:capabilities:scp:capability:schema-validation/v1,{SCOPED},scp:system:relay-operation"
+        ))
         .unwrap();
         assert_eq!(caps.len(), 3);
         assert!(matches!(caps[0], CapabilityUri::Protocol { .. }));
-        assert!(matches!(caps[1], CapabilityUri::DidScoped { .. }));
+        assert!(matches!(caps[1], CapabilityUri::IdentifierScoped { .. }));
         assert!(matches!(caps[2], CapabilityUri::System { .. }));
     }
 
@@ -588,7 +601,7 @@ mod tests {
             did: "did:dht:zTestDid".into(),
             capabilities: vec![
                 cap("scp:capability:schema-validation/v1"),
-                cap("did:dht:z6Mk123:capability:custom/v1"),
+                cap(SCOPED),
                 cap("scp:system:relay-operation"),
             ],
             service_endpoints: vec!["scp:capabilities:test".into()],
@@ -596,7 +609,7 @@ mod tests {
         };
 
         assert!(entry.capabilities[0].is_protocol());
-        assert!(entry.capabilities[1].is_did_scoped());
+        assert!(entry.capabilities[1].is_identifier_scoped());
         assert!(entry.capabilities[2].is_system());
 
         // Round-trip serialization preserves all variants.

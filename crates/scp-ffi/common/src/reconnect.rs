@@ -53,23 +53,15 @@ use scp_protocol::envelope::outer::{OuterEnvelope, create_outer_envelope};
 use scp_protocol::sync::{CatchUpStatus, SyncError, SyncEvent, SyncPolicy};
 use scp_transport::{RoutingId, TransportManager};
 
+// The checkpoint signer is resolved at the FFI boundary, not held by the
+// actor, and holds no private key material (ADR-049 Decision 7a).
+use scp_core::context::actor::CommandSigner;
+
 /// Default blob TTL (seconds) used when wrapping a Tier-3 plaintext reset
 /// request in an outer envelope. The reset request is short-lived; one
 /// hour matches the relay's typical retention floor and is well within
 /// the relay's accepted TTL band.
 const RESET_BLOB_TTL_SECS: u32 = 3600;
-
-/// Local Ed25519 signing-key seed carried for checkpoint build.
-/// Held in [`RelayActorSyncDriver`] so Phase 3 can sign the local
-/// checkpoint as the application send path does — the signing key is not
-/// actor-owned state (it lives at the FFI boundary).
-///
-/// Wrapped in [`Zeroizing`](zeroize::Zeroizing) so the 32-byte private seed
-/// is zeroed when the driver (and every clone threaded into the per-tier
-/// engines) drops, on the stack as well as the heap; the wiping global
-/// allocator of security model spec §9.15 (freed heap memory) reaches freed
-/// heap blocks only.
-type SigningKeyBytes = zeroize::Zeroizing<[u8; 32]>;
 
 /// Relay-backed driver for the ADR-029 reconnection protocol.
 ///
@@ -86,16 +78,15 @@ pub struct RelayActorSyncDriver<'a> {
     supervisor: &'a Arc<Supervisor>,
     /// Local member DID — the checkpoint author / reset requester.
     member_did: DID,
-    /// Local Ed25519 signing-key seed used to sign the Phase-3 local
-    /// checkpoint. Zeroized by the caller after the driver is dropped
-    /// (the caller owns the key material lifetime).
-    signing_key: SigningKeyBytes,
+    /// Custody-backed signer for `member_did`, used to sign the Phase-3
+    /// local checkpoint.
+    signer: CommandSigner,
 }
 
 impl<'a> RelayActorSyncDriver<'a> {
     /// Constructs a driver borrowing the bridge's transport + supervisor.
     ///
-    /// `signing_key` is the 32-byte Ed25519 seed for `member_did`; it is
+    /// `signer` signs for `member_did` through its custody; it is
     /// used only to sign the local consistency checkpoint in Phase 3
     /// (the same authority the application send path uses). The
     /// [`SyncPolicy`] lives on the [`ReconnectionCoordinator`] and is
@@ -106,13 +97,13 @@ impl<'a> RelayActorSyncDriver<'a> {
         transport: &'a Arc<TransportManager>,
         supervisor: &'a Arc<Supervisor>,
         member_did: DID,
-        signing_key: SigningKeyBytes,
+        signer: CommandSigner,
     ) -> Self {
         Self {
             transport,
             supervisor,
             member_did,
-            signing_key,
+            signer,
         }
     }
 
@@ -380,10 +371,9 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
     /// alerts the actor emitted while comparing retrieved remote
     /// checkpoints in Phase 2.
     async fn event_log_sync(&self, context_id: &str) -> Result<(u64, Vec<SyncEvent>), SyncError> {
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&self.signing_key);
         let checkpoint = self
             .supervisor
-            .build_local_checkpoint(context_id, &self.member_did, &signing_key)
+            .build_local_checkpoint(context_id, &self.member_did, &self.signer)
             .await
             .map_err(|e| SyncError::EventLogSyncFailed {
                 context_id: context_id.to_owned(),
@@ -779,7 +769,7 @@ fn outcome_str(outcome: &scp_protocol::sync::SyncOutcome) -> (String, bool) {
 /// `ProtocolRepository` at the bridge layer, not in actor state, so the
 /// caller supplies the drain.
 ///
-/// `signing_key` is the 32-byte Ed25519 seed for `member_did`; it signs the
+/// `signer` signs for `member_did` through its custody; it signs the
 /// Phase-3 local checkpoint.
 // `implicit_hasher`: `last_relay_contacts` is forwarded verbatim to
 // `ReconnectionCoordinator::with_policy`, which fixes the default
@@ -790,7 +780,7 @@ pub async fn reconnect_contexts<F, Fut>(
     transport: &Arc<TransportManager>,
     supervisor: &Arc<Supervisor>,
     member_did: DID,
-    signing_key: SigningKeyBytes,
+    signer: CommandSigner,
     context_ids: Vec<String>,
     last_relay_contacts: HashMap<String, u64>,
     now: u64,
@@ -801,12 +791,8 @@ where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = (u64, u64)>,
 {
-    let driver = RelayActorSyncDriver::new(
-        transport,
-        supervisor,
-        member_did.clone(),
-        signing_key.clone(),
-    );
+    let driver =
+        RelayActorSyncDriver::new(transport, supervisor, member_did.clone(), signer.clone());
 
     let coordinator = ReconnectionCoordinator::with_policy(
         member_did,
@@ -850,7 +836,7 @@ where
                     transport,
                     supervisor,
                     coordinator.member_did().clone(),
-                    signing_key.clone(),
+                    signer.clone(),
                 ));
                 let outcome = match engine.fetch_snapshot(&context_id).await {
                     Ok(Some(_snapshot)) => scp_protocol::sync::SyncOutcome::FullyCaughtUp,
@@ -870,7 +856,7 @@ where
                     transport,
                     supervisor,
                     coordinator.member_did().clone(),
-                    signing_key.clone(),
+                    signer.clone(),
                 ));
                 let timeout_secs = policy_welcome_timeout_secs();
                 let outcome = match executor.await_welcome(&context_id, timeout_secs).await {
@@ -940,7 +926,7 @@ pub async fn reconnect_contexts_no_drain(
     transport: &Arc<TransportManager>,
     supervisor: &Arc<Supervisor>,
     member_did: DID,
-    signing_key: SigningKeyBytes,
+    signer: CommandSigner,
     context_ids: Vec<String>,
     last_relay_contacts: HashMap<String, u64>,
     now: u64,
@@ -952,7 +938,7 @@ pub async fn reconnect_contexts_no_drain(
         transport,
         supervisor,
         member_did,
-        signing_key,
+        signer,
         context_ids,
         last_relay_contacts,
         now,

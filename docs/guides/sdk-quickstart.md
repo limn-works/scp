@@ -264,6 +264,7 @@ let params = ContextParams(
     economicPolicy: nil,
     consequenceRulesJson: nil,
     consequenceConfigJson: nil,
+    capabilityRequirementsJson: nil,
     pseudonymRotation: nil
 )
 let handle = try await scp.contextCreate(identity: identity, params: params)
@@ -294,6 +295,7 @@ val params = ContextParams(
     economicPolicy = null,
     consequenceRulesJson = null,
     consequenceConfigJson = null,
+    capabilityRequirementsJson = null,
     pseudonymRotation = null,
 )
 val handle = scp.contextCreate(identity, params)

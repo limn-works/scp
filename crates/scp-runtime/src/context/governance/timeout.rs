@@ -442,6 +442,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use scp_protocol::context::governance::GovernanceEngineRawKey as _;
     use scp_protocol::context::governance::majority::MajorityVoteEngine;
     use scp_protocol::context::governance::multisig::ThresholdEngine;
     use scp_protocol::context::governance::unanimity::UnanimityEngine;

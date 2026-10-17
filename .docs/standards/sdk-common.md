@@ -76,7 +76,7 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | Code | Layer | Condition |
 |------|-------|-----------|
 | `SCP-SAGA-13000` | protocol | Canonical preimage construction exceeded the length-prefix ceiling |
-| `SCP-SAGA-13001` | protocol | P-256 saga signature failed verification |
+| `SCP-SAGA-13001` | protocol | Saga signature failed verification |
 | `SCP-SAGA-13002` | protocol | Malformed P-256 verifying key |
 | `SCP-SAGA-13010` | handler | Caller lacks `outlet:interface` capability (outbound) |
 | `SCP-SAGA-13011` | handler | Caller not in outbound `allowed_callers` |
@@ -267,8 +267,9 @@ constant).
 | `SCP-CRYPTO-4030` | `scp-client-wasm` (browser participant) | Event-log append / proof failure (`ClientError::EventLog`) |
 | `SCP-CRYPTO-4040` | `scp-client-wasm` (browser participant) | Convergent committer-timestamp AAD failure — missing or malformed (ADR-057) (`ClientError::Mls(ConvergentTimestampMissing \| ConvergentTimestampMalformed)`) |
 | `SCP-CRYPTO-4041` | `scp-client-wasm` (browser participant) | Generic MLS group operation failure — create/add/join/encrypt/decrypt/commit catch-all (`ClientError::Mls(_)`) |
-| `SCP-CRYPTO-4060` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Key custody error: a key custody provider or a host custody callback failed for a reason other than key-not-found or a rejected host pseudonym. Covers every `PlatformError` variant except `KeyNotFound` (`SCP-CRYPTO-4006`), `PseudonymRejected` (`SCP-IDENT-1055`), `StorageLockHeld` (`SCP-STORAGE-8005`), `StorageClosed` (`SCP-STORAGE-8006`), `AttestationError` (`SCP-ATTEST-9001`), `Unsupported` (`SCP-CRYPTO-4061`) and `PushError` (`SCP-TRANS-5080` to `SCP-TRANS-5084`), whether it reaches the bridge as a `PlatformError` or as a `CustodyFailure` (ADR-006 2026-09-29 and 2026-10-12 amendments) |
+| `SCP-CRYPTO-4060` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Key custody error: a key custody provider or a host custody callback failed for a reason that has no more specific code. Covers every custody failure except `KeyNotFound` (`SCP-CRYPTO-4006`), `PseudonymRejected` (`SCP-IDENT-1055`), `StorageLockHeld` (`SCP-STORAGE-8005`), `StorageClosed` (`SCP-STORAGE-8006`), `AttestationError` (`SCP-ATTEST-9001`), `Unsupported` (`SCP-CRYPTO-4061`), a custody sign past the ADR-049 Decision 7a budget (`CustodyFailureKind::TimedOut`, `SCP-CRYPTO-4062`) and `PushError` (`SCP-TRANS-5080` to `SCP-TRANS-5084`), whether it reaches the bridge as a `PlatformError` or as a `CustodyFailure` (ADR-006 2026-09-29 and 2026-10-12 amendments) |
 | `SCP-CRYPTO-4061` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Unsupported platform operation: the backend does not support an optional operation, such as an HSM-backed custody asked for an extractable Ed25519 seed or a signature it cannot make (`PlatformError::Unsupported`, bare or wrapped in a `CustodyFailure`; ADR-006 2026-10-12 amendment) |
+| `SCP-CRYPTO-4062` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Key custody timeout: a custody sign did not answer within the ADR-049 Decision 7a budget (`CustodyFailureKind::TimedOut`) (ADR-006 2026-10-11 amendment) |
 | `SCP-TRANS-5005` | `scp-client-wasm` (browser participant) | Injected outbound `Socket`/`RelaySink` failed to enqueue a relay frame — WebSocket closed / JS exception (`ClientError::Transport`) |
 | `SCP-TRANS-5080` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Push wake payload invalid: a received push payload is not the platform's wake signal (`PlatformError::PushError` with `PushFailureKind::WakePayloadInvalid`; ADR-006 2026-10-12 amendment) |
 | `SCP-TRANS-5081` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Push registration rejected: the relay found the registration's signature, key state or encoding invalid (`PushFailureKind::RegistrationRejected`; ADR-006 2026-10-12 amendment) |
@@ -283,6 +284,19 @@ constant).
 | `SCP-VALID-7025` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | wasm module not initialized — `initScp()` (or `ScpBrowserClient.connect`) must be awaited before constructing/using a client |
 | `SCP-VALID-7026` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | `WebSocketRelaySocket` (the managed transport) passed to `create()` instead of `ScpBrowserClient.connect()` — it would be left unattached |
 | `SCP-VALID-7081` | SDK-wrapper native-loader guard (**one meaning in every SDK that loads a native bridge**; never minted by a bridge). ts-native SDK: `src/internal/native.ts`. Python SDK: `scp_sdk/_extension.py` | No native bridge is installed for the platform; in the ts-native SDK, no napi addon package resolves; in the Python SDK, no `scp_sdk._scp_core` extension file is present. The only native-load failure a test skip guard may treat as absence |
+| `SCP-VALID-7140` | native FFI-common registry | Recovery or custody-migration concurrency cap reached; back off and retry |
+| `SCP-VALID-7141` | Swift SDK (`Governance.swift`) | Site hostname is empty |
+| `SCP-VALID-7142` | Swift SDK (`Governance.swift`) | Site hostname exceeds 253 characters |
+| `SCP-VALID-7143` | native FFI-common registry | A challenge request or response exceeds its size bound (`TrustError::ResponseTooLarge`) |
+| `SCP-VALID-7144` | native FFI-common registry | Two capability definitions with one URI disagree (`TrustError::DefinitionEquivocation`) |
+| `SCP-VALID-7146` | native FFI-common registry | The challenger cannot grade now and the attempt is not used: every grading permit is held, or an evaluator's reserve refused the call for its rate limit or budget; resubmit the attempt (`TrustError::GradingCapacityExhausted`) |
+| `SCP-VALID-7147` | native FFI-common registry | An identifier is not the canonical spelling of its key (`TrustError::NonCanonicalIdentifier`, `AdmissionError::NonCanonicalIdentifier`) |
+| `SCP-VALID-7148` | native FFI-common registry | A context names more than `MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT` capability requirements (`AdmissionError::TooManyCapabilityRequirements`) |
+| `SCP-VALID-7149` | native FFI-common registry | A grading's lease expired or was replaced before its commit; nothing was written (`TrustError::GradingLeaseLost`) |
+| `SCP-VALID-7150` | native FFI-common registry | A capability requirement breaks a shape rule of spec 07 §7.3.4.4 (`AdmissionError::InvalidRequirement`) |
+| `SCP-VALID-7151` | native FFI-common registry | The challenger's last challenge to this subject for this capability is inside its window; retry at that challenge's `expires_at` (`TrustError::ChallengeWindowOpen`, spec 07 §7.3.4 step 1) |
+| `SCP-VALID-7152` | Swift SDK (`Governance.swift`) | Site `deployRetentionCount` is outside 1 to 8 |
+| `SCP-VALID-7153` | native FFI-common registry | An attempt was graded at or before its challenge's `created_at`; resubmit it at `created_at + 1` (`TrustError::ChallengeNotYetGradable`, spec 07 §7.3.4 step 3) |
 | `SCP-VALID-7082` | SDK-wrapper native-loader guard (**one meaning in every SDK that loads a native bridge**; never minted by a bridge). ts-native SDK: `src/internal/native.ts`, `src/scp.ts`. Python SDK: `scp_sdk/__init__.py`, `scp_sdk/_extension.py`, `scp_sdk/scp.py` | A native bridge is installed and failed to load (`dlopen` error, ABI or architecture mismatch, missing shared library), or it loaded without an export the SDK calls. A test skip guard fails on it |
 
 The browser participant reuses **only** `SCP-CTX-2095` from the shared band —
@@ -545,6 +559,10 @@ All public handle types (`Identity`, `ContextHandle`/`Context`, `TransportManage
 | Java | Thread-safe | Interior locking in Rust core via JNA |
 
 **Invariant:** No SDK user should ever need an external lock to use SCP types safely. If a data race is possible without user-side synchronization, the SDK has a bug.
+
+### Signing operations take the `Identity` handle
+
+An SDK operation that signs as a participant takes that participant's `Identity` handle, in every SDK: the challenger of `trustCreateChallenge` and `trustGradeResponse`, and the subject of `trustRespondToChallenge`. A DID string names a party the call does not sign as, such as a challenge's subject at creation. Every SDK in this table has an `Identity` handle, so no language forces a string in its place, and an SDK that takes a DID string for a signer diverges from this rule.
 
 ## Context Creation
 

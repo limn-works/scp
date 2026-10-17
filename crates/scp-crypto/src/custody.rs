@@ -27,6 +27,8 @@ pub enum CustodyFailureKind {
     /// The custody backend's durable directory lock is still held (spec §17.6
     /// "One Opener per Durable Directory").
     StorageLockHeld,
+    /// Custody did not answer within the ADR-049 Decision 7a signing budget.
+    TimedOut,
     /// A device attestation operation failed
     /// (`PlatformError::AttestationError`).
     AttestationFailed,

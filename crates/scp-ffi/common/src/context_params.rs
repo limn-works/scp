@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use scp_core::context::ContextParams;
+use scp_core::context::governance::GovernanceAction;
 use scp_core::context::params::{
     CeilingPolicy, ConsequenceConfig, ContextMode, GovernanceModel, IncompleteVerificationPolicy,
     MemoryScope, MetadataVisibilityPolicy, OutletRegistration, PromotionPolicy,
@@ -21,6 +22,42 @@ use scp_core::context::params::{
 use scp_core::context::roles::Capability;
 use scp_core::provenance::CounterpartyPolicy;
 use scp_core::trust::ConsequenceRule;
+use scp_core::trust::admission::CapabilityRequirements;
+use scp_protocol::trust::{AdmissionError, CapabilityRequirement, RawCapabilityRequirement};
+
+use crate::error_codes::{VALID_7000, admission_error_code};
+
+/// Why [`build_context_params`] refused a bridge's parameters.
+#[derive(Debug, thiserror::Error)]
+pub enum ContextParamsError {
+    /// A parameter is malformed: an unsupported value, invalid JSON, a
+    /// capability the §5.4.2.1 parser refuses, or a consequence rule its
+    /// config refuses. The bridge reports [`VALID_7000`].
+    #[error("{0}")]
+    Invalid(String),
+    /// A capability requirement breaks a rule of spec 07 §7.3.4.4. The bridge
+    /// reports the code [`admission_error_code`] gives it.
+    #[error("invalid capability_requirements: {0}")]
+    Requirement(#[from] AdmissionError),
+}
+
+impl From<String> for ContextParamsError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl ContextParamsError {
+    /// The bridge error code, the same on every bridge. Every refusal is a
+    /// validation error.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => VALID_7000,
+            Self::Requirement(e) => admission_error_code(e).0,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Bridge-agnostic intermediate type
@@ -87,6 +124,14 @@ pub struct CommonContextParams {
     /// Optional economic policy as a JSON string (spec §19, ADR-033).
     pub economic_policy_json: Option<String>,
 
+    /// The context's admission capability requirements as a JSON array of
+    /// `CapabilityRequirement` objects (spec §7.3.4.4). `None` or an empty
+    /// string means no requirements. The array is parsed through the
+    /// validating `CapabilityRequirements` type, so a malformed entry or more
+    /// than `MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT` entries refuses the
+    /// create.
+    pub capability_requirements_json: Option<String>,
+
     /// Consequence rules as a JSON string (ADR-017, #1531).
     /// `None` or empty string means no rules.
     pub consequence_rules_json: Option<String>,
@@ -126,12 +171,15 @@ pub struct CommonContextParams {
 ///
 /// # Errors
 ///
-/// Returns `Err(String)` on:
+/// Returns [`ContextParamsError::Requirement`] for a capability requirement
+/// the validating type refuses, and [`ContextParamsError::Invalid`] on:
 /// - Unsupported governance model (only `"single_admin"` is currently valid)
-/// - Invalid JSON in `economic_policy_json`, `consequence_rules_json`, or
-///   `consequence_config_json`
+/// - Invalid JSON in `economic_policy_json`, `capability_requirements_json`,
+///   `consequence_rules_json`, or `consequence_config_json`
 /// - Consequence rule validation failure against the config
-pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParams, String> {
+pub fn build_context_params(
+    params: &CommonContextParams,
+) -> Result<ContextParams, ContextParamsError> {
     let mode = match params.mode.as_str() {
         "broadcast" | "Broadcast" => ContextMode::Broadcast,
         _ => ContextMode::Encrypted,
@@ -168,6 +216,8 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
     let governance = parse_governance(&params.governance, params)?;
     let ttl = params.ttl;
     let economic_policy = parse_economic_policy(params.economic_policy_json.as_ref())?;
+    let capability_requirements =
+        parse_capability_requirements(params.capability_requirements_json.as_ref())?;
     let (consequence_rules, consequence_config) = parse_and_validate_consequences(
         params.consequence_rules_json.as_ref(),
         params.consequence_config_json.as_ref(),
@@ -202,7 +252,7 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         session_cap: params.session_cap,
         counterparty_policy: CounterpartyPolicy::default(),
         participation_requirements: Vec::new(),
-        capability_requirements: Vec::new(),
+        capability_requirements,
         incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         min_protocol_version: params.min_protocol_version,
         migration_source: None,
@@ -278,6 +328,55 @@ fn parse_economic_policy(
         .filter(|s| !s.is_empty())
         .map(|s| serde_json::from_str(s).map_err(|e| format!("invalid economic_policy JSON: {e}")))
         .transpose()
+}
+
+/// Parses the admission capability requirements through the validating
+/// [`CapabilityRequirements`] type; absent or empty means none.
+///
+/// The JSON decodes to the unvalidated wire form first, so a shape the
+/// protocol refuses comes back as its typed [`AdmissionError`] and keeps its
+/// own code, instead of a decoder message.
+fn parse_capability_requirements(
+    json: Option<&String>,
+) -> Result<CapabilityRequirements, ContextParamsError> {
+    let Some(json) = json.map(String::as_str).filter(|s| !s.is_empty()) else {
+        return Ok(CapabilityRequirements::default());
+    };
+    decode_capability_requirements(json)
+}
+
+/// Decodes a JSON array of capability requirements through the validating
+/// types: the wire form first, then each requirement, then the list, so every
+/// refusal keeps the code [`ContextParamsError::code`] gives it.
+fn decode_capability_requirements(
+    json: &str,
+) -> Result<CapabilityRequirements, ContextParamsError> {
+    let raw: Vec<RawCapabilityRequirement> = serde_json::from_str(json).map_err(|e| {
+        ContextParamsError::Invalid(format!("invalid capability_requirements JSON: {e}"))
+    })?;
+    let validated = raw
+        .into_iter()
+        .map(CapabilityRequirement::try_from)
+        .collect::<Result<Vec<_>, AdmissionError>>()?;
+    Ok(CapabilityRequirements::try_from(validated)?)
+}
+
+/// Builds the `ModifyCapabilityRequirements` governance action (spec 07
+/// §7.3.4.4) from a JSON array holding the complete new list; `[]` clears it.
+///
+/// Every bridge's `modify capability requirements` export calls this, so a
+/// malformed requirement reaches the caller with its own code (7147, 7148,
+/// 7150) and malformed JSON with 7000, the same codes context creation gives.
+///
+/// # Errors
+///
+/// [`ContextParamsError`] when the JSON or a requirement is malformed.
+pub fn modify_capability_requirements_action(
+    requirements_json: &str,
+) -> Result<GovernanceAction, ContextParamsError> {
+    Ok(GovernanceAction::ModifyCapabilityRequirements {
+        requirements: decode_capability_requirements(requirements_json)?,
+    })
 }
 
 /// Parses and cross-validates consequence rules and config from JSON strings.
@@ -411,6 +510,7 @@ fn parse_template_id(tid: &str) -> Result<scp_core::context::params::TemplateId,
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use scp_core::trust::challenge::MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT;
 
     /// Helper: build and assert success.
     fn build_ok(params: &CommonContextParams) -> ContextParams {
@@ -419,7 +519,7 @@ mod tests {
 
     /// Helper: build and assert failure.
     fn build_err(params: &CommonContextParams) -> String {
-        build_context_params(params).unwrap_err()
+        build_context_params(params).unwrap_err().to_string()
     }
 
     #[test]
@@ -434,6 +534,138 @@ mod tests {
         assert!(ctx.ttl.is_none());
         assert!(ctx.economic_policy.is_none());
         assert!(ctx.consequence_rules.is_empty());
+    }
+
+    /// One `ChallengeVerified` requirement naming `verifiers`, as JSON.
+    fn requirement_json(verifiers: &[String]) -> serde_json::Value {
+        serde_json::json!({
+            "capability": "scp:capability:schema-validation/v1",
+            "verification_level": "ChallengeVerified",
+            "trusted_verifiers": verifiers,
+        })
+    }
+
+    fn verifier(seed: u8) -> String {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        scp_did::did_dht_from_public_key(&key.verifying_key().to_bytes()).to_string()
+    }
+
+    #[test]
+    fn capability_requirements_reach_context_params() {
+        let json = serde_json::json!([requirement_json(&[verifier(7)])]).to_string();
+        let ctx = build_ok(&CommonContextParams {
+            capability_requirements_json: Some(json),
+            ..Default::default()
+        });
+        assert_eq!(ctx.capability_requirements.len(), 1);
+        let requirement = &ctx.capability_requirements.as_slice()[0];
+        assert_eq!(
+            requirement.capability().to_string(),
+            "scp:capability:schema-validation/v1"
+        );
+        assert_eq!(requirement.trusted_verifiers().len(), 1);
+        // Absent and empty both mean no requirements.
+        assert!(
+            build_ok(&CommonContextParams::default())
+                .capability_requirements
+                .is_empty()
+        );
+        let empty = build_ok(&CommonContextParams {
+            capability_requirements_json: Some(String::new()),
+            ..Default::default()
+        });
+        assert!(empty.capability_requirements.is_empty());
+    }
+
+    /// Each refusal keeps its own code: a shape rule 7150, a non-canonical
+    /// verifier 7147, more than the per-context bound 7148, and JSON that does
+    /// not decode 7000.
+    #[test]
+    fn invalid_capability_requirements_refuse_create_with_their_codes() {
+        let refuse = |json: String| {
+            build_context_params(&CommonContextParams {
+                capability_requirements_json: Some(json),
+                ..Default::default()
+            })
+            .unwrap_err()
+        };
+        // A ChallengeVerified requirement must name a verifier.
+        let err = refuse(serde_json::json!([requirement_json(&[])]).to_string());
+        assert!(
+            matches!(
+                err,
+                ContextParamsError::Requirement(AdmissionError::InvalidRequirement { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.code(), crate::error_codes::VALID_7150);
+        assert!(err.to_string().contains("names a verifier"), "{err}");
+        // A verifier that is not the canonical spelling of its key.
+        let mut padded = verifier(7);
+        padded.push('=');
+        let err = refuse(serde_json::json!([requirement_json(&[padded])]).to_string());
+        assert_eq!(err.code(), crate::error_codes::VALID_7147, "{err:?}");
+        // More than the per-context bound.
+        let over: Vec<_> = (0..=MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT)
+            .map(|_| requirement_json(&[verifier(7)]))
+            .collect();
+        let err = refuse(serde_json::Value::from(over).to_string());
+        assert!(
+            matches!(
+                err,
+                ContextParamsError::Requirement(
+                    AdmissionError::TooManyCapabilityRequirements { .. }
+                )
+            ),
+            "{err:?}"
+        );
+        assert_eq!(err.code(), crate::error_codes::VALID_7148);
+        // Malformed JSON.
+        let err = refuse("{".to_owned());
+        assert!(matches!(err, ContextParamsError::Invalid(_)), "{err:?}");
+        assert_eq!(err.code(), crate::error_codes::VALID_7000);
+        assert!(
+            err.to_string()
+                .contains("invalid capability_requirements JSON"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn modify_capability_requirements_action_keeps_each_refusal_code() {
+        let list = serde_json::json!([requirement_json(&[verifier(7)])]).to_string();
+        let GovernanceAction::ModifyCapabilityRequirements { requirements } =
+            modify_capability_requirements_action(&list).unwrap()
+        else {
+            panic!("the builder makes a ModifyCapabilityRequirements action");
+        };
+        assert_eq!(requirements.len(), 1);
+        let GovernanceAction::ModifyCapabilityRequirements { requirements } =
+            modify_capability_requirements_action("[]").unwrap()
+        else {
+            panic!("the builder makes a ModifyCapabilityRequirements action");
+        };
+        assert!(requirements.is_empty());
+
+        let code = |json: &str| {
+            modify_capability_requirements_action(json)
+                .unwrap_err()
+                .code()
+        };
+        assert_eq!(
+            code(&serde_json::json!([requirement_json(&[])]).to_string()),
+            crate::error_codes::VALID_7150
+        );
+        let over: Vec<_> = (0..=MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT)
+            .map(|_| requirement_json(&[verifier(7)]))
+            .collect();
+        assert_eq!(
+            code(&serde_json::Value::from(over).to_string()),
+            crate::error_codes::VALID_7148
+        );
+        // An absent list is not a clear: the caller must send `[]`.
+        assert_eq!(code(""), crate::error_codes::VALID_7000);
+        assert_eq!(code("{"), crate::error_codes::VALID_7000);
     }
 
     #[test]

@@ -579,46 +579,39 @@ async fn derive_member_pseudonym_required(
 ///
 /// Best effort by design: the announcement is an optimisation that peers
 /// recover from on the announcer's next explicit announcement, and a
-/// sign-only custody (a Secure Enclave key that cannot export raw signing
-/// bytes) must still create and join contexts. So a failed export or
-/// dispatch skips the announcement, but is logged at `warn` with its error,
-/// never discarded silently. Never panics.
+/// failed signer build or dispatch skips the announcement, but is logged at
+/// `warn` with its error, never discarded silently. The announcement signs
+/// through custody (ADR-049 Decision 7a). Never panics.
 async fn announce_pseudonym_best_effort(
     sup: &scp_core::context::supervisor::Supervisor,
     identity: &Identity,
     context_id: &str,
     params: scp_core::context::ContextParams,
 ) {
-    let Some(ref ik) = identity.core_id else {
+    // A DID-only handle (no retained key material or custody) has nothing to
+    // announce with.
+    if identity.core_id.is_none() || identity.custody.is_none() {
         return;
-    };
-    let Some(custody) = identity.custody.as_deref() else {
-        return;
-    };
-    let exported = custody
-        .export_ed25519_signing_key(&ik.active_signing_key)
-        .await;
-    let sk = match exported {
-        Ok(sk) => sk,
+    }
+    let signer = match resolve_identity_signer(identity).await {
+        Ok(signer) => signer,
         Err(e) => {
             tracing::warn!(
                 context_id,
                 error = %e,
-                "pseudonym announcement skipped: the active signing key cannot be exported"
+                "pseudonym announcement skipped: the active signer cannot be built"
             );
             return;
         }
     };
-    use scp_core::context::actor::commands::{
-        MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
-    };
+    use scp_core::context::actor::commands::{MessagingCommand, SendPseudonymAnnouncementPayload};
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = MessagingCommand::SendPseudonymAnnouncement {
         payload: Box::new(SendPseudonymAnnouncementPayload {
             context_id: context_id.to_owned(),
             params,
             sender_did: scp_did::DID(identity.did.clone()),
-            signing_key: SigningKeyBytes::from_signing_key(&sk),
+            signer,
         }),
         reply: tx,
     };
@@ -963,32 +956,6 @@ impl KeyCustody for CallbackKeyCustody {
     }
 }
 
-impl CallbackKeyCustody {
-    /// Exports the raw Ed25519 signing key for the given handle.
-    ///
-    /// Delegates to [`KeyCustodyProvider::export_signing_key_bytes`](crate::KeyCustodyProvider::export_signing_key_bytes)
-    /// on the platform callback through the shared flow, which requires the
-    /// seed to produce the handle's verifying key. Required for governance
-    /// vote signing.
-    pub(crate) async fn export_ed25519_signing_key(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
-        let p = &*self.provider;
-        scp_ffi_common::callback_custody::export_ed25519_signing_key(
-            &self.registry,
-            handle,
-            |key_id| async move {
-                p.export_signing_key_bytes(key_id)
-                    .await
-                    .map_err(host_err("export_signing_key_bytes"))
-            },
-            |key_id| host_public_key(p, key_id),
-        )
-        .await
-    }
-}
-
 // ---------------------------------------------------------------------------
 // UniffiKeyCustody — enum dispatch over the retained custody backends
 //
@@ -1049,41 +1016,6 @@ impl fmt::Debug for UniffiKeyCustody {
             Self::InMemory(_) => f.write_str("UniffiKeyCustody::InMemory([redacted])"),
             Self::Callback(_) => f.write_str("UniffiKeyCustody::Callback([platform])"),
             Self::File(_) => f.write_str("UniffiKeyCustody::File([redacted])"),
-        }
-    }
-}
-
-impl UniffiKeyCustody {
-    /// Names the backend in an error message.
-    pub(crate) const fn kind(&self) -> &'static str {
-        match self {
-            #[cfg(feature = "testing")]
-            Self::InMemory(_) => CustodyRequest::InMemory.as_str(),
-            Self::Callback(_) => CustodyRequest::OsKeystore.as_str(),
-            Self::File(_) => CustodyRequest::EncryptedFile.as_str(),
-        }
-    }
-
-    /// Exports the raw Ed25519 signing key for `handle` by dispatching to the
-    /// active backend — the enum analogue of the per-backend
-    /// `export_ed25519_signing_key` used by [`resolve_uniffi_signing_key`].
-    ///
-    /// Needed by the streaming-saga in-session reconnect/repair recover path
-    /// (SCP-OUT-047), which resolves the TARGET context creator's Active Signing
-    /// Key from the
-    /// per-instance identity custody registry (a `UniffiKeyCustody`) by DID —
-    /// there is no `ContextHandle` on the reconnect leg. Private key material
-    /// never crosses the FFI boundary; it is used in-process to seal the durable
-    /// prefix and dropped (ADR-006).
-    pub(crate) async fn export_ed25519_signing_key(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
-        match self {
-            #[cfg(feature = "testing")]
-            Self::InMemory(imc) => imc.0.export_ed25519_signing_key(handle).await,
-            Self::Callback(cb) => cb.export_ed25519_signing_key(handle).await,
-            Self::File(kc) => kc.export_ed25519_signing_key(handle).await,
         }
     }
 }
@@ -1360,6 +1292,17 @@ impl ScpError {
 // ---------------------------------------------------------------------------
 // From<scp-core error types> for ScpError
 // ---------------------------------------------------------------------------
+
+/// A bridge wait that could not drive its future (`scp_ffi_common::block_on`)
+/// reports `SCP-CTX-2001`, as the `PyO3` bridge does.
+impl From<scp_ffi_common::bridge_wait::BridgeBlockOnError> for ScpError {
+    fn from(e: scp_ffi_common::bridge_wait::BridgeBlockOnError) -> Self {
+        Self::Context {
+            msg: e.to_string(),
+            code: codes::CTX_2001.to_owned(),
+        }
+    }
+}
 
 impl From<scp_ffi_common::validate::ValidationError> for ScpError {
     fn from(e: scp_ffi_common::validate::ValidationError) -> Self {
@@ -1792,12 +1735,12 @@ impl From<scp_core::provenance::ProvenanceError> for ScpError {
 }
 
 impl From<scp_core::trust::TrustError> for ScpError {
+    /// The code comes from the shared table, so a challenge refusal carries
+    /// its own code on every bridge.
     fn from(e: scp_core::trust::TrustError) -> Self {
         Self::Validation {
-            msg: format!(
-                "trust evaluation failed: {e} — check event log data and attestation validity"
-            ),
-            code: codes::VALID_7003.to_owned(),
+            msg: scp_ffi_common::error_codes::trust_error_message(&e),
+            code: scp_ffi_common::error_codes::trust_error_code(&e).to_owned(),
         }
     }
 }
@@ -1869,22 +1812,6 @@ impl ScpError {
             _ => Self::Context {
                 msg,
                 code: codes::CTX_2027.to_owned(),
-            },
-        }
-    }
-
-    /// A failed inner-envelope signing: a custody failure keeps its custody
-    /// code ([`Self::custody_failure`]), and any other envelope failure is
-    /// `SCP-CRYPTO-4001`.
-    pub(crate) fn inner_envelope_error(e: &scp_core::envelope::EnvelopeError) -> Self {
-        let msg = format!("inner envelope signing failed: {e}");
-        match e {
-            scp_core::envelope::EnvelopeError::Custody(failure) => {
-                Self::custody_failure(msg, failure)
-            }
-            _ => Self::Crypto {
-                msg,
-                code: codes::CRYPTO_4001.to_owned(),
             },
         }
     }
@@ -2091,6 +2018,30 @@ pub enum CeilingPolicy {
 // See ADR-021 acceptance criterion 10.
 // ---------------------------------------------------------------------------
 
+/// The JSON inputs of one [`Scp::aggregate_trust_input`] call (spec §7.3).
+///
+/// They travel as one record so that the export takes three buffer
+/// arguments: JNA on darwin-aarch64 corrupts a by-value `RustBuffer`
+/// argument of some calls that pass nine or more of them, and the
+/// `ffi_buffer_arg_bound` test holds every export to eight.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TrustAggregationInputs {
+    /// The subject's event-log entries, as a JSON array of `Event`.
+    pub events_json: String,
+    /// The log's 32-byte Merkle root, as a JSON array of bytes.
+    pub merkle_root_json: String,
+    /// The context's consequence rules, as a JSON array.
+    pub consequence_rules_json: String,
+    /// Threshold requirements keyed by attestation type, as a JSON object.
+    pub threshold_requirements_json: String,
+    /// Attestor sets keyed by attestation type, as a JSON object.
+    pub attestor_sets_json: String,
+    /// Cached attestations to verify and store, as a JSON array.
+    pub cached_attestations_json: String,
+    /// Signed challenge verification records, as a JSON array.
+    pub challenge_results_json: String,
+}
+
 /// A DID document returned by identity resolution.
 ///
 /// See ADR-002 (DID) and spec §3 (Identity).
@@ -2160,6 +2111,9 @@ pub struct ContextParams {
     /// `None` means the default config (severe enforcement tiers gated to
     /// governance only).
     pub consequence_config_json: Option<String>,
+    /// The admission capability requirements as a JSON array of
+    /// `CapabilityRequirement` (spec §7.3.4.4). `None` means none.
+    pub capability_requirements_json: Option<String>,
     /// Pseudonym rotation policy (spec 09 §9.10.4.1). `None` disables
     /// rotation: members keep one routing ID for the context's lifetime. A
     /// set policy must name at least one trigger, and a set
@@ -3891,7 +3845,6 @@ impl TransportManager {
 
         // Phase D (#1695): the handle's `bi` field is the owning
         // `UniffiBridgeInstance` — mutate its transport slot directly.
-        let rt = runtime();
         let sourced = SourcedRelayUrl {
             url: relay_url.clone(),
             source: RelayUrlSource::Explicit,
@@ -3907,13 +3860,12 @@ impl TransportManager {
         // bridge's `transport_add_relay`.
         let profile = scp_transport::profile::TransportProfile::platform_default();
         let selector = self.bi.core.transport_selector();
-        let (adapter, suppression_rx) = rt
-            .block_on(async {
-                selector
-                    .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
-                    .await
-            })
-            .map_err(ScpError::from)?;
+        let (adapter, suppression_rx) = crate::block_on_shared(async {
+            selector
+                .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
+                .await
+        })?
+        .map_err(ScpError::from)?;
 
         // The manager records the relay with its adapter; a budget eviction
         // removes the evicted relay from the bridge's relay set in the same
@@ -5375,11 +5327,10 @@ impl McpUniFfiBridgeProvider {
         };
         let sup = Arc::clone(sup);
         let id = context_id.to_owned();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { sup.get_role_state_checked(&id).await })
-        })
-        .map_err(|e| format!("role state of context '{context_id}' could not be read: {e}"))
+        crate::block_on_shared(async move { sup.get_role_state_checked(&id).await })
+            .map_err(|e| e.to_string())
+            .and_then(|read| read.map_err(|e| e.to_string()))
+            .map_err(|e| format!("role state of context '{context_id}' could not be read: {e}"))
     }
 
     /// Reads `context_id`'s role state through [`Self::role_state_of`], for
@@ -5443,10 +5394,10 @@ impl McpUniFfiBridgeProvider {
         };
         let sup = Arc::clone(sup);
         let id = context_id.to_owned();
-        match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { sup.read_context_state_checked(&id).await })
-        }) {
+        match crate::block_on_shared(async move { sup.read_context_state_checked(&id).await })
+            .map_err(|e| e.to_string())
+            .and_then(|read| read.map_err(|e| e.to_string()))
+        {
             Ok(Some(scp_core::context::ContextState::Active)) => Ok(()),
             Ok(_) => Err(denied()),
             Err(e) => Err(AccessRefusal::Unreadable(format!(
@@ -5577,15 +5528,14 @@ impl McpUniFfiBridgeProvider {
                 ))
             })?
         };
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(bi.ensure_ucan_registered_while_active(context_id))
-        })
-        .map_err(|e| {
-            AccessRefusal::Unreadable(format!(
-                "UCAN state of context '{context_id}' could not be registered: {e}"
-            ))
-        })?;
+        crate::block_on_shared(bi.ensure_ucan_registered_while_active(context_id))
+            .map_err(|e| e.to_string())
+            .and_then(|registered| registered.map_err(|e| e.to_string()))
+            .map_err(|e| {
+                AccessRefusal::Unreadable(format!(
+                    "UCAN state of context '{context_id}' could not be registered: {e}"
+                ))
+            })?;
 
         // ADR-016 step 8 compares the token's grants against the ceiling in
         // `role_state`, and the chain check anchors on its `creator_did`. The
@@ -5901,7 +5851,10 @@ impl McpUniFfiBridgeProvider {
             )
             .map_err(|msg| format!("input validation failed for outlet '{outlet_name}': {msg}"))?;
 
-            let input_hash = scp_core::context::outlets::sha256_json(&arguments);
+            // An input with no canonical form (a number outside I-JSON) has
+            // no hash, so it fails input validation.
+            let input_hash = scp_core::context::outlets::sha256_json(&arguments)
+                .map_err(|e| format!("input validation failed for outlet '{outlet_name}': {e}"))?;
 
             let handler_dispatch = {
                 let outlet_handlers = handle
@@ -5928,15 +5881,28 @@ impl McpUniFfiBridgeProvider {
         // Phase 2: Execute handler OUTSIDE the locks so that concurrent
         // same-context operations are not blocked. Handler execution is
         // bounded by `outlet_timeout_ms` (matching PyO3 pattern, issue #123).
-        let output = {
+        let (output, output_hash) = {
             let (handler, output_schema) = dispatch;
-            let (tx, rx) = std::sync::mpsc::channel();
+            let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
                 let result = handler(arguments);
                 let _ = tx.send(result);
             });
 
-            let handler_result = rx.recv_timeout(timeout).map_err(|_| {
+            // The wait is an async timeout driven by the bridge wait, because
+            // no bridge code blocks outside `bridge_wait`. Inside a
+            // current-thread runtime it runs on a private runtime, so the
+            // handler is waited on in every regime, as before. A timeout, or a
+            // handler thread that ended without sending (it panicked), is
+            // reported as the timeout.
+            let handler_result = scp_ffi_common::bridge_wait::bridge_block_on_off_thread(
+                || Ok(crate::runtime()),
+                async move { tokio::time::timeout(timeout, rx).await },
+            )
+            .map_err(|e| format!("outlet handler for '{outlet_name}' wait failed: {e}"))?
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| {
                 format!(
                     "outlet handler for '{outlet_name}' timed out after {}ms",
                     timeout.as_millis()
@@ -5952,8 +5918,12 @@ impl McpUniFfiBridgeProvider {
                 &output_schema,
             )
             .map_err(|msg| format!("output validation failed for outlet '{outlet_name}': {msg}"))?;
+            // An output with no canonical form has no hash, so it fails
+            // output validation before any event is appended.
+            let output_hash = scp_core::context::outlets::sha256_json(&output)
+                .map_err(|e| format!("output validation failed for outlet '{outlet_name}': {e}"))?;
 
-            output
+            (output, output_hash)
         };
 
         // Phase 3: Append OutletInvokedEvent to the event log (ADR-010
@@ -5976,7 +5946,7 @@ impl McpUniFfiBridgeProvider {
             status: scp_core::context::outlets::OutletStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
-            output_hash: Some(scp_core::context::outlets::sha256_json(&output)),
+            output_hash: Some(output_hash),
             cost: None,
             // Non-streaming bridge invocation: degenerate/no-manifest
             // streaming-field defaults matching the lifecycle serde defaults.
@@ -5995,10 +5965,10 @@ impl McpUniFfiBridgeProvider {
         // Ensure UCAN state is registered before appending the event, while
         // the supervisor reports the context `Active`. A failure leaves the
         // append to the `None` arm below, which logs it.
-        if let Err(e) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(bi.ensure_ucan_registered_while_active(context_id))
-        }) {
+        if let Err(e) = crate::block_on_shared(bi.ensure_ucan_registered_while_active(context_id))
+            .map_err(|e| e.to_string())
+            .and_then(|registered| registered.map_err(|e| e.to_string()))
+        {
             tracing::warn!(
                 outlet = %outlet_name,
                 context = %context_id,
@@ -6559,28 +6529,28 @@ async fn event_log_checkpoint_impl(
             let sender_did = scp_did::DID(identity.did.clone());
             let context_id = handle.context_id.clone();
 
+            // The bounded, key-type-checked sign of ADR-049 Decision 7a: a
+            // custody that never answers fails with SCP-CRYPTO-4062.
+            let signer = scp_ffi_common::signer::identity_command_signer(
+                Arc::clone(&custody),
+                core_id.active_signing_key,
+            )
+            .await
+            .map_err(ScpError::from)?;
             let checkpoint = bi
                 .with_ucan_state(&context_id, |ucan_state| {
-                    let signer = scp_core::event_log::KeyCustodySigner {
-                        custody: &*custody,
-                        key: &core_id.active_signing_key,
-                    };
-                    // generate_checkpoint is async — use block_in_place to allow
-                    // blocking inside this spawned async task. block_in_place moves
-                    // the worker thread to blocking mode (requires multi-thread runtime).
-                    let handle = tokio::runtime::Handle::current();
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(async {
-                            scp_event_log::checkpoint::generate_checkpoint(
-                                &ucan_state.event_log,
-                                &sender_did,
-                                epoch,
-                                &signer,
-                            )
-                            .await
-                            .map_err(|e| ScpError::checkpoint_error(&e))
-                        })
-                    })
+                    // generate_checkpoint is async; this closure is sync, so
+                    // the wait blocks this spawned task's worker.
+                    crate::block_on_shared(async {
+                        scp_event_log::checkpoint::generate_checkpoint(
+                            &ucan_state.event_log,
+                            &sender_did,
+                            epoch,
+                            &signer,
+                        )
+                        .await
+                        .map_err(|e| ScpError::checkpoint_error(&e))
+                    })?
                 })
                 .ok_or_else(|| ScpError::Context {
                     msg: format!("context '{context_id}' not found in UCAN registry"),
@@ -6679,28 +6649,28 @@ async fn event_log_checkpoint_by_did_impl(
             let sender_did = scp_did::DID(did);
             let context_id = handle.context_id.clone();
 
+            // The bounded, key-type-checked sign of ADR-049 Decision 7a: a
+            // custody that never answers fails with SCP-CRYPTO-4062.
+            let signer = scp_ffi_common::signer::identity_command_signer(
+                Arc::clone(&custody),
+                core_id.active_signing_key,
+            )
+            .await
+            .map_err(ScpError::from)?;
             let checkpoint = bi
                 .with_ucan_state(&context_id, |ucan_state| {
-                    let signer = scp_core::event_log::KeyCustodySigner {
-                        custody: &*custody,
-                        key: &core_id.active_signing_key,
-                    };
-                    // generate_checkpoint is async — use block_in_place to allow
-                    // blocking inside this spawned async task. block_in_place moves
-                    // the worker thread to blocking mode (requires multi-thread runtime).
-                    let handle = tokio::runtime::Handle::current();
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(async {
-                            scp_event_log::checkpoint::generate_checkpoint(
-                                &ucan_state.event_log,
-                                &sender_did,
-                                epoch,
-                                &signer,
-                            )
-                            .await
-                            .map_err(|e| ScpError::checkpoint_error(&e))
-                        })
-                    })
+                    // generate_checkpoint is async; this closure is sync, so
+                    // the wait blocks this spawned task's worker.
+                    crate::block_on_shared(async {
+                        scp_event_log::checkpoint::generate_checkpoint(
+                            &ucan_state.event_log,
+                            &sender_did,
+                            epoch,
+                            &signer,
+                        )
+                        .await
+                        .map_err(|e| ScpError::checkpoint_error(&e))
+                    })?
                 })
                 .ok_or_else(|| ScpError::Context {
                     msg: format!("context '{context_id}' not found in UCAN registry"),
@@ -6735,156 +6705,98 @@ async fn event_log_checkpoint_by_did_impl(
 // Free functions — governance proposal lifecycle (#621)
 // ---------------------------------------------------------------------------
 
-/// Resolves the raw Ed25519 signing key from a `UniFFI` `ContextHandle`.
+/// Builds the `#active` [`CommandSigner`](scp_core::context::actor::CommandSigner)
+/// over an `Identity`'s retained custody (ADR-049 Decision 7a). The private
+/// key stays in custody.
 ///
-/// Exports through the handle's single retained `custody`. Returns
-/// `ScpError::Context` if the handle holds no custody or no key handle.
-/// Resolves the raw Ed25519 signing key from an `Identity`'s retained
-/// custody (platform callback OR in-memory). Used by `context_reconnect`
-/// to sign the Phase-3 consistency checkpoint. The export path mirrors
-/// `announce_pseudonym_best_effort` but surfaces a typed error rather than
-/// swallowing a missing key.
-async fn resolve_identity_signing_key(
+/// # Errors
+///
+/// - `SCP-IDENT-1054` when the identity has no retained key material or no
+///   custody.
+/// - The custody's own code through `ScpError::from(PlatformError)` when the
+///   signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
+async fn resolve_identity_signer(
     identity: &Identity,
-) -> Result<ed25519_dalek::SigningKey, ScpError> {
+) -> Result<scp_core::context::actor::CommandSigner, ScpError> {
     let core_id = identity
         .core_id
         .as_ref()
         .ok_or_else(|| ScpError::Identity {
-            msg: "identity has no retained key material — reconnect requires a \
-              real local signing key to sign the consistency checkpoint"
+            msg: "identity has no retained key material — signing requires a custodied \
+              identity"
                 .to_owned(),
             code: codes::IDENT_1054.to_owned(),
         })?;
-    let key_handle = core_id.active_signing_key;
-
-    match identity.custody.as_deref() {
-        Some(custody) => custody
-            .export_ed25519_signing_key(&key_handle)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!(
-                    "failed to export signing key from {} custody: {e}",
-                    custody.kind()
-                ),
-                code: codes::CTX_2040.to_owned(),
-            }),
-        None => Err(ScpError::Identity {
-            msg: "identity has no usable custody backend for reconnect signing".to_owned(),
+    let custody = identity
+        .custody
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity has no usable custody backend for signing".to_owned(),
             code: codes::IDENT_1054.to_owned(),
-        }),
-    }
+        })?;
+    scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), core_id.active_signing_key)
+        .await
+        .map_err(ScpError::from)
 }
 
-pub(crate) async fn resolve_uniffi_signing_key(
+/// Builds the `#active` [`CommandSigner`](scp_core::context::actor::CommandSigner)
+/// over a `ContextHandle`'s retained custody (ADR-049 Decision 7a), for the
+/// governance lifecycle and context export. The private key stays in custody.
+///
+/// # Errors
+///
+/// - `SCP-CTX-2040` when the handle holds no custody or no key handle.
+/// - The custody's own code through `ScpError::from(PlatformError)` when the
+///   signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
+pub(crate) async fn resolve_uniffi_signer(
     handle: &ContextHandle,
-) -> Result<ed25519_dalek::SigningKey, ScpError> {
+) -> Result<scp_core::context::actor::CommandSigner, ScpError> {
     let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
-        msg: "no signing key on context handle — governance lifecycle \
+        msg: "no signing key on context handle — signing \
                   requires an identity with an active signing key"
             .to_owned(),
         code: codes::CTX_2040.to_owned(),
     })?;
-
-    match handle.custody.as_deref() {
-        Some(custody) => custody
-            .export_ed25519_signing_key(&key_handle)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!(
-                    "failed to export signing key from {} custody: {e}",
-                    custody.kind()
-                ),
-                code: codes::CTX_2040.to_owned(),
-            }),
-        None => Err(ScpError::Context {
-            msg: "no custody provider on context handle — governance lifecycle \
-                  requires an identity created with custody"
-                .to_owned(),
-            code: codes::CTX_2040.to_owned(),
-        }),
-    }
-}
-
-/// Exports the raw Ed25519 signing key for a key handle via the SENDER
-/// IDENTITY's OWN retained custody (platform/callback custody first, then —
-/// only under `testing` — the in-memory dev custody), mirroring the resolution
-/// order of [`resolve_uniffi_signing_key`] but sourcing custody from the
-/// identity that owns the key rather than the context handle.
-///
-/// The `#agent` send path uses this so the agent key handle and the custody it
-/// is exported through come from the SAME identity — mirroring the `PyO3`
-/// reference `resolve_message_signer`, which reads both from one registry entry.
-/// Exporting through the context handle's custody could export the wrong
-/// identity's key when the two differ (fail-closed at the receiver, but a latent
-/// correctness bug that bites when RFC #2242 activates the agent path).
-async fn export_uniffi_key_via_identity_custody(
-    identity: &Identity,
-    key_handle: &KeyHandle,
-) -> Result<ed25519_dalek::SigningKey, ScpError> {
-    match identity.custody.as_deref() {
-        Some(custody) => custody
-            .export_ed25519_signing_key(key_handle)
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!(
-                    "failed to export agent signing key from {} custody: {e}",
-                    custody.kind()
-                ),
-                code: codes::CTX_2040.to_owned(),
-            }),
-        None => Err(ScpError::Identity {
-            msg: format!(
-                "identity '{}' has an agent key but no usable custody backend to export it — \
-             cannot send under #agent",
-                identity.did
-            ),
-            code: codes::IDENT_1023.to_owned(),
-        }),
-    }
+    let custody = handle.custody.as_ref().ok_or_else(|| ScpError::Context {
+        msg: "no custody provider on context handle — signing \
+              requires an identity created with custody"
+            .to_owned(),
+        code: codes::CTX_2040.to_owned(),
+    })?;
+    scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), key_handle)
+        .await
+        .map_err(ScpError::from)
 }
 
 /// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
 /// for a **message send** under the requested persona (ADR-039 Enforcement-Stack
-/// Layer 2).
+/// Layer 2). The signer signs through custody (ADR-049 Decision 7a); no key is
+/// exported.
 ///
 /// Selects BOTH the key handle and the persona so the `#active`/`#agent` stamp
 /// and the signing key are chosen together and cannot diverge:
 /// - [`SigningKeyId::Active`](scp_did::SigningKeyId::Active) → the handle's
-///   retained active signing key (byte-identical to [`resolve_uniffi_signing_key`],
-///   so the default send path is unchanged). A failure there is remapped to a
-///   send-specific `SCP-CRYPTO-4001` rather than propagating the
-///   governance-worded `SCP-CTX-2040` from [`resolve_uniffi_signing_key`].
+///   retained active signing key, through [`resolve_uniffi_signer`].
 /// - [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) → the sender
-///   identity's agent signing key (from its retained [`ScpIdentity`]), exported
-///   via the sender identity's OWN retained custody (same source as the key
-///   handle — see [`export_uniffi_key_via_identity_custody`]). **Fail-closed**
-///   with `SCP-IDENT-1023` when the identity has no retained key material or no
-///   agent key — NEVER falls back to `#active`.
+///   identity's agent signing key, signed through the sender identity's OWN
+///   retained custody, so the key handle and the custody that holds it come
+///   from the same identity. **Fail-closed** with `SCP-IDENT-1023` when the
+///   identity has no retained key material, no agent key, or no custody —
+///   NEVER falls back to `#active`.
+///
+/// # Errors
+///
+/// - `SCP-CTX-2040` when the handle carries no custody or no active key
+///   (`#active`); `SCP-IDENT-1023` as above (`#agent`).
+/// - The custody's own code through `ScpError::from(PlatformError)` when the
+///   signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
 async fn resolve_uniffi_message_signer(
     handle: &ContextHandle,
     identity: &Identity,
     persona: scp_did::SigningKeyId,
 ) -> Result<scp_ffi_common::persona::ResolvedMessageSigner, ScpError> {
-    let key = match persona {
-        scp_did::SigningKeyId::Active => {
-            resolve_uniffi_signing_key(handle).await.map_err(|e| {
-                // Preserve the underlying custody-export diagnostic before
-                // collapsing to the send-specific SCP-CRYPTO-4001 (the returned
-                // code is intentionally unchanged — only the otherwise-lost
-                // detail is logged).
-                tracing::warn!(
-                    error = %e,
-                    "send #active signing-key resolution failed; returning SCP-CRYPTO-4001"
-                );
-                ScpError::Crypto {
-                    msg: "signing key required for send: could not resolve the sender's \
-                          #active signing key from retained custody"
-                        .to_owned(),
-                    code: codes::CRYPTO_4001.to_owned(),
-                }
-            })?
-        }
+    let signer = match persona {
+        scp_did::SigningKeyId::Active => resolve_uniffi_signer(handle).await?,
         scp_did::SigningKeyId::Agent => {
             let core_id = identity
                 .core_id
@@ -6906,11 +6818,24 @@ async fn resolve_uniffi_message_signer(
                     ),
                     code: codes::IDENT_1023.to_owned(),
                 })?;
-            export_uniffi_key_via_identity_custody(identity, &agent_handle).await?
+            let custody = identity
+                .custody
+                .as_ref()
+                .ok_or_else(|| ScpError::Identity {
+                    msg: format!(
+                        "identity '{}' has an agent key but no usable custody backend to \
+                         sign with it — cannot send under #agent",
+                        identity.did
+                    ),
+                    code: codes::IDENT_1023.to_owned(),
+                })?;
+            scp_ffi_common::signer::identity_command_signer(Arc::clone(custody), agent_handle)
+                .await
+                .map_err(ScpError::from)?
         }
     };
     Ok(scp_ffi_common::persona::ResolvedMessageSigner::new(
-        key, persona,
+        signer, persona,
     ))
 }
 
@@ -7030,78 +6955,6 @@ pub(crate) async fn enforce_caller_principal_binding(
         });
     }
     Ok(())
-}
-
-/// Resolves the context-export signing key handle, failing closed with
-/// `ScpError::Context` (CTX-2040) when the handle carries no signing-key
-/// handle or no custody provider. `context_export` calls it before
-/// `export_context`, so [`sign_export_snapshot_via_custody`] runs only with a
-/// key and a custody present, and its error is the custody's own.
-fn export_signing_key(handle: &ContextHandle) -> Result<KeyHandle, ScpError> {
-    let key_handle = handle.signing_key.ok_or_else(|| ScpError::Context {
-        msg: "no signing key on context handle — context export \
-                  requires an identity with an active signing key"
-            .to_owned(),
-        code: codes::CTX_2040.to_owned(),
-    })?;
-    if handle.custody.is_none() {
-        return Err(ScpError::Context {
-            msg: "no custody provider on context handle — context export \
-                      requires an identity created with custody"
-                .to_owned(),
-            code: codes::CTX_2040.to_owned(),
-        });
-    }
-    Ok(key_handle)
-}
-
-/// Signs the §23.16.8 context-export snapshot digest via the exporter
-/// identity's [`KeyCustody::sign`] — delegating to whichever backend backs the
-/// handle (platform/software callback custody OR in-memory custody) — instead
-/// of extracting a raw Ed25519 signing key.
-///
-/// This is the export-path analogue of [`resolve_uniffi_signing_key`]: the
-/// governance lifecycle paths still extract a raw key (they sign with
-/// `ed25519_dalek::Signer` directly), but context export only needs a detached
-/// signature over the canonical snapshot digest, so it can route through
-/// `custody.sign` and never materialize private key bytes. A sign-only /
-/// keychain / HSM-shaped callback custody — one that implements `sign` but
-/// intentionally does NOT implement `export_ed25519_signing_key` — can
-/// therefore still produce a verifiable signed export. Private key material
-/// never crosses the FFI boundary (ADR-006).
-///
-/// Matches the handle's single retained `custody` exhaustively, like every
-/// other key-bearing `UniFFI` path.
-///
-/// Returns the custody's [`PlatformError`], which
-/// `export_context` carries as `ContextError::Custody` so the caller sees the
-/// code [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
-/// assigns. It
-/// validates that the returned signature is exactly 64 bytes (Ed25519), so a
-/// misbehaving custody can never yield an under-length signature that would
-/// later fail verification in a confusing place. The caller
-/// (`context_export`) never emits an unsigned export on any error path.
-async fn sign_export_snapshot_via_custody(
-    handle: &ContextHandle,
-    key_handle: &KeyHandle,
-    hash: &[u8; 32],
-) -> Result<[u8; 64], scp_platform::PlatformError> {
-    let signature = match handle.custody.as_deref() {
-        Some(custody) => custody.sign(key_handle, hash).await?,
-        None => {
-            return Err(scp_platform::PlatformError::CustodyError(
-                "no custody provider on context handle".to_owned(),
-            ));
-        }
-    };
-
-    let bytes: [u8; 64] = signature.as_bytes().try_into().map_err(|_| {
-        scp_platform::PlatformError::CustodyError(format!(
-            "custody sign returned {} bytes, expected 64 (Ed25519) for context export snapshot",
-            signature.as_bytes().len()
-        ))
-    })?;
-    Ok(bytes)
 }
 
 /// Resolves the snapshot creator's Ed25519 verification key for
@@ -7358,14 +7211,22 @@ fn bridge_params_to_core(
         economic_policy_json: params.economic_policy.clone(),
         consequence_rules_json: params.consequence_rules_json.clone(),
         consequence_config_json: params.consequence_config_json.clone(),
+        capability_requirements_json: params.capability_requirements_json.clone(),
         pseudonym_rotation: params.pseudonym_rotation.map(Into::into),
-        ..Default::default()
+        // Named so a new common field does not compile until this bridge
+        // reads it.
+        governance_threshold: None,
+        governance_signers: None,
+        governance_voters: None,
+        roles: Vec::new(),
+        outlets: Vec::new(),
+        template_id: None,
     };
 
     scp_ffi_common::context_params::build_context_params(&common).map_err(|e| {
         ScpError::Validation {
-            msg: e,
-            code: codes::VALID_7000.to_owned(),
+            msg: e.to_string(),
+            code: e.code().to_owned(),
         }
     })
 }
@@ -7746,10 +7607,42 @@ pub struct AttestationVerificationResult {
 /// Result of creating a challenge request.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChallengeResult {
-    /// The unique challenge ID (UUID v4).
+    /// The challenge ID: lowercase hex of its 32 random bytes.
     pub challenge_id: String,
-    /// The serialized challenge request (JSON).
-    pub challenge_json: String,
+    /// The signed `ChallengeRequest` (JSON), which carries no answers.
+    pub request_json: String,
+}
+
+/// A challenger's choice of fewer retries or a longer cooldown than the
+/// capability definition's. An absent field takes the definition's value.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct ChallengePolicy {
+    /// Retries after the first attempt; at most the definition's.
+    pub max_retries: Option<u32>,
+    /// Seconds between graded attempts; at least the definition's.
+    pub cooldown_secs: Option<u32>,
+}
+
+/// A graded attempt, as `trust_grade_response` returns it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChallengeGradeResult {
+    /// The signed `ChallengeVerification` (JSON).
+    pub record_json: String,
+    /// The per-case results (JSON array of `CaseResult`), never signed.
+    pub reasons_json: String,
+    /// Why the record could not be written to this instance's trust store,
+    /// when it could not; the record is signed and the attempt used either
+    /// way.
+    pub trust_store_error: Option<TrustStoreWriteError>,
+}
+
+/// A failed write of a graded record to this instance's trust store.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TrustStoreWriteError {
+    /// The error code, the one every trust-store write failure reports.
+    pub code: String,
+    /// The message.
+    pub message: String,
 }
 
 /// Queries a trust score for the given DID in the given context.
@@ -7789,11 +7682,33 @@ pub fn trust_query_score(did: String, context_id: String) -> Result<TrustScoreRe
     })
 }
 
+/// Runs a trust operation that resolves signers' `#active` keys (spec 09
+/// §9.7.1) on tokio's blocking pool, so a DID lookup blocks neither the
+/// caller's thread nor an async worker.
+///
+/// # Errors
+///
+/// `work`'s own error, or `CTX_2000` when the blocking task panics or is
+/// cancelled.
+async fn on_resolution_pool<T, F>(work: F) -> Result<T, ScpError>
+where
+    F: FnOnce(&scp_ffi_common::BlockingResolutionScope) -> Result<T, ScpError> + Send + 'static,
+    T: Send + 'static,
+{
+    scp_ffi_common::run_blocking_resolution(work)
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: e.to_string(),
+            code: codes::CTX_2000.to_owned(),
+        })?
+}
+
 /// Verifies one attestation against the revocation list in the concrete
-/// backend behind a `ProtocolRepoVariant` arm, with the production DID-key
-/// resolver and clock.
+/// backend behind a `ProtocolRepoVariant` arm, with the instance's `#active`
+/// key resolver and the system clock.
 fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
     repo: &std::sync::Arc<scp_core::store::ProtocolRepository<S>>,
+    resolver: &dyn scp_core::trust::attestation::ActiveKeyResolver,
     context_id: &str,
     attestation: &scp_core::trust::Attestation,
 ) -> Result<scp_ffi_common::trust_store::AttestationVerdict, scp_core::trust::TrustError> {
@@ -7804,104 +7719,232 @@ fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
         &bridge,
         context_id,
         attestation,
-        &scp_core::trust::IdentityDidPublicKeyResolver,
+        resolver,
         &scp_clock::SystemClock,
     )
 }
 
-/// Creates a challenge request for capability verification.
-///
-/// See ADR-017 Layer 3 (Challenge-Response).
-#[uniffi::export]
-pub fn trust_create_challenge(target_did: String) -> Result<ChallengeResult, ScpError> {
-    if target_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "target DID must not be empty".to_owned(),
-            code: codes::VALID_7013.to_owned(),
-        });
-    }
-
-    struct EphemeralSigner(ed25519_dalek::SigningKey);
-    impl scp_core::trust::ChallengeSigner for EphemeralSigner {
-        fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
-            use ed25519_dalek::Signer;
-            let sig = self.0.sign(data);
-            Ok(sig.to_bytes().to_vec())
+/// Maps a shared challenge-operation failure to its bridge error through
+/// [`ChallengeOpError::code_and_class`](scp_ffi_common::challenge::ChallengeOpError::code_and_class),
+/// so the code and class are the same on every bridge; a runtime failure
+/// takes this bridge's `ContextError` conversion.
+fn challenge_op_error(e: scp_ffi_common::challenge::ChallengeOpError) -> ScpError {
+    use scp_ffi_common::challenge::ChallengeFailure;
+    use scp_ffi_common::error_codes::TrustFailureClass;
+    match e.code_and_class() {
+        ChallengeFailure::Coded {
+            code,
+            class,
+            message: msg,
+        } => {
+            let code = code.to_owned();
+            match class {
+                TrustFailureClass::Validation => ScpError::Validation { msg, code },
+                TrustFailureClass::Identity => ScpError::Identity { msg, code },
+                TrustFailureClass::Context => ScpError::Context { msg, code },
+            }
         }
+        ChallengeFailure::Context(e) => ScpError::from(e),
+    }
+}
+
+/// The evaluator state of this bridge: the outlet registry and host
+/// handlers of the evaluator context's handle in this instance's context
+/// handle registry. A lookup finds nothing when no handle for the context is
+/// registered on this instance.
+struct UniffiEvaluatorHost<'a> {
+    bi: &'a Arc<crate::runtime::UniffiBridgeInstance>,
+}
+
+impl UniffiEvaluatorHost<'_> {
+    fn handle(&self, evaluator_context_id: &str) -> Option<Arc<ContextHandle>> {
+        context_handle_registry(self.bi)
+            .get(evaluator_context_id)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+}
+
+impl scp_ffi_common::challenge::EvaluatorHost for UniffiEvaluatorHost<'_> {
+    fn registry(
+        &self,
+        evaluator_context_id: &str,
+    ) -> Option<scp_core::context::outlets::OutletRegistry> {
+        let handle = self.handle(evaluator_context_id)?;
+        let registry = handle
+            .outlet_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Some(registry)
     }
 
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let signer = EphemeralSigner(signing_key);
+    fn handler(
+        &self,
+        evaluator_context_id: &str,
+        outlet_id: &scp_core::context::outlets::OutletId,
+    ) -> Option<scp_ffi_common::challenge::EvaluatorHandler> {
+        let handle = self.handle(evaluator_context_id)?;
+        let handlers = handle
+            .outlet_handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handlers.get(outlet_id.as_str()).cloned()
+    }
+}
 
-    let request = scp_core::trust::issue_challenge(
-        "did:key:ephemeral-challenger".into(),
-        target_did.into(),
-        scp_core::trust::ChallengeType::schema_validation(),
-        "scp:capability:schema-validation/v1".to_string(),
-        serde_json::json!({}),
-        std::time::Duration::from_mins(5),
+/// Implementation of [`Scp::trust_create_challenge`] (spec 07 §7.3.4 step 1,
+/// ADR-017).
+#[allow(clippy::too_many_arguments)]
+async fn trust_create_challenge_impl(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    verifier: &Identity,
+    subject: String,
+    capability_uri: String,
+    test_cases_json: String,
+    context_id: String,
+    window_secs: u64,
+    evaluator_context_id: Option<String>,
+    policy: Option<ChallengePolicy>,
+) -> Result<ChallengeResult, ScpError> {
+    scp_ffi_common::challenge::validate_challenge_did(&verifier.did).map_err(challenge_op_error)?;
+    scp_ffi_common::challenge::validate_challenge_did(&subject).map_err(challenge_op_error)?;
+    scp_ffi_common::challenge::validate_challenge_context_id(&context_id)
+        .map_err(challenge_op_error)?;
+    if let Some(id) = &evaluator_context_id {
+        scp_ffi_common::challenge::validate_challenge_context_id(id).map_err(challenge_op_error)?;
+    }
+    let sup = bi.context_manager_expect()?;
+    let signer = resolve_identity_signer(verifier).await?;
+    let host = UniffiEvaluatorHost { bi };
+    let invoker = scp_ffi_common::challenge::SharedEvaluatorInvoker::new(sup, &host);
+    let request = scp_ffi_common::challenge::create_challenge(
+        sup,
         &signer,
+        scp_ffi_common::challenge::CreateChallenge {
+            verifier: verifier.did.as_str().into(),
+            subject: subject.into(),
+            capability_uri,
+            test_cases_json,
+            window_secs,
+            context_id,
+            policy: policy
+                .map(|p| scp_core::trust::PolicyPick {
+                    max_retries: p.max_retries,
+                    cooldown_secs: p.cooldown_secs,
+                })
+                .unwrap_or_default(),
+            evaluator_context_id,
+        },
+        &invoker,
+        &scp_core::trust::ProtocolOnlyDefinitions,
     )
-    .map_err(|e| ScpError::Validation {
-        msg: format!("challenge creation failed: {e}"),
-        code: codes::VALID_7014.to_owned(),
-    })?;
-
-    let challenge_json = serde_json::to_string(&request).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize challenge: {e}"),
-        code: codes::VALID_7015.to_owned(),
-    })?;
-
+    .await
+    .map_err(challenge_op_error)?;
     Ok(ChallengeResult {
-        challenge_id: request.challenge_id,
-        challenge_json,
+        challenge_id: hex::encode(request.challenge_id),
+        request_json: scp_ffi_common::challenge::challenge_json(
+            "challenge",
+            serde_json::to_string(&request),
+        )
+        .map_err(challenge_op_error)?,
     })
 }
 
-/// Verifies a challenge response against its original challenge request.
-///
-/// See ADR-017 Layer 3 (Challenge-Response).
-#[uniffi::export]
-pub fn trust_verify_response(
-    challenge_json: String,
+/// Implementation of [`Scp::trust_respond_to_challenge`] (spec 07 §7.3.4
+/// step 2, ADR-017).
+async fn trust_respond_to_challenge_impl(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    subject: &Identity,
+    request_json: String,
+    outputs_json: String,
+    attempt: u32,
+) -> Result<String, ScpError> {
+    scp_ffi_common::challenge::validate_challenge_did(&subject.did).map_err(challenge_op_error)?;
+    let resolver = scp_ffi_common::challenge::required_did_resolver(
+        bi.did_resolver(),
+        "trustRespondToChallenge",
+    )
+    .map_err(challenge_op_error)?;
+    let signer = resolve_identity_signer(subject).await?;
+    let response = scp_ffi_common::challenge::respond_to_challenge(
+        &signer,
+        resolver,
+        subject.did.clone(),
+        &request_json,
+        &outputs_json,
+        attempt,
+    )
+    .await
+    .map_err(challenge_op_error)?;
+    scp_ffi_common::challenge::challenge_json(
+        "challenge response",
+        serde_json::to_string(&response),
+    )
+    .map_err(challenge_op_error)
+}
+
+/// Implementation of [`Scp::trust_grade_response`] (spec 07 §7.3.4 steps 3
+/// and 4, ADR-017).
+async fn trust_grade_response_impl(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    verifier: &Identity,
+    request_json: String,
     response_json: String,
-) -> Result<bool, ScpError> {
-    let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse challenge JSON: {e}"),
-            code: codes::VALID_7016.to_owned(),
-        })?;
-
-    let response: scp_core::trust::ChallengeResponse = serde_json::from_str(&response_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse response JSON: {e}"),
-            code: codes::VALID_7017.to_owned(),
-        })?;
-
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_clock::SystemClock;
-
-    struct EphemeralVerifySigner(ed25519_dalek::SigningKey);
-    impl scp_core::trust::ChallengeSigner for EphemeralVerifySigner {
-        fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
-            use ed25519_dalek::Signer;
-            let sig = self.0.sign(data);
-            Ok(sig.to_bytes().to_vec())
+) -> Result<ChallengeGradeResult, ScpError> {
+    scp_ffi_common::challenge::validate_challenge_did(&verifier.did).map_err(challenge_op_error)?;
+    let resolver =
+        scp_ffi_common::challenge::required_did_resolver(bi.did_resolver(), "trustGradeResponse")
+            .map_err(challenge_op_error)?;
+    let sup = bi.context_manager_expect()?;
+    let signer = resolve_identity_signer(verifier).await?;
+    let verifier_did: scp_did::DID = verifier.did.as_str().into();
+    let host = UniffiEvaluatorHost { bi };
+    let invoker = scp_ffi_common::challenge::SharedEvaluatorInvoker::new(sup, &host);
+    let grading = scp_ffi_common::challenge::Grader {
+        sup,
+        signer: &signer,
+        resolver,
+        invoker: &invoker,
+    };
+    let graded = match bi.protocol_repository() {
+        crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+            scp_ffi_common::challenge::grade_response(
+                &grading,
+                repo,
+                &verifier_did,
+                &request_json,
+                &response_json,
+            )
+            .await
+        }
+        crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+            scp_ffi_common::challenge::grade_response(
+                &grading,
+                repo,
+                &verifier_did,
+                &request_json,
+                &response_json,
+            )
+            .await
         }
     }
-
-    let verify_signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-    let verify_signer = EphemeralVerifySigner(verify_signing_key);
-
-    Ok(scp_core::trust::verify_challenge_response(
-        &request,
-        &response,
-        &resolver,
-        &clock,
-        &verify_signer,
-        None,
-    )
-    .is_ok())
+    .map_err(challenge_op_error)?;
+    Ok(ChallengeGradeResult {
+        record_json: scp_ffi_common::challenge::challenge_json(
+            "challenge verification",
+            serde_json::to_string(&graded.record),
+        )
+        .map_err(challenge_op_error)?,
+        reasons_json: scp_ffi_common::challenge::challenge_json(
+            "case results",
+            serde_json::to_string(&graded.reasons),
+        )
+        .map_err(challenge_op_error)?,
+        trust_store_error: graded.trust_store_error.map(|e| TrustStoreWriteError {
+            code: e.code.to_owned(),
+            message: e.message,
+        }),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -7966,94 +8009,6 @@ pub fn verify_participation_requirements(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// check_capability_requirements (§7.3.4.4, SCP-ACR-008)
-// ---------------------------------------------------------------------------
-
-/// Verifies that an agent meets a context's capability requirements for
-/// admission, bound to the agent and context being admitted.
-///
-/// Inputs:
-/// - `context_id`: the context the agent is being admitted to. A challenge
-///   verification only satisfies a requirement when its signed `context_id`
-///   equals this value.
-/// - `subject_did`: the DID of the agent being admitted. Only challenge
-///   verifications whose signed `subject_did` equals this value can satisfy a
-///   requirement (cross-subject attribution is rejected).
-/// - `requirements_json`: JSON array of `CapabilityRequirement` objects.
-/// - `agent_capabilities_json`: JSON array of capability-URI strings.
-/// - `challenge_verifications_json`: JSON array of `ChallengeVerification`
-///   records; each is signature-verified and only counts if authentic,
-///   in-context, in-subject, passed, and unexpired.
-///
-/// Uses the production `IdentityDidPublicKeyResolver` for verifier-DID key
-/// resolution and the fail-closed system clock for expiry. Returns without error
-/// (unit) if all requirements are satisfied, throws `ScpError` with a diagnostic
-/// message if any requirement is unmet or if the JSON is malformed.
-///
-/// Security caveat — authenticity is not authorization: a passing
-/// `ChallengeVerified` check proves the verifier's signature is authentic and
-/// bound to this subject/context, NOT that the verifier is trusted. Establish
-/// verifier legitimacy separately (spec §7.3.4.4 / §7.4).
-///
-/// See §7.3.4.4.
-#[uniffi::export]
-pub fn check_capability_requirements(
-    context_id: String,
-    subject_did: String,
-    requirements_json: String,
-    agent_capabilities_json: String,
-    challenge_verifications_json: String,
-) -> Result<(), ScpError> {
-    // Full DID-format validation (matching the PyO3 reference bridge), not just a
-    // non-empty check, so all native bridges reject malformed ids identically.
-    validate_did(&subject_did)?;
-
-    let requirements: Vec<scp_core::trust::CapabilityRequirement> =
-        serde_json::from_str(&requirements_json).map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse capability requirements JSON: {e}"),
-            code: codes::VALID_7073.to_owned(),
-        })?;
-
-    let agent_capabilities: Vec<scp_core::trust::CapabilityUri> =
-        serde_json::from_str(&agent_capabilities_json).map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse agent capabilities JSON: {e}"),
-            code: codes::VALID_7074.to_owned(),
-        })?;
-
-    let challenge_verifications: Vec<scp_core::trust::ChallengeVerification> =
-        serde_json::from_str(&challenge_verifications_json).map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse challenge verifications JSON: {e}"),
-            code: codes::VALID_7075.to_owned(),
-        })?;
-
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_clock::SystemClock;
-
-    scp_core::trust::check_capability_requirements(
-        &requirements,
-        &agent_capabilities,
-        &challenge_verifications,
-        &context_id,
-        &subject_did,
-        &resolver,
-        &clock,
-    )
-    .map_err(|e| match e {
-        scp_core::trust::AdmissionError::EmptySubjectDid => ScpError::Validation {
-            msg: format!("capability admission verification failed: {e}"),
-            code: codes::VALID_7077.to_owned(),
-        },
-        scp_core::trust::AdmissionError::MissingCapability { .. }
-        | scp_core::trust::AdmissionError::VerificationRequired { .. } => ScpError::Validation {
-            msg: format!("capability admission verification failed: {e}"),
-            code: codes::VALID_7076.to_owned(),
-        },
-    })?;
-
-    Ok(())
-}
-
 /// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
 /// [`ProtocolRepoVariant`](scp_ffi_common::bridge_runtime::ProtocolRepoVariant) arm and reads back the subject's verified
 /// attestations. Single source of truth for the per-backend
@@ -8063,6 +8018,7 @@ pub fn check_capability_requirements(
 /// concrete `ProtocolRepository<S>`.
 fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
     repo: &std::sync::Arc<scp_core::store::ProtocolRepository<S>>,
+    resolver: &dyn scp_core::trust::attestation::ActiveKeyResolver,
     context_id: &str,
     subject_did: &str,
     cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
@@ -8072,6 +8028,7 @@ fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
         scp_core::trust::ProtocolRepositoryTrustBridge::new(std::sync::Arc::clone(repo), handle);
     scp_ffi_common::trust_store::verified_attestations(
         bridge,
+        resolver,
         context_id,
         subject_did,
         cached_attestations,
@@ -9210,15 +9167,14 @@ pub(crate) fn scpid_sign_impl(
         code: codes::IDENT_1008.to_owned(),
     })?;
 
-    let rt = crate::runtime();
-    let response = rt.block_on(core_sign(
+    let response = crate::block_on_shared(core_sign(
         &*custody,
         &key_handle,
         &identity.did,
         key_id,
         &challenge,
         signed_at_override,
-    ));
+    ))?;
 
     let response = response.map_err(|e| ScpError::Identity {
         msg: e.to_string(),
@@ -9281,9 +9237,7 @@ fn scpid_verify_on(
         code: codes::IDENT_1033.to_owned(),
     })?;
 
-    let rt = crate::runtime();
-    let auth = rt
-        .block_on(core_verify(resolver.as_ref(), &response, &challenge))
+    let auth = crate::block_on_shared(core_verify(resolver.as_ref(), &response, &challenge))?
         .map_err(|e| ScpError::Identity {
             msg: e.to_string(),
             code: scpid_error_code(&e).to_owned(),
@@ -9884,6 +9838,50 @@ async fn mint_identity(
 }
 
 use crate::scp::Scp;
+
+impl Scp {
+    /// Validates and proposes a decoded governance action, for
+    /// `governance_propose` and the typed proposal exports.
+    /// The caller has already checked `handle` against this instance, and
+    /// builds its wire string from the outcome.
+    async fn propose_governance_action(
+        &self,
+        handle: Arc<ContextHandle>,
+        proposer_did: String,
+        action: scp_core::context::governance::GovernanceAction,
+    ) -> Result<scp_core::context::state::ProposalOutcome, ScpError> {
+        let signer = resolve_uniffi_signer(&handle).await?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+
+        let result = runtime()
+            .spawn(async move {
+                // Defense-in-depth: validate user-controlled string fields at the
+                // FFI boundary before the action reaches the ContextManager.
+                scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(
+                    |e| ScpError::Validation {
+                        msg: e.message,
+                        code: codes::CTX_2041.to_owned(),
+                    },
+                )?;
+                let did = scp_did::DID(proposer_did);
+                let manager = bi.context_manager_or_error()?;
+                let outcome = manager
+                    .propose_governance_action_checked(&context_id, &did, action, &signer)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                Ok::<_, ScpError>(outcome)
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during governance proposal: {e}"),
+                code: codes::CTX_2041.to_owned(),
+            })??;
+
+        Ok(result)
+    }
+}
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Scp {
@@ -10926,27 +10924,19 @@ impl Scp {
                 bi.init_context_manager_with_did(&creator_did);
                 let sup = bi.context_manager_or_error()?;
 
-                // Resolve the inviter's raw Ed25519 signing key from retained
-                // custody. A non-custodied (DID-only) inviter fails HERE with
-                // SCP-IDENT-1054, before any context lookup. This `.await` completes
-                // before the invite `.await` below, so the two are sequential (not
-                // nested).
-                let signing_key = resolve_identity_signing_key(&identity).await?;
+                // Build the inviter's custody signer (ADR-049 Decision 7a). A
+                // non-custodied (DID-only) inviter fails HERE with SCP-IDENT-1054,
+                // before any context lookup.
+                let signer = resolve_identity_signer(&identity).await?;
                 let outcome = sup
                     .invite_member(
                         context_id,
                         scp_did::DID(creator_did),
                         scp_did::DID(invitee_did),
                         invitee_key_package,
-                        &signing_key,
+                        &signer,
                     )
                     .await;
-                // Defense-in-depth: wipe the raw signing key the moment the invite
-                // is produced. `ed25519_dalek::SigningKey` is `ZeroizeOnDrop` (the
-                // `zeroize` feature) but does NOT implement bare `Zeroize`, so the
-                // explicit early `drop` — not a `.zeroize()` call — triggers the
-                // wipe here rather than at end-of-scope.
-                drop(signing_key);
 
                 let outcome = outcome.map_err(ScpError::from)?;
                 Ok(InviteMemberOutcome::from_core(outcome))
@@ -11405,45 +11395,10 @@ impl Scp {
                 })
                 .await?;
 
-                // Validate inner envelope signing via the retained KeyCustody
-                // (SCP-214 criterion 6). This ensures the identity's mandatory
-                // `#active` signing key can produce a valid Ed25519 signature
-                // before delegating to the ContextManager. This is a discarded
-                // custody smoke-test on the baseline operational key (identity
-                // plumbing), NOT the wire persona — the persona actually stamped
-                // on the message is chosen below via the ADR-039 persona-source
-                // seam and validated for the chosen persona by
-                // `resolve_uniffi_message_signer` (fail-closed on `#agent` with
-                // no agent key).
-                if let Some(core_id) = identity.core_id.as_ref() {
-                    let context_id = handle.context_id.clone();
-                    let sender_did_str = identity.did.clone();
-                    let now_ms = scp_clock::SystemClock.now_millis();
-
-                    let params = scp_core::envelope::InnerEnvelopeParams {
-                        version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
-                        context_id: &context_id,
-                        sender_did: &sender_did_str,
-                        epoch: 0,
-                        generation: 0,
-                        sequence: 0,
-                        timestamp: now_ms,
-                        message_type: scp_core::envelope::MessageType::Content,
-                        payload: &payload,
-                        provenance: None,
-                        signing_key_id: scp_did::SigningKeyId::Active,
-                    };
-
-                    if let Some(custody) = handle.custody.as_deref() {
-                        scp_core::envelope::create_inner_envelope(
-                            &params,
-                            custody,
-                            &core_id.active_signing_key,
-                        )
-                        .await
-                        .map_err(|e| ScpError::inner_envelope_error(&e))?;
-                    }
-                }
+                // The message's inner envelope is signed through the retained
+                // custody in the actor turn (SCP-214 criterion 6; ADR-049
+                // Decision 7a), so no separate custody check signs here: a
+                // second sign would prompt a biometric custody twice per send.
 
                 // ADR-039 Enforcement-Stack Layer 2: consult the per-instance
                 // persona-source seam to choose the send persona (default
@@ -11651,44 +11606,57 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
-        let signing_key = resolve_uniffi_signing_key(&handle).await?;
-        let bi = Arc::clone(&self.inner);
-        let context_id = handle.context_id.clone();
+        let action: scp_core::context::governance::GovernanceAction =
+            serde_json::from_str(&action_json)?;
+        let outcome = self
+            .propose_governance_action(handle, proposer_did, action)
+            .await?;
+        Ok(
+            scp_ffi_common::governance_result::governance_propose_response(
+                &outcome.proposal.proposal_id,
+                &outcome.status,
+                outcome.execution_result.as_ref(),
+            ),
+        )
+    }
 
-        let result = runtime()
-            .spawn(async move {
-                let action: scp_core::context::governance::GovernanceAction =
-                    serde_json::from_str(&action_json)?;
-                // Defense-in-depth: validate user-controlled string fields at the
-                // FFI boundary before the action reaches the ContextManager (#1601).
-                scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(
-                    |e| ScpError::Validation {
-                        msg: e.message,
-                        code: codes::CTX_2041.to_owned(),
-                    },
-                )?;
-                let did = scp_did::DID(proposer_did);
-                let manager = bi.context_manager_or_error()?;
-                let outcome = manager
-                    .propose_governance_action_checked(&context_id, &did, action, &signing_key)
-                    .await
-                    .map_err(ScpError::from)?;
-
-                Ok::<_, ScpError>(
-                    scp_ffi_common::governance_result::governance_propose_response(
-                        &outcome.proposal.proposal_id,
-                        &outcome.status,
-                        outcome.execution_result.as_ref(),
-                    ),
-                )
-            })
-            .await
-            .map_err(|e| ScpError::Context {
-                msg: format!("tokio task join error during governance proposal: {e}"),
-                code: codes::CTX_2041.to_owned(),
-            })??;
-
-        Ok(result)
+    /// Proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4) with the
+    /// complete new list in `requirements_json`, a JSON array; `[]` clears
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// `ScpError::Validation` with `SCP-VALID-7000` for a malformed list, and
+    /// with the requirement's own code (7147, 7148, 7150) for a requirement
+    /// that breaks a §7.3.4.4 rule; otherwise fails as `governance_propose`
+    /// does.
+    pub async fn governance_modify_capability_requirements(
+        &self,
+        handle: Arc<ContextHandle>,
+        proposer_did: String,
+        requirements_json: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let action = scp_ffi_common::context_params::modify_capability_requirements_action(
+            &requirements_json,
+        )
+        .map_err(|e| ScpError::Validation {
+            msg: e.to_string(),
+            code: e.code().to_owned(),
+        })?;
+        let outcome = self
+            .propose_governance_action(handle, proposer_did, action)
+            .await?;
+        Ok(
+            scp_ffi_common::governance_result::governance_propose_response(
+                &outcome.proposal.proposal_id,
+                &outcome.status,
+                outcome.execution_result.as_ref(),
+            ),
+        )
     }
 
     /// Per-instance equivalent of the free-function `governance_approve`.
@@ -11705,7 +11673,7 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
-        let signing_key = resolve_uniffi_signing_key(&handle).await?;
+        let signer = resolve_uniffi_signer(&handle).await?;
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
         let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
@@ -11716,7 +11684,7 @@ impl Scp {
                 let sup = bi.context_manager_or_error()?;
                 let status = {
                     use scp_core::context::actor::commands::{
-                        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+                        GovernanceCommand, VoteOnProposalPayload,
                     };
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let cmd = GovernanceCommand::ApproveGovernanceProposal {
@@ -11724,7 +11692,7 @@ impl Scp {
                             context_id: context_id.clone(),
                             proposal_id,
                             voter_did: did,
-                            signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                            signer,
                         }),
                         reply: tx,
                     };
@@ -11764,7 +11732,7 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
-        let signing_key = resolve_uniffi_signing_key(&handle).await?;
+        let signer = resolve_uniffi_signer(&handle).await?;
         let bi = Arc::clone(&self.inner);
         let context_id = handle.context_id.clone();
         let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
@@ -11775,7 +11743,7 @@ impl Scp {
                 let sup = bi.context_manager_or_error()?;
                 let status = {
                     use scp_core::context::actor::commands::{
-                        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+                        GovernanceCommand, VoteOnProposalPayload,
                     };
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let cmd = GovernanceCommand::RejectGovernanceProposal {
@@ -11783,7 +11751,7 @@ impl Scp {
                             context_id: context_id.clone(),
                             proposal_id,
                             voter_did: did,
-                            signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                            signer,
                         }),
                         reply: tx,
                     };
@@ -12536,7 +12504,23 @@ impl Scp {
                             .to_owned(),
                         code: codes::IDENT_1017.to_owned(),
                     })?;
-                let signing_key_handle = core_id.active_signing_key;
+                // The publish signs inside the actor turn through this signer (ADR-049
+                // Decision 7a); the private key stays in custody.
+                let custody = identity
+                    .custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "broadcast publish requires retained signing custody — use \
+                          identity_create_with_custody() to inject a platform custody provider"
+                            .to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
+                    })?;
+                let signer = scp_ffi_common::signer::identity_command_signer(
+                    Arc::clone(custody),
+                    core_id.active_signing_key,
+                )
+                .await
+                .map_err(ScpError::from)?;
 
                 let sup = bi.context_manager_or_error()?;
 
@@ -12544,52 +12528,25 @@ impl Scp {
                     BroadcastCommand, PublishBroadcastPayload,
                 };
 
-                // Dispatch to the correct custody path (callback > in-memory).
-                match identity.custody.as_deref() {
-                    Some(custody) => {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let cmd = BroadcastCommand::PublishBroadcast {
-                            payload: Box::new(PublishBroadcastPayload {
-                                context_id: handle.context_id.clone(),
-                                author_did: did,
-                                payload,
-                                signing_key_handle,
-                            }),
-                            reply: tx,
-                        };
-                        sup.dispatch_broadcast_command_with_custody(cmd, custody)
-                            .await
-                            .map_err(ScpError::from)?;
-                        rx.await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("publish_broadcast shim reply dropped: {e}"),
-                                code: codes::CTX_2035.to_owned(),
-                            })?
-                            .map_err(ScpError::from)?;
-                    }
-                    #[cfg(feature = "testing")]
-                    None => {
-                        return Err(ScpError::Identity {
-                            msg: "broadcast publish requires retained signing custody — this \
-                                          identity has no retained custody (it was externally \
-                                          loaded). Use identity_create(\"in_memory\") or \
-                                          identity_create_with_custody()"
-                                .to_owned(),
-                            code: codes::IDENT_1017.to_owned(),
-                        });
-                    }
-                    #[cfg(not(feature = "testing"))]
-                    None => {
-                        let _ = (signing_key_handle, payload, did);
-                        return Err(ScpError::Identity {
-                            msg: "broadcast publish requires retained signing custody — use \
-                                      identity_create_with_custody() to inject a platform \
-                                      custody provider"
-                                .to_owned(),
-                            code: codes::IDENT_1017.to_owned(),
-                        });
-                    }
-                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = BroadcastCommand::PublishBroadcast {
+                    payload: Box::new(PublishBroadcastPayload {
+                        context_id: handle.context_id.clone(),
+                        author_did: did,
+                        payload,
+                        signer,
+                    }),
+                    reply: tx,
+                };
+                sup.dispatch_broadcast_command(cmd)
+                    .await
+                    .map_err(ScpError::from)?;
+                rx.await
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("publish_broadcast shim reply dropped: {e}"),
+                        code: codes::CTX_2035.to_owned(),
+                    })?
+                    .map_err(ScpError::from)?;
 
                 Ok(())
             })
@@ -12638,7 +12595,23 @@ impl Scp {
                             .to_owned(),
                         code: codes::IDENT_1017.to_owned(),
                     })?;
-                let signing_key_handle = core_id.active_signing_key;
+                // The publish signs inside the actor turn through this signer (ADR-049
+                // Decision 7a); the private key stays in custody.
+                let custody = identity
+                    .custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "broadcast publish requires retained signing custody — use \
+                          identity_create_with_custody() to inject a platform custody provider"
+                            .to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
+                    })?;
+                let signer = scp_ffi_common::signer::identity_command_signer(
+                    Arc::clone(custody),
+                    core_id.active_signing_key,
+                )
+                .await
+                .map_err(ScpError::from)?;
 
                 let sup = bi.context_manager_or_error()?;
 
@@ -12698,52 +12671,26 @@ impl Scp {
                     BroadcastCommand, PublishBroadcastContentPayload,
                 };
 
-                // Dispatch to the correct custody path (callback > in-memory).
-                let envelope = match identity.custody.as_deref() {
-                    Some(custody) => {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        let cmd = BroadcastCommand::PublishBroadcastContent {
-                            payload: Box::new(PublishBroadcastContentPayload {
-                                context_id: handle.context_id.clone(),
-                                author_did: did,
-                                content,
-                                signing_key_handle,
-                            }),
-                            reply: tx,
-                        };
-                        sup.dispatch_broadcast_command_with_custody(cmd, custody)
-                            .await
-                            .map_err(ScpError::from)?;
-                        rx.await
-                            .map_err(|e| ScpError::Context {
-                                msg: format!("publish_broadcast_content shim reply dropped: {e}"),
-                                code: codes::CTX_2043.to_owned(),
-                            })?
-                            .map_err(ScpError::from)?
-                    }
-                    #[cfg(feature = "testing")]
-                    None => {
-                        return Err(ScpError::Identity {
-                            msg: "broadcast publish asset requires retained signing custody — \
-                                      this identity has no retained custody (it was externally \
-                                      loaded). Use identity_create(\"in_memory\") or \
-                                      identity_create_with_custody()"
-                                .to_owned(),
-                            code: codes::IDENT_1017.to_owned(),
-                        });
-                    }
-                    #[cfg(not(feature = "testing"))]
-                    None => {
-                        let _ = (content, signing_key_handle, did);
-                        return Err(ScpError::Identity {
-                            msg: "broadcast publish asset requires retained signing custody — use \
-                                  identity_create_with_custody() to inject a platform \
-                                  custody provider"
-                                .to_owned(),
-                            code: codes::IDENT_1017.to_owned(),
-                        });
-                    }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = BroadcastCommand::PublishBroadcastContent {
+                    payload: Box::new(PublishBroadcastContentPayload {
+                        context_id: handle.context_id.clone(),
+                        author_did: did,
+                        content,
+                        signer,
+                    }),
+                    reply: tx,
                 };
+                sup.dispatch_broadcast_command(cmd)
+                    .await
+                    .map_err(ScpError::from)?;
+                let envelope = rx
+                    .await
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("publish_broadcast_content shim reply dropped: {e}"),
+                        code: codes::CTX_2043.to_owned(),
+                    })?
+                    .map_err(ScpError::from)?;
 
                 let envelope_bytes =
                     rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
@@ -12817,7 +12764,23 @@ impl Scp {
                             .to_owned(),
                         code: codes::IDENT_1017.to_owned(),
                     })?;
-                let signing_key_handle = core_id.active_signing_key;
+                // The publish signs inside the actor turn through this signer (ADR-049
+                // Decision 7a); the private key stays in custody.
+                let custody = identity
+                    .custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "broadcast publish requires retained signing custody — use \
+                          identity_create_with_custody() to inject a platform custody provider"
+                            .to_owned(),
+                        code: codes::IDENT_1017.to_owned(),
+                    })?;
+                let signer = scp_ffi_common::signer::identity_command_signer(
+                    Arc::clone(custody),
+                    core_id.active_signing_key,
+                )
+                .await
+                .map_err(ScpError::from)?;
 
                 let sup = bi.context_manager_or_error()?;
 
@@ -12876,52 +12839,26 @@ impl Scp {
                         body: asset.body,
                     };
 
-                    let envelope = match identity.custody.as_deref() {
-                        Some(custody) => {
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            let cmd = BroadcastCommand::PublishBroadcastContent {
-                                payload: Box::new(PublishBroadcastContentPayload {
-                                    context_id: handle.context_id.clone(),
-                                    author_did: did.clone(),
-                                    content,
-                                    signing_key_handle,
-                                }),
-                                reply: tx,
-                            };
-                            sup.dispatch_broadcast_command_with_custody(cmd, custody)
-                                .await
-                                .map_err(ScpError::from)?;
-                            rx.await
-                                .map_err(|e| ScpError::Context {
-                                    msg: format!(
-                                        "publish_broadcast_content shim reply dropped: {e}"
-                                    ),
-                                    code: codes::CTX_2043.to_owned(),
-                                })?
-                                .map_err(ScpError::from)?
-                        }
-                        #[cfg(feature = "testing")]
-                        None => {
-                            return Err(ScpError::Identity {
-                                msg: "broadcast publish assets requires retained signing \
-                                          custody — this identity has no retained custody (it was \
-                                          externally loaded)"
-                                    .to_owned(),
-                                code: codes::IDENT_1017.to_owned(),
-                            });
-                        }
-                        #[cfg(not(feature = "testing"))]
-                        None => {
-                            let _ = (content, signing_key_handle, &did);
-                            return Err(ScpError::Identity {
-                                msg: "broadcast publish assets requires retained signing custody \
-                                      — this identity has no retained custody (it was externally \
-                                      loaded)"
-                                    .to_owned(),
-                                code: codes::IDENT_1017.to_owned(),
-                            });
-                        }
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cmd = BroadcastCommand::PublishBroadcastContent {
+                        payload: Box::new(PublishBroadcastContentPayload {
+                            context_id: handle.context_id.clone(),
+                            author_did: did.clone(),
+                            content,
+                            signer: signer.clone(),
+                        }),
+                        reply: tx,
                     };
+                    sup.dispatch_broadcast_command(cmd)
+                        .await
+                        .map_err(ScpError::from)?;
+                    let envelope = rx
+                        .await
+                        .map_err(|e| ScpError::Context {
+                            msg: format!("publish_broadcast_content shim reply dropped: {e}"),
+                            code: codes::CTX_2043.to_owned(),
+                        })?
+                        .map_err(ScpError::from)?;
 
                     let envelope_bytes =
                         rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
@@ -13262,20 +13199,15 @@ impl Scp {
                 code: codes::TRANS_5010.to_owned(),
             })?;
 
-        // Resolve the local member's Ed25519 signing key from the identity's
-        // retained custody (used to sign the Phase-3 consistency checkpoint).
-        // Private key never crosses FFI beyond this in-process driver call.
-        // The 32-byte seed is held in `Zeroizing` so it is wiped after the
-        // driver call, on the stack as well as the heap; the wiping global
-        // allocator reaches freed heap blocks only (security model spec §9.15).
-        let signing_key = resolve_identity_signing_key(&identity).await?;
-        let signing_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
+        // The Phase-3 consistency checkpoint signs through the identity's
+        // retained custody (ADR-049 Decision 7a); no key is exported.
+        let signer = resolve_identity_signer(&identity).await?;
 
         let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
             &transport,
             supervisor,
             scp_did::DID(identity.did.clone()),
-            signing_key_bytes,
+            signer,
             context_ids,
             last_relay_contacts,
             scp_clock::Clock::now_secs(&scp_clock::SystemClock),
@@ -14085,7 +14017,7 @@ impl Scp {
         chain_depth: u8,
         ucan_proof_id: Option<String>,
     ) -> Result<SagaResult, ScpError> {
-        use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigningKeys};
+        use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigners};
 
         // Per-instance handle affinity: both participant handles MUST have been
         // minted by THIS bridge instance (mirrors `outlet_invoke_cross_context`).
@@ -14173,8 +14105,8 @@ impl Scp {
                 // no `context_handle_registry` lookup. Each context signs its
                 // own side (target → receipt; each → its own divergence
                 // marker) under its registered Active Signing Key.
-                let target_signing_key = resolve_uniffi_signing_key(&target_handle).await?;
-                let caller_signing_key = resolve_uniffi_signing_key(&source_handle).await?;
+                let target_signer = resolve_uniffi_signer(&target_handle).await?;
+                let caller_signer = resolve_uniffi_signer(&source_handle).await?;
 
                 // ----- Executor: snapshot the TARGET context's outlet handler --
                 //
@@ -14240,9 +14172,9 @@ impl Scp {
                 let output = supervisor
                     .start_cross_context_outlet_invocation_saga(
                         request,
-                        SagaSigningKeys {
-                            target: &target_signing_key,
-                            caller: &caller_signing_key,
+                        SagaSigners {
+                            target: target_signer,
+                            caller: caller_signer,
                         },
                         executor,
                     )
@@ -16015,7 +15947,8 @@ impl Scp {
     // `mcp_reset_stdio_allowlist`, `mcp_get_stdio_allowlist`,
     // `register_local_did`, `is_local_did`, `trust_query_score`,
     // `trust_verify_attestation`, `trust_create_challenge`,
-    // `trust_verify_response`, `verify_participation_requirements`,
+    // `trust_respond_to_challenge`, `trust_grade_response`,
+    // `verify_participation_requirements`,
     // `aggregate_trust_input`,
     // `sync_classify_offline`, `sync_classify_offline_custom`,
     // `sync_get_policy`) to `impl crate::scp::Scp` methods routing through
@@ -16034,7 +15967,6 @@ impl Scp {
     //
     // Purely stateless helpers (`sync_classify_offline`,
     // `sync_classify_offline_custom`, `sync_get_policy`,
-    // `trust_verify_response`, `trust_create_challenge`,
     // `verify_participation_requirements`) are
     // exposed as thin delegating methods so SDK callers have a uniform
     // `scp.method(...)` API surface; the bodies simply forward to the free
@@ -16914,7 +16846,7 @@ impl Scp {
     /// `context_id` (§7.4.4). A rejection returns `valid: false` with the
     /// reason; a revocation list that cannot be read is an error
     /// (`VALID_7052`), never a verdict. See ADR-017 Layer 3 (Attestation).
-    pub fn trust_verify_attestation(
+    pub async fn trust_verify_attestation(
         &self,
         context_id: String,
         attestation_json: String,
@@ -16931,18 +16863,28 @@ impl Scp {
                 code: codes::VALID_7012.to_owned(),
             })?;
 
-        let verdict = match self.inner.protocol_repository() {
-            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
-                run_verify_attestation(repo, &context_id, &attestation)
+        // The issuer's current `#active` key (spec 09 §9.7.1), resolved
+        // through this instance's DID resolver; an instance without one fails
+        // closed.
+        let inner = Arc::clone(&self.inner);
+        let verdict = on_resolution_pool(move |scope| {
+            let did_resolver = inner.did_resolver();
+            let resolver =
+                scp_ffi_common::instance_active_key_resolver(scope, did_resolver.as_ref());
+            match inner.protocol_repository() {
+                crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                    run_verify_attestation(repo, resolver, &context_id, &attestation)
+                }
+                crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                    run_verify_attestation(repo, resolver, &context_id, &attestation)
+                }
             }
-            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
-                run_verify_attestation(repo, &context_id, &attestation)
-            }
-        }
-        .map_err(|e| ScpError::Validation {
-            msg: e.to_string(),
-            code: codes::VALID_7052.to_owned(),
-        })?;
+            .map_err(|e| ScpError::Validation {
+                msg: e.to_string(),
+                code: codes::VALID_7052.to_owned(),
+            })
+        })
+        .await?;
 
         Ok(match verdict {
             AttestationVerdict::Valid => AttestationVerificationResult {
@@ -16958,119 +16900,197 @@ impl Scp {
         })
     }
 
-    /// Per-instance equivalent of the free-function [`trust_create_challenge`].
+    /// Creates a challenge in `verifier`'s ledger and returns the request the
+    /// ledger signed with `verifier`'s `#active` key (spec 07 §7.3.4 step 1,
+    /// ADR-017).
     ///
-    /// Stateless helper — uses an ephemeral signing key per call.
-    pub fn trust_create_challenge(&self, target_did: String) -> Result<ChallengeResult, ScpError> {
-        if target_did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "target DID must not be empty".to_owned(),
-                code: codes::VALID_7013.to_owned(),
-            });
-        }
-
-        struct EphemeralSigner(ed25519_dalek::SigningKey);
-        impl scp_core::trust::ChallengeSigner for EphemeralSigner {
-            fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
-                use ed25519_dalek::Signer;
-                let sig = self.0.sign(data);
-                Ok(sig.to_bytes().to_vec())
-            }
-        }
-
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let signer = EphemeralSigner(signing_key);
-
-        let request = scp_core::trust::issue_challenge(
-            "did:key:ephemeral-challenger".into(),
-            target_did.into(),
-            scp_core::trust::ChallengeType::schema_validation(),
-            "scp:capability:schema-validation/v1".to_string(),
-            serde_json::json!({}),
-            std::time::Duration::from_mins(5),
-            &signer,
+    /// `test_cases_json` is the challenger-written JSON array of `TestCase`,
+    /// with their answers; the request carries only their commitments. The
+    /// subject answers within `window_secs`. `context_id` is the context the
+    /// record will be bound to. `evaluator_context_id` names the context whose
+    /// outlets grade `CustomEval` cases. `policy` picks fewer retries or a
+    /// longer cooldown than the capability definition's.
+    ///
+    /// # Errors
+    ///
+    /// - The handle check's error when `verifier` belongs to another `Scp`.
+    /// - `SCP-VALID-7013` for an invalid verifier or subject DID,
+    ///   `SCP-VALID-7011` for an invalid context id.
+    /// - `SCP-VALID-7002` for malformed `test_cases_json`.
+    /// - The `TrustError` code of the refusal: a suite below the definition's
+    ///   minimum, a policy looser than the definition's, a self-challenge, or
+    ///   a `CustomEval` evaluator that is not registered.
+    /// - `SCP-CTX-2000` when this instance has no supervisor.
+    /// - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+    ///   error when signing fails (`SCP-CRYPTO-4006` for a destroyed key).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn trust_create_challenge(
+        &self,
+        verifier: Arc<Identity>,
+        subject: String,
+        capability_uri: String,
+        test_cases_json: String,
+        context_id: String,
+        window_secs: u32,
+        evaluator_context_id: Option<String>,
+        policy: Option<ChallengePolicy>,
+    ) -> Result<ChallengeResult, ScpError> {
+        self.inner
+            .core
+            .check_handle(verifier.instance_id())
+            .map_err(ScpError::from)?;
+        trust_create_challenge_impl(
+            &self.inner,
+            &verifier,
+            subject,
+            capability_uri,
+            test_cases_json,
+            context_id,
+            u64::from(window_secs),
+            evaluator_context_id,
+            policy,
         )
-        .map_err(|e| ScpError::Validation {
-            msg: format!("challenge creation failed: {e}"),
-            code: codes::VALID_7014.to_owned(),
-        })?;
-
-        let challenge_json = serde_json::to_string(&request).map_err(|e| ScpError::Validation {
-            msg: format!("failed to serialize challenge: {e}"),
-            code: codes::VALID_7015.to_owned(),
-        })?;
-
-        Ok(ChallengeResult {
-            challenge_id: request.challenge_id,
-            challenge_json,
-        })
+        .await
     }
 
-    /// Per-instance equivalent of the free-function [`trust_verify_response`].
+    /// Answers a challenge: checks the challenger's signature on
+    /// `request_json` through this instance's DID resolver, and returns the
+    /// `ChallengeResponse` JSON of `outputs_json` for `attempt`, signed with
+    /// `subject`'s `#active` key (spec 07 §7.3.4 step 2, ADR-017).
     ///
-    /// Stateless helper — uses an ephemeral verification signer per call.
-    pub fn trust_verify_response(
+    /// # Errors
+    ///
+    /// - The handle check's error when `subject` belongs to another `Scp`.
+    /// - `SCP-VALID-7013` for an invalid subject DID.
+    /// - `SCP-VALID-7002` for a malformed request or outputs JSON.
+    /// - `SCP-IDENT-1033` when this instance has no DID resolver.
+    /// - The `TrustError` code when the request is refused: a bad signature,
+    ///   another subject, an expired window, or outputs that do not match its
+    ///   cases.
+    /// - `SCP-IDENT-1054` when `subject` has no custodied key, and the custody
+    ///   error when signing fails.
+    pub async fn trust_respond_to_challenge(
         &self,
-        challenge_json: String,
+        subject: Arc<Identity>,
+        request_json: String,
+        outputs_json: String,
+        attempt: u32,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(subject.instance_id())
+            .map_err(ScpError::from)?;
+        trust_respond_to_challenge_impl(&self.inner, &subject, request_json, outputs_json, attempt)
+            .await
+    }
+
+    /// Grades the subject's `response_json` to `request_json` in `verifier`'s
+    /// ledger and returns the record it signed with `verifier`'s `#active`
+    /// key (spec 07 §7.3.4 steps 3 and 4, ADR-017).
+    ///
+    /// `CustomEval` cases run on the outlets of the evaluator context's handle
+    /// in this `Scp`. The record is written to this instance's protocol
+    /// repository; a write failure is reported in `trust_store_error`, since
+    /// the attempt is used either way.
+    ///
+    /// # Errors
+    ///
+    /// - The handle check's error when `verifier` belongs to another `Scp`.
+    /// - `SCP-VALID-7013` for an invalid verifier DID.
+    /// - `SCP-VALID-7002` for a malformed request or response JSON.
+    /// - `SCP-IDENT-1033` when this instance has no DID resolver.
+    /// - The `TrustError` code when the response is refused: an unknown
+    ///   challenge, a bad subject signature, an attempt out of turn, a
+    ///   cooldown not yet over, an expired window, or the grading capacity
+    ///   exhausted.
+    /// - `SCP-CTX-2000` when this instance has no supervisor.
+    /// - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+    ///   error when signing fails.
+    pub async fn trust_grade_response(
+        &self,
+        verifier: Arc<Identity>,
+        request_json: String,
         response_json: String,
-    ) -> Result<bool, ScpError> {
-        let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
-            .map_err(|e| ScpError::Validation {
-                msg: format!("failed to parse challenge JSON: {e}"),
-                code: codes::VALID_7016.to_owned(),
-            })?;
+    ) -> Result<ChallengeGradeResult, ScpError> {
+        self.inner
+            .core
+            .check_handle(verifier.instance_id())
+            .map_err(ScpError::from)?;
+        trust_grade_response_impl(&self.inner, &verifier, request_json, response_json).await
+    }
 
-        let response: scp_core::trust::ChallengeResponse = serde_json::from_str(&response_json)
-            .map_err(|e| ScpError::Validation {
-                msg: format!("failed to parse response JSON: {e}"),
-                code: codes::VALID_7017.to_owned(),
-            })?;
-
-        let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-        let clock = scp_clock::SystemClock;
-
-        struct EphemeralVerifySigner(ed25519_dalek::SigningKey);
-        impl scp_core::trust::ChallengeSigner for EphemeralVerifySigner {
-            fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
-                use ed25519_dalek::Signer;
-                let sig = self.0.sign(data);
-                Ok(sig.to_bytes().to_vec())
-            }
-        }
-
-        let verify_signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let verify_signer = EphemeralVerifySigner(verify_signing_key);
-
-        Ok(scp_core::trust::verify_challenge_response(
-            &request,
-            &response,
-            &resolver,
-            &clock,
-            &verify_signer,
-            None,
+    /// Checks an agent against the capability requirements in `context_id`'s
+    /// governance state, read at call time (spec 07 §7.3.4.4).
+    ///
+    /// Inputs:
+    /// - `context_id`: the context the agent is being admitted to. A record
+    ///   only counts when its signed `context_id` equals this value.
+    /// - `subject_did`: the DID of the agent being admitted. Only records whose
+    ///   signed `subject` equals this value count.
+    /// - `agent_capabilities_json`: JSON array of capability-URI strings.
+    /// - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+    ///   records. Each counts only if its signature verifies against the
+    ///   verifier's `#active` key, resolved through this instance's DID
+    ///   resolver on the blocking pool, and it comes from a verifier the
+    ///   requirement trusts, within the requirement's retry cap.
+    ///
+    /// # Errors
+    ///
+    /// - `SCP-VALID-7000` for an invalid `subject_did`, `SCP-VALID-7011` for
+    ///   an invalid `context_id`.
+    /// - `SCP-VALID-7074` / `7075` for malformed agent-capabilities or
+    ///   challenge-verifications JSON.
+    /// - The admission code of the refusal: `SCP-VALID-7076` for an unmet
+    ///   requirement, `SCP-VALID-7121` for an untrusted verifier,
+    ///   `SCP-VALID-7137` past the retry cap.
+    /// - `SCP-IDENT-1033` when a record must be verified and this instance has
+    ///   no DID resolver, or its backend is unreachable.
+    /// - The `ContextError` code when the context's governance cannot be read.
+    pub async fn check_capability_requirements(
+        &self,
+        context_id: String,
+        subject_did: String,
+        agent_capabilities_json: String,
+        challenge_verifications_json: String,
+    ) -> Result<(), ScpError> {
+        // Full DID-format validation, so all native bridges reject malformed
+        // ids identically.
+        validate_did(&subject_did)?;
+        scp_ffi_common::challenge::validate_challenge_context_id(&context_id)
+            .map_err(challenge_op_error)?;
+        let sup = self.inner.context_manager_expect()?;
+        scp_ffi_common::challenge::check_capability_requirements(
+            sup,
+            self.inner.did_resolver(),
+            context_id,
+            subject_did,
+            &agent_capabilities_json,
+            &challenge_verifications_json,
         )
-        .is_ok())
+        .await
+        .map_err(challenge_op_error)
     }
 
     /// Per-instance equivalent of the free-function `aggregate_trust_input`.
     ///
     /// Routes through `&*self.inner` — trust data is populated against
-    /// THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
-    /// falling back to an ephemeral in-memory store when no repository
-    /// is attached.
-    #[allow(clippy::too_many_arguments)]
-    pub fn aggregate_trust_input(
+    /// THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`).
+    /// The JSON inputs arrive as one [`TrustAggregationInputs`] record.
+    pub async fn aggregate_trust_input(
         &self,
         context_id: String,
         subject_did: String,
-        events_json: String,
-        merkle_root_json: String,
-        consequence_rules_json: String,
-        threshold_requirements_json: String,
-        attestor_sets_json: String,
-        cached_attestations_json: String,
-        challenge_results_json: String,
+        inputs: TrustAggregationInputs,
     ) -> Result<String, ScpError> {
+        let TrustAggregationInputs {
+            events_json,
+            merkle_root_json,
+            consequence_rules_json,
+            threshold_requirements_json,
+            attestor_sets_json,
+            cached_attestations_json,
+            challenge_results_json,
+        } = inputs;
         if context_id.is_empty() {
             return Err(ScpError::Validation {
                 msg: "context_id must not be empty".to_owned(),
@@ -17139,57 +17159,69 @@ impl Scp {
                 code: codes::VALID_7049.to_owned(),
             })?;
 
-        // Route trust aggregation through THIS instance's
-        // `ProtocolRepository` variant. Falls back to an ephemeral
-        // in-memory store when no repository is attached yet.
-        match self.inner.protocol_repository() {
-            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
-                let handle = runtime().handle().clone();
-                let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
-                    std::sync::Arc::clone(repo),
-                    handle,
-                );
-                scp_ffi_common::trust_store::populate_and_aggregate(
-                    bridge,
-                    &context_id,
-                    &subject_did,
-                    cached_attestations,
-                    &challenge_results,
-                    &events,
-                    merkle_root,
-                    &consequence_rules,
-                    &threshold_requirements,
-                    &attestor_sets,
-                )
-                .map_err(|e| ScpError::Validation {
-                    msg: e.to_string(),
-                    code: codes::VALID_7052.to_owned(),
-                })
+        // The instance resolver verifies each attestation's and challenge
+        // record's `#active` signature; without one, a supplied record fails
+        // closed.
+        let inner = Arc::clone(&self.inner);
+        on_resolution_pool(move |scope| {
+            let did_resolver = inner.did_resolver();
+
+            // Route trust aggregation through THIS instance's
+            // `ProtocolRepository` variant.
+            match inner.protocol_repository() {
+                crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                    let handle = runtime().handle().clone();
+                    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                        std::sync::Arc::clone(repo),
+                        handle,
+                    );
+                    scp_ffi_common::trust_store::populate_and_aggregate(
+                        bridge,
+                        scp_ffi_common::instance_active_key_resolver(scope, did_resolver.as_ref()),
+                        &scp_core::trust::ProtocolOnlyDefinitions,
+                        &context_id,
+                        &subject_did,
+                        cached_attestations,
+                        &challenge_results,
+                        &events,
+                        merkle_root,
+                        &consequence_rules,
+                        &threshold_requirements,
+                        &attestor_sets,
+                    )
+                    .map_err(|e| ScpError::Validation {
+                        msg: e.to_string(),
+                        code: codes::VALID_7052.to_owned(),
+                    })
+                }
+                crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                    let handle = runtime().handle().clone();
+                    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                        std::sync::Arc::clone(repo),
+                        handle,
+                    );
+                    scp_ffi_common::trust_store::populate_and_aggregate(
+                        bridge,
+                        scp_ffi_common::instance_active_key_resolver(scope, did_resolver.as_ref()),
+                        &scp_core::trust::ProtocolOnlyDefinitions,
+                        &context_id,
+                        &subject_did,
+                        cached_attestations,
+                        &challenge_results,
+                        &events,
+                        merkle_root,
+                        &consequence_rules,
+                        &threshold_requirements,
+                        &attestor_sets,
+                    )
+                    .map_err(|e| ScpError::Validation {
+                        msg: e.to_string(),
+                        code: codes::VALID_7052.to_owned(),
+                    })
+                }
             }
-            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
-                let handle = runtime().handle().clone();
-                let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
-                    std::sync::Arc::clone(repo),
-                    handle,
-                );
-                scp_ffi_common::trust_store::populate_and_aggregate(
-                    bridge,
-                    &context_id,
-                    &subject_did,
-                    cached_attestations,
-                    &challenge_results,
-                    &events,
-                    merkle_root,
-                    &consequence_rules,
-                    &threshold_requirements,
-                    &attestor_sets,
-                )
-                .map_err(|e| ScpError::Validation {
-                    msg: e.to_string(),
-                    code: codes::VALID_7052.to_owned(),
-                })
-            }
-        }
+        })
+        .await
     }
 
     /// Computes the structured participation record (§7.3.2) for `subject_did`
@@ -17202,7 +17234,7 @@ impl Scp {
     /// Supervisor gathers the FULL event log + Merkle root for every other fact.
     /// Returns the flattened typed [`ParticipationRecordView`] so the
     /// Swift/Kotlin SDKs never re-aggregate. See ADR-017, spec §7.3.2.
-    pub fn participation_record(
+    pub async fn participation_record(
         &self,
         context_id: String,
         subject_did: String,
@@ -17223,50 +17255,63 @@ impl Scp {
         // Source verified attestations from this instance's `ProtocolRepository`
         // (same backend as context/event-log writes). Both variants route
         // through the single generic `run_verified_attestations` helper.
-        let verified = match self.inner.protocol_repository() {
-            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
-                run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
+        let inner = Arc::clone(&self.inner);
+        on_resolution_pool(move |scope| {
+            let did_resolver = inner.did_resolver();
+            let resolver =
+                scp_ffi_common::instance_active_key_resolver(scope, did_resolver.as_ref());
+            let verified = match inner.protocol_repository() {
+                crate::runtime::ProtocolRepoVariant::InMemory(repo) => run_verified_attestations(
+                    repo,
+                    resolver,
+                    &context_id,
+                    &subject_did,
+                    cached_attestations,
+                ),
+                crate::runtime::ProtocolRepoVariant::Sqlite(repo) => run_verified_attestations(
+                    repo,
+                    resolver,
+                    &context_id,
+                    &subject_did,
+                    cached_attestations,
+                ),
             }
-            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
-                run_verified_attestations(repo, &context_id, &subject_did, cached_attestations)
-            }
-        }
-        // An error from `verified_attestations` is an INFRA fault (trust-store
-        // read, signature-verification infrastructure) — NOT caller-input
-        // validation. Code it as a context-layer fault (CTX_2000), consistent
-        // with the generic-failure arm of `participation_record` below, and keep
-        // it propagating (fail-closed): it must never be folded into the empty-log
-        // CTX_2076 path.
-        .map_err(|e| ScpError::Context {
-            msg: e.to_string(),
-            code: codes::CTX_2000.to_owned(),
-        })?;
+            // An error from `verified_attestations` is an INFRA fault (trust-store
+            // read, signature-verification infrastructure) — NOT caller-input
+            // validation. Code it as a context-layer fault (CTX_2000), consistent
+            // with the generic-failure arm of `participation_record` below, and keep
+            // it propagating (fail-closed): it must never be folded into the empty-log
+            // CTX_2076 path.
+            .map_err(|e| ScpError::Context {
+                msg: e.to_string(),
+                code: codes::CTX_2000.to_owned(),
+            })?;
 
-        let supervisor = self
-            .inner
-            .core
-            .supervisor()
-            .ok_or_else(|| ScpError::Context {
+            let supervisor = inner.core.supervisor().ok_or_else(|| ScpError::Context {
                 msg: "supervisor not initialized — cannot compute participation record".to_owned(),
                 code: codes::CTX_2000.to_owned(),
             })?;
-        let record = supervisor
-            .participation_record(&context_id, &subject_did, &verified)
-            .map_err(|e| {
-                // Empty-log → dedicated CTX_2076 so SDKs branch on the code, not
-                // the message; genuine failures stay on the generic CTX_2000.
-                let code = match e {
-                    scp_core::context::ContextError::NoParticipationFacts { .. } => codes::CTX_2076,
-                    _ => codes::CTX_2000,
-                };
-                ScpError::Context {
-                    msg: e.to_string(),
-                    code: code.to_owned(),
-                }
-            })?;
+            let record = supervisor
+                .participation_record(&context_id, &subject_did, &verified)
+                .map_err(|e| {
+                    // Empty-log → dedicated CTX_2076 so SDKs branch on the code, not
+                    // the message; genuine failures stay on the generic CTX_2000.
+                    let code = match e {
+                        scp_core::context::ContextError::NoParticipationFacts { .. } => {
+                            codes::CTX_2076
+                        }
+                        _ => codes::CTX_2000,
+                    };
+                    ScpError::Context {
+                        msg: e.to_string(),
+                        code: code.to_owned(),
+                    }
+                })?;
 
-        let facts = scp_core::trust::ParticipationFacts::from(&record);
-        Ok(ParticipationRecordView::from(&facts))
+            let facts = scp_core::trust::ParticipationFacts::from(&record);
+            Ok(ParticipationRecordView::from(&facts))
+        })
+        .await
     }
 
     // ===== State-touching operations — per-instance methods on `Scp` =====
@@ -17673,14 +17718,12 @@ impl Scp {
             CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
         let backend = NotConfiguredMigrationBackend;
 
-        let rt = crate::runtime();
-
-        let result = rt
-            .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
-            .map_err(|e| ScpError::Identity {
-                msg: format!("custody migration failed: {e}"),
-                code: codes::IDENT_1025.to_owned(),
-            })?;
+        let result =
+            crate::block_on_shared(orchestrator.execute(&backend, &scp_clock::SystemClock))?
+                .map_err(|e| ScpError::Identity {
+                    msg: format!("custody migration failed: {e}"),
+                    code: codes::IDENT_1025.to_owned(),
+                })?;
 
         serde_json::to_string(&result).map_err(|e| ScpError::Identity {
             msg: format!("failed to serialize custody migration result: {e}"),
@@ -18568,27 +18611,24 @@ impl Scp {
             guard.get(&owner_did).cloned().unwrap_or_default()
         };
 
-        let handle = tokio::runtime::Handle::current();
-        let outcome = tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                let mut resolver = scp_core::discovery::AddressResolver::new();
-                let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
-                resolver
-                    .resolve(
-                        &address,
-                        &petname_map,
-                        &querier,
-                        &known_contexts,
-                        &known_domains,
-                        &scp_clock::SystemClock,
-                    )
-                    .await
-                    .map_err(|e| ScpError::Validation {
-                        msg: format!("address resolution failed: {e}"),
-                        code: petname_helpers::address_resolution_error_code(&e).to_owned(),
-                    })
-            })
-        })?;
+        let outcome = crate::block_on_shared(async {
+            let mut resolver = scp_core::discovery::AddressResolver::new();
+            let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
+            resolver
+                .resolve(
+                    &address,
+                    &petname_map,
+                    &querier,
+                    &known_contexts,
+                    &known_domains,
+                    &scp_clock::SystemClock,
+                )
+                .await
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("address resolution failed: {e}"),
+                    code: petname_helpers::address_resolution_error_code(&e).to_owned(),
+                })
+        })??;
 
         // §22.8.2 ranks results by trust level, so a caller reads
         // `unavailable_layers` to learn which higher-trust layers this build
@@ -18871,37 +18911,14 @@ impl Scp {
         runtime()
             .spawn(async move {
                 let manager = bi.context_manager_or_error()?;
-                // Sign the §23.16.8 snapshot digest via the exporter identity's
-                // `KeyCustody::sign` (callback OR in-memory custody) rather than
-                // extracting a raw Ed25519 key. This lets a sign-only /
-                // keychain / HSM-shaped callback custody — one that signs but
-                // cannot export key bytes — produce a verifiable signed export.
-                // Private key material never crosses the FFI boundary (ADR-006).
-                //
-                // `export_context`'s `sign` closure is synchronous, but custody
-                // `sign` is async (a callback custody awaits a Swift/Kotlin
-                // `KeyCustodyProvider`). Bridge the two with `block_in_place` +
-                // `block_on` on the current multi-thread runtime — the same
-                // pattern used by `member_dids`/`get_role_state` elsewhere in
-                // this bridge. This task already runs on a `runtime()` worker
-                // (`new_multi_thread`), so a runtime handle is always present
-                // and `block_in_place` is legal here.
-                let rt = tokio::runtime::Handle::current();
-                let key_handle = export_signing_key(&handle)?;
+                // The exporter's `#active` signer signs the §23.16.8 snapshot
+                // digest through custody inside the exporting actor's turn,
+                // bounded by `SIGN_TIMEOUT` (ADR-049 Decision 7a). No key leaves
+                // custody, so a sign-only keychain/HSM custody exports too
+                // (ADR-006); a handle without custody or key is `SCP-CTX-2040`.
+                let signer = resolve_uniffi_signer(&handle).await?;
                 let export = manager
-                    .export_context(
-                        &ctx_id,
-                        scp_did::DID::from(creator_did),
-                        |hash: &[u8; 32]| {
-                            tokio::task::block_in_place(|| {
-                                rt.block_on(sign_export_snapshot_via_custody(
-                                    &handle,
-                                    &key_handle,
-                                    hash,
-                                ))
-                            })
-                        },
-                    )
+                    .export_context(&ctx_id, scp_did::DID::from(creator_did), &signer)
                     .await
                     .map_err(ScpError::from)?;
                 scp_core::context::export_import::serialize_export(&export).map_err(|e| {
@@ -19688,6 +19705,7 @@ mod tests {
             economic_policy: None,
             consequence_rules_json: None,
             consequence_config_json: None,
+            capability_requirements_json: None,
             pseudonym_rotation: None,
         }
     }
@@ -22809,9 +22827,8 @@ mod tests {
     }
 
     /// An identity whose `#active` key custody no longer holds fails
-    /// `event_log_checkpoint` with `SCP-CRYPTO-4006`: `KeyCustodySigner`
-    /// carries the signing failure as `EventLogError::Custody`, and the bridge
-    /// maps its kind.
+    /// `event_log_checkpoint` with `SCP-CRYPTO-4006`: building the `#active`
+    /// signer finds the key gone, and the bridge maps the custody's kind.
     #[test]
     #[cfg(feature = "testing")]
     fn event_log_checkpoint_with_a_destroyed_signing_key_is_crypto_4006() {
@@ -22958,62 +22975,498 @@ mod tests {
     #[test]
     fn trust_verify_attestation_rejects_invalid_json_with_code() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
-        let result = scp.trust_verify_attestation("ctx-1".to_owned(), "not json".to_owned());
+        let result = runtime()
+            .block_on(scp.trust_verify_attestation("ctx-1".to_owned(), "not json".to_owned()));
         assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7012);
     }
 
     #[test]
     fn trust_verify_attestation_rejects_malformed_context_with_code() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
-        let result = scp.trust_verify_attestation(String::new(), "{}".to_owned());
+        let result =
+            runtime().block_on(scp.trust_verify_attestation(String::new(), "{}".to_owned()));
         assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7011);
     }
 
-    #[test]
-    fn trust_create_challenge_rejects_empty_did_with_code() {
-        let result = trust_create_challenge(String::new());
-        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7013);
+    const SCHEMA_URI: &str = "scp:capability:schema-validation/v1";
+
+    /// `n` exact-match test cases whose weights sum to 10000.
+    fn challenge_cases_json(n: usize) -> String {
+        let weight = 10_000 / n;
+        let cases: Vec<scp_core::trust::TestCase> = (0..n)
+            .map(|i| scp_core::trust::TestCase {
+                test_id: format!("t{i}"),
+                input: serde_json::json!({ "i": i }),
+                expected: scp_core::trust::ExpectedOutput::ExactMatch {
+                    value: serde_json::json!({ "ok": true }),
+                },
+                category: "basic".to_owned(),
+                weight: u32::try_from(if i == 0 {
+                    10_000 - weight * (n - 1)
+                } else {
+                    weight
+                })
+                .unwrap(),
+            })
+            .collect();
+        serde_json::to_string(&cases).unwrap()
+    }
+
+    fn assert_error_code<T: std::fmt::Debug>(result: Result<T, ScpError>, code: &str) {
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(err.contains(code), "expected {code}, got: {err}");
+    }
+
+    #[cfg(feature = "testing")]
+    fn challenge_identity(scp: &crate::scp::Scp) -> Arc<Identity> {
+        runtime()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed")
+    }
+
+    /// A DID no identity of the tests hosts.
+    const OTHER_DID: &str = "did:dht:zjerxoow7gsm8suaqfsc86txbreganh7chorzwwh4crbh7imbdhgy";
+
+    /// Creates a `SCHEMA_URI` challenge from `verifier` to `subject` in
+    /// `context_id` with `cases_json`.
+    #[cfg(feature = "testing")]
+    fn create_challenge(
+        scp: &crate::scp::Scp,
+        verifier: &Arc<Identity>,
+        subject: &str,
+        context_id: &str,
+        cases_json: String,
+    ) -> Result<ChallengeResult, ScpError> {
+        runtime().block_on(scp.trust_create_challenge(
+            Arc::clone(verifier),
+            subject.to_owned(),
+            SCHEMA_URI.to_owned(),
+            cases_json,
+            context_id.to_owned(),
+            300,
+            None,
+            None,
+        ))
     }
 
     #[test]
-    fn trust_verify_response_rejects_invalid_challenge_json_with_code() {
-        // Malformed JSON in the CHALLENGE position.
-        let result = trust_verify_response("bad".to_owned(), "bad".to_owned());
-        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7016);
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_rejects_invalid_arguments() {
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
+        assert_error_code(
+            create_challenge(&scp, &v, "", "ctx", challenge_cases_json(20)),
+            codes::VALID_7013,
+        );
+        assert_error_code(
+            create_challenge(&scp, &v, OTHER_DID, "", challenge_cases_json(20)),
+            codes::VALID_7011,
+        );
     }
 
     #[test]
-    fn trust_verify_response_rejects_invalid_response_json_with_code() {
-        // Malformed JSON in the RESPONSE position: the challenge parses, so
-        // the failure is attributed to the response argument.
-        let challenge = trust_create_challenge("did:key:target".to_owned()).unwrap();
-        let result = trust_verify_response(challenge.challenge_json, "bad".to_owned());
-        assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7017);
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_below_minimum_is_valid_7039() {
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
+        // The challenger ledger lives on the supervisor a context attaches.
+        context_with(&scp, &v, serde_json::json!([])).unwrap();
+        assert_error_code(
+            create_challenge(&scp, &v, OTHER_DID, "ctx", challenge_cases_json(19)),
+            codes::VALID_7039,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_rejects_malformed_test_cases_json() {
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
+        // The challenger ledger lives on the supervisor a context attaches.
+        context_with(&scp, &v, serde_json::json!([])).unwrap();
+        assert_error_code(
+            create_challenge(
+                &scp,
+                &v,
+                OTHER_DID,
+                "ctx",
+                r#"{"not":"an array"}"#.to_owned(),
+            ),
+            codes::VALID_7002,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_refuses_self_challenge() {
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
+        // The challenger ledger lives on the supervisor a context attaches.
+        context_with(&scp, &v, serde_json::json!([])).unwrap();
+        assert_error_code(
+            create_challenge(&scp, &v, &v.did, "ctx", challenge_cases_json(20)),
+            codes::VALID_7127,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_destroyed_key_is_crypto_4006() {
+        let scp = scp_test();
+        let v = challenge_identity(&scp);
+        // The challenger ledger lives on the supervisor a context attaches.
+        context_with(&scp, &v, serde_json::json!([])).unwrap();
+        let active = v.core_id.as_ref().unwrap().active_signing_key;
+        runtime()
+            .block_on(v.custody.as_ref().unwrap().destroy_key(&active))
+            .unwrap();
+        assert_error_code(
+            create_challenge(&scp, &v, OTHER_DID, "ctx", challenge_cases_json(20)),
+            codes::CRYPTO_4006,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_create_challenge_rejects_identity_of_another_instance() {
+        let scp = scp_test();
+        let other = scp_test();
+        let v = challenge_identity(&other);
+        assert!(create_challenge(&scp, &v, OTHER_DID, "ctx", challenge_cases_json(20)).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_respond_and_grade_without_resolver_are_ident_1033() {
+        let scp = scp_test();
+        let other = scp_test();
+        // `other` mints the identity, so `scp` never initializes a resolver.
+        // The impls run after the handle check, so they are called directly.
+        let v = challenge_identity(&other);
+        assert!(scp.inner.did_resolver().is_none());
+        assert_error_code(
+            runtime().block_on(trust_respond_to_challenge_impl(
+                &scp.inner,
+                &v,
+                "{}".to_owned(),
+                "[]".to_owned(),
+                1,
+            )),
+            codes::IDENT_1033,
+        );
+        assert_error_code(
+            runtime().block_on(trust_grade_response_impl(
+                &scp.inner,
+                &v,
+                "{}".to_owned(),
+                "{}".to_owned(),
+            )),
+            codes::IDENT_1033,
+        );
+    }
+
+    /// Params for a context whose governance holds `requirements`.
+    #[cfg(feature = "testing")]
+    fn requirement_params(requirements: serde_json::Value) -> ContextParams {
+        ContextParams {
+            capability_requirements_json: Some(requirements.to_string()),
+            ..encrypted_join_test_params()
+        }
+    }
+
+    /// Creates a context through the bridge, created by `creator`, whose
+    /// governance holds `requirements`, and returns its id.
+    #[cfg(feature = "testing")]
+    fn context_with(
+        scp: &crate::scp::Scp,
+        creator: &Arc<Identity>,
+        requirements: serde_json::Value,
+    ) -> Result<String, ScpError> {
+        runtime()
+            .block_on(scp.context_create(Arc::clone(creator), requirement_params(requirements)))
+            .map(|handle| handle.context_id())
+    }
+
+    /// A requirement for `SCHEMA_URI` verified by `verifier_did`.
+    fn challenge_requirement(verifier_did: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "capability": SCHEMA_URI,
+            "verification_level": "ChallengeVerified",
+            "trusted_verifiers": [verifier_did],
+        }])
+    }
+
+    /// A verifier, a subject, and a context created by the verifier that
+    /// requires `SCHEMA_URI` verified by it, on one instance.
+    #[cfg(feature = "testing")]
+    struct Graded {
+        scp: Arc<crate::scp::Scp>,
+        verifier: Arc<Identity>,
+        subject: Arc<Identity>,
+        context_id: String,
+    }
+
+    #[cfg(feature = "testing")]
+    impl Graded {
+        fn new() -> Self {
+            let scp = scp_test();
+            let verifier = challenge_identity(&scp);
+            let subject = challenge_identity(&scp);
+            let context_id =
+                context_with(&scp, &verifier, challenge_requirement(&verifier.did)).unwrap();
+            Self {
+                scp,
+                verifier,
+                subject,
+                context_id,
+            }
+        }
+
+        /// Runs create, respond and grade through the bridge with every
+        /// answer correct.
+        fn grade(&self) -> ChallengeGradeResult {
+            let created = create_challenge(
+                &self.scp,
+                &self.verifier,
+                &self.subject.did,
+                &self.context_id,
+                challenge_cases_json(20),
+            )
+            .unwrap();
+            assert_eq!(created.challenge_id.len(), 64);
+            assert_eq!(created.challenge_id, created.challenge_id.to_lowercase());
+            // The window is open strictly after `created_at` (spec 07
+            // §7.3.4), and the bridge reads the wall clock.
+            let created_at = serde_json::from_str::<serde_json::Value>(&created.request_json)
+                .unwrap()["created_at"]
+                .as_u64()
+                .unwrap();
+            while std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                <= created_at
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let outputs: Vec<scp_core::trust::TestOutput> = (0..20)
+                .map(|i| scp_core::trust::TestOutput {
+                    test_id: format!("t{i}"),
+                    output: serde_json::json!({ "ok": true }),
+                })
+                .collect();
+            let response_json = runtime()
+                .block_on(self.scp.trust_respond_to_challenge(
+                    Arc::clone(&self.subject),
+                    created.request_json.clone(),
+                    serde_json::to_string(&outputs).unwrap(),
+                    1,
+                ))
+                .unwrap();
+            runtime()
+                .block_on(self.scp.trust_grade_response(
+                    Arc::clone(&self.verifier),
+                    created.request_json,
+                    response_json,
+                ))
+                .unwrap()
+        }
+
+        /// The admission check of `subject` in `context_id` with
+        /// `records_json` and no self-attested capabilities.
+        fn admit(
+            &self,
+            subject: &str,
+            context_id: &str,
+            records_json: String,
+        ) -> Result<(), ScpError> {
+            runtime().block_on(self.scp.check_capability_requirements(
+                context_id.to_owned(),
+                subject.to_owned(),
+                "[]".to_owned(),
+                records_json,
+            ))
+        }
+    }
+
+    /// A requirement list that breaks a spec 07 §7.3.4.4 rule refuses
+    /// context creation and a `ModifyCapabilityRequirements` proposal with
+    /// the rule's own code; a valid proposal sets the list admission reads.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn capability_requirement_refusals_keep_their_codes() {
+        use scp_core::trust::challenge::MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT;
+        let validation_code = |result: Result<_, ScpError>| match result {
+            Err(ScpError::Validation { code, .. }) => code,
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+        let scp = scp_test();
+        let creator = challenge_identity(&scp);
+        let no_verifier = serde_json::json!([{
+            "capability": SCHEMA_URI,
+            "verification_level": "ChallengeVerified",
+            "trusted_verifiers": [],
+        }]);
+        let too_many = serde_json::Value::from(vec![
+            challenge_requirement(&creator.did)[0].clone();
+            MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT + 1
+        ]);
+        assert_eq!(
+            validation_code(context_with(&scp, &creator, no_verifier.clone())),
+            codes::VALID_7150
+        );
+        assert_eq!(
+            validation_code(context_with(&scp, &creator, too_many.clone())),
+            codes::VALID_7148
+        );
+
+        let handle = runtime()
+            .block_on(scp.context_create(
+                Arc::clone(&creator),
+                ContextParams {
+                    ceiling: vec!["messages:read".to_owned(), "governance:propose".to_owned()],
+                    ..requirement_params(serde_json::json!([]))
+                },
+            ))
+            .unwrap();
+        let context_id = handle.context_id();
+        let modify = |requirements: &serde_json::Value| {
+            runtime().block_on(scp.governance_modify_capability_requirements(
+                Arc::clone(&handle),
+                creator.did.clone(),
+                requirements.to_string(),
+            ))
+        };
+        assert_eq!(validation_code(modify(&no_verifier)), codes::VALID_7150);
+        assert_eq!(validation_code(modify(&too_many)), codes::VALID_7148);
+        let admit = || {
+            runtime().block_on(scp.check_capability_requirements(
+                context_id.clone(),
+                creator.did.clone(),
+                "[]".to_owned(),
+                "[]".to_owned(),
+            ))
+        };
+        admit().unwrap();
+        modify(&challenge_requirement(&creator.did)).unwrap();
+        assert_error_code(admit(), codes::VALID_7076);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_grade_response_rejects_malformed_json() {
+        let g = Graded::new();
+        let created = create_challenge(
+            &g.scp,
+            &g.verifier,
+            &g.subject.did,
+            &g.context_id,
+            challenge_cases_json(20),
+        )
+        .unwrap();
+        for (request, response) in [
+            ("bad".to_owned(), "bad".to_owned()),
+            (created.request_json, "bad".to_owned()),
+        ] {
+            assert_error_code(
+                runtime().block_on(g.scp.trust_grade_response(
+                    Arc::clone(&g.verifier),
+                    request,
+                    response,
+                )),
+                codes::VALID_7002,
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn trust_create_respond_grade_round_trip_with_production_resolver() {
+        let g = Graded::new();
+        let v_id = g.verifier.core_id.as_ref().unwrap();
+        let s_id = g.subject.core_id.as_ref().unwrap();
+        // `#0` and `#active` differ, so only an `#active` lookup verifies.
+        assert_ne!(v_id.identity_key, v_id.active_signing_key);
+        assert_ne!(s_id.identity_key, s_id.active_signing_key);
+
+        let graded = g.grade();
+        assert_eq!(graded.trust_store_error, None);
+        let reasons: Vec<scp_core::trust::CaseResult> =
+            serde_json::from_str(&graded.reasons_json).unwrap();
+        assert_eq!(reasons.len(), 20);
+        let record: scp_core::trust::ChallengeVerification =
+            serde_json::from_str(&graded.record_json).unwrap();
+        assert!(record.passed, "{record:?}");
+        assert_eq!((record.attempt, record.pass_count), (1, 20));
+        assert_eq!(record.subject, g.subject.did);
+        assert_eq!(record.context_id, g.context_id);
+
+        let resolver = g.scp.inner.did_resolver().unwrap();
+        let check = |resolver: &dyn scp_core::trust::attestation::ActiveKeyResolver| {
+            scp_core::trust::verify_challenge_verification(
+                &record,
+                resolver,
+                &scp_core::trust::ProtocolOnlyDefinitions,
+                &g.context_id,
+                &g.subject.did,
+                &scp_clock::SystemClock,
+            )
+        };
+        check(resolver.as_ref()).unwrap();
+        // Negative: the `#0` key does not verify the record.
+        let identity_key = check(&scp_core::trust::IdentityDidPublicKeyResolver);
+        assert!(
+            matches!(
+                identity_key,
+                Err(scp_core::trust::TrustError::ChallengeVerificationSignatureInvalid { .. })
+            ),
+            "{identity_key:?}"
+        );
+
+        // The context's governed requirement admits the subject with the
+        // record, and refuses it without one.
+        g.admit(
+            &g.subject.did,
+            &g.context_id,
+            format!("[{}]", graded.record_json),
+        )
+        .unwrap();
+        assert_error_code(
+            g.admit(&g.subject.did, &g.context_id, "[]".to_owned()),
+            codes::VALID_7076,
+        );
     }
 
     #[test]
     fn participation_record_rejects_empty_context() {
         let scp = scp_test();
-        let result =
-            scp.participation_record(String::new(), "did:key:test".to_owned(), "[]".to_owned());
+        let result = runtime().block_on(scp.participation_record(
+            String::new(),
+            "did:key:test".to_owned(),
+            "[]".to_owned(),
+        ));
         assert!(result.is_err());
     }
 
     #[test]
     fn participation_record_rejects_empty_did() {
         let scp = scp_test();
-        let result = scp.participation_record("ctx-1".to_owned(), String::new(), "[]".to_owned());
+        let result = runtime().block_on(scp.participation_record(
+            "ctx-1".to_owned(),
+            String::new(),
+            "[]".to_owned(),
+        ));
         assert!(result.is_err());
     }
 
     #[test]
     fn participation_record_rejects_invalid_attestations_json() {
         let scp = scp_test();
-        let result = scp.participation_record(
+        let result = runtime().block_on(scp.participation_record(
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
             "not json".to_owned(),
-        );
+        ));
         assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7059);
     }
 
@@ -23022,8 +23475,11 @@ mod tests {
         // Format validation (not just non-empty) matches the PyO3 reference
         // bridge: a non-empty but malformed DID is rejected.
         let scp = scp_test();
-        let result =
-            scp.participation_record("ctx-1".to_owned(), "not-a-did".to_owned(), "[]".to_owned());
+        let result = runtime().block_on(scp.participation_record(
+            "ctx-1".to_owned(),
+            "not-a-did".to_owned(),
+            "[]".to_owned(),
+        ));
         assert!(result.is_err());
     }
 
@@ -23095,17 +23551,19 @@ mod tests {
         cached_attestations_json: &str,
         challenge_results_json: &str,
     ) -> Result<String, ScpError> {
-        scp_test().aggregate_trust_input(
+        runtime().block_on(scp_test().aggregate_trust_input(
             context_id.to_owned(),
             subject_did.to_owned(),
-            events_json.to_owned(),
-            merkle_root_json.to_owned(),
-            consequence_rules_json.to_owned(),
-            threshold_requirements_json.to_owned(),
-            attestor_sets_json.to_owned(),
-            cached_attestations_json.to_owned(),
-            challenge_results_json.to_owned(),
-        )
+            TrustAggregationInputs {
+                events_json: events_json.to_owned(),
+                merkle_root_json: merkle_root_json.to_owned(),
+                consequence_rules_json: consequence_rules_json.to_owned(),
+                threshold_requirements_json: threshold_requirements_json.to_owned(),
+                attestor_sets_json: attestor_sets_json.to_owned(),
+                cached_attestations_json: cached_attestations_json.to_owned(),
+                challenge_results_json: challenge_results_json.to_owned(),
+            },
+        ))
     }
 
     const TEST_MERKLE_ROOT_JSON: &str =
@@ -23274,191 +23732,162 @@ mod tests {
     // -- check_capability_requirements (§7.3.4.4, SCP-ACR-008) --
 
     #[test]
-    fn check_capability_requirements_rejects_invalid_requirements_json() {
-        let result = check_capability_requirements(
-            "ctx-1".to_owned(),
-            "did:key:alice".to_owned(),
-            "not json".to_owned(),
-            "[]".to_owned(),
-            "[]".to_owned(),
-        );
-        assert!(result.is_err());
+    fn check_capability_requirements_rejects_empty_and_malformed_subject() {
+        for subject in ["", "not-a-did"] {
+            let result = runtime().block_on(scp_test().check_capability_requirements(
+                "ctx-1".to_owned(),
+                subject.to_owned(),
+                "[]".to_owned(),
+                "[]".to_owned(),
+            ));
+            assert_error_code(result, codes::VALID_7000);
+        }
     }
 
     #[test]
-    fn check_capability_requirements_rejects_invalid_capabilities_json() {
-        let result = check_capability_requirements(
-            "ctx-1".to_owned(),
-            "did:key:alice".to_owned(),
-            "[]".to_owned(),
-            "not json".to_owned(),
-            "[]".to_owned(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn check_capability_requirements_rejects_invalid_verifications_json() {
-        let result = check_capability_requirements(
-            "ctx-1".to_owned(),
-            "did:key:alice".to_owned(),
-            "[]".to_owned(),
-            "[]".to_owned(),
-            "not json".to_owned(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn check_capability_requirements_empty_inputs_succeeds() {
-        let result = check_capability_requirements(
-            "ctx-1".to_owned(),
-            "did:key:alice".to_owned(),
-            "[]".to_owned(),
-            "[]".to_owned(),
-            "[]".to_owned(),
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn check_capability_requirements_rejects_empty_subject() {
-        let result = check_capability_requirements(
-            "ctx-1".to_owned(),
+    fn check_capability_requirements_rejects_empty_context_id() {
+        let result = runtime().block_on(scp_test().check_capability_requirements(
             String::new(),
+            OTHER_DID.to_owned(),
             "[]".to_owned(),
             "[]".to_owned(),
-            "[]".to_owned(),
-        );
-        assert!(result.is_err());
+        ));
+        assert_error_code(result, codes::VALID_7011);
+    }
+
+    fn self_attested() -> serde_json::Value {
+        serde_json::json!([{
+            "capability": SCHEMA_URI,
+            "verification_level": "SelfAttested",
+        }])
     }
 
     #[test]
-    fn check_capability_requirements_rejects_malformed_subject() {
-        let result = check_capability_requirements(
-            "ctx-1".to_owned(),
-            "not-a-did".to_owned(),
-            "[]".to_owned(),
-            "[]".to_owned(),
-            "[]".to_owned(),
-        );
-        assert!(result.is_err());
+    #[cfg(feature = "testing")]
+    fn context_create_refuses_malformed_capability_requirements() {
+        let scp = scp_test();
+        let creator = challenge_identity(&scp);
+        for bad in [
+            serde_json::json!("not an array"),
+            serde_json::json!([{ "capability": SCHEMA_URI }]),
+        ] {
+            assert!(context_with(&scp, &creator, bad).is_err());
+        }
     }
 
     #[test]
-    fn check_capability_requirements_self_attested_present_succeeds() {
-        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
-        let capabilities = r#"["scp:capability:schema-validation/v1"]"#;
-        let result = check_capability_requirements(
-            "ctx-1".to_owned(),
-            "did:key:alice".to_owned(),
-            requirements.to_owned(),
-            capabilities.to_owned(),
-            "[]".to_owned(),
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn check_capability_requirements_self_attested_missing_fails() {
-        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
-        let result = check_capability_requirements(
-            "ctx-1".to_owned(),
-            "did:key:alice".to_owned(),
-            requirements.to_owned(),
-            "[]".to_owned(),
-            "[]".to_owned(),
-        );
-        assert!(result.is_err());
-    }
-
-    /// Builds a genuinely verifier-signed `ChallengeVerification` JSON array
-    /// bound to `subject_did`/`context_id`, far-future expiry, verifier DID
-    /// derived from a fixed key (did:dht:z, offline-resolvable by the production
-    /// `IdentityDidPublicKeyResolver`).
-    fn signed_cv_json(uri: &str, subject_did: &str, context_id: &str) -> String {
-        use ed25519_dalek::{Signer, SigningKey};
-
-        let verifier_key = SigningKey::from_bytes(&[9u8; 32]);
-        let verifier_pub = verifier_key.verifying_key().to_bytes();
-        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
-        let cap: scp_core::trust::CapabilityUri = uri.parse().unwrap();
-
-        let mut cv = scp_core::trust::ChallengeVerification {
-            verification_id: "bridge-test-challenge".to_owned(),
-            verifier_did,
-            subject_did: subject_did.into(),
-            capability_uri: uri.to_owned(),
-            challenge_type: scp_core::trust::ChallengeType::Uri(cap.clone()),
-            verification_method: scp_core::trust::VerificationMethod::ChallengeVerified {
-                challenge_type: scp_core::trust::ChallengeType::Uri(cap),
-            },
-            passed: true,
-            score: None,
-            test_count: 1,
-            pass_count: 1,
-            result: serde_json::Value::Bool(true),
-            completed_at: 1_700_000_000,
-            verified_at: 1_700_000_000,
-            expires_at: 4_000_000_000,
-            context_id: Some(context_id.to_owned()),
-            verifier_signature: Vec::new(),
+    #[cfg(feature = "testing")]
+    fn check_capability_requirements_rejects_malformed_inputs_and_unknown_context() {
+        let scp = scp_test();
+        let creator = challenge_identity(&scp);
+        let ctx = context_with(&scp, &creator, self_attested()).unwrap();
+        let check = |ctx: &str, caps: &str, records: &str| {
+            runtime().block_on(scp.check_capability_requirements(
+                ctx.to_owned(),
+                OTHER_DID.to_owned(),
+                caps.to_owned(),
+                records.to_owned(),
+            ))
         };
-        let canonical = scp_core::trust::canonical_challenge_verification_bytes(&cv).unwrap();
-        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
-        serde_json::to_string(&vec![cv]).unwrap()
+        assert_error_code(check(&ctx, "not json", "[]"), codes::VALID_7074);
+        assert_error_code(check(&ctx, "[]", "not json"), codes::VALID_7075);
+        assert_error_code(check("ctx-never-created", "[]", "[]"), codes::CTX_2001);
+    }
+
+    /// The requirement comes from the context's governance: with none, empty
+    /// inputs pass; with a `SelfAttested` one, the declared capability decides.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn check_capability_requirements_reads_the_context_requirement() {
+        let scp = scp_test();
+        let creator = challenge_identity(&scp);
+        let open = context_with(&scp, &creator, serde_json::json!([])).unwrap();
+        let gated = context_with(&scp, &creator, self_attested()).unwrap();
+        let check = |ctx: &str, caps: String| {
+            runtime().block_on(scp.check_capability_requirements(
+                ctx.to_owned(),
+                OTHER_DID.to_owned(),
+                caps,
+                "[]".to_owned(),
+            ))
+        };
+        check(&open, "[]".to_owned()).unwrap();
+        check(&gated, format!(r#"["{SCHEMA_URI}"]"#)).unwrap();
+        assert_error_code(check(&gated, "[]".to_owned()), codes::VALID_7076);
+    }
+
+    /// Which key re-signs a graded record.
+    #[cfg(feature = "testing")]
+    enum CvSigner {
+        /// The verifier's self-certifying identity key `#0`, through its
+        /// custody.
+        IdentityKey,
+        /// A key unrelated to the verifier's DID.
+        Unrelated,
+    }
+
+    /// A record signed by the verifier's `#active` key is admitted through
+    /// the instance resolver; the same record re-signed by an unrelated key
+    /// or by `#0` is dropped, so the requirement is unmet.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn check_capability_requirements_admits_only_active_key_records() {
+        let g = Graded::new();
+        let graded = g.grade();
+        g.admit(
+            &g.subject.did,
+            &g.context_id,
+            format!("[{}]", graded.record_json),
+        )
+        .unwrap();
+        let v_id = g.verifier.core_id.as_ref().unwrap();
+        let custody = g.verifier.custody.as_ref().unwrap();
+        for signer in [CvSigner::IdentityKey, CvSigner::Unrelated] {
+            let mut record: scp_core::trust::ChallengeVerification =
+                serde_json::from_str(&graded.record_json).unwrap();
+            let digest = scp_core::trust::challenge_verification_signing_digest(&record).unwrap();
+            record.verifier_signature = match signer {
+                CvSigner::IdentityKey => runtime()
+                    .block_on(custody.sign(&v_id.identity_key, &digest))
+                    .unwrap()
+                    .into_bytes(),
+                CvSigner::Unrelated => {
+                    use ed25519_dalek::Signer;
+                    ed25519_dalek::SigningKey::from_bytes(&[42; 32])
+                        .sign(&digest)
+                        .to_bytes()
+                        .to_vec()
+                }
+            };
+            assert_error_code(
+                g.admit(
+                    &g.subject.did,
+                    &g.context_id,
+                    serde_json::to_string(&[record]).unwrap(),
+                ),
+                codes::VALID_7076,
+            );
+        }
     }
 
     #[test]
-    fn check_capability_requirements_challenge_verified_happy_path() {
-        let uri = "scp:capability:prompt-injection-resistance/v1";
-        let subject = "did:dht:zResponder";
-        let ctx = "ctx-admission";
-        let requirements =
-            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
-        let cvs = signed_cv_json(uri, subject, ctx);
-        let result = check_capability_requirements(
-            ctx.to_owned(),
-            subject.to_owned(),
-            requirements,
-            "[]".to_owned(),
-            cvs,
+    #[cfg(feature = "testing")]
+    fn check_capability_requirements_binds_subject_and_context() {
+        let g = Graded::new();
+        let records = format!("[{}]", g.grade().record_json);
+        // Control: the record admits its own subject in its own context.
+        g.admit(&g.subject.did, &g.context_id, records.clone())
+            .unwrap();
+        // Cross-subject replay.
+        assert_error_code(
+            g.admit(OTHER_DID, &g.context_id, records.clone()),
+            codes::VALID_7076,
         );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn check_capability_requirements_rejects_cross_subject_replay() {
-        let uri = "scp:capability:prompt-injection-resistance/v1";
-        let ctx = "ctx-admission";
-        let requirements =
-            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
-        let cvs = signed_cv_json(uri, "did:dht:zVictim", ctx);
-        let result = check_capability_requirements(
-            ctx.to_owned(),
-            "did:dht:zAttacker".to_owned(),
-            requirements,
-            "[]".to_owned(),
-            cvs,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn check_capability_requirements_rejects_cross_context_replay() {
-        let uri = "scp:capability:prompt-injection-resistance/v1";
-        let subject = "did:dht:zResponder";
-        let requirements =
-            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
-        let cvs = signed_cv_json(uri, subject, "ctx-other");
-        let result = check_capability_requirements(
-            "ctx-admission".to_owned(),
-            subject.to_owned(),
-            requirements,
-            "[]".to_owned(),
-            cvs,
-        );
-        assert!(result.is_err());
+        // Cross-context replay, into a context with the same requirement.
+        let other =
+            context_with(&g.scp, &g.verifier, challenge_requirement(&g.verifier.did)).unwrap();
+        assert_ne!(other, g.context_id);
+        assert_error_code(g.admit(&g.subject.did, &other, records), codes::VALID_7076);
     }
 
     /// The typed `ParticipationRecordView` surfaces every flattened fact from
@@ -23573,23 +24002,28 @@ mod tests {
     // handle from ONE persona (fail-closed on `#agent` with no agent key).
     // -----------------------------------------------------------------------
 
+    /// The 32-byte public key `custody` reports for `handle`.
+    #[cfg(feature = "testing")]
+    async fn persona_public_key(custody: &InMemoryKeyCustody, handle: &KeyHandle) -> [u8; 32] {
+        let key = scp_platform::KeyCustody::public_key(custody, handle)
+            .await
+            .expect("custody reports the public key");
+        <[u8; 32]>::try_from(key.as_bytes()).expect("an Ed25519 public key")
+    }
+
     /// Builds a fresh in-memory `Identity` (optionally carrying an `#agent`
     /// signing key) plus a `ContextHandle` that shares the identity's custody +
     /// active key handle, returning `(identity, handle, active_key, agent_key)`
-    /// with the two keys exported for byte-comparison. The `#active` resolution
-    /// path exports through the handle's custody; the `#agent` path exports
-    /// through the identity's OWN custody — both wrap the SAME in-memory custody
-    /// instance here so the resolved keys can be compared against the exports.
+    /// with the two keys' public keys, as custody reports them, for
+    /// byte-comparison. The `#active` resolution path signs through the
+    /// handle's custody; the `#agent` path signs through the identity's OWN
+    /// custody — both wrap the SAME in-memory custody instance here so the
+    /// resolved keys can be compared against the reported public keys.
     #[cfg(feature = "testing")]
     async fn build_persona_test_identity(
         scp: &Arc<crate::scp::Scp>,
         with_agent_key: bool,
-    ) -> (
-        Identity,
-        ContextHandle,
-        ed25519_dalek::SigningKey,
-        Option<ed25519_dalek::SigningKey>,
-    ) {
+    ) -> (Identity, ContextHandle, [u8; 32], Option<[u8; 32]>) {
         let instance_id = scp.instance_id();
         let custody = InMemoryKeyCustody::new();
         let pre_rotation_custody =
@@ -23607,17 +24041,9 @@ mod tests {
         let did = core_id.did.clone();
         // `KeyHandle` is `Copy` — read handles before moving `core_id`/`custody`.
         let active_handle = core_id.active_signing_key;
-        let active_key = custody
-            .export_ed25519_signing_key(&active_handle)
-            .await
-            .expect("export active key");
+        let active_key = persona_public_key(&custody, &active_handle).await;
         let agent_key = match core_id.agent_signing_key {
-            Some(h) => Some(
-                custody
-                    .export_ed25519_signing_key(&h)
-                    .await
-                    .expect("export agent key"),
-            ),
+            Some(h) => Some(persona_public_key(&custody, &h).await),
             None => None,
         };
         // Wrap the SAME custody instance so identity + handle share key material.
@@ -23666,8 +24092,7 @@ mod tests {
             build_persona_test_identity(&scp, true).await;
         let agent_key = agent_key.expect("agent-keyed identity has an agent key");
         assert_ne!(
-            active_key.to_bytes(),
-            agent_key.to_bytes(),
+            active_key, agent_key,
             "test identity must have distinct active and agent keys"
         );
 
@@ -23683,8 +24108,8 @@ mod tests {
             scp_did::SigningKeyId::Agent
         );
         assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            agent_key.to_bytes(),
+            signer.message_signer().signer().public_key(),
+            agent_key,
             "#agent persona MUST resolve the agent key, never the active key"
         );
 
@@ -23695,10 +24120,7 @@ mod tests {
                 .unwrap();
         assert_eq!(signer.persona(), scp_did::SigningKeyId::Active);
         assert!(matches!(signer.message_signer(), MessageSigner::Active(_)));
-        assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            active_key.to_bytes()
-        );
+        assert_eq!(signer.message_signer().signer().public_key(), active_key);
     }
 
     /// Fail-closed: `#agent` requested for an identity with NO agent key returns
@@ -23730,10 +24152,7 @@ mod tests {
             super::resolve_uniffi_message_signer(&handle, &identity, scp_did::SigningKeyId::Active)
                 .await
                 .unwrap();
-        assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            active_key.to_bytes()
-        );
+        assert_eq!(signer.message_signer().signer().public_key(), active_key);
     }
 
     /// REGRESSION GUARD (fix 3): the `#agent` arm MUST export the agent key
@@ -23770,10 +24189,7 @@ mod tests {
         let agent_handle = core_id
             .agent_signing_key
             .expect("agent-keyed identity has an agent key handle");
-        let agent_key = custody_a
-            .export_ed25519_signing_key(&agent_handle)
-            .await
-            .expect("export agent key from custody_A");
+        let agent_key = persona_public_key(&custody_a, &agent_handle).await;
 
         let opaque_a = Arc::new(OpaqueInMemoryKeyCustody(custody_a));
         let identity = Identity {
@@ -23818,11 +24234,11 @@ mod tests {
                      resolver sourcing custody from the context handle (custody_B) would fail",
                 );
         assert_eq!(
-            signer.message_signer().key().to_bytes(),
-            agent_key.to_bytes(),
-            "#agent MUST export the agent key through the sender identity's own custody \
-             (custody_A); sourcing from the context handle's custody_B would export the wrong \
-             key or fail closed"
+            signer.message_signer().signer().public_key(),
+            agent_key,
+            "#agent MUST sign with the agent key through the sender identity's own custody \
+             (custody_A); sourcing from the context handle's custody_B would sign with the \
+             wrong key or fail closed"
         );
     }
 
@@ -23982,12 +24398,6 @@ mod tests {
         ) -> Result<Vec<u8>, ScpError> {
             self.host
                 .derive_pseudonym(&key_id, &context_id, Some(pseudonym_epoch))
-                .map_err(|e| fake_host_err(&e))
-        }
-
-        async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
-            self.host
-                .export_signing_key_bytes(&key_id)
                 .map_err(|e| fake_host_err(&e))
         }
 
@@ -24222,9 +24632,9 @@ mod tests {
             .expect("an identity derives");
     }
 
-    /// `export_ed25519_signing_key` and `ed25519_to_x25519_agree` refuse a
-    /// P-256 handle with `WrongKeyType` before any host export or agreement
-    /// call, whether the adapter minted the handle or resolves it.
+    /// `ed25519_to_x25519_agree` refuses a P-256 handle with `WrongKeyType`
+    /// before any host agreement call, whether the adapter minted the handle
+    /// or resolves it.
     #[tokio::test]
     async fn callback_custody_ed25519_only_paths_refuse_p256() {
         use scp_platform::KeyCustody;
@@ -24244,27 +24654,24 @@ mod tests {
         );
         for handle in [minted, resolved] {
             assert!(matches!(
-                custody.export_ed25519_signing_key(&handle).await,
-                Err(PlatformError::WrongKeyType { .. })
-            ));
-            assert!(matches!(
                 custody.ed25519_to_x25519_agree(&handle, &[9u8; 32]).await,
                 Err(PlatformError::WrongKeyType { .. })
             ));
         }
-        assert_eq!(host.calls("export_signing_key_bytes"), 0);
         assert_eq!(host.calls("dh_agree"), 0);
 
-        // The Ed25519 control: the same paths reach the host.
+        // The Ed25519 control: the same path reaches the host. The fake host
+        // agrees with HPKE keys only, so its refusal is a custody error.
         let ed = custody
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("ed25519 generation");
-        custody
-            .export_ed25519_signing_key(&ed)
-            .await
-            .expect("an Ed25519 key exports");
-        assert_eq!(host.calls("export_signing_key_bytes"), 1);
+        let agreed = custody.ed25519_to_x25519_agree(&ed, &[9u8; 32]).await;
+        assert!(
+            matches!(agreed, Err(PlatformError::CustodyError(_))),
+            "{agreed:?}"
+        );
+        assert_eq!(host.calls("dh_agree"), 1);
     }
 
     /// For `UniFFI`: the rotatable derivation reaches the host's
@@ -24285,13 +24692,17 @@ mod tests {
             .expect("rotatable derive");
         assert_eq!(host.calls("derive_rotatable_pseudonym"), 1);
         assert_eq!(host.calls("derive_pseudonym"), 0);
-        let seed = zeroize::Zeroizing::new(
-            <[u8; 32]>::try_from(
-                host.export_signing_key_bytes(&identity.id().to_string())
-                    .expect("seed")
-                    .as_slice(),
-            )
-            .expect("32 bytes"),
+        let seed = scp_ffi_common::callback_custody::fake_host::scalar_for(identity.id());
+        assert_eq!(
+            custody
+                .public_key(&identity)
+                .await
+                .expect("public key")
+                .as_bytes(),
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .as_bytes(),
+            "the recomputed seed is the host's key"
         );
         let expected = scp_crypto::pseudonym::derive_pseudonym(
             &seed,
@@ -24309,12 +24720,10 @@ mod tests {
     // ----- Context export signing via sign-only custody (§23.16.8) -----
 
     /// A deliberately **sign-only** `KeyCustodyProvider`: it signs and exposes a
-    /// public key, but does NOT override `export_signing_key_bytes`, so the
-    /// trait default (CTX-2050 "not implemented") applies. This models a
-    /// keychain / Secure-Enclave / HSM-shaped custody whose raw private key is
-    /// non-exportable — the exact case the prior raw-key export path could not
-    /// sign a context export for. Backed by a fixed Ed25519 key so the produced
-    /// signature is independently verifiable against the public key.
+    /// public key and nothing more. This models a keychain / Secure-Enclave /
+    /// HSM-shaped custody whose raw private key never leaves it. Backed by a
+    /// fixed Ed25519 key so the produced signature is independently verifiable
+    /// against the public key.
     struct SignOnlyCustody {
         signing_key: ed25519_dalek::SigningKey,
     }
@@ -24381,22 +24790,15 @@ mod tests {
             })
         }
 
-        // NOTE: `export_signing_key_bytes` is intentionally NOT overridden —
-        // the trait default returns CTX-2050, which is what makes this custody
-        // "sign-only". `CallbackKeyCustody::export_ed25519_signing_key` (the old
-        // export-signing path) therefore fails for this custody.
-
         fn custody_type(&self, _key_id: String) -> String {
             "hardware".to_owned()
         }
     }
 
-    /// A sign-only custody (whose raw key cannot be exported) must still be able
-    /// to sign a context-export snapshot digest via `KeyCustody::sign`
-    /// (§23.16.8), producing a 64-byte Ed25519 signature that verifies against
-    /// the custody's public key. This is the `UniFFI` parity fix for the `NAPI`
-    /// callback-custody export path: the prior raw-key export path
-    /// (`export_ed25519_signing_key`) cannot serve this custody.
+    /// A sign-only custody (whose raw key never leaves it) signs a
+    /// context-export snapshot digest via `KeyCustody::sign` (§23.16.8),
+    /// producing a 64-byte Ed25519 signature that verifies against the
+    /// custody's public key.
     #[tokio::test]
     async fn sign_only_custody_signs_export_snapshot_and_verifies() {
         use ed25519_dalek::Verifier;
@@ -24407,19 +24809,6 @@ mod tests {
 
         let callback = Arc::new(CallbackKeyCustody::new(Box::new(provider)));
         let key_handle = KeyHandle::new(1);
-
-        // Sanity: the old raw-key export path must FAIL for a sign-only custody,
-        // proving the new `custody.sign` path is load-bearing (not redundant
-        // with the still-extant governance raw-key path).
-        // The refusal must be the host's own (the trait default,
-        // CTX-2050), reached after the adapter resolved handle 1 through
-        // `get_public_key`; a host that exported its key would return Ok.
-        match callback.export_ed25519_signing_key(&key_handle).await {
-            Err(PlatformError::CustodyError(msg)) => {
-                assert!(msg.contains(codes::CTX_2050), "{msg}");
-            }
-            other => panic!("expected the host's CTX-2050 refusal, got {other:?}"),
-        }
 
         // Build a context handle carrying the sign-only callback custody and the
         // `#active` key handle, exactly as `context_create` would for a
@@ -24441,16 +24830,17 @@ mod tests {
         });
 
         // The §23.16.8 digest is opaque to the signer — any 32-byte hash works
-        // to prove the signing path.
+        // to prove the signing path `context_export` takes.
         let hash = [0x42u8; 32];
-        let key_handle =
-            super::export_signing_key(&handle).expect("the handle carries a key and a custody");
-        let signature = super::sign_export_snapshot_via_custody(&handle, &key_handle, &hash)
+        let signer = super::resolve_uniffi_signer(&handle)
+            .await
+            .expect("the handle carries a key and a custody");
+        let signature = signer
+            .sign_bounded_ed25519(&hash)
             .await
             .expect("sign-only custody must produce a context-export signature");
 
-        // Exactly 64 bytes (length validation in the helper) and verifiable
-        // against the custody's public key.
+        // Exactly 64 bytes and verifiable against the custody's public key.
         assert_eq!(signature.len(), 64, "Ed25519 signature must be 64 bytes");
         let sig = ed25519_dalek::Signature::from_bytes(&signature);
         verifying_key
@@ -24458,13 +24848,13 @@ mod tests {
             .expect("signature must verify against the sign-only custody public key");
     }
 
-    /// `export_signing_key` must fail closed when the handle carries no
+    /// The export signer resolution fails closed when the handle carries no
     /// signing-key handle, so no export is signed.
     #[tokio::test]
     async fn export_snapshot_signing_fails_closed_without_signing_key() {
         let scp = scp_test();
         let handle = test_handle_for(&scp); // signing_key: None, no custody
-        let result = super::export_signing_key(&handle);
+        let result = super::resolve_uniffi_signer(&handle).await;
         let err = result.expect_err("missing signing key must be rejected");
         match err {
             ScpError::Context { ref code, .. } => assert_eq!(code, codes::CTX_2040),
@@ -27594,6 +27984,151 @@ mod tests {
             1,
             "the replayed call runs no outlet"
         );
+    }
+
+    /// A handler that outlives `outlet_timeout_ms` fails the call with the
+    /// timeout error, and the wait returns at the timeout, not when the
+    /// handler finishes. The wait is an async timeout driven by the bridge
+    /// wait; a wait that ignored the timeout would hold the call for the
+    /// handler's full five seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "testing")]
+    async fn uniffi_invoke_outlet_times_out_a_slow_handler() {
+        use scp_platform::traits::KeyCustody as _;
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
+        let key = custody
+            .generate_keypair(scp_platform::traits::KeyType::Ed25519)
+            .await
+            .expect("keypair");
+        let mut public_key = [0_u8; 32];
+        public_key.copy_from_slice(
+            custody
+                .public_key(&key)
+                .await
+                .expect("public key")
+                .as_bytes(),
+        );
+        let issuer = scp_did::did_dht_from_public_key(&public_key).0;
+        let agent = "did:dht:z6MkAgentSlowHandler";
+
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+        bi.init_context_manager_with_did(&issuer);
+        let supervisor = bi
+            .context_manager_or_error()
+            .expect("supervisor must be attached")
+            .clone();
+        supervisor
+            .create_context(
+                "ctx-test".to_owned(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![
+                        scp_core::context::roles::Capability::MessagesRead,
+                        scp_core::context::roles::Capability::OutletCallAll,
+                    ],
+                    ..scp_core::context::ContextParams::default()
+                },
+                scp_did::DID(issuer.clone()),
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect("context creation must succeed");
+        supervisor
+            .test_insert_member("ctx-test", scp_did::DID(agent.to_owned()), "admin")
+            .await
+            .expect("the agent must be recorded as a member of the actor");
+        let handle = test_handle_with(&scp, "did:dht:z6MkStaleHandleCreator");
+        register_context_handle(&bi, &handle);
+        handle
+            .outlet_registry
+            .lock()
+            .expect("registry lock")
+            .insert(scp_core::context::outlets::OutletRegistration {
+                outlet_id: "calculator".to_owned(),
+                kind: scp_core::context::outlets::OutletKind::Action,
+                name: "Calculator".to_owned(),
+                description: "A simple calculator".to_owned(),
+                schema: scp_core::context::outlets::OutletSchema {
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
+                },
+                implementation_hash: [0xAA; 32],
+                test_vectors: vec![],
+                operator_did: "did:dht:z6MkOperator".into(),
+                cost: None,
+                message_catalog: Vec::new(),
+                registered_at: 0,
+                signature: Vec::new(),
+            });
+        handle.outlet_handlers.lock().expect("handler lock").insert(
+            "calculator".to_owned(),
+            Arc::new(
+                move |input: serde_json::Value| -> Result<serde_json::Value, String> {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    Ok(serde_json::json!({"sum": input["a"]}))
+                },
+            ),
+        );
+
+        let capabilities = vec!["outlet:call:*".to_owned()];
+        let params = scp_core::crypto::ucan::mint::MintParams {
+            issuer_did: &issuer,
+            issuer_key: &key,
+            audience_did: agent,
+            context_id: "ctx-test",
+            capabilities: &capabilities,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        // One token per call: the Invoke check spends each token's nonce.
+        let mut providers = Vec::new();
+        for _ in 0..2 {
+            let token =
+                scp_core::crypto::ucan::mint::mint_ucan(&params, &custody, &scp_clock::SystemClock)
+                    .await
+                    .expect("mint");
+            providers.push(McpUniFfiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: agent.to_owned(),
+                context_ids: vec!["ctx-test".to_owned()],
+                outlet_timeout_ms: 50,
+                agent_ucan_token: Some(token.encoded),
+                agent_proof_tokens: None,
+            });
+        }
+        let on_foreign = providers.pop().expect("two providers");
+        let provider = providers.pop().expect("two providers");
+        use scp_mcp::server::ContextProvider as _;
+        let assert_times_out = |provider: &McpUniFfiBridgeProvider, regime: &str| {
+            let started = std::time::Instant::now();
+            let result =
+                provider.invoke_outlet("ctx-test", "calculator", serde_json::json!({"a": 1}));
+            let waited = started.elapsed();
+            let err = result.expect_err("a handler slower than the timeout must fail the call");
+            let text = format!("{err:?}");
+            assert!(
+                text.contains("timed out after 50ms"),
+                "{regime}: the error must name the timeout: {text}"
+            );
+            assert!(
+                waited < std::time::Duration::from_secs(4),
+                "{regime}: the wait must end at the timeout, not when the handler returns: {waited:?}"
+            );
+        };
+        // On a runtime worker: the multi-thread regime.
+        assert_times_out(&provider, "runtime worker");
+        // On a foreign thread with no runtime: the shared-runtime regime,
+        // which builds the timer inside the runtime it drives.
+        std::thread::spawn(move || assert_times_out(&on_foreign, "foreign thread"))
+            .join()
+            .expect("the foreign-thread call must not panic");
     }
 
     /// The MCP outlet and resource access gates read the actor's lifecycle
@@ -32417,6 +32952,7 @@ mod tests {
                 economic_policy: None,
                 consequence_rules_json: None,
                 consequence_config_json: None,
+                capability_requirements_json: None,
                 pseudonym_rotation: None,
             }
         }
@@ -33223,6 +33759,101 @@ mod tests {
                     );
                 }
                 other => panic!("expected SagaAborted (axis a), got {other:?}"),
+            }
+        }
+
+        /// ADR-049 Decision 7a: governance signs through custody, so a host
+        /// custody whose raw key never leaves it (`ProdLikeCustody`) still
+        /// proposes, and
+        /// the single-admin proposal auto-executes after the engine verifies
+        /// the custody's signature.
+        #[tokio::test]
+        async fn governance_propose_signs_through_sign_only_custody() {
+            let scp = scp_test();
+            let bi = Arc::clone(&scp.inner);
+            install_seedable_resolver(&bi);
+            let owner_identity = scp
+                .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+                .await
+                .expect("identity_create_with_custody");
+            let owner = owner_identity.did.clone();
+            let handle = scp
+                .context_create(
+                    Arc::clone(&owner_identity),
+                    saga_context_params(&["governance:propose", "outlet:register"]),
+                )
+                .await
+                .expect("context_create");
+            let register_json =
+                saga_register_outlet_action_json("outlet-sign_only", "sign_only", &owner);
+            let result = scp
+                .governance_propose(handle, owner, register_json)
+                .await
+                .expect("a sign-only custody proposes through CommandSigner");
+            assert_governance_executed(&result, "RegisterOutlet");
+        }
+
+        /// ADR-049 Decision 7a: a send builds its `CommandSigner` from
+        /// custody's public key, so a host custody whose raw key never leaves
+        /// it (`ProdLikeCustody`) still sends. A group-context send signs no
+        /// envelope with the identity key; only a broadcast envelope does.
+        #[tokio::test]
+        async fn context_send_succeeds_with_sign_only_custody() {
+            let scp = scp_test();
+            let bi = Arc::clone(&scp.inner);
+            install_seedable_resolver(&bi);
+            let identity = scp
+                .identity_create_with_custody(Box::new(ProdLikeCustody::new()))
+                .await
+                .expect("identity_create_with_custody");
+            let handle = scp
+                .context_create(
+                    Arc::clone(&identity),
+                    saga_context_params(&["governance:propose", "messages:write"]),
+                )
+                .await
+                .expect("context_create");
+            scp.context_send(handle, identity, b"sign-only send".to_vec(), None)
+                .await
+                .expect("a sign-only custody sends through CommandSigner");
+        }
+
+        /// A proposer whose `#active` key custody no longer holds fails
+        /// `governance_propose` with `SCP-CRYPTO-4006` when the signer is
+        /// built, before any proposal is recorded.
+        #[tokio::test]
+        async fn governance_propose_with_a_destroyed_signing_key_is_crypto_4006() {
+            use scp_platform::traits::KeyCustody as _;
+            let scp = scp_test();
+            let identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create");
+            let owner = identity.did.clone();
+            let handle = scp
+                .context_create(
+                    Arc::clone(&identity),
+                    saga_context_params(&["governance:propose", "outlet:register"]),
+                )
+                .await
+                .expect("context_create");
+            let Some(UniffiKeyCustody::InMemory(custody)) = handle.custody.as_deref() else {
+                panic!("an in-memory identity retains its custody on the handle");
+            };
+            let key = handle
+                .signing_key
+                .expect("the handle retains the signing key");
+            custody.0.destroy_key(&key).await.expect("destroy_key");
+
+            let register_json =
+                saga_register_outlet_action_json("outlet-destroyed", "destroyed", &owner);
+            let err = scp
+                .governance_propose(handle, owner, register_json)
+                .await
+                .expect_err("a destroyed signing key cannot propose");
+            match err {
+                ScpError::Crypto { code, .. } => assert_eq!(code, codes::CRYPTO_4006),
+                other => panic!("expected Crypto CRYPTO_4006, got: {other:?}"),
             }
         }
     }

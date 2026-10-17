@@ -467,11 +467,14 @@ impl crate::scp::PyScp {
     /// Returns `RuntimeError` if the receipts JSON is invalid or the
     /// supervisor is not initialized.
     #[pyo3(name = "economy_verify_payment_receipts")]
-    pub fn economy_verify_payment_receipts(&self, receipts_json: &str) -> PyResult<String> {
+    pub fn economy_verify_payment_receipts(
+        &self,
+        py: Python<'_>,
+        receipts_json: &str,
+    ) -> PyResult<String> {
         use pyo3::exceptions::{PyRuntimeError, PyValueError};
 
         let bi = &*self.inner;
-        let rt = crate::runtime()?;
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = sup.clone();
@@ -490,7 +493,7 @@ impl crate::scp::PyScp {
             )));
         }
 
-        rt.block_on(async move {
+        crate::actor_wait::block_on_released(py, async move {
             use scp_core::context::actor::commands::EconomyCommand;
 
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -510,7 +513,7 @@ impl crate::scp::PyScp {
             // `valid`/`all_valid` semantics) cannot drift across PyO3, napi, and
             // UniFFI. See `scp_runtime::economy::receipt::verification_results_to_json`.
             Ok(scp_core::economy::verification_results_to_json(results))
-        })
+        })?
     }
 }
 

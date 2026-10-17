@@ -45,7 +45,6 @@ use scp_runtime::context::ContextHandle;
 use scp_runtime::context::outlets::invoke::{
     has_outlet_call_capability, invoke_outlet_aggregating,
 };
-use scp_runtime::event_log::KeyCustodySigner;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -612,7 +611,7 @@ async fn phase2_end_to_end_integration() {
     //         Merkle roots match.
     // -----------------------------------------------------------------------
 
-    let custody = InMemoryKeyCustody::new();
+    let custody = std::sync::Arc::new(InMemoryKeyCustody::new());
     let alice_checkpoint_key = custody
         .generate_keypair(KeyType::Ed25519)
         .await
@@ -622,18 +621,28 @@ async fn phase2_end_to_end_integration() {
         .await
         .expect("generate bob checkpoint key");
 
-    let alice_signer = KeyCustodySigner {
-        custody: &custody,
-        key: &alice_checkpoint_key,
-    };
+    let alice_signer = scp_runtime::context::actor::CommandSigner::from_custody(
+        scp_platform::signer::CustodySigner::new(
+            std::sync::Arc::clone(&custody),
+            alice_checkpoint_key,
+            scp_crypto::SigAlg::Ed25519,
+        )
+        .await
+        .expect("alice checkpoint signer"),
+    );
     let alice_checkpoint = generate_checkpoint(&alice_log, &alice_did, 1, &alice_signer)
         .await
         .expect("Alice checkpoint");
 
-    let bob_signer = KeyCustodySigner {
-        custody: &custody,
-        key: &bob_checkpoint_key,
-    };
+    let bob_signer = scp_runtime::context::actor::CommandSigner::from_custody(
+        scp_platform::signer::CustodySigner::new(
+            std::sync::Arc::clone(&custody),
+            bob_checkpoint_key,
+            scp_crypto::SigAlg::Ed25519,
+        )
+        .await
+        .expect("bob checkpoint signer"),
+    );
     let bob_checkpoint = generate_checkpoint(&bob_log, &bob_did, 1, &bob_signer)
         .await
         .expect("Bob checkpoint");

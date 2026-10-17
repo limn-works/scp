@@ -661,8 +661,11 @@ where
     // see. Doing this before execution lets the hash be recorded even if the
     // executor mutates the input object (serde_json::Value is a value type,
     // but this also protects against any future change to `F` that might
-    // take the input by reference and mutate it).
-    let input_hash = sha256_json(&input);
+    // take the input by reference and mutate it). An input with no canonical
+    // form (a number outside I-JSON) has no hash, so it fails input validation.
+    let input_hash = sha256_json(&input).map_err(|e| InvocationError::InputValidationFailed {
+        message: e.to_string(),
+    })?;
 
     // 5. Execute the outlet with timeout.
     //
@@ -697,7 +700,10 @@ where
     validate_value_against_schema(&output, &registration.schema.output_schema)
         .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
 
-    let output_hash = sha256_json(&output);
+    let output_hash =
+        sha256_json(&output).map_err(|e| InvocationError::OutputValidationFailed {
+            message: e.to_string(),
+        })?;
     let execution_time_ms = elapsed_ms(start);
 
     Ok(InvokeExecuteOutcome {
@@ -906,6 +912,13 @@ where
     }
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
+    // The input hash is taken from the value the executor will see, so the
+    // `OutletInvokedEvent` records it verbatim although the cancellation path
+    // clones the input. It is taken here, before any economy state moves,
+    // because an input with no canonical form fails input validation.
+    let input_hash = sha256_json(&input).map_err(|e| InvocationError::InputValidationFailed {
+        message: e.to_string(),
+    })?;
 
     // 4a. Economy pre-check (#1537). Strategy B: `economy_pre_check` is pure
     // compute — it does NOT deduct budget. Callers record the spend
@@ -949,11 +962,6 @@ where
     } else {
         None
     };
-
-    // 4c. Compute the input hash from the value the executor will see so
-    // the resulting `OutletInvokedEvent` records it verbatim even though we
-    // have to clone the input for the cancellation path.
-    let input_hash = sha256_json(&input);
 
     // 5. Execute with timeout and cancellation. The cancellation variant
     // keeps its own `tokio::select!` body because composing `tokio::select!`
@@ -999,18 +1007,24 @@ where
     // 6. Validate output + post-invocation bookkeeping.
     // H6: on output validation failure, void escrow and rollback budget
     // before returning.
-    if let Err(msg) = validate_value_against_schema(&output, &registration.schema.output_schema) {
-        void_escrow_and_rollback(
-            escrow.as_ref(),
-            escrow_parts.as_ref(),
-            action_cost,
-            &mut economy,
-            invoker_did,
-        )
-        .await;
-        return Err(InvocationError::OutputValidationFailed { message: msg });
-    }
-    let output_hash = sha256_json(&output);
+    // An output with no canonical form has no hash, so it fails output
+    // validation through the same escrow rollback.
+    let validated = validate_value_against_schema(&output, &registration.schema.output_schema)
+        .and_then(|()| sha256_json(&output).map_err(|e| e.to_string()));
+    let output_hash = match validated {
+        Ok(hash) => hash,
+        Err(msg) => {
+            void_escrow_and_rollback(
+                escrow.as_ref(),
+                escrow_parts.as_ref(),
+                action_cost,
+                &mut economy,
+                invoker_did,
+            )
+            .await;
+            return Err(InvocationError::OutputValidationFailed { message: msg });
+        }
+    };
     let execution_time_ms = elapsed_ms(start);
     let triggered = economy
         .as_mut()
@@ -3768,8 +3782,11 @@ where
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
     // SCP-OUT-035: snapshot the input hash before handing the value to
     // the executor so the §5.4.5 event records what the executor saw
-    // even if the executor mutates the value internally.
-    let input_hash = sha256_json(&input);
+    // even if the executor mutates the value internally. An input with no
+    // canonical form has no hash, so it fails input validation.
+    let input_hash = sha256_json(&input).map_err(|e| InvocationError::InputValidationFailed {
+        message: e.to_string(),
+    })?;
 
     // Open the stream. The channel capacity matches the §5.4.5
     // `credit_window` default (32). When the buffer fills, the executor
@@ -4135,7 +4152,8 @@ impl Default for StreamTerminalSummary {
 impl StreamTerminalSummary {
     /// Folds one emitted chunk's payload into the terminal summary. `Data`
     /// and `Progress` (and non-terminal `Error`) leave it unchanged; `End`
-    /// sets `Ok` + `output_hash`; a terminal `Error` sets `Error(code)`.
+    /// sets `Ok` + `output_hash`, or the Output-class error when the aggregate
+    /// has no canonical form; a terminal `Error` sets `Error(code)`.
     /// Chunks MUST be observed in emission order (last write wins, exactly
     /// as the batch scan resolved it).
     pub fn observe(&mut self, payload: &ChunkPayload) {
@@ -4144,9 +4162,20 @@ impl StreamTerminalSummary {
             ChunkPayload::End { aggregate, .. } => {
                 self.terminal_status = StreamTerminalStatus::Ok;
                 self.legacy_status = OutletStatus::Success;
-                self.output_hash = Some(scp_protocol::context::outlets::lifecycle::sha256_json(
-                    aggregate,
-                ));
+                // An aggregate with no canonical form has no hash: the stream
+                // ends in the Output-class error instead of a success that
+                // commits to no output.
+                if let Ok(hash) = scp_protocol::context::outlets::lifecycle::sha256_json(aggregate)
+                {
+                    self.output_hash = Some(hash);
+                } else {
+                    self.output_hash = None;
+                    self.terminal_status = StreamTerminalStatus::Error(
+                        scp_protocol::context::outlets::error_codes::CODE_OUTPUT_VIOLATION
+                            .to_owned(),
+                    );
+                    self.legacy_status = OutletStatus::Error;
+                }
             }
             ChunkPayload::Error { code, terminal, .. } => {
                 if *terminal {
@@ -5242,7 +5271,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
     supervisor: std::sync::Weak<crate::context::supervisor::Supervisor>,
     target_context_hex: String,
     saga_id: crate::context::supervisor::saga_journal::SagaId,
-    target_signing_key: crate::context::actor::commands::SigningKeyBytes,
+    target_signer: crate::context::actor::signer::CommandSigner,
     mut inner_rx: mpsc::Receiver<OutletStreamChunk>,
     outer_tx: mpsc::Sender<OutletStreamChunk>,
     escrow_ticket: crate::context::outlets::dispatch::StreamEscrowTicket,
@@ -5483,7 +5512,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
                         saga_id: settle_saga_id,
                         terminal_status,
                         cancel_ack_seq: None,
-                        target_signing_key,
+                        target_signer,
                         reply,
                     })
                 })
@@ -5859,8 +5888,14 @@ where
     let aggregate_schema = registration.schema.aggregate_schema.clone();
     // A's event log records only the manifest hash + input hash, never chunk
     // plaintext (the streaming parity of the unary saga's `output_hash`-only
-    // caller log, §6.2.4). Compute the input hash before `input` is moved.
-    let input_hash = sha256_json(&input);
+    // caller log, §6.2.4). Compute the input hash before `input` is moved; an
+    // input with no canonical form has no hash, so it fails input validation
+    // before the B-side open reserves anything.
+    let input_hash = sha256_json(&input).map_err(|e| {
+        OutletOpenError::Invocation(InvocationError::InputValidationFailed {
+            message: e.to_string(),
+        })
+    })?;
 
     // Open the B-side stream through the spawner taken above, so this open has
     // one shutdown refusal point. `open_outlet_stream_with_spawner` reserves escrow (zero for
@@ -5950,6 +5985,36 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    /// A stream whose `End` aggregate has no canonical form records the
+    /// Output-class error and no output hash, never a success that commits to
+    /// no output.
+    #[test]
+    fn an_end_aggregate_beyond_2_53_ends_the_stream_in_the_output_error() {
+        let end = |aggregate| ChunkPayload::End {
+            aggregate,
+            provenance: stream_output_provenance(
+                "ctx-i-json",
+                scp_protocol::context::params::MemoryScope::Ephemeral,
+            ),
+            execution_time_ms: 1,
+        };
+        let mut refused = StreamTerminalSummary::default();
+        refused.observe(&end(serde_json::json!({"id": 9_007_199_254_740_993_u64})));
+        assert_eq!(refused.output_hash, None);
+        assert_eq!(
+            refused.terminal_status,
+            StreamTerminalStatus::Error(
+                scp_protocol::context::outlets::error_codes::CODE_OUTPUT_VIOLATION.to_owned()
+            )
+        );
+        assert_eq!(refused.legacy_status, OutletStatus::Error);
+
+        let mut accepted = StreamTerminalSummary::default();
+        accepted.observe(&end(serde_json::json!({"id": 9_007_199_254_740_992_u64})));
+        assert!(accepted.output_hash.is_some());
+        assert_eq!(accepted.terminal_status, StreamTerminalStatus::Ok);
+    }
     use scp_protocol::context::ContextParams;
     use scp_protocol::context::outlets::OutletKind;
     use scp_protocol::context::outlets::registry::{
@@ -6500,8 +6565,8 @@ mod tests {
         .unwrap();
 
         // Verify hashes are present and correct.
-        let expected_input_hash = sha256_json(&input);
-        let expected_output_hash = sha256_json(&output);
+        let expected_input_hash = sha256_json(&input).unwrap();
+        let expected_output_hash = sha256_json(&output).unwrap();
 
         assert_eq!(event.input_hash, expected_input_hash);
         assert_eq!(event.output_hash, Some(expected_output_hash));
@@ -9775,9 +9840,7 @@ mod tests {
                     std::sync::Weak::new(),
                     B_CTX.to_owned(),
                     crate::context::supervisor::saga_journal::SagaId("saga-dropped-sup".to_owned()),
-                    crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                        &operator_key(),
-                    ),
+                    crate::context::actor::signer::CommandSigner::local_ed25519(operator_key()),
                     inner_rx,
                     outer_tx,
                     ticket,

@@ -6,14 +6,14 @@
 //! > (recommended interval: 60 seconds when the context has active
 //! > participants).
 //!
-//! After the ADR-049 actor refactor the per-context actor has **no signer** —
-//! its `key_resolver` resolves only *public* keys, and the `KeyCustody` signer
-//! is not mailbox-addressable. The signing key lives at the FFI/SDK boundary,
-//! the same layer that owns the relay subscription lifecycle. Therefore the
-//! periodic heartbeat send originates here, in a task spawned alongside the
-//! subscribe loop, and is routed through the actor's serialized send path via
-//! [`Supervisor::send_heartbeat`] (the key enters per-call, exactly like
-//! `send_message`). This mirrors the reconnection-driver location decision in
+//! After the ADR-049 actor refactor the per-context actor holds **no signer** —
+//! its `key_resolver` resolves only *public* keys. The custody-backed
+//! [`CommandSigner`] is resolved at the FFI/SDK boundary, the same layer that
+//! owns the relay subscription lifecycle. Therefore the periodic heartbeat send
+//! originates here, in a task spawned alongside the subscribe loop, and is
+//! routed through the actor's serialized send path via
+//! [`Supervisor::send_heartbeat`] (the signer enters per-call, exactly like
+//! `send_message`; ADR-049 Decision 7a). This mirrors the reconnection-driver location decision in
 //! [`crate::reconnect`].
 //!
 //! The cadence is the local node's per-profile send interval from
@@ -28,9 +28,7 @@
 //! send no heartbeats (the interval source returns `None`), matching the
 //! monitor's poll-based silence.
 
-use std::sync::Arc;
-
-use ed25519_dalek::SigningKey;
+use scp_core::context::actor::CommandSigner;
 use scp_core::context::supervisor::Supervisor;
 use scp_did::DID;
 use scp_transport::HeartbeatConfig;
@@ -52,7 +50,7 @@ pub fn heartbeat_interval(profile: TransportProfile) -> Option<std::time::Durati
 ///
 /// Loops on a timer at `interval`, calling
 /// [`Supervisor::send_heartbeat`] each tick with the caller-held
-/// `signing_key`. The send is best-effort: a transport failure is logged but
+/// `signer`. The send is best-effort: a transport or signing failure is logged but
 /// never breaks the loop, because a failed or undelivered heartbeat is itself a
 /// suppression signal — surfaced by the *receiver's* gap detection, not by
 /// tearing down the sender. The loop exits cleanly when either `cancel` (the
@@ -65,25 +63,19 @@ pub fn heartbeat_interval(profile: TransportProfile) -> Option<std::time::Durati
 ///
 /// Intended to be `tokio::spawn`'d (or enrolled in the bridge's `JoinSet`)
 /// alongside the relay subscribe loop. Holds a `Weak<Supervisor>` (ADR-049
-/// Decision 16) and an owned key, so it has no borrow ties to the subscribe
+/// Decision 16) and an owned signer, so it has no borrow ties to the subscribe
 /// task.
 /// Each tick upgrades the `Weak`; a failed upgrade stops the scheduler.
 pub async fn run_heartbeat_scheduler(
     supervisor: std::sync::Weak<Supervisor>,
     context_id: String,
     sender_did: DID,
-    signing_key: SigningKey,
+    signer: CommandSigner,
     interval: std::time::Duration,
     cancel: CancellationToken,
     bridge_cancel: CancellationToken,
 ) {
     let ctx_for_log = context_id.clone();
-    // Wrap the secret signing key in an `Arc` ONCE so each tick clones a
-    // refcount handle, never a copy of the Ed25519 secret scalar. The key
-    // material exists in exactly one heap location for the scheduler's
-    // lifetime (matching the prior single-capture exposure window) rather than
-    // being re-copied per tick.
-    let signing_key = Arc::new(signing_key);
     // A child token the tick cancels when the Supervisor has dropped; the
     // parent subscription token is untouched.
     let cancel = cancel.child_token();
@@ -92,14 +84,14 @@ pub async fn run_heartbeat_scheduler(
         // The per-tick async block is `move` and outlives the `FnMut` closure
         // call, so it must OWN what it touches — it cannot borrow the closure's
         // captures. Per tick we take only cheap handles: the `Weak` upgrade
-        // and the `Arc<SigningKey>` clone are refcount bumps (no secret-scalar
-        // copy), and the DID / context-id string clones are negligible against
-        // the ≥60s tick cadence.
+        // and the `CommandSigner` clone are refcount bumps, and the DID /
+        // context-id string clones are negligible against the ≥60s tick
+        // cadence.
         let supervisor = supervisor.upgrade();
         let stop = stop.clone();
         let context_id = context_id.clone();
         let sender_did = sender_did.clone();
-        let signing_key = Arc::clone(&signing_key);
+        let signer = signer.clone();
         async move {
             let Some(supervisor) = supervisor else {
                 tracing::debug!(
@@ -110,7 +102,7 @@ pub async fn run_heartbeat_scheduler(
                 return;
             };
             if let Err(e) = supervisor
-                .send_heartbeat(&context_id, &sender_did, &signing_key)
+                .send_heartbeat(&context_id, &sender_did, &signer)
                 .await
             {
                 // Best-effort (§9.9.2): a failed send does not stop the
@@ -177,6 +169,7 @@ async fn scheduler_loop<F, Fut>(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// Yields the test task enough times for a separately-spawned task to wake
     /// on an advanced paused clock, run its `select!`, and drive the per-tick
@@ -241,7 +234,9 @@ mod tests {
             std::sync::Weak::new(),
             "ctx".to_owned(),
             DID::from("did:dht:heartbeat-test"),
-            SigningKey::from_bytes(&[7; 32]),
+            CommandSigner::new(Arc::new(scp_crypto::LocalEd25519Signer::new(
+                ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            ))),
             interval,
             cancel.clone(),
             bridge_cancel.clone(),

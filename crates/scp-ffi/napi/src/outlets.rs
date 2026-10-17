@@ -886,37 +886,30 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
     }
 }
 
-/// Resolves the Active Signing Key the supervisor saga signs under for a
-/// co-resident context owned by `creator_did` — exported via the shared
-/// callback/in-memory custody path. The caller and target each resolve to their
-/// OWN creator's key so the receipt (target-signed) and each side's divergence
-/// marker (own-signed) are signed under the correct per-context Active Signing
-/// Key (spec §6.2.4 "Signer authorization": the receipt key MUST be the one
+/// Builds the custody signer the supervisor saga signs with for a co-resident
+/// context owned by `creator_did` (ADR-049 Decision 7a); the private key stays
+/// in custody. The caller and target each resolve to their OWN creator's
+/// signer, so the receipt (target-signed) and each side's divergence marker
+/// (own-signed) are signed under the correct per-context Active Signing Key
+/// (spec §6.2.4 "Signer authorization": the receipt key MUST be the one
 /// authorized to act for `target_context_id`).
 ///
-/// `context_id` is carried only for the error message.
-pub(crate) async fn resolve_context_signing_key(
+/// # Errors
+///
+/// The `with_identity` error when `creator_did` is not hosted here, and the
+/// custody's own code through `ScpNapiError::from(PlatformError)` when the
+/// signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
+pub(crate) async fn resolve_context_signer(
     bi: &crate::runtime::NapiBridgeInstance,
     creator_did: &str,
-    context_id: &str,
-) -> napi::Result<ed25519_dalek::SigningKey> {
+) -> napi::Result<scp_core::context::actor::CommandSigner> {
     let (custody, key_handle) = crate::runtime::with_identity(bi, creator_did, |entry| {
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })
     .map_err(napi::Error::from)?;
-    custody
-        .export_ed25519_signing_key(&key_handle)
+    scp_ffi_common::signer::identity_command_signer(custody, key_handle)
         .await
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Crypto {
-                message: format!(
-                    "cannot export the Active Signing Key for context '{context_id}' \
-                     (owner '{creator_did}') — a cross-context saga signs the receipt and \
-                     divergence markers with each context's own key: {e}"
-                ),
-                code: codes::CRYPTO_4001.to_owned(),
-            })
-        })
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))
 }
 
 /// Decodes the §6.2.4 envelope nonce from its canonical 32-char hex form into
@@ -1037,7 +1030,7 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
     asserted_chain_depth: u8,
     ucan_proof_id: Option<String>,
 ) -> napi::Result<NapiSagaResult> {
-    use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigningKeys};
+    use scp_core::context::supervisor::{CrossContextOutletInvocationRequest, SagaSigners};
 
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
 
@@ -1106,10 +1099,8 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
     // ----- Signing keys: each context's Active Signing Key -------------------
     // Each side signs as the creator its supervisor actor reported to that
     // side's gate above.
-    let target_signing_key =
-        resolve_context_signing_key(bi, &target_creator_did, &target_context_id).await?;
-    let caller_signing_key =
-        resolve_context_signing_key(bi, &caller_creator_did, &caller_context_id).await?;
+    let target_signer = resolve_context_signer(bi, &target_creator_did).await?;
+    let caller_signer = resolve_context_signer(bi, &caller_creator_did).await?;
 
     // ----- Executor: snapshot the TARGET context's outlet handler --------------
     //
@@ -1172,9 +1163,9 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
     // (`clippy::large_futures`).
     let output = Box::pin(supervisor.start_cross_context_outlet_invocation_saga(
         request,
-        SagaSigningKeys {
-            target: &target_signing_key,
-            caller: &caller_signing_key,
+        SagaSigners {
+            target: target_signer,
+            caller: caller_signer,
         },
         executor,
     ))

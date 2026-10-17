@@ -1691,7 +1691,7 @@ impl UniffiBridgeInstance {
             }
         };
         scp_ffi_common::ucan_durable_state::block_on_storage(
-            Some(crate::runtime().handle()),
+            Some(crate::runtime()),
             self.protocol_repository.load_ucan_state(context_id),
         )
         .map_err(to_error)?
@@ -1723,7 +1723,7 @@ impl UniffiBridgeInstance {
         // last write carries every revocation made before it.
         self.with_ucan_state(context_id, |state| {
             scp_ffi_common::ucan_durable_state::block_on_storage(
-                Some(crate::runtime().handle()),
+                Some(crate::runtime()),
                 self.protocol_repository
                     .persist_ucan_revocation_list(context_id, &state.revocation_list),
             )
@@ -1774,7 +1774,7 @@ impl UniffiBridgeInstance {
         // it reads the tracker entry the run just recorded.
         self.with_ucan_state(context_id, |state| {
             scp_ffi_common::ucan_durable_state::block_on_storage(
-                Some(crate::runtime().handle()),
+                Some(crate::runtime()),
                 self.protocol_repository.persist_ucan_recorded_nonce(
                     context_id,
                     &state.nonce_tracker,

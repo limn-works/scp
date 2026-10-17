@@ -124,15 +124,17 @@ pub(crate) fn scpid_sign_on(
             }
         };
 
-        let rt = crate::runtime();
-        let response = rt.block_on(core_sign(
+        // Waits on no context actor; signs through custody on the JS thread,
+        // so a JS callback custody cannot complete here (known defect,
+        // reported separately).
+        let response = crate::block_on_shared(core_sign(
             entry.custody.as_ref(),
             &key_handle,
             &did,
             key_id,
             &challenge,
             signed_at_override_u64,
-        ));
+        ))?;
 
         let response = response.map_err(|e| ScpNapiError::Identity {
             message: e.to_string(),
@@ -171,9 +173,9 @@ pub(crate) fn scpid_verify_on(
         code: codes::IDENT_1033.to_owned(),
     })?;
 
-    let rt = crate::runtime();
-    let auth = rt
-        .block_on(core_verify(resolver.as_ref(), &response, &challenge))
+    // Verifies a response against the DID resolver; waits on no context
+    // actor and no host callback.
+    let auth = crate::block_on_shared(core_verify(resolver.as_ref(), &response, &challenge))?
         .map_err(|e| ScpNapiError::Identity {
             message: e.to_string(),
             code: scpid_error_code(&e).to_owned(),

@@ -4,8 +4,7 @@ import Foundation
 //   - RelayHandle: relayUrl() -> String, relayPort() -> UInt16, isShutdown() -> Bool, shutdown()
 //   - NodeHandle: relayUrl() -> String, relayPort() -> UInt16, did() -> String,
 //                 isShutdown() -> Bool, shutdown(),
-//                 enableSiteProjection(contextId:broadcastKeyHex:authorDid:admission:hostname:
-//                     indexPath:maxAssetsPerDeploy:maxDeploySizeBytes:deployRetentionCount:cspOverride:)
+//                 enableSiteProjection(contextId:admission:broadcastKeyHex:authorDid:site:)
 //                 commitDeploy(contextId:deployId:) -> UInt32
 //                 rollbackDeploy(contextId:deployId:)
 //                 disableSiteProjection(contextId:)
@@ -268,14 +267,16 @@ public struct Node: Sendable {
         try await handle.enableSiteProjection(
             contextId: contextId,
             admission: admission,
-            hostname: config.hostname,
             broadcastKeyHex: broadcastKeyHex,
             authorDid: authorDid,
-            indexPath: config.indexPath == "/index.html" ? nil : config.indexPath,
-            maxAssetsPerDeploy: config.maxAssetsPerDeploy == 10000 ? nil : UInt32(config.maxAssetsPerDeploy),
-            maxDeploySizeBytes: config.maxDeploySizeBytes == 536_870_912 ? nil : UInt64(config.maxDeploySizeBytes),
-            deployRetentionCount: config.deployRetentionCount == 2 ? nil : UInt32(config.deployRetentionCount),
-            cspOverride: config.cspOverride
+            site: SiteProjectionSettings(
+                hostname: config.hostname,
+                indexPath: config.indexPath == "/index.html" ? nil : config.indexPath,
+                maxAssetsPerDeploy: config.maxAssetsPerDeploy == 10000 ? nil : UInt32(config.maxAssetsPerDeploy),
+                maxDeploySizeBytes: config.maxDeploySizeBytes == 536_870_912 ? nil : UInt64(config.maxDeploySizeBytes),
+                deployRetentionCount: config.deployRetentionCount == 2 ? nil : UInt32(config.deployRetentionCount),
+                cspOverride: config.cspOverride
+            )
         )
     }
 

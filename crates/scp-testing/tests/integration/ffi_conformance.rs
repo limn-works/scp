@@ -3598,6 +3598,12 @@ const WIRE_SITES: &[WireSite] = &[
     ("uniffi", UNIFFI_BRIDGE, "context_member_role", &[ROLE]),
     ("pyo3", PYO3_CONTEXT, "governance_execute", &[OUTCOME]),
     ("pyo3", PYO3_CONTEXT, "governance_propose", &[PROPOSE]),
+    (
+        "pyo3",
+        PYO3_CONTEXT,
+        "governance_modify_capability_requirements",
+        &[PROPOSE],
+    ),
     ("pyo3", PYO3_CONTEXT, "governance_approve", &[STATUS]),
     ("pyo3", PYO3_CONTEXT, "governance_reject", &[STATUS]),
     ("pyo3", PYO3_CONTEXT, "governance_withdraw", &[STATUS]),
@@ -3648,6 +3654,12 @@ const WIRE_SITES: &[WireSite] = &[
     (
         "napi",
         NAPI_CONTEXT,
+        "context_governance_modify_capability_requirements_on",
+        &[PROPOSE],
+    ),
+    (
+        "napi",
+        NAPI_CONTEXT,
         "context_governance_approve_on",
         &[STATUS],
     ),
@@ -3685,6 +3697,12 @@ const WIRE_SITES: &[WireSite] = &[
     ("napi", NAPI_EVENT_LOG, "event_log_query_on", &[EVENT_TYPE]),
     ("uniffi", UNIFFI_BRIDGE, "governance_execute", &[OUTCOME]),
     ("uniffi", UNIFFI_BRIDGE, "governance_propose", &[PROPOSE]),
+    (
+        "uniffi",
+        UNIFFI_BRIDGE,
+        "governance_modify_capability_requirements",
+        &[PROPOSE],
+    ),
     ("uniffi", UNIFFI_BRIDGE, "governance_approve", &[STATUS]),
     ("uniffi", UNIFFI_BRIDGE, "governance_reject", &[STATUS]),
     ("uniffi", UNIFFI_BRIDGE, "governance_withdraw", &[STATUS]),

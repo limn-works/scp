@@ -141,7 +141,7 @@ function asPublicKey(method: string): (raw: unknown) => NativeCustodyPublicKey {
 }
 
 /**
- * `asBytes` for key material (`dhAgree`, `exportSigningKeyBytes`). napi-rs
+ * `asBytes` for key material (`dhAgree`). napi-rs
  * reads a Rust `Vec<u8>` only from a JS `Array<number>`, so the adapter must
  * hand the bridge a copy of the host's secret. napi-rs copies that array into
  * Rust synchronously, as soon as the callback returns; the microtask below
@@ -223,19 +223,6 @@ export function toNativeCustodyProvider(provider: KeyCustodyProvider) {
         "deriveRotatablePseudonym",
         () => provider.deriveRotatablePseudonym(keyId, Uint8Array.from(contextId), epoch),
         asBytes("deriveRotatablePseudonym"),
-      ),
-    // A sign-only / hardware / secure-enclave custody throws here to signal it
-    // cannot export raw private-key bytes (ADR-006). The failure reaches Rust
-    // as an error: §9.10.4 best-effort paths (the post-create / post-import
-    // `PseudonymAnnouncement`, which signs via the exported key) skip, and
-    // required callers surface a custody error. Signing never uses this path;
-    // it goes through `KeyCustody::sign`, so sign-only custody can still
-    // produce a signed export.
-    exportSigningKeyBytes: (keyId: string): NativeHostResult<number[]> =>
-      hostCall(
-        "exportSigningKeyBytes",
-        () => provider.exportSigningKeyBytes(keyId),
-        asSecretBytes("exportSigningKeyBytes"),
       ),
     custodyType: (keyId: string): NativeHostResult<string> =>
       hostCall("custodyType", () => provider.custodyType(keyId), asString("custodyType")),

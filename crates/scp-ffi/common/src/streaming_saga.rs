@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use scp_core::context::actor::commands::SigningKeyBytes;
+use scp_core::context::actor::CommandSigner;
 use scp_core::context::outlets::stream::OutletStreamChunk;
 use scp_core::context::supervisor::{SagaError, SagaId, Supervisor};
 use tokio::sync::{Mutex, mpsc};
@@ -115,8 +115,8 @@ pub fn serialize_saga_chunk(
 /// miss the actor — pinning the conversion here closes that drift across
 /// bridges.
 ///
-/// The `signing_key` is the Active Signing Key resolved per-call from custody —
-/// NEVER envelope-asserted.
+/// The `signer` is the target context's Active Signing Key signer, resolved
+/// per call from custody — NEVER envelope-asserted.
 ///
 /// # Errors
 ///
@@ -129,12 +129,12 @@ pub async fn drive_recover_truncated_close(
     supervisor: &Arc<Supervisor>,
     saga_id: SagaId,
     target_context_id: &str,
-    signing_key: SigningKeyBytes,
+    signer: CommandSigner,
 ) -> Result<(), SagaError> {
     // ADR-056 chokepoint: decode the id STRING the SAME way the producer keys
     // the actor (decode a real 64-hex id rather than re-hashing it).
     let target_bytes = scp_core::context::state::context_id_to_bytes(target_context_id);
     supervisor
-        .recover_streaming_saga_truncated_close(saga_id, target_bytes, signing_key)
+        .recover_streaming_saga_truncated_close(saga_id, target_bytes, signer)
         .await
 }

@@ -558,8 +558,8 @@ pub async fn load_core<S: Storage>(
 ///   `ScpMlsProvider` uses for the sync `OpenMLS` storage trait. `fallback` is
 ///   not read on this path.
 /// - Outside any tokio runtime (a `PyO3` call arriving from a Python thread):
-///   `fallback` names the bridge's own runtime and `Handle::block_on` drives the
-///   future on it.
+///   `fallback` names the bridge's own runtime and `Runtime::block_on` drives
+///   the future on it.
 /// - Inside a current-thread runtime: neither primitive is legal, so this
 ///   returns [`UcanDurableStateError::NoBlockingContext`] and the caller fails
 ///   closed. The `PyO3` bridge builds a current-thread runtime only when
@@ -568,30 +568,27 @@ pub async fn load_core<S: Storage>(
 ///   to drive the future on, so this returns
 ///   [`UcanDurableStateError::NoBlockingContext`] as well.
 ///
-/// `crates/scp-ffi/**` is outside the scope of the `block_in_place` CI gate
-/// (`scripts/check-block-in-place.py`), which excludes the whole directory
-/// because the FFI boundary is where sync callers meet async protocol code.
+/// The wait goes through [`crate::bridge_wait::bridge_block_on`], the one
+/// thread-blocking primitive the bridges may use
+/// (`scripts/check-bridge-block-on.py`).
 ///
 /// # Errors
 ///
 /// Returns [`UcanDurableStateError::NoBlockingContext`] when called from inside
 /// a current-thread tokio runtime, or when the caller is outside any runtime and
-/// passes no `fallback` handle.
+/// passes no `fallback` runtime.
 pub fn block_on_storage<F>(
-    fallback: Option<&tokio::runtime::Handle>,
+    fallback: Option<&tokio::runtime::Runtime>,
     fut: F,
 ) -> Result<F::Output, UcanDurableStateError>
 where
     F: std::future::Future,
 {
-    if let Ok(current) = tokio::runtime::Handle::try_current() {
-        if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-            return Err(UcanDurableStateError::NoBlockingContext);
-        }
-        return Ok(tokio::task::block_in_place(|| current.block_on(fut)));
-    }
-    let handle = fallback.ok_or(UcanDurableStateError::NoBlockingContext)?;
-    Ok(handle.block_on(fut)) // ci-allow: block-on: sync FFI entry point outside any runtime
+    crate::bridge_wait::bridge_block_on(
+        || fallback.ok_or_else(|| "no fallback runtime".to_owned()),
+        fut,
+    )
+    .map_err(|_| UcanDurableStateError::NoBlockingContext)
 }
 
 #[cfg(test)]

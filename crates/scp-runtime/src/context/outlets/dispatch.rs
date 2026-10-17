@@ -279,6 +279,12 @@ pub enum OpenStreamRejection {
     /// `WithBackoff` retry policy — a saturated node needs the caller to back
     /// off, not retry immediately). See §5.4.5.
     StreamCapExhausted,
+    /// The stream input has no JCS canonical form: it carries a number outside
+    /// I-JSON (RFC 7493), such as an integer beyond 2^53, so the §5.4.5
+    /// `OutletInvokedEvent` cannot commit to its hash. Checked before the
+    /// admission gate, so the refusal consumes no admission slot, escrow, or
+    /// pump permit. Slug: `input.schema-violation`; code: `SCP-OUTLET-6120`.
+    InputNotCanonicalizable,
     /// The §7.3.8 caveat post-input check
     /// ([`CaveatPostInputCheck`](super::invoke::CaveatPostInputCheck))
     /// rejected the open. The stream validates its input ONCE at open
@@ -353,6 +359,7 @@ impl OpenStreamRejection {
             Self::InsufficientFunds => error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS,
             Self::CaveatsBindingMismatch => error_codes::SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
             Self::StreamCapExhausted => error_codes::SLUG_EXECUTION_STREAM_CAP_EXHAUSTED,
+            Self::InputNotCanonicalizable => error_codes::SLUG_INPUT_SCHEMA_VIOLATION,
             // #2196 — reuse the mid-stream teardown slug for a pre-open teardown.
             Self::ContextNotActive { .. } => error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
         }
@@ -363,7 +370,9 @@ impl OpenStreamRejection {
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::AdmissionRateLimited { .. } => error_codes::CODE_TRANSPORT_FAULT,
-            Self::EstimateExceedsBound => error_codes::CODE_INPUT_VIOLATION,
+            Self::EstimateExceedsBound | Self::InputNotCanonicalizable => {
+                error_codes::CODE_INPUT_VIOLATION
+            }
             Self::EscrowOverflow | Self::InsufficientFunds => error_codes::CODE_ECONOMIC_FAULT,
             Self::CaveatsBindingMismatch => error_codes::CODE_AUTHORIZATION_DENIED,
             Self::StreamCapExhausted => error_codes::CODE_EXECUTION_STREAM_CAP,
@@ -2248,6 +2257,11 @@ where
     // a binding-forged open never increments admission counters.
     verify_caveats_binding_at_open(&params)?;
 
+    // The §5.4.5 OutletInvokedEvent commits to the input's hash, so an input
+    // with no canonical form is refused here, before any counter moves.
+    let input_hash = scp_protocol::context::outlets::lifecycle::sha256_json(&input)
+        .map_err(|_| OpenStreamRejection::InputNotCanonicalizable)?;
+
     // Step 1: admission gate.
     run_admission_gate(&admission, &origin_admission, &params)?;
 
@@ -2348,7 +2362,6 @@ where
     // before forwarding the input value, and (iii) emit the event
     // ourselves in the pump settlement block from the outer pump's
     // incremental `MerkleFrontier` (manifest_root + manifest_billed).
-    let input_hash = scp_protocol::context::outlets::lifecycle::sha256_json(&input);
     let event_context_id = context.context_id().to_owned();
     let event_outlet_id: OutletId = outlet_id.clone();
     let event_invoker_did: DID = invoker_did.clone();

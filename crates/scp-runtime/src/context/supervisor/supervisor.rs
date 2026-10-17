@@ -649,15 +649,15 @@ enum CallerAbortReversal {
 
 /// The owned per-side plan [`Supervisor::divergence_marker_plan`] produces for
 /// a `NeedsRepair` divergence: `(committed_event_id, nonce, [(side-label,
-/// context_id, that side's Active Signing Key); 2])`. Each side signs + appends
-/// its OWN marker (spec §6.2.4 "Dual event-log recording").
+/// context_id, that side's Active Signing Key signer); 2])`. Each side signs +
+/// appends its OWN marker (spec §6.2.4 "Dual event-log recording").
 type DivergenceMarkerPlan = (
     String,
     [u8; 16],
     [(
         &'static str,
         [u8; 32],
-        crate::context::actor::commands::SigningKeyBytes,
+        crate::context::actor::signer::CommandSigner,
     ); 2],
     // CONVERGENT committer-assigned leaf-timestamp (seconds) for the
     // divergence-marker leaf: B's staged `recorded_timestamp_ms / 1000`, the
@@ -716,18 +716,18 @@ struct CrossContextSagaCtx<'a> {
     /// real role (spec §6.2.4 "Caller authentication"). `None` ⇒ no explicit
     /// role assignment.
     caller_source_role: Option<String>,
-    /// The target context's Active Signing Key — receipt + divergence-marker
-    /// signing (Commit-B / NeedsRepair). The actor holds no custody key
-    /// (ADR-049); the FSM rebuilds a `SigningKeyBytes` (zeroizes on drop) per
-    /// command from this caller-supplied key.
-    target_signing_key: ed25519_dalek::SigningKey,
-    /// The caller context's Active Signing Key — used ONLY to sign the
-    /// caller-side `CrossContextDivergenceMarker` on a `NeedsRepair` outcome
-    /// (spec §6.2.4 "Dual event-log recording"). The actor holds no custody
-    /// key (ADR-049); the FSM rebuilds a `SigningKeyBytes` per command from
-    /// this caller-supplied key. Distinct from `target_signing_key`: each side
-    /// signs its OWN marker into its OWN log under its OWN Active Signing Key.
-    caller_signing_key: ed25519_dalek::SigningKey,
+    /// The signer for the target context's Active Signing Key — receipt +
+    /// divergence-marker signing (Commit-B / NeedsRepair). The actor holds no
+    /// custody key (ADR-049); the FSM passes a clone of this caller-supplied
+    /// signer with each command, and the actor signs through it in the turn
+    /// (Decision 7a).
+    target_signer: crate::context::actor::signer::CommandSigner,
+    /// The signer for the caller context's Active Signing Key — used ONLY to
+    /// sign the caller-side `CrossContextDivergenceMarker` on a `NeedsRepair`
+    /// outcome (spec §6.2.4 "Dual event-log recording"). Distinct from
+    /// `target_signer`: each side signs its OWN marker into its OWN log under
+    /// its OWN Active Signing Key.
+    caller_signer: crate::context::actor::signer::CommandSigner,
     /// The supervisor-side outlet executor, taken once at Commit-B.
     executor: Option<SagaOutletExecutor<'a>>,
     /// The captured outlet output bytes, stashed the moment the executor runs
@@ -862,8 +862,9 @@ fn build_outlet_stream_pump_semaphore(requested: u32) -> Arc<tokio::sync::Semaph
 
 /// Supervisor configuration (per-node tunables). Saga phase timeouts and
 /// respawn-budget windows are still derived from code constants
-/// (`Supervisor::LIFECYCLE_TIMEOUT`, the function-local `PHASE_TIMEOUT`, and
-/// the module-level `CRASH_WINDOW_MS`) rather than this struct.
+/// (`Supervisor::LIFECYCLE_TIMEOUT`, the Prepare phase's function-local
+/// `PHASE_TIMEOUT`, and the module-level `COMMIT_PHASE_TIMEOUT` and
+/// `CRASH_WINDOW_MS`) rather than this struct.
 #[derive(Clone, Debug)]
 pub struct SupervisorConfig {
     /// Node-level ceiling on the number of outlet stream pumps that may run
@@ -890,6 +891,36 @@ impl Default for SupervisorConfig {
 /// Crashes older than this (relative to the newest crash) are evicted
 /// before the budget is evaluated.
 const CRASH_WINDOW_MS: u64 = 60_000;
+
+/// The budget of the supervisor-side outlet executor within one saga Commit
+/// attempt (§6.2.4). The executor runs off the actor mailbox (ADR-049 §3), so
+/// no actor turn bounds it.
+const COMMIT_EXECUTOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The budget of one saga Commit attempt, built from its parts: the executor
+/// ([`COMMIT_EXECUTOR_TIMEOUT`]), the Commit-B settle turn, which signs the
+/// receipt through `CommandSigner::sign_bounded_ed25519` and so takes
+/// [`SIGNING_HANDLER_TIMEOUT`](crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT),
+/// and 30 seconds for the Commit-B reserve and Commit-A turns.
+///
+/// A phase budget equal to the sign budget would expire with it, so a stalled
+/// custody would surface as the phase's `TransportTimeout`. With this budget
+/// the stalled sign fails first, as `SCP-CRYPTO-4062` (ADR-049 Decision 7a).
+const COMMIT_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    COMMIT_EXECUTOR_TIMEOUT.as_secs()
+        + crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT.as_secs()
+        + 30,
+);
+
+const _: () = assert!(
+    COMMIT_PHASE_TIMEOUT.as_secs()
+        > COMMIT_EXECUTOR_TIMEOUT.as_secs() + crate::context::actor::signer::SIGN_TIMEOUT.as_secs()
+);
+const _: () = assert!(
+    COMMIT_PHASE_TIMEOUT.as_secs()
+        > COMMIT_EXECUTOR_TIMEOUT.as_secs()
+            + crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT.as_secs()
+);
 
 /// Number of crashes within [`CRASH_WINDOW_MS`] that poisons a context
 /// (ADR-049 §10): "3 crashes in 60s poisons the context."
@@ -1490,7 +1521,7 @@ fn in_tracked_task(tracker: &tokio_util::task::TaskTracker) -> bool {
 /// named fields foreclose. Per the project's Agent-first API tenet: one flat
 /// config object, every field named, no builder, no ordering to track.
 ///
-/// The two Active Signing Keys (carried in the named-field [`SagaSigningKeys`])
+/// The two Active Signing Key signers (carried in the named-field [`SagaSigners`])
 /// and the supervisor-side outlet executor stay explicit parameters of the entry
 /// point — they are not envelope data (the keys are custody material the actor
 /// never holds; the executor is a non-`Send` closure), so folding them onto the
@@ -1600,31 +1631,32 @@ pub struct WelcomeJoinRequest {
     pub local_pseudonym: Option<[u8; 32]>,
 }
 
-/// The two Active Signing Keys a §6.2.4 cross-context saga signs under, named by
-/// role so the call site cannot transpose them.
+/// The signers for the two Active Signing Keys a §6.2.4 cross-context saga
+/// signs under, named by role so the call site cannot transpose them.
 ///
-/// `target` and `caller` are both `&SigningKey` of the SAME type; passed as two
-/// adjacent positional `&SigningKey` parameters a swap would compile and stay
-/// self-consistent (verification uses whichever key was supplied), silently
-/// signing each side's divergence marker under the wrong key — the same
-/// confused-deputy footgun the named-field [`CrossContextOutletInvocationRequest`]
-/// foreclosed one layer up for the `[u8; 32]` ids. Naming the role at the call
-/// site (`SagaSigningKeys { target: &…, caller: &… }`) makes a swap a visible
-/// field-name error, not a silent miscapture. Per the Agent-first API tenet:
-/// one flat named-field object, no ordering to track.
+/// `target` and `caller` are the SAME type; passed as two adjacent positional
+/// parameters a swap would compile and stay self-consistent (verification uses
+/// whichever key was supplied), silently signing each side's divergence marker
+/// under the wrong key — the same confused-deputy footgun the named-field
+/// [`CrossContextOutletInvocationRequest`] foreclosed one layer up for the
+/// `[u8; 32]` ids. Naming the role at the call site (`SagaSigners { target: …,
+/// caller: … }`) makes a swap a visible field-name error, not a silent
+/// miscapture. Per the Agent-first API tenet: one flat named-field object, no
+/// ordering to track.
 ///
-/// The keys are held by reference (the entry point clones each into the
-/// FSM-carried context); they are capabilities, NOT envelope data, so they stay
-/// off the wire [`CrossContextOutletInvocationRequest`].
-#[derive(Debug, Clone, Copy)]
-pub struct SagaSigningKeys<'a> {
-    /// The target context's Active Signing Key. Signs the
+/// Each signer reaches its key through custody (ADR-049 Decision 7a): the
+/// runtime never holds the key bytes. The signers are capabilities, NOT
+/// envelope data, so they stay off the wire
+/// [`CrossContextOutletInvocationRequest`].
+#[derive(Debug, Clone)]
+pub struct SagaSigners {
+    /// The target context's Active Signing Key signer. Signs the
     /// [`CrossContextOutletReceipt`]
     /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`.
-    pub target: &'a ed25519_dalek::SigningKey,
-    /// The caller context's Active Signing Key. Signs the CALLER-side divergence
-    /// marker on `NeedsRepair`.
-    pub caller: &'a ed25519_dalek::SigningKey,
+    pub target: crate::context::actor::signer::CommandSigner,
+    /// The caller context's Active Signing Key signer. Signs the CALLER-side
+    /// divergence marker on `NeedsRepair`.
+    pub caller: crate::context::actor::signer::CommandSigner,
 }
 
 /// The Phase-1 (pre-pump) outputs of an outlet-stream open, shared by
@@ -1704,34 +1736,37 @@ pub struct StreamingSagaHandle {
 // MessageSigner (ADR-039)
 // ---------------------------------------------------------------------------
 
-/// Pairs the signing key with its verification method so the persona stamped on
+/// Pairs the signer with its verification method so the persona stamped on
 /// the wire cannot disagree with the key that signed. Every send path requires a
-/// key, so this is non-optional.
+/// signer, so this is non-optional.
 ///
 /// ADR-039 — the inner envelope's `signing_key_id` (`#active` / `#agent`)
 /// selects which DID-document verification method the recipient resolves to
-/// check the signature. Carrying the key and its persona as two independent
+/// check the signature. Carrying the signer and its persona as two independent
 /// arguments let a caller stamp `#agent` while signing with the `#active` key
 /// (or vice versa), producing a message the recipient cannot verify. This enum
 /// binds the two together: [`Self::signing_key_id`] is derived from the same
-/// variant that carries the key, so the stamp and the key are one source of
+/// variant that carries the signer, so the stamp and the key are one source of
 /// truth. The single stamp+sign site
 /// (`build_encrypted_envelope_actor`)
-/// takes the `MessageSigner` directly.
+/// takes the `MessageSigner` directly. The signer is a [`CommandSigner`]
+/// (ADR-049 Decision 7a): the key stays in custody.
+///
+/// [`CommandSigner`]: crate::context::actor::signer::CommandSigner
 #[derive(Clone, Copy)]
 pub enum MessageSigner<'a> {
     /// Sign under the human `#active` verification method.
-    Active(&'a ed25519_dalek::SigningKey),
+    Active(&'a crate::context::actor::signer::CommandSigner),
     /// Sign under the autonomous `#agent` verification method (ADR-039).
-    Agent(&'a ed25519_dalek::SigningKey),
+    Agent(&'a crate::context::actor::signer::CommandSigner),
 }
 
 impl<'a> MessageSigner<'a> {
-    /// The Ed25519 signing key, regardless of persona.
+    /// The signer, regardless of persona.
     #[must_use]
-    pub const fn key(&self) -> &'a ed25519_dalek::SigningKey {
+    pub const fn signer(&self) -> &'a crate::context::actor::signer::CommandSigner {
         match self {
-            Self::Active(k) | Self::Agent(k) => k,
+            Self::Active(s) | Self::Agent(s) => s,
         }
     }
 
@@ -1821,6 +1856,12 @@ pub struct Supervisor {
     pub(in crate::context::supervisor) saga_journal: Arc<dyn SagaJournal>,
     /// Per-identity `KeyPackageStoreActor` handles.
     pub(in crate::context::supervisor) key_package_stores: DashMap<DID, KeyPackageStoreHandle>,
+    /// Per-challenger `ChallengerLedgerActor` handles, keyed by the
+    /// challenger's canonical identifier (spec 07 §7.3.4).
+    pub(in crate::context::supervisor) challenger_ledgers: DashMap<
+        String,
+        crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerHandle,
+    >,
     /// The one task tracker every supervisor-held task spawns through
     /// (ADR-049 Decision 16, supervisor task drain); Decision 16 item 1 states
     /// which tasks are members. Spawn only through [`Self::spawn_permit`],
@@ -2345,6 +2386,7 @@ impl Supervisor {
             pending_discards: dashmap::DashSet::new(),
             saga_journal,
             key_package_stores: DashMap::new(),
+            challenger_ledgers: DashMap::new(),
             task_tracker: tokio_util::task::TaskTracker::new(),
             spawn_gate: std::sync::RwLock::new(false),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
@@ -2852,6 +2894,21 @@ impl Supervisor {
     #[must_use]
     pub(crate) fn clock_ref(&self) -> Option<&Arc<dyn Clock>> {
         self.clock.get()
+    }
+
+    /// The supervisor clock's current Unix seconds: the time a challenger
+    /// signs as `created_at`, from the same clock its ledger checks windows
+    /// against.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInitialized`] when the supervisor has no clock
+    /// ([`Self::with_providers_and_journal`] was not used).
+    pub fn now_secs(&self) -> Result<u64, ContextError> {
+        use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
+        self.clock_ref()
+            .map(scp_clock::Clock::now_secs)
+            .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))
     }
 
     /// Cheap reference to the supervisor's
@@ -4420,10 +4477,10 @@ impl Supervisor {
         recovering_did: &str,
         contact_did: &str,
         payload: &[u8],
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<(), ContextError> {
         use crate::context::actor::commands::{
-            RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
+            RecoverySendNotificationPayload, TrustRecoveryCommand,
         };
 
         // Lock-free actor-registry fan-out: the first context where BOTH
@@ -4446,7 +4503,7 @@ impl Supervisor {
                     sender_did: recovering_did.to_owned(),
                     payload: payload.to_vec(),
                     sequence: 4,
-                    signing_key: SigningKeyBytes::from_signing_key(signing_key),
+                    signer: signer.clone(),
                 };
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let cmd = TrustRecoveryCommand::RecoverySendNotification {
@@ -4476,10 +4533,11 @@ impl Supervisor {
     /// Mirrors the standing/queries/lifecycle direct precedents.
     /// `RecoveryNotifyContact` is intrinsically cross-context (it carries
     /// no `context_id`, so it always reaches this path): its arm wraps
-    /// the actor-native [`Self::recovery_notify_contact`] fan-out in a
-    /// 30s timeout matching the actor-handler shape (plan §"Transport
-    /// timeouts inside actor handlers") and relays the typed reply on the
-    /// variant's oneshot.
+    /// the actor-native [`Self::recovery_notify_contact`] fan-out in the
+    /// signing handler budget
+    /// ([`SIGNING_HANDLER_TIMEOUT`](crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT)),
+    /// because the dispatched notification signs in the shared context's turn,
+    /// and relays the typed reply on the variant's oneshot.
     ///
     /// The per-context variants reach this path only for a context with
     /// no registered actor. Post-Step-B every valid *registered* context
@@ -4504,17 +4562,17 @@ impl Supervisor {
         self: &Arc<Self>,
         cmd: TrustRecoveryCommand,
     ) -> Outcome<()> {
-        const TRUST_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const TRUST_RECOVERY_TIMEOUT: std::time::Duration =
+            crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 
         match cmd {
             TrustRecoveryCommand::RecoveryNotifyContact { payload, reply } => {
                 let recovering_did = payload.recovering_did.clone();
-                let signing_key = payload.signing_key.to_signing_key();
                 let notify_fut = self.recovery_notify_contact(
                     &payload.recovering_did,
                     &payload.contact_did,
                     &payload.payload,
-                    &signing_key,
+                    &payload.signer,
                 );
                 let (outcome, reply_result) = match tokio::time::timeout(
                     TRUST_RECOVERY_TIMEOUT,
@@ -4581,14 +4639,13 @@ impl Supervisor {
             // provider seal produced (best-effort no-op). See
             // `recovery_send_notification_direct` for the full contract.
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
-                let signing_key = payload.signing_key.to_signing_key();
                 let send_result = self
                     .recovery_send_notification_direct(
                         &payload.context_id,
                         &payload.sender_did,
                         &payload.payload,
                         payload.sequence,
-                        &signing_key,
+                        &payload.signer,
                     )
                     .await;
                 match send_result {
@@ -4674,17 +4731,17 @@ impl Supervisor {
         sender_did: &str,
         payload: &[u8],
         sequence: u64,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ContextError>> + Send + 'a>>
     {
         use crate::context::actor::commands::{
-            ContextCommand, RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
+            ContextCommand, RecoverySendNotificationPayload, TrustRecoveryCommand,
         };
 
         let context_id = context_id.to_owned();
         let sender_did = sender_did.to_owned();
         let payload = payload.to_vec();
-        let signing_key = signing_key.clone();
+        let signer = signer.clone();
 
         Box::pin(async move {
             // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) lazy-spawn seal: the per-context
@@ -4748,7 +4805,7 @@ impl Supervisor {
                 sender_did,
                 payload,
                 sequence,
-                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                signer,
             };
             let cmd =
                 ContextCommand::TrustRecovery(TrustRecoveryCommand::RecoverySendNotification {
@@ -4812,7 +4869,8 @@ impl Supervisor {
             // context surfaces the dedicated poison error (ADR-049 §10).
             QueriesCommand::LocalPseudonym { ref context_id, .. }
             | QueriesCommand::LocalRoutingIds { ref context_id, .. }
-            | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. } => {
+            | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. }
+            | QueriesCommand::GetCapabilityRequirements { ref context_id, .. } => {
                 let err = self
                     .lookup_miss_error(context_id, format!("context not registered: {context_id}"));
                 reply_with_error(cmd, err);
@@ -5872,6 +5930,26 @@ impl Supervisor {
             .insert(context_id.to_owned(), ContextActorHandle::from_sender(tx));
     }
 
+    /// Test fixture: registers an actor handle for `context_id` whose mailbox
+    /// accepts a command that no task ever handles, so a caller's command is
+    /// enqueued and its reply never arrives: the actor turn stalls until
+    /// [`REPLY_TIMEOUT`](crate::context::actor::handle::REPLY_TIMEOUT).
+    ///
+    /// Returns the mailbox's receiving half. Holding it keeps the stall;
+    /// dropping it drops every queued command and its reply sender, so a
+    /// waiting caller fails at once.
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    #[must_use = "dropping the receiver ends the stall"]
+    pub fn test_stall_actor(&self, context_id: &str) -> Box<dyn std::any::Any + Send> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        self.actors
+            .insert(context_id.to_owned(), ContextActorHandle::from_sender(tx));
+        Box::new(rx)
+    }
+
     /// Map a per-context `lookup` miss to the right typed error (ADR-049
     /// §10). Three cases, in precedence order:
     ///
@@ -6496,7 +6574,7 @@ impl Supervisor {
     /// outlet-invocation saga (spec §6.2.4) is produced directly by
     /// [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga),
     /// not via the actor mailbox: that saga's
-    /// [`SagaSigningKeys`]
+    /// [`SagaSigners`]
     /// are borrowed (non-`'static`) `&ed25519_dalek::SigningKey`
     /// references that cannot move into a `'static` mailbox message,
     /// even though its executor is itself `Send + 'static`. Note that
@@ -6700,384 +6778,58 @@ impl Supervisor {
     }
 
     /// Reply to a [`BroadcastCommand`] whose target context has no
-    /// registered actor.
-    ///
-    /// Per-context variants (subscribe/unsubscribe/block/unblock/key
-    /// request/queries) get a typed [`ContextError::ContextNotRegistered`]
-    /// on their reply oneshot. The custody-bound publish variants and the
-    /// two-phase reserve/apply/release variants keep their own typed
-    /// replies (these never reach a per-context actor through this
-    /// no-custody router).
-    fn reply_broadcast_not_registered(cmd: BroadcastCommand) -> Outcome<()> {
+    /// registered actor, with the poison-aware lookup-miss error
+    /// ([`Self::lookup_miss_error`]): `ContextPoisoned` or `ActorCrashed`
+    /// when the context's crash window says so, `ContextNotRegistered`
+    /// otherwise.
+    fn reply_broadcast_lookup_miss(&self, cmd: BroadcastCommand) -> Outcome<()> {
+        let ctx_id = Self::broadcast_command_context_id(&cmd).to_owned();
+        let err = self.lookup_miss_error(&ctx_id, ctx_id.clone());
         match cmd {
-            BroadcastCommand::SubscribeBroadcast { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::SubscribeBroadcast { reply, .. } => reply_lookup_miss(reply, err),
+            BroadcastCommand::UnsubscribeBroadcast { reply, .. } => reply_lookup_miss(reply, err),
+            BroadcastCommand::PublishBroadcast { reply, .. }
+            | BroadcastCommand::PublishBroadcastContent { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::UnsubscribeBroadcast { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::BlockBroadcastSubscriber { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::BlockBroadcastSubscriber { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::UnblockBroadcastSubscriber { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::UnblockBroadcastSubscriber { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::HandleBroadcastKeyRequest { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::HandleBroadcastKeyRequest {
-                context_id, reply, ..
-            } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::BroadcastSubscriberCount { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::BroadcastSubscriberCount { context_id, reply } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            BroadcastCommand::IsBroadcastSubscriber {
-                context_id, reply, ..
-            } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            BroadcastCommand::BroadcastAdmission { context_id, reply } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            // Publish variants require a `KeyCustody` reference that cannot
-            // cross the actor mailbox — route through
-            // `dispatch_broadcast_command_with_custody`. Reaching here means
-            // a caller took the wrong path; surface a typed error.
-            BroadcastCommand::PublishBroadcast { reply, .. } => {
-                const MSG: &str = "BroadcastCommand::PublishBroadcast requires a KeyCustody \
-                     reference; route through \
-                     Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
-                let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
-                Outcome::err(ContextError::InvalidState(MSG.to_owned()))
-            }
-            BroadcastCommand::PublishBroadcastContent { reply, .. } => {
-                const MSG: &str = "BroadcastCommand::PublishBroadcastContent requires a KeyCustody \
-                     reference; route through \
-                     Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
-                let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
-                Outcome::err(ContextError::InvalidState(MSG.to_owned()))
-            }
-            // Two-phase publish requires a per-context actor (the
-            // reservation lives in actor-owned state). No actor → typed
-            // not-registered.
-            BroadcastCommand::ReserveBroadcastPublish { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            BroadcastCommand::ApplyBroadcastPublish { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            // No actor → no reservation could have been issued. Idempotent
-            // release: reply Ok so an abort path never errors spuriously.
-            BroadcastCommand::ReleaseBroadcastReservation { reply, .. } => {
-                let _ = reply.send(Ok(()));
-                Outcome::ok(())
-            }
-            // Test-only seed seam — context must exist.
+            BroadcastCommand::IsBroadcastSubscriber { reply, .. } => reply_lookup_miss(reply, err),
+            BroadcastCommand::BroadcastAdmission { reply, .. } => reply_lookup_miss(reply, err),
             #[cfg(feature = "testing")]
-            BroadcastCommand::SeedBroadcastAuthor {
-                context_id, reply, ..
-            } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
+            BroadcastCommand::SeedBroadcastAuthor { reply, .. } => reply_lookup_miss(reply, err),
         }
     }
 
-    /// Dispatch a [`BroadcastCommand`] for every non-publish variant.
+    /// Dispatch a [`BroadcastCommand`] through the target context's actor
+    /// mailbox.
     ///
-    /// Publish variants require a
-    /// [`KeyCustody`](scp_platform::KeyCustody) reference that cannot
-    /// cross the actor mailbox (RPITIT trait, not `dyn`-safe); use
-    /// [`Self::dispatch_broadcast_command_with_custody`] for publish.
+    /// The publish variants carry the author's `CommandSigner` and sign
+    /// inside the actor turn (ADR-049 Decision 7a).
     ///
     /// # Errors
     ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`] has
-    ///   been attached yet.
+    /// - [`ContextError::ChannelClosed`] or a mailbox error when the actor
+    ///   is registered but cannot take the command. An absent, poisoned or
+    ///   crashed actor is reported on the command's reply channel.
     pub async fn dispatch_broadcast_command(
         &self,
         cmd: BroadcastCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // Try the actor mailbox first. Post-Step-B every valid context
-        // has a registered actor, so the per-context broadcast handlers
-        // run on the actor. Reaching the fallback means no actor is
-        // registered for the target context — surface a typed
-        // `ContextNotRegistered` on the command's reply oneshot.
-        if let Some(ctx_id) = Self::broadcast_command_context_id(&cmd)
-            && let Some(actor) = self.lookup(ctx_id)
-        {
+        if let Some(actor) = self.lookup(Self::broadcast_command_context_id(&cmd)) {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd)).await;
         }
-        Ok(Self::reply_broadcast_not_registered(cmd))
-    }
-
-    /// Dispatch a [`BroadcastCommand`] with an explicit key custody
-    /// reference (ADR-049 §15 / plan row 11).
-    ///
-    /// # Why a custody-generic shim still exists
-    ///
-    /// [`KeyCustody`](scp_platform::KeyCustody) is an RPITIT trait whose
-    /// methods return `impl Future` — it is not `dyn`-safe, so a custody
-    /// reference cannot be erased and shipped across the actor mailbox.
-    /// The publish variants (`PublishBroadcast`, `PublishBroadcastContent`)
-    /// need the caller's custody to derive the sender key, and so they
-    /// remain on this generic shim path for the foreseeable future.
-    ///
-    /// # Routing
-    ///
-    /// - **Non-publish variants** (`Subscribe`, `Unsubscribe`, `Block`,
-    ///   `Unblock`, key request, queries) have a per-context owner and a
-    ///   `context_id` surfaced by
-    ///   `Self::broadcast_command_context_id`. They route through the
-    ///   per-context actor mailbox.
-    /// - **Publish variants** are intentionally returned as `None` from
-    ///   `broadcast_command_context_id`, fall through the mailbox check,
-    ///   and dispatch on the custody-generic shim below.
-    ///
-    /// This split is permanent: only the publish path needs custody; the
-    /// rest is identical to [`Self::dispatch_broadcast_command`].
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`] has
-    ///   been attached yet.
-    pub async fn dispatch_broadcast_command_with_custody<C: scp_platform::KeyCustody>(
-        &self,
-        cmd: BroadcastCommand,
-        custody: &C,
-    ) -> Result<Outcome<()>, ContextError> {
-        // Publish variants drive the two-phase reservation flow: the
-        // actor reserves the sequence (phase 1), the supervisor signs
-        // with the caller's custody OUTSIDE the actor, then the actor
-        // seals (phase 2). The custody never crosses the mailbox; both
-        // mailbox phases are custody-free. This removes the legacy
-        // DashMap read the single-phase shim used.
-        match cmd {
-            BroadcastCommand::PublishBroadcast { payload, reply } => {
-                let p = *payload;
-                self.publish_broadcast_two_phase(
-                    p.context_id,
-                    p.author_did,
-                    p.payload,
-                    &p.signing_key_handle,
-                    custody,
-                    reply,
-                )
-                .await
-            }
-            BroadcastCommand::PublishBroadcastContent { payload, reply } => {
-                let p = *payload;
-                let payload_bytes =
-                    match scp_protocol::context::broadcast_content::serialize_broadcast_content(
-                        &p.content,
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            let msg = format!("content serialization failed: {e}");
-                            let _ = reply.send(Err(ContextError::CryptoFailed(msg.clone())));
-                            return Ok(Outcome::err(ContextError::CryptoFailed(msg)));
-                        }
-                    };
-                self.publish_broadcast_two_phase(
-                    p.context_id,
-                    p.author_did,
-                    payload_bytes,
-                    &p.signing_key_handle,
-                    custody,
-                    reply,
-                )
-                .await
-            }
-            // Non-publish variants are custody-free and route straight
-            // through the per-context actor mailbox.
-            other => {
-                if let Some(ctx_id) = Self::broadcast_command_context_id(&other)
-                    && let Some(actor) = self.lookup(ctx_id)
-                {
-                    return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(other))
-                        .await;
-                }
-                // No registered actor — surface a typed not-registered
-                // error on the command's reply oneshot. (Publish variants
-                // are handled above and never reach here; non-publish
-                // variants need no custody.)
-                Ok(Self::reply_broadcast_not_registered(other))
-            }
-        }
-    }
-
-    /// Drive the two-phase broadcast publish across the actor mailbox.
-    ///
-    /// Phase 1 (`ReserveBroadcastPublish`) and phase 2
-    /// (`ApplyBroadcastPublish`) are custody-free mailbox commands; the
-    /// signing happens here, between them, with the caller's custody.
-    /// A reservation that cannot be applied (no actor, signing failure,
-    /// apply failure) is released via `ReleaseBroadcastReservation` so
-    /// the reserved sequence is not burned. The final
-    /// [`BroadcastEnvelope`](scp_protocol::crypto::sender_keys::BroadcastEnvelope)
-    /// (or error) is forwarded to the caller's `reply` channel.
-    async fn publish_broadcast_two_phase<C: scp_platform::KeyCustody>(
-        &self,
-        context_id: String,
-        author_did: DID,
-        payload: Vec<u8>,
-        signing_key_handle: &scp_platform::KeyHandle,
-        custody: &C,
-        reply: crate::context::actor::commands::PublishBroadcastReply,
-    ) -> Result<Outcome<()>, ContextError> {
-        use crate::context::actor::commands::{
-            ApplyBroadcastPublishPayload, ReserveBroadcastPublishPayload,
-        };
-
-        // Resolve the actor up front. Publish requires a registered
-        // per-context actor (the reservation lives in actor-owned state). On a
-        // miss, route through `lookup_miss_error` so a poisoned / silently-
-        // dead context surfaces the dedicated poison error rather than a
-        // misleading `ContextNotRegistered` (ADR-049 §10). The error is built
-        // twice (reply + outcome sketch) because `ContextError` is not
-        // `Clone`; both calls observe the same poison index.
-        let Some(actor) = self.lookup(&context_id) else {
-            let _ = reply.send(Err(self.lookup_miss_error(&context_id, context_id.clone())));
-            return Ok(Outcome::err(
-                self.lookup_miss_error(&context_id, context_id.clone()),
-            ));
-        };
-
-        // Phase 1 — reserve the sequence and get the signing payload.
-        let (reserve_tx, reserve_rx) = tokio::sync::oneshot::channel();
-        let reserve_cmd = BroadcastCommand::ReserveBroadcastPublish {
-            payload: Box::new(ReserveBroadcastPublishPayload {
-                context_id: context_id.clone(),
-                author_did: author_did.clone(),
-            }),
-            reply: reserve_tx,
-        };
-        Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(reserve_cmd)).await?;
-        let reservation = match bounded_reply_await(reserve_rx).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(e)) => {
-                // Operation-level error already typed by the handler;
-                // forward to the caller. The dispatch itself succeeded.
-                let _ = reply.send(Err(e));
-                return Ok(Outcome::ok_mutated(()));
-            }
-            Err(_) => {
-                let msg = "broadcast reserve reply channel closed".to_owned();
-                let _ = reply.send(Err(ContextError::InvalidState(msg.clone())));
-                return Ok(Outcome::err(ContextError::InvalidState(msg)));
-            }
-        };
-
-        // Sign OUTSIDE the actor with the caller's custody.
-        let signature = match custody
-            .sign(signing_key_handle, &reservation.signing_payload)
-            .await
-        {
-            Ok(sig) => sig.as_bytes().to_vec(),
-            Err(e) => {
-                // Signing failed — release the reservation so the
-                // sequence is reusable, then surface the error.
-                self.release_broadcast_reservation(&actor, context_id, reservation.reservation_id)
-                    .await;
-                let _ = reply.send(Err(ContextError::Custody((&e).into())));
-                return Ok(Outcome::ok_mutated(()));
-            }
-        };
-
-        // Phase 2 — apply the reservation with the signature.
-        let (apply_tx, apply_rx) = tokio::sync::oneshot::channel();
-        let apply_cmd = BroadcastCommand::ApplyBroadcastPublish {
-            payload: Box::new(ApplyBroadcastPublishPayload {
-                context_id: context_id.clone(),
-                reservation_id: reservation.reservation_id.clone(),
-                signature,
-                payload,
-            }),
-            reply: apply_tx,
-        };
-        Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(apply_cmd)).await?;
-        match bounded_reply_await(apply_rx).await {
-            Ok(Ok(envelope)) => {
-                let _ = reply.send(Ok(envelope));
-                Ok(Outcome::ok_mutated(()))
-            }
-            Ok(Err(e)) => {
-                // Apply itself released the reservation on its error
-                // paths; nothing more to do here.
-                let _ = reply.send(Err(e));
-                Ok(Outcome::ok_mutated(()))
-            }
-            Err(_) => {
-                // Apply reply channel closed without a result — release
-                // defensively in case the reservation is still live.
-                self.release_broadcast_reservation(&actor, context_id, reservation.reservation_id)
-                    .await;
-                let msg = "broadcast apply reply channel closed".to_owned();
-                let _ = reply.send(Err(ContextError::InvalidState(msg.clone())));
-                Ok(Outcome::err(ContextError::InvalidState(msg)))
-            }
-        }
-    }
-
-    /// Send a best-effort `ReleaseBroadcastReservation` to the actor so a
-    /// reservation that will never be applied does not burn its sequence.
-    /// Errors are swallowed — the snapshot floor is the crash-safe
-    /// backstop; this is the in-process fast path.
-    async fn release_broadcast_reservation(
-        &self,
-        actor: &ContextActorHandle,
-        context_id: String,
-        reservation_id: crate::context::actor::state::BroadcastReservationId,
-    ) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = BroadcastCommand::ReleaseBroadcastReservation {
-            payload: Box::new(
-                crate::context::actor::commands::ReleaseBroadcastReservationPayload {
-                    context_id,
-                    reservation_id,
-                },
-            ),
-            reply: tx,
-        };
-        if Self::dispatch_via_mailbox(actor, ContextCommand::Broadcast(cmd))
-            .await
-            .is_ok()
-        {
-            let _ = bounded_reply_await(rx).await;
-        }
+        Ok(self.reply_broadcast_lookup_miss(cmd))
     }
 
     /// Start a cross-context saga. See plan §"Cross-context saga
@@ -7162,13 +6914,13 @@ impl Supervisor {
     /// **exactly once** supervisor-side between the two Commit-B round-trips
     /// (the non-`Send` executor cannot cross the actor mailbox per ADR-049 §3).
     ///
-    /// `signing_keys` carries the two Active Signing Keys named by role
-    /// ([`SagaSigningKeys`]): `target` signs the
+    /// `signers` carries the two Active Signing Key signers named by role
+    /// ([`SagaSigners`]): `target` signs the
     /// [`CrossContextOutletReceipt`]
     /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`;
     /// `caller` signs the CALLER-side divergence marker on `NeedsRepair`. Each
     /// side signs its own marker into its own log. The named fields make a
-    /// same-typed `&SigningKey` swap a compile-visible field-name error rather
+    /// same-typed signer swap a compile-visible field-name error rather
     /// than a silent miscapture. The actor holds no custody key (ADR-049), so
     /// the caller supplies both per-call exactly as [`Self::send_heartbeat`] /
     /// [`Self::build_local_checkpoint`] do.
@@ -7256,7 +7008,7 @@ impl Supervisor {
     pub async fn start_cross_context_outlet_invocation_saga<F, Fut>(
         &self,
         request: CrossContextOutletInvocationRequest,
-        signing_keys: SagaSigningKeys<'_>,
+        signers: SagaSigners,
         executor: F,
     ) -> Result<SagaOutput, SagaError>
     where
@@ -7352,8 +7104,8 @@ impl Supervisor {
             asserted_nonce,
             asserted_timestamp_ms,
             caller_source_role,
-            target_signing_key: signing_keys.target.clone(),
-            caller_signing_key: signing_keys.caller.clone(),
+            target_signer: signers.target,
+            caller_signer: signers.caller,
             executor: Some(boxed_executor),
             executor_output: None,
             prepared_a: None,
@@ -7428,7 +7180,7 @@ impl Supervisor {
     ///
     /// `caller_context_id` is the RECEIVING context A (the invoker's context);
     /// `target_context_id` is the OPERATING context B (which hosts the streaming
-    /// outlet registration). `signing_keys.target` signs the SCP-OUT-043
+    /// outlet registration). `signers.target` signs the SCP-OUT-043
     /// streaming receipt at seal-close.
     ///
     /// # Errors
@@ -7454,14 +7206,14 @@ impl Supervisor {
         timeout_ms: Option<u32>,
         executor: Arc<E>,
         caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
-        signing_keys: SagaSigningKeys<'_>,
+        signers: SagaSigners,
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<StreamingSagaHandle, SagaError>
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
     {
         use crate::context::actor::commands::{
-            PrepareBOutcome, PrepareBStreamingFields, SagaPhaseMessage, SigningKeyBytes,
+            PrepareBOutcome, PrepareBStreamingFields, SagaPhaseMessage,
         };
 
         // Taken before any reserve, so a saga refused by shutdown has staged
@@ -7886,7 +7638,7 @@ impl Supervisor {
                 Arc::downgrade(self),
                 target_hex.clone(),
                 saga_id.clone(),
-                SigningKeyBytes::from_signing_key(signing_keys.target),
+                signers.target,
                 inner_rx,
                 outer_tx,
                 escrow_ticket,
@@ -7968,7 +7720,7 @@ impl Supervisor {
         self: &Arc<Self>,
         saga_id: SagaId,
         target_context_id: [u8; 32],
-        target_signing_key: crate::context::actor::commands::SigningKeyBytes,
+        target_signer: crate::context::actor::signer::CommandSigner,
     ) -> Result<(), SagaError> {
         use crate::context::actor::commands::SagaPhaseMessage;
         use scp_protocol::context::outlets::stream::StreamTerminalStatus;
@@ -7998,7 +7750,7 @@ impl Supervisor {
                             .to_owned(),
                     ),
                     cancel_ack_seq: None,
-                    target_signing_key,
+                    target_signer,
                     reply,
                 })
             })
@@ -9935,7 +9687,8 @@ impl Supervisor {
         }))
     }
 
-    /// Dispatch the Commit phase under the 30s per-attempt timeout.
+    /// Dispatch the Commit phase under the per-attempt
+    /// [`COMMIT_PHASE_TIMEOUT`].
     ///
     /// For a wired `CrossContextOutletInvocation` this drives the §6.2.4 Commit:
     /// Commit-B reserve → run the executor supervisor-side → Commit-B settle →
@@ -9946,8 +9699,6 @@ impl Supervisor {
         input: &SagaInput,
         xctx: Option<&mut CrossContextSagaCtx<'_>>,
     ) -> Result<(), ContextError> {
-        const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
         let dispatch_fut = async {
             match input {
                 SagaInput::CrossContextOutletInvocation { .. } => {
@@ -9980,11 +9731,11 @@ impl Supervisor {
             }
         };
 
-        match tokio::time::timeout(PHASE_TIMEOUT, dispatch_fut).await {
+        match tokio::time::timeout(COMMIT_PHASE_TIMEOUT, dispatch_fut).await {
             Ok(r) => r,
-            Err(_elapsed) => Err(ContextError::TransportTimeout(
-                "saga Commit exceeded 30s phase budget".to_owned(),
-            )),
+            Err(_elapsed) => Err(ContextError::TransportTimeout(format!(
+                "saga Commit exceeded {COMMIT_PHASE_TIMEOUT:?} phase budget"
+            ))),
         }
     }
 
@@ -9997,7 +9748,7 @@ impl Supervisor {
     /// 2. **Run the executor supervisor-side** — the non-`Send` outlet executor
     ///    runs off the actor mailbox (ADR-049 §3), producing the output.
     /// 3. **Commit-B settle** — hand the output to the target actor, which
-    ///    signs the receipt with `target_signing_key`, appends `OutletInvoked`,
+    ///    signs the receipt through `target_signer`, appends `OutletInvoked`,
     ///    and durably captures the output keyed by `SagaId`.
     /// 4. **Commit-A** — hand the receipt/output + the held Prepare-A
     ///    reservation to the caller actor, which settles escrow and records
@@ -10018,7 +9769,7 @@ impl Supervisor {
         // Verify-before-settle (spec §6.2.4 "Signer authorization"): before
         // Commit-A settles escrow + records the provenance edge, the FSM
         // re-verifies B's signature over the receipt against the SAME key it
-        // gave B to sign with (`ctx.target_signing_key`). This is an in-saga
+        // gave B to sign with (`ctx.target_signer`). This is an in-saga
         // integrity check — it proves the receipt was not corrupted/forged in
         // transit back from Commit-B — NOT the spec's independent
         // signer-authorization (governance-resolution) step. That step — confirm
@@ -10046,7 +9797,7 @@ impl Supervisor {
     /// authorization", normative MUST) and return the parsed receipt for the
     /// Commit-A binding.
     ///
-    /// The FSM holds the resolved target key (`ctx.target_signing_key` — the key
+    /// The FSM holds the resolved target signer (`ctx.target_signer` — the one
     /// it supplied to Commit-B for signing), so verifying the receipt's
     /// signature against `verifying_key()` is exactly "signed by the key
     /// authorized for `target_context_id`". On a parse or signature failure this
@@ -10065,7 +9816,7 @@ impl Supervisor {
                     saga_id.0
                 ))
             })?;
-        let authorized_target_key = ctx.target_signing_key.verifying_key();
+        let authorized_target_key = ctx.target_signer.verifying_key()?;
         receipt.verify(&authorized_target_key).map_err(|e| {
             ContextError::CryptoFailed(format!(
                 "SCP-SAGA-13064: cross-context saga Commit — target receipt signature for saga \
@@ -10160,12 +9911,23 @@ impl Supervisor {
                         .to_owned(),
                 )
             })?;
-            let output_value = executor(ctx.input.clone()).await.map_err(|e| {
-                ContextError::CryptoFailed(format!(
-                    "SCP-SAGA-13057: cross-context outlet executor failed for saga '{}': {e}",
-                    saga_id.0
-                ))
-            })?;
+            let output_value =
+                tokio::time::timeout(COMMIT_EXECUTOR_TIMEOUT, executor(ctx.input.clone()))
+                    .await
+                    .map_err(|_elapsed| {
+                        ContextError::TransportTimeout(format!(
+                            "saga Commit outlet executor exceeded {COMMIT_EXECUTOR_TIMEOUT:?} \
+                             budget for saga '{}'",
+                            saga_id.0
+                        ))
+                    })?
+                    .map_err(|e| {
+                        ContextError::CryptoFailed(format!(
+                            "SCP-SAGA-13057: cross-context outlet executor failed for saga '{}': \
+                             {e}",
+                            saga_id.0
+                        ))
+                    })?;
             let bytes = serde_json::to_vec(&output_value).map_err(|e| {
                 ContextError::CryptoFailed(format!(
                     "SCP-SAGA-13058: cross-context outlet output is not serializable for saga \
@@ -10189,9 +9951,7 @@ impl Supervisor {
             ))
         })?;
         let settle_saga_id = saga_id.clone();
-        let target_signing_key = crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-            &ctx.target_signing_key,
-        );
+        let target_signer = ctx.target_signer.clone();
         let CommitBSettleOutcome {
             receipt,
             output_bytes,
@@ -10201,7 +9961,7 @@ impl Supervisor {
                 ContextCommand::SagaPhase(SagaPhaseMessage::CommitBSettle {
                     saga_id: settle_saga_id,
                     output_bytes: exec_output_bytes,
-                    target_signing_key,
+                    target_signer,
                     reply,
                 })
             })
@@ -10455,7 +10215,7 @@ impl Supervisor {
         let (committed_event_id, nonce, sides, committed_timestamp_secs) = plan;
         let committed_side = CommittedSide::Target;
 
-        for (label, context_id, signing_key_bytes) in sides {
+        for (label, context_id, signer) in sides {
             let context_hex = hex::encode(context_id);
             if let Some(actor) = self.lookup(&context_hex) {
                 let marker_saga_id = saga_id.clone();
@@ -10468,7 +10228,7 @@ impl Supervisor {
                             committed_side,
                             committed_event_id: committed_event_id_for_send,
                             committed_timestamp_secs,
-                            signing_key: signing_key_bytes,
+                            signer,
                             reply,
                         })
                     })
@@ -10530,7 +10290,6 @@ impl Supervisor {
     /// (rather than across the caller's `.await`s) keeps the caller future
     /// `Send` despite the ctx's non-`Sync` boxed executor.
     fn divergence_marker_plan(ctx: &CrossContextSagaCtx<'_>) -> Option<DivergenceMarkerPlan> {
-        use crate::context::actor::commands::SigningKeyBytes;
         let committed_event_id = ctx.committed_b_outlet_invoked_event_id.clone()?;
         // B's VERIFIED staged provenance is the ONLY admissible source for the
         // convergent marker-leaf nonce + timestamp. In the current FSM a
@@ -10560,16 +10319,8 @@ impl Supervisor {
         // mirroring `commit_b_first_settle`'s witness-persist-before-append
         // ordering. A one-sided divergence is therefore always Target-committed.
         let sides = [
-            (
-                "target",
-                ctx.target_context_id,
-                SigningKeyBytes::from_signing_key(&ctx.target_signing_key),
-            ),
-            (
-                "caller",
-                ctx.caller_context_id,
-                SigningKeyBytes::from_signing_key(&ctx.caller_signing_key),
-            ),
+            ("target", ctx.target_context_id, ctx.target_signer.clone()),
+            ("caller", ctx.caller_context_id, ctx.caller_signer.clone()),
         ];
         // Source the STAGED `recorded_nonce` (B's captured copy of the wire
         // value) for symmetry with the signed receipt, which draws its `nonce`
@@ -11416,67 +11167,42 @@ impl Supervisor {
     /// [`ContextExport`](crate::context::export_import::ContextExport)
     /// (§23.16.8, ADR-050).
     ///
-    /// The per-context actor captures the UNSIGNED export building blocks
-    /// (snapshot + Merkle event-log data) via the
-    /// [`LifecycleCommand::ExportContext`] mailbox turn; the snapshot is then
-    /// signed HERE, at the dispatch boundary, because the runtime holds no
-    /// custody key. The caller supplies a `sign` closure that produces an
-    /// Ed25519 signature over the canonical snapshot digest
+    /// The per-context actor captures the snapshot and Merkle event-log data
+    /// and signs the canonical snapshot digest
     /// (`SHA-256("SCP-CONTEXT-EXPORT-V1:" || scope-tag-byte || JCS(snapshot))`)
-    /// using the exporter's custody key.
+    /// through `signer` in the same turn (ADR-049 Decision 7a), so a custody
+    /// that never answers fails the export after `SIGN_TIMEOUT`.
     ///
     /// The exporter MUST be the snapshot `creator_did` (the importer enforces
-    /// `exporter_did == creator_did`). The FFI bridge resolves the signing
-    /// key via `resolve_signing_key`, mirroring the governance signing path.
-    /// The closure receives the canonical digest computed over the final
-    /// (post–public-stripping) snapshot.
+    /// `exporter_did == creator_did`), and `signer` holds that DID's key.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError`] if the context does not exist, the actor reply
     /// channel closes, event-log export or Merkle verification fails, canonical
-    /// hashing fails, or `sign` returns an error ([`ContextError::Custody`],
-    /// which keeps the custody failure's kind for the bridges).
-    pub async fn export_context<F, E>(
+    /// hashing fails, or the sign fails: [`ContextError::Custody`] keeps the
+    /// custody failure's kind (`TimedOut`, SCP-CRYPTO-4062, past
+    /// `SIGN_TIMEOUT`), and [`ContextError::CryptoFailed`] names a signer that
+    /// is not Ed25519.
+    pub async fn export_context(
         self: &Arc<Self>,
         context_id: &str,
         exporter_did: DID,
-        sign: F,
-    ) -> Result<crate::context::export_import::ContextExport, ContextError>
-    where
-        F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
-        E: Into<scp_crypto::CustodyFailure>,
-    {
+        signer: &crate::context::actor::CommandSigner,
+    ) -> Result<crate::context::export_import::ContextExport, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = LifecycleCommand::ExportContext {
             context_id: context_id.to_owned(),
-            exporter_did: exporter_did.clone(),
+            exporter_did,
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_lifecycle_command(cmd).await?;
-        let (snapshot, event_log_data) = bounded_reply_await(rx).await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::export_context — actor reply channel closed".to_owned(),
             )
-        })??;
-
-        // Sign at the dispatch boundary: the actor holds no custody key, so
-        // the FFI-supplied `sign` closure produces the Ed25519 signature over
-        // the canonical snapshot digest computed inside `create_export`
-        // (§23.16.8, ADR-050).
-        let clock = self.clock_ref().ok_or_else(|| {
-            ContextError::PersistenceFailed(
-                "Supervisor::export_context — clock provider not initialized".to_owned(),
-            )
-        })?;
-        crate::context::export_import::create_export(
-            snapshot,
-            event_log_data,
-            exporter_did,
-            crate::context::export_import::ExportScope::Full,
-            clock.as_ref(),
-            sign,
-        )
+        })?
     }
 
     /// Imports a previously exported context (§23.16.8, ADR-050).
@@ -11831,6 +11557,36 @@ impl Supervisor {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         self.shutdown_token.cancel();
+    }
+
+    /// Stops every challenger-ledger actor and clears `challenger_ledgers`
+    /// (ADR-049 Decision 16, step 3), as [`Self::stop_key_package_actors`]
+    /// does for the key-package actors. The ledger is durable, so a stopped
+    /// actor loses only its in-memory grading leases.
+    pub(in crate::context) async fn stop_challenger_ledger_actors(&self) {
+        let handles: Vec<(
+            String,
+            crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerHandle,
+        )> = {
+            let _guard = self.write_lock.lock().await;
+            let drained = self
+                .challenger_ledgers
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect();
+            self.challenger_ledgers.clear();
+            drained
+        };
+        for (identity, handle) in handles {
+            if let Err(e) = handle.send_shutdown().await {
+                tracing::warn!(
+                    identity = %identity,
+                    error = %e,
+                    "shutdown: challenger-ledger actor did not accept Shutdown; its inbox \
+                     closes when the last handle drops"
+                );
+            }
+        }
     }
 
     /// Stops every key-package actor and clears `key_package_stores`
@@ -12506,26 +12262,26 @@ impl Supervisor {
     /// through the actor mailbox via [`Self::dispatch_command`].
     ///
     /// Used by the reconnection driver's Phase 3 (`event_log_sync`): the
-    /// caller supplies its locally-controlled `sender_did` + `signing_key`
+    /// caller supplies its locally-controlled `sender_did` + `signer`
     /// exactly as the application send path does.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the handler;
-    /// [`ContextError::TransportFailed`] if the reply channel is dropped.
+    /// Propagates [`ContextError`] from the handler, including
+    /// [`ContextError::Custody`] when the checkpoint sign is refused or times
+    /// out (`SCP-CRYPTO-4062`); [`ContextError::TransportFailed`] if the reply
+    /// channel is dropped.
     pub async fn build_local_checkpoint(
         &self,
         context_id: &str,
         sender_did: &DID,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::BuildLocalCheckpoint {
             context_id: context_id.to_owned(),
             sender_did: sender_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -12542,8 +12298,8 @@ impl Supervisor {
     ///
     /// Driven by the bridge/SDK subscribe-path periodic scheduler (the
     /// §9.9.2 "the SDK sends heartbeats" boundary): the caller supplies its
-    /// locally-controlled `sender_did` + `signing_key` exactly as the
-    /// application send path does — the signing key is not actor-owned state.
+    /// locally-controlled `sender_did` + `signer` exactly as the
+    /// application send path does — the actor holds no key material.
     /// The heartbeat carries an empty payload; its only purpose is to give
     /// peers a liveness beacon for suppression detection.
     ///
@@ -12557,15 +12313,13 @@ impl Supervisor {
         &self,
         context_id: &str,
         sender_did: &DID,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<(), ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::SendHeartbeat {
             context_id: context_id.to_owned(),
             sender_did: sender_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -12595,7 +12349,7 @@ impl Supervisor {
         &self,
         context_id: &str,
         sender_did: &DID,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
         new_epoch: u64,
         new_routing_id: [u8; 32],
     ) -> Result<(), ContextError> {
@@ -12605,9 +12359,7 @@ impl Supervisor {
             new_epoch,
             new_routing_id,
             sender_did: sender_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -13035,6 +12787,332 @@ impl Supervisor {
             Err(reply_error) => Err(ContextError::ActorBusy(format!(
                 "context '{context_id}' has a live actor that did not answer a role-state \
                  read: {reply_error:?}"
+            ))),
+        }
+    }
+
+    /// Get-or-spawn the attempt-ledger actor of `challenger` (spec 07
+    /// §7.3.4), keyed by its canonical identifier so two spellings of one key
+    /// can never hold two ledgers. A handle whose actor stopped is replaced;
+    /// the replacement keeps the old [`ChallengerLedgerShared`] state, so
+    /// permits held by unfinished gradings still count and no lease id is
+    /// issued twice.
+    ///
+    /// [`ChallengerLedgerShared`]: crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerShared
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::NonCanonicalIdentifier`](scp_protocol::trust::TrustError::NonCanonicalIdentifier)
+    /// for a non-canonical `challenger`; [`ContextError::NotInitialized`]
+    /// without storage or a clock; the spawn gate's error during shutdown.
+    async fn challenger_ledger_for(
+        &self,
+        challenger: &str,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerHandle,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::{
+            ChallengerLedgerActor, ChallengerLedgerShared,
+        };
+        let identity = scp_protocol::trust::CanonicalIdentifier::parse(challenger)?;
+        let key = identity.as_str().to_owned();
+        if let Some(handle) = self.challenger_ledgers.get(&key)
+            && !handle.is_closed()
+        {
+            return Ok(handle.value().clone());
+        }
+        let _guard = self.write_lock.lock().await;
+        let shared = match self.challenger_ledgers.get(&key) {
+            Some(handle) if !handle.is_closed() => return Ok(handle.value().clone()),
+            Some(handle) => handle.shared(),
+            None => ChallengerLedgerShared::new(),
+        };
+        let deps = self.build_challenger_ledger_deps()?;
+        let permit = self.spawn_permit("spawn challenger-ledger actor")?;
+        let (handle, _join) = ChallengerLedgerActor::spawn_through(&permit, identity, deps, shared);
+        self.challenger_ledgers.insert(key, handle.clone());
+        drop(permit);
+        Ok(handle)
+    }
+
+    /// Assembles the ledger actor's collaborators from the supervisor's
+    /// provider slots.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInitialized`] if storage or the clock is not wired.
+    fn build_challenger_ledger_deps(
+        &self,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerDeps,
+        ContextError,
+    > {
+        use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
+        let not_init = || ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned());
+        Ok(
+            crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerDeps {
+                mls_storage: Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?),
+                clock: Arc::clone(self.clock_ref().ok_or_else(not_init)?),
+            },
+        )
+    }
+
+    /// Takes one of `challenger`'s `MAX_CONCURRENT_GRADINGS_PER_CHALLENGER`
+    /// grading permits without waiting (spec 09 §9.18.C). The grading holds
+    /// it until its future and every blocking closure it started finish.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::GradingCapacityExhausted`](scp_protocol::trust::TrustError::GradingCapacityExhausted)
+    /// when every permit is held; the errors of the ledger lookup.
+    pub async fn challenge_grading_permit(
+        &self,
+        challenger: &str,
+    ) -> Result<
+        tokio::sync::OwnedSemaphorePermit,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle.grading_semaphore().try_acquire_owned().map_err(|_| {
+            scp_protocol::trust::TrustError::GradingCapacityExhausted {
+                challenger: challenger.to_owned(),
+                cause: scp_protocol::trust::GradingCapacityCause::GradingPermits,
+            }
+            .into()
+        })
+    }
+
+    /// Persists a new challenge in `challenger`'s ledger and signs its
+    /// request in the same ledger turn (spec 07 §7.3.4 step 1).
+    ///
+    /// # Errors
+    ///
+    /// The ledger's refusal ([`TrustError::ChallengeWindowOpen`](scp_protocol::trust::TrustError::ChallengeWindowOpen),
+    /// [`TrustError::ChallengeNotOpen`](scp_protocol::trust::TrustError::ChallengeNotOpen),
+    /// a verifier mismatch), a persistence or custody failure, or
+    /// [`ContextError::ActorBusy`]. On any error no signed request exists.
+    pub async fn dispatch_challenge_create(
+        &self,
+        challenger: &str,
+        unsigned: scp_protocol::trust::UnsignedChallengeRequest,
+        answer_key: scp_protocol::trust::AnswerKey,
+        evaluator_context_id: Option<String>,
+        signer: crate::context::actor::signer::CommandSigner,
+    ) -> Result<
+        scp_protocol::trust::ChallengeRequest,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Create {
+                unsigned: Box::new(unsigned),
+                answer_key,
+                evaluator_context_id,
+                signer,
+                reply,
+            })
+            .await
+    }
+
+    /// Read-only: whether `challenger`'s ledger holds a live challenge with
+    /// this id, request digest and subject, and, once that challenge is
+    /// closed, an attempt graded from `response` (spec 07 §7.3.4 step 3,
+    /// before any resolution). Takes no lease and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::UnknownChallenge`](scp_protocol::trust::TrustError::UnknownChallenge)
+    /// when no such challenge exists;
+    /// [`TrustError::ChallengeClosed`](scp_protocol::trust::TrustError::ChallengeClosed)
+    /// when it is closed and `response` is not one it graded; a
+    /// non-canonical subject or an unencodable response; a load failure or
+    /// [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_lookup(
+        &self,
+        challenger: &str,
+        request: &scp_protocol::trust::ChallengeRequest,
+        response: &scp_protocol::trust::ChallengeResponse,
+    ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let request_digest = scp_protocol::trust::challenge_request_signing_digest(request)?;
+        let response_digest = scp_protocol::trust::challenge_response_signing_digest(response)?;
+        let subject = scp_protocol::trust::CanonicalIdentifier::parse(&request.subject)?;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Lookup {
+                challenge_id: request.challenge_id,
+                request_digest,
+                subject,
+                response_digest,
+                reply,
+            })
+            .await
+    }
+
+    /// Begins grading an authenticated response (spec 07 §7.3.4 step 3
+    /// Begin): a stored record for a resubmit, else the grading lease.
+    ///
+    /// # Errors
+    ///
+    /// The ledger's refusal (`UnknownChallenge`, the `check_attempt` errors,
+    /// `GradingInProgress`), a load failure, or [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_begin_grade(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::BeginOutcome,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::BeginGrade { auth, reply })
+            .await
+    }
+
+    /// Signs a graded attempt's record and records it (spec 07 §7.3.4 step
+    /// 4).
+    ///
+    /// # Errors
+    ///
+    /// `GradingLeaseLost` with nothing written, the `check_attempt` errors at
+    /// the commit time, a persistence or custody failure, or
+    /// [`ContextError::ActorBusy`]. Every error but the last leaves nothing
+    /// written and the attempt unused.
+    pub async fn dispatch_challenge_commit(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
+        lease_id: u64,
+        outcome: scp_protocol::trust::GradeOutcome,
+        signer: crate::context::actor::signer::CommandSigner,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::GradedAttempt,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Commit {
+                auth,
+                lease_id,
+                outcome,
+                signer,
+                reply,
+            })
+            .await
+    }
+
+    /// Records a challenger fault for the grading of `auth` (spec 07 §7.3.4
+    /// step 3). It uses no attempt and closes nothing; the cooldown restarts
+    /// from it.
+    ///
+    /// # Errors
+    ///
+    /// `GradingLeaseLost` with nothing written when the lease is not live
+    /// for this `(attempt, D_r)`, a persistence failure, or
+    /// [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_fault(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
+        lease_id: u64,
+        fault: scp_protocol::trust::TrustError,
+    ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::RecordFault {
+                auth,
+                lease_id,
+                fault,
+                reply,
+            })
+            .await
+    }
+
+    /// Releases the grading lease of `auth` and records nothing (spec 07
+    /// §7.3.4 step 3): the grading was refused for capacity, so it uses no
+    /// attempt, records no fault and starts no cooldown.
+    ///
+    /// # Errors
+    ///
+    /// `GradingLeaseLost` when the lease is not live for this
+    /// `(attempt, D_r)`, a load failure, or [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_release(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
+        lease_id: u64,
+    ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Release {
+                auth,
+                lease_id,
+                reply,
+            })
+            .await
+    }
+
+    /// Spawns a challenge evaluator's economy pipeline onto the Supervisor's
+    /// task tracker (ADR-049 Decision 16), so a shutdown waits for the
+    /// pipeline's settle and storage never closes under a reserve that has
+    /// not settled.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] once shutdown has begun; the
+    /// future is dropped without running.
+    pub fn spawn_evaluator_pipeline<F>(
+        &self,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, ContextError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_tracked("challenge evaluator pipeline", future)
+    }
+
+    /// Reads the context's live capability requirements (spec §8.10), the
+    /// list a member must satisfy, as set by `ModifyCapabilityRequirements`.
+    ///
+    /// Fails closed: an unknown, crashed, poisoned or busy context is an
+    /// error, never an empty list, because an empty list admits everyone.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] when the supervisor serves no
+    ///   context for `context_id`.
+    /// - [`ContextError::ContextPoisoned`] / [`ContextError::ActorCrashed`]
+    ///   for a poisoned or respawning context (ADR-049 §10).
+    /// - [`ContextError::ActorBusy`] when the actor's mailbox send or reply
+    ///   timed out.
+    pub async fn capability_requirements_checked(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_protocol::trust::CapabilityRequirements, ContextError> {
+        let Some(actor) = self.lookup(context_id) else {
+            return Err(
+                self.lookup_miss_error(context_id, format!("context not registered: {context_id}"))
+            );
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::Queries(QueriesCommand::GetCapabilityRequirements {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        });
+        Self::dispatch_via_mailbox(&actor, cmd).await?;
+        match bounded_reply_await(rx).await {
+            Ok(answer) => answer,
+            Err(reply_error) => Err(ContextError::ActorBusy(format!(
+                "context '{context_id}' has a live actor that did not answer a \
+                 capability-requirements read: {reply_error:?}"
             ))),
         }
     }
@@ -14866,7 +14944,7 @@ impl Supervisor {
         creator_did: DID,
         invitee_did: DID,
         invitee_key_package: Vec<u8>,
-        proposer_signing_key: &ed25519_dalek::SigningKey,
+        proposer_signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<InviteMemberOutcome, ContextError> {
         use rand::RngCore as _;
         use scp_protocol::context::governance::GovernanceAction;
@@ -14965,7 +15043,7 @@ impl Supervisor {
                     did: invitee_did.clone(),
                     role: "member".to_owned(),
                 },
-                proposer_signing_key,
+                proposer_signer,
                 Some(invitee_key_package),
             )
             .await?;
@@ -15030,9 +15108,9 @@ impl Supervisor {
                 sender_key_seed: None,
             };
 
-            // 5. Build + sign the bundle with the creator's #active key. The SAME
-            //    key just authorized (and signed) the governance `AddMember`
-            //    proposal, so signing the bundle here with it makes it
+            // 5. Build + sign the bundle through the creator's signer (ADR-049
+            //    Decision 7a). The SAME signer just authorized (and signed) the
+            //    governance `AddMember` proposal, so signing the bundle with it makes it
             //    STRUCTURALLY impossible for the authenticated `creator_did` on
             //    the bundle to diverge from the DID the governance gate authorized
             //    (a two-signing-input design could sign the proposal under admin A
@@ -15049,9 +15127,11 @@ impl Supervisor {
                 metadata_snapshot,
                 signature: Vec::new(),
             };
-            bundle.sign(proposer_signing_key).map_err(|e| {
-                ContextError::CryptoFailed(format!("invite_member: bundle sign failed: {e}"))
+            let bundle_hash = bundle.invitation_bundle_signing_hash().map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: bundle hash failed: {e}"))
             })?;
+            // A custody refusal or timeout keeps its typed custody error.
+            bundle.set_signature(proposer_signer.sign_bounded_ed25519(&bundle_hash).await?);
 
             // 6. HPKE-seal the serialized bundle to the invitee. `wire` carries
             //    the plaintext `context_metadata_key` (§9.10.4.B) — hold it in
@@ -15143,7 +15223,7 @@ impl Supervisor {
                                 "invitation could not be sealed/delivered after the add".to_owned(),
                             ),
                         },
-                        proposer_signing_key,
+                        proposer_signer,
                         None,
                     )
                     .await;
@@ -16122,7 +16202,6 @@ impl Supervisor {
                         deps.clock.now_secs(),
                     ),
             },
-            pending_broadcast_publishes: HashMap::new(),
             // Transient join-handshake state; the fused join already consumed
             // it, so a fresh joiner state carries none.
             welcome_scratchpad: None,
@@ -16262,15 +16341,15 @@ impl Supervisor {
     /// Encrypts and broadcasts a payload through the context's MLS
     /// group via the actor mailbox.
     ///
-    /// `signer` ([`MessageSigner`]) pairs the Ed25519 signing key with the
+    /// `signer` ([`MessageSigner`]) pairs the custody-backed signer with the
     /// verification method it is signed under (ADR-039):
     /// [`MessageSigner::Active`] for human-originated sends,
     /// [`MessageSigner::Agent`] for agent-autonomous sends. The persona is
     /// stamped into the inner envelope's `signing_key_id` from the same enum
-    /// variant that carries the key, so the recipient resolves the matching
+    /// variant that carries the signer, so the recipient resolves the matching
     /// public key (`#active` / `#agent`) from the sender's DID document and the
     /// stamp can never disagree with the key that signed. Every send path
-    /// requires a key, so the signer is non-optional.
+    /// requires a signer, so it is non-optional.
     ///
     /// Every per-context method on `Supervisor` builds a typed
     /// `ContextCommand` carrying an embedded reply oneshot, enqueues it
@@ -16300,7 +16379,7 @@ impl Supervisor {
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        // Single construction point: both `signing_key` and `signing_key_id`
+        // Single construction point: both `signer` and `signing_key_id`
         // are derived from the one `MessageSigner` so the persona stamped on the
         // wire cannot diverge from the key that signs (ADR-039). The owned
         // payload keeps two fields to cross the actor mailbox, but they are set
@@ -16311,9 +16390,7 @@ impl Supervisor {
             params: handle.params().clone(),
             sender_did: sender_did.clone(),
             payload: payload.to_vec(),
-            signing_key: Some(
-                crate::context::actor::commands::SigningKeyBytes::from_signing_key(signer.key()),
-            ),
+            signer: signer.signer().clone(),
             signing_key_id: signer.signing_key_id(),
             source_provenance: source_provenance.cloned(),
             spending_ucan: spending_ucan.cloned(),
@@ -16825,7 +16902,7 @@ impl Supervisor {
         context_id: &str,
         proposer_did: &DID,
         action: scp_protocol::context::governance::GovernanceAction,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<
         (
             scp_protocol::context::governance::GovernanceProposal,
@@ -16840,9 +16917,7 @@ impl Supervisor {
                 context_id: context_id.to_owned(),
                 proposer_did: proposer_did.clone(),
                 action,
-                signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                    signing_key,
-                ),
+                signer: signer.clone(),
                 // The unchecked propose path never carries an invitee KeyPackage
                 // (the invitation path uses the checked variant).
                 key_package: None,
@@ -16869,13 +16944,13 @@ impl Supervisor {
         context_id: &str,
         proposer_did: &DID,
         action: scp_protocol::context::governance::GovernanceAction,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
         self.propose_governance_action_checked_carrying_key_package(
             context_id,
             proposer_did,
             action,
-            signing_key,
+            signer,
             None,
         )
         .await
@@ -16900,7 +16975,7 @@ impl Supervisor {
         context_id: &str,
         proposer_did: &DID,
         action: scp_protocol::context::governance::GovernanceAction,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
         key_package: Option<Vec<u8>>,
     ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -16909,9 +16984,7 @@ impl Supervisor {
                 context_id: context_id.to_owned(),
                 proposer_did: proposer_did.clone(),
                 action,
-                signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                    signing_key,
-                ),
+                signer: signer.clone(),
                 key_package,
             },
         );
@@ -16942,7 +17015,7 @@ impl Supervisor {
         proposal_id: &scp_protocol::context::governance::ProposalId,
         voter_did: &DID,
         approve: bool,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<
         (
             scp_protocol::context::governance::ProposalStatus,
@@ -16955,9 +17028,7 @@ impl Supervisor {
             context_id: context_id.to_owned(),
             proposal_id: *proposal_id,
             voter_did: voter_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
         });
         let cmd = GovernanceCommand::VoteOnProposal {
             payload,
@@ -17316,43 +17387,26 @@ impl Supervisor {
         }
     }
 
-    /// Extract the target context_id from a [`BroadcastCommand`].
-    /// Publish variants are deliberately excluded because they require
-    /// the custody-generic shim path.
-    fn broadcast_command_context_id(cmd: &BroadcastCommand) -> Option<&str> {
+    /// Extract the target context_id from a [`BroadcastCommand`]. Every
+    /// variant names its context.
+    fn broadcast_command_context_id(cmd: &BroadcastCommand) -> &str {
         match cmd {
-            BroadcastCommand::SubscribeBroadcast { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            BroadcastCommand::UnsubscribeBroadcast { payload, .. } => {
-                Some(payload.context_id.as_str())
+            BroadcastCommand::SubscribeBroadcast { payload, .. } => payload.context_id.as_str(),
+            BroadcastCommand::UnsubscribeBroadcast { payload, .. } => payload.context_id.as_str(),
+            BroadcastCommand::PublishBroadcast { payload, .. } => payload.context_id.as_str(),
+            BroadcastCommand::PublishBroadcastContent { payload, .. } => {
+                payload.context_id.as_str()
             }
             BroadcastCommand::BlockBroadcastSubscriber { payload, .. }
             | BroadcastCommand::UnblockBroadcastSubscriber { payload, .. } => {
-                Some(payload.context_id.as_str())
+                payload.context_id.as_str()
             }
             BroadcastCommand::HandleBroadcastKeyRequest { context_id, .. }
             | BroadcastCommand::BroadcastSubscriberCount { context_id, .. }
             | BroadcastCommand::IsBroadcastSubscriber { context_id, .. }
-            | BroadcastCommand::BroadcastAdmission { context_id, .. } => Some(context_id.as_str()),
-            // Two-phase publish is custody-free — both phases route
-            // through the per-context actor mailbox.
-            BroadcastCommand::ReserveBroadcastPublish { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            BroadcastCommand::ApplyBroadcastPublish { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            BroadcastCommand::ReleaseBroadcastReservation { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            // Test-only seed seam — routed to the per-context actor.
+            | BroadcastCommand::BroadcastAdmission { context_id, .. } => context_id.as_str(),
             #[cfg(feature = "testing")]
-            BroadcastCommand::SeedBroadcastAuthor { context_id, .. } => Some(context_id.as_str()),
-            // PublishBroadcast / PublishBroadcastContent need
-            // KeyCustody on the shim, so they have no string target for
-            // this custody-free router.
-            _ => None,
+            BroadcastCommand::SeedBroadcastAuthor { context_id, .. } => context_id.as_str(),
         }
     }
 
@@ -17488,6 +17542,7 @@ impl Supervisor {
         match cmd {
             QueriesCommand::ReadContextState { context_id, .. }
             | QueriesCommand::LocalPseudonym { context_id, .. }
+            | QueriesCommand::GetCapabilityRequirements { context_id, .. }
             | QueriesCommand::LocalRoutingIds { context_id, .. }
             | QueriesCommand::GetBroadcastKeyForLocalAuthor { context_id, .. }
             | QueriesCommand::MemberCount { context_id, .. }
@@ -17519,6 +17574,17 @@ impl Supervisor {
 /// `outcome_error_sketch` pattern used in `handlers::*`. Kept in
 /// `supervisor.rs` to scope the helper to the standing-direct dispatch
 /// path; the actor handlers each carry their own equivalent sketch.
+/// Sends `err` on a broadcast command's reply channel and returns the
+/// matching error outcome.
+fn reply_lookup_miss<T>(
+    reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+    err: ContextError,
+) -> Outcome<()> {
+    let sketch = standing_outcome_error_sketch(&err);
+    let _ = reply.send(Err(err));
+    Outcome::err(sketch)
+}
+
 fn standing_outcome_error_sketch(err: &ContextError) -> ContextError {
     match err {
         ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
@@ -17843,6 +17909,14 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         | QueriesCommand::GetBroadcastKeyForLocalAuthor { .. } => {
             debug_assert!(false, "hard-error variant routed through soft-default path");
         }
+        // No soft default exists: an empty requirements list would admit
+        // every member, so a misrouted read fails closed.
+        QueriesCommand::GetCapabilityRequirements { reply, context_id } => {
+            debug_assert!(false, "hard-error variant routed through soft-default path");
+            let _ = reply.send(Err(ContextError::ContextNotRegistered(format!(
+                "context not registered: {context_id}"
+            ))));
+        }
         // Legacy `member_count` returns `None` on unknown context.
         QueriesCommand::MemberCount { reply, .. } => {
             let _ = reply.send(Ok(None));
@@ -17943,6 +18017,9 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
         QueriesCommand::GetBroadcastKeyForLocalAuthor { reply, .. } => {
             let _ = reply.send(Err(err));
         }
+        QueriesCommand::GetCapabilityRequirements { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
         #[cfg(feature = "testing")]
         QueriesCommand::CheckpointEventsSince { reply, .. } => {
             let _ = reply.send(Err(err));
@@ -17989,6 +18066,7 @@ struct WelcomeBundleFacts<'a> {
 )]
 mod tests {
     use super::*;
+    use crate::context::actor::signer::CommandSigner;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::in_memory::InMemoryStorage;
 
@@ -22461,6 +22539,9 @@ mod tests {
             outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
+            capability_requirements: crate::context::state::Replicated::Live(
+                scp_protocol::trust::CapabilityRequirements::default(),
+            ),
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
@@ -24242,32 +24323,27 @@ mod tests {
             .expect("a recovered identity resolves a live handle");
     }
 
-    /// Two concurrent broadcast publishes reserve DISTINCT sequences
-    /// through the actor mailbox.
-    ///
-    /// This is the end-to-end witness for the two-phase reservation
-    /// guarantee (ADR-049 §SequenceReservation): both `ReserveBroadcastPublish`
-    /// commands ride the per-context actor mailbox and are serialized by
-    /// the actor's command loop, so even when both are issued before
-    /// either applies, the reserved sequences never collide. The
-    /// single-phase shim could not close this hazard because a concurrent
-    /// publish could read the same `next_sequence` between snapshot and
-    /// seal.
+    /// Two publishes through `dispatch_broadcast_command` each sign inside
+    /// the actor turn with the payload's `CommandSigner`, take consecutive
+    /// sequences, and produce envelopes whose signatures verify against the
+    /// signer's key.
     #[tokio::test]
-    async fn concurrent_reserve_broadcast_publish_yields_distinct_sequences() {
-        use crate::context::actor::commands::ReserveBroadcastPublishPayload;
+    async fn publish_broadcast_dispatches_through_mailbox() {
+        use crate::context::actor::commands::PublishBroadcastPayload;
 
         let supervisor_arc = supervisor_with_providers();
-        let deps = test_actor_deps(&supervisor_arc).await;
+        let mut deps = test_actor_deps(&supervisor_arc).await;
+        // The test supervisor's transport refuses sends; publish delivers
+        // the sealed envelope, so this actor gets one that accepts them.
+        deps.transport = Arc::new(crate::context::builder::LocalTransportProvider);
 
         let ctx_id_bytes = [0xC0u8; 32];
         let ctx_key = hex::encode(ctx_id_bytes);
         let author = DID("did:example:author".to_owned());
 
-        // Build a broadcast-mode state with the author registered (so
-        // `can_write` passes) and present in membership (so the apply
-        // phase's per-sender sequence assignment can resolve). Transition
-        // the handle to Active so `require_active` passes.
+        // A broadcast-mode state with the author registered (so the
+        // reservation passes) and present in membership (so the seal's
+        // per-sender sequence resolves), in the Active state.
         let mut state = crate::context::actor::state::PerContextState::new_for_test_broadcast(
             ctx_id_bytes,
             1_700_000_000,
@@ -24293,48 +24369,72 @@ mod tests {
             .spawn_actor_with_state(state, deps, None)
             .await
             .expect("spawn_actor_with_state: fresh context id registers");
-        assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
-        // Issue two reservations back-to-back via the mailbox.
-        let reserve = |author: DID| {
-            let ctx_key = ctx_key.clone();
-            let supervisor_arc = Arc::clone(&supervisor_arc);
-            async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = BroadcastCommand::ReserveBroadcastPublish {
-                    payload: Box::new(ReserveBroadcastPublishPayload {
-                        context_id: ctx_key,
-                        author_did: author,
-                    }),
-                    reply: tx,
-                };
-                if let Some(actor) = supervisor_arc.lookup(
-                    Supervisor::broadcast_command_context_id(&cmd)
-                        .expect("publish carries a context id"),
-                ) {
-                    Supervisor::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd))
-                        .await
-                        .expect("mailbox dispatch succeeds");
-                }
-                rx.await.expect("reserve reply").expect("reserve succeeds")
-            }
-        };
+        let signer =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]));
+        let verifying_key = signer.verifying_key().expect("Ed25519 signer");
 
-        let r1 = reserve(author.clone()).await;
-        let r2 = reserve(author.clone()).await;
+        let mut envelopes = Vec::new();
+        for body in [b"first".as_slice(), b"second".as_slice()] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcast {
+                payload: Box::new(PublishBroadcastPayload {
+                    context_id: ctx_key.clone(),
+                    author_did: author.clone(),
+                    payload: body.to_vec(),
+                    signer: signer.clone(),
+                }),
+                reply: tx,
+            };
+            supervisor_arc
+                .dispatch_broadcast_command(cmd)
+                .await
+                .expect("mailbox dispatch succeeds");
+            envelopes.push(rx.await.expect("publish reply").expect("publish succeeds"));
+        }
 
-        assert_ne!(
-            r1.reservation_id, r2.reservation_id,
-            "each reservation gets a unique id",
+        assert_eq!(
+            envelopes[1].sequence,
+            envelopes[0].sequence + 1,
+            "the mailbox serializes publishes onto consecutive sequences",
         );
+        for envelope in &envelopes {
+            crate::context::broadcast_helpers::check_envelope_signed_by(envelope, &verifying_key)
+                .expect("each envelope verifies under the custody key");
+        }
 
-        // Both reservations are live in actor-owned state; release them to
-        // confirm the actor accepts the release mailbox command. The core
-        // assertion is that the two reservations are distinct — proven by
-        // the distinct ids and by the protocol-layer
-        // `concurrent_reservations_get_distinct_sequences` test that pins
-        // the sequence values themselves.
         handle.send_shutdown().await.expect("handle is live");
+    }
+
+    /// A broadcast command for a context with no registered actor replies
+    /// `ContextNotRegistered` on its own channel, publish included.
+    #[tokio::test]
+    async fn publish_broadcast_without_actor_replies_not_registered() {
+        use crate::context::actor::commands::PublishBroadcastPayload;
+
+        let supervisor_arc = supervisor_with_providers();
+        let ctx_key = hex::encode([0xC1u8; 32]);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::PublishBroadcast {
+            payload: Box::new(PublishBroadcastPayload {
+                context_id: ctx_key.clone(),
+                author_did: DID("did:example:author".to_owned()),
+                payload: b"x".to_vec(),
+                signer: CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(
+                    &[0x42; 32],
+                )),
+            }),
+            reply: tx,
+        };
+        let outcome = supervisor_arc
+            .dispatch_broadcast_command(cmd)
+            .await
+            .expect("an absent actor is reported on the reply channel");
+        assert!(outcome.result.is_err(), "the outcome carries the miss");
+        match rx.await.expect("publish reply") {
+            Err(ContextError::ContextNotRegistered(id)) => assert_eq!(id, ctx_key),
+            other => panic!("expected ContextNotRegistered, got {other:?}"),
+        }
     }
 
     // =================================================================
@@ -26491,23 +26591,29 @@ mod tests {
                 Self::BOB.to_owned(),
                 self.bob_access_key.clone(),
             )]);
-            crate::context::messaging_helpers::build_encrypted_envelope_actor(
-                &clock,
-                self.alice_state
-                    .mode
-                    .crypto_mut()
-                    .expect("encrypted context"),
-                Self::ALICE,
-                ctx_str,
-                &DID::from(claimed_sender),
-                payload,
-                crate::context::supervisor::MessageSigner::Active(signing_key),
-                &recipients,
-                aad_sequence,
-                None,
-                scp_protocol::envelope::inner::MessageType::Content,
-            )
-            .expect("alice seals the application message")
+            let signer = CommandSigner::local_ed25519(signing_key.clone());
+            let crypto = self
+                .alice_state
+                .mode
+                .crypto_mut()
+                .expect("encrypted context");
+            self.rt
+                .block_on(
+                    crate::context::messaging_helpers::build_encrypted_envelope_actor(
+                        &clock,
+                        crypto,
+                        Self::ALICE,
+                        ctx_str,
+                        &DID::from(claimed_sender),
+                        payload,
+                        crate::context::supervisor::MessageSigner::Active(&signer),
+                        &recipients,
+                        aad_sequence,
+                        None,
+                        scp_protocol::envelope::inner::MessageType::Content,
+                    ),
+                )
+                .expect("alice seals the application message")
         }
 
         /// Alice's correctly signed inner envelope for `payload` at sender
@@ -26523,20 +26629,22 @@ mod tests {
                 Self::BOB.to_owned(),
                 self.bob_access_key.clone(),
             )]);
-            crate::context::messaging_helpers::build_inner_wire(
-                &clock,
-                ctx_str,
-                &DID::from(Self::ALICE),
-                payload,
-                crate::context::supervisor::MessageSigner::Active(
-                    &crate::crypto::mls::two_party_test_support::alice_signing_key(),
-                ),
-                &recipients,
-                aad_sequence,
-                None,
-                scp_protocol::envelope::inner::MessageType::Content,
-            )
-            .expect("alice builds the inner envelope")
+            let signer = CommandSigner::local_ed25519(
+                crate::crypto::mls::two_party_test_support::alice_signing_key(),
+            );
+            self.rt
+                .block_on(crate::context::messaging_helpers::build_inner_wire(
+                    &clock,
+                    ctx_str,
+                    &DID::from(Self::ALICE),
+                    payload,
+                    crate::context::supervisor::MessageSigner::Active(&signer),
+                    &recipients,
+                    aad_sequence,
+                    None,
+                    scp_protocol::envelope::inner::MessageType::Content,
+                ))
+                .expect("alice builds the inner envelope")
         }
 
         /// Seals `inner` through Alice's production sender-key and MLS seal at
@@ -26871,7 +26979,7 @@ mod tests {
     #[test]
     fn send_heartbeat_handler_reports_mutated() {
         use crate::context::actor::class_s::ClassSCell;
-        use crate::context::actor::commands::{MessagingCommand, SigningKeyBytes};
+        use crate::context::actor::commands::MessagingCommand;
         use scp_protocol::context::ContextState;
         use scp_protocol::context::roles::Capability;
 
@@ -26923,8 +27031,8 @@ mod tests {
             let heartbeat = MessagingCommand::SendHeartbeat {
                 context_id: ctx_str.to_owned(),
                 sender_did: DID::from(ALICE),
-                signing_key: SigningKeyBytes::from_signing_key(
-                    &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+                signer: CommandSigner::local_ed25519(
+                    crate::crypto::mls::two_party_test_support::alice_signing_key(),
                 ),
                 reply: htx,
             };
@@ -26945,6 +27053,109 @@ mod tests {
                  generation — the handler MUST report mutated (ADR-049 §9 HIGH-1)"
             );
             hrx.await.expect("heartbeat reply").expect("heartbeat ok");
+        });
+    }
+
+    /// ADR-049 Decision 7a: a custody that never answers fails a signing
+    /// handler's turn with a custody failure of kind `TimedOut`
+    /// (`SCP-CRYPTO-4062`), not the handler's `TransportTimeout`. The handler
+    /// budget (`SIGNING_HANDLER_TIMEOUT`) outlasts the sign budget
+    /// (`SIGN_TIMEOUT`), so the sign budget always fires first.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn stalled_custody_fails_signing_handler_with_custody_timeout() {
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::commands::MessagingCommand;
+        use crate::context::actor::signer::SIGN_TIMEOUT;
+        use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
+        use scp_protocol::context::ContextState;
+        use scp_protocol::context::roles::Capability;
+
+        /// A signer whose sign never completes, standing in for an
+        /// unanswered biometric prompt.
+        struct StalledSigner(Vec<u8>);
+
+        impl DynScpSigner for StalledSigner {
+            fn algorithm(&self) -> SigAlg {
+                SigAlg::Ed25519
+            }
+
+            fn public_key(&self) -> Vec<u8> {
+                self.0.clone()
+            }
+
+            fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> SignFuture<'a> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        const ALICE: &str = "did:dht:z6MkAliceStalledAliceStalledAliceStall1";
+        const BOB: &str = "did:dht:z6MkBobStalledBobStalledBobStalledBobSt1";
+        let ctx_str = "stalled-custody-handler-timeout";
+
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_provider: alice_crypto,
+            mut alice_state,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        let alice_sup = supervisor_with_crypto(Arc::clone(&alice_crypto));
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, drives async dispatch from a sync #[test]; not a production async bridge
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let alice_deps = rt
+            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .expect("build alice's actor deps");
+
+        alice_state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("transition test handle to Active");
+        alice_state
+            .membership
+            .add_member(DID::from(ALICE), "member".to_owned(), Vec::new());
+        alice_state.members.insert(DID::from(ALICE));
+        alice_state.role_state.members.insert(ALICE.to_owned());
+        alice_state.role_state.member_capabilities.insert(
+            ALICE.to_owned(),
+            std::collections::HashSet::from([Capability::MessagesWrite]),
+        );
+        let mut cell = ClassSCell::new(alice_state);
+        let public_key = crate::crypto::mls::two_party_test_support::alice_signing_key()
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+
+        rt.block_on(async {
+            let (htx, hrx) = tokio::sync::oneshot::channel();
+            let heartbeat = MessagingCommand::SendHeartbeat {
+                context_id: ctx_str.to_owned(),
+                sender_did: DID::from(ALICE),
+                signer: CommandSigner::new(Arc::new(StalledSigner(public_key))),
+                reply: htx,
+            };
+            let started = tokio::time::Instant::now();
+            let outcome = crate::context::actor::handlers::messaging::dispatch(
+                &mut cell,
+                &alice_deps,
+                heartbeat,
+            )
+            .await;
+            assert!(outcome.result.is_err(), "a stalled sign must fail the turn");
+            assert!(started.elapsed() >= SIGN_TIMEOUT);
+            let result = hrx.await.expect("heartbeat reply");
+            assert!(
+                matches!(
+                    &result,
+                    Err(ContextError::Custody(CustodyFailure {
+                        kind: CustodyFailureKind::TimedOut,
+                        ..
+                    }))
+                ),
+                "a stalled custody must surface as TimedOut (SCP-CRYPTO-4062), got {result:?}"
+            );
         });
     }
 
@@ -27220,7 +27431,8 @@ mod tests {
             .expect("create the real 64-hex context under the digest");
         assert_eq!(created.context_id(), context_id);
 
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]));
         let result = sup
             .recovery_send_notification_direct(
                 &context_id,
@@ -29292,7 +29504,8 @@ mod tests {
             .handle
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]));
 
         // `finalize_send` is actor-shape (ADR-049 §9): it takes the owning
         // `ClassSCell` so it can drive the Class-S fail-closed persist (via the
@@ -29309,7 +29522,7 @@ mod tests {
             &sender,
             0,
             b"paid",
-            Some(&signing_key),
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Paid send: a deferred spending-nonce token whose fail-closed
             // commit drives the persist (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -29332,7 +29545,7 @@ mod tests {
             &sender,
             1,
             b"free",
-            Some(&signing_key),
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Free send: no token (previously the `false` bool) — keeps the
             // best-effort persist, un-regressed.
             None,
@@ -29344,6 +29557,87 @@ mod tests {
             "a free (non-spending) send must keep best-effort persist and \
              not be regressed to fail-closed: got {free:?}"
         );
+    }
+
+    /// §9.9.3 + ADR-039: a checkpoint is stamped `#active`, so an agent-persona
+    /// send that makes one due builds none (no agent-key signature under the
+    /// `#active` stamp), and the next `#active` send builds one that verifies
+    /// against the `#active` key, as a peer checks it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_send_leaves_the_due_checkpoint_to_the_next_active_send() {
+        let sup = supervisor_with_providers();
+        let mut deps = test_actor_deps(&sup).await;
+        let ctx_id_bytes = [0xC7u8; 32];
+        // A real Merkle log: the checkpoint signs the log's count and root.
+        let event_log =
+            Arc::new(crate::context::providers::event_log::MerkleEventLogProvider::new());
+        event_log.init_event_log(&ctx_id_bytes).await.unwrap();
+        deps.event_log = event_log;
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let sender = DID("did:example:checkpoint-persona".to_owned());
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            sender.clone(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let active = CommandSigner::local_ed25519(active_key.clone());
+        let agent =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]));
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        // One more send reaches the 50-event threshold.
+        *cell.class_c_view().checkpoint_events_since_mut() = 49;
+
+        crate::context::messaging_helpers::finalize_send(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            &ctx_id_bytes,
+            &sender,
+            0,
+            b"agent",
+            MessageSigner::Agent(&agent),
+            None,
+            /* is_broadcast = */ false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cell.class_c_view().checkpoints_mut().is_empty(),
+            "an agent-persona send must not build a checkpoint"
+        );
+        assert_eq!(*cell.class_c_view().checkpoint_events_since_mut(), 50);
+
+        crate::context::messaging_helpers::finalize_send(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            &ctx_id_bytes,
+            &sender,
+            1,
+            b"active",
+            MessageSigner::Active(&active),
+            None,
+            /* is_broadcast = */ false,
+        )
+        .await
+        .unwrap();
+        let checkpoints = cell.class_c_view().checkpoints_mut().clone();
+        assert_eq!(
+            checkpoints.len(),
+            1,
+            "the #active send builds the due checkpoint"
+        );
+        scp_event_log::checkpoint::verify_checkpoint_signature(
+            &checkpoints[0],
+            &active_key.verifying_key(),
+        )
+        .unwrap();
+        assert_eq!(*cell.class_c_view().checkpoint_events_since_mut(), 0);
     }
 
     /// Build an Active broadcast `PerContextState` with `author` registered as
@@ -29991,7 +30285,8 @@ mod tests {
                 seed_entries,
             );
         let deps = test_actor_deps(&sup).await;
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]);
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]));
         // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
         // owning `ClassSCell` for the call, then reclaim it via `into_inner` to
         // hand off to `spawn_actor_with_state`.
@@ -30004,7 +30299,7 @@ mod tests {
             &sender,
             0,
             b"paid-send",
-            Some(&signing_key),
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Paid send: deferred token whose fail-closed commit persists the
             // consumed nonce (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -30444,7 +30739,8 @@ mod tests {
             .handle
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]));
 
         // Baseline: the sender's sequence counter before any reservation.
         let baseline = state
@@ -30477,7 +30773,7 @@ mod tests {
             &sender,
             reserved,
             b"paid",
-            Some(&signing_key),
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Paid send: deferred token whose fail-closed commit fails here,
             // driving the sequence-rollback path (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -31061,9 +31357,9 @@ mod tests {
         supervisor
             .start_cross_context_outlet_invocation_saga(
                 xctx_request(caller_did, now_ms, nonce),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31323,9 +31619,9 @@ mod tests {
         let result = supervisor
             .start_cross_context_outlet_invocation_saga(
                 xctx_request(caller_did, now_ms, [0x44u8; 16]),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31543,9 +31839,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31685,9 +31981,9 @@ mod tests {
                     asserted_nonce: [0x43u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31803,9 +32099,9 @@ mod tests {
                     asserted_nonce: [0x43u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31845,9 +32141,9 @@ mod tests {
                     asserted_nonce: [0x44u8; 16],
                     asserted_timestamp_ms: now_ms2,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
             )
@@ -31914,9 +32210,9 @@ mod tests {
                     asserted_nonce: [0x4Du8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
             )
@@ -32002,9 +32298,9 @@ mod tests {
                     asserted_nonce: [0x4Au8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
             )
@@ -32096,9 +32392,9 @@ mod tests {
                     asserted_nonce: [0x45u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
             )
@@ -32560,6 +32856,88 @@ mod tests {
         assert!(aborted.to_string().contains("SCP-SAGA-13013"));
     }
 
+    /// A target custody that never answers fails each Commit attempt with
+    /// `SCP-CRYPTO-4062` from `CommandSigner::sign_bounded_ed25519`, never with the phase's
+    /// `TransportTimeout`: the Commit budget is built from the executor budget
+    /// plus the signing turn's budget, so the sign budget always fires first.
+    #[tokio::test(start_paused = true)]
+    async fn xctx_saga_stalled_target_custody_fails_commit_with_custody_timeout() {
+        use crate::context::actor::signer::SIGN_TIMEOUT;
+        use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
+
+        /// A signer whose sign never completes, standing in for an
+        /// unanswered biometric prompt.
+        struct StalledSigner(Vec<u8>);
+
+        impl DynScpSigner for StalledSigner {
+            fn algorithm(&self) -> SigAlg {
+                SigAlg::Ed25519
+            }
+
+            fn public_key(&self) -> Vec<u8> {
+                self.0.clone()
+            }
+
+            fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> SignFuture<'a> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkXctxStallCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxStallCaller";
+
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_public = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let executor =
+            |_input: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) };
+
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let started = tokio::time::Instant::now();
+        let err = supervisor
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    outlet_registration_id: XCTX_OUTLET.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x47u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigners {
+                    target: CommandSigner::new(Arc::new(StalledSigner(target_public))),
+                    caller: CommandSigner::local_ed25519(caller_signing),
+                },
+                executor,
+            )
+            .await
+            .expect_err("a stalled target custody fails the saga");
+
+        let SagaError::NeedsRepair { message, .. } = err else {
+            panic!("a failed Commit lifts to NeedsRepair, got {err:?}");
+        };
+        // The public NeedsRepair carries the last Commit attempt's error as
+        // text; it is the typed `CommandSigner::sign_bounded_ed25519` timeout (`SCP-CRYPTO-4062` at
+        // the bridges), not the phase's `TransportTimeout`.
+        let expected = ContextError::Custody(CustodyFailure {
+            kind: CustodyFailureKind::TimedOut,
+            detail: format!("custody did not sign within {SIGN_TIMEOUT:?}"),
+        });
+        assert_eq!(message, expected.to_string());
+        assert!(started.elapsed() >= SIGN_TIMEOUT);
+    }
+
     /// Replay: after a saga commits, re-driving Commit-B for the SAME `SagaId`
     /// (the crash-recovery replay path) re-emits the STORED output + receipt
     /// WITHOUT re-invoking the outlet. We run a full saga, then directly send a
@@ -32608,9 +32986,9 @@ mod tests {
                     asserted_nonce: [0x46u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -32700,8 +33078,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: 1_700_000_000,
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({})) }) as _
             })),
@@ -33481,9 +33859,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -33582,9 +33960,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -33689,9 +34067,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -33899,9 +34277,9 @@ mod tests {
                     asserted_nonce: [0x42u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -33961,8 +34339,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34073,8 +34451,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34311,8 +34689,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34584,8 +34962,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34702,8 +35080,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34841,8 +35219,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -35287,8 +35665,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -35433,8 +35811,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -35575,8 +35953,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -37626,6 +38004,7 @@ mod open_outlet_stream_tests {
     clippy::disallowed_types
 )]
 mod streaming_saga_tests {
+    use crate::context::actor::signer::CommandSigner;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -37646,9 +38025,9 @@ mod streaming_saga_tests {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
     use scp_protocol::trust::caveats::InvocationCaveats;
 
-    use super::{DurableProviders, SagaAbortReason, SagaError, SagaSigningKeys, Supervisor};
+    use super::{DurableProviders, SagaAbortReason, SagaError, SagaSigners, Supervisor};
     use crate::context::actor::ContextCommand;
-    use crate::context::actor::commands::{QueriesCommand, SagaPhaseMessage, SigningKeyBytes};
+    use crate::context::actor::commands::{QueriesCommand, SagaPhaseMessage};
     use crate::context::actor::state::PerContextState;
     use crate::context::builder::ContextEventLogProvider;
     use crate::context::outlets::dispatch::OpenStreamParams;
@@ -38242,9 +38621,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -38348,7 +38727,7 @@ mod streaming_saga_tests {
         // receipt bytes to verify.
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -38356,7 +38735,7 @@ mod streaming_saga_tests {
                         terminal_status:
                             scp_protocol::context::outlets::stream::StreamTerminalStatus::Ok,
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -38600,9 +38979,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -38767,9 +39146,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -38973,9 +39352,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -39088,7 +39467,7 @@ mod streaming_saga_tests {
             .recover_streaming_saga_truncated_close(
                 saga_id.clone(),
                 SS_TARGET,
-                SigningKeyBytes::from_signing_key(&target_signing),
+                CommandSigner::local_ed25519(target_signing.clone()),
             )
             .await
             .expect("AC7 (key-bearing): the truncated close seals the durable prefix");
@@ -39131,7 +39510,7 @@ mod streaming_saga_tests {
         // attests the manifest over the durable PREFIX (never the full stream).
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -39141,7 +39520,7 @@ mod streaming_saga_tests {
                                 "replay".to_owned(),
                             ),
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -39235,9 +39614,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -39279,7 +39658,7 @@ mod streaming_saga_tests {
         // DO NOT apply it (the seal task "died" before settle_outlet_stream_via_actor).
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -39289,7 +39668,7 @@ mod streaming_saga_tests {
                                 "crash-window seal".to_owned(),
                             ),
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -39483,9 +39862,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -39527,7 +39906,7 @@ mod streaming_saga_tests {
         // handoff point).
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -39537,7 +39916,7 @@ mod streaming_saga_tests {
                                 "concurrent-settle seal".to_owned(),
                             ),
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -39747,9 +40126,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 s1_executor,
                 Some(s1_binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 s1_params,
             )
@@ -39796,9 +40175,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 s2_executor,
                 Some(s2_binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 s2_params,
             )

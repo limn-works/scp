@@ -84,13 +84,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(members.len(), 2);
 
     // 5. Alice sends a message.
-    let alice_sk = support::signing_key_for(&alice);
+    let alice_signer = support::command_signer_for(&alice).await?;
     manager
         .send_message(
             &handle,
             &alice,
             b"Hello Bob!",
-            MessageSigner::Active(&alice_sk),
+            MessageSigner::Active(&alice_signer),
             None,
             None,
         )
@@ -98,13 +98,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nAlice: Hello Bob!");
 
     // 6. Bob sends a reply.
-    let bob_sk = support::signing_key_for(&bob);
+    let bob_signer = support::command_signer_for(&bob).await?;
     manager
         .send_message(
             &handle,
             &bob,
             b"Hi Alice!",
-            MessageSigner::Active(&bob_sk),
+            MessageSigner::Active(&bob_signer),
             None,
             None,
         )

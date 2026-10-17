@@ -164,6 +164,15 @@ pub(crate) async fn dispatch(
             Outcome::ok(())
         }
 
+        QueriesCommand::GetCapabilityRequirements {
+            context_id: _,
+            reply,
+        } => {
+            let answer = queries_helpers::capability_requirements(state);
+            let _ = reply.send(answer);
+            Outcome::ok(())
+        }
+
         QueriesCommand::RelayUrls {
             context_id: _,
             reply,

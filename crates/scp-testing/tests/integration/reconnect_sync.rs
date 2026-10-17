@@ -223,7 +223,7 @@ async fn reconnect_classifies_all_three_tiers() {
         &transport,
         &alice.manager,
         DID::from(ALICE_DID),
-        zeroize::Zeroizing::new(signing_key_for(ALICE_DID).to_bytes()),
+        scp_core::context::actor::CommandSigner::local_ed25519(signing_key_for(ALICE_DID)),
         vec![short_ctx.to_owned()],
         short_contacts,
         now,
@@ -305,7 +305,11 @@ async fn reconnect_tier1_builds_checkpoint_and_clears_flag() {
     // is signed + retained and carries the post-update MLS epoch.
     let cp = alice
         .manager
-        .build_local_checkpoint(ctx_id, &DID::from(ALICE_DID), &signing_key_for(ALICE_DID))
+        .build_local_checkpoint(
+            ctx_id,
+            &DID::from(ALICE_DID),
+            &scp_core::context::actor::CommandSigner::local_ed25519(signing_key_for(ALICE_DID)),
+        )
         .await
         .expect("alice builds a checkpoint");
     assert_eq!(cp.context_id, ctx_id);
@@ -359,7 +363,11 @@ async fn reconnect_detects_forged_divergent_checkpoint() {
     // different-root with a VALID signature (not a signature failure).
     let honest = alice
         .manager
-        .build_local_checkpoint(ctx_id, &DID::from(ALICE_DID), &signing_key_for(ALICE_DID))
+        .build_local_checkpoint(
+            ctx_id,
+            &DID::from(ALICE_DID),
+            &scp_core::context::actor::CommandSigner::local_ed25519(signing_key_for(ALICE_DID)),
+        )
         .await
         .expect("alice builds checkpoint");
 
@@ -462,7 +470,11 @@ async fn runtime_equivocation_dispatch_and_targeted_drain() {
     // then forge a divergent one (equal count, different root) signed by Bob.
     let honest = alice
         .manager
-        .build_local_checkpoint(ctx_id, &DID::from(ALICE_DID), &signing_key_for(ALICE_DID))
+        .build_local_checkpoint(
+            ctx_id,
+            &DID::from(ALICE_DID),
+            &scp_core::context::actor::CommandSigner::local_ed25519(signing_key_for(ALICE_DID)),
+        )
         .await
         .expect("alice builds honest checkpoint");
 

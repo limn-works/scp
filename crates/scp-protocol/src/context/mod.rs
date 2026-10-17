@@ -39,9 +39,12 @@ pub use governance::{
     AccessScope, CheckpointAttestationStatus, ConflictResolution, CosignedCheckpoint,
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, GovernanceReconfigAction, KeyResolver, ProposalId,
-    ProposalStatus, RejectionReason, SignedVote, VoteType, actions_conflict, compute_proposal_id,
-    sign_vote, verify_proposal_votes, verify_vote,
+    ProposalStatus, ProposeIntent, RejectionReason, SignedVote, VoteIntent, VoteType,
+    actions_conflict, compute_proposal_id, signed_vote, verify_proposal_votes, verify_vote,
+    vote_signing_digest,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use governance::{GovernanceEngineRawKey, sign_vote};
 pub use group_context_extension::{
     SCP_CONTEXT_EXTENSION_TYPE_ID, ScpContextBindingError, ScpContextExtension,
 };

@@ -822,7 +822,7 @@ describe("SCP governance wrappers", () => {
     expect((err as UnknownGovernanceOutcomeError).code).toBe("SCP-GOV-11040");
   });
 
-  it("propose, approve, reject, and withdraw check every name", async () => {
+  it("propose, approve, reject, withdraw, and modify-requirements check every name", async () => {
     const ok = JSON.stringify({ status: "Pending" });
     const cases: [string, (scp: SCP) => Promise<string>, string][] = [
       [
@@ -843,6 +843,16 @@ describe("SCP governance wrappers", () => {
       [
         "contextGovernanceWithdraw",
         (scp) => scp.contextGovernanceWithdraw(mockContext(scp), "ab", "did:dht:zA"),
+        JSON.stringify({ status: "SomethingNew" }),
+      ],
+      [
+        "contextGovernanceModifyCapabilityRequirements",
+        (scp) =>
+          scp.contextGovernanceModifyCapabilityRequirements(
+            mockContext(scp),
+            [{ kind: "SelfAttested", capability: "scp:capability:schema-validation/v1" }],
+            "did:dht:zA",
+          ),
         JSON.stringify({ status: "SomethingNew" }),
       ],
     ];

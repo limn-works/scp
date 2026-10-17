@@ -141,9 +141,6 @@ class UniffiKeyCustodyTest {
                 update(message, 0, message.size)
             }
             assertTrue(verifier.verifySignature(signature))
-
-            val seed = provider.exportSigningKeyBytes(id)
-            assertArrayEquals(publicKey.publicKey, Ed25519PrivateKeyParameters(seed, 0).generatePublicKey().encoded)
             assertEquals("software", provider.custodyType(id))
         }
     }
@@ -227,7 +224,6 @@ class UniffiKeyCustodyTest {
                 "dhAgree" to { provider.dhAgree(unknown, peer) },
                 "derivePseudonym" to { provider.derivePseudonym(unknown, byteArrayOf(1)) },
                 "deriveRotatablePseudonym" to { provider.deriveRotatablePseudonym(unknown, byteArrayOf(1), 1uL) },
-                "exportSigningKeyBytes" to { provider.exportSigningKeyBytes(unknown) },
             )
             for ((name, call) in calls) {
                 assertEquals("SCP-CRYPTO-4006", cryptoError(call).code, name)

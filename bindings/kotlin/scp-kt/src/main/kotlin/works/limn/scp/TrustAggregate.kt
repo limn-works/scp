@@ -20,6 +20,11 @@
 
 package works.limn.scp
 
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -29,6 +34,9 @@ import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import uniffi.scp.ChallengePolicy
+import uniffi.scp.Identity
+import uniffi.scp.ScpException
 
 /**
  * Attestation type (ADR-017).
@@ -328,60 +336,191 @@ private fun encodeOptionalEnvelopeElement(envelope: CachedAttestationEnvelope?):
 // ---------------------------------------------------------------------------
 
 /**
- * A challenge request for capability verification (ADR-017, spec §7.3.4).
+ * How a test case's output is judged (spec 07 §7.3.4.2).
  *
- * The serde wire shape of the Rust `ChallengeRequest` (`scp-core`) the bridge
- * deserializes for [SCP.trustVerifyResponse]. [challengeType] is a bare
- * capability URI string (the Rust `ChallengeType` serializes as its URI
- * string); [timeout] is the Rust `std::time::Duration` serde shape
- * ([CachedAttestationDuration]). Mirrors the Swift SDK `ChallengeRequest`
- * and the TypeScript/Python models 1:1.
- *
- * @property challengeId Unique challenge identifier (UUID v4).
- * @property challengeType The type of challenge being issued (a capability
- *   URI string).
- * @property challengerDid DID of the entity issuing the challenge.
- * @property subjectDid DID of the entity being challenged.
- * @property capabilityUri The capability URI being tested (§7.3.4.1).
- * @property parameters Challenge-specific parameters (schema, test vectors,
- *   limits, etc.).
- * @property timeout Maximum time allowed for the subject to respond.
- * @property signature Ed25519 signature over the canonical challenge bytes
- *   (64 bytes).
+ * Encodes to the Rust `ExpectedOutput` enum's externally tagged serde shape,
+ * for example `{"ExactMatch":{"value":...}}`. Mirrors the Swift SDK
+ * `ExpectedOutput`, the TypeScript `ExpectedOutput` union and the Python
+ * variant classes 1:1.
  */
-data class ChallengeRequest(
-    val challengeId: String,
-    val challengeType: String,
-    val challengerDid: String,
-    val subjectDid: String,
-    val capabilityUri: String,
-    val parameters: JsonElement,
-    val timeout: CachedAttestationDuration,
-    val signature: List<UByte>,
+sealed class ExpectedOutput {
+    /** The output must equal [value]. */
+    data class ExactMatch(val value: JsonElement) : ExpectedOutput()
+
+    /** The output must validate against the JSON Schema [schema]. */
+    data class SchemaMatch(val schema: JsonElement) : ExpectedOutput()
+
+    /** The output must contain every string in [required]. */
+    data class ContainsAll(val required: List<String>) : ExpectedOutput()
+
+    /** The output must contain none of the strings in [forbidden]. */
+    data class ContainsNone(val forbidden: List<String>) : ExpectedOutput()
+
+    /**
+     * An outlet the verifier names judges the output.
+     *
+     * The wire form carries [evaluatorOutletId] only.
+     * [SCP.trustCreateChallenge] passes [evaluatorContextId] to the bridge as
+     * the one context whose outlets grade the request's `CustomEval` cases, so
+     * every `CustomEval` case of one request names the same context.
+     *
+     * @property evaluatorOutletId The evaluator outlet's identifier.
+     * @property evaluatorContextId The context in this instance whose outlet
+     *   [evaluatorOutletId] grades the case.
+     */
+    data class CustomEval(
+        val evaluatorOutletId: String,
+        val evaluatorContextId: String,
+    ) : ExpectedOutput()
+}
+
+/**
+ * One challenger-written test case (spec 07 §7.3.4.2).
+ *
+ * @property testId Identifier unique within the challenge.
+ * @property input The input the subject runs.
+ * @property expected How the output is judged.
+ * @property category The case's category; a BCP 47 language tag for
+ *   `multilingual/v1`.
+ * @property weight The case's weight in basis points; a protocol suite's
+ *   weights sum to 10000.
+ */
+data class TestCase(
+    val testId: String,
+    val input: JsonElement,
+    val expected: ExpectedOutput,
+    val category: String,
+    val weight: UInt,
 )
 
 /**
- * A response to a challenge request (ADR-017, spec §7.3.4).
+ * One case as the subject sees it: the challenger's [TestCase] without its
+ * expected output (spec 07 §7.3.4.2).
  *
- * The serde wire shape of the Rust `ChallengeResponse` (`scp-core`) the
- * bridge deserializes for [SCP.trustVerifyResponse]. Mirrors the Swift SDK
- * `ChallengeResponse` and the TypeScript/Python models 1:1.
+ * Mirrors the Rust `ChallengeCase`, the Swift SDK `ChallengeCase`, the
+ * TypeScript SDK `ChallengeCase` and the Python SDK `ChallengeCase` 1:1.
  *
- * @property challengeId The challenge ID this response corresponds to.
- * @property responderDid DID of the entity responding to the challenge.
- * @property result Challenge-specific result data (pass/fail, metrics,
- *   evidence, etc.).
- * @property completedAt Unix timestamp (seconds) when the response was
- *   completed.
- * @property signature Ed25519 signature over the canonical response bytes
- *   (64 bytes).
+ * @property testId Identifier unique within the challenge.
+ * @property input The input the subject runs.
+ * @property category The case's category.
+ * @property weight The case's weight in basis points.
  */
+@Serializable
+data class ChallengeCase(
+    @SerialName("test_id") val testId: String,
+    val input: JsonElement,
+    val category: String,
+    val weight: UInt,
+)
+
+/**
+ * A signed challenge request (spec 07 §7.3.4 step 1, ADR-017).
+ *
+ * [SCP.trustCreateChallenge] returns one. The verifier's signature covers
+ * every field, so a request with any field altered is refused by
+ * [SCP.trustRespondToChallenge] and [SCP.trustGradeResponse]. Mirrors the Rust
+ * `ChallengeRequest`, the Swift SDK `ChallengeRequest`, and the TypeScript and
+ * Python models 1:1.
+ *
+ * @property challengeId 64 lowercase hex characters (32 random bytes).
+ * @property capabilityUri The capability URI under test.
+ * @property definitionDigest Digest of the capability definition followed,
+ *   64 lowercase hex characters.
+ * @property testCases The cases the subject answers, in order.
+ * @property createdAt Unix seconds, challenger clock.
+ * @property expiresAt Unix seconds after which no attempt is graded.
+ * @property maxRetries Retries allowed after the first attempt.
+ * @property cooldownSecs Seconds between graded attempts.
+ * @property passThresholdBps Score in basis points needed to pass.
+ * @property contextId The context the challenge is administered in.
+ * @property verifier DID of the challenger.
+ * @property subject DID of the challenged identity.
+ * @property verifierSignature Ed25519 signature by the verifier's `#active`
+ *   key over the request digest (64 bytes).
+ */
+@Serializable
+data class ChallengeRequest(
+    @SerialName("challenge_id") val challengeId: String,
+    @SerialName("capability_uri") val capabilityUri: String,
+    @SerialName("definition_digest") val definitionDigest: String,
+    @SerialName("test_cases") val testCases: List<ChallengeCase>,
+    @SerialName("created_at") val createdAt: ULong,
+    @SerialName("expires_at") val expiresAt: ULong,
+    @SerialName("max_retries") val maxRetries: UInt,
+    @SerialName("cooldown_secs") val cooldownSecs: UInt,
+    @SerialName("pass_threshold_bps") val passThresholdBps: UInt,
+    @SerialName("context_id") val contextId: String,
+    val verifier: String,
+    val subject: String,
+    @SerialName("verifier_signature") val verifierSignature: List<UByte>,
+)
+
+/**
+ * One output, answering the case with the same [testId] (spec 07 §7.3.4
+ * step 2).
+ *
+ * @property testId The case answered.
+ * @property output The subject's output.
+ */
+@Serializable
+data class TestOutput(
+    @SerialName("test_id") val testId: String,
+    val output: JsonElement,
+)
+
+/**
+ * A subject's signed answer to one attempt (spec 07 §7.3.4 step 2, ADR-017).
+ *
+ * [SCP.trustRespondToChallenge] returns one; pass it to
+ * [SCP.trustGradeResponse]. Mirrors the Rust `ChallengeResponse`, the Swift
+ * SDK `ChallengeResponse`, and the TypeScript and Python models 1:1.
+ *
+ * @property challengeId The request's challenge id, 64 lowercase hex
+ *   characters.
+ * @property requestDigest Digest of the request answered, 64 lowercase hex
+ *   characters.
+ * @property subject DID of the subject, as named in the request.
+ * @property attempt The attempt number, starting at 1.
+ * @property outputs One output per case, in case order.
+ * @property subjectSignature Ed25519 signature by the subject's `#active` key
+ *   over the response digest (64 bytes).
+ */
+@Serializable
 data class ChallengeResponse(
-    val challengeId: String,
-    val responderDid: String,
-    val result: JsonElement,
-    val completedAt: ULong,
-    val signature: List<UByte>,
+    @SerialName("challenge_id") val challengeId: String,
+    @SerialName("request_digest") val requestDigest: String,
+    val subject: String,
+    val attempt: UInt,
+    val outputs: List<TestOutput>,
+    @SerialName("subject_signature") val subjectSignature: List<UByte>,
+)
+
+/**
+ * One case's grade. The challenger keeps [reason] and never signs it.
+ *
+ * @property passed Whether the case passed.
+ * @property reason Why the case failed, or the evaluator's reason; `null`
+ *   when there is none.
+ */
+@Serializable
+data class CaseResult(
+    val passed: Boolean,
+    val reason: String?,
+)
+
+/**
+ * What [SCP.trustGradeResponse] returns.
+ *
+ * @property record The signed record of the graded attempt, pass or fail.
+ * @property caseResults One result per case, in case order.
+ * @property trustStoreError Why the record was not written to this
+ *   instance's trust store, with its error code, or `null` when it was. The
+ *   record is valid either way.
+ */
+data class GradedChallenge(
+    val record: ChallengeVerification,
+    val caseResults: List<CaseResult>,
+    val trustStoreError: uniffi.scp.TrustStoreWriteError?,
 )
 
 /**
@@ -393,63 +532,220 @@ data class ChallengeResponse(
 fun encodeAttestationJson(attestation: CachedAttestationEnvelope): String =
     Json.encodeToString(JsonObject.serializer(), encodeEnvelopeElement(attestation))
 
+private const val HEX_32_LENGTH = 64
+
+/**
+ * Requires [value] to be 64 lowercase hex characters, the wire form of a
+ * 32-byte challenge id, verification id or suite digest.
+ *
+ * @throws IllegalArgumentException naming `typeName.fieldName` otherwise.
+ */
+internal fun requireLowerHex32(
+    typeName: String,
+    fieldName: String,
+    value: String,
+) {
+    require(value.length == HEX_32_LENGTH && value.all { it in '0'..'9' || it in 'a'..'f' }) {
+        "$typeName.$fieldName must be 64 lowercase hex characters"
+    }
+}
+
+private fun encodeExpectedOutputElement(expected: ExpectedOutput): JsonObject =
+    when (expected) {
+        is ExpectedOutput.ExactMatch ->
+            buildJsonObject { put("ExactMatch", buildJsonObject { put("value", expected.value) }) }
+        is ExpectedOutput.SchemaMatch ->
+            buildJsonObject { put("SchemaMatch", buildJsonObject { put("schema", expected.schema) }) }
+        is ExpectedOutput.ContainsAll ->
+            buildJsonObject {
+                put(
+                    "ContainsAll",
+                    buildJsonObject {
+                        put("required", buildJsonArray { expected.required.forEach { add(it) } })
+                    },
+                )
+            }
+        is ExpectedOutput.ContainsNone ->
+            buildJsonObject {
+                put(
+                    "ContainsNone",
+                    buildJsonObject {
+                        put("forbidden", buildJsonArray { expected.forbidden.forEach { add(it) } })
+                    },
+                )
+            }
+        is ExpectedOutput.CustomEval ->
+            buildJsonObject {
+                put(
+                    "CustomEval",
+                    buildJsonObject { put("evaluator_outlet_id", expected.evaluatorOutletId) },
+                )
+            }
+    }
+
+private fun encodeTestCasesElement(testCases: List<TestCase>): JsonArray =
+    buildJsonArray {
+        for (case in testCases) {
+            add(
+                buildJsonObject {
+                    put("test_id", case.testId)
+                    put("input", case.input)
+                    put("expected", encodeExpectedOutputElement(case.expected))
+                    put("category", case.category)
+                    put("weight", case.weight.toLong())
+                },
+            )
+        }
+    }
+
+/**
+ * Encodes typed test cases to the JSON array [SCP.trustCreateChallenge] passes
+ * to the bridge (`Vec<TestCase>`).
+ */
+fun encodeTestCasesJson(testCases: List<TestCase>): String {
+    val element = encodeTestCasesElement(testCases)
+    return Json.encodeToString(JsonArray.serializer(), element)
+}
+
+/**
+ * The arguments of [SCP.trustCreateChallenge] (spec 07 §7.3.4 step 1).
+ *
+ * @property verifier The challenger's identity; its `#active` key signs the
+ *   request.
+ * @property subject DID of the challenged identity.
+ * @property capabilityUri The capability URI under test.
+ * @property testCases The challenger-written cases with their expected
+ *   outputs; their weights sum to 10000. Every `CustomEval` case names the
+ *   same [ExpectedOutput.CustomEval.evaluatorContextId].
+ * @property contextId The context the challenge is administered in, and the
+ *   context its record is bound to.
+ * @property windowSecs The grading window: seconds from creation during
+ *   which attempts are graded.
+ * @property policy Fewer retries or a longer cooldown than the capability
+ *   definition's; `null`, or a `null` field, takes the definition's value. A
+ *   policy may only tighten the definition, on any URI.
+ */
+data class CreateChallengeConfig(
+    val verifier: Identity,
+    val subject: String,
+    val capabilityUri: String,
+    val testCases: List<TestCase>,
+    val contextId: String,
+    val windowSecs: UInt,
+    val policy: ChallengePolicy? = null,
+)
+
+/** The code the SDK raises for an argument it refuses before the bridge. */
+private const val INVALID_ARGUMENT_CODE = "SCP-VALID-7001"
+
+/**
+ * The one evaluator context that the `CustomEval` cases of [testCases] name,
+ * or `null` when there are none.
+ *
+ * @throws ScpException.Validation with code `SCP-VALID-7001` when two cases
+ *   name different evaluator contexts.
+ */
+internal fun evaluatorContextOf(testCases: List<TestCase>): String? {
+    val contexts =
+        testCases
+            .mapNotNull { (it.expected as? ExpectedOutput.CustomEval)?.evaluatorContextId }
+            .distinct()
+    if (contexts.size > 1) {
+        throw ScpException.Validation(
+            msg = "CustomEval cases name ${contexts.size} evaluator contexts; one request grades in one",
+            code = INVALID_ARGUMENT_CODE,
+        )
+    }
+    return contexts.firstOrNull()
+}
+
+private fun <T> decodeChallengeJson(
+    type: String,
+    serializer: KSerializer<T>,
+    json: String,
+): T =
+    try {
+        trustAdmissionJson.decodeFromString(serializer, json)
+    } catch (e: SerializationException) {
+        throw IllegalArgumentException("malformed $type JSON: ${e.message}", e)
+    }
+
+private fun requireChallengeRequest(request: ChallengeRequest) {
+    val type = "ChallengeRequest"
+    requireLowerHex32(type, "challengeId", request.challengeId)
+    requireLowerHex32(type, "definitionDigest", request.definitionDigest)
+    requireAggregateByteLength(type, "verifierSignature", AGGREGATE_BYTES_64, request.verifierSignature)
+}
+
+private fun requireChallengeResponse(response: ChallengeResponse) {
+    val type = "ChallengeResponse"
+    requireLowerHex32(type, "challengeId", response.challengeId)
+    requireLowerHex32(type, "requestDigest", response.requestDigest)
+    requireAggregateByteLength(type, "subjectSignature", AGGREGATE_BYTES_64, response.subjectSignature)
+}
+
 /**
  * Encodes a typed [ChallengeRequest] to the JSON wire shape the bridge
  * deserializes (`ChallengeRequest`).
  *
- * @throws IllegalArgumentException if [ChallengeRequest.signature] is not
- *   exactly 64 elements (before any bridge call).
+ * @throws IllegalArgumentException if an id or digest is not 64 lowercase
+ *   hex characters or the signature is not 64 bytes (before any bridge call).
  */
-fun encodeChallengeRequestJson(challenge: ChallengeRequest): String {
-    requireAggregateByteLength(
-        "ChallengeRequest",
-        "signature",
-        AGGREGATE_BYTES_64,
-        challenge.signature,
-    )
-    return Json.encodeToString(
-        JsonObject.serializer(),
-        buildJsonObject {
-            put("challenge_id", challenge.challengeId)
-            put("challenge_type", challenge.challengeType)
-            put("challenger_did", challenge.challengerDid)
-            put("subject_did", challenge.subjectDid)
-            put("capability_uri", challenge.capabilityUri)
-            put("parameters", challenge.parameters)
-            put(
-                "timeout",
-                buildJsonObject {
-                    put("secs", challenge.timeout.secs.toLong())
-                    put("nanos", challenge.timeout.nanos.toLong())
-                },
-            )
-            put("signature", buildJsonArray { challenge.signature.forEach { add(it.toInt()) } })
-        },
-    )
+fun encodeChallengeRequestJson(request: ChallengeRequest): String {
+    requireChallengeRequest(request)
+    return trustAdmissionJson.encodeToString(ChallengeRequest.serializer(), request)
 }
+
+/**
+ * Decodes the request JSON the bridge returns into a typed [ChallengeRequest].
+ *
+ * @throws IllegalArgumentException if the JSON is not a request (a field is
+ *   missing or unknown), an id or digest is not 64 lowercase hex characters,
+ *   or the signature is not 64 bytes.
+ */
+fun decodeChallengeRequestJson(json: String): ChallengeRequest {
+    val request = decodeChallengeJson("ChallengeRequest", ChallengeRequest.serializer(), json)
+    requireChallengeRequest(request)
+    return request
+}
+
+/**
+ * Encodes typed outputs to the JSON array the bridge deserializes
+ * (`Vec<TestOutput>`).
+ */
+fun encodeTestOutputsJson(outputs: List<TestOutput>): String =
+    trustAdmissionJson.encodeToString(ListSerializer(TestOutput.serializer()), outputs)
 
 /**
  * Encodes a typed [ChallengeResponse] to the JSON wire shape the bridge
  * deserializes (`ChallengeResponse`).
  *
- * @throws IllegalArgumentException if [ChallengeResponse.signature] is not
- *   exactly 64 elements (before any bridge call).
+ * @throws IllegalArgumentException if the id or digest is not 64 lowercase
+ *   hex characters or the signature is not 64 bytes (before any bridge call).
  */
 fun encodeChallengeResponseJson(response: ChallengeResponse): String {
-    requireAggregateByteLength(
-        "ChallengeResponse",
-        "signature",
-        AGGREGATE_BYTES_64,
-        response.signature,
-    )
-    return Json.encodeToString(
-        JsonObject.serializer(),
-        buildJsonObject {
-            put("challenge_id", response.challengeId)
-            put("responder_did", response.responderDid)
-            put("result", response.result)
-            put("completed_at", response.completedAt.toLong())
-            put("signature", buildJsonArray { response.signature.forEach { add(it.toInt()) } })
-        },
-    )
+    requireChallengeResponse(response)
+    return trustAdmissionJson.encodeToString(ChallengeResponse.serializer(), response)
 }
+
+/**
+ * Decodes the response JSON the bridge returns into a typed
+ * [ChallengeResponse].
+ *
+ * @throws IllegalArgumentException if the JSON is not a response (a field is
+ *   missing or unknown), the id or digest is not 64 lowercase hex characters,
+ *   or the signature is not 64 bytes.
+ */
+fun decodeChallengeResponseJson(json: String): ChallengeResponse {
+    val response = decodeChallengeJson("ChallengeResponse", ChallengeResponse.serializer(), json)
+    requireChallengeResponse(response)
+    return response
+}
+
+/**
+ * Decodes the per-case results JSON the grading bridge returns.
+ *
+ * @throws IllegalArgumentException if the JSON is not an array of results.
+ */
+fun decodeCaseResultsJson(json: String): List<CaseResult> =
+    decodeChallengeJson("CaseResults", ListSerializer(CaseResult.serializer()), json)

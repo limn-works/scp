@@ -59,6 +59,7 @@ final class BroadcastKeyRequestTests: XCTestCase {
             economicPolicy: nil,
             consequenceRulesJson: nil,
             consequenceConfigJson: nil,
+            capabilityRequirementsJson: nil,
             pseudonymRotation: nil
         )
     }

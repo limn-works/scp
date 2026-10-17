@@ -43,6 +43,7 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import uniffi.scp.ContextHandle
+import uniffi.scp.OutletStreamAuthority
 import uniffi.scp.ScpException
 import java.util.concurrent.atomic.AtomicBoolean
 import uniffi.scp.Scp as NativeScp
@@ -687,9 +688,12 @@ internal class ScpStreamingSagaNative(
             assertedNonceHex = assertedNonceHex,
             timestampMs = timestampMs,
             chainDepth = chainDepth,
-            ucanToken = ucanToken,
-            proofTokens = proofTokens,
-            ucanProofId = ucanProofId,
+            authority =
+                OutletStreamAuthority(
+                    ucanToken = ucanToken,
+                    proofTokens = proofTokens,
+                    ucanProofId = ucanProofId,
+                ),
             timeoutMs = timeoutMs,
             estimatedChunkCount = estimatedChunkCount,
         )

@@ -52,6 +52,7 @@
 //! errors directly to the Python exception hierarchy without string
 //! roundtripping.
 
+use pyo3::Python;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -1428,12 +1429,20 @@ pub fn resolver_cache(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::cache::
 /// The resolver caches resolved documents with a multi-day TTL. Without this,
 /// a freshly rotated identity would keep resolving to its pre-rotation document
 /// (and pre-rotation `#active` key) until the cache TTL expired — defeating
-/// rotation's revocation purpose. Best-effort: a no-op when no cache is wired.
-pub fn invalidate_resolver_cache(bi: &PyBridgeInstance, did: &str, rt: &tokio::runtime::Runtime) {
+/// rotation's revocation purpose. A no-op when no cache is wired.
+///
+/// # Errors
+///
+/// Returns an error when the bridge cannot drive the wait, so a caller never
+/// reports a rotation whose stale cached document still resolves.
+pub fn invalidate_resolver_cache(
+    py: Python<'_>,
+    bi: &PyBridgeInstance,
+    did: &str,
+) -> Result<(), ScpPyError> {
     // Delegates to the shared `BridgeInstanceCore::invalidate_resolver_cache`
-    // (the single implementation of the invalidation body); the sync PyO3 bridge
-    // drives the async method on the shared runtime.
-    rt.block_on(bi.core.invalidate_resolver_cache(did));
+    // (the single implementation of the invalidation body).
+    crate::actor_wait::block_on_released(py, bi.core.invalidate_resolver_cache(did))
 }
 
 // ---------------------------------------------------------------------------
@@ -1766,7 +1775,6 @@ fn run_storage_io<F: std::future::Future>(
         super::init_runtime()
             .ok()
             .and_then(|()| super::runtime().ok())
-            .map(tokio::runtime::Runtime::handle)
     };
     scp_ffi_common::ucan_durable_state::block_on_storage(fallback, fut)
 }
@@ -1871,75 +1879,6 @@ where
 // Live supervisor lifecycle state
 // ---------------------------------------------------------------------------
 
-/// Runs `fut` to completion under whichever tokio regime the calling thread
-/// sits in, and returns whatever `fut` produced.
-///
-/// A caller reaches this function from one of three regimes:
-///
-/// 1. a Python call that carries no ambient tokio runtime (`PyO3` methods are
-///    synchronous, and the Python SDK dispatches them through
-///    `asyncio.to_thread`);
-/// 2. a task running on a multi-thread runtime, where `Runtime::block_on`
-///    panics but `block_in_place` is legal; and
-/// 3. a task running on a current-thread runtime, where `Runtime::block_on`
-///    and `block_in_place` both panic.
-///
-/// This function reads the ambient handle, then picks the bridge that regime
-/// permits: the shared runtime's `block_on`, `block_in_place` around the
-/// ambient handle, or a private current-thread runtime on a fresh thread. The
-/// supervisor query itself only awaits a mailbox channel, so a private runtime
-/// drives it to completion while the per-context actor keeps running on the
-/// shared runtime. `scripts/check-block-in-place.py` excludes
-/// `crates/scp-ffi/**` because every FFI bridge needs a synchronous-to-async
-/// seam of exactly this shape.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` when the shared tokio runtime is absent,
-/// when a private current-thread runtime fails to build, or when the fresh
-/// thread ends before it sends an answer.
-fn block_on_supervisor_query<T, F>(fut: F) -> Result<T, ScpPyError>
-where
-    T: Send + 'static,
-    F: std::future::Future<Output = T> + Send + 'static,
-{
-    match tokio::runtime::Handle::try_current() {
-        Err(_) => {
-            let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-            Ok(rt.block_on(fut))
-        }
-        Ok(handle)
-            if matches!(
-                handle.runtime_flavor(),
-                tokio::runtime::RuntimeFlavor::MultiThread
-            ) =>
-        {
-            Ok(tokio::task::block_in_place(|| handle.block_on(fut)))
-        }
-        Ok(_) => {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => drop(tx.send(rt.block_on(fut))),
-                    Err(e) => tracing::error!(
-                        error = %e,
-                        "live supervisor query could not build a private runtime; \
-                         the caller fails closed"
-                    ),
-                }
-            });
-            rx.recv().map_err(|_| {
-                ScpPyError::context(
-                    "live supervisor query ended before the supervisor answered".to_owned(),
-                )
-            })
-        }
-    }
-}
-
 /// Reads a context's lifecycle state from that context's supervisor actor, and
 /// fails when no actor serves the context.
 ///
@@ -1965,11 +1904,12 @@ where
 /// reports no actor for `context_id`, and every error
 /// [`read_live_context_state`] returns.
 pub fn live_context_state(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     absent_code: &str,
 ) -> Result<scp_core::context::ContextState, ScpPyError> {
-    read_live_context_state(bi, context_id)?.ok_or_else(|| ScpPyError::ContextError {
+    read_live_context_state(py, bi, context_id)?.ok_or_else(|| ScpPyError::ContextError {
         message: format!(
             "context '{context_id}' has no live supervisor state — refusing to run a \
              lifecycle-gated operation against a context no actor serves"
@@ -2004,10 +1944,11 @@ pub fn live_context_state(
 /// when the crash watchdog despawned `context_id`'s actor for a respawn it has
 /// not finished or its last respawn failed (ADR-049 §10).
 pub fn read_live_context_state(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
-    read_live_context_state_on(Arc::clone(supervisor(bi)?), context_id)
+    read_live_context_state_on(py, Arc::clone(supervisor(bi)?), context_id)
 }
 
 /// Runs the [`read_live_context_state`] read on `sup`.
@@ -2021,12 +1962,16 @@ pub fn read_live_context_state(
 /// Returns every error [`read_live_context_state`] returns except the
 /// supervisor-resolution error, which the caller met when it resolved `sup`.
 pub fn read_live_context_state_on(
+    py: Python<'_>,
     sup: Arc<scp_core::context::supervisor::Supervisor>,
     context_id: &str,
 ) -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
     let ctx = context_id.to_owned();
-    block_on_supervisor_query(async move { sup.read_context_state_checked(&ctx).await })?
-        .map_err(ScpPyError::from)
+    crate::actor_wait::block_on_released(
+        py,
+        async move { sup.read_context_state_checked(&ctx).await },
+    )?
+    .map_err(ScpPyError::from)
 }
 
 /// The most release marks one [`PyBridgeInstance`] holds once every release
@@ -2160,12 +2105,13 @@ pub(crate) fn clear_release_mark_set_by(
 /// When the mark is gone by the time of the removal, it removes nothing and
 /// returns `false`. The mark stays in flight until this function returns.
 pub fn release_context_unless_readmitted(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     sup: &Arc<scp_core::context::supervisor::Supervisor>,
     context_id: &str,
 ) -> bool {
     let marked_at = set_release_mark(bi, context_id);
-    let released = match read_live_context_state_on(Arc::clone(sup), context_id) {
+    let released = match read_live_context_state_on(py, Arc::clone(sup), context_id) {
         Ok(Some(scp_core::context::ContextState::Active)) => {
             clear_release_mark_set_by(bi, context_id, marked_at);
             false
@@ -2221,10 +2167,11 @@ pub fn release_context_unless_readmitted(
 /// poisoned, and when the role-state read finds no role state.
 ///
 /// Returns the [`supervisor`] error unchanged when the bridge is suspended or
-/// has no `ContextManager` attached, and the `block_on_supervisor_query`
+/// has no `ContextManager` attached, and the `block_on_released`
 /// error unchanged when either read cannot reach the supervisor from this
 /// thread.
 pub fn active_role_state_before_authz<F>(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     verb: &str,
@@ -2233,13 +2180,14 @@ pub fn active_role_state_before_authz<F>(
 where
     F: FnOnce(String) -> ScpPyError,
 {
-    active_role_state_on(Arc::clone(supervisor(bi)?), context_id, verb, mk_err)
+    active_role_state_on(py, Arc::clone(supervisor(bi)?), context_id, verb, mk_err)
 }
 
 /// Runs both [`active_role_state_before_authz`] reads, the lifecycle state
 /// read and then the role-state read, on `sup`, the supervisor that function
 /// resolved.
 fn active_role_state_on<F>(
+    py: Python<'_>,
     sup: Arc<scp_core::context::supervisor::Supervisor>,
     context_id: &str,
     verb: &str,
@@ -2250,12 +2198,11 @@ where
 {
     let lifecycle_sup = Arc::clone(&sup);
     let ctx = context_id.to_owned();
-    let state =
-        block_on_supervisor_query(
-            async move { lifecycle_sup.read_context_state_checked(&ctx).await },
-        )?
-        .map_err(ScpPyError::from);
-    withhold_before_authz(state, || role_state_on(sup, context_id), verb, mk_err)
+    let state = crate::actor_wait::block_on_released(py, async move {
+        lifecycle_sup.read_context_state_checked(&ctx).await
+    })?
+    .map_err(ScpPyError::from);
+    withhold_before_authz(state, || role_state_on(py, sup, context_id), verb, mk_err)
 }
 
 /// Applies the [`active_role_state_before_authz`] refusal rule to a lifecycle
@@ -2263,7 +2210,7 @@ where
 /// `state` reads `Active`. An outer `Err` from `read_role_state` is a
 /// sync-to-async bridge failure and returns unchanged; every other outcome of
 /// either becomes the one withheld refusal `mk_err` builds.
-fn withhold_before_authz<F>(
+pub(crate) fn withhold_before_authz<F>(
     state: Result<Option<scp_core::context::ContextState>, ScpPyError>,
     read_role_state: impl FnOnce() -> Result<Result<ContextRoleState, ScpPyError>, ScpPyError>,
     verb: &str,
@@ -2301,10 +2248,11 @@ where
 /// context's actor is saturated, wedged, mid-respawn, or poisoned, so a caller
 /// never reads an actor that did not answer as an absent context.
 pub(crate) fn live_role_state(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> Result<ContextRoleState, ScpPyError> {
-    role_state_on(Arc::clone(supervisor(bi)?), context_id)?
+    role_state_on(py, Arc::clone(supervisor(bi)?), context_id)?
 }
 
 /// Reads `context_id`'s role state from `sup`, a supervisor the caller has
@@ -2315,16 +2263,21 @@ pub(crate) fn live_role_state(
 ///
 /// # Errors
 ///
-/// Returns the `block_on_supervisor_query` error as the outer `Err`. Returns
+/// Returns the `block_on_released` error as the outer `Err`. Returns
 /// as the inner `Err` the converted `ActorBusy`, `ActorCrashed`, or
 /// `ContextPoisoned` error, and `ScpPyError::ContextError` with `SCP-CTX-2023`
 /// when the supervisor holds no role state for `context_id`.
 fn role_state_on(
+    py: Python<'_>,
     sup: Arc<scp_core::context::supervisor::Supervisor>,
     context_id: &str,
 ) -> Result<Result<ContextRoleState, ScpPyError>, ScpPyError> {
     let ctx = context_id.to_owned();
-    let answer = block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })?;
+    let answer =
+        crate::actor_wait::block_on_released(
+            py,
+            async move { sup.get_role_state_checked(&ctx).await },
+        )?;
     Ok(answer.map_err(ScpPyError::from).and_then(|role_state| {
         role_state.ok_or_else(|| ScpPyError::ContextError {
             message: format!(
@@ -2352,6 +2305,7 @@ fn role_state_on(
 /// actor does not answer, so an actor that did not answer never drops its
 /// context from the result.
 pub fn member_context_role_states(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     member_did: &str,
 ) -> Result<Vec<(String, ContextRoleState)>, ScpPyError> {
@@ -2367,9 +2321,10 @@ pub fn member_context_role_states(
     for id in ids {
         let sup = Arc::clone(&sup);
         let ctx = id.clone();
-        let answer =
-            block_on_supervisor_query(async move { sup.get_role_state_checked(&ctx).await })?
-                .map_err(ScpPyError::from)?;
+        let answer = crate::actor_wait::block_on_released(py, async move {
+            sup.get_role_state_checked(&ctx).await
+        })?
+        .map_err(ScpPyError::from)?;
         if let Some(role_state) = answer.filter(|rs| rs.members.contains(member_did)) {
             matched.push((id, role_state));
         }
@@ -2575,6 +2530,7 @@ pub fn clone_receive_channel_handles(
 }
 
 pub fn deliver_message(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     message: PyMessage,
@@ -2591,7 +2547,7 @@ pub fn deliver_message(
         })?;
         Ok((tx, rx))
     })?;
-    deliver_message_with_handles(bi, context_id, &tx, &rx_arc, message)
+    deliver_message_with_handles(py, bi, context_id, &tx, &rx_arc, message)
 }
 
 /// Deliver a message through pre-captured channel handles.
@@ -2603,9 +2559,11 @@ pub fn deliver_message(
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ContextError` if the channel is closed or a send
-/// fails after an overflow drop.
+/// Returns `ScpPyError::ContextError` if the channel is closed, if the
+/// overflow drop's wait for the receiver lock cannot run, or if a send fails
+/// after an overflow drop.
 pub fn deliver_message_with_handles(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     tx: &mpsc::Sender<PyMessage>,
@@ -2615,15 +2573,17 @@ pub fn deliver_message_with_handles(
     match tx.try_send(message.clone()) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => {
-            // Use blocking_lock() instead of try_lock() to guarantee
+            // Wait for the receiver lock instead of try_lock() to guarantee
             // oldest-drop semantics. try_lock() would drop the NEW
             // message on lock contention — the opposite of documented
             // behavior. The lock is only held for a single try_recv()
-            // (VecDeque pop_front), so blocking is brief and safe.
-            let mut rx_guard = rx_arc.blocking_lock();
-
-            let _ = rx_guard.try_recv();
-            drop(rx_guard);
+            // (VecDeque pop_front), so the wait is brief. It goes through
+            // `block_on_released`, the bridge's one blocking path, which
+            // picks a regime that cannot panic on a runtime
+            // thread and releases the GIL while it waits.
+            crate::actor_wait::block_on_released(py, async {
+                let _ = rx_arc.lock().await.try_recv();
+            })?;
 
             tx.try_send(message).map_err(|e| {
                 ScpPyError::context(format!(
@@ -3399,36 +3359,39 @@ mod tests {
     /// `readmit_and_register_ffi_state` clears the mark and registers the id.
     #[test]
     fn a_release_mark_refuses_registration_until_a_readmit() {
-        let (bi, ctx_id) = unserved_context("mark-refuses");
-        let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
+        pyo3::Python::with_gil(|py| {
+            let (bi, ctx_id) = unserved_context("mark-refuses");
+            let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
 
-        assert!(
-            release_context_unless_readmitted(&bi, &sup, &ctx_id),
-            "a context no actor serves must be released"
-        );
-        assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
-        assert!(
-            lock_release_marks(&bi)
-                .get(&ctx_id)
-                .is_some_and(|mark| !mark.in_flight),
-            "the release must leave the id marked, out of flight"
-        );
+            assert!(
+                release_context_unless_readmitted(py, &bi, &sup, &ctx_id),
+                "a context no actor serves must be released"
+            );
+            assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
+            assert!(
+                lock_release_marks(&bi)
+                    .get(&ctx_id)
+                    .is_some_and(|mark| !mark.in_flight),
+                "the release must leave the id marked, out of flight"
+            );
 
-        let refusal = register_ffi_state(&bi, &ctx_id, &[])
-            .expect_err("a marked id must not regain bridge state")
-            .to_string();
-        assert!(
-            refusal.contains(scp_ffi_common::error_codes::CTX_2023)
-                && refusal.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                && !refusal.contains(&ctx_id),
-            "the refusal must carry SCP-CTX-2023 and the withheld text: {refusal}"
-        );
-        assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
+            let refusal = register_ffi_state(&bi, &ctx_id, &[])
+                .expect_err("a marked id must not regain bridge state")
+                .to_string();
+            assert!(
+                refusal.contains(scp_ffi_common::error_codes::CTX_2023)
+                    && refusal.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                    && !refusal.contains(&ctx_id),
+                "the refusal must carry SCP-CTX-2023 and the withheld text: {refusal}"
+            );
+            assert!(!ffi_state_registry(&bi).contains_key(&ctx_id));
 
-        readmit_and_register_ffi_state(&bi, &ctx_id, &[]).expect("a readmit registers a vacant id");
-        assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
-        assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
-        remove_context(&bi, &ctx_id);
+            readmit_and_register_ffi_state(&bi, &ctx_id, &[])
+                .expect("a readmit registers a vacant id");
+            assert!(!lock_release_marks(&bi).contains_key(&ctx_id));
+            assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
+            remove_context(&bi, &ctx_id);
+        });
     }
 
     /// `readmit_and_register_ffi_state` on an occupied entry fails and leaves
@@ -3537,25 +3500,27 @@ mod tests {
     /// mark, so the context keeps working on this bridge.
     #[test]
     fn an_active_re_read_keeps_the_state_and_clears_the_mark() {
-        let (bi, ctx_id) = unserved_context("mark-active");
-        create_supervisor_context_for_test(
-            &bi,
-            &ctx_id,
-            "did:dht:z6MkReleaseMark",
-            &["messages:read".to_owned()],
-        );
-        let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
+        pyo3::Python::with_gil(|py| {
+            let (bi, ctx_id) = unserved_context("mark-active");
+            create_supervisor_context_for_test(
+                &bi,
+                &ctx_id,
+                "did:dht:z6MkReleaseMark",
+                &["messages:read".to_owned()],
+            );
+            let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
 
-        assert!(
-            !release_context_unless_readmitted(&bi, &sup, &ctx_id),
-            "an Active context must not be released"
-        );
-        assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
-        assert!(
-            !lock_release_marks(&bi).contains_key(&ctx_id),
-            "an Active re-read must clear the mark it set"
-        );
-        remove_context(&bi, &ctx_id);
+            assert!(
+                !release_context_unless_readmitted(py, &bi, &sup, &ctx_id),
+                "an Active context must not be released"
+            );
+            assert!(ffi_state_registry(&bi).contains_key(&ctx_id));
+            assert!(
+                !lock_release_marks(&bi).contains_key(&ctx_id),
+                "an Active re-read must clear the mark it set"
+            );
+            remove_context(&bi, &ctx_id);
+        });
     }
 
     /// The removal runs only while the mark stands: once a readmit cleared the
@@ -3764,7 +3729,7 @@ mod tests {
             0.0,
             ctx_id.clone(),
         );
-        deliver_message_with_handles(bi, &ctx_id, &tx2, &rx2, msg)
+        Python::with_gil(|py| deliver_message_with_handles(py, bi, &ctx_id, &tx2, &rx2, msg))
             .expect("captured handles still deliver after FFI-state removal");
 
         // The receiver observes the delivered close event.
@@ -3784,90 +3749,94 @@ mod tests {
     /// trip through the supervisor.
     #[test]
     fn user_ceiling_strings_converted_to_ucan_format() {
-        crate::init_runtime().ok();
-        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
-        let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
-        let ctx_id = unique_ctx_id("ceiling-conv");
-        let creator = "did:dht:z6MkCeilingConv";
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+            let bi = &*bi_arc;
+            init_context_manager_for_test(bi);
+            let ctx_id = unique_ctx_id("ceiling-conv");
+            let creator = "did:dht:z6MkCeilingConv";
 
-        let user_ceiling = vec![
-            "outlet:call:*".to_owned(),
-            "messages:write".to_owned(),
-            "context:child:create".to_owned(),
-            "outlet:call:calculator".to_owned(),
-        ];
+            let user_ceiling = vec![
+                "outlet:call:*".to_owned(),
+                "messages:write".to_owned(),
+                "context:child:create".to_owned(),
+                "outlet:call:calculator".to_owned(),
+            ];
 
-        register_context(bi, &ctx_id, creator, &user_ceiling).unwrap();
-        create_supervisor_context_for_test(bi, &ctx_id, creator, &user_ceiling);
+            register_context(bi, &ctx_id, creator, &user_ceiling).unwrap();
+            create_supervisor_context_for_test(bi, &ctx_id, creator, &user_ceiling);
 
-        let ceiling = live_role_state(bi, &ctx_id)
-            .unwrap()
-            .ceiling()
-            .to_ucan_string_set();
+            let ceiling = live_role_state(py, bi, &ctx_id)
+                .unwrap()
+                .ceiling()
+                .to_ucan_string_set();
 
-        // Compound resources must have underscores joining their segments.
-        assert!(
-            ceiling.contains("outlet_call:*"),
-            "expected 'outlet_call:*' but got: {ceiling:?}"
-        );
-        assert!(
-            ceiling.contains("context_child:create"),
-            "expected 'context_child:create' but got: {ceiling:?}"
-        );
-        assert!(
-            ceiling.contains("outlet_call:calculator"),
-            "expected 'outlet_call:calculator' but got: {ceiling:?}"
-        );
-        // Simple two-segment capabilities should pass through unchanged.
-        assert!(
-            ceiling.contains("messages:write"),
-            "expected 'messages:write' but got: {ceiling:?}"
-        );
-        // Raw colon-format strings must NOT be present.
-        assert!(
-            !ceiling.contains("outlet:call:*"),
-            "raw 'outlet:call:*' should not be in ceiling: {ceiling:?}"
-        );
-        assert!(
-            !ceiling.contains("context:child:create"),
-            "raw 'context:child:create' should not be in ceiling: {ceiling:?}"
-        );
+            // Compound resources must have underscores joining their segments.
+            assert!(
+                ceiling.contains("outlet_call:*"),
+                "expected 'outlet_call:*' but got: {ceiling:?}"
+            );
+            assert!(
+                ceiling.contains("context_child:create"),
+                "expected 'context_child:create' but got: {ceiling:?}"
+            );
+            assert!(
+                ceiling.contains("outlet_call:calculator"),
+                "expected 'outlet_call:calculator' but got: {ceiling:?}"
+            );
+            // Simple two-segment capabilities should pass through unchanged.
+            assert!(
+                ceiling.contains("messages:write"),
+                "expected 'messages:write' but got: {ceiling:?}"
+            );
+            // Raw colon-format strings must NOT be present.
+            assert!(
+                !ceiling.contains("outlet:call:*"),
+                "raw 'outlet:call:*' should not be in ceiling: {ceiling:?}"
+            );
+            assert!(
+                !ceiling.contains("context:child:create"),
+                "raw 'context:child:create' should not be in ceiling: {ceiling:?}"
+            );
 
-        remove_context(bi, &ctx_id);
+            remove_context(bi, &ctx_id);
+        });
     }
 
     /// The supervisor reports a context declaring every `default_ceiling()`
     /// capability in UCAN underscore format.
     #[test]
     fn default_ceiling_reads_in_ucan_format() {
-        crate::init_runtime().ok();
-        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
-        let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
-        let ctx_id = unique_ctx_id("ceiling-default");
-        let creator = "did:dht:z6MkCeilingDefault";
-        let declared = crate::context::default_ceiling_strings();
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+            let bi = &*bi_arc;
+            init_context_manager_for_test(bi);
+            let ctx_id = unique_ctx_id("ceiling-default");
+            let creator = "did:dht:z6MkCeilingDefault";
+            let declared = crate::context::default_ceiling_strings();
 
-        register_context(bi, &ctx_id, creator, &declared).unwrap();
-        create_supervisor_context_for_test(bi, &ctx_id, creator, &declared);
+            register_context(bi, &ctx_id, creator, &declared).unwrap();
+            create_supervisor_context_for_test(bi, &ctx_id, creator, &declared);
 
-        let ceiling = live_role_state(bi, &ctx_id)
-            .unwrap()
-            .ceiling()
-            .to_ucan_string_set();
+            let ceiling = live_role_state(py, bi, &ctx_id)
+                .unwrap()
+                .ceiling()
+                .to_ucan_string_set();
 
-        // Default ceiling must include outlet_call:* (not outlet:call:*).
-        assert!(
-            ceiling.contains("outlet_call:*"),
-            "default ceiling should contain 'outlet_call:*' but got: {ceiling:?}"
-        );
-        assert!(
-            !ceiling.contains("outlet:call:*"),
-            "default ceiling should not contain raw 'outlet:call:*': {ceiling:?}"
-        );
+            // Default ceiling must include outlet_call:* (not outlet:call:*).
+            assert!(
+                ceiling.contains("outlet_call:*"),
+                "default ceiling should contain 'outlet_call:*' but got: {ceiling:?}"
+            );
+            assert!(
+                !ceiling.contains("outlet:call:*"),
+                "default ceiling should not contain raw 'outlet:call:*': {ceiling:?}"
+            );
 
-        remove_context(bi, &ctx_id);
+            remove_context(bi, &ctx_id);
+        });
     }
 
     /// Spawns a supervisor actor for a fresh context and returns the bridge
@@ -3886,7 +3855,7 @@ mod tests {
         (bi, ctx_id)
     }
 
-    /// From a task on a multi-thread runtime, `block_on_supervisor_query`
+    /// From a task on a multi-thread runtime, `block_on_released`
     /// takes its `block_in_place` branch: a live context reads `Active` and an
     /// unknown one reads absent, without panicking inside the worker.
     #[test]
@@ -3903,11 +3872,14 @@ mod tests {
                     tokio::runtime::Handle::current().runtime_flavor(),
                     tokio::runtime::RuntimeFlavor::MultiThread
                 ));
-                (
-                    live_context_state(&bi, &ctx_id, "SCP-TEST-0001").map_err(|e| e.to_string()),
-                    live_context_state(&bi, &"f".repeat(64), "SCP-TEST-0001")
-                        .map_err(|e| e.to_string()),
-                )
+                Python::with_gil(|py| {
+                    (
+                        live_context_state(py, &bi, &ctx_id, "SCP-TEST-0001")
+                            .map_err(|e| e.to_string()),
+                        live_context_state(py, &bi, &"f".repeat(64), "SCP-TEST-0001")
+                            .map_err(|e| e.to_string()),
+                    )
+                })
             }))
             .unwrap();
         assert!(
@@ -3920,7 +3892,7 @@ mod tests {
         );
     }
 
-    /// From a task on a current-thread runtime, `block_on_supervisor_query`
+    /// From a task on a current-thread runtime, `block_on_released`
     /// runs the query on a private runtime on a fresh thread: a live context
     /// reads `Active` and an unknown one reads absent, without panicking.
     #[test]
@@ -3935,11 +3907,14 @@ mod tests {
                 tokio::runtime::Handle::current().runtime_flavor(),
                 tokio::runtime::RuntimeFlavor::CurrentThread
             ));
-            (
-                live_context_state(&bi, &ctx_id, "SCP-TEST-0002").map_err(|e| e.to_string()),
-                live_context_state(&bi, &"f".repeat(64), "SCP-TEST-0002")
-                    .map_err(|e| e.to_string()),
-            )
+            Python::with_gil(|py| {
+                (
+                    live_context_state(py, &bi, &ctx_id, "SCP-TEST-0002")
+                        .map_err(|e| e.to_string()),
+                    live_context_state(py, &bi, &"f".repeat(64), "SCP-TEST-0002")
+                        .map_err(|e| e.to_string()),
+                )
+            })
         });
         assert!(
             matches!(live, Ok(scp_core::context::ContextState::Active)),
@@ -4603,69 +4578,80 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn pre_authz_gate_withholds_crashed_and_busy_states() {
-        crate::init_runtime().ok();
-        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
-        let bi = &*bi_arc;
-        init_context_manager_for_test(bi);
-        let creator = "did:dht:z6MkGateCrashed";
-        let sup = Arc::clone(supervisor(bi).expect("supervisor"));
-        let rt = crate::runtime().expect("tokio runtime");
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+            let bi = &*bi_arc;
+            init_context_manager_for_test(bi);
+            let creator = "did:dht:z6MkGateCrashed";
+            let sup = Arc::clone(supervisor(bi).expect("supervisor"));
+            let rt = crate::runtime().expect("tokio runtime");
 
-        for fault in ["mid_respawn", "respawn_failed", "poisoned", "unreachable"] {
-            let ctx_id = unique_ctx_id(&format!("gate-{fault}"));
-            create_supervisor_context_for_test(bi, &ctx_id, creator, &["messages:read".to_owned()]);
-            match fault {
-                "mid_respawn" => rt.block_on(sup.test_hold_context_mid_respawn(&ctx_id)),
-                "respawn_failed" => rt.block_on(sup.test_fail_context_respawn(&ctx_id)),
-                "poisoned" => rt.block_on(sup.test_poison_context(&ctx_id)),
-                _ => sup.test_make_actor_unreachable(&ctx_id),
+            for fault in ["mid_respawn", "respawn_failed", "poisoned", "unreachable"] {
+                let ctx_id = unique_ctx_id(&format!("gate-{fault}"));
+                create_supervisor_context_for_test(
+                    bi,
+                    &ctx_id,
+                    creator,
+                    &["messages:read".to_owned()],
+                );
+                match fault {
+                    "mid_respawn" => rt.block_on(sup.test_hold_context_mid_respawn(&ctx_id)),
+                    "respawn_failed" => rt.block_on(sup.test_fail_context_respawn(&ctx_id)),
+                    "poisoned" => rt.block_on(sup.test_poison_context(&ctx_id)),
+                    _ => sup.test_make_actor_unreachable(&ctx_id),
+                }
+                assert!(
+                    !matches!(
+                        read_live_context_state(py, bi, &ctx_id),
+                        Ok(Some(scp_core::context::ContextState::Active))
+                    ),
+                    "the fixture must leave the context unable to read Active ({fault})"
+                );
+
+                let err = active_role_state_before_authz(
+                    py,
+                    bi,
+                    &ctx_id,
+                    "validate a UCAN in context",
+                    |message| ScpPyError::ContextError {
+                        message,
+                        code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
+                    },
+                )
+                .expect_err("the gate must refuse a context that does not read Active");
+                let text = err.to_string();
+                assert!(
+                    text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                        && text.contains(scp_ffi_common::error_codes::CTX_2023),
+                    "the refusal must carry the withheld text and the caller's code ({fault}): {text}"
+                );
+                assert!(
+                    !text.contains(scp_ffi_common::error_codes::CTX_2135)
+                        && !text.contains(scp_ffi_common::error_codes::CTX_2134)
+                        && !text.contains("SCP-CTX-2130")
+                        && !text.contains(&ctx_id),
+                    "the refusal must not disclose the fault or echo the id ({fault}): {text}"
+                );
             }
-            assert!(
-                !matches!(
-                    read_live_context_state(bi, &ctx_id),
-                    Ok(Some(scp_core::context::ContextState::Active))
-                ),
-                "the fixture must leave the context unable to read Active ({fault})"
-            );
 
-            let err = active_role_state_before_authz(
+            // The gate admits a context its actor reports `Active`, so the refusals
+            // above come from the fault and not from a gate that refuses everything.
+            let live = unique_ctx_id("gate-active");
+            create_supervisor_context_for_test(bi, &live, creator, &["messages:read".to_owned()]);
+            let admitted = active_role_state_before_authz(
+                py,
                 bi,
-                &ctx_id,
+                &live,
                 "validate a UCAN in context",
-                |message| ScpPyError::ContextError {
-                    message,
-                    code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
-                },
+                ScpPyError::context,
             )
-            .expect_err("the gate must refuse a context that does not read Active");
-            let text = err.to_string();
-            assert!(
-                text.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                    && text.contains(scp_ffi_common::error_codes::CTX_2023),
-                "the refusal must carry the withheld text and the caller's code ({fault}): {text}"
-            );
-            assert!(
-                !text.contains(scp_ffi_common::error_codes::CTX_2135)
-                    && !text.contains(scp_ffi_common::error_codes::CTX_2134)
-                    && !text.contains("SCP-CTX-2130")
-                    && !text.contains(&ctx_id),
-                "the refusal must not disclose the fault or echo the id ({fault}): {text}"
-            );
-        }
-
-        // The gate admits a context its actor reports `Active`, so the refusals
-        // above come from the fault and not from a gate that refuses everything.
-        let live = unique_ctx_id("gate-active");
-        create_supervisor_context_for_test(bi, &live, creator, &["messages:read".to_owned()]);
-        let admitted =
-            active_role_state_before_authz(bi, &live, "validate a UCAN in context", |message| {
-                ScpPyError::context(message)
-            })
             .expect("the gate must admit an Active context");
-        assert_eq!(
-            admitted.creator_did, creator,
-            "the gate must hand back the supervisor's role state"
-        );
+            assert_eq!(
+                admitted.creator_did, creator,
+                "the gate must hand back the supervisor's role state"
+            );
+        });
     }
 
     /// The pre-authorization gate withholds a failure of the role-state read it
@@ -4681,10 +4667,9 @@ mod tests {
     fn pre_authz_gate_withholds_a_role_state_read_that_fails_after_active() {
         let creator = "did:dht:z6MkGateRoleReadFails";
         let (bi, ctx_id) = live_state_fixture("gate-role-read", creator, &["messages:read"]);
-        let role_state = live_role_state(&bi, &ctx_id).expect("the fixture's actor answers");
-        let active = || -> Result<Option<scp_core::context::ContextState>, ScpPyError> {
-            Ok(Some(scp_core::context::ContextState::Active))
-        };
+        let role_state = pyo3::Python::with_gil(|py| live_role_state(py, &bi, &ctx_id))
+            .expect("the fixture's actor answers");
+        let active = || Ok(Some(scp_core::context::ContextState::Active));
         let caller_err = |message: String| ScpPyError::ContextError {
             message,
             code: scp_ffi_common::error_codes::CTX_2023.to_owned(),
@@ -4794,25 +4779,28 @@ mod tests {
     /// which the gate withholds as a context refusal.
     #[test]
     fn role_state_read_runs_on_the_resolved_supervisor_after_a_suspend() {
-        let creator = "did:dht:z6MkRoleReadResolvedSup";
-        let (bi, ctx_id) = live_state_fixture("role-read-resolved", creator, &["messages:read"]);
-        let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
-        bi.core.suspend().expect("suspend");
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkRoleReadResolvedSup";
+            let (bi, ctx_id) =
+                live_state_fixture("role-read-resolved", creator, &["messages:read"]);
+            let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
+            bi.core.suspend().expect("suspend");
 
-        let suspended = live_role_state(&bi, &ctx_id)
-            .expect_err("a fresh resolution on a suspended bridge must refuse");
-        assert!(
-            suspended.to_string().contains("bridge is suspended"),
-            "a fresh resolution must return the suspended-bridge error: {suspended}"
-        );
-        let role_state = role_state_on(sup, &ctx_id)
-            .expect("the sync-to-async bridge answers")
-            .expect("the resolved supervisor answers after the suspend");
-        assert_eq!(
-            role_state.creator_did, creator,
-            "the read must return the resolved supervisor's role state"
-        );
-        remove_context(&bi, &ctx_id);
+            let suspended = live_role_state(py, &bi, &ctx_id)
+                .expect_err("a fresh resolution on a suspended bridge must refuse");
+            assert!(
+                suspended.to_string().contains("bridge is suspended"),
+                "a fresh resolution must return the suspended-bridge error: {suspended}"
+            );
+            let role_state = role_state_on(py, sup, &ctx_id)
+                .expect("the sync-to-async bridge answers")
+                .expect("the resolved supervisor answers after the suspend");
+            assert_eq!(
+                role_state.creator_did, creator,
+                "the read must return the resolved supervisor's role state"
+            );
+            remove_context(&bi, &ctx_id);
+        });
     }
 
     /// `live_role_state` fails closed when the context has no supervisor actor,
@@ -4820,21 +4808,23 @@ mod tests {
     /// record it could not read.
     #[test]
     fn live_role_state_fails_closed_without_a_supervisor_actor() {
-        crate::init_runtime().ok();
-        let bi = Arc::new(PyBridgeInstance::new_py());
-        let ctx_id = unique_ctx_id("live-no-actor");
-        // FFI state exists; the supervisor never created the context.
-        register_context(&bi, &ctx_id, "did:dht:z6MkLiveNoActor", &[]).unwrap();
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi = Arc::new(PyBridgeInstance::new_py());
+            let ctx_id = unique_ctx_id("live-no-actor");
+            // FFI state exists; the supervisor never created the context.
+            register_context(&bi, &ctx_id, "did:dht:z6MkLiveNoActor", &[]).unwrap();
 
-        let err = live_role_state(&bi, &ctx_id)
-            .expect_err("a context with no supervisor role state must refuse to authorize");
-        let text = format!("{err:?}");
-        assert!(
-            text.contains("no live supervisor role state")
-                && text.contains(scp_ffi_common::error_codes::CTX_2023),
-            "the refusal must name the absent supervisor role state and carry SCP-CTX-2023: {text}"
-        );
-        remove_context(&bi, &ctx_id);
+            let err = live_role_state(py, &bi, &ctx_id)
+                .expect_err("a context with no supervisor role state must refuse to authorize");
+            let text = format!("{err:?}");
+            assert!(
+                text.contains("no live supervisor role state")
+                    && text.contains(scp_ffi_common::error_codes::CTX_2023),
+                "the refusal must name the absent supervisor role state and carry SCP-CTX-2023: {text}"
+            );
+            remove_context(&bi, &ctx_id);
+        });
     }
 
     /// `live_role_state` reports a context whose actor does not answer as
@@ -4844,72 +4834,77 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn live_role_state_reports_an_unreachable_actor_as_busy_not_absent() {
-        let (bi, ctx_id) = live_state_fixture(
-            "live-role-busy",
-            "did:dht:z6MkLiveRoleBusy",
-            &["messages:read"],
-        );
-        live_role_state(&bi, &ctx_id).expect("the fixture's actor answers");
-        supervisor(&bi)
-            .expect("supervisor")
-            .test_make_actor_unreachable(&ctx_id);
+        pyo3::Python::with_gil(|py| {
+            let (bi, ctx_id) = live_state_fixture(
+                "live-role-busy",
+                "did:dht:z6MkLiveRoleBusy",
+                &["messages:read"],
+            );
+            live_role_state(py, &bi, &ctx_id).expect("the fixture's actor answers");
+            supervisor(&bi)
+                .expect("supervisor")
+                .test_make_actor_unreachable(&ctx_id);
 
-        let err = format!(
-            "{:?}",
-            live_role_state(&bi, &ctx_id).expect_err("an unreachable actor must refuse")
-        );
-        assert!(
-            err.contains("SCP-CTX-2130") && !err.contains("no live supervisor role state"),
-            "an unreachable actor must read as busy, not absent: {err}"
-        );
-        remove_context(&bi, &ctx_id);
+            let err = format!(
+                "{:?}",
+                live_role_state(py, &bi, &ctx_id).expect_err("an unreachable actor must refuse")
+            );
+            assert!(
+                err.contains("SCP-CTX-2130") && !err.contains("no live supervisor role state"),
+                "an unreachable actor must read as busy, not absent: {err}"
+            );
+            remove_context(&bi, &ctx_id);
+        });
     }
 
     /// `member_context_role_states` reports a member the supervisor actor records.
     #[test]
     #[cfg(feature = "testing")]
     fn member_context_role_states_reads_supervisor_membership() {
-        let creator = "did:dht:z6MkIdsForMemberCreator";
-        let member = "did:dht:z6MkIdsForMemberJoiner";
-        let (bi, ctx_id) = live_state_fixture("ids-for-member", creator, &["messages:read"]);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkIdsForMemberCreator";
+            let member = "did:dht:z6MkIdsForMemberJoiner";
+            let (bi, ctx_id) = live_state_fixture("ids-for-member", creator, &["messages:read"]);
 
-        assert!(
-            !member_context_role_states(&bi, member)
-                .unwrap()
-                .iter()
-                .any(|(id, _)| id == &ctx_id),
-            "precondition: the member is not in the context yet"
-        );
+            assert!(
+                !member_context_role_states(py, &bi, member)
+                    .unwrap()
+                    .iter()
+                    .any(|(id, _)| id == &ctx_id),
+                "precondition: the member is not in the context yet"
+            );
 
-        insert_supervisor_member_for_test(&bi, &ctx_id, member)
-            .expect("supervisor must record the member");
+            insert_supervisor_member_for_test(&bi, &ctx_id, member)
+                .expect("supervisor must record the member");
 
-        let matched = member_context_role_states(&bi, member).unwrap();
-        let (_, role_state) = matched
-            .iter()
-            .find(|(id, _)| id == &ctx_id)
-            .expect("a member the supervisor recorded must be reported, with no bridge-side write");
-        assert!(
-            role_state.members.contains(member) && role_state.creator_did == creator,
-            "the returned role state must be the supervisor's, which lists the member"
-        );
-        remove_context(&bi, &ctx_id);
+            let matched = member_context_role_states(py, &bi, member).unwrap();
+            let (_, role_state) = matched.iter().find(|(id, _)| id == &ctx_id).expect(
+                "a member the supervisor recorded must be reported, with no bridge-side write",
+            );
+            assert!(
+                role_state.members.contains(member) && role_state.creator_did == creator,
+                "the returned role state must be the supervisor's, which lists the member"
+            );
+            remove_context(&bi, &ctx_id);
+        });
     }
 
     /// `member_context_role_states` refuses when a context is registered but no
     /// supervisor is attached.
     #[test]
     fn member_context_role_states_fails_closed_without_a_supervisor() {
-        crate::init_runtime().ok();
-        let bi = Arc::new(PyBridgeInstance::new_py());
-        let ctx_id = unique_ctx_id("ids-no-supervisor");
-        let creator = "did:dht:z6MkIdsNoSupervisor";
-        select_in_memory_storage_for_test(&bi);
-        register_ffi_state(&bi, &ctx_id, &[]).unwrap();
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let bi = Arc::new(PyBridgeInstance::new_py());
+            let ctx_id = unique_ctx_id("ids-no-supervisor");
+            let creator = "did:dht:z6MkIdsNoSupervisor";
+            select_in_memory_storage_for_test(&bi);
+            register_ffi_state(&bi, &ctx_id, &[]).unwrap();
 
-        member_context_role_states(&bi, creator)
-            .expect_err("a registered context with no supervisor must refuse, not answer");
-        remove_context(&bi, &ctx_id);
+            member_context_role_states(py, &bi, creator)
+                .expect_err("a registered context with no supervisor must refuse, not answer");
+            remove_context(&bi, &ctx_id);
+        });
     }
 
     /// `member_context_role_states` returns the actor's `ActorBusy` error when a
@@ -4918,29 +4913,31 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn member_context_role_states_propagates_an_unreachable_actor() {
-        let creator = "did:dht:z6MkIdsBusyCreator";
-        let (bi, ctx_id) = live_state_fixture("ids-busy", creator, &["messages:read"]);
-        assert!(
-            member_context_role_states(&bi, creator)
-                .unwrap()
-                .iter()
-                .any(|(id, _)| id == &ctx_id),
-            "precondition: the creator's context is reported while its actor answers"
-        );
-        supervisor(&bi)
-            .expect("supervisor")
-            .test_make_actor_unreachable(&ctx_id);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkIdsBusyCreator";
+            let (bi, ctx_id) = live_state_fixture("ids-busy", creator, &["messages:read"]);
+            assert!(
+                member_context_role_states(py, &bi, creator)
+                    .unwrap()
+                    .iter()
+                    .any(|(id, _)| id == &ctx_id),
+                "precondition: the creator's context is reported while its actor answers"
+            );
+            supervisor(&bi)
+                .expect("supervisor")
+                .test_make_actor_unreachable(&ctx_id);
 
-        let err = format!(
-            "{:?}",
-            member_context_role_states(&bi, creator)
-                .expect_err("an unreachable actor must refuse, not drop its context")
-        );
-        assert!(
-            err.contains("SCP-CTX-2130"),
-            "the refusal must carry the actor's busy code: {err}"
-        );
-        remove_context(&bi, &ctx_id);
+            let err = format!(
+                "{:?}",
+                member_context_role_states(py, &bi, creator)
+                    .expect_err("an unreachable actor must refuse, not drop its context")
+            );
+            assert!(
+                err.contains("SCP-CTX-2130"),
+                "the refusal must carry the actor's busy code: {err}"
+            );
+            remove_context(&bi, &ctx_id);
+        });
     }
 
     /// The pre-authorization gate returns the ceiling the SUPERVISOR holds. The
@@ -4949,30 +4946,33 @@ mod tests {
     /// below.
     #[test]
     fn pre_authz_gate_returns_the_supervisor_ceiling() {
-        let creator = "did:dht:z6MkLiveCeilingCreator";
-        let (bi, ctx_id) = live_state_fixture(
-            "live-ceiling",
-            creator,
-            &["messages:read", "messages:write"],
-        );
-        let ceiling = active_role_state_before_authz(
-            &bi,
-            &ctx_id,
-            "delegate a UCAN in context",
-            ScpPyError::context,
-        )
-        .unwrap()
-        .ceiling()
-        .to_ucan_string_set();
-        assert!(
-            ceiling.contains("messages:write"),
-            "the supervisor ceiling entry must be present: {ceiling:?}"
-        );
-        assert!(
-            !ceiling.contains("outlet_call:*"),
-            "an entry the supervisor ceiling omits must be absent: {ceiling:?}"
-        );
-        remove_context(&bi, &ctx_id);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkLiveCeilingCreator";
+            let (bi, ctx_id) = live_state_fixture(
+                "live-ceiling",
+                creator,
+                &["messages:read", "messages:write"],
+            );
+            let ceiling = active_role_state_before_authz(
+                py,
+                &bi,
+                &ctx_id,
+                "delegate a UCAN in context",
+                ScpPyError::context,
+            )
+            .unwrap()
+            .ceiling()
+            .to_ucan_string_set();
+            assert!(
+                ceiling.contains("messages:write"),
+                "the supervisor ceiling entry must be present: {ceiling:?}"
+            );
+            assert!(
+                !ceiling.contains("outlet_call:*"),
+                "an entry the supervisor ceiling omits must be absent: {ceiling:?}"
+            );
+            remove_context(&bi, &ctx_id);
+        });
     }
 
     /// `live_role_state` answers from inside `Runtime::block_on`, the regime a
@@ -4985,7 +4985,8 @@ mod tests {
         let (bi, ctx_id) = live_state_fixture("regime-block-on", creator, &["messages:read"]);
 
         let rt = crate::runtime().unwrap();
-        let answer = rt.block_on(async { live_role_state(&bi, &ctx_id) });
+        let answer =
+            rt.block_on(async { Python::with_gil(|py| live_role_state(py, &bi, &ctx_id)) });
         assert_eq!(
             answer
                 .expect("the read must answer from inside block_on")
@@ -5007,9 +5008,11 @@ mod tests {
         let bi_for_task = Arc::clone(&bi);
         let ctx_for_task = ctx_id.clone();
         let answer = rt.block_on(async move {
-            rt.spawn(async move { live_role_state(&bi_for_task, &ctx_for_task) })
-                .await
-                .expect("the spawned task must not panic")
+            rt.spawn(async move {
+                Python::with_gil(|py| live_role_state(py, &bi_for_task, &ctx_for_task))
+            })
+            .await
+            .expect("the spawned task must not panic")
         });
         assert_eq!(
             answer
@@ -5033,7 +5036,8 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let answer = host.block_on(async { live_role_state(&bi, &ctx_id) });
+        let answer =
+            host.block_on(async { Python::with_gil(|py| live_role_state(py, &bi, &ctx_id)) });
         assert_eq!(
             answer
                 .expect("the read must answer from inside a current-thread runtime")
