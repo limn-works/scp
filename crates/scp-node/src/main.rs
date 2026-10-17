@@ -371,7 +371,7 @@ const CLOUD_BLOBS_FEATURE: &str = "cloud-blobs";
 /// Runs a bare relay server (same as `scp-relay` binary).
 async fn run_relay_only() {
     let backend = or_exit(startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE));
-    let config = or_exit(startup::relay_config_from_env());
+    let mut config = or_exit(startup::relay_config_from_env());
     tracing::info!(
         bind_addr = %config.bind_addr,
         max_blob_size = config.max_blob_size,
@@ -381,10 +381,10 @@ async fn run_relay_only() {
 
     // A relay-only node is a standalone relay, so its operator selects push
     // exactly as an scp-relay operator does (PUSH-012). Read before the blob
-    // store opens, so a refusal leaves no store behind.
+    // store opens, so a refusal leaves no blob store behind.
     let push = or_exit(startup::push_selection_from_env());
-    or_exit(startup::require_push_servable(&push));
-    tracing::info!("push: none (SCP_RELAY_PUSH_PLATFORMS=none)");
+    config.push = or_exit(startup::push_role_from(push));
+    startup::log_push_role(&config.push);
 
     let storage = Arc::new(or_exit(startup::storage_from_env(backend).await));
     let shutdown = or_exit(startup::shutdown_signal());

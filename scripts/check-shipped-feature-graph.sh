@@ -274,6 +274,7 @@ scp-relay-client/default
 scp-runtime/default
 scp-sqlite-pools/default
 scp-transport/default
+scp-transport/push-store
 scp-transport/redb-blob
 scp-transport/sqlite-blob
 scp-transport/startup

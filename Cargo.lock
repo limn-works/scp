@@ -5315,6 +5315,7 @@ name = "scp-relay"
 version = "0.1.0-beta.2"
 dependencies = [
  "axum",
+ "base64",
  "metrics",
  "metrics-exporter-prometheus",
  "scp-alloc",
