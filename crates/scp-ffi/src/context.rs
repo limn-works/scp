@@ -1638,7 +1638,7 @@ fn drain_and_deliver(py: Python<'_>, bi: &crate::runtime::PyBridgeInstance, cont
         // Best-effort: if no channel is open or the channel is full, the
         // event is dropped. This matches the subscription model where
         // events before subscribe are lost.
-        let _ = crate::runtime::deliver_message(bi, context_id, msg);
+        let _ = crate::runtime::deliver_message(py, bi, context_id, msg);
     }
 }
 
@@ -1682,7 +1682,7 @@ fn drain_and_deliver_via_sender(
         let msg = PyMessage::new(bi, sender_did, payload, timestamp, context_id.to_owned());
         // Best-effort delivery through the captured handles (same
         // oldest-drop overflow semantics as `deliver_message`).
-        let _ = crate::runtime::deliver_message_with_handles(bi, context_id, &tx, &rx, msg);
+        let _ = crate::runtime::deliver_message_with_handles(py, bi, context_id, &tx, &rx, msg);
     }
 }
 
@@ -7540,8 +7540,9 @@ mod tests {
         })
         .unwrap();
 
+        pyo3::prepare_freethreaded_python();
         let msg = make_test_message(42, context_id);
-        crate::runtime::deliver_message(&bi, context_id, msg).unwrap();
+        Python::with_gil(|py| crate::runtime::deliver_message(py, &bi, context_id, msg)).unwrap();
 
         let mut guard = rx_arc.lock().await;
         let received = guard.try_recv().unwrap();
@@ -7550,10 +7551,56 @@ mod tests {
 
         crate::runtime::close_receive_channel(&bi, context_id).unwrap();
 
-        let result =
-            crate::runtime::deliver_message(&bi, context_id, make_test_message(43, context_id));
+        let result = Python::with_gil(|py| {
+            crate::runtime::deliver_message(py, &bi, context_id, make_test_message(43, context_id))
+        });
         assert!(result.is_err(), "should fail after channel is closed");
 
+        crate::runtime::remove_context(&bi, context_id);
+    }
+
+    /// The oldest-drop overflow runs on a runtime worker thread. Its wait for
+    /// the receiver lock goes through the bridge wait, which takes the
+    /// multi-thread regime there; the `blocking_lock` it replaced panicked
+    /// with "Cannot block the current thread from within a runtime".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deliver_message_overflow_on_a_runtime_worker_drops_the_oldest() {
+        let context_id = "ctx-overflow-on-worker";
+        let capacity = RECEIVE_BUFFER_CAPACITY;
+        let bi = __bi();
+        pyo3::prepare_freethreaded_python();
+
+        crate::runtime::register_context(&bi, context_id, "did:test:creator", &[]).unwrap();
+
+        let (tx, rx) = mpsc::channel::<PyMessage>(capacity);
+        let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
+
+        crate::runtime::with_context(&bi, context_id, |rt| {
+            rt.message_tx = Some(tx);
+            rt.message_rx = Some(Arc::clone(&rx_arc));
+            Ok(())
+        })
+        .unwrap();
+
+        Python::with_gil(|py| {
+            for i in 0..=capacity {
+                crate::runtime::deliver_message(
+                    py,
+                    &bi,
+                    context_id,
+                    make_test_message(i, context_id),
+                )
+                .unwrap();
+            }
+        });
+
+        let mut guard = rx_arc.lock().await;
+        let first = guard.try_recv().unwrap();
+        assert_eq!(
+            first.sender_did, "did:test:sender-1",
+            "the oldest message (sender-0) must have been dropped"
+        );
+        drop(guard);
         crate::runtime::remove_context(&bi, context_id);
     }
 
@@ -7575,23 +7622,32 @@ mod tests {
         })
         .unwrap();
 
-        // Fill the buffer from a blocking thread to avoid the
-        // "cannot call blocking_lock from within a runtime" panic.
-        // deliver_message uses blocking_lock internally for oldest-drop.
+        // Fill the buffer from a blocking thread: deliver_message's
+        // oldest-drop waits for the receiver lock through the bridge wait,
+        // which must not block this test's runtime thread.
+        pyo3::prepare_freethreaded_python();
         let ctx_id = context_id.to_owned();
         let bi_task = Arc::clone(&bi);
         tokio::task::spawn_blocking(move || {
-            for i in 0..capacity {
-                crate::runtime::deliver_message(&bi_task, &ctx_id, make_test_message(i, &ctx_id))
+            Python::with_gil(|py| {
+                for i in 0..capacity {
+                    crate::runtime::deliver_message(
+                        py,
+                        &bi_task,
+                        &ctx_id,
+                        make_test_message(i, &ctx_id),
+                    )
                     .unwrap();
-            }
+                }
 
-            crate::runtime::deliver_message(
-                &bi_task,
-                &ctx_id,
-                make_test_message(capacity, &ctx_id),
-            )
-            .unwrap();
+                crate::runtime::deliver_message(
+                    py,
+                    &bi_task,
+                    &ctx_id,
+                    make_test_message(capacity, &ctx_id),
+                )
+                .unwrap();
+            });
         })
         .await
         .unwrap();
@@ -7639,8 +7695,10 @@ mod tests {
 
         crate::runtime::close_receive_channel(&bi, context_id).unwrap();
 
-        let result =
-            crate::runtime::deliver_message(&bi, context_id, make_test_message(0, context_id));
+        pyo3::prepare_freethreaded_python();
+        let result = Python::with_gil(|py| {
+            crate::runtime::deliver_message(py, &bi, context_id, make_test_message(0, context_id))
+        });
         assert!(
             result.is_err(),
             "deliver should fail after close_receive_channel"

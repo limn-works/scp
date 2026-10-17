@@ -21,9 +21,9 @@
 //! [`OnceLock`]. Every synchronous bridge function waits on a tokio future
 //! through `actor_wait::block_on_released`, which releases the Python GIL for
 //! the whole wait (ADR-049 Decision 7a). `scripts/check-bridge-block-on.py`
-//! fails every `block_on` and `block_in_place` under `crates/scp-ffi/` outside
-//! `scp_ffi_common::bridge_wait::bridge_block_on`, and every caller of that
-//! helper missing from the gate's `CALLERS` list.
+//! fails every `block_on`, `block_in_place` and other thread-blocking call
+//! under `crates/scp-ffi/` outside `scp_ffi_common::bridge_wait`, and every
+//! caller of its waits missing from the gate's `CALLERS` list.
 //!
 //! The exception is `PyMessageReceiver::__anext__`, which returns an
 //! `asyncio.Future` and spawns the recv on the tokio runtime, resolving the

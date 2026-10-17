@@ -5826,13 +5826,26 @@ impl McpUniFfiBridgeProvider {
         // bounded by `outlet_timeout_ms` (matching PyO3 pattern, issue #123).
         let (output, output_hash) = {
             let (handler, output_schema) = dispatch;
-            let (tx, rx) = std::sync::mpsc::channel();
+            let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
                 let result = handler(arguments);
                 let _ = tx.send(result);
             });
 
-            let handler_result = rx.recv_timeout(timeout).map_err(|_| {
+            // The wait is an async timeout driven by the bridge wait, because
+            // no bridge code blocks outside `bridge_wait`. Inside a
+            // current-thread runtime it runs on a private runtime, so the
+            // handler is waited on in every regime, as before. A timeout, or a
+            // handler thread that ended without sending (it panicked), is
+            // reported as the timeout.
+            let handler_result = scp_ffi_common::bridge_wait::bridge_block_on_off_thread(
+                || Ok(crate::runtime()),
+                async move { tokio::time::timeout(timeout, rx).await },
+            )
+            .map_err(|e| format!("outlet handler for '{outlet_name}' wait failed: {e}"))?
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| {
                 format!(
                     "outlet handler for '{outlet_name}' timed out after {}ms",
                     timeout.as_millis()
@@ -27581,6 +27594,150 @@ mod tests {
             1,
             "the replayed call runs no outlet"
         );
+    }
+
+    /// A handler that outlives `outlet_timeout_ms` fails the call with the
+    /// timeout error, and the wait returns at the timeout, not when the
+    /// handler finishes. The wait is an async timeout driven by the bridge
+    /// wait; a wait that ignored the timeout would hold the call for the
+    /// handler's full five seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "testing")]
+    async fn uniffi_invoke_outlet_times_out_a_slow_handler() {
+        use scp_platform::traits::KeyCustody as _;
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
+        let key = custody
+            .generate_keypair(scp_platform::traits::KeyType::Ed25519)
+            .await
+            .expect("keypair");
+        let mut public_key = [0_u8; 32];
+        public_key.copy_from_slice(
+            custody
+                .public_key(&key)
+                .await
+                .expect("public key")
+                .as_bytes(),
+        );
+        let issuer = scp_did::did_dht_from_public_key(&public_key).0;
+        let agent = "did:dht:z6MkAgentSlowHandler";
+
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+        bi.init_context_manager_with_did(&issuer);
+        let supervisor = bi
+            .context_manager_or_error()
+            .expect("supervisor must be attached")
+            .clone();
+        supervisor
+            .create_context(
+                "ctx-test".to_owned(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![
+                        scp_core::context::roles::Capability::MessagesRead,
+                        scp_core::context::roles::Capability::OutletCallAll,
+                    ],
+                    ..scp_core::context::ContextParams::default()
+                },
+                scp_did::DID(issuer.clone()),
+                None,
+            )
+            .await
+            .expect("context creation must succeed");
+        supervisor
+            .test_insert_member("ctx-test", scp_did::DID(agent.to_owned()), "admin")
+            .await
+            .expect("the agent must be recorded as a member of the actor");
+        let handle = test_handle_with(&scp, "did:dht:z6MkStaleHandleCreator");
+        register_context_handle(&bi, &handle);
+        handle
+            .outlet_registry
+            .lock()
+            .expect("registry lock")
+            .insert(scp_core::context::outlets::OutletRegistration {
+                outlet_id: "calculator".to_owned(),
+                kind: scp_core::context::outlets::OutletKind::Action,
+                name: "Calculator".to_owned(),
+                description: "A simple calculator".to_owned(),
+                schema: scp_core::context::outlets::OutletSchema {
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
+                },
+                implementation_hash: [0xAA; 32],
+                test_vectors: vec![],
+                operator_did: "did:dht:z6MkOperator".into(),
+                cost: None,
+                message_catalog: Vec::new(),
+                registered_at: 0,
+                signature: Vec::new(),
+            });
+        handle.outlet_handlers.lock().expect("handler lock").insert(
+            "calculator".to_owned(),
+            Arc::new(
+                move |input: serde_json::Value| -> Result<serde_json::Value, String> {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    Ok(serde_json::json!({"sum": input["a"]}))
+                },
+            ),
+        );
+
+        let capabilities = vec!["outlet:call:*".to_owned()];
+        let params = scp_core::crypto::ucan::mint::MintParams {
+            issuer_did: &issuer,
+            issuer_key: &key,
+            audience_did: agent,
+            context_id: "ctx-test",
+            capabilities: &capabilities,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+        };
+        // One token per call: the Invoke check spends each token's nonce.
+        let mut providers = Vec::new();
+        for _ in 0..2 {
+            let token =
+                scp_core::crypto::ucan::mint::mint_ucan(&params, &custody, &scp_clock::SystemClock)
+                    .await
+                    .expect("mint");
+            providers.push(McpUniFfiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: agent.to_owned(),
+                context_ids: vec!["ctx-test".to_owned()],
+                outlet_timeout_ms: 50,
+                agent_ucan_token: Some(token.encoded),
+                agent_proof_tokens: None,
+            });
+        }
+        let on_foreign = providers.pop().expect("two providers");
+        let provider = providers.pop().expect("two providers");
+        use scp_mcp::server::ContextProvider as _;
+        let assert_times_out = |provider: &McpUniFfiBridgeProvider, regime: &str| {
+            let started = std::time::Instant::now();
+            let result =
+                provider.invoke_outlet("ctx-test", "calculator", serde_json::json!({"a": 1}));
+            let waited = started.elapsed();
+            let err = result.expect_err("a handler slower than the timeout must fail the call");
+            let text = format!("{err:?}");
+            assert!(
+                text.contains("timed out after 50ms"),
+                "{regime}: the error must name the timeout: {text}"
+            );
+            assert!(
+                waited < std::time::Duration::from_secs(4),
+                "{regime}: the wait must end at the timeout, not when the handler returns: {waited:?}"
+            );
+        };
+        // On a runtime worker: the multi-thread regime.
+        assert_times_out(&provider, "runtime worker");
+        // On a foreign thread with no runtime: the shared-runtime regime,
+        // which builds the timer inside the runtime it drives.
+        std::thread::spawn(move || assert_times_out(&on_foreign, "foreign thread"))
+            .join()
+            .expect("the foreign-thread call must not panic");
     }
 
     /// The MCP outlet and resource access gates read the actor's lifecycle

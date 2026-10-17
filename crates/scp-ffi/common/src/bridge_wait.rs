@@ -1,15 +1,21 @@
 //! The one way an FFI bridge blocks a thread on async work.
 //!
-//! [`bridge_block_on`] is the only `block_on` or `block_in_place` caller
-//! under `crates/scp-ffi/`; `scripts/check-bridge-block-on.py` fails any
-//! other production site in the `PyO3`, napi and `UniFFI` bridges and in this
-//! crate (ADR-049 Decision 7a, "Host threads"). A bridge that must release a
+//! This module is the only code in any bridge allowed to block a thread.
+//! Its private `drive` is the only `block_on` or
+//! `block_in_place` caller under `crates/scp-ffi/`, reached through
+//! [`bridge_block_on`] and [`bridge_block_on_off_thread`];
+//! `scripts/check-bridge-block-on.py` fails any other production site in the
+//! `PyO3`, napi and `UniFFI` bridges and in this crate, and every other
+//! thread-blocking call (`std::thread::sleep`, a sync channel's `recv`,
+//! `recv_timeout` or `recv_deadline`, a `Condvar` wait, tokio's `blocking_*`)
+//! outside this file (ADR-049 Decision 7a, "Host threads"). A bridge that must release a
 //! host lock around the wait does so around its call to this helper: `PyO3`
 //! calls [`bridge_block_on_off_thread`] inside `Python::allow_threads`
 //! (`actor_wait::block_on_released`).
 //!
-//! The helper picks the regime that the ambient tokio state permits, so no
-//! call site chooses one and none can choose one that panics:
+//! The helper reads the ambient tokio state once per wait (`regime`) and
+//! picks the regime it permits, so no call site chooses one and none can
+//! choose one that panics:
 //!
 //! 1. no ambient runtime (a host thread, a napi-rs or libuv worker, a
 //!    scoped resolution thread): the caller's shared runtime's
@@ -56,9 +62,49 @@ pub enum BridgeBlockOnError {
     WaitThreadPanicked,
 }
 
-fn ambient_is_current_thread() -> bool {
-    tokio::runtime::Handle::try_current()
-        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread)
+/// The ambient tokio state, read once per wait; the module documentation
+/// numbers the regimes.
+enum Regime {
+    /// Regime 1: no ambient runtime.
+    NoRuntime,
+    /// Regime 2: a multi-thread ambient runtime, whose handle drives the
+    /// wait under `block_in_place`.
+    MultiThread(tokio::runtime::Handle),
+    /// Regime 3: a current-thread ambient runtime, or a flavor neither
+    /// `Runtime::block_on` nor `block_in_place` is known to accept there.
+    CurrentThread,
+}
+
+fn regime() -> Regime {
+    match tokio::runtime::Handle::try_current() {
+        Err(_) => Regime::NoRuntime,
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            Regime::MultiThread(handle)
+        }
+        Ok(_) => Regime::CurrentThread,
+    }
+}
+
+/// Drives `fut` in regime 1 or 2, and gives it back unpolled in regime 3.
+/// The only code under `crates/scp-ffi/` that names `block_on` or
+/// `block_in_place` (`scripts/check-bridge-block-on.py`).
+fn drive<'r, F, S>(
+    regime: Regime,
+    shared: S,
+    fut: F,
+) -> Result<Result<F::Output, F>, BridgeBlockOnError>
+where
+    F: Future,
+    S: FnOnce() -> Result<&'r tokio::runtime::Runtime, String>,
+{
+    match regime {
+        Regime::NoRuntime => {
+            let rt = shared().map_err(BridgeBlockOnError::SharedRuntimeUnavailable)?;
+            Ok(Ok(rt.block_on(fut)))
+        }
+        Regime::MultiThread(handle) => Ok(Ok(tokio::task::block_in_place(|| handle.block_on(fut)))),
+        Regime::CurrentThread => Ok(Err(fut)),
+    }
 }
 
 /// Drives `fut` to completion on the calling thread, in the regime the
@@ -76,16 +122,7 @@ where
     F: Future,
     S: FnOnce() -> Result<&'r tokio::runtime::Runtime, String>,
 {
-    match tokio::runtime::Handle::try_current() {
-        Err(_) => {
-            let rt = shared().map_err(BridgeBlockOnError::SharedRuntimeUnavailable)?;
-            Ok(rt.block_on(fut))
-        }
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            Ok(tokio::task::block_in_place(|| handle.block_on(fut)))
-        }
-        Ok(_) => Err(BridgeBlockOnError::CurrentThreadRuntime),
-    }
+    drive(regime(), shared, fut)?.map_err(|_| BridgeBlockOnError::CurrentThreadRuntime)
 }
 
 /// [`bridge_block_on`], except that in regime 3 it drives `fut` on a private
@@ -105,9 +142,10 @@ where
     F::Output: Send,
     S: FnOnce() -> Result<&'r tokio::runtime::Runtime, String>,
 {
-    if !ambient_is_current_thread() {
-        return bridge_block_on(shared, fut);
-    }
+    let fut = match drive(regime(), shared, fut)? {
+        Ok(output) => return Ok(output),
+        Err(fut) => fut,
+    };
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -115,7 +153,9 @@ where
                     .enable_all()
                     .build()
                     .map_err(|e| BridgeBlockOnError::PrivateRuntimeBuild(e.to_string()))?;
-                bridge_block_on(|| Ok(&rt), fut)
+                // A scoped thread has no ambient runtime: regime 1 on `rt`.
+                drive(Regime::NoRuntime, || Ok(&rt), fut)?
+                    .map_err(|_| BridgeBlockOnError::CurrentThreadRuntime)
             })
             .join()
             .map_err(|_| BridgeBlockOnError::WaitThreadPanicked)?
@@ -214,6 +254,48 @@ mod tests {
             })
         })?;
         assert_eq!(out, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn regime_reads_no_runtime_outside_every_runtime() {
+        assert!(matches!(regime(), Regime::NoRuntime));
+    }
+
+    #[test]
+    fn regime_reads_a_multi_thread_ambient_runtime() -> Result<(), BridgeBlockOnError> {
+        let ambient = shared_rt()?;
+        let read = ambient.block_on(async { regime() });
+        assert!(matches!(read, Regime::MultiThread(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn regime_reads_a_current_thread_ambient_runtime() -> Result<(), BridgeBlockOnError> {
+        let ambient = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| BridgeBlockOnError::PrivateRuntimeBuild(e.to_string()))?;
+        let read = ambient.block_on(async { regime() });
+        assert!(matches!(read, Regime::CurrentThread));
+        Ok(())
+    }
+
+    /// Regime 3 gives the future back unpolled, so the caller still owns it.
+    #[test]
+    fn drive_gives_the_future_back_in_regime_3() -> Result<(), BridgeBlockOnError> {
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let fut = async {
+            polled.store(true, std::sync::atomic::Ordering::SeqCst);
+            4_u8
+        };
+        let back = drive(
+            Regime::CurrentThread,
+            || Err("must not be called".to_owned()),
+            fut,
+        )?;
+        assert!(back.is_err());
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
         Ok(())
     }
 
