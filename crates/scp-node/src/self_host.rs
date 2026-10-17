@@ -69,9 +69,6 @@ pub enum SelfHostError {
     /// Failed to connect the in-process supervisor to the loopback relay.
     #[error("failed to connect supervisor to loopback relay: {0}")]
     RelayConnect(String),
-    /// Failed to register the node DID with the supervisor.
-    #[error("failed to register local DID with supervisor: {0}")]
-    RegisterDid(String),
     /// Failed to register the broadcast context on the node.
     #[error("failed to register broadcast context on node: {0}")]
     RegisterContext(String),
@@ -851,12 +848,7 @@ where
         durable,
     );
 
-    if let Err(e) = supervisor.register_local_did(author_did.clone()).await {
-        // Drain before failing, so no tracked task outlives the caller's
-        // storage (ADR-049 Decision 16).
-        let cause = SelfHostError::RegisterDid(e.to_string());
-        return Err(drain_after_failure(&supervisor, cause).await);
-    }
+    supervisor.register_local_did(author_did.clone()).await;
 
     Ok(supervisor)
 }

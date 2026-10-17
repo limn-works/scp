@@ -2739,13 +2739,7 @@ impl crate::scp::PyScp {
                 // matching NAPI's behavior. Routes through the supervisor's direct
                 // method (no per-context command — the local-DID set is
                 // supervisor-wide).
-                sup.register_local_did(creator_did_for_register)
-                    .await
-                    .map_err(|e| {
-                        scp_core::context::ContextError::CreationFailed(format!(
-                            "register_local_did failed: {e}"
-                        ))
-                    })?;
+                sup.register_local_did(creator_did_for_register).await;
                 Ok::<(), scp_core::context::ContextError>(())
             })
             .map_err(|e| {

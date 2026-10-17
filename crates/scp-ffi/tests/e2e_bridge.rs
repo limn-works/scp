@@ -162,7 +162,7 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
             .create_context(ctx_id.clone(), params, creator.clone(), None, Vec::new())
             .await
             .unwrap();
-        supervisor.register_local_did(creator).await.unwrap();
+        supervisor.register_local_did(creator).await;
     });
 
     context_id
@@ -1421,7 +1421,7 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
             .create_context(ctx_id.clone(), params, creator.clone(), None, Vec::new())
             .await
             .unwrap();
-        supervisor.register_local_did(creator).await.unwrap();
+        supervisor.register_local_did(creator).await;
     });
 }
 
@@ -3284,8 +3284,7 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
         }
         let creator = scp_did::DID(owner);
         let sup = supervisor;
-        rt.block_on(async move { sup.register_local_did(creator).await })
-            .unwrap();
+        rt.block_on(async move { sup.register_local_did(creator).await });
 
         let token = scp
             .ucan_mint(&wide, &holder, vec!["messages:write".to_owned()], None)
@@ -3384,8 +3383,7 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator() {
         }
         let creator = scp_did::DID(owner.clone());
         let sup = supervisor;
-        rt.block_on(async move { sup.register_local_did(creator).await })
-            .unwrap();
+        rt.block_on(async move { sup.register_local_did(creator).await });
 
         // The mint issues as the supervisor's creator of `anchored`: `owner`.
         let token = scp
@@ -3646,7 +3644,7 @@ fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
                 .create_context(narrow_ctx, params, creator.clone(), None, Vec::new())
                 .await
                 .unwrap();
-            supervisor.register_local_did(creator).await.unwrap();
+            supervisor.register_local_did(creator).await;
         });
 
         let err = scp
@@ -4017,7 +4015,7 @@ fn session_invoke_validates_the_ucan_against_the_supervisor_ceiling() {
                 .create_context(supervisor_ctx, params, creator.clone(), None, Vec::new())
                 .await
                 .unwrap();
-            supervisor.register_local_did(creator).await.unwrap();
+            supervisor.register_local_did(creator).await;
         });
         rt.block_on(seeding_supervisor.test_insert_member(
             &ctx_id,

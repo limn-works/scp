@@ -1932,8 +1932,11 @@ pub struct Supervisor {
     // -----------------------------------------------------------------
     /// Shared crypto provider. Populated by [`Self::with_providers_and_journal`].
     crypto: OnceLock<Arc<crate::crypto::mls::provider::NodeMlsFactory>>,
-    /// Shared transport provider. Populated by [`Self::with_providers_and_journal`].
-    transport: OnceLock<Arc<dyn ContextTransportProvider>>,
+    /// Shared transport binding. Populated by [`Self::with_providers_and_journal`]
+    /// with a [`TransportSlot`](super::TransportSlot) around the caller's
+    /// provider. The `OnceLock` is set once; the provider inside the slot is
+    /// rebound through an `ArcSwap` (lock-free read per ADR-049 Decision 12).
+    transport: OnceLock<Arc<super::TransportSlot>>,
     /// Shared event-log provider. Populated by [`Self::with_providers_and_journal`].
     event_log: OnceLock<Arc<dyn ContextEventLogProvider>>,
     /// Helper-side persistence slot. [`Self::with_providers_and_journal`]
@@ -2599,7 +2602,9 @@ impl Supervisor {
         // is already populated, which is impossible on this freshly-constructed
         // supervisor; `let _ =` discards the `Result` for clippy.
         let _ = supervisor.crypto.set(crypto);
-        let _ = supervisor.transport.set(Arc::from(transport));
+        let _ = supervisor
+            .transport
+            .set(Arc::new(super::TransportSlot::new(Arc::from(transport))));
         let _ = supervisor.event_log.set(Arc::from(event_log));
         if let Some(p) = helper_persistence {
             let _ = supervisor.helper_persistence.set(p);
@@ -2742,12 +2747,27 @@ impl Supervisor {
         self.crypto.get()
     }
 
-    /// Cheap reference to the supervisor's shared
-    /// [`ContextTransportProvider`]. Returns `None` if
+    /// The supervisor's shared [`ContextTransportProvider`]: its
+    /// [`TransportSlot`](super::TransportSlot), whose calls reach the
+    /// provider bound at call time. Returns `None` if
     /// [`Self::with_providers_and_journal`] was not used.
     #[must_use]
-    pub(crate) fn transport_ref(&self) -> Option<&Arc<dyn ContextTransportProvider>> {
-        self.transport.get()
+    pub(crate) fn transport_ref(&self) -> Option<Arc<dyn ContextTransportProvider>> {
+        self.transport
+            .get()
+            .map(|slot| Arc::clone(slot) as Arc<dyn ContextTransportProvider>)
+    }
+
+    /// This supervisor's [`TransportSlot`](super::TransportSlot), through which
+    /// a bridge binds the transport of the node it starts
+    /// (`construction.md` §"Node start — `NodeStartConfig`"). Every actor
+    /// this supervisor spawned holds the same slot, so a
+    /// [`TransportSlot::replace`](super::TransportSlot::replace) reaches
+    /// running contexts without a respawn. Returns `None` for a supervisor
+    /// built without providers.
+    #[must_use]
+    pub fn transport_slot(&self) -> Option<Arc<super::TransportSlot>> {
+        self.transport.get().map(Arc::clone)
     }
 
     /// Cheap reference to the supervisor's shared
@@ -3194,7 +3214,7 @@ impl Supervisor {
 
         let crypto = self.crypto_ref().ok_or_else(not_init)?;
         let mls = Arc::clone(crypto.mls_backend());
-        let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
+        let transport = self.transport_ref().ok_or_else(not_init)?;
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
         let mls_storage = Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?);
         Ok(
@@ -3298,7 +3318,7 @@ impl Supervisor {
         // mls/hpke stay transitive — the NodeMlsFactory owns the only
         // backend pair (ADR §6); no Supervisor field mirrors them.
         let mls = Arc::clone(crypto.mls_backend());
-        let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
+        let transport = self.transport_ref().ok_or_else(not_init)?;
         let event_log = Arc::clone(self.event_log_ref().ok_or_else(not_init)?);
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
         let key_resolver = self.key_resolver_ref().ok_or_else(not_init)?.clone();
@@ -11242,16 +11262,10 @@ impl Supervisor {
 
     /// Register a DID as locally controlled by this node / SDK.
     ///
-    /// Idempotent: registering the same DID twice is a no-op.
-    ///
-    /// # Errors
-    ///
-    /// Currently always returns `Ok(())` — the `Result` shape preserves
-    /// the legacy method's signature so callers can keep their
-    /// `?`-style propagation untouched.
-    pub async fn register_local_did(&self, did: DID) -> Result<(), ContextError> {
+    /// Idempotent: registering the same DID twice is a no-op. Infallible: the
+    /// registration is an insert into the supervisor-wide local-DID set.
+    pub async fn register_local_did(&self, did: DID) {
         crate::context::queries_helpers::register_local_did(self, did).await;
-        Ok(())
     }
 
     /// Returns `true` iff `did` is registered as locally controlled.
@@ -11261,19 +11275,6 @@ impl Supervisor {
     /// Currently always returns `Ok(_)`.
     pub async fn is_local_did(&self, did: &DID) -> Result<bool, ContextError> {
         Ok(crate::context::queries_helpers::is_local_did(self, did).await)
-    }
-
-    /// Returns `true` when this `Supervisor` holds a transport provider whose
-    /// [`ContextTransportProvider::is_connected`] reports a reachable relay.
-    ///
-    /// `false` for a `Supervisor` built without providers and for one holding
-    /// the bridges' `NotConfiguredTransportProvider`. A bridge's node start
-    /// reads it after attaching the `Supervisor`, and fails with
-    /// `ServerError::SupervisorWiring` when it is `false` (sdk-common.md
-    /// §"Node start error codes").
-    #[must_use]
-    pub fn transport_connected(&self) -> bool {
-        self.transport_ref().is_some_and(|t| t.is_connected())
     }
 
     /// Restore every persisted context from the configured persistence
@@ -17991,12 +17992,11 @@ mod tests {
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::in_memory::InMemoryStorage;
 
-    /// A `Supervisor` with no transport provider reports no connected relay.
-    /// The bridges' node-start tests cover the connected case, where a
-    /// `RelayTransportProvider` reaches the node's relay.
+    /// A `Supervisor` built without providers holds no transport slot, so a
+    /// bridge cannot bind a node's relay transport to it.
     #[test]
-    fn transport_connected_is_false_without_a_transport_provider() {
-        assert!(!Supervisor::for_query_shim().transport_connected());
+    fn transport_slot_is_absent_without_providers() {
+        assert!(Supervisor::for_query_shim().transport_slot().is_none());
     }
 
     /// The escrow-reversal join log names a panic as a panic without its
@@ -26432,8 +26432,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(bob_sup.register_local_did(DID::from(Self::BOB)))
-                .expect("register bob as a local DID");
+            rt.block_on(bob_sup.register_local_did(DID::from(Self::BOB)));
             let bob_deps = rt
                 .block_on(bob_sup.build_actor_deps(&DID::from(Self::BOB)))
                 .expect("build bob's actor deps");
@@ -28527,8 +28526,8 @@ mod tests {
         // smaller one; the respawn will derive that as `owning_did`.
         let did_a = DID("did:example:aaa-first".to_owned());
         let did_b = DID("did:example:zzz-second".to_owned());
-        sup.register_local_did(did_a.clone()).await.unwrap();
-        sup.register_local_did(did_b.clone()).await.unwrap();
+        sup.register_local_did(did_a.clone()).await;
+        sup.register_local_did(did_b.clone()).await;
 
         // Spawn an Active context (creator = did_b, the NON-min DID) and
         // persist its snapshot.

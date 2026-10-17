@@ -1635,6 +1635,7 @@ mod server_error_tests {
     /// after SCP-321, paired with its code and class. `DevStartUnavailable` is
     /// absent until it exists.
     fn rows() -> Vec<(E, &'static str, ServerErrorClass)> {
+        use crate::server::SupervisorWiringError as W;
         use ServerErrorClass::{Context, Identity, Transport, Validation};
         let io = || std::io::Error::other("x");
         vec![
@@ -1684,7 +1685,26 @@ mod server_error_tests {
                 Transport,
             ),
             (
-                E::SupervisorWiring(crate::server::SupervisorWiringError::SupervisorNotConnected),
+                E::SupervisorWiring(W::NodeAlreadyBound),
+                TRANS_5056,
+                Transport,
+            ),
+            (
+                E::SupervisorWiring(W::RelayConnect(
+                    scp_transport::TransportError::ConnectionFailed("x".into()),
+                )),
+                TRANS_5056,
+                Transport,
+            ),
+            (
+                E::SupervisorWiring(W::SupervisorUnavailable),
+                TRANS_5056,
+                Transport,
+            ),
+            (
+                E::SupervisorWiring(W::TransportInstall(
+                    crate::bridge_instance::TransportLockError::Poisoned,
+                )),
                 TRANS_5056,
                 Transport,
             ),

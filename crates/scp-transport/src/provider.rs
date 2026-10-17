@@ -16,9 +16,12 @@
 //! `Arc<dyn ContextTransportProvider>` in `ActorDeps` (moved into
 //! `tokio::spawn`).
 //!
-//! The `is_connected` method stays **sync** — it tracks connection state via
-//! an `AtomicBool` set during construction or reconnection (ADR-049 Decision 7
-//! `is_connected`-stays-sync carve-out).
+//! The `is_connected` method stays **sync**: it reads an `AtomicBool`
+//! (ADR-049 Decision 7 `is_connected`-stays-sync carve-out). The flag is
+//! `true` from construction and changes only through
+//! [`RelayTransportProvider::mark_disconnected`] and
+//! [`RelayTransportProvider::mark_connected`], which no adapter path calls, so
+//! it does not report whether the relay is reachable now.
 //!
 //! # Thread Safety
 //!
@@ -47,8 +50,10 @@ const DEFAULT_BLOB_TTL: u32 = 3600;
 
 /// Production [`ContextTransportProvider`] wrapping a [`TransportAdapter`].
 ///
-/// Provides relay connectivity checks, context publication, deletion, and
-/// message sending by delegating to the underlying transport adapter.
+/// Provides context publication, deletion, and message sending by delegating
+/// to the underlying transport adapter. Its `is_connected` flag reports only
+/// what the last `mark_*` call set, `true` from construction; it never probes
+/// the relay.
 ///
 /// # Construction
 ///
@@ -69,15 +74,19 @@ pub struct RelayTransportProvider<A: TransportAdapter + Send + Sync + 'static> {
     /// `Mutex`): every [`TransportAdapter`] method takes `&self`, so the
     /// async provider methods share `&A` and `.await` directly.
     adapter: Arc<A>,
-    /// Whether the transport is currently connected.
+    /// The connection flag `is_connected` returns: `true` from construction,
+    /// changed only by [`Self::mark_disconnected`] and
+    /// [`Self::mark_connected`]. No adapter path calls either, so the flag
+    /// does not follow the adapter's live connection.
     connected: AtomicBool,
 }
 
 impl<A: TransportAdapter + Send + Sync + 'static> RelayTransportProvider<A> {
     /// Creates a new `RelayTransportProvider` wrapping the given adapter.
     ///
-    /// The provider starts in the connected state (the adapter was
-    /// successfully connected during construction).
+    /// The provider starts with its connection flag set: the caller passes an
+    /// adapter that already connected. The flag does not change when that
+    /// adapter later loses its connection.
     #[must_use]
     pub fn new(adapter: A) -> Self {
         Self {
@@ -86,19 +95,19 @@ impl<A: TransportAdapter + Send + Sync + 'static> RelayTransportProvider<A> {
         }
     }
 
-    /// Marks the provider as disconnected.
+    /// Clears the connection flag, so `is_connected()` returns `false` until
+    /// [`mark_connected`](Self::mark_connected) sets it again.
     ///
-    /// Call this when the underlying transport connection is lost (e.g.,
-    /// WebSocket close, network error). The provider will report
-    /// `is_connected() == false` until [`mark_connected`](Self::mark_connected)
-    /// is called.
+    /// No adapter path calls this method; a caller that observes the adapter
+    /// losing its connection calls it.
     pub fn mark_disconnected(&self) {
         self.connected.store(false, Ordering::Release);
     }
 
-    /// Marks the provider as connected.
+    /// Sets the connection flag, so `is_connected()` returns `true`.
     ///
-    /// Call this after successfully reconnecting the underlying transport.
+    /// No adapter path calls this method; a caller that reconnected the
+    /// adapter calls it.
     pub fn mark_connected(&self) {
         self.connected.store(true, Ordering::Release);
     }

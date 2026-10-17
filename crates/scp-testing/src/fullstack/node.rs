@@ -321,7 +321,7 @@ impl FullStackNode {
         // the harness never registered its own DID; in production the FFI bridge
         // registers each identity via `identity_add`. Mirror that here (idempotent,
         // supervisor-wide) so this node can identify itself as the local member.
-        let _ = self.manager.register_local_did(self.did.clone()).await;
+        self.manager.register_local_did(self.did.clone()).await;
         self.manager
             // The in-process harness has no relay (module docs), so no relay
             // hosts the context.
@@ -514,7 +514,7 @@ impl FullStackNode {
         // production the FFI bridge registers each identity via `identity_add`;
         // mirror that here (idempotent) so this joiner can identify itself as the
         // local member when it opens incumbent traffic.
-        let _ = self.manager.register_local_did(self.did.clone()).await;
+        self.manager.register_local_did(self.did.clone()).await;
 
         // 1. Take the sealed invitation (bundle + reservation id) the creator
         //    deposited.

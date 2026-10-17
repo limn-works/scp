@@ -69,14 +69,15 @@ fn node_err(e: NodeError) -> NapiError {
 /// shuts `node` down, removes it from the instance's node registry, and
 /// returns `ServerError::SupervisorWiring` (`SCP-TRANS-5056`, sdk-common.md
 /// §"Node start error codes"). The attach step is napi's
-/// `init_supervisor_with_relay_transport`.
+/// [`crate::runtime::init_supervisor`], the same set-once init
+/// `context_create` runs.
 async fn auto_wire_context_manager(
     bi: &Arc<NapiBridgeInstance>,
     node: &Arc<RunningNode>,
     relay_url: &str,
 ) -> napi::Result<()> {
-    server::wire_supervisor_to_node(&bi.core, node, relay_url, |did, adapter| {
-        crate::runtime::init_supervisor_with_relay_transport(bi, did, adapter);
+    server::wire_supervisor_to_node(&bi.core, node, relay_url, |did| {
+        crate::runtime::init_supervisor(bi, did);
     })
     .await
     .map_err(server_err)
@@ -196,13 +197,15 @@ impl NapiNodeHandle {
         self.inner.is_shutdown()
     }
 
-    /// Signals the node to stop (relay + background tasks).
+    /// Signals the node to stop (relay + background tasks), and unbinds the
+    /// instance's `Supervisor` transport from this node when it holds the
+    /// binding.
     ///
     /// In-flight connection handlers drain naturally after shutdown is
     /// signaled — they are not cancelled.
     #[napi]
     pub fn shutdown(&self) {
-        self.inner.shutdown();
+        server::stop_node(&self.bi.core, &self.inner);
     }
 
     /// Activates HTTP broadcast projection with site configuration.
@@ -384,7 +387,7 @@ impl NapiNodeHandle {
 
 impl Drop for NapiNodeHandle {
     fn drop(&mut self) {
-        self.inner.shutdown();
+        server::stop_node(&self.bi.core, &self.inner);
         decrement_handle_count();
     }
 }
@@ -917,9 +920,7 @@ mod tests {
                 codes::TRANS_5054,
             ),
             (
-                ServerError::SupervisorWiring(
-                    server::SupervisorWiringError::SupervisorNotConnected,
-                ),
+                ServerError::SupervisorWiring(server::SupervisorWiringError::NodeAlreadyBound),
                 "transport",
                 codes::TRANS_5056,
             ),
@@ -989,8 +990,10 @@ mod tests {
     /// node with a relay URL that refuses the connection, returns
     /// `SCP-TRANS-5056`, shuts the node down, unregisters it, leaves no
     /// fallback `Supervisor`, and leaves the transport manager the instance
-    /// held before the start in place. A second start on an instance that
-    /// already holds a `Supervisor` also returns `SCP-TRANS-5056`.
+    /// held before the start in place. A second start while a running node
+    /// holds the binding also returns `SCP-TRANS-5056`, and a start after
+    /// that node stops binds again and puts the earlier manager back on its
+    /// stop.
     #[test]
     #[cfg(feature = "testing")]
     fn node_start_wiring_failure_returns_trans_5056_and_unregisters_the_node() {
@@ -1066,6 +1069,22 @@ mod tests {
         );
         assert_coded(&reason, "transport", codes::TRANS_5056, "second node start");
         node.shutdown();
+        let restarted = rt()
+            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .expect("a start after the bound node stops binds again");
+        assert!(server::supervisor_wired_to(
+            &scp.inner.core,
+            &restarted.inner
+        ));
+        restarted.shutdown();
+        assert_eq!(
+            scp.inner
+                .core
+                .with_transport(scp_transport::TransportManager::relay_urls)
+                .unwrap(),
+            [relay.relay_url()],
+            "a stop puts back the transport manager the first start displaced"
+        );
         relay.shutdown();
     }
 
@@ -1157,5 +1176,129 @@ mod tests {
             assert_coded(&reason, class, code, label);
         }
         drop(taken);
+    }
+
+    /// Asserts `result` is the transport error carrying `SCP-TRANS-5056` that
+    /// a start returns while another node of the instance holds the binding.
+    #[cfg(feature = "testing")]
+    fn assert_refused_while_bound(result: napi::Result<NapiNodeHandle>, label: &str) {
+        let reason = match result {
+            Ok(node) => {
+                node.shutdown();
+                panic!("{label}: a start while a running node holds the binding must fail");
+            }
+            Err(e) => e.reason.clone(),
+        };
+        assert_coded(&reason, "transport", codes::TRANS_5056, label);
+    }
+
+    /// `context_create` attaches a `Supervisor` with an unconfigured
+    /// transport. `node_start_in_memory` then binds that same `Supervisor` to
+    /// the node's relay; a second start while the first node runs fails
+    /// closed with `SCP-TRANS-5056` and leaves the first binding and the
+    /// borrower registry as they were; dropping the first handle unbinds it,
+    /// so a later start binds again.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_in_memory_binds_after_context_create_and_fails_closed_while_bound() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let did = identity.did();
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        rt().block_on(crate::context::context_create_on(
+            &scp.inner,
+            &identity,
+            params_json,
+        ))
+        .expect("context_create must succeed");
+        let core = &scp.inner.core;
+        let attached = Arc::clone(
+            core.try_supervisor()
+                .expect("context_create attaches a Supervisor"),
+        );
+
+        let first = rt()
+            .block_on(scp.node_start_in_memory(Some(did.clone())))
+            .expect("a start after context_create binds the attached Supervisor");
+        assert!(
+            Arc::ptr_eq(core.try_supervisor().unwrap(), &attached),
+            "the start keeps the Supervisor context_create attached"
+        );
+        assert!(server::supervisor_wired_to(core, &first.inner));
+
+        let borrowers = core.borrower_count();
+        assert_refused_while_bound(
+            rt().block_on(scp.node_start_in_memory(Some(did.clone()))),
+            "node_start_in_memory",
+        );
+        assert_eq!(
+            core.borrower_count(),
+            borrowers,
+            "a refused start unregisters its node"
+        );
+        assert!(server::supervisor_wired_to(core, &first.inner));
+
+        drop(first);
+        assert!(
+            core.node_binding().is_none(),
+            "dropping the handle unbinds its node"
+        );
+        let second = rt()
+            .block_on(scp.node_start_in_memory(Some(did)))
+            .expect("a start after the bound node's handle drops binds again");
+        assert!(Arc::ptr_eq(core.try_supervisor().unwrap(), &attached));
+        assert!(server::supervisor_wired_to(core, &second.inner));
+        second.shutdown();
+    }
+
+    /// `configure_local_transport` attaches a `Supervisor` with a loopback
+    /// transport. `node_start_local` then binds that same `Supervisor` to the
+    /// node's relay; a second start while the first node runs fails closed
+    /// with `SCP-TRANS-5056`; a start after `shutdown` binds again.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_local_binds_after_configure_local_transport_and_fails_closed_while_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = |name: &str| tmp.path().join(name).display().to_string();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let did = identity.did();
+        scp.configure_local_transport(did.clone()).unwrap();
+        let core = &scp.inner.core;
+        let attached = Arc::clone(
+            core.try_supervisor()
+                .expect("configure_local_transport attaches a Supervisor"),
+        );
+
+        let first = rt()
+            .block_on(scp.node_start_local(dir("first"), Some(did.clone()), None))
+            .expect("a start after configure_local_transport binds the attached Supervisor");
+        assert!(Arc::ptr_eq(core.try_supervisor().unwrap(), &attached));
+        assert!(server::supervisor_wired_to(core, &first.inner));
+
+        let borrowers = core.borrower_count();
+        assert_refused_while_bound(
+            rt().block_on(scp.node_start_local(dir("second"), Some(did.clone()), None)),
+            "node_start_local",
+        );
+        assert_eq!(core.borrower_count(), borrowers);
+        assert!(server::supervisor_wired_to(core, &first.inner));
+
+        first.shutdown();
+        assert!(!server::supervisor_wired_to(core, &first.inner));
+        let third = rt()
+            .block_on(scp.node_start_local(dir("third"), Some(did), None))
+            .expect("a start after shutdown binds again");
+        assert!(server::supervisor_wired_to(core, &third.inner));
+        third.shutdown();
     }
 }

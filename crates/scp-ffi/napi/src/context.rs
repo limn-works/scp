@@ -924,14 +924,7 @@ pub(crate) async fn context_create_on(
     // Register the creator's DID as a local DID for defense-in-depth. Routes
     // through the supervisor's direct method — the local-DID set is
     // supervisor-wide (no per-context command target).
-    sup.register_local_did(DID(creator_did.clone()))
-        .await
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("register_local_did failed: {e}"),
-                code: codes::CTX_2000.to_owned(),
-            })
-        })?;
+    sup.register_local_did(DID(creator_did.clone())).await;
 
     // Register the created context in the known-contexts discovery registry so
     // the CREATOR surfaces its own context, closing the last cell of the

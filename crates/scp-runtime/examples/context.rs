@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Register our DID so the manager recognizes us as a local participant.
     let alice: DID = "did:dht:z6MkAlice".into();
-    manager.register_local_did(alice.clone()).await?;
+    manager.register_local_did(alice.clone()).await;
 
     // 3. Define context parameters.
     let params = ContextParams {

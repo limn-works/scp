@@ -217,9 +217,7 @@ async fn bridge_restore_entry_runs_restore_and_replay_legs() {
             journal1,
             Arc::clone(&mls_storage),
         );
-        sup1.register_local_did(DID::from(creator_did))
-            .await
-            .unwrap();
+        sup1.register_local_did(DID::from(creator_did)).await;
 
         // `Encrypted` (MLS-backed) is the standard restore path: the group state
         // lives in the shared OpenMLS storage and the restore leg reinstates it.
@@ -305,9 +303,7 @@ async fn bridge_restore_entry_runs_restore_and_replay_legs() {
         Arc::clone(&journal2_for_probe),
         Arc::clone(&mls_storage),
     );
-    sup2.register_local_did(DID::from(creator_did))
-        .await
-        .unwrap();
+    sup2.register_local_did(DID::from(creator_did)).await;
 
     let bridge = CoreFields::with_supervisor(Arc::clone(&sup2));
 

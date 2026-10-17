@@ -77,10 +77,11 @@ fn node_err(e: NodeError) -> PyErr {
 /// Delegates to [`server::wire_supervisor_to_node`], which on any failure
 /// shuts `node` down, removes it from the instance's node registry, and
 /// returns `ServerError::SupervisorWiring` (`SCP-TRANS-5056`, sdk-common.md
-/// §"Node start error codes"). The attach step builds the `PyO3`
-/// `Supervisor` with a `RelayTransportProvider` over the connected adapter
-/// and the instance's persistent event-log provider: a `NoOp` event log would
-/// drop every governance, role and membership leaf that
+/// §"Node start error codes"). The attach step is
+/// [`crate::runtime::init_context_manager`], the same set-once init
+/// `context_create` runs, which builds the `Supervisor` with the instance's
+/// persistent event-log provider: a `NoOp` event log would drop every
+/// governance, role and membership leaf that
 /// `Supervisor::participation_record` (§7.3.2) reads.
 fn auto_wire_context_manager(
     bi: &crate::runtime::PyBridgeInstance,
@@ -94,17 +95,7 @@ fn auto_wire_context_manager(
             &bi.core,
             node,
             relay_url,
-            |did, adapter| {
-                let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
-                    did.to_owned(),
-                    Arc::new(scp_clock::SystemClock),
-                ));
-                let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
-                let event_log = crate::runtime::build_event_log_provider(bi);
-                crate::runtime::init_context_manager_with(
-                    bi, did, crypto, transport, event_log, None,
-                );
-            },
+            |did| crate::runtime::init_context_manager(bi, did),
         ))
     })
     .map_err(server_error)
@@ -235,9 +226,11 @@ impl PyNodeHandle {
         self.inner.is_shutdown()
     }
 
-    /// Signals the node to stop (relay + background tasks).
+    /// Signals the node to stop (relay + background tasks), and unbinds the
+    /// instance's `Supervisor` transport from this node when it holds the
+    /// binding.
     fn shutdown(&self) {
-        self.inner.shutdown();
+        server::stop_node(&self.bi.core, &self.inner);
     }
 
     /// Activates HTTP broadcast projection with site configuration.
@@ -451,7 +444,7 @@ impl PyNodeHandle {
 
 impl Drop for PyNodeHandle {
     fn drop(&mut self) {
-        self.inner.shutdown();
+        server::stop_node(&self.bi.core, &self.inner);
     }
 }
 
@@ -1141,9 +1134,7 @@ mod tests {
                 codes::TRANS_5054,
             ),
             (
-                ServerError::SupervisorWiring(
-                    server::SupervisorWiringError::SupervisorNotConnected,
-                ),
+                ServerError::SupervisorWiring(server::SupervisorWiringError::NodeAlreadyBound),
                 "transport",
                 codes::TRANS_5056,
             ),
@@ -1211,8 +1202,9 @@ mod tests {
     /// `node_start_on`'s wiring step, run on a real started and registered
     /// node with a relay URL that refuses the connection, returns
     /// `SCP-TRANS-5056`, shuts the node down, unregisters it, and leaves no
-    /// fallback `Supervisor`. A second start on an instance that already holds
-    /// a `Supervisor` also returns `SCP-TRANS-5056`.
+    /// fallback `Supervisor`. A second start while a running node holds the
+    /// binding also returns `SCP-TRANS-5056`, and a start after that node
+    /// stops binds again.
     #[test]
     #[cfg(feature = "testing")]
     fn node_start_wiring_failure_returns_trans_5056_and_unregisters_the_node() {
@@ -1257,6 +1249,11 @@ mod tests {
                 "{err:?}"
             );
             node.shutdown();
+            let restarted = scp
+                .node_start(py, &start_json(&did, |_| {}))
+                .expect("a start after the bound node stops binds again");
+            assert!(server::supervisor_wired_to(&bi.core, &restarted.inner));
+            restarted.shutdown();
         });
     }
 
@@ -1350,5 +1347,139 @@ mod tests {
             }
         });
         drop(taken);
+    }
+
+    /// Asserts `result` is the `TransportError` carrying `SCP-TRANS-5056` that
+    /// a start returns while another node of the instance holds the binding.
+    #[cfg(feature = "testing")]
+    fn assert_refused_while_bound(py: Python<'_>, result: PyResult<PyNodeHandle>, label: &str) {
+        let err = match result {
+            Ok(node) => {
+                node.shutdown();
+                panic!("{label}: a start while a running node holds the binding must fail");
+            }
+            Err(e) => e,
+        };
+        assert!(
+            err.is_instance_of::<crate::error::TransportError>(py),
+            "{label}: {err}"
+        );
+        let raised = err.value(py).to_string();
+        assert!(raised.contains(codes::TRANS_5056), "{label}: {raised}");
+    }
+
+    /// `context_create` attaches a `Supervisor` with an unconfigured
+    /// transport. `node_start_in_memory` then binds that same `Supervisor` to
+    /// the node's relay; a second start while the first node runs fails
+    /// closed with `SCP-TRANS-5056` and leaves the first binding and the
+    /// borrower registry as they were; dropping the first handle unbinds it,
+    /// so a later start binds again.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_in_memory_binds_after_context_create_and_fails_closed_while_bound() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let did = scp
+                .identity_create(py, "in_memory", None)
+                .unwrap()
+                .did()
+                .to_owned();
+            let params = pyo3::types::PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            params.set_item("ceiling", vec!["messages:read"]).unwrap();
+            scp.context_create(&did, &params)
+                .expect("context_create must succeed");
+            let core = &scp.inner.core;
+            let attached = Arc::clone(
+                core.try_supervisor()
+                    .expect("context_create attaches a Supervisor"),
+            );
+
+            let first = scp
+                .node_start_in_memory(py, Some(did.clone()))
+                .expect("a start after context_create binds the attached Supervisor");
+            assert!(
+                Arc::ptr_eq(core.try_supervisor().unwrap(), &attached),
+                "the start keeps the Supervisor context_create attached"
+            );
+            assert!(server::supervisor_wired_to(core, &first.inner));
+
+            let borrowers = core.borrower_count();
+            assert_refused_while_bound(
+                py,
+                scp.node_start_in_memory(py, Some(did.clone())),
+                "node_start_in_memory",
+            );
+            assert_eq!(
+                core.borrower_count(),
+                borrowers,
+                "a refused start unregisters its node"
+            );
+            assert!(server::supervisor_wired_to(core, &first.inner));
+
+            drop(first);
+            assert!(
+                core.node_binding().is_none(),
+                "dropping the handle unbinds its node"
+            );
+            let second = scp
+                .node_start_in_memory(py, Some(did))
+                .expect("a start after the bound node's handle drops binds again");
+            assert!(Arc::ptr_eq(core.try_supervisor().unwrap(), &attached));
+            assert!(server::supervisor_wired_to(core, &second.inner));
+            second.shutdown();
+        });
+    }
+
+    /// `configure_local_transport` attaches a `Supervisor` with a loopback
+    /// transport. `node_start_local` then binds that same `Supervisor` to the
+    /// node's relay; a second start while the first node runs fails closed
+    /// with `SCP-TRANS-5056`; a start after `shutdown` binds again.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_local_binds_after_configure_local_transport_and_fails_closed_while_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = |name: &str| tmp.path().join(name).display().to_string();
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let did = scp
+                .identity_create(py, "in_memory", None)
+                .unwrap()
+                .did()
+                .to_owned();
+            scp.configure_local_transport(&did).unwrap();
+            let core = &scp.inner.core;
+            let attached = Arc::clone(
+                core.try_supervisor()
+                    .expect("configure_local_transport attaches a Supervisor"),
+            );
+
+            let first = scp
+                .node_start_local(py, dir("first"), Some(did.clone()), None)
+                .expect("a start after configure_local_transport binds the attached Supervisor");
+            assert!(Arc::ptr_eq(core.try_supervisor().unwrap(), &attached));
+            assert!(server::supervisor_wired_to(core, &first.inner));
+
+            let borrowers = core.borrower_count();
+            assert_refused_while_bound(
+                py,
+                scp.node_start_local(py, dir("second"), Some(did.clone()), None),
+                "node_start_local",
+            );
+            assert_eq!(core.borrower_count(), borrowers);
+            assert!(server::supervisor_wired_to(core, &first.inner));
+
+            first.shutdown();
+            assert!(!server::supervisor_wired_to(core, &first.inner));
+            let third = scp
+                .node_start_local(py, dir("third"), Some(did), None)
+                .expect("a start after shutdown binds again");
+            assert!(server::supervisor_wired_to(core, &third.inner));
+            third.shutdown();
+        });
     }
 }

@@ -10444,9 +10444,7 @@ impl Scp {
                 // Register the creator's DID as a local DID for defense-in-depth,
                 // matching NAPI's behavior. Routes through the supervisor's direct
                 // method — the local-DID set is supervisor-wide.
-                sup.register_local_did(identity.did.clone().into())
-                    .await
-                    .map_err(ScpError::from)?;
+                sup.register_local_did(identity.did.clone().into()).await;
 
                 // Register per-context UCAN validation state (revocation list,
                 // nonce tracker, event log) for the UCAN pipeline on this instance.
@@ -16771,10 +16769,7 @@ impl Scp {
         validate_did(&did)?;
         self.inner.init_context_manager_with_did(&did);
         let manager = self.inner.context_manager_expect()?;
-        manager
-            .register_local_did(did.into())
-            .await
-            .map_err(ScpError::from)?;
+        manager.register_local_did(did.into()).await;
         Ok(())
     }
 

@@ -126,6 +126,7 @@ pub mod saga_journal;
 pub mod saga_prepared_state;
 #[allow(clippy::module_inception)]
 pub mod supervisor;
+pub mod transport_slot;
 
 #[cfg(test)]
 #[path = "spawn_from_welcome_tests.rs"]
@@ -168,3 +169,4 @@ pub use supervisor::{
     SagaAbortReason, SagaDivergenceRepairRecord, SagaError, SagaInput, SagaOutput, SagaSigningKeys,
     Supervisor, SupervisorConfig, WelcomeJoinRequest,
 };
+pub use transport_slot::TransportSlot;

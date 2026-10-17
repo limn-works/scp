@@ -6002,6 +6002,50 @@ fn every_bridge_node_start_delegates_to_server_node_start_in_order() {
     );
 }
 
+/// Each bridge's node handle `shutdown` and `Drop` stop the node through
+/// `server::stop_node(`, which unbinds the instance's `Supervisor` transport
+/// from that node (construction.md §"Node start — `NodeStartConfig`"). A path
+/// that called only `RunningNode::shutdown` would leave the binding in place,
+/// so the instance's sends would go on targeting a stopped relay.
+#[test]
+fn every_bridge_node_handle_stop_path_calls_server_stop_node() {
+    for (bridge, src, handle_impl, drop_impl) in [
+        (
+            "PyO3",
+            PYO3_SERVER_SRC,
+            "impl PyNodeHandle {",
+            "impl Drop for PyNodeHandle {",
+        ),
+        (
+            "napi-rs",
+            NAPI_SERVER_SRC,
+            "impl NapiNodeHandle {",
+            "impl Drop for NapiNodeHandle {",
+        ),
+        (
+            "UniFFI",
+            UNIFFI_SERVER_SRC,
+            "impl NodeHandle {",
+            "impl Drop for NodeHandle {",
+        ),
+    ] {
+        for (label, header, method) in [
+            ("shutdown", handle_impl, "shutdown"),
+            ("Drop", drop_impl, "drop"),
+        ] {
+            let at = src
+                .find(header)
+                .unwrap_or_else(|| panic!("{bridge} server.rs must contain `{header}`"));
+            let body = extract_fn_body(&src[at..], method)
+                .unwrap_or_else(|| panic!("{bridge} `{header}` must define fn {method}"));
+            assert!(
+                body.contains("server::stop_node("),
+                "{bridge} node handle {label} must call server::stop_node"
+            );
+        }
+    }
+}
+
 /// Verifies that the root AGENTS.md contains the required enforcement sections.
 /// These sections instruct agents to check integration wiring before
 /// writing code and to never weaken enforcement files.

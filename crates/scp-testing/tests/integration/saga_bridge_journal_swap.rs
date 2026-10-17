@@ -246,9 +246,7 @@ async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
             journal1,
             Arc::clone(&mls_storage),
         );
-        sup1.register_local_did(DID::from(creator_did))
-            .await
-            .unwrap();
+        sup1.register_local_did(DID::from(creator_did)).await;
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
@@ -315,9 +313,7 @@ async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
         Arc::clone(&journal2),
         Arc::clone(&mls_storage),
     );
-    sup2.register_local_did(DID::from(creator_did))
-        .await
-        .unwrap();
+    sup2.register_local_did(DID::from(creator_did)).await;
 
     let bridge = CoreFields::with_supervisor(Arc::clone(&sup2));
     assert!(
@@ -387,9 +383,7 @@ async fn journal_swap_restores_context_before_replaying_sagas() {
             journal1,
             Arc::clone(&mls_storage),
         );
-        sup1.register_local_did(DID::from(creator_did))
-            .await
-            .unwrap();
+        sup1.register_local_did(DID::from(creator_did)).await;
         let params = ContextParams {
             mode: ContextMode::Encrypted,
             ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
@@ -426,9 +420,7 @@ async fn journal_swap_restores_context_before_replaying_sagas() {
         Arc::clone(&journal2),
         Arc::clone(&mls_storage),
     );
-    sup2.register_local_did(DID::from(creator_did))
-        .await
-        .unwrap();
+    sup2.register_local_did(DID::from(creator_did)).await;
 
     // Drive the combined restore-then-replay entry directly on the supervisor.
     let restored = sup2.restore_on_startup().await.expect("restore_on_startup");
@@ -475,9 +467,7 @@ async fn journal_swap_replay_on_empty_journal_is_a_noop() {
         Arc::clone(&journal),
         mls_storage,
     );
-    sup.register_local_did(DID::from(creator_did))
-        .await
-        .unwrap();
+    sup.register_local_did(DID::from(creator_did)).await;
 
     // No entries appended (producer dark). The empty-journal precondition.
     assert!(
@@ -540,9 +530,7 @@ async fn journal_swap_second_restart_replay_is_idempotent() {
         Arc::clone(&journal),
         mls_storage,
     );
-    sup.register_local_did(DID::from(creator_did))
-        .await
-        .unwrap();
+    sup.register_local_did(DID::from(creator_did)).await;
 
     // First restart: reconciles the Initiated saga to terminal Aborted.
     sup.restore_on_startup()
@@ -654,9 +642,7 @@ async fn journal_swap_sqlite_durable_crash_recovery_round_trips_on_disk() {
         Arc::clone(&journal2),
         mls_storage,
     );
-    sup2.register_local_did(DID::from(creator_did))
-        .await
-        .unwrap();
+    sup2.register_local_did(DID::from(creator_did)).await;
 
     sup2.restore_on_startup()
         .await
@@ -722,9 +708,7 @@ async fn journal_swap_needs_repair_carries_over_without_rebuilding_reservation()
         Arc::clone(&journal),
         mls_storage,
     );
-    sup.register_local_did(DID::from(creator_did))
-        .await
-        .unwrap();
+    sup.register_local_did(DID::from(creator_did)).await;
 
     sup.restore_on_startup()
         .await
