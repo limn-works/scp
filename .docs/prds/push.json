@@ -1895,7 +1895,7 @@
         }
       ],
       "details": {
-        "missing": "Two parts of the acceptance criteria have no two-node test. (1) B accepting a v2 announcement from C at a lower epoch after C rejoins: a non-committer never adds a member added after it joined to its runtime membership or role state, so B rejects every message from C as from a non-member (issue #2922). The runtime test `a_processed_removal_admits_the_rejoiners_lower_epoch_announcement` drives the deletion and the lower-epoch announcement through the real in-order ingest path instead. (2) A Commit that adds a second device leaf for C: the Supervisor AddMember path rejects a DID that is already a member, so no Commit with a second device leaf can be produced end to end. The DID classifier tests in scp-protocol, the received-Commit test in scp-mls and the runtime unit test cover that rule. The two-node test `a_non_committer_rotates_once_per_membership_commit_and_deletes_the_removed_record` covers the add and remove signals and the record deletion."
+        "missing": "One part of the acceptance criteria has no two-node test: a Commit that adds a second device leaf for C. The Supervisor AddMember path rejects a DID that is already a member, so no Commit with a second device leaf can be produced end to end. The DID classifier tests in scp-protocol, the received-Commit test in scp-mls and the runtime unit test cover that rule. The two-node test `a_non_committer_rotates_once_per_membership_commit_and_deletes_the_removed_record` covers the add and remove signals, the record deletion, and B accepting C's lower-epoch announcement after C rejoins."
       }
     },
     {

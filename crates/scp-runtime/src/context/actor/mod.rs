@@ -1841,19 +1841,34 @@ mod tests {
 
         const LOCAL: &str = "did:dht:z6MkLocalDirect";
         let deps = new_test_deps().await;
-        // DIRECT_BOB is the peer that leaves and rejoins.
+        // DIRECT_BOB is the peer that leaves and rejoins. The role state holds
+        // the built-in roles, as a created or joined context does, so the
+        // rejoin's processed add can assign `member`.
         let mut state = writable_encrypted_state(0x35, DIRECT_BOB);
+        state.role_state = scp_protocol::context::roles::ContextRoleState::new(
+            ctx_hex(0x35),
+            DIRECT_ALICE,
+            scp_protocol::context::roles::CapabilityCeiling::new([
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+            ]),
+            Vec::new(),
+            &*deps.clock,
+        )
+        .expect("built-in roles");
         state.membership.add_member(
             scp_did::DID(LOCAL.to_owned()),
             "member".to_owned(),
             Vec::new(),
         );
         state.members.insert(scp_did::DID(LOCAL.to_owned()));
-        state.role_state.members.insert(LOCAL.to_owned());
-        state.role_state.member_capabilities.insert(
-            LOCAL.to_owned(),
-            std::iter::once(Capability::MessagesWrite).collect(),
-        );
+        for member in [LOCAL, DIRECT_BOB] {
+            state.role_state.members.insert(member.to_owned());
+            state
+                .role_state
+                .system_assign_role(member, "member", &*deps.clock)
+                .expect("assign member");
+        }
 
         assert!(
             ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 1, 1, [0x51; 32])
@@ -1878,7 +1893,10 @@ mod tests {
                     removed_dids: vec![DIRECT_BOB.to_owned()],
                 },
             },
-        );
+            &*deps.clock,
+            |did| deps.supervisor.remove_member_floors(&[0x35; 32], did),
+        )
+        .expect("the removal applies");
         let registry = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert!(!registry.contains_key(&scp_did::DID(DIRECT_BOB.to_owned())));
         // The removal also leaves the membership and role state, so the
@@ -1896,17 +1914,23 @@ mod tests {
             "a removed DID is not a member; got {removed:?}"
         );
 
-        // The rejoin's add, as the committer's add path applies it.
-        state.membership.add_member(
-            scp_did::DID(DIRECT_BOB.to_owned()),
-            "member".to_owned(),
-            Vec::new(),
-        );
-        state.role_state.members.insert(DIRECT_BOB.to_owned());
-        state.role_state.member_capabilities.insert(
-            DIRECT_BOB.to_owned(),
-            std::iter::once(Capability::MessagesWrite).collect(),
-        );
+        // The rejoin's AddMember Commit, processed by this non-committing
+        // member.
+        note_processed_commit(
+            &mut state,
+            &ctx_hex(0x35),
+            LOCAL,
+            &ProcessedCommit {
+                committer_did: DIRECT_ALICE.to_owned(),
+                change: CommitMembershipChange {
+                    added_dids: vec![DIRECT_BOB.to_owned()],
+                    removed_dids: Vec::new(),
+                },
+            },
+            &*deps.clock,
+            |did| deps.supervisor.remove_member_floors(&[0x35; 32], did),
+        )
+        .expect("the rejoin's add applies");
         assert!(
             ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 3, 0, [0x52; 32])
                 .await

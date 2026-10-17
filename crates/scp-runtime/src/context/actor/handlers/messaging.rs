@@ -900,12 +900,12 @@ async fn handle_deliver_incoming(
     }
 
     // Spec 09 §9.10.4.1 "Membership trigger" and "Record lifetime": the merged
-    // Commit's membership changes reach Class-S state through a fail-closed,
-    // keep-direction commit, the rule every commit-path persist follows. The
-    // MLS group has already merged the Commit, so the changes are never
-    // rolled back: on persist failure they stay in memory for the next persist
-    // and the durability error replaces the reply, keeping any delivery error
-    // in its message.
+    // Commit's membership changes (removals, adds and the rotation trigger)
+    // reach the actor state through a fail-closed, keep-direction commit, the
+    // rule every commit-path persist follows. The MLS group has already merged
+    // the Commit, so the changes are never rolled back: on persist failure
+    // they stay in memory for the next persist and the durability error
+    // replaces the reply, keeping any delivery error in its message.
     let reply_result = if let Some(commit) = processed_commit.take() {
         let applied = cell
             .commit_class_s_keep(deps, context_id, |mut v| {
@@ -914,8 +914,14 @@ async fn handle_deliver_incoming(
                     context_id,
                     deps.crypto.local_did(),
                     &commit,
-                );
-                Ok(())
+                    &*deps.clock,
+                    |did| {
+                        deps.supervisor.remove_member_floors(
+                            &crate::context::state::context_id_to_bytes(context_id),
+                            did,
+                        );
+                    },
+                )
             })
             .await;
         match applied {
