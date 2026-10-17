@@ -11607,9 +11607,11 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/scp_sdk/server.py",
+        "bindings/python/scp_sdk/scp.py",
+        "bindings/python/scp_sdk/__init__.py",
         "bindings/python/scp_sdk/_scp_core.pyi",
         "bindings/python/tests/test_server.py"
       ],
