@@ -47,6 +47,10 @@ pub mod error;
 pub mod file;
 #[cfg(feature = "filesystem")]
 pub mod filesystem;
+// The one type in this crate that takes an exclusive advisory file lock; it
+// unlocks before it closes the file (spec §17.6, §17.8).
+#[cfg(any(feature = "file", feature = "sqlite"))]
+pub mod file_lock;
 // The one durability-only in-memory adapter, `InMemoryStorage`, gated by the
 // `in-memory-storage` feature, NOT `testing`. It loses state on restart but
 // nullifies no security property (spec §17.17.2 durability-only-vs-nullifier
