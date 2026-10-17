@@ -3060,7 +3060,8 @@ Both seeds go through the `"SCP-PSEUDONYM-P256-V1"` seed-to-scalar step above. T
 | `MAX_GOVERNANCE_BLOCK_PARTS` | 64 | Most Commits one governance transfer spans. Parts hold whole records, so 64 parts carry at least 6,000 approvals. | `07-trust-validation-and-capabilities.md` §7.3.1.1 |
 | `MAX_GOVERNANCE_ACTION_BYTES` | 8,192 | Longest RFC 8785 `action_bytes` a proposal carries; the proposal travels whole in a transfer's first part, and the leaf that holds the action whole in its last part. | `05-contexts.md` §5.9.1 |
 | `MAX_GOVERNANCE_ORPHAN_VOTES` | 256 per context | Most vote messages a member holds for proposals it has not yet received. | `05-contexts.md` §5.9.1 |
-| Votes one transfer carries | The approvals the governance model requires | Plus one for each carried voter who left before the final part; at most 169 bytes each. | `07-trust-validation-and-capabilities.md` §7.3.1.1 |
+| Votes one transfer carries | At least the approvals the governance model requires | A receiver counts one approval per voter that still counts at the final part; approvals that stopped counting are not counted and do not reject the Commit. At most 169 bytes each. | `07-trust-validation-and-capabilities.md` §7.3.1.1 |
+| `MAX_GOVERNANCE_TRANSFER_EPOCHS` | 256 epochs | Longest a governance transfer stays staged, counted from the sending epoch of its part 0; it is also the longest a committer holds a pending add, reset, or fast-forward while another member's transfer is staged. | `07-trust-validation-and-capabilities.md` §7.3.1.1 |
 
 #### 9.18.11 Transport and Relay
 

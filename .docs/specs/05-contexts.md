@@ -86,7 +86,7 @@ The following is the complete enumeration of the **built-in** capability categor
 | `outlet:query:{outlet_id}` | Invoke a specific Query outlet (parameterized) | Role permission |
 | `outlet:call:*` | Invoke any registered Action outlet (§5.4.2) | Role permission |
 | `outlet:call:{outlet_id}` | Invoke a specific Action outlet (parameterized) | Role permission |
-| `member:invite` | Invite new members to the context | Role permission |
+| `member:invite` | Invite new members to the context | Role permission + governance |
 | `member:remove` | Remove members from the context | Role permission + governance |
 | `member:ban` | Ban members (revoke read access) | Role permission + governance |
 | `role:assign` | Assign or change member roles | Role permission + governance |
@@ -922,7 +922,7 @@ A vote record is at most 1 + 58 + 1 + 34 + 9 + 66 = 169 bytes. A Commit carries 
 
 ECDSA signs the 32-byte §9.5.1 canonical hash as a prehashed digest: the hash is the ECDSA message digest itself, with no second SHA-256 over it, and RFC 6979 runs with that digest as `h1` (`09-security-model.md` §9.5, `25-test-vectors.md`). The same leaf key also signs MLS content under RFC 9420 `SignWithLabel`, where ECDSA hashes the `SignContent` bytes with SHA-256 to form its digest. `SignContent` begins with a variable-length size and the label `MLS 1.0 `, and an SCP canonical-hash preimage begins with an `SCP-` domain separator, so the two preimages always differ. A signature of one kind verifies as the other only when the two preimages have the same SHA-256 digest, which is a SHA-256 collision.
 
-**Re-signing after a key change.** A member whose leaf `signature_key` changes, by its own Update or by a Commit that carries its UpdatePath, sends again each pending proposal it made and each vote it cast and has not withdrawn whose `expires_epoch` has not passed, signed under the new key. A re-signed proposal keeps its `anchor_seq`, so its `proposal_id` is unchanged. No Commit can carry a signature under a leaf key that is no longer in the tree. A signature that a merged part of a transfer already carried keeps counting for that transfer (`07-trust-validation-and-capabilities.md` §7.3.1.1).
+**Re-signing after a key change.** A member whose leaf `signature_key` changes, by its own Update or by a Commit that carries its UpdatePath, sends again each pending proposal it made and each vote it cast and has not withdrawn whose `expires_epoch` has not passed, signed under the new key. A re-signed proposal keeps its `anchor_seq`, so its `proposal_id` is unchanged. No Commit can carry a signature under a leaf key that is no longer in the tree. A signature that a merged part of a transfer already carried stops counting at the final part once the signer's key changes, and a later part that carries the re-signed vote replaces it (`07-trust-validation-and-capabilities.md` §7.3.1.1).
 
 **Withdrawing an approval.** A voter withdraws an approval by sending a `Withdraw` vote message and committing an UpdatePath for its own leaf in the same step. The `Withdraw` message tells the other engines to drop the approval from their tallies; the new leaf key is what stops a Commit from carrying it, because a receiver never sees the `Withdraw` message.
 
