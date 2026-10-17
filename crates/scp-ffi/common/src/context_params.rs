@@ -88,7 +88,7 @@ pub struct CommonContextParams {
     pub economic_policy_json: Option<String>,
 
     /// The context's admission capability requirements as a JSON array of
-    /// `CapabilityRequirement` objects (spec §7.3.5). `None` or an empty
+    /// `CapabilityRequirement` objects (spec §7.3.4.4). `None` or an empty
     /// string means no requirements. The array is parsed through the
     /// validating `CapabilityRequirements` type, so a malformed entry or more
     /// than `MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT` entries refuses the

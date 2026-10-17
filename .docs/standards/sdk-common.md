@@ -284,6 +284,12 @@ constant).
 | `SCP-VALID-7025` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | wasm module not initialized — `initScp()` (or `ScpBrowserClient.connect`) must be awaited before constructing/using a client |
 | `SCP-VALID-7026` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | `WebSocketRelaySocket` (the managed transport) passed to `create()` instead of `ScpBrowserClient.connect()` — it would be left unattached |
 | `SCP-VALID-7081` | SDK-wrapper native-loader guard (**one meaning in every SDK that loads a native bridge**; never minted by a bridge). ts-native SDK: `src/internal/native.ts`. Python SDK: `scp_sdk/_extension.py` | No native bridge is installed for the platform; in the ts-native SDK, no napi addon package resolves; in the Python SDK, no `scp_sdk._scp_core` extension file is present. The only native-load failure a test skip guard may treat as absence |
+| `SCP-VALID-7140` | native FFI-common registry | Recovery or custody-migration concurrency cap reached; back off and retry |
+| `SCP-VALID-7141` | Swift SDK (`Governance.swift`) | Site hostname is empty |
+| `SCP-VALID-7142` | Swift SDK (`Governance.swift`) | Site hostname exceeds 253 characters |
+| `SCP-VALID-7150` | native FFI-common registry | A capability requirement breaks a shape rule of spec 07 §7.3.4.4 (`AdmissionError::InvalidRequirement`) |
+| `SCP-VALID-7151` | native FFI-common registry | The challenger's last challenge to this subject for this capability is inside its window; retry at that challenge's `expires_at` (`TrustError::ChallengeWindowOpen`, spec 07 §7.3.4 step 1) |
+| `SCP-VALID-7152` | Swift SDK (`Governance.swift`) | Site `deployRetentionCount` is outside 1 to 8 |
 | `SCP-VALID-7082` | SDK-wrapper native-loader guard (**one meaning in every SDK that loads a native bridge**; never minted by a bridge). ts-native SDK: `src/internal/native.ts`, `src/scp.ts`. Python SDK: `scp_sdk/__init__.py`, `scp_sdk/_extension.py`, `scp_sdk/scp.py` | A native bridge is installed and failed to load (`dlopen` error, ABI or architecture mismatch, missing shared library), or it loaded without an export the SDK calls. A test skip guard fails on it |
 
 The browser participant reuses **only** `SCP-CTX-2095` from the shared band —
@@ -521,6 +527,10 @@ All public handle types (`Identity`, `ContextHandle`/`Context`, `TransportManage
 | Java | Thread-safe | Interior locking in Rust core via JNA |
 
 **Invariant:** No SDK user should ever need an external lock to use SCP types safely. If a data race is possible without user-side synchronization, the SDK has a bug.
+
+### Signing operations take the `Identity` handle
+
+An SDK operation that signs as a participant takes that participant's `Identity` handle, in every SDK: the challenger of `trustCreateChallenge` and `trustGradeResponse`, and the subject of `trustRespondToChallenge`. A DID string names a party the call does not sign as, such as a challenge's subject at creation. Every SDK in this table has an `Identity` handle, so no language forces a string in its place, and an SDK that takes a DID string for a signer diverges from this rule.
 
 ## Context Creation
 

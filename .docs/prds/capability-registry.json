@@ -228,7 +228,7 @@
       "actionItems": [
         "Make challenge_request_unsigned validate capability_uri against the registry",
         "Enforce each protocol capability's minimum test-case rule",
-        "Update verify_challenge_response to accept URI-based challenge types",
+        "Accept URI-based capabilities in challenge_request_unsigned and verify_challenge_verification",
         "Add integration tests covering all 10 categories",
         "Add test for identity-scoped custom capability challenge",
         "Add negative test for unknown protocol capability rejection"

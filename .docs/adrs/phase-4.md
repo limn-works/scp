@@ -31,7 +31,16 @@ Build order: ADR-017 + ADR-019 (parallel, both depend on Phase 1-3) --> ADR-018 
 
 **Amendment (2026-10-12 — challenge request and record converge on spec 07 §7.3.4).** The challenge request takes the field set of `07-trust-validation-and-capabilities.md` §7.3.4 plus `subject`, and carries a `verifier_signature`. The request and the `ChallengeVerification` record are each signed over the SHA-256 digest of their §9.5.1 canonical preimages, through the custody of the verifier's `#active` key, and the record is returned signed. The request carries no suite label; the record carries `suite_digest`, the SHA-256 of the request's test-case encoding. A challenge for a protocol capability URI with fewer cases than its standard's minimum is refused. `challenge_id` is 32 bytes, carried as 64-character lowercase hex at the bridges. All three challenge separators keep their `-V1` suffix (Alec, 2026-10-12). Two of their encodings change before release: `SCP-CHALLENGE-REQ-V1:` and `SCP-CHALLENGE-VERIFY-V1:`. The `SCP-CHALLENGE-RESP-V1:` encoding is unchanged; the response gains only the I-JSON check on its caller-supplied JSON.
 
-**Amendment (2026-10-13 — challenger grading).** Challenge verification (Layer 2, §7.3.4) is graded by the challenger. The subject submits outputs only; the request commits to separated, salted answers (`SCP-CHALLENGE-COMMIT-V1:`) and names the capability definition it follows; the challenger keeps the answer key in its own attempt ledger, authenticates each response before grading it, and signs a record for every graded attempt carrying the attempt number, the digest of the response graded, its policy values, and a graded-at time inside the request's signed window. A definition's retries are a ceiling and its cooldown a floor; a challenger may only be stricter. A record counts toward admission only when it matches its capability definition (§7.3.4.6), its verifier is in the requirement's governance-held `trusted_verifiers` set and is not the subject, and it respects the requirement's `retry_cap`. Only records are published. Challenger state (attempts, cooldown, closure, answer key) lives in a per-identity runtime ledger.
+**Amendment (2026-10-13 — challenger grading).** Challenge verification (Layer 2, §7.3.4) is graded by the challenger. The subject submits outputs only; the request carries the case inputs, no answers in any form, and names the capability definition it follows; the challenger keeps the answer key in its own attempt ledger, authenticates each response before grading it, and signs a record for every graded attempt carrying the attempt number, the digest of the response graded, its policy values, and a graded-at time inside the request's signed window. A definition's retries are a ceiling and its cooldown a floor; a challenger may only be stricter. A record counts toward admission only when it matches its capability definition (§7.3.4.6), its verifier is in the requirement's governance-held `trusted_verifiers` set and is not the subject, and it respects the requirement's `retry_cap`. The challenger returns each signed record to its caller, who delivers it. Challenger state (attempts, cooldown, closure, answer key) lives in a per-identity runtime ledger.
+
+**Amendment (2026-10-17 — challenge revisions).** Alec's rulings of 2026-10-17 change the 2026-10-13 design in five ways, each specified in `07-trust-validation-and-capabilities.md` §7.3.4:
+- The request carries no answers at all: no plaintext, no hash and no commitment. The `SCP-CHALLENGE-COMMIT-V1:` separator and the answer-key mismatch fault are removed, and `suite_digest` covers the cases without answers.
+- The protocol sets no ceiling on retries or cooldown. A definition may set any `u32` for each; every sum of a time and a cooldown saturates.
+- A challenger refuses a new challenge to a subject for a capability while its last challenge to that subject for that capability is inside its window (`ChallengeWindowOpen`), closed or not. Retries are bounded in time by the window as well as by `max_retries`.
+- A graded-at time lies strictly after `created_at` and strictly before `expires_at`.
+- A challenger fault no longer closes a challenge. It uses no attempt and starts the cooldown. A rate-limit or budget refusal in the evaluator context's reserve step is a capacity refusal, which records nothing. The window is at least the cooldown. The challenger signs a request or a record before the ledger writes it, so a failed signature or a failed write leaves nothing behind.
+
+**Amendment (2026-10-17 — why a capability-requirement change keeps a tightening).** `ModifyCapabilityRequirements` and `ModifyThreshold` are both Class-S governance changes (ADR-049 §9), and they take opposite directions when the persist fails. A failed `ModifyThreshold` always restores the old threshold. Raising a threshold is not safe in every case: a threshold above the number of signers who can still act locks governance out of every later change, the lowering included. A capability-requirement list that only restricts admission (`is_tightening_of`) has no such failure: it refuses admissions the old list allowed, and governance can still loosen it by a later proposal. Restoring the looser list would admit agents under a requirement the context has already voted to tighten, so a pure tightening stays in force when its persist fails, as a removed threshold signer does (`RemoveSigner`). Any other requirement change, including one that tightens one requirement and loosens another, restores the old list, so a loosening takes effect only when it is durable.
 
 ### Context
 
@@ -179,11 +188,11 @@ pub struct TrustInput {
    - Constructs a challenge request over the given suite and signs its canonical digest through the custody of the verifier's `#active` key.
    - The challenger supplies the test cases; a protocol capability URI sets a minimum count (spec 07 §7.3.4.3).
 
-5. **`verify_challenge_response(request, response) -> Result<ChallengeVerification, TrustError>`**
-   - Verifies the response signature against the responder's operational key.
-   - Validates response matches the challenge parameters.
-   - Distinguishes self-attested vs challenge-verified in metadata.
-   - Verifies the request signature against the verifier's `#active` key and the response against the subject's `#active` key; returns a `ChallengeVerification` signed through the verifier's `#active` custody; `context_id` is a required input (spec 07 §7.3.4.4 step 4(a)).
+5. **`grade_response(request, response) -> Result<ChallengeVerification, TrustError>` (the challenger's, signed through its `#active` custody)**
+   - Authenticates the response: it answers the request's digest, and its signature verifies against the subject's `#active` key.
+   - Grades each output against the answer key in the challenger's ledger (spec 07 §7.3.4 step 3), so the subject never grades itself.
+   - Returns a `ChallengeVerification` for every graded attempt, passed or failed, signed through the verifier's `#active` custody; the record carries the request's `context_id` (spec 07 §7.3.4.4 step 4(a)).
+   - The subject builds and signs its response with `respond_to_challenge`, and a consumer checks records with `check_capability_requirements`.
 
 6. **`evaluate_consequence_rules(rules, event_log, subject_did) -> Vec<TriggeredConsequence>`**
    - Checks each rule's trigger condition against event log data within the rule's time window.
@@ -227,7 +236,7 @@ pub struct TrustInput {
 | `mod.rs` | Module root, `TrustInput`, re-exports |
 | `participation.rs` | `ParticipationRecord`, `compute_participation_record` |
 | `attestation.rs` | `Attestation`, `AttestationType`, `verify_attestation`, `check_attestation_freshness`, `check_threshold_attestation` |
-| `challenge.rs` | `ChallengeRequest`, `ChallengeResponse`, `issue_challenge`, `verify_challenge_response` |
+| `challenge.rs` | `ChallengeRequest`, `ChallengeResponse`, `ChallengeVerification`, `challenge_request_unsigned`, `challenge_response_unsigned`, `authenticate_challenge_response`, `grade`, `verify_challenge_verification` (`issue_challenge` is a test-only helper behind the `testing` feature) |
 | `consequence.rs` | `ConsequenceRule`, `evaluate_consequence_rules` |
 | `aggregate.rs` | `aggregate_trust_input` — combines all layers into `TrustInput` |
 

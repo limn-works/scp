@@ -681,7 +681,7 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         })?),
     };
 
-    // The admission capability requirements (spec §7.3.5): a JSON array, or
+    // The admission capability requirements (spec §7.3.4.4): a JSON array, or
     // a JSON-encoded string, normalized to a JSON string for the common
     // builder, which parses it through the validating type.
     let capability_requirements_json: Option<String> = match &params["capabilityRequirements"] {

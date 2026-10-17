@@ -2118,7 +2118,7 @@ pub struct ContextParams {
     /// governance only).
     pub consequence_config_json: Option<String>,
     /// The admission capability requirements as a JSON array of
-    /// `CapabilityRequirement` (spec §7.3.5). `None` means none.
+    /// `CapabilityRequirement` (spec §7.3.4.4). `None` means none.
     pub capability_requirements_json: Option<String>,
 }
 

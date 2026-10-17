@@ -2828,8 +2828,7 @@ All domain separators are UTF-8 strings used as prefixes (or, where a row says s
 | `"scp-pseudonym-routing-v1:"` | Per-context pseudonym routing id — `SHA-256("scp-pseudonym-routing-v1:" \|\| context_pseudonym)` over the 33-byte compressed pseudonym public key, which is the 32-byte value every routing field carries; a routing-derivation prefix, NOT a §9.5.1 signature-preimage separator | §9.10.4 |
 | `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
 | `"SCP-HANDLE-OUTLET-V1:"` | Handle and scope outlet request signing | §22.3.1, §22.3.5 |
-| `"SCP-CHALLENGE-REQ-V1:"` | Trust challenge request: the §9.5 signature over `SHA-256` of the §9.5.1 canonical hash of the request fields, `definition_digest` among them, with salted answer commitments in place of the answers | §7.3.4 |
-| `"SCP-CHALLENGE-COMMIT-V1:"` | Answer commitment inside a trust challenge request: `SHA-256` over the salt and the canonical expected output; never signed alone | §7.3.4 |
+| `"SCP-CHALLENGE-REQ-V1:"` | Trust challenge request: the §9.5 signature over `SHA-256` of the §9.5.1 canonical hash of the request fields, `definition_digest` among them; the request carries no answers and nothing derived from them | §7.3.4 |
 | `"SCP-CHALLENGE-RESP-V1:"` | Trust challenge response: the subject's §9.5 signature over `SHA-256` of the §9.5.1 canonical hash of `challenge_id`, the request digest, `subject`, `attempt` and the outputs | §7.3.4 |
 | `"SCP-CHALLENGE-VERIFY-V1:"` | Trust challenge verification record, one per graded attempt: the §9.5 signature over `SHA-256` of the §9.5.1 canonical hash of its 22 fields, `definition_digest` and `response_digest` among them | §7.3.4 |
 | `"SCP-CAPABILITY-DEFINITION-V1:"` | Capability definition record: the definer's §9.5 signature over `SHA-256` of the canonical definition; a protocol row's definition takes the same digest and no signature | §7.3.4.6 |
@@ -3106,16 +3105,15 @@ The challenge protocol of `07-trust-validation-and-capabilities.md` §7.3.4 read
 | `MAX_VERIFICATION_VALIDITY_SECS` | 7776000 s (90 d) | The cap on a record's validity after its graded-at time; capabilities degrade as models and configurations change | §7.3.4 step 5(e) |
 | `CHALLENGE_CLOCK_SKEW_SECS` | 300 s (5 min) | The skew a subject allows on the request window and a consumer allows on a record's graded-at time; equal to the §9.14 clock-skew tolerance | §7.3.4 steps 2 and 5(d); §7.3.4.5 |
 | `MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT` | 32 | Bounds the governance payload of one capability requirement | §7.3.4.4 |
-| `MAX_CHALLENGE_RETRIES` | 10 | The upper bound on every `max_retries` in a definition, a request, a record and a `retry_cap` | §7.3.4 steps 1 and 5(f); §7.3.4.4; §7.3.4.6 |
-| `MAX_CHALLENGE_COOLDOWN_SECS` | 604800 s (7 d) | The upper bound on every `cooldown_secs` and `min_cooldown_secs`. It equals `MAX_CHALLENGE_WINDOW_SECS`: a longer cooldown leaves no retry inside any window, which means the same as 0 retries. The bound also keeps every sum of a graded-at time and a cooldown far from integer overflow | §7.3.4 steps 1 and 5(f); §7.3.4.4; §7.3.4.6 |
 | `CHALLENGE_GRADING_BUDGET_SECS` | 60 s | One total budget for grading every case of one attempt | §7.3.4 step 3 |
 | `CHALLENGE_LEASE_MARGIN_SECS` | 30 s | Added to the grading budget to set a grading lease's deadline, which covers the record write and signature | §7.3.4 step 3 |
-| `MAX_GRADING_FAULTS` | 3 | Bounds the challenger-side faults one challenge records before it closes as `Faulted` | §7.3.4 step 3 |
 | `MAX_CHALLENGE_RESPONSE_BYTES` | 1048576 (1 MiB) | Bounds what a challenger parses and grades for one response | §7.3.4 steps 2 and 3 |
 | `MAX_CHALLENGE_SCHEMA_BYTES` | 65536 (64 KiB) | Bounds the canonical JSON of one `SchemaMatch` schema, and so its compilation cost | §7.3.4 step 1 |
 | `MAX_CHALLENGE_JSON_DEPTH` | 64 | Bounds recursion over a schema and over a response's outputs | §7.3.4 steps 1 and 3 |
+| `MAX_CONTAINS_HAYSTACK_BYTES` | 65536 (64 KiB) | Bounds the decoded string values and object keys one `ContainsAll` or `ContainsNone` case scans, so the scan cost of one case is bounded by its needles times this bound and not by the whole response | §7.3.4 step 3 |
 | `MAX_CAPABILITY_DESCRIPTION_BYTES` | 1024 | Bounds the definition record | §7.3.4.6 |
 | `MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT` | 64 | Bounds the governance payload and the admission work for one context; the 28 protocol capabilities and identifier-scoped capabilities fit | §7.3.4.4 |
+| `MAX_ADMISSION_RECORDS` | 256 | Bounds the `ChallengeVerification` records one admission check decodes, four per requirement at `MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT`; a larger set is refused before any record is resolved or verified | §7.3.4.4 |
 
 ### 9.18.B Configurable Parameters
 
@@ -3149,5 +3147,5 @@ The following values are RECOMMENDED defaults for SDK implementations. They are 
 | Sender key timeout | 60s | SDK decides retry strategy. Already configurable via `SyncPolicy`. | §9.16.2 |
 | Reconnection timeout | 120s | Overall reconnection timeout. SDK decides retry strategy. | §23 |
 | Reconnection dedup window | 30s | Multi-device reconnection deduplication. Already configurable via `SyncPolicy`. | §23 |
-| `MAX_OPEN_CHALLENGES_PER_CHALLENGER` | 1024 | The open challenges one challenger identity's ledger holds; a challenger refuses to create a challenge past it. | §7.3.4.5 |
+| `MAX_OPEN_CHALLENGES_PER_CHALLENGER` | 1024 | The challenges one challenger identity's ledger holds that are not closed; a challenger refuses to create a challenge past it. A closed challenge stays in the ledger until its prune time and does not count. | §7.3.4.5 |
 | `MAX_CONCURRENT_GRADINGS_PER_CHALLENGER` | 8 | The grading permits of one challenger identity. A grading holds one permit until its future and every blocking evaluator call it started have returned, so an evaluator that never returns holds its permit until it returns. | §7.3.4 step 3 |

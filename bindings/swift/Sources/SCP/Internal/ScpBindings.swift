@@ -9480,7 +9480,7 @@ public struct ContextParams {
     public var consequenceConfigJson: String?
     /**
      * The admission capability requirements as a JSON array of
-     * `CapabilityRequirement` (spec §7.3.5). `None` means none.
+     * `CapabilityRequirement` (spec §7.3.4.4). `None` means none.
      */
     public var capabilityRequirementsJson: String?
 
@@ -9550,7 +9550,7 @@ public struct ContextParams {
          */consequenceConfigJson: String?, 
         /**
          * The admission capability requirements as a JSON array of
-         * `CapabilityRequirement` (spec §7.3.5). `None` means none.
+         * `CapabilityRequirement` (spec §7.3.4.4). `None` means none.
          */capabilityRequirementsJson: String?) {
         self.mode = mode
         self.ceiling = ceiling

@@ -457,12 +457,11 @@ ExpectedOutput:
   | ContainsNone  { forbidden: Vec<String> }          // output must contain none of these
   | CustomEval    { evaluator_outlet_id: OutletId }   // an evaluator outlet the challenger chooses
 
-ChallengeCase {                  // what the subject sees
-  test_id:           String,
-  input:             Value,
-  category:          String,
-  weight:            u32,
-  answer_commitment: [u8; 32],   // hex on the wire
+ChallengeCase {                  // what the subject sees: the case without its expected output
+  test_id:  String,
+  input:    Value,
+  category: String,
+  weight:   u32,
 }
 
 ChallengeRequest {
@@ -471,7 +470,7 @@ ChallengeRequest {
   definition_digest:  [u8; 32],          // digest of the capability definition followed (§7.3.4.6)
   test_cases:         Vec<ChallengeCase>,
   created_at:         u64,               // Unix seconds, challenger clock
-  expires_at:         u64,               // last second at which the challenger grades an attempt
+  expires_at:         u64,               // the challenger grades an attempt only at a time t with created_at < t < expires_at
   max_retries:        u32,               // attempts allowed = 1 + max_retries
   cooldown_secs:      u32,               // minimum seconds between graded attempts
   pass_threshold_bps: u32,               // equals the definition's threshold
@@ -521,9 +520,9 @@ ChallengeVerification {
 
 `CustomEval` carries only the evaluator outlet's identifier. The challenger chooses the context that hosts the evaluator when it creates the challenge; that context's identifier stays in the challenger's ledger and never enters the request.
 
-**Answer commitment.** For each case the challenger draws a fresh 32-byte random `salt` and computes `answer_commitment = SHA-256("SCP-CHALLENGE-COMMIT-V1:" ‖ Fixed32(salt) ‖ F(JCS(expected)))`, where `expected` takes its externally tagged wire form, the object `{"<Variant>": {<fields>}}` whose variant and field names are those of `ExpectedOutput` above (`JsonSchema` is any JSON value, and `OutletId` is a JSON string). The uniform 256-bit salt makes the commitment reveal nothing about `expected` to the subject or to anyone else who sees the request, not even its length. SHA-256 collision resistance binds the challenger to one `expected` per case. Only the challenger's own grading exercises that binding, and so does an auditor the challenger chooses to open the commitment to (§7.3.4.5). For a `CustomEval` case, `expected` is the evaluator outlet's identifier, so the commitment binds that identifier and nothing the outlet does.
+**No answers in the request.** A request carries each case's `test_id`, `input`, `category` and `weight`, and nothing derived from `expected`: no plaintext answer, no hash of one and no commitment to one. The expected outputs stay in the challenger's ledger (§7.3.4.5).
 
-**Test-case field and suite digest.** `T = U32(n) ‖` for each case in list order `F(test_id) ‖ F(JCS(input)) ‖ F(category) ‖ U32(weight) ‖ Fixed32(answer_commitment)`. `suite_digest = SHA-256(T)`. `T` takes no domain separator: it is never signed alone, and the request signature binds the same bytes under `SCP-CHALLENGE-REQ-V1:`.
+**Test-case field and suite digest.** `T = U32(n) ‖` for each case in list order `F(test_id) ‖ F(JCS(input)) ‖ F(category) ‖ U32(weight)`. `suite_digest = SHA-256(T)`, so the suite digest covers the cases without their answers. `T` takes no domain separator: it is never signed alone, and the request signature binds the same bytes under `SCP-CHALLENGE-REQ-V1:`.
 
 **Request signature.** `R = "SCP-CHALLENGE-REQ-V1:" ‖ Fixed32(challenge_id) ‖ F(capability_uri) ‖ Fixed32(definition_digest) ‖ T ‖ U64(created_at) ‖ U64(expires_at) ‖ U32(max_retries) ‖ U32(cooldown_secs) ‖ U32(pass_threshold_bps) ‖ F(context_id) ‖ F(verifier) ‖ F(subject)`. The verifier's `#active` key signs `D = SHA-256(R)` with the signature algorithm of `09-security-model.md` §9.5.
 
@@ -531,9 +530,9 @@ ChallengeVerification {
 
 **Verification identifier.** `verification_id = SHA-256(F(verifier) ‖ F(subject) ‖ F(capability_uri) ‖ Fixed32(challenge_id) ‖ U32(attempt) ‖ U64(timestamp))`.
 
-**Verification signature.** `R_v = "SCP-CHALLENGE-VERIFY-V1:" ‖ Fixed32(verification_id) ‖ F(verifier) ‖ F(subject) ‖ F(capability_uri) ‖ Fixed32(definition_digest) ‖ Fixed32(suite_digest) ‖ Fixed32(challenge_id) ‖ U32(attempt) ‖ Fixed32(response_digest) ‖ U32(max_retries) ‖ U32(cooldown_secs) ‖ U32(pass_threshold_bps) ‖ U32(min_category_cases) ‖ U8(passed) ‖ U32(score) ‖ U32(test_count) ‖ U32(pass_count) ‖ U64(challenge_created_at) ‖ U64(challenge_expires_at) ‖ U64(timestamp) ‖ U64(expires_at) ‖ F(context_id)`. The record has 22 signed fields, and none is optional. The verifier's `#active` key signs `D_v = SHA-256(R_v)`. `response_digest` lets an auditor the challenger opens to tie the record to exactly one subject-signed response; a consumer that does not hold the response reads it as 32 opaque bytes.
+**Verification signature.** `R_v = "SCP-CHALLENGE-VERIFY-V1:" ‖ Fixed32(verification_id) ‖ F(verifier) ‖ F(subject) ‖ F(capability_uri) ‖ Fixed32(definition_digest) ‖ Fixed32(suite_digest) ‖ Fixed32(challenge_id) ‖ U32(attempt) ‖ Fixed32(response_digest) ‖ U32(max_retries) ‖ U32(cooldown_secs) ‖ U32(pass_threshold_bps) ‖ U32(min_category_cases) ‖ U8(passed) ‖ U32(score) ‖ U32(test_count) ‖ U32(pass_count) ‖ U64(challenge_created_at) ‖ U64(challenge_expires_at) ‖ U64(timestamp) ‖ U64(expires_at) ‖ F(context_id)`. The record has 22 signed fields, and none is optional. The verifier's `#active` key signs `D_v = SHA-256(R_v)`. `response_digest` ties the record to exactly one subject-signed response; a party that holds the response can check it, and any other party reads it as 32 opaque bytes.
 
-These encodings replace the earlier encodings under `SCP-CHALLENGE-REQ-V1:` and `SCP-CHALLENGE-VERIFY-V1:`; no signature made under an earlier encoding verifies. `25-test-vectors.md` §25.30 pins each preimage.
+These encodings replace the earlier encodings under `SCP-CHALLENGE-REQ-V1:` and `SCP-CHALLENGE-VERIFY-V1:`, including the earlier request encoding that carried a commitment per case; no signature made under an earlier encoding verifies. `25-test-vectors.md` §25.30 pins each preimage.
 
 **Identifiers.** Each entry point (create, respond, grade, consume, and the admission requirement of §7.3.4.4) parses every identifier it receives into its canonical form, and refuses an identifier whose text is not the canonical encoding of its key with `NonCanonicalIdentifier`. Two identifiers are equal when their decoded keys are equal. The encoders take the text form as given.
 
@@ -544,44 +543,46 @@ These encodings replace the earlier encodings under `SCP-CHALLENGE-REQ-V1:` and 
    - writes the `TestCase` list, whose weights sum to 10000, whose `test_id` values are distinct, which is not empty, and which meets the definition's `min_cases` (`TrustError::ChallengeSuiteBelowMinimum` otherwise);
    - admits each `SchemaMatch` schema only when its canonical JSON is at most `MAX_CHALLENGE_SCHEMA_BYTES` and its nesting depth at most `MAX_CHALLENGE_JSON_DEPTH`; every object in the schema document that carries a `$schema` key carries `https://json-schema.org/draft/2020-12/schema`; every `$ref` and `$dynamicRef` begins with `#`; no `$recursiveRef` appears; every `pattern` value and every `patternProperties` key parses as a regular expression without backreferences, lookaround, atomic groups or possessive quantifiers; and the schema compiles under draft 2020-12 with a retriever that fetches nothing. The walk visits data positions too (`const`, `enum`, `default`, `examples`), so a data key named `$schema` or `$ref` is refused. An inadmissible schema is refused with `SchemaRejected`;
    - for each `CustomEval` case, requires that the evaluator outlet is registered in the evaluator context the challenger names, that the challenger is a member of that context, and that the challenger's role grants the outlet-call permission (`EvaluatorUnavailable` otherwise);
-   - draws `challenge_id` and the salts, sets `created_at` to its clock, and requires `0 < expires_at − created_at ≤ MAX_CHALLENGE_WINDOW_SECS`;
-   - sets the policy within the definition's limits: `max_retries ≤` the definition's `max_retries`; the definition's `cooldown_secs ≤ cooldown_secs ≤ MAX_CHALLENGE_COOLDOWN_SECS`; `pass_threshold_bps` equal to the definition's. A challenger that picks no values takes the definition's. Any other value is refused with `PolicyOutsideDefinition`;
+   - sets the policy within the definition's limits: `max_retries ≤` the definition's `max_retries`; `cooldown_secs ≥` the definition's `cooldown_secs`; `pass_threshold_bps` equal to the definition's. A challenger that picks no values takes the definition's. Any other value is refused with `PolicyOutsideDefinition`. The protocol sets no ceiling on either value: a definition may set any `u32`;
+   - draws `challenge_id`, sets `created_at` to its clock, and requires `0 < expires_at − created_at ≤ MAX_CHALLENGE_WINDOW_SECS` and `expires_at − created_at ≥ cooldown_secs` (`ChallengeWindowInvalid` otherwise, naming the window and the cooldown). A window shorter than the cooldown would leave no retry inside it. A definition whose `cooldown_secs` exceeds `MAX_CHALLENGE_WINDOW_SECS` is therefore valid, and no challenge can be created under it;
    - refuses `verifier == subject` with `SelfChallenge`;
-   - persists the challenge and its answer key in its attempt ledger (§7.3.4.5), then signs `D`. A request leaves the challenger only after its ledger entry is durable.
+   - refuses with `ChallengeWindowOpen` while the last challenge it issued to the same subject, compared by decoded key, for the same `capability_uri` is still inside its window (`now < expires_at`). A closed challenge counts until its window ends. The refusal names that challenge and its `expires_at`, at which the caller may retry. The ledger makes this check and the write that follows in one step, so two concurrent creates cannot both pass it;
+   - signs `D`, then persists the challenge, its signed request and its answer key in its attempt ledger (§7.3.4.5). A persist failure returns the error and discards the signature. A request leaves the challenger only after its ledger entry is durable.
 
 2. **Respond.** The subject verifies the request signature against the verifier's `#active` key, checks that `subject` is its own identifier, checks `created_at − CHALLENGE_CLOCK_SKEW_SECS ≤ now ≤ expires_at + CHALLENGE_CLOCK_SKEW_SECS`, builds one output per case in case order, refuses to send a response larger than `MAX_CHALLENGE_RESPONSE_BYTES`, and signs `D_r` with `attempt` one greater than its last graded attempt. A subject that declines the challenge sends nothing. Declining is not penalized at the protocol level, and the challenger can observe it.
 
 3. **Grade.** The challenger:
    1. refuses a response larger than `MAX_CHALLENGE_RESPONSE_BYTES` or nested deeper than `MAX_CHALLENGE_JSON_DEPTH` with `ResponseTooLarge`, before any parse beyond framing;
-   2. looks up the challenge in its ledger without changing it, and refuses with `UnknownChallenge` unless the entry exists, its stored `D` equals the `D` computed from the request the caller supplied, and its stored subject equals `request.subject`. This lookup runs before any identifier resolution;
+   2. looks up the challenge in its ledger without changing it, and refuses with `UnknownChallenge` unless the entry exists, its stored `D` equals the `D` computed from the request the caller supplied, its stored subject equals `request.subject`, and, when the challenge is closed, a stored attempt has the response's `D_r` (a resubmit, step 5). This lookup runs before any identifier resolution;
    3. authenticates the response: `response.request_digest == D` (`OutputsMismatch` otherwise); `request.verifier` is the challenger itself; `response.subject` equals `request.subject`; the subject signature verifies over `D_r` against the subject's `#active` key; the outputs match the cases one for one and in order (`OutputsMismatch` otherwise). A response that fails steps 1 to 3 changes no ledger state and counts as no attempt and no fault;
    4. takes one of its `MAX_CONCURRENT_GRADINGS_PER_CHALLENGER` grading permits (§9.18.C), or refuses with `GradingCapacityExhausted`;
    5. begins the attempt in one ledger step. A stored attempt with the same `attempt` and `D_r` returns its stored record, and nothing is graded again. Otherwise the ledger requires the entry to match the authenticated `D` and subject (`UnknownChallenge`), runs the attempt check below, and takes a grading lease whose deadline is `now + CHALLENGE_GRADING_BUDGET_SECS + CHALLENGE_LEASE_MARGIN_SECS`. A lease held past its deadline is replaced; a live lease refuses the attempt with `GradingInProgress`;
-   6. grades the cases one at a time, in order, under one total budget of `CHALLENGE_GRADING_BUDGET_SECS`, after checking each case's opening against its commitment.
+   6. grades the cases one at a time, in order, under one total budget of `CHALLENGE_GRADING_BUDGET_SECS`.
 
-   **Attempt check.** The ledger refuses an attempt when `now` is before `created_at` or after `expires_at` (`ChallengeExpired`), when the challenge is closed (`ChallengeClosed`), when `attempt` is not the last graded attempt plus one (`AttemptOutOfOrder`), when `attempt > 1 + max_retries` (`RetriesExhausted`), when `now` is earlier than the last graded attempt's `timestamp` plus `cooldown_secs` (`CooldownActive`), and when the challenge has recorded `MAX_GRADING_FAULTS` faults (`ChallengeFaulted`). The ledger runs the check when the attempt begins, before any grading work, and again when the attempt commits.
+   **Attempt check.** The ledger refuses an attempt unless `created_at < now < expires_at` (`ChallengeExpired`); it refuses when the challenge is closed (`ChallengeClosed`), when `attempt` is not the last graded attempt plus one (`AttemptOutOfOrder`), when `attempt − 1 > max_retries` (`RetriesExhausted`), and when `now` is earlier than `c + cooldown_secs`, where `c` is the later of the last graded attempt's `timestamp` and the time of the challenge's last fault (`CooldownActive`). The sum saturates at the largest `u64`, so no `cooldown_secs` overflows it. The ledger runs the check when the attempt begins, before any grading work, and again when the attempt commits.
 
    **Per-case grading.**
    - `ExactMatch`: `JCS(output) == JCS(value)`.
    - `SchemaMatch`: `output` validates against `schema` under JSON Schema draft 2020-12, with format assertions off. Validation that stops at a regular-expression backtracking limit fails the case.
    - `ContainsAll`: every `required` string occurs, byte-exact and case-sensitive, in some decoded string value or object key of `output`.
    - `ContainsNone`: no `forbidden` string occurs, byte-exact and case-sensitive, in any decoded string value or object key of `output`.
+   - For `ContainsAll` and `ContainsNone`, a case whose decoded string values and object keys total more than `MAX_CONTAINS_HAYSTACK_BYTES` fails without a scan.
    - `CustomEval`: the challenger calls the evaluator outlet with `{"case": {"test_id", "input", "category", "weight"}, "output": <output>}` and reads `{"passed": bool, "reason": string}`. The subject never names or reaches the evaluator.
 
-   **Case failures and faults.** An outcome that the subject's output can cause fails the case: an evaluator error after the evaluator started (a handler error, an input or output schema mismatch, a panic, a malformed result, a timeout), a regular-expression backtracking limit, and the expiry of the grading budget, which fails the case in progress and every later case. An outcome fixed by challenger state is a fault: an opening that does not match its commitment (`AnswerKeyMismatch`), an evaluator that cannot start (no handler, an unregistered outlet, a missing membership or permission, or a rate, budget or payment refusal before the evaluator runs), and a settlement error after the evaluator returned a verdict, whose verdict the challenger discards. A fault uses no attempt, releases the lease and increments the challenge's fault count. At `MAX_GRADING_FAULTS` faults the challenge closes as `Faulted`.
+   **Case failures, faults and capacity refusals.** An outcome that the subject's output can cause fails the case: an evaluator error after the evaluator started (a handler error, an input or output schema mismatch, a panic, a malformed result, a timeout), a regular-expression backtracking limit, and the expiry of the grading budget, which fails the case in progress and every later case. An outcome fixed by challenger state is a fault: an evaluator that cannot start (no handler, an unregistered outlet, a missing membership or permission, or a payment refusal before the evaluator runs), and a settlement error after the evaluator returned a verdict, whose verdict the challenger discards. A fault uses no attempt, releases the lease and records the fault's time, from which the cooldown runs; the challenge stays open. A rate-limit or budget refusal by the evaluator context's reserve step, before the evaluator runs, is a capacity refusal: the challenger releases the lease, records neither an attempt nor a fault, and refuses the grading with `GradingCapacityExhausted`, and the subject may resubmit the same attempt at once.
 
    **Results.** `score` is the sum of the weights of the passed cases, and `passed = score ≥ pass_threshold_bps`. `pass_count` is the number of passed cases, and `test_count` the number of cases. `min_category_cases` is the smallest number of cases in any one category of the suite, with categories grouped by ASCII lowercase. The challenger keeps the per-case reasons in its ledger and returns them to its caller; no signature covers them.
 
-4. **Record.** In one ledger step the challenger confirms that it still holds the attempt's lease (`GradingLeaseLost` otherwise, with nothing written), reads its clock once as `timestamp`, runs the attempt check again at `timestamp`, writes the attempt as pending together with the challenge's closure (`Passed` after a pass, `Exhausted` after the last allowed attempt), signs `D_v`, writes the signed attempt and releases the lease. Every graded attempt, passed or failed, yields one signed record. A pass closes the challenge. The challenger publishes the record to the subject's service endpoint and MAY record it in the context's event log.
+4. **Record.** In one ledger step the challenger confirms that it still holds the attempt's lease for this `attempt` and `D_r` (`GradingLeaseLost` otherwise, with nothing written), reads its clock once as `timestamp`, runs the attempt check again at `timestamp`, signs `D_v`, writes the signed attempt together with the challenge's closure (`Passed` after a pass, `Exhausted` after the last allowed attempt) in one write, and releases the lease. A sign failure or a write failure records nothing: the attempt stays unused and the signature never leaves the challenger. Every graded attempt, passed or failed, yields one signed record. A pass closes the challenge. The challenger returns the signed record to its caller, who delivers it, and MAY record it in the context's event log.
 
 5. **Consume.** A party that reads a `ChallengeVerification` parses `verifier`, `subject` and the subject it expects as canonical identifiers, and then rejects the record unless:
    - (a) the signature verifies over `D_v` against the verifier's `#active` key;
    - (b) `verification_id` equals the derivation above;
-   - (c) `challenge_created_at ≤ timestamp ≤ challenge_expires_at`;
+   - (c) `challenge_created_at < timestamp < challenge_expires_at`;
    - (d) `timestamp ≤ now + CHALLENGE_CLOCK_SKEW_SECS`;
    - (e) `expires_at − timestamp ≤ MAX_VERIFICATION_VALIDITY_SECS`;
-   - (f) `1 ≤ attempt ≤ 1 + max_retries`, `max_retries ≤ MAX_CHALLENGE_RETRIES`, and `cooldown_secs ≤ MAX_CHALLENGE_COOLDOWN_SECS`;
-   - (g) the party resolves the capability definition (§7.3.4.6), failing closed with `CapabilityDefinitionUnavailable` and refusing the §7.3.4.7 standards with `StandardNotGradable`, and then `definition_digest` equals the definition's digest, `pass_threshold_bps` equals the definition's, `max_retries ≤` the definition's `max_retries`, `cooldown_secs ≥` the definition's `cooldown_secs`, `test_count ≥ k` under `Total(k)`, `min_category_cases ≥ k` under `PerCategory(k)`, and `min_category_cases ≤ test_count` (`PolicyOutsideDefinition` otherwise);
+   - (f) `1 ≤ attempt` and `attempt − 1 ≤ max_retries`;
+   - (g) the party resolves the capability definition (§7.3.4.6), failing closed with `CapabilityDefinitionUnavailable` and refusing the §7.3.4.7 standards with `StandardNotGradable`, and then `definition_digest` equals the definition's digest, `pass_threshold_bps` equals the definition's, `max_retries ≤` the definition's `max_retries`, `cooldown_secs ≥` the definition's `cooldown_secs`, `challenge_expires_at − challenge_created_at ≥` the definition's `cooldown_secs`, `test_count ≥ k` under `Total(k)`, `min_category_cases ≥ k` under `PerCategory(k)`, and `min_category_cases ≤ test_count` (`PolicyOutsideDefinition` otherwise);
    - (h) `passed == (score ≥ pass_threshold_bps)`, `score ≤ 10000` and `pass_count ≤ test_count`;
    - (i) `verifier ≠ subject` (`SelfChallenge`);
    - (j) `subject` equals the subject the party expects;
@@ -590,18 +591,18 @@ These encodings replace the earlier encodings under `SCP-CHALLENGE-REQ-V1:` and 
 
    Step (d) bounds the validity cap in real time: without it, a record stamped years ahead would pass step (e) and stay unexpired for years. A consumer cannot check the cooldown between two attempts from one record; step (g) proves only that the signed cooldown was within the definition's limits. Admission applies the requirement's governance cap (§7.3.4.4).
 
-**Storage and discovery.** A `ChallengeVerification` record is its own signed object the subject references, and not a field of any document the subject publishes; the service record carries only the self-asserted capability URIs (`03-identity.md` §3.10.13). Verifiers fetch records from the endpoint the subject's service record names during admission checks (§7.3.4.4). Records are identified by `verification_id` for deduplication and revocation. Only the signed record is published: the challenger publishes neither the cases' expected outputs nor the openings. An auditor asks the challenger, and the challenger MAY open its commitments to that auditor. To a party without the openings, the record is the challenger's signed assertion.
+**Storage and discovery.** A `ChallengeVerification` record is its own signed object the subject references, and not a field of any document the subject publishes; the service record carries only the self-asserted capability URIs (`03-identity.md` §3.10.13). Verifiers fetch records from the endpoint the subject's service record names during admission checks (§7.3.4.4). Records are identified by `verification_id` for deduplication and revocation. The challenger returns each signed record to its caller, who delivers it; the cases' expected outputs never leave the challenger. A record is the challenger's signed assertion of the grade: nothing in the request or the record lets another party recompute it.
 
 **Expiry.** Challenge verifications expire at their `expires_at`. The maximum validity period is `MAX_VERIFICATION_VALIDITY_SECS` (90 days), because capabilities can degrade over time (model updates, configuration changes) and re-verification is necessary. Contexts MAY require shorter validity periods in their admission requirements.
 
 **Limitations.** The protocol does not provide the following:
 - `ContainsNone` is a lexical screen: zero-width characters, homoglyphs, alternative Unicode normalization forms and encodings inside strings evade it.
+- `ContainsAll` is a necessary check, not a sufficient one: an output that lists every required string passes, whatever else it says. A challenger that needs a judgment of meaning uses `SchemaMatch`, `ExactMatch` or `CustomEval` for that case.
 - The challenger alone enforces the cooldown between attempts.
 - `verifier ≠ subject` stops only literal self-signing. The requirement's `trusted_verifiers` set (§7.3.4.4) is the control on who may grade.
 - Standards graded on traces the subject writes (`idempotency/v1`, `outlet-schema-compliance/v1`, the outlet-call part of `credential-handling/v1`, `spending-compliance/v1`) grade what the subject chose to report.
-- A `CustomEval` case's commitment binds only the evaluator outlet's identifier. The outlet's behaviour, and any reference answer it holds, can change after the challenger signs the request, so an auditor cannot confirm that a `CustomEval` case's answer was fixed at signing.
 - Evaluator errors and budget overruns fail cases, so a slow or unreliable evaluator costs honest subjects attempts.
-- An evaluator refusal before the evaluator runs, such as the evaluator context's rate limit or budget, is a fault. A challenger sizes its evaluator context for its grading load. A party that can exhaust that context can close challenges as `Faulted`, and a `Faulted` challenge leaves no record.
+- A fault uses no attempt and starts the cooldown. A challenger whose evaluators keep faulting delays each subject's attempts by one cooldown per fault, and a challenge whose window ends that way leaves no record. A capacity refusal starts nothing, so a party that exhausts the evaluator context's rate limit or budget delays a grading without using the subject's attempts or cooldown. A challenger sizes its evaluator context for its grading load.
 - An evaluator handler that never returns holds its grading permit until it returns. After `MAX_CONCURRENT_GRADINGS_PER_CHALLENGER` such handlers, the challenger identity refuses every grading with `GradingCapacityExhausted` until it restarts. The challenger answers for the evaluators it chooses.
 
 #### 7.3.4.1 Capability URI Namespace
@@ -734,7 +735,7 @@ The protocol defines 28 challenge capabilities across 10 categories; the list is
 | `hallucination-resistance/v1` | 15 | 9000 (90%) | 2 | 300 | Binary per-case: "I don't know" or equivalent for nonexistent/fabricated subjects | None |
 | `source-attribution/v1` | 10 | 8000 (80%) | 2 | 300 | Binary per-case: citations are real, verifiable, and support the claim | None |
 
-**Test case format.** The challenger writes each challenge's `TestCase` list and keeps it (§7.3.4); the request carries each case's input and answer commitment. `CustomEval` names an evaluator outlet the challenger chooses; the SDK ships no reference evaluator. It serves capabilities whose pass or fail needs semantic judgment.
+**Test case format.** The challenger writes each challenge's `TestCase` list and keeps it (§7.3.4); the request carries each case's input, category and weight, and nothing derived from its expected output. `CustomEval` names an evaluator outlet the challenger chooses; the SDK ships no reference evaluator. It serves capabilities whose pass or fail needs semantic judgment.
 
 ##### 7.3.4.3.1 Protocol Constant
 
@@ -761,8 +762,8 @@ CapabilityRequirement {
 }
 
 RetryCap {
-  max_retries:       u32,   // ≤ MAX_CHALLENGE_RETRIES
-  min_cooldown_secs: u32,   // ≤ MAX_CHALLENGE_COOLDOWN_SECS
+  max_retries:       u32,   // any u32
+  min_cooldown_secs: u32,   // any u32
 }
 ```
 
@@ -773,7 +774,7 @@ Under `ChallengeVerified`, `trusted_verifiers` holds 1 to `MAX_TRUSTED_VERIFIERS
 1. Context declares one or more `CapabilityRequirement` entries — each pairs a capability URI with a required `VerificationLevel` (`SelfAttested` or `ChallengeVerified`), and a `ChallengeVerified` entry names its trusted verifiers.
 2. Joining agent sees the requirements in context metadata before opting in (legibility tenet — visible before join decision).
 3. Admitting context fetches the joining agent's self-attested capability URIs (`SCPCapabilities` entries) and `ChallengeVerification` records (from the subject's `SCPCapabilities` endpoint, §7.3.4).
-4. Admitting context reads the live requirement list and verifies, for each requirement: (a) every candidate `ChallengeVerification`'s signed `subject` equals the identifier of the agent being admitted AND its signed `context_id` equals the context being admitted to — a result minted for another subject or another context is discarded before it can satisfy any requirement (closing cross-subject and cross-context challenge-result replay, where a genuine result issued for a different agent or context is presented to admit this one), (b) every candidate record passes §7.3.4 step 5, which includes its verifier's P-256 signature over its canonical bytes, its capability definition and its expiry relative to the current clock (verify-on-use — a record that fails step 5 is not considered), (c) the record's `verifier` is in the requirement's `trusted_verifiers`, compared by decoded key (`UntrustedVerifier` otherwise), (d) the record's `verifier` is not its `subject` (`SelfChallenge` otherwise), (e) when `retry_cap` is set, the record's `max_retries ≤ retry_cap.max_retries` and its `cooldown_secs ≥ retry_cap.min_cooldown_secs` (`RetryCapExceeded` otherwise), (f) a `SelfAttested` requirement is met when the capability URI appears among the agent's self-attested capabilities OR a valid `ChallengeVerification` with `passed == true` exists for it (challenge-verified implies self-attested), (g) a `ChallengeVerified` requirement is met only by a record that passes (a) to (e) with `passed == true` for that capability.
+4. Admitting context reads the live requirement list and verifies, for each requirement: (a) every candidate `ChallengeVerification`'s signed `subject` equals the identifier of the agent being admitted AND its signed `context_id` equals the context being admitted to — a result minted for another subject or another context is discarded before it can satisfy any requirement (closing cross-subject and cross-context challenge-result replay, where a genuine result issued for a different agent or context is presented to admit this one), (b) every candidate record passes §7.3.4 step 5, which includes its verifier's P-256 signature over its canonical bytes, its capability definition and its expiry relative to the current clock (verify-on-use — a record that fails step 5 is not considered), (c) the record's `verifier` is in the requirement's `trusted_verifiers`, compared by decoded key (`UntrustedVerifier` otherwise), (d) the record's `verifier` is not its `subject` (`SelfChallenge` otherwise), (e) when `retry_cap` is set, the record's `max_retries ≤ retry_cap.max_retries`, its `cooldown_secs ≥ retry_cap.min_cooldown_secs`, and its window `challenge_expires_at − challenge_created_at ≥ retry_cap.min_cooldown_secs` (`RetryCapExceeded` otherwise), (f) a `SelfAttested` requirement is met when the capability URI appears among the agent's self-attested capabilities OR a valid `ChallengeVerification` with `passed == true` exists for it (challenge-verified implies self-attested), (g) a `ChallengeVerified` requirement is met only by a record that passes (a) to (e) with `passed == true` for that capability.
 5. If any requirement is not met, admission is denied (`MissingCapability` for an absent self-attested capability, `VerificationRequired` for a challenge-verified capability lacking a valid record).
 
 Subject binding and context binding are enforced by the protocol (steps 4a–4b), mirroring the participation-admission sibling (§7.3.2.1): the admission primitive takes the identifier of the agent being admitted (`subject`) and the context being admitted to (`context_id`), and discards any challenge result whose signed subject or context does not match. All checks are mechanical — no judgment, no discretion, no governance vote at admission time.
@@ -782,7 +783,7 @@ Subject binding and context binding are enforced by the protocol (steps 4a–4b)
 
 #### 7.3.4.5 Answer Key Custody
 
-The answer key of a challenge is each case's `expected` output and `salt`. The key lives in the challenger's attempt ledger, which the storage backend encrypts at rest. The ledger holds each challenge from its creation until `expires_at + CHALLENGE_CLOCK_SKEW_SECS` (`09-security-model.md` §9.18.18), and the challenger prunes it afterwards. The challenger refuses to grade a challenge its ledger does not hold (`UnknownChallenge`). The ledger also holds the attempt state §7.3.4 step 3 checks: the last graded attempt and its `timestamp`, the challenge's closure, its fault count, and each attempt's record. The ledger writes the entry durably before the challenger signs the request, and writes each attempt durably before it replies. A stateless evaluator can grade a case, and the ledger cannot be stateless.
+The answer key of a challenge is each case's `expected` output, in case order. The key lives in the challenger's attempt ledger, which the storage backend encrypts at rest, and nothing derived from it leaves the challenger. The ledger holds each challenge, open or closed, from its creation until `expires_at + CHALLENGE_CLOCK_SKEW_SECS` (`09-security-model.md` §9.18.18), and the challenger prunes it afterwards. A prune whose delete fails leaves the entry in place, is retried on a later step, and refuses nothing. The challenger refuses to grade a challenge its ledger does not hold (`UnknownChallenge`). The ledger also holds the attempt state §7.3.4 step 3 checks: the last graded attempt and its `timestamp`, the time of the challenge's last fault, the challenge's closure, and each attempt's signed record; and it holds each challenge's subject and `capability_uri` for the `ChallengeWindowOpen` check of §7.3.4 step 1. `MAX_OPEN_CHALLENGES_PER_CHALLENGER` (§9.18.C) counts the challenges that are not closed. The challenger signs the request before the ledger writes its entry, and the entry holds the signed request; it signs each record before the ledger writes the attempt, and the attempt holds the signed record. The ledger writes each durably before the challenger replies, and a signature whose write fails is discarded. A stateless evaluator can grade a case, and the ledger cannot be stateless.
 
 #### 7.3.4.6 Capability Definition Record
 
@@ -793,8 +794,8 @@ CapabilityDefinition {
   capability_uri:     String,     // the URI the definition governs
   min_cases:          MinCases,   // Total(u32) | PerCategory(u32)
   pass_threshold_bps: u32,        // 1..=10000
-  max_retries:        u32,        // limit (ceiling); ≤ MAX_CHALLENGE_RETRIES; taken when the challenger picks none
-  cooldown_secs:      u32,        // limit (floor); ≤ MAX_CHALLENGE_COOLDOWN_SECS; taken when the challenger picks none
+  max_retries:        u32,        // limit (ceiling); any u32; taken when the challenger picks none
+  cooldown_secs:      u32,        // limit (floor); any u32; taken when the challenger picks none
   description:        String,     // UTF-8, at most MAX_CAPABILITY_DESCRIPTION_BYTES
 }
 
@@ -806,7 +807,7 @@ SignedCapabilityDefinition {      // identifier-scoped URIs only
 
 **Digest.** `Def = "SCP-CAPABILITY-DEFINITION-V1:" ‖ F(capability_uri) ‖ U8(tag) ‖ U32(min) ‖ U32(pass_threshold_bps) ‖ U32(max_retries) ‖ U32(cooldown_secs) ‖ F(description)`, where `tag` is 0 for `Total` and 1 for `PerCategory` and `min` is the count either variant carries. `definition_digest = SHA-256(Def)`. `25-test-vectors.md` §25.30 Vector 63 pins `Def`.
 
-**Validity.** A definition is valid only when `min ≥ 1`, `1 ≤ pass_threshold_bps ≤ 10000`, `max_retries ≤ MAX_CHALLENGE_RETRIES`, `cooldown_secs ≤ MAX_CHALLENGE_COOLDOWN_SECS`, and its description fits `MAX_CAPABILITY_DESCRIPTION_BYTES`. A party treats an invalid signed definition as one it cannot obtain.
+**Validity.** A definition is valid only when `min ≥ 1`, `1 ≤ pass_threshold_bps ≤ 10000`, and its description fits `MAX_CAPABILITY_DESCRIPTION_BYTES`. The protocol bounds neither `max_retries` nor `cooldown_secs`: every `u32` is valid for each. A party treats an invalid signed definition as one it cannot obtain.
 
 **Limits.** A definition's `max_retries` is a ceiling and its `cooldown_secs` a floor. A challenger may pick fewer retries or a longer cooldown, and the request and record sign the values it picked. The pass threshold is fixed: a request and a record carry the definition's threshold exactly. Context governance may tighten both limits per requirement (`retry_cap`, §7.3.4.4).
 
@@ -818,7 +819,7 @@ SignedCapabilityDefinition {      // identifier-scoped URIs only
 
 **Publication and fetch.** A definer publishes its signed definition as a retained relay record addressed from the definer's identifier and the capability path. A party fetches it by resolving the definer, fetching the record, verifying the signature against the definer's `#active` key, checking that `capability_uri` equals the URI requested, and pinning the digest. Until an SDK ships that fetch path, its only definition source is the protocol rows, and it refuses every identifier-scoped URI end to end with `CapabilityDefinitionUnavailable`.
 
-**Who reads it.** The challenger snapshots the definition into its ledger entry when it creates a challenge (§7.3.4 step 1). A consumer resolves the definition at §7.3.4 step 5(g). Admission also applies the requirement's `retry_cap`. A party that obtains no definition refuses with `CapabilityDefinitionUnavailable`, at creation and at consumption, which reports an outage and not a judgment on the subject. The protocol has no default definition.
+**Who reads it.** The challenger resolves the definition when it creates a challenge (§7.3.4 step 1), and the request signs its digest and the policy picked under it. A consumer resolves the definition at §7.3.4 step 5(g). Admission also applies the requirement's `retry_cap`. A party that obtains no definition refuses with `CapabilityDefinitionUnavailable`, at creation and at consumption, which reports an outage and not a judgment on the subject. The protocol has no default definition.
 
 #### 7.3.4.7 Standards Not Gradable From Outputs
 

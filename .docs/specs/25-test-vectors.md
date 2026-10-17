@@ -2099,7 +2099,7 @@ rejected, padded:
 
 ## 25.30 Trust Challenge Vectors (§7.3.4)
 
-`07-trust-validation-and-capabilities.md` §7.3.4 fixes five encodings: the request preimage under `SCP-CHALLENGE-REQ-V1:`, the answer commitment under `SCP-CHALLENGE-COMMIT-V1:`, the response preimage under `SCP-CHALLENGE-RESP-V1:`, the verification record preimage under `SCP-CHALLENGE-VERIFY-V1:`, and the `verification_id` and `suite_digest` derivations. §7.3.4.6 fixes the capability definition preimage under `SCP-CAPABILITY-DEFINITION-V1:`. The request and record encodings each changed under the same separator, and no earlier encoding has a vector. None of these vectors carries a key or a signature: each pins a preimage and its SHA-256 digest, which the signer's `#active` key signs, so none depends on the curve. `verifier` and `subject` are the §25.1 fixture identifiers of those roles, in the `scp:` text form, so each carries the length prefix `00000038`. `capability_uri` is an identifier-scoped URI whose definer is the fixture identifier `definer`. A protocol capability URI would need at least the minimum number of test cases §7.3.4.3 sets for it, 20 for `schema-validation/v1`, and a conforming SDK refuses a one-case request for one.
+`07-trust-validation-and-capabilities.md` §7.3.4 fixes four encodings: the request preimage under `SCP-CHALLENGE-REQ-V1:`, the response preimage under `SCP-CHALLENGE-RESP-V1:`, the verification record preimage under `SCP-CHALLENGE-VERIFY-V1:`, and the `verification_id` and `suite_digest` derivations. §7.3.4.6 fixes the capability definition preimage under `SCP-CAPABILITY-DEFINITION-V1:`. The request and record encodings each changed under the same separator, and no earlier encoding has a vector. None of these vectors carries a key or a signature: each pins a preimage and its SHA-256 digest, which the signer's `#active` key signs, so none depends on the curve. `verifier` and `subject` are the §25.1 fixture identifiers of those roles, in the `scp:` text form, so each carries the length prefix `00000038`. `capability_uri` is an identifier-scoped URI whose definer is the fixture identifier `definer`. A protocol capability URI would need at least the minimum number of test cases §7.3.4.3 sets for it, 20 for `schema-validation/v1`, and a conforming SDK refuses a one-case request for one.
 
 The five vectors share these inputs:
 
@@ -2137,16 +2137,12 @@ definition_digest = SHA-256(Def):  1947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9
 
 ### Vector 59: the challenge request
 
-Inputs, beyond the shared ones: `definition_digest` the Vector 63 value; one test case with `test_id` `schema-validation-001`, `input` `{"name":"widget","count":3}`, `category` `schema` and `weight` 10000, whose expected output `SchemaMatch { schema: {"type":"object","required":["name","count"]} }` enters the request only through its answer commitment; the case's `salt`, the 32 bytes `21` through `40`.
+Inputs, beyond the shared ones: `definition_digest` the Vector 63 value; one test case with `test_id` `schema-validation-001`, `input` `{"name":"widget","count":3}`, `category` `schema` and `weight` 10000, whose expected output `SchemaMatch { schema: {"type":"object","required":["name","count"]} }` stays with the challenger and enters no byte of the request.
 
-`input` enters the preimage as RFC 8785 canonical JSON behind a 4-byte big-endian length. The expected output takes its externally tagged wire form, so RFC 8785 sorts the members of `schema` and leaves the order of the `required` array as given. The commitment hashes the separator, the salt as 32 fixed bytes, and the length-prefixed canonical expected output.
+`input` enters the preimage as RFC 8785 canonical JSON behind a 4-byte big-endian length.
 
 ```
 JCS(input):     {"count":3,"name":"widget"}
-JCS(expected):  {"SchemaMatch":{"schema":{"required":["name","count"],"type":"object"}}}
-salt:           2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40
-answer_commitment = SHA-256("SCP-CHALLENGE-COMMIT-V1:" ‖ salt ‖ F(JCS(expected))):
-                b73317ea1cf075724a76d4454a3c777e10b4cf31a853d650f667398c6e52a2d8
 ```
 
 **`test_cases` field `T` (the count, then the one element; 106 bytes):**

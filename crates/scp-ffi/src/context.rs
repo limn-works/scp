@@ -519,7 +519,7 @@ pub struct PyContextParams {
     /// enforcement tiers gated to governance only).
     consequence_config: Option<String>,
     /// The admission capability requirements as a JSON array of
-    /// `CapabilityRequirement` (spec §7.3.5). When `None`, the context has
+    /// `CapabilityRequirement` (spec §7.3.4.4). When `None`, the context has
     /// none.
     capability_requirements: Option<String>,
 }
@@ -974,7 +974,7 @@ impl PyContextParams {
             None => None,
         };
 
-        // capability_requirements: Optional[str] (JSON array, default: None) -- spec §7.3.5
+        // capability_requirements: Optional[str] (JSON array, default: None) -- spec §7.3.4.4
         let capability_requirements: Option<String> =
             match dict.get_item("capability_requirements")? {
                 Some(val) if val.is_none() => None,
