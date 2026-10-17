@@ -1471,7 +1471,9 @@ mod tests {
     }
 
     /// Asserts `result` is the transport error carrying `SCP-TRANS-5056` that
-    /// a start returns while another node of the instance holds the binding.
+    /// a start returns while another node of the instance holds the binding,
+    /// and that its message is the `NodeAlreadyBound` step's, so a 5056 from
+    /// any other step, such as `RelayConnect`, fails the assertion.
     #[cfg(feature = "testing")]
     fn assert_refused_while_bound(result: Result<Arc<NodeHandle>, ScpError>, label: &str) {
         let err = match result {
@@ -1485,6 +1487,17 @@ mod tests {
             class_and_code(&err),
             ("transport", codes::TRANS_5056),
             "{label}: {err:?}"
+        );
+        let ScpError::Transport { msg, .. } = &err else {
+            panic!("{label}: a 5056 refusal is a transport error: {err:?}");
+        };
+        assert_eq!(
+            *msg,
+            scp_ffi_common::server::ServerError::SupervisorWiring(
+                scp_ffi_common::server::SupervisorWiringError::NodeAlreadyBound,
+            )
+            .user_message(),
+            "{label}: the refusal names NodeAlreadyBound"
         );
     }
 

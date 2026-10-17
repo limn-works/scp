@@ -1179,7 +1179,9 @@ mod tests {
     }
 
     /// Asserts `result` is the transport error carrying `SCP-TRANS-5056` that
-    /// a start returns while another node of the instance holds the binding.
+    /// a start returns while another node of the instance holds the binding,
+    /// and that it names the `NodeAlreadyBound` step, so a 5056 from any
+    /// other step, such as `RelayConnect`, fails the assertion.
     #[cfg(feature = "testing")]
     fn assert_refused_while_bound(result: napi::Result<NapiNodeHandle>, label: &str) {
         let reason = match result {
@@ -1190,6 +1192,11 @@ mod tests {
             Err(e) => e.reason.clone(),
         };
         assert_coded(&reason, "transport", codes::TRANS_5056, label);
+        let step = scp_ffi_common::server::SupervisorWiringError::NodeAlreadyBound.user_message();
+        assert!(
+            reason.contains(step),
+            "{label}: the refusal names NodeAlreadyBound: {reason}"
+        );
     }
 
     /// `context_create` attaches a `Supervisor` with an unconfigured

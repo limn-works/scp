@@ -333,6 +333,28 @@ impl NodeBinding {
     }
 }
 
+/// The set of relay URLs `manager` holds an adapter for.
+fn relay_url_set(manager: &scp_transport::TransportManager) -> HashSet<String> {
+    manager.relay_urls().into_iter().collect()
+}
+
+/// Returns whether `current` is the node transport `installed` names: both
+/// hold adapters for the same set of relay URLs.
+///
+/// A resume rebuilds the instance's transport manager over the relay URLs
+/// it held, so the rebuilt manager is a new `Arc` for the same node
+/// transport, and an `Arc::ptr_eq` comparison would read it as a manager
+/// another call installed. [`CoreFields::restore_transport`] and the stale
+/// binding reclaim in `scp_ffi_common::server::wire_supervisor_to_node`
+/// both decide through this function, so the two cannot disagree.
+#[must_use]
+pub fn same_node_transport(
+    current: &scp_transport::TransportManager,
+    installed: &scp_transport::TransportManager,
+) -> bool {
+    relay_url_set(current) == relay_url_set(installed)
+}
+
 #[derive(Default)]
 struct BorrowerRegistry {
     /// Set by [`CoreFields::stop_borrowers`]. Never cleared: shutdown is a
@@ -1758,9 +1780,9 @@ impl CoreFields {
     ///
     /// The instance still serves the node when its manager, or, while a
     /// suspend has cleared the manager, its reconnect set, names exactly the
-    /// relays `installed` names; a resume rebuilds the manager over those
-    /// same URLs, so the URL set and not the `Arc` identifies the node's
-    /// transport. Changes nothing when the instance is shut down or no longer
+    /// relays `installed` names; [`same_node_transport`] decides it, because
+    /// a resume rebuilds the manager over the same URLs. Changes nothing when
+    /// the instance is shut down or no longer
     /// serves the node. On a suspended instance it leaves the manager empty
     /// and sets the reconnect set, so a resume reconnects `previous`'s relays
     /// rather than the stopped node's relay. Recovers a poisoned lock,
@@ -1783,18 +1805,14 @@ impl CoreFields {
             .relay_urls
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let installed_urls: HashSet<String> = installed.relay_urls().into_iter().collect();
         let serves_node = slot.as_ref().map_or_else(
-            || *pending == installed_urls,
-            |current| current.relay_urls().into_iter().collect::<HashSet<_>>() == installed_urls,
+            || *pending == relay_url_set(installed),
+            |current| same_node_transport(current, installed),
         );
         if !serves_node {
             return;
         }
-        *pending = previous
-            .as_ref()
-            .map(|m| m.relay_urls().into_iter().collect())
-            .unwrap_or_default();
+        *pending = previous.as_deref().map(relay_url_set).unwrap_or_default();
         if slot.is_some() {
             *slot = previous;
         }
@@ -4014,7 +4032,7 @@ pub(crate) mod tests {
     }
 
     /// A manager holding one no-op adapter connected to `url`.
-    fn manager_on(url: &str) -> scp_transport::TransportManager {
+    pub fn manager_on(url: &str) -> scp_transport::TransportManager {
         scp_transport::TransportManager::new(url.to_owned(), Box::new(NoOpAdapter))
     }
 

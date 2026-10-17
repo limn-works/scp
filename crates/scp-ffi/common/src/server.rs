@@ -190,7 +190,32 @@ impl ServerError {
             Self::OperatorIdentityUnavailable => {
                 "operator identity is not available to the node".to_owned()
             }
-            Self::SupervisorWiring(_) => "wiring the Supervisor to the node failed".to_owned(),
+            Self::SupervisorWiring(step) => {
+                format!(
+                    "wiring the Supervisor to the node failed: {}",
+                    step.user_message()
+                )
+            }
+        }
+    }
+}
+
+impl SupervisorWiringError {
+    /// Returns a sanitized message that names the failed wiring step, so a
+    /// caller can tell `NodeAlreadyBound` from `RelayConnect` under the one
+    /// `SCP-TRANS-5056` code. The message carries no inner transport or lock
+    /// error, because a transport error can name a relay address.
+    #[must_use]
+    pub const fn user_message(&self) -> &'static str {
+        match self {
+            Self::NodeAlreadyBound => {
+                "another running node holds this instance's Supervisor transport"
+            }
+            Self::RelayConnect(_) => "connecting to the node's relay failed",
+            Self::SupervisorUnavailable => {
+                "the bridge could not attach a Supervisor to the instance"
+            }
+            Self::TransportInstall(_) => "installing the node's relay transport failed",
         }
     }
 }
@@ -1501,11 +1526,15 @@ where
         let replaced_manager = core.swap_transport(Arc::clone(&manager))?;
         let replaced_provider = slot.replace(Arc::clone(&provider));
         // A stale binding's node stopped without unbinding; the transport it
-        // displaced is the one a stop of this node puts back.
+        // displaced is the one a stop of this node puts back. A manager over
+        // the stale node's relay URLs is that node's transport, even when a
+        // resume rebuilt it as a new `Arc`.
         let (displaced_provider, displaced_manager) = match binding.take() {
             Some(stale) => {
                 let manager_before = match replaced_manager {
-                    Some(m) if !Arc::ptr_eq(&m, &stale.manager) => Some(m),
+                    Some(m) if !crate::bridge_instance::same_node_transport(&m, &stale.manager) => {
+                        Some(m)
+                    }
                     _ => stale.displaced_manager,
                 };
                 (stale.displaced_provider, manager_before)
@@ -2880,6 +2909,79 @@ mod tests {
         assert_eq!(
             core.with_transport(|_| ()),
             Err(crate::bridge_instance::TransportLockError::NotInitialized)
+        );
+    }
+
+    /// A resume rebuilds the instance's transport manager over the same
+    /// relay URLs as a new `Arc`. A start that reclaims the stale binding
+    /// reads the rebuilt manager as the stale node's transport, so a stop of
+    /// the new node puts back the manager from before the stale binding and
+    /// not the rebuilt manager of the stopped node.
+    #[tokio::test]
+    async fn stale_binding_reclaim_recognises_a_manager_a_resume_rebuilt() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let first = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &first, &first.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        // Stopped without `stop_node`, so the record still names it.
+        first.shutdown();
+        let recorded = Arc::clone(
+            &core
+                .node_binding()
+                .as_ref()
+                .expect("the stale binding stays recorded")
+                .manager,
+        );
+        let rebuilt = Arc::new(crate::bridge_instance::tests::manager_on(
+            &first.internal_relay_url(),
+        ));
+        assert!(!Arc::ptr_eq(&rebuilt, &recorded));
+        core.install_transport(rebuilt)
+            .expect("a resume installs the rebuilt manager");
+
+        let second = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &second, &second.internal_relay_url(), |_| {})
+            .await
+            .expect("a start reclaims the stale binding");
+        assert!(
+            core.node_binding()
+                .as_ref()
+                .is_some_and(|b| b.displaced_manager.is_none()),
+            "the reclaim keeps the stale binding's displaced manager, not the rebuilt one"
+        );
+
+        stop_node(&core, &second);
+        assert_eq!(
+            core.with_transport(|_| ()),
+            Err(crate::bridge_instance::TransportLockError::NotInitialized),
+            "a stop puts back the empty manager from before the stale binding"
+        );
+    }
+
+    /// Each `SupervisorWiringError` step gives the caller a distinct
+    /// message, so a bridge test can tell `NodeAlreadyBound` from
+    /// `RelayConnect` under the shared `SCP-TRANS-5056` code.
+    #[test]
+    fn supervisor_wiring_user_messages_name_distinct_steps() {
+        let steps = [
+            SupervisorWiringError::NodeAlreadyBound,
+            SupervisorWiringError::RelayConnect(scp_transport::TransportError::ConnectionFailed(
+                "ws://10.0.0.7:4000/scp/v1".to_owned(),
+            )),
+            SupervisorWiringError::SupervisorUnavailable,
+            SupervisorWiringError::TransportInstall(
+                crate::bridge_instance::TransportLockError::Poisoned,
+            ),
+        ];
+        let messages: std::collections::HashSet<String> = steps
+            .into_iter()
+            .map(|step| ServerError::SupervisorWiring(step).user_message())
+            .collect();
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert!(
+            messages.iter().all(|m| !m.contains("10.0.0.7")),
+            "a step message carries no inner transport error: {messages:?}"
         );
     }
 

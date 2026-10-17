@@ -1350,7 +1350,9 @@ mod tests {
     }
 
     /// Asserts `result` is the `TransportError` carrying `SCP-TRANS-5056` that
-    /// a start returns while another node of the instance holds the binding.
+    /// a start returns while another node of the instance holds the binding,
+    /// and that it names the `NodeAlreadyBound` step, so a 5056 from any
+    /// other step, such as `RelayConnect`, fails the assertion.
     #[cfg(feature = "testing")]
     fn assert_refused_while_bound(py: Python<'_>, result: PyResult<PyNodeHandle>, label: &str) {
         let err = match result {
@@ -1366,6 +1368,11 @@ mod tests {
         );
         let raised = err.value(py).to_string();
         assert!(raised.contains(codes::TRANS_5056), "{label}: {raised}");
+        let step = scp_ffi_common::server::SupervisorWiringError::NodeAlreadyBound.user_message();
+        assert!(
+            raised.contains(step),
+            "{label}: the refusal names NodeAlreadyBound: {raised}"
+        );
     }
 
     /// `context_create` attaches a `Supervisor` with an unconfigured
