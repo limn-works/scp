@@ -731,19 +731,6 @@
       ]
     },
     {
-      "canonical": "trust_verify_response",
-      "category": "trust",
-      "pyo3": [
-        "trust_verify_response"
-      ],
-      "uniffi": [
-        "trust_verify_response"
-      ],
-      "napi": [
-        "trust_verify_response"
-      ]
-    },
-    {
       "canonical": "trust_respond_to_challenge",
       "category": "trust",
       "pyo3": [

@@ -656,7 +656,7 @@ impl PyContextParams {
     }
 
     /// Returns the admission capability requirements as a JSON string, or
-    /// `None` if the context has none (spec §7.3.5).
+    /// `None` if the context has none (spec §7.3.4.4).
     #[getter]
     fn capability_requirements(&self) -> Option<&str> {
         self.capability_requirements.as_deref()

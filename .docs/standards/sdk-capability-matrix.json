@@ -700,7 +700,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Challenge-issuance op (ADR-017, spec 07 §7.3.4): all four SDKs expose an async method taking the verifier identity, the subject, the capability URI, the challenger-written test cases and timeout_secs; the request is signed through the verifier's #active custody and returned (Python SCP.trust_create_challenge, TypeScript SCP.trustCreateChallenge, Kotlin suspend SCP.trustCreateChallenge, Swift async SCP.trustCreateChallenge). A protocol capability URI with fewer cases than its standard's minimum is refused with SCP-VALID-7039."
+          "notes": "Challenge-issuance op (ADR-017, spec 07 §7.3.4 step 1): all four SDKs expose an async method taking the verifier identity, the subject DID, the capability URI, the challenger-written test cases, the context id, the window in seconds, an optional evaluator context id and an optional stricter retry policy (Python SCP.trust_create_challenge, TypeScript SCP.trustCreateChallenge, Kotlin suspend SCP.trustCreateChallenge, Swift async SCP.trustCreateChallenge). Every bridge delegates to scp_ffi_common::challenge::create_challenge, which resolves the capability definition and the policy, builds the unsigned request, and has the challenger's ledger sign it with the verifier's #active key. The returned ChallengeRequest carries a salted commitment to each answer and never the answer. A protocol capability URI with fewer cases than its standard's minimum is refused with SCP-VALID-7039, a policy looser than the definition with SCP-VALID-7137, and an identifier that is not canonical with SCP-VALID-7147."
         },
         {
           "name": "trust_verify_attestation",
@@ -711,12 +711,20 @@
           "notes": "Attestation verification op (ADR-017, §7.4.4): a per-instance op taking a context id, because step 5 reads that context's revocation list from the instance's storage; an unreadable list raises, never a verdict. Every bridge exports it as an instance method (PyO3 SCP.trust_verify_attestation, UniFFI Scp.trust_verify_attestation, NAPI trustVerifyAttestation) over scp_ffi_common::trust_store::verify_attestation_in_context. All four SDKs expose a typed wrapper taking the context id and the CachedAttestationEnvelope wire DTO (Python scp_sdk.trust_verify_attestation(scp, context_id, attestation) and SCP.trust_verify_attestation, TypeScript SCP.trustVerifyAttestation, Kotlin SCP.trustVerifyAttestation, Swift SCP.trustVerifyAttestation)."
         },
         {
-          "name": "trust_verify_response",
+          "name": "trust_respond_to_challenge",
           "python": true,
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Challenge-response verification op (ADR-017, spec 07 §7.3.4): all four SDKs expose an async method taking the verifier identity, the ChallengeRequest/ChallengeResponse wire DTOs and a required context_id, returning the ChallengeVerification (with suite_digest) signed through the verifier's #active custody (Python SCP.trust_verify_response, TypeScript SCP.trustVerifyResponse, Kotlin suspend SCP.trustVerifyResponse, Swift async SCP.trustVerifyResponse)."
+          "notes": "Challenge-answer op (ADR-017, spec 07 §7.3.4 step 2): all four SDKs expose an async method taking the subject identity, the signed ChallengeRequest, the outputs and the attempt number, returning the ChallengeResponse signed with the subject's #active key (Python SCP.trust_respond_to_challenge, TypeScript SCP.trustRespondToChallenge, Kotlin suspend SCP.trustRespondToChallenge, Swift async SCP.trustRespondToChallenge). Every bridge delegates to scp_ffi_common::challenge::respond_to_challenge, which checks the challenger's signature on the request against the key the instance DID resolver returns before anything is signed; SCP-IDENT-1033 when the instance has no resolver."
+        },
+        {
+          "name": "trust_grade_response",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Challenge-grading op (ADR-017, spec 07 §7.3.4 steps 3 and 4): all four SDKs expose an async method taking the verifier identity, the signed ChallengeRequest and the subject's ChallengeResponse, returning the 23-field ChallengeVerification signed by the challenger's ledger with the verifier's #active key, the per-case results, and the trust-store write error if any (Python SCP.trust_grade_response, TypeScript SCP.trustGradeResponse, Kotlin suspend SCP.trustGradeResponse, Swift async SCP.trustGradeResponse). Every bridge delegates to scp_ffi_common::challenge::grade_response, which reads the ledger entry before any DID resolution, authenticates both signatures, takes a grading permit and the attempt lease, grades each case against the stored answer key, and commits the record for the attempt, pass or fail. A grading that uses no attempt is refused with SCP-VALID-7145 (answer key mismatch), SCP-VALID-7146 (grading capacity exhausted) or SCP-VALID-7149 (grading lease lost)."
         },
         {
           "name": "verify_participation_requirements",
@@ -731,7 +739,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Capability-admission op (spec §7.3.4.4, SCP-ACR-008): sibling of verify_participation_requirements. Instance methods on every bridge: PyO3 SCP.check_capability_requirements, NAPI Scp.checkCapabilityRequirements (check_capability_requirements_on), and UniFFI Scp::check_capability_requirements take the JSON envelope (context_id, subject_did, requirements_json, agent_capabilities_json, challenge_verifications_json), validate_did(subject_did) at the boundary, and delegate to scp_protocol::trust::check_capability_requirements with the instance DID resolver (instance_challenge_resolver over the instance IdentityBackedDidResolver, which reads the verifier's #active key; SCP-IDENT-1033 when a record must be verified and the instance has none) + fail-closed SystemClock so each ChallengeVerification is signature/subject/context/expiry bound. All four SDKs expose idiomatic instance wrappers (Python SCP.check_capability_requirements, TypeScript SCP.checkCapabilityRequirements, Kotlin SCP.checkCapabilityRequirements, Swift SCP.checkCapabilityRequirements)."
+          "notes": "Capability-admission op (spec 07 §7.3.4.4): sibling of verify_participation_requirements. Instance methods on every bridge (PyO3 SCP.check_capability_requirements, NAPI Scp.checkCapabilityRequirements via check_capability_requirements_on, UniFFI Scp::check_capability_requirements) take the context id, the subject DID, the agent capabilities JSON and the challenge verifications JSON, and delegate to scp_ffi_common::challenge::check_capability_requirements. That reads the requirements the context's governance holds through Supervisor::capability_requirements_checked (an unreadable context never reads as an empty list; the caller cannot supply requirements) and runs scp_protocol::trust::check_capability_requirements with the instance DID resolver, so each ChallengeVerification is bound to its signature, a trusted verifier, the subject, the context, the retry cap and expiry; SCP-IDENT-1033 when a record must be verified and the instance has none. Context creation sets the requirements through ContextParams.capability_requirements. All four SDKs expose idiomatic instance wrappers (Python SCP.check_capability_requirements, TypeScript SCP.checkCapabilityRequirements, Kotlin SCP.checkCapabilityRequirements, Swift SCP.checkCapabilityRequirements)."
         },
         {
           "name": "participation_record",

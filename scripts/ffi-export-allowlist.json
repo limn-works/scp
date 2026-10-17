@@ -76,6 +76,12 @@
       "reason": "Getter for consequence config on a metadata result type."
     },
     {
+      "name": "capability_requirements",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "getter",
+      "reason": "Getter for admission capability requirements on a metadata result type (spec \u00a77.3.4.4)."
+    },
+    {
       "name": "consequence_rules",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",

@@ -741,11 +741,17 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["trustVerifyAttestation"],
         "swift": ["trustVerifyAttestation"],
     },
-    ("Trust", "trust_verify_response"): {
-        "python": ["trust_verify_response"],
-        "typescript": ["trustVerifyResponse"],
-        "kotlin": ["trustVerifyResponse"],
-        "swift": ["trustVerifyResponse"],
+    ("Trust", "trust_respond_to_challenge"): {
+        "python": ["trust_respond_to_challenge"],
+        "typescript": ["trustRespondToChallenge"],
+        "kotlin": ["trustRespondToChallenge"],
+        "swift": ["trustRespondToChallenge"],
+    },
+    ("Trust", "trust_grade_response"): {
+        "python": ["trust_grade_response"],
+        "typescript": ["trustGradeResponse"],
+        "kotlin": ["trustGradeResponse"],
+        "swift": ["trustGradeResponse"],
     },
     # Discovery -- bare/different names across SDKs
     ("Discovery", "parse_address"): {
