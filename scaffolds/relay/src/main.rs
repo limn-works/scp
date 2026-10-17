@@ -44,7 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr: SocketAddr = "0.0.0.0:9000".parse()?;
     // It has no default: set SCP_RELAY_URL, for example
     // `ws://127.0.0.1:9000/scp/v1` for a local relay.
-    let relay_url = LiveRelayUrl::new(RelayUrl::new(&std::env::var("SCP_RELAY_URL")?)?);
+    let relay_url_text = std::env::var("SCP_RELAY_URL")
+        .map_err(|e| format!("SCP_RELAY_URL must be set to the relay's public URL: {e}"))?;
+    let relay_url = LiveRelayUrl::new(RelayUrl::new(&relay_url_text)?);
 
     let config = RelayConfig {
         bind_addr,

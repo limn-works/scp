@@ -1109,8 +1109,8 @@ where
     // The listener binds first so the relay starts on the URL of the address it
     // actually serves, even for a port-0 bind. `build_no_domain_inner` then sets
     // the advertised URL on this shared handle before the node publishes any
-    // URL, and the tier task moves it on every tier change, so the relay always
-    // reserves the push routing ID of the URL clients read (§10.7.1 step 2).
+    // URL, and the tier task moves it on each tier change to a URL with a
+    // §9.18.2 canonical form (§10.7.1 step 2).
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .map_err(|e| RelayError::BindFailed(e.to_string()))?;

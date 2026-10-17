@@ -312,19 +312,6 @@ pub async fn seed_from_startup_publish(
     }))
 }
 
-/// Handles a detected tier change: re-points the node's relay endpoint,
-/// re-publishes the document through the node's publish seam, and advances the
-/// node's state in ONE write.
-///
-/// The node's only post-construction writer. Nothing is returned and nothing is
-/// handed back for a caller to store. Which fields move is gated per
-/// [`NodePublishedState`]: the advertised address always, the document and the
-/// signed record only on a successful publish — so a failed re-publish leaves
-/// the node serving the document it actually published while still reporting the
-/// address it actually moved to, and the next re-evaluation retries the publish.
-/// A [`DhtMode::Disabled`](crate::DhtMode) node publishes nothing (`Ok(None)`)
-/// and is still a success, so its document advances with `record` left at the
-/// honest `None`.
 /// Moves the relay's live URL handle to `advertised_url`, the URL the node is
 /// about to publish, so every relay listener reserves its push routing ID
 /// before any client reads it (§10.7.1 step 2).
@@ -349,6 +336,19 @@ pub fn reserve_push_routing_id(relay: &LiveRelayUrl, advertised_url: &str) {
     }
 }
 
+/// Handles a detected tier change: re-points the node's relay endpoint,
+/// re-publishes the document through the node's publish seam, and advances the
+/// node's state in ONE write.
+///
+/// The node's only post-construction writer. Nothing is returned and nothing is
+/// handed back for a caller to store. Which fields move is gated per
+/// [`NodePublishedState`]: the advertised address always, the document and the
+/// signed record only on a successful publish — so a failed re-publish leaves
+/// the node serving the document it actually published while still reporting the
+/// address it actually moved to, and the next re-evaluation retries the publish.
+/// A [`DhtMode::Disabled`](crate::DhtMode) node publishes nothing (`Ok(None)`)
+/// and is still a success, so its document advances with `record` left at the
+/// honest `None`.
 pub async fn apply_tier_change(
     live_state: &LiveSlot<NodePublishedState>,
     relay: &LiveRelayUrl,

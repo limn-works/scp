@@ -180,9 +180,10 @@ impl PushPublishGate {
 
 /// The most previous reserved push routing IDs a [`LiveRelayUrl`] remembers.
 ///
-/// A relay whose URL changes keeps refusing a PUBLISH to the routing ID of any of
-/// its previous URLs, so a registration signed for an old URL is never stored as a
-/// blob. The bound keeps an unbounded run of URL changes from growing the list.
+/// A relay whose URL changes keeps refusing a PUBLISH to the routing ID of each of
+/// its last 64 previous URLs. A routing ID older than that is forgotten, and a
+/// PUBLISH to it is stored as an ordinary blob. The bound keeps an unbounded run
+/// of URL changes from growing the list.
 pub const MAX_RETIRED_PUSH_ROUTING_IDS: usize = 64;
 
 #[derive(Debug)]
@@ -204,11 +205,11 @@ struct UrlState {
 ///
 /// **A PUBLISH during a switch.** The gate reads the URL once per PUBLISH, so
 /// one PUBLISH sees either the old URL or the new one, never a mix. After a
-/// switch, a PUBLISH to a previous URL's routing ID is still intercepted and is
-/// never stored as a blob: a relay without push answers `4063`, and a relay
+/// switch, a PUBLISH to the routing ID of one of the last
+/// [`MAX_RETIRED_PUSH_ROUTING_IDS`] previous URLs is still intercepted and is
+/// not stored as a blob: a relay without push answers `4063`, and a relay
 /// with push answers `4060`, because the relay no longer holds the URL the
 /// message was signed for, and the client re-registers against the new one.
-/// The handle remembers up to [`MAX_RETIRED_PUSH_ROUTING_IDS`] previous IDs.
 /// Stored registrations are keyed by (identity, platform, token) and list
 /// context routing IDs, so a URL change leaves every one in place.
 #[derive(Debug, Clone)]

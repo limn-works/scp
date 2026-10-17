@@ -529,7 +529,7 @@
         "A relay returns 4061 for a platform with no configured sender.",
         "A valid deregistration removes exactly its own key.",
         "The new codes are constants in `crates/scp-relay-client/src/error.rs`.",
-        "Every listener (WebSocket, QUIC, UDP/DTLS, WebTransport) reads the shared relay URL handle: after a URL change it intercepts the new reserved routing ID and refuses the previous one, storing nothing at either; a full node's NAT tier change moves the handle."
+        "Every listener (WebSocket, QUIC, UDP/DTLS, WebTransport) reads the shared relay URL handle: after a URL change it intercepts the new reserved routing ID and refuses the previous one, storing nothing at either; a full node's NAT tier change to a URL with a \u00a79.18.2 canonical form moves the handle, and a change to a URL without one (a tier 3 `bridge_target` URL) leaves it in place."
       ],
       "actionItems": [
         "Add `PushRole` and `PushServiceConfig` to `RelayConfig`.",
