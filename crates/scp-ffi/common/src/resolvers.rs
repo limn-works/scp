@@ -397,9 +397,10 @@ impl IdentityBackedDidResolver {
     ///
     /// The async resolution is driven to completion on the long-lived,
     /// shared resolution runtime (see [`Self::resolution_runtime`]) via
-    /// [`crate::bridge_wait::bridge_block_on`]. Critically, that `block_on` is invoked from a
-    /// freshly-spawned scoped OS thread — a thread that is NOT itself inside any
-    /// tokio runtime — and the result is handed back through `join()`. There is
+    /// [`crate::bridge_wait::bridge_block_on_scoped_thread`]. Critically, that
+    /// helper invokes `block_on` from a freshly-spawned scoped OS thread — a
+    /// thread that is NOT itself inside any tokio runtime — and hands the
+    /// result back to the calling thread. There is
     /// NO per-call runtime construction: the reactor + worker threads are built
     /// exactly once across the whole process (this is a hot, shared path —
     /// every FFI bridge resolves all DIDs here, and a single UCAN
@@ -422,31 +423,26 @@ impl IdentityBackedDidResolver {
     ///
     /// The async resolve future is `Send` (see `AsyncResolveFn`), so driving it
     /// from another thread is sound. DID resolution is short and bounded
-    /// (in-memory DHT lookup or a single network round-trip), so the blocking
-    /// `join()` on the calling thread is acceptable.
+    /// (in-memory DHT lookup or a single network round-trip), so the calling
+    /// thread's wait for the scoped thread is acceptable.
     fn resolve_sync(&self, did: &str) -> Result<ResolvedDidDocument, ResolutionError> {
         let resolve_fn = Arc::clone(&self.resolve_fn);
         let did_owned = did.to_owned();
         let rt = self.resolution_runtime()?;
 
-        // The scoped thread is outside every runtime, so the helper takes its
-        // first regime: `Runtime::block_on` on the resolution runtime.
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || {
-                    crate::bridge_wait::bridge_block_on(
-                        || Ok(rt),
-                        Self::resolve_document(&*resolve_fn, &did_owned),
-                    )
-                    .map_err(|e| ResolutionError::NetworkUnavailable(e.to_string()))?
-                })
-                .join()
-                .unwrap_or_else(|_| {
-                    Err(ResolutionError::NetworkUnavailable(
-                        "DID-resolution thread panicked".to_owned(),
-                    ))
-                })
-        })
+        // The helper's scoped thread is outside every runtime, so the wait
+        // takes its first regime: `Runtime::block_on` on the resolution
+        // runtime.
+        crate::bridge_wait::bridge_block_on_scoped_thread(
+            || Ok(rt),
+            Self::resolve_document(&*resolve_fn, &did_owned),
+        )
+        .map_err(|e| match e {
+            crate::bridge_wait::BridgeBlockOnError::WaitThreadPanicked => {
+                ResolutionError::NetworkUnavailable("DID-resolution thread panicked".to_owned())
+            }
+            e => ResolutionError::NetworkUnavailable(e.to_string()),
+        })?
     }
 
     /// Checks sequence number for rotation detection and downgrade prevention.

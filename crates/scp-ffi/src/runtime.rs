@@ -2361,6 +2361,7 @@ pub fn clone_receive_channel_handles(
 }
 
 pub fn deliver_message(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     message: PyMessage,
@@ -2377,7 +2378,7 @@ pub fn deliver_message(
         })?;
         Ok((tx, rx))
     })?;
-    deliver_message_with_handles(bi, context_id, &tx, &rx_arc, message)
+    deliver_message_with_handles(py, bi, context_id, &tx, &rx_arc, message)
 }
 
 /// Deliver a message through pre-captured channel handles.
@@ -2389,9 +2390,11 @@ pub fn deliver_message(
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ContextError` if the channel is closed or a send
-/// fails after an overflow drop.
+/// Returns `ScpPyError::ContextError` if the channel is closed, if the
+/// overflow drop's wait for the receiver lock cannot run, or if a send fails
+/// after an overflow drop.
 pub fn deliver_message_with_handles(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     tx: &mpsc::Sender<PyMessage>,
@@ -2401,15 +2404,17 @@ pub fn deliver_message_with_handles(
     match tx.try_send(message.clone()) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => {
-            // Use blocking_lock() instead of try_lock() to guarantee
+            // Wait for the receiver lock instead of try_lock() to guarantee
             // oldest-drop semantics. try_lock() would drop the NEW
             // message on lock contention — the opposite of documented
             // behavior. The lock is only held for a single try_recv()
-            // (VecDeque pop_front), so blocking is brief and safe.
-            let mut rx_guard = rx_arc.blocking_lock();
-
-            let _ = rx_guard.try_recv();
-            drop(rx_guard);
+            // (VecDeque pop_front), so the wait is brief. It goes through
+            // `block_on_released`, the bridge's one blocking path, which
+            // picks a regime that cannot panic on a runtime
+            // thread and releases the GIL while it waits.
+            crate::actor_wait::block_on_released(py, async {
+                let _ = rx_arc.lock().await.try_recv();
+            })?;
 
             tx.try_send(message).map_err(|e| {
                 ScpPyError::context(format!(
@@ -3571,7 +3576,7 @@ mod tests {
             0.0,
             ctx_id.clone(),
         );
-        deliver_message_with_handles(bi, &ctx_id, &tx2, &rx2, msg)
+        Python::with_gil(|py| deliver_message_with_handles(py, bi, &ctx_id, &tx2, &rx2, msg))
             .expect("captured handles still deliver after FFI-state removal");
 
         // The receiver observes the delivered close event.

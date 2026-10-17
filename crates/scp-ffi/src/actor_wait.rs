@@ -9,10 +9,10 @@
 //!
 //! [`block_on_released`] releases the GIL for the whole wait, so a host
 //! callback, or another Python thread, can always run.
-//! `scripts/check-bridge-block-on.py` fails every `block_on` and
-//! `block_in_place` under `crates/scp-ffi/` outside
-//! `scp_ffi_common::bridge_wait::bridge_block_on`, which this wait reaches
-//! through `bridge_block_on_off_thread`.
+//! `scripts/check-bridge-block-on.py` fails every `block_on`,
+//! `block_in_place` and other thread-blocking call under `crates/scp-ffi/`
+//! outside `scp_ffi_common::bridge_wait`, which this wait reaches through
+//! `bridge_block_on_off_thread`.
 //!
 //! The future must not touch Python objects: `Python<'_>` and `Bound<'_, _>`
 //! are `!Send`, so the compiler rejects them, but `Py<T>` is `Send` and is not

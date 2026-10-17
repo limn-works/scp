@@ -1076,8 +1076,10 @@ impl FfiBridgeProvider {
             let (handler, output_schema) = dispatch;
             // Run the handler on a dedicated thread with a timeout to
             // prevent indefinite blocking. The handler is Send + Sync
-            // (Arc<dyn Fn>), so it is safe to move across threads.
-            let (tx, rx) = std::sync::mpsc::channel();
+            // (Arc<dyn Fn>), so it is safe to move across threads. The wait
+            // is an async timeout driven by the bridge wait, because no
+            // bridge code blocks outside `bridge_wait`.
+            let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
                 let result = handler(arguments);
                 // If the receiver has been dropped (timeout elapsed), the
@@ -1085,12 +1087,23 @@ impl FfiBridgeProvider {
                 let _ = tx.send(result);
             });
 
-            let handler_result = rx.recv_timeout(timeout).map_err(|_| {
-                refund(format!(
-                    "outlet handler for '{outlet_name}' timed out after {}ms",
-                    timeout.as_millis()
-                ))
-            })?;
+            // A timeout, or a handler thread that ended without sending (it
+            // panicked), is reported as the timeout, as before.
+            let handler_result =
+                block_on_provider_task(async move { tokio::time::timeout(timeout, rx).await })
+                    .map_err(|e| {
+                        refund(format!(
+                            "outlet handler for '{outlet_name}' wait failed: {e}"
+                        ))
+                    })?
+                    .ok()
+                    .and_then(Result::ok)
+                    .ok_or_else(|| {
+                        refund(format!(
+                            "outlet handler for '{outlet_name}' timed out after {}ms",
+                            timeout.as_millis()
+                        ))
+                    })?;
 
             let output = handler_result
                 .map_err(|e| refund(format!("outlet handler for '{outlet_name}' failed: {e}")))?;
