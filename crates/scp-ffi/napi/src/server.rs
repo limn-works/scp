@@ -977,6 +977,7 @@ mod tests {
 
     /// A relay URL on a loopback port nothing listens on, so a connect to it
     /// fails with a refused connection.
+    #[cfg(feature = "testing")]
     fn unreachable_relay_url() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
