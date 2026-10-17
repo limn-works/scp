@@ -4343,6 +4343,19 @@ impl Scp {
     ) -> napi::Result<NapiNodeHandle> {
         crate::server::node_start_local_on(&self.inner, data_dir, identity_did, passphrase).await
     }
+
+    /// Starts a production node from this `SCP` instance.
+    ///
+    /// `config_json` is a `NodeStartConfig` (construction.md §"Node start —
+    /// `NodeStartConfig`"): its `identity` names an operator identity
+    /// registered on this instance, and the node runs on this instance's own
+    /// storage. Each failure rejects with the code sdk-common.md §"Node start
+    /// error codes" gives it, such as `SCP-IDENT-1063` for an unregistered
+    /// operator DID.
+    #[napi(js_name = "nodeStart")]
+    pub async fn node_start(&self, config_json: String) -> napi::Result<NapiNodeHandle> {
+        crate::server::node_start_on(&self.inner, config_json).await
+    }
 }
 
 // ---------------------------------------------------------------------------

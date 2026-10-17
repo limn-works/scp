@@ -93,7 +93,7 @@ pub enum FfiCorsOrigins {
     /// Allow every origin (`*`), only because the caller named it.
     AnyOrigin {},
     /// Allow exactly these origins.
-    List {
+    Allowlist {
         /// Each origin, such as `https://app.example.org`.
         origins: Vec<String>,
     },
@@ -167,7 +167,7 @@ mod tests {
         "blob_storage": {"kind": "redb", "path": "/var/lib/scp/blobs.redb"},
         "tls": {"kind": "acme", "email": "ops@example.org"},
         "dht": {"kind": "disabled"},
-        "cors_origins": {"kind": "list", "origins": ["https://app.example.org"]},
+        "cors_origins": {"kind": "allowlist", "origins": ["https://app.example.org"]},
         "bind_addr": "127.0.0.1:0",
         "nat": {"kind": "auto"},
         "projection_rate_limit": 30
@@ -197,7 +197,7 @@ mod tests {
                     email: Some("ops@example.org".to_owned())
                 },
                 dht: FfiDhtMode::Disabled {},
-                cors_origins: FfiCorsOrigins::List {
+                cors_origins: FfiCorsOrigins::Allowlist {
                     origins: vec!["https://app.example.org".to_owned()]
                 },
                 bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -311,7 +311,7 @@ mod tests {
         assert_ne!(without_tls, VALID);
         assert!(invalid(&without_tls), "missing tls accepted");
         let without_cors = VALID.replacen(
-            r#""cors_origins": {"kind": "list", "origins": ["https://app.example.org"]},"#,
+            r#""cors_origins": {"kind": "allowlist", "origins": ["https://app.example.org"]},"#,
             "",
             1,
         );

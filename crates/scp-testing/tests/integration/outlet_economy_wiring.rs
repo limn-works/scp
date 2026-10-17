@@ -367,7 +367,7 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
     // clears — and can grant itself budget via SingleAdmin ApproveSpend.
     let invoker = DID::from("did:dht:z6MkOutletEconomyInvoker");
     let sup = build_supervisor(invoker.as_ref(), mock_key_resolver());
-    sup.register_local_did(invoker.clone()).await.unwrap();
+    sup.register_local_did(invoker.clone()).await;
 
     let context_id = "ctx-c4-outlet-economy";
     let mut params = governance_params_with_outlets();
@@ -495,7 +495,7 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
 async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
     let invoker = DID::from("did:dht:z6MkOutletEconomyBroke");
     let sup = build_supervisor(invoker.as_ref(), mock_key_resolver());
-    sup.register_local_did(invoker.clone()).await.unwrap();
+    sup.register_local_did(invoker.clone()).await;
 
     let context_id = "ctx-c4-budget-rejected";
     let mut params = governance_params_with_outlets();

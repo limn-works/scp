@@ -34,7 +34,7 @@ use scp_platform::file::FileKeyCustody;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::sqlite::SqliteStorage;
 
-use crate::bridge_instance::{CoreFields, InstanceBorrower};
+use crate::bridge_instance::{CoreFields, InstanceBorrower, NodeBinding};
 use crate::dht::{DhtInitError, FfiDhtClient};
 use crate::node_start_config::{
     FfiBlobBackend, FfiCorsOrigins, FfiDhtMode, FfiNat, FfiReach, FfiTlsMode, NodeStartConfig,
@@ -134,6 +134,34 @@ pub enum ServerError {
     /// the bridge resolved from this `SCP` instance.
     #[error("operator identity is not available to the node")]
     OperatorIdentityUnavailable,
+
+    /// The node started, but the bridge could not wire the `SCP` instance's
+    /// `Supervisor` to it. [`wire_supervisor_to_node`] shut the node down and
+    /// removed it from the instance's node registry before returning this
+    /// error (sdk-common.md §"Node start error codes", `SCP-TRANS-5056`).
+    #[error("supervisor wiring failed: {0}")]
+    SupervisorWiring(#[from] SupervisorWiringError),
+}
+
+/// The step at which [`wire_supervisor_to_node`] failed to wire an `SCP`
+/// instance's `Supervisor` to a node it started.
+#[derive(Debug, thiserror::Error)]
+pub enum SupervisorWiringError {
+    /// Another node of this instance is running and holds the `Supervisor`'s
+    /// transport binding. One node at a time binds an instance's transport.
+    #[error("another running node holds this instance's Supervisor transport")]
+    NodeAlreadyBound,
+    /// The connection to the node's relay failed.
+    #[error("connecting to the node's relay failed: {0}")]
+    RelayConnect(#[from] scp_transport::TransportError),
+    /// After the bridge's attach step, the instance holds no `Supervisor`
+    /// built with providers: the bridge's `Supervisor` build failed.
+    #[error("the bridge could not attach a Supervisor to the instance")]
+    SupervisorUnavailable,
+    /// The instance refused the transport manager for the node's relay,
+    /// because the instance is suspended or its transport lock is poisoned.
+    #[error("installing the node's relay transport failed: {0}")]
+    TransportInstall(#[from] crate::bridge_instance::TransportLockError),
 }
 
 impl ServerError {
@@ -162,6 +190,32 @@ impl ServerError {
             Self::OperatorIdentityUnavailable => {
                 "operator identity is not available to the node".to_owned()
             }
+            Self::SupervisorWiring(step) => {
+                format!(
+                    "wiring the Supervisor to the node failed: {}",
+                    step.user_message()
+                )
+            }
+        }
+    }
+}
+
+impl SupervisorWiringError {
+    /// Returns a sanitized message that names the failed wiring step, so a
+    /// caller can tell `NodeAlreadyBound` from `RelayConnect` under the one
+    /// `SCP-TRANS-5056` code. The message carries no inner transport or lock
+    /// error, because a transport error can name a relay address.
+    #[must_use]
+    pub const fn user_message(&self) -> &'static str {
+        match self {
+            Self::NodeAlreadyBound => {
+                "another running node holds this instance's Supervisor transport"
+            }
+            Self::RelayConnect(_) => "connecting to the node's relay failed",
+            Self::SupervisorUnavailable => {
+                "the bridge could not attach a Supervisor to the instance"
+            }
+            Self::TransportInstall(_) => "installing the node's relay transport failed",
         }
     }
 }
@@ -870,7 +924,7 @@ fn lower_tls(tls: FfiTlsMode) -> Result<TlsMode, ServerError> {
 fn lower_cors(cors: FfiCorsOrigins) -> Result<Option<Vec<String>>, ServerError> {
     match cors {
         FfiCorsOrigins::AnyOrigin {} => Ok(None),
-        FfiCorsOrigins::List { origins } => {
+        FfiCorsOrigins::Allowlist { origins } => {
             for origin in &origins {
                 if origin == "*" {
                     return Err(invalid(
@@ -1306,7 +1360,7 @@ impl InstanceBorrower for RunningNode {
 /// Wraps a started node in an [`Arc`] and registers it with `core` as a
 /// borrower of that instance's storage.
 ///
-/// Every bridge node-start path (`node_start_in_memory_*`,
+/// Every bridge node-start path (`node_start_on`, `node_start_in_memory_*`,
 /// `node_start_local_*`, across `PyO3`, NAPI, and `UniFFI`) routes its node
 /// through this one call, so registration is not a step a bridge author can
 /// forget while still obtaining an `Arc<RunningNode>` for its handle type.
@@ -1322,6 +1376,186 @@ pub fn register_node(core: &CoreFields, node: RunningNode) -> Arc<RunningNode> {
     let node = Arc::new(node);
     core.register_borrower(&node);
     node
+}
+
+/// Wires `core`'s `Supervisor` to a started, registered `node`, or stops and
+/// unregisters `node`.
+///
+/// On failure this shuts `node` down, removes it from `core`'s node registry,
+/// and returns [`ServerError::SupervisorWiring`] (construction.md §"Node
+/// start — `NodeStartConfig`").
+///
+/// Every bridge node-start path (`node_start_on`, `node_start_in_memory_*`,
+/// `node_start_local_*` on `PyO3`, napi-rs and `UniFFI`) runs this one wiring
+/// step. Each bridge passes `node.internal_relay_url()` as `relay_url`, and
+/// passes `ensure_supervisor`, the bridge's set-once `Supervisor` init, which
+/// attaches a `Supervisor` with an unconfigured transport when the instance
+/// holds none and does nothing when it holds one.
+///
+/// Steps, in order: refuse when another running node holds the binding;
+/// connect twice to the relay with the node's bearer token, one adapter for
+/// the `Supervisor`'s transport and one for the instance's transport manager,
+/// because an adapter is not `Clone`; call `ensure_supervisor` with the
+/// operator DID; then, holding [`CoreFields::node_binding`], check the binding
+/// again, install the transport manager, bind the `Supervisor`'s
+/// [`TransportSlot`](scp_core::context::supervisor::TransportSlot) to the
+/// node's relay, and record the [`NodeBinding`]; last, register the operator
+/// DID as a local DID. The binding works whichever call attached the
+/// `Supervisor`, and that `Supervisor` keeps the DID its attaching call gave
+/// its MLS factory. No step falls back to a `Supervisor` without relay
+/// transport, and the function returns `Ok` only after its own bind.
+///
+/// # Errors
+///
+/// [`ServerError::SupervisorWiring`] naming the failed step.
+pub async fn wire_supervisor_to_node<E>(
+    core: &CoreFields,
+    node: &Arc<RunningNode>,
+    relay_url: &str,
+    ensure_supervisor: E,
+) -> Result<(), ServerError>
+where
+    E: FnOnce(&str),
+{
+    let Err(e) = wire_steps(core, node, relay_url, ensure_supervisor).await else {
+        return Ok(());
+    };
+    tracing::warn!(error = %e, "node start: Supervisor wiring failed; shutting the node down");
+    node.shutdown();
+    core.unregister_borrower(node);
+    Err(ServerError::SupervisorWiring(e))
+}
+
+/// Stops `node`, and unbinds `core`'s `Supervisor` transport from it when
+/// `node` holds the binding.
+///
+/// Every bridge node handle's `shutdown` and `Drop` call this. The unbind puts
+/// back the transport provider and the transport manager the binding
+/// displaced, so a later node start binds again. When another node holds the
+/// binding, or none does, only the stop happens.
+pub fn stop_node(core: &CoreFields, node: &Arc<RunningNode>) {
+    node.shutdown();
+    let mut binding = core.node_binding();
+    if !binding.as_ref().is_some_and(|b| b.is_for(node)) {
+        return;
+    }
+    if let Some(b) = binding.take() {
+        b.slot.replace(b.displaced_provider);
+        core.restore_transport(&b.manager, b.displaced_manager);
+    }
+}
+
+/// Returns whether `core` is wired to `node` as [`wire_supervisor_to_node`]
+/// leaves it.
+///
+/// Wired means `core`'s binding record names `node`, `core`'s `Supervisor`
+/// holds the recorded transport slot and that slot holds the recorded
+/// relay provider, and `core`'s transport manager holds exactly `node`'s
+/// internal relay URL.
+#[must_use]
+pub fn supervisor_wired_to(core: &CoreFields, node: &Arc<RunningNode>) -> bool {
+    let bound = core.node_binding().as_ref().is_some_and(|b| {
+        b.is_for(node)
+            && b.slot.holds(&b.provider)
+            && core
+                .try_supervisor()
+                .and_then(|s| s.transport_slot())
+                .is_some_and(|slot| Arc::ptr_eq(&slot, &b.slot))
+    });
+    bound
+        && core
+            .with_transport(scp_transport::TransportManager::relay_urls)
+            .is_ok_and(|urls| urls == [node.internal_relay_url()])
+}
+
+/// Returns [`SupervisorWiringError::NodeAlreadyBound`] when `binding` names a
+/// live node.
+fn refuse_live_binding(binding: Option<&NodeBinding>) -> Result<(), SupervisorWiringError> {
+    if binding.is_some_and(NodeBinding::is_live) {
+        return Err(SupervisorWiringError::NodeAlreadyBound);
+    }
+    Ok(())
+}
+
+/// The fallible steps of [`wire_supervisor_to_node`].
+async fn wire_steps<E>(
+    core: &CoreFields,
+    node: &Arc<RunningNode>,
+    relay_url: &str,
+    ensure_supervisor: E,
+) -> Result<(), SupervisorWiringError>
+where
+    E: FnOnce(&str),
+{
+    use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+    refuse_live_binding(core.node_binding().as_ref())?;
+    let sourced = SourcedRelayUrl {
+        url: relay_url.to_owned(),
+        source: RelayUrlSource::Explicit,
+    };
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    // Bearer-authenticated relays are WebSocket-only (spec §10.14.3 item 4);
+    // the selector keeps this connect on the shared selection surface (ADR-037).
+    let selector = core.transport_selector();
+    let supervisor_adapter = selector
+        .select_and_connect_with_bearer(&sourced, Some(node.bridge_token_hex()), Some(&profile))
+        .await?;
+    let manager_adapter = selector
+        .select_and_connect_with_bearer(&sourced, Some(node.bridge_token_hex()), Some(&profile))
+        .await?;
+    ensure_supervisor(node.did());
+    let supervisor = Arc::clone(
+        core.try_supervisor()
+            .ok_or(SupervisorWiringError::SupervisorUnavailable)?,
+    );
+    let slot = supervisor
+        .transport_slot()
+        .ok_or(SupervisorWiringError::SupervisorUnavailable)?;
+    let provider: Arc<dyn scp_core::context::builder::ContextTransportProvider> = Arc::new(
+        scp_transport::RelayTransportProvider::new(supervisor_adapter),
+    );
+    let manager = Arc::new(scp_transport::TransportManager::new(
+        relay_url.to_owned(),
+        manager_adapter,
+    ));
+    {
+        // No `.await` in this block: the record, the manager slot and the
+        // transport slot change together under the binding lock.
+        let mut binding = core.node_binding();
+        refuse_live_binding(binding.as_ref())?;
+        let replaced_manager = core.swap_transport(Arc::clone(&manager))?;
+        let replaced_provider = slot.replace(Arc::clone(&provider));
+        // A stale binding's node stopped without unbinding; the transport it
+        // displaced is the one a stop of this node puts back. A manager over
+        // the stale node's relay URLs is that node's transport, even when a
+        // resume rebuilt it as a new `Arc`.
+        let (displaced_provider, displaced_manager) = match binding.take() {
+            Some(stale) => {
+                let manager_before = match replaced_manager {
+                    Some(m) if !crate::bridge_instance::same_node_transport(&m, &stale.manager) => {
+                        Some(m)
+                    }
+                    _ => stale.displaced_manager,
+                };
+                (stale.displaced_provider, manager_before)
+            }
+            None => (replaced_provider, replaced_manager),
+        };
+        let node_weak: std::sync::Weak<dyn crate::bridge_instance::InstanceBorrower> =
+            Arc::downgrade(node) as _;
+        *binding = Some(NodeBinding {
+            node: node_weak,
+            slot,
+            provider,
+            manager,
+            displaced_provider,
+            displaced_manager,
+        });
+    }
+    supervisor
+        .register_local_did(node.did().to_owned().into())
+        .await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2342,7 +2576,7 @@ mod tests {
             },
             tls: FfiTlsMode::Plaintext {},
             dht: FfiDhtMode::Disabled {},
-            cors_origins: FfiCorsOrigins::List {
+            cors_origins: FfiCorsOrigins::Allowlist {
                 origins: vec!["https://app.example.org".to_owned()],
             },
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -2399,7 +2633,7 @@ mod tests {
             (
                 "wildcard cors entry",
                 |c| {
-                    c.cors_origins = FfiCorsOrigins::List {
+                    c.cors_origins = FfiCorsOrigins::Allowlist {
                         origins: vec!["*".to_owned()],
                     };
                 },
@@ -2517,5 +2751,277 @@ mod tests {
             let addr: SocketAddr = addr.parse().expect("fixture address");
             assert_eq!(bound_relay_ws_url(addr), url);
         }
+    }
+
+    /// Starts an in-memory node and registers it on `core`, as every bridge
+    /// node-start path does before it wires the `Supervisor`.
+    async fn registered_node(core: &CoreFields) -> Arc<RunningNode> {
+        let node = start_node_in_memory(None).await.unwrap();
+        register_node(core, RunningNode::InMemoryEncrypted(node))
+    }
+
+    /// The provider the binding displaced, read from `core`'s record.
+    fn displaced_provider(
+        core: &CoreFields,
+    ) -> Arc<dyn scp_core::context::builder::ContextTransportProvider> {
+        Arc::clone(
+            &core
+                .node_binding()
+                .as_ref()
+                .expect("a wired node leaves a binding record")
+                .displaced_provider,
+        )
+    }
+
+    fn slot_of(core: &CoreFields) -> Arc<scp_core::context::supervisor::TransportSlot> {
+        core.try_supervisor()
+            .and_then(|s| s.transport_slot())
+            .expect("a Supervisor built with providers holds a transport slot")
+    }
+
+    #[tokio::test]
+    async fn wire_binds_a_supervisor_attached_before_the_node_start() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let node = registered_node(&core).await;
+
+        wire_supervisor_to_node(&core, &node, &node.internal_relay_url(), |_| {})
+            .await
+            .expect("a node start binds a Supervisor that an earlier call attached");
+
+        assert!(supervisor_wired_to(&core, &node));
+        assert!(
+            !slot_of(&core).holds(&displaced_provider(&core)),
+            "the Supervisor's transport now reaches the node's relay"
+        );
+        stop_node(&core, &node);
+    }
+
+    /// A `configure_local_transport` that attaches a `Supervisor` after the
+    /// node start's connects and before its attach step wins the set-once
+    /// slot; the start still binds that `Supervisor` to the node's relay
+    /// before it returns `Ok`.
+    #[tokio::test]
+    async fn wire_binds_a_supervisor_attached_by_a_racing_local_transport() {
+        let core = CoreFields::new();
+        let node = registered_node(&core).await;
+
+        wire_supervisor_to_node(&core, &node, &node.internal_relay_url(), |_| {
+            core.set_supervisor(crate::bridge_instance::tests::test_supervisor());
+        })
+        .await
+        .expect("a racing attach leaves a Supervisor the start binds");
+
+        assert!(
+            supervisor_wired_to(&core, &node),
+            "Ok means this start bound the Supervisor's transport to the node's relay"
+        );
+        assert!(!slot_of(&core).holds(&displaced_provider(&core)));
+        stop_node(&core, &node);
+    }
+
+    #[tokio::test]
+    async fn stop_node_restores_displaced_provider_and_manager_and_restart_binds_again() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let first = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &first, &first.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        let displaced = displaced_provider(&core);
+
+        stop_node(&core, &first);
+
+        assert!(first.is_shutdown());
+        assert!(core.node_binding().is_none(), "a stop clears the binding");
+        assert!(
+            slot_of(&core).holds(&displaced),
+            "a stop puts back the provider the start displaced"
+        );
+        assert_eq!(
+            core.with_transport(|_| ()),
+            Err(crate::bridge_instance::TransportLockError::NotInitialized),
+            "a stop puts back the instance's empty transport manager"
+        );
+        assert!(!supervisor_wired_to(&core, &first));
+
+        let second = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &second, &second.internal_relay_url(), |_| {})
+            .await
+            .expect("a start after a stop binds again");
+        assert!(supervisor_wired_to(&core, &second));
+        stop_node(&core, &second);
+        assert!(slot_of(&core).holds(&displaced));
+    }
+
+    #[tokio::test]
+    async fn wire_fails_closed_while_a_running_node_holds_the_binding() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let first = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &first, &first.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        let second = registered_node(&core).await;
+
+        let err = wire_supervisor_to_node(&core, &second, &second.internal_relay_url(), |_| {})
+            .await
+            .expect_err("one node at a time binds an instance's transport");
+
+        assert!(
+            matches!(
+                err,
+                ServerError::SupervisorWiring(SupervisorWiringError::NodeAlreadyBound)
+            ),
+            "{err:?}"
+        );
+        assert!(second.is_shutdown(), "a refused start stops its node");
+        assert!(
+            !core.has_borrower(&second),
+            "a refused start unregisters its node"
+        );
+        assert!(
+            supervisor_wired_to(&core, &first),
+            "a refused start leaves the first node's binding in place"
+        );
+        stop_node(&core, &first);
+    }
+
+    #[tokio::test]
+    async fn stale_binding_of_a_shut_down_node_is_reclaimed() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let first = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &first, &first.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        let original = displaced_provider(&core);
+        // Stopped without `stop_node`, so the record still names it.
+        first.shutdown();
+
+        let second = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &second, &second.internal_relay_url(), |_| {})
+            .await
+            .expect("a binding whose node stopped is stale and a start reclaims it");
+        assert!(supervisor_wired_to(&core, &second));
+
+        stop_node(&core, &second);
+        assert!(
+            slot_of(&core).holds(&original),
+            "the provider before the stale binding is the one a stop puts back"
+        );
+        assert_eq!(
+            core.with_transport(|_| ()),
+            Err(crate::bridge_instance::TransportLockError::NotInitialized)
+        );
+    }
+
+    /// A resume rebuilds the instance's transport manager over the same
+    /// relay URLs as a new `Arc`. A start that reclaims the stale binding
+    /// reads the rebuilt manager as the stale node's transport, so a stop of
+    /// the new node puts back the manager from before the stale binding and
+    /// not the rebuilt manager of the stopped node.
+    #[tokio::test]
+    async fn stale_binding_reclaim_recognises_a_manager_a_resume_rebuilt() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let first = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &first, &first.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        // Stopped without `stop_node`, so the record still names it.
+        first.shutdown();
+        let recorded = Arc::clone(
+            &core
+                .node_binding()
+                .as_ref()
+                .expect("the stale binding stays recorded")
+                .manager,
+        );
+        let rebuilt = Arc::new(crate::bridge_instance::tests::manager_on(
+            &first.internal_relay_url(),
+        ));
+        assert!(!Arc::ptr_eq(&rebuilt, &recorded));
+        core.install_transport(rebuilt)
+            .expect("a resume installs the rebuilt manager");
+
+        let second = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &second, &second.internal_relay_url(), |_| {})
+            .await
+            .expect("a start reclaims the stale binding");
+        assert!(
+            core.node_binding()
+                .as_ref()
+                .is_some_and(|b| b.displaced_manager.is_none()),
+            "the reclaim keeps the stale binding's displaced manager, not the rebuilt one"
+        );
+
+        stop_node(&core, &second);
+        assert_eq!(
+            core.with_transport(|_| ()),
+            Err(crate::bridge_instance::TransportLockError::NotInitialized),
+            "a stop puts back the empty manager from before the stale binding"
+        );
+    }
+
+    /// Each `SupervisorWiringError` step gives the caller a distinct
+    /// message, so a bridge test can tell `NodeAlreadyBound` from
+    /// `RelayConnect` under the shared `SCP-TRANS-5056` code.
+    #[test]
+    fn supervisor_wiring_user_messages_name_distinct_steps() {
+        let steps = [
+            SupervisorWiringError::NodeAlreadyBound,
+            SupervisorWiringError::RelayConnect(scp_transport::TransportError::ConnectionFailed(
+                "ws://10.0.0.7:4000/scp/v1".to_owned(),
+            )),
+            SupervisorWiringError::SupervisorUnavailable,
+            SupervisorWiringError::TransportInstall(
+                crate::bridge_instance::TransportLockError::Poisoned,
+            ),
+        ];
+        let messages: std::collections::HashSet<String> = steps
+            .into_iter()
+            .map(|step| ServerError::SupervisorWiring(step).user_message())
+            .collect();
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert!(
+            messages.iter().all(|m| !m.contains("10.0.0.7")),
+            "a step message carries no inner transport error: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_fails_closed_when_no_supervisor_attaches() {
+        let core = CoreFields::new();
+        let node = registered_node(&core).await;
+
+        let err = wire_supervisor_to_node(&core, &node, &node.internal_relay_url(), |_| {})
+            .await
+            .expect_err("a start whose attach step attached nothing fails closed");
+
+        assert!(
+            matches!(
+                err,
+                ServerError::SupervisorWiring(SupervisorWiringError::SupervisorUnavailable)
+            ),
+            "{err:?}"
+        );
+        assert!(node.is_shutdown());
+        assert!(!core.has_borrower(&node));
+        assert!(core.node_binding().is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_node_of_an_unbound_node_leaves_the_binding() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let bound = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &bound, &bound.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        let other = registered_node(&core).await;
+
+        stop_node(&core, &other);
+
+        assert!(other.is_shutdown());
+        assert!(
+            supervisor_wired_to(&core, &bound),
+            "stopping a node that holds no binding unbinds nothing"
+        );
+        stop_node(&core, &bound);
     }
 }

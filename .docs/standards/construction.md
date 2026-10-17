@@ -188,7 +188,7 @@ Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `No
 | `blob_storage` | `FfiBlobBackend{InMemory, Redb{path}, Sqlite{path}}` | required; S3 and Postgres omitted |
 | `tls` | `FfiTlsMode{SelfSigned, Acme{email?}, Plaintext, Terminated}` | required |
 | `dht` | `FfiDhtMode{Disabled}` | required; `Disabled` only, by keri's scope ruling of 2026-10-13 |
-| `cors_origins` | `FfiCorsOrigins{AnyOrigin, List{origins}}` | required |
+| `cors_origins` | `FfiCorsOrigins{AnyOrigin, Allowlist{origins}}` | required |
 | `bind_addr`, `http_bind_addr` | `Option<SocketAddr>` | optional |
 | `nat` | `{Auto}` | optional |
 | `projection_rate_limit` | `Option<u32>`, greater than 0 | optional |
@@ -198,7 +198,7 @@ Field rules:
 - **`identity` names the operator.** Alec ruled on 2026-08-17: "nodes don't get identities and don't act. they are not participants". The handle names an operator identity that is already registered on the same `SCP` instance, and the bridge lowers it to `IdentitySource::Explicit`. `NodeStartConfig` has no `Persisted` arm, no passphrase field and no key path.
 - **No storage field.** `node_start` takes the `SCP` instance's own storage handle (`17-persistence-and-storage.md` §17.6, first-party storage adapters). A second store on the same directory fails, because `SqliteStorage::new` takes a non-blocking exclusive lock on `scp.db.lock` in that directory. When the instance store is in-memory, `node_start` logs a warning that the node loses all state on drop.
 - **`tls` and `dht` are required at the FFI layer, although the core `NodeConfig` defaults both.** The PyO3 and napi-rs bridges read untyped input, so an optional field with a default would let a misspelled key select that default.
-- **`cors_origins` is required, because the core `NodeConfig` reads `None` as the permissive `*` origin.** `AnyOrigin` selects `*` only when the caller names it.
+- **`cors_origins` is required, because the core `NodeConfig` reads `None` as the permissive `*` origin.** `AnyOrigin` selects `*` only when the caller names it. The listed arm is `Allowlist`, not `List`: UniFFI generates a Kotlin data class per data arm, and a class named `List` shadows `kotlin.collections.List` in its own `origins` field, so the Kotlin bindings do not compile.
 - **Validation finishes before any directory or file exists.** `node_start` runs `scp_node::validate_reach_and_tls` and the field checks first, and creates the blob directory and files only after both pass.
 - **`internal_relay_url` uses the relay's bound address,** not a hardcoded `ws://127.0.0.1:{port}`.
 

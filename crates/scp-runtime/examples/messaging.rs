@@ -40,8 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Register two participants.
     let alice: DID = "did:dht:z6MkAlice".into();
     let bob: DID = "did:dht:z6MkBob".into();
-    manager.register_local_did(alice.clone()).await?;
-    manager.register_local_did(bob.clone()).await?;
+    manager.register_local_did(alice.clone()).await;
+    manager.register_local_did(bob.clone()).await;
 
     // 3. Alice creates a context with messaging capabilities.
     let params = ContextParams {

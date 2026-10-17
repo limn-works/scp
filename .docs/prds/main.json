@@ -11548,7 +11548,7 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/server.rs",
         "crates/scp-ffi/napi/src/server.rs",

@@ -232,6 +232,13 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // every bridge's `trust_verify_attestation` reaches, lives here.
 const FFI_TRUST_STORE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/trust_store.rs");
+// Each bridge's `node_start` (construction.md §"Node start — `NodeStartConfig`"):
+// PyO3's and napi-rs's bodies live in `node_start_on` in their `server.rs`,
+// UniFFI's in `node_start_on` in `uniffi/src/server.rs`.
+const PYO3_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/src/server.rs");
+const NAPI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/server.rs");
+const NAPI_SCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs");
+const UNIFFI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/server.rs");
 
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
@@ -5880,6 +5887,163 @@ fn every_node_start_path_starts_the_self_did_republish_cycle() {
          shutdown would keep asserting this node's address on the DHT for the \
          life of the process (§10.12.1)"
     );
+}
+
+/// Asserts that `steps` occur in `body` in the given order, each after the one
+/// before it.
+fn assert_steps_in_order(bridge: &str, body: &str, steps: &[&str]) {
+    let mut from = 0;
+    for step in steps {
+        let Some(at) = body[from..].find(step) else {
+            panic!("{bridge} node_start_on must run `{step}` after the steps before it");
+        };
+        from += at + step.len();
+    }
+}
+
+/// Each bridge's `node_start` delegates to `server::node_start(` and runs its
+/// steps in the order construction.md §"Node start — `NodeStartConfig`" and
+/// SCP-322 give: the handle check (UniFFI), the config parse or conversion,
+/// operator identity resolution, the instance storage, `server::node_start`,
+/// `server::register_node`, `auto_wire_context_manager`, and the handle. An
+/// unregistered operator identity is `OperatorIdentityUnavailable`.
+#[test]
+fn every_bridge_node_start_delegates_to_server_node_start_in_order() {
+    let pyo3 = extract_fn_body(PYO3_SERVER_SRC, "node_start_on")
+        .expect("PyO3 server.rs must define node_start_on");
+    assert_steps_in_order(
+        "PyO3",
+        &pyo3,
+        &[
+            "NodeStartConfig::from_json(",
+            "resolve_operator_identity(",
+            "instance_storage(",
+            "server::node_start(",
+            "server::register_node(",
+            "auto_wire_context_manager(",
+            "PyNodeHandle {",
+        ],
+    );
+    let napi = extract_fn_body(NAPI_SERVER_SRC, "node_start_on")
+        .expect("napi server.rs must define node_start_on");
+    assert_steps_in_order(
+        "napi-rs",
+        &napi,
+        &[
+            "NodeStartConfig::from_json(",
+            "resolve_operator_identity(",
+            ".instance_storage()",
+            "server::node_start(",
+            "server::register_node(",
+            "auto_wire_context_manager(",
+            "NapiNodeHandle {",
+        ],
+    );
+    let uniffi = extract_fn_body(UNIFFI_SERVER_SRC, "node_start_on")
+        .expect("UniFFI server.rs must define node_start_on");
+    assert_steps_in_order(
+        "UniFFI",
+        &uniffi,
+        &[
+            ".check_handle(",
+            "lower_node_start_config(",
+            "build_node_identity_from_uniffi(",
+            ".instance_storage()",
+            "server::node_start(",
+            "server::register_node(",
+            "auto_wire_context_manager(",
+            "NodeHandle {",
+        ],
+    );
+
+    // The exported entry points reach `node_start_on`.
+    assert!(
+        fn_body_contains(PYO3_SERVER_SRC, "node_start", "node_start_on("),
+        "PyO3 SCP.node_start must delegate to node_start_on"
+    );
+    assert!(
+        fn_body_contains(NAPI_SCP_SRC, "node_start", "crate::server::node_start_on("),
+        "napi-rs Scp.nodeStart must delegate to node_start_on"
+    );
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "node_start",
+            "crate::server::node_start_on("
+        ),
+        "UniFFI Scp.node_start must delegate to node_start_on"
+    );
+
+    // Identity resolution: PyO3 and napi-rs look the DID up in the instance
+    // registry, and a miss is `OperatorIdentityUnavailable` (SCP-IDENT-1063).
+    for (bridge, src) in [("PyO3", PYO3_SERVER_SRC), ("napi-rs", NAPI_SERVER_SRC)] {
+        assert!(
+            fn_body_contains(src, "resolve_operator_identity", "build_node_identity("),
+            "{bridge} resolve_operator_identity must call build_node_identity"
+        );
+        assert!(
+            fn_body_contains(
+                src,
+                "build_node_identity",
+                "ServerError::OperatorIdentityUnavailable"
+            ),
+            "{bridge} build_node_identity must map a registry miss to \
+             OperatorIdentityUnavailable"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            UNIFFI_SERVER_SRC,
+            "build_node_identity_from_uniffi",
+            "ServerError::OperatorIdentityUnavailable"
+        ),
+        "UniFFI build_node_identity_from_uniffi must map a handle without key \
+         material to OperatorIdentityUnavailable"
+    );
+}
+
+/// Each bridge's node handle `shutdown` and `Drop` stop the node through
+/// `server::stop_node(`, which unbinds the instance's `Supervisor` transport
+/// from that node (construction.md §"Node start — `NodeStartConfig`"). A path
+/// that called only `RunningNode::shutdown` would leave the binding in place,
+/// so the instance's sends would go on targeting a stopped relay.
+#[test]
+fn every_bridge_node_handle_stop_path_calls_server_stop_node() {
+    for (bridge, src, handle_impl, drop_impl) in [
+        (
+            "PyO3",
+            PYO3_SERVER_SRC,
+            "impl PyNodeHandle {",
+            "impl Drop for PyNodeHandle {",
+        ),
+        (
+            "napi-rs",
+            NAPI_SERVER_SRC,
+            "impl NapiNodeHandle {",
+            "impl Drop for NapiNodeHandle {",
+        ),
+        (
+            "UniFFI",
+            UNIFFI_SERVER_SRC,
+            "impl NodeHandle {",
+            "impl Drop for NodeHandle {",
+        ),
+    ] {
+        for (label, header, method) in [
+            ("shutdown", handle_impl, "shutdown"),
+            ("Drop", drop_impl, "drop"),
+        ] {
+            let at = src
+                .find(header)
+                .unwrap_or_else(|| panic!("{bridge} server.rs must contain `{header}`"));
+            let body = extract_fn_body(&src[at..], method)
+                .unwrap_or_else(|| panic!("{bridge} `{header}` must define fn {method}"));
+            assert!(
+                body.contains("server::stop_node("),
+                "{bridge} node handle {label} must call server::stop_node"
+            );
+        }
+    }
 }
 
 /// Verifies that the root AGENTS.md contains the required enforcement sections.

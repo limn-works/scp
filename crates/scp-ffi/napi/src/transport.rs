@@ -59,28 +59,6 @@ pub(crate) fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
     }
 }
 
-/// Installs a pre-built `Arc<TransportManager>` on the given bridge instance (called by [`crate::server`] auto-wire where the
-/// caller needs to construct the manager externally).
-///
-/// Delegates to [`CoreFields::install_transport`](scp_ffi_common::bridge_instance::CoreFields::install_transport).
-///
-/// # Errors
-///
-/// Returns `ScpNapiError::Transport` if the lock is poisoned.
-///
-/// Gated to match its sole caller, the `server`-gated node auto-wiring path
-/// in `server.rs` (`mod server` is `#[cfg(feature = "server")]`). Without the
-/// gate the function is dead code in `--no-default-features` builds.
-#[cfg(feature = "server")]
-pub(crate) fn set_transport_manager_arc_on(
-    bi: &NapiBridgeInstance,
-    manager: Arc<scp_transport::TransportManager>,
-) -> Result<(), ScpNapiError> {
-    bi.core
-        .install_transport(manager)
-        .map_err(map_transport_lock_error)
-}
-
 /// Per-bridge-instance implementation of `with_transport_manager`.
 pub(crate) fn with_transport_manager_on<T>(
     bi: &NapiBridgeInstance,
