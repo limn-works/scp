@@ -474,7 +474,7 @@ fn lock_file_path(path: &Path) -> PathBuf {
 /// Holds an exclusive advisory lock on one key file's lock sibling until this
 /// value drops.
 ///
-/// `fs2` maps this onto `flock` on Unix and `LockFileEx` on Windows. Both
+/// std maps this onto `flock` on Unix and `LockFileEx` on Windows. Both
 /// exclude a second process and a second open file description inside this
 /// process, which is what makes two `FileKeyCustody` objects over one path
 /// serialize. Drop unlocks before the lock file closes: closing alone releases
@@ -553,9 +553,7 @@ fn lock_key_file_for_write_within(
     loop {
         match ExclusiveFileLock::try_acquire(file, &path) {
             Ok(lock) => return Ok(lock),
-            Err((returned, e))
-                if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
-            {
+            Err((returned, std::fs::TryLockError::WouldBlock)) => {
                 file = returned;
                 if std::time::Instant::now() >= deadline {
                     return Err(PlatformError::CustodyError(format!(
@@ -4200,7 +4198,7 @@ mod tests {
     ///
     /// Two `FileKeyCustody` objects hold two `file_write_lock` mutexes, so this
     /// advisory lock is the only thing that makes them take turns. Replacing
-    /// the `fs2::FileExt::try_lock_exclusive` loop with a call that returns
+    /// the `ExclusiveFileLock::try_acquire` loop with a call that returns
     /// immediately makes
     /// the second thread set its flag inside the wait below, which fails this
     /// assertion.
@@ -4239,8 +4237,8 @@ mod tests {
     /// A writer whose lock another holder keeps past the wait bound gets an
     /// error instead of waiting forever.
     ///
-    /// Replacing the bounded `try_lock_exclusive` loop with the blocking
-    /// `fs2::FileExt::lock_exclusive` makes the second call below never return
+    /// Replacing the bounded `try_acquire` loop with the blocking
+    /// `File::lock` makes the second call below never return
     /// while the first guard is held, so the receive times out and this test
     /// fails.
     #[test]

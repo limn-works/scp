@@ -1,7 +1,7 @@
 //! Exclusive advisory file locks that unlock explicitly on every release path.
 //!
-//! `fs2` maps an exclusive lock onto `flock(2)` on Unix and `LockFileEx` on
-//! Windows. A `flock` belongs to the open file description, not to the
+//! std's `File::try_lock` takes an exclusive lock through `flock(2)` on Unix
+//! and `LockFileEx` on Windows. A `flock` belongs to the open file description, not to the
 //! descriptor: every descriptor that shares the description shares the lock,
 //! and closing one descriptor releases nothing while another survives. A child
 //! process forked while the lock is held gets a copy of the descriptor, which
@@ -17,7 +17,7 @@
 //! crate that takes an exclusive file lock (spec §17.6 "One Opener per Durable
 //! Directory", §17.8 "One writer at a time").
 
-use std::fs::File;
+use std::fs::{File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -43,12 +43,11 @@ impl ExclusiveFileLock {
     ///
     /// # Errors
     ///
-    /// Returns the `File` and the OS error when the lock cannot be taken, so a
+    /// Returns the `File` and the error when the lock cannot be taken, so a
     /// caller that waits on contention can retry on the same open file. The
-    /// error's OS code equals `fs2::lock_contended_error()`'s when another
-    /// holder has the lock.
-    pub fn try_acquire(file: File, path: &Path) -> Result<Self, (File, io::Error)> {
-        match fs2::FileExt::try_lock_exclusive(&file) {
+    /// error is [`TryLockError::WouldBlock`] when another holder has the lock.
+    pub fn try_acquire(file: File, path: &Path) -> Result<Self, (File, TryLockError)> {
+        match file.try_lock() {
             Ok(()) => Ok(Self {
                 file: Some(file),
                 path: path.to_path_buf(),
@@ -66,9 +65,7 @@ impl ExclusiveFileLock {
     /// descriptor sharing the open file description closes.
     pub fn release(mut self) -> io::Result<()> {
         // The taken `File` closes when this expression ends, after the unlock.
-        self.file
-            .take()
-            .map_or(Ok(()), |file| fs2::FileExt::unlock(&file))
+        self.file.take().map_or(Ok(()), |file| file.unlock())
     }
 
     /// The locked file, for tests that copy its descriptor.
@@ -81,7 +78,7 @@ impl ExclusiveFileLock {
 impl Drop for ExclusiveFileLock {
     fn drop(&mut self) {
         if let Some(file) = self.file.take()
-            && let Err(e) = fs2::FileExt::unlock(&file)
+            && let Err(e) = file.unlock()
         {
             tracing::warn!(
                 path = %self.path.display(),
@@ -106,11 +103,8 @@ mod tests {
             .open(path)
     }
 
-    fn contended(result: &Result<ExclusiveFileLock, (File, io::Error)>) -> bool {
-        matches!(
-            result,
-            Err((_, e)) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error()
-        )
+    fn contended(result: &Result<ExclusiveFileLock, (File, TryLockError)>) -> bool {
+        matches!(result, Err((_, TryLockError::WouldBlock)))
     }
 
     /// `release` unlocks the shared open file description, so a copy of the

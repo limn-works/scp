@@ -125,7 +125,7 @@ impl SqliteStorage {
             .map_err(|e| PlatformError::StorageError(format!("failed to create directory: {e}")))?;
 
         // Take the advisory exclusive lock BEFORE opening the database. We
-        // use `try_lock_exclusive` (non-blocking) so a second caller gets an
+        // use `File::try_lock` (non-blocking) so a second caller gets an
         // actionable error immediately rather than silently blocking — the
         // caller is expected to use a single `SqliteStorage` per database
         // directory. The lock file is persistent (created with OpenOptions
@@ -145,7 +145,7 @@ impl SqliteStorage {
                 ))
             })?;
         let lock_file = ExclusiveFileLock::try_acquire(lock_file, &lock_path)
-            .map_err(|(_, e)| lock_error(&e, dir, &lock_path))?;
+            .map_err(|(_, e)| lock_error(e, dir, &lock_path))?;
 
         let db_path = dir.join("scp.db");
         // `scp_sqlite_pools::open` refuses, before it opens the file, unless
@@ -570,21 +570,19 @@ fn prefix_successor(prefix: &str) -> Option<String> {
     None
 }
 
-/// Classifies a failed `try_lock_exclusive` on `lock_path`. Contention is the
+/// Classifies a failed `File::try_lock` on `lock_path`. Contention
+/// ([`TryLockError::WouldBlock`](std::fs::TryLockError::WouldBlock)) is the
 /// typed lock-still-held condition (spec §17.6); any other lock failure is an
-/// I/O fault on the lock file and stays a generic storage error. The OS error
-/// code is compared, not the `ErrorKind`: std maps the Windows contention code
-/// to no specific kind, so a kind comparison also matches unrelated
-/// uncategorized failures.
-fn lock_error(e: &std::io::Error, dir: &Path, lock_path: &Path) -> PlatformError {
-    let contended = fs2::lock_contended_error().raw_os_error();
-    if contended.is_some() && e.raw_os_error() == contended {
-        PlatformError::StorageLockHeld {
+/// I/O fault on the lock file and stays a generic storage error.
+fn lock_error(e: std::fs::TryLockError, dir: &Path, lock_path: &Path) -> PlatformError {
+    match e {
+        std::fs::TryLockError::WouldBlock => PlatformError::StorageLockHeld {
             dir: dir.display().to_string(),
             lock_path: lock_path.display().to_string(),
+        },
+        std::fs::TryLockError::Error(e) => {
+            PlatformError::StorageError(format!("failed to lock {}: {e}", lock_path.display()))
         }
-    } else {
-        PlatformError::StorageError(format!("failed to lock {}: {e}", lock_path.display()))
     }
 }
 
@@ -1245,28 +1243,26 @@ mod tests {
         ));
     }
 
-    /// Only the OS contention code is the typed lock-held condition. An error
-    /// with the same `ErrorKind` but no OS code, or a different OS code, is a
-    /// generic storage error.
+    /// Only contention is the typed lock-held condition. Any other lock
+    /// failure, including one whose `ErrorKind` is `WouldBlock`, is a generic
+    /// storage error.
     #[test]
-    fn lock_error_matches_the_contention_os_code_only() {
+    fn lock_error_matches_contention_only() {
         let dir = Path::new("/d");
         let lock_path = Path::new("/d/scp.db.lock");
-        let contended = fs2::lock_contended_error();
 
         assert!(matches!(
-            lock_error(&contended, dir, lock_path),
+            lock_error(std::fs::TryLockError::WouldBlock, dir, lock_path),
             PlatformError::StorageLockHeld { .. }
         ));
-        let same_kind = std::io::Error::new(contended.kind(), "same kind, no OS code");
+        let same_kind = std::io::Error::new(std::io::ErrorKind::WouldBlock, "an I/O fault");
         assert!(matches!(
-            lock_error(&same_kind, dir, lock_path),
+            lock_error(std::fs::TryLockError::Error(same_kind), dir, lock_path),
             PlatformError::StorageError(_)
         ));
         let other_code = std::io::Error::from_raw_os_error(9);
-        assert_ne!(other_code.raw_os_error(), contended.raw_os_error());
         assert!(matches!(
-            lock_error(&other_code, dir, lock_path),
+            lock_error(std::fs::TryLockError::Error(other_code), dir, lock_path),
             PlatformError::StorageError(_)
         ));
     }
