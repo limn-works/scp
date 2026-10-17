@@ -194,7 +194,7 @@ async fn supervisor_send_emits_stripped_message_sent_to_subscriber() {
         ..ContextParams::default()
     };
     let handle = supervisor
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .expect("context creation should succeed");
     assert_eq!(handle.context_id(), ctx_id);
@@ -313,7 +313,7 @@ async fn supervisor_leave_emits_member_left_audit_event_to_subscriber() {
         ..ContextParams::default()
     };
     let handle = supervisor
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), None, Vec::new())
         .await
         .expect("context creation should succeed");
     assert_eq!(handle.context_id(), ctx_id);

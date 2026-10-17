@@ -17,7 +17,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use scp_ffi_common::error_codes::{STORAGE_8000, STORAGE_8004, STORAGE_8005, STORAGE_8006};
+use scp_ffi_common::error_codes::{
+    STORAGE_8000, STORAGE_8004, STORAGE_8005, STORAGE_8006, STORAGE_8007, STORAGE_8008,
+    STORAGE_8009,
+};
 
 /// Numbers the `scp-kt-android` `AndroidStorage` backend owns
 /// (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes):
@@ -43,6 +46,9 @@ fn ffi_common_storage_codes_carry_their_registered_numbers() {
     assert_eq!(STORAGE_8004, "SCP-STORAGE-8004");
     assert_eq!(STORAGE_8005, "SCP-STORAGE-8005");
     assert_eq!(STORAGE_8006, "SCP-STORAGE-8006");
+    assert_eq!(STORAGE_8007, "SCP-STORAGE-8007");
+    assert_eq!(STORAGE_8008, "SCP-STORAGE-8008");
+    assert_eq!(STORAGE_8009, "SCP-STORAGE-8009");
 }
 
 /// No `SCP-STORAGE-` code `scp-ffi-common` defines takes a number another
@@ -51,7 +57,15 @@ fn ffi_common_storage_codes_carry_their_registered_numbers() {
 /// name two conditions in that app.
 #[test]
 fn ffi_common_storage_codes_avoid_every_other_owner_sub_block() {
-    for code in [STORAGE_8000, STORAGE_8004, STORAGE_8005, STORAGE_8006] {
+    for code in [
+        STORAGE_8000,
+        STORAGE_8004,
+        STORAGE_8005,
+        STORAGE_8006,
+        STORAGE_8007,
+        STORAGE_8008,
+        STORAGE_8009,
+    ] {
         assert!(
             !ANDROID_OWNED.contains(&code),
             "{code} collides with a number scp-kt-android AndroidStorage owns"

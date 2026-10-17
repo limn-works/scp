@@ -69,9 +69,6 @@ pub enum SelfHostError {
     /// Failed to connect the in-process supervisor to the loopback relay.
     #[error("failed to connect supervisor to loopback relay: {0}")]
     RelayConnect(String),
-    /// Failed to register the node DID with the supervisor.
-    #[error("failed to register local DID with supervisor: {0}")]
-    RegisterDid(String),
     /// Failed to register the broadcast context on the node.
     #[error("failed to register broadcast context on node: {0}")]
     RegisterContext(String),
@@ -545,8 +542,17 @@ impl SelfHostDeployer {
                 ],
                 ..Default::default()
             };
+            // The node's own relay hosts the site's context (§5.12.3.1): the
+            // public URL it publishes in its DID document, not the loopback
+            // address the in-process supervisor dials.
             supervisor
-                .create_context(context_id.clone(), context_params, author_did.clone(), None)
+                .create_context(
+                    context_id.clone(),
+                    context_params,
+                    author_did.clone(),
+                    None,
+                    vec![node.relay_url()],
+                )
                 .await
                 .map_err(|e| SelfHostError::CreateContext(e.to_string()))?;
 
@@ -848,12 +854,7 @@ where
         durable,
     );
 
-    if let Err(e) = supervisor.register_local_did(author_did.clone()).await {
-        // Drain before failing, so no tracked task outlives the caller's
-        // storage (ADR-049 Decision 16).
-        let cause = SelfHostError::RegisterDid(e.to_string());
-        return Err(drain_after_failure(&supervisor, cause).await);
-    }
+    supervisor.register_local_did(author_did.clone()).await;
 
     Ok(supervisor)
 }

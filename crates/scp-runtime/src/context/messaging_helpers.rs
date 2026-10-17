@@ -48,7 +48,8 @@
 //!     on overflow.
 //! 16. [`deliver_message_and_drain_buffered`] — in-order delivery +
 //!     drain consecutive buffered.
-//! 17. [`send_pseudonym_announcement`] — best-effort announcement.
+//! 17. [`send_pseudonym_announcement`] — announcement, v1 or v2.
+//! 18. [`rotate_pseudonym`] — fail-closed pseudonym rotation, then announce.
 
 use std::sync::Arc;
 
@@ -610,11 +611,15 @@ pub fn deliver_plaintext_or_announcement(
 /// `Err(PermissionDenied)`. `NotAnnouncement` means the plaintext is ordinary
 /// application data (not a tagged announcement) and should be delivered as a
 /// normal message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnouncementOutcome {
-    /// The plaintext was a well-formed announcement that passed every check;
-    /// the peer registry was updated. A `PseudonymAnnounced` event is emitted
-    /// only when the recorded pseudonym was NEW or CHANGED (emit-on-change) —
-    /// an identical re-announce records the (unchanged) value and emits nothing.
+    /// The plaintext was a well-formed announcement that passed every check,
+    /// and the caller consumes it. An accepted announcement replaces the
+    /// announcer's record; a `PseudonymAnnounced` event is emitted only when the
+    /// recorded routing ID was NEW or CHANGED (emit-on-change). A v2
+    /// re-announcement of the recorded epoch and routing ID (the classifier's
+    /// `Unchanged`, spec 09 §9.10.4.1) leaves the registry as it is and emits
+    /// nothing.
     Recorded,
     /// The plaintext is not a tagged `PseudonymAnnouncement` — deliver it as a
     /// normal application message.
@@ -635,8 +640,10 @@ pub enum AnnouncementOutcome {
 ///    announcement),
 /// 2. `member_did == sender_did` (forged-announcement guard),
 /// 3. reserved-value rejection (`is_reserved_pseudonym`),
-/// 4. broadcast-context reject + cross-DID collision
-///    (`pseudonym_collides_with_other_did`), then registry insert + event emit.
+/// 4. broadcast-context reject + collision with another DID's record or with
+///    this member's own routing ID,
+/// 5. the §9.10.4.1 epoch ordering against the announcer's record, then
+///    registry insert + event emit.
 ///
 /// On any rejection the rejection metric is recorded and a warning is logged
 /// HERE, so neither call site has to. The validator STOPS at "record + emit":
@@ -661,15 +668,30 @@ fn ingest_pseudonym_announcement(
     // announcement is rejected as a collision. `local_pseudonym()` and
     // `peer_registry()` both read the routing state; capture the local pseudonym
     // first so the two borrows do not overlap.
-    let local_pseudonym = view.routing_mut().local_pseudonym();
+    //
+    // §9.10.4.1 also names the previous routing ID while it is in its rotation
+    // grace. The grace arm discards the previous routing ID when the grace ends,
+    // so the one this member still holds is the one in its grace.
+    let previous_routing_id = view
+        .class_s()
+        .pseudonym_rotation
+        .previous()
+        .map(|p| p.routing_id);
+    let own_routing_ids: Vec<[u8; 32]> = view
+        .routing_mut()
+        .local_pseudonym()
+        .into_iter()
+        .chain(previous_routing_id)
+        .collect();
     match classify_pseudonym_announcement(
         plaintext,
         sender_did,
         context_id,
         view.routing_mut().peer_registry(),
-        local_pseudonym,
+        &own_routing_ids,
     ) {
         PseudonymAnnouncementDecision::NotAnnouncement => AnnouncementOutcome::NotAnnouncement,
+        PseudonymAnnouncementDecision::Unchanged => AnnouncementOutcome::Recorded,
         PseudonymAnnouncementDecision::Rejected {
             reason,
             claimed_did,
@@ -699,6 +721,13 @@ fn ingest_pseudonym_announcement(
                     sender_did,
                     "pseudonym announcement received on broadcast context — rejecting"
                 );
+            } else if reason == pseudonym::REJECT_EPOCH || reason == pseudonym::REJECT_V1_AFTER_V2 {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    reason,
+                    "pseudonym announcement fails the epoch ordering — rejecting"
+                );
             } else {
                 tracing::warn!(
                     context_id,
@@ -708,10 +737,7 @@ fn ingest_pseudonym_announcement(
             }
             AnnouncementOutcome::Rejected(reason)
         }
-        PseudonymAnnouncementDecision::Accept {
-            member_did,
-            pseudonym,
-        } => {
+        PseudonymAnnouncementDecision::Accept { member_did, record } => {
             // The classifier only returns `Accept` for an encrypted context whose
             // peer registry is present and non-colliding; re-borrow it mutably to
             // insert. The `if let` (rather than a workspace-denied `expect`) is a
@@ -722,7 +748,7 @@ fn ingest_pseudonym_announcement(
             let previous = view
                 .routing_mut()
                 .peer_registry_mut()
-                .and_then(|registry| registry.insert(member_did.clone(), pseudonym));
+                .and_then(|registry| registry.insert(member_did.clone(), record));
             // Record + emit-ON-CHANGE. Emit the `PseudonymAnnounced` observability
             // event only when the recorded pseudonym is NEW **or CHANGED** — a
             // first-contact peer, or a KNOWN peer that rotated its pseudonym and
@@ -733,10 +759,12 @@ fn ingest_pseudonym_announcement(
             // (`scp-client` `ingest_application_plaintext`) so accept/emit cannot
             // drift across targets (share-don't-fork). The `routing_mut()` borrow
             // above has ended (NLL) before this disjoint `receive_buffer` emit.
-            if previous != Some(pseudonym) {
+            // The emit compares routing IDs only: a v1 → v2 upgrade or an epoch
+            // advance that keeps the routing ID changes no routing.
+            if previous.map(|r| r.routing_id) != Some(record.routing_id) {
                 let event = ContextEvent::PseudonymAnnounced {
                     member_did,
-                    pseudonym,
+                    pseudonym: record.routing_id,
                 };
                 emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
             }
@@ -1157,7 +1185,7 @@ pub async fn send_message(
                 let peer_pseudonyms: Vec<[u8; 32]> = view
                     .routing_mut()
                     .peer_registry()
-                    .map(|reg| reg.values().copied().collect())
+                    .map(|reg| reg.values().map(|r| r.routing_id).collect())
                     .unwrap_or_default();
                 if member_count > 1 && peer_pseudonyms.is_empty() {
                     // App-data send into an encrypted multi-member context with an
@@ -1865,7 +1893,7 @@ pub(crate) async fn send_checkpoint(
         let peer_pseudonyms: Vec<[u8; 32]> = cell
             .routing
             .peer_registry()
-            .map(|reg| reg.values().copied().collect())
+            .map(|reg| reg.values().map(|r| r.routing_id).collect())
             .unwrap_or_default();
         (
             cell.access.access_key_store.get_all(context_id),
@@ -2005,7 +2033,7 @@ pub(crate) async fn send_heartbeat(
         let peer_pseudonyms: Vec<[u8; 32]> = cell
             .routing
             .peer_registry()
-            .map(|reg| reg.values().copied().collect())
+            .map(|reg| reg.values().map(|r| r.routing_id).collect())
             .unwrap_or_default();
         (
             cell.access.access_key_store.get_all(context_id),
@@ -2923,6 +2951,7 @@ pub fn build_snapshot_from_state(
         // single shared type between live state and the serialized snapshot,
         // so no field-by-field translation is needed.
         routing: state.routing.clone(),
+        relay_urls: state.relay_urls.clone(),
         // ADR-049 §9 Class S (line 144): persist the staged saga slot through
         // its sanctioned serialization mirror so a Prepare's staged evidence
         // survives an actor crash. See [`saga_pending_snapshot`].
@@ -2944,6 +2973,9 @@ pub fn build_snapshot_from_state(
         // of any stream whose off-mailbox pump survived the crash. See
         // [`stream_reservations_snapshot`].
         stream_reservations: stream_reservations_snapshot(state),
+        // §9.10.4.1 Class S: persist the rotation state so a crash after the
+        // rotation's persist restores the new epoch with `announce_pending`.
+        pseudonym_rotation: state.class_s.pseudonym_rotation,
         // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold the broadcast
         // security + roster state (per-author key epochs, block lists, subscriber
         // registry) into the fail-closed snapshot so a block / governance ban /
@@ -3825,36 +3857,45 @@ pub async fn deliver_message_and_drain_buffered(
 // 17. send_pseudonym_announcement
 // ---------------------------------------------------------------------------
 
-/// Sends a pseudonym announcement MLS message so other members can map
-/// the announcing member's DID to their per-context pseudonym routing
-/// ID. Best-effort — internal log on transport / serialization failure.
+/// Sends the local member's pseudonym announcement as an MLS application
+/// message, so other members map its DID to its current routing ID (spec 09
+/// §9.10.4; §9.10.4.1 "Transition protocol and grace").
+///
+/// A member with a v2 rotation epoch sends the v2 form
+/// ([`PseudonymAnnouncementV2`](scp_protocol::context::pseudonym::PseudonymAnnouncementV2))
+/// carrying that epoch; a member that still holds its v1 routing ID sends the
+/// v1 form. Both travel only to the shared `context_routing_id` (the §9.10.4
+/// bootstrap rule, applied by `send_message`). When a persisted rotation waits
+/// for this announcement (`announce_pending`), a successful send clears the
+/// flag with a fail-closed persist, the last step of the §9.10.4.1 rotation
+/// order.
+///
+/// # Errors
+///
+/// - [`ContextError::NotPseudonymousContext`] for a broadcast context, which
+///   has no local routing ID.
+/// - [`ContextError::InvalidState`] when the announcement fails to serialize.
+/// - The `send_message` error (inactive context, commit fault, capability,
+///   transport); `announce_pending` then stays set.
+/// - The persist error of clearing `announce_pending`; the flag then stays
+///   set, and the next announcement repeats the same `(epoch, routing ID)`,
+///   which receivers accept as an idempotent no-op.
 pub async fn send_pseudonym_announcement(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     handle: &ContextHandle,
     sender_did: &DID,
     signer: &crate::context::actor::signer::CommandSigner,
-) {
+) -> Result<(), ContextError> {
     let context_id = handle.context_id().to_owned();
-    // Read the routing pseudonym via Deref; the borrow ends before the
-    // cell-taking `send_message` call below (which reaches the spending-nonce
-    // leaf).
-    let Some(pseudonym) = cell.routing.local_pseudonym() else {
-        return;
+    // Read the routing pseudonym and rotation state via Deref; the borrow ends
+    // before the cell-taking `send_message` call below.
+    let Some(routing_id) = cell.routing.local_pseudonym() else {
+        return Err(ContextError::NotPseudonymousContext { context_id });
     };
-    let announcement = PseudonymAnnouncement {
-        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
-        member_did: sender_did.as_ref().to_owned(),
-        pseudonym,
-    };
-    let Ok(payload) = rmp_serde::to_vec_named(&announcement) else {
-        tracing::warn!(
-            context_id = %context_id,
-            "failed to serialize pseudonym announcement"
-        );
-        return;
-    };
-    if let Err(e) = send_message(
+    let rotation = cell.class_s.pseudonym_rotation;
+    let payload = encode_local_announcement(sender_did.as_ref(), routing_id, rotation.epoch())?;
+    send_message(
         cell,
         deps,
         handle,
@@ -3868,13 +3909,192 @@ pub async fn send_pseudonym_announcement(
         None,
     )
     .await
-    {
+    .inspect_err(|e| {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
             "failed to send pseudonym announcement — peers cannot address this member until it re-announces (no shared-RID fallback for application data)"
         );
+    })?;
+
+    // §9.10.4.1 step 5: clear `announce_pending` only for the announcement
+    // just sent. A rotation that committed after this announcement was built
+    // carries a different epoch, and its own announcement clears its flag.
+    if rotation.announce_pending() {
+        cell.commit_class_s_restore(deps, &context_id, |mut view| {
+            let current = &mut view.rest_mut().class_s.pseudonym_rotation;
+            if current.epoch() == rotation.epoch() {
+                current.announce_pending = false;
+            }
+            Ok(())
+        })
+        .await?;
     }
+    Ok(())
+}
+
+/// The plaintext of the local member's pseudonym announcement: the v2
+/// `PseudonymAnnouncementV2` carrying `pseudonym_epoch` when the member holds a
+/// v2 epoch (spec 09 §9.10.4.1 "Announcement wire format (v2)", §25.19
+/// Vector 58), else the v1 `PseudonymAnnouncement` (§9.10.4, Vector 36). Both
+/// are name-keyed `MessagePack` maps from `rmp_serde::to_vec_named`.
+///
+/// # Errors
+///
+/// [`ContextError::InvalidState`] when the announcement fails to serialize.
+pub(super) fn encode_local_announcement(
+    member_did: &str,
+    routing_id: [u8; 32],
+    pseudonym_epoch: Option<u64>,
+) -> Result<Vec<u8>, ContextError> {
+    let encoded = pseudonym_epoch.map_or_else(
+        || {
+            rmp_serde::to_vec_named(&PseudonymAnnouncement {
+                tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+                member_did: member_did.to_owned(),
+                pseudonym: routing_id,
+            })
+        },
+        |pseudonym_epoch| {
+            rmp_serde::to_vec_named(&scp_protocol::context::pseudonym::PseudonymAnnouncementV2 {
+                tag: scp_protocol::context::pseudonym::PSEUDONYM_ANNOUNCEMENT_V2_TAG.to_owned(),
+                member_did: member_did.to_owned(),
+                pseudonym_epoch,
+                routing_id,
+            })
+        },
+    );
+    encoded.map_err(|e| {
+        ContextError::InvalidState(format!("pseudonym announcement failed to serialize: {e}"))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 18. rotate_pseudonym
+// ---------------------------------------------------------------------------
+
+/// Rotates the local member's pseudonym to `new_routing_id` at `new_epoch`
+/// (spec 09 §9.10.4.1 "Rotation order and crash recovery", steps 2 and 4).
+///
+/// The bridge driver derives `new_routing_id` with
+/// `KeyCustody::derive_rotatable_pseudonym` at the epoch
+/// [`LocalRoutingIds::next_pseudonym_epoch`](crate::context::actor::pseudonym_rotation::LocalRoutingIds)
+/// names, subscribes to it, and dispatches it here. This helper validates the
+/// pair, persists the rotation fail-closed (new epoch, new routing ID, the
+/// previous routing ID with its grace end, and `announce_pending`), emits
+/// [`ContextEvent::LocalPseudonymRotated`], then sends the announcement and
+/// clears `announce_pending`.
+///
+/// # Errors
+///
+/// - [`ContextError::ContextNotActive`] when the context is not active.
+/// - [`ContextError::NotPseudonymousContext`] for a broadcast context.
+/// - [`ContextError::PermissionDenied`] when `sender_did` is not the local
+///   member's DID.
+/// - [`ContextError::InvalidState`] when no rotation is due (no rotation
+///   policy, no boundary, membership change or join derivation pending since
+///   the last rotation, the previous rotation's announcement still pending, no
+///   creation timestamp under an interval policy, or an exhausted epoch), when
+///   `new_epoch` is not the
+///   due epoch, when `new_routing_id` is a
+///   reserved value, the current or previous routing ID, or a peer's routing
+///   ID, or when the grace end overflows. Nothing changes on any of these.
+/// - The persist error of the rotation; the epoch, routing ID and grace state
+///   are restored and nothing is sent.
+/// - The [`send_pseudonym_announcement`] error; the rotation stays committed
+///   with `announce_pending` set, and the rotation arm keeps signalling
+///   [`ContextEvent::PseudonymAnnouncementPending`] until an announcement
+///   succeeds.
+pub(super) async fn rotate_pseudonym(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    sender_did: &DID,
+    signer: &crate::context::actor::signer::CommandSigner,
+    new_epoch: u64,
+    new_routing_id: [u8; 32],
+) -> Result<(), ContextError> {
+    let handle = cell.handle.clone();
+    let context_id = handle.context_id().to_owned();
+    state::require_active(&handle)?;
+    let Some(old_routing_id) = cell.routing.local_pseudonym() else {
+        return Err(ContextError::NotPseudonymousContext { context_id });
+    };
+    if sender_did.as_ref() != deps.crypto.local_did() {
+        return Err(ContextError::PermissionDenied(
+            "a member rotates only its own pseudonym (spec 09 §9.10.4.1)".into(),
+        ));
+    }
+
+    let now_secs = deps.clock.now_secs();
+    let policy = handle.params().pseudonym_rotation;
+    let mut rotation = cell.class_s.pseudonym_rotation;
+    let Some(expected_epoch) = rotation.due_epoch(policy.as_ref(), now_secs) else {
+        return Err(ContextError::InvalidState(
+            "no pseudonym rotation is due: the context has no rotation policy, no trigger has \
+             fired since the last rotation, the previous rotation's announcement is pending, \
+             the member holds no creation timestamp for an interval schedule, or the epoch has \
+             no successor (spec 09 §9.10.4.1)"
+                .into(),
+        ));
+    };
+    if new_epoch != expected_epoch {
+        return Err(ContextError::InvalidState(format!(
+            "pseudonym rotation epoch {new_epoch} is not the due epoch {expected_epoch} \
+             (spec 09 §9.10.4.1 epoch schedule)"
+        )));
+    }
+    let collides_with_peer = cell
+        .routing
+        .peer_registry()
+        .is_some_and(|reg| reg.values().any(|r| r.routing_id == new_routing_id));
+    if pseudonym::is_reserved_pseudonym(&new_routing_id, &context_id)
+        || new_routing_id == old_routing_id
+        || rotation
+            .previous()
+            .is_some_and(|p| p.routing_id == new_routing_id)
+        || collides_with_peer
+    {
+        return Err(ContextError::InvalidState(
+            "rotated routing ID is reserved, already held by this member, or a peer's routing \
+             ID (spec 09 §9.10.4)"
+                .into(),
+        ));
+    }
+    rotation
+        .record_rotation(new_epoch, old_routing_id, policy.as_ref(), now_secs)
+        .ok_or_else(|| {
+            ContextError::InvalidState("pseudonym rotation grace end overflows u64".into())
+        })?;
+
+    // §9.10.4.1 step 2: the fail-closed persist. On failure the combinator
+    // restores the Class-S rotation state and the compensation restores the
+    // routing ID, so the member keeps its old pseudonym and sends nothing.
+    cell.commit_class_s_compensating(
+        deps,
+        &context_id,
+        |mut view| {
+            let state = view.rest_mut();
+            state.routing.set_local_pseudonym(new_routing_id);
+            state.class_s.pseudonym_rotation = rotation;
+            Ok(((), old_routing_id))
+        },
+        async |old, mut view, _deps| {
+            view.routing_mut().set_local_pseudonym(old);
+        },
+    )
+    .await?;
+    // The event carries no routing ID: the supervisor channel also feeds
+    // webhooks.
+    cell.class_c_view().emit_event(
+        ContextEvent::LocalPseudonymRotated {
+            pseudonym_epoch: new_epoch,
+        },
+        &context_id,
+        deps.event_tx.as_ref(),
+    );
+
+    // §9.10.4.1 steps 4 and 5: announce, then clear `announce_pending`.
+    send_pseudonym_announcement(cell, deps, &handle, sender_did, signer).await
 }
 
 #[cfg(test)]
@@ -3962,7 +4182,10 @@ mod pseudonym_routing_tests {
         assert_eq!(result, None);
         // Registry now maps Alice's DID to her announced routing ID.
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
-        assert_eq!(reg.get(&DID(ALICE.to_owned())), Some(&alice_pseudonym));
+        assert_eq!(
+            reg.get(&DID(ALICE.to_owned())).map(|r| &r.routing_id),
+            Some(&alice_pseudonym)
+        );
     }
 
     #[test]
@@ -4030,7 +4253,7 @@ mod pseudonym_routing_tests {
         );
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(
-            reg.get(&DID(ALICE.to_owned())),
+            reg.get(&DID(ALICE.to_owned())).map(|r| &r.routing_id),
             Some(&rotated),
             "a same-DID re-announce must update (not reject) the registry"
         );
@@ -4106,6 +4329,126 @@ mod pseudonym_routing_tests {
             2,
             "a rotated (changed) pseudonym re-announce must emit a fresh PseudonymAnnounced event"
         );
+    }
+
+    fn announcement_v2_bytes(
+        member_did: &str,
+        pseudonym_epoch: u64,
+        routing_id: [u8; 32],
+    ) -> Vec<u8> {
+        rmp_serde::to_vec_named(&scp_protocol::context::pseudonym::PseudonymAnnouncementV2 {
+            tag: scp_protocol::context::pseudonym::PSEUDONYM_ANNOUNCEMENT_V2_TAG.to_owned(),
+            member_did: member_did.to_owned(),
+            pseudonym_epoch,
+            routing_id,
+        })
+        .expect("serialize v2 announcement")
+    }
+
+    /// Spec 09 §9.10.4.1 receipt ordering through the native ingest wrapper:
+    ///
+    /// - a v2 over a v1 record with the SAME routing ID is accepted, records
+    ///   the epoch, and emits nothing (no routing change);
+    /// - a same-epoch, same-ID re-announcement is `Recorded` with nothing
+    ///   changed;
+    /// - a lower epoch, an equal epoch with another ID, a v1 after v2, and a
+    ///   v2 whose routing ID equals the receiver's own each reject with their
+    ///   reason, leave the record as it was, and emit nothing;
+    /// - a higher epoch replaces the record and emits.
+    #[test]
+    fn ingest_applies_v2_epoch_ordering() {
+        use scp_protocol::context::pseudonym::{
+            PseudonymRecord, REJECT_COLLISION, REJECT_EPOCH, REJECT_V1_AFTER_V2,
+        };
+
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        let own = [0x77u8; 32];
+        state.routing.set_local_pseudonym(own);
+        let v1_id = [0x42u8; 32];
+        let e2 = [0x52u8; 32];
+        let count_events = |s: &PerContextState| {
+            s.receive_buffer
+                .event_log_entries()
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        scp_protocol::context::membership::ContextEvent::PseudonymAnnounced { .. }
+                    )
+                })
+                .count()
+        };
+        let record = |s: &PerContextState| {
+            s.routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .get(&DID(ALICE.to_owned()))
+                .copied()
+        };
+        let ingest = |s: &mut PerContextState, bytes: Vec<u8>| {
+            ingest_pseudonym_announcement(&mut ClassCMut::from_state(s), ALICE, &bytes, &ctx, None)
+        };
+
+        assert_eq!(
+            ingest(&mut state, announcement_bytes(ALICE, v1_id)),
+            AnnouncementOutcome::Recorded
+        );
+        assert_eq!(count_events(&state), 1);
+
+        // v1 → v2 upgrade keeping the routing ID: epoch recorded, no emit.
+        assert_eq!(
+            ingest(&mut state, announcement_v2_bytes(ALICE, 1, v1_id)),
+            AnnouncementOutcome::Recorded
+        );
+        assert_eq!(
+            record(&state),
+            Some(PseudonymRecord {
+                routing_id: v1_id,
+                epoch: Some(1),
+            })
+        );
+        assert_eq!(
+            count_events(&state),
+            1,
+            "same routing ID ⇒ no routing change to emit"
+        );
+
+        // Same epoch, same ID: `Unchanged`, surfaced as `Recorded`.
+        assert_eq!(
+            ingest(&mut state, announcement_v2_bytes(ALICE, 1, v1_id)),
+            AnnouncementOutcome::Recorded
+        );
+        assert_eq!(count_events(&state), 1);
+
+        let before = record(&state);
+        for (bytes, reason) in [
+            (announcement_v2_bytes(ALICE, 0, e2), REJECT_EPOCH),
+            (announcement_v2_bytes(ALICE, 1, e2), REJECT_EPOCH),
+            (announcement_bytes(ALICE, e2), REJECT_V1_AFTER_V2),
+            (announcement_v2_bytes(ALICE, 2, own), REJECT_COLLISION),
+        ] {
+            assert_eq!(
+                ingest(&mut state, bytes),
+                AnnouncementOutcome::Rejected(reason)
+            );
+            assert_eq!(record(&state), before, "{reason}: the record is unchanged");
+            assert_eq!(count_events(&state), 1, "{reason}: nothing emitted");
+        }
+
+        // Higher epoch, new routing ID: replaces the record and emits.
+        assert_eq!(
+            ingest(&mut state, announcement_v2_bytes(ALICE, 2, e2)),
+            AnnouncementOutcome::Recorded
+        );
+        assert_eq!(
+            record(&state),
+            Some(PseudonymRecord {
+                routing_id: e2,
+                epoch: Some(2),
+            })
+        );
+        assert_eq!(count_events(&state), 2);
     }
 
     #[test]
@@ -4194,7 +4537,10 @@ mod pseudonym_routing_tests {
             "a cross-DID routing-ID collision must be dropped"
         );
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
-        assert_eq!(reg.get(&DID(ALICE.to_owned())), Some(&shared_rid));
+        assert_eq!(
+            reg.get(&DID(ALICE.to_owned())).map(|r| &r.routing_id),
+            Some(&shared_rid)
+        );
         assert!(
             !reg.contains_key(&DID(BOB.to_owned())),
             "the colliding announcer must not be inserted"
@@ -4532,7 +4878,7 @@ mod pseudonym_routing_tests {
     struct DrainRecordingEventLog {
         consequence_triggered: std::sync::Arc<std::sync::atomic::AtomicBool>,
         message_sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        /// `EventType` enumerates 77 variants; `PseudonymAnnounced` was REMOVED
+        /// `PseudonymAnnounced` was REMOVED from `EventType`
         /// (it is a `ContextEvent`-only routing signal, not a durable event). A
         /// recorder cannot match a non-existent variant, so a received
         /// announcement is proven buffer-only by the ABSENCE of any append at
@@ -4892,7 +5238,7 @@ mod pseudonym_routing_tests {
         );
         let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert_eq!(
-            reg.get(&DID(ALICE.to_owned())),
+            reg.get(&DID(ALICE.to_owned())).map(|r| &r.routing_id),
             Some(&alice_pseudonym),
             "a processed announcement must update the in-memory peer registry (its entire function)"
         );
@@ -4974,7 +5320,8 @@ mod pseudonym_routing_tests {
                 .routing
                 .peer_registry()
                 .expect("encrypted ⇒ registry")
-                .get(&DID(BOB.to_owned())),
+                .get(&DID(BOB.to_owned()))
+                .map(|r| &r.routing_id),
             Some(&bob_pseudonym),
             "BOB's pseudonym is now recorded (the first-time trigger fired)"
         );

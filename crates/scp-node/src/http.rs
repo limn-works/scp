@@ -114,8 +114,11 @@ pub struct NodeState {
     /// Bind address for the public HTTP server used by [`ApplicationNode::serve`].
     ///
     /// Separate from `relay_addr` (the relay's internal listener) to avoid
-    /// double-binding the same port (#224). Defaults to `0.0.0.0:8443`.
-    pub(crate) http_bind_addr: SocketAddr,
+    /// double-binding the same port (#224). `None` when the caller configured
+    /// no address: [`NodeState::public_bind_addr`] then falls back to
+    /// `0.0.0.0:8443` for `serve`, and `serve_background*` falls back to
+    /// loopback `127.0.0.1:8443` (SCP-320).
+    pub(crate) http_bind_addr: Option<SocketAddr>,
     /// Shared cancellation token for graceful shutdown of both the public
     /// HTTPS listener and the dev API listener. Cancelled by
     /// [`ApplicationNode::shutdown`].
@@ -273,6 +276,17 @@ pub struct NodeState {
     /// bind-failure case (spec §10.14.3 item 1).
     #[cfg(feature = "quic")]
     pub(crate) quic_listening: std::sync::atomic::AtomicBool,
+}
+
+impl NodeState {
+    /// The address [`ApplicationNode::serve`] and [`ApplicationNode::bind`]
+    /// listen on: the configured `http_bind_addr`, or
+    /// [`DEFAULT_HTTP_BIND_ADDR`](crate::DEFAULT_HTTP_BIND_ADDR) (`0.0.0.0:8443`)
+    /// when none is configured. The background server does not read this; it
+    /// falls back to loopback instead.
+    pub(crate) fn public_bind_addr(&self) -> SocketAddr {
+        self.http_bind_addr.unwrap_or(crate::DEFAULT_HTTP_BIND_ADDR)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +931,7 @@ const PORT_ZERO_PAIR_ATTEMPTS: u32 = 8;
 async fn bind_public_listeners(
     state: &Arc<NodeState>,
 ) -> Result<(tokio::net::TcpListener, SocketAddr, Option<SocketAddr>), NodeError> {
-    let requested = state.http_bind_addr;
+    let requested = state.public_bind_addr();
     #[cfg(feature = "quic")]
     {
         let mut draws: u32 = 1;
@@ -1314,9 +1328,14 @@ mod tests {
             dev_bind_addr: None,
             projected_contexts: RwLock::new(HashMap::new()),
             blob_storage: Arc::new(BlobStorageBackend::in_memory()),
-            relay_config: scp_transport::native::server::RelayConfig::default(),
+            relay_config: scp_transport::native::server::RelayConfig::defaults(
+                scp_transport::relay::push_gate::LiveRelayUrl::new(
+                    scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1")
+                        .unwrap(),
+                ),
+            ),
             start_time: Instant::now(),
-            http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
+            http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             shutdown_token: CancellationToken::new(),
             cors_origins,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -1511,9 +1530,14 @@ mod vhost_tests {
             dev_bind_addr: None,
             projected_contexts: RwLock::new(projected),
             blob_storage: Arc::new(BlobStorageBackend::from(storage)),
-            relay_config: scp_transport::native::server::RelayConfig::default(),
+            relay_config: scp_transport::native::server::RelayConfig::defaults(
+                scp_transport::relay::push_gate::LiveRelayUrl::new(
+                    scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1")
+                        .unwrap(),
+                ),
+            ),
             start_time: Instant::now(),
-            http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
+            http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -1945,7 +1969,7 @@ fn spawn_quic_listener(
 
     // Bind UDP on the same interface and port as the public WebSocket/TLS
     // listener so both transports share one address (spec §10.14.3 item 1).
-    let bind_addr = SocketAddr::new(state.http_bind_addr.ip(), tcp_port);
+    let bind_addr = SocketAddr::new(state.public_bind_addr().ip(), tcp_port);
 
     // Mirror the relay's operational limits so QUIC and WebSocket enforce the
     // same policy.
@@ -1966,6 +1990,11 @@ fn spawn_quic_listener(
         // store (§3.10.2). The listener also shares the relay's slot registry
         // below — the two together honor one set of claimed slots.
         did_record_validation: rc.did_record_validation,
+        // A clone of the WebSocket relay's live URL handle and the same push
+        // role, so a push message is intercepted on QUIC too and a tier change
+        // moves both transports' reserved push routing ID at once (§10.7.1).
+        relay_url: rc.relay_url.clone(),
+        push: rc.push.clone(),
     };
 
     let listener = QuicListener::new(

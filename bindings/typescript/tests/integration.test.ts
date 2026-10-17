@@ -2053,6 +2053,27 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         await other.shutdown(1);
       }
     });
+
+    it("contextGovernanceModifyCapabilityRequirements with a handle minted by another SCP is rejected", async () => {
+      const other = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const ours = await createInMemoryIdentity(scp);
+        const ourCtx = await scp.contextCreate(
+          ours,
+          JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
+        );
+        let threw = false;
+        try {
+          await other.contextGovernanceModifyCapabilityRequirements(ourCtx, [], ours.did);
+        } catch (err) {
+          threw = true;
+          expect(String(err)).toMatch(/SCP-PERM-3030/);
+        }
+        expect(threw).toBe(true);
+      } finally {
+        await other.shutdown(1);
+      }
+    });
   });
 
   // -------------------------------------------------------------------

@@ -2308,7 +2308,13 @@ mod tests {
 
         // Create the context. This registers it in the manager.
         let handle = manager
-            .create_context(context_id.to_owned(), params, creator_did.clone(), None)
+            .create_context(
+                context_id.to_owned(),
+                params,
+                creator_did.clone(),
+                None,
+                Vec::new(),
+            )
             .await
             .expect("failed to create test context");
 

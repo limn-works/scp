@@ -75,6 +75,7 @@ fn full_capability_params() -> ContextParams {
         consequence_rules_json: None,
         consequence_config_json: None,
         capability_requirements_json: None,
+        pseudonym_rotation: None,
     }
 }
 
@@ -99,6 +100,7 @@ fn default_encrypted_params() -> ContextParams {
         consequence_rules_json: None,
         consequence_config_json: None,
         capability_requirements_json: None,
+        pseudonym_rotation: None,
     }
 }
 
@@ -576,7 +578,6 @@ async fn invite_member_seals_for_a_locally_minted_invitee() {
             context_id.clone(),
             invitee.did(),
             reservation.key_package_public,
-            Vec::new(),
         )
         .await
         .expect("invite_member should seal for an invitee this instance minted");
@@ -1277,6 +1278,7 @@ async fn context_create_with_all_governance_models() {
             consequence_rules_json: None,
             consequence_config_json: None,
             capability_requirements_json: None,
+            pseudonym_rotation: None,
         };
         let handle = scp.context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");
@@ -1312,6 +1314,7 @@ async fn context_create_with_all_memory_scopes() {
             consequence_rules_json: None,
             consequence_config_json: None,
             capability_requirements_json: None,
+            pseudonym_rotation: None,
         };
         let handle = scp.context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");

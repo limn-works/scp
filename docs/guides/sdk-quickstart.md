@@ -264,7 +264,8 @@ let params = ContextParams(
     economicPolicy: nil,
     consequenceRulesJson: nil,
     consequenceConfigJson: nil,
-    capabilityRequirementsJson: nil
+    capabilityRequirementsJson: nil,
+    pseudonymRotation: nil
 )
 let handle = try await scp.contextCreate(identity: identity, params: params)
 print("Context ID: \(handle.contextId())")
@@ -295,6 +296,7 @@ val params = ContextParams(
     consequenceRulesJson = null,
     consequenceConfigJson = null,
     capabilityRequirementsJson = null,
+    pseudonymRotation = null,
 )
 val handle = scp.contextCreate(identity, params)
 println("Context ID: ${handle.contextId()}")

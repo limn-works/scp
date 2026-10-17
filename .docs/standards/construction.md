@@ -90,7 +90,7 @@ Instead:
   NodeConfig { reach, identity, storage, blob_storage, ..NodeConfig::defaults(reach2, identity2, storage2, blob_storage2) }
   ```
 
-A config whose every field is genuinely fail-safe **may** keep `Default` — `RelayConfig` qualifies, since every field has a safe default. This explicitly depends on `BridgeRole::default() == Disabled`: `bridge` is `RelayConfig`'s only security-consequential field, and because its `Default` is the fail-safe `Disabled` (a relay that brokers nothing until explicitly enabled), the whole struct's `Default` manufactures no unsafe value. If `BridgeRole::default()` were `Enabled`, `RelayConfig` would forfeit this exception and M4 would fire. The rule fires only when a field is security-relevant or irreducible *and lacks a fail-safe default*.
+A config whose every field is genuinely fail-safe **may** keep `Default`. The rule fires only when a field is security-relevant or irreducible *and lacks a fail-safe default*. `RelayConfig` shows both halves: its `bridge` field alone would not fire M4, because `BridgeRole::default() == Disabled` (a relay that brokers nothing until explicitly enabled) is fail-safe; its `relay_url` field does fire M4, because the relay's public URL fixes its reserved push routing ID (spec §10.7.1 step 2) and no value is safe to invent. `RelayConfig` therefore has no `Default` and is built with `RelayConfig::defaults(relay_url)`.
 
 ### M5 — One greppable contract
 
@@ -175,9 +175,54 @@ NodeConfig {
 
 Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) + `Node::start_for_testing(NodeConfig)` (feature-gated). The `Dom`/`Id` typestate markers are deleted; the `<K, D, S>` generics survive, carried by the config and its selectors. (The `IdentitySource` name-reconciliation against the existing private `scp-node` enum is an implementation-sequencing detail — see the ADR-052 Dependencies bullet, not restated here.)
 
+### Node start — `NodeStartConfig`
+
+`node_start` starts a production node from an existing `SCP` instance. The PyO3, napi-rs and UniFFI bridges export it, and the Python, TypeScript and macOS Swift SDKs wrap it. `server::node_start` in `scp-ffi-common` converts a `NodeStartConfig` into the core `NodeConfig` above, and calls `Node::start`. The config takes the name `NodeStartConfig` because the converting function has both `NodeStartConfig` and `NodeConfig` in scope.
+
+`NodeStartConfig` lives in `crates/scp-ffi/common/src/node_start_config.rs`. It is a flat config under this standard. Serde deserializes it with `deny_unknown_fields`, and each of its data enums carries the tag `kind`. A `kind` value is the arm's name in `snake_case`, as the bridges' `StorageConfig` spells `in_memory`: `{"kind": "nat_traversal"}`, `{"kind": "any_origin"}`.
+
+| Field | Type | Status |
+|---|---|---|
+| `reach` | `FfiReach{Domain{domain}, NatTraversal, Local}` | required; `Tunnel` omitted |
+| `identity` | operator handle: each SDK (Python, TypeScript, Swift) takes its own `Identity` handle object; the wrapper lowers it to its DID string at the PyO3 and napi-rs bridges and passes `Arc<Identity>` at UniFFI | required |
+| `blob_storage` | `FfiBlobBackend{InMemory, Redb{path}, Sqlite{path}}` | required; S3 and Postgres omitted |
+| `tls` | `FfiTlsMode{SelfSigned, Acme{email?}, Plaintext, Terminated}` | required |
+| `dht` | `FfiDhtMode{Disabled}` | required; `Disabled` only, by keri's scope ruling of 2026-10-13 |
+| `cors_origins` | `FfiCorsOrigins{AnyOrigin, Allowlist{origins}}` | required |
+| `bind_addr`, `http_bind_addr` | `Option<SocketAddr>` | optional |
+| `nat` | `{Auto}` | optional |
+| `projection_rate_limit` | `Option<u32>`, greater than 0 | optional |
+
+Field rules:
+
+- **`identity` names the operator.** Alec ruled on 2026-08-17: "nodes don't get identities and don't act. they are not participants". The handle names an operator identity that is already registered on the same `SCP` instance, and the bridge lowers it to `IdentitySource::Explicit`. `NodeStartConfig` has no `Persisted` arm, no passphrase field and no key path.
+- **No storage field.** `node_start` takes the `SCP` instance's own storage handle (`17-persistence-and-storage.md` §17.6, first-party storage adapters). A second store on the same directory fails, because `SqliteStorage::new` takes a non-blocking exclusive lock on `scp.db.lock` in that directory. When the instance store is in-memory, `node_start` logs a warning that the node loses all state on drop.
+- **`tls` and `dht` are required at the FFI layer, although the core `NodeConfig` defaults both.** The PyO3 and napi-rs bridges read untyped input, so an optional field with a default would let a misspelled key select that default.
+- **`cors_origins` is required, because the core `NodeConfig` reads `None` as the permissive `*` origin.** `AnyOrigin` selects `*` only when the caller names it. The listed arm is `Allowlist`, not `List`: UniFFI generates a Kotlin data class per data arm, and a class named `List` shadows `kotlin.collections.List` in its own `origins` field, so the Kotlin bindings do not compile.
+- **Validation finishes before any directory or file exists.** `node_start` runs `scp_node::validate_reach_and_tls` and the field checks first, and creates the blob directory and files only after both pass.
+- **`internal_relay_url` uses the relay's bound address,** not a hardcoded `ws://127.0.0.1:{port}`.
+
+Arms and fields that `NodeStartConfig` omits:
+
+| Omitted | Reason |
+|---|---|
+| `Reach::Tunnel` | The core does not thread `public_url` into the published relay URL. |
+| `TlsMode::Custom` | It carries an `Arc<dyn TlsProvider>` trait object, which cannot cross the FFI boundary. |
+| `DhtMode::Memory` | Its in-memory client is a nullifier compiled only under `feature = "testing"` (ADR-062, capability injection, Decision 1). |
+| `NatSlot::Custom`, `NatSlot::Tuned` | Both carry `NatStrategy` trait objects. |
+| `local_api`, `http3`, `dns_provider`, `network_detector`, `dht_gateways` | `local_api` is a development control plane whose token the node mints. The `http3` field compiles only under `feature = "http3"`, which no bridge enables. `dns_provider` overrides the selected `tls` and `domain` without saying so in the signature. `network_detector` is a core capability slot. `dht_gateways` has no DHT client to reach, because the operator identity owns its DID method and its DHT client. |
+
+keri's scope ruling of 2026-10-13: `dht` exposes `Disabled` only, because ADR-063 removes Mainline publication; under `Disabled` the node runs its relay and publishes nothing. `DnsSubdomain` stays out of the SDK mirror and `dns_provider` stays binary-only, because the DID-derived label collides across one operator's nodes and changes at the `Identifier` cut-over; the keri workstream owns defining that label and a future relay-advertisement variant.
+
+Entry: each bridge's `node_start` resolves the operator identity, takes the instance storage, and calls `server::node_start(cfg, NodeIdentity, InstanceStorage)` in `scp-ffi-common`, which validates and then calls `Node::start`. `sdk-common.md` §"Node start error codes" lists the error code each failure returns.
+
+After `server::node_start` returns the running node, the bridge registers it in the `SCP` instance's node registry and binds the instance's `Supervisor` to it in four steps. First, the start refuses when a running node already holds the instance's binding. Second, the start connects to the node's relay. Third, the start attaches a `Supervisor` when the instance holds none, and reuses the instance's `Supervisor` when it holds one. Fourth, the start rebinds the `Supervisor`'s transport and the instance's transport manager to the relay connection, and registers the operator DID as a local DID. Because the connect runs before the attach, a `RelayConnect` failure attaches no `Supervisor`. Any call that attaches a `Supervisor` lazily leaves one on the instance, and a later start reuses it. The complete list of those calls: `context_create`, `context_join_from_welcome`, `context_import`, `reserve_key_package`, `configure_relay_transport` and `configure_local_transport` on every bridge; `context_join` on PyO3; and `invite_member`, `register_local_did` and `is_local_did` on UniFFI. One node at a time holds an instance's binding: while a running node holds it, a second start returns `ServerError::SupervisorWiring` (`SCP-TRANS-5056`). When a step fails, the bridge shuts the started node down, removes it from the node registry, and returns `ServerError::SupervisorWiring` (`SCP-TRANS-5056`). No bridge falls back to a `Supervisor` without relay transport, and `node_start` returns a node handle only after its own rebind succeeds.
+
+A node handle's `shutdown` and its drop put back the transport provider and the transport manager the start displaced, so a later start binds again. A send already in flight when the transport is rebound finishes on the provider it loaded, and later sends use the new one. A `Supervisor` attached lazily before the start keeps the DID its attaching call gave its MLS factory; the start rebinds only its transport.
+
 ### Relay — `RelayConfig`
 
-Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled }` (M1). `BridgeRole::Enabled` is payload-free and needs no config secret, which the M2 Relay bullet states. The relay's `bridge_secret: Option<[u8;32]>` stays a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret, set independently of the broker role — and is therefore out of the construction-pattern surface (not folded into `BridgeRole`). Entry: `Relay::start(RelayConfig, storage)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` may keep `Default` (every field is fail-safe — M4 does not fire), an exception that holds **precisely because** `BridgeRole::default() == Disabled` (its sole security-consequential field has a fail-safe default).
+Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled }` (M1). `BridgeRole::Enabled` is payload-free and needs no config secret, which the M2 Relay bullet states. The relay's `bridge_secret: Option<[u8;32]>` stays a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret, set independently of the broker role — and is therefore out of the construction-pattern surface (not folded into `BridgeRole`). Entry: `Relay::start(RelayConfig, storage)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` has no `Default`: `relay_url` (a `LiveRelayUrl` handle every listener of the relay shares, from which the reserved push routing ID derives, §10.7.1 step 2) is irreducible, so M4 fires and the factory is `RelayConfig::defaults(relay_url)`. `bridge` is not the reason, since `BridgeRole::default() == Disabled` is fail-safe.
 
 ### host_site — `HostSiteConfig`
 

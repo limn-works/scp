@@ -122,7 +122,9 @@ async fn start_relay() -> (ShutdownHandle, SocketAddr) {
     let config = RelayConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         delivery_jitter_ms: 0,
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(scp_transport::relay::push_gate::LiveRelayUrl::new(
+            scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1").unwrap(),
+        ))
     };
     let storage = Arc::new(BlobStorageBackend::in_memory());
     let server = RelayServer::new(config, storage);
@@ -140,7 +142,7 @@ async fn connect_transport(relay_addr: SocketAddr) -> Arc<TransportManager> {
     let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
         .await
         .expect("relay adapter connect");
-    Arc::new(TransportManager::new(Box::new(adapter)))
+    Arc::new(TransportManager::new(sourced.url, Box::new(adapter)))
 }
 
 /// End-to-end relay-backed driver run plus all-three-tier classification.

@@ -70,6 +70,8 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use scp_core::context::ContextPersistence;
+use scp_core::context::builder::ContextTransportProvider;
+use scp_core::context::supervisor::TransportSlot;
 use scp_core::context::supervisor::{DrainWithDeadline, JoinFailure, Supervisor};
 use scp_core::discovery::handles::HandleRegistry;
 use scp_core::discovery::petnames::PetnameMap;
@@ -288,6 +290,71 @@ pub fn late_registration_refusal(saga_id: Option<&str>) -> (&'static str, String
 /// instead of a lost registration: once [`CoreFields::stop_borrowers`] sets it,
 /// a later [`CoreFields::register_borrower`] stops its argument immediately
 /// rather than filing a `Weak` nothing will ever read.
+/// The record of which node an instance's `Supervisor` transport is bound to,
+/// and what that binding displaced.
+///
+/// `scp_ffi_common::server::wire_supervisor_to_node` writes it, and
+/// `scp_ffi_common::server::stop_node` clears it, each while holding
+/// [`CoreFields::node_binding`]. Those two functions are the only code that
+/// calls [`TransportSlot::replace`] on a bridge `Supervisor`, so the slot's
+/// provider and this record change together (construction.md §"Node start —
+/// `NodeStartConfig`").
+pub struct NodeBinding {
+    /// The node the transport is bound to. `Weak`, so the record keeps no node
+    /// alive past its handle.
+    pub node: Weak<dyn InstanceBorrower>,
+    /// The `Supervisor` transport slot the binding wrote.
+    pub slot: Arc<TransportSlot>,
+    /// The relay transport provider the binding put into `slot`.
+    pub provider: Arc<dyn ContextTransportProvider>,
+    /// The transport manager the binding installed on the instance.
+    pub manager: Arc<scp_transport::TransportManager>,
+    /// The provider `slot` held before the first binding in an unbroken run
+    /// of bindings; [`TransportSlot::replace`] puts it back on stop.
+    pub displaced_provider: Arc<dyn ContextTransportProvider>,
+    /// The transport manager the instance held before that same binding.
+    pub displaced_manager: Option<Arc<scp_transport::TransportManager>>,
+}
+
+impl NodeBinding {
+    /// Returns whether the bound node is alive and has not stopped. A binding
+    /// whose node was dropped, or stopped without the bridge clearing the
+    /// record, is stale, and the next node start reclaims it.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.node.upgrade().is_some_and(|node| !node.stopped())
+    }
+
+    /// Returns whether this binding names `node`, compared by allocation
+    /// address.
+    #[must_use]
+    pub fn is_for<B: InstanceBorrower + 'static>(&self, node: &Arc<B>) -> bool {
+        self.node.as_ptr().cast::<()>() == Arc::as_ptr(node).cast::<()>()
+    }
+}
+
+/// The set of relay URLs `manager` holds an adapter for.
+fn relay_url_set(manager: &scp_transport::TransportManager) -> HashSet<String> {
+    manager.relay_urls().into_iter().collect()
+}
+
+/// Returns whether `current` is the node transport `installed` names: both
+/// hold adapters for the same set of relay URLs.
+///
+/// A resume rebuilds the instance's transport manager over the relay URLs
+/// it held, so the rebuilt manager is a new `Arc` for the same node
+/// transport, and an `Arc::ptr_eq` comparison would read it as a manager
+/// another call installed. [`CoreFields::restore_transport`] and the stale
+/// binding reclaim in `scp_ffi_common::server::wire_supervisor_to_node`
+/// both decide through this function, so the two cannot disagree.
+#[must_use]
+pub fn same_node_transport(
+    current: &scp_transport::TransportManager,
+    installed: &scp_transport::TransportManager,
+) -> bool {
+    relay_url_set(current) == relay_url_set(installed)
+}
+
 #[derive(Default)]
 struct BorrowerRegistry {
     /// Set by [`CoreFields::stop_borrowers`]. Never cleared: shutdown is a
@@ -445,7 +512,11 @@ pub struct CoreFields {
     /// concurrent reads (probe/query). Wrapped in `Arc` so that NAPI bridge
     /// subscription tasks (which run in spawned async tasks) can hold a
     /// `Send`-compatible reference without keeping the `RwLock` guard alive
-    /// across `.await` points.
+    /// across `.await` points. The manager records the relay URL of each
+    /// adapter it holds ([`scp_transport::TransportManager::relay_urls`]), and
+    /// [`Self::context_relay_urls`] reads that set under this lock, so the
+    /// relay set a create records cannot name a relay the installed manager
+    /// holds no adapter for.
     transport: RwLock<Option<Arc<scp_transport::TransportManager>>>,
 
     /// Instance-scoped transport selector (transparent QUIC↔WebSocket
@@ -586,6 +657,8 @@ pub struct CoreFields {
     // Relay URLs — for resume after suspend (multi-URL since #1678)
     // -----------------------------------------------------------------
     /// Every relay URL currently registered for reconnection after resume.
+    /// This set is used only to reconnect; the relay set a create records is
+    /// the installed manager's ([`Self::context_relay_urls`]).
     ///
     /// Bridges may connect to more than one relay simultaneously
     /// (`TransportManager` already supports multi-adapter routing). The
@@ -715,6 +788,10 @@ pub struct CoreFields {
     /// advisory `flock(2)`. See [`InstanceBorrower`] for why that order
     /// matters.
     borrowers: Mutex<BorrowerRegistry>,
+    /// Which node this instance's `Supervisor` transport is bound to, if any.
+    /// See [`NodeBinding`]. Lock order: this mutex before `transport` and
+    /// `relay_urls`; no `.await` runs while it is held.
+    node_binding: Mutex<Option<NodeBinding>>,
     /// Set once shutdown begins, by [`stop_borrowers`](Self::stop_borrowers)
     /// or by either shutdown transition, and never cleared. Every
     /// [`StreamRegistry`] built from this instance reads it on insert.
@@ -775,6 +852,7 @@ impl CoreFields {
             mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
             persona_source: RwLock::new(crate::persona::default_persona_source()),
             borrowers: Mutex::new(BorrowerRegistry::default()),
+            node_binding: Mutex::new(None),
             stream_registration_closed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -864,6 +942,7 @@ impl CoreFields {
             mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
             persona_source: RwLock::new(crate::persona::default_persona_source()),
             borrowers: Mutex::new(BorrowerRegistry::default()),
+            node_binding: Mutex::new(None),
             stream_registration_closed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1299,6 +1378,64 @@ impl CoreFields {
         }
     }
 
+    /// Removes `borrower` from this instance's borrower registry, matching by
+    /// allocation address, and returns whether an entry was removed.
+    ///
+    /// A bridge's node start calls this after it stopped a node whose
+    /// `Supervisor` wiring failed, so the instance no longer lists a node the
+    /// caller never received (construction.md §"Node start —
+    /// `NodeStartConfig`"). Recovers a poisoned `Mutex` for the reason
+    /// [`register_borrower`](Self::register_borrower) gives.
+    pub fn unregister_borrower<B: InstanceBorrower + 'static>(&self, borrower: &Arc<B>) -> bool {
+        let target = Arc::as_ptr(borrower).cast::<()>();
+        let mut registry = self
+            .borrowers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let before = registry.entries.len();
+        registry
+            .entries
+            .retain(|entry| entry.as_ptr().cast::<()>() != target);
+        registry.entries.len() != before
+    }
+
+    /// Returns whether this instance's borrower registry lists `borrower`,
+    /// matching by allocation address.
+    #[must_use]
+    pub fn has_borrower<B: InstanceBorrower + 'static>(&self, borrower: &Arc<B>) -> bool {
+        let target = Arc::as_ptr(borrower).cast::<()>();
+        self.borrowers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .iter()
+            .any(|entry| entry.as_ptr().cast::<()>() == target)
+    }
+
+    /// Counts the live borrowers this instance's registry lists.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn borrower_count(&self) -> usize {
+        self.borrowers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .iter()
+            .filter(|entry| entry.strong_count() > 0)
+            .count()
+    }
+
+    /// Locks this instance's [`NodeBinding`] record.
+    ///
+    /// Recovers a poisoned `Mutex`: every critical section over the record
+    /// replaces the whole `Option`, so a poisoned guard still holds a record
+    /// that matches the `Supervisor` transport slot.
+    pub fn node_binding(&self) -> std::sync::MutexGuard<'_, Option<NodeBinding>> {
+        self.node_binding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Stops every live borrower this instance recorded, and refuses later
     /// registrations by stopping them on arrival.
     ///
@@ -1598,11 +1735,99 @@ impl CoreFields {
     ///
     /// Returns `Err` if the `RwLock` is poisoned, or if the instance is
     /// suspended (lifecycle violation — call `resume()` first).
-    #[allow(clippy::significant_drop_tightening)]
+    ///
+    /// The reconnect set ([`Self::pending_relay_urls`]) is left as it is.
     pub fn set_transport(
         &self,
         manager: Arc<scp_transport::TransportManager>,
     ) -> Result<(), TransportLockError> {
+        self.install_transport_inner(manager, false).map(drop)
+    }
+
+    /// Installs `manager`, replacing any previous transport manager, and
+    /// makes the relays it holds an adapter for the bridge's whole reconnect
+    /// set ([`Self::pending_relay_urls`]). The replaced manager's relays are
+    /// no longer connected, so they leave the reconnect set in the same
+    /// write-locked step that installs `manager`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_transport`], plus [`TransportLockError::Poisoned`]
+    /// when the reconnect-set mutex is poisoned.
+    pub fn install_transport(
+        &self,
+        manager: Arc<scp_transport::TransportManager>,
+    ) -> Result<(), TransportLockError> {
+        self.install_transport_inner(manager, true).map(drop)
+    }
+
+    /// Installs `manager` as [`Self::install_transport`] does, and returns the
+    /// manager it replaced, read under the same write lock.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::install_transport`].
+    pub fn swap_transport(
+        &self,
+        manager: Arc<scp_transport::TransportManager>,
+    ) -> Result<Option<Arc<scp_transport::TransportManager>>, TransportLockError> {
+        self.install_transport_inner(manager, true)
+    }
+
+    /// Puts `previous` back in place of `installed`, the manager a node start
+    /// put on this instance, and makes the relays `previous` holds the
+    /// reconnect set.
+    ///
+    /// The instance still serves the node when its manager, or, while a
+    /// suspend has cleared the manager, its reconnect set, names exactly the
+    /// relays `installed` names; [`same_node_transport`] decides it, because
+    /// a resume rebuilds the manager over the same URLs. Changes nothing when
+    /// the instance is shut down or no longer
+    /// serves the node. On a suspended instance it leaves the manager empty
+    /// and sets the reconnect set, so a resume reconnects `previous`'s relays
+    /// rather than the stopped node's relay. Recovers a poisoned lock,
+    /// because each critical section here and in
+    /// [`Self::install_transport`] replaces a whole value.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn restore_transport(
+        &self,
+        installed: &Arc<scp_transport::TransportManager>,
+        previous: Option<Arc<scp_transport::TransportManager>>,
+    ) {
+        if self.is_shutdown() {
+            return;
+        }
+        let mut slot = self
+            .transport
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut pending = self
+            .relay_urls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let serves_node = slot.as_ref().map_or_else(
+            || *pending == relay_url_set(installed),
+            |current| same_node_transport(current, installed),
+        );
+        if !serves_node {
+            return;
+        }
+        *pending = previous.as_deref().map(relay_url_set).unwrap_or_default();
+        if slot.is_some() {
+            *slot = previous;
+        }
+    }
+
+    /// Installs `manager` as the installed transport. When `replace_pending`
+    /// is set, the relays `manager` holds an adapter for also become the
+    /// reconnect set; otherwise the reconnect set is left as it is, so a relay
+    /// that failed to reconnect stays there for retry.
+    #[allow(clippy::significant_drop_tightening)]
+    fn install_transport_inner(
+        &self,
+        manager: Arc<scp_transport::TransportManager>,
+        replace_pending: bool,
+    ) -> Result<Option<Arc<scp_transport::TransportManager>>, TransportLockError> {
         // Shutdown: warn only — matches bridge_instance()/context_manager()
         // behavior where shutdown is a terminal state and operations fail
         // naturally at the MLS/transport layer. This avoids hard failures
@@ -1620,8 +1845,16 @@ impl CoreFields {
             .transport
             .write()
             .map_err(|_| TransportLockError::Poisoned)?;
-        *guard = Some(manager);
-        Ok(())
+        // After shutdown the reconnect set stays empty, as `add_relay_url`
+        // keeps it.
+        if replace_pending && !self.is_shutdown() {
+            let mut pending = self
+                .relay_urls
+                .lock()
+                .map_err(|_| TransportLockError::Poisoned)?;
+            *pending = manager.relay_urls().into_iter().collect();
+        }
+        Ok(guard.replace(manager))
     }
 
     /// Clears the transport manager (called on disconnect or suspend).
@@ -1668,12 +1901,14 @@ impl CoreFields {
     }
 
     /// Registers `url` as a relay that this bridge intends to stay
-    /// connected to.
+    /// connected to, so that [`Self::pending_relay_urls`] returns the URL in
+    /// subsequent reconnect attempts after [`Self::resume`]. Duplicate calls
+    /// are idempotent because the underlying set deduplicates.
     ///
-    /// Callers (bridge `transport_connect` functions) call this immediately
-    /// after [`Self::set_transport`] so that [`Self::pending_relay_urls`] returns the
-    /// URL in subsequent reconnect attempts after [`Self::resume`]. Duplicate
-    /// calls are idempotent because the underlying set deduplicates.
+    /// This touches only the reconnect set. A relay joins the set a create
+    /// records ([`Self::context_relay_urls`]) only when the installed manager
+    /// holds an adapter for it, through [`Self::add_relay_adapter`] or an
+    /// install.
     ///
     /// No-op after [`Self::shutdown`] — [`Self::pending_relay_urls`] is cleared on
     /// shutdown and we must not resurrect it by admitting a late writer.
@@ -1715,6 +1950,71 @@ impl CoreFields {
         }
     }
 
+    /// Adds `adapter`, connected to `relay_url`, to the installed transport
+    /// manager, and registers `relay_url` for reconnection after resume.
+    /// Returns the manager's adapter count after the add.
+    ///
+    /// When the add exceeds the manager's connection budget, the manager
+    /// evicts its least recently used adapter, and that adapter's relay URL
+    /// leaves [`Self::context_relay_urls`] with it
+    /// ([`scp_transport::TransportManager::add_adapter`]). The evicted URL
+    /// also leaves the reconnect set unless another adapter the manager still
+    /// holds connects to the same relay, so a resume does not redial a relay
+    /// the budget dropped. Both steps run under the transport write lock.
+    ///
+    /// After [`Self::shutdown`] the adapter is still added, and the reconnect
+    /// set stays empty, as [`Self::add_relay_url`] keeps it.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportLockError::NotInitialized`] when no manager is installed,
+    /// [`TransportLockError::InUse`] when a subscription task holds the
+    /// manager, and [`TransportLockError::Poisoned`] when the transport lock
+    /// or the reconnect-set mutex is poisoned.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn add_relay_adapter(
+        &self,
+        relay_url: String,
+        adapter: Box<dyn scp_transport::TransportAdapter>,
+    ) -> Result<usize, TransportLockError> {
+        let mut guard = self.transport.write().map_err(|_| {
+            tracing::debug!("transport RwLock poisoned (a writer panicked)");
+            TransportLockError::Poisoned
+        })?;
+        let arc = guard.as_mut().ok_or_else(|| {
+            tracing::debug!("transport slot is empty — no transport_connect call");
+            TransportLockError::NotInitialized
+        })?;
+        let strong_count = Arc::strong_count(arc);
+        let manager = Arc::get_mut(arc).ok_or_else(|| {
+            tracing::debug!(
+                strong_count,
+                "transport Arc has multiple holders — subscription task(s) holding references",
+            );
+            TransportLockError::InUse
+        })?;
+        let mut pending = self
+            .relay_urls
+            .lock()
+            .map_err(|_| TransportLockError::Poisoned)?;
+        let eviction = manager.add_adapter(relay_url.clone(), adapter);
+        if let Some(outcome) = eviction.as_ref() {
+            tracing::info!(
+                evicted_relay_url = %outcome.evicted_relay_url,
+                "connection budget evicted a relay from the installed transport"
+            );
+        }
+        if !self.is_shutdown() {
+            pending.insert(relay_url);
+            if let Some(outcome) = eviction
+                && !manager.relay_urls().contains(&outcome.evicted_relay_url)
+            {
+                pending.remove(&outcome.evicted_relay_url);
+            }
+        }
+        Ok(manager.adapter_count())
+    }
+
     /// Removes a single relay URL from the pending-reconnect set.
     ///
     /// Called by explicit transport disconnect paths (`transport_disconnect`)
@@ -1752,6 +2052,29 @@ impl CoreFields {
             .unwrap_or_default()
     }
 
+    /// Returns the bridge's relay set, sorted, as the relay set of a context
+    /// the bridge creates: the creator's relays host the context (§5.12.3.1
+    /// `relay_urls`, PUSH-025). The set is the installed transport manager's
+    /// [`scp_transport::TransportManager::relay_urls`], read under the
+    /// transport lock, and is empty when no manager is installed. A relay the
+    /// manager evicted, or one left in [`Self::pending_relay_urls`] after a
+    /// failed reconnect, is not in it.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportLockError::Poisoned`] when the transport lock is poisoned,
+    /// so a create fails instead of recording a relay set it cannot vouch
+    /// for.
+    pub fn context_relay_urls(&self) -> Result<Vec<String>, TransportLockError> {
+        Ok(self
+            .transport
+            .read()
+            .map_err(|_| TransportLockError::Poisoned)?
+            .as_ref()
+            .map(|manager| manager.relay_urls())
+            .unwrap_or_default())
+    }
+
     /// Returns `true` if any relay URL is currently registered.
     #[must_use]
     pub fn has_pending_relay_urls(&self) -> bool {
@@ -1762,8 +2085,9 @@ impl CoreFields {
     ///
     /// Iterates the deduplicated snapshot from [`Self::pending_relay_urls`], calls
     /// `NativeRelayAdapter::connect_sourced` (source = `Explicit`) for each
-    /// URL, wraps the adapter in a [`scp_transport::TransportManager`], and
-    /// stores it via [`Self::set_transport`]. Called from the
+    /// URL, registers each adapter with its URL in one
+    /// [`scp_transport::TransportManager`], and installs it, leaving the
+    /// reconnect set as it was. Called from the
     /// `BridgeInstanceCore::resume` default body after the core flag flip.
     ///
     /// Collects every failure and returns the first as
@@ -1814,10 +2138,11 @@ impl CoreFields {
         let cancel = self.reconnect_cancel_token();
         let profile = scp_transport::profile::TransportProfile::platform_default();
         // Build ONE TransportManager and register every successful adapter
-        // in it. `TransportManager::new(adapter)` creates a manager with a
-        // single adapter, so calling it in a loop and set_transport'ing each
-        // time would keep only the last URL's adapter. Using `builder()` +
-        // `add_adapter` preserves multi-relay semantics.
+        // in it. `TransportManager::new(relay_url, adapter)` creates a
+        // manager holding a single relay URL and its adapter, so calling it
+        // in a loop and set_transport'ing each time would keep only the last
+        // URL's adapter. Using `builder()` + `add_adapter(relay_url, adapter)`
+        // preserves multi-relay semantics.
         //
         // Dial every URL in parallel with a per-URL timeout. A serial loop
         // would let a single slow (or attacker-controlled) relay stall
@@ -1929,15 +2254,18 @@ impl CoreFields {
         // a silent-success path can't swallow the case where every
         // spawned task panicked (empty `results`, no per-URL failure).
         let mut first_failure: Option<LifecycleError> = first_panic_failure;
-        let mut connected_count = 0_usize;
         for (url, outcome) in results {
             match outcome {
                 Ok(adapter) => {
-                    // `add_adapter` may return an `EvictionOutcome` if we hit the
-                    // connection budget; we don't surface it here because the
-                    // caller's reconnect intent is best-effort multi-relay.
-                    let _eviction = manager.add_adapter(Box::new(adapter));
-                    connected_count += 1;
+                    // The manager records `url` with the adapter, so a budget
+                    // eviction here removes the evicted relay from the set
+                    // `context_relay_urls` reads in the same operation.
+                    if let Some(eviction) = manager.add_adapter(url, Box::new(adapter)) {
+                        tracing::info!(
+                            evicted_relay_url = %eviction.evicted_relay_url,
+                            "reconnect_transport_if_pending: connection budget evicted a relay"
+                        );
+                    }
                 }
                 Err(reason) => {
                     tracing::warn!(
@@ -1954,8 +2282,9 @@ impl CoreFields {
                 }
             }
         }
+        let connected_count = manager.adapter_count();
         // #1696: one more cancellation check between the dial loop and
-        // `set_transport`. If suspend fired *after* the last successful
+        // the install. If suspend fired *after* the last successful
         // dial but *before* we install the manager, installing it now
         // would immediately fail the suspended-state guard — but more
         // importantly, the adapters we just connected belong to a
@@ -1963,7 +2292,7 @@ impl CoreFields {
         // installed.
         if cancel.is_cancelled() {
             tracing::debug!(
-                "reconnect_transport_if_pending: cancelled before set_transport — dropping {connected_count} connected adapter(s)"
+                "reconnect_transport_if_pending: cancelled before install — dropping {connected_count} connected adapter(s)"
             );
             // `manager` (and its adapters) are dropped at the end of
             // this block. Each adapter's Drop fires `cover_traffic_cancel`
@@ -1983,10 +2312,12 @@ impl CoreFields {
         // with a confusing "no adapters" error instead of the clearer
         // "reconnect failed" we surface below.
         let install_failed = if connected_count > 0 {
+            // The installed manager holds only the relays that reconnected;
+            // a failed relay stays in the reconnect set for retry.
             if let Err(e) = self.set_transport(Arc::new(manager)) {
                 tracing::warn!(
                     error = %e,
-                    "reconnect_transport_if_pending: set_transport failed after successful reconnects"
+                    "reconnect_transport_if_pending: transport install failed after successful reconnects"
                 );
                 if first_failure.is_none() {
                     first_failure = Some(LifecycleError::ReconnectFailed {
@@ -2011,7 +2342,7 @@ impl CoreFields {
         // `tracing::error!` with a structured `panicked` field so log-based
         // alerting can page on it. Plain per-URL dial failures (network
         // refused, timeout) stay at `tracing::warn!` — those are routine
-        // and recoverable on the next reconnect cycle. If `set_transport`
+        // and recoverable on the next reconnect cycle. If the install
         // itself failed, we keep the error so the caller can distinguish
         // "nothing landed" from "transport live with some losses".
         if connected_count > 0 && !install_failed {
@@ -2124,7 +2455,7 @@ impl CoreFields {
             .transport
             .read()
             .map_err(|_| TransportLockError::Poisoned)?;
-        Ok(guard.clone())
+        Ok(guard.as_ref().map(Arc::clone))
     }
 
     /// Executes a closure with a read reference to the `TransportManager`.
@@ -2146,43 +2477,6 @@ impl CoreFields {
         let manager = guard.as_deref().ok_or_else(|| {
             tracing::debug!("transport slot is empty — no transport_connect call");
             TransportLockError::NotInitialized
-        })?;
-        Ok(f(manager))
-    }
-
-    /// Executes a closure with a mutable reference to the `TransportManager`.
-    ///
-    /// Requires exclusive access to the `Arc` (refcount == 1). If subscription
-    /// tasks hold cloned `Arc` references, this will return
-    /// [`TransportLockError::InUse`].
-    ///
-    /// # Errors
-    ///
-    /// Returns `TransportLockError::Poisoned` if the lock is poisoned,
-    /// `TransportLockError::NotInitialized` if no transport manager has been
-    /// set, or `TransportLockError::InUse` if the `Arc` has other holders.
-    #[allow(clippy::significant_drop_tightening)]
-    pub fn with_transport_mut<T>(
-        &self,
-        f: impl FnOnce(&mut scp_transport::TransportManager) -> T,
-    ) -> Result<T, TransportLockError> {
-        let mut guard = self.transport.write().map_err(|_| {
-            tracing::debug!("transport RwLock poisoned (a writer panicked)");
-            TransportLockError::Poisoned
-        })?;
-        let arc = guard.as_mut().ok_or_else(|| {
-            tracing::debug!("transport slot is empty — no transport_connect call");
-            TransportLockError::NotInitialized
-        })?;
-        // Capture strong count before the mutable borrow attempt (can't borrow
-        // arc immutably inside the ok_or_else closure while get_mut borrows it).
-        let strong_count = Arc::strong_count(arc);
-        let manager = Arc::get_mut(arc).ok_or_else(|| {
-            tracing::debug!(
-                strong_count,
-                "transport Arc has multiple holders — subscription task(s) holding references",
-            );
-            TransportLockError::InUse
         })?;
         Ok(f(manager))
     }
@@ -2245,6 +2539,38 @@ impl CoreFields {
             }
         }
         self.known_contexts.insert(context_id.to_owned(), known);
+    }
+
+    /// Registers a known context whose `relay_url` is the first entry of the
+    /// runtime's stored relay set for `context_id` (§5.12.3.1 `relay_urls`,
+    /// PUSH-025), read through
+    /// [`Supervisor::context_relay_urls`](scp_core::context::supervisor::Supervisor::context_relay_urls).
+    ///
+    /// `relay_url` is `None` when no supervisor is bound, the context's actor
+    /// does not answer, or the stored set is empty.
+    pub async fn register_known_context_from_runtime(
+        &self,
+        context_id: &str,
+        routing_id: [u8; 32],
+        member_did: String,
+        last_seen: u64,
+    ) {
+        let relay_url = match self.supervisor() {
+            Some(sup) => sup
+                .context_relay_urls(context_id)
+                .await
+                .and_then(|urls| urls.into_iter().next()),
+            None => None,
+        };
+        self.register_known_context(
+            context_id,
+            KnownContext {
+                routing_id,
+                relay_url,
+                member_did,
+                last_seen,
+            },
+        );
     }
 
     /// Removes a known context from the discovery registry.
@@ -3579,7 +3905,7 @@ pub enum ShutdownError {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use scp_core::context::LocalTransportProvider;
     use scp_core::context::builder::{ContextCreationError, ContextEventLogProvider};
@@ -3648,7 +3974,7 @@ mod tests {
     /// populates the lifted-provider slots expected by every
     /// `Supervisor::*` passthrough method (ADR-049 commit 12c.9g.3.6 —
     /// the FFI layer no longer touches `ContextManager` directly).
-    fn test_supervisor() -> Arc<Supervisor> {
+    pub fn test_supervisor() -> Arc<Supervisor> {
         // Use LocalTransportProvider (silently succeeds) for tests.
         // Key resolver returns None — no signature verification in tests.
         let key_resolver: scp_core::context::governance::KeyResolver =
@@ -3702,7 +4028,32 @@ mod tests {
     }
 
     fn test_transport_manager() -> scp_transport::TransportManager {
-        scp_transport::TransportManager::new(Box::new(NoOpAdapter))
+        manager_on("wss://test.example")
+    }
+
+    /// A manager holding one no-op adapter connected to `url`.
+    pub fn manager_on(url: &str) -> scp_transport::TransportManager {
+        scp_transport::TransportManager::new(url.to_owned(), Box::new(NoOpAdapter))
+    }
+
+    /// A manager under `profile` holding one no-op adapter per URL in `urls`.
+    fn manager_with(
+        profile: scp_transport::profile::TransportProfile,
+        urls: &[&str],
+    ) -> scp_transport::TransportManager {
+        let mut manager =
+            scp_transport::TransportManager::with_config(&scp_transport::config::TransportConfig {
+                profile,
+                ..scp_transport::config::TransportConfig::default()
+            });
+        for url in urls {
+            assert!(
+                manager
+                    .add_adapter((*url).to_owned(), Box::new(NoOpAdapter))
+                    .is_none()
+            );
+        }
+        manager
     }
 
     #[test]
@@ -3728,6 +4079,42 @@ mod tests {
         assert!(!instance.has_supervisor());
         assert!(instance.try_supervisor().is_none());
         assert!(!instance.is_shutdown());
+    }
+
+    /// `unregister_borrower` removes only the borrower it names, while the
+    /// caller still holds that borrower, and reports whether it removed one.
+    #[test]
+    fn unregister_borrower_removes_only_the_named_borrower() {
+        struct Borrower(std::sync::atomic::AtomicBool);
+        impl InstanceBorrower for Borrower {
+            fn stop(&self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            fn stopped(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let instance = CoreFields::new();
+        let a = Arc::new(Borrower(std::sync::atomic::AtomicBool::new(false)));
+        let b = Arc::new(Borrower(std::sync::atomic::AtomicBool::new(false)));
+        instance.register_borrower(&a);
+        instance.register_borrower(&b);
+        assert!(instance.has_borrower(&a) && instance.has_borrower(&b));
+
+        assert!(instance.unregister_borrower(&a));
+        assert!(!instance.has_borrower(&a));
+        assert!(instance.has_borrower(&b));
+        assert!(
+            !instance.unregister_borrower(&a),
+            "a second removal finds nothing"
+        );
+
+        instance.stop_borrowers();
+        assert!(
+            !a.stopped(),
+            "shutdown no longer reaches an unregistered borrower"
+        );
+        assert!(b.stopped());
     }
 
     /// A stream entry inserted before shutdown begins stays registered; one
@@ -4674,6 +5061,223 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert!(urls.contains("wss://relay1.example.com"));
         assert!(urls.contains("wss://relay2.example.com"));
+    }
+
+    #[test]
+    fn context_relay_urls_is_the_sorted_set_of_the_installed_manager() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
+        instance
+            .install_transport(Arc::new(manager_on("wss://relay2.example.com")))
+            .unwrap();
+        instance
+            .add_relay_adapter("wss://relay1.example.com".to_owned(), Box::new(NoOpAdapter))
+            .unwrap();
+        // A URL registered only for reconnect names no adapter.
+        instance.add_relay_url("wss://relay3.example.com".to_owned());
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec![
+                "wss://relay1.example.com".to_owned(),
+                "wss://relay2.example.com".to_owned(),
+            ])
+        );
+        assert_eq!(instance.pending_relay_urls().len(), 3);
+    }
+
+    #[test]
+    fn install_transport_replaces_the_relay_set_of_the_replaced_manager() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        instance
+            .install_transport(Arc::new(manager_on("wss://a.example")))
+            .unwrap();
+        instance
+            .install_transport(Arc::new(manager_on("wss://b.example")))
+            .unwrap();
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec!["wss://b.example".to_owned()]),
+            "the replaced manager's relay is no longer connected"
+        );
+        assert_eq!(
+            instance.pending_relay_urls(),
+            HashSet::from(["wss://b.example".to_owned()])
+        );
+    }
+
+    #[test]
+    fn set_transport_keeps_the_pending_set_and_records_only_its_own_relays() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        instance.add_relay_url("wss://a.example".to_owned());
+        instance.add_relay_url("wss://b.example".to_owned());
+        instance
+            .set_transport(Arc::new(manager_on("wss://a.example")))
+            .unwrap();
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec!["wss://a.example".to_owned()]),
+            "a pending relay the manager has no adapter for hosts nothing"
+        );
+        assert_eq!(instance.pending_relay_urls().len(), 2);
+    }
+
+    #[test]
+    fn add_relay_adapter_budget_eviction_removes_the_evicted_relay_everywhere() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        instance
+            .install_transport(Arc::new(manager_with(
+                scp_transport::profile::TransportProfile::Constrained,
+                &["wss://r0.example"],
+            )))
+            .unwrap();
+        assert_eq!(
+            instance.add_relay_adapter("wss://r1.example".to_owned(), Box::new(NoOpAdapter)),
+            Ok(2)
+        );
+        // The third adapter exceeds the Constrained budget of 2 and evicts
+        // the least recently used adapter, r0.
+        assert_eq!(
+            instance.add_relay_adapter("wss://r2.example".to_owned(), Box::new(NoOpAdapter)),
+            Ok(2)
+        );
+        let recorded = instance.context_relay_urls().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            !recorded.contains(&"wss://r0.example".to_owned()),
+            "an evicted relay hosts nothing"
+        );
+        assert!(recorded.contains(&"wss://r2.example".to_owned()));
+        let pending = instance.pending_relay_urls();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            !pending.contains("wss://r0.example"),
+            "a resume does not redial a relay the budget dropped"
+        );
+    }
+
+    #[test]
+    fn add_relay_adapter_without_a_transport_is_not_initialized() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        assert_eq!(
+            instance.add_relay_adapter("wss://a.example".to_owned(), Box::new(NoOpAdapter)),
+            Err(TransportLockError::NotInitialized)
+        );
+        assert!(instance.pending_relay_urls().is_empty());
+    }
+
+    #[test]
+    fn add_relay_adapter_while_a_task_holds_the_manager_is_in_use() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        instance
+            .install_transport(Arc::new(manager_on("wss://a.example")))
+            .unwrap();
+        let held = instance.get_transport_arc().unwrap();
+        assert_eq!(
+            instance.add_relay_adapter("wss://b.example".to_owned(), Box::new(NoOpAdapter)),
+            Err(TransportLockError::InUse)
+        );
+        drop(held);
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec!["wss://a.example".to_owned()])
+        );
+        assert!(!instance.pending_relay_urls().contains("wss://b.example"));
+    }
+
+    #[test]
+    fn context_relay_urls_is_empty_without_an_installed_transport() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        instance.add_relay_url("wss://pending.example".to_owned());
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(Vec::new()),
+            "a pending relay with no transport hosts nothing"
+        );
+        instance
+            .install_transport(Arc::new(manager_on("wss://a.example")))
+            .unwrap();
+        instance.clear_transport().unwrap();
+        assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
+        assert!(
+            instance.pending_relay_urls().contains("wss://a.example"),
+            "clear_transport keeps the relay for reconnect"
+        );
+    }
+
+    /// The known-context cache names the first relay of the runtime's stored
+    /// set, not the bridge's installed transport, so a context joined onto
+    /// another relay set is cached with that set's relay.
+    #[tokio::test]
+    async fn register_known_context_from_runtime_reads_the_stored_relay_set() {
+        let sup = test_supervisor();
+        let stored = vec![
+            "wss://relay-b.example/scp/v1".to_owned(),
+            "wss://relay-a.example/scp/v1".to_owned(),
+        ];
+        sup.create_context(
+            "known-from-runtime".to_owned(),
+            scp_core::context::ContextParams {
+                ceiling: vec![scp_core::context::Capability::MessagesRead],
+                ..scp_core::context::ContextParams::default()
+            },
+            scp_did::DID::from("did:dht:zknownfromruntime"),
+            None,
+            stored,
+        )
+        .await
+        .expect("create context");
+        let instance = CoreFields::with_supervisor(sup);
+        instance
+            .install_transport(Arc::new(manager_on("wss://bridge.example")))
+            .unwrap();
+
+        instance
+            .register_known_context_from_runtime("known-from-runtime", [7; 32], "m".to_owned(), 5)
+            .await;
+        let known = instance
+            .known_contexts()
+            .get("known-from-runtime")
+            .map(|e| e.value().clone())
+            .expect("registered");
+        assert_eq!(
+            known.relay_url.as_deref(),
+            Some("wss://relay-b.example/scp/v1")
+        );
+        assert_eq!(known.routing_id, [7; 32]);
+        assert_eq!(known.member_did, "m");
+        assert_eq!(known.last_seen, 5);
+
+        // A context the runtime does not hold has no stored set.
+        instance
+            .register_known_context_from_runtime("not-in-runtime", [8; 32], "m".to_owned(), 5)
+            .await;
+        assert_eq!(
+            instance
+                .known_contexts()
+                .get("not-in-runtime")
+                .map(|e| e.value().relay_url.clone()),
+            Some(None)
+        );
+    }
+
+    /// Without a supervisor there is no stored relay set, so the cache records
+    /// no relay even when the bridge has a transport installed.
+    #[tokio::test]
+    async fn register_known_context_from_runtime_without_supervisor_records_no_relay() {
+        let instance = CoreFields::new();
+        instance
+            .install_transport(Arc::new(manager_on("wss://bridge.example")))
+            .unwrap();
+        instance
+            .register_known_context_from_runtime("ctx", [1; 32], "m".to_owned(), 1)
+            .await;
+        assert_eq!(
+            instance
+                .known_contexts()
+                .get("ctx")
+                .map(|e| e.value().relay_url.clone()),
+            Some(None)
+        );
     }
 
     #[test]
@@ -5707,6 +6311,7 @@ mod tests {
                 },
                 scp_did::DID::from("did:dht:zbridgedraincreator"),
                 None,
+                Vec::new(),
             )
             .await
             .expect("create context");
@@ -6245,5 +6850,64 @@ mod tests {
             ),
             Err(ShutdownError::DurableStoreClose(_))
         ));
+    }
+
+    #[test]
+    fn restore_transport_puts_the_previous_manager_back() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        let previous = Arc::new(manager_on("wss://previous.example"));
+        instance.install_transport(Arc::clone(&previous)).unwrap();
+        let installed = Arc::new(manager_on("ws://127.0.0.1:1/scp/v1"));
+        let replaced = instance.swap_transport(Arc::clone(&installed)).unwrap();
+        assert!(replaced.is_some_and(|m| Arc::ptr_eq(&m, &previous)));
+
+        instance.restore_transport(&installed, Some(Arc::clone(&previous)));
+
+        assert_eq!(
+            instance.with_transport(scp_transport::TransportManager::relay_urls),
+            Ok(vec!["wss://previous.example".to_owned()]),
+            "a restore puts back the manager the node start displaced"
+        );
+        assert_eq!(
+            instance.pending_relay_urls(),
+            HashSet::from(["wss://previous.example".to_owned()]),
+        );
+    }
+
+    #[test]
+    fn restore_transport_on_a_suspended_instance_retargets_the_reconnect_set() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        let installed = Arc::new(manager_on("ws://127.0.0.1:1/scp/v1"));
+        instance.install_transport(Arc::clone(&installed)).unwrap();
+        instance.suspend().unwrap();
+
+        instance.restore_transport(&installed, None);
+
+        assert!(
+            instance.pending_relay_urls().is_empty(),
+            "a resume must not reconnect a stopped node's relay"
+        );
+        assert_eq!(
+            instance.with_transport(|_| ()),
+            Err(TransportLockError::NotInitialized)
+        );
+    }
+
+    #[test]
+    fn restore_transport_leaves_a_manager_another_call_installed() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        let installed = Arc::new(manager_on("ws://127.0.0.1:1/scp/v1"));
+        instance.install_transport(Arc::clone(&installed)).unwrap();
+        instance
+            .install_transport(Arc::new(manager_on("wss://later.example")))
+            .unwrap();
+
+        instance.restore_transport(&installed, None);
+
+        assert_eq!(
+            instance.with_transport(scp_transport::TransportManager::relay_urls),
+            Ok(vec!["wss://later.example".to_owned()]),
+            "a restore never removes a manager the node start did not install"
+        );
     }
 }

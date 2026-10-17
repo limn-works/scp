@@ -384,7 +384,8 @@ pub(crate) fn validate_outlet_ucan(
         crate::ucan::build_proof_resolver_from_tokens(proof_tokens.map(Vec::as_slice))?;
     let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
-    crate::runtime::with_context(bi, context_id, |rt| {
+    let mut recorded = None;
+    let validated = crate::runtime::with_context(bi, context_id, |rt| {
         // SCP-OUT-014: select the split capability stem from the outlet's
         // registered kind. `outlet_query:{id}` for Query outlets,
         // `outlet_call:{id}` for Action outlets — the two stems are
@@ -406,9 +407,8 @@ pub(crate) fn validate_outlet_ucan(
         let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
             revocation_list: &rt.revocation_list,
         };
-        let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
-            inner: &mut rt.nonce_tracker,
-        };
+        let mut nonce_adapter =
+            crate::bridge_adapters::BridgeNonceTracker::new(&mut rt.nonce_tracker, &mut recorded);
 
         let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
             did_resolver: &did_resolver,
@@ -441,7 +441,15 @@ pub(crate) fn validate_outlet_ucan(
                 "UCAN authorization failed for outlet '{outlet_id}': {e}"
             ))
         })
-    })?;
+    });
+
+    // Step 9 of the pipeline records the token's nonce, so write the context's
+    // nonce entries to durable storage before returning. A rejected token keeps
+    // its own error: the caller is already denied, so a durability failure on
+    // that path grants nothing.
+    let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id, recorded);
+    validated?;
+    persisted?;
     Ok(())
 }
 

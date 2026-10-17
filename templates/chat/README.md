@@ -70,4 +70,4 @@ The invitation crosses by copy and paste:
 - **Capabilities**: add `OUTLET_QUERY_ALL`, `GOVERNANCE_VOTE`, etc. to the ceiling for richer contexts.
 - **Memory scope**: change `MemoryScope.EPHEMERAL` to `MemoryScope.FULL` to retain chat history after the context closes.
 - **Custody**: pass a `KeyCustodyProvider` to `identity_create_with_custody` to keep keys in your own key store instead of `keys.bin`.
-- **Invitation delivery**: the creator passes the relay URL to `invite_member`; when the returned outcome's `delivered` is true, the runtime has already published the sealed invitation to the joiner's routing ID.
+- **Invitation delivery**: the sealed invitation carries the relay set the context stored when it was created, read from the connected transport; when the returned outcome's `delivered` is true, the runtime has already published the sealed invitation to the joiner's routing ID.

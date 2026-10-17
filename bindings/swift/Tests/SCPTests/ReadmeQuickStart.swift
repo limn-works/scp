@@ -32,7 +32,8 @@ func runQuickStart() async throws {
             economicPolicy: nil,
             consequenceRulesJson: nil,
             consequenceConfigJson: nil,
-            capabilityRequirementsJson: nil
+            capabilityRequirementsJson: nil,
+            pseudonymRotation: nil
         )
     )
 

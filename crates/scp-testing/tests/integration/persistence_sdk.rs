@@ -224,9 +224,15 @@ async fn context_create_persists_membership_to_sqlite() {
             ))) as Arc<dyn OpenMlsStorageAdapter>,
         );
 
-        manager.register_local_did(alice.clone()).await.unwrap();
+        manager.register_local_did(alice.clone()).await;
         let handle = manager
-            .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
+            .create_context(
+                ctx_id.to_owned(),
+                encrypted_params(),
+                alice.clone(),
+                None,
+                Vec::new(),
+            )
             .await
             .expect("context_create must succeed with sqlite-backed persistence");
         assert_eq!(handle.state(), ContextState::Active);
@@ -328,9 +334,15 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
             ))) as Arc<dyn OpenMlsStorageAdapter>,
         );
 
-        manager.register_local_did(alice.clone()).await.unwrap();
+        manager.register_local_did(alice.clone()).await;
         let _handle = manager
-            .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
+            .create_context(
+                ctx_id.to_owned(),
+                encrypted_params(),
+                alice.clone(),
+                None,
+                Vec::new(),
+            )
             .await
             .expect("context_create must succeed");
 
@@ -399,7 +411,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         ))) as Arc<dyn OpenMlsStorageAdapter>,
     );
 
-    manager2.register_local_did(alice.clone()).await.unwrap();
+    manager2.register_local_did(alice.clone()).await;
     // Route through the production startup entry (`restore_on_startup` =
     // restore THEN saga-journal replay). The bare `restore_all_contexts` leg is
     // `pub(crate)` (restore-implies-replay seal); cross-crate callers must use
@@ -480,13 +492,14 @@ async fn close_then_reopen_same_path_is_deterministic() {
     let storage = Arc::new(SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap());
     {
         let manager = supervisor_over(Arc::clone(&storage));
-        manager.register_local_did(alice.clone()).await.unwrap();
+        manager.register_local_did(alice.clone()).await;
         manager
             .create_context(
                 "ctx-reopen-drop".to_owned(),
                 encrypted_params(),
                 alice.clone(),
                 None,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -506,13 +519,14 @@ async fn close_then_reopen_same_path_is_deterministic() {
             .expect("the first reopen after a drained shutdown must succeed"),
     );
     let manager = supervisor_over(Arc::clone(&storage));
-    manager.register_local_did(alice.clone()).await.unwrap();
+    manager.register_local_did(alice.clone()).await;
     manager
         .create_context(
             "ctx-reopen-close".to_owned(),
             encrypted_params(),
             alice.clone(),
             None,
+            Vec::new(),
         )
         .await
         .unwrap();

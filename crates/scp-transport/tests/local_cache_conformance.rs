@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use scp_transport::native::local_cache::LocalBlobCache;
-use scp_transport::native::storage::{ClockFn, InMemoryBlobStorage, StorageError};
+use scp_transport::native::storage::{ClockFn, InMemoryBlobStorage};
 
 fn make_local_cache() -> (LocalBlobCache<InMemoryBlobStorage>, Arc<AtomicU64>) {
     let clock = Arc::new(AtomicU64::new(1_000_000));

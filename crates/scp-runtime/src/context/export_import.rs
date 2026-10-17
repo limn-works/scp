@@ -808,6 +808,10 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // snapshots are never imported back into a live encrypted context, so
         // the routing axis is irrelevant here.)
         routing: crate::context::actor::state::ContextRouting::Broadcast,
+        // The hosting relays are public: §5.12.3.1 hands them to every invitee,
+        // and a pre-join observer (§5.7) reads the context's parameters from
+        // those relays. Retained (PUSH-025).
+        relay_urls: snapshot.relay_urls.clone(),
         // ADR-049 §9: staged saga evidence is local-instance cross-context
         // coordination state with no authority on any other node. A foreign
         // saga must never drive a public importer's Commit/Abort, so it is
@@ -834,6 +838,11 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // public export (like the budget tracker and the caveat counters). A
         // foreign node must never drive a local escrow refund / counter release.
         stream_reservations: HashMap::new(),
+        // §9.10.4.1: rotation state names the member's previous routing ID and
+        // is local to the member that rotated — ALWAYS stripped from the public
+        // export, like the routing axis above.
+        pseudonym_rotation:
+            crate::context::actor::pseudonym_rotation::PseudonymRotationState::default(),
         // Broadcast per-author keys and block lists are sensitive access-control
         // state; a public-scope export is for pre-join observers, so it is
         // redacted here (mirrors the empty `read_exclusion_list` / `membership`).
@@ -1125,6 +1134,9 @@ mod tests {
             checkpoint_last_time_secs: 0,
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
+            relay_urls: Vec::new(),
+            pseudonym_rotation:
+                crate::context::actor::pseudonym_rotation::PseudonymRotationState::default(),
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),

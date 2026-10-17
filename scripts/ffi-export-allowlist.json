@@ -196,6 +196,12 @@
       "reason": "Getter for promotion policy on a metadata result type (spec \u00a75.7)."
     },
     {
+      "name": "pseudonym_rotation",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "getter",
+      "reason": "Getter for the pseudonym rotation policy on the PyContextParams value type (spec 09 \u00a79.10.4.1)."
+    },
+    {
       "name": "roles",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",

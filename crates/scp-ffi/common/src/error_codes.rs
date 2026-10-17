@@ -82,8 +82,6 @@ pub const IDENT_1010: &str = "SCP-IDENT-1010";
 pub const IDENT_1011: &str = "SCP-IDENT-1011";
 /// `UniFFI` identity resolve error.
 pub const IDENT_1012: &str = "SCP-IDENT-1012";
-/// `UniFFI` identity passphrase error.
-pub const IDENT_1013: &str = "SCP-IDENT-1013";
 /// DID method or format invalid.
 ///
 /// Distinct from `IDENT_1004` (key generation failure) which is a
@@ -373,6 +371,13 @@ pub const IDENT_1061: &str = "SCP-IDENT-1061";
 /// verified under a key an issuer's DID document publishes, so what remains
 /// unchecked is an external resource rather than an issuer's document.
 pub const IDENT_1062: &str = "SCP-IDENT-1062";
+
+/// The operator identity is not available to a starting node.
+///
+/// The identity a node start config names is not registered on this `SCP`
+/// instance, or the core node's identity operation failed (sdk-common.md
+/// §"Node start error codes").
+pub const IDENT_1063: &str = "SCP-IDENT-1063";
 
 /// An identity-creating SDK entry received no custody argument (FAIL CLOSED).
 ///
@@ -823,10 +828,11 @@ pub const TRANS_5050: &str = "SCP-TRANS-5050";
 pub const TRANS_5051: &str = "SCP-TRANS-5051";
 /// `UniFFI` transport TLS error.
 pub const TRANS_5052: &str = "SCP-TRANS-5052";
-/// `UniFFI` transport storage error.
-pub const TRANS_5053: &str = "SCP-TRANS-5053";
 /// `UniFFI` transport node error.
 pub const TRANS_5054: &str = "SCP-TRANS-5054";
+/// Node start: the bridge could not wire the `SCP` instance's `Supervisor`
+/// to the node it started (sdk-common.md §"Node start error codes").
+pub const TRANS_5056: &str = "SCP-TRANS-5056";
 /// `UniFFI` transport relay connect error.
 pub const TRANS_5060: &str = "SCP-TRANS-5060";
 /// `UniFFI` transport relay send error.
@@ -1367,6 +1373,22 @@ pub const STORAGE_8005: &str = "SCP-STORAGE-8005";
 /// `scp_platform::PlatformError::StorageClosed` to this code.
 pub const STORAGE_8006: &str = "SCP-STORAGE-8006";
 
+/// The node start configuration is invalid.
+///
+/// A required field is missing, a field value is invalid, or
+/// `scp_node::validate_reach_and_tls` rejected the reach and TLS pair.
+/// `node_start` returns it before it creates any directory or file
+/// (sdk-common.md §"Node start error codes").
+pub const STORAGE_8007: &str = "SCP-STORAGE-8007";
+
+/// Node start's blob storage backend failed to open, or its directory could not
+/// be created (sdk-common.md §"Node start error codes").
+pub const STORAGE_8008: &str = "SCP-STORAGE-8008";
+
+/// The core node returned a storage error during node start
+/// (`NodeError::Storage`; sdk-common.md §"Node start error codes").
+pub const STORAGE_8009: &str = "SCP-STORAGE-8009";
+
 // -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)
 // -------------------------------------------------------------------------
@@ -1786,4 +1808,189 @@ pub const fn admission_error_code(
         }
     };
     (code, TrustFailureClass::Validation)
+}
+
+/// The bridge error code for a [`ServerError`](crate::server::ServerError).
+///
+/// One mapping for the `PyO3`, napi-rs and `UniFFI` bridges, following
+/// [`custody_failure_code`]; sdk-common.md §"Node start error codes" lists
+/// every row. `AutoGenerateUnavailable` has no row there, because
+/// `DevStartUnavailable` replaces it; until then it keeps [`VALID_7004`], the
+/// code the bridges already return for it.
+#[cfg(feature = "server")]
+#[must_use]
+pub const fn server_error_code(e: &crate::server::ServerError) -> &'static str {
+    use crate::server::ServerError as E;
+    use scp_node::NodeError as N;
+    match e {
+        E::InvalidConfig(_) | E::Node(N::MissingField(_) | N::InvalidConfig(_)) => STORAGE_8007,
+        E::Storage(_) | E::Io(_) => STORAGE_8008,
+        E::Node(N::Storage(_)) => STORAGE_8009,
+        E::OperatorIdentityUnavailable | E::Node(N::Identity(_)) => IDENT_1063,
+        E::Node(N::Relay(_)) => TRANS_5051,
+        E::Node(N::Tls(_)) => TRANS_5052,
+        E::Node(N::Serve(_) | N::Nat(_)) => TRANS_5054,
+        E::Relay(_) => TRANS_5050,
+        E::SupervisorWiring(_) => TRANS_5056,
+        E::DhtInit(_) => IDENT_1001,
+        E::MissingPassphrase | E::AutoGenerateUnavailable => VALID_7004,
+        E::Platform(_) => CTX_2053,
+    }
+}
+
+/// The bridge error class a [`ServerError`](crate::server::ServerError)
+/// reaches the caller as; each bridge maps it to its own error variant.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerErrorClass {
+    /// A validation error: an invalid config, a missing passphrase, or a
+    /// storage selection the bridge could not honour (`SCP-STORAGE-*`, as for
+    /// the selection layer's `SCP-STORAGE-8004`).
+    Validation,
+    /// An identity error: the operator identity is unavailable, or the DHT
+    /// client could not be built.
+    Identity,
+    /// A transport error: the relay, TLS, HTTP server or NAT traversal failed,
+    /// or the bridge could not wire its `Supervisor` to a started node.
+    Transport,
+    /// A context error: a dev-pair `PlatformError`.
+    Context,
+}
+
+/// The error class for a [`ServerError`](crate::server::ServerError), one
+/// mapping for the `PyO3`, napi-rs and `UniFFI` bridges.
+#[cfg(feature = "server")]
+#[must_use]
+pub const fn server_error_class(e: &crate::server::ServerError) -> ServerErrorClass {
+    use crate::server::ServerError as E;
+    use scp_node::NodeError as N;
+    match e {
+        E::InvalidConfig(_)
+        | E::Node(N::MissingField(_) | N::InvalidConfig(_) | N::Storage(_))
+        | E::Storage(_)
+        | E::Io(_)
+        | E::MissingPassphrase
+        | E::AutoGenerateUnavailable => ServerErrorClass::Validation,
+        E::OperatorIdentityUnavailable | E::Node(N::Identity(_)) | E::DhtInit(_) => {
+            ServerErrorClass::Identity
+        }
+        E::Node(N::Relay(_) | N::Tls(_) | N::Serve(_) | N::Nat(_))
+        | E::Relay(_)
+        | E::SupervisorWiring(_) => ServerErrorClass::Transport,
+        E::Platform(_) => ServerErrorClass::Context,
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod server_error_tests {
+    use super::*;
+    use crate::server::ServerError as E;
+    use scp_node::NodeError as N;
+
+    /// One error per sdk-common.md §"Node start error codes" row that exists
+    /// after SCP-321, paired with its code and class. `DevStartUnavailable` is
+    /// absent until it exists.
+    fn rows() -> Vec<(E, &'static str, ServerErrorClass)> {
+        use crate::server::SupervisorWiringError as W;
+        use ServerErrorClass::{Context, Identity, Transport, Validation};
+        let io = || std::io::Error::other("x");
+        vec![
+            (E::InvalidConfig("x".into()), STORAGE_8007, Validation),
+            (E::Node(N::MissingField("reach")), STORAGE_8007, Validation),
+            (
+                E::Node(N::InvalidConfig("x".into())),
+                STORAGE_8007,
+                Validation,
+            ),
+            (
+                E::Storage(scp_transport::native::storage::StorageError::Internal(
+                    "x".into(),
+                )),
+                STORAGE_8008,
+                Validation,
+            ),
+            (E::Io(io()), STORAGE_8008, Validation),
+            (E::Node(N::Storage("x".into())), STORAGE_8009, Validation),
+            (E::OperatorIdentityUnavailable, IDENT_1063, Identity),
+            (
+                E::Node(N::Identity(scp_identity::IdentityError::Platform(
+                    scp_platform::error::PlatformError::StorageClosed,
+                ))),
+                IDENT_1063,
+                Identity,
+            ),
+            (
+                E::Node(N::Relay(
+                    scp_transport::native::server::RelayError::BindFailed("x".into()),
+                )),
+                TRANS_5051,
+                Transport,
+            ),
+            (
+                E::Node(N::Tls(scp_node::tls::TlsError::Acme("x".into()))),
+                TRANS_5052,
+                Transport,
+            ),
+            (E::Node(N::Serve("x".into())), TRANS_5054, Transport),
+            (E::Node(N::Nat("x".into())), TRANS_5054, Transport),
+            (
+                E::Relay(scp_transport::native::server::RelayError::BindFailed(
+                    "x".into(),
+                )),
+                TRANS_5050,
+                Transport,
+            ),
+            (
+                E::SupervisorWiring(W::NodeAlreadyBound),
+                TRANS_5056,
+                Transport,
+            ),
+            (
+                E::SupervisorWiring(W::RelayConnect(
+                    scp_transport::TransportError::ConnectionFailed("x".into()),
+                )),
+                TRANS_5056,
+                Transport,
+            ),
+            (
+                E::SupervisorWiring(W::SupervisorUnavailable),
+                TRANS_5056,
+                Transport,
+            ),
+            (
+                E::SupervisorWiring(W::TransportInstall(
+                    crate::bridge_instance::TransportLockError::Poisoned,
+                )),
+                TRANS_5056,
+                Transport,
+            ),
+            (
+                E::DhtInit(crate::dht::DhtInitError::InvalidGateway {
+                    url: "x".into(),
+                    reason: "x".into(),
+                }),
+                IDENT_1001,
+                Identity,
+            ),
+            (E::MissingPassphrase, VALID_7004, Validation),
+            (
+                E::Platform(scp_platform::error::PlatformError::StorageError("x".into())),
+                CTX_2053,
+                Context,
+            ),
+        ]
+    }
+
+    #[test]
+    fn server_error_code_and_class_match_every_sdk_common_row() {
+        for (err, code, class) in rows() {
+            assert_eq!(server_error_code(&err), code, "{err:?}");
+            assert_eq!(server_error_class(&err), class, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn auto_generate_unavailable_keeps_its_bridge_code() {
+        assert_eq!(server_error_code(&E::AutoGenerateUnavailable), VALID_7004);
+    }
 }

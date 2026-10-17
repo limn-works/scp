@@ -146,6 +146,11 @@ const NODE_BUILDER_SRC: &str = include_str!("../../../../crates/scp-node/src/lib
 // BEP44 record would give its monotonic sequence two independent writers.
 const NODE_SELF_HOST_SRC: &str = include_str!("../../../../crates/scp-node/src/self_host.rs");
 
+// Node published-state source — owns `apply_tier_change`, the NAT-tier task's
+// one writer, which moves the relay's live URL handle (PUSH-007, §10.7.1).
+const NODE_PUBLISHED_STATE_SRC: &str =
+    include_str!("../../../../crates/scp-node/src/published_state.rs");
+
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
@@ -182,6 +187,16 @@ const HANDLERS_BROADCAST_SRC: &str =
 // ADR-049 Decision-1 / finding A3). Pinned by
 // `actor_owned_timer_arms_reconcile_from_state`.
 const ACTOR_MOD_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/actor/mod.rs");
+
+// Push handler source — owns `handlers::push::dispatch`, the mailbox step of
+// the PUSH-013 push routing-ID query (§10.7.1).
+const HANDLERS_PUSH_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/push.rs");
+// Actor queries-handler source — owns the `QueriesCommand::LocalRoutingIds`
+// arm that answers through `queries_helpers::local_routing_ids` (spec 09
+// §9.10.4.1). Pinned by `local_pseudonym_rotation_reaches_its_helpers`.
+const HANDLERS_QUERIES_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/queries.rs");
 
 // UCAN validation pipeline source — owns `validate_ucan`, the 11-step
 // capability authorization gate. The `ucan_step8_enforces_ceiling_over_all_att`
@@ -235,6 +250,12 @@ const LEDGER_SRC: &str = include_str!(
 const FFI_CONTEXT_PARAMS_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/context_params.rs");
 const NAPI_SCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs");
+// Each bridge's `node_start` (construction.md §"Node start — `NodeStartConfig`"):
+// PyO3's and napi-rs's bodies live in `node_start_on` in their `server.rs`,
+// UniFFI's in `node_start_on` in `uniffi/src/server.rs`.
+const PYO3_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/src/server.rs");
+const NAPI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/server.rs");
+const UNIFFI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/server.rs");
 
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
@@ -292,7 +313,10 @@ const NAPI_SCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp
 // Raised 88 -> 89 when each bridge gained its modify-requirements proposal
 // export: one assertion pins all three to the shared decode and to the
 // bridge's governance propose path.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 89;
+// Raised 89 -> 90 when the local member's pseudonym rotation (spec 09
+// §9.10.4.1) was wired: one assertion pins the rotate command, the routing-ID
+// query, and the actor's rotation and grace arms to their helpers.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 90;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -1035,6 +1059,133 @@ fn gated_broadcast_subscribe_builds_real_validation_context() {
         fn_body_contains(MANAGER_SRC, "handle_broadcast_key_request", "is_banned("),
         "broadcast_helpers::handle_broadcast_key_request must consult the durable ban \
          record via bc.is_banned(...) before granting a broadcast key (BLACK-303)"
+    );
+}
+
+// PUSH-025 (§5.12.3.1 `relay_urls`, §9.18.2): every path that writes a
+// context's relay set stores it through `normalize_relay_urls`, which maps each
+// URL to its canonical relay URL when it has one. Create, import and restore
+// call it in `lifecycle_helpers`; a Welcome joiner calls it in
+// `Supervisor::build_welcome_joiner_state`, after bundle verification.
+const LIFECYCLE_HELPERS_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs");
+
+#[test]
+fn relay_set_writes_store_canonical_relay_urls() {
+    assert!(
+        fn_body_contains(
+            LIFECYCLE_HELPERS_SRC,
+            "normalize_relay_urls",
+            "canonical_relay_url("
+        ),
+        "normalize_relay_urls must map each relay URL through canonical_relay_url"
+    );
+    for entry in ["create_context", "import_context", "restore_context"] {
+        assert!(
+            fn_body_contains(LIFECYCLE_HELPERS_SRC, entry, "normalize_relay_urls("),
+            "lifecycle_helpers::{entry} must store its relay set through normalize_relay_urls"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "build_welcome_joiner_state",
+            "normalize_relay_urls("
+        ),
+        "Supervisor::build_welcome_joiner_state must store the bundle's relay set through \
+         normalize_relay_urls"
+    );
+}
+
+// PUSH-007 (§10.7.1 step 2): the NAT-tier task writes the relay's live URL
+// handle, so every relay listener reserves the push routing ID of the URL the
+// node advertises after a tier change. `build_no_domain_inner` hands the task a
+// clone of the relay config's handle, the task calls `apply_tier_change` with
+// it, and `apply_tier_change` sets the handle before it publishes the document.
+#[test]
+fn nat_tier_task_writes_the_relay_push_url_handle() {
+    assert!(
+        fn_body_contains(
+            NODE_BUILDER_SRC,
+            "build_no_domain_inner",
+            "relay_config.relay_url.clone()"
+        ),
+        "build_no_domain_inner must give the tier task the relay config's live URL handle"
+    );
+    assert!(
+        fn_body_contains(
+            NODE_BUILDER_SRC,
+            "build_no_domain_inner",
+            "reserve_push_routing_id(&relay_config.relay_url, &relay_url)"
+        ),
+        "build_no_domain_inner must set the probed tier's URL on the relay handle"
+    );
+    assert!(
+        fn_body_contains(NODE_BUILDER_SRC, "spawn_tier_reevaluation", "&relay_url,"),
+        "the tier task must pass the relay handle to apply_tier_change"
+    );
+    let body = extract_fn_body(NODE_PUBLISHED_STATE_SRC, "apply_tier_change")
+        .expect("apply_tier_change body");
+    let set = body
+        .find("reserve_push_routing_id(relay, new_relay_url)")
+        .expect("apply_tier_change must set the relay's live URL handle");
+    assert!(
+        fn_body_contains(
+            NODE_PUBLISHED_STATE_SRC,
+            "reserve_push_routing_id",
+            "relay.set(url)"
+        ),
+        "reserve_push_routing_id must set the relay's live URL handle"
+    );
+    let publish = body
+        .find(".publish(")
+        .expect("apply_tier_change must publish the document");
+    assert!(
+        set < publish,
+        "apply_tier_change must move the relay handle before it publishes the new URL"
+    );
+}
+
+// PUSH-013 (§10.7.1): the push routing-ID query runs
+// `Supervisor::push_routing_ids` → `dispatch_push_command` → actor mailbox →
+// `handlers::push::dispatch` → `push_helpers::push_routes`.
+#[test]
+fn push_routing_ids_reach_push_helpers_through_the_actor_mailbox() {
+    assert!(
+        fn_body_contains(SUPERVISOR_SRC, "push_routing_ids", "dispatch_push_command("),
+        "Supervisor::push_routing_ids must ask each actor through dispatch_push_command"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "push_routing_ids",
+            "self.known_context_ids()"
+        ),
+        "Supervisor::push_routing_ids must enumerate known_context_ids, so a context whose actor is down fails the query"
+    );
+    assert!(
+        fn_body_contains(SUPERVISOR_SRC, "push_routing_ids", "canonical_relay_url("),
+        "Supervisor::push_routing_ids must group by the canonical relay URL"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_push_command",
+            "dispatch_via_mailbox(&actor, ContextCommand::Push(cmd))"
+        ),
+        "dispatch_push_command must send ContextCommand::Push through the actor mailbox"
+    );
+    assert!(
+        fn_body_contains(ACTOR_MOD_SRC, "dispatch_state", "handlers::push::dispatch("),
+        "the actor's dispatch_state must route ContextCommand::Push to handlers::push::dispatch"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_PUSH_SRC,
+            "dispatch",
+            "push_helpers::push_routes(state)"
+        ),
+        "handlers::push::dispatch must answer PushCommand::Routes from push_helpers::push_routes"
     );
 }
 
@@ -1946,6 +2097,143 @@ fn execute_remove_member_calls_remove_member_sender_key() {
             "remove_member_sender_key"
         ),
         "execute_remove_member must call remove_member_sender_key"
+    );
+}
+
+/// Spec 09 §9.10.4.1, ADR-031: an approved `ModifyPseudonymRotationPolicy`
+/// reaches its executor. `execute_governance_action` (the approved-proposal
+/// path of propose and vote) calls `dispatch_governance_action`, whose arm for
+/// the variant calls `execute_modify_pseudonym_rotation_policy`, which writes
+/// the policy through the fail-closed Class-S commit and appends the ADR-011
+/// event.
+#[test]
+fn modify_pseudonym_rotation_policy_reaches_its_executor() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "execute_governance_action",
+            "dispatch_governance_action("
+        ),
+        "execute_governance_action must call dispatch_governance_action"
+    );
+    let dispatch = extract_fn_body(MANAGER_SRC, "dispatch_governance_action")
+        .expect("dispatch_governance_action exists");
+    assert!(
+        dispatch.contains("GovernanceAction::ModifyPseudonymRotationPolicy")
+            && dispatch.contains("execute_modify_pseudonym_rotation_policy("),
+        "dispatch_governance_action must route ModifyPseudonymRotationPolicy to \
+         execute_modify_pseudonym_rotation_policy"
+    );
+    let executor = extract_fn_body(MANAGER_SRC, "execute_modify_pseudonym_rotation_policy")
+        .expect("execute_modify_pseudonym_rotation_policy exists");
+    for step in [
+        ".validate()",
+        "commit_class_s_keep",
+        "set_pseudonym_rotation(",
+        "EventType::PseudonymRotationPolicyModified",
+    ] {
+        assert!(
+            executor.contains(step),
+            "execute_modify_pseudonym_rotation_policy must contain `{step}`"
+        );
+    }
+}
+
+/// Spec 09 §9.10.4.1: the local member's pseudonym rotation is reachable on
+/// its production paths. `Supervisor::rotate_pseudonym` dispatches
+/// `MessagingCommand::RotatePseudonym`, the messaging handler calls
+/// `messaging_helpers::rotate_pseudonym`, which commits through the
+/// fail-closed compensating Class-S commit and then announces through
+/// `send_pseudonym_announcement`. `Supervisor::local_routing_ids` dispatches
+/// `QueriesCommand::LocalRoutingIds`, answered by
+/// `queries_helpers::local_routing_ids`. The actor run loop drives the
+/// rotation arm (`on_rotation_tick`, which signals from
+/// `PseudonymRotationState::wake`) and the grace arm (`on_grace_tick`, which
+/// drops the previous routing ID through the restore commit), and
+/// `reconcile_timers` re-arms both from state.
+#[test]
+fn local_pseudonym_rotation_reaches_its_helpers() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "rotate_pseudonym",
+            "MessagingCommand::RotatePseudonym"
+        ),
+        "Supervisor::rotate_pseudonym must dispatch MessagingCommand::RotatePseudonym"
+    );
+    let dispatch = extract_fn_body(HANDLERS_MESSAGING_SRC, "dispatch")
+        .expect("the messaging handler dispatch exists");
+    assert!(
+        dispatch.contains("MessagingCommand::RotatePseudonym")
+            && dispatch.contains("handle_rotate_pseudonym("),
+        "the messaging dispatch must route RotatePseudonym to handle_rotate_pseudonym"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_MESSAGING_SRC,
+            "handle_rotate_pseudonym",
+            "messaging_helpers::rotate_pseudonym("
+        ),
+        "handle_rotate_pseudonym must call messaging_helpers::rotate_pseudonym"
+    );
+    let helper = extract_fn_body(MANAGER_SRC, "rotate_pseudonym")
+        .expect("messaging_helpers::rotate_pseudonym exists");
+    for step in [
+        "due_epoch(",
+        "commit_class_s_compensating(",
+        "record_rotation(",
+        "ContextEvent::LocalPseudonymRotated",
+        "send_pseudonym_announcement(",
+    ] {
+        assert!(
+            helper.contains(step),
+            "messaging_helpers::rotate_pseudonym must contain `{step}`"
+        );
+    }
+
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "local_routing_ids",
+            "QueriesCommand::LocalRoutingIds"
+        ),
+        "Supervisor::local_routing_ids must dispatch QueriesCommand::LocalRoutingIds"
+    );
+    let queries = extract_fn_body(HANDLERS_QUERIES_SRC, "dispatch")
+        .expect("the queries handler dispatch exists");
+    assert!(
+        queries.contains("QueriesCommand::LocalRoutingIds")
+            && queries.contains("queries_helpers::local_routing_ids("),
+        "the queries dispatch must answer LocalRoutingIds through \
+         queries_helpers::local_routing_ids"
+    );
+
+    let run = extract_fn_body(ACTOR_MOD_SRC, "run").expect("ContextActor::run exists");
+    assert!(
+        run.contains("self.on_rotation_tick()") && run.contains("self.on_grace_tick()"),
+        "the actor run loop must drive the rotation and grace arms"
+    );
+    assert!(
+        fn_body_contains(
+            ACTOR_MOD_SRC,
+            "reconcile_timers",
+            "reconcile_pseudonym_timers("
+        ),
+        "reconcile_timers must re-arm the pseudonym timers from state"
+    );
+    assert!(
+        fn_body_contains(ACTOR_MOD_SRC, "on_rotation_tick", ".wake("),
+        "on_rotation_tick must signal from PseudonymRotationState::wake"
+    );
+    assert!(
+        fn_body_contains(ACTOR_MOD_SRC, "on_grace_tick", "commit_class_s_restore(")
+            && fn_body_contains(
+                ACTOR_MOD_SRC,
+                "on_grace_tick",
+                "ContextEvent::PseudonymGraceEnded"
+            ),
+        "on_grace_tick must drop the previous routing ID through the restore commit \
+         and emit PseudonymGraceEnded"
     );
 }
 
@@ -6303,6 +6591,163 @@ fn every_node_start_path_starts_the_self_did_republish_cycle() {
          shutdown would keep asserting this node's address on the DHT for the \
          life of the process (§10.12.1)"
     );
+}
+
+/// Asserts that `steps` occur in `body` in the given order, each after the one
+/// before it.
+fn assert_steps_in_order(bridge: &str, body: &str, steps: &[&str]) {
+    let mut from = 0;
+    for step in steps {
+        let Some(at) = body[from..].find(step) else {
+            panic!("{bridge} node_start_on must run `{step}` after the steps before it");
+        };
+        from += at + step.len();
+    }
+}
+
+/// Each bridge's `node_start` delegates to `server::node_start(` and runs its
+/// steps in the order construction.md §"Node start — `NodeStartConfig`" and
+/// SCP-322 give: the handle check (UniFFI), the config parse or conversion,
+/// operator identity resolution, the instance storage, `server::node_start`,
+/// `server::register_node`, `auto_wire_context_manager`, and the handle. An
+/// unregistered operator identity is `OperatorIdentityUnavailable`.
+#[test]
+fn every_bridge_node_start_delegates_to_server_node_start_in_order() {
+    let pyo3 = extract_fn_body(PYO3_SERVER_SRC, "node_start_on")
+        .expect("PyO3 server.rs must define node_start_on");
+    assert_steps_in_order(
+        "PyO3",
+        &pyo3,
+        &[
+            "NodeStartConfig::from_json(",
+            "resolve_operator_identity(",
+            "instance_storage(",
+            "server::node_start(",
+            "server::register_node(",
+            "auto_wire_context_manager(",
+            "PyNodeHandle {",
+        ],
+    );
+    let napi = extract_fn_body(NAPI_SERVER_SRC, "node_start_on")
+        .expect("napi server.rs must define node_start_on");
+    assert_steps_in_order(
+        "napi-rs",
+        &napi,
+        &[
+            "NodeStartConfig::from_json(",
+            "resolve_operator_identity(",
+            ".instance_storage()",
+            "server::node_start(",
+            "server::register_node(",
+            "auto_wire_context_manager(",
+            "NapiNodeHandle {",
+        ],
+    );
+    let uniffi = extract_fn_body(UNIFFI_SERVER_SRC, "node_start_on")
+        .expect("UniFFI server.rs must define node_start_on");
+    assert_steps_in_order(
+        "UniFFI",
+        &uniffi,
+        &[
+            ".check_handle(",
+            "lower_node_start_config(",
+            "build_node_identity_from_uniffi(",
+            ".instance_storage()",
+            "server::node_start(",
+            "server::register_node(",
+            "auto_wire_context_manager(",
+            "NodeHandle {",
+        ],
+    );
+
+    // The exported entry points reach `node_start_on`.
+    assert!(
+        fn_body_contains(PYO3_SERVER_SRC, "node_start", "node_start_on("),
+        "PyO3 SCP.node_start must delegate to node_start_on"
+    );
+    assert!(
+        fn_body_contains(NAPI_SCP_SRC, "node_start", "crate::server::node_start_on("),
+        "napi-rs Scp.nodeStart must delegate to node_start_on"
+    );
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "node_start",
+            "crate::server::node_start_on("
+        ),
+        "UniFFI Scp.node_start must delegate to node_start_on"
+    );
+
+    // Identity resolution: PyO3 and napi-rs look the DID up in the instance
+    // registry, and a miss is `OperatorIdentityUnavailable` (SCP-IDENT-1063).
+    for (bridge, src) in [("PyO3", PYO3_SERVER_SRC), ("napi-rs", NAPI_SERVER_SRC)] {
+        assert!(
+            fn_body_contains(src, "resolve_operator_identity", "build_node_identity("),
+            "{bridge} resolve_operator_identity must call build_node_identity"
+        );
+        assert!(
+            fn_body_contains(
+                src,
+                "build_node_identity",
+                "ServerError::OperatorIdentityUnavailable"
+            ),
+            "{bridge} build_node_identity must map a registry miss to \
+             OperatorIdentityUnavailable"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            UNIFFI_SERVER_SRC,
+            "build_node_identity_from_uniffi",
+            "ServerError::OperatorIdentityUnavailable"
+        ),
+        "UniFFI build_node_identity_from_uniffi must map a handle without key \
+         material to OperatorIdentityUnavailable"
+    );
+}
+
+/// Each bridge's node handle `shutdown` and `Drop` stop the node through
+/// `server::stop_node(`, which unbinds the instance's `Supervisor` transport
+/// from that node (construction.md §"Node start — `NodeStartConfig`"). A path
+/// that called only `RunningNode::shutdown` would leave the binding in place,
+/// so the instance's sends would go on targeting a stopped relay.
+#[test]
+fn every_bridge_node_handle_stop_path_calls_server_stop_node() {
+    for (bridge, src, handle_impl, drop_impl) in [
+        (
+            "PyO3",
+            PYO3_SERVER_SRC,
+            "impl PyNodeHandle {",
+            "impl Drop for PyNodeHandle {",
+        ),
+        (
+            "napi-rs",
+            NAPI_SERVER_SRC,
+            "impl NapiNodeHandle {",
+            "impl Drop for NapiNodeHandle {",
+        ),
+        (
+            "UniFFI",
+            UNIFFI_SERVER_SRC,
+            "impl NodeHandle {",
+            "impl Drop for NodeHandle {",
+        ),
+    ] {
+        for (label, header, method) in [
+            ("shutdown", handle_impl, "shutdown"),
+            ("Drop", drop_impl, "drop"),
+        ] {
+            let at = src
+                .find(header)
+                .unwrap_or_else(|| panic!("{bridge} server.rs must contain `{header}`"));
+            let body = extract_fn_body(&src[at..], method)
+                .unwrap_or_else(|| panic!("{bridge} `{header}` must define fn {method}"));
+            assert!(
+                body.contains("server::stop_node("),
+                "{bridge} node handle {label} must call server::stop_node"
+            );
+        }
+    }
 }
 
 /// Verifies that the root AGENTS.md contains the required enforcement sections.

@@ -122,6 +122,7 @@ pub const fn event_type_label(event_type: &scp_event_log::EventType) -> &'static
         EventType::AppUnbound => "AppUnbound",
         EventType::CrossContextOutletInvoked => "CrossContextOutletInvoked",
         EventType::CrossContextDivergenceMarker => "CrossContextDivergenceMarker",
+        EventType::PseudonymRotationPolicyModified => "PseudonymRotationPolicyModified",
     }
 }
 
@@ -258,7 +259,7 @@ mod tests {
 
     /// Every `EventType` with the label bridges surface as `event_type` and
     /// SDKs compare against variant names.
-    const EVENT_TYPE_LABELS: [(scp_event_log::EventType, &str); 77] = {
+    const EVENT_TYPE_LABELS: [(scp_event_log::EventType, &str); 78] = {
         use scp_event_log::EventType;
         [
             (EventType::ContextCreated, "ContextCreated"),
@@ -389,10 +390,14 @@ mod tests {
                 EventType::CrossContextDivergenceMarker,
                 "CrossContextDivergenceMarker",
             ),
+            (
+                EventType::PseudonymRotationPolicyModified,
+                "PseudonymRotationPolicyModified",
+            ),
         ]
     };
 
-    /// Pins all 77 labels and checks that no two event types share one.
+    /// Pins all 78 labels and checks that no two event types share one.
     #[test]
     fn every_event_type_has_its_pinned_label() {
         let mut seen = std::collections::HashSet::new();

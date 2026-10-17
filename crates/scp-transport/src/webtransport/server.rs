@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::native::did_slot::DidSlotRegistry;
 use crate::native::storage::BlobStorage;
+use crate::relay::push_gate::LiveRelayUrl;
 use crate::relay::rate_limit::{ConnectionTracker, PublishRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 
@@ -39,7 +40,8 @@ use super::session::{SessionId, WebTransportSessionConfig, WebTransportSessionHa
 /// Configuration for the WebTransport listener.
 ///
 /// Controls connection limits and inherits relay-level settings for blob
-/// handling and rate limiting.
+/// handling and rate limiting. Build it with
+/// [`WebTransportListenerConfig::defaults`], which takes the relay's URL.
 #[derive(Debug, Clone)]
 pub struct WebTransportListenerConfig {
     /// Address to bind the QUIC listener to (UDP).
@@ -52,13 +54,15 @@ pub struct WebTransportListenerConfig {
     pub session_config: WebTransportSessionConfig,
 }
 
-impl Default for WebTransportListenerConfig {
-    fn default() -> Self {
+impl WebTransportListenerConfig {
+    /// The defaults for every field, with `relay_url` as the relay's URL.
+    #[must_use]
+    pub fn defaults(relay_url: LiveRelayUrl) -> Self {
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 9444)),
             max_connections_per_ip: 10,
             max_total_connections: 1000,
-            session_config: WebTransportSessionConfig::default(),
+            session_config: WebTransportSessionConfig::defaults(relay_url),
         }
     }
 }
@@ -144,6 +148,9 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
     /// store (ADR-037 AC3, §3.10.2). Obtain the shared registry via
     /// [`RelayServer::did_slot_registry`](crate::native::server::RelayServer::did_slot_registry)
     /// and set `config.session_config.did_record_validation` to the relay's mode.
+    /// Set `config.session_config.relay_url` to a clone of the relay's handle
+    /// and `config.session_config.push` to the relay's value too, so push
+    /// messages are intercepted and follow a URL change (§10.7.1).
     #[must_use]
     pub const fn new(
         config: WebTransportListenerConfig,
@@ -250,7 +257,7 @@ mod tests {
         let conn_tracker = crate::relay::rate_limit::new_connection_tracker();
 
         WebTransportListener::new(
-            WebTransportListenerConfig::default(),
+            WebTransportListenerConfig::defaults(crate::relay::push_gate::test_relay_url()),
             storage,
             subscriptions,
             rate_limiter,
@@ -278,7 +285,8 @@ mod tests {
 
     #[test]
     fn listener_config_defaults() {
-        let config = WebTransportListenerConfig::default();
+        let config =
+            WebTransportListenerConfig::defaults(crate::relay::push_gate::test_relay_url());
         assert_eq!(config.bind_addr, SocketAddr::from(([127, 0, 0, 1], 9444)));
         assert_eq!(config.max_connections_per_ip, 10);
         assert_eq!(config.max_total_connections, 1000);
@@ -292,5 +300,55 @@ mod tests {
         assert!(!handle.is_shutdown());
         handle.shutdown();
         assert!(handle.is_shutdown());
+    }
+
+    /// Every session the WebTransport listener creates reads the shared
+    /// [`LiveRelayUrl`]: after a `set` on a clone of the handle, a session
+    /// answers the new reserved routing ID and the previous one with 4063 and
+    /// stores nothing at either.
+    #[tokio::test]
+    async fn webtransport_listener_reads_the_shared_relay_url() {
+        use super::super::session::DispatchResult;
+        use crate::relay::push_gate::RelayUrl;
+        use scp_relay_client::{ClientMessage, RelayMessage};
+        let old = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let new = RelayUrl::new("ws://203.0.113.42:8443/scp/v1").unwrap();
+        let live = LiveRelayUrl::new(old.clone());
+        let storage = Arc::new(InMemoryBlobStorage::new());
+        let mut config = WebTransportListenerConfig::defaults(live.clone());
+        config.session_config.delivery_jitter_ms = 0;
+        let listener = WebTransportListener::new(
+            config,
+            Arc::clone(&storage),
+            crate::relay::subscription::new_registry(),
+            PublishRateLimiter::new(100),
+            crate::relay::rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
+        );
+        let mut session =
+            listener.create_session(IpAddr::V4(Ipv4Addr::LOCALHOST), CancellationToken::new());
+        session.mark_active();
+        live.set(new.clone());
+
+        for rid in [new.push_routing_id(), old.push_routing_id()] {
+            let reply = session
+                .dispatch_message_multi(&ClientMessage::Publish {
+                    ref_id: Some("push".to_owned()),
+                    routing_id: rid,
+                    recipient_hint: None,
+                    blob_ttl: 60,
+                    blob: vec![0x42; 64],
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    &reply,
+                    DispatchResult::Single(RelayMessage::Err { code: 4063, .. })
+                ),
+                "{reply:?}"
+            );
+            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+        }
     }
 }

@@ -451,7 +451,7 @@ mod tests {
 
     /// Spec 25 Vector 57's identifier in the `03-identity.md` §3.1 text form.
     const DEFINER: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
-    /// Spec 25 Vector 59's definer, whose last character is `q`.
+    /// Spec 25 Vector 61's definer, whose last character is `q`.
     const DEFINER_ENDING_Q: &str = "scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq";
 
     fn scoped(definer: &str, tail: &str) -> String {

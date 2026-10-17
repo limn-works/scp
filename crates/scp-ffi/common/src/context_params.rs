@@ -16,7 +16,8 @@ use scp_core::context::ContextParams;
 use scp_core::context::governance::GovernanceAction;
 use scp_core::context::params::{
     CeilingPolicy, ConsequenceConfig, ContextMode, GovernanceModel, IncompleteVerificationPolicy,
-    MemoryScope, MetadataVisibilityPolicy, OutletRegistration, PromotionPolicy, RoleDefinition,
+    MemoryScope, MetadataVisibilityPolicy, OutletRegistration, PromotionPolicy,
+    PseudonymRotationPolicy, RoleDefinition,
 };
 use scp_core::context::roles::Capability;
 use scp_core::provenance::CounterpartyPolicy;
@@ -154,6 +155,11 @@ pub struct CommonContextParams {
 
     /// Optional template identifier (spec §5.14). Used by `PyO3` bridge.
     pub template_id: Option<String>,
+
+    /// Pseudonym rotation policy (spec §9.10.4.1); `None` means no rotation.
+    /// [`build_context_params`] rejects a policy that fails
+    /// [`PseudonymRotationPolicy::validate`].
+    pub pseudonym_rotation: Option<PseudonymRotationPolicy>,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +226,11 @@ pub fn build_context_params(
         .template_id
         .as_deref()
         .and_then(|tid| parse_template_id(tid).ok());
+    if let Some(policy) = &params.pseudonym_rotation {
+        policy
+            .validate()
+            .map_err(|e| format!("invalid pseudonym_rotation (spec §9.10.4.1): {e}"))?;
+    }
 
     Ok(ContextParams {
         mode,
@@ -248,6 +259,7 @@ pub fn build_context_params(
         consequence_rules,
         consequence_config,
         sybil_policy: None,
+        pseudonym_rotation: params.pseudonym_rotation,
         // §9.18.B streaming ContextParams fields (SCP-OUT-034) are not yet
         // projected onto the FFI `CommonContextParams` surface; a context
         // created through the bridges takes the protocol defaults until the
@@ -654,6 +666,43 @@ mod tests {
         // An absent list is not a clear: the caller must send `[]`.
         assert_eq!(code(""), crate::error_codes::VALID_7000);
         assert_eq!(code("{"), crate::error_codes::VALID_7000);
+    }
+
+    #[test]
+    fn pseudonym_rotation_policy_carried_through() {
+        let policy = PseudonymRotationPolicy {
+            interval_secs: Some(3_600),
+            on_membership_change: true,
+        };
+        let ctx = build_ok(&CommonContextParams {
+            pseudonym_rotation: Some(policy),
+            ..Default::default()
+        });
+        assert_eq!(ctx.pseudonym_rotation, Some(policy));
+        assert_eq!(
+            build_ok(&CommonContextParams::default()).pseudonym_rotation,
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_pseudonym_rotation_policy_rejected() {
+        for invalid in [
+            PseudonymRotationPolicy {
+                interval_secs: None,
+                on_membership_change: false,
+            },
+            PseudonymRotationPolicy {
+                interval_secs: Some(599),
+                on_membership_change: false,
+            },
+        ] {
+            let err = build_err(&CommonContextParams {
+                pseudonym_rotation: Some(invalid),
+                ..Default::default()
+            });
+            assert!(err.contains("pseudonym_rotation"), "{err}");
+        }
     }
 
     #[test]

@@ -287,6 +287,7 @@ fn streaming_context_params(ceiling: &[&str]) -> crate::bridge::ContextParams {
         consequence_rules_json: None,
         consequence_config_json: None,
         capability_requirements_json: None,
+        pseudonym_rotation: None,
     }
 }
 

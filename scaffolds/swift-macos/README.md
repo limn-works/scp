@@ -34,7 +34,7 @@ identity creations a shipped build refuses.
 ## Next Steps
 
 - Invite a second identity with `reserveKeyPackage(identity:)`,
-  `inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:relayUrls:)` and
+  `inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:)` and
   `contextJoinFromWelcome(identity:sealed:reservationId:)`
 - Connect to a relay with `configureRelayTransport(relayUrl:localDid:)`, then send
   with `contextSend` and receive with `contextSubscribe`

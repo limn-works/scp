@@ -152,6 +152,18 @@ async fn bob_imported_custody() -> (InMemoryKeyCustody, KeyHandle) {
 /// for a valid bundle, or an ATTACKER key to drive a signature-verify rejection.
 /// Callers may hand-tamper the returned bundle (e.g. flip a `signature` byte or
 /// diverge a `metadata_snapshot.structural` field) before sealing it.
+/// The relays every test bundle names as hosting its context (§5.12.3.1
+/// `relay_urls`). The creator signs these spellings as written. Entries 0 and 2
+/// spell one relay two ways, entry 1 is a non-canonical spelling, and entry 3
+/// has no §9.18.2 canonical form, so every Welcome join test also proves that
+/// such a URL fails no join.
+const BUNDLE_RELAY_URLS: [&str; 4] = [
+    "wss://relay-b.example/scp/v1",
+    "WSS://Relay-A.Example:443/scp/v1/",
+    "wss://relay-b.example:443/scp/v1/",
+    "https://Relay-C.Example/scp/",
+];
+
 fn signed_bundle(
     signer: &SigningKey,
     creator_did: &DID,
@@ -167,7 +179,7 @@ fn signed_bundle(
     let mut bundle = InvitationBundle {
         context_id: context_id.to_owned(),
         creator_did: creator_did.clone(),
-        relay_urls: vec![],
+        relay_urls: BUNDLE_RELAY_URLS.map(str::to_owned).to_vec(),
         welcome_message: welcome_bytes,
         key_material: InvitationKeyMaterial {
             context_metadata_key: [7u8; 32],
@@ -909,7 +921,7 @@ async fn welcome_joiner_capability_requirements_await_replication() {
     };
     let rec = RecordingPersistence::default();
     let (result, j) = run_join_with(
-        0x2e,
+        0x30,
         Some(Box::new(rec.clone())),
         Some(params.clone()),
         params.clone(),
@@ -940,6 +952,60 @@ async fn welcome_joiner_capability_requirements_await_replication() {
     assert!(
         matches!(err, scp_protocol::context::ContextError::InvalidState(_)),
         "{err:?}"
+    );
+}
+
+/// Runs a Welcome join of a bundle naming [`BUNDLE_RELAY_URLS`] and returns
+/// the relay set of the persisted Class-S snapshot, which the spawn writes
+/// from the joiner's live state (§5.12.3.1 `relay_urls`, PUSH-025). The join
+/// succeeds only when the joiner verifies the signature over the URLs as the
+/// creator signed them.
+async fn welcome_joiner_relay_set(seed: u8) -> Vec<String> {
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        seed,
+        Some(Box::new(rec.clone())),
+        Some(joiner_params()),
+        joiner_params(),
+        None,
+    )
+    .await;
+    result.expect("welcome join succeeds whatever the relay URLs");
+    rec.store
+        .get(&j.ctx_id)
+        .map(|e| e.value().relay_urls.clone())
+        .expect("the joiner persisted a Class-S snapshot before spawning")
+}
+
+/// A Welcome joiner stores two spellings of one relay as one entry, the
+/// §9.18.2 canonical relay URL, at the first spelling's position.
+#[tokio::test]
+async fn welcome_joiner_stores_two_spellings_of_a_relay_as_one_canonical_entry() {
+    let stored = welcome_joiner_relay_set(0x2d).await;
+    assert_eq!(
+        stored[..2],
+        [
+            "wss://relay-b.example/scp/v1".to_owned(),
+            "wss://relay-a.example/scp/v1".to_owned(),
+        ],
+        "the joiner stores each relay once, in canonical form, in first-seen order"
+    );
+    assert_eq!(
+        stored.len(),
+        3,
+        "the two relay-b spellings collapse: {stored:?}"
+    );
+}
+
+/// A Welcome joiner stores a relay URL with no §9.18.2 canonical form exactly
+/// as the bundle wrote it, and the join succeeds.
+#[tokio::test]
+async fn welcome_joiner_stores_a_relay_url_without_canonical_form_as_written() {
+    let stored = welcome_joiner_relay_set(0x2e).await;
+    assert_eq!(
+        stored.last().map(String::as_str),
+        Some("https://Relay-C.Example/scp/"),
+        "the joiner stores the https URL as written: {stored:?}"
     );
 }
 
@@ -1446,6 +1512,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         broadcast_params,
         bob.clone(),
         some_pseudonym(),
+        Vec::new(),
     )
     .await
     .expect("bob creates the colliding broadcast context");
@@ -1963,6 +2030,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
         joiner_params(),
         bob.clone(),
         some_pseudonym(),
+        Vec::new(),
     )
     .await
     .expect("a later bootstrap for a different id proceeds — the global lock was released");
@@ -2655,6 +2723,7 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted context");
@@ -2675,7 +2744,6 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
@@ -2733,6 +2801,71 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
         bob_sup.local_mls_epoch(&ctx_id).await,
         Some(1),
         "bob's joined MLS group is installed at the joined absolute epoch (1)"
+    );
+}
+
+/// `invite_member` seals the context's stored relay set (§5.12.3.1
+/// `relay_urls`, PUSH-025) and takes no relay list from its caller, so the
+/// joiner stores exactly the set the creator holds, in stored order.
+#[tokio::test]
+async fn invite_member_seals_the_creators_stored_relay_set() {
+    let ctx_id = ctx_hex(0xd6);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+    let stored = vec![
+        "wss://relay-a.example/scp/v1".to_owned(),
+        "wss://relay-b.example/scp/v1".to_owned(),
+    ];
+
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+            stored.clone(),
+        )
+        .await
+        .expect("alice creates the encrypted context");
+    assert_eq!(
+        alice_sup.context_relay_urls(&ctx_id).await,
+        Some(stored.clone())
+    );
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    let InviteMemberOutcome::Sealed { bundle, .. } = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
+        )
+        .await
+        .expect("alice seals an invitation for bob");
+    let enc =
+        <[u8; 32]>::try_from(bundle.enc.as_slice()).expect("sealed bundle enc is exactly 32 bytes");
+
+    let (bob_custody, bob_handle) = bob_imported_custody().await;
+    let req = WelcomeJoinRequest {
+        context_id: ctx_id.clone(),
+        creator_did: alice.clone(),
+        sealed_bundle_enc: enc,
+        sealed_bundle_ct: bundle.ciphertext,
+        reservation_id,
+        local_pseudonym: some_pseudonym(),
+    };
+    bob_sup
+        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+        .await
+        .expect("bob joins from alice's invitation");
+    assert_eq!(
+        bob_sup.context_relay_urls(&ctx_id).await,
+        Some(stored),
+        "the joiner stores the creator's relay set in stored order"
     );
 }
 
@@ -2839,6 +2972,7 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted context");
@@ -2852,7 +2986,6 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
@@ -2902,6 +3035,7 @@ async fn invite_member_into_voting_context_is_rejected() {
             voting_params,
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the voting context");
@@ -2915,7 +3049,6 @@ async fn invite_member_into_voting_context_is_rejected() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
@@ -2969,6 +3102,7 @@ async fn invite_member_by_non_admin_is_rejected() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted SingleAdmin context");
@@ -2984,7 +3118,6 @@ async fn invite_member_by_non_admin_is_rejected() {
             bob.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &crate::context::actor::CommandSigner::local_ed25519(bob_signing_key().clone()),
         )
         .await;
@@ -3077,6 +3210,7 @@ async fn invite_member_rolls_back_the_add_on_delivery_failure() {
             joiner_params(),
             alice.clone(),
             some_pseudonym(),
+            Vec::new(),
         )
         .await
         .expect("alice creates the encrypted context");
@@ -3090,7 +3224,6 @@ async fn invite_member_rolls_back_the_add_on_delivery_failure() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            vec![],
             &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await;
@@ -4160,5 +4293,51 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
     assert_eq!(
         response.sender_did, BOB_DID,
         "the response carries bob's sender key (not an empty/echoed answer)"
+    );
+}
+
+/// spec 09 §9.10.4.1 puts the interval boundaries at `T0 + j × interval_secs`,
+/// where `T0` is the creator's stamp. The invitation bundle carries no `T0`, so
+/// a Welcome joiner under an interval policy admits no rotation rather than one
+/// on boundaries counted from its own join time; under a membership-only policy,
+/// whose schedule index is 0, its next epoch is 0.
+#[tokio::test]
+async fn a_welcome_joiner_admits_no_interval_rotation_without_the_creators_t0() {
+    use scp_protocol::context::params::PseudonymRotationPolicy;
+
+    let with_policy = |interval_secs: Option<u64>, on_membership_change: bool| ContextParams {
+        pseudonym_rotation: Some(PseudonymRotationPolicy {
+            interval_secs,
+            on_membership_change,
+        }),
+        ..joiner_params()
+    };
+
+    let interval = with_policy(Some(3_600), true);
+    let (result, j) = run_join_with(0x5A, None, Some(interval.clone()), interval, None).await;
+    result.expect("the join under an interval policy succeeds");
+    let ids = j
+        .sup
+        .local_routing_ids(&j.ctx_id)
+        .await
+        .expect("routing ids");
+    assert_eq!(ids.pseudonym_epoch, None);
+    assert_eq!(
+        ids.next_pseudonym_epoch, None,
+        "a joiner without T0 admits no interval-schedule rotation"
+    );
+
+    let membership = with_policy(None, true);
+    let (result, j) = run_join_with(0x5B, None, Some(membership.clone()), membership, None).await;
+    result.expect("the join under a membership-only policy succeeds");
+    let ids = j
+        .sup
+        .local_routing_ids(&j.ctx_id)
+        .await
+        .expect("routing ids");
+    assert_eq!(
+        ids.next_pseudonym_epoch,
+        Some(0),
+        "a membership-only policy needs no T0: the next epoch is 0"
     );
 }

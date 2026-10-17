@@ -44,6 +44,7 @@ suspend fun main() {
                     consequenceRulesJson = null,
                     consequenceConfigJson = null,
                     capabilityRequirementsJson = null,
+                    pseudonymRotation = null,
                 ),
         )
 

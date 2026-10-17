@@ -362,16 +362,15 @@ impl crate::scp::PyScp {
 
         // Execute the full 11-step validation pipeline within the context runtime.
         // Use production DID resolver when available (#311), fallback to string-only.
-        crate::runtime::with_context(bi, context_id, |rt| {
+        let mut recorded = None;
+        let validated = crate::runtime::with_context(bi, context_id, |rt| {
             let production_resolver = crate::runtime::did_resolver(bi);
             let did_resolver =
                 DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
             let revocation_checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
             };
-            let mut nonce_adapter = BridgeNonceTracker {
-                inner: &mut rt.nonce_tracker,
-            };
+            let mut nonce_adapter = BridgeNonceTracker::new(&mut rt.nonce_tracker, &mut recorded);
 
             let mut ctx = ValidationContext {
                 did_resolver: &did_resolver,
@@ -391,7 +390,15 @@ impl crate::scp::PyScp {
             };
 
             validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)
-        })?;
+        });
+
+        // Step 9 of the pipeline records the token's nonce, so write the
+        // context's nonce entries to durable storage before returning. A
+        // rejected token keeps its own error: the caller is already denied, so
+        // a durability failure on that path grants nothing.
+        let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id, recorded);
+        validated?;
+        persisted?;
 
         Ok(())
     }
@@ -516,9 +523,9 @@ impl crate::scp::PyScp {
             let revocation_checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
             };
-            let mut nonce_adapter = BridgeNonceTracker {
-                inner: &mut rt.nonce_tracker,
-            };
+            let mut never_recorded = None;
+            let mut nonce_adapter =
+                BridgeNonceTracker::new(&mut rt.nonce_tracker, &mut never_recorded);
 
             let ctx = ValidationContext {
                 did_resolver: &did_resolver,
@@ -874,6 +881,12 @@ impl crate::scp::PyScp {
             .map_err(ScpPyError::from)
         })?;
 
+        // Make the revocation durable before returning. The in-memory list
+        // already denies the token, so a failure here leaves the instance in
+        // the more restrictive state and tells the caller the record did not
+        // land.
+        crate::runtime::persist_ucan_revocation_blocking(bi, context_id)?;
+
         Ok(())
     }
 }
@@ -1097,9 +1110,8 @@ mod tests {
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;
 
-        let mut adapter = BridgeNonceTracker {
-            inner: &mut tracker,
-        };
+        let mut recorded = None;
+        let mut adapter = BridgeNonceTracker::new(&mut tracker, &mut recorded);
 
         // First check should succeed.
         assert!(adapter.check_and_record(&nonce, expiry).is_ok());
@@ -2005,6 +2017,136 @@ mod tests {
                 .expect("the supervisor's creator may revoke any token in its context");
             assert!(revoke_checker_reports_revoked(&scp, &ctx_id, &token_cid));
             crate::runtime::remove_context(bi, &ctx_id);
+        });
+    }
+
+    /// A token revoked and a nonce recorded on one bridge instance stay
+    /// revoked and recorded on a new instance opened over the same store.
+    ///
+    /// Instance A creates a context, mints three tokens, revokes the first
+    /// without presenting it, and presents the second. Instance B reopens the
+    /// `SQLCipher` store, restores the context, and registers its bridge state
+    /// through the readmitting registration path, so the only source of B's
+    /// revocation list and nonce tracker is the durable record A wrote. B must
+    /// refuse the first token as revoked, the second as a replay, and accept
+    /// the third.
+    #[test]
+    fn ucan_revocation_and_nonce_survive_a_bridge_instance_restart() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let open = || {
+            crate::scp::PyScp::from_bridge_instance(std::sync::Arc::new(
+                crate::runtime::PyBridgeInstance::with_storage_py(
+                    crate::runtime::StorageConfig::Sqlite {
+                        path: tmp.path().to_path_buf(),
+                        key: crate::runtime::SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(
+                            vec![0x5Au8; 32],
+                        )),
+                    },
+                )
+                .expect("SQLCipher open must succeed"),
+            ))
+        };
+
+        Python::with_gil(|py| {
+            let scp = open();
+            let creator = scp
+                .identity_create(py, "in_memory", None)
+                .expect("identity_create should succeed")
+                .did()
+                .to_owned();
+            let params = pyo3::types::PyDict::new(py);
+            params
+                .set_item("ceiling", vec!["messages:read", "messages:write"])
+                .unwrap();
+            params.set_item("memory_scope", "full").unwrap();
+            let context_id = scp
+                .context_create(py, &creator, &params)
+                .expect("context_create should succeed")
+                .context_id()
+                .to_owned();
+            let member = "did:dht:z6MkPyo3RevokedAcrossRestart";
+            let capability = format!("scp:ctx:{context_id}/messages:read");
+
+            let tokens: Vec<String> = (0..3)
+                .map(|_| {
+                    scp.ucan_mint(
+                        py,
+                        &context_id,
+                        member,
+                        vec!["messages:read".to_owned()],
+                        None,
+                    )
+                    .expect("the creator may mint a token in its own context")
+                    .encoded
+                })
+                .collect();
+            let (revoked, used, untouched) = (&tokens[0], &tokens[1], &tokens[2]);
+
+            // A never presents the revoked token: step 9 records a nonce before
+            // step 10 checks revocation, so a presentation here would make B
+            // refuse it as a replay and hide whether the revocation survived.
+            scp.ucan_revoke(py, &context_id, revoked, &creator)
+                .expect("the context creator may revoke a token in its context");
+            scp.ucan_validate(py, &context_id, used, &capability, member, None)
+                .expect("an unrevoked token validates on A");
+            // The PyO3 resolver keeps its DHT client per instance, and under
+            // `testing` that client is an in-memory store. Hand A's client to B
+            // so B reads the DHT A published to, as two processes share the
+            // Mainline DHT.
+            let dht = crate::runtime::resolver_dht_client(&scp.inner)
+                .expect("identity_create attaches A's DHT client");
+            scp.shutdown(py, 10_000)
+                .expect("A's shutdown must release the store");
+            drop(scp);
+
+            let reopened = open();
+            crate::runtime::init_context_manager_for_test(&reopened.inner);
+            // A restarted process resolves the issuer's DID document through
+            // the resolver an identity call attaches; B makes no identity call.
+            crate::runtime::set_resolver_dht_client(&reopened.inner, dht);
+            crate::identity::ensure_did_resolver_initialized_on(
+                &reopened.inner,
+                crate::runtime().expect("bridge runtime").handle().clone(),
+            )
+            .expect("resolver initialization must succeed on B");
+            let restored = reopened
+                .restore_all_contexts(py)
+                .expect("restore_all_contexts must succeed on the reopened store");
+            assert!(
+                restored.contains(&context_id),
+                "the reopened instance must restore the context: {restored}"
+            );
+            assert!(
+                crate::runtime::with_context(&reopened.inner, &context_id, |_| Ok(())).is_err(),
+                "instance B starts with no per-context UCAN state"
+            );
+            crate::runtime::readmit_and_register_ffi_state(&reopened.inner, &context_id, &[])
+                .expect("B registers the restored context's bridge state");
+
+            let err = reopened
+                .ucan_validate(py, &context_id, revoked, &capability, member, None)
+                .expect_err("a token revoked before the restart must stay revoked after it");
+            assert!(
+                err.to_string().contains("token revoked"),
+                "B reported: {err}"
+            );
+
+            let err = reopened
+                .ucan_validate(py, &context_id, used, &capability, member, None)
+                .expect_err("a nonce accepted before the restart must stay used after it");
+            assert!(
+                err.to_string().contains("nonce reused"),
+                "B reported: {err}"
+            );
+
+            reopened
+                .ucan_validate(py, &context_id, untouched, &capability, member, None)
+                .expect("a token nobody revoked or presented still validates after the restart");
+            reopened
+                .shutdown(py, 10_000)
+                .expect("B's shutdown must release the store");
         });
     }
 }

@@ -301,8 +301,8 @@ impl Harness {
     async fn new(params: ContextParams) -> Self {
         let clock = Arc::new(TestClock::new(scp_clock::Clock::now_secs(&SystemClock)));
         let sup = supervisor(&clock);
-        sup.register_local_did(did(1)).await.unwrap();
-        sup.create_context(EVAL_CTX.to_owned(), params, did(1), None)
+        sup.register_local_did(did(1)).await;
+        sup.create_context(EVAL_CTX.to_owned(), params, did(1), None, Vec::new())
             .await
             .unwrap();
         Self {

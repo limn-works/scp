@@ -40,8 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Register two participants.
     let alice: DID = "did:dht:z6MkAlice".into();
     let bob: DID = "did:dht:z6MkBob".into();
-    manager.register_local_did(alice.clone()).await?;
-    manager.register_local_did(bob.clone()).await?;
+    manager.register_local_did(alice.clone()).await;
+    manager.register_local_did(bob.clone()).await;
 
     // 3. Alice creates a context with messaging capabilities.
     let params = ContextParams {
@@ -56,8 +56,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..ContextParams::default()
     };
 
+    // The example runs in process with no relay, so no relay hosts the context.
     let handle = manager
-        .create_context("chat-demo".to_owned(), params, alice.clone(), None)
+        .create_context(
+            "chat-demo".to_owned(),
+            params,
+            alice.clone(),
+            None,
+            Vec::new(),
+        )
         .await?;
     println!("Alice created context: {}", handle.context_id());
 

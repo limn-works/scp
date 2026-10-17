@@ -1,8 +1,9 @@
 //! §25 Cryptographic Test Vectors — the Rust assertions for the vectors whose
 //! production builders live in `scp-protocol` and `scp-runtime`.
 //!
-//! Every value below is printed in `.docs/specs/25-test-vectors.md` and
-//! produced by `scripts/gen-test-vectors-p256.py`. Each test feeds the spec
+//! Every value below, except the push vectors whose section says so, is
+//! printed in `.docs/specs/25-test-vectors.md` and produced by
+//! `scripts/gen-test-vectors-p256.py`. Each test feeds the spec
 //! inputs to the production builder and asserts the spec output. A test also
 //! hashes the spec's printed preimage and compares that digest with the
 //! production result, which proves the production preimage is byte-identical
@@ -34,6 +35,10 @@ use scp_protocol::context::governance::{
 use scp_protocol::context::outlets::interface::InterfaceOffer;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 use scp_protocol::crypto::sender_keys::key_protocol_verify::build_hpke_info;
+use scp_protocol::discovery::push::{
+    PushDeregistration, PushPlatform, PushRegistration, push_deregistration_signing_bytes,
+    push_registration_routing_id, push_registration_signing_bytes,
+};
 use scp_protocol::envelope::inner::compute_canonical_hash;
 use scp_protocol::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
 use scp_protocol::envelope::{InnerEnvelopeParams, MessageType};
@@ -969,39 +974,201 @@ fn vector37_keypackage_attestation() {
 }
 
 // ---------------------------------------------------------------------------
-// §25.30 Trust challenge vectors (§7.3.4, §7.3.4.6)
+// Push preimages and the reserved push routing ID (§9.5.2, §9.18.2)
+// ---------------------------------------------------------------------------
+//
+// §25 prints no push vector, so these golden values are pinned here. Each was
+// computed from the §9.5.2 tables outside the production builder, and each
+// test checks the production bytes against both the golden hex and a layout
+// the test assembles byte by byte. The registrant is the §25.1 sender fixture
+// in its 56-byte `scp:` text form, the encoding §9.5.2 fixes, so the vectors
+// stay valid when SCP-308 S1 retypes the field.
+
+const PUSH_TOKEN_HEX: &str = "0123456789abcdef";
+const PUSH_TIMESTAMP: u64 = 1_700_000_000;
+const PUSH_DEREGISTER_TIMESTAMP: u64 = 1_700_000_300;
+const PUSH_RELAY_A: &str = "wss://relay.example";
+const PUSH_RELAY_B: &str = "wss://relay.example/scp/v1";
+
+const PUSH_REGISTER_A_HEX: &str = "5343502d505553482d52454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6101000000080123456789abcdef00000002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1ef6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725356e000000006553f100000000137773733a2f2f72656c61792e6578616d706c65";
+const PUSH_REGISTER_B_HEX: &str = "5343502d505553482d52454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6101000000080123456789abcdef00000002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1ef6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725356e000000006553f1000000001a7773733a2f2f72656c61792e6578616d706c652f7363702f7631";
+const PUSH_DEREGISTER_A_HEX: &str = "5343502d505553482d444552454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6102000000080123456789abcdef000000006553f22c000000137773733a2f2f72656c61792e6578616d706c65";
+const PUSH_DEREGISTER_B_HEX: &str = "5343502d505553482d444552454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6102000000080123456789abcdef000000006553f22c0000001a7773733a2f2f72656c61792e6578616d706c652f7363702f7631";
+const PUSH_ROUTING_ID_A_HEX: &str =
+    "b980a702c8f9cc2504a164bde90549a079621c8306fdf64d2c3adefd2739367a";
+const PUSH_ROUTING_ID_B_HEX: &str =
+    "b2f96d91d7b43038f18f9d1b686a5e033f8e07635e9baa819754d6a829942fcd";
+
+fn push_routing_ids() -> [[u8; 32]; 2] {
+    [
+        sha256(b"SCP test vector push routing id 1"),
+        sha256(b"SCP test vector push routing id 2"),
+    ]
+}
+
+fn push_registration_fixture() -> PushRegistration {
+    PushRegistration {
+        registrant: DID::from(ID_SENDER),
+        platform: PushPlatform::Apns,
+        token: unhex(PUSH_TOKEN_HEX),
+        routing_ids: push_routing_ids().to_vec(),
+        timestamp: PUSH_TIMESTAMP,
+        signature: [0; 64],
+    }
+}
+
+fn push_deregistration_fixture() -> PushDeregistration {
+    PushDeregistration {
+        registrant: DID::from(ID_SENDER),
+        platform: PushPlatform::Fcm,
+        token: unhex(PUSH_TOKEN_HEX),
+        timestamp: PUSH_DEREGISTER_TIMESTAMP,
+        signature: [0; 64],
+    }
+}
+
+/// Appends a 4-byte big-endian length and the bytes.
+fn push_var(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// The §9.5.2 `PushRegistration` table, assembled field by field.
+fn push_register_layout(relay_url: &str) -> Vec<u8> {
+    let mut out = b"SCP-PUSH-REGISTER-V1:".to_vec();
+    assert_eq!(ID_SENDER.len(), 56);
+    push_var(&mut out, ID_SENDER.as_bytes());
+    out.push(0x01);
+    push_var(&mut out, &unhex(PUSH_TOKEN_HEX));
+    out.extend_from_slice(&2u32.to_be_bytes());
+    for id in push_routing_ids() {
+        out.extend_from_slice(&id);
+    }
+    out.extend_from_slice(&PUSH_TIMESTAMP.to_be_bytes());
+    push_var(&mut out, relay_url.as_bytes());
+    out
+}
+
+/// The §9.5.2 `PushDeregistration` table, assembled field by field.
+fn push_deregister_layout(relay_url: &str) -> Vec<u8> {
+    let mut out = b"SCP-PUSH-DEREGISTER-V1:".to_vec();
+    push_var(&mut out, ID_SENDER.as_bytes());
+    out.push(0x02);
+    push_var(&mut out, &unhex(PUSH_TOKEN_HEX));
+    out.extend_from_slice(&PUSH_DEREGISTER_TIMESTAMP.to_be_bytes());
+    push_var(&mut out, relay_url.as_bytes());
+    out
+}
+
+#[test]
+fn push_registration_signing_bytes_match_golden_vectors() {
+    let reg = push_registration_fixture();
+    for (url, golden) in [
+        (PUSH_RELAY_A, PUSH_REGISTER_A_HEX),
+        (PUSH_RELAY_B, PUSH_REGISTER_B_HEX),
+    ] {
+        let produced = push_registration_signing_bytes(&reg, url).unwrap();
+        assert_eq!(hex::encode(&produced), golden, "{url}: golden vector");
+        assert_eq!(produced, push_register_layout(url), "{url}: §9.5.2 layout");
+    }
+    assert_eq!(unhex(PUSH_REGISTER_A_HEX).len(), 193);
+}
+
+#[test]
+fn push_deregistration_signing_bytes_match_golden_vectors() {
+    let dereg = push_deregistration_fixture();
+    for (url, golden) in [
+        (PUSH_RELAY_A, PUSH_DEREGISTER_A_HEX),
+        (PUSH_RELAY_B, PUSH_DEREGISTER_B_HEX),
+    ] {
+        let produced = push_deregistration_signing_bytes(&dereg, url).unwrap();
+        assert_eq!(hex::encode(&produced), golden, "{url}: golden vector");
+        assert_eq!(
+            produced,
+            push_deregister_layout(url),
+            "{url}: §9.5.2 layout"
+        );
+    }
+    assert_eq!(unhex(PUSH_DEREGISTER_A_HEX).len(), 127);
+}
+
+#[test]
+fn push_preimages_differ_across_relay_urls() {
+    let reg = push_registration_fixture();
+    assert_ne!(
+        push_registration_signing_bytes(&reg, PUSH_RELAY_A).unwrap(),
+        push_registration_signing_bytes(&reg, PUSH_RELAY_B).unwrap()
+    );
+    let dereg = push_deregistration_fixture();
+    assert_ne!(
+        push_deregistration_signing_bytes(&dereg, PUSH_RELAY_A).unwrap(),
+        push_deregistration_signing_bytes(&dereg, PUSH_RELAY_B).unwrap()
+    );
+}
+
+#[test]
+fn push_preimages_are_equal_across_spellings_of_one_relay_url() {
+    let reg = push_registration_fixture();
+    assert_eq!(
+        hex::encode(push_registration_signing_bytes(&reg, "WSS://Relay.Example:443/").unwrap()),
+        PUSH_REGISTER_A_HEX
+    );
+    let dereg = push_deregistration_fixture();
+    assert_eq!(
+        hex::encode(push_deregistration_signing_bytes(&dereg, "WSS://Relay.Example:443/").unwrap()),
+        PUSH_DEREGISTER_A_HEX
+    );
+}
+
+#[test]
+fn push_registration_routing_id_matches_golden_vectors() {
+    let a = push_registration_routing_id("WSS://Relay.Example:443/").unwrap();
+    assert_eq!(a, push_registration_routing_id(PUSH_RELAY_A).unwrap());
+    assert_eq!(hex::encode(a), PUSH_ROUTING_ID_A_HEX);
+    assert_eq!(
+        a,
+        sha256(&[b"scp-push-registration".as_slice(), PUSH_RELAY_A.as_bytes()].concat())
+    );
+    assert_eq!(
+        hex::encode(push_registration_routing_id(PUSH_RELAY_B).unwrap()),
+        PUSH_ROUTING_ID_B_HEX
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §25.31 Trust challenge vectors (§7.3.4, §7.3.4.6)
 // ---------------------------------------------------------------------------
 
 /// An identifier-scoped URI: `ID_DEFINER` followed by
 /// `:capability:schema-validation/v1`.
 const CHALLENGE_CAPABILITY_URI: &str =
     "scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq:capability:schema-validation/v1";
-/// Vector 63 `definition_digest`.
+/// Vector 65 `definition_digest`.
 const CHALLENGE_DEFINITION_DIGEST_HEX: &str =
     "1947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f67";
-/// Vector 59 `suite_digest`: SHA-256 of `T`, no prefix.
+/// Vector 61 `suite_digest`: SHA-256 of `T`, no prefix.
 const CHALLENGE_SUITE_DIGEST_HEX: &str =
     "9cec9fc1c4c6a8a835e448fd94c33310692514aa51c4b52d2ba2d4a819f13cd8";
-/// Vector 59 `D`.
+/// Vector 61 `D`.
 const CHALLENGE_REQUEST_DIGEST_HEX: &str =
     "bf8a8adb49daf2eb0078296f1a4bd29a637b992aa1c795cf930a863978c0e7e2";
-/// Vector 63 `Def`.
+/// Vector 65 `Def`.
 const VDEF_HEX: &str = "5343502d4341504142494c4954592d444546494e4954494f4e2d56313a000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f7631000000000100001f400000000200000e100000002d4669787475726520646566696e6974696f6e20666f72207370656320323520766563746f72732035392d36322e";
-/// Vector 59 `T`.
+/// Vector 61 `T`.
 const VT_HEX: &str = "0000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d00000006736368656d6100002710";
-/// Vector 59 `R`.
+/// Vector 61 `R`.
 const VR_HEX: &str = "5343502d4348414c4c454e47452d5245512d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76311947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f670000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d00000006736368656d6100002710000000006553f10000000000655542800000000200000e1000001f400000000f746573742d636f6e746578742d3031000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461";
-/// Vector 62 `P`, attempt 2.
+/// Vector 64 `P`, attempt 2.
 const VP2_HEX: &str = "5343502d4348414c4c454e47452d524553502d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20bf8a8adb49daf2eb0078296f1a4bd29a637b992aa1c795cf930a863978c0e7e2000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000020000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d";
-/// Vector 60 attempt-1 response `P`.
+/// Vector 62 attempt-1 response `P`.
 const VP1_HEX: &str = "5343502d4348414c4c454e47452d524553502d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20bf8a8adb49daf2eb0078296f1a4bd29a637b992aa1c795cf930a863978c0e7e2000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000010000000100000015736368656d612d76616c69646174696f6e2d303031000000117b226e616d65223a22776964676574227d";
-/// Vector 60 `verification_id` preimage.
+/// Vector 62 `verification_id` preimage.
 const VID60_HEX: &str = "000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76310102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2000000001000000006553f358";
-/// Vector 60 `R_v`.
+/// Vector 62 `R_v`.
 const VRV60_HEX: &str = "5343502d4348414c4c454e47452d5645524946592d56313a9554fd256e3c6bb5ee6c73e1ca28e72ade44785bde24d84c17869cb1da667b77000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76311947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f679cec9fc1c4c6a8a835e448fd94c33310692514aa51c4b52d2ba2d4a819f13cd80102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2000000001e2d6a7768d281382acb3573e23ba9c76f58c07509c2f7727a151b589a687a1850000000200000e1000001f400000000100000000000000000100000000000000006553f1000000000065554280000000006553f3580000000065ca9a580000000f746573742d636f6e746578742d3031";
-/// Vector 61 `verification_id` preimage.
+/// Vector 63 `verification_id` preimage.
 const VID61_HEX: &str = "000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76310102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000000020000000065540168";
-/// Vector 61 `R_v`.
+/// Vector 63 `R_v`.
 const VRV61_HEX: &str = "5343502d4348414c4c454e47452d5645524946592d56313a5cec3cdef9ef548b71a346c713eead24381a8cac1e0d422e1a788cf524d99d63000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76311947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f679cec9fc1c4c6a8a835e448fd94c33310692514aa51c4b52d2ba2d4a819f13cd80102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2000000002f6e06ef6438935719b8b784119b6f75e8095ea27ffdfb8c60efc1c88bddb49490000000200000e1000001f400000000101000027100000000100000001000000006553f100000000006555428000000000655401680000000065caa8680000000f746573742d636f6e746578742d3031";
 
 fn challenge_vector_id() -> [u8; 32] {
@@ -1128,7 +1295,7 @@ fn assert_challenge_verification_vector(v: &VerificationVector<'_>) -> Vec<u8> {
 }
 
 #[test]
-fn vector_63_capability_definition() {
+fn vector_65_capability_definition() {
     let definition = CapabilityDefinition {
         capability_uri: CHALLENGE_CAPABILITY_URI.to_owned(),
         min_cases: MinCases::Total(1),
@@ -1148,7 +1315,7 @@ fn vector_63_capability_definition() {
 }
 
 #[test]
-fn vector_59_challenge_request() {
+fn vector_61_challenge_request() {
     assert_eq!(
         CHALLENGE_CAPABILITY_URI,
         format!("{ID_DEFINER}:capability:schema-validation/v1")
@@ -1182,7 +1349,7 @@ fn vector_59_challenge_request() {
 }
 
 #[test]
-fn vector_62_challenge_response() {
+fn vector_64_challenge_response() {
     let request = challenge_vector_request();
     assert_eq!(
         challenge_request_signing_digest(&request).unwrap(),
@@ -1217,9 +1384,9 @@ fn vector_62_challenge_response() {
 }
 
 #[test]
-fn vector_60_challenge_verification() {
+fn vector_62_challenge_verification() {
     let rv = assert_challenge_verification_vector(&VerificationVector {
-        label: "vector 60",
+        label: "vector 62",
         attempt: 1,
         response_preimage_hex: VP1_HEX,
         passed: false,
@@ -1237,9 +1404,9 @@ fn vector_60_challenge_verification() {
 }
 
 #[test]
-fn vector_61_challenge_verification_passing_attempt() {
+fn vector_63_challenge_verification_passing_attempt() {
     let rv = assert_challenge_verification_vector(&VerificationVector {
-        label: "vector 61",
+        label: "vector 63",
         attempt: 2,
         response_preimage_hex: VP2_HEX,
         passed: true,
@@ -1300,6 +1467,8 @@ fn domain_separators_are_all_unique() {
         "SCP-KEY-REQUEST-V1:",
         "SCP-DID-AUTH-V1:",
         "SCP-KEYPACKAGE-ATTESTATION-V1:",
+        "SCP-PUSH-REGISTER-V1:",
+        "SCP-PUSH-DEREGISTER-V1:",
     ];
 
     // HKDF/HMAC labels, used as info strings, salts, or trailing labels. A
@@ -1318,6 +1487,7 @@ fn domain_separators_are_all_unique() {
         "scp-test-attestation-v1:",
         "scp-pseudonym",
         "scp-pseudonym-v2",
+        "scp-push-registration",
     ];
 
     let all: Vec<&str> = hash_domains

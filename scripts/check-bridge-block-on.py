@@ -112,16 +112,21 @@ WAIT_NAMES = frozenset(
         "bridge_block_on_off_thread",
         "bridge_block_on_scoped_thread",
         "block_on_shared",
+        "block_on_storage",
     }
 )
 # (file, enclosing function) -> references to a `WAIT_NAMES` function.
 # `<module>` is a reference outside every function (a `use`).
 CALLERS: dict[tuple[str, str], int] = {
     ("crates/scp-ffi/common/src/resolvers.rs", "resolve_sync"): 1,
+    ("crates/scp-ffi/common/src/ucan_durable_state.rs", "block_on_storage"): 1,
     ("crates/scp-ffi/napi/src/event_log.rs", "event_log_checkpoint_by_did_on"): 1,
     ("crates/scp-ffi/napi/src/event_log.rs", "event_log_checkpoint_on"): 1,
     ("crates/scp-ffi/napi/src/lib.rs", "block_on_shared"): 1,
     ("crates/scp-ffi/napi/src/mcp.rs", "held_role_state"): 1,
+    ("crates/scp-ffi/napi/src/runtime.rs", "load_ucan_state_blocking"): 1,
+    ("crates/scp-ffi/napi/src/runtime.rs", "persist_ucan_nonces_blocking"): 1,
+    ("crates/scp-ffi/napi/src/runtime.rs", "persist_ucan_revocation_blocking"): 1,
     ("crates/scp-ffi/napi/src/scp.rs", "identity_execute_custody_migration"): 1,
     ("crates/scp-ffi/napi/src/scpid.rs", "scpid_sign_on"): 1,
     ("crates/scp-ffi/napi/src/scpid.rs", "scpid_verify_on"): 1,
@@ -138,6 +143,7 @@ CALLERS: dict[tuple[str, str], int] = {
     ("crates/scp-ffi/src/identity.rs", "identity_execute_custody_migration"): 1,
     ("crates/scp-ffi/src/lib.rs", "drain_runtime"): 1,
     ("crates/scp-ffi/src/mcp.rs", "block_on_provider_task"): 1,
+    ("crates/scp-ffi/src/runtime.rs", "run_storage_io"): 1,
     ("crates/scp-ffi/uniffi/src/bridge.rs", "add_relay"): 1,
     ("crates/scp-ffi/uniffi/src/bridge.rs", "address_resolve"): 1,
     ("crates/scp-ffi/uniffi/src/bridge.rs", "event_log_checkpoint_by_did_impl"): 1,
@@ -150,6 +156,9 @@ CALLERS: dict[tuple[str, str], int] = {
     ("crates/scp-ffi/uniffi/src/bridge.rs", "scpid_sign_impl"): 1,
     ("crates/scp-ffi/uniffi/src/bridge.rs", "scpid_verify_on"): 1,
     ("crates/scp-ffi/uniffi/src/lib.rs", "block_on_shared"): 1,
+    ("crates/scp-ffi/uniffi/src/runtime.rs", "load_ucan_state_blocking"): 1,
+    ("crates/scp-ffi/uniffi/src/runtime.rs", "persist_ucan_nonces_blocking"): 1,
+    ("crates/scp-ffi/uniffi/src/runtime.rs", "persist_ucan_revocation_blocking"): 1,
 }
 # Every other thread-blocking call, which only the helper file
 # may make. These names block whenever they are called or named.

@@ -318,7 +318,7 @@ Per ADR-048, `BridgeInstance` splits into per-bridge concrete structs sharing a 
 
 Empirical justification: OpenSSL issue [#30659](https://github.com/openssl/openssl/issues/30659) ("Analysis of read locks taken while handshaking") measured `RWLOCK_read_lock` at ~67 cycles per acquire even uncontended vs `__atomic_load_n(__ATOMIC_RELAXED)` at ~17 cycles — a 4× hot-path cost. PR [#30670](https://github.com/openssl/openssl/pull/30670) (merged 2026-04-14) applied the TTAS fix; visible gains on `randbytes`, zero gains on `handshake` (rand was 4% of work; contention shifted to other locks). The takeaway: callsite-cost dominates uncontested-acquire frequency, and lock-elimination at one site shifts contention to whichever site is now the next-most-loaded — not necessarily a macro win.
 
-Our `OnceLock<Arc<dyn …>>` for `crypto`/`transport`/`event_log`/`clock`/`key_resolver` is the Rust equivalent of OpenSSL's TTAS pattern. Doc comments on these accessors should name the lineage ("lock-free read per ADR-049 §Decision 12; same pattern as OpenSSL's `__atomic_load_n` TTAS").
+Our `OnceLock<Arc<dyn …>>` for `crypto`/`transport`/`event_log`/`clock`/`key_resolver` is the Rust equivalent of OpenSSL's TTAS pattern. Amended 2026-10-17 (SCP-322): the `transport` `OnceLock` holds a `TransportSlot`, an `ArcSwap` of the transport provider that a node start rebinds to the node's relay and a node stop rebinds back, and this decision allows it because `ArcSwap` is on its list of allowed read primitives. Doc comments on these accessors should name the lineage ("lock-free read per ADR-049 §Decision 12; same pattern as OpenSSL's `__atomic_load_n` TTAS").
 
 Enforced via `crates/scp-runtime/clippy.toml`:
 

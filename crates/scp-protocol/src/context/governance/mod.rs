@@ -56,7 +56,7 @@ use sha2::{Digest, Sha256};
 
 use super::outlets::OutletId;
 use super::outlets::interface::OutletInterface;
-use super::params::{Capability, ContextParams, OutletRegistration};
+use super::params::{Capability, ContextParams, OutletRegistration, PseudonymRotationPolicy};
 use crate::economy::antispam::HardRateLimitConfig;
 use crate::economy::types::{Amount, EconomicPolicy};
 use scp_did::{DID, SigningKeyId};
@@ -921,6 +921,18 @@ pub enum GovernanceAction {
         /// The complete new list. It replaces the current one.
         requirements: crate::trust::CapabilityRequirements,
     },
+    /// Set, change or remove the context's pseudonym rotation policy
+    /// (`ContextParams.pseudonym_rotation`, 09-security-model.md §9.10.4.1;
+    /// ADR-031 amendment of 2026-10-12).
+    ///
+    /// `None` stops every later rotation, and each member keeps the routing
+    /// ID it holds. A `Some` policy must pass
+    /// [`PseudonymRotationPolicy::validate`]; execution rejects one that does
+    /// not. The action changes no MLS state.
+    ModifyPseudonymRotationPolicy {
+        /// The new value of `ContextParams.pseudonym_rotation`.
+        new_policy: Option<PseudonymRotationPolicy>,
+    },
 }
 
 impl GovernanceAction {
@@ -959,6 +971,7 @@ impl GovernanceAction {
             Self::CancelContextMigration => "CancelContextMigration",
             Self::ModifyHardRateLimit { .. } => "ModifyHardRateLimit",
             Self::ModifyCapabilityRequirements { .. } => "ModifyCapabilityRequirements",
+            Self::ModifyPseudonymRotationPolicy { .. } => "ModifyPseudonymRotationPolicy",
         }
     }
 
@@ -1017,7 +1030,8 @@ impl GovernanceAction {
             | Self::ProposeContextMigration { .. }
             | Self::CancelContextMigration
             | Self::ModifyHardRateLimit { .. }
-            | Self::ModifyCapabilityRequirements { .. } => false,
+            | Self::ModifyCapabilityRequirements { .. }
+            | Self::ModifyPseudonymRotationPolicy { .. } => false,
         }
     }
 
@@ -1108,7 +1122,8 @@ impl GovernanceAction {
             | Self::ProposeContextMigration { .. }
             | Self::CancelContextMigration
             | Self::ModifyHardRateLimit { .. }
-            | Self::ModifyCapabilityRequirements { .. } => None,
+            | Self::ModifyCapabilityRequirements { .. }
+            | Self::ModifyPseudonymRotationPolicy { .. } => None,
         }
     }
 }

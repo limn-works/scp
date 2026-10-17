@@ -29,13 +29,14 @@ use scp_identity::{DidMethod, ScpIdentity};
 use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::NetworkChangeDetector;
-use scp_transport::native::server::{RelayConfig, RelayServer};
+use scp_transport::native::server::{RelayConfig, RelayError, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 
 use crate::{
-    ApplicationNode, DEFAULT_HTTP_BIND_ADDR, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy,
-    NoOpCustody, NoOpDidMethod, NoOpStorage, NodeError, TlsProvider, build_domain_inner,
-    build_no_domain_inner, generate_bridge_secret, generate_dev_token,
+    ApplicationNode, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy, NoOpCustody, NoOpDidMethod,
+    NoOpStorage, NodeError, TlsProvider, build_domain_inner, build_no_domain_inner,
+    domain_relay_url, generate_bridge_secret, generate_dev_token,
     provision_with_challenge_listener, resolve_identity_persistent, resolve_nat, resolve_tls,
 };
 
@@ -371,7 +372,12 @@ pub struct NodeConfig<
     pub bind_addr: Option<SocketAddr>,
     /// Bind address for the local dev API (`None` = dev API disabled).
     pub local_api: Option<SocketAddr>,
-    /// Bind address for the public HTTP server (`None` = default `0.0.0.0:8443`).
+    /// Bind address for the public HTTP server.
+    ///
+    /// `None` leaves the address unconfigured: the node advertises, and NAT
+    /// tier selection uses, the default port 8443; `serve`/`bind` listen on
+    /// `0.0.0.0:8443`; and `serve_background*(None)` listens on loopback
+    /// `127.0.0.1:8443`, never `0.0.0.0`.
     pub http_bind_addr: Option<SocketAddr>,
     /// CORS allowed origins for public endpoints (`None` = permissive `*`).
     pub cors_origins: Option<Vec<String>>,
@@ -533,6 +539,15 @@ struct ConfigTail {
 /// Validates the config, returning a loud error for contradictory combinations
 /// (ADR-052 M2/M3 — fail loud, never silent).
 ///
+/// Public and re-exported as `scp_node::validate_reach_and_tls`
+/// (`.docs/prds/main.json` SCP-319).
+///
+/// # Errors
+///
+/// Returns [`NodeError::InvalidConfig`] for each `✗` cell of the matrix below:
+/// `Reach::Domain` with `TlsMode::Plaintext`, and `TlsMode::Acme` with any
+/// non-`Domain` reach.
+///
 /// # TLS × Reach validity matrix
 ///
 /// The first axis is TLS-vs-Reach; every cell below is decided (never a silent
@@ -570,7 +585,7 @@ struct ConfigTail {
 /// deliberate, explicit opt-in (`Disabled` is the default). Erroring on
 /// `Disabled` would reject the safe direction and nudge callers toward the
 /// disclosing one, so it is never rejected here.
-fn validate_config(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
+pub fn validate_reach_and_tls(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
     // TLS axis, rule 1: Domain cannot serve plaintext.
     if matches!(reach, Reach::Domain { .. }) && matches!(tls, TlsMode::Plaintext) {
         return Err(NodeError::InvalidConfig(
@@ -609,7 +624,7 @@ fn validate_config(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
 /// no-publish. The `dht_gateways` field is still dropped here (not yet threaded
 /// end-to-end on the `Node::start` path — see #2153).
 ///
-/// `validate_config` borrows `config.reach` / `config.tls` and so MUST run
+/// `validate_reach_and_tls` borrows `config.reach` / `config.tls` and so MUST run
 /// **before** this function moves `config` — callers keep that ordering.
 fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
     config: NodeConfig<K, D, S>,
@@ -692,7 +707,7 @@ fn resolve_nat_slot(nat: NatSlot) -> Arc<dyn NatStrategy> {
 ///   (non-domain builds skip TLS provisioning entirely — no domain to sign for).
 /// - `Acme` returns `None`: the engine's default `resolve_tls` constructs the
 ///   `AcmeProvider` for the domain (only ever reached on a `Domain` reach —
-///   `validate_config` already rejected `Acme` on every non-`Domain` reach). The
+///   `validate_reach_and_tls` already rejected `Acme` on every non-`Domain` reach). The
 ///   ACME contact email is threaded separately via the engine's `acme_email`.
 /// - `Terminated` (TLS terminated upstream by a tunnel/reverse proxy) on a
 ///   `Domain` reach installs the **no-network** [`SelfSignedTlsProvider`]: the
@@ -704,7 +719,7 @@ fn resolve_nat_slot(nat: NatSlot) -> Arc<dyn NatStrategy> {
 ///   the construction standard forbids. The upstream proxy presents the real CA
 ///   certificate to the public; the node-side self-signed cert only secures the
 ///   proxy↔node hop.
-/// - `Plaintext` is only valid on a non-`Domain` reach (`validate_config` already
+/// - `Plaintext` is only valid on a non-`Domain` reach (`validate_reach_and_tls` already
 ///   rejected `Domain` + `Plaintext`); no-domain mode skips TLS, so it returns
 ///   `None` (no-op). On a non-`Domain` reach, `Terminated` is likewise `None`
 ///   (the loopback listener is plaintext; the proxy adds TLS).
@@ -726,7 +741,7 @@ fn tls_override(tls: TlsMode, reach: &Reach) -> Option<Arc<dyn TlsProvider>> {
         // `Acme` and `Plaintext` both return no override, for distinct reasons:
         //   - `Acme`: the engine's `resolve_tls` constructs the default
         //     `AcmeProvider::new(domain)` and threads `acme_email` itself
-        //     (only ever reached on a `Domain` reach — `validate_config` rejects
+        //     (only ever reached on a `Domain` reach — `validate_reach_and_tls` rejects
         //     `Acme` on every non-`Domain` reach).
         //   - `Plaintext`: only valid on a non-`Domain` reach (Domain+Plaintext
         //     errored already); no-domain mode skips TLS, so it is a no-op.
@@ -889,7 +904,10 @@ async fn build_node_domain<D, S>(
     dht: DhtMode,
     bind_addr: Option<SocketAddr>,
     local_api: Option<SocketAddr>,
-    http_bind_addr_opt: Option<SocketAddr>,
+    // Threaded as an `Option` to `NodeState`, which records whether the caller
+    // configured an address, so `serve_background*` falls back to loopback and
+    // not to the all-interfaces `DEFAULT_HTTP_BIND_ADDR` (SCP-320).
+    http_bind_addr: Option<SocketAddr>,
     cors_origins: Option<Vec<String>>,
     projection_rate_limit_opt: Option<u32>,
     dns_provider: Option<crate::dns_provider::DnsProviderConfig>,
@@ -940,10 +958,14 @@ where
 
     let bridge_secret = generate_bridge_secret();
     let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+    // The relay knows the URL the node publishes, so it reserves the matching
+    // push routing ID and answers a PUBLISH there itself (§10.7.1).
+    let relay_url = RelayUrl::new(&domain_relay_url(&domain))
+        .map_err(|e| NodeError::InvalidConfig(format!("relay URL for domain {domain}: {e}")))?;
     let relay_config = RelayConfig {
         bind_addr,
         bridge_secret: Some(*bridge_secret),
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
     // The caller's explicit blob-backend selection, threaded verbatim — never
@@ -963,7 +985,6 @@ where
     let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start().await?;
     let dev_token = local_api.map(generate_dev_token);
-    let http_bind_addr = http_bind_addr_opt.unwrap_or(DEFAULT_HTTP_BIND_ADDR);
 
     let tls_provider = resolve_tls(
         tls_provider_override,
@@ -1036,7 +1057,7 @@ where
                 local_api,
                 blob_storage,
                 relay_config,
-                Some(http_bind_addr),
+                http_bind_addr,
                 cors_origins,
                 rate_limit,
                 network_detector,
@@ -1085,10 +1106,25 @@ where
     // 3. Start relay server.
     let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
     let bridge_secret = generate_bridge_secret();
+    // The listener binds first so the relay starts on the URL of the address it
+    // actually serves, even for a port-0 bind. `build_no_domain_inner` then sets
+    // the advertised URL on this shared handle before the node publishes any
+    // URL, and the tier task moves it on each tier change to a URL with a
+    // §9.18.2 canonical form (§10.7.1 step 2).
+    let listener = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .map_err(|e| RelayError::BindFailed(e.to_string()))?;
+    let seed_url = crate::bound_relay_ws_url(
+        listener
+            .local_addr()
+            .map_err(|e| RelayError::BindFailed(e.to_string()))?,
+    );
+    let relay_url = RelayUrl::new(&seed_url)
+        .map_err(|e| NodeError::InvalidConfig(format!("relay URL {seed_url}: {e}")))?;
     let relay_config = RelayConfig {
         bind_addr,
         bridge_secret: Some(*bridge_secret),
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
     // The caller's explicit blob-backend selection, threaded verbatim — never
@@ -1105,7 +1141,7 @@ where
     // unused in no-domain mode, kept for a uniform NodeState).
     #[cfg(feature = "quic")]
     let did_slot_registry = relay_server.did_slot_registry();
-    let (shutdown_handle, bound_addr) = relay_server.start().await?;
+    let (shutdown_handle, bound_addr) = relay_server.start_with_listener(listener).await?;
 
     // 4. Generate dev API token if local_api was configured.
     let dev_token = local_api.map(generate_dev_token);
@@ -1217,9 +1253,9 @@ impl Node {
         D: DidMethod + 'static,
         S: EncryptedStorage + 'static,
     {
-        // `validate_config` borrows `config.reach` / `config.tls`, so it MUST
+        // `validate_reach_and_tls` borrows `config.reach` / `config.tls`, so it MUST
         // run before `split_config` moves `config`.
-        validate_config(&config.reach, &config.tls)?;
+        validate_reach_and_tls(&config.reach, &config.tls)?;
         let (storage, identity, tail) = split_config(config);
 
         // Production constructor: `ProtocolRepository::new` (the only difference
@@ -1303,9 +1339,9 @@ impl Node {
         D: DidMethod + 'static,
         S: Storage + 'static,
     {
-        // `validate_config` borrows `config.reach` / `config.tls`, so it MUST
+        // `validate_reach_and_tls` borrows `config.reach` / `config.tls`, so it MUST
         // run before `split_config` moves `config`.
-        validate_config(&config.reach, &config.tls)?;
+        validate_reach_and_tls(&config.reach, &config.tls)?;
         let (storage, identity, tail) = split_config(config);
 
         // Testing constructor: `ProtocolRepository::new_for_testing` (the only
@@ -1451,6 +1487,17 @@ mod tests {
             node.relay_url(),
             "wss://config-gen.example.com/scp/v1",
             "domain mode should publish the wss:// relay url (spec §18.5.2)"
+        );
+        // The relay server reserves the push routing ID of the published URL
+        // (§10.7.1 step 2), so a PUBLISH there is answered, never stored.
+        assert_eq!(
+            node.state
+                .relay_config
+                .relay_url
+                .current()
+                .push_routing_id(),
+            RelayUrl::new(&node.relay_url()).unwrap().push_routing_id(),
+            "the domain node's relay must reserve the push routing ID of its published URL"
         );
         node.shutdown();
     }
@@ -2215,14 +2262,14 @@ mod tests {
         // domain `build()` falls through to `AcmeProvider::new(domain)` with no
         // contact email). It must be a VALID config on a `Reach::Domain` reach —
         // no loud error (the DHT mode does not affect TLS×Reach validity).
-        // We assert at the `validate_config` layer rather than building, because
+        // We assert at the `validate_reach_and_tls` layer rather than building, because
         // a real ACME provision would contact Let's Encrypt over the network;
         // validation is the observable acceptance gate before any provisioning.
         let reach = Reach::Domain {
             domain: "config-acme-headless.example.com".to_owned(),
         };
         let tls = TlsMode::Acme { email: None };
-        validate_config(&reach, &tls)
+        validate_reach_and_tls(&reach, &tls)
             .expect("Domain + Acme { email: None } must be a valid config");
     }
 

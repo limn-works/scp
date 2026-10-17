@@ -468,7 +468,8 @@ public extension ContextParams {
         economicPolicy: String? = nil,
         consequenceRules: [ConsequenceRule]?,
         consequenceConfig: ConsequenceConfig?,
-        capabilityRequirements: [CapabilityRequirement]? = nil
+        capabilityRequirements: [CapabilityRequirement]? = nil,
+        pseudonymRotation: PseudonymRotationPolicy? = nil
     ) throws {
         let rulesJson = try consequenceRules.map { try encodeConsequenceRulesJson($0) }
         let configJson = try consequenceConfig.map { try encodeConsequenceConfigJson($0) }
@@ -488,7 +489,8 @@ public extension ContextParams {
             economicPolicy: economicPolicy,
             consequenceRulesJson: rulesJson,
             consequenceConfigJson: configJson,
-            capabilityRequirementsJson: requirementsJson
+            capabilityRequirementsJson: requirementsJson,
+            pseudonymRotation: pseudonymRotation
         )
     }
 }

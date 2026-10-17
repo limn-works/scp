@@ -36,9 +36,12 @@
         "PUSH-015",
         "PUSH-016",
         "PUSH-019",
+        "PUSH-025",
         "PUSH-026",
         "PUSH-028",
-        "PUSH-029"
+        "PUSH-029",
+        "PUSH-030",
+        "PUSH-031"
       ]
     },
     {
@@ -68,7 +71,7 @@
       "gate": "gate-push-spec",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/specs/10-infrastructure-and-self-hosting.md",
         ".docs/adrs/phase-5.md",
@@ -149,7 +152,7 @@
       "gate": "gate-push-spec",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/specs/22-human-readable-addressing.md",
         ".docs/specs/09-security-model.md",
@@ -246,7 +249,7 @@
       "gate": "gate-push-spec",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/specs/10-infrastructure-and-self-hosting.md",
         ".docs/specs/22-human-readable-addressing.md"
@@ -310,7 +313,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-protocol/src/discovery/push.rs",
         "crates/scp-runtime/tests/test_vectors.rs",
@@ -370,7 +373,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-identity/src/push_verify.rs",
         "crates/scp-identity/src/lib.rs",
@@ -435,7 +438,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/push_store.rs",
         "crates/scp-transport/src/relay/mod.rs"
@@ -497,13 +500,25 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/server.rs",
         "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-transport/src/relay/mod.rs",
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/quic/listener.rs",
+        "crates/scp-transport/src/udp/listener.rs",
+        "crates/scp-transport/src/webtransport/session.rs",
+        "crates/scp-transport/src/webtransport/server.rs",
+        "crates/scp-transport/src/startup.rs",
+        "crates/scp-node/src/http.rs",
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/published_state.rs",
+        "crates/scp-ffi/common/src/server.rs",
         "crates/scp-relay-client/src/error.rs"
       ],
-      "description": "Adds `RelayConfig.push: PushRole` with the variants `Disabled` and `Enabled(PushServiceConfig)`. `Disabled` is the default, because it fails safe in the same way as `BridgeRole::Disabled` (ADR-052, the unified construction pattern, M2 and M4). `PushServiceConfig` holds the store, the `Arc<dyn PushSignatureVerifier>` and the configured senders; all three are required, with no defaults. The push gate runs in `handle_publish` beside `did_slots.gate_publish`, after the rate-limit, size and TTL checks and before `storage.store`. On any verifier rejection the relay stores nothing and changes nothing. File location `push_gate.rs` is an indicator. The operation is relay-internal and has no client dispatch, so the `pw` row is n/a.",
+      "description": "Adds `RelayConfig.push: PushRole` with the variants `Disabled` and `Enabled(PushServiceConfig)`. `Disabled` is the default, because it fails safe in the same way as `BridgeRole::Disabled` (ADR-052, the unified construction pattern, M2 and M4). `PushServiceConfig` holds the store, the `Arc<dyn PushSignatureVerifier>` and the configured senders; all three are required, with no defaults. `RelayConfig.relay_url` is a required `LiveRelayUrl` handle holding the relay's \u00a79.18.2 canonical URL, from which the relay derives its reserved push routing ID and rebuilds every preimage (\u00a710.7.1 steps 2 and 3). `RelayConfig` has no `Default` (M4 fires on `relay_url`), so no relay is built without a URL. A full node seeds the handle from its domain or its NAT tier address, and the NAT-tier task sets it before republishing on a tier change; the handle keeps a bounded list of retired routing IDs, and a PUBLISH to one is refused and never stored. The push gate runs in the PUBLISH handler of every relay transport that stores blobs (WebSocket, QUIC, UDP/DTLS and WebTransport) beside `did_slots.gate_publish`, after the rate-limit, size and TTL checks and before `storage.store`; the QUIC and WebTransport configurations carry clones of the same `relay_url` handle and the same `push` field, so every listener reads one URL and a change moves all of them at once. On any verifier rejection the relay stores nothing and changes nothing. File location `push_gate.rs` is an indicator. The operation is relay-internal and has no client dispatch, so the `pw` row is n/a.",
       "acceptanceCriteria": [
         "A PUBLISH to the reserved routing ID never reaches `storage.store` or `deliver_to_subscribers`, whatever the result; tests prove this by querying and subscribing to the reserved routing ID afterwards.",
         "A relay with `Disabled` returns 4063.",
@@ -513,7 +528,8 @@
         "A relay returns 4062 for a timestamp outside the skew window (indicator: \u00b1300 s) or not newer than the stored one.",
         "A relay returns 4061 for a platform with no configured sender.",
         "A valid deregistration removes exactly its own key.",
-        "The new codes are constants in `crates/scp-relay-client/src/error.rs`."
+        "The new codes are constants in `crates/scp-relay-client/src/error.rs`.",
+        "Every listener (WebSocket, QUIC, UDP/DTLS, WebTransport) reads the shared relay URL handle: after a URL change it intercepts the new reserved routing ID and refuses the previous one, storing nothing at either; a full node's NAT tier change to a URL with a \u00a79.18.2 canonical form moves the handle, and a change to a URL without one (a tier 3 `bridge_target` URL) leaves it in place."
       ],
       "actionItems": [
         "Add `PushRole` and `PushServiceConfig` to `RelayConfig`.",
@@ -656,7 +672,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-transport/src/relay/push_apns.rs",
         "crates/scp-transport/Cargo.toml"
@@ -703,7 +719,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-transport/src/relay/push_fcm.rs",
         "crates/scp-transport/Cargo.toml"
@@ -777,6 +793,7 @@
         "Expose the selection in the `scp-node` builder."
       ],
       "blockedBy": [
+        "PUSH-007",
         "PUSH-010",
         "PUSH-011"
       ],
@@ -814,19 +831,22 @@
       "gate": "gate-push-client",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/actor/commands.rs",
+        "crates/scp-runtime/src/context/actor/mod.rs",
         "crates/scp-runtime/src/context/actor/handlers/push.rs",
-        "crates/scp-runtime/src/context/actor/handlers/push_helpers.rs",
         "crates/scp-runtime/src/context/actor/handlers/mod.rs",
+        "crates/scp-runtime/src/context/push_helpers.rs",
+        "crates/scp-runtime/src/context/mod.rs",
         "crates/scp-testing/tests/integration/pipeline_wiring.rs"
       ],
-      "description": "`Supervisor::push_routing_ids()` fans a query out to each standing context actor. Each actor returns its `context_routing_id` and this device's current `pseudonym_routing_id` (\u00a79.10.4). The Supervisor groups the results by relay URL. FFI, SDK and matrix rows are covered by PUSH-015.",
+      "description": "`Supervisor::push_routing_ids()` fans a query out to each standing context actor. Each actor returns its `context_routing_id` and this device's current `pseudonym_routing_id` (\u00a79.10.4). The Supervisor groups the results by canonical relay URL (\u00a79.18.2). FFI, SDK and matrix rows are covered by PUSH-015.",
       "acceptanceCriteria": [
         "With two contexts on two relays, the result maps each relay to exactly the routing IDs of the contexts on it.",
-        "After a pseudonym rotation, the result holds the new pseudonym routing ID and not the old one.",
-        "The query runs `dispatch_query` \u2192 actor mailbox \u2192 `handlers/push.rs` \u2192 `push_helpers.rs`.",
+        "the result contains this device's current local pseudonym routing ID for each context; after the local pseudonym changes, the next query returns the new one and not the old one",
+        "The query runs `dispatch_push_command` \u2192 actor mailbox \u2192 `handlers/push.rs` \u2192 `push_helpers.rs`.",
         "`pipeline_wiring.rs` asserts that step."
       ],
       "actionItems": [
@@ -834,7 +854,7 @@
         "Add the `pipeline_wiring.rs` assertion."
       ],
       "blockedBy": [
-        "PUSH-004"
+        "PUSH-025"
       ],
       "sources": [
         {
@@ -1153,7 +1173,7 @@
       "gate": "gate-push-client",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/common/src/error_codes.rs",
         "crates/scp-ffi/common/src/custody_parse.rs",
@@ -1235,7 +1255,7 @@
       "gate": "gate-push-webpush",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/specs/10-infrastructure-and-self-hosting.md",
         ".docs/specs/22-human-readable-addressing.md",
@@ -1482,12 +1502,68 @@
       ]
     },
     {
+      "id": "PUSH-025",
+      "title": "The runtime persists each context's relay set",
+      "gate": "gate-push-client",
+      "priority": "P0",
+      "severity": "major",
+      "status": "done",
+      "files": [
+        "crates/scp-runtime/src/context/actor/state.rs",
+        "crates/scp-runtime/src/context/state.rs",
+        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
+        "crates/scp-runtime/src/context/actor/commands.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/export_import.rs",
+        "crates/scp-runtime/src/context/manager_methods.rs",
+        "crates/scp-runtime/src/context/messaging_helpers.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/napi/src/runtime.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs"
+      ],
+      "description": "Each context's actor state holds the relay endpoints that host the context, the set the \u00a75.12.3.1 `InvitationBundle` carries as `relay_urls`. The creator sets it at create, a joiner takes the bundle's `relay_urls` at join, and import and restore install the set the snapshot stored. Each path stores a URL in its \u00a79.18.2 canonical form when it has one. PUSH-013 groups routing IDs by this set.",
+      "acceptanceCriteria": [
+        "`PerContextState` holds `relay_urls`, and `ContextSnapshot` persists it with no serde default.",
+        "`Supervisor::create_context` takes the creator's relay set, and the created context holds it.",
+        "A Welcome joiner's context holds the `relay_urls` of the `InvitationBundle` it joined through.",
+        "A snapshot of a context round-trips its relay set, and import and restore install the stored set.",
+        "Create, Welcome join, import and restore store each relay URL as its \u00a79.18.2 canonical relay URL when the URL has one, and store every other URL exactly as written (\u00a75.12.3.1 `relay_urls`). Two spellings of one relay become one stored entry, and no relay URL fails any of the four operations.",
+        "Every FFI bridge's create passes the bridge's connected relay set; no production caller passes an empty set when a relay set exists."
+      ],
+      "actionItems": [
+        "Add the field to `PerContextState` and `ContextSnapshot`, and set it on the create, join, import and restore paths.",
+        "Pass the relay set through every create caller in the runtime, the FFI bridges and the node.",
+        "Test create, join, the snapshot round trip and restore."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "#### 5.12.3.1 InvitationBundle Wire Format"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "existing create, join, import and restore paths",
+          "pw": "no new operation",
+          "ffi": "create passes the relay set",
+          "sdk": "no API change",
+          "matrix": "no new row"
+        }
+      }
+    },
+    {
       "id": "PUSH-026",
       "title": "Pseudonym rotation in the runtime: policy, actor trigger, persisted epoch, announcement and ordered receipt",
       "gate": "gate-push-client",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-protocol/src/context/params.rs",
         "crates/scp-protocol/src/context/governance/mod.rs",
@@ -1514,7 +1590,7 @@
         "crates/scp-ffi/common/src/validate.rs",
         "crates/scp-testing/tests/integration/pipeline_wiring.rs"
       ],
-      "description": "Implements the runtime half of pseudonym rotation, which \u00a79.10.4.1 of the security-model spec (pseudonym rotation, the BLACK-001 mitigation) specifies; issue #366, the closed pseudonym-rotation feature issue, tracked it. PUSH-027, the rotation spec amendment, wrote every clause this story cites. A context opts into rotation through `ContextParams.pseudonym_rotation`, which context governance sets through `ModifyPseudonymRotationPolicy` (ADR-031, multi-admin governance models). Contexts that do not opt in keep the v1 static pseudonym of \u00a79.10.4, as a per-context configuration choice and not a compatibility shim. The context actor owns rotation timing: an actor-owned timer arm, armed from persisted state like the TTL arm (ADR-049, the actor-per-context concurrency model, Decision 1 and A3), plus the membership-change trigger. The actor holds no signer and no KeyCustody, so the actor only signals that a rotation is due. PUSH-028, the rotation bridge story, builds the bridge-side driver that derives the new routing ID through `KeyCustody::derive_rotatable_pseudonym` and dispatches it back as `RotatePseudonym`. This story builds everything the driver dispatches into: the command, the fail-closed persist of the rotation state, the v2 announcement, the epoch-ordered receipt in `scp-runtime` and `scp-client`, the local-routing-ID query, and the `LocalPseudonymRotated` event. Bindings from keri: rotation reads no key state; an identity-key cut-over (keri slice S12) changes every pseudonym, so no persisted routing ID is assumed to survive a cut-over; native and browser pseudonyms differ by design (\u00a79.10.4.A). Merge order: the PR that adds the rotation state to `ContextSnapshot` merges after PUSH-025 and rebases on it. PUSH-025 is a story not yet on main that changes `PerContextState` and `ContextSnapshot` through the same `build_snapshot_from_state`, `strip_snapshot_for_public` and governance-migration paths, and its field has no serde default. PUSH-025 stays out of `blockedBy` because `scripts/validate-prd.py` rejects a reference to a story that push.json does not contain. The push registrar's re-registration on rotation is PUSH-029, not this story. Types and file locations named here (`RotatePseudonym`, `LocalRoutingIds`, `LocalPseudonymRotated`, `PseudonymRotationState`) are indicators.",
+      "description": "Implements the runtime half of pseudonym rotation, which \u00a79.10.4.1 of the security-model spec (pseudonym rotation, the BLACK-001 mitigation) specifies; issue #366, the closed pseudonym-rotation feature issue, tracked it. PUSH-027, the rotation spec amendment, wrote every clause this story cites. A context opts into rotation through `ContextParams.pseudonym_rotation`, which context governance sets through `ModifyPseudonymRotationPolicy` (ADR-031, multi-admin governance models). Contexts that do not opt in keep the v1 static pseudonym of \u00a79.10.4, as a per-context configuration choice and not a compatibility shim. The context actor owns rotation timing: an actor-owned timer arm, armed from persisted state like the TTL arm (ADR-049, the actor-per-context concurrency model, Decision 1 and A3), plus the membership-change trigger. The actor holds no signer and no KeyCustody, so the actor only signals that a rotation is due. PUSH-028, the rotation bridge story, builds the bridge-side driver that derives the new routing ID through `KeyCustody::derive_rotatable_pseudonym` and dispatches it back as `RotatePseudonym`. This story builds everything the driver dispatches into: the command, the fail-closed persist of the rotation state, the v2 announcement, the epoch-ordered receipt in `scp-runtime` and `scp-client`, the local-routing-ID query, and the `LocalPseudonymRotated` event. Bindings from keri: rotation reads no key state; any change to the key or secret that `pseudonym_secret` derives from (\u00a79.10.4.A) (keri slice S12) changes every pseudonym, so no persisted routing ID is assumed to survive that change; native and browser pseudonyms differ by design (\u00a79.10.4.A). Merge order: the PR that adds the rotation state to `ContextSnapshot` merges after PUSH-025 and rebases on it. PUSH-025 is a story not yet on main that changes `PerContextState` and `ContextSnapshot` through the same `build_snapshot_from_state`, `strip_snapshot_for_public` and governance-migration paths, and its field has no serde default. PUSH-025 stays out of `blockedBy` because `scripts/validate-prd.py` rejects a reference to a story that push.json does not contain. The push registrar's re-registration on rotation is PUSH-029, not this story. The DID-level membership-change classifier, and the rotation-due signal and record deletion on a processed membership Commit, are PUSH-030, the non-committing member story. Types and file locations named here (`RotatePseudonym`, `LocalRoutingIds`, `LocalPseudonymRotated`, `PseudonymRotationState`) are indicators.",
       "acceptanceCriteria": [
         "Opt-in (\u00a79.10.4.1 'Rotation is opt-in'): in a context created without a rotation policy, the local routing ID equals the v1 derivation (\u00a79.10.4), and a test clock advanced past 1000 policy periods produces zero rotation signals and an unchanged routing ID.",
         "Policy in governance (\u00a79.10.4.1 'Rotation policy, and where it lives'): a context created with a rotation policy persists it in `ContextParams`. An executed `ModifyPseudonymRotationPolicy` that sets or changes the policy takes effect on the next actor turn and survives restore. A non-member's or unapproved proposal leaves the policy unchanged. Context creation and the action each reject a policy that sets no trigger, and a policy whose `interval_secs` is below 600 s. An executed action that sets `None` produces zero later rotation signals, and the local routing ID stays the routing ID held before the action.",
@@ -1540,7 +1616,9 @@
       ],
       "blockedBy": [
         "PUSH-027",
-        "PUSH-013"
+        "PUSH-013",
+        "PUSH-030",
+        "PUSH-031"
       ],
       "sources": [
         {
@@ -1600,7 +1678,7 @@
         ".docs/adrs/phase-2.md",
         ".docs/prds/push.json"
       ],
-      "description": "Closes the twelve gaps that \u00a79.10.4.1 of the security-model spec (pseudonym rotation, the BLACK-001 mitigation) left open, so that PUSH-026 and PUSH-028 cite stated behaviour. \u00a79.10.4.1 gains a clause each for the rotation policy and its governance action, the epoch schedule, the first v2 derivation, the v2 announcement wire format, the announcement channel, receipt ordering, the grace, the rotation order and crash recovery, the identity-key cut-over, leave and close during a grace, and reconnect catch-up. \u00a79.10.4.A gains the browser interim, \u00a79.10.11 gains the relay-linkage residual, and \u00a79.18.11 registers the application-data blob TTL and the pseudonym rotation grace. \u00a725.19 gains Vector 58, the v2 rotation announcement and its classifier decisions; Vector 37 already belongs to the KeyPackage attestation vector of \u00a725.23. ADR-031, multi-admin governance models, gains `ModifyPseudonymRotationPolicy`. Docs only.",
+      "description": "Closes the twelve gaps that \u00a79.10.4.1 of the security-model spec (pseudonym rotation, the BLACK-001 mitigation) left open, so that PUSH-026 and PUSH-028 cite stated behaviour. \u00a79.10.4.1 gains a clause each for the rotation policy and its governance action, the epoch schedule, the first v2 derivation, the v2 announcement wire format, the announcement channel, receipt ordering, the grace, the rotation order and crash recovery, the change of the pseudonym-secret source, leave and close during a grace, and reconnect catch-up. \u00a79.10.4.A gains the browser interim, \u00a79.10.11 gains the relay-linkage residual, and \u00a79.18.11 registers the application-data blob TTL and the pseudonym rotation grace. \u00a725.19 gains Vector 58, the v2 rotation announcement and its classifier decisions; Vector 37 already belongs to the KeyPackage attestation vector of \u00a725.23. ADR-031, multi-admin governance models, gains `ModifyPseudonymRotationPolicy`. Docs only.",
       "acceptanceCriteria": [
         "\u00a79.10.4.1 states each of the twelve gaps as a normative clause, and each clause names its criterion.",
         "\u00a725.19 adds Vector 58 for the rotation-announcement MessagePack layout and its classifier decisions, including the epoch-ordering rejects.",
@@ -1674,20 +1752,20 @@
         "crates/scp-testing/tests/integration/pipeline_wiring.rs",
         ".docs/standards/sdk-capability-matrix.json"
       ],
-      "description": "Implements the bridge half of pseudonym rotation (\u00a79.10.4.1 of the security-model spec), on top of the runtime half in PUSH-026. The context actor holds no KeyCustody, so a bridge-side driver in `scp-ffi-common`, modelled on `heartbeat_scheduler.rs`, holds a weak Supervisor reference, the custody, the identity key handle and a cancel token. On a 'rotation due' signal or on start, the driver reads `LocalRoutingIds`, calls `derive_rotatable_pseudonym` at the next epoch, and dispatches `RotatePseudonym`. At start it also runs the identity-key cut-over check and re-publishes a pending announcement. napi `context_subscribe_on` replaces its one-time pseudonym subscription with the routing-ID set that `LocalRoutingIds` returns, re-read on rotation and grace-end events and on a periodic tick, and spawns and tears down the driver next to the heartbeat scheduler. Reconnect catch-up covers the same set, which also changes what PUSH-016, device wake handling, pulls. UniFFI (whose `context_subscribe` is a stub) and PyO3 (which has no subscribe loop) export only the policy through `ContextParams` and the governance action, and the capability matrix records their dual-subscription rows as exemptions. Per the plan's PR split, the dual-subscription, restore-subscription and napi/matrix wiring criteria move here from PUSH-026. The custody-call, cut-over and destroyed-identity criteria also move here, because the driver this story builds is the only caller of the custody. Type and file names (`pseudonym_rotation_scheduler.rs`) are indicators.",
+      "description": "Implements the bridge half of pseudonym rotation (\u00a79.10.4.1 of the security-model spec), on top of the runtime half in PUSH-026. The context actor holds no KeyCustody, so a bridge-side driver in `scp-ffi-common`, modelled on `heartbeat_scheduler.rs`, holds a weak Supervisor reference, the custody, the identity key handle and a cancel token. On a 'rotation due' signal or on start, the driver reads `LocalRoutingIds`, calls `derive_rotatable_pseudonym` at the next epoch, and dispatches `RotatePseudonym`. At start it also runs the \u00a79.10.4.1 re-derivation check for a change of the pseudonym-secret source and re-publishes a pending announcement. napi `context_subscribe_on` replaces its one-time pseudonym subscription with the routing-ID set that `LocalRoutingIds` returns, re-read on rotation and grace-end events and on a periodic tick, and spawns and tears down the driver next to the heartbeat scheduler. Reconnect catch-up covers the same set, which also changes what PUSH-016, device wake handling, pulls. UniFFI (whose `context_subscribe` is a stub) and PyO3 (which has no subscribe loop) export only the policy through `ContextParams` and the governance action, and the capability matrix records their dual-subscription rows as exemptions. Per the plan's PR split, the dual-subscription, restore-subscription and napi/matrix wiring criteria move here from PUSH-026. The custody-call, pseudonym-secret-source and destroyed-identity criteria also move here, because the driver this story builds is the only caller of the custody. Type and file names (`pseudonym_rotation_scheduler.rs`) are indicators.",
       "acceptanceCriteria": [
         "Custody call only (\u00a79.10.4.1 'Custody compatibility'; keri ruling): a counting custody double records exactly one `derive_rotatable_pseudonym` call per rotation, with `pseudonym_epoch` = persisted epoch + 1, and no other custody or key-state read. For identity seed 0x01\u00d732 at epoch 1 the new routing ID equals the \u00a725.19 Vector 30 v2 routing ID.",
         "First v2 derivation (\u00a79.10.4.1 'First v2 derivation, at join and when rotation is enabled'): a member that joins a context whose interval policy puts the test clock at schedule index k = 3 derives its routing ID with v2 at epoch 3. A v1 member of a live context on which governance enables rotation keeps its v1 routing ID until its next trigger, and that rotation derives v2 at the schedule index k of that moment.",
         "Dual subscription, then drop (\u00a79.10.4.1 'Transition protocol and grace'): from rotation until rotation time + 600 s, the napi subscribe loop holds subscriptions on both the old and the new routing ID, and a blob published to the old routing ID during the grace is delivered. Once the grace elapses, `TransportManager::unsubscribe` is called with the old routing ID, and a blob published to it afterwards is not delivered.",
         "Restore and crash (\u00a79.10.4.1 'Rotation order and crash recovery'): at each kill point the clause enumerates (after persist and before subscribe; after subscribe and before announce), a restore leaves the member subscribed to the new routing ID, and to the old one until its persisted `grace_until`, and the member re-publishes the announcement exactly once when `announce_pending` is set. A restore after `grace_until` subscribes only to the new routing ID.",
-        "Identity-key cut-over (\u00a79.10.4.1 'Identity-key cut-over'; keri ruling S12): restoring or re-keying with an identity key whose derivation at the persisted epoch differs from the persisted local routing ID rotates to epoch N+1, keeps the persisted routing ID subscribed for the grace, and announces. In a v1 context the member subscribes to and re-announces its new v1 routing ID. No code path treats the persisted routing ID as current without re-deriving it.",
+        "Change of the pseudonym-secret source (\u00a79.10.4.1 'Change of the pseudonym-secret source'; keri ruling S12): on restore, and on any change to the key or secret that `pseudonym_secret` derives from (\u00a79.10.4.A), a member whose derivation at the persisted epoch differs from the persisted local routing ID rotates to epoch N+1, keeps the persisted routing ID subscribed for the grace, and announces. In a v1 context the member subscribes to and re-announces its new v1 routing ID. No code path treats the persisted routing ID as current without re-deriving it.",
         "Destroyed identity (\u00a79.10.4.A 'Destruction'): after the identity is destroyed, the driver's derive fails with key-not-found (SCP-CRYPTO-4006). The context keeps its epoch and routing ID, sends no announcement, and stays subscribed.",
         "Leave, close and expiry (\u00a79.10.4.1 'Leave, close and expiry during a grace'): leaving, closing or expiring a context during a grace calls `TransportManager::unsubscribe` for both the current and the previous routing ID, and stops the driver.",
         "Reconnect catch-up (\u00a79.10.4.1 'Reconnect catch-up'): a reconnect during a grace queries the shared `context_routing_id`, the current routing ID and the previous routing ID, and a blob stored on the previous routing ID while the member was offline is delivered.",
         "Bridge wiring (AGENTS.md integration checklist): `pipeline_wiring.rs` asserts that the driver calls `derive_rotatable_pseudonym` and `rotate_pseudonym`, and that napi `context_subscribe_on` spawns and tears down the driver and calls `unsubscribe`. The capability matrix lists the rotation policy for every binding and records napi-only dual subscription, with exemptions for UniFFI (stub `context_subscribe`) and PyO3 (no subscribe loop). The TypeScript, Python, Kotlin and Swift SDKs expose the policy field and the policy `EventType` string."
       ],
       "actionItems": [
-        "Add the `scp-ffi-common` rotation driver, including the cut-over check and the pending re-announce at start.",
+        "Add the `scp-ffi-common` rotation driver, including the re-derivation check for a change of the pseudonym-secret source and the pending re-announce at start.",
         "Derive the first v2 routing ID at the schedule index on join in an opted-in context.",
         "Replace the napi one-time pseudonym subscription with the `LocalRoutingIds` set, and spawn and tear down the driver from `context_subscribe_on`.",
         "Extend reconnect catch-up in `reconnect.rs` to the current and in-grace routing IDs.",
@@ -1770,6 +1848,98 @@
           "matrix": "PUSH-015"
         }
       }
+    },
+    {
+      "id": "PUSH-030",
+      "title": "Non-committing members rotate on a processed membership Commit",
+      "gate": "gate-push-client",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/membership.rs",
+        "crates/scp-runtime/src/context/messaging_helpers.rs",
+        "crates/scp-runtime/src/context/actor/handlers/messaging.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-testing/tests/integration/governance.rs"
+      ],
+      "description": "Implements the membership trigger of \u00a79.10.4.1 of the security-model spec (pseudonym rotation, the BLACK-001 mitigation) for a member that did not commit the membership change. \u00a79.10.4.1 'Epoch schedule' states that the member that commits an AddMember or RemoveMember rotates after it commits, and that every other member rotates when it processes the Commit that applies the change; it also states the membership-change criterion, which counts changes by DID and not by MLS leaf. A Commit is an AddMember for each DID that held no leaf before the Commit, and a RemoveMember for each DID whose last leaf the Commit removes. A Commit that adds or removes a device leaf of a DID that holds another leaf before and after the Commit is neither. A removed member does not rotate, and a Commit that applies several membership changes triggers one rotation. \u00a79.10.4.1 'Receipt ordering', in its record-lifetime rule, also has a member that processes a RemoveMember Commit delete the removed DID's pseudonym-registry record. This story builds the DID-level classifier over the leaf sets before and after a Commit, and calls it on the path where the context actor processes an incoming Commit (`DeliverIncoming`, which merges the staged Commit), so that processing emits the rotation-due signal and deletes the record. PUSH-026, the runtime rotation story, owns the rotation-due signal's consumer, the committer's trigger, the timer arms and `RotatePseudonym`, and is blocked by this story. Types and file locations named here are indicators.",
+      "acceptanceCriteria": [
+        "Non-committer trigger (\u00a79.10.4.1 'Epoch schedule', membership trigger and membership-change criterion): in a context whose policy sets `on_membership_change`, a member that did not commit an AddMember or a RemoveMember emits exactly one rotation-due signal when it processes the Commit that applies that change, and a Commit that adds a second device leaf for a DID that already holds a leaf yields zero signals. Test: a two-node test in which node A creates the context, node B joins by Welcome, and A adds and then removes a third identity C; B emits one rotation-due signal when it processes the Commit adding C and one when it processes the Commit removing C. A Commit from A that adds a second device leaf for C's DID while C is a member yields no signal on B.",
+        "Record deletion on a processed Commit (\u00a79.10.4.1 'Receipt ordering', record lifetime): in the same two-node test, after B processes A's Commit removing C, B's pseudonym registry holds no record for C's DID, and B accepts a v2 announcement from C at a lower epoch after C rejoins."
+      ],
+      "actionItems": [
+        "Add a DID-level membership-change classifier over the leaf sets before and after a Commit: AddMember for a DID with no leaf before, RemoveMember for a DID whose last leaf the Commit removes, and neither for a device leaf of a DID that holds another leaf before and after.",
+        "Call the classifier on the incoming-Commit processing path, emit one rotation-due signal per Commit that applies at least one membership change when the policy sets `on_membership_change` and the local member is not the removed member, and delete each removed DID's registry record.",
+        "Add the two-node integration test with the Welcome join, the add and remove of C, and the extra device leaf."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)"
+        },
+        {
+          "file": ".docs/specs/26-conformance-suite.md",
+          "section": "### CONF-005: Multi-Device (One Identity, Different Device Leaf Keys)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "PUSH-031",
+      "title": "The 0xFF02 extension commits T0; members install T0 and the TTL base from it",
+      "gate": "gate-push-client",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/group_context_extension.rs",
+        "crates/scp-mls/src/context_extension.rs",
+        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
+        "crates/scp-runtime/src/context/export_import.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/supervisor/spawn_from_welcome_tests.rs",
+        "crates/scp-runtime/src/context/ttl_close_helpers.rs"
+      ],
+      "description": "Implements the `creation_timestamp_secs` field of the `0xFF02` SCP Context Parameters MLS group-context extension and validation rule 9, which `05-contexts.md` \u00a75.13.3 (context creation) specifies. Alec chose this design on 2026-10-13. The creator's `ContextCreated` leaf timestamp (`T0`) is a genesis fact, so the creator commits it in the extension, and every member installs it from the committed extension as `T0` for the pseudonym rotation schedule (`09-security-model.md` \u00a79.10.4.1) and as the TTL-deadline base (`05-contexts.md` \u00a75.10). No member takes it from an invitation bundle signature, a snapshot field, or its own clock. The extension commits the value because a bundle signature proves only who signed the bundle (\u00a75.12.3.1 step 4, \u00a75.13.3 rule 8). A false `T0` would make a joiner rotate alone, so a relay could link its subscriptions across rotations, and it would move the joiner's TTL deadline. The field is required: SCP has no users, so no transition path accepts an extension without it. TTL extensions still reach a member as `TTLExtended` leaves in the event log, and ADR-049's single-source TTL-deadline invariant keeps the persisted `ContextSnapshot.creation_timestamp_secs` as the prune-immune base, now filled from the committed extension. PUSH-026, the pseudonym rotation runtime story, needs `T0` on a Welcome joiner, so this story blocks PUSH-026. The rotation runtime itself is PUSH-026, not this story. File locations are indicators.",
+      "acceptanceCriteria": [
+        "Creator writes the field (\u00a75.13.3 'Creation timestamp'): a context created at test-clock time T0 carries a `0xFF02` extension whose JCS bytes include `creation_timestamp_secs` equal to the `timestamp` of the creator's `ContextCreated` leaf, and that value is unchanged in the extension after a later AddMember Commit. Creation rejects a creation timestamp above 2^53 \u2212 1.",
+        "Install on join, import and restore (\u00a75.13.3 rule 9): a Welcome joiner, an import and a restore each set the context's `T0` and its TTL-deadline base to the committed `creation_timestamp_secs`. A test whose invitation bundle, snapshot or local clock carries a different value shows the installed value still equals the committed one. The SDK rejects an import or restore whose snapshot creation timestamp differs from the committed value, before it installs any authority.",
+        "Reject a missing or invalid field (\u00a75.13.3 rule 1 and rule 9): a Welcome join, an import and a restore each reject an MLS group whose `0xFF02` extension omits `creation_timestamp_secs`, carries a value above 2^53 \u2212 1, or carries a value later than the member's clock plus 300 s, and each rejection installs no governance engine and no admin set.",
+        "Two-node test (\u00a79.10.4.1 'Epoch schedule' and 'First v2 derivation'; \u00a75.10 'Deadline base'): node A creates a context at T0 with `interval_secs` 3600 and a 5 h TTL, and node B joins through a Welcome at T0 + 3.5 h. B's first v2 epoch is 3, A and B each signal 'rotation due' at the same boundary T0 + 4 h, and B's TTL deadline is T0 + 5 h, not T0 + 8.5 h.",
+        "The two-node test above replaces the PUSH-026 test `a_welcome_joiner_admits_no_interval_rotation_without_the_creators_t0` in `spawn_from_welcome_tests.rs`, which the story deletes; a repository search for that test name returns no hit."
+      ],
+      "actionItems": [
+        "Add the required `creation_timestamp_secs: u64` to the `0xFF02` extension type, its JCS serialization, and its validation, with the 2^53 \u2212 1 bound.",
+        "Write the field at context creation from the `ContextCreated` leaf timestamp.",
+        "On Welcome join, import and restore, read `T0` and the TTL base from the committed extension, check the snapshot value against it, and apply the future bound of \u00a79.8.2.",
+        "Replace the PUSH-026 Welcome-joiner test with the two-node test."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.13.3 Creation"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.10 Context TTL (Time-to-Live)"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "#### 5.12.3.1 InvitationBundle Wire Format"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 9. Persistence: coalesced by default, sync for safety-critical"
+        }
+      ],
+      "details": {}
     }
   ]
 }

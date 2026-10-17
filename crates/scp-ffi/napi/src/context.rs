@@ -719,6 +719,8 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         .unwrap_or("ephemeral")
         .to_owned();
 
+    let pseudonym_rotation = parse_pseudonym_rotation(&params["pseudonymRotation"])?;
+
     // Delegate to the shared context-params builder (#1447). All parsing,
     // validation, and ContextParams construction happens in scp-ffi-common.
     let common = scp_ffi_common::context_params::CommonContextParams {
@@ -737,6 +739,7 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         capability_requirements_json,
         consequence_rules_json,
         consequence_config_json,
+        pseudonym_rotation,
         // Named so a new common field does not compile until this bridge
         // reads it.
         governance_threshold: None,
@@ -764,6 +767,53 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         governance,
         economic_policy,
     })
+}
+
+/// Parses the `pseudonymRotation` value of a context-params JSON (spec 09
+/// §9.10.4.1): `null` or absent disables rotation; otherwise it must be
+/// `{ intervalSecs?: number | null, onMembershipChange: boolean }`. A
+/// non-object, an unknown or misspelled key (so a typo cannot leave rotation
+/// off), a missing or mistyped field each fail with `SCP-VALID-7000`; the
+/// common builder then applies the §9.10.4.1 validity criterion.
+fn parse_pseudonym_rotation(
+    value: &serde_json::Value,
+) -> napi::Result<Option<scp_core::context::PseudonymRotationPolicy>> {
+    let invalid = |detail: String| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!(
+                "invalid pseudonymRotation (spec §9.10.4.1): {detail}; expected null or \
+                 {{ intervalSecs?: number | null, onMembershipChange: boolean }}"
+            ),
+            code: codes::VALID_7000.to_owned(),
+        })
+    };
+    let object = match value {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::Object(object) => object,
+        other => return Err(invalid(format!("not an object: {other}"))),
+    };
+    if let Some(key) = object
+        .keys()
+        .find(|k| *k != "intervalSecs" && *k != "onMembershipChange")
+    {
+        return Err(invalid(format!("unknown key '{key}'")));
+    }
+    let interval_secs =
+        match object.get("intervalSecs") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(v.as_u64().ok_or_else(|| {
+                invalid(format!("intervalSecs is not a non-negative integer: {v}"))
+            })?),
+        };
+    let on_membership_change = match object.get("onMembershipChange") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(v) => return Err(invalid(format!("onMembershipChange is not a boolean: {v}"))),
+        None => return Err(invalid("missing onMembershipChange".to_owned())),
+    };
+    Ok(Some(scp_core::context::PseudonymRotationPolicy {
+        interval_secs,
+        on_membership_change,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -828,6 +878,12 @@ pub(crate) async fn context_create_on(
     // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
     // rather than calling a `ContextManager` method directly. The actor
     // mailbox wraps the delegated call in the 30s transport-timeout budget.
+    // The bridge's relay set hosts the new context (§5.12.3.1 `relay_urls`,
+    // PUSH-025).
+    let relay_urls = bi
+        .core
+        .context_relay_urls()
+        .map_err(|e| NapiError::from(crate::transport::map_transport_lock_error(e)))?;
     let sup = crate::runtime::supervisor(bi)?;
     let core_handle = {
         use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
@@ -838,6 +894,7 @@ pub(crate) async fn context_create_on(
                 params: context_params,
                 creator_did: DID(creator_did.clone()),
                 local_pseudonym,
+                relay_urls,
             }),
             reply: tx,
         };
@@ -857,14 +914,7 @@ pub(crate) async fn context_create_on(
     // Register the creator's DID as a local DID for defense-in-depth. Routes
     // through the supervisor's direct method — the local-DID set is
     // supervisor-wide (no per-context command target).
-    sup.register_local_did(DID(creator_did.clone()))
-        .await
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("register_local_did failed: {e}"),
-                code: codes::CTX_2000.to_owned(),
-            })
-        })?;
+    sup.register_local_did(DID(creator_did.clone())).await;
 
     // Register the created context in the known-contexts discovery registry so
     // the CREATOR surfaces its own context, closing the last cell of the
@@ -875,10 +925,6 @@ pub(crate) async fn context_create_on(
     // send path) for broadcast contexts, which carry no per-member pseudonym.
     // Infallible and idempotent (overwrites), so it is safe after the committed
     // create and needs no rollback.
-    //
-    // The relay URL comes from the handleless transport probe. On the NAPI bridge
-    // the relay URL lives on a `NapiTransportManager` handle, so the honest value
-    // here is whatever `transport_status_on` surfaces (never a fabricated URL).
     let routing_id = local_pseudonym.unwrap_or_else(|| {
         if create_is_broadcast {
             scp_core::context::broadcast_routing_id(&context_id)
@@ -886,24 +932,14 @@ pub(crate) async fn context_create_on(
             scp_core::context::context_routing_id(&context_id)
         }
     });
-    let relay_url = match crate::transport::transport_status_on(bi, None).await {
-        Ok(status) => status.relay_url,
-        Err(e) => {
-            tracing::warn!(
-                "failed to query transport status during context create registration: {e}"
-            );
-            None
-        }
-    };
-    bi.core.register_known_context(
-        &context_id,
-        scp_ffi_common::bridge_instance::KnownContext {
+    bi.core
+        .register_known_context_from_runtime(
+            &context_id,
             routing_id,
-            relay_url,
-            member_did: creator_did.clone(),
-            last_seen: scp_clock::SystemClock.now_secs(),
-        },
-    );
+            creator_did.clone(),
+            scp_clock::SystemClock.now_secs(),
+        )
+        .await;
 
     // §9.10.4: a freshly created context has exactly one member, so the
     // pseudonym routing-ID announcement has no recipients and is a guaranteed
@@ -1075,10 +1111,6 @@ pub(crate) async fn context_join_on(
     // matching the send path) for broadcast contexts, which carry no per-member
     // pseudonym. Infallible and idempotent (overwrites), so it is safe after the
     // committed join and needs no rollback.
-    //
-    // The relay URL comes from the handleless transport probe. On the NAPI bridge
-    // the relay URL lives on a `NapiTransportManager` handle, so the honest value
-    // here is whatever `transport_status_on` surfaces (never a fabricated URL).
     let routing_id = local_pseudonym.unwrap_or_else(|| {
         if join_is_broadcast {
             scp_core::context::broadcast_routing_id(&context_id)
@@ -1086,24 +1118,14 @@ pub(crate) async fn context_join_on(
             scp_core::context::context_routing_id(&context_id)
         }
     });
-    let relay_url = match crate::transport::transport_status_on(bi, None).await {
-        Ok(status) => status.relay_url,
-        Err(e) => {
-            tracing::warn!(
-                "failed to query transport status during context join registration: {e}"
-            );
-            None
-        }
-    };
-    bi.core.register_known_context(
-        &context_id,
-        scp_ffi_common::bridge_instance::KnownContext {
+    bi.core
+        .register_known_context_from_runtime(
+            &context_id,
             routing_id,
-            relay_url,
-            member_did: identity_did.clone(),
-            last_seen: scp_clock::SystemClock.now_secs(),
-        },
-    );
+            identity_did.clone(),
+            scp_clock::SystemClock.now_secs(),
+        )
+        .await;
 
     Ok(())
 }
@@ -1526,28 +1548,14 @@ pub(crate) async fn context_join_from_welcome_on(
     // pseudonym (`local_pseudonym` is `Copy`, still valid after the request
     // move); the member is the JOINER, the member `spawn_actor_from_welcome`
     // recorded in the supervisor's role state.
-    //
-    // The relay URL comes from the handleless transport probe. On the NAPI
-    // bridge the relay URL lives on a `NapiTransportManager` handle, not on the
-    // bridge instance, and the bare-DID join receives no such handle — so the
-    // honest value here is `None` (never a fabricated URL). Peers refresh
-    // `last_seen`/relay on subsequent activity.
-    let relay_url = match crate::transport::transport_status_on(bi, None).await {
-        Ok(status) => status.relay_url,
-        Err(e) => {
-            tracing::warn!("failed to query transport status during join registration: {e}");
-            None
-        }
-    };
-    bi.core.register_known_context(
-        &sealed.context_id,
-        scp_ffi_common::bridge_instance::KnownContext {
-            routing_id: local_pseudonym,
-            relay_url,
-            member_did: owning_did.clone(),
-            last_seen: scp_clock::SystemClock.now_secs(),
-        },
-    );
+    bi.core
+        .register_known_context_from_runtime(
+            &sealed.context_id,
+            local_pseudonym,
+            owning_did.clone(),
+            scp_clock::SystemClock.now_secs(),
+        )
+        .await;
 
     // Build the returned handle from the AUTHENTICATED params carried by the
     // joined MLS group's signed context binding — NOT from caller input (there is
@@ -1596,13 +1604,15 @@ pub(crate) async fn context_join_from_welcome_on(
 /// via the identity registry. The raw signing key is wiped the moment the invite
 /// is produced (`SigningKey` is `ZeroizeOnDrop`, so the explicit early `drop`
 /// triggers the wipe).
+///
+/// The bundle carries the context's stored relay set (§5.12.3.1
+/// `relay_urls`), which the runtime reads; the caller supplies none.
 pub(crate) async fn invite_member_on(
     bi: &NapiBridgeInstance,
     context_id: String,
     creator_did: String,
     invitee_did: String,
     invitee_key_package: Vec<u8>,
-    relay_urls: Vec<String>,
 ) -> napi::Result<NapiInviteMemberOutcome> {
     scp_ffi_common::validate::validate_context_id(&context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -1631,7 +1641,6 @@ pub(crate) async fn invite_member_on(
             DID(creator_did),
             DID(invitee_did),
             invitee_key_package,
-            relay_urls,
             &signer,
         )
         .await;
@@ -1724,10 +1733,7 @@ pub(crate) async fn context_close_on(
     // holder of the handle can release this bridge's `UcanContextState` once
     // the supervisor reports no actor or a terminal state. The release marks
     // the id, and `crate::runtime::ensure_registered` refuses to rebuild a
-    // marked id's revocation list and nonce tracker. This bridge keeps
-    // revocations in process memory, so a revocation recorded before the
-    // close does not survive a later readmit of the id, just as it does not
-    // survive a process restart.
+    // marked id's revocation list and nonce tracker.
     //
     // `Poisoned` and `MigratingOut` refuse because a release while the
     // context can still return to `Active` would leave the `Active` context
@@ -5647,6 +5653,7 @@ mod tests {
                 params,
                 creator_did: creator,
                 local_pseudonym: None,
+                relay_urls: Vec::new(),
             }),
             reply: tx,
         };
@@ -6534,7 +6541,6 @@ mod tests {
                 inviter_did.clone(),
                 "did:dht:z6MkNapiInviteeUnknownCtx".to_owned(),
                 b"bogus-key-package".to_vec(),
-                vec![],
             )
             .await
             else {
@@ -6555,7 +6561,6 @@ mod tests {
             "did:dht:z6MkNoSuchNapiInviterIdentity".to_owned(),
             "did:dht:z6MkNapiInviteeUncustodied".to_owned(),
             b"bogus-key-package".to_vec(),
-            vec![],
         )
         .await
         else {
@@ -8206,6 +8211,57 @@ mod tests {
             parsed_ceiling_names(r#"{"ceiling":["messages:write"]}"#),
             std::iter::once("messages:write".to_owned()).collect::<std::collections::HashSet<_>>()
         );
+    }
+
+    /// Spec 09 §9.10.4.1: `pseudonymRotation` reaches the core params; an
+    /// absent key or `null` disables rotation; a malformed object (wrong type,
+    /// unknown key, missing `onMembershipChange`) and a policy failing the
+    /// validity criterion both reject with `SCP-VALID-7000`.
+    #[test]
+    fn parse_context_params_carries_and_validates_pseudonym_rotation() {
+        let rotation = |json: &str| {
+            super::parse_context_params(json)
+                .map(|p| p.core.pseudonym_rotation)
+                .map_err(|e| e.reason.clone())
+        };
+        assert_eq!(rotation(r#"{"ceiling":["messages:write"]}"#), Ok(None));
+        assert_eq!(
+            rotation(r#"{"ceiling":["messages:write"],"pseudonymRotation":null}"#),
+            Ok(None)
+        );
+        assert_eq!(
+            rotation(
+                r#"{"ceiling":["messages:write"],"pseudonymRotation":{"intervalSecs":3600,"onMembershipChange":false}}"#
+            ),
+            Ok(Some(scp_core::context::PseudonymRotationPolicy {
+                interval_secs: Some(3600),
+                on_membership_change: false,
+            }))
+        );
+        assert_eq!(
+            rotation(
+                r#"{"ceiling":["messages:write"],"pseudonymRotation":{"onMembershipChange":true}}"#
+            ),
+            Ok(Some(scp_core::context::PseudonymRotationPolicy {
+                interval_secs: None,
+                on_membership_change: true,
+            }))
+        );
+        for bad in [
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":true}"#,
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":{"intervalSecs":3600}}"#,
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":{"intervalSec":3600,"onMembershipChange":false}}"#,
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":{"intervalSecs":-1,"onMembershipChange":true}}"#,
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":{"onMembershipChange":false}}"#,
+            r#"{"ceiling":["messages:write"],"pseudonymRotation":{"intervalSecs":599,"onMembershipChange":true}}"#,
+        ] {
+            let reason = rotation(bad).expect_err(bad);
+            assert!(
+                reason.starts_with(&format!("[{}] ", codes::VALID_7000)),
+                "{bad} must reject with {}, got: {reason}",
+                codes::VALID_7000
+            );
+        }
     }
 
     /// A close of a context whose actor the supervisor despawned succeeds
@@ -10356,5 +10412,161 @@ mod tests {
             vec![ctx_id],
             "the reopened SQLCipher instance must restore the context the first instance created"
         );
+    }
+
+    /// A UCAN revoked through `ucan_revoke` before a restart is still refused
+    /// by `ucan_validate` after one, and a nonce `ucan_validate` accepted
+    /// before the restart is still refused as a replay after it (#2298).
+    ///
+    /// Instance A creates a context over a `SQLCipher` store, mints three
+    /// tokens, revokes the first through the real `ucan_revoke_on`, and
+    /// validates the second through the real `ucan_validate_on`. Instance B
+    /// reopens the same store, restores the context, and drives
+    /// `ucan_validate_on` again: the first token must fail at the revocation
+    /// step, the second at the nonce step, and the third, which A never
+    /// touched, must pass. Removing either durable write or the hydration at
+    /// registration makes B accept a refused token.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_revocation_and_nonce_survive_a_bridge_instance_restart() {
+        use crate::runtime::{NapiBridgeInstance, SqliteKeyMaterial, StorageConfig};
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let open = || {
+            NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+                path: tmp.path().to_path_buf(),
+                key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x5Au8; 32])),
+            })
+            .expect("SQLCipher open must succeed")
+        };
+
+        let scp = crate::scp::Scp {
+            inner: Arc::new(open()),
+        };
+        let bi = Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let did = identity.inner.did.clone();
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write"],
+            "memoryScope": "full",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &identity, params_json)
+            .await
+            .expect("context_create should succeed");
+        let ctx_id = handle.context_id.clone();
+        let member = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed")
+            .inner
+            .did
+            .clone();
+        let capability = format!("scp:ctx:{ctx_id}/messages:read");
+
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            let token = crate::ucan::ucan_mint_on(
+                &bi,
+                &handle,
+                member.clone(),
+                vec!["messages:read".to_owned()],
+                None,
+            )
+            .await
+            .expect("the creator may mint a token in its own context");
+            tokens.push(token.encoded());
+        }
+        let (revoked, used, untouched) = (tokens[0].clone(), tokens[1].clone(), tokens[2].clone());
+
+        // A never presents the revoked token: step 9 records a nonce before
+        // step 10 checks revocation, so a presentation here would make B refuse
+        // it as a replay and hide whether the revocation survived.
+        crate::ucan::ucan_revoke_on(&bi, &handle, revoked.clone(), did.clone())
+            .await
+            .expect("the context creator may revoke a token in its context");
+        crate::ucan::ucan_validate_on(
+            &bi,
+            &handle,
+            used.clone(),
+            capability.clone(),
+            member.clone(),
+            None,
+        )
+        .await
+        .expect("an unrevoked token validates on A");
+
+        drop(handle);
+        drop(identity);
+        bi.shutdown(std::time::Duration::from_secs(10))
+            .await
+            .expect("shutdown must release the store");
+        drop(bi);
+        drop(scp);
+
+        let reopened = Arc::new(open());
+        crate::runtime::init_supervisor(&reopened, &did);
+        // A restarted process resolves the issuer's DID document through the
+        // resolver an identity call attaches; B makes no identity call.
+        crate::identity::ensure_did_resolver_initialized_on(&reopened)
+            .expect("resolver initialization must succeed on B");
+        let restored_json = super::context_restore_all_on(&reopened)
+            .await
+            .expect("restore_all must succeed on the reopened store");
+        assert!(
+            restored_json.contains(&ctx_id),
+            "the reopened instance must restore the context: {restored_json}"
+        );
+        assert!(
+            !crate::runtime::ucan_registry(&reopened).contains_key(&ctx_id),
+            "instance B starts with no per-context UCAN state"
+        );
+        let handle_b = active_handle_for(&reopened, &ctx_id, &did);
+
+        let err = crate::ucan::ucan_validate_on(
+            &reopened,
+            &handle_b,
+            revoked,
+            capability.clone(),
+            member.clone(),
+            None,
+        )
+        .await
+        .expect_err("a token revoked before the restart must stay revoked after it");
+        assert!(
+            err.to_string().contains("token revoked"),
+            "B reported: {err}"
+        );
+
+        let err = crate::ucan::ucan_validate_on(
+            &reopened,
+            &handle_b,
+            used,
+            capability.clone(),
+            member.clone(),
+            None,
+        )
+        .await
+        .expect_err("a nonce accepted before the restart must stay used after it");
+        assert!(
+            err.to_string().contains("nonce reused"),
+            "B reported: {err}"
+        );
+
+        crate::ucan::ucan_validate_on(&reopened, &handle_b, untouched, capability, member, None)
+            .await
+            .expect("a token nobody revoked or presented still validates after the restart");
+
+        // The restored actor writes through the SQLCipher connection, so B
+        // drains it and closes the store before the test returns.
+        drop(handle_b);
+        reopened
+            .shutdown(std::time::Duration::from_secs(10))
+            .await
+            .expect("B's shutdown must release the store");
     }
 }

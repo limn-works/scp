@@ -46,8 +46,14 @@ pub use scp_protocol::context::builder::{
 /// `#[async_trait]`, not `?Send`.
 #[async_trait::async_trait]
 pub trait ContextTransportProvider: Send + Sync {
-    /// Returns `true` if the transport layer is connected and at least one
-    /// relay is reachable.
+    /// Returns the provider's connection flag.
+    ///
+    /// Each implementor states what sets its flag. `RelayTransportProvider` in
+    /// `scp-transport` sets it at construction and changes it only through its
+    /// `mark_*` methods, which no adapter path calls, so a `true` result does
+    /// not mean a relay is reachable now. No production caller reads this
+    /// method to decide whether a send can succeed; a send reports its own
+    /// failure.
     fn is_connected(&self) -> bool;
 
     /// Publishes the context announcement to connected relays.
@@ -835,6 +841,9 @@ impl CreationReceipt {
 ///
 /// Returns [`ContextCreationError::TemplateValidationFailed`] if a template
 /// is specified and the params do not match the template definition.
+///
+/// Returns [`ContextCreationError::InvalidPseudonymRotationPolicy`] if
+/// `pseudonym_rotation` fails the §9.10.4.1 validity criterion.
 fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // Governance model validation (SCP-267, ADR-031).
     // GovernanceModel is a variant-only enum in ContextParams. Structural
@@ -872,6 +881,13 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // caller, so `Supervisor::spawn_actor_from_welcome`'s Precheck C calls the
     // SAME validator on the creator-signed parameters (GitHub #2250).
     crate::context::state::validate_genesis_outlets(&params.outlets)?;
+
+    // §9.10.4.1 validity criterion: creation rejects an invalid rotation
+    // policy. `lifecycle_helpers::create_context` checks it first; this check
+    // makes the rule hold for every in-crate caller of `create_context`.
+    if let Some(policy) = &params.pseudonym_rotation {
+        policy.validate()?;
+    }
 
     // Validate memory scope is permitted for the context mode (§5.11).
     // Broadcast contexts only support MemoryScope::Full — Ephemeral and

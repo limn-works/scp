@@ -957,7 +957,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
             Arc::clone(&mls_storage),
             Arc::clone(&clock),
         );
-        sup1.register_local_did(creator.clone()).await.unwrap();
+        sup1.register_local_did(creator.clone()).await;
 
         // `Encrypted` (MLS-backed) is the standard restore path: the group state
         // lives in the shared OpenMLS storage and the restore leg reinstates it.
@@ -966,7 +966,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
             ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
-        sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None)
+        sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None, Vec::new())
             .await
             .expect("create_context");
 
@@ -1022,7 +1022,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
         Arc::clone(&mls_storage),
         Arc::clone(&clock),
     );
-    sup2.register_local_did(creator.clone()).await.unwrap();
+    sup2.register_local_did(creator.clone()).await;
 
     // Pre-condition: the context is NOT yet resident (process 2 hasn't restored).
     assert!(
@@ -1189,13 +1189,13 @@ async fn expired_context_is_not_resurrected_and_refuses_operations() {
             Arc::clone(&mls_storage),
             Arc::clone(&clock),
         );
-        sup1.register_local_did(creator.clone()).await.unwrap();
+        sup1.register_local_did(creator.clone()).await;
         let params = ContextParams {
             mode: ContextMode::Encrypted,
             ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
             ..ContextParams::default()
         };
-        sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None)
+        sup1.create_context(ctx_id.to_owned(), params, creator.clone(), None, Vec::new())
             .await
             .expect("create_context");
         sup1.flush_all_contexts().await.expect("flush_all_contexts");
@@ -1228,7 +1228,7 @@ async fn expired_context_is_not_resurrected_and_refuses_operations() {
         Arc::clone(&mls_storage),
         Arc::clone(&clock),
     );
-    sup2.register_local_did(creator.clone()).await.unwrap();
+    sup2.register_local_did(creator.clone()).await;
 
     let restored = sup2.restore_on_startup().await.expect("restore_on_startup");
     assert!(

@@ -61,12 +61,18 @@ from typing import (
 
 from scp_sdk._extension import EXTENSION_LOAD_FAILED_CODE, native_module
 from scp_sdk.context import Context
-from scp_sdk.errors import IdentityError, ScpError, ValidationError, _coded_bridge_error
+from scp_sdk.errors import (
+    IdentityError,
+    ScpError,
+    ValidationError,
+    _coded_bridge_error,
+    _require_type,
+)
 from scp_sdk.fullstack import FullStackNode
 from scp_sdk.governance import GovernanceActionResult, check_proposal_response
 from scp_sdk.identity import Identity
 from scp_sdk.mcp import McpClient, McpServer
-from scp_sdk.server import Node, Relay
+from scp_sdk.server import Node, NodeStartConfig, Relay
 from scp_sdk.types import CustodyType, CustomRole, MemberRole
 
 if TYPE_CHECKING:
@@ -529,13 +535,7 @@ def _unwrap_handle(
     :class:`~scp_sdk.errors.ValidationError` with ``SCP-VALID-7005``, so a
     caller never meets an ``AttributeError`` or a bridge ``TypeError``.
     """
-    if isinstance(value, expected):
-        return value._raw_handle
-    raise ValidationError(
-        f"SCP.{method}(): {param} must be a scp_sdk.{expected.__name__} returned "
-        f"by the SDK, got {type(value).__module__}.{type(value).__qualname__}",
-        "SCP-VALID-7005",
-    )
+    return _require_type(value, expected, f"SCP.{method}(): {param}")._raw_handle
 
 
 def _to_native_sealed(sealed: SealedInvitation) -> Any:
@@ -1409,6 +1409,13 @@ class SCP:
     async def context_create(self, identity_did: str, params: dict[str, Any]) -> Context:
         """Delegate to ``_scp_core.SCP.context_create`` (returns :class:`Context`).
 
+
+        ``params["pseudonym_rotation"]`` (spec 09 §9.10.4.1) is ``None`` (the
+        default: rotation off) or ``{"interval_secs": int | None,
+        "on_membership_change": bool}``. A malformed dict, an unknown key, no
+        trigger, or an ``interval_secs`` under 600 raises ``ValidationError``
+        with ``SCP-VALID-7000``.
+
         ``params["capability_requirements"]`` is optional and defaults to no
         requirement. When present, it is a list of
         :class:`~scp_sdk.trust.SelfAttested` and
@@ -1609,7 +1616,6 @@ class SCP:
         creator_did: str,
         invitee_did: str,
         invitee_key_package: bytes,
-        relay_urls: list[str],
     ) -> InviteMemberOutcome:
         """Invite a member into a context (ADR-049 Phase 2J; FFI-02 Option A).
 
@@ -1632,13 +1638,16 @@ class SCP:
         capability in the context's declared ceiling, so the creator can invite
         only when that ceiling includes ``governance:propose``.
 
+        The bundle carries the context's stored relay set (§5.12.3.1
+        ``relay_urls``), which the runtime reads; the caller supplies none.
+
         Example::
 
             reservation_id, invitee_kp = await joiner_scp.reserve_key_package(
                 invitee.did
             )
             outcome = await scp.invite_member(
-                context_id, creator.did, invitee.did, invitee_kp, []
+                context_id, creator.did, invitee.did, invitee_kp
             )
             # `outcome.bundle` is directly usable — no manual re-assembly:
             ctx = await joiner_scp.context_join_from_welcome(
@@ -1652,7 +1661,6 @@ class SCP:
             invitee_did: The DID being invited.
             invitee_key_package: The invitee's TLS-serialized MLS ``KeyPackage``
                 (the public bytes from the invitee's :meth:`reserve_key_package`).
-            relay_urls: Relay URLs to include for the invitee's first contact.
 
         Returns:
             A :class:`Sealed` outcome carrying the sealed
@@ -1673,7 +1681,6 @@ class SCP:
             creator_did,
             invitee_did,
             invitee_key_package,
-            relay_urls,
         )
         return _to_invite_outcome(raw)
 
@@ -3972,6 +3979,48 @@ class SCP:
     # endregion Discovery
 
     # region Server
+
+    async def node_start(self, config: NodeStartConfig) -> Node:
+        """Start a production node from this instance under an operator identity.
+
+        Delegates to ``_scp_core.SCP.node_start`` with ``config`` encoded as
+        the bridge's ``NodeStartConfig`` (construction.md §"Node start —
+        ``NodeStartConfig``"). The node runs on this instance's own storage,
+        under the operator identity ``config.identity`` names, and this
+        instance's ``Supervisor`` is bound to the node's relay before the call
+        returns. One running node at a time holds that binding. Each failure
+        raises the SDK error of its code's category, carrying the code
+        sdk-common.md §"Node start error codes" gives it.
+
+        Returns:
+            The running :class:`~scp_sdk.server.Node`; its ``did`` is the
+            operator DID.
+
+        Raises:
+            ValidationError: ``SCP-VALID-7005`` when ``config`` is not a
+                :class:`~scp_sdk.server.NodeStartConfig` or its ``identity`` is
+                not an :class:`~scp_sdk.Identity`.
+            StorageError: ``SCP-STORAGE-8007`` for an invalid config,
+                ``SCP-STORAGE-8008`` when the blob storage cannot be opened or
+                its directory created, ``SCP-STORAGE-8009`` for a core node
+                storage error.
+            IdentityError: ``SCP-IDENT-1063`` when the operator identity is not
+                registered on this instance or the node's identity operation
+                fails.
+            TransportError: ``SCP-TRANS-5051`` when the relay fails to start,
+                ``SCP-TRANS-5052`` when TLS provisioning fails,
+                ``SCP-TRANS-5054`` when serving or NAT traversal fails, and
+                ``SCP-TRANS-5056`` when this instance's ``Supervisor`` cannot be
+                bound to the node, including while another running node of this
+                instance holds the binding; the bridge has shut the node down
+                before it raises ``SCP-TRANS-5056``.
+        """
+        config_json = _require_type(config, NodeStartConfig, "SCP.node_start(): config")._to_json()
+        try:
+            raw = await asyncio.to_thread(self._native.node_start, config_json)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
+        return Node(raw)
 
     async def node_start_in_memory(self, identity_did: str | None = None) -> Node:
         """Delegate to ``_scp_core.SCP.node_start_in_memory`` (returns :class:`Node`)."""

@@ -340,7 +340,7 @@ pub struct PyContextHandle {
 impl PyContextHandle {
     /// Returns the context's unique identifier.
     #[getter]
-    fn context_id(&self) -> &str {
+    pub(crate) fn context_id(&self) -> &str {
         &self.context_id
     }
 
@@ -463,6 +463,11 @@ impl PyContextHandle {
 /// - `promotion_policy` -- string: `"no_promotion"` (default), `"promotable"` (spec §5.10)
 /// - `template_id` -- optional string: template identifier (spec §5.14)
 /// - `economic_policy` -- optional JSON string: economic policy (spec §19)
+/// - `pseudonym_rotation` -- `None` (default: rotation off) or a dict
+///   `{"interval_secs": int | None, "on_membership_change": bool}` (spec 09
+///   §9.10.4.1). `on_membership_change` is required; a malformed dict, an
+///   unknown key, and a policy failing the validity criterion (no trigger, or
+///   `interval_secs` under 600) raise `ValidationError` with `SCP-VALID-7000`.
 ///
 /// Unrecognized keys are silently ignored. A missing optional key uses its
 /// protocol default.
@@ -522,6 +527,9 @@ pub struct PyContextParams {
     /// `CapabilityRequirement` (spec §7.3.4.4). When `None`, the context has
     /// none.
     capability_requirements: Option<String>,
+    /// Pseudonym rotation policy (spec 09 §9.10.4.1). `None` disables
+    /// rotation.
+    pseudonym_rotation: Option<scp_core::context::PseudonymRotationPolicy>,
 }
 
 #[pymethods]
@@ -662,6 +670,21 @@ impl PyContextParams {
         self.capability_requirements.as_deref()
     }
 
+    /// Returns the pseudonym rotation policy as a dict
+    /// `{"interval_secs": int | None, "on_membership_change": bool}`, or
+    /// `None` when rotation is off (spec 09 §9.10.4.1).
+    #[getter]
+    fn pseudonym_rotation<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.pseudonym_rotation
+            .map(|policy| {
+                let dict = PyDict::new(py);
+                dict.set_item("interval_secs", policy.interval_secs)?;
+                dict.set_item("on_membership_change", policy.on_membership_change)?;
+                Ok(dict)
+            })
+            .transpose()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyContextParams(ceiling={:?}, roles={:?}, outlets={:?}, ttl={:?}, \
@@ -670,7 +693,7 @@ impl PyContextParams {
              min_protocol_version={:?}, max_chain_depth={:?}, \
              max_nesting_depth={:?}, session_cap={:?}, \
              consequence_rules={:?}, consequence_config={:?}, \
-             capability_requirements={:?})",
+             capability_requirements={:?}, pseudonym_rotation={:?})",
             self.ceiling,
             self.roles,
             self.outlets,
@@ -689,6 +712,7 @@ impl PyContextParams {
             self.consequence_rules,
             self.consequence_config,
             self.capability_requirements,
+            self.pseudonym_rotation,
         )
     }
 }
@@ -732,6 +756,58 @@ fn typed_supervisor_error(
         message: format!("{op} failed: {e}"),
         code: code.to_owned(),
     })
+}
+
+/// Extracts a `pseudonym_rotation` dict (spec 09 §9.10.4.1). The dict holds
+/// `on_membership_change` (bool, required) and optionally `interval_secs`
+/// (non-negative int or `None`). A non-dict value, an unknown or misspelled
+/// key, a missing or mistyped field, and a policy failing the §9.10.4.1
+/// validity criterion (no trigger, or `interval_secs` under 600) each raise
+/// `ValidationError` with `SCP-VALID-7000`.
+fn pseudonym_rotation_from_py(
+    val: &Bound<'_, PyAny>,
+) -> PyResult<scp_core::context::PseudonymRotationPolicy> {
+    let invalid = |detail: String| -> PyErr {
+        crate::error::ScpPyError::ValidationError {
+            message: format!(
+                "invalid pseudonym_rotation (spec §9.10.4.1): {detail}; expected None or \
+                 {{'interval_secs': int | None, 'on_membership_change': bool}}"
+            ),
+            code: codes::VALID_7000.to_owned(),
+        }
+        .into()
+    };
+    let dict = val
+        .downcast::<PyDict>()
+        .map_err(|_| invalid("not a dict".to_owned()))?;
+    for key in dict.keys() {
+        let key: String = key
+            .extract()
+            .map_err(|_| invalid("a key is not a string".to_owned()))?;
+        if key != "interval_secs" && key != "on_membership_change" {
+            return Err(invalid(format!("unknown key '{key}'")));
+        }
+    }
+    let interval_secs: Option<u64> = match dict.get_item("interval_secs")? {
+        Some(v) if v.is_none() => None,
+        Some(v) => Some(
+            v.extract()
+                .map_err(|e| invalid(format!("interval_secs: {e}")))?,
+        ),
+        None => None,
+    };
+    let on_membership_change: bool = match dict.get_item("on_membership_change")? {
+        Some(v) => v
+            .extract()
+            .map_err(|e| invalid(format!("on_membership_change: {e}")))?,
+        None => return Err(invalid("missing 'on_membership_change'".to_owned())),
+    };
+    let policy = scp_core::context::PseudonymRotationPolicy {
+        interval_secs,
+        on_membership_change,
+    };
+    policy.validate().map_err(|e| invalid(e.to_string()))?;
+    Ok(policy)
 }
 
 /// Valid template ID strings accepted from the Python bridge layer.
@@ -981,6 +1057,11 @@ impl PyContextParams {
                 Some(val) => Some(val.extract()?),
                 None => None,
             };
+        let pseudonym_rotation = match dict.get_item("pseudonym_rotation")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => Some(pseudonym_rotation_from_py(&val)?),
+            None => None,
+        };
 
         Ok(Self {
             ceiling,
@@ -1001,6 +1082,7 @@ impl PyContextParams {
             consequence_rules,
             consequence_config,
             capability_requirements,
+            pseudonym_rotation,
         })
     }
 
@@ -1122,6 +1204,7 @@ impl PyContextParams {
             consequence_rules,
             consequence_config,
             capability_requirements,
+            pseudonym_rotation: params.pseudonym_rotation,
         }
     }
 }
@@ -1716,6 +1799,7 @@ fn build_core_context_params(
         consequence_rules_json: py_params.consequence_rules.clone(),
         consequence_config_json: py_params.consequence_config.clone(),
         capability_requirements_json: py_params.capability_requirements.clone(),
+        pseudonym_rotation: py_params.pseudonym_rotation,
         roles: py_params
             .roles
             .iter()
@@ -2703,6 +2787,13 @@ impl crate::scp::PyScp {
             Some(derive_member_pseudonym(py, bi, identity_did, &context_id)?)
         };
 
+        // The bridge's relay set hosts the new context (§5.12.3.1
+        // `relay_urls`, PUSH-025).
+        let relay_urls = bi
+            .core
+            .context_relay_urls()
+            .map_err(|e| crate::error::ScpPyError::transport(e.to_string()))?;
+
         // Create the context via the shared ContextManager.
         {
             let creator_did_owned = scp_did::DID(identity_did.to_owned());
@@ -2712,20 +2803,20 @@ impl crate::scp::PyScp {
             let ctx_id = context_id.clone();
             let creator_did_for_register = scp_did::DID(identity_did.to_owned());
             crate::actor_wait::block_on_released(py, async move {
-                sup.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
-                    .await
-                    .map_err(create_context_failure)?;
+                sup.create_context(
+                    ctx_id,
+                    core_params,
+                    creator_did_owned,
+                    local_pseudonym,
+                    relay_urls,
+                )
+                .await
+                .map_err(create_context_failure)?;
                 // Register the creator's DID as a local DID for defense-in-depth,
                 // matching NAPI's behavior. Routes through the supervisor's direct
                 // method (no per-context command — the local-DID set is
                 // supervisor-wide).
-                sup.register_local_did(creator_did_for_register)
-                    .await
-                    .map_err(|e| {
-                        scp_core::context::ContextError::CreationFailed(format!(
-                            "register_local_did failed: {e}"
-                        ))
-                    })?;
+                sup.register_local_did(creator_did_for_register).await;
                 Ok::<(), scp_core::context::ContextError>(())
             })?
             .map_err(|e| {
@@ -2787,26 +2878,15 @@ impl crate::scp::PyScp {
                 }
             });
 
-            // Get the relay URL from transport status if a relay is connected.
-            let relay_url = match self.transport_status() {
-                Ok(status) => status.relay_url,
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to query transport status during context registration: {e}"
-                    );
-                    None
-                }
-            };
-
-            let last_seen = scp_clock::SystemClock.now_secs();
-
-            let known = crate::runtime::KnownContext {
-                routing_id,
-                relay_url,
-                member_did: identity_did.to_owned(),
-                last_seen,
-            };
-            crate::runtime::register_known_context_on(bi, &context_id, known);
+            crate::actor_wait::block_on_released(
+                py,
+                bi.core.register_known_context_from_runtime(
+                    &context_id,
+                    routing_id,
+                    identity_did.to_owned(),
+                    scp_clock::SystemClock.now_secs(),
+                ),
+            )?;
         }
 
         // Transition to "active" -- in the full runtime this happens after MLS
@@ -2992,23 +3072,15 @@ impl crate::scp::PyScp {
                     }
                 });
 
-                let relay_url = match self.transport_status() {
-                    Ok(status) => status.relay_url,
-                    Err(e) => {
-                        tracing::warn!(
-                            "failed to query transport status during context join registration: {e}"
-                        );
-                        None
-                    }
-                };
-
-                let known = crate::runtime::KnownContext {
-                    routing_id,
-                    relay_url,
-                    member_did,
-                    last_seen: scp_clock::SystemClock.now_secs(),
-                };
-                crate::runtime::register_known_context_on(bi, &context_id, known);
+                crate::actor_wait::block_on_released(
+                    py,
+                    bi.core.register_known_context_from_runtime(
+                        &context_id,
+                        routing_id,
+                        member_did,
+                        scp_clock::SystemClock.now_secs(),
+                    ),
+                )?;
             }
         }
 
@@ -3250,21 +3322,15 @@ impl crate::scp::PyScp {
         // ENCRYPTED context, so the routing id is the joiner's derived §9.10.4
         // pseudonym (`local_pseudonym` is `Copy`, still valid after the request
         // move). The member is the JOINER (`owning_did`).
-        let relay_url = match self.transport_status() {
-            Ok(status) => status.relay_url,
-            Err(e) => {
-                tracing::warn!("failed to query transport status during join registration: {e}");
-                None
-            }
-        };
-        let known = crate::runtime::KnownContext {
-            routing_id: local_pseudonym,
-            relay_url,
-            member_did: owning_did,
-            last_seen: scp_clock::SystemClock.now_secs(),
-        };
-
-        crate::runtime::register_known_context_on(bi, &sealed.context_id, known);
+        crate::actor_wait::block_on_released(
+            py,
+            bi.core.register_known_context_from_runtime(
+                &sealed.context_id,
+                local_pseudonym,
+                owning_did,
+                scp_clock::SystemClock.now_secs(),
+            ),
+        )?;
 
         // Build the returned handle from the AUTHENTICATED params carried by the
         // joined MLS group's signed context binding — NOT from caller input
@@ -3308,7 +3374,9 @@ impl crate::scp::PyScp {
     ///   the invite is signed under its `#active` key).
     /// * `invitee_did` -- The DID being invited.
     /// * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
-    /// * `relay_urls` -- Relay URLs to include for the invitee's first contact.
+    ///
+    /// The bundle carries the context's stored relay set (§5.12.3.1
+    /// `relay_urls`), which the runtime reads; the caller supplies none.
     ///
     /// # Errors
     ///
@@ -3316,7 +3384,7 @@ impl crate::scp::PyScp {
     /// key cannot be resolved, the context is voting-governed (governed-context
     /// invitations are not yet implemented), or the runtime invite fails (e.g.
     /// unauthorized inviter, invalid `KeyPackage`).
-    #[pyo3(signature = (context_id, creator_did, invitee_did, invitee_key_package, relay_urls))]
+    #[pyo3(signature = (context_id, creator_did, invitee_did, invitee_key_package))]
     pub fn invite_member(
         &self,
         py: Python<'_>,
@@ -3324,7 +3392,6 @@ impl crate::scp::PyScp {
         creator_did: String,
         invitee_did: String,
         invitee_key_package: Vec<u8>,
-        relay_urls: Vec<String>,
     ) -> PyResult<PyInviteMemberOutcome> {
         let bi = &*self.inner;
         validate::validate_context_id(&context_id)?;
@@ -3346,7 +3413,6 @@ impl crate::scp::PyScp {
                 scp_did::DID(creator_did),
                 scp_did::DID(invitee_did),
                 invitee_key_package,
-                relay_urls,
                 &signer,
             ),
         )?;
@@ -6492,6 +6558,7 @@ mod tests {
                 },
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
             let (custody, key) = crate::runtime::with_identity(&bi, &creator, |entry| {
@@ -7231,7 +7298,6 @@ mod tests {
                     creator_did,
                     "did:dht:z6MkInviteeUnknownCtx".to_owned(),
                     b"bogus-key-package".to_vec(),
-                    vec![],
                 )
                 .expect_err("inviting into an unknown context must be rejected")
                 .to_string();
@@ -7249,7 +7315,6 @@ mod tests {
                     "did:dht:z6MkNoSuchInviterIdentity".to_owned(),
                     "did:dht:z6MkInviteeUncustodied".to_owned(),
                     b"bogus-key-package".to_vec(),
-                    vec![],
                 )
                 .expect_err("a non-locally-custodied inviter must be rejected")
                 .to_string();
@@ -7411,6 +7476,7 @@ mod tests {
             params,
             scp_did::DID(creator.to_owned()),
             None,
+            Vec::new(),
         ))
         .unwrap();
         (bi, ctx_id)
@@ -7586,7 +7652,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    // Multi-thread flavor: `register_context` rebuilds the context's durable
+    // UCAN state, and that read bridges sync to async through
+    // `block_in_place`, which a current-thread runtime cannot host. Production
+    // `PyO3` callers arrive from a Python thread with no ambient runtime, so
+    // they take the `Handle::block_on` arm instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deliver_message_via_runtime() {
         let context_id = "ctx-deliver-test";
         let bi = __bi();
@@ -7667,7 +7738,12 @@ mod tests {
         crate::runtime::remove_context(&bi, context_id);
     }
 
-    #[tokio::test]
+    // Multi-thread flavor: `register_context` rebuilds the context's durable
+    // UCAN state, and that read bridges sync to async through
+    // `block_in_place`, which a current-thread runtime cannot host. Production
+    // `PyO3` callers arrive from a Python thread with no ambient runtime, so
+    // they take the `Handle::block_on` arm instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deliver_message_overflow_injects_warning() {
         let context_id = "ctx-overflow-deliver";
         let capacity = RECEIVE_BUFFER_CAPACITY;
@@ -7795,7 +7871,102 @@ mod tests {
             consequence_rules: None,
             consequence_config: None,
             capability_requirements: None,
+            pseudonym_rotation: None,
         }
+    }
+
+    /// Spec 09 §9.10.4.1: a `pseudonym_rotation` dict reaches the core
+    /// params and round-trips through `from_core_params`; `None` and an
+    /// absent key disable rotation; a malformed or invalid value raises
+    /// `ValidationError` (`SCP-VALID-7000`) before any context state exists.
+    #[test]
+    fn params_pseudonym_rotation_parsed_validated_and_projected() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let parse = |rotation: Option<Bound<'_, PyAny>>| {
+                let dict = PyDict::new(py);
+                dict.set_item("ceiling", vec!["messages:read"]).unwrap();
+                if let Some(r) = rotation {
+                    dict.set_item("pseudonym_rotation", r).unwrap();
+                }
+                PyContextParams::from_py_dict(&dict)
+            };
+            let policy = |pairs: &[(&str, Bound<'_, PyAny>)]| {
+                let d = PyDict::new(py);
+                for (k, v) in pairs {
+                    d.set_item(*k, v).unwrap();
+                }
+                Some(d.into_any())
+            };
+            let int = |n: i64| n.into_pyobject(py).unwrap().into_any();
+            let flag = |b: bool| b.into_pyobject(py).unwrap().to_owned().into_any();
+
+            assert_eq!(parse(None).unwrap().pseudonym_rotation, None);
+            assert_eq!(
+                parse(Some(py.None().into_bound(py)))
+                    .unwrap()
+                    .pseudonym_rotation,
+                None
+            );
+
+            let parsed = parse(policy(&[
+                ("interval_secs", int(3600)),
+                ("on_membership_change", flag(true)),
+            ]))
+            .unwrap();
+            let expected = scp_core::context::PseudonymRotationPolicy {
+                interval_secs: Some(3600),
+                on_membership_change: true,
+            };
+            assert_eq!(parsed.pseudonym_rotation, Some(expected));
+            let core = super::build_core_context_params(&parsed).unwrap();
+            assert_eq!(core.pseudonym_rotation, Some(expected));
+            assert_eq!(
+                PyContextParams::from_core_params(&core).pseudonym_rotation,
+                Some(expected)
+            );
+            let getter = parsed.pseudonym_rotation(py).unwrap().unwrap();
+            let interval: Option<u64> = getter
+                .get_item("interval_secs")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(interval, Some(3600));
+
+            // Malformed, and well-formed but invalid under §9.10.4.1 (no
+            // trigger; interval under 600): each raises ValidationError with
+            // SCP-VALID-7000.
+            for bad in [
+                Some(int(5)),
+                policy(&[("interval_secs", int(3600))]),
+                policy(&[
+                    ("interval_sec", int(3600)),
+                    ("on_membership_change", flag(false)),
+                ]),
+                policy(&[
+                    ("interval_secs", int(-1)),
+                    ("on_membership_change", flag(true)),
+                ]),
+                policy(&[("on_membership_change", flag(false))]),
+                policy(&[
+                    ("interval_secs", int(599)),
+                    ("on_membership_change", flag(true)),
+                ]),
+            ] {
+                let err = parse(bad).expect_err("must reject");
+                assert!(
+                    err.is_instance_of::<crate::error::ValidationError>(py),
+                    "expected ValidationError, got {err}"
+                );
+                let message = err.value(py).to_string();
+                assert!(
+                    message.starts_with(&format!("[{}]", codes::VALID_7000)),
+                    "expected {}, got {message}",
+                    codes::VALID_7000
+                );
+            }
+        });
     }
 
     #[test]
@@ -8203,6 +8374,7 @@ mod tests {
                 },
                 scp_did::DID(creator.to_owned()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
 
@@ -9155,6 +9327,7 @@ mod tests {
                 },
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .expect("create_context");
             let exported = scp.context_export(py, &ctx_id).expect("context_export");
@@ -10155,6 +10328,7 @@ mod tests {
                 params,
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
 
@@ -10418,6 +10592,7 @@ class SignOnlyCustody:
                 },
                 scp_did::DID(creator.clone()),
                 None,
+                Vec::new(),
             ))
             .unwrap();
 

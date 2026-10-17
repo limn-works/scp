@@ -154,6 +154,7 @@ class ReadmeQuickStartTest {
                 consequenceRulesJson = null,
                 consequenceConfigJson = null,
                 capabilityRequirementsJson = null,
+                pseudonymRotation = null,
             )
     }
 }

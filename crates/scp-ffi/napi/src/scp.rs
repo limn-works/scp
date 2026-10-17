@@ -1924,6 +1924,8 @@ impl Scp {
     /// `contextJoinFromWelcome`. A voting-governed context throws (governed-
     /// context invitations are not yet implemented). `creatorDid` MUST be a
     /// locally-custodied identity; the invite is signed under its `#active` key.
+    /// The bundle carries the context's stored relay set (§5.12.3.1
+    /// `relay_urls`), which the runtime reads; the caller supplies none.
     #[napi(js_name = "inviteMember")]
     pub async fn invite_member(
         &self,
@@ -1931,7 +1933,6 @@ impl Scp {
         creator_did: String,
         invitee_did: String,
         invitee_key_package: Vec<u8>,
-        relay_urls: Vec<String>,
     ) -> napi::Result<NapiInviteMemberOutcome> {
         crate::context::invite_member_on(
             &self.inner,
@@ -1939,7 +1940,6 @@ impl Scp {
             creator_did,
             invitee_did,
             invitee_key_package,
-            relay_urls,
         )
         .await
     }
@@ -2352,6 +2352,7 @@ impl Scp {
         requirements_json: String,
         proposer_did: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_governance_modify_capability_requirements_on(
             &self.inner,
             handle,
@@ -4420,6 +4421,19 @@ impl Scp {
         passphrase: Option<String>,
     ) -> napi::Result<NapiNodeHandle> {
         crate::server::node_start_local_on(&self.inner, data_dir, identity_did, passphrase).await
+    }
+
+    /// Starts a production node from this `SCP` instance.
+    ///
+    /// `config_json` is a `NodeStartConfig` (construction.md §"Node start —
+    /// `NodeStartConfig`"): its `identity` names an operator identity
+    /// registered on this instance, and the node runs on this instance's own
+    /// storage. Each failure rejects with the code sdk-common.md §"Node start
+    /// error codes" gives it, such as `SCP-IDENT-1063` for an unregistered
+    /// operator DID.
+    #[napi(js_name = "nodeStart")]
+    pub async fn node_start(&self, config_json: String) -> napi::Result<NapiNodeHandle> {
+        crate::server::node_start_on(&self.inner, config_json).await
     }
 }
 

@@ -76,11 +76,11 @@ cargo build --release -p scp-node --features cloud-blobs
 Runs a bare `RelayServer`. No identity, no HTTP, no TLS. Suitable for infrastructure operators who want a minimal relay that accepts WebSocket connections.
 
 ```bash
-SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 ```
 
-`scp-relay` has no default storage backend and no default database path; section 4
-lists the values and what an unset value does.
+`scp-relay` has no default public URL, push selection, storage backend or database path; section 3
+lists the URL and push values and section 4 the storage values, and what an unset value does.
 
 ### scp-node modes
 
@@ -96,8 +96,8 @@ lists the values and what an unset value does.
 # Full node (a shipped binary logs "no production pre-rotation custody backend available" and exits 1; see section 6)
 SCP_NODE_DOMAIN=relay.example.com SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/blobs.db scp-node
 
-# Relay-only mode (names its storage backend and path, which have no default; see section 4)
-SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-node --relay-only
+# Relay-only mode (names its public URL, push selection, storage backend and path, none of which has a default; see sections 3 and 4)
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-node --relay-only
 
 # Ephemeral mode (everything in memory); a shipped binary exits 1 on --ephemeral, alone or beside another mode flag
 SCP_NODE_DOMAIN=localhost cargo run -p scp-node --features testing -- --ephemeral
@@ -113,6 +113,7 @@ All relay configuration is via `SCP_RELAY_*` environment variables. These map to
 
 | Environment Variable | `RelayConfig` Field | Default | Description |
 |---------------------|---------------------|---------|-------------|
+| `SCP_RELAY_URL` | `relay_url` | none (required) | The relay's public WebSocket URL, which determines its reserved push routing ID (spec §10.7.1, push registration protocol). Set it to the URL clients connect to. `scp-relay` and `scp-node --relay-only` exit 1 when it is unset or empty. A full node does not read it: the node derives the URL from its domain or from the address its NAT tier advertises. Every listener (WebSocket, QUIC, UDP/DTLS) reads the same URL |
 | `SCP_RELAY_BIND_ADDR` | `bind_addr` | `0.0.0.0:9000` | WebSocket listener bind address |
 | `SCP_RELAY_MAX_BLOB_SIZE` | `max_blob_size` | `262144` (256 KB) | Maximum blob size in bytes |
 | `SCP_RELAY_MAX_BLOB_TTL` | `max_blob_ttl` | `604800` (7 days) | Maximum blob TTL in seconds |
@@ -133,6 +134,31 @@ Additional `RelayConfig` fields with fixed defaults (not configurable via env va
 | `delivery_jitter_ms` | `50` | Random delivery delay for metadata privacy |
 | `bridge_secret` | `None` | Shared secret for internal bridge auth |
 | `supports_bridge` | `false` | Whether BRIDGE operations are accepted |
+
+### Push configuration (`scp-relay` and `scp-node --relay-only`)
+
+A relay wakes a registered mobile device through APNs or FCM when a message arrives for it (spec §10.7.1). The operator names the platforms the relay serves in `SCP_RELAY_PUSH_PLATFORMS`, which has no default (persistence spec §17.17.1, SCP-CAPSEL-8000): a relay that reads it unset, empty or only whitespace prints `SCP_RELAY_PUSH_PLATFORMS is unset or empty, and it has no default (SCP-CAPSEL-8000 ...)` and exits 1 before it opens any store. A full node does not read these variables: its embedded relay offers no push.
+
+| Environment Variable | Required when | Values |
+|---------------------|---------------|--------|
+| `SCP_RELAY_PUSH_PLATFORMS` | always | `none`, `apns`, `fcm`, or `apns,fcm` (any order and case) |
+| `SCP_RELAY_PUSH_STORE` | a platform is listed | `sqlite` |
+| `SCP_RELAY_PUSH_STORE_PATH` | the store is `sqlite` | Absolute path of the push registration database |
+| `SCP_RELAY_APNS_KEY_PATH` | `apns` is listed | Absolute path of the APNs authentication key (`.p8`) |
+| `SCP_RELAY_APNS_KEY_ID` | `apns` is listed | The key's ID |
+| `SCP_RELAY_APNS_TEAM_ID` | `apns` is listed | The Apple developer team ID |
+| `SCP_RELAY_APNS_TOPIC` | `apns` is listed | The app's bundle ID |
+| `SCP_RELAY_APNS_ENVIRONMENT` | `apns` is listed | `production` or `sandbox`, no default |
+| `SCP_RELAY_FCM_SERVICE_ACCOUNT_PATH` | `fcm` is listed | Absolute path of the Firebase service-account JSON |
+| `SCP_RELAY_FCM_PROJECT_ID` | `fcm` is listed and the JSON names no `project_id` | The Firebase project ID |
+
+`none` reads no other push variable, and the relay serves no push. Every other variable has no default: a listed platform with any of its variables unset or blank exits 1 with an error that names the variable. `SCP_RELAY_PUSH_STORE=memory` exits 1, because the in-memory push store compiles only into test builds (persistence spec §17.17.5).
+
+Credentials load only from files, never from an environment value. Each credential file must be a regular file of at most 64 KiB whose mode grants nothing to its group or to others (`chmod 600` or `chmod 400`); a looser mode exits 1 naming the variable and the mode. The relay reads key bytes into buffers it zeroes on release, and no log line or error message carries them: startup logs only that each platform's credentials loaded, and the APNs environment.
+
+One relay serves one Apple team, topic and APNs environment, and one Firebase project.
+
+With a platform listed, the relay opens the SQLite push store at `SCP_RELAY_PUSH_STORE_PATH` before it opens its blob store and serves its reserved push routing ID through the push gate. A store that cannot open exits 1 with `SCP_RELAY_PUSH_STORE=sqlite cannot open the push store at SCP_RELAY_PUSH_STORE_PATH='<path>' ... (SCP-CAPSEL-8001)`, and nothing falls back to another store. The relay verifies each registration's signature against the registrant's key-event log; until that verifier's key-state resolution is built, it refuses every registration with `5003` `PUSH_VERIFIER_UNAVAILABLE` and stores none.
 
 ### Node-specific configuration
 
@@ -190,14 +216,18 @@ OPTIONS:
 
 ```bash
 # SQLite
-SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 
 # PostgreSQL (binary built with: cargo build --release -p scp-relay --features cloud-blobs)
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 \
+SCP_RELAY_PUSH_PLATFORMS=none \
 SCP_RELAY_STORAGE_BACKEND=postgres \
 SCP_RELAY_DATABASE_URL="postgres://user:pass@localhost/scp_relay" \
 scp-relay
 
 # S3-compatible, e.g. MinIO (binary built with --features cloud-blobs)
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 \
+SCP_RELAY_PUSH_PLATFORMS=none \
 SCP_RELAY_STORAGE_BACKEND=s3 \
 SCP_RELAY_S3_BUCKET=scp-blobs \
 SCP_RELAY_S3_PREFIX=production/ \
@@ -206,7 +236,7 @@ AWS_SECRET_ACCESS_KEY=... \
 scp-relay
 
 # In-memory (development only)
-SCP_RELAY_STORAGE_BACKEND=memory scp-relay
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=memory scp-relay
 ```
 
 All backends implement the `BlobStorage` trait and pass the `blob_store_conformance!` test suite. See [Storage Backends](storage-backends.md) for details on the trait and conformance testing.
@@ -219,9 +249,11 @@ All backends implement the `BlobStorage` trait and pass the `blob_store_conforma
 
 ```bash
 # Minimal: SQLite storage, bind 0.0.0.0:9000
-SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 SCP_RELAY_PUSH_PLATFORMS=none SCP_RELAY_STORAGE_BACKEND=sqlite SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db scp-relay
 
 # Custom bind address and limits
+SCP_RELAY_URL=wss://relay.example.com/scp/v1 \
+SCP_RELAY_PUSH_PLATFORMS=none \
 SCP_RELAY_STORAGE_BACKEND=sqlite \
 SCP_RELAY_STORAGE_PATH=/var/lib/scp/relay.db \
 SCP_RELAY_BIND_ADDR=127.0.0.1:8080 \
@@ -233,7 +265,7 @@ scp-relay
 
 Each limit and bind variable takes its default only when it is unset: a value that does not parse, including an empty one, makes the relay exit 1 with an error naming the variable.
 
-The relay logs to stderr. Control verbosity with `SCP_RELAY_LOG_LEVEL` or `RUST_LOG`; a filter that does not parse, or a `SCP_RELAY_LOG_FORMAT` other than `json` or `pretty`, exits 1. The commands below assume `SCP_RELAY_STORAGE_BACKEND` and `SCP_RELAY_STORAGE_PATH` are already exported, as in the examples above:
+The relay logs to stderr. Control verbosity with `SCP_RELAY_LOG_LEVEL` or `RUST_LOG`; a filter that does not parse, or a `SCP_RELAY_LOG_FORMAT` other than `json` or `pretty`, exits 1. The commands below assume `SCP_RELAY_URL`, `SCP_RELAY_PUSH_PLATFORMS`, `SCP_RELAY_STORAGE_BACKEND` and `SCP_RELAY_STORAGE_PATH` are already exported, as in the examples above:
 
 ```bash
 # Structured JSON logs for production

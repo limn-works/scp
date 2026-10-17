@@ -86,6 +86,18 @@ pub(crate) async fn dispatch(
             Outcome::ok(())
         }
 
+        QueriesCommand::LocalRoutingIds {
+            context_id: _,
+            reply,
+        } => {
+            // §9.10.4.1: typed read; the previous routing ID is filtered by
+            // the wall clock so a grace that ended before the grace arm ran
+            // is not reported.
+            let answer = queries_helpers::local_routing_ids(state, deps.clock.now_secs());
+            let _ = reply.send(answer);
+            Outcome::ok(())
+        }
+
         QueriesCommand::GetBroadcastKeyForLocalAuthor {
             context_id: _,
             author_did,
@@ -158,6 +170,14 @@ pub(crate) async fn dispatch(
         } => {
             let answer = queries_helpers::capability_requirements(state);
             let _ = reply.send(answer);
+            Outcome::ok(())
+        }
+
+        QueriesCommand::RelayUrls {
+            context_id: _,
+            reply,
+        } => {
+            let _ = reply.send(Ok(Some(state.relay_urls.clone())));
             Outcome::ok(())
         }
 

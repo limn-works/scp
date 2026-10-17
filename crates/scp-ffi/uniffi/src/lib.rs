@@ -1190,6 +1190,7 @@ mod tests {
             consequence_rules_json: None,
             consequence_config_json: None,
             capability_requirements_json: None,
+            pseudonym_rotation: None,
         };
 
         let handle = rt
@@ -1254,6 +1255,7 @@ mod tests {
             consequence_rules_json: None,
             consequence_config_json: None,
             capability_requirements_json: None,
+            pseudonym_rotation: None,
         };
 
         let handle = rt

@@ -127,7 +127,6 @@ describe("SCP.inviteMember — delegation and outcome narrowing", () => {
       "did:dht:creator",
       "did:dht:invitee",
       new Uint8Array([7, 7]),
-      ["wss://relay.example"],
     );
 
     const call = native.__lastCall("inviteMember");
@@ -137,7 +136,9 @@ describe("SCP.inviteMember — delegation and outcome narrowing", () => {
     // KeyPackage bytes marshaled to a plain number[] on the wire.
     expect(Array.isArray(call?.args[3])).toBe(true);
     expect(call?.args[3]).toEqual([7, 7]);
-    expect(call?.args[4]).toEqual(["wss://relay.example"]);
+    // The runtime reads the context's stored relay set; no list crosses the
+    // bridge.
+    expect(call?.args).toHaveLength(4);
 
     // The `bundle` is a SealedInvitation directly usable as the join input.
     expect(outcome.bundle.contextId).toBe("ctx-1");
@@ -163,7 +164,7 @@ describe("SCP.inviteMember — delegation and outcome narrowing", () => {
     }));
 
     const kp: readonly number[] = [1, 2, 3];
-    await scp.inviteMember("ctx", "did:dht:creator", "did:dht:invitee", kp, []);
+    await scp.inviteMember("ctx", "did:dht:creator", "did:dht:invitee", kp);
 
     const call = native.__lastCall("inviteMember");
     expect(call?.args[3]).toEqual([1, 2, 3]);
@@ -177,7 +178,7 @@ describe("SCP.inviteMember — delegation and outcome narrowing", () => {
     });
 
     await expect(
-      scp.inviteMember("ctx", "did:dht:creator", "did:dht:invitee", new Uint8Array([1]), []),
+      scp.inviteMember("ctx", "did:dht:creator", "did:dht:invitee", new Uint8Array([1])),
     ).rejects.toBeInstanceOf(ContextError);
   });
 });
@@ -357,7 +358,6 @@ if (!scpAvailable) {
           creator.did,
           invitee.did,
           reservation.keyPackagePublic,
-          [],
         );
 
         // The outcome carries a SealedInvitation `bundle` directly usable as the
@@ -406,7 +406,6 @@ if (!scpAvailable) {
             "did:dht:not-custodied-here",
             invitee.did,
             reservation.keyPackagePublic,
-            [],
           ),
         ).rejects.toThrow();
       } finally {

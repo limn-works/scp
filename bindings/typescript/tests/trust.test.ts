@@ -20,7 +20,7 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Context } from "../src/context";
-import { IdentityError, ValidationError } from "../src/errors";
+import { IdentityError, UcanPermissionError, ValidationError } from "../src/errors";
 import { Identity } from "../src/identity";
 import type { SCP } from "../src/scp";
 import type {
@@ -171,19 +171,8 @@ function mountWithContext() {
   return { scp, native, context };
 }
 
-/**
- * Thin wrapper so tests can call `evaluateTrust(scp, did, ctx, tokens?)` rather
- * than `scp.evaluateTrust(ctx, did, tokens?)` — mirrors Python's
- * standalone `evaluate_trust(scp, did, ctx, tokens)` helper convention.
- */
-function evaluateTrust(
-  scp: SCP,
-  subjectDid: string,
-  context: Context,
-  tokens?: readonly string[],
-): ReturnType<SCP["evaluateTrust"]> {
-  return scp.evaluateTrust(context, subjectDid, tokens);
-}
+// These tests call `scp.evaluateTrust(context, subjectDid, tokens?)` directly.
+// §7 of ADR-048 requires a stateful operation to be a method on `SCP`.
 
 describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
   let cleanup: (() => Promise<void>) | undefined;
@@ -261,7 +250,7 @@ describe("scp.ucanEvaluate — structured read-only diagnostic", () => {
 
     let threw = false;
     try {
-      await evaluateTrust(scp, "did:dht:z6MkBob", context, ["fake-token"]);
+      await scp.evaluateTrust(context, "did:dht:z6MkBob", ["fake-token"]);
     } catch (err) {
       threw = true;
       // mapBridgeError re-wraps the raw error; check the preserved message.
@@ -276,6 +265,110 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
   afterEach(async () => {
     await cleanup?.();
     cleanup = undefined;
+  });
+
+  // ADR-059 Decision 3 forbids an SDK from reconstructing which validation
+  // stage failed by matching error-message text.
+  //
+  // This assertion is closed by construction rather than sampled: it pins the
+  // THROWN INSTANCE, not its wording. Any classifier must either swallow the
+  // throw (no rejection) or build a replacement error (a different instance),
+  // so every spelling of the defect fails here, including spellings nobody
+  // wrote down.
+  it("rethrows the bridge's capability error by identity, never reading its message", async () => {
+    const { scp, native, context } = mountWithContext();
+    const thrown = new UcanPermissionError("any prose at all", "SCP-PERM-3001");
+    native.__stub("ucanEvaluate", () => Promise.reject(thrown));
+
+    await expect(scp.evaluateTrust(context, "did:dht:subject", ["token-a"])).rejects.toBe(thrown);
+  });
+
+  // The reader-facing form of the same property: one failure, stated twice.
+  // "token expired" is a spelling the deleted `EXPIRY_PREFIXES` table matched
+  // and the deleted classifier turned into a five-field-true verdict; the
+  // rewording matched no table and produced an all-false verdict. Equal
+  // outcomes here mean the wording decided nothing.
+  it("reports the same outcome when the bridge error message is reworded", async () => {
+    const outcomes = await Promise.all(
+      ["token expired", "the token's validity window has already closed"].map(async (core) => {
+        const { scp, native, context } = mountWithContext();
+        native.__stub("ucanEvaluate", () =>
+          Promise.reject(
+            new UcanPermissionError(
+              `[SCP-PERM-3001] permission error: ${core} — check token format`,
+              "SCP-PERM-3001",
+            ),
+          ),
+        );
+        // Layer 2 must succeed, so the outcome this test compares is decided by
+        // Layer 1 alone. Leaving `participationRecord` unstubbed would make the
+        // mock reject for BOTH spellings and hide a Layer-1 divergence behind a
+        // Layer-2 failure.
+        native.__stub("participationRecord", () => fakeParticipationRecord());
+        try {
+          const value = await scp.evaluateTrust(context, "did:dht:subject", ["token-a"]);
+          return { rejected: false, capabilityValidation: value.capabilityValidation };
+        } catch {
+          return { rejected: true, capabilityValidation: null };
+        }
+      }),
+    );
+
+    expect(outcomes[0]).toEqual(outcomes[1] as (typeof outcomes)[0]);
+    expect(outcomes[0]?.rejected).toBe(true);
+  });
+
+  // Each of the six fields must carry its OWN per-token value into the
+  // aggregate. Falsifying one field at a time and asserting that exactly that
+  // field goes false pins the wiring field by field. Without this, transposing
+  // two lines of the AND-combine — `tokensValid &&= perToken.signaturesValid`
+  // beside `signaturesValid &&= perToken.tokensValid` — passes every other test
+  // in this suite, because every other double returns both fields `true`.
+  const CAPABILITY_FIELDS = [
+    "tokensValid",
+    "signaturesValid",
+    "withinCeiling",
+    "nonceValid",
+    "notRevoked",
+    "timeBoundsValid",
+  ] as const;
+
+  for (const field of CAPABILITY_FIELDS) {
+    it(`carries a per-token ${field}:false into the aggregate and leaves the other five true`, async () => {
+      const { scp, native, context } = mountWithContext();
+      const probe = statefulUcanEvaluate({ "token-a": { [field]: false } });
+      native.__stub("ucanEvaluate", probe.fn);
+      native.__stub("participationRecord", () => fakeParticipationRecord());
+
+      const result = await scp.evaluateTrust(context, "did:dht:subject", ["token-a"]);
+
+      expect(result.capabilityValidation).toEqual({ ...ALL_PASS, [field]: false });
+    });
+  }
+
+  // Layer 1 must consider EVERY attenuation the token declares, not `att[0]`.
+  // The deleted implementation decoded the unverified payload, took
+  // `att[0].with`, and sent that single URI to the enforcing gate. Supplying no
+  // challenge capability puts the core in intrinsic-validity mode, where it
+  // parses the whole `att` set and checks the ceiling against every granted
+  // capability. This pins the omission on the wire.
+  it("sends no challenge capability, so the core evaluates every attenuation", async () => {
+    const { scp, native, context } = mountWithContext();
+    const probe = statefulUcanEvaluate();
+    native.__stub("ucanEvaluate", probe.fn);
+    native.__stub("participationRecord", () => fakeParticipationRecord());
+
+    await scp.evaluateTrust(context, "did:dht:subject", ["token-a"]);
+
+    // The native call is (handle, token, capability, presentingAgentDid,
+    // proofTokens) — `SCP.ucanEvaluate` reorders its own signature onto that
+    // wire order. An omitted capability crosses as `null`, which the bridge
+    // reads as "no challenge".
+    const args = native.__calls("ucanEvaluate")[0]?.args;
+    expect(args?.[1]).toBe("token-a");
+    expect(args?.[2]).toBeNull();
+    expect(args?.[3]).toBe("did:dht:subject");
+    expect(probe.evaluateCountFor("token-a")).toBe(1);
   });
 
   it("is idempotent: re-evaluating the same token keeps nonceValid true (read-only)", async () => {
@@ -918,7 +1011,7 @@ describe("encodeCapabilityRequirements", () => {
     // The catch block in Layer 2 must re-throw non-context errors — it must NOT
     // swallow them into behavioralRecord: null (which would hide genuine faults).
     // mapBridgeError re-wraps the raw error; check the preserved message.
-    await expect(evaluateTrust(scp, "did:dht:z6MkBob", context)).rejects.toThrow("Network timeout");
+    await expect(scp.evaluateTrust(context, "did:dht:z6MkBob")).rejects.toThrow("Network timeout");
   });
 });
 

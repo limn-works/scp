@@ -10,7 +10,7 @@ This section carries known-answer test vectors for SCP's cryptographic construct
 python3.12 scripts/gen-test-vectors-p256.py
 ```
 
-The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, and the Vector 35 `DataProvenance` hash, which the Rust KAT that §25.8 names computes independently through `rmp_serde`, and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
+The script uses nothing outside the Python standard library, and it self-gates before it prints a byte: it checks itself against `SHA-256("")`, the RFC 6979 Appendix A.2.5 P-256 nonce and signature, RFC 5869 Appendix A.1 for HKDF-SHA256, FIPS 197 Appendix C.1 and the zero-key GCM test case for AES-128-GCM, RFC 8291 Appendix A for WebPush message encryption, and the Vector 35 `DataProvenance` hash, which the Rust KAT that §25.8 names computes independently through `rmp_serde`, and it computes every public key twice by two scalar multiplications sharing no arithmetic, and a third time through the `cryptography` package where that package imports. A mismatch raises before anything prints.
 
 **Identifier strings in the fixtures.** Where a signed or hashed structure takes a fixture party's identifier as UTF-8 bytes, the vectors print it in the `scp:` text form that Vector 57 of §25.29 pins: `"scp:"` followed by the lowercase, unpadded RFC 4648 base32 of the 32-byte identifier, 56 characters in all, so each such field carries the length prefix `BE32(56)` or the MessagePack header `0xd9 0x38`. Each fixture party's 32-byte identifier is `SHA-256("SCP test vector identifier <role>")` over the ASCII label, with one role per party, following the precedent of §25.9. The 25 roles, each `<role>` exactly as the label spells it, are `a`, `agent`, `alice`, `announcing member`, `app`, `b`, `bob`, `carol`, `dave`, `definer`, `event-log actor`, `hpke member`, `hpke sender`, `issuer`, `leaf attester`, `m`, `new member`, `other member`, `proposer`, `pseudonymized member`, `sender`, `subject`, `sync member`, `verifier`, `voter`. A fixture identifier is bound to no key: the vectors that carry one pin a preimage, not a binding between an identifier and the key that signs it. The rule covers the fixture parties only: Vector 52's signed export preimage carries the literal snapshot string `"creator_did":"<scp-identifier:creator>"`, which is not an identifier in the `scp:` form, and Vectors 41 through 57 are unchanged by it.
 
@@ -448,7 +448,91 @@ Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree cons
 
 ### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)
 
-Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with the §25.2 reference P-256 key under RFC 6979, so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77); the ADR-031 amendment of 2026-10-12 (`phase-6.md`) added the `ModifyPseudonymRotationPolicy` action that `PseudonymRotationPolicyModified` (tag 78) records). The events are signed with the §25.2 reference P-256 key under RFC 6979, so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+
+**`EventType` tags.** This table is the complete closed `EventType` taxonomy and fixes the `event_type_tag` that the signed value below carries for each variant. The tags are protocol constants and never change. Tag 59 is retired: it belonged to `PseudonymAnnounced`, which is not a durable event, and no event carries it.
+
+| Tag | `EventType` variant |
+|-----|---------------------|
+| 0 | `ContextCreated` |
+| 1 | `ContextClosing` |
+| 2 | `ContextClosed` |
+| 3 | `ContextExpired` |
+| 4 | `MemberJoined` |
+| 5 | `MemberLeft` |
+| 6 | `RoleAssigned` |
+| 7 | `TokenRevoked` |
+| 8 | `MessageSent` |
+| 9 | `OutletRegistered` |
+| 10 | `OutletUpdated` |
+| 11 | `OutletInvoked` |
+| 12 | `OutletVerified` |
+| 13 | `OutletInterfaceEstablished` |
+| 14 | `GovernanceAction` |
+| 15 | `ConsistencyCheckpoint` |
+| 16 | `AbsenceProofRequested` |
+| 17 | `MemberBlocked` |
+| 18 | `KeyEpochAdvance` |
+| 19 | `MediaSessionStarted` |
+| 20 | `MediaSessionEnded` |
+| 21 | `PaymentReceived` |
+| 22 | `EconomicPolicyChanged` |
+| 23 | `SpendingUcanGranted` |
+| 24 | `SpendingUcanRevoked` |
+| 25 | `GovernanceProposalCreated` |
+| 26 | `GovernanceVoteCast` |
+| 27 | `GovernanceVoteWithdrawn` |
+| 28 | `GovernanceProposalResolved` |
+| 29 | `GovernanceConflictDetected` |
+| 30 | `GovernanceConflictResolved` |
+| 31 | `GovernanceDeadlockRecovery` |
+| 32 | `GovernanceActionExecuted` |
+| 33 | `EconomicPolicyApplied` |
+| 34 | `ProvenanceAttached` |
+| 35 | `ProvenanceReceived` |
+| 36 | `AdminTransferred` |
+| 37 | `CeilingModified` |
+| 38 | `CeilingModificationPending` |
+| 39 | `ThresholdModified` |
+| 40 | `SignerAdded` |
+| 41 | `SignerRemoved` |
+| 42 | `ChildContextCreated` |
+| 43 | `ContextPromoted` |
+| 44 | `ContentKeysRotated` |
+| 45 | `MemberReset` |
+| 46 | `MemberSuspended` |
+| 47 | `MemberSuspendedAll` |
+| 48 | `MemberUnblocked` |
+| 49 | `AccessRestored` |
+| 50 | `GovernanceReconfigured` |
+| 51 | `GovernanceFreezeExpired` |
+| 52 | `HardRateLimitModified` |
+| 53 | `EconomicPolicyLocked` |
+| 54 | `ContextMigrationStarted` |
+| 55 | `OutletRemoved` |
+| 56 | `PruningPolicyModified` |
+| 57 | `CommitBroadcasted` |
+| 58 | `CommitBroadcastPending` |
+| 59 | retired |
+| 60 | `ContextTombstoned` |
+| 61 | `ContextMigrationCancelled` |
+| 62 | `TtlExtended` |
+| 63 | `TtlExtensionRejected` |
+| 64 | `AccessRevoked` |
+| 65 | `SpendApproved` |
+| 66 | `PaymentCaptureFailed` |
+| 67 | `ConsequenceTriggered` |
+| 68 | `ConsequenceEnforced` |
+| 69 | `ConsequenceEnforcementFailed` |
+| 70 | `ConsequenceEscalatedToSuspendAll` |
+| 71 | `CommitBroadcastSucceeded` |
+| 72 | `CommitBroadcastFailed` |
+| 73 | `RecoveryEpochAdvanced` |
+| 74 | `AppBound` |
+| 75 | `AppUnbound` |
+| 76 | `CrossContextOutletInvoked` |
+| 77 | `CrossContextDivergenceMarker` |
+| 78 | `PseudonymRotationPolicyModified` |
 
 **MessagePack layout of a signed `Event`.** The seven fields serialize positionally, so an implementer reproduces the bytes without reading Rust: a 7-element array holding the `EventType` variant **name** as a string, the actor DID as a string, the timestamp as an unsigned integer, the sequence as an unsigned integer, the one-element `EventPayload` array holding the payload as a MessagePack binary, the 32-byte `prev_hash` as a 32-element array of unsigned integers, and the 64-byte signature as a MessagePack binary. The signed value is `SHA-256("SCP-EVENT-V1:" || BE16(event_type_tag) || BE32(len(actor_did)) || actor_did || BE64(timestamp) || BE64(sequence) || BE32(len(payload)) || payload || prev_hash)`.
 
@@ -1108,7 +1192,7 @@ Expected bytes (hex, 171 bytes, single continuous string):
 
 where `member`, `other` and `ctx` are the values Vector 36 defines. Every `Rejected` and `Unchanged` row leaves the registry exactly as the row's input states it.
 
-No test asserts this vector yet. A conforming implementation reproduces both byte strings and every decision in the table on native and on `wasm32`, as Vector 36 requires of v1.
+A conforming implementation reproduces both byte strings and every decision in the table on native and on `wasm32`, as Vector 36 requires of v1. `vector_58_v2_wire_and_decision_table_match_on_every_target` in `crates/scp-client-wasm/tests/pseudonym_cross_target_kat.rs` asserts both on native and on `wasm32` (native `#[test]` plus `#[wasm_bindgen_test]`), and `vector_58_v2_wire_bytes_match_golden` and `vector_58_decision_table` in `crates/scp-protocol/src/context/pseudonym.rs` assert them beside the classifier.
 
 ## 25.20 Trust Attestation Signing Vectors (§7.4.1, §9.5.2)
 
@@ -2097,7 +2181,105 @@ rejected, padded:
   scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za====
 ```
 
-## 25.30 Trust Challenge Vectors (§7.3.4)
+## 25.30 WebPush Token, Wake Body and VAPID JWT Vectors (`22-human-readable-addressing.md` §22.11.4, `10-infrastructure-and-self-hosting.md` §10.7.1)
+
+Both vectors take the subscription keys and the sender inputs of RFC 8291 Appendix A, so an implementer checks the WebPush encryption against the RFC's published example first and against these vectors second. The generator reproduces the RFC 8291 Appendix A ciphertext, FIPS 197 Appendix C.1 and the zero-key GCM test case before it prints a byte.
+
+### Vector 59: a WebPush token
+
+The token encodes one browser subscription as `BE32(len(endpoint)) || endpoint || p256dh || auth` (§22.11.4). `p256dh` and `auth` are the user agent's public key and authentication secret from RFC 8291 Appendix A, and the endpoint takes the form of the push resource URLs RFC 8030 prints.
+
+```
+endpoint (59 bytes):
+  https://push.example.net/p/LBhhw0OohO-Wl4Oi971UGsB7sdQGUibx
+p256dh (RFC 8291 Appendix A ua_public):
+  042571b2becdfde360551aaf1ed0f4cd366c11cebe555f89bcb7b186a5333917
+  3168ece2ebe018597bd30479b86e3c8f8eced577ca59187e9246990db682008b
+  0e
+auth (RFC 8291 Appendix A auth):
+  05305932a1c7eabe13b6cec9fda48882
+token (144 bytes):
+  0000003b68747470733a2f2f707573682e6578616d706c652e6e65742f702f4c
+  42686877304f6f684f2d576c344f693937315547734237736451475569627804
+  2571b2becdfde360551aaf1ed0f4cd366c11cebe555f89bcb7b186a533391731
+  68ece2ebe018597bd30479b86e3c8f8eced577ca59187e9246990db682008b0e
+  05305932a1c7eabe13b6cec9fda48882
+longest token, with a 2,048-byte endpoint (§9.18.13):
+  2133 bytes
+```
+
+### Vector 60: a WebPush wake body and its `Authorization` header
+
+The body is the RFC 8291 encryption of the wake plaintext `{"scp":"1"}` as one aes128gcm record with `rs` 4,096 (§10.7.1 step 5). A relay draws a fresh ephemeral key pair and salt for every wake, so no two real wake bodies match; this vector fixes both to RFC 8291 Appendix A's `as_private` and `salt`, so it reproduces exactly. The intermediates follow RFC 8291 §3.4 and RFC 8188 §2: `prk_key = HMAC-SHA256(auth, ecdh_secret)`, `ikm = HMAC-SHA256(prk_key, "WebPush: info" || 0x00 || ua_public || as_public || 0x01)`, `prk = HMAC-SHA256(salt, ikm)`, `cek` the first 16 bytes of `HMAC-SHA256(prk, "Content-Encoding: aes128gcm" || 0x00 || 0x01)`, and `nonce` the first 12 bytes of `HMAC-SHA256(prk, "Content-Encoding: nonce" || 0x00 || 0x01)`. The record encrypts the plaintext followed by the delimiter `0x02`.
+
+```
+plaintext (11 bytes):
+  7b22736370223a2231227d
+ephemeral private key (RFC 8291 Appendix A as_private):
+  c9f58f89813e9f8e872e71f42aa64e1757c9254dcc62b72ddc010bb4043ea11c
+ephemeral public key (keyid):
+  04fe33f4ab0dea71914db55823f73b54948f41306d920732dbb9a59a53286482
+  200e597a7b7bc260ba1c227998580992e93973002f3012a28ae8f06bbb78e5ec
+  0f
+salt (RFC 8291 Appendix A salt):
+  0c6bfaadad67958803092d454676f397
+ecdh_secret:
+  932acbd63208387133837b0cd995911c3441eb66000998614a592727aef6912b
+prk_key:
+  4a7af724cc5a1d50d71d6267e70742e765a3a42b5dd84204181ca40dc656df69
+ikm:
+  4b895831bfcbd05c427aad16843c7cd772a0498a94dba90ecb359476c5d8cab8
+prk:
+  d3dfde5191abb2fc428430864427642e20d7ad178638455e48274270f0522527
+cek:
+  a088555b4e0c45dcb65cdf4288a2f14e
+nonce:
+  e21ffde6495727913faa7a0d
+header, salt || rs || idlen || keyid (86 bytes):
+  0c6bfaadad67958803092d454676f397000010004104fe33f4ab0dea71914db5
+  5823f73b54948f41306d920732dbb9a59a53286482200e597a7b7bc260ba1c22
+  7998580992e93973002f3012a28ae8f06bbb78e5ec0f
+ciphertext, AES-128-GCM of plaintext || 0x02 with its tag (28 bytes):
+  deddc85612f0a034109eae8c1bde9c4f0cc78cfeb46af48de50400fd
+body (114 bytes):
+  0c6bfaadad67958803092d454676f397000010004104fe33f4ab0dea71914db5
+  5823f73b54948f41306d920732dbb9a59a53286482200e597a7b7bc260ba1c22
+  7998580992e93973002f3012a28ae8f06bbb78e5ec0fdeddc85612f0a034109e
+  ae8c1bde9c4f0cc78cfeb46af48de50400fd
+```
+
+The VAPID key is §25.2's reference key, which is not the ephemeral key, as RFC 8292 §2 requires. `aud` is the origin of Vector 59's endpoint, and an endpoint that names port 8443 has the audience `https://push.example.net:8443`. The claims below are serialized with no whitespace in the order `aud`, `exp`, `sub`. §10.7.1 fixes neither that order nor `exp`, so an implementation reproduces the signature only from this exact claims string; with any other claims it checks that the signature verifies under `k`. The signature is RFC 6979 ECDSA over the SHA-256 of the signing input, low-`s`, as `r || s`.
+
+```
+VAPID public key k (§25.2 reference key, uncompressed, base64url):
+  BDscrCP0XPHN_fCzL493e5kWbBtpZJwilbFReIPUfzAnRxaVV054co31A6DCHdHa
+  n3t3JS2DmFJ6GyF3x4Ik8FE
+JOSE header:
+  {"typ":"JWT","alg":"ES256"}
+claims:
+  {"aud":"https://push.example.net","exp":1700043200,"sub":"mailto
+  :operator@relay.example"}
+signing input:
+  eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.eyJhdWQiOiJodHRwczovL3B1c2g
+  uZXhhbXBsZS5uZXQiLCJleHAiOjE3MDAwNDMyMDAsInN1YiI6Im1haWx0bzpvcGV
+  yYXRvckByZWxheS5leGFtcGxlIn0
+SHA-256(signing input):
+  5585c581e754d22b3281c15282d1c472f8c9c3255bcfff34fe2147cf1c29ab09
+signature (r || s):
+  5716be9290e287360d15c7473601159c64693b6caccd5b380fb0593c9a156a57
+  6288a822d005ad23ec01035ef237c9c8e008b0c3d717e47a4766a70e1d8ef621
+Authorization header value:
+  vapid t=eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.eyJhdWQiOiJodHRwczo
+  vL3B1c2guZXhhbXBsZS5uZXQiLCJleHAiOjE3MDAwNDMyMDAsInN1YiI6Im1haWx
+  0bzpvcGVyYXRvckByZWxheS5leGFtcGxlIn0.Vxa-kpDihzYNFcdHNgEVnGRpO2y
+  szVs4D7BZPJoValdiiKgi0AWtI-wBA17yN8nI4Aiww9cX5HpHZqcOHY72IQ, k=B
+  DscrCP0XPHN_fCzL493e5kWbBtpZJwilbFReIPUfzAnRxaVV054co31A6DCHdHan
+  3t3JS2DmFJ6GyF3x4Ik8FE
+```
+
+The claims string, the signing input and the header value are each one line; the breaks above wrap them for width only.
+
+## 25.31 Trust Challenge Vectors (§7.3.4)
 
 `07-trust-validation-and-capabilities.md` §7.3.4 fixes four encodings: the request preimage under `SCP-CHALLENGE-REQ-V1:`, the response preimage under `SCP-CHALLENGE-RESP-V1:`, the verification record preimage under `SCP-CHALLENGE-VERIFY-V1:`, and the `verification_id` and `suite_digest` derivations. §7.3.4.6 fixes the capability definition preimage under `SCP-CAPABILITY-DEFINITION-V1:`. The request and record encodings each changed under the same separator, and no earlier encoding has a vector. None of these vectors carries a key or a signature: each pins a preimage and its SHA-256 digest, which the signer's `#active` key signs, so none depends on the curve. `verifier` and `subject` are the §25.1 fixture identifiers of those roles, in the `scp:` text form, so each carries the length prefix `00000038`. `capability_uri` is an identifier-scoped URI whose definer is the fixture identifier `definer`. A protocol capability URI would need at least the minimum number of test cases §7.3.4.3 sets for it, 20 for `schema-validation/v1`, and a conforming SDK refuses a one-case request for one.
 
@@ -2106,7 +2288,7 @@ The five vectors share these inputs:
 - `challenge_id`: the 32 bytes `01` through `20`;
 - `capability_uri`: `scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq:capability:schema-validation/v1`, whose definer `scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq` ends in `q`, so the last base32 character carries four zero bits (§7.3.4.1);
 - `created_at` 1700000000 and `expires_at` 1700086400, a one-day window;
-- `max_retries` 2, `cooldown_secs` 3600 and `pass_threshold_bps` 8000, which equal Vector 63's definition;
+- `max_retries` 2, `cooldown_secs` 3600 and `pass_threshold_bps` 8000, which equal Vector 65's definition;
 - `context_id`: `test-context-01`;
 - `verifier` and `subject`: the fixture identifiers `verifier` and `subject`.
 
@@ -2116,7 +2298,7 @@ verifier:       scp:vsrmsobf2uzejsbdaag3txwauasjrpnt5wlkulhahbbfwtdfaapa
 subject:        scp:ktarg6aqtsju6mh2ws3hk7t5kmsvmckq7d5eqwsmaw5di3e3p4ta
 ```
 
-### Vector 63: the capability definition
+### Vector 65: the capability definition
 
 The fixture URI is identifier-scoped, so its definition is a definer-signed §7.3.4.6 record. Inputs: `capability_uri` as above; `min_cases` `Total(1)`, so the tag byte is `00` and the count is 1; `pass_threshold_bps` 8000; `max_retries` 2; `cooldown_secs` 3600; `description` `Fixture definition for spec 25 vectors 59-62.`. The description is part of the preimage, so the vector keeps its text as written.
 
@@ -2135,9 +2317,9 @@ The fixture URI is identifier-scoped, so its definition is a definer-signed §7.
 definition_digest = SHA-256(Def):  1947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f67
 ```
 
-### Vector 59: the challenge request
+### Vector 61: the challenge request
 
-Inputs, beyond the shared ones: `definition_digest` the Vector 63 value; one test case with `test_id` `schema-validation-001`, `input` `{"name":"widget","count":3}`, `category` `schema` and `weight` 10000, whose expected output `SchemaMatch { schema: {"type":"object","required":["name","count"]} }` stays with the challenger and enters no byte of the request.
+Inputs, beyond the shared ones: `definition_digest` the Vector 65 value; one test case with `test_id` `schema-validation-001`, `input` `{"name":"widget","count":3}`, `category` `schema` and `weight` 10000, whose expected output `SchemaMatch { schema: {"type":"object","required":["name","count"]} }` stays with the challenger and enters no byte of the request.
 
 `input` enters the preimage as RFC 8785 canonical JSON behind a 4-byte big-endian length.
 
@@ -2153,7 +2335,7 @@ JCS(input):     {"count":3,"name":"widget"}
   736368656d6100002710
 ```
 
-`suite_digest` is `SHA-256(T)` with no domain prefix, and Vectors 60 and 61 carry it. `T` carries no byte of the expected output:
+`suite_digest` is `SHA-256(T)` with no domain prefix, and Vectors 62 and 63 carry it. `T` carries no byte of the expected output:
 
 ```
 suite_digest = SHA-256(T):  9cec9fc1c4c6a8a835e448fd94c33310692514aa51c4b52d2ba2d4a819f13cd8
@@ -2182,9 +2364,9 @@ suite_digest = SHA-256(T):  9cec9fc1c4c6a8a835e448fd94c33310692514aa51c4b52d2ba2
 D = SHA-256(R):  bf8a8adb49daf2eb0078296f1a4bd29a637b992aa1c795cf930a863978c0e7e2
 ```
 
-### Vector 62: the challenge response, attempt 2
+### Vector 64: the challenge response, attempt 2
 
-The subject answers the one case of Vector 59 with `{"count":3,"name":"widget"}`, which satisfies the schema. Inputs: `challenge_id` and `subject` as above; `request_digest` Vector 59's `D`; `attempt` 2; one output for `schema-validation-001`. Vector 62 is the first vector under `SCP-CHALLENGE-RESP-V1:`.
+The subject answers the one case of Vector 61 with `{"count":3,"name":"widget"}`, which satisfies the schema. Inputs: `challenge_id` and `subject` as above; `request_digest` Vector 61's `D`; `attempt` 2; one output for `schema-validation-001`. Vector 64 is the first vector under `SCP-CHALLENGE-RESP-V1:`.
 
 **`P` (210 bytes):**
 
@@ -2202,9 +2384,9 @@ The subject answers the one case of Vector 59 with `{"count":3,"name":"widget"}`
 D_r = SHA-256(P):  f6e06ef6438935719b8b784119b6f75e8095ea27ffdfb8c60efc1c88bddb4949
 ```
 
-### Vector 60: the verification record, failed attempt 1
+### Vector 62: the verification record, failed attempt 1
 
-Attempt 1 answered with `{"name":"widget"}`, which lacks the required `count`, so the case failed. Its response preimage takes the inputs of Vector 62 except `attempt` 1 and that output; the record's `response_digest` is that response's `D_r`.
+Attempt 1 answered with `{"name":"widget"}`, which lacks the required `count`, so the case failed. Its response preimage takes the inputs of Vector 64 except `attempt` 1 and that output; the record's `response_digest` is that response's `D_r`.
 
 **Attempt-1 response `P` (200 bytes):**
 
@@ -2222,7 +2404,7 @@ Attempt 1 answered with `{"name":"widget"}`, which lacks the required `count`, s
 D_r = SHA-256(P):  e2d6a7768d281382acb3573e23ba9c76f58c07509c2f7727a151b589a687a185
 ```
 
-Record inputs: `verifier`, `subject`, `capability_uri` and `challenge_id` as above; `definition_digest` the Vector 63 value; `suite_digest` the Vector 59 value; `attempt` 1; `response_digest` the attempt-1 `D_r`; `max_retries` 2, `cooldown_secs` 3600 and `pass_threshold_bps` 8000; `min_category_cases` 1; `passed` false; `score` 0; `test_count` 1 and `pass_count` 0; `challenge_created_at` 1700000000 and `challenge_expires_at` 1700086400; `timestamp` 1700000600; `expires_at` 1707776600, `timestamp` plus 7776000 seconds (90 days); `context_id` `test-context-01`.
+Record inputs: `verifier`, `subject`, `capability_uri` and `challenge_id` as above; `definition_digest` the Vector 65 value; `suite_digest` the Vector 61 value; `attempt` 1; `response_digest` the attempt-1 `D_r`; `max_retries` 2, `cooldown_secs` 3600 and `pass_threshold_bps` 8000; `min_category_cases` 1; `passed` false; `score` 0; `test_count` 1 and `pass_count` 0; `challenge_created_at` 1700000000 and `challenge_expires_at` 1700086400; `timestamp` 1700000600; `expires_at` 1707776600, `timestamp` plus 7776000 seconds (90 days); `context_id` `test-context-01`.
 
 **`verification_id` preimage (256 bytes):**
 
@@ -2265,9 +2447,9 @@ verification_id:               9554fd256e3c6bb5ee6c73e1ca28e72ade44785bde24d84c1
 D_v = SHA-256(R_v):            b4c5366bb9a106b8819cb974e602a6490a9b1b3f862497a6def7764d5bfa162d
 ```
 
-### Vector 61: the verification record, passing attempt 2 at the cooldown boundary
+### Vector 63: the verification record, passing attempt 2 at the cooldown boundary
 
-Inputs as in Vector 60 except: `attempt` 2; `response_digest` Vector 62's `D_r`; `passed` true; `score` 10000; `pass_count` 1; `timestamp` 1700004200; `expires_at` 1707780200. The challenger graded attempt 2 at Vector 60's `timestamp` plus `cooldown_secs`, the earliest time §7.3.4 step 3 admits it.
+Inputs as in Vector 62 except: `attempt` 2; `response_digest` Vector 64's `D_r`; `passed` true; `score` 10000; `pass_count` 1; `timestamp` 1700004200; `expires_at` 1707780200. The challenger graded attempt 2 at Vector 62's `timestamp` plus `cooldown_secs`, the earliest time §7.3.4 step 3 admits it.
 
 **`verification_id` preimage (256 bytes):**
 

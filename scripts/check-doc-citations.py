@@ -60,6 +60,23 @@ WHAT THE CHECK DOES NOT READ, AND WHY
     number resolves to nothing, and it exempts only the occurrence it follows. This
     check carries no per-site allowlist and gets none.
 
+BARE SCP CODES
+    Every Markdown file git tracks or would track (`git ls-files --cached --others
+    --exclude-standard`), outside `.docs/archive/`, fails on `SCP-` followed directly by
+    digits, at a word boundary, unless those digits name a story in `.docs/prds/`. The
+    archive keeps the record of cut features, whose stories have left the ledger.
+
+    Two registries own an identifier that starts with `SCP-`: the PRD story ledger,
+    whose IDs read `SCP-NNN` (`SCP-046`), and the SDK error registry in `crates/scp-ffi/common/src/error_codes.rs`,
+    whose codes carry a band (`SCP-CAPSEL-8001`). A relay wire code from the error table
+    of ADR-004, the SCP native relay protocol, is a bare number with a name (`4061`
+    PUSH_PLATFORM_UNAVAILABLE). Prose that writes `SCP-4061` puts a wire code in the
+    spelling of the SDK registry, so a reader searches `error_codes.rs` for a code that
+    no registry holds. The check resolves the digits against the story ledger, so a
+    story reference that names a real story passes, and every other `SCP-<digits>`
+    fails, whether its author meant a wire code, dropped an SDK band, or invented a
+    story.
+
 USAGE
     python3.12 scripts/check-doc-citations.py [--self-test]
 
@@ -74,11 +91,17 @@ USAGE
     widens the marker past the occurrence it follows. Run it before the real scan: a
     scanner that reports nothing on a tree with a planted defect proves nothing about
     the tree it scans next.
+
+    The self-test also plants `SCP-4061` in a lesson and `SCP-4063` in `docs/guides/`,
+    outside the citation scope, and asserts that the bare-code scan reports both and
+    passes `SCP-CAPSEL-8001`, the story reference `SCP-046`, which the scratch story
+    ledger declares, and the archived story `SCP-084`.
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -92,6 +115,12 @@ FOREIGN = re.compile(
     r"(RFC\s*\d+|ISO\s*[\d\-:]+|BEP\s*\d+|draft-[a-z0-9\-]+)\s*$", re.IGNORECASE
 )
 MARKER = "[no such section]"
+# `SCP-` followed directly by digits: a story ID, or a wire code in SDK spelling.
+BARE_SCP = re.compile(r"\bSCP-\d+\b")
+# A story ID as a PRD file declares it.
+STORY_ID = re.compile(r'"id"\s*:\s*"(SCP-\d+)"')
+# The record of cut features; its story IDs no longer appear in the ledger.
+ARCHIVE = ".docs/archive/"
 
 # Positive scope: the artifacts that govern work in this repository.
 SCOPE_DIRS = (
@@ -139,6 +168,57 @@ def scan_files(root: Path) -> list[Path]:
     return out
 
 
+def story_ids(root: Path) -> set[str]:
+    """Collect every story ID the PRD files declare."""
+    out: set[str] = set()
+    prds = root / ".docs" / "prds"
+    if prds.is_dir():
+        for path in sorted(prds.glob("*.json")):
+            out.update(STORY_ID.findall(path.read_text(encoding="utf-8")))
+    return out
+
+
+def markdown_files(root: Path) -> list[Path]:
+    """List every Markdown file git tracks or would track under root.
+
+    git applies .gitignore, which excludes `.claude/worktrees` and `target/`. The
+    archive of cut features is skipped. A root git cannot list raises, so the check
+    fails rather than scanning nothing.
+    """
+    listed = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.md",
+        ],
+        cwd=root,
+        capture_output=True,
+        check=True,
+    ).stdout.decode("utf-8")
+    paths = {
+        root / rel for rel in listed.split("\0") if rel and not rel.startswith(ARCHIVE)
+    }
+    return sorted(p for p in paths if p.is_file())
+
+
+def scan_bare_codes(root: Path) -> list[tuple[Path, int, str]]:
+    """Return every `SCP-<digits>` that names no story, as (file, line, code)."""
+    stories = story_ids(root)
+    failures: list[tuple[Path, int, str]] = []
+    for path in markdown_files(root):
+        text = path.read_text(encoding="utf-8")
+        for number, line in enumerate(text.splitlines(), start=1):
+            for match in BARE_SCP.finditer(line):
+                if match.group(0) not in stories:
+                    failures.append((path, number, match.group(0)))
+    return failures
+
+
 def scan(root: Path) -> list[tuple[Path, int, str]]:
     """Return every dead citation the scope contains, as (file, line, reference)."""
     specs = spec_files(root)
@@ -180,6 +260,22 @@ Story SCP-046 lands in §99.1 of a spec this repository does not carry.
 The passage cites §18.11.13.2 [no such section], which this scratch spec does not carry.
 """
 
+SELF_TEST_PRD = """{"stories": [{"id": "SCP-046"}]}
+"""
+
+# A relay wire code in SDK spelling in a guide, outside the citation scope.
+SELF_TEST_GUIDE_CODE = """A registration under other Apple credentials receives SCP-4063.
+"""
+
+# An archived feature's story, which left the ledger when the feature was cut.
+SELF_TEST_ARCHIVE = """The cut feature shipped as SCP-084.
+"""
+
+# A relay wire code in SDK spelling, beside a registered SDK code that must pass.
+SELF_TEST_BARE_CODE = """A relay with no APNs sender answers SCP-4061.
+A capability selection failure reports SCP-CAPSEL-8001.
+"""
+
 SELF_TEST_BAD = """The addressability and deployment spec says, in §18.11.99, that a verifier reads JSON.
 """
 
@@ -210,6 +306,17 @@ def self_test() -> int:
         (lessons / "bad.md").write_text(SELF_TEST_BAD)
         (lessons / "twin.md").write_text(SELF_TEST_TWIN)
         (lessons / "sameline.md").write_text(SELF_TEST_SAME_LINE)
+        (lessons / "barecode.md").write_text(SELF_TEST_BARE_CODE)
+        prds = root / ".docs" / "prds"
+        prds.mkdir(parents=True)
+        (prds / "main.json").write_text(SELF_TEST_PRD)
+        guides = root / "docs" / "guides"
+        guides.mkdir(parents=True)
+        (guides / "relay-operations.md").write_text(SELF_TEST_GUIDE_CODE)
+        archive = root / ".docs" / "archive" / "cut-feature"
+        archive.mkdir(parents=True)
+        (archive / "HISTORY.md").write_text(SELF_TEST_ARCHIVE)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
 
         failures = scan(root)
         got = sorted((f.name, line, ref) for f, line, ref in failures)
@@ -221,6 +328,15 @@ def self_test() -> int:
         if got != want:
             print(f"SELF-TEST FAILED: expected {want}, scanner reported {got}")
             return 1
+
+        bare = sorted((f.name, line, code) for f, line, code in scan_bare_codes(root))
+        want_bare = [
+            ("barecode.md", 1, "SCP-4061"),
+            ("relay-operations.md", 1, "SCP-4063"),
+        ]
+        if bare != want_bare:
+            print(f"SELF-TEST FAILED: expected bare codes {want_bare}, got {bare}")
+            return 1
     print("SELF-TEST PASSED: the scanner reports all three planted dead citations,")
     print("  including the unmarked repeat of a reference the same file marks one line")
     print("  earlier and the unmarked repeat that shares a line with its own marker,")
@@ -228,6 +344,9 @@ def self_test() -> int:
         "  and skips a resolving citation, an RFC citation, a non-spec number, and the"
     )
     print("  occurrence the marker directly follows.")
+    print("SELF-TEST PASSED: the bare-code scan reports SCP-4061 and SCP-4063 in")
+    print("  docs/guides/, and passes SCP-CAPSEL-8001, the ledger story SCP-046,")
+    print("  and the archived story SCP-084.")
     return 0
 
 
@@ -237,11 +356,24 @@ def main() -> int:
 
     root = Path(__file__).resolve().parent.parent
     failures = scan(root)
-    if not failures:
+    bare = scan_bare_codes(root)
+    if not failures and not bare:
         print(
-            "check-doc-citations: every spec citation in the governing artifacts resolves."
+            "check-doc-citations: every spec citation in the governing artifacts resolves,"
         )
+        print("  and every bare SCP-<digits> names a story in .docs/prds/.")
         return 0
+
+    if bare:
+        print("check-doc-citations: these SCP-<digits> identifiers name no story.")
+        print("Write a relay wire code as the bare number with its ADR-004 name")
+        print("(`4061` PUSH_PLATFORM_UNAVAILABLE), or an SDK error code with its band")
+        print("(`SCP-CAPSEL-8001`).\n")
+        for path, line, code in bare:
+            print(f"  {path.relative_to(root)}:{line}: {code}")
+        if not failures:
+            return 1
+        print()
 
     print(
         "check-doc-citations: these citations name a section their spec file does not contain."

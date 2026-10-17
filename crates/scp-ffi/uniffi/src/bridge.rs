@@ -2114,6 +2114,33 @@ pub struct ContextParams {
     /// The admission capability requirements as a JSON array of
     /// `CapabilityRequirement` (spec §7.3.4.4). `None` means none.
     pub capability_requirements_json: Option<String>,
+    /// Pseudonym rotation policy (spec 09 §9.10.4.1). `None` disables
+    /// rotation: members keep one routing ID for the context's lifetime. A
+    /// set policy must name at least one trigger, and a set
+    /// `interval_secs` must be at least 600; otherwise the create fails with
+    /// `SCP-VALID-7000`.
+    pub pseudonym_rotation: Option<PseudonymRotationPolicy>,
+}
+
+/// When members of a context rotate their relay routing ID (spec 09
+/// §9.10.4.1). Mirrors `scp_core::context::PseudonymRotationPolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct PseudonymRotationPolicy {
+    /// Interval trigger in seconds: members rotate at each multiple of the
+    /// interval after context creation. When set, at least 600.
+    pub interval_secs: Option<u64>,
+    /// Membership trigger: every member except the added or removed one
+    /// rotates once after each committed `AddMember` or `RemoveMember`.
+    pub on_membership_change: bool,
+}
+
+impl From<PseudonymRotationPolicy> for scp_core::context::PseudonymRotationPolicy {
+    fn from(policy: PseudonymRotationPolicy) -> Self {
+        Self {
+            interval_secs: policy.interval_secs,
+            on_membership_change: policy.on_membership_change,
+        }
+    }
 }
 
 /// A message received from an SCP context.
@@ -2819,13 +2846,16 @@ pub struct Identity {
     /// `remove_agent_key`, migrate) can reach the per-instance shared DHT
     /// client and resolver cache. Mirrors the NAPI bridge's `bi` field.
     ///
-    /// Only READ by the mutable identity methods, which all fail closed on a
+    /// READ by the mutable identity methods, which all fail closed on a
     /// shipped (no-`testing`) build before consulting it (ADR-062 §Decision 6),
-    /// so it is written-but-unread there — hence the conditional `dead_code`
-    /// allowance. It remains a production field (written by `identity_load`).
+    /// and by `node_start`'s operator identity resolution (`server` feature),
+    /// which reaches the instance's shared DHT client through it. A build with
+    /// neither feature writes it without reading it — hence the conditional
+    /// `dead_code` allowance. It remains a production field (written by
+    /// `identity_load`).
     ///
     /// Rust-internal field — NOT exposed through `#[uniffi::export]`.
-    #[cfg_attr(not(feature = "testing"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "testing", feature = "server")), allow(dead_code))]
     pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// JSON-serialized `scp_did::DidRotationEvent` produced when this
     /// handle was minted by [`Scp::identity_migrate`]. SDK callers MUST
@@ -3837,19 +3867,19 @@ impl TransportManager {
         })?
         .map_err(ScpError::from)?;
 
+        // The manager records the relay with its adapter; a budget eviction
+        // removes the evicted relay from the bridge's relay set in the same
+        // step.
         let count = self
             .bi
             .core
-            .with_transport_mut(|mgr| {
-                let _eviction = mgr.add_adapter(adapter);
-                #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
-                let count = mgr.adapter_count() as u32;
-                count
-            })
+            .add_relay_adapter(relay_url.clone(), adapter)
             .map_err(|e| ScpError::Transport {
                 msg: e.to_string(),
                 code: codes::TRANS_5003.to_owned(),
             })?;
+        #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
+        let count = count as u32;
 
         // Spawn suppression → scoring bridge task against this handle's
         // owning `UniffiBridgeInstance`.
@@ -4567,43 +4597,61 @@ pub(crate) fn validate_outlet_ucan_uniffi(
     let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
     let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
-    bi.with_ucan_state(&handle.context_id, |ucan_state| {
-        let production_resolver = bi.did_resolver();
-        let did_resolver = scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
-        let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-            revocation_list: &ucan_state.revocation_list,
-        };
-        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-            inner: &mut ucan_state.nonce_tracker,
-        };
+    let mut recorded = None;
+    let validated = bi
+        .with_ucan_state(&handle.context_id, |ucan_state| {
+            let production_resolver = bi.did_resolver();
+            let did_resolver =
+                scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
+            let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                revocation_list: &ucan_state.revocation_list,
+            };
+            let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker::new(
+                &mut ucan_state.nonce_tracker,
+                &mut recorded,
+            );
 
-        let mut ctx = ValidationContext {
-            did_resolver: &did_resolver,
-            nonce_tracker: &mut nonce_adapter,
-            revocation_checker: &revocation_checker,
-            proof_resolver: &proof_resolver,
-            ceiling: &ceiling_strings,
-            context_creator_did: &role_state.creator_did,
-            presenting_agent_did: identity_did,
-            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_clock::SystemClock,
-            // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
-            // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
-            // and Step 11b (time-box) run over the proof chain's VALIDATED-
-            // NARROWED caveat set.
-            caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
-        };
+            let mut ctx = ValidationContext {
+                did_resolver: &did_resolver,
+                nonce_tracker: &mut nonce_adapter,
+                revocation_checker: &revocation_checker,
+                proof_resolver: &proof_resolver,
+                ceiling: &ceiling_strings,
+                context_creator_did: &role_state.creator_did,
+                presenting_agent_did: identity_did,
+                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_clock::SystemClock,
+                // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
+                // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
+                // and Step 11b (time-box) run over the proof chain's VALIDATED-
+                // NARROWED caveat set.
+                caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+            };
 
-        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, kind, &mut ctx)
+            validate_outlet_invocation_ucan(
+                ucan_token,
+                &handle.context_id,
+                outlet_id,
+                kind,
+                &mut ctx,
+            )
             .map_err(|e| ScpError::Permission {
                 msg: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
                 code: codes::PERM_3002.to_owned(),
             })
-    })
-    .ok_or_else(|| ScpError::Permission {
-        msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-        code: codes::PERM_3002.to_owned(),
-    })?
+        })
+        .ok_or_else(|| ScpError::Permission {
+            msg: format!("context '{}' not found in UCAN registry", handle.context_id),
+            code: codes::PERM_3002.to_owned(),
+        });
+
+    // Step 9 of the pipeline records the token's nonce, so write the context's
+    // nonce entries to durable storage before returning. A rejected token keeps
+    // its own error: the caller is already denied, so a durability failure on
+    // that path grants nothing.
+    let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id, recorded);
+    validated??;
+    persisted
 }
 
 // ---------------------------------------------------------------------------
@@ -5495,58 +5543,73 @@ impl McpUniFfiBridgeProvider {
         // nonce tracker.
         let ceiling_strings = role_state.ceiling().to_ucan_string_set();
         let agent_did = self.agent_did.clone();
-        bi.with_ucan_state(context_id, |ucan_state| {
-            let production_resolver = bi.did_resolver();
-            let did_resolver =
-                scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
-            let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-                revocation_list: &ucan_state.revocation_list,
-            };
-            // Only the Invoke check made just before a `tools/call` runs
-            // its outlet records the nonce; a probe records nothing.
-            let mut nonce_adapter =
-                scp_ffi_common::OutletGrantNonceTracker::new(&mut ucan_state.nonce_tracker, check);
-
-            let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                did_resolver: &did_resolver,
-                nonce_tracker: &mut nonce_adapter,
-                revocation_checker: &revocation_checker,
-                proof_resolver: &proof_resolver,
-                ceiling: &ceiling_strings,
-                context_creator_did: &role_state.creator_did,
-                presenting_agent_did: &agent_did,
-                clock_skew_tolerance_secs:
-                    scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                clock: &scp_clock::SystemClock,
-                // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
-                // caveats from each token's `nb` field so §7.3.8 Step 7b
-                // (per-edge narrow) and Step 11b (time-box) run over the
-                // proof chain's VALIDATED-NARROWED caveat set.
-                caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
-            };
-
-            scp_core::context::outlets::validate_outlet_invocation_ucan(
-                token,
-                context_id,
-                outlet_name,
-                outlet_kind_for_ucan,
-                &mut ctx,
-            )
-            .map_err(|e| {
-                tracing::warn!(
-                    agent = %agent_did,
-                    outlet = %outlet_name,
-                    context = %context_id,
-                    error = %e,
-                    "UCAN validation failed for outlet invocation"
+        let mut recorded = None;
+        let decision = bi
+            .with_ucan_state(context_id, |ucan_state| {
+                let production_resolver = bi.did_resolver();
+                let did_resolver =
+                    scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
+                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                    revocation_list: &ucan_state.revocation_list,
+                };
+                // Only the Invoke check made just before a `tools/call` runs
+                // its outlet records the nonce; a probe records nothing.
+                let mut nonce_adapter = scp_ffi_common::OutletGrantNonceTracker::new(
+                    &mut ucan_state.nonce_tracker,
+                    check,
+                    &mut recorded,
                 );
-                format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
+
+                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &ceiling_strings,
+                    context_creator_did: &role_state.creator_did,
+                    presenting_agent_did: &agent_did,
+                    clock_skew_tolerance_secs:
+                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                    clock: &scp_clock::SystemClock,
+                    // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
+                    // caveats from each token's `nb` field so §7.3.8 Step 7b
+                    // (per-edge narrow) and Step 11b (time-box) run over the
+                    // proof chain's VALIDATED-NARROWED caveat set.
+                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+                };
+
+                scp_core::context::outlets::validate_outlet_invocation_ucan(
+                    token,
+                    context_id,
+                    outlet_name,
+                    outlet_kind_for_ucan,
+                    &mut ctx,
+                )
+                .map_err(|e| {
+                    tracing::warn!(
+                        agent = %agent_did,
+                        outlet = %outlet_name,
+                        context = %context_id,
+                        error = %e,
+                        "UCAN validation failed for outlet invocation"
+                    );
+                    format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
+                })
             })
-        })
-        .ok_or_else(|| {
-            AccessRefusal::Unreadable(format!("UCAN state not found for context '{context_id}'"))
-        })?
-        .map_err(AccessRefusal::Denied)?;
+            .ok_or_else(|| {
+                AccessRefusal::Unreadable(format!(
+                    "UCAN state not found for context '{context_id}'"
+                ))
+            })?;
+        // Step 9 of the pipeline records the token's nonce on an Invoke check,
+        // so write the context's nonce entries to durable storage before the
+        // outlet runs. A probe, or a token refused before step 9, records
+        // nothing and writes nothing. A rejected token keeps its own refusal:
+        // the caller is already denied, so a durability failure on that path
+        // grants nothing.
+        let persisted = bi.persist_ucan_nonces_blocking(context_id, recorded);
+        decision.map_err(AccessRefusal::Denied)?;
+        persisted.map_err(|e| AccessRefusal::Unreadable(e.to_string()))?;
         Ok(())
     }
 }
@@ -7149,6 +7212,7 @@ fn bridge_params_to_core(
         consequence_rules_json: params.consequence_rules_json.clone(),
         consequence_config_json: params.consequence_config_json.clone(),
         capability_requirements_json: params.capability_requirements_json.clone(),
+        pseudonym_rotation: params.pseudonym_rotation.map(Into::into),
         // Named so a new common field does not compile until this bridge
         // reads it.
         governance_threshold: None,
@@ -10339,6 +10403,15 @@ impl Scp {
                 // rather than calling a `ContextManager` method directly. The
                 // actor mailbox wraps the delegated call in the 30s
                 // transport-timeout budget.
+                // The bridge's relay set hosts the new context (§5.12.3.1
+                // `relay_urls`, PUSH-025).
+                let relay_urls = bi
+                    .core
+                    .context_relay_urls()
+                    .map_err(|e| ScpError::Transport {
+                        msg: e.to_string(),
+                        code: codes::TRANS_5002.to_owned(),
+                    })?;
                 let sup = bi.context_manager_or_error()?;
                 {
                     use scp_core::context::actor::commands::{
@@ -10351,6 +10424,7 @@ impl Scp {
                             params: core_params,
                             creator_did: identity.did.clone().into(),
                             local_pseudonym,
+                            relay_urls,
                         }),
                         reply: tx,
                     };
@@ -10368,9 +10442,7 @@ impl Scp {
                 // Register the creator's DID as a local DID for defense-in-depth,
                 // matching NAPI's behavior. Routes through the supervisor's direct
                 // method — the local-DID set is supervisor-wide.
-                sup.register_local_did(identity.did.clone().into())
-                    .await
-                    .map_err(ScpError::from)?;
+                sup.register_local_did(identity.did.clone().into()).await;
 
                 // Register per-context UCAN validation state (revocation list,
                 // nonce tracker, event log) for the UCAN pipeline on this instance.
@@ -10433,9 +10505,7 @@ impl Scp {
                 // pseudonym) fall back to the mode-appropriate deterministic
                 // routing id — `broadcast_routing_id` for broadcast,
                 // `context_routing_id` otherwise — matching the PyO3 reference.
-                // `relay_url` is `None`: the connected relay lives on the
-                // caller-held `TransportManager` handle, not on the bridge
-                // instance. Infallible + idempotent, so it is safe after the
+                // Infallible + idempotent, so it is safe after the
                 // irreversible runtime commit and needs no rollback.
                 let routing_id = local_pseudonym.unwrap_or_else(|| {
                     if create_is_broadcast {
@@ -10444,13 +10514,14 @@ impl Scp {
                         scp_core::context::context_routing_id(&handle.context_id)
                     }
                 });
-                let known = scp_ffi_common::bridge_instance::KnownContext {
-                    routing_id,
-                    relay_url: None,
-                    member_did: identity.did.clone(),
-                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-                };
-                bi.core.register_known_context(&handle.context_id, known);
+                bi.core
+                    .register_known_context_from_runtime(
+                        &handle.context_id,
+                        routing_id,
+                        identity.did.clone(),
+                        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                    )
+                    .await;
 
                 Ok(handle)
             })
@@ -10770,17 +10841,15 @@ impl Scp {
                 // Post-commit discovery registration. spawn-from-Welcome always
                 // stands up an ENCRYPTED context, so the routing id is the joiner's
                 // derived §9.10.4 pseudonym (`local_pseudonym` is `Copy`, still
-                // valid after the request move). The member is the JOINER; the
-                // relay_url is `None` because a UniFFI `Scp` instance does not
-                // retain the connected relay URL — it lives on the caller-held
-                // opaque `TransportManager`, so `None` is the honest value here.
-                let known = scp_ffi_common::bridge_instance::KnownContext {
-                    routing_id: local_pseudonym,
-                    relay_url: None,
-                    member_did: identity.did.clone(),
-                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-                };
-                bi.core.register_known_context(&context_id, known);
+                // valid after the request move). The member is the JOINER.
+                bi.core
+                    .register_known_context_from_runtime(
+                        &context_id,
+                        local_pseudonym,
+                        identity.did.clone(),
+                        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                    )
+                    .await;
 
                 Ok(handle)
             })
@@ -10817,7 +10886,9 @@ impl Scp {
     /// * `context_id` -- The context to invite into.
     /// * `invitee_did` -- The DID being invited.
     /// * `invitee_key_package` -- The invitee's TLS-serialized MLS `KeyPackage`.
-    /// * `relay_urls` -- Relay URLs to include for the invitee's first contact.
+    ///
+    /// The bundle carries the context's stored relay set (§5.12.3.1
+    /// `relay_urls`), which the runtime reads; the caller supplies none.
     ///
     /// # Errors
     ///
@@ -10831,7 +10902,6 @@ impl Scp {
         context_id: String,
         invitee_did: String,
         invitee_key_package: Vec<u8>,
-        relay_urls: Vec<String>,
     ) -> Result<InviteMemberOutcome, ScpError> {
         self.inner
             .core
@@ -10864,7 +10934,6 @@ impl Scp {
                         scp_did::DID(creator_did),
                         scp_did::DID(invitee_did),
                         invitee_key_package,
-                        relay_urls,
                         &signer,
                     )
                     .await;
@@ -11028,10 +11097,8 @@ impl Scp {
                 // context must be discoverable just like a created one. Routing
                 // id is the joiner's pre-derived §9.10.4 pseudonym; BROADCAST
                 // joins (which carry no per-member pseudonym) fall back to the
-                // mode-appropriate deterministic routing id. `relay_url` is
-                // `None` — the connected relay lives on the caller-held
-                // `TransportManager` handle, not the bridge instance. Infallible
-                // + idempotent, so it is safe after the irreversible runtime
+                // mode-appropriate deterministic routing id. Infallible +
+                // idempotent, so it is safe after the irreversible runtime
                 // commit and needs no rollback.
                 let routing_id = local_pseudonym.unwrap_or_else(|| {
                     if join_is_broadcast {
@@ -11040,13 +11107,14 @@ impl Scp {
                         scp_core::context::context_routing_id(&handle.context_id)
                     }
                 });
-                let known = scp_ffi_common::bridge_instance::KnownContext {
-                    routing_id,
-                    relay_url: None,
-                    member_did: identity.did.clone(),
-                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-                };
-                bi.core.register_known_context(&handle.context_id, known);
+                bi.core
+                    .register_known_context_from_runtime(
+                        &handle.context_id,
+                        routing_id,
+                        identity.did.clone(),
+                        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                    )
+                    .await;
 
                 Ok(())
             })
@@ -15468,6 +15536,7 @@ impl Scp {
                 let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
                 // Execute the full 11-step validation pipeline via per-context state.
+                let mut recorded = None;
                 let validation_result = bi
                     .with_ucan_state(&handle.context_id, |ucan_state| {
                         let production_resolver = bi.did_resolver();
@@ -15477,9 +15546,10 @@ impl Scp {
                         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                             revocation_list: &ucan_state.revocation_list,
                         };
-                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                            inner: &mut ucan_state.nonce_tracker,
-                        };
+                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker::new(
+                            &mut ucan_state.nonce_tracker,
+                            &mut recorded,
+                        );
 
                         let mut ctx = ValidationContext {
                             did_resolver: &did_resolver,
@@ -15511,9 +15581,13 @@ impl Scp {
                         msg: format!("context '{}' not found in UCAN registry", handle.context_id),
                         code: codes::PERM_3002.to_owned(),
                     })?;
+                // Step 9 of the pipeline records the token's nonce, so write the
+                // context's nonce entries to durable storage before returning. A
+                // rejected token keeps its own error: the caller is already
+                // denied, so a durability failure on that path grants nothing.
+                let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id, recorded);
                 validation_result?;
-
-                Ok(())
+                persisted
             })
             .await
             .map_err(|e| ScpError::Permission {
@@ -15654,9 +15728,11 @@ impl Scp {
                         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                             revocation_list: &ucan_state.revocation_list,
                         };
-                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                            inner: &mut ucan_state.nonce_tracker,
-                        };
+                        let mut never_recorded = None;
+                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker::new(
+                            &mut ucan_state.nonce_tracker,
+                            &mut never_recorded,
+                        );
 
                         let ctx = ValidationContext {
                             did_resolver: &did_resolver,
@@ -15809,7 +15885,11 @@ impl Scp {
                     code: codes::PERM_3006.to_owned(),
                 })??;
 
-                Ok(())
+                // The revocation reaches durable storage before `ucan_revoke`
+                // returns, so a token revoked now stays revoked after the bridge
+                // instance is rebuilt. A failed write fails the call instead of
+                // reporting a revocation the next process start would forget.
+                bi.persist_ucan_revocation_blocking(&handle.context_id)
             })
             .await
             .map_err(|e| ScpError::Permission {
@@ -15942,21 +16022,20 @@ impl Scp {
                 // The selector returns a `Box<dyn TransportAdapter>`; the
                 // blanket `impl TransportAdapter for Box<dyn TransportAdapter>`
                 // lets it be used where a concrete adapter is expected.
-                let manager = scp_transport::TransportManager::new(adapter);
+                let manager = scp_transport::TransportManager::new(relay_url.clone(), adapter);
 
                 // Install the manager on THIS instance's CoreFields — not on
-                // the process-wide DEFAULT_BRIDGE_INSTANCE.
+                // the process-wide DEFAULT_BRIDGE_INSTANCE. Its relays become
+                // the bridge's whole reconnect set, so
+                // `BridgeInstanceCore::resume` rebuilds the transport after
+                // suspend/resume cycles (#1678), and a context created next is
+                // hosted on the relay actually connected.
                 bi.core
-                    .set_transport(std::sync::Arc::new(manager))
+                    .install_transport(std::sync::Arc::new(manager))
                     .map_err(|e| ScpError::Transport {
                         msg: e.to_string(),
                         code: codes::TRANS_5002.to_owned(),
                     })?;
-
-                // Register the URL on this bridge's pending-reconnect set
-                // so `BridgeInstanceCore::resume` can rebuild the transport
-                // after suspend/resume cycles (#1678).
-                bi.core.add_relay_url(relay_url.clone());
 
                 let handle = Arc::new(TransportManager {
                     status: std::sync::Mutex::new(TransportStatus {
@@ -16622,10 +16701,7 @@ impl Scp {
         validate_did(&did)?;
         self.inner.init_context_manager_with_did(&did);
         let manager = self.inner.context_manager_expect()?;
-        manager
-            .register_local_did(did.into())
-            .await
-            .map_err(ScpError::from)?;
+        manager.register_local_did(did.into()).await;
         Ok(())
     }
 
@@ -16706,6 +16782,24 @@ impl Scp {
         data_dir: String,
     ) -> Result<Arc<crate::server::RelayHandle>, ScpError> {
         crate::server::relay_start_local_on(&self.inner, data_dir).await
+    }
+
+    /// Starts a production node from this `Scp` (construction.md §"Node start
+    /// — `NodeStartConfig`"): the node runs under the operator identity
+    /// `config.identity`, which this `Scp` must have minted, and on this
+    /// instance's own storage.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-PERM-3030` when another `Scp` minted `config.identity`; otherwise
+    /// the code sdk-common.md §"Node start error codes" gives the failure,
+    /// such as `SCP-IDENT-1063` for an identity loaded with no custody.
+    #[cfg(feature = "server")]
+    pub async fn node_start(
+        &self,
+        config: crate::server::NodeStartConfig,
+    ) -> Result<Arc<crate::server::NodeHandle>, ScpError> {
+        crate::server::node_start_on(&self.inner, config).await
     }
 
     /// Per-instance equivalent of the free-function `node_start_in_memory`.
@@ -18972,21 +19066,20 @@ impl Scp {
                 // registering `local_pseudonym` here would make a broadcast
                 // re-home silently unaddressable. Encrypted imports use the
                 // importer's derived §9.10.4 pseudonym as the routing id.
-                // `relay_url` is `None` (the connected relay lives on the
-                // caller-held `TransportManager` handle, not the bridge
-                // instance). Infallible + idempotent, so it needs no rollback.
+                // Infallible + idempotent, so it needs no rollback.
                 let routing_id = if imported_is_broadcast {
                     scp_core::context::broadcast_routing_id(&context_id)
                 } else {
                     local_pseudonym
                 };
-                let known = scp_ffi_common::bridge_instance::KnownContext {
-                    routing_id,
-                    relay_url: None,
-                    member_did: identity.did.clone(),
-                    last_seen: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-                };
-                bi.core.register_known_context(&context_id, known);
+                bi.core
+                    .register_known_context_from_runtime(
+                        &context_id,
+                        routing_id,
+                        identity.did.clone(),
+                        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                    )
+                    .await;
 
                 Ok(context_id)
             })
@@ -19613,6 +19706,49 @@ mod tests {
             consequence_rules_json: None,
             consequence_config_json: None,
             capability_requirements_json: None,
+            pseudonym_rotation: None,
+        }
+    }
+
+    /// Spec 09 §9.10.4.1: the record's pseudonym rotation policy reaches the
+    /// core `ContextParams` unchanged, `None` stays `None`, and a policy that
+    /// fails the validity criterion fails the conversion with `SCP-VALID-7000`.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn bridge_params_carry_pseudonym_rotation_policy() {
+        let mut params = encrypted_join_test_params();
+        assert_eq!(
+            bridge_params_to_core(&params).unwrap().pseudonym_rotation,
+            None
+        );
+
+        params.pseudonym_rotation = Some(PseudonymRotationPolicy {
+            interval_secs: Some(3600),
+            on_membership_change: true,
+        });
+        assert_eq!(
+            bridge_params_to_core(&params).unwrap().pseudonym_rotation,
+            Some(scp_core::context::PseudonymRotationPolicy {
+                interval_secs: Some(3600),
+                on_membership_change: true,
+            })
+        );
+
+        for invalid in [
+            PseudonymRotationPolicy {
+                interval_secs: None,
+                on_membership_change: false,
+            },
+            PseudonymRotationPolicy {
+                interval_secs: Some(599),
+                on_membership_change: true,
+            },
+        ] {
+            params.pseudonym_rotation = Some(invalid);
+            match bridge_params_to_core(&params) {
+                Err(ScpError::Validation { code, .. }) => assert_eq!(code, codes::VALID_7000),
+                other => panic!("expected SCP-VALID-7000 for {invalid:?}, got {other:?}"),
+            }
         }
     }
 
@@ -21618,6 +21754,172 @@ mod tests {
         );
     }
 
+    /// A token revoked and a nonce recorded on one bridge instance stay
+    /// revoked and recorded on a new instance opened over the same store.
+    ///
+    /// Instance A creates a context, mints three tokens, revokes the first
+    /// without presenting it, and presents the second. Instance B reopens the
+    /// `SQLCipher` store, restores the context, and starts with no UCAN state, so
+    /// the only source of B's revocation list and nonce tracker is the durable
+    /// record A wrote. B must refuse the first token as revoked, the second as
+    /// a replay, and accept the third.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn ucan_revocation_and_nonce_survive_a_bridge_instance_restart() {
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        let rt = runtime();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let open = || {
+            crate::scp::Scp::with_storage(crate::StorageConfig::Sqlite {
+                path: tmp.path().to_string_lossy().into_owned(),
+                key: crate::runtime::SqliteKeyMaterial::Raw {
+                    key: vec![0x5Au8; 32],
+                },
+            })
+            .expect("sqlite storage must construct")
+        };
+
+        let scp = open();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let creator = identity.did();
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&identity), encrypted_join_test_params()))
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+        let member = "did:dht:z6MkUniffiRevokedAcrossRestart".to_owned();
+
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            let minted = rt
+                .block_on(scp.ucan_mint(
+                    Arc::clone(&handle),
+                    member.clone(),
+                    vec!["messages:read".to_owned()],
+                    None,
+                ))
+                .expect("the creator may mint a token in its own context");
+            tokens.push(minted.encoded.clone());
+        }
+        let capability = format!("scp:ctx:{context_id}/messages:read");
+        let (revoked, used, untouched) = (tokens[0].clone(), tokens[1].clone(), tokens[2].clone());
+
+        // A never presents the revoked token: step 9 records a nonce before
+        // step 10 checks revocation, so a presentation here would make B refuse
+        // it as a replay and hide whether the revocation survived.
+        rt.block_on(scp.ucan_revoke(Arc::clone(&handle), revoked.clone(), creator.clone()))
+            .expect("the creator may revoke a token the creator issued");
+        rt.block_on(scp.ucan_validate(
+            Arc::clone(&handle),
+            used.clone(),
+            capability.clone(),
+            member.clone(),
+            None,
+        ))
+        .expect("an unrevoked token validates on A");
+
+        drop(handle);
+        drop(identity);
+        // The UniFFI resolver keeps its DHT client per instance, and under
+        // `testing` that client is an in-memory store. Hand A's client to B so
+        // B reads the DHT A published to, as two processes share the Mainline
+        // DHT.
+        let dht = scp
+            .inner
+            .core
+            .dht_client()
+            .map(Arc::clone)
+            .expect("identity_create attaches A's DHT client");
+        let outcome = rt.block_on(scp.inner.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "A's shutdown must drain every actor and close the store: {outcome:?}"
+        );
+        drop(scp);
+
+        let reopened = open();
+        reopened.inner.init_context_manager_with_did(&creator);
+        // A restarted process resolves the issuer's DID document through the
+        // resolver an identity call attaches; B makes no identity call.
+        reopened.inner.core.set_dht_client(dht);
+        ensure_did_resolver_initialized_on(&reopened.inner, rt.handle().clone())
+            .expect("resolver initialization must succeed on B");
+        let restored = rt
+            .block_on(reopened.restore_all_contexts())
+            .expect("restore_all_contexts must succeed on the reopened store");
+        assert!(
+            restored.contains(&context_id),
+            "the reopened instance must restore the context: {restored}"
+        );
+        assert!(
+            reopened
+                .inner
+                .with_ucan_state(&context_id, |_| ())
+                .is_none(),
+            "instance B starts with no per-context UCAN state"
+        );
+        let handle_b = Arc::new(ContextHandle {
+            context_id,
+            state: tokio::sync::Mutex::new(ContextState::Active),
+            creator_did: creator,
+            custody: None,
+            signing_key: None,
+            outlet_registry: std::sync::Mutex::new(
+                scp_core::context::outlets::OutletRegistry::new(),
+            ),
+            outlet_handlers: std::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
+            economic_policy: std::sync::Mutex::new(None),
+            core_context_params: scp_core::context::ContextParams::default(),
+            instance_id: reopened.instance_id(),
+        });
+
+        let err = rt
+            .block_on(reopened.ucan_validate(
+                Arc::clone(&handle_b),
+                revoked,
+                capability.clone(),
+                member.clone(),
+                None,
+            ))
+            .expect_err("a token revoked before the restart must stay revoked after it");
+        assert!(
+            err.to_string().contains("token revoked"),
+            "B reported: {err:?}"
+        );
+
+        let err = rt
+            .block_on(reopened.ucan_validate(
+                Arc::clone(&handle_b),
+                used,
+                capability.clone(),
+                member.clone(),
+                None,
+            ))
+            .expect_err("a nonce accepted before the restart must stay used after it");
+        assert!(
+            err.to_string().contains("nonce reused"),
+            "B reported: {err:?}"
+        );
+
+        rt.block_on(reopened.ucan_validate(
+            Arc::clone(&handle_b),
+            untouched,
+            capability,
+            member,
+            None,
+        ))
+        .expect("a token nobody revoked or presented still validates after the restart");
+
+        drop(handle_b);
+        let outcome = rt.block_on(reopened.inner.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "B's shutdown must drain every actor and close the store: {outcome:?}"
+        );
+    }
+
     /// The cross-context outlet entry points gate both contexts on the
     /// supervisor actor, and each refusal withholds the lifecycle state.
     ///
@@ -21990,7 +22292,6 @@ mod tests {
                 context_id.clone(),
                 invitee.did(),
                 reservation.key_package_public,
-                Vec::new(),
             ))
             .expect("invite_member should seal a bundle");
 
@@ -22206,7 +22507,6 @@ mod tests {
                 unknown_ctx,
                 "did:dht:z6MkInviteeUnknownCtx".to_owned(),
                 b"bogus-key-package".to_vec(),
-                vec![],
             ))
             .expect_err("inviting into an unknown context must be rejected");
         assert!(
@@ -22228,7 +22528,6 @@ mod tests {
                 scp_ffi_common::generate_context_id(),
                 "did:dht:z6MkInviteeUncustodied".to_owned(),
                 b"bogus-key-package".to_vec(),
-                vec![],
             ))
             .expect_err("a non-locally-custodied inviter must be rejected");
         assert!(
@@ -24567,7 +24866,12 @@ mod tests {
     /// `target_did` into the returned event's `payload_json`, decoded through the
     /// shared `scp_event_log::payload::project_payload` so the value is
     /// byte-identical across the three native bridges.
-    #[tokio::test]
+    // Multi-thread flavor: `ensure_ucan_registered` rebuilds the context's
+    // durable UCAN state, and that read bridges sync to async through
+    // `block_in_place`, which a current-thread runtime cannot host. The
+    // bridge's own runtime is multi-threaded, so every production caller
+    // reaches this code on a worker that can step aside.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_query_projects_governance_target_did() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
@@ -24619,7 +24923,12 @@ mod tests {
     /// `payload_json`, decoded through the shared
     /// `scp_event_log::payload::project_payload` so the value is byte-identical
     /// across the three native bridges.
-    #[tokio::test]
+    // Multi-thread flavor: `ensure_ucan_registered` rebuilds the context's
+    // durable UCAN state, and that read bridges sync to async through
+    // `block_in_place`, which a current-thread runtime cannot host. The
+    // bridge's own runtime is multi-threaded, so every production caller
+    // reaches this code on a worker that can step aside.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_query_projects_role_assigned_subject_did() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
@@ -26058,6 +26367,7 @@ mod tests {
                 },
                 scp_did::DID(creator.to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -27481,6 +27791,7 @@ mod tests {
                 },
                 scp_did::DID("did:dht:z6MkDenialCreator".to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -27572,6 +27883,7 @@ mod tests {
                 },
                 scp_did::DID(issuer.clone()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -27718,6 +28030,7 @@ mod tests {
                 },
                 scp_did::DID(issuer.clone()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -27866,6 +28179,7 @@ mod tests {
                 },
                 scp_did::DID(issuer.clone()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -28469,6 +28783,7 @@ mod tests {
                 },
                 scp_did::DID("did:dht:z6MkSubscriber".to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -28611,6 +28926,7 @@ mod tests {
                 },
                 scp_did::DID("did:dht:z6MkSubscriber".to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("context creation must succeed");
@@ -29418,6 +29734,113 @@ mod tests {
         );
 
         relay.shutdown();
+    }
+
+    /// Under the Mobile connection budget of 10, the eleventh relay a bridge
+    /// adds through `add_relay` evicts the least recently used relay, r0. The
+    /// bridge's relay set drops r0 in the same step, so a context created next
+    /// records r1..r10 as its stored relay set (§5.12.3.1 `relay_urls`), and
+    /// the invitation bundle `invite_member` seals carries no relay the bridge
+    /// no longer holds a connection to.
+    #[cfg(all(feature = "server", feature = "testing"))]
+    #[test]
+    fn add_relay_mobile_budget_eviction_drops_the_evicted_relay_from_a_created_context() {
+        use scp_transport::profile::TransportProfile;
+        use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+        let rt = runtime();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let relays: Vec<_> = (0..11)
+            .map(|_| {
+                rt.block_on(scp.relay_start_in_memory())
+                    .expect("in-memory relay must start")
+            })
+            .collect();
+        let urls: Vec<String> = relays.iter().map(|r| r.relay_url()).collect();
+        let mobile = TransportProfile::Mobile;
+        assert_eq!(mobile.max_connections(), 10);
+
+        // Connect r0, then replace the platform-default manager with one under
+        // the Mobile profile holding r0, as a Mobile build installs it.
+        let handle = rt
+            .block_on(scp.transport_connect(urls[0].clone()))
+            .expect("connect to r0");
+        let (r0_adapter, _suppression_rx) = rt
+            .block_on(
+                scp.inner
+                    .core
+                    .transport_selector()
+                    .select_and_connect_discovering_with_suppression(
+                        &SourcedRelayUrl {
+                            url: urls[0].clone(),
+                            source: RelayUrlSource::Explicit,
+                        },
+                        Some(&mobile),
+                    ),
+            )
+            .expect("connect r0 under the Mobile profile");
+        let mut manager =
+            scp_transport::TransportManager::with_config(&scp_transport::TransportConfig {
+                profile: mobile,
+                ..scp_transport::TransportConfig::default()
+            });
+        assert!(manager.add_adapter(urls[0].clone(), r0_adapter).is_none());
+        scp.inner
+            .core
+            .install_transport(Arc::new(manager))
+            .expect("install the Mobile-profile manager");
+
+        // `add_relay` is a sync export, so it runs on a plain thread with no
+        // ambient runtime, as UniFFI calls it.
+        for (i, url) in urls.iter().enumerate().skip(1) {
+            let add_handle = Arc::clone(&handle);
+            let url = url.clone();
+            let count = std::thread::spawn(move || add_handle.add_relay(url))
+                .join()
+                .expect("add_relay thread must not panic")
+                .expect("add_relay to a live relay succeeds");
+            assert_eq!(
+                count,
+                u32::try_from(i + 1).unwrap().min(10),
+                "the manager holds at most the Mobile budget"
+            );
+        }
+
+        let mut expected: Vec<String> = urls[1..].to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            scp.inner.core.context_relay_urls(),
+            Ok(expected.clone()),
+            "the evicted relay r0 leaves the bridge's relay set"
+        );
+        assert!(
+            !scp.inner.core.pending_relay_urls().contains(&urls[0]),
+            "a resume does not redial the evicted relay"
+        );
+
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create");
+        let context_id = rt
+            .block_on(scp.context_create(Arc::clone(&creator), encrypted_join_test_params()))
+            .expect("context_create")
+            .context_id();
+        let sup = Arc::clone(
+            scp.inner
+                .context_manager_or_error()
+                .expect("context_create attaches the supervisor"),
+        );
+        let stored = rt
+            .block_on(sup.context_relay_urls(&context_id))
+            .expect("the created context is live");
+        assert_eq!(
+            stored, expected,
+            "the created context records r1..r10 and never the evicted r0"
+        );
+
+        for relay in relays {
+            relay.shutdown();
+        }
     }
 
     /// `Scp::configure_relay_transport` must route through the instance selector
@@ -30778,6 +31201,7 @@ mod tests {
                 params,
                 scp_did::DID(creator_did.to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("test supervisor context creation must succeed");
@@ -31744,6 +32168,7 @@ mod tests {
             },
             scp_did::DID(owner.did()),
             None,
+            Vec::new(),
         ))
         .expect("the narrowed actor must spawn");
         assert!(
@@ -31885,6 +32310,7 @@ mod tests {
             },
             scp_did::DID(owner.did()),
             None,
+            Vec::new(),
         ))
         .expect("the narrowed actor must spawn");
         assert!(
@@ -32527,6 +32953,7 @@ mod tests {
                 consequence_rules_json: None,
                 consequence_config_json: None,
                 capability_requirements_json: None,
+                pseudonym_rotation: None,
             }
         }
 

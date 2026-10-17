@@ -83,6 +83,7 @@ class BroadcastKeyRequestRealFfiTest {
             consequenceRulesJson = null,
             consequenceConfigJson = null,
             capabilityRequirementsJson = null,
+            pseudonymRotation = null,
         )
 
     private fun shutdownBridge(): CoroutineBridge =

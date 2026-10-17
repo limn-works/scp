@@ -73,6 +73,7 @@ fun contextExample(
             consequenceRulesJson = null,
             consequenceConfigJson = null,
             capabilityRequirementsJson = null,
+            pseudonymRotation = null,
         )
 
     // 3. Alice creates the context. The returned ContextHandle is the
@@ -87,15 +88,14 @@ fun contextExample(
     //    bytes out of band.
     val reservation = bobNode.reserveKeyPackage(bob)
 
-    // 5. Alice seals an invitation to that KeyPackage. An empty relay list
-    //    means Alice delivers the sealed bundle to Bob herself.
+    // 5. Alice seals an invitation to that KeyPackage. The bundle carries
+    //    the relay set the context stored when Alice created it.
     val outcome =
         aliceNode.inviteMember(
             identity = alice,
             contextId = handle.contextId(),
             inviteeDid = bob.did(),
             inviteeKeyPackage = reservation.keyPackagePublic,
-            relayUrls = emptyList(),
         )
     val bundle =
         when (outcome) {

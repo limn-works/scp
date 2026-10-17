@@ -1,19 +1,55 @@
-"""Unit tests for Node broadcast deployment lifecycle (SCP-296).
+"""Unit tests for Node broadcast deployment lifecycle (SCP-296) and for
+``SCP.node_start`` and its ``NodeStartConfig`` (SCP-323).
 
-Tests mock the ``_scp_core`` bridge layer; no Rust extension required.
+Most tests mock the ``_scp_core`` bridge layer. The ``node_start`` tests that
+take the ``scp`` fixture run against the built extension
+(``maturin develop --features testing``) and skip only when no extension is
+installed.
 
 See spec section 18.11.8 and ``.docs/prds/http-features.json`` SCP-296.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
+import re
+import socket
+from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from scp_sdk.context import SiteConfig
-from scp_sdk.server import Node
+from scp_sdk.errors import (
+    ContextError,
+    IdentityError,
+    ScpError,
+    StorageError,
+    TransportError,
+    ValidationError,
+)
+from scp_sdk.identity import Identity
+from scp_sdk.server import (
+    _ARMS,
+    BlobInMemory,
+    BlobRedb,
+    BlobSqlite,
+    CorsAllowlist,
+    CorsAnyOrigin,
+    DhtDisabled,
+    NatAuto,
+    Node,
+    NodeStartConfig,
+    ReachDomain,
+    ReachLocal,
+    TlsAcme,
+    TlsPlaintext,
+)
+from tests.harness_custody import create_in_memory_native_identity
 
 # ---------------------------------------------------------------------------
 # Helpers -- mock bridge objects
@@ -410,3 +446,467 @@ async def test_enable_site_projection_both_none_passes_through() -> None:
 
     assert handle._last_enable_args["broadcast_key_hex"] is None
     assert handle._last_enable_args["author_did"] is None
+
+
+# ---------------------------------------------------------------------------
+# node_start (SCP-323): NodeStartConfig wire shape, delegation, error mapping
+# ---------------------------------------------------------------------------
+
+_REPO = Path(__file__).resolve().parents[3]
+
+#: The bridge's wire-shape fixture: every arm of every sum type, a full config,
+#: and the optional fields. The ``node_start_config.rs`` unit tests check it
+#: against the Rust types, so a field or arm added, renamed or made optional in
+#: Rust fails there until the fixture follows, and fails here until the Python
+#: types follow.
+_WIRE = json.loads(
+    (_REPO / "crates/scp-ffi/common/tests/fixtures/node_start_config.json").read_text()
+)
+
+
+@pytest.fixture
+def operator(scp: Any) -> Identity:
+    """An identity registered on the ``scp`` instance."""
+    return Identity(create_in_memory_native_identity(scp._native))
+
+
+@pytest.fixture
+def stranger(scp: Any) -> Iterator[Identity]:
+    """An identity registered on another instance, not on ``scp``."""
+    from scp_sdk import SCP
+
+    other = SCP(storage={"type": "in_memory"})
+    try:
+        yield Identity(create_in_memory_native_identity(other._native))
+    finally:
+        other.__exit__(None, None, None)
+
+
+def _arm_class(field: str, kind: str) -> type:
+    """The Python arm of sum-typed ``field`` whose ``kind`` is ``kind``."""
+    matches = [cls for cls in _ARMS[field] if cls._KIND == kind]
+    assert len(matches) == 1, (field, kind, _ARMS[field])
+    return matches[0]
+
+
+def _arm_from_wire(field: str, wire: dict[str, Any]) -> Any:
+    """The Python arm a fixture entry describes, built from its fields."""
+    return _arm_class(field, wire["kind"])(**{k: v for k, v in wire.items() if k != "kind"})
+
+
+def _fixture_config(identity: Identity) -> NodeStartConfig:
+    """The fixture's full config, as a Python config under ``identity``."""
+    values = {
+        name: (_arm_from_wire(name, value) if name in _ARMS else value)
+        for name, value in _WIRE["config"].items()
+    }
+    values["identity"] = identity
+    return NodeStartConfig(**values)
+
+
+def _config(identity: Identity, **overrides: Any) -> NodeStartConfig:
+    fields: dict[str, Any] = {
+        "reach": ReachLocal(),
+        "identity": identity,
+        "blob_storage": BlobInMemory(),
+        "tls": TlsPlaintext(),
+        "dht": DhtDisabled(),
+        "cors_origins": CorsAnyOrigin(),
+        "bind_addr": "127.0.0.1:0",
+    }
+    fields.update(overrides)
+    return NodeStartConfig(**fields)
+
+
+def _defaults_to_none(field: dataclasses.Field[Any]) -> bool:
+    return field.default is None and field.default_factory is dataclasses.MISSING
+
+
+def test_node_start_config_fields_match_the_bridge_struct() -> None:
+    """NodeStartConfig carries the bridge struct's fields, in order, and a field
+    is optional (defaults to None) exactly when the bridge's is."""
+    fields = dataclasses.fields(NodeStartConfig)
+    assert [f.name for f in fields] == _WIRE["fields"]
+    optional = [f.name for f in fields if _defaults_to_none(f)]
+    assert optional == _WIRE["optional_fields"]
+    required = [f.name for f in fields if f.default is dataclasses.MISSING]
+    assert required == [n for n in _WIRE["fields"] if n not in _WIRE["optional_fields"]]
+
+
+def test_node_start_config_sum_fields_match_the_bridge() -> None:
+    """The fields typed by an arm alias are exactly the bridge's enum-typed
+    fields."""
+    assert sorted(_ARMS) == sorted(_WIRE["arms"])
+
+
+@pytest.mark.parametrize("field", sorted(_WIRE["arms"]))
+def test_node_start_config_arms_match_the_bridge_enum(field: str) -> None:
+    """Each sum type has exactly the bridge enum's arms; each arm built from the
+    fixture entry emits that entry, and an arm field is optional exactly when
+    the bridge's is."""
+    entries = _WIRE["arms"][field]
+    assert sorted(cls._KIND for cls in _ARMS[field]) == sorted(e["kind"] for e in entries)
+    for entry in entries:
+        arm = _arm_from_wire(field, entry)
+        assert arm._wire() == entry
+        optional = _WIRE["optional_arm_fields"].get(field, {}).get(entry["kind"], [])
+        fields = dataclasses.fields(type(arm))
+        assert [f.name for f in fields if _defaults_to_none(f)] == optional, entry
+        assert all(f.default is dataclasses.MISSING for f in fields if f.name not in optional), (
+            entry
+        )
+
+
+def test_node_start_config_requires_every_bridge_required_field(operator: Identity) -> None:
+    """Omitting a required field raises TypeError, and an omitted optional field
+    is None, which the bridge reads as absent."""
+    full = _fixture_config(operator)
+    values = {f.name: getattr(full, f.name) for f in dataclasses.fields(NodeStartConfig)}
+    for name in _WIRE["fields"]:
+        partial = {k: v for k, v in values.items() if k != name}
+        if name in _WIRE["optional_fields"]:
+            assert getattr(NodeStartConfig(**partial), name) is None
+        else:
+            with pytest.raises(TypeError, match=name):
+                NodeStartConfig(**partial)
+
+
+def test_node_start_config_takes_named_fields_only(operator: Identity) -> None:
+    with pytest.raises(TypeError):
+        NodeStartConfig(ReachLocal(), operator)  # type: ignore[misc]
+
+
+def test_node_start_config_wire_is_the_bridge_shape_field_for_field(operator: Identity) -> None:
+    """_to_wire emits the fixture's full config field for field and in the
+    bridge's order, with the identity lowered to its DID; an absent optional is
+    null."""
+    expected = {**_WIRE["config"], "identity": operator.did}
+    wire = _fixture_config(operator)._to_wire()
+    assert wire == expected
+    assert list(wire) == _WIRE["fields"]
+    minimal = NodeStartConfig(
+        **{
+            name: value
+            for name, value in vars(_fixture_config(operator)).items()
+            if name not in _WIRE["optional_fields"]
+        }
+    )
+    assert json.loads(minimal._to_json()) == {
+        **{k: v for k, v in expected.items() if k not in _WIRE["optional_fields"]},
+        **dict.fromkeys(_WIRE["optional_fields"]),
+    }
+
+
+def test_node_start_config_lowers_a_path_like_blob_path(operator: Identity) -> None:
+    """A pathlib.Path blob path is accepted and sent as its string."""
+    for arm in (BlobRedb, BlobSqlite):
+        config = _config(operator, blob_storage=arm(path=Path("/var/lib/scp/blobs.db")))
+        wire = json.loads(config._to_json())["blob_storage"]
+        assert wire == {"kind": arm._KIND, "path": "/var/lib/scp/blobs.db"}
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ["did:dht:z6MkNodeStartOperatorProbe", None, object()],
+    ids=["did-string", "none", "object"],
+)
+def test_node_start_config_rejects_an_identity_that_is_not_an_identity(identity: Any) -> None:
+    """An identity that is not an scp_sdk.Identity raises ValidationError
+    SCP-VALID-7005 naming the expected type."""
+    with pytest.raises(ValidationError) as raised:
+        _config(identity)._to_json()
+    assert raised.value.code == "SCP-VALID-7005"
+    assert "scp_sdk.Identity" in raised.value.message
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tls", ReachLocal()),
+        ("reach", "local"),
+        ("cors_origins", None),
+        ("dht", {"kind": "disabled"}),
+        ("nat", TlsPlaintext()),
+    ],
+)
+def test_node_start_config_rejects_a_value_outside_its_arms(
+    operator: Identity, field: str, value: Any
+) -> None:
+    """A sum-typed field holding anything but one of its arms raises
+    StorageError SCP-STORAGE-8007."""
+    with pytest.raises(StorageError) as raised:
+        _config(operator, **{field: value})._to_json()
+    assert raised.value.code == "SCP-STORAGE-8007"
+    assert field in raised.value.message
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"cors_origins": CorsAllowlist(origins=[b"https://app.example.org"])},  # type: ignore[list-item]
+        {"projection_rate_limit": float("nan")},
+    ],
+    ids=["bytes", "nan"],
+)
+def test_node_start_config_rejects_a_value_json_cannot_encode(
+    operator: Identity, overrides: dict[str, Any]
+) -> None:
+    with pytest.raises(StorageError) as raised:
+        _config(operator, **overrides)._to_json()
+    assert raised.value.code == "SCP-STORAGE-8007"
+
+
+class _NodeStartNative:
+    """Raw-bridge double for ``SCP.node_start``: records each config string,
+    then returns a handle or raises ``error``."""
+
+    def __init__(self, did: str, error: Exception | None = None) -> None:
+        self.calls: list[str] = []
+        self.did = did
+        self.error = error
+
+    def node_start(self, config_json: str) -> _MockNodeHandle:
+        self.calls.append(config_json)
+        if self.error is not None:
+            raise self.error
+        return _MockNodeHandle(did=self.did)
+
+
+class _NodeStartSCP:
+    def __init__(self, native: _NodeStartNative) -> None:
+        self._native = native
+
+
+@pytest.mark.asyncio
+async def test_node_start_sends_the_encoded_config_and_returns_a_node(operator: Identity) -> None:
+    """SCP.node_start calls the bridge's node_start once with the config's JSON
+    and wraps the handle in a Node."""
+    from scp_sdk.scp import SCP
+
+    native = _NodeStartNative(operator.did)
+    config = _config(operator, tls=TlsAcme(), projection_rate_limit=5)
+    node = await SCP.node_start(_NodeStartSCP(native), config)  # type: ignore[arg-type]
+    assert isinstance(node, Node)
+    assert node.did == operator.did
+    assert len(native.calls) == 1
+    assert json.loads(native.calls[0]) == config._to_wire()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "error", "code"),
+    [
+        ("not-a-config", ValidationError, "SCP-VALID-7005"),
+        ("bad-identity", ValidationError, "SCP-VALID-7005"),
+        ("bad-arm", StorageError, "SCP-STORAGE-8007"),
+    ],
+)
+async def test_node_start_rejects_a_bad_config_before_the_bridge(
+    operator: Identity, config: str, error: type[ScpError], code: str
+) -> None:
+    """A value that is not a config, an identity that is not an Identity, and
+    an arm outside its type each raise their typed error, and the bridge is
+    never called."""
+    from scp_sdk.scp import SCP
+
+    value: Any = {
+        "not-a-config": _WIRE["config"],
+        "bad-identity": _config(operator.did),  # type: ignore[arg-type]
+        "bad-arm": _config(operator, tls="plaintext"),
+    }[config]
+    native = _NodeStartNative(operator.did)
+    with pytest.raises(error) as raised:
+        await SCP.node_start(_NodeStartSCP(native), value)  # type: ignore[arg-type]
+    assert raised.value.code == code
+    assert native.calls == []
+
+
+#: Every row of sdk-common.md §"Node start error codes": the code and the SDK
+#: class of its category.
+_NODE_START_CODES: list[tuple[str, type[ScpError]]] = [
+    ("SCP-STORAGE-8007", StorageError),
+    ("SCP-STORAGE-8008", StorageError),
+    ("SCP-STORAGE-8009", StorageError),
+    ("SCP-IDENT-1063", IdentityError),
+    ("SCP-TRANS-5051", TransportError),
+    ("SCP-TRANS-5052", TransportError),
+    ("SCP-TRANS-5054", TransportError),
+    ("SCP-TRANS-5050", TransportError),
+    ("SCP-IDENT-1001", IdentityError),
+    ("SCP-VALID-7004", ValidationError),
+    ("SCP-CTX-2053", ContextError),
+    ("SCP-TRANS-5055", TransportError),
+    ("SCP-TRANS-5056", TransportError),
+]
+
+
+def test_node_start_code_table_covers_every_sdk_common_row() -> None:
+    """The table above names exactly the codes of sdk-common.md §"Node start
+    error codes"."""
+    doc = (_REPO / ".docs/standards/sdk-common.md").read_text()
+    section = doc[doc.index("### Node start error codes") :]
+    section = section[: section.index("\n### ")]
+    rows = re.findall(r"^\| [^|]+ \| `(SCP-[A-Z]+-\d+)` \|", section, re.MULTILINE)
+    assert len(rows) == len(set(rows))
+    assert sorted(rows) == sorted(code for code, _ in _NODE_START_CODES)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("code", "sdk_class"), _NODE_START_CODES)
+async def test_node_start_raises_the_typed_error_of_each_code(
+    operator: Identity, code: str, sdk_class: type[ScpError]
+) -> None:
+    """A bridge failure with a node start code raises the SDK error of the code's
+    category, with the code preserved and the bridge error as its cause. The
+    SDK classifies by the code alone, so the bridge exception's own class does
+    not enter into it."""
+    from scp_sdk.scp import SCP
+
+    bridge_error = Exception(f"[{code}] node start failed")
+    native = _NodeStartNative(operator.did, bridge_error)
+    with pytest.raises(ScpError) as raised:
+        await SCP.node_start(_NodeStartSCP(native), _config(operator))  # type: ignore[arg-type]
+    assert type(raised.value) is sdk_class
+    assert raised.value.code == code
+    assert raised.value.__cause__ is bridge_error
+
+
+# ---------------------------------------------------------------------------
+# node_start against the built extension (the `scp` fixture)
+# ---------------------------------------------------------------------------
+
+
+async def _start_error(scp: Any, config: NodeStartConfig) -> ScpError:
+    try:
+        node = await scp.node_start(config)
+    except ScpError as exc:
+        return exc
+    await node.shutdown()
+    pytest.fail(f"node_start must fail for {config}")
+
+
+@pytest.mark.asyncio
+async def test_node_start_starts_and_stops_a_node_on_the_extension(
+    scp: Any, operator: Identity
+) -> None:
+    """A valid config starts a node under the operator identity, and shutdown
+    stops it."""
+    node = await scp.node_start(_config(operator))
+    try:
+        assert isinstance(node, Node)
+        assert node.did == operator.did
+        assert node.relay_port > 0
+        assert node.relay_url.startswith("ws://127.0.0.1:")
+        assert node.is_shutdown is False
+    finally:
+        await node.shutdown()
+    assert node.is_shutdown is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "entry"),
+    [(field, entry) for field, entries in _WIRE["arms"].items() for entry in entries],
+    ids=lambda v: v if isinstance(v, str) else v["kind"],
+)
+async def test_node_start_extension_reads_every_arm(
+    scp: Any, stranger: Identity, field: str, entry: dict[str, Any]
+) -> None:
+    """The extension parses a config carrying each arm and every optional field:
+    an operator not registered on the instance fails at identity resolution
+    (SCP-IDENT-1063), which runs only after the parse that rejects an unknown
+    key or ``kind`` with SCP-STORAGE-8007."""
+    overrides: dict[str, Any] = {
+        "http_bind_addr": "127.0.0.1:0",
+        "nat": NatAuto(),
+        "projection_rate_limit": 5,
+        field: _arm_from_wire(field, entry),
+    }
+    err = await _start_error(scp, _config(stranger, **overrides))
+    assert (type(err), err.code) == (IdentityError, "SCP-IDENT-1063"), err
+
+
+def test_node_start_extension_rejects_a_key_outside_the_bridge_shape(
+    scp: Any, operator: Identity
+) -> None:
+    """Control for the parse check above: the extension refuses a config with a
+    key the bridge struct lacks, so a misnamed wire key could not pass it."""
+    wire = _config(operator)._to_wire()
+    wire["bind_address"] = wire.pop("bind_addr")
+    with pytest.raises(Exception, match=r"^\[SCP-STORAGE-8007\]"):
+        scp._native.node_start(json.dumps(wire))
+
+
+@pytest.mark.asyncio
+async def test_node_start_extension_raises_8007_8008_1063_5051_and_5056(
+    scp: Any, operator: Identity, stranger: Identity, tmp_path: Path
+) -> None:
+    """The extension raises SCP-STORAGE-8007, SCP-STORAGE-8008, SCP-IDENT-1063,
+    SCP-TRANS-5051 and SCP-TRANS-5056 as the typed SDK error carrying each code.
+
+    No config makes the extension raise the other node start codes from a test:
+
+    - ``SCP-STORAGE-8009`` is a core node storage error. The node writes to the
+      ``SCP`` instance's own storage, which the config does not name, and the
+      in-memory instance store a test builds does not fail.
+    - ``SCP-TRANS-5052`` is a TLS provisioning failure. A self-signed
+      certificate is generated for any domain, and ACME needs port 80 and a
+      reachable certificate authority, so its outcome depends on the network.
+    - ``SCP-TRANS-5054`` is a serve or NAT traversal failure. ``node_start``
+      does not bind the HTTP server (a taken ``http_bind_addr`` starts), and
+      NAT traversal fails only when its STUN exchange over the network does.
+
+    The table test above shows each of these codes raises its typed error.
+    """
+    regular_file = tmp_path / "regular-file"
+    regular_file.write_bytes(b"x")
+    taken = socket.socket()
+    taken.bind(("127.0.0.1", 0))
+    taken.listen()
+    taken_addr = f"127.0.0.1:{taken.getsockname()[1]}"
+    cases: list[tuple[str, NodeStartConfig, type[ScpError], str]] = [
+        (
+            "domain with plaintext",
+            _config(operator, reach=ReachDomain(domain="node.example.org")),
+            StorageError,
+            "SCP-STORAGE-8007",
+        ),
+        (
+            "zero projection rate limit",
+            _config(operator, projection_rate_limit=0),
+            StorageError,
+            "SCP-STORAGE-8007",
+        ),
+        (
+            "malformed bind address",
+            _config(operator, bind_addr="not-an-address"),
+            StorageError,
+            "SCP-STORAGE-8007",
+        ),
+        (
+            "blob parent under a regular file",
+            _config(operator, blob_storage=BlobRedb(path=regular_file / "sub" / "blobs.redb")),
+            StorageError,
+            "SCP-STORAGE-8008",
+        ),
+        ("unregistered operator", _config(stranger), IdentityError, "SCP-IDENT-1063"),
+        (
+            "relay bind on a taken port",
+            _config(operator, bind_addr=taken_addr),
+            TransportError,
+            "SCP-TRANS-5051",
+        ),
+    ]
+    try:
+        for label, config, sdk_class, code in cases:
+            err = await _start_error(scp, config)
+            assert (type(err), err.code) == (sdk_class, code), (label, err)
+    finally:
+        taken.close()
+
+    first = await scp.node_start(_config(operator))
+    try:
+        err = await _start_error(scp, _config(operator))
+        assert (type(err), err.code) == (TransportError, "SCP-TRANS-5056"), err
+    finally:
+        await first.shutdown()

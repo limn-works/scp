@@ -31,6 +31,8 @@ metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Encodes the run-time APNs .p8 key the push startup tests write (PUSH-012).
+base64 = { workspace = true }
 
 [features]
 # The same feature as `scp-node`'s `cloud-blobs`. scp-relay depends on

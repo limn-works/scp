@@ -84,7 +84,8 @@ enum MessagingExample {
             economicPolicy: nil,
             consequenceRulesJson: nil,
             consequenceConfigJson: nil,
-            capabilityRequirementsJson: nil
+            capabilityRequirementsJson: nil,
+            pseudonymRotation: nil
         )
         let aliceHandle = try await aliceNode.contextCreate(identity: alice, params: params)
 
@@ -95,8 +96,7 @@ enum MessagingExample {
             identity: alice,
             contextId: aliceHandle.contextId(),
             inviteeDid: bob.did(),
-            inviteeKeyPackage: reservation.keyPackagePublic,
-            relayUrls: [relayURL]
+            inviteeKeyPackage: reservation.keyPackagePublic
         )
         let bundle: SealedInvitation
         switch outcome {

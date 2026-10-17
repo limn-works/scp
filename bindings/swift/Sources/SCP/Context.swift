@@ -328,7 +328,7 @@ public actor Context {
     /// completes the reserve → invite → join handshake begun by
     /// ``SCP/reserveKeyPackage(identity:)``. Given the ``SealedInvitation`` the
     /// creator produced with
-    /// ``SCP/inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:relayUrls:)``,
+    /// ``SCP/inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:)``,
     /// this opens and AUTHENTICATES the bundle, installs the joined MLS group,
     /// derives the joiner's §9.10.4 routing pseudonym from its locally-custodied
     /// identity (never caller-supplied), registers a context handle, and returns
@@ -377,7 +377,7 @@ public actor Context {
     ///     from `sealed.creatorDid` so the two cannot be transposed.
     ///   - sealed: The creator-signed, HPKE-sealed ``SealedInvitation`` bundle
     ///     produced by
-    ///     ``SCP/inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:relayUrls:)``.
+    ///     ``SCP/inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:)``.
     ///     Carries the AUTHORITATIVE context id, creator DID, and encrypted
     ///     genesis params + MLS Welcome. The runtime opens the bundle, verifies
     ///     the creator signature, and derives all authority from it.

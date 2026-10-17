@@ -52,7 +52,9 @@ async fn start_relay() -> (ShutdownHandle, SocketAddr) {
     let config = RelayConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         delivery_jitter_ms: 0,
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(scp_transport::relay::push_gate::LiveRelayUrl::new(
+            scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1").unwrap(),
+        ))
     };
     let storage = Arc::new(BlobStorageBackend::in_memory());
     let server = RelayServer::new(config, storage);
@@ -189,10 +191,52 @@ async fn reconnect_transport_if_pending_against_two_relays() {
         2,
         "successful URLs remain pending for future resume cycles"
     );
+    let mut both = vec![r1_url.clone(), r2_url.clone()];
+    both.sort_unstable();
+    assert_eq!(
+        core.context_relay_urls(),
+        Ok(both),
+        "a create records every relay that reconnected"
+    );
 
     // Cleanup — avoid leaking relay tasks.
     r1_handle.shutdown();
     r2_handle.shutdown();
+}
+
+/// A resume that reconnects only some relays installs a manager whose
+/// relay set, the set a create records as hosts, holds only the relays
+/// that reconnected; the failed relay stays pending for retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_reconnect_records_only_reconnected_relays() {
+    let (live_handle, live_addr) = start_relay().await;
+    let live_url = ws_url(live_addr);
+    // 127.0.0.1:1 is unlikely to have an SCP relay listening.
+    let dead_url = "ws://127.0.0.1:1/scp/v1".to_owned();
+
+    let core = CoreFields::new();
+    core.add_relay_url(live_url.clone());
+    core.add_relay_url(dead_url.clone());
+
+    // At least one adapter landed, so the reconnect reports success.
+    core.reconnect_transport_if_pending()
+        .await
+        .expect("a reconnect that installs an adapter reports success");
+    assert_eq!(
+        core.with_transport(scp_transport::TransportManager::adapter_count),
+        Ok(1)
+    );
+    assert_eq!(
+        core.context_relay_urls(),
+        Ok(vec![live_url]),
+        "the relay that failed to reconnect has no adapter and hosts nothing"
+    );
+    assert!(
+        core.pending_relay_urls().contains(&dead_url),
+        "the failed relay stays pending for retry"
+    );
+
+    live_handle.shutdown();
 }
 
 /// `reconnect_transport_if_pending` against an empty set is a no-op.

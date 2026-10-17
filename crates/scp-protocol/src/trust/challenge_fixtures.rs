@@ -37,7 +37,7 @@ pub const FIXTURE_URI: &str =
 /// A protocol row: `Total(20)`, 9500, 2 retries, cooldown 300.
 pub const PROTOCOL_URI: &str = "scp:capability:schema-validation/v1";
 
-/// The spec 25 Vector 63 definition.
+/// The spec 25 Vector 65 definition.
 pub fn fixture_definition() -> CapabilityDefinition {
     CapabilityDefinition {
         capability_uri: FIXTURE_URI.to_owned(),

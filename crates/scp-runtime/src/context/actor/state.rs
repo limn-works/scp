@@ -70,6 +70,7 @@ use scp_did::DID;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
 use scp_protocol::context::broadcast::BroadcastContext as ProtocolBroadcastContext;
 use scp_protocol::context::membership::{MembershipState, ReceiveBuffer};
+use scp_protocol::context::pseudonym::PseudonymRecord;
 use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::crypto::sender_keys::{NonceDedup, SenderKey, SenderKeyStore};
 use scp_protocol::crypto::ucan::validate::InMemoryProofResolver;
@@ -628,9 +629,10 @@ impl Default for ContextCryptoState {
 /// [`ContextModeState`]-equivalent mode information at
 /// creation / join / restore time.
 ///
-/// `DID` is `#[serde(transparent)]` over `String`, so the serialized wire
-/// format for `pseudonym_registry` is a plain string-keyed map — wire
-/// compatible with the historical `HashMap<String, [u8; 32]>` snapshot field.
+/// `DID` is `#[serde(transparent)]` over `String`, so the serialized
+/// `pseudonym_registry` is a string-keyed map of [`PseudonymRecord`]s. A
+/// record's `epoch` carries `#[serde(default)]`, so a record persisted without
+/// it restores as a v1 record (spec 09 §9.10.4.1, receipt ordering).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ContextRouting {
@@ -651,11 +653,13 @@ pub enum ContextRouting {
         /// private field — the persisted wire format is unchanged.
         #[serde(with = "serde_bytes")]
         local_pseudonym: [u8; 32],
-        /// Known members' pseudonym routing IDs, keyed by DID. Private for the
-        /// same reason as `local_pseudonym`; mutate via [`peer_registry_mut`].
+        /// Known members' pseudonym records (routing ID plus the announced
+        /// epoch, `None` for v1), keyed by DID. The epoch drives the §9.10.4.1
+        /// receipt ordering. Private for the same reason as
+        /// `local_pseudonym`; mutate via [`peer_registry_mut`].
         ///
         /// [`peer_registry_mut`]: ContextRouting::peer_registry_mut
-        pseudonym_registry: HashMap<DID, [u8; 32]>,
+        pseudonym_registry: HashMap<DID, PseudonymRecord>,
     },
     /// Broadcast context. Uses `SHA-256(context_id)` as the shared routing ID
     /// per spec §5.14; no pseudonym state is retained. Broadcast contexts are
@@ -704,7 +708,7 @@ impl ContextRouting {
     /// Returns a read-only view of the peer pseudonym registry for a
     /// pseudonymous (encrypted) context, or `None` for a broadcast context.
     #[must_use]
-    pub const fn peer_registry(&self) -> Option<&HashMap<DID, [u8; 32]>> {
+    pub const fn peer_registry(&self) -> Option<&HashMap<DID, PseudonymRecord>> {
         match self {
             Self::Pseudonymous {
                 pseudonym_registry, ..
@@ -716,7 +720,7 @@ impl ContextRouting {
     /// Returns a mutable view of the peer pseudonym registry for a
     /// pseudonymous (encrypted) context, or `None` for a broadcast context.
     #[must_use]
-    pub const fn peer_registry_mut(&mut self) -> Option<&mut HashMap<DID, [u8; 32]>> {
+    pub const fn peer_registry_mut(&mut self) -> Option<&mut HashMap<DID, PseudonymRecord>> {
         match self {
             Self::Pseudonymous {
                 pseudonym_registry, ..
@@ -1051,6 +1055,14 @@ pub struct ClassSState {
     /// exactly like [`Self::caveat_counters`].
     pub(crate) stream_reservations:
         HashMap<String, crate::context::outlets::invoke::StreamReservationRecord>,
+    /// The local member's pseudonym rotation state (spec 09 §9.10.4.1).
+    ///
+    /// **Class S.** A rotation persists it fail-closed before the
+    /// announcement: a coalesce-window loss would let the member announce an
+    /// epoch it then forgets, and a re-announcement at the forgotten epoch is
+    /// one every peer rejects under the receipt-ordering rule. Same-node
+    /// restore rehydrates it; a public export strips it.
+    pub(crate) pseudonym_rotation: super::pseudonym_rotation::PseudonymRotationState,
 }
 
 /// Lossless, `Clone`-able mirror of [`ClassSState`] (ADR-049 §9).
@@ -1101,6 +1113,8 @@ pub struct ClassSStateSnapshot {
     /// is `Clone` + serde, so this snapshots by direct clone (no projection).
     pub(crate) stream_reservations:
         HashMap<String, crate::context::outlets::invoke::StreamReservationRecord>,
+    /// Mirror of [`ClassSState::pseudonym_rotation`] (`Copy`).
+    pub(crate) pseudonym_rotation: super::pseudonym_rotation::PseudonymRotationState,
 }
 
 #[allow(
@@ -1132,6 +1146,7 @@ impl ClassSState {
             xctx_caller_reservations: self.xctx_caller_reservations.clone(),
             caveat_counters: self.caveat_counters.clone(),
             stream_reservations: self.stream_reservations.clone(),
+            pseudonym_rotation: self.pseudonym_rotation,
         }
     }
 
@@ -1154,6 +1169,7 @@ impl ClassSState {
         self.xctx_caller_reservations = snap.xctx_caller_reservations;
         self.caveat_counters = snap.caveat_counters;
         self.stream_reservations = snap.stream_reservations;
+        self.pseudonym_rotation = snap.pseudonym_rotation;
     }
 }
 
@@ -1355,6 +1371,18 @@ pub struct PerContextState {
     /// fixed at creation / join / restore time and MUST agree with
     /// [`Self::mode`](ContextModeState).
     pub routing: ContextRouting,
+
+    /// The relay endpoints that host this context (§5.12.3.1
+    /// `InvitationBundle.relay_urls`, "Relay endpoints where the context is
+    /// hosted"). Set once per instance: the creator's relays at create, the
+    /// invitation bundle's `relay_urls` at Welcome join, and the persisted set
+    /// at import and restore (PUSH-025). Every write passes the set through
+    /// `lifecycle_helpers::normalize_relay_urls`, which stores each URL's
+    /// §9.18.2 canonical relay URL when it has one, keeps every other URL as
+    /// written, and deduplicates in first-seen order. An
+    /// empty set states that no relay hosts the context, as for a context
+    /// created with no relay connected.
+    pub relay_urls: Vec<String>,
 
     // -----------------------------------------------------------------
     // Anti-replay + reorder buffers (§9.8.2, §9.8.5)
@@ -1589,6 +1617,7 @@ impl PerContextState {
             access: AccessControlState::new_empty_for_actor(),
             ttl: TtlState::new_fresh_for_actor(),
             routing,
+            relay_urls: Vec::new(),
             sequence_tracker: SequenceTracker::new(),
             reorder_buffer: ReorderBuffer::default(),
             pending_commits: VecDeque::new(),
@@ -1618,6 +1647,12 @@ impl PerContextState {
                 xctx_caller_reservations: std::collections::HashMap::new(),
                 caveat_counters: HashMap::new(),
                 stream_reservations: HashMap::new(),
+                pseudonym_rotation:
+                    crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
+                        None,
+                        Some(created_at),
+                        created_at,
+                    ),
             },
             welcome_scratchpad: None,
             lifecycle_state: ContextLifecycleState::Open,
@@ -3157,9 +3192,16 @@ impl PerContextState {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::context::actor::pseudonym_rotation::PseudonymRotationState;
 
     fn test_admin() -> DID {
         DID("did:example:admin".to_owned())
+    }
+
+    /// The rotation state a context created at `t0` starts with: no policy,
+    /// the schedule anchored at the creator's T0.
+    fn rotation_anchored_at(t0: u64) -> PseudonymRotationState {
+        PseudonymRotationState::anchored(None, Some(t0), t0)
     }
 
     /// §9.10.4: `ContextRouting::for_mode` makes "encrypted context with no
@@ -3195,12 +3237,44 @@ mod tests {
         assert_eq!(bc.local_pseudonym(), None);
     }
 
+    /// §9.10.4.1 receipt ordering: each record's `(epoch, routing_id)` survives
+    /// the `MessagePack` snapshot encoding (`rmp_serde::to_vec_named`, the path
+    /// `ContextPersistence` uses), so a restored registry still rejects a
+    /// replayed lower-epoch announcement. A v1 record keeps `epoch: None`.
+    #[test]
+    fn context_routing_registry_epochs_survive_msgpack_snapshot() {
+        let mut routing = ContextRouting::for_mode(false, [5u8; 32]);
+        let v2 = PseudonymRecord {
+            routing_id: [6u8; 32],
+            epoch: Some(u64::MAX),
+        };
+        let v1 = PseudonymRecord {
+            routing_id: [7u8; 32],
+            epoch: None,
+        };
+        let registry = routing.peer_registry_mut().expect("registry");
+        registry.insert(DID("did:key:v2".to_owned()), v2);
+        registry.insert(DID("did:key:v1".to_owned()), v1);
+        let bytes = rmp_serde::to_vec_named(&routing).expect("serialize");
+        let back: ContextRouting = rmp_serde::from_slice(&bytes).expect("deserialize");
+        let back_registry = back.peer_registry().expect("registry");
+        assert_eq!(back_registry.get(&DID("did:key:v2".to_owned())), Some(&v2));
+        assert_eq!(back_registry.get(&DID("did:key:v1".to_owned())), Some(&v1));
+        assert_eq!(back_registry.len(), 2);
+    }
+
     #[test]
     fn peer_registry_mut_inserts_for_encrypted_none_for_broadcast() {
         let mut enc = ContextRouting::for_mode(false, [1u8; 32]);
         enc.peer_registry_mut()
             .expect("encrypted has a registry")
-            .insert(DID("did:key:peer".to_owned()), [4u8; 32]);
+            .insert(
+                DID("did:key:peer".to_owned()),
+                PseudonymRecord {
+                    routing_id: [4u8; 32],
+                    epoch: None,
+                },
+            );
         assert_eq!(enc.peer_registry().map(HashMap::len), Some(1));
 
         let mut bc = ContextRouting::Broadcast;
@@ -3209,15 +3283,18 @@ mod tests {
 
     /// §9.10.4: `ContextRouting` round-trips through the snapshot serde format.
     /// The `DID`-keyed registry serializes with plain string keys (DID is
-    /// `serde(transparent)`), so it is wire-compatible with the historical
-    /// `HashMap<String, [u8; 32]>` snapshot field.
+    /// `serde(transparent)`).
     #[test]
     fn context_routing_serde_roundtrip() {
         let mut routing = ContextRouting::for_mode(false, [5u8; 32]);
+        let record = PseudonymRecord {
+            routing_id: [6u8; 32],
+            epoch: None,
+        };
         routing
             .peer_registry_mut()
             .expect("registry")
-            .insert(DID("did:key:peer".to_owned()), [6u8; 32]);
+            .insert(DID("did:key:peer".to_owned()), record);
         let json = serde_json::to_string(&routing).expect("serialize");
         assert!(
             json.contains("did:key:peer"),
@@ -3228,7 +3305,7 @@ mod tests {
         assert_eq!(
             back.peer_registry()
                 .and_then(|r| r.get(&DID("did:key:peer".to_owned())).copied()),
-            Some([6u8; 32])
+            Some(record)
         );
 
         let bc_json = serde_json::to_string(&ContextRouting::Broadcast).expect("serialize");
@@ -3460,6 +3537,7 @@ mod tests {
             access,
             ttl,
             routing,
+            relay_urls,
             sequence_tracker,
             reorder_buffer,
             pending_commits,
@@ -3488,6 +3566,7 @@ mod tests {
             xctx_caller_reservations,
             caveat_counters,
             stream_reservations,
+            pseudonym_rotation,
         } = class_s;
 
         // Identity + lifetime.
@@ -3526,6 +3605,8 @@ mod tests {
         assert!(!routing.is_broadcast());
         assert!(routing.local_pseudonym().is_some());
         assert!(routing.peer_registry().is_some_and(HashMap::is_empty));
+        // A test constructor's context has no relay host (PUSH-025).
+        assert!(relay_urls.is_empty());
 
         // Anti-replay + reorder buffers.
         let _ = &sequence_tracker;
@@ -3561,6 +3642,7 @@ mod tests {
         assert!(caveat_counters.is_empty());
         // No in-flight streaming reservation recovery records on a fresh context.
         assert!(stream_reservations.is_empty());
+        assert_eq!(pseudonym_rotation, rotation_anchored_at(12));
         assert!(welcome_scratchpad.is_none());
         assert_eq!(lifecycle_state, ContextLifecycleState::Open);
 
@@ -3596,6 +3678,7 @@ mod tests {
             access: _,
             ttl: _,
             routing,
+            relay_urls,
             sequence_tracker: _,
             reorder_buffer: _,
             pending_commits: _,
@@ -3617,6 +3700,7 @@ mod tests {
                     xctx_caller_reservations: _,
                     caveat_counters: _,
                     stream_reservations: _,
+                    pseudonym_rotation: _,
                 },
             welcome_scratchpad: _,
             lifecycle_state: _,
@@ -3628,6 +3712,8 @@ mod tests {
         assert!(routing.is_broadcast());
         assert!(routing.local_pseudonym().is_none());
         assert!(routing.peer_registry().is_none());
+        // A test constructor's context has no relay host (PUSH-025).
+        assert!(relay_urls.is_empty());
 
         match mode {
             ContextModeState::Broadcast(b) => {

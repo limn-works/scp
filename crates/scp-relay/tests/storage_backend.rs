@@ -68,7 +68,7 @@ fn assert_cloud_backend_fails_closed(backend: &str, required_var: &str) {
         let tmp = tempfile::tempdir().expect("failed to create tempdir");
         let db_path = tmp.path().join("must-not-exist.db");
         let output = output_within_deadline(
-            Command::new(relay_bin())
+            relay_command()
                 .env("SCP_RELAY_STORAGE_BACKEND", &value)
                 .env("SCP_RELAY_STORAGE_PATH", &db_path)
                 .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
@@ -105,6 +105,136 @@ fn relay_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_scp-relay"))
 }
 
+/// The relay URL every test but `unset_or_empty_relay_url_exits_with_error`
+/// sets, so each reaches the configuration it tests.
+const RELAY_URL: &str = "wss://relay.example/scp/v1";
+
+/// A command that runs `scp-relay` with `SCP_RELAY_URL` set to [`RELAY_URL`]
+/// and `SCP_RELAY_PUSH_PLATFORMS=none`. The relay refuses to start without
+/// either. The URL and push tests below override or remove one of them.
+fn relay_command() -> Command {
+    let mut command = Command::new(relay_bin());
+    command
+        .env("SCP_RELAY_URL", RELAY_URL)
+        .env("SCP_RELAY_PUSH_PLATFORMS", "none");
+    command
+}
+
+/// An unset, empty, or whitespace `SCP_RELAY_URL` makes the relay exit 1 with
+/// an error naming the variable, before it opens a store. The relay derives
+/// its reserved push routing ID from that URL (§10.7.1), so the variable has
+/// no default.
+#[test]
+fn unset_or_empty_relay_url_exits_with_error() {
+    for value in [None, Some(""), Some("  ")] {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tmp.path().join("must-not-exist.db");
+        let mut command = relay_command();
+        command
+            .current_dir(tmp.path())
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("RUST_LOG");
+        match value {
+            Some(v) => command.env("SCP_RELAY_URL", v),
+            None => command.env_remove("SCP_RELAY_URL"),
+        };
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{value:?}: {stderr}");
+        assert!(
+            stderr.contains("SCP_RELAY_URL must be set to a non-empty value"),
+            "{value:?}: {stderr}"
+        );
+        assert!(!db_path.exists(), "{value:?} opened a store");
+    }
+}
+
+/// PUSH-012: an unset or blank `SCP_RELAY_PUSH_PLATFORMS` makes the relay exit
+/// 1 naming the variable and SCP-CAPSEL-8000 (push selection has no default),
+/// before it opens its blob store.
+#[test]
+fn unset_push_platforms_exits_with_capsel_8000() {
+    for value in [None, Some(""), Some(" ")] {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tmp.path().join("must-not-exist.db");
+        let mut command = relay_command();
+        command
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("RUST_LOG");
+        match value {
+            Some(v) => command.env("SCP_RELAY_PUSH_PLATFORMS", v),
+            None => command.env_remove("SCP_RELAY_PUSH_PLATFORMS"),
+        };
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{value:?}: {stderr}");
+        assert!(
+            stderr.contains("SCP_RELAY_PUSH_PLATFORMS is unset or empty"),
+            "{value:?}: {stderr}"
+        );
+        assert!(stderr.contains("SCP-CAPSEL-8000"), "{value:?}: {stderr}");
+        assert!(!db_path.exists(), "{value:?} opened {}", db_path.display());
+    }
+}
+
+/// PUSH-012: a push platform with a partial configuration makes the relay
+/// exit 1 naming the first missing variable, and opens neither the push store
+/// nor the blob store.
+#[test]
+fn partial_push_configuration_exits_naming_the_variable() {
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let db_path = tmp.path().join("must-not-exist.db");
+    let push_path = tmp.path().join("push-must-not-exist.db");
+    let cases: [(&[(&str, &str)], &str); 3] = [
+        (
+            &[("SCP_RELAY_PUSH_PLATFORMS", "apns")],
+            "SCP_RELAY_PUSH_STORE",
+        ),
+        (
+            &[
+                ("SCP_RELAY_PUSH_PLATFORMS", "apns"),
+                ("SCP_RELAY_PUSH_STORE", "memory"),
+            ],
+            "SCP_RELAY_PUSH_STORE",
+        ),
+        (
+            &[
+                ("SCP_RELAY_PUSH_PLATFORMS", "fcm"),
+                ("SCP_RELAY_PUSH_STORE", "sqlite"),
+            ],
+            "SCP_RELAY_FCM_SERVICE_ACCOUNT_PATH",
+        ),
+    ];
+    for (vars, named) in cases {
+        let mut command = relay_command();
+        command
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_PUSH_STORE_PATH", &push_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("SCP_RELAY_PUSH_STORE")
+            .env_remove("SCP_RELAY_FCM_SERVICE_ACCOUNT_PATH")
+            .env_remove("RUST_LOG");
+        for (var, value) in vars {
+            command.env(var, value);
+        }
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{vars:?}: {stderr}");
+        assert!(stderr.contains(named), "{vars:?}: {stderr}");
+        assert!(!db_path.exists(), "{vars:?} opened {}", db_path.display());
+        assert!(
+            !push_path.exists(),
+            "{vars:?} opened {}",
+            push_path.display()
+        );
+    }
+}
+
 /// An unset `SCP_RELAY_STORAGE_BACKEND`, and an empty or whitespace one, each
 /// make the relay exit 1 with an error naming the variable, SCP-CAPSEL-8000
 /// (persistence spec §17.17.1, selection is mandatory), and the valid values,
@@ -118,7 +248,7 @@ fn unset_or_empty_backend_exits_with_capsel_8000() {
     for value in [None, Some(""), Some("  ")] {
         let tmp = tempfile::tempdir().expect("failed to create tempdir");
         let db_path = tmp.path().join("must-not-exist.db");
-        let mut command = Command::new(relay_bin());
+        let mut command = relay_command();
         command
             .current_dir(tmp.path())
             .env("SCP_RELAY_STORAGE_PATH", &db_path)
@@ -160,7 +290,7 @@ fn sqlite_without_an_absolute_path_exits_with_error() {
         (Some("scp-relay.db"), "is a relative path"),
     ] {
         let tmp = tempfile::tempdir().expect("failed to create tempdir");
-        let mut command = Command::new(relay_bin());
+        let mut command = relay_command();
         command
             .current_dir(tmp.path())
             .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
@@ -192,7 +322,7 @@ fn sqlite_without_an_absolute_path_exits_with_error() {
 /// message naming the valid options.
 #[test]
 fn invalid_backend_exits_with_error() {
-    let output = Command::new(relay_bin())
+    let output = relay_command()
         .env("SCP_RELAY_STORAGE_BACKEND", "banana")
         .env_remove("RUST_LOG")
         .output()
@@ -317,17 +447,37 @@ fn sqlite_blob_persistence_across_reopens() {
 /// returns and logs.
 #[test]
 fn explicit_sqlite_backend_starts() {
-    use std::io::BufRead;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-
     const OPENED: &str = "using sqlite blob storage";
 
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
     let db_path = tmp.path().join("explicit-backend.db");
 
-    let mut child = Command::new(relay_bin())
-        .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
-        .env("SCP_RELAY_STORAGE_PATH", db_path.to_str().unwrap())
+    let (opened, output) = run_until_logged(
+        relay_command()
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", db_path.to_str().unwrap()),
+        OPENED,
+    );
+
+    assert!(
+        opened,
+        "relay should have logged '{OPENED}' within one minute; output: {output}"
+    );
+    assert!(
+        db_path.exists(),
+        "sqlite database file should be created when the operator names sqlite; output: {output}"
+    );
+}
+
+/// Starts `command` with a loopback bind address, JSON logs at info level, and
+/// stderr piped, waits until a log line contains `needle` or the relay exits,
+/// then kills the relay. Returns whether the line appeared and everything the
+/// relay wrote to stderr.
+fn run_until_logged(command: &mut Command, needle: &str) -> (bool, String) {
+    use std::io::BufRead;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    let mut child = command
         .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
         .env("SCP_RELAY_LOG_FORMAT", "json")
         .env("RUST_LOG", "scp_relay=info,scp_transport=info")
@@ -350,28 +500,27 @@ fn explicit_sqlite_backend_starts() {
     });
 
     // The deadline bounds how long this test waits; it states nothing about
-    // the relay, because the assertions below still require that a relay
-    // logged `using sqlite blob storage` and created its sqlite file. A longer
-    // wait therefore weakens nothing. Under `cargo nextest run --workspace`
-    // this binary starts alongside ~11,000 other tests: a 10-second deadline
-    // expired twice on one 2026-08-17 local run, and once more on a pass over
-    // 11019 tests where a debug-profile relay binary competed for CPU with
-    // every other test binary and reached 10.062s without writing its file.
-    // Both reruns passed, and this test passes on its own in 1.4 to 2.9
-    // seconds, so 10 seconds measured machine load rather than relay behavior.
-    // One minute leaves headroom under that load and still fails within one
-    // test-run budget when a relay genuinely never starts.
+    // the relay, because each caller still asserts on the line and on the
+    // files the relay created. A longer wait therefore weakens nothing. Under
+    // `cargo nextest run --workspace` this binary starts alongside ~11,000
+    // other tests: a 10-second deadline expired twice on one 2026-08-17 local
+    // run, and once more on a pass over 11019 tests where a debug-profile
+    // relay binary competed for CPU with every other test binary and reached
+    // 10.062s without writing its file. Both reruns passed, and a relay starts
+    // on its own in 1.4 to 2.9 seconds, so 10 seconds measured machine load
+    // rather than relay behavior. One minute leaves headroom under that load
+    // and still fails within one test-run budget when a relay never starts.
     let deadline = Instant::now() + Duration::from_mins(1);
     let mut output = String::new();
-    let mut opened = false;
+    let mut seen = false;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match lines_rx.recv_timeout(remaining) {
             Ok(line) => {
-                opened = line.contains(OPENED);
+                seen = line.contains(needle);
                 output.push_str(&line);
                 output.push('\n');
-                if opened {
+                if seen {
                     break;
                 }
             }
@@ -384,15 +533,119 @@ fn explicit_sqlite_backend_starts() {
     child.wait().ok();
     output.extend(lines_rx.iter().map(|line| line + "\n"));
     reader_thread.join().expect("stderr reader thread panicked");
+    (seen, output)
+}
+
+/// Writes `contents` to `name` in `dir` with owner-only permissions, as the
+/// relay requires of a credential file.
+#[cfg(unix)]
+fn write_owner_only(dir: &std::path::Path, name: &str, contents: &[u8]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, contents).expect("write credential file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict credential file");
+    path
+}
+
+/// A version-0 PKCS#8 P-256 private key as a .p8 PEM file, built at run time
+/// so no key file is committed. The scalar is fixed: the relay only parses
+/// the key at startup and these tests send no wake signal.
+#[cfg(unix)]
+fn apns_p8_pem() -> String {
+    use base64::Engine as _;
+    // The P-256 `AlgorithmIdentifier` (id-ecPublicKey, prime256v1).
+    const P256_ALGORITHM_ID: [u8; 19] = [
+        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce,
+        0x3d, 0x03, 0x01, 0x07,
+    ];
+    let mut ec = vec![0x30, 0x25, 0x02, 0x01, 0x01, 0x04, 0x20];
+    ec.extend_from_slice(&[0x11; 32]);
+    let mut body = vec![0x02, 0x01, 0x00, 0x30, 0x13];
+    body.extend_from_slice(&P256_ALGORITHM_ID);
+    body.push(0x04);
+    body.push(u8::try_from(ec.len()).unwrap());
+    body.extend_from_slice(&ec);
+    let mut der = vec![0x30, u8::try_from(body.len()).unwrap()];
+    der.extend_from_slice(&body);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    format!("-----BEGIN PRIVATE KEY-----\n{encoded}\n-----END PRIVATE KEY-----\n")
+}
+
+/// A relay command with `SCP_RELAY_PUSH_PLATFORMS=apns`, an APNs key file in
+/// `dir`, the `sqlite` push store at `push_path`, and a `memory` blob store.
+#[cfg(unix)]
+fn apns_relay_command(dir: &std::path::Path, push_path: &std::path::Path) -> Command {
+    let key_path = write_owner_only(dir, "AuthKey.p8", apns_p8_pem().as_bytes());
+    let mut command = relay_command();
+    command
+        .current_dir(dir)
+        .env("SCP_RELAY_STORAGE_BACKEND", "memory")
+        .env("SCP_RELAY_PUSH_PLATFORMS", "apns")
+        .env("SCP_RELAY_PUSH_STORE", "sqlite")
+        .env("SCP_RELAY_PUSH_STORE_PATH", push_path)
+        .env("SCP_RELAY_APNS_KEY_PATH", key_path)
+        .env("SCP_RELAY_APNS_KEY_ID", "ABC123DEFG")
+        .env("SCP_RELAY_APNS_TEAM_ID", "TEAM123456")
+        .env("SCP_RELAY_APNS_TOPIC", "works.limn.app")
+        .env("SCP_RELAY_APNS_ENVIRONMENT", "sandbox");
+    command
+}
+
+/// PUSH-012 criterion 6: the shipped `scp-relay` binary accepts
+/// `SCP_RELAY_PUSH_STORE=sqlite`. With `apns` listed it opens the SQLite push
+/// store at `SCP_RELAY_PUSH_STORE_PATH`, logs that push is enabled, and
+/// listens; the file it created opens as a push store after the relay stops.
+#[cfg(unix)]
+#[test]
+fn sqlite_push_store_starts_the_relay_with_push_enabled() {
+    const ENABLED: &str = "push: enabled with the sqlite push store";
+    const LISTENING: &str = "relay listening";
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let push_path = tmp.path().join("push.sqlite");
+
+    let (listening, output) =
+        run_until_logged(&mut apns_relay_command(tmp.path(), &push_path), LISTENING);
 
     assert!(
-        opened,
-        "relay should have logged '{OPENED}' within one minute; output: {output}"
+        listening,
+        "relay should have logged '{LISTENING}'; output: {output}"
     );
     assert!(
-        db_path.exists(),
-        "sqlite database file should be created when the operator names sqlite; output: {output}"
+        output.contains(ENABLED),
+        "relay did not report push enabled; output: {output}"
     );
+    assert!(
+        push_path.exists(),
+        "the relay did not create its push store at {}; output: {output}",
+        push_path.display()
+    );
+    scp_transport::relay::push_store::PushRegistrationStore::open_sqlite(&push_path)
+        .expect("the file the relay created opens as a push store");
+}
+
+/// A push store path whose parent is a regular file makes the relay exit 1
+/// with the typed store-open refusal under SCP-CAPSEL-8001, and the relay never
+/// reports push as enabled or starts listening.
+#[cfg(unix)]
+#[test]
+fn unopenable_push_store_exits_with_capsel_8001() {
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let blocker = tmp.path().join("this-is-a-file");
+    std::fs::write(&blocker, b"not a directory").expect("write blocker file");
+    let push_path = blocker.join("push.sqlite");
+
+    let output = output_within_deadline(
+        apns_relay_command(tmp.path(), &push_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env("RUST_LOG", "scp_relay=info,scp_transport=info"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot open the push store"), "{stderr}");
+    assert!(stderr.contains("SCP-CAPSEL-8001"), "{stderr}");
+    assert!(!stderr.contains("push: enabled"), "{stderr}");
+    assert!(!stderr.contains("relay listening"), "{stderr}");
 }
 
 /// A `sqlite` store that cannot open makes the relay exit 1 with the
@@ -411,7 +664,7 @@ fn sqlite_store_that_cannot_open_exits_without_logging_the_backend() {
     let db_path = blocker.join("relay.db");
 
     let output = output_within_deadline(
-        Command::new(relay_bin())
+        relay_command()
             .current_dir(tmp.path())
             .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
             .env("SCP_RELAY_STORAGE_PATH", &db_path)

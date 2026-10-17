@@ -163,6 +163,15 @@ pub mod bridge_runtime;
 #[cfg(feature = "resolvers")]
 pub mod outlet_stream_credit;
 
+// Durable per-context UCAN revocation list and nonce tracker (ADR-016 criteria
+// 5 and 6) shared by all three bridges. A bridge instance writes a revocation
+// through this module as part of `ucan_revoke` and rebuilds its revocation and
+// nonce state through this module when it constructs per-context UCAN state, so
+// a token revoked before a restart stays revoked after one. Requires
+// scp-platform and scp-core (behind `resolvers`, which always pulls both in).
+#[cfg(feature = "resolvers")]
+pub mod ucan_durable_state;
+
 // Bridge-agnostic pieces of the §5.4.5 cross-context streaming-saga FFI surface
 // (SCP-OUT-047): the per-instance registry value, the chunk serialize/terminal
 // step, and the ADR-056-chokepoint key-bearing truncated-close recovery driver.
@@ -290,6 +299,11 @@ pub mod test_helpers;
 // Requires scp-transport, scp-node, scp-platform, tokio.
 #[cfg(feature = "server")]
 pub mod server;
+
+// `NodeStartConfig`, the flat config `server::node_start` reads
+// (construction.md §"Node start — `NodeStartConfig`").
+#[cfg(feature = "server")]
+pub mod node_start_config;
 
 // Shared DHT client for all FFI bridges (ADR-062 §Decision 1). `scp-dht` is a
 // non-optional dependency compiled with `production-dht`, so the real

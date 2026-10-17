@@ -1977,12 +1977,14 @@ export class SCP {
    * `creatorDid` MUST be a locally-custodied identity; the invite is signed
    * under its `#active` key.
    *
+   * The bundle carries the context's stored relay set (§5.12.3.1
+   * `relay_urls`), which the runtime reads; the caller supplies none.
+   *
    * @param contextId The context to invite the member into.
    * @param creatorDid The inviting creator/admin DID (locally custodied).
    * @param inviteeDid The DID of the member being invited.
    * @param inviteeKeyPackage The invitee's PUBLIC MLS `KeyPackage` bytes (from
    *   the invitee's {@link reserveKeyPackage}).
-   * @param relayUrls Relay URLs the runtime may publish the sealed bundle to.
    * @returns The {@link InviteMemberOutcome} — the sealed `bundle` plus the
    *   `delivered` flag.
    *
@@ -1992,7 +1994,6 @@ export class SCP {
    *   creator.did,
    *   invitee.did,
    *   reservation.keyPackagePublic,
-   *   [],
    * );
    * // `outcome.bundle` is directly usable — no manual re-assembly:
    * const joined = await joinerScp.contextJoinFromWelcome(
@@ -2006,7 +2007,6 @@ export class SCP {
     creatorDid: string,
     inviteeDid: string,
     inviteeKeyPackage: Uint8Array | readonly number[],
-    relayUrls: readonly string[],
   ): Promise<InviteMemberOutcome> {
     const keyPackageArray = ArrayBuffer.isView(inviteeKeyPackage)
       ? Array.from(inviteeKeyPackage as Uint8Array)
@@ -2017,7 +2017,6 @@ export class SCP {
         c: string,
         i: string,
         kp: readonly number[],
-        r: readonly string[],
       ) => Promise<{
         bundle: {
           contextId: string;
@@ -2027,7 +2026,7 @@ export class SCP {
         };
         delivered: boolean;
       }>
-    )(contextId, creatorDid, inviteeDid, keyPackageArray, relayUrls);
+    )(contextId, creatorDid, inviteeDid, keyPackageArray);
 
     // Project the flat napi object into the SDK outcome. The `bundle` is a
     // SealedInvitation directly usable as the join input. A voting-governed
@@ -4329,6 +4328,20 @@ export class SCP {
    * The capability outcome is non-throwing (it reads booleans); malformed FFI
    * inputs (bad context handle / token / capability) propagate as a typed
    * {@link "./errors".ScpError}.
+   *
+   * NOT AN AUTHORIZATION DECISION. Layer 1 supplies no challenge capability, so
+   * the core skips the invoked-capability grant-match and reports each token's
+   * intrinsic validity. An all-`true` {@link CapabilityValidation} therefore
+   * does NOT establish that the subject may perform any particular action — a
+   * token declaring an empty `att` set reports all six fields `true`. §7.2.4 of
+   * the trust spec names gating an action on a no-challenge diagnostic a
+   * misuse: to authorize, call {@link ucanValidate} with the concrete
+   * capability URI, which runs the grant-match and consumes the nonce.
+   *
+   * Layer 1 also passes no delegation-chain proof tokens, so a token that
+   * depends on a proof chain reports `signaturesValid: false` here. Pass the
+   * proofs to {@link ucanEvaluate} directly when a delegated token must be
+   * assessed.
    *
    * SECURITY: the behavioral record's `attestationCount` (and any challenge
    * results, where consumed) are authentic-but-self-mintable signals — an

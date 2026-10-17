@@ -312,7 +312,8 @@ pub(crate) async fn ucan_validate_on(
     // and nonce tracker from the runtime registry. This ensures:
     // - Revoked tokens are rejected across calls (persistent RevocationList).
     // - Replayed nonces are detected across calls (persistent NonceTracker).
-    crate::runtime::with_context(bi, &context_id, |rt| {
+    let mut recorded = None;
+    let validated = crate::runtime::with_context(bi, &context_id, |rt| {
         // Build validation context using persistent runtime state.
         // Use production DID resolver when available (#311), fallback to string-only.
         let production_resolver = crate::runtime::did_resolver(bi);
@@ -321,9 +322,7 @@ pub(crate) async fn ucan_validate_on(
         let revocation_checker = BridgeRevocationChecker {
             revocation_list: &rt.core.revocation_list,
         };
-        let mut nonce_adapter = BridgeNonceTracker {
-            inner: &mut rt.core.nonce_tracker,
-        };
+        let mut nonce_adapter = BridgeNonceTracker::new(&mut rt.core.nonce_tracker, &mut recorded);
 
         let mut ctx = ValidationContext {
             did_resolver: &did_resolver,
@@ -346,8 +345,15 @@ pub(crate) async fn ucan_validate_on(
         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpNapiError::from)?;
 
         Ok(())
-    })
-    .map_err(napi::Error::from)?;
+    });
+
+    // Step 9 of the pipeline records the token's nonce, so write the context's
+    // nonce entries to durable storage before returning. A rejected token keeps
+    // its own error: the caller is already denied, so a durability failure on
+    // that path grants nothing.
+    let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, &context_id, recorded);
+    validated.map_err(napi::Error::from)?;
+    persisted.map_err(napi::Error::from)?;
 
     Ok(())
 }
@@ -445,9 +451,9 @@ pub(crate) async fn ucan_evaluate_on(
         let revocation_checker = BridgeRevocationChecker {
             revocation_list: &rt.core.revocation_list,
         };
-        let mut nonce_adapter = BridgeNonceTracker {
-            inner: &mut rt.core.nonce_tracker,
-        };
+        let mut never_recorded = None;
+        let mut nonce_adapter =
+            BridgeNonceTracker::new(&mut rt.core.nonce_tracker, &mut never_recorded);
 
         let ctx = ValidationContext {
             did_resolver: &did_resolver,
@@ -774,6 +780,11 @@ pub(crate) async fn ucan_revoke_on(
     })
     .map_err(napi::Error::from)?;
 
+    // Make the revocation durable before returning. The in-memory list already
+    // denies the token, so a failure here leaves the instance in the more
+    // restrictive state and tells the caller the record did not land.
+    crate::runtime::persist_ucan_revocation_blocking(bi, &context_id).map_err(napi::Error::from)?;
+
     Ok(())
 }
 
@@ -983,9 +994,8 @@ mod tests {
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;
 
-        let mut adapter = BridgeNonceTracker {
-            inner: &mut tracker,
-        };
+        let mut recorded = None;
+        let mut adapter = BridgeNonceTracker::new(&mut tracker, &mut recorded);
 
         // First check should succeed.
         assert!(adapter.check_and_record(&nonce, expiry).is_ok());
@@ -1308,9 +1318,7 @@ mod tests {
         /// The creator's close takes the supervisor to `Closing` and releases
         /// this bridge's `UcanContextState`; `contextFinalizeClose` then takes
         /// it to `Closed`, and the actor stays resident and still answers the
-        /// role-state read. A rebuilt state would hold an empty revocation
-        /// list, so a validation that reached one would accept the revoked
-        /// token. The validation must refuse, `ensure_registered` must refuse
+        /// role-state read. The validation must refuse, `ensure_registered` must refuse
         /// to rebuild the state and leave the registry without it, and after
         /// `readmit_context` it builds the state again.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

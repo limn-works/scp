@@ -328,6 +328,9 @@ enforcement mechanism.)
 | `SCP-STORAGE-8004` | selection layer (all bridges) | Selected durable storage backend failed to open |
 | `SCP-STORAGE-8005` | selection layer, SDK `shutdown`, and `From<PlatformError>` and `CustodyFailure` translation (all bridges) | Durable storage directory's advisory lock is still held: at open, by another store; at shutdown, by the instance's own store; or `PlatformError::StorageLockHeld` from a custody backend, bare or wrapped in a `CustodyFailure` (§17.6 "One Opener per Durable Directory") |
 | `SCP-STORAGE-8006` | `From<PlatformError>` and `CustodyFailure` translation (all bridges) | `PlatformError::StorageClosed`, bare or wrapped in a `CustodyFailure` (§17.6 "One Opener per Durable Directory") |
+| `SCP-STORAGE-8007` | node start (all bridges) | Node start configuration invalid; §"Node start error codes" below lists the variants |
+| `SCP-STORAGE-8008` | node start (all bridges) | Node start blob storage failed to open, or its directory could not be created |
+| `SCP-STORAGE-8009` | node start (all bridges) | Node start core storage error (`NodeError::Storage`) |
 | `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
 | `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
 | `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-identifier mismatch) |
@@ -392,6 +395,28 @@ and are documented with their own features.
 | `SCP-IDENT-1017` | Operation requires retained signing custody (identity loaded externally with no retained custody, or handle is sign-only). Surfaced by handle-borne bridges for UCAN **mint** (NAPI + UniFFI), event-log **checkpoint** (NAPI + UniFFI), and **broadcast publish** (NAPI + UniFFI). UCAN **delegate** surfaces `SCP-IDENT-1001`, not `SCP-IDENT-1017`, on every bridge: PyO3, NAPI, and UniFFI each read a delegator's key from their identity registry, because a delegation signs with a delegator's own key and never with a context creator's key, so a missing delegator is a registry miss. |
 
 **Cross-bridge note.** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise); NAPI's and UniFFI's UCAN **delegate** paths are registry-based for that same structural reason and surface `SCP-IDENT-1001` as well (see that table above). On all three bridges (PyO3, NAPI, and UniFFI → Swift / Kotlin / TS-via-NAPI), consumers that catch the `IdentityError` category are safe for the missing-custody condition; only code that switches on the exact code string must account for the per-bridge code splits described above.
+
+### Node start error codes
+
+`node_start` starts a production node from an `SCP` instance, and `construction.md` §"Node start — `NodeStartConfig`" gives its config. One shared function pair in `crates/scp-ffi/common/src/error_codes.rs`, `server_error_code` and `server_error_class`, maps every `ServerError` to its code, following the `custody_failure_code` precedent. The PyO3, napi-rs and UniFFI bridges all map through that pair, so each failure returns the same code on every bridge. No bridge returns an uncoded runtime error for a `ServerError`.
+
+| `ServerError` variant | Code | Condition |
+|---|---|---|
+| `InvalidConfig`, `Node(MissingField)`, `Node(InvalidConfig)` | `SCP-STORAGE-8007` | The node start configuration is invalid: a required field is missing, a field value is invalid, or `scp_node::validate_reach_and_tls` rejected the reach and TLS pair. The check runs before `node_start` creates any directory or file |
+| `Storage`, `Io` | `SCP-STORAGE-8008` | The blob storage backend failed to open (`Storage`), or `node_start` could not create the blob storage directory (`Io`) |
+| `Node(Storage)` | `SCP-STORAGE-8009` | The core node returned a storage error |
+| `OperatorIdentityUnavailable`, `Node(Identity(_))` | `SCP-IDENT-1063` | The operator identity is not available to the node: the identity is not registered on this `SCP` instance, or the core node's identity operation failed |
+| `Node(Relay)` | `SCP-TRANS-5051` | The node's relay failed to start, such as a failed bind on `bind_addr` |
+| `Node(Tls)` | `SCP-TRANS-5052` | TLS provisioning failed |
+| `Node(Serve)`, `Node(Nat)` | `SCP-TRANS-5054` | The HTTP server failed to bind or hit a fatal I/O error (`Serve`), or NAT traversal failed (`Nat`) |
+| `Relay` | `SCP-TRANS-5050` | An SDK relay start failed: the relay server could not bind or accept |
+| `DhtInit` | `SCP-IDENT-1001` | The production DHT client could not be built |
+| `MissingPassphrase` (dev pair) | `SCP-VALID-7004` | A dev-pair start that persists a node identity received no passphrase, or an empty one |
+| `Platform` (dev pair) | `SCP-CTX-2053` | A dev-pair start received a `PlatformError`, such as from a key custody file it could not open |
+| `DevStartUnavailable` | `SCP-TRANS-5055` | A dev-pair constructor (`start_node_in_memory`, `start_node_local`) was called on a bridge built without its `testing` feature |
+| `SupervisorWiring` | `SCP-TRANS-5056` | The node started, but the bridge could not bind the `SCP` instance's `Supervisor` to it, for one of four causes: another running node of the instance holds the binding (`NodeAlreadyBound`); the connection to the node's relay failed (`RelayConnect`); no `Supervisor` was attached after the bridge's attach step (`SupervisorUnavailable`); or the instance's transport manager could not be installed, because the instance is suspended or its transport lock is poisoned (`TransportInstall`). The bridge has shut the node down and removed it from the instance's node registry before it returns this error (`construction.md` §"Node start — `NodeStartConfig`") |
+
+`SCP-IDENT-1063` is the next free number in the `SCP-IDENT-1000` to `SCP-IDENT-1099` bridge sub-block. The `SCP-IDENT-1100` to `SCP-IDENT-1199` sub-block stays with the key-event-log identity model of `03-identity.md` §3.10.10. `SCP-STORAGE-8007` to `SCP-STORAGE-8009` sit between the selection layer's `8004` to `8006` and the browser participant's `8010` to `8013`. `SCP-TRANS-5055` follows the node codes `SCP-TRANS-5050` to `SCP-TRANS-5054`. `SCP-TRANS-5056` follows `SCP-TRANS-5055`, and `server_error_class` maps `SupervisorWiring` to the transport class, with the other relay failures. `DevStartUnavailable` replaces `AutoGenerateUnavailable`. `SCP-TRANS-5053`, the former UniFFI node-storage code, is retired, and a node storage failure now returns `SCP-STORAGE-8009`.
 
 ### Custody request
 

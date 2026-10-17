@@ -753,6 +753,17 @@ pub fn validate_governance_action_strings(
                 })?;
             }
         }
+        GovernanceAction::ModifyPseudonymRotationPolicy {
+            new_policy: Some(policy),
+        } => {
+            // §9.10.4.1 validity criterion at the FFI boundary, ahead of the
+            // runtime's check in `execute_modify_pseudonym_rotation_policy`.
+            policy.validate().map_err(|e| {
+                ValidationError::new(format!(
+                    "ModifyPseudonymRotationPolicy: invalid policy (spec §9.10.4.1): {e}"
+                ))
+            })?;
+        }
         // Variants without user-controlled string fields.
         GovernanceAction::RemoveMember { reason: None, .. }
         | GovernanceAction::CloseContext { reason: None, .. }
@@ -777,6 +788,7 @@ pub fn validate_governance_action_strings(
         // Every requirement's identifiers were validated when the list
         // deserialized (`CapabilityRequirement::try_from`).
         | GovernanceAction::ModifyCapabilityRequirements { .. }
+        | GovernanceAction::ModifyPseudonymRotationPolicy { new_policy: None }
         | GovernanceAction::CancelContextMigration => {}
     }
     Ok(())
@@ -1650,6 +1662,36 @@ mod tests {
             reason: Some("   ".to_owned()),
         };
         assert!(validate_governance_action_strings(&action).is_err());
+    }
+
+    #[test]
+    fn modify_pseudonym_rotation_policy_rejects_invalid_policy_and_accepts_valid_or_none() {
+        use scp_protocol::context::PseudonymRotationPolicy;
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = |new_policy| GovernanceAction::ModifyPseudonymRotationPolicy { new_policy };
+        for invalid in [
+            PseudonymRotationPolicy {
+                interval_secs: None,
+                on_membership_change: false,
+            },
+            PseudonymRotationPolicy {
+                interval_secs: Some(599),
+                on_membership_change: true,
+            },
+        ] {
+            let err = validate_governance_action_strings(&action(Some(invalid))).unwrap_err();
+            assert!(
+                err.to_string().contains("ModifyPseudonymRotationPolicy"),
+                "{err}"
+            );
+        }
+        let valid = PseudonymRotationPolicy {
+            interval_secs: Some(600),
+            on_membership_change: false,
+        };
+        assert!(validate_governance_action_strings(&action(Some(valid))).is_ok());
+        assert!(validate_governance_action_strings(&action(None)).is_ok());
     }
 
     #[test]

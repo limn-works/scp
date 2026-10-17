@@ -214,7 +214,8 @@ private fun buildContextParams(
         economicPolicy = null,
         consequenceRulesJson = null,
         consequenceConfigJson = null,
-        capabilityRequirementsJson = null
+        capabilityRequirementsJson = null,
+        pseudonymRotation = null
     )
 
 private fun ceilingFromArgs(

@@ -129,7 +129,8 @@ final class ReadmeQuickStartTests: XCTestCase {
                 economicPolicy: nil,
                 consequenceRulesJson: nil,
                 consequenceConfigJson: nil,
-                capabilityRequirementsJson: nil
+                capabilityRequirementsJson: nil,
+                pseudonymRotation: nil
             )
         )
         try await scp.contextClose(handle: ctx, identity: identity)

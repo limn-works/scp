@@ -173,6 +173,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
+use crate::file_lock::ExclusiveFileLock;
 use crate::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyRole, KeyType, Pseudonym, PublicKey, SharedSecret,
     Signature,
@@ -473,27 +474,13 @@ fn lock_file_path(path: &Path) -> PathBuf {
 /// Holds an exclusive advisory lock on one key file's lock sibling until this
 /// value drops.
 ///
-/// `fs2` maps this onto `flock` on Unix and `LockFileEx` on Windows. Both
+/// std maps this onto `flock` on Unix and `LockFileEx` on Windows. Both
 /// exclude a second process and a second open file description inside this
 /// process, which is what makes two `FileKeyCustody` objects over one path
-/// serialize.
-struct KeyFileWriteLock {
-    file: std::fs::File,
-    path: PathBuf,
-}
-
-impl Drop for KeyFileWriteLock {
-    fn drop(&mut self) {
-        if let Err(e) = fs2::FileExt::unlock(&self.file) {
-            tracing::warn!(
-                path = %self.path.display(),
-                error = %e,
-                "FileKeyCustody could not release its key-file lock explicitly; closing the \
-                 file releases it"
-            );
-        }
-    }
-}
+/// serialize. Drop unlocks before the lock file closes: closing alone releases
+/// nothing while a descriptor copy a child process inherited stays open (see
+/// [`crate::file_lock`]).
+type KeyFileWriteLock = ExclusiveFileLock;
 
 /// Takes the exclusive advisory lock that guards a read-modify-write of the key
 /// file at `key_path`, creating the lock file when it does not exist.
@@ -555,7 +542,7 @@ fn lock_key_file_for_write_within(
         options.mode(0o600);
     }
 
-    let file = options.open(&path).map_err(|e| {
+    let mut file = options.open(&path).map_err(|e| {
         PlatformError::CustodyError(format!(
             "failed to open key-file lock at {}: {e}",
             path.display()
@@ -564,9 +551,10 @@ fn lock_key_file_for_write_within(
 
     let deadline = std::time::Instant::now() + wait;
     loop {
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => return Ok(KeyFileWriteLock { file, path }),
-            Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+        match ExclusiveFileLock::try_acquire(file, &path) {
+            Ok(lock) => return Ok(lock),
+            Err((returned, std::fs::TryLockError::WouldBlock)) => {
+                file = returned;
                 if std::time::Instant::now() >= deadline {
                     return Err(PlatformError::CustodyError(format!(
                         "another writer held the key-file lock at {} for longer than {} ms; \
@@ -577,7 +565,7 @@ fn lock_key_file_for_write_within(
                 }
                 std::thread::sleep(KEY_FILE_LOCK_POLL);
             }
-            Err(e) => {
+            Err((_, e)) => {
                 return Err(PlatformError::CustodyError(format!(
                     "failed to take the key-file lock at {}: {e}",
                     path.display()
@@ -2056,6 +2044,29 @@ mod tests {
     fn make_custody(dir: &TempDir, passphrase: &str) -> FileKeyCustody {
         let path = dir.path().join("keys.scp");
         FileKeyCustody::new(&path, passphrase).unwrap()
+    }
+
+    /// Dropping the key-file lock unlocks it before closing the lock file, so a
+    /// descriptor copy that a concurrently spawned or forked child inherited
+    /// does not keep the next writer waiting.
+    #[test]
+    fn key_file_lock_drop_releases_the_lock_while_an_inherited_descriptor_survives()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("keys.scp");
+        let held = lock_key_file_for_write(&path)?;
+        let inherited = held.file().map(std::fs::File::try_clone).transpose()?;
+        assert!(inherited.is_some(), "the held lock must own its file");
+
+        drop(held);
+        let next = lock_key_file_for_write_within(&path, std::time::Duration::ZERO);
+        assert!(
+            next.is_ok(),
+            "drop must unlock, not only close: {:?}",
+            next.err()
+        );
+        drop(inherited);
+        Ok(())
     }
 
     /// Every handle `custody` holds, in no particular order.
@@ -4168,7 +4179,7 @@ mod tests {
     ///
     /// Two `FileKeyCustody` objects hold two `file_write_lock` mutexes, so this
     /// advisory lock is the only thing that makes them take turns. Replacing
-    /// the `fs2::FileExt::try_lock_exclusive` loop with a call that returns
+    /// the `ExclusiveFileLock::try_acquire` loop with a call that returns
     /// immediately makes
     /// the second thread set its flag inside the wait below, which fails this
     /// assertion.
@@ -4207,8 +4218,8 @@ mod tests {
     /// A writer whose lock another holder keeps past the wait bound gets an
     /// error instead of waiting forever.
     ///
-    /// Replacing the bounded `try_lock_exclusive` loop with the blocking
-    /// `fs2::FileExt::lock_exclusive` makes the second call below never return
+    /// Replacing the bounded `try_acquire` loop with the blocking
+    /// `File::lock` makes the second call below never return
     /// while the first guard is held, so the receive times out and this test
     /// fails.
     #[test]

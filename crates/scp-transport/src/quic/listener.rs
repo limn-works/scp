@@ -50,6 +50,7 @@ use tokio_util::sync::CancellationToken;
 use crate::native::did_slot::{DidDeleteGate, DidPublishGate, DidSlotRegistry};
 use crate::native::server::DidRecordValidation;
 use crate::native::storage::BlobStorage;
+use crate::relay::push_gate::{self, LiveRelayUrl, PushRole};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
@@ -89,8 +90,10 @@ const DEFAULT_RATE_LIMIT_SUBSCRIBES_PER_MINUTE: u32 = 20;
 
 /// Configuration for the relay-side QUIC listener.
 ///
-/// All fields have sensible defaults matching the WebSocket relay's
-/// [`RelayConfig`](crate::native::server::RelayConfig) counterparts.
+/// Every field but `relay_url` has a default matching the WebSocket relay's
+/// [`RelayConfig`](crate::native::server::RelayConfig) counterpart. The
+/// relay's URL has none (construction.md M4), so build the configuration with
+/// [`QuicListenerConfig::defaults`].
 #[derive(Debug, Clone)]
 pub struct QuicListenerConfig {
     /// Address to bind the QUIC listener to (UDP).
@@ -132,10 +135,23 @@ pub struct QuicListenerConfig {
     /// opaquely like a foreign transport. Never a trust dependency (the client
     /// always re-verifies, RELAYRES-002).
     pub did_record_validation: DidRecordValidation,
+    /// The relay's live URL, from which the reserved push routing ID derives
+    /// (§10.7.1 step 2). When this listener shares a relay's blob store, it
+    /// MUST be a clone of that relay's
+    /// [`RelayConfig::relay_url`](crate::native::server::RelayConfig::relay_url)
+    /// handle, so a push message is intercepted whichever transport carries it
+    /// and a URL change moves every transport at once.
+    pub relay_url: LiveRelayUrl,
+    /// Whether this listener offers push (§10.7.1). It MUST equal the shared
+    /// relay's [`RelayConfig::push`](crate::native::server::RelayConfig::push);
+    /// the default is [`PushRole::Disabled`].
+    pub push: PushRole,
 }
 
-impl Default for QuicListenerConfig {
-    fn default() -> Self {
+impl QuicListenerConfig {
+    /// The defaults for every field, with `relay_url` as the relay's URL.
+    #[must_use]
+    pub fn defaults(relay_url: LiveRelayUrl) -> Self {
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 9443)),
             max_blob_size: MAX_BLOB_SIZE,
@@ -151,6 +167,8 @@ impl Default for QuicListenerConfig {
             // default. The node wiring overrides this to match the co-deployed
             // WebSocket relay's configured mode.
             did_record_validation: DidRecordValidation::Enabled,
+            relay_url,
+            push: PushRole::Disabled,
         }
     }
 }
@@ -869,6 +887,22 @@ async fn handle_publish<S: BlobStorage>(
         return write_and_finish(send, &err).await;
     }
 
+    // Push interception (§10.7.1, ADR-004 "Push registration interception"),
+    // the same gate every relay transport runs: a PUBLISH to the reserved push
+    // routing ID is answered here and never reaches storage or a subscriber.
+    if let Some(reply) = push_gate::gate_publish(
+        &config.relay_url,
+        &config.push,
+        &routing_id,
+        blob,
+        scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+    )
+    .await
+    .reply(ref_id.as_deref())
+    {
+        return write_and_finish(send, &reply).await;
+    }
+
     // Compute blob_id = SHA-256(blob).
     let blob_id = *crate::traits::BlobId::from_sha256(blob).as_bytes();
 
@@ -1284,7 +1318,7 @@ mod tests {
         let config = QuicListenerConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            ..QuicListenerConfig::default()
+            ..QuicListenerConfig::defaults(push_gate::test_relay_url())
         };
 
         let listener = QuicListener::new(
@@ -1319,7 +1353,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
             did_record_validation: DidRecordValidation::Enabled,
-            ..QuicListenerConfig::default()
+            ..QuicListenerConfig::defaults(push_gate::test_relay_url())
         };
 
         let listener = QuicListener::new(
@@ -1412,7 +1446,7 @@ mod tests {
 
     #[test]
     fn quic_listener_config_default_values() {
-        let config = QuicListenerConfig::default();
+        let config = QuicListenerConfig::defaults(push_gate::test_relay_url());
         assert_eq!(config.bind_addr, SocketAddr::from(([127, 0, 0, 1], 9443)));
         assert_eq!(config.max_blob_size, MAX_BLOB_SIZE);
         assert_eq!(config.max_blob_ttl, MAX_BLOB_TTL);
@@ -2266,6 +2300,61 @@ mod tests {
         let stored = storage.query(&rid, None, 100).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].blob_id, bid);
+
+        connection.close(0u32.into(), b"done");
+        handle.shutdown();
+    }
+
+    /// A QUIC listener runs the same push gate as the WebSocket relay
+    /// (§10.7.1) and reads the shared [`LiveRelayUrl`] on every PUBLISH: after
+    /// a `set` on a clone of the handle, the new reserved routing ID and the
+    /// previous one are both answered with 4063 and nothing is stored at
+    /// either.
+    #[tokio::test]
+    async fn quic_listener_reads_the_shared_relay_url() {
+        use crate::relay::push_gate::RelayUrl;
+        let old = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
+        let new = RelayUrl::new("ws://203.0.113.42:8443/scp/v1").unwrap();
+        let live = LiveRelayUrl::new(old.clone());
+        let (server_config, certs) = test_server_config();
+        let storage = Arc::new(InMemoryBlobStorage::new());
+        let listener = QuicListener::new(
+            QuicListenerConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                delivery_jitter_ms: 0,
+                ..QuicListenerConfig::defaults(live.clone())
+            },
+            Arc::clone(&storage),
+            subscription::new_registry(),
+            PublishRateLimiter::new(100),
+            rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
+        );
+        let (handle, addr) = listener.start(server_config).unwrap();
+        live.set(new.clone());
+        let connection = connect_client(addr, &certs).await;
+
+        for rid in [new.push_routing_id(), old.push_routing_id()] {
+            let responses = send_and_recv(
+                &connection,
+                &ClientMessage::Publish {
+                    ref_id: Some("push".into()),
+                    routing_id: rid,
+                    recipient_hint: None,
+                    blob_ttl: 3600,
+                    blob: vec![0x42; 64],
+                },
+            )
+            .await;
+            assert!(
+                matches!(
+                    responses.as_slice(),
+                    [RelayMessage::Err { code: 4063, ref_id: Some(r), .. }] if r == "push"
+                ),
+                "{responses:?}"
+            );
+            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+        }
 
         connection.close(0u32.into(), b"done");
         handle.shutdown();

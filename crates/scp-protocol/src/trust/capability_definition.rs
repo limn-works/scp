@@ -239,7 +239,7 @@ mod tests {
         uri.parse().unwrap()
     }
 
-    /// Spec 25 Vector 63: the fixture definition's `Def` and digest.
+    /// Spec 25 Vector 65: the fixture definition's `Def` and digest.
     #[test]
     fn vector_63_capability_definition() {
         let definition = CapabilityDefinition {

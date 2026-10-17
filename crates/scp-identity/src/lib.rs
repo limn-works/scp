@@ -36,6 +36,7 @@
 pub mod cache;
 pub mod config;
 pub mod dht;
+pub mod push_verify;
 pub mod relay_querier;
 pub mod republish;
 pub mod resolution;
@@ -50,6 +51,9 @@ pub use dht::{
     SequenceStore, did_from_ed25519_public_key, extract_public_key, verify_migration,
     verify_self_certification,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use push_verify::TestPushVerifier;
+pub use push_verify::{KelPushVerifier, PushMessage, PushSignatureVerifier, PushVerifyError};
 pub use relay_querier::RealMultiRelayQuerier;
 pub use republish::RepublishManager;
 // The three DID→`routing_id` derivations are re-exported SYMMETRICALLY: they

@@ -1,0 +1,27 @@
+# Dictionary for PushRegistration and PushDeregistration MessagePack
+# deserialization (§22.11.4). Both encode as maps with named fields.
+
+# Field names
+"registrant"
+"platform"
+"token"
+"routing_ids"
+"timestamp"
+"signature"
+
+# PushPlatform variant strings
+"Apns"
+"Fcm"
+"WebPush"
+
+# Registrant forms
+"did:dht:"
+"scp:"
+
+# MessagePack markers: fixmap(6), fixmap(5), bin8 of 32 and 64 bytes, u64
+"\x86"
+"\x85"
+"\xc4\x20"
+"\xc4\x40"
+"\xcf"
+"\x91"

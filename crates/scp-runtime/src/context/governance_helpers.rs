@@ -309,6 +309,9 @@ pub async fn tombstone_migrated_context(
             migration_proposal_id: migration_pid,
         };
         emit(state, tombstone_event, context_id, deps);
+        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // context drops its previous routing ID and pending rotation work.
+        state.class_s.pseudonym_rotation.discard_grace();
 
         // TTL + governance timers are actor-owned arms (ADR-049 finding A3);
         // the tombstone leaves the context non-Active so `reconcile_timers`
@@ -1338,9 +1341,17 @@ pub async fn execute_add_member(
     // matching the prior provider disposition; the error propagates unchanged.
     let add_output = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
-            v.rest_mut()
+            let state = v.rest_mut();
+            let output = state
                 .add_member(did.as_ref(), key_package, deps.clock.as_ref())
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            // §9.10.4.1 membership trigger, persisted with the add.
+            crate::context::actor::pseudonym_rotation::note_member_added(
+                state,
+                deps.crypto.local_did(),
+                did.as_ref(),
+            );
+            Ok(output)
         })
         .await?;
 
@@ -1650,6 +1661,12 @@ pub async fn execute_remove_member(
             if let Some(reg) = state.routing.peer_registry_mut() {
                 reg.remove(did);
             }
+            // §9.10.4.1 membership trigger, persisted with the removal.
+            crate::context::actor::pseudonym_rotation::note_member_removed(
+                state,
+                deps.crypto.local_did(),
+                did.as_ref(),
+            );
 
             emit(
                 state,
@@ -2141,6 +2158,9 @@ pub async fn execute_close_context(
         state.ttl.timer.deadline_unix_secs = None;
         state.broadcast_context = None;
         state.governance.decay_participation();
+        // §9.10.4.1 "Leave, close and expiry during a grace": a terminal
+        // context drops its previous routing ID and pending rotation work.
+        state.class_s.pseudonym_rotation.discard_grace();
         Ok(())
     })
     .await?;
@@ -3883,6 +3903,76 @@ pub async fn execute_modify_capability_requirements(
 }
 
 // ---------------------------------------------------------------------------
+// execute_modify_pseudonym_rotation_policy (per-action leaf helper)
+// ---------------------------------------------------------------------------
+
+/// Executes an approved `ModifyPseudonymRotationPolicy` (ADR-031 amendment of
+/// 2026-10-12; spec 09 §9.10.4.1 "Rotation policy, and where it lives").
+///
+/// # Errors
+///
+/// - [`ContextError::GovernanceFailed`] when `new_policy` fails the §9.10.4.1
+///   validity criterion; nothing is persisted.
+/// - The [`require_active`] error when the context is not active.
+/// - The persist error of `commit_class_s_keep`, and the event-log append
+///   error.
+pub async fn execute_modify_pseudonym_rotation_policy(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    new_policy: Option<scp_protocol::context::params::PseudonymRotationPolicy>,
+    meta: CommitMeta<'_>,
+) -> Result<(), ContextError> {
+    let CommitMeta {
+        pid: _,
+        actor_did,
+        timestamp_secs,
+    } = meta;
+    let context_id_bytes = context_id_to_bytes(context_id);
+
+    if let Some(policy) = &new_policy {
+        policy.validate().map_err(|e| {
+            ContextError::GovernanceFailed(format!(
+                "ModifyPseudonymRotationPolicy: invalid policy (spec §9.10.4.1): {e}"
+            ))
+        })?;
+    }
+    require_active(&cell.handle)?;
+
+    // The policy lives in `ContextParams`, which only the Class-S snapshot
+    // persists. Route the change through the fail-closed `commit_class_s_keep`,
+    // like `execute_promote_context`: a best-effort persist that failed would
+    // let a respawn resume the superseded policy after members were told the
+    // change applied.
+    //
+    // The same commit re-anchors the local member's epoch schedule at the
+    // moment the policy applies (spec 09 §9.10.4.1 "First v2 derivation"):
+    // interval boundaries that passed before the change trigger nothing, and a
+    // pending membership trigger survives only under `on_membership_change`.
+    let now_secs = deps.clock.now_secs();
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        state.handle.set_pseudonym_rotation(new_policy);
+        state
+            .class_s
+            .pseudonym_rotation
+            .anchor_schedule(new_policy.as_ref(), now_secs);
+        Ok(())
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::PseudonymRotationPolicyModified,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // execute_propose_context_migration (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
@@ -4016,6 +4106,9 @@ pub fn execute_propose_context_migration<'a>(
             dest_params,
             creator,
             None,
+            // The destination is hosted on the source context's relays
+            // (§5.12.3.1, PUSH-025).
+            cell.relay_urls.clone(),
         ));
         if let Err(e) = create_fut.await {
             // Roll back: revert the source handle to Active. No Class-C field
@@ -5017,7 +5110,8 @@ pub async fn dispatch_content_governance_action(
         | GovernanceAction::ProposeContextMigration { .. }
         | GovernanceAction::CancelContextMigration
         | GovernanceAction::ModifyHardRateLimit { .. }
-        | GovernanceAction::ModifyCapabilityRequirements { .. } => {
+        | GovernanceAction::ModifyCapabilityRequirements { .. }
+        | GovernanceAction::ModifyPseudonymRotationPolicy { .. } => {
             // ADR-049 §10 (round-9): these variants are routed by
             // `dispatch_governance_action` / `dispatch_context_governance_action`
             // and never reach this content-level leaf. A future routing change
@@ -5293,7 +5387,8 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::ApproveSpend { .. }
         | GovernanceAction::LockEconomicPolicy
         | GovernanceAction::ModifyHardRateLimit { .. }
-        | GovernanceAction::ModifyCapabilityRequirements { .. } => {
+        | GovernanceAction::ModifyCapabilityRequirements { .. }
+        | GovernanceAction::ModifyPseudonymRotationPolicy { .. } => {
             // ADR-049 §10 (round-9): these variants are handled by the top-level
             // `dispatch_governance_action` and never reach this context-level
             // dispatcher. A future routing change that delivers one here must
@@ -5554,6 +5649,21 @@ pub async fn dispatch_governance_action(
                 deps,
                 context_id,
                 requirements,
+                CommitMeta {
+                    pid,
+                    actor_did: actor,
+                    timestamp_secs: ts,
+                },
+            )
+            .await?;
+            Ok(GovernanceActionResult::Executed)
+        }
+        GovernanceAction::ModifyPseudonymRotationPolicy { new_policy } => {
+            execute_modify_pseudonym_rotation_policy(
+                cell,
+                deps,
+                context_id,
+                *new_policy,
                 CommitMeta {
                     pid,
                     actor_did: actor,

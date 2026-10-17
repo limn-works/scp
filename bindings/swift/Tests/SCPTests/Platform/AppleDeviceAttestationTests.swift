@@ -1448,9 +1448,9 @@
             let assertion: @Sendable () async throws(ScpError) -> Data = {
                 try await adapter.assertRequest(requestHash: requestHash)
             }
-            /// The hook runs inside the key-ID read, on the caller's own task,
-            /// and cancels that task there.
             func cancelDuringRead() {
+                // The hook runs inside the key-ID read, on the caller's own
+                // task, and cancels that task there.
                 defaults.onNextAccess {
                     withUnsafeCurrentTask { task in
                         if let task {

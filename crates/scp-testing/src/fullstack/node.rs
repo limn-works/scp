@@ -321,9 +321,11 @@ impl FullStackNode {
         // the harness never registered its own DID; in production the FFI bridge
         // registers each identity via `identity_add`. Mirror that here (idempotent,
         // supervisor-wide) so this node can identify itself as the local member.
-        let _ = self.manager.register_local_did(self.did.clone()).await;
+        self.manager.register_local_did(self.did.clone()).await;
         self.manager
-            .create_context(context_id.to_owned(), params, self.did.clone(), None)
+            // The in-process harness has no relay (module docs), so no relay
+            // hosts the context.
+            .create_context(context_id.to_owned(), params, self.did.clone(), None, Vec::new())
             .await
     }
 
@@ -397,7 +399,6 @@ impl FullStackNode {
                 self.did.clone(),
                 DID::from(member_did),
                 kp_bytes,
-                vec![],
                 &scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone()),
             )
             .await?;
@@ -513,7 +514,7 @@ impl FullStackNode {
         // production the FFI bridge registers each identity via `identity_add`;
         // mirror that here (idempotent) so this joiner can identify itself as the
         // local member when it opens incumbent traffic.
-        let _ = self.manager.register_local_did(self.did.clone()).await;
+        self.manager.register_local_did(self.did.clone()).await;
 
         // 1. Take the sealed invitation (bundle + reservation id) the creator
         //    deposited.

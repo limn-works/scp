@@ -103,9 +103,9 @@
 //!   other fields it carries. §10.7 opacity binds the sender (§10.7.1 step 5
 //!   of the infrastructure spec), and no code in this repository sends a push,
 //!   so SCP-112's opacity criterion is unmet.
-//! - [`storage`] — `SQLCipher` encrypted storage whose 32-byte passphrase is
-//!   derived from a Keystore-held AES-256 key; `SQLCipher` derives the database
-//!   key from that passphrase.
+//! - [`storage`] — `SQLCipher` encrypted storage whose 32-byte database key is
+//!   derived by HKDF-SHA-256 from the MAC a Keystore-held HMAC-SHA-256 key
+//!   computes, as §17.6 of the persistence spec requires.
 //!
 //! # Conditional Compilation
 //!

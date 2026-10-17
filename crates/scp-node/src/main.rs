@@ -259,6 +259,17 @@ ENVIRONMENT VARIABLES:
     SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
     SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
     SCP_RELAY_S3_PREFIX         S3 key prefix (default: blobs/)
+    SCP_RELAY_PUSH_PLATFORMS    Push platforms the relay serves: none, apns, fcm, apns,fcm.
+                                Required in --relay-only mode: no default, and an unset or
+                                empty value exits 1. This build serves only 'none'; any
+                                platform exits 1. Full node mode does not read it
+    SCP_RELAY_URL               The relay's public WebSocket URL, which determines its
+                                reserved push routing ID (spec section 10.7.1, push
+                                registration protocol). Required in --relay-only mode:
+                                no default, and an unset or empty value exits 1. Full
+                                node mode does not read it: the node derives the URL
+                                from its domain or its NAT tier address, and a tier
+                                change moves the reserved routing ID on every listener
     SCP_RELAY_MAX_BLOB_SIZE     Max blob size in bytes (default: 262144)
     SCP_RELAY_MAX_BLOB_TTL      Max blob TTL in seconds (default: 604800)
     SCP_RELAY_MAX_CONNECTIONS   Max total connections (default: 1000)
@@ -362,13 +373,20 @@ const CLOUD_BLOBS_FEATURE: &str = "cloud-blobs";
 /// Runs a bare relay server (same as `scp-relay` binary).
 async fn run_relay_only() {
     let backend = or_exit(startup::backend_choice_from_env(CLOUD_BLOBS_FEATURE));
-    let config = or_exit(startup::relay_config_from_env());
+    let mut config = or_exit(startup::relay_config_from_env());
     tracing::info!(
         bind_addr = %config.bind_addr,
         max_blob_size = config.max_blob_size,
         max_connections = config.max_total_connections,
         "starting scp-node in relay-only mode"
     );
+
+    // A relay-only node is a standalone relay, so its operator selects push
+    // exactly as an scp-relay operator does (PUSH-012). Read before the blob
+    // store opens, so a refusal leaves no blob store behind.
+    let push = or_exit(startup::push_selection_from_env());
+    config.push = or_exit(startup::push_role_from(push));
+    startup::log_push_role(&config.push);
 
     let storage = Arc::new(or_exit(startup::storage_from_env(backend).await));
     let shutdown = or_exit(startup::shutdown_signal());

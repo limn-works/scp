@@ -79,6 +79,7 @@ let handle = supervisor
         params,
         "did:dht:z6Mk...creator".into(),
         None,                          // local pseudonym (§9.10.4)
+        vec!["wss://relay.example.com/scp/v1".into()], // relays hosting it (§5.12.3.1)
     )
     .await?;
 

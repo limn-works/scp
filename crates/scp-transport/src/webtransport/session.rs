@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::native::did_slot::{DidDeleteGate, DidPublishGate, DidSlotRegistry};
 use crate::native::server::DidRecordValidation;
 use crate::native::storage::BlobStorage;
+use crate::relay::push_gate::{self, LiveRelayUrl, PushRole};
 use crate::relay::rate_limit::{PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
 use scp_relay_client::code;
@@ -82,7 +83,9 @@ pub(crate) struct StreamSubscription {
 /// Configuration for WebTransport session handling.
 ///
 /// Shares the relay-level configuration (max blob size, TTL, rate limits)
-/// plus WebTransport-specific settings.
+/// plus WebTransport-specific settings. Every field but `relay_url` has a
+/// default; the relay's URL has none (construction.md M4), so build the
+/// configuration with [`WebTransportSessionConfig::defaults`].
 #[derive(Debug, Clone)]
 pub struct WebTransportSessionConfig {
     /// Maximum concurrent bidirectional streams per session (default: 100).
@@ -123,10 +126,23 @@ pub struct WebTransportSessionConfig {
     /// [`DidRecordValidation::Enabled`](crate::native::server::DidRecordValidation::Enabled),
     /// the canonical SCP-native behavior. Never a trust dependency (RELAYRES-002).
     pub did_record_validation: DidRecordValidation,
+    /// The relay's live URL, from which the reserved push routing ID derives
+    /// (§10.7.1 step 2). When this listener shares a relay's blob store, it
+    /// MUST be a clone of that relay's
+    /// [`RelayConfig::relay_url`](crate::native::server::RelayConfig::relay_url)
+    /// handle, so a push message is intercepted whichever transport carries it
+    /// and a URL change moves every transport at once.
+    pub relay_url: LiveRelayUrl,
+    /// Whether this listener offers push (§10.7.1). It MUST equal the shared
+    /// relay's [`RelayConfig::push`](crate::native::server::RelayConfig::push);
+    /// the default is [`PushRole::Disabled`].
+    pub push: PushRole,
 }
 
-impl Default for WebTransportSessionConfig {
-    fn default() -> Self {
+impl WebTransportSessionConfig {
+    /// The defaults for every field, with `relay_url` as the relay's URL.
+    #[must_use]
+    pub const fn defaults(relay_url: LiveRelayUrl) -> Self {
         Self {
             max_concurrent_streams: 100,
             max_blob_size: MAX_BLOB_SIZE,
@@ -136,6 +152,8 @@ impl Default for WebTransportSessionConfig {
             delivery_jitter_ms: 50,
             subscribe_rate_limit: 20,
             did_record_validation: DidRecordValidation::Enabled,
+            relay_url,
+            push: PushRole::Disabled,
         }
     }
 }
@@ -436,6 +454,23 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
                     MIN_BLOB_TTL, self.config.max_blob_ttl, blob_ttl
                 ),
             });
+        }
+
+        // Push interception (§10.7.1, ADR-004 "Push registration interception"),
+        // the same gate every relay transport runs: a PUBLISH to the reserved
+        // push routing ID is answered here and never reaches storage or a
+        // subscriber.
+        if let Some(reply) = push_gate::gate_publish(
+            &self.config.relay_url,
+            &self.config.push,
+            &routing_id,
+            blob,
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+        )
+        .await
+        .reply(ref_id.as_deref())
+        {
+            return Ok(reply);
         }
 
         // Compute blob_id = SHA-256(blob) using the canonical BlobId helper.
@@ -949,7 +984,7 @@ mod tests {
         let rate_limiter = PublishRateLimiter::new(100);
         WebTransportSessionHandler::new(
             SessionId(1),
-            WebTransportSessionConfig::default(),
+            WebTransportSessionConfig::defaults(push_gate::test_relay_url()),
             storage,
             subscriptions,
             token,
@@ -992,7 +1027,7 @@ mod tests {
 
     #[test]
     fn default_config_values() {
-        let config = WebTransportSessionConfig::default();
+        let config = WebTransportSessionConfig::defaults(push_gate::test_relay_url());
         assert_eq!(config.max_concurrent_streams, 100);
         assert_eq!(config.max_blob_size, MAX_BLOB_SIZE);
         assert_eq!(config.max_blob_ttl, MAX_BLOB_TTL);
@@ -1224,7 +1259,7 @@ mod tests {
 
         let mut handler = WebTransportSessionHandler::new(
             SessionId(42),
-            WebTransportSessionConfig::default(),
+            WebTransportSessionConfig::defaults(push_gate::test_relay_url()),
             storage,
             subscriptions,
             token.clone(),
@@ -1262,7 +1297,7 @@ mod tests {
 
         let mut handler = WebTransportSessionHandler::new(
             SessionId(99),
-            WebTransportSessionConfig::default(),
+            WebTransportSessionConfig::defaults(push_gate::test_relay_url()),
             storage,
             subscriptions.clone(),
             token,
@@ -1313,7 +1348,7 @@ mod tests {
 
         let mut handler = WebTransportSessionHandler::new(
             SessionId(10),
-            WebTransportSessionConfig::default(),
+            WebTransportSessionConfig::defaults(push_gate::test_relay_url()),
             storage,
             subscriptions.clone(),
             token,
@@ -1675,7 +1710,7 @@ mod tests {
             SessionId(1),
             WebTransportSessionConfig {
                 delivery_jitter_ms: 0, // No jitter for test determinism.
-                ..WebTransportSessionConfig::default()
+                ..WebTransportSessionConfig::defaults(push_gate::test_relay_url())
             },
             storage,
             subscriptions,
@@ -1735,5 +1770,45 @@ mod tests {
 
         handler.state = SessionState::Closed;
         assert_eq!(handler.state(), SessionState::Closed);
+    }
+
+    /// A WebTransport session runs the same push gate as the WebSocket relay
+    /// (§10.7.1): with push disabled it answers a PUBLISH to the reserved push
+    /// routing ID with 4063 and stores nothing there.
+    #[tokio::test]
+    async fn webtransport_rejects_the_reserved_push_routing_id_with_4063_and_stores_nothing() {
+        let url = crate::relay::push_gate::RelayUrl::new("wss://relay.push.test").unwrap();
+        let storage = Arc::new(InMemoryBlobStorage::new());
+        let mut handler = WebTransportSessionHandler::new(
+            SessionId(1),
+            WebTransportSessionConfig {
+                delivery_jitter_ms: 0,
+                ..WebTransportSessionConfig::defaults(LiveRelayUrl::new(url.clone()))
+            },
+            Arc::clone(&storage),
+            crate::relay::subscription::new_registry(),
+            CancellationToken::new(),
+            PublishRateLimiter::new(100),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            DidSlotRegistry::new(),
+        );
+        handler.mark_active();
+
+        let rid = url.push_routing_id();
+        let result = handler
+            .dispatch_message_multi(&ClientMessage::Publish {
+                ref_id: Some("push".to_owned()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 60,
+                blob: vec![0x42; 64],
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            unwrap_single(result),
+            RelayMessage::Err { code: 4063, ref_id: Some(ref r), .. } if r == "push"
+        ));
+        assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
     }
 }

@@ -341,10 +341,7 @@ async fn build_pair(
     // intersecting context membership with the supervisor's registered local
     // DIDs. The full-stack harness never registers one (its own receive tests
     // decrypt at the crypto layer), so register Bob here for the actor path.
-    bob.manager
-        .register_local_did(bob.did.clone())
-        .await
-        .expect("register bob as local did");
+    bob.manager.register_local_did(bob.did.clone()).await;
     (network, alice, bob, handle, ctx_id)
 }
 

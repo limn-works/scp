@@ -53,6 +53,7 @@ pub(crate) mod outlets_helpers;
 pub mod persistence;
 pub mod policy;
 pub mod providers;
+pub(crate) mod push_helpers;
 pub(crate) mod queries_helpers;
 pub(crate) mod standing_helpers;
 pub mod state;
@@ -77,6 +78,9 @@ pub use config::{ContextConfig, ContextCreation};
 // only member the bridges must NAME, so it is re-exported here (and through
 // `scp_core::context::outlets`) while the rest of the helpers stay internal.
 pub use outlets_helpers::InvocationCaveatBinding;
+// §10.7.1: the per-context reply `PushCommand::Routes` carries. The enclosing
+// `push_helpers` module is `pub(crate)`; the public command enum names this type.
+pub use push_helpers::ContextPushRoutes;
 
 // ---------------------------------------------------------------------------
 // ContextHandle
@@ -161,6 +165,17 @@ impl ContextHandle {
     pub const fn promote_params(&mut self) {
         self.params.memory_scope = params::MemoryScope::Full;
         self.params.ttl = None;
+    }
+
+    /// Replaces `ContextParams.pseudonym_rotation` with an executed
+    /// `ModifyPseudonymRotationPolicy` value (ADR-031 amendment of 2026-10-12;
+    /// spec 09 §9.10.4.1). The caller validates `policy` first; `None`
+    /// disables rotation and freezes each member's current routing ID.
+    pub const fn set_pseudonym_rotation(
+        &mut self,
+        policy: Option<params::PseudonymRotationPolicy>,
+    ) {
+        self.params.pseudonym_rotation = policy;
     }
 
     /// Returns the context's current lifecycle state.
@@ -487,3 +502,7 @@ mod tests {
 // items sit together at the tail of the module.
 #[cfg(test)]
 mod agent_binding_pipeline_tests;
+
+// Runtime pseudonym-rotation tests (spec 09 §9.10.4.1), also `#![cfg(test)]`.
+#[cfg(test)]
+mod pseudonym_rotation_runtime_tests;

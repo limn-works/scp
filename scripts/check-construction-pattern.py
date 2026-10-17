@@ -64,6 +64,14 @@ CONSTRUCTION_MODULE_GLOBS = [
     "crates/*/src/*config*.rs",
 ]
 
+# Construction modules the globs above cannot reach because they sit below a
+# nested crate directory. Each path must exist, so a rename fails this check
+# instead of silently leaving the file unscanned.
+# `node_start_config.rs`: construction.md §"Node start — `NodeStartConfig`".
+CONSTRUCTION_MODULE_FILES = [
+    "crates/scp-ffi/common/src/node_start_config.rs",
+]
+
 # ---------------------------------------------------------------------------
 # M5 — Builder and typestate-marker allowlists
 # ---------------------------------------------------------------------------
@@ -306,6 +314,16 @@ def main() -> int:
     files: list[pathlib.Path] = []
     for pattern in CONSTRUCTION_MODULE_GLOBS:
         files.extend(repo_root.glob(pattern))
+    for rel in CONSTRUCTION_MODULE_FILES:
+        path = repo_root / rel
+        if not path.is_file():
+            print(
+                f"FAIL: scripts/check-construction-pattern.py: {rel} is listed in "
+                "CONSTRUCTION_MODULE_FILES but does not exist",
+                file=sys.stderr,
+            )
+            return 1
+        files.append(path)
     files = sorted(set(files))
 
     # Run the scanner.

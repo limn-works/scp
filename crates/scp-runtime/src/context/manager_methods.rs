@@ -336,6 +336,7 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         checkpoint_last_time_secs: ctx.checkpoint_last_time_secs,
         generation: ctx.generation,
         routing: ctx.routing.clone(),
+        relay_urls: ctx.relay_urls.clone(),
         // ADR-049 §9 Class S (line 144): persist the staged saga slot through
         // its sanctioned mirror via the shared helper.
         saga_pending: crate::context::messaging_helpers::saga_pending_snapshot(ctx),
@@ -353,6 +354,7 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         caveat_counters: crate::context::messaging_helpers::caveat_counters_snapshot(ctx),
         // Fix-D Class S: persist the streaming reservation recovery records.
         stream_reservations: crate::context::messaging_helpers::stream_reservations_snapshot(ctx),
+        pseudonym_rotation: ctx.class_s.pseudonym_rotation,
         // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold broadcast security
         // + roster state into the snapshot so block / ban / key-epoch advance is
         // durable atomically with `read_exclusion_list`.

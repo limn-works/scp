@@ -569,10 +569,8 @@ interface KeyCustodyProvider {
  * Platform trait for encrypted key-value storage.
  *
  * Abstracts persistent, encrypted storage behind a uniform interface. The Android
- * implementation ([AndroidStorage]) uses SQLCipher with a 32-byte passphrase derived from an
- * AES-256 key that Android Keystore holds; SQLCipher derives the database key from that
- * passphrase. The adapter does not read `KeyInfo.securityLevel`, so it does not know whether
- * Keystore put the AES key in the TEE or in software.
+ * implementation ([AndroidStorage]) uses SQLCipher with a key derived as persistence spec §17.6
+ * requires; [AndroidStorage] states the derivation.
  *
  * This interface declares the six methods of the UniFFI `StorageProvider` callback interface in
  * `crates/scp-ffi/uniffi/src/lib.rs` under the same names. The Rust `Storage` trait in

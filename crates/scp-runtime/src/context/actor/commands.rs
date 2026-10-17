@@ -109,6 +109,9 @@ pub enum ContextCommand {
     /// initiator — the cross-context outlet-invocation saga runs
     /// supervisor-side, not over this mailbox.
     Outlets(OutletsCommand),
+    /// Push: the routing IDs this device registers for push wakes (§10.7.1).
+    /// Read-only, like `Queries`.
+    Push(PushCommand),
     /// Read-only queries. Handlers MUST NOT mutate state; the actor
     /// takes `&self.state` when dispatching this variant.
     Queries(QueriesCommand),
@@ -297,19 +300,46 @@ pub enum MessagingCommand {
     /// Send the local member's pseudonym announcement (§9.10.4) to the
     /// other members of a context.
     ///
-    /// Mirrors the legacy
-    /// `messaging_helpers::send_pseudonym_announcement`
-    /// signature exactly: the handler delegates to that method which
-    /// in turn wraps the announcement payload and routes it through
-    /// `send_message`. Best-effort — the legacy method returns no
-    /// error and silently swallows transport / serialization failures
-    /// (only logs them); this dispatch surface preserves the same
-    /// contract by replying `Ok(())` regardless of inner errors.
+    /// The handler delegates to
+    /// `messaging_helpers::send_pseudonym_announcement`, which sends the v2
+    /// form for a member with a rotation epoch and the v1 form otherwise
+    /// (spec 09 §9.10.4.1), routes it through `send_message`, and clears a
+    /// pending rotation announcement on success. This is also the re-publish
+    /// path for a rotation whose announcement failed or was interrupted.
     SendPseudonymAnnouncement {
         /// Boxed owned payload — see [`SendPseudonymAnnouncementPayload`].
         payload: Box<SendPseudonymAnnouncementPayload>,
-        /// Oneshot reply channel. Always replies `Ok(())` (matches the
-        /// legacy method's no-error contract).
+        /// Oneshot reply channel: `Ok(())` once the announcement is sent and
+        /// any pending flag cleared, else the typed error of
+        /// `send_pseudonym_announcement`.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Rotate the local member's pseudonym (spec 09 §9.10.4.1 "Rotation
+    /// order and crash recovery").
+    ///
+    /// The bridge driver derives `new_routing_id` with
+    /// `KeyCustody::derive_rotatable_pseudonym` at `new_epoch` and subscribes
+    /// to it before dispatching; the handler delegates to
+    /// `messaging_helpers::rotate_pseudonym`, which persists the rotation
+    /// fail-closed, emits `ContextEvent::LocalPseudonymRotated`, and sends the
+    /// announcement. The signer is per-call because the actor holds no
+    /// signing key.
+    RotatePseudonym {
+        /// Context identifier.
+        context_id: String,
+        /// The epoch the new routing ID was derived at; must equal the
+        /// epoch `LocalRoutingIds::next_pseudonym_epoch` names.
+        new_epoch: u64,
+        /// The routing ID derived at `new_epoch`.
+        new_routing_id: [u8; 32],
+        /// The local member's DID, which signs the announcement.
+        sender_did: scp_did::DID,
+        /// The member's signer; the announcement is signed through it in the
+        /// handler's turn.
+        signer: crate::context::actor::signer::CommandSigner,
+        /// Oneshot reply channel: `Ok(())` once the rotation is persisted and
+        /// announced, else the typed error of `rotate_pseudonym`.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
@@ -744,6 +774,9 @@ pub struct CreateContextPayload {
     /// Optional §9.10.4 pseudonym routing ID for the creator's
     /// local member. `None` on broadcast contexts (ignored).
     pub local_pseudonym: Option<[u8; 32]>,
+    /// The relays that host the new context (§5.12.3.1 `relay_urls`): the
+    /// creator's relays. Stored on `PerContextState::relay_urls` (PUSH-025).
+    pub relay_urls: Vec<String>,
 }
 
 /// Payload for [`LifecycleCommand::JoinContext`]. Boxed inside the
@@ -1959,6 +1992,10 @@ pub enum StandingCommand {
         local_did: scp_did::DID,
         /// Remote peer DID.
         peer_did: scp_did::DID,
+        /// The relays that host the standing context when this call creates
+        /// it (§5.12.3.1 `relay_urls`, PUSH-025): the local identity's relays.
+        /// Unused when the context already exists.
+        relay_urls: Vec<String>,
         /// Oneshot reply channel. `Ok(String)` carries the
         /// deterministic standing context ID; the underlying method
         /// returns the same ID whether the context already existed or
@@ -2146,6 +2183,18 @@ pub enum TtlCloseCommand {
         payload: Box<TtlContextPayload>,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+}
+
+/// See [`ContextCommand::Push`]. Read-only: the actor answers from its owned
+/// state through `crate::context::push_helpers`.
+pub enum PushCommand {
+    /// This context's push routes (§10.7.1): its relay set and the routing IDs
+    /// on those relays at which a blob for this device arrives. `None` for a
+    /// `Closed`, `Expired` or `Tombstoned` context.
+    Routes {
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Option<crate::context::push_helpers::ContextPushRoutes>>,
     },
 }
 
@@ -2605,6 +2654,19 @@ pub enum QueriesCommand {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<[u8; 32], ContextError>>,
     },
+    /// The local member's routing IDs and rotation state (spec 09
+    /// §9.10.4.1): the current routing ID, the previous one while its grace
+    /// runs, the epoch, the epoch the next rotation must carry, and whether
+    /// an announcement is pending. Read-only. `Err(NotPseudonymousContext)`
+    /// for a broadcast context.
+    LocalRoutingIds {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<
+            Result<crate::context::actor::pseudonym_rotation::LocalRoutingIds, ContextError>,
+        >,
+    },
     /// Broadcast key + epoch for a locally-controlled author in a
     /// broadcast context. Read-only.
     GetBroadcastKeyForLocalAuthor {
@@ -2672,6 +2734,14 @@ pub enum QueriesCommand {
         context_id: String,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<scp_protocol::trust::CapabilityRequirements, ContextError>>,
+    },
+    /// The context's stored relay set (§5.12.3.1 `relay_urls`,
+    /// `PerContextState::relay_urls`).
+    RelayUrls {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. `Ok(None)` iff the context is unknown.
+        reply: oneshot::Sender<Result<Option<Vec<String>>, ContextError>>,
     },
     /// Role state snapshot (cloned).
     GetRoleState {

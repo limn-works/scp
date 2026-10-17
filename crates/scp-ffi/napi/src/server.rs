@@ -7,6 +7,8 @@
 //! - [`NapiNodeHandle`] — opaque handle to a running application node (wraps
 //!   encrypted-in-memory and `SQLCipher` variants via an internal enum).
 //! - `relay_start_in_memory` / `relay_start_local` — relay startup.
+//! - `node_start` — production node start from this instance's storage under
+//!   an operator identity (SCP-322).
 //! - `node_start_in_memory` / `node_start_local` — node startup.
 //!
 //! Gated behind the `server` feature on `scp-ffi-common`.
@@ -17,6 +19,8 @@ use napi::Error as NapiError;
 use napi_derive::napi;
 use zeroize::Zeroizing;
 
+use scp_ffi_common::error_codes as codes;
+use scp_ffi_common::node_start_config::NodeStartConfig;
 use scp_ffi_common::server::{self, NodeIdentity, RunningNode, RunningRelay, ServerError};
 use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
@@ -29,122 +33,54 @@ use crate::{decrement_handle_count, increment_handle_count};
 // Error conversion
 // ---------------------------------------------------------------------------
 
+/// Builds the [`ScpNapiError`] for `e` with `message`: the variant from
+/// `server_error_class` and the code from `server_error_code`, the one mapping
+/// the `PyO3`, napi-rs and `UniFFI` bridges share (sdk-common.md §"Node start
+/// error codes").
+fn coded(e: &ServerError, message: String) -> ScpNapiError {
+    let code = codes::server_error_code(e).to_owned();
+    match codes::server_error_class(e) {
+        codes::ServerErrorClass::Validation => ScpNapiError::Validation { message, code },
+        codes::ServerErrorClass::Identity => ScpNapiError::Identity { message, code },
+        codes::ServerErrorClass::Transport => ScpNapiError::Transport { message, code },
+        codes::ServerErrorClass::Context => ScpNapiError::Context { message, code },
+    }
+}
+
+/// Maps a [`ServerError`] to its coded error with the sanitized
+/// [`ServerError::user_message`]; the full error goes to the debug log only.
 fn server_err(e: ServerError) -> NapiError {
     tracing::debug!(error = %e, "server operation failed");
-    match &e {
-        ServerError::MissingPassphrase => {
-            // Map to Validation error (code SCP-VALID-7004) to match the
-            // UniFFI bridge and allow TypeScript callers to distinguish this
-            // actionable error from generic failures.
-            NapiError::from(ScpNapiError::Validation {
-                message: e.user_message(),
-                code: scp_ffi_common::error_codes::VALID_7004.to_owned(),
-            })
-        }
-        _ => NapiError::from_reason(e.user_message()),
-    }
+    coded(&e, e.user_message()).into()
 }
 
+/// A `NodeError` from a running node's operation (projection, deploy, serve)
+/// maps as `ServerError::Node` does, with a message that names no path.
 fn node_err(e: NodeError) -> NapiError {
     tracing::debug!(error = %e, "node operation failed");
-    NapiError::from_reason("node operation failed")
+    coded(&ServerError::Node(e), "node operation failed".to_owned()).into()
 }
 
-/// Auto-wires the global `ContextManager` with relay transport after
-/// node startup.
+/// Wires `bi`'s `Supervisor` to the started, registered `node` through the
+/// relay at `relay_url`, which every production caller sets to
+/// `node.internal_relay_url()`.
 ///
-/// Connects to the node's local relay (with bearer token authentication)
-/// and initializes the `ContextManager` with `RelayTransportProvider` so
-/// that context operations (create, join, send) work immediately. If the
-/// `ContextManager` was already initialized (e.g., by a prior
-/// `configureLocalTransport` or `contextCreate` call), this is a no-op —
-/// the `OnceLock` ensures first-writer-wins semantics.
-///
-/// The `bridge_token` is required because `ApplicationNode` relays enforce
-/// `Authorization: Bearer <token>` on all WebSocket connections.
-///
-/// Best-effort: logs a warning if the relay connection fails rather than
-/// blocking node startup.
+/// Delegates to [`server::wire_supervisor_to_node`], which on any failure
+/// shuts `node` down, removes it from the instance's node registry, and
+/// returns `ServerError::SupervisorWiring` (`SCP-TRANS-5056`, sdk-common.md
+/// §"Node start error codes"). The attach step is napi's
+/// [`crate::runtime::init_supervisor`], the same set-once init
+/// `context_create` runs.
 async fn auto_wire_context_manager(
     bi: &Arc<NapiBridgeInstance>,
-    did: &str,
+    node: &Arc<RunningNode>,
     relay_url: &str,
-    bridge_token: Zeroizing<String>,
-) {
-    let sourced = scp_transport::relay::connection::SourcedRelayUrl {
-        url: relay_url.to_owned(),
-        source: scp_transport::relay::connection::RelayUrlSource::Explicit,
-    };
-    let token2 = bridge_token.clone();
-    let profile = scp_transport::profile::TransportProfile::platform_default();
-    match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
-        &sourced,
-        Some(bridge_token),
-        Some(&profile),
-    )
+) -> napi::Result<()> {
+    server::wire_supervisor_to_node(&bi.core, node, relay_url, |did| {
+        crate::runtime::init_supervisor(bi, did);
+    })
     .await
-    {
-        Ok(adapter) => {
-            // The bearer auto-wire path stays WebSocket-only (QUIC has no
-            // bearer-upgrade surface, spec §10.14.3 item 4), so it connects
-            // directly via `connect_sourced_with_bearer` rather than the QUIC
-            // selector. The shared `init_supervisor_with_relay_transport`
-            // helper now takes a `Box<dyn TransportAdapter>` (so the discovering
-            // connect sites can hand it the selector's boxed adapter); box the
-            // concrete bearer adapter here to match.
-            crate::runtime::init_supervisor_with_relay_transport(bi, did, Box::new(adapter));
-
-            // Also populate the BridgeInstance transport manager so that
-            // broadcast publish, context subscribe, and discovery probing
-            // work without a separate `transportConnect` call. This requires
-            // a second WebSocket connection because NativeRelayAdapter is not
-            // Clone and the first was consumed by RelayTransportProvider.
-            match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
-                &sourced,
-                Some(token2),
-                Some(&profile),
-            )
-            .await
-            {
-                Ok(relay_adapter) => {
-                    let manager = scp_transport::TransportManager::new(Box::new(relay_adapter));
-                    let _ = crate::transport::set_transport_manager_arc_on(
-                        bi,
-                        std::sync::Arc::new(manager),
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        relay_url = %relay_url,
-                        "auto_wire_supervisor: Supervisor wired but failed to \
-                         populate BridgeInstance transport manager — broadcast publish and \
-                         discovery may require a manual transportConnect call"
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                relay_url = %relay_url,
-                "auto_wire_context_manager: failed to connect to node relay — \
-                 context operations may fail until transport is configured manually"
-            );
-            // Fall back to initializing without transport so that at least
-            // the Supervisor exists (with NotConfiguredTransportProvider).
-            crate::runtime::init_supervisor(bi, did);
-        }
-    }
-    // Always register the node's DID as a local DID for defense-in-depth.
-    if let Ok(supervisor) = crate::runtime::supervisor(bi)
-        && let Err(e) = supervisor.register_local_did(did.to_owned().into()).await
-    {
-        tracing::debug!(
-            error = %e,
-            "auto_wire_context_manager: register_local_did skipped (supervisor not ready)"
-        );
-    }
+    .map_err(server_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -261,13 +197,15 @@ impl NapiNodeHandle {
         self.inner.is_shutdown()
     }
 
-    /// Signals the node to stop (relay + background tasks).
+    /// Signals the node to stop (relay + background tasks), and unbinds the
+    /// instance's `Supervisor` transport from this node when it holds the
+    /// binding.
     ///
     /// In-flight connection handlers drain naturally after shutdown is
     /// signaled — they are not cancelled.
     #[napi]
     pub fn shutdown(&self) {
-        self.inner.shutdown();
+        server::stop_node(&self.bi.core, &self.inner);
     }
 
     /// Activates HTTP broadcast projection with site configuration.
@@ -449,7 +387,7 @@ impl NapiNodeHandle {
 
 impl Drop for NapiNodeHandle {
     fn drop(&mut self) {
-        self.inner.shutdown();
+        server::stop_node(&self.bi.core, &self.inner);
         decrement_handle_count();
     }
 }
@@ -466,7 +404,10 @@ impl Drop for NapiNodeHandle {
 ///
 /// # Errors
 ///
-/// Returns `napi::Error` if the DID is not found in the identity registry.
+/// - `SCP-IDENT-1063` (`OperatorIdentityUnavailable`, sdk-common.md §"Node
+///   start error codes") when the DID is not registered on this instance.
+/// - `SCP-IDENT-1058` when no shared DHT client exists and the production
+///   client cannot be built.
 ///
 /// Works for any locally registered identity — in-memory OR a production
 /// callback custody (`identityCreateWithCustody`) — since signing dispatches
@@ -478,60 +419,105 @@ fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeI
     use scp_identity::DidCache;
     use scp_platform::traits::KeyCustody;
 
-    crate::runtime::with_identity(bi, did, |entry| {
-        let custody_clone = Arc::clone(&entry.custody);
+    let entry = crate::runtime::identity_registry(bi)
+        .get(did)
+        .ok_or_else(|| server_err(ServerError::OperatorIdentityUnavailable))?;
+    let custody_clone = Arc::clone(&entry.custody);
 
-        // Hand-rolled sign_fn: `ConcreteDidMethod::make_sign_fn` requires
-        // `Arc<K: KeyCustody>`, and `NapiKeyCustody` does implement `KeyCustody`
-        // via enum dispatch, so we sign through it directly. Same pattern as
-        // `make_dht_with_signer` in identity.rs.
-        let sign_fn: Arc<
-            dyn Fn(
-                    u64,
-                    Vec<u8>,
-                ) -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<
-                                Output = Result<Vec<u8>, scp_identity::IdentityError>,
-                            > + Send,
-                    >,
-                > + Send
-                + Sync,
-        > = Arc::new(move |key_id: u64, data: Vec<u8>| {
-            let kc = Arc::clone(&custody_clone);
-            Box::pin(async move {
-                let handle = scp_platform::traits::KeyHandle::new(key_id);
-                let sig = kc
-                    .sign(&handle, &data)
-                    .await
-                    .map_err(scp_identity::IdentityError::Platform)?;
-                Ok(sig.into_bytes())
-            })
-        });
-
-        // Publish through the process-shared DHT client (the one the resolver
-        // reads from) so a node serving this identity re-publishes into the same
-        // DHT the rest of the bridge resolves against. Fall back to a fail-closed
-        // production client if the resolver was never initialized — never an
-        // in-memory nullifier on a shipped path (ADR-062 §Decision 1).
-        let dht_client = match crate::runtime::shared_dht_client() {
-            Some(client) => Arc::clone(client),
-            None => Arc::new(crate::identity::build_ffi_dht_client()?),
-        };
-        let cache = Arc::new(DidCache::new());
-        let did_method = Arc::new(
-            scp_ffi_common::server::ConcreteDidMethod::with_client_and_signer(
-                dht_client, cache, sign_fn,
-            ),
-        );
-
-        Ok(NodeIdentity {
-            identity: entry.identity.clone(),
-            document: entry.document.clone(),
-            did_method,
+    // Hand-rolled sign_fn: `ConcreteDidMethod::make_sign_fn` requires
+    // `Arc<K: KeyCustody>`, and `NapiKeyCustody` does implement `KeyCustody`
+    // via enum dispatch, so we sign through it directly. Same pattern as
+    // `make_dht_with_signer` in identity.rs.
+    let sign_fn: Arc<
+        dyn Fn(
+                u64,
+                Vec<u8>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<Vec<u8>, scp_identity::IdentityError>>
+                        + Send,
+                >,
+            > + Send
+            + Sync,
+    > = Arc::new(move |key_id: u64, data: Vec<u8>| {
+        let kc = Arc::clone(&custody_clone);
+        Box::pin(async move {
+            let handle = scp_platform::traits::KeyHandle::new(key_id);
+            let sig = kc
+                .sign(&handle, &data)
+                .await
+                .map_err(scp_identity::IdentityError::Platform)?;
+            Ok(sig.into_bytes())
         })
+    });
+
+    // Publish through the process-shared DHT client (the one the resolver
+    // reads from) so a node serving this identity re-publishes into the same
+    // DHT the rest of the bridge resolves against. Fall back to a fail-closed
+    // production client if the resolver was never initialized — never an
+    // in-memory nullifier on a shipped path (ADR-062 §Decision 1).
+    let dht_client = match crate::runtime::shared_dht_client() {
+        Some(client) => Arc::clone(client),
+        None => Arc::new(crate::identity::build_ffi_dht_client().map_err(napi::Error::from)?),
+    };
+    let cache = Arc::new(DidCache::new());
+    let did_method = Arc::new(
+        scp_ffi_common::server::ConcreteDidMethod::with_client_and_signer(
+            dht_client, cache, sign_fn,
+        ),
+    );
+
+    Ok(NodeIdentity {
+        identity: entry.identity.clone(),
+        document: entry.document.clone(),
+        did_method,
     })
-    .map_err(napi::Error::from)
+}
+
+/// Resolves the operator identity a node start config names: a malformed DID
+/// is `InvalidConfig` (`SCP-STORAGE-8007`), and a DID not registered on this
+/// instance is `OperatorIdentityUnavailable` (`SCP-IDENT-1063`).
+fn resolve_operator_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeIdentity> {
+    if validate_did(did).is_err() {
+        return Err(server_err(ServerError::InvalidConfig(
+            "identity must be a DID".to_owned(),
+        )));
+    }
+    build_node_identity(bi, did)
+}
+
+/// Per-bridge-instance implementation of `node_start`: starts a production
+/// node on `bi`'s storage under the operator identity the config names
+/// (construction.md §"Node start — `NodeStartConfig`").
+///
+/// Runs, in order: the config parse, the operator identity resolution, taking
+/// the instance storage, `server::node_start`, `server::register_node`,
+/// `auto_wire_context_manager`, and wrapping the handle.
+///
+/// # Errors
+///
+/// The code sdk-common.md §"Node start error codes" gives each failure.
+pub(crate) async fn node_start_on(
+    bi: &Arc<NapiBridgeInstance>,
+    config_json: String,
+) -> napi::Result<NapiNodeHandle> {
+    let cfg = NodeStartConfig::from_json(&config_json).map_err(server_err)?;
+    let identity = resolve_operator_identity(bi, &cfg.identity)?;
+    let storage = crate::runtime::protocol_repository(bi).instance_storage();
+    let node = server::node_start(cfg, identity, storage)
+        .await
+        .map_err(server_err)?;
+    // Registered before anything else can fail, so `SCP.shutdown()` stops
+    // this node before it releases the storage the node holds
+    // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+    let inner = server::register_node(&bi.core, node);
+    auto_wire_context_manager(bi, &inner, &inner.internal_relay_url()).await?;
+    increment_handle_count();
+    Ok(NapiNodeHandle {
+        inner,
+        bi: Arc::clone(bi),
+        instance_id: bi.instance_id(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -585,15 +571,12 @@ pub(crate) async fn node_start_in_memory_on(
         .await
         .map_err(server_err)?;
 
-    let did = node.identity().did().to_owned();
-    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
-    let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
-
     // Register this node as a borrower of this instance's resources, so
     // `SCP.shutdown()` stops it before `bridge_specific_shutdown` releases
-    // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+    // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`), and so a
+    // failed wiring below can remove it again.
     let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
+    auto_wire_context_manager(bi, &inner, &inner.internal_relay_url()).await?;
 
     increment_handle_count();
     Ok(NapiNodeHandle {
@@ -648,10 +631,7 @@ pub(crate) async fn node_start_local_on(
     // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
     let inner = server::register_node(&bi.core, inner);
 
-    let did = inner.did().to_owned();
-    let relay_url = inner.internal_relay_url();
-    let bridge_token = inner.bridge_token_hex();
-    auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
+    auto_wire_context_manager(bi, &inner, &inner.internal_relay_url()).await?;
 
     increment_handle_count();
     Ok(NapiNodeHandle {
@@ -854,5 +834,478 @@ mod tests {
         rt().block_on(inner.disable_broadcast_projection("no-such-ctx"));
         // Should not panic.
         inner.shutdown();
+    }
+
+    /// A `NodeStartConfig` JSON naming `identity`, on loopback with plaintext,
+    /// in-memory blobs and an OS-assigned relay port, with `edit` applied.
+    fn start_json(identity: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut cfg = serde_json::json!({
+            "reach": {"kind": "local"},
+            "identity": identity,
+            "blob_storage": {"kind": "in_memory"},
+            "tls": {"kind": "plaintext"},
+            "dht": {"kind": "disabled"},
+            "cors_origins": {"kind": "any_origin"},
+            "bind_addr": "127.0.0.1:0",
+        });
+        edit(&mut cfg);
+        cfg.to_string()
+    }
+
+    /// The reason a refused `node_start` returned.
+    fn start_error(result: napi::Result<NapiNodeHandle>, label: &str) -> String {
+        match result {
+            Ok(node) => {
+                node.shutdown();
+                panic!("{label}: node_start must fail");
+            }
+            Err(e) => e.reason.clone(),
+        }
+    }
+
+    /// Asserts `reason` is the `ScpNapiError` rendering with `code` and
+    /// `class`, the form the TypeScript SDK parses.
+    fn assert_coded(reason: &str, class: &str, code: &str, label: &str) {
+        let prefix = format!("[{code}] {class} error: ");
+        assert!(
+            reason.starts_with(&prefix),
+            "{label}: expected {prefix:?}, got {reason:?}"
+        );
+    }
+
+    /// A well-formed operator DID that no identity on this instance holds
+    /// returns `SCP-IDENT-1063` on a shipped build as on a `testing` build.
+    #[test]
+    fn node_start_with_unregistered_operator_did_returns_ident_1063() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let json = start_json("did:dht:z6MkNodeStartOperatorProbe", |_| {});
+        let reason = start_error(rt().block_on(scp.node_start(json)), "unregistered operator");
+        assert_coded(
+            &reason,
+            "identity",
+            codes::IDENT_1063,
+            "unregistered operator",
+        );
+    }
+
+    /// One `ServerError` per class: each bridge error takes its variant from
+    /// `server_error_class` and its code from `server_error_code`, and a
+    /// running node's `NodeError` names no path in its message.
+    #[test]
+    fn server_and_node_errors_map_through_the_shared_table() {
+        let cases: Vec<(ServerError, &str, &str)> = vec![
+            (
+                ServerError::InvalidConfig("x".into()),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                ServerError::Io(std::io::Error::other("/secret/path")),
+                "validation",
+                codes::STORAGE_8008,
+            ),
+            (
+                ServerError::Node(NodeError::Storage("x".into())),
+                "validation",
+                codes::STORAGE_8009,
+            ),
+            (
+                ServerError::OperatorIdentityUnavailable,
+                "identity",
+                codes::IDENT_1063,
+            ),
+            (
+                ServerError::Node(NodeError::Serve("x".into())),
+                "transport",
+                codes::TRANS_5054,
+            ),
+            (
+                ServerError::SupervisorWiring(server::SupervisorWiringError::NodeAlreadyBound),
+                "transport",
+                codes::TRANS_5056,
+            ),
+            (
+                ServerError::MissingPassphrase,
+                "validation",
+                codes::VALID_7004,
+            ),
+            (
+                ServerError::Platform(scp_platform::error::PlatformError::StorageError("x".into())),
+                "context",
+                codes::CTX_2053,
+            ),
+        ];
+        for (e, class, code) in cases {
+            let label = format!("{e:?}");
+            assert_coded(&server_err(e).reason, class, code, &label);
+        }
+
+        let reason = node_err(NodeError::InvalidConfig("/secret/path/data.db".into()))
+            .reason
+            .clone();
+        assert_eq!(
+            reason,
+            format!(
+                "[{}] validation error: node operation failed",
+                codes::STORAGE_8007
+            )
+        );
+    }
+
+    /// A valid config starts a node under the operator identity, registers it
+    /// with the instance, and wires the instance's `Supervisor` to its relay.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_runs_a_node_under_the_operator_identity() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let did = identity.did();
+        let node = rt()
+            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .unwrap();
+
+        assert_eq!(node.did(), did);
+        assert!(node.relay_port() > 0);
+        assert!(
+            server::supervisor_wired_to(&scp.inner.core, &node.inner),
+            "node_start must wire the instance's Supervisor to the node's relay"
+        );
+        node.shutdown();
+        assert!(node.is_shutdown());
+    }
+
+    /// A relay URL on a loopback port nothing listens on, so a connect to it
+    /// fails with a refused connection.
+    #[cfg(feature = "testing")]
+    fn unreachable_relay_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("ws://127.0.0.1:{port}/scp/v1")
+    }
+
+    /// `node_start_on`'s wiring step, run on a real started and registered
+    /// node with a relay URL that refuses the connection, returns
+    /// `SCP-TRANS-5056`, shuts the node down, unregisters it, leaves no
+    /// fallback `Supervisor`, and leaves the transport manager the instance
+    /// held before the start in place. A second start while a running node
+    /// holds the binding also returns `SCP-TRANS-5056`, and a start after
+    /// that node stops binds again and puts the earlier manager back on its
+    /// stop.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_wiring_failure_returns_trans_5056_and_unregisters_the_node() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let relay = rt().block_on(scp.relay_start_in_memory()).unwrap();
+        let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+            url: relay.relay_url(),
+            source: scp_transport::relay::connection::RelayUrlSource::Explicit,
+        };
+        let adapter = rt()
+            .block_on(
+                scp_transport::TransportSelector::new()
+                    .select_and_connect_with_bearer(&sourced, None, None),
+            )
+            .unwrap();
+        scp.inner
+            .core
+            .install_transport(Arc::new(scp_transport::TransportManager::new(
+                relay.relay_url(),
+                adapter,
+            )))
+            .unwrap();
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let did = identity.did();
+        let cfg = NodeStartConfig::from_json(&start_json(&did, |_| {})).unwrap();
+        let node_identity = resolve_operator_identity(&scp.inner, &cfg.identity).unwrap();
+        let storage = crate::runtime::protocol_repository(&scp.inner).instance_storage();
+        let node = rt()
+            .block_on(server::node_start(cfg, node_identity, storage))
+            .unwrap();
+        let inner = server::register_node(&scp.inner.core, node);
+
+        let err = rt()
+            .block_on(auto_wire_context_manager(
+                &scp.inner,
+                &inner,
+                &unreachable_relay_url(),
+            ))
+            .expect_err("a refused relay connect must fail the node start");
+        assert_coded(
+            &err.reason,
+            "transport",
+            codes::TRANS_5056,
+            "refused connect",
+        );
+        assert!(
+            !scp.inner.core.has_borrower(&inner),
+            "the node stays registered"
+        );
+        assert!(inner.is_shutdown(), "the node keeps running");
+        assert!(
+            !scp.inner.core.has_supervisor(),
+            "a fallback Supervisor was attached"
+        );
+        assert_eq!(
+            scp.inner
+                .core
+                .with_transport(scp_transport::TransportManager::relay_urls)
+                .unwrap(),
+            [relay.relay_url()],
+            "the failed start must restore the instance's previous transport manager"
+        );
+
+        let node = rt()
+            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .unwrap();
+        assert!(server::supervisor_wired_to(&scp.inner.core, &node.inner));
+        let reason = start_error(
+            rt().block_on(scp.node_start(start_json(&did, |_| {}))),
+            "second node start",
+        );
+        assert_coded(&reason, "transport", codes::TRANS_5056, "second node start");
+        node.shutdown();
+        let restarted = rt()
+            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .expect("a start after the bound node stops binds again");
+        assert!(server::supervisor_wired_to(
+            &scp.inner.core,
+            &restarted.inner
+        ));
+        restarted.shutdown();
+        assert_eq!(
+            scp.inner
+                .core
+                .with_transport(scp_transport::TransportManager::relay_urls)
+                .unwrap(),
+            [relay.relay_url()],
+            "a stop puts back the transport manager the first start displaced"
+        );
+        relay.shutdown();
+    }
+
+    /// Every sdk-common.md §"Node start error codes" row a napi-rs caller can
+    /// reach through `node_start` returns its code and class.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_maps_each_reachable_failure_to_its_sdk_common_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("regular-file");
+        std::fs::write(&file, b"x").unwrap();
+        let under_file = file.join("sub").join("blobs.redb").display().to_string();
+        let dir = tmp.path().join("a-directory");
+        std::fs::create_dir(&dir).unwrap();
+        let dir = dir.display().to_string();
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken_addr = taken.local_addr().unwrap().to_string();
+
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let did = identity.did();
+
+        let cases: Vec<(&str, String, &str, &str)> = vec![
+            (
+                "malformed JSON (InvalidConfig)",
+                "{not json".to_owned(),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "unknown field (InvalidConfig)",
+                start_json(&did, |c| c["port"] = 1.into()),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "malformed operator DID (InvalidConfig)",
+                start_json("not-a-did", |_| {}),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "domain with a scheme (InvalidConfig)",
+                start_json(&did, |c| {
+                    c["reach"] = serde_json::json!({
+                        "kind": "domain", "domain": "https://node.example.org"
+                    });
+                    c["tls"] = serde_json::json!({"kind": "self_signed"});
+                }),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "domain with plaintext (Node(InvalidConfig))",
+                start_json(&did, |c| {
+                    c["reach"] =
+                        serde_json::json!({"kind": "domain", "domain": "node.example.org"});
+                }),
+                "validation",
+                codes::STORAGE_8007,
+            ),
+            (
+                "blob parent under a regular file (Io)",
+                start_json(&did, |c| {
+                    c["blob_storage"] = serde_json::json!({"kind": "redb", "path": under_file});
+                }),
+                "validation",
+                codes::STORAGE_8008,
+            ),
+            (
+                "redb path that is a directory (Storage)",
+                start_json(&did, |c| {
+                    c["blob_storage"] = serde_json::json!({"kind": "redb", "path": dir});
+                }),
+                "validation",
+                codes::STORAGE_8008,
+            ),
+            (
+                "relay bind on a taken port (Node(Relay))",
+                start_json(&did, |c| c["bind_addr"] = taken_addr.clone().into()),
+                "transport",
+                codes::TRANS_5051,
+            ),
+        ];
+        for (label, json, class, code) in cases {
+            let reason = start_error(rt().block_on(scp.node_start(json)), label);
+            assert_coded(&reason, class, code, label);
+        }
+        drop(taken);
+    }
+
+    /// Asserts `result` is the transport error carrying `SCP-TRANS-5056` that
+    /// a start returns while another node of the instance holds the binding,
+    /// and that it names the `NodeAlreadyBound` step, so a 5056 from any
+    /// other step, such as `RelayConnect`, fails the assertion.
+    #[cfg(feature = "testing")]
+    fn assert_refused_while_bound(result: napi::Result<NapiNodeHandle>, label: &str) {
+        let reason = match result {
+            Ok(node) => {
+                node.shutdown();
+                panic!("{label}: a start while a running node holds the binding must fail");
+            }
+            Err(e) => e.reason.clone(),
+        };
+        assert_coded(&reason, "transport", codes::TRANS_5056, label);
+        let step = scp_ffi_common::server::SupervisorWiringError::NodeAlreadyBound.user_message();
+        assert!(
+            reason.contains(step),
+            "{label}: the refusal names NodeAlreadyBound: {reason}"
+        );
+    }
+
+    /// `context_create` attaches a `Supervisor` with an unconfigured
+    /// transport. `node_start_in_memory` then binds that same `Supervisor` to
+    /// the node's relay; a second start while the first node runs fails
+    /// closed with `SCP-TRANS-5056` and leaves the first binding and the
+    /// borrower registry as they were; dropping the first handle unbinds it,
+    /// so a later start binds again.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_in_memory_binds_after_context_create_and_fails_closed_while_bound() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let did = identity.did();
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        rt().block_on(crate::context::context_create_on(
+            &scp.inner,
+            &identity,
+            params_json,
+        ))
+        .expect("context_create must succeed");
+        let core = &scp.inner.core;
+        let attached = Arc::clone(
+            core.try_supervisor()
+                .expect("context_create attaches a Supervisor"),
+        );
+
+        let first = rt()
+            .block_on(scp.node_start_in_memory(Some(did.clone())))
+            .expect("a start after context_create binds the attached Supervisor");
+        assert!(
+            Arc::ptr_eq(core.try_supervisor().unwrap(), &attached),
+            "the start keeps the Supervisor context_create attached"
+        );
+        assert!(server::supervisor_wired_to(core, &first.inner));
+
+        let borrowers = core.borrower_count();
+        assert_refused_while_bound(
+            rt().block_on(scp.node_start_in_memory(Some(did.clone()))),
+            "node_start_in_memory",
+        );
+        assert_eq!(
+            core.borrower_count(),
+            borrowers,
+            "a refused start unregisters its node"
+        );
+        assert!(server::supervisor_wired_to(core, &first.inner));
+
+        drop(first);
+        assert!(
+            core.node_binding().is_none(),
+            "dropping the handle unbinds its node"
+        );
+        let second = rt()
+            .block_on(scp.node_start_in_memory(Some(did)))
+            .expect("a start after the bound node's handle drops binds again");
+        assert!(Arc::ptr_eq(core.try_supervisor().unwrap(), &attached));
+        assert!(server::supervisor_wired_to(core, &second.inner));
+        second.shutdown();
+    }
+
+    /// `configure_local_transport` attaches a `Supervisor` with a loopback
+    /// transport. `node_start_local` then binds that same `Supervisor` to the
+    /// node's relay; a second start while the first node runs fails closed
+    /// with `SCP-TRANS-5056`; a start after `shutdown` binds again.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_local_binds_after_configure_local_transport_and_fails_closed_while_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = |name: &str| tmp.path().join(name).display().to_string();
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let did = identity.did();
+        scp.configure_local_transport(did.clone()).unwrap();
+        let core = &scp.inner.core;
+        let attached = Arc::clone(
+            core.try_supervisor()
+                .expect("configure_local_transport attaches a Supervisor"),
+        );
+
+        let first = rt()
+            .block_on(scp.node_start_local(dir("first"), Some(did.clone()), None))
+            .expect("a start after configure_local_transport binds the attached Supervisor");
+        assert!(Arc::ptr_eq(core.try_supervisor().unwrap(), &attached));
+        assert!(server::supervisor_wired_to(core, &first.inner));
+
+        let borrowers = core.borrower_count();
+        assert_refused_while_bound(
+            rt().block_on(scp.node_start_local(dir("second"), Some(did.clone()), None)),
+            "node_start_local",
+        );
+        assert_eq!(core.borrower_count(), borrowers);
+        assert!(server::supervisor_wired_to(core, &first.inner));
+
+        first.shutdown();
+        assert!(!server::supervisor_wired_to(core, &first.inner));
+        let third = rt()
+            .block_on(scp.node_start_local(dir("third"), Some(did), None))
+            .expect("a start after shutdown binds again");
+        assert!(server::supervisor_wired_to(core, &third.inner));
+        third.shutdown();
     }
 }

@@ -1911,7 +1911,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -1950,7 +1950,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             ttl_check_interval: Duration::from_millis(100),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let storage = Arc::new(BlobStorageBackend::in_memory());
         let server = RelayServer::new(config, storage);
@@ -2087,7 +2087,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
             did_record_validation: DidRecordValidation::Disabled,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
             .await
@@ -2143,7 +2143,7 @@ mod tests {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
             did_record_validation: DidRecordValidation::Disabled,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
             .await
@@ -2181,7 +2181,7 @@ mod tests {
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             delivery_jitter_ms: 0,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
         };
         let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
             .await

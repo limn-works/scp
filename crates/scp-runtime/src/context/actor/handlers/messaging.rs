@@ -193,6 +193,28 @@ pub(crate) async fn dispatch(
             signer,
             reply,
         } => handle_send_heartbeat(cell, deps, &context_id, &sender_did, &signer, reply).await,
+        MessagingCommand::RotatePseudonym {
+            context_id,
+            new_epoch,
+            new_routing_id,
+            sender_did,
+            signer,
+            reply,
+        } => {
+            handle_rotate_pseudonym(
+                cell,
+                deps,
+                &context_id,
+                RotateRequest {
+                    new_epoch,
+                    new_routing_id,
+                    sender_did: &sender_did,
+                    signer: &signer,
+                },
+                reply,
+            )
+            .await
+        }
         #[cfg(feature = "testing")]
         MessagingCommand::HandleSenderKeyRequest {
             context_id,
@@ -481,7 +503,13 @@ fn handle_seed_peer_pseudonym(
     let result = view.routing_mut().peer_registry_mut().map_or(
         Err(ContextError::NotPseudonymousContext { context_id }),
         |reg| {
-            reg.insert(member_did, pseudonym);
+            reg.insert(
+                member_did,
+                scp_protocol::context::pseudonym::PseudonymRecord {
+                    routing_id: pseudonym,
+                    epoch: None,
+                },
+            );
             Ok(())
         },
     );
@@ -974,10 +1002,16 @@ async fn handle_send_pseudonym_announcement(
         cell, deps, &handle, sender_did, signer,
     );
 
+    // The announcement seals an MLS message (send-ratchet advance) and may
+    // clear `announce_pending`, so every arm reports `mutated`.
     let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, send_fut)
         .await
     {
-        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "send_pseudonym_announcement exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
@@ -987,6 +1021,72 @@ async fn handle_send_pseudonym_announcement(
         }
     };
 
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// The rotation a [`MessagingCommand::RotatePseudonym`] carries, bundled so
+/// [`handle_rotate_pseudonym`] stays under the argument-count lint.
+struct RotateRequest<'a> {
+    new_epoch: u64,
+    new_routing_id: [u8; 32],
+    sender_did: &'a scp_did::DID,
+    signer: &'a crate::context::actor::signer::CommandSigner,
+}
+
+/// Handle [`MessagingCommand::RotatePseudonym`] (actor-shape).
+///
+/// Delegates to
+/// [`rotate_pseudonym`](crate::context::messaging_helpers::rotate_pseudonym)
+/// under [`SIGNING_HANDLER_TIMEOUT`], because the announcement signs through
+/// the custody signer, and replies with its result. An error reports
+/// `mutated` when the rotation state or the local routing ID changed (the
+/// rotation committed before an announcement error) and on a timeout, which
+/// can stop the helper part-way; a rejection or a restored persist failure
+/// changed nothing and reports no mutation.
+async fn handle_rotate_pseudonym(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    request: RotateRequest<'_>,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let before = (
+        cell.class_s.pseudonym_rotation,
+        cell.routing.local_pseudonym(),
+    );
+    let rotate_fut = crate::context::messaging_helpers::rotate_pseudonym(
+        cell,
+        deps,
+        request.sender_did,
+        request.signer,
+        request.new_epoch,
+        request.new_routing_id,
+    );
+    let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, rotate_fut)
+        .await
+    {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(err)) => {
+            let sketch = outcome_error_sketch(&err);
+            let after = (
+                cell.class_s.pseudonym_rotation,
+                cell.routing.local_pseudonym(),
+            );
+            if after == before {
+                (Outcome::err(sketch), Err(err))
+            } else {
+                (Outcome::err_mutated(sketch), Err(err))
+            }
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "rotate_pseudonym exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
     let _ = reply.send(reply_result);
     outcome
 }

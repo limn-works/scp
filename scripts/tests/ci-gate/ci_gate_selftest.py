@@ -285,6 +285,12 @@ nothing:
                on no leg, and every leg still passes. LEG_COMMANDS pins the
                commands each group ran before the split, and the check fails
                unless each event's legs run every pinned command exactly once.
+  linted-features
+               Code behind an off-by-default scp-transport or scp-node feature
+               that no `cargo clippy` command enables carries lint errors onto
+               main unseen. The check reports each `[features]` key of either
+               crate's Cargo.toml that no clippy command in ci.yml enables,
+               directly or through another feature of that crate.
   package-writers
                Job docker-image-cache writes the Docker layer cache to the
                ghcr.io tag `buildcache:docker-image` with the `docker-cache`
@@ -511,6 +517,7 @@ RUSTDOC_LINT_LEVEL = "forbid"
 # kind; remove one only alongside the job it names.
 WORKSPACE_SCOPED_JOBS = {
     ("ci.yml", "rust-clippy"),
+    ("ci.yml", "rust-deny"),
     ("ci.yml", "rust-doc"),
     ("ci.yml", "rust-doctest"),
     ("ci.yml", "rust-test"),
@@ -642,6 +649,7 @@ SHIPPED_CONFIG_LANES = {
 NON_BRIDGE_SHIPPED_ASSERTION_LANES = {
     "scp-identity": "fail-closed-pre-rotation",
     "scp-node": "fail-closed-pre-rotation",
+    "scp-transport": "rust-test-optional-features",
 }
 
 # Attributes that mark a Rust function as a test, and the attribute that
@@ -6849,7 +6857,10 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
                 f"cargo clippy -p scp-transport --features {TRANSPORT_FEATURES} --all-targets "
                 "-- -D warnings"
             ),
-            "cargo clippy -p scp-node --features quic,http3,udp,testing --all-targets -- -D warnings",
+            (
+                "cargo clippy -p scp-node --features quic,http3,udp,coap,upnp,testing --all-targets "
+                "-- -D warnings"
+            ),
             (
                 f"cargo clippy -p scp-platform --features {APPLE_FEATURES} --all-targets "
                 "-- -D warnings"
@@ -6858,6 +6869,15 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
             (
                 "cargo clippy -p scp-transport --features "
                 "sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings"
+            ),
+            "cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings",
+            (
+                "cargo clippy -p scp-transport --features push-store,testing --all-targets "
+                "-- -D warnings"
+            ),
+            (
+                "cargo clippy -p scp-transport --features combined,local-cache,push-store,"
+                "relay-persistence,testing,upnp --all-targets -- -D warnings"
             ),
             "cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings",
             "cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings",
@@ -8768,6 +8788,109 @@ def run_leg_commands(inputs: Inputs) -> None:
     check_leg_commands(inputs.workflow)
 
 
+# Crates whose off-by-default features gate code that only a clippy command
+# naming the feature compiles.
+LINTED_FEATURE_CRATES = ("scp-transport", "scp-node")
+# Features whose code compiles only for one target (webtransport/mod.rs gates
+# the client on `target_arch = "wasm32"`): only a clippy command passing
+# `--target` with that target lints them.
+TARGET_GATED_FEATURES = {("scp-transport", "webtransport-wasm"): "wasm32-unknown-unknown"}
+# Target-gated features no build compiles: scp-transport's unconditional
+# tokio-tungstenite dependency pulls mio, which fails to compile for
+# wasm32-unknown-unknown. The check fails once a command lints one, so the
+# entry goes when the build is fixed.
+UNBUILDABLE_FEATURES = (("scp-transport", "webtransport-wasm"),)
+
+
+def unlinted_features(
+    doc: dict, package: str, features: dict[str, list[str]], targets: dict[str, str] | None = None
+) -> list[str]:
+    """Return each feature of `package` that no `cargo clippy` command enables.
+
+    CRITERION: a feature counts as linted when some `cargo clippy` command in a
+    step of `doc` passes `--all-features` with `-p <package>`, names it (or a
+    feature of `package` that enables it, per `features`) in `--features` with
+    `-p <package>`, or names `<package>/<feature>`; a feature in `targets`
+    counts only from a command whose `--target` is its target.
+    """
+    if targets is None:
+        targets = {f: t for (p, f), t in TARGET_GATED_FEATURES.items() if p == package}
+    linted: set[str] = set()
+    for job in doc["jobs"].values():
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            for line in logical_lines(step.get("run") or ""):
+                tokens = line.split()
+                if tokens[:2] != ["cargo", "clippy"]:
+                    continue
+                own = package in [b for a, b in itertools.pairwise(tokens) if a == "-p"]
+                target = next((b for a, b in itertools.pairwise(tokens) if a == "--target"), None)
+                named: set[str] = set(features) if own and "--all-features" in tokens else set()
+                for flag, value in itertools.pairwise(tokens):
+                    if flag != "--features":
+                        continue
+                    for name in value.split(","):
+                        if name.startswith(f"{package}/"):
+                            named.add(name.removeprefix(f"{package}/"))
+                        elif own and "/" not in name:
+                            named.add(name)
+                built, pending = set(), [name for name in named if name in features]
+                while pending:
+                    name = pending.pop()
+                    if name not in built:
+                        built.add(name)
+                        pending.extend(dep for dep in features[name] if dep in features)
+                linted.update(name for name in built if targets.get(name, target) == target)
+    return sorted(name for name in features if name not in linted)
+
+
+def run_linted_features(inputs: Inputs) -> None:
+    print("linted-features — every feature of " + ", ".join(LINTED_FEATURE_CRATES) + " is in a clippy command")
+    for package in LINTED_FEATURE_CRATES:
+        manifest = REPO / "crates" / package / "Cargo.toml"
+        features = tomllib.loads(manifest.read_text())["features"]
+        missing = unlinted_features(inputs.workflow, package, features)
+        unbuildable = sorted(f for p, f in UNBUILDABLE_FEATURES if p == package)
+        for name in unbuildable:
+            print(f"  NOT LINTED: {package} feature {name}: no build compiles its target-gated code")
+        check(f"every buildable {package} feature is linted by a clippy command", missing == unbuildable, f"{missing}")
+    features = tomllib.loads((REPO / "crates/scp-transport/Cargo.toml").read_text())["features"]
+    check("the scp-transport manifest names upnp", "upnp" in features, f"{sorted(features)}")
+    mutant = copy.deepcopy(inputs.workflow)
+    for job in mutant["jobs"].values():
+        for step in job.get("steps") or []:
+            if isinstance(step, dict) and step.get("run"):
+                step["run"] = step["run"].replace("upnp", "")
+    missing = unlinted_features(mutant, "scp-transport", features)
+    check("a workflow that lints no upnp build is reported", missing == ["upnp", "webtransport-wasm"], f"{missing}")
+
+    def synthetic(command: str) -> dict:
+        return {"jobs": {"j": {"steps": [{"run": command}]}}}
+
+    missing = unlinted_features(synthetic("cargo clippy -p scp-transport --all-features"), "scp-transport", features)
+    check(
+        "host-target --all-features lints every scp-transport feature but webtransport-wasm",
+        missing == ["webtransport-wasm"],
+        f"{missing}",
+    )
+    toy = {"a": ["b"], "b": [], "c": []}
+    missing = unlinted_features(synthetic("cargo clippy -p x --features a"), "x", toy)
+    check("a feature another named feature enables counts as linted", missing == ["c"], f"{missing}")
+    missing = unlinted_features(synthetic("cargo clippy -p y --features a,c"), "x", toy)
+    check("another package's feature of the same name is not counted", missing == ["a", "b", "c"], f"{missing}")
+    missing = unlinted_features(synthetic("cargo clippy -p y --features x/c"), "x", toy)
+    check("a <package>/<feature> name counts for that package", missing == ["a", "b"], f"{missing}")
+    missing = unlinted_features(synthetic("cargo test -p x --features a,c"), "x", toy)
+    check("a command other than cargo clippy is not counted", missing == ["a", "b", "c"], f"{missing}")
+    wasm = {"a": "wasm32-unknown-unknown"}
+    missing = unlinted_features(synthetic("cargo clippy -p x --features a"), "x", toy, wasm)
+    check("a host-target command does not lint a wasm32-gated feature", missing == ["a", "c"], f"{missing}")
+    command = "cargo clippy -p x --features a --target wasm32-unknown-unknown"
+    missing = unlinted_features(synthetic(command), "x", toy, wasm)
+    check("a wasm32-target command lints a wasm32-gated feature", missing == ["c"], f"{missing}")
+
+
 def run_empty_input(inputs: Inputs) -> None:
     documents = inputs.documents
     print(
@@ -9559,6 +9682,7 @@ CHECKS: dict[str, Callable[[Inputs], None]] = {
     "win-shell": run_win_shell,
     "matrix-axis": run_matrix_axis,
     "leg-commands": run_leg_commands,
+    "linted-features": run_linted_features,
     "empty-input": run_empty_input,
     "downloaded-module": run_downloaded_module,
     "downloaded-addon": run_downloaded_addon,
@@ -9614,6 +9738,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "win-shell",
         "matrix-axis",
         "leg-commands",
+        "linted-features",
         "empty-input",
         "downloaded-module",
         "downloaded-addon",

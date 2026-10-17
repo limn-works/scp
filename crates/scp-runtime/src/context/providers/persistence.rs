@@ -214,6 +214,9 @@ mod tests {
             checkpoint_last_time_secs: 0,
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
+            relay_urls: Vec::new(),
+            pseudonym_rotation:
+                crate::context::actor::pseudonym_rotation::PseudonymRotationState::default(),
             saga_pending: std::collections::HashMap::new(),
             xctx_committed_outputs: std::collections::HashMap::new(),
             xctx_committed_stream_outputs: std::collections::HashMap::new(),

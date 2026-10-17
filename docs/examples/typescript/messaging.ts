@@ -133,7 +133,6 @@ export async function messagingExample(
       alice.did,
       bob.did,
       reservation.keyPackagePublic,
-      [relayUrl],
     );
     const bobCtx = await bobNode.contextJoinFromWelcome(
       bob.did,

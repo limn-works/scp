@@ -117,6 +117,7 @@ fun messagingExample(
             consequenceRulesJson = null,
             consequenceConfigJson = null,
             capabilityRequirementsJson = null,
+            pseudonymRotation = null,
         )
     val aliceHandle = aliceNode.contextCreate(alice, params)
 
@@ -129,7 +130,6 @@ fun messagingExample(
             contextId = aliceHandle.contextId(),
             inviteeDid = bob.did(),
             inviteeKeyPackage = reservation.keyPackagePublic,
-            relayUrls = listOf(relayUrl),
         )
     val bundle =
         when (outcome) {

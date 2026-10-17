@@ -16,6 +16,54 @@ fn node_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_scp-node"))
 }
 
+/// A command that runs `scp-node` with `SCP_RELAY_URL` set and
+/// `SCP_RELAY_PUSH_PLATFORMS=none`. A `--relay-only` node refuses to start
+/// without either, so each test reaches the configuration it tests. A full
+/// node reads neither variable.
+fn node_command() -> Command {
+    let mut command = Command::new(node_bin());
+    command
+        .env("SCP_RELAY_URL", "wss://relay.example/scp/v1")
+        .env("SCP_RELAY_PUSH_PLATFORMS", "none");
+    command
+}
+
+/// PUSH-012: a `--relay-only` node selects push as `scp-relay` does, so an
+/// unset `SCP_RELAY_PUSH_PLATFORMS` makes it exit 1 naming the variable and
+/// SCP-CAPSEL-8000 before it opens its blob store, and a push platform with no
+/// push store makes it exit 1 too.
+#[test]
+fn relay_only_requires_a_push_selection() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("must-not-exist.db");
+    for (value, named) in [
+        (None, "SCP_RELAY_PUSH_PLATFORMS is unset or empty"),
+        (Some("apns"), "SCP_RELAY_PUSH_STORE"),
+    ] {
+        let mut command = node_command();
+        command
+            .arg("--relay-only")
+            .current_dir(tmp.path())
+            .env("SCP_RELAY_STORAGE_BACKEND", "sqlite")
+            .env("SCP_RELAY_STORAGE_PATH", &db_path)
+            .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
+            .env_remove("SCP_RELAY_PUSH_STORE")
+            .env_remove("RUST_LOG");
+        match value {
+            Some(v) => command.env("SCP_RELAY_PUSH_PLATFORMS", v),
+            None => command.env_remove("SCP_RELAY_PUSH_PLATFORMS"),
+        };
+        let output = output_within_deadline(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{value:?}: {stderr}");
+        assert!(stderr.contains(named), "{value:?}: {stderr}");
+        if value.is_none() {
+            assert!(stderr.contains("SCP-CAPSEL-8000"), "{stderr}");
+        }
+        assert!(!db_path.exists(), "{value:?} opened {}", db_path.display());
+    }
+}
+
 /// Runs `command` and returns its output, killing the child and failing the
 /// test when it has not exited after 30 seconds.
 ///
@@ -80,7 +128,7 @@ fn a_cloud_backend_fails_closed() {
             let blob_db = tmp.path().join("blobs.db");
             let node_storage = tmp.path().join("node-storage");
             let output = output_within_deadline(
-                Command::new(node_bin())
+                node_command()
                     .args(mode)
                     .current_dir(tmp.path())
                     .env("SCP_NODE_DOMAIN", "example.com")
@@ -133,7 +181,7 @@ fn a_fixed_store_mode_rejects_a_cloud_backend() {
         for backend in ["postgres", "s3", "POSTGRES", "S3"] {
             let tmp = tempfile::tempdir().expect("tempdir");
             let output = output_within_deadline(
-                Command::new(node_bin())
+                node_command()
                     .arg(flag)
                     .current_dir(tmp.path())
                     .env("SCP_NODE_DOMAIN", "example.com")
@@ -169,7 +217,7 @@ fn an_unset_or_empty_backend_fails_closed() {
             let tmp = tempfile::tempdir().expect("tempdir");
             let blob_db = tmp.path().join("blobs.db");
             let node_storage = tmp.path().join("node-storage");
-            let mut command = Command::new(node_bin());
+            let mut command = node_command();
             command
                 .args(mode)
                 .current_dir(tmp.path())
@@ -219,7 +267,7 @@ fn a_sqlite_backend_without_an_absolute_path_fails_closed() {
             let work = tmp.path().join("work");
             std::fs::create_dir(&work).expect("create work dir");
             let node_storage = tmp.path().join("node-storage");
-            let mut command = Command::new(node_bin());
+            let mut command = node_command();
             command
                 .args(mode)
                 .current_dir(&work)

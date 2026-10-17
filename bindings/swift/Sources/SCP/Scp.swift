@@ -468,13 +468,15 @@ public extension SCP {
     /// capability in the context's ceiling, so the creator can invite only
     /// when that ceiling includes `governance:propose`.
     ///
+    /// The bundle carries the context's stored relay set (§5.12.3.1
+    /// `relay_urls`), which the runtime reads; the caller supplies none.
+    ///
     /// ```swift
     /// let outcome = try await scp.inviteMember(
     ///     identity: creator,
     ///     contextId: ctx.contextId,
     ///     inviteeDid: invitee.did(),
-    ///     inviteeKeyPackage: reservation.keyPackagePublic,
-    ///     relayUrls: []
+    ///     inviteeKeyPackage: reservation.keyPackagePublic
     /// )
     /// // Destructure the native `.sealed` case; `bundle` is directly usable as
     /// // the join input — no manual re-assembly:
@@ -494,7 +496,6 @@ public extension SCP {
     ///   - inviteeDid: The DID of the member being invited.
     ///   - inviteeKeyPackage: The invitee's PUBLIC MLS `KeyPackage` bytes (from
     ///     the invitee's ``reserveKeyPackage(identity:)``).
-    ///   - relayUrls: Relay URLs the runtime may publish the sealed bundle to.
     /// - Returns: The native ``InviteMemberOutcome`` — the `.sealed` case
     ///   carrying the sealed `bundle` and the `delivered` flag.
     /// - Throws: ``ScpError/Identity(msg:code:)`` if the inviter is not locally
@@ -506,15 +507,13 @@ public extension SCP {
         identity: Identity,
         contextId: String,
         inviteeDid: String,
-        inviteeKeyPackage: Data,
-        relayUrls: [String]
+        inviteeKeyPackage: Data
     ) async throws -> InviteMemberOutcome {
         try await inner.inviteMember(
             identity: identity,
             contextId: contextId,
             inviteeDid: inviteeDid,
-            inviteeKeyPackage: inviteeKeyPackage,
-            relayUrls: relayUrls
+            inviteeKeyPackage: inviteeKeyPackage
         )
     }
 
@@ -1081,7 +1080,7 @@ public extension SCP {
     /// the joiner's private signer state never leaves the native core. Hand
     /// those public bytes to the context creator (out of band); the creator
     /// seals a signed invitation bundle addressed to this reservation via
-    /// ``inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:relayUrls:)``,
+    /// ``inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:)``,
     /// then you pass ``ReservedKeyPackage/reservationId`` and the
     /// ``SealedInvitation`` to
     /// ``Context/joinFromWelcome(scp:identity:sealed:reservationId:)``.

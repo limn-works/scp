@@ -207,7 +207,10 @@ class PyContextHandle:
 class PyContextParams:
     """Context creation parameters."""
 
-    ...
+    @property
+    def pseudonym_rotation(self) -> dict[str, Any] | None:
+        """Spec 09 §9.10.4.1 rotation policy: ``interval_secs`` and ``on_membership_change``."""
+        ...
 
 class PyMessage:
     """An incoming protocol message."""
@@ -526,12 +529,7 @@ class SCP:
         self, owning_did: Any, sealed: PySealedInvitation, reservation_id: Any
     ) -> Any: ...
     def invite_member(
-        self,
-        context_id: Any,
-        creator_did: Any,
-        invitee_did: Any,
-        invitee_key_package: Any,
-        relay_urls: Any,
+        self, context_id: Any, creator_did: Any, invitee_did: Any, invitee_key_package: Any
     ) -> PyInviteMemberOutcome: ...
     def context_leave(self, handle: Any, identity_did: Any) -> Any: ...
     def context_member_count(self, handle: Any) -> Any: ...
@@ -679,6 +677,7 @@ class SCP:
     ) -> Any: ...
 
     # -- server --
+    def node_start(self, config_json: str) -> NodeHandle: ...
     def node_start_in_memory(self, identity_did: Any = ...) -> Any: ...
     def node_start_local(
         self, data_dir: Any, identity_did: Any = ..., passphrase: Any = ...

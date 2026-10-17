@@ -43,8 +43,9 @@ use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::actor::commands::{
     BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
-    MessagingCommand, OutletsCommand, PrepareAOutcome, PrepareBOutcome, QueriesCommand, SagaReject,
-    StandingCommand, TrustRecoveryCommand, TtlCloseCommand, saga_reject,
+    MessagingCommand, OutletsCommand, PrepareAOutcome, PrepareBOutcome, PushCommand,
+    QueriesCommand, SagaReject, StandingCommand, TrustRecoveryCommand, TtlCloseCommand,
+    saga_reject,
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::outcome::Outcome;
@@ -934,6 +935,10 @@ const CRASH_POISON_THRESHOLD: usize = 3;
 /// keeps the structure O(1) in space regardless of clock behaviour.
 const CRASH_DEQUE_CAP: usize = CRASH_POISON_THRESHOLD;
 
+/// The `crash_windows` key prefix of a per-identity KeyPackage actor's window
+/// ([`Supervisor::kp_crash_key`]); no context ID starts with it.
+const KP_CRASH_KEY_PREFIX: &str = "kp::";
+
 /// Per-context crash-count window (ADR-049 §10 — actor respawn budget).
 ///
 /// Tracks the wall-clock-millisecond timestamps of recent actor crashes
@@ -1072,6 +1077,14 @@ impl CrashWindow {
     /// budget — but it is no longer "silently dead".
     const fn mark_respawn_succeeded(&mut self) {
         self.last_respawn_failed = false;
+    }
+
+    /// Whether the window records a context whose actor is down: poisoned,
+    /// its last respawn failed, or mid-respawn. [`Supervisor::lookup_miss_error`]
+    /// returns `ContextPoisoned` or `ActorCrashed` for exactly these windows,
+    /// and [`Supervisor::known_context_ids`] lists their context IDs.
+    const fn actor_down(&self) -> bool {
+        self.poisoned || self.last_respawn_failed || self.respawning
     }
 
     /// Whether the context is mid-respawn (despawned, not yet re-registered).
@@ -1960,8 +1973,11 @@ pub struct Supervisor {
     // -----------------------------------------------------------------
     /// Shared crypto provider. Populated by [`Self::with_providers_and_journal`].
     crypto: OnceLock<Arc<crate::crypto::mls::provider::NodeMlsFactory>>,
-    /// Shared transport provider. Populated by [`Self::with_providers_and_journal`].
-    transport: OnceLock<Arc<dyn ContextTransportProvider>>,
+    /// Shared transport binding. Populated by [`Self::with_providers_and_journal`]
+    /// with a [`TransportSlot`](super::TransportSlot) around the caller's
+    /// provider. The `OnceLock` is set once; the provider inside the slot is
+    /// rebound through an `ArcSwap` (lock-free read per ADR-049 Decision 12).
+    transport: OnceLock<Arc<super::TransportSlot>>,
     /// Shared event-log provider. Populated by [`Self::with_providers_and_journal`].
     event_log: OnceLock<Arc<dyn ContextEventLogProvider>>,
     /// Helper-side persistence slot. [`Self::with_providers_and_journal`]
@@ -2628,7 +2644,9 @@ impl Supervisor {
         // is already populated, which is impossible on this freshly-constructed
         // supervisor; `let _ =` discards the `Result` for clippy.
         let _ = supervisor.crypto.set(crypto);
-        let _ = supervisor.transport.set(Arc::from(transport));
+        let _ = supervisor
+            .transport
+            .set(Arc::new(super::TransportSlot::new(Arc::from(transport))));
         let _ = supervisor.event_log.set(Arc::from(event_log));
         if let Some(p) = helper_persistence {
             let _ = supervisor.helper_persistence.set(p);
@@ -2771,12 +2789,27 @@ impl Supervisor {
         self.crypto.get()
     }
 
-    /// Cheap reference to the supervisor's shared
-    /// [`ContextTransportProvider`]. Returns `None` if
+    /// The supervisor's shared [`ContextTransportProvider`]: its
+    /// [`TransportSlot`](super::TransportSlot), whose calls reach the
+    /// provider bound at call time. Returns `None` if
     /// [`Self::with_providers_and_journal`] was not used.
     #[must_use]
-    pub(crate) fn transport_ref(&self) -> Option<&Arc<dyn ContextTransportProvider>> {
-        self.transport.get()
+    pub(crate) fn transport_ref(&self) -> Option<Arc<dyn ContextTransportProvider>> {
+        self.transport
+            .get()
+            .map(|slot| Arc::clone(slot) as Arc<dyn ContextTransportProvider>)
+    }
+
+    /// This supervisor's [`TransportSlot`](super::TransportSlot), through which
+    /// a bridge binds the transport of the node it starts
+    /// (`construction.md` §"Node start — `NodeStartConfig`"). Every actor
+    /// this supervisor spawned holds the same slot, so a
+    /// [`TransportSlot::replace`](super::TransportSlot::replace) reaches
+    /// running contexts without a respawn. Returns `None` for a supervisor
+    /// built without providers.
+    #[must_use]
+    pub fn transport_slot(&self) -> Option<Arc<super::TransportSlot>> {
+        self.transport.get().map(Arc::clone)
     }
 
     /// Cheap reference to the supervisor's shared
@@ -3170,7 +3203,7 @@ impl Supervisor {
     /// (context keys are hex context-ids / original id strings, neither of
     /// which start with `kp::`).
     fn kp_crash_key(identity: &DID) -> String {
-        format!("kp::{}", identity.0)
+        format!("{KP_CRASH_KEY_PREFIX}{}", identity.0)
     }
 
     /// The sticky typed error a poisoned KeyPackage actor surfaces on the next
@@ -3238,7 +3271,7 @@ impl Supervisor {
 
         let crypto = self.crypto_ref().ok_or_else(not_init)?;
         let mls = Arc::clone(crypto.mls_backend());
-        let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
+        let transport = self.transport_ref().ok_or_else(not_init)?;
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
         let mls_storage = Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?);
         Ok(
@@ -3342,7 +3375,7 @@ impl Supervisor {
         // mls/hpke stay transitive — the NodeMlsFactory owns the only
         // backend pair (ADR §6); no Supervisor field mirrors them.
         let mls = Arc::clone(crypto.mls_backend());
-        let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
+        let transport = self.transport_ref().ok_or_else(not_init)?;
         let event_log = Arc::clone(self.event_log_ref().ok_or_else(not_init)?);
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
         let key_resolver = self.key_resolver_ref().ok_or_else(not_init)?.clone();
@@ -3739,6 +3772,7 @@ impl Supervisor {
                     p.params,
                     p.creator_did,
                     p.local_pseudonym,
+                    p.relay_urls,
                 );
                 // `Box::pin` the create future: owned-state spawn keeps the
                 // freshly built `PerContextState` live across the spawn
@@ -4834,6 +4868,7 @@ impl Supervisor {
             // through `lookup_miss_error` so a poisoned / silently-dead
             // context surfaces the dedicated poison error (ADR-049 §10).
             QueriesCommand::LocalPseudonym { ref context_id, .. }
+            | QueriesCommand::LocalRoutingIds { ref context_id, .. }
             | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. }
             | QueriesCommand::GetCapabilityRequirements { ref context_id, .. } => {
                 let err = self
@@ -4855,6 +4890,7 @@ impl Supervisor {
             | QueriesCommand::MemberDids { .. }
             | QueriesCommand::MemberRole { .. }
             | QueriesCommand::ContextParams { .. }
+            | QueriesCommand::RelayUrls { .. }
             | QueriesCommand::GetRoleState { .. }
             | QueriesCommand::HasEstablishedOutletInterface { .. }
             | QueriesCommand::PendingCommits { .. }
@@ -4926,6 +4962,24 @@ impl Supervisor {
     #[must_use]
     pub(in crate::context) fn actor_ids(&self) -> Vec<String> {
         self.actors.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Returns every context ID the supervisor knows: each registered actor's,
+    /// plus each context whose actor is down ([`CrashWindow::actor_down`]),
+    /// for which [`Self::lookup_miss_error`] returns `ContextPoisoned` or
+    /// `ActorCrashed`. KeyPackage-actor windows (`kp::` keys) are not contexts
+    /// and are left out. Sorted, without duplicates.
+    #[must_use]
+    pub(in crate::context) fn known_context_ids(&self) -> Vec<String> {
+        let mut ids: std::collections::BTreeSet<String> =
+            self.actors.iter().map(|e| e.key().clone()).collect();
+        ids.extend(
+            self.crash_windows
+                .iter()
+                .filter(|e| !e.key().starts_with(KP_CRASH_KEY_PREFIX) && e.value().actor_down())
+                .map(|e| e.key().clone()),
+        );
+        ids.into_iter().collect()
     }
 
     /// Spawn a new `ContextActor` task that owns drained
@@ -5919,13 +5973,14 @@ impl Supervisor {
     ///    [`ContextError::ContextNotRegistered`] with the caller's
     ///    diagnostic message.
     fn lookup_miss_error(&self, ctx_id: &str, not_registered_msg: String) -> ContextError {
-        if let Some(window) = self.crash_windows.get(ctx_id) {
-            if window.is_poisoned() {
-                return ContextError::ContextPoisoned(ctx_id.to_owned());
-            }
-            if window.last_respawn_failed() || window.is_respawning() {
-                return ContextError::ActorCrashed(ctx_id.to_owned());
-            }
+        if let Some(window) = self.crash_windows.get(ctx_id)
+            && window.actor_down()
+        {
+            return if window.is_poisoned() {
+                ContextError::ContextPoisoned(ctx_id.to_owned())
+            } else {
+                ContextError::ActorCrashed(ctx_id.to_owned())
+            };
         }
         ContextError::ContextNotRegistered(not_registered_msg)
     }
@@ -6436,9 +6491,10 @@ impl Supervisor {
             StandingCommand::StandingContext {
                 local_did,
                 peer_did,
+                relay_urls,
                 reply,
             } => {
-                let fut = self.standing_context(&local_did, &peer_did);
+                let fut = self.standing_context(&local_did, &peer_did, relay_urls);
                 let (outcome, reply_result) =
                     match tokio::time::timeout(STANDING_TIMEOUT, fut).await {
                         Ok(Ok(ctx_id)) => (Outcome::ok_mutated(()), Ok(ctx_id)),
@@ -10957,16 +11013,10 @@ impl Supervisor {
 
     /// Register a DID as locally controlled by this node / SDK.
     ///
-    /// Idempotent: registering the same DID twice is a no-op.
-    ///
-    /// # Errors
-    ///
-    /// Currently always returns `Ok(())` — the `Result` shape preserves
-    /// the legacy method's signature so callers can keep their
-    /// `?`-style propagation untouched.
-    pub async fn register_local_did(&self, did: DID) -> Result<(), ContextError> {
+    /// Idempotent: registering the same DID twice is a no-op. Infallible: the
+    /// registration is an insert into the supervisor-wide local-DID set.
+    pub async fn register_local_did(&self, did: DID) {
         crate::context::queries_helpers::register_local_did(self, did).await;
-        Ok(())
     }
 
     /// Returns `true` iff `did` is registered as locally controlled.
@@ -11839,6 +11889,7 @@ impl Supervisor {
         self: &Arc<Self>,
         local_did: &DID,
         peer_did: &DID,
+        relay_urls: Vec<String>,
     ) -> Result<String, ContextError> {
         use scp_protocol::context::ContextState;
 
@@ -11941,6 +11992,9 @@ impl Supervisor {
                 params,
                 local_did.clone(),
                 None,
+                // §5.12.3.1: the local identity's relays host the recreated
+                // standing context (PUSH-025).
+                relay_urls,
             ))
             .await
             .map(|_handle| ())
@@ -12276,6 +12330,46 @@ impl Supervisor {
         })?
     }
 
+    /// Rotates the local member's pseudonym in `context_id` to
+    /// `new_routing_id` at `new_epoch` (spec 09 §9.10.4.1). Routes through
+    /// the actor mailbox via [`Self::dispatch_command`].
+    ///
+    /// The caller (the bridge rotation driver) derives `new_routing_id` with
+    /// `KeyCustody::derive_rotatable_pseudonym` at the epoch
+    /// [`Self::local_routing_ids`] reports as `next_pseudonym_epoch`, and
+    /// subscribes to it first. The actor persists the rotation fail-closed,
+    /// emits `ContextEvent::LocalPseudonymRotated`, and announces.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the typed [`ContextError`] of
+    /// [`messaging_helpers::rotate_pseudonym`](crate::context::messaging_helpers::rotate_pseudonym);
+    /// [`ContextError::TransportFailed`] if the reply channel is dropped.
+    pub async fn rotate_pseudonym(
+        &self,
+        context_id: &str,
+        sender_did: &DID,
+        signer: &crate::context::actor::signer::CommandSigner,
+        new_epoch: u64,
+        new_routing_id: [u8; 32],
+    ) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::RotatePseudonym {
+            context_id: context_id.to_owned(),
+            new_epoch,
+            new_routing_id,
+            sender_did: sender_did.clone(),
+            signer: signer.clone(),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::rotate_pseudonym — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Compares a remote consistency checkpoint against local event-log
     /// state for equivocation detection (§9.9.3). Routes through the actor
     /// mailbox via [`Self::dispatch_command`].
@@ -12572,6 +12666,25 @@ impl Supervisor {
     ) -> Option<scp_protocol::context::ContextParams> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = QueriesCommand::ContextParams {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return None;
+        }
+        match bounded_reply_await(rx).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
+    /// Returns the context's stored relay set (§5.12.3.1 `relay_urls`), or
+    /// `None` when the context is unknown or its actor could not be reached.
+    /// Routes through the actor mailbox via [`Self::dispatch_query`].
+    #[must_use]
+    pub async fn context_relay_urls(&self, context_id: &str) -> Option<Vec<String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::RelayUrls {
             context_id: context_id.to_owned(),
             reply: tx,
         };
@@ -14643,12 +14756,17 @@ impl Supervisor {
     /// when `params.ceiling` is empty (construction.md M2); the context is
     /// not created. A dropped reply channel maps to
     /// [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed).
+    ///
+    /// `relay_urls` names the relays that host the context (§5.12.3.1): the
+    /// creator's relays. The actor stores the set (PUSH-025); an empty set
+    /// states that no relay hosts the context.
     pub async fn create_context(
         self: &Arc<Self>,
         context_id: String,
         params: scp_protocol::context::ContextParams,
         creator_did: DID,
         local_pseudonym: Option<[u8; 32]>,
+        relay_urls: Vec<String>,
     ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -14657,6 +14775,7 @@ impl Supervisor {
             params,
             creator_did,
             local_pseudonym,
+            relay_urls,
         });
         let cmd = LifecycleCommand::CreateContext { payload, reply: tx };
         if let Err(e) = self.dispatch_lifecycle_command(cmd).await {
@@ -14764,7 +14883,8 @@ impl Supervisor {
     ///    added member is left without the sealed Welcome.
     /// 4. Assembles the bundle: genesis `context_params`, the visibility-filtered
     ///    [`MetadataSnapshot`](scp_protocol::context::metadata::MetadataSnapshot),
-    ///    `relay_urls`, and the §9.10.4.B `context_metadata_key`.
+    ///    the context's stored `relay_urls`, and the §9.10.4.B
+    ///    `context_metadata_key`.
     /// 5. Signs it over
     ///    [`invitation_bundle_signing_hash`](scp_protocol::context::InvitationBundle::invitation_bundle_signing_hash)
     ///    with the creator's `#active` key — the SAME `proposer_signing_key`
@@ -14824,7 +14944,6 @@ impl Supervisor {
         creator_did: DID,
         invitee_did: DID,
         invitee_key_package: Vec<u8>,
-        relay_urls: Vec<String>,
         proposer_signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<InviteMemberOutcome, ContextError> {
         use rand::RngCore as _;
@@ -14867,6 +14986,15 @@ impl Supervisor {
                     .to_owned(),
             ));
         }
+
+        // The bundle carries the context's stored relay set (§5.12.3.1
+        // `relay_urls`) and no caller-supplied list, so every member stores
+        // the set the inviter holds.
+        let relay_urls = self.context_relay_urls(&context_id).await.ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "invite_member: no live context '{context_id}'"
+            ))
+        })?;
 
         // 2. Resolve the invitee's #active key -> X25519 recipient.
         let resolver = self.key_resolver_ref().ok_or_else(|| {
@@ -15400,6 +15528,9 @@ impl Supervisor {
         let context_id = bundle.context_id.clone();
         let creator_did = bundle.creator_did.clone();
         let params = bundle.context_params.clone();
+        // §5.12.3.1: the creator-signed bundle names the relays that host the
+        // context; the joiner stores that set (PUSH-025).
+        let relay_urls = bundle.relay_urls.clone();
         let welcome_bytes = bundle.welcome_message.clone();
 
         // ---- REVERSIBLE PRECHECKS (before the irreversible ConfirmConsume) ----
@@ -15474,6 +15605,14 @@ impl Supervisor {
         // the checks hold on both sides of the invitation (GitHub #2250).
         crate::context::state::validate_genesis_outlets(&params.outlets)
             .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+        // §9.10.4.1 validity criterion. Creation and the governance action both
+        // reject an invalid rotation policy; a joiner's `params` arrive from a
+        // peer, so apply the same criterion before the consume.
+        if let Some(policy) = &params.pseudonym_rotation {
+            policy
+                .validate()
+                .map_err(|e| ContextError::CreationFailed(e.to_string()))?;
+        }
 
         // Build the joiner's actor deps (crypto, transport, event log, KP store,
         // mls_storage, persistence, capability token) for the owning identity.
@@ -15645,9 +15784,12 @@ impl Supervisor {
                     //    tear down.
                     let mut state = match Self::build_welcome_joiner_state(
                         &deps,
-                        &context_id,
-                        &params,
-                        &creator_did,
+                        WelcomeBundleFacts {
+                            context_id: &context_id,
+                            params: &params,
+                            creator_did: &creator_did,
+                            relay_urls: &relay_urls,
+                        },
                         &owning_did,
                         local_pseudonym,
                         joined_epoch,
@@ -15895,15 +16037,20 @@ impl Supervisor {
     #[allow(clippy::too_many_lines)]
     fn build_welcome_joiner_state(
         deps: &crate::context::actor::deps::ActorDeps,
-        context_id: &str,
-        params: &scp_protocol::context::ContextParams,
-        creator_did: &DID,
+        bundle: WelcomeBundleFacts<'_>,
         joiner_did: &DID,
         local_pseudonym: [u8; 32],
         joined_epoch: u64,
     ) -> Result<crate::context::actor::state::PerContextState, ContextError> {
         use scp_protocol::context::roles::{CapabilityCeiling, ContextRoleState};
         use std::collections::{HashMap, HashSet, VecDeque};
+
+        let WelcomeBundleFacts {
+            context_id,
+            params,
+            creator_did,
+            relay_urls,
+        } = bundle;
 
         // NOTE: the reversible legible-param validations
         // (`check_version_compatibility` / `validate_governance_model`) are run by
@@ -16022,6 +16169,10 @@ impl Supervisor {
             checkpoints: Vec::new(),
             last_seen_remote_checkpoint: std::collections::HashMap::new(),
             routing,
+            // §5.12.3.1: the bundle's relays host the context (PUSH-025).
+            relay_urls: crate::context::lifecycle_helpers::normalize_relay_urls(
+                relay_urls.to_vec(),
+            ),
             send_tracker: crate::context::actor::sequence::SendSequenceTracker::new(),
             recv_tracker: crate::context::actor::state::RecvSequenceTracker::new(),
             xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
@@ -16038,6 +16189,18 @@ impl Supervisor {
                 caveat_counters: HashMap::new(),
                 // Fix-D streaming reservation recovery: a fresh joiner carries none.
                 stream_reservations: HashMap::new(),
+                // §9.10.4.1 "First v2 derivation": under a policy a joiner's
+                // first rotation, to v2 at the schedule index, is due at once.
+                // The invitation bundle carries no copy of the creator's T0, and
+                // `creation_timestamp_secs` above is this joiner's clock, so the
+                // joiner holds no T0: under an interval policy no rotation is
+                // admissible rather than one off the members' shared boundaries.
+                pseudonym_rotation:
+                    crate::context::actor::pseudonym_rotation::PseudonymRotationState::joined(
+                        params.pseudonym_rotation.as_ref(),
+                        None,
+                        deps.clock.now_secs(),
+                    ),
             },
             // Transient join-handshake state; the fused join already consumed
             // it, so a fresh joiner state carries none.
@@ -16089,6 +16252,7 @@ impl Supervisor {
         config: crate::context::config::ContextConfig,
         creator_did: DID,
         local_pseudonym: Option<[u8; 32]>,
+        relay_urls: Vec<String>,
     ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
     {
         // Fail loud, never silent (AGENTS.md "no silent" tenet): a supplied
@@ -16102,7 +16266,7 @@ impl Supervisor {
                 scp_protocol::context::builder::ContextCreationError::BilateralPeerNotSupported,
             );
         }
-        self.create_context(context_id, params, creator_did, local_pseudonym)
+        self.create_context(context_id, params, creator_did, local_pseudonym, relay_urls)
             .await
     }
 
@@ -16934,6 +17098,129 @@ impl Supervisor {
         })?
     }
 
+    /// Dispatch a read-only [`PushCommand`] to `ctx_id`'s actor mailbox, where
+    /// `handlers::push::dispatch` answers it from `push_helpers`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`], [`ContextError::ContextPoisoned`]
+    ///   or [`ContextError::ActorCrashed`] when no actor serves `ctx_id`.
+    /// - [`ContextError::ActorBusy`] from the mailbox send.
+    pub async fn dispatch_push_command(
+        &self,
+        ctx_id: &str,
+        cmd: PushCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let actor = self.lookup(ctx_id).ok_or_else(|| {
+            self.lookup_miss_error(
+                ctx_id,
+                format!("dispatch_push_command — no actor registered for context_id `{ctx_id}`"),
+            )
+        })?;
+        Self::dispatch_via_mailbox(&actor, ContextCommand::Push(cmd)).await
+    }
+
+    /// Returns the routing IDs this device registers for push wakes, grouped by
+    /// canonical relay URL (`10-infrastructure-and-self-hosting.md` §10.7.1,
+    /// `09-security-model.md` §9.18.2).
+    ///
+    /// Asks every context in [`Self::known_context_ids`] for its push routes
+    /// through [`Self::dispatch_push_command`], concurrently. Each context adds
+    /// its shared routing ID and, in an encrypted context, this device's
+    /// current pseudonym routing ID (§9.10.4) under the canonical form of every
+    /// relay in its relay set, so two spellings of one relay share one key.
+    /// The result holds no context ID. A context that is `Closed`, `Expired`
+    /// or `Tombstoned`, or whose actor was removed with no crash record after
+    /// the IDs were read, adds nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails rather than return a partial set, because a registration built
+    /// from a partial set would silently drop the wakes for the missing
+    /// contexts:
+    /// - [`ContextError::ContextPoisoned`] or [`ContextError::ActorCrashed`]
+    ///   when a context's actor is down;
+    /// - [`ContextError::ActorBusy`] from a mailbox send;
+    /// - [`ContextError::TransportFailed`] when an actor drops its reply or
+    ///   does not answer within the reply bound.
+    ///
+    /// A relay URL with no §9.18.2 canonical form gets no entry, because
+    /// §9.18.2 derives no reserved push routing ID for it. The query still
+    /// returns the routing IDs of every other relay and context.
+    pub async fn push_routing_ids(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<String, std::collections::BTreeSet<[u8; 32]>>,
+        ContextError,
+    > {
+        let replies = futures::future::join_all(self.known_context_ids().into_iter().map(
+            |ctx_id| async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                match self
+                    .dispatch_push_command(&ctx_id, PushCommand::Routes { reply: tx })
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(ContextError::ContextNotRegistered(_)) => return Ok(None),
+                    Err(err) => return Err(err),
+                }
+                bounded_reply_await(rx).await.map_err(|_| {
+                    ContextError::TransportFailed(format!(
+                        "Supervisor::push_routing_ids — no reply from the actor of `{ctx_id}`"
+                    ))
+                })
+            },
+        ))
+        .await;
+        let mut by_relay =
+            std::collections::BTreeMap::<String, std::collections::BTreeSet<[u8; 32]>>::new();
+        for routes in replies {
+            let Some(routes) = routes? else { continue };
+            for relay_url in routes.relay_urls {
+                // §9.18.2: a URL that a step rejects has no canonical URL, so
+                // the client derives no reserved push routing ID for it.
+                let Ok(canonical) = scp_protocol::discovery::push::canonical_relay_url(&relay_url)
+                else {
+                    continue;
+                };
+                by_relay
+                    .entry(canonical)
+                    .or_default()
+                    .extend(routes.routing_ids.iter().copied());
+            }
+        }
+        Ok(by_relay)
+    }
+
+    /// Returns the local member's routing IDs and rotation state (spec 09
+    /// §9.10.4.1) for `context_id`: the current routing ID, the previous one
+    /// while its grace runs, the epoch, the epoch the next rotation must
+    /// carry, and whether an announcement is pending. Routes through the
+    /// actor mailbox via [`Self::dispatch_query`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotPseudonymousContext`] for a broadcast context.
+    /// - [`ContextError::ContextNotRegistered`] (or the poison error) for an
+    ///   unknown context.
+    /// - [`ContextError::TransportFailed`] if the reply channel is dropped.
+    pub async fn local_routing_ids(
+        &self,
+        context_id: &str,
+    ) -> Result<crate::context::actor::pseudonym_rotation::LocalRoutingIds, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::LocalRoutingIds {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_query(cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::local_routing_ids — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Returns every commit currently in the per-context retry queue.
     /// Soft-default contract: empty `Vec` on unknown context or
     /// mailbox failure. Routes through the actor mailbox via
@@ -17256,12 +17543,14 @@ impl Supervisor {
             QueriesCommand::ReadContextState { context_id, .. }
             | QueriesCommand::LocalPseudonym { context_id, .. }
             | QueriesCommand::GetCapabilityRequirements { context_id, .. }
+            | QueriesCommand::LocalRoutingIds { context_id, .. }
             | QueriesCommand::GetBroadcastKeyForLocalAuthor { context_id, .. }
             | QueriesCommand::MemberCount { context_id, .. }
             | QueriesCommand::IsMember { context_id, .. }
             | QueriesCommand::MemberDids { context_id, .. }
             | QueriesCommand::MemberRole { context_id, .. }
             | QueriesCommand::ContextParams { context_id, .. }
+            | QueriesCommand::RelayUrls { context_id, .. }
             | QueriesCommand::GetRoleState { context_id, .. }
             | QueriesCommand::HasEstablishedOutletInterface { context_id, .. }
             | QueriesCommand::PendingCommits { context_id, .. }
@@ -17616,6 +17905,7 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         // `reply_with_error` instead. Left unreachable so a future
         // dispatch-classification change trips a compile-time match.
         QueriesCommand::LocalPseudonym { .. }
+        | QueriesCommand::LocalRoutingIds { .. }
         | QueriesCommand::GetBroadcastKeyForLocalAuthor { .. } => {
             debug_assert!(false, "hard-error variant routed through soft-default path");
         }
@@ -17645,6 +17935,10 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         }
         // Legacy `context_params` returns `None`.
         QueriesCommand::ContextParams { reply, .. } => {
+            let _ = reply.send(Ok(None));
+        }
+        // An unknown context has no stored relay set.
+        QueriesCommand::RelayUrls { reply, .. } => {
             let _ = reply.send(Ok(None));
         }
         // Legacy `get_role_state` returns `None`.
@@ -17717,6 +18011,9 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
         QueriesCommand::LocalPseudonym { reply, .. } => {
             let _ = reply.send(Err(err));
         }
+        QueriesCommand::LocalRoutingIds { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
         QueriesCommand::GetBroadcastKeyForLocalAuthor { reply, .. } => {
             let _ = reply.send(Err(err));
         }
@@ -17735,6 +18032,18 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
             reply_with_soft_default(other);
         }
     }
+}
+
+/// What a verified §5.12.3.1 `InvitationBundle` tells a Welcome joiner about
+/// the context it joins: the id, the genesis parameters, the creator, and the
+/// relays that host it. `Supervisor::build_welcome_joiner_state` builds the
+/// joiner's actor state from these facts.
+#[derive(Clone, Copy)]
+struct WelcomeBundleFacts<'a> {
+    context_id: &'a str,
+    params: &'a scp_protocol::context::ContextParams,
+    creator_did: &'a DID,
+    relay_urls: &'a [String],
 }
 
 // ---------------------------------------------------------------------------
@@ -17760,6 +18069,13 @@ mod tests {
     use crate::context::actor::signer::CommandSigner;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::in_memory::InMemoryStorage;
+
+    /// A `Supervisor` built without providers holds no transport slot, so a
+    /// bridge cannot bind a node's relay transport to it.
+    #[test]
+    fn transport_slot_is_absent_without_providers() {
+        assert!(Supervisor::for_query_shim().transport_slot().is_none());
+    }
 
     /// The escrow-reversal join log names a panic as a panic without its
     /// payload, and names a cancelled task as cancelled, never as panicked.
@@ -18271,6 +18587,7 @@ mod tests {
                     },
                     identity.clone(),
                     None,
+                    Vec::new(),
                 )
                 .await
                 .unwrap();
@@ -18301,6 +18618,424 @@ mod tests {
             "no key is loaded for another DID"
         );
         assert_eq!(persisted_own_wrapping_key(&contexts, &ctx_a), Some(owner));
+    }
+
+    /// A context's relay set (§5.12.3.1 `relay_urls`, PUSH-025) is the
+    /// creator's set at create, deduplicated in first-seen order, and its
+    /// snapshot persists it. Restore installs the stored set: the test rewrites
+    /// the stored set while the actor is down, deletes the snapshot after the
+    /// restore, and the flush writes the rewritten set back from the live actor.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_relay_set_is_set_at_create_and_installed_on_restore() {
+        const RELAY_A: &str = "wss://relay-a.example/scp/v1";
+        const RELAY_B: &str = "wss://relay-b.example/scp/v1";
+        const RELAY_C: &str = "wss://relay-c.example/scp/v1";
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(persistence),
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([0xC3u8; 32]);
+        let stored = |contexts: &DashMap<String, crate::context::state::ContextSnapshot>| {
+            contexts
+                .get(&ctx)
+                .map(|snapshot| snapshot.relay_urls.clone())
+        };
+
+        let handle = sup
+            .create_context(
+                ctx.clone(),
+                scp_protocol::context::ContextParams {
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..Default::default()
+                },
+                identity,
+                None,
+                vec![RELAY_B.to_owned(), RELAY_A.to_owned(), RELAY_B.to_owned()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored(&contexts),
+            Some(vec![RELAY_B.to_owned(), RELAY_A.to_owned()]),
+            "create persists the creator's relay set, each relay once"
+        );
+
+        assert!(sup.despawn_actor(&ctx).await);
+        contexts
+            .get_mut(&ctx)
+            .expect("context persisted")
+            .relay_urls = vec![RELAY_C.to_owned()];
+        sup.restore_context(&ctx, &handle).await.unwrap();
+        contexts.remove(&ctx);
+        sup.flush_all_contexts().await.unwrap();
+        assert_eq!(
+            stored(&contexts),
+            Some(vec![RELAY_C.to_owned()]),
+            "restore installs the stored relay set on the live actor"
+        );
+    }
+
+    /// Creates a context on `relay_urls`, then returns the relay set its
+    /// snapshot persists and the relay set its live actor holds.
+    #[cfg(feature = "testing")]
+    async fn created_relay_set(
+        ctx_byte: u8,
+        relay_urls: &[&str],
+    ) -> (Option<Vec<String>>, Option<Vec<String>>) {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(persistence),
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([ctx_byte; 32]);
+        sup.create_context(
+            ctx.clone(),
+            scp_protocol::context::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..Default::default()
+            },
+            identity,
+            None,
+            relay_urls.iter().map(|u| (*u).to_owned()).collect(),
+        )
+        .await
+        .expect("create succeeds whatever the relay URLs");
+        let persisted = contexts.get(&ctx).map(|s| s.relay_urls.clone());
+        (persisted, sup.context_relay_urls(&ctx).await)
+    }
+
+    /// Create stores two spellings of one relay as one entry, the §9.18.2
+    /// canonical relay URL (§5.12.3.1 `relay_urls`).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_stores_two_spellings_of_a_relay_as_one_canonical_entry() {
+        const SPELLING_1: &str = "WSS://Relay-A.Example:443/scp/v1/";
+        const SPELLING_2: &str = "wss://relay-a.example/scp/v1";
+        let want = Some(vec![SPELLING_2.to_owned()]);
+        assert_eq!(
+            created_relay_set(0xC4, &[SPELLING_1, SPELLING_2]).await,
+            (want.clone(), want)
+        );
+    }
+
+    /// Create stores a relay URL with no §9.18.2 canonical form exactly as
+    /// written, and succeeds.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_stores_a_relay_url_without_canonical_form_as_written() {
+        const HTTPS: &str = "https://Relay-A.Example/scp/v1/";
+        let want = Some(vec![HTTPS.to_owned()]);
+        assert_eq!(
+            created_relay_set(0xC5, &[HTTPS]).await,
+            (want.clone(), want)
+        );
+    }
+
+    /// Creates a context, rewrites its persisted relay set to `stored` while
+    /// its actor is down, restores it, and returns the relay set the flush
+    /// writes back from the live actor.
+    #[cfg(feature = "testing")]
+    async fn restored_relay_set(ctx_byte: u8, stored: &[&str]) -> Option<Vec<String>> {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(persistence),
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([ctx_byte; 32]);
+        let handle = sup
+            .create_context(
+                ctx.clone(),
+                scp_protocol::context::ContextParams {
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..Default::default()
+                },
+                identity,
+                None,
+                vec!["wss://relay-z.example".to_owned()],
+            )
+            .await
+            .unwrap();
+        assert!(sup.despawn_actor(&ctx).await);
+        contexts
+            .get_mut(&ctx)
+            .expect("context persisted")
+            .relay_urls = stored.iter().map(|u| (*u).to_owned()).collect();
+        sup.restore_context(&ctx, &handle)
+            .await
+            .expect("restore succeeds whatever the relay URLs");
+        contexts.remove(&ctx);
+        sup.flush_all_contexts().await.unwrap();
+        contexts.get(&ctx).map(|s| s.relay_urls.clone())
+    }
+
+    /// Restore stores two spellings of one relay as one entry, the §9.18.2
+    /// canonical relay URL.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_stores_two_spellings_of_a_relay_as_one_canonical_entry() {
+        const SPELLING_1: &str = "WSS://Relay-A.Example:443/scp/v1/";
+        const SPELLING_2: &str = "wss://relay-a.example/scp/v1";
+        assert_eq!(
+            restored_relay_set(0xC6, &[SPELLING_1, SPELLING_2]).await,
+            Some(vec![SPELLING_2.to_owned()])
+        );
+    }
+
+    /// Restore stores a relay URL with no §9.18.2 canonical form exactly as
+    /// written, and succeeds.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_stores_a_relay_url_without_canonical_form_as_written() {
+        const HTTPS: &str = "https://Relay-A.Example/scp/v1/";
+        assert_eq!(
+            restored_relay_set(0xC7, &[HTTPS]).await,
+            Some(vec![HTTPS.to_owned()])
+        );
+    }
+
+    /// PUSH-013: with two contexts on two relays, one of them on both,
+    /// `push_routing_ids` maps each relay to exactly the routing IDs of the
+    /// contexts on it, and holds this
+    /// device's current local pseudonym routing ID for each context. After the
+    /// local pseudonym changes through the join path, the next query returns
+    /// the new one and not the old one.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_routing_ids_group_by_relay_and_follow_the_local_pseudonym() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        const RELAY_A: &str = "wss://relay-a.example/scp/v1";
+        const RELAY_B: &str = "wss://relay-b.example/scp/v1";
+        const PSEUDONYM_A: [u8; 32] = [0xA1; 32];
+        const PSEUDONYM_B: [u8; 32] = [0xB1; 32];
+        const PSEUDONYM_A_NEW: [u8; 32] = [0xA2; 32];
+        let sup = supervisor_with_providers();
+        let identity = sup.node_identity().unwrap();
+        let params = || scp_protocol::context::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..Default::default()
+        };
+        let ctx_a = hex::encode([0xA0u8; 32]);
+        let ctx_b = hex::encode([0xB0u8; 32]);
+        let handle_a = sup
+            .create_context(
+                ctx_a.clone(),
+                params(),
+                identity.clone(),
+                Some(PSEUDONYM_A),
+                vec![RELAY_A.to_owned()],
+            )
+            .await
+            .unwrap();
+        sup.create_context(
+            ctx_b.clone(),
+            params(),
+            identity,
+            Some(PSEUDONYM_B),
+            vec![RELAY_B.to_owned(), RELAY_A.to_owned()],
+        )
+        .await
+        .unwrap();
+        let shared_a = scp_protocol::context::context_routing_id(&ctx_a);
+        let shared_b = scp_protocol::context::context_routing_id(&ctx_b);
+
+        assert_eq!(
+            sup.push_routing_ids().await.unwrap(),
+            BTreeMap::from([
+                (
+                    RELAY_A.to_owned(),
+                    BTreeSet::from([shared_a, PSEUDONYM_A, shared_b, PSEUDONYM_B]),
+                ),
+                (RELAY_B.to_owned(), BTreeSet::from([shared_b, PSEUDONYM_B])),
+            ]),
+            "each relay maps to exactly the routing IDs of the contexts on it"
+        );
+
+        sup.join_context(
+            &handle_a,
+            scp_protocol::context::membership::KeyPackage::mock(DID(
+                "did:dht:z6MkPushRoutingJoiner".to_owned(),
+            )),
+            None,
+            Some(PSEUDONYM_A_NEW),
+        )
+        .await
+        .unwrap();
+
+        let after = sup.push_routing_ids().await.unwrap();
+        assert_eq!(
+            after.get(RELAY_A),
+            Some(&BTreeSet::from([
+                shared_a,
+                PSEUDONYM_A_NEW,
+                shared_b,
+                PSEUDONYM_B
+            ])),
+            "the next query returns the new local pseudonym and not the old one"
+        );
+        assert_eq!(
+            after.get(RELAY_B),
+            Some(&BTreeSet::from([shared_b, PSEUDONYM_B])),
+            "the other context's routing IDs are unchanged"
+        );
+    }
+
+    /// A supervisor with no context actors returns an empty map.
+    #[tokio::test]
+    async fn push_routing_ids_is_empty_without_contexts() {
+        let sup = supervisor_with_providers();
+        assert!(sup.push_routing_ids().await.unwrap().is_empty());
+    }
+
+    /// Creates an encrypted context `ctx_id` on `relay_urls` for the
+    /// `push_routing_ids` tests.
+    #[cfg(feature = "testing")]
+    async fn create_push_context(sup: &Arc<Supervisor>, ctx_id: &str, relay_urls: &[&str]) {
+        let identity = sup.node_identity().unwrap();
+        sup.create_context(
+            ctx_id.to_owned(),
+            scp_protocol::context::ContextParams {
+                ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                ..Default::default()
+            },
+            identity,
+            Some([0x5A; 32]),
+            relay_urls.iter().map(|u| (*u).to_owned()).collect(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Two spellings of one relay share one key, the §9.18.2 canonical URL.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_routing_ids_group_equivalent_relay_spellings_under_one_key() {
+        let sup = supervisor_with_providers();
+        let ctx_a = hex::encode([0xC0u8; 32]);
+        let ctx_b = hex::encode([0xC1u8; 32]);
+        create_push_context(&sup, &ctx_a, &["wss://relay.example"]).await;
+        create_push_context(&sup, &ctx_b, &["WSS://Relay.Example:443/"]).await;
+        let by_relay = sup.push_routing_ids().await.unwrap();
+        assert_eq!(
+            by_relay.keys().collect::<Vec<_>>(),
+            vec!["wss://relay.example"],
+            "both spellings map to the one canonical relay URL"
+        );
+        let ids = &by_relay["wss://relay.example"];
+        assert!(ids.contains(&scp_protocol::context::context_routing_id(&ctx_a)));
+        assert!(ids.contains(&scp_protocol::context::context_routing_id(&ctx_b)));
+    }
+
+    /// A relay URL with no §9.18.2 canonical form gets no entry. The query
+    /// still returns the routing IDs for the context's other relay and for a
+    /// second context on the same device.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_routing_ids_skip_a_relay_url_with_no_canonical_form() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let sup = supervisor_with_providers();
+        let mixed = hex::encode([0xC2u8; 32]);
+        let other = hex::encode([0xC3u8; 32]);
+        create_push_context(
+            &sup,
+            &mixed,
+            &["wss://relay-a.example", "https://relay-b.example"],
+        )
+        .await;
+        create_push_context(&sup, &other, &["wss://relay-c.example"]).await;
+        assert_eq!(
+            sup.push_routing_ids().await.unwrap(),
+            BTreeMap::from([
+                (
+                    "wss://relay-a.example".to_owned(),
+                    BTreeSet::from([
+                        scp_protocol::context::context_routing_id(&mixed),
+                        [0x5A; 32]
+                    ]),
+                ),
+                (
+                    "wss://relay-c.example".to_owned(),
+                    BTreeSet::from([
+                        scp_protocol::context::context_routing_id(&other),
+                        [0x5A; 32]
+                    ]),
+                ),
+            ]),
+            "the https URL gets no entry, and both contexts keep their routing IDs"
+        );
+    }
+
+    /// A context whose actor is down — poisoned, its last respawn failed, or
+    /// mid-respawn — fails the query with the typed error `lookup_miss_error`
+    /// gives it, instead of being left out of an `Ok` result.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_routing_ids_fail_when_a_context_actor_is_down() {
+        for down in 0..3u8 {
+            let sup = supervisor_with_providers();
+            let healthy = hex::encode([0xD0u8; 32]);
+            let broken = hex::encode([0xD1u8; 32]);
+            create_push_context(&sup, &healthy, &["wss://relay.example"]).await;
+            create_push_context(&sup, &broken, &["wss://relay.example"]).await;
+            assert!(sup.push_routing_ids().await.is_ok(), "both actors are up");
+            match down {
+                0 => sup.test_poison_context(&broken).await,
+                1 => sup.test_fail_context_respawn(&broken).await,
+                _ => sup.test_hold_context_mid_respawn(&broken).await,
+            }
+            let result = sup.push_routing_ids().await;
+            if down == 0 {
+                assert!(
+                    matches!(result, Err(ContextError::ContextPoisoned(ref id)) if *id == broken),
+                    "a poisoned context fails the query: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(ContextError::ActorCrashed(ref id)) if *id == broken),
+                    "a crashed context fails the query: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// `known_context_ids` lists registered actors and contexts whose actor is
+    /// down, and leaves out KeyPackage-actor windows and crash windows that do
+    /// not mark an actor down.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn known_context_ids_list_live_and_down_contexts_only() {
+        let sup = supervisor_with_providers();
+        let live = hex::encode([0xE0u8; 32]);
+        create_push_context(&sup, &live, &["wss://relay.example"]).await;
+        let crash = |id: String, crashes: usize| {
+            let mut window = sup.crash_windows.entry(id).or_default();
+            for _ in 0..crashes {
+                window.record(0);
+            }
+        };
+        crash("poisoned-ctx".to_owned(), CRASH_POISON_THRESHOLD);
+        crash("crashed-once-ctx".to_owned(), 1);
+        crash(
+            format!("{KP_CRASH_KEY_PREFIX}did:dht:z6MkKnownIds"),
+            CRASH_POISON_THRESHOLD,
+        );
+        sup.crash_windows
+            .entry("respawning-ctx".to_owned())
+            .or_default()
+            .mark_respawning();
+        assert_eq!(
+            sup.known_context_ids(),
+            vec![live, "poisoned-ctx".to_owned(), "respawning-ctx".to_owned()]
+        );
     }
 
     /// The `0xFF01` wrapping key a KeyPackage's leaf publishes.
@@ -21841,6 +22576,9 @@ mod tests {
             checkpoint_last_time_secs: 0,
             generation: 0,
             routing: crate::context::actor::state::ContextRouting::Broadcast,
+            relay_urls: Vec::new(),
+            pseudonym_rotation:
+                crate::context::actor::pseudonym_rotation::PseudonymRotationState::default(),
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
             xctx_committed_stream_outputs: HashMap::new(),
@@ -21993,13 +22731,28 @@ mod tests {
         creator: &str,
         ctx_id_bytes: &[u8; 32],
     ) -> Result<crate::context::ContextHandle, ContextError> {
+        Box::pin(import_snapshot_into(
+            MapPersistence::default(),
+            snapshot,
+            creator,
+            ctx_id_bytes,
+        ))
+        .await
+    }
+
+    /// [`import_snapshot_signed_by_creator`] into a supervisor that persists
+    /// to `persistence`, so a test can read what the import persisted.
+    async fn import_snapshot_into(
+        persistence: MapPersistence,
+        snapshot: crate::context::state::ContextSnapshot,
+        creator: &str,
+        ctx_id_bytes: &[u8; 32],
+    ) -> Result<crate::context::ContextHandle, ContextError> {
         use ed25519_dalek::{Signer, SigningKey};
 
         let clock_dyn: Arc<dyn Clock> = Arc::new(TestClock::new(1_700_000_000));
-        let sup = supervisor_with_clock_persistence_and_merkle_log(
-            clock_dyn,
-            Box::new(MapPersistence::default()),
-        );
+        let sup =
+            supervisor_with_clock_persistence_and_merkle_log(clock_dyn, Box::new(persistence));
         let event_log_data =
             create_event_log_data(ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]).await;
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
@@ -22017,6 +22770,87 @@ mod tests {
         .expect("build a valid signed full export");
 
         sup.import_context(export, &verifying_key, None).await
+    }
+
+    /// Import installs the relay set the creator-signed snapshot names
+    /// (§5.12.3.1 `relay_urls`, PUSH-025), each relay once, and persists it.
+    #[tokio::test]
+    async fn import_installs_the_exported_relay_set() {
+        let creator = "did:key:import-relay-set-creator";
+        let context_id = "import-relay-set-ctx";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.relay_urls = vec![
+            "wss://relay-b.example/scp/v1".to_owned(),
+            "wss://relay-a.example/scp/v1".to_owned(),
+            "wss://relay-b.example/scp/v1".to_owned(),
+        ];
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+
+        Box::pin(import_snapshot_into(
+            persistence,
+            snapshot,
+            creator,
+            &ctx_id_bytes,
+        ))
+        .await
+        .expect("a creator-signed export imports");
+        assert_eq!(
+            contexts
+                .get(context_id)
+                .map(|stored| stored.relay_urls.clone()),
+            Some(vec![
+                "wss://relay-b.example/scp/v1".to_owned(),
+                "wss://relay-a.example/scp/v1".to_owned(),
+            ]),
+            "import installs and persists the exported relay set, each relay once"
+        );
+    }
+
+    /// Imports a creator-signed export whose snapshot names `relay_urls`, then
+    /// returns the relay set the importer persists.
+    async fn imported_relay_set(context_id: &str, relay_urls: &[&str]) -> Option<Vec<String>> {
+        let creator = "did:key:import-relay-set-creator";
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(context_id);
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.relay_urls = relay_urls.iter().map(|u| (*u).to_owned()).collect();
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        Box::pin(import_snapshot_into(
+            persistence,
+            snapshot,
+            creator,
+            &ctx_id_bytes,
+        ))
+        .await
+        .expect("a creator-signed export imports whatever the relay URLs");
+        contexts
+            .get(context_id)
+            .map(|stored| stored.relay_urls.clone())
+    }
+
+    /// Import stores two spellings of one relay as one entry, the §9.18.2
+    /// canonical relay URL.
+    #[tokio::test]
+    async fn import_stores_two_spellings_of_a_relay_as_one_canonical_entry() {
+        const SPELLING_1: &str = "WSS://Relay-A.Example:443/scp/v1/";
+        const SPELLING_2: &str = "wss://relay-a.example/scp/v1";
+        assert_eq!(
+            imported_relay_set("import-relay-spellings-ctx", &[SPELLING_1, SPELLING_2]).await,
+            Some(vec![SPELLING_2.to_owned()])
+        );
+    }
+
+    /// Import stores a relay URL with no §9.18.2 canonical form exactly as
+    /// written, and succeeds.
+    #[tokio::test]
+    async fn import_stores_a_relay_url_without_canonical_form_as_written() {
+        const HTTPS: &str = "https://Relay-A.Example/scp/v1/";
+        assert_eq!(
+            imported_relay_set("import-relay-https-ctx", &[HTTPS]).await,
+            Some(vec![HTTPS.to_owned()])
+        );
     }
 
     /// The import path installs `export.snapshot.registered_outlets` into the
@@ -23855,6 +24689,7 @@ mod tests {
                     },
                     DID(creator.to_owned()),
                     None,
+                    Vec::new(),
                 )
                 .await;
 
@@ -23891,6 +24726,7 @@ mod tests {
                 },
                 DID(creator.to_owned()),
                 None,
+                Vec::new(),
             )
             .await
             .expect("create over an ABSENT snapshot must succeed (precheck allows it)");
@@ -23915,6 +24751,7 @@ mod tests {
             params(),
             DID(creator.to_owned()),
             None,
+            Vec::new(),
         )
         .await
         .expect("a create before shutdown succeeds");
@@ -23928,6 +24765,7 @@ mod tests {
                 params(),
                 DID("did:dht:z6MkCreateAfterShutdownSecondCreator".to_owned()),
                 None,
+                Vec::new(),
             )
             .await;
         assert!(
@@ -24370,6 +25208,7 @@ mod tests {
             params,
             creator_did: DID("did:dht:z6MkReplyOrderCreator".to_owned()),
             local_pseudonym: None,
+            relay_urls: Vec::new(),
         });
         (LifecycleCommand::CreateContext { payload, reply: tx }, rx)
     }
@@ -25693,8 +26532,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(bob_sup.register_local_did(DID::from(Self::BOB)))
-                .expect("register bob as a local DID");
+            rt.block_on(bob_sup.register_local_did(DID::from(Self::BOB)));
             let bob_deps = rt
                 .block_on(bob_sup.build_actor_deps(&DID::from(Self::BOB)))
                 .expect("build bob's actor deps");
@@ -26587,6 +27425,7 @@ mod tests {
                 },
                 creator,
                 None,
+                Vec::new(),
             )
             .await
             .expect("create the real 64-hex context under the digest");
@@ -27093,7 +27932,7 @@ mod tests {
         );
         assert!(!sup.is_context_poisoned(&ctx_key));
 
-        let revived = sup.standing_context(&local, &peer).await;
+        let revived = sup.standing_context(&local, &peer, Vec::new()).await;
         assert_eq!(
             revived.as_deref().ok(),
             Some(ctx_key.as_str()),
@@ -27158,7 +27997,7 @@ mod tests {
         let ctx_key = crate::context::standing_helpers::generate_standing_context_id(&local, &peer);
         let respawn = sup.respawn_from_snapshot(&ctx_key, &local).await;
         assert!(matches!(respawn, Err(ContextError::ActorCrashed(_))));
-        let failed = sup.standing_context(&local, &peer).await;
+        let failed = sup.standing_context(&local, &peer, Vec::new()).await;
         assert!(
             matches!(failed, Err(ContextError::TransportFailed(_))),
             "a recreate that registers no actor must surface the create error, got {failed:?}"
@@ -27190,7 +28029,7 @@ mod tests {
             }
         }
         assert!(sup.is_context_poisoned(&ctx_key));
-        let failed = sup.standing_context(&local, &peer).await;
+        let failed = sup.standing_context(&local, &peer, Vec::new()).await;
         assert!(
             matches!(failed, Err(ContextError::TransportFailed(_))),
             "a recreate that registers no actor must surface the create error, got {failed:?}"
@@ -27234,7 +28073,7 @@ mod tests {
             .expect("a key-package actor spawns before shutdown");
         sup.close_spawn_gate();
         let peer = DID("did:example:peer-standing-after-shutdown-spawn".to_owned());
-        let spawn_refused = sup.standing_context(&local, &peer).await;
+        let spawn_refused = sup.standing_context(&local, &peer, Vec::new()).await;
         assert!(
             matches!(spawn_refused, Err(ContextError::SupervisorShutDown(_))),
             "a refused actor spawn must keep SupervisorShutDown; got {spawn_refused:?}"
@@ -27243,7 +28082,7 @@ mod tests {
         // No key-package actor, so the refusal comes from `build_actor_deps`.
         sup.stop_key_package_actors().await;
         let peer = DID("did:example:peer-standing-after-shutdown-deps".to_owned());
-        let deps_refused = sup.standing_context(&local, &peer).await;
+        let deps_refused = sup.standing_context(&local, &peer, Vec::new()).await;
         assert!(
             matches!(deps_refused, Err(ContextError::SupervisorShutDown(_))),
             "a refused key-package spawn must keep SupervisorShutDown; got {deps_refused:?}"
@@ -27273,7 +28112,7 @@ mod tests {
         drop(rx);
         sup.actors
             .insert(ctx_key.clone(), ContextActorHandle::from_sender(tx));
-        let busy = sup.standing_context(&local, &peer).await;
+        let busy = sup.standing_context(&local, &peer, Vec::new()).await;
         assert!(
             matches!(busy, Err(ContextError::ActorBusy(_))),
             "a standing context whose actor does not answer must surface ActorBusy, got {busy:?}"
@@ -27899,8 +28738,8 @@ mod tests {
         // smaller one; the respawn will derive that as `owning_did`.
         let did_a = DID("did:example:aaa-first".to_owned());
         let did_b = DID("did:example:zzz-second".to_owned());
-        sup.register_local_did(did_a.clone()).await.unwrap();
-        sup.register_local_did(did_b.clone()).await.unwrap();
+        sup.register_local_did(did_a.clone()).await;
+        sup.register_local_did(did_b.clone()).await;
 
         // Spawn an Active context (creator = did_b, the NON-min DID) and
         // persist its snapshot.
