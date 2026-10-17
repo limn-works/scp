@@ -1869,6 +1869,7 @@ mod tests {
 
         note_processed_commit(
             &mut state,
+            &ctx_hex(0x35),
             LOCAL,
             &ProcessedCommit {
                 committer_did: DIRECT_ALICE.to_owned(),
@@ -1880,7 +1881,32 @@ mod tests {
         );
         let registry = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert!(!registry.contains_key(&scp_did::DID(DIRECT_BOB.to_owned())));
+        // The removal also leaves the membership and role state, so the
+        // removed DID's announcement is refused until it is added again.
+        assert!(!state.membership.contains(DIRECT_BOB));
+        assert!(
+            !state
+                .role_state
+                .member_has_capability(DIRECT_BOB, &Capability::MessagesWrite)
+        );
+        let removed =
+            ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 3, 0, [0x52; 32]).await;
+        assert!(
+            matches!(removed, Err(ContextError::MemberNotFound(_))),
+            "a removed DID is not a member; got {removed:?}"
+        );
 
+        // The rejoin's add, as the committer's add path applies it.
+        state.membership.add_member(
+            scp_did::DID(DIRECT_BOB.to_owned()),
+            "member".to_owned(),
+            Vec::new(),
+        );
+        state.role_state.members.insert(DIRECT_BOB.to_owned());
+        state.role_state.member_capabilities.insert(
+            DIRECT_BOB.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
         assert!(
             ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 3, 0, [0x52; 32])
                 .await

@@ -1526,6 +1526,28 @@ fn empty_role_state_for_test() -> ContextRoleState {
 }
 
 impl PerContextState {
+    /// Tears down every per-DID record of a member that leaves the context
+    /// (spec §5.6.1): the membership entry, all role state, the access key
+    /// (§9.17.2), the read-exclusion entry (§9.17) and the pseudonym routing
+    /// record (§9.10.4). The committed removal, the committed leave and a
+    /// processed peer Commit all tear down through this one function, so no
+    /// removal path can keep part of a departed member's state. Returns whether
+    /// the membership held `did`. Call it inside the fail-closed
+    /// `commit_class_s_keep` that persists the removal (ADR-049 §9).
+    pub(crate) fn remove_member_state(&mut self, context_id: &str, did: &DID) -> bool {
+        let was_member = self.membership.remove_member(did.as_ref());
+        self.members.remove(did);
+        self.role_state.remove_member(did.as_ref());
+        self.access
+            .access_key_store
+            .remove(context_id, did.as_ref());
+        self.access.read_exclusion_list.remove(did);
+        if let Some(registry) = self.routing.peer_registry_mut() {
+            registry.remove(did);
+        }
+        was_member
+    }
+
     /// Read-only view of the staged cross-context saga slot
     /// (`ClassSState::saga_pending`). A `pub` accessor (the field itself is
     /// `pub(crate)` on the Class-S sub-struct) so the SDK-visible shape

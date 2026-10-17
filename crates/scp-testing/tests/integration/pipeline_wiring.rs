@@ -2252,9 +2252,10 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
 /// `MessagingCommand::DeliverIncoming`, the messaging handler calls
 /// `deliver_incoming`, which counts the Commit's membership changes by DID with
 /// `classify_commit_membership`. The handler then applies them through the
-/// fail-closed keep-direction commit to `note_processed_commit`, which deletes
-/// each removed DID's record and records the trigger through
-/// `note_membership_change`; the actor's rotation arm turns the trigger into
+/// fail-closed keep-direction commit to `note_processed_commit`, which tears
+/// down each removed DID's record, membership and role state through
+/// `remove_member_state`, the teardown the committed removal and leave share,
+/// and records the trigger through `note_membership_change`; the actor's rotation arm turns the trigger into
 /// the `PseudonymRotationDue` signal.
 #[test]
 fn processed_membership_commit_reaches_rotation_and_registry() {
@@ -2295,9 +2296,15 @@ fn processed_membership_commit_reaches_rotation_and_registry() {
     let note = extract_fn_body(PSEUDONYM_ROTATION_SRC, "note_processed_commit")
         .expect("note_processed_commit exists");
     assert!(
-        note.contains("peer_registry_mut()") && note.contains(".note_membership_change("),
-        "note_processed_commit must delete removed DIDs' records and record the trigger"
+        note.contains(".remove_member_state(") && note.contains(".note_membership_change("),
+        "note_processed_commit must tear down removed DIDs' state and record the trigger"
     );
+    for removal in ["execute_remove_member", "leave_context"] {
+        assert!(
+            fn_body_contains(MANAGER_SRC, removal, ".remove_member_state("),
+            "{removal} must tear down the departed member through remove_member_state"
+        );
+    }
     assert!(
         fn_body_contains(
             ACTOR_MOD_SRC,

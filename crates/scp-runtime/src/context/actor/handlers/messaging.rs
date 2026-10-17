@@ -911,6 +911,7 @@ async fn handle_deliver_incoming(
             .commit_class_s_keep(deps, context_id, |mut v| {
                 crate::context::actor::pseudonym_rotation::note_processed_commit(
                     v.rest_mut(),
+                    context_id,
                     deps.crypto.local_did(),
                     &commit,
                 );
