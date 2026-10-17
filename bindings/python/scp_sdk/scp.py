@@ -3686,6 +3686,9 @@ class SCP:
             operator DID.
 
         Raises:
+            ValidationError: ``SCP-VALID-7005`` when ``config`` is not a
+                :class:`~scp_sdk.server.NodeStartConfig` or its ``identity`` is
+                not an :class:`~scp_sdk.Identity`.
             StorageError: ``SCP-STORAGE-8007`` for an invalid config,
                 ``SCP-STORAGE-8008`` when the blob storage cannot be opened or
                 its directory created, ``SCP-STORAGE-8009`` for a core node
@@ -3701,8 +3704,13 @@ class SCP:
                 instance holds the binding; the bridge has shut the node down
                 before it raises ``SCP-TRANS-5056``.
         """
-
-        config_json = config.to_json()
+        if not isinstance(config, NodeStartConfig):
+            raise ValidationError(
+                "SCP.node_start(): config must be a scp_sdk.NodeStartConfig, got "
+                f"{type(config).__module__}.{type(config).__qualname__}",
+                "SCP-VALID-7005",
+            )
+        config_json = config._to_json()
         try:
             raw = await asyncio.to_thread(self._native.node_start, config_json)
         except Exception as exc:

@@ -318,4 +318,204 @@ mod tests {
         assert_ne!(without_cors, VALID);
         assert!(invalid(&without_cors), "missing cors_origins accepted");
     }
+
+    // -----------------------------------------------------------------------
+    // Wire-shape fixture shared with the Python SDK's `test_server.py`
+    // -----------------------------------------------------------------------
+
+    use serde::de::DeserializeOwned;
+    use serde_json::{Map, Value, json};
+
+    /// Every arm of every sum type, a full config, and the optional fields,
+    /// which the Python SDK's `NodeStartConfig` tests compare their wire output
+    /// against.
+    const WIRE_FIXTURE: &str = include_str!("../tests/fixtures/node_start_config.json");
+
+    /// A key and a `kind` no type here declares, to draw serde's list of the
+    /// names it expects.
+    const PROBE: &str = "probe_undeclared_name";
+
+    fn fixture() -> Value {
+        serde_json::from_str(WIRE_FIXTURE).expect("fixture is JSON")
+    }
+
+    fn strings(value: &Value) -> Vec<String> {
+        value
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|v| v.as_str().expect("string").to_owned())
+            .collect()
+    }
+
+    /// The names serde's unknown-variant or unknown-field error lists as
+    /// expected, in declaration order. serde derives that list from the type,
+    /// renames included, so it changes with every variant or field added,
+    /// removed or renamed in Rust, with no list kept by hand.
+    fn expected_names<T: DeserializeOwned + std::fmt::Debug>(
+        probe: Value,
+        what: &str,
+    ) -> Vec<String> {
+        let err = serde_json::from_value::<T>(probe).expect_err("the probe must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with(&format!("unknown {what} `{PROBE}`")),
+            "{msg}"
+        );
+        if msg.contains("there are no ") {
+            return Vec::new();
+        }
+        let (_, tail) = msg
+            .split_once(", expected ")
+            .expect("serde lists the expected names");
+        tail.split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Asserts that `T` accepts `object`, rejects it without each required
+    /// key and with each required key set to null, and accepts it without each
+    /// key of `optional` and with that key set to null.
+    fn assert_required_split<T: DeserializeOwned + std::fmt::Debug>(
+        what: &str,
+        object: &Map<String, Value>,
+        keys: &[String],
+        optional: &[String],
+    ) {
+        serde_json::from_value::<T>(Value::Object(object.clone()))
+            .unwrap_or_else(|e| panic!("{what} rejected: {e}"));
+        for key in keys {
+            let mut absent = object.clone();
+            absent.remove(key);
+            let mut null = object.clone();
+            null.insert(key.clone(), Value::Null);
+            let is_optional = optional.contains(key);
+            for (case, value) in [("absent", absent), ("null", null)] {
+                let accepted = serde_json::from_value::<T>(Value::Object(value)).is_ok();
+                assert_eq!(
+                    accepted, is_optional,
+                    "{what}: `{key}` {case} accepted={accepted}, fixture optional={is_optional}"
+                );
+            }
+        }
+    }
+
+    /// Checks one sum type against the fixture: the arms are exactly `T`'s
+    /// variants, each arm carries exactly its variant's fields, and each field
+    /// is optional exactly when the fixture says so.
+    fn assert_sum_type<T: DeserializeOwned + std::fmt::Debug>(field: &str, fx: &Value) {
+        let arms = fx["arms"][field].as_array().expect("fixture arms");
+        let kinds: Vec<String> = arms
+            .iter()
+            .map(|a| a["kind"].as_str().expect("kind").to_owned())
+            .collect();
+        let mut declared = expected_names::<T>(json!({ "kind": PROBE }), "variant");
+        assert!(!declared.is_empty(), "{field}: no variants drawn");
+        let mut listed = kinds.clone();
+        declared.sort();
+        listed.sort();
+        assert_eq!(
+            listed, declared,
+            "{field}: fixture arms differ from the Rust variants"
+        );
+        for (arm, kind) in arms.iter().zip(&kinds) {
+            let object = arm.as_object().expect("arm object");
+            let mut declared = expected_names::<T>(json!({ "kind": kind, PROBE: 0 }), "field");
+            let mut keys: Vec<String> = object.keys().filter(|k| *k != "kind").cloned().collect();
+            declared.sort();
+            keys.sort();
+            assert_eq!(
+                keys, declared,
+                "{field}.{kind}: fixture fields differ from Rust"
+            );
+            let optional = fx["optional_arm_fields"][field][kind.as_str()]
+                .as_array()
+                .map(|_| strings(&fx["optional_arm_fields"][field][kind.as_str()]))
+                .unwrap_or_default();
+            assert_required_split::<T>(&format!("{field}.{kind}"), object, &keys, &optional);
+        }
+    }
+
+    #[test]
+    fn wire_fixture_matches_the_bridge_types() {
+        let fx = fixture();
+
+        // Top level: the fields in declaration order, the full config, and the
+        // required and optional split.
+        let fields = strings(&fx["fields"]);
+        assert_eq!(
+            expected_names::<NodeStartConfig>(json!({ PROBE: 0 }), "field"),
+            fields,
+            "fixture `fields` differ from NodeStartConfig's fields or their order"
+        );
+        let config = fx["config"].as_object().expect("config object");
+        let mut config_keys: Vec<String> = config.keys().cloned().collect();
+        let mut sorted_fields = fields.clone();
+        config_keys.sort();
+        sorted_fields.sort();
+        assert_eq!(
+            config_keys, sorted_fields,
+            "fixture config must set every field"
+        );
+        assert_required_split::<NodeStartConfig>(
+            "NodeStartConfig",
+            config,
+            &fields,
+            &strings(&fx["optional_fields"]),
+        );
+
+        // Every field the config sets to an arm has an `arms` entry, and every
+        // `arms` entry names a field.
+        let mut sum_fields: Vec<&str> = config
+            .iter()
+            .filter(|(_, v)| v.get("kind").is_some())
+            .map(|(k, _)| k.as_str())
+            .collect();
+        let mut arm_fields: Vec<&str> = fx["arms"]
+            .as_object()
+            .expect("arms object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        sum_fields.sort_unstable();
+        arm_fields.sort_unstable();
+        assert_eq!(arm_fields, sum_fields);
+
+        for field in arm_fields {
+            match field {
+                "reach" => assert_sum_type::<FfiReach>(field, &fx),
+                "blob_storage" => assert_sum_type::<FfiBlobBackend>(field, &fx),
+                "tls" => assert_sum_type::<FfiTlsMode>(field, &fx),
+                "dht" => assert_sum_type::<FfiDhtMode>(field, &fx),
+                "cors_origins" => assert_sum_type::<FfiCorsOrigins>(field, &fx),
+                "nat" => assert_sum_type::<FfiNat>(field, &fx),
+                other => panic!("no Rust type checks the fixture's `{other}` arms"),
+            }
+        }
+    }
+
+    #[test]
+    fn expected_names_reads_each_serde_list_form() {
+        // Control for the probe the fixture test relies on: one, two and many
+        // variants, and a variant with no fields.
+        assert_eq!(
+            expected_names::<FfiDhtMode>(json!({ "kind": PROBE }), "variant"),
+            ["disabled"]
+        );
+        assert_eq!(
+            expected_names::<FfiCorsOrigins>(json!({ "kind": PROBE }), "variant"),
+            ["any_origin", "allowlist"]
+        );
+        assert_eq!(
+            expected_names::<FfiTlsMode>(json!({ "kind": PROBE }), "variant"),
+            ["self_signed", "acme", "plaintext", "terminated"]
+        );
+        assert!(expected_names::<FfiNat>(json!({ "kind": "auto", PROBE: 0 }), "field").is_empty());
+        assert_eq!(
+            expected_names::<FfiTlsMode>(json!({ "kind": "acme", PROBE: 0 }), "field"),
+            ["email"]
+        );
+    }
 }

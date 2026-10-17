@@ -1,0 +1,51 @@
+{
+  "description": "Wire shape of NodeStartConfig (construction.md, Node start). arms lists every arm of every sum-typed field with all its fields set; optional_arm_fields names the arm fields a caller may omit or send as null; fields lists the top-level fields in declaration order; config is a full config with every field set; optional_fields names the top-level fields a caller may omit or send as null. The node_start_config.rs unit tests check this file against the Rust types, and the Python SDK's test_server.py checks its NodeStartConfig against this file.",
+  "arms": {
+    "reach": [
+      {"kind": "domain", "domain": "node.example.org"},
+      {"kind": "nat_traversal"},
+      {"kind": "local"}
+    ],
+    "blob_storage": [
+      {"kind": "in_memory"},
+      {"kind": "redb", "path": "/var/lib/scp/blobs.redb"},
+      {"kind": "sqlite", "path": "/var/lib/scp/blobs.sqlite"}
+    ],
+    "tls": [
+      {"kind": "self_signed"},
+      {"kind": "acme", "email": "ops@example.org"},
+      {"kind": "plaintext"},
+      {"kind": "terminated"}
+    ],
+    "dht": [
+      {"kind": "disabled"}
+    ],
+    "cors_origins": [
+      {"kind": "any_origin"},
+      {"kind": "allowlist", "origins": ["https://app.example.org"]}
+    ],
+    "nat": [
+      {"kind": "auto"}
+    ]
+  },
+  "optional_arm_fields": {
+    "tls": {"acme": ["email"]}
+  },
+  "fields": [
+    "reach", "identity", "blob_storage", "tls", "dht", "cors_origins",
+    "bind_addr", "http_bind_addr", "nat", "projection_rate_limit"
+  ],
+  "config": {
+    "reach": {"kind": "domain", "domain": "node.example.org"},
+    "identity": "did:dht:z6MkNodeStartOperatorProbe",
+    "blob_storage": {"kind": "redb", "path": "/var/lib/scp/blobs.redb"},
+    "tls": {"kind": "acme", "email": "ops@example.org"},
+    "dht": {"kind": "disabled"},
+    "cors_origins": {"kind": "allowlist", "origins": ["https://app.example.org"]},
+    "bind_addr": "127.0.0.1:0",
+    "http_bind_addr": "0.0.0.0:8443",
+    "nat": {"kind": "auto"},
+    "projection_rate_limit": 30
+  },
+  "optional_fields": ["bind_addr", "http_bind_addr", "nat", "projection_rate_limit"]
+}

@@ -26,12 +26,14 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
 from dataclasses import dataclass
-from types import TracebackType
-from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
+from types import NoneType, TracebackType
+from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias, get_args, get_type_hints
 
 from scp_sdk.context import validate_admission, validate_broadcast_key_hex
-from scp_sdk.errors import StorageError
+from scp_sdk.errors import StorageError, ValidationError
+from scp_sdk.identity import Identity
 
 if TYPE_CHECKING:
     from scp_sdk.context import SiteConfig
@@ -58,8 +60,13 @@ class _Arm:
     _KIND: ClassVar[str]
 
     def _wire(self) -> dict[str, Any]:
-        fields = {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}  # type: ignore[arg-type]
-        return {"kind": self._KIND, **fields}
+        """Return ``{"kind": _KIND, **fields}``, each path lowered to its string
+        with :func:`os.fspath`."""
+        wire: dict[str, Any] = {"kind": self._KIND}
+        for f in dataclasses.fields(self):  # type: ignore[arg-type]
+            value = getattr(self, f.name)
+            wire[f.name] = os.fspath(value) if isinstance(value, os.PathLike) else value
+        return wire
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -100,20 +107,20 @@ class BlobInMemory(_Arm):
 
 @dataclass(frozen=True, kw_only=True)
 class BlobRedb(_Arm):
-    """A redb blob database file at ``path``; ``node_start`` creates its parent
-    directory."""
+    """A redb blob database file at ``path``, a ``str`` or path-like object;
+    ``node_start`` creates its parent directory."""
 
     _KIND: ClassVar[str] = "redb"
-    path: str
+    path: str | os.PathLike[str]
 
 
 @dataclass(frozen=True, kw_only=True)
 class BlobSqlite(_Arm):
-    """A SQLite blob database file at ``path``; ``node_start`` creates its parent
-    directory."""
+    """A SQLite blob database file at ``path``, a ``str`` or path-like object;
+    ``node_start`` creates its parent directory."""
 
     _KIND: ClassVar[str] = "sqlite"
-    path: str
+    path: str | os.PathLike[str]
 
 
 #: The relay's blob storage backend. S3 and Postgres are not exposed.
@@ -197,17 +204,6 @@ class NatAuto(_Arm):
 #: and are not exposed.
 Nat: TypeAlias = NatAuto
 
-#: The arms each sum-typed field accepts, keyed by field name. ``None`` is
-#: accepted only for the optional ``nat``.
-_ARMS: dict[str, tuple[type[_Arm], ...]] = {
-    "reach": (ReachDomain, ReachNatTraversal, ReachLocal),
-    "blob_storage": (BlobInMemory, BlobRedb, BlobSqlite),
-    "tls": (TlsSelfSigned, TlsAcme, TlsPlaintext, TlsTerminated),
-    "dht": (DhtDisabled,),
-    "cors_origins": (CorsAnyOrigin, CorsAllowlist),
-    "nat": (NatAuto,),
-}
-
 
 @dataclass(frozen=True, kw_only=True)
 class NodeStartConfig:
@@ -220,8 +216,9 @@ class NodeStartConfig:
 
     Attributes:
         reach: How the node is reached.
-        identity: The DID of the operator identity, already created on the same
-            ``SCP`` instance. Nodes have no identity of their own.
+        identity: The operator :class:`~scp_sdk.Identity`, already created on
+            the same ``SCP`` instance; the bridge receives its DID. Nodes have
+            no identity of their own.
         blob_storage: The relay's blob storage backend.
         tls: TLS selection.
         dht: DID-document publication; :class:`DhtDisabled` is the only arm.
@@ -237,7 +234,7 @@ class NodeStartConfig:
     """
 
     reach: Reach
-    identity: str
+    identity: Identity
     blob_storage: BlobBackend
     tls: TlsMode
     dht: DhtMode
@@ -247,23 +244,35 @@ class NodeStartConfig:
     nat: Nat | None = None
     projection_rate_limit: int | None = None
 
-    def to_wire(self) -> dict[str, Any]:
+    def _to_wire(self) -> dict[str, Any]:
         """Return the dict the bridge's ``NodeStartConfig::from_json`` reads.
 
-        Every field appears under its own name; an absent optional is ``null``,
+        Every field appears under its own name and in declaration order;
+        ``identity`` is lowered to its DID, and an absent optional is ``null``,
         which the bridge reads as absent.
 
         Raises:
+            ValidationError: ``SCP-VALID-7005`` when ``identity`` is not an
+                :class:`~scp_sdk.Identity`.
             StorageError: ``SCP-STORAGE-8007`` when a sum-typed field holds a
                 value that is not one of its arms.
         """
         wire: dict[str, Any] = {}
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
+            if field.name == "identity":
+                if not isinstance(value, Identity):
+                    raise ValidationError(
+                        "NodeStartConfig.identity must be a scp_sdk.Identity returned by "
+                        f"the SDK, got {type(value).__module__}.{type(value).__qualname__}",
+                        "SCP-VALID-7005",
+                    )
+                wire[field.name] = value.did
+                continue
             arms = _ARMS.get(field.name)
             if arms is None:
                 wire[field.name] = value
-            elif value is None and field.name == "nat":
+            elif value is None and field.name in _OPTIONAL_SUM_FIELDS:
                 wire[field.name] = None
             elif isinstance(value, arms):
                 wire[field.name] = value._wire()
@@ -276,22 +285,46 @@ class NodeStartConfig:
                 )
         return wire
 
-    def to_json(self) -> str:
-        """Return :meth:`to_wire` as the JSON string the bridge's ``node_start``
+    def _to_json(self) -> str:
+        """Return :meth:`_to_wire` as the JSON string the bridge's ``node_start``
         takes.
 
         Raises:
+            ValidationError: ``SCP-VALID-7005`` when ``identity`` is not an
+                :class:`~scp_sdk.Identity`.
             StorageError: ``SCP-STORAGE-8007`` when the config holds a value
-                that is not one of its arms or that JSON cannot encode.
+                that is not one of its arms or that JSON cannot encode, such as
+                ``bytes`` or a non-finite float.
         """
-        wire = self.to_wire()
+        wire = self._to_wire()
         try:
-            return json.dumps(wire)
+            return json.dumps(wire, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise StorageError(
                 f"NodeStartConfig cannot be encoded: {exc}",
                 code=NODE_START_INVALID_CONFIG_CODE,
             ) from exc
+
+
+def _arms_of(hint: Any) -> tuple[type[_Arm], ...]:
+    """The :class:`_Arm` classes a field's type hint admits: every member of a
+    union, or the hint itself when it is one arm."""
+    members = get_args(hint) or (hint,)
+    return tuple(m for m in members if isinstance(m, type) and issubclass(m, _Arm))
+
+
+_HINTS = get_type_hints(NodeStartConfig)
+
+#: The arms each sum-typed field accepts, keyed by field name, derived from the
+#: field's type alias so a new arm in an alias needs no second list.
+_ARMS: dict[str, tuple[type[_Arm], ...]] = {
+    name: arms for name, hint in _HINTS.items() if (arms := _arms_of(hint))
+}
+
+#: The sum-typed fields whose hint admits ``None``.
+_OPTIONAL_SUM_FIELDS: frozenset[str] = frozenset(
+    name for name in _ARMS if NoneType in get_args(_HINTS[name])
+)
 
 
 class Relay:
