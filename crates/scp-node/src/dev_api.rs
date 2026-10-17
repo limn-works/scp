@@ -633,7 +633,12 @@ mod tests {
             dev_bind_addr: Some("127.0.0.1:9100".parse::<SocketAddr>().unwrap()),
             projected_contexts: RwLock::new(HashMap::new()),
             blob_storage: Arc::new(BlobStorageBackend::in_memory()),
-            relay_config: scp_transport::native::server::RelayConfig::default(),
+            relay_config: scp_transport::native::server::RelayConfig::defaults(
+                scp_transport::relay::push_gate::LiveRelayUrl::new(
+                    scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1")
+                        .unwrap(),
+                ),
+            ),
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
             shutdown_token: tokio_util::sync::CancellationToken::new(),

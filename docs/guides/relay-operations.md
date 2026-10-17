@@ -113,7 +113,7 @@ All relay configuration is via `SCP_RELAY_*` environment variables. These map to
 
 | Environment Variable | `RelayConfig` Field | Default | Description |
 |---------------------|---------------------|---------|-------------|
-| `SCP_RELAY_URL` | `relay_url` | none (required) | The relay's public WebSocket URL, which determines its reserved push routing ID (spec §10.7.1, push registration protocol). Set it to the URL clients connect to. `scp-relay` and `scp-node --relay-only` exit 1 when it is unset or empty; a full node does not read it |
+| `SCP_RELAY_URL` | `relay_url` | none (required) | The relay's public WebSocket URL, which determines its reserved push routing ID (spec §10.7.1, push registration protocol). Set it to the URL clients connect to. `scp-relay` and `scp-node --relay-only` exit 1 when it is unset or empty. A full node does not read it: the node derives the URL from its domain or from the address its NAT tier advertises. Every listener (WebSocket, QUIC, UDP/DTLS) reads the same URL |
 | `SCP_RELAY_BIND_ADDR` | `bind_addr` | `0.0.0.0:9000` | WebSocket listener bind address |
 | `SCP_RELAY_MAX_BLOB_SIZE` | `max_blob_size` | `262144` (256 KB) | Maximum blob size in bytes |
 | `SCP_RELAY_MAX_BLOB_TTL` | `max_blob_ttl` | `604800` (7 days) | Maximum blob TTL in seconds |

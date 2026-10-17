@@ -267,7 +267,9 @@ ENVIRONMENT VARIABLES:
                                 reserved push routing ID (spec section 10.7.1, push
                                 registration protocol). Required in --relay-only mode:
                                 no default, and an unset or empty value exits 1. Full
-                                node mode does not read it
+                                node mode does not read it: the node derives the URL
+                                from its domain or its NAT tier address, and a tier
+                                change moves the reserved routing ID on every listener
     SCP_RELAY_MAX_BLOB_SIZE     Max blob size in bytes (default: 262144)
     SCP_RELAY_MAX_BLOB_TTL      Max blob TTL in seconds (default: 604800)
     SCP_RELAY_MAX_CONNECTIONS   Max total connections (default: 1000)

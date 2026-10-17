@@ -1163,6 +1163,10 @@ mod tests {
         let next_url = format!("ws://203.0.113.42:{}/scp/v1", 9000 + nth);
         apply_tier_change(
             live_state,
+            &scp_transport::relay::push_gate::LiveRelayUrl::new(
+                scp_transport::relay::push_gate::RelayUrl::new("ws://203.0.113.42:9000/scp/v1")
+                    .expect("canonical test URL"),
+            ),
             &next_url,
             "test tier change",
             publisher,
@@ -1260,6 +1264,10 @@ mod tests {
         let new_relay_url = "ws://203.0.113.42:8443/scp/v1";
         apply_tier_change(
             &live_state,
+            &scp_transport::relay::push_gate::LiveRelayUrl::new(
+                scp_transport::relay::push_gate::RelayUrl::new("ws://203.0.113.42:9000/scp/v1")
+                    .expect("canonical test URL"),
+            ),
             new_relay_url,
             "test tier change",
             &publisher,

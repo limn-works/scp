@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -36,9 +37,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 2. Configure the relay ───────────────────────────────────
     //
-    // All fields have sensible defaults. Override what you need.
-    // See `RelayConfig` docs for the full list of tuning knobs.
+    // Every field but the relay's public URL has a sensible default.
+    // Override what you need. See `RelayConfig` docs for the full list of
+    // tuning knobs. The URL is the one clients connect to; the relay derives
+    // its reserved push routing ID from it (§10.7.1).
     let bind_addr: SocketAddr = "0.0.0.0:9000".parse()?;
+    // It has no default: set SCP_RELAY_URL, for example
+    // `ws://127.0.0.1:9000/scp/v1` for a local relay.
+    let relay_url_text = std::env::var("SCP_RELAY_URL")
+        .map_err(|e| format!("SCP_RELAY_URL must be set to the relay's public URL: {e}"))?;
+    let relay_url = LiveRelayUrl::new(RelayUrl::new(&relay_url_text)?);
 
     let config = RelayConfig {
         bind_addr,
@@ -51,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_connections_per_ip: 10,
         // Rate limiting: PUBLISH ops per second per IP.
         rate_limit_publishes_per_second: 100,
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(relay_url)
     };
 
     // ── 3. Choose a blob storage backend ─────────────────────────

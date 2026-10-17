@@ -90,7 +90,7 @@ Instead:
   NodeConfig { reach, identity, storage, blob_storage, ..NodeConfig::defaults(reach2, identity2, storage2, blob_storage2) }
   ```
 
-A config whose every field is genuinely fail-safe **may** keep `Default` — `RelayConfig` qualifies, since every field has a safe default. This explicitly depends on `BridgeRole::default() == Disabled`: `bridge` is `RelayConfig`'s only security-consequential field, and because its `Default` is the fail-safe `Disabled` (a relay that brokers nothing until explicitly enabled), the whole struct's `Default` manufactures no unsafe value. If `BridgeRole::default()` were `Enabled`, `RelayConfig` would forfeit this exception and M4 would fire. The rule fires only when a field is security-relevant or irreducible *and lacks a fail-safe default*.
+A config whose every field is genuinely fail-safe **may** keep `Default`. The rule fires only when a field is security-relevant or irreducible *and lacks a fail-safe default*. `RelayConfig` shows both halves: its `bridge` field alone would not fire M4, because `BridgeRole::default() == Disabled` (a relay that brokers nothing until explicitly enabled) is fail-safe; its `relay_url` field does fire M4, because the relay's public URL fixes its reserved push routing ID (spec §10.7.1 step 2) and no value is safe to invent. `RelayConfig` therefore has no `Default` and is built with `RelayConfig::defaults(relay_url)`.
 
 ### M5 — One greppable contract
 
@@ -222,7 +222,7 @@ A node handle's `shutdown` and its drop put back the transport provider and the 
 
 ### Relay — `RelayConfig`
 
-Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled }` (M1). `BridgeRole::Enabled` is payload-free and needs no config secret, which the M2 Relay bullet states. The relay's `bridge_secret: Option<[u8;32]>` stays a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret, set independently of the broker role — and is therefore out of the construction-pattern surface (not folded into `BridgeRole`). Entry: `Relay::start(RelayConfig, storage)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` may keep `Default` (every field is fail-safe — M4 does not fire), an exception that holds **precisely because** `BridgeRole::default() == Disabled` (its sole security-consequential field has a fail-safe default).
+Already a flat config object. Bring fully in line: `supports_bridge: bool` → `bridge: BridgeRole { Disabled, Enabled }` (M1). `BridgeRole::Enabled` is payload-free and needs no config secret, which the M2 Relay bullet states. The relay's `bridge_secret: Option<[u8;32]>` stays a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret, set independently of the broker role — and is therefore out of the construction-pattern surface (not folded into `BridgeRole`). Entry: `Relay::start(RelayConfig, storage)` — the SDK-facing entry, which wraps the internal `RelayServer::new(config, storage)` (see the entry-verb rule). `RelayConfig` has no `Default`: `relay_url` (a `LiveRelayUrl` handle every listener of the relay shares, from which the reserved push routing ID derives, §10.7.1 step 2) is irreducible, so M4 fires and the factory is `RelayConfig::defaults(relay_url)`. `bridge` is not the reason, since `BridgeRole::default() == Disabled` is fail-safe.
 
 ### host_site — `HostSiteConfig`
 

@@ -28,6 +28,7 @@ use scp_identity::DidMethod;
 use scp_identity::ScpIdentity;
 use scp_identity::republish::RepublishEntry;
 use scp_transport::nat::NatTierChange;
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 
 use crate::DhtMode;
 use crate::NodeError;
@@ -311,6 +312,30 @@ pub async fn seed_from_startup_publish(
     }))
 }
 
+/// Moves the relay's live URL handle to `advertised_url`, the URL the node is
+/// about to publish, so every relay listener reserves its push routing ID
+/// before any client reads it (§10.7.1 step 2).
+///
+/// A tier 3 bridge URL carries a `bridge_target` query (§10.12.4 step 4) and
+/// so has no §9.18.2 canonical form: no client can derive a reserved push
+/// routing ID from it, and the relay has none to reserve. The handle then
+/// stays on its current URL, whose routing ID the relay keeps intercepting,
+/// and the caller still publishes `advertised_url`.
+pub fn reserve_push_routing_id(relay: &LiveRelayUrl, advertised_url: &str) {
+    match RelayUrl::new(advertised_url) {
+        Ok(url) => relay.set(url),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                advertised_url = %advertised_url,
+                reserved_url = %relay.current().canonical(),
+                "advertised relay URL has no canonical form, so it has no push routing ID; \
+                 the relay keeps reserving its current URL's"
+            );
+        }
+    }
+}
+
 /// Handles a detected tier change: re-points the node's relay endpoint,
 /// re-publishes the document through the node's publish seam, and advances the
 /// node's state in ONE write.
@@ -326,12 +351,19 @@ pub async fn seed_from_startup_publish(
 /// honest `None`.
 pub async fn apply_tier_change(
     live_state: &LiveSlot<NodePublishedState>,
+    relay: &LiveRelayUrl,
     new_relay_url: &str,
     trigger_reason: &str,
     publisher: &NodePublisher,
     identity: &ScpIdentity,
     event_tx: Option<&tokio::sync::mpsc::Sender<NatTierChange>>,
 ) {
+    // The relay moves first: every listener reserves the new URL's push
+    // routing ID before any client can read that URL from the document or the
+    // slot, so a registration signed for it is intercepted, never stored as a
+    // blob (§10.7.1 step 2). A bridge URL has no routing ID to reserve and is
+    // still published; see `reserve_push_routing_id`.
+    reserve_push_routing_id(relay, new_relay_url);
     let current = live_state.get();
     let previous_relay_url = current.relay_url;
     let mut next_document = current.document;

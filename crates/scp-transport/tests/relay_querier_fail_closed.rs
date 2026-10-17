@@ -34,6 +34,7 @@ use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 
 /// How long the client may take to observe the dead socket before the test
 /// fails. Loopback teardown is observed in milliseconds; the bound only stops
@@ -59,17 +60,27 @@ impl DedicatedRelay {
                 .build()
                 .expect("build the relay's dedicated runtime");
             let addr = rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .await
+                    .expect("bind the relay listener");
+                let port = listener
+                    .local_addr()
+                    .expect("relay listener address")
+                    .port();
+                let relay_url = LiveRelayUrl::new(
+                    RelayUrl::new(&format!("ws://127.0.0.1:{port}/scp/v1"))
+                        .expect("canonical relay URL"),
+                );
                 let config = RelayConfig {
-                    bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                     ttl_check_interval: Duration::from_millis(100),
                     delivery_jitter_ms: 0,
-                    ..RelayConfig::default()
+                    ..RelayConfig::defaults(relay_url)
                 };
                 let storage = Arc::new(BlobStorageBackend::in_memory());
                 let (handle, addr) = RelayServer::new(config, storage)
-                    .start()
+                    .start_with_listener(listener)
                     .await
-                    .expect("bind the relay server");
+                    .expect("start the relay server");
                 // The handle only stops the accept loop; this test kills the
                 // whole runtime instead, so nothing needs to hold it.
                 drop(handle);

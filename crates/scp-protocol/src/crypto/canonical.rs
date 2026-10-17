@@ -43,7 +43,7 @@ pub const MAX_VAR_BYTES_LEN: usize = u32::MAX as usize;
 /// length-prefix ceiling (`u32::MAX` bytes). Protocol messages are bounded
 /// to 256 KB by the envelope layer (§9.10.3), so this error should never
 /// occur in production; it is present to eliminate the panic path (I1).
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum CanonicalError {
     /// A [`CanonicalField::VarBytes`] field exceeded `u32::MAX` bytes and
     /// cannot be length-prefixed in the canonical encoding.

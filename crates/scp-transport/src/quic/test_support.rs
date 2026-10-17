@@ -95,7 +95,9 @@ pub fn start_test_listener() -> (
     let config = QuicListenerConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         delivery_jitter_ms: 0,
-        ..QuicListenerConfig::default()
+        ..QuicListenerConfig::defaults(crate::relay::push_gate::LiveRelayUrl::new(
+            crate::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1").unwrap(),
+        ))
     };
 
     let listener = QuicListener::new(
