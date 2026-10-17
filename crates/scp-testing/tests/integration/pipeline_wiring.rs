@@ -2161,10 +2161,13 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
 /// `deliver_incoming`, which counts the Commit's membership changes by DID with
 /// `classify_commit_membership`. The handler then applies them through the
 /// fail-closed keep-direction commit to `note_processed_commit`, which tears
-/// down each removed DID's record, membership and role state through
+/// down each removed DID's sender key, its floors through the handler's
+/// `remove_member_floors`, and its record, membership and role state through
 /// `remove_member_state`, the teardown the committed removal and leave share,
-/// and records the trigger through `note_membership_change`; the actor's rotation arm turns the trigger into
-/// the `PseudonymRotationDue` signal.
+/// records each added DID's membership and role state through
+/// `add_member_state`, and records the trigger through `note_membership_change`;
+/// the actor's rotation arm turns the trigger into the `PseudonymRotationDue`
+/// signal.
 #[test]
 fn processed_membership_commit_reaches_rotation_and_registry() {
     assert!(
@@ -2189,6 +2192,7 @@ fn processed_membership_commit_reaches_rotation_and_registry() {
         "&mut processed_commit",
         "commit_class_s_keep(",
         "note_processed_commit(",
+        ".remove_member_floors(",
     ] {
         assert!(
             handler.contains(step),
@@ -2204,8 +2208,12 @@ fn processed_membership_commit_reaches_rotation_and_registry() {
     let note = extract_fn_body(PSEUDONYM_ROTATION_SRC, "note_processed_commit")
         .expect("note_processed_commit exists");
     assert!(
-        note.contains(".remove_member_state(") && note.contains(".note_membership_change("),
-        "note_processed_commit must tear down removed DIDs' state and record the trigger"
+        note.contains(".remove_member_state(")
+            && note.contains(".remove_member_sender_key(")
+            && note.contains("remove_floors(did)")
+            && note.contains(".add_member_state(")
+            && note.contains(".note_membership_change("),
+        "note_processed_commit must tear down removed DIDs' state, record added DIDs' state and record the trigger"
     );
     for removal in ["execute_remove_member", "leave_context"] {
         assert!(
