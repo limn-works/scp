@@ -527,8 +527,13 @@ async fn challenge_request_response() {
         response_digest
     );
 
-    let auth =
-        authenticate_challenge_response(&request, &response, &challenger_did, &resolver).unwrap();
+    let auth = authenticate_challenge_response(
+        request.clone(),
+        response.clone(),
+        &challenger_did,
+        &resolver,
+    )
+    .unwrap();
     let outcome = grade(
         &auth,
         &answer_key,

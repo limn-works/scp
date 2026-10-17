@@ -5306,8 +5306,8 @@ fn uniffi_trust_verify_attestation_reads_the_instance_revocation_list() {
 // evaluator, and records the challenge in the challenger's ledger, which signs
 // it. `respond_to_challenge` signs the subject's response through custody.
 // `grade_response` looks the challenge up in the ledger before any DID
-// resolution, authenticates the response on the blocking pool, takes a grading
-// permit and the ledger lease, grades, commits, and writes the record to the
+// resolution, authenticates the response on the blocking pool, takes the ledger
+// lease and then a grading permit, grades, commits, and writes the record to the
 // bridge's repository. Each supervisor dispatch reaches the challenger ledger's
 // mailbox, whose Begin and Commit handlers check the attempt. Each bridge's
 // export reaches the shared body, and each bridge's evaluator invoker runs the
@@ -5363,11 +5363,22 @@ fn shared_grade_response_authenticates_then_grades_and_commits() {
             && begin.is_some()
             && commit.is_some()
             && lookup < resolve
-            && resolve < permit
-            && permit < begin
-            && begin < commit,
-        "grade_response_within must look the challenge up, then resolve, then take a \
-         permit, then Begin, then Commit, in that order"
+            && resolve < begin
+            && begin < permit
+            && permit < commit,
+        "grade_response_within must look the challenge up, then resolve, then Begin, \
+         then take a permit, then Commit, in that order: a stored resubmit takes no permit"
+    );
+    assert!(
+        fn_body_contains(
+            FFI_CHALLENGE_SRC,
+            "release_lease",
+            ".dispatch_challenge_release("
+        ) && body.contains("release_lease(")
+            && fn_body_contains(LEDGER_SRC, "handle_release", "self.require_lease(")
+            && fn_body_contains(LEDGER_SRC, "handle_release", "self.leases.remove("),
+        "a capacity refusal in grade_response_within must release the lease through \
+         release_lease, whose ledger handler checks and drops the lease"
     );
     assert!(
         body.contains("authenticate_challenge_response(")
@@ -5392,16 +5403,20 @@ fn shared_grade_response_authenticates_then_grades_and_commits() {
 }
 
 /// Begin and Commit both check the attempt in the ledger turn, and Commit signs
-/// the record it persisted.
+/// the record before it persists it.
 #[test]
 fn ledger_begin_and_commit_check_the_attempt() {
+    let commit = extract_fn_body(LEDGER_SRC, "handle_commit").expect("handle_commit");
+    let sign = commit.find(".sign_bounded_ed25519(");
+    let persist = commit.find("self.persist_entry(");
     assert!(
         fn_body_contains(LEDGER_SRC, "handle_begin", "check_attempt(")
-            && fn_body_contains(LEDGER_SRC, "handle_commit", "check_attempt(")
-            && fn_body_contains(LEDGER_SRC, "handle_commit", ".signed_attempt(")
-            && fn_body_contains(LEDGER_SRC, "signed_attempt", ".sign_bounded_ed25519("),
+            && commit.contains("check_attempt(")
+            && sign.is_some()
+            && persist.is_some()
+            && sign < persist,
         "the ledger's Begin and Commit handlers must check the attempt, and Commit must \
-         sign the record through sign_bounded_ed25519"
+         sign the record through sign_bounded_ed25519 before it persists the attempt"
     );
 }
 
@@ -5672,7 +5687,13 @@ fn shared_evaluator_outlet_spawns_blocking_inside_the_economy_pipeline() {
     assert!(
         reaches("tokio::task::spawn_blocking(")
             && reaches("let _permit = permit;")
-            && reaches("tokio::spawn(")
+            && reaches(".spawn_evaluator_pipeline(")
+            && !reaches("tokio::spawn(")
+            && fn_body_contains(
+                SUPERVISOR_SRC,
+                "spawn_evaluator_pipeline",
+                "self.spawn_tracked("
+            )
             && reaches(".invoke_outlet_with_economy(")
             && reaches("let Some(handler) = handler else")
             && reaches("EvaluatorOutcome::Unavailable("),

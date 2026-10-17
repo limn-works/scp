@@ -15,7 +15,7 @@
 //! 2. **Respond.** The subject checks the request with
 //!    [`challenge_response_unsigned`] and signs one output per case.
 //! 3. **Grade.** The challenger bounds the raw response with
-//!    [`check_response_bounds`], authenticates it with
+//!    [`check_challenge_json_bounds`], authenticates it with
 //!    [`authenticate_challenge_response`], checks the attempt against its
 //!    ledger with [`check_attempt`], and computes a [`GradeOutcome`] with
 //!    [`grade`].
@@ -255,6 +255,7 @@ pub enum ExpectedOutput {
 /// One test case as the subject sees it: the case without its expected
 /// output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChallengeCase {
     /// Identifier, unique within the suite.
     pub test_id: String,
@@ -269,6 +270,7 @@ pub struct ChallengeCase {
 /// A signed challenge request. Every field except `verifier_signature` is
 /// covered by the signature, over [`challenge_request_signing_digest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChallengeRequest {
     /// Random 32-byte challenge identifier, lowercase hex on the wire.
     #[serde(with = "crate::identity::scpid::hex_serde_32")]
@@ -302,6 +304,7 @@ pub struct ChallengeRequest {
 
 /// One output, answering the case with the same `test_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestOutput {
     /// The case answered.
     pub test_id: String,
@@ -311,6 +314,7 @@ pub struct TestOutput {
 
 /// A subject's signed answer to one attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChallengeResponse {
     /// The request's challenge id, lowercase hex on the wire.
     #[serde(with = "crate::identity::scpid::hex_serde_32")]
@@ -331,6 +335,7 @@ pub struct ChallengeResponse {
 /// A record the challenger signs for one graded attempt (spec 07 §7.3.4).
 /// Every field except `verifier_signature` is signed, in `R_v` order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChallengeVerification {
     /// [`challenge_verification_id`] of the record, lowercase hex.
     #[serde(with = "crate::identity::scpid::hex_serde_32")]
@@ -1128,14 +1133,17 @@ pub fn challenge_request_unsigned(
 // Respond
 // ---------------------------------------------------------------------------
 
-/// Refuses a raw response above `MAX_CHALLENGE_RESPONSE_BYTES`, or whose
-/// container nesting exceeds `MAX_CHALLENGE_JSON_DEPTH`. It scans bytes
-/// only, so it runs before any parse.
+/// Refuses an oversize or overdeep raw request or response (spec 07 §7.3.4
+/// step 3).
+///
+/// The bounds are `MAX_CHALLENGE_RESPONSE_BYTES` and
+/// `MAX_CHALLENGE_JSON_DEPTH`. It scans bytes only, so it runs before any
+/// parse.
 ///
 /// # Errors
 ///
 /// [`TrustError::ResponseTooLarge`].
-pub fn check_response_bounds(raw: &[u8]) -> Result<(), TrustError> {
+pub fn check_challenge_json_bounds(raw: &[u8]) -> Result<(), TrustError> {
     if raw.len() > MAX_CHALLENGE_RESPONSE_BYTES {
         return Err(TrustError::ResponseTooLarge {
             reason: format!("{} bytes exceed {MAX_CHALLENGE_RESPONSE_BYTES}", raw.len()),
@@ -1222,7 +1230,7 @@ fn verify_request_signature(
 /// 4. `1 <= attempt <= 1 + max_retries` ([`TrustError::AttemptOutOfOrder`],
 ///    [`TrustError::RetriesExhausted`]);
 /// 5. one output per case, in order ([`TrustError::OutputsMismatch`]);
-/// 6. the signed response's JSON fits [`check_response_bounds`].
+/// 6. the signed response's JSON fits [`check_challenge_json_bounds`].
 ///
 /// # Errors
 ///
@@ -1271,7 +1279,7 @@ pub fn challenge_response_unsigned(
     let wire = serde_json::to_vec(&response).map_err(|e| TrustError::CanonicalizationFailed {
         reason: format!("response does not serialize: {e}"),
     })?;
-    check_response_bounds(&wire)?;
+    check_challenge_json_bounds(&wire)?;
     response.subject_signature = Vec::new();
     let digest = challenge_response_signing_digest(&response)?;
     Ok(UnsignedChallengeResponse { response, digest })
@@ -1306,27 +1314,30 @@ fn check_attempt_range(
 // ---------------------------------------------------------------------------
 
 /// A response whose subject signature verified against the request it
-/// answers. Only [`authenticate_challenge_response`] makes one, so
-/// [`grade`] never sees an unauthenticated response.
-#[derive(Debug, Clone, Copy)]
-pub struct AuthenticatedResponse<'a> {
-    request: &'a ChallengeRequest,
-    response: &'a ChallengeResponse,
+/// answers, owning both.
+///
+/// Only [`authenticate_challenge_response`] makes one,
+/// so [`grade`] never sees an unauthenticated response, and the value can
+/// cross a task or mailbox boundary without losing that proof.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedResponse {
+    request: ChallengeRequest,
+    response: ChallengeResponse,
     request_digest: [u8; 32],
     response_digest: [u8; 32],
 }
 
-impl<'a> AuthenticatedResponse<'a> {
+impl AuthenticatedResponse {
     /// The request answered.
     #[must_use]
-    pub const fn request(&self) -> &'a ChallengeRequest {
-        self.request
+    pub const fn request(&self) -> &ChallengeRequest {
+        &self.request
     }
 
     /// The authenticated response.
     #[must_use]
-    pub const fn response(&self) -> &'a ChallengeResponse {
-        self.response
+    pub const fn response(&self) -> &ChallengeResponse {
+        &self.response
     }
 
     /// `D`, the request digest.
@@ -1339,44 +1350,6 @@ impl<'a> AuthenticatedResponse<'a> {
     #[must_use]
     pub const fn response_digest(&self) -> [u8; 32] {
         self.response_digest
-    }
-}
-
-impl AuthenticatedResponse<'_> {
-    /// Copies the authenticated pair into an owned value that can cross a
-    /// task or mailbox boundary without losing the proof of authentication.
-    #[must_use]
-    pub fn to_owned_response(&self) -> OwnedAuthenticatedResponse {
-        OwnedAuthenticatedResponse {
-            request: self.request.clone(),
-            response: self.response.clone(),
-            request_digest: self.request_digest,
-            response_digest: self.response_digest,
-        }
-    }
-}
-
-/// An [`AuthenticatedResponse`] that owns its request and response. Only
-/// [`AuthenticatedResponse::to_owned_response`] makes one, so holding one
-/// still proves the subject signature verified.
-#[derive(Debug, Clone)]
-pub struct OwnedAuthenticatedResponse {
-    request: ChallengeRequest,
-    response: ChallengeResponse,
-    request_digest: [u8; 32],
-    response_digest: [u8; 32],
-}
-
-impl OwnedAuthenticatedResponse {
-    /// Borrows the pair as an [`AuthenticatedResponse`].
-    #[must_use]
-    pub const fn as_authenticated(&self) -> AuthenticatedResponse<'_> {
-        AuthenticatedResponse {
-            request: &self.request,
-            response: &self.response,
-            request_digest: self.request_digest,
-            response_digest: self.response_digest,
-        }
     }
 }
 
@@ -1402,14 +1375,14 @@ impl OwnedAuthenticatedResponse {
 /// # Errors
 ///
 /// The errors above; a resolver error propagates unchanged.
-pub fn authenticate_challenge_response<'a>(
-    request: &'a ChallengeRequest,
-    response: &'a ChallengeResponse,
+pub fn authenticate_challenge_response(
+    request: ChallengeRequest,
+    response: ChallengeResponse,
     challenger: &str,
     resolver: &dyn ActiveKeyResolver,
-) -> Result<AuthenticatedResponse<'a>, TrustError> {
+) -> Result<AuthenticatedResponse, TrustError> {
     let challenge_id = hex::encode(request.challenge_id);
-    let request_digest = challenge_request_signing_digest(request)?;
+    let request_digest = challenge_request_signing_digest(&request)?;
     if response.challenge_id != request.challenge_id || response.request_digest != request_digest {
         return Err(TrustError::OutputsMismatch {
             challenge_id,
@@ -1441,7 +1414,7 @@ pub fn authenticate_challenge_response<'a>(
             reason: format!("weights sum to {weight_sum}, not {TOTAL_WEIGHT_BPS}"),
         });
     }
-    let response_digest = challenge_response_signing_digest(response)?;
+    let response_digest = challenge_response_signing_digest(&response)?;
     let key = resolver.resolve_active_key(&response.subject)?;
     verify_ed25519_signature(&key, &response_digest, &response.subject_signature).map_err(
         |reason| TrustError::ChallengeSignatureInvalid {
@@ -1548,7 +1521,7 @@ fn string_haystacks(output: &serde_json::Value) -> Vec<&str> {
 /// [`challenge_verification_unsigned`] refuses that outcome.
 #[must_use]
 pub fn grade(
-    auth: &AuthenticatedResponse<'_>,
+    auth: &AuthenticatedResponse,
     key: &AnswerKey,
     evals: &BTreeMap<usize, CaseResult>,
     schema_results: &BTreeMap<usize, SchemaVerdict>,
@@ -1674,7 +1647,8 @@ pub struct AttemptLedgerView {
 /// Decides whether `attempt` may be graded at `now`. Pure, so the ledger's
 /// begin and commit turns run the same check.
 ///
-/// Checks, in order: the window `created_at < now < expires_at`
+/// Checks, in order: `now > created_at`
+/// ([`TrustError::ChallengeNotYetGradable`]); `now < expires_at`
 /// ([`TrustError::ChallengeExpired`]); not closed
 /// ([`TrustError::ChallengeClosed`]); `attempt == last_attempt + 1`
 /// ([`TrustError::AttemptOutOfOrder`]); `attempt <= 1 + max_retries`
@@ -1687,7 +1661,15 @@ pub struct AttemptLedgerView {
 /// The errors above.
 pub fn check_attempt(view: &AttemptLedgerView, attempt: u32, now: u64) -> Result<(), TrustError> {
     let challenge_id = || hex::encode(view.challenge_id);
-    if !grading_time_in_window(view.created_at, view.expires_at, now) {
+    if now <= view.created_at {
+        return Err(TrustError::ChallengeNotYetGradable {
+            challenge_id: challenge_id(),
+            now,
+            created_at: view.created_at,
+            retry_at: view.created_at.saturating_add(1),
+        });
+    }
+    if now >= view.expires_at {
         return Err(TrustError::ChallengeExpired {
             challenge_id: challenge_id(),
             now,
@@ -1735,11 +1717,11 @@ pub fn check_attempt(view: &AttemptLedgerView, attempt: u32, now: u64) -> Result
 /// if `outcome` does not belong to `auth`'s request;
 /// [`TrustError::CanonicalizationFailed`] if encoding fails.
 pub fn challenge_verification_unsigned(
-    auth: &AuthenticatedResponse<'_>,
+    auth: &AuthenticatedResponse,
     outcome: &GradeOutcome,
     timestamp: u64,
 ) -> Result<UnsignedChallengeVerification, TrustError> {
-    let request = auth.request;
+    let request = &auth.request;
     let attempt = auth.response.attempt;
     let verification_id = challenge_verification_id(
         &request.verifier,
@@ -2330,7 +2312,7 @@ mod tests {
             .collect();
         let response = fx.respond(&request, 1, outputs).unwrap();
         let auth =
-            authenticate_challenge_response(&request, &response, &fx.verifier.did, &fx.resolver)
+            authenticate_challenge_response(request, response, &fx.verifier.did, &fx.resolver)
                 .unwrap();
         grade(&auth, &key, evals, schemas)
     }
@@ -2435,13 +2417,13 @@ mod tests {
     fn response_over_cap_refused() {
         let big = vec![b' '; MAX_CHALLENGE_RESPONSE_BYTES + 1];
         assert!(matches!(
-            check_response_bounds(&big),
+            check_challenge_json_bounds(&big),
             Err(TrustError::ResponseTooLarge { .. })
         ));
-        check_response_bounds(&big[1..]).unwrap();
+        check_challenge_json_bounds(&big[1..]).unwrap();
         let deep = "[".repeat(MAX_CHALLENGE_JSON_DEPTH + 1);
         assert!(matches!(
-            check_response_bounds(deep.as_bytes()),
+            check_challenge_json_bounds(deep.as_bytes()),
             Err(TrustError::ResponseTooLarge { .. })
         ));
         let at_cap = format!(
@@ -2449,11 +2431,11 @@ mod tests {
             "[".repeat(MAX_CHALLENGE_JSON_DEPTH),
             "]".repeat(MAX_CHALLENGE_JSON_DEPTH)
         );
-        check_response_bounds(at_cap.as_bytes()).unwrap();
+        check_challenge_json_bounds(at_cap.as_bytes()).unwrap();
         // Brackets inside strings, including after an escaped quote, do
         // not count.
         let quoted = format!("[\"\\\"{}\"]", "[".repeat(MAX_CHALLENGE_JSON_DEPTH * 2));
-        check_response_bounds(quoted.as_bytes()).unwrap();
+        check_challenge_json_bounds(quoted.as_bytes()).unwrap();
     }
 
     /// Test 9.
@@ -2543,9 +2525,13 @@ mod tests {
             })
             .collect();
         let response = fx.respond(&request, 1, outputs).unwrap();
-        let auth =
-            authenticate_challenge_response(&request, &response, &fx.verifier.did, &fx.resolver)
-                .unwrap();
+        let auth = authenticate_challenge_response(
+            request.clone(),
+            response,
+            &fx.verifier.did,
+            &fx.resolver,
+        )
+        .unwrap();
         let mut short = key;
         short.expected.pop();
         let outcome = grade(&auth, &short, &BTreeMap::new(), &BTreeMap::new());
@@ -2591,9 +2577,13 @@ mod tests {
             })
             .collect();
         let response = fx.respond(&request, 1, outputs).unwrap();
-        let auth =
-            authenticate_challenge_response(&request, &response, &fx.verifier.did, &fx.resolver)
-                .unwrap();
+        let auth = authenticate_challenge_response(
+            request.clone(),
+            response,
+            &fx.verifier.did,
+            &fx.resolver,
+        )
+        .unwrap();
         let outcome = grade(&auth, &key, &BTreeMap::new(), &BTreeMap::new());
         let (created, expires) = (request.created_at, request.expires_at);
         let ledger = AttemptLedgerView {
@@ -2614,7 +2604,11 @@ mod tests {
             let checked = check_attempt(&ledger, 1, t);
             assert_eq!(checked.is_ok(), inside, "check_attempt at {t}: {checked:?}");
             assert!(
-                inside || matches!(checked, Err(TrustError::ChallengeExpired { .. })),
+                inside
+                    || (t == created
+                        && matches!(checked, Err(TrustError::ChallengeNotYetGradable { .. })))
+                    || (t == expires
+                        && matches!(checked, Err(TrustError::ChallengeExpired { .. }))),
                 "{checked:?}"
             );
             let built = challenge_verification_unsigned(&auth, &outcome, t);
@@ -2652,6 +2646,88 @@ mod tests {
                     )
             );
         }
+    }
+
+    /// An attempt at or before `created_at` is refused as not yet gradable,
+    /// naming `created_at + 1` as the first second it may be resubmitted; it
+    /// is not reported as expired, and `created_at + 1` grades.
+    #[test]
+    fn attempt_at_or_before_created_at_is_not_yet_gradable() {
+        for now in [NOW - 1, NOW] {
+            let checked = check_attempt(&view(), 1, now);
+            assert!(
+                matches!(
+                    checked,
+                    Err(TrustError::ChallengeNotYetGradable {
+                        now: n,
+                        created_at: NOW,
+                        retry_at,
+                        ..
+                    }) if n == now && retry_at == NOW + 1
+                ),
+                "{checked:?}"
+            );
+            assert!(!checked.unwrap_err().is_record_rejection());
+        }
+        check_attempt(&view(), 1, NOW + 1).unwrap();
+        let saturated = AttemptLedgerView {
+            created_at: u64::MAX,
+            expires_at: u64::MAX,
+            ..view()
+        };
+        assert!(matches!(
+            check_attempt(&saturated, 1, u64::MAX),
+            Err(TrustError::ChallengeNotYetGradable {
+                retry_at: u64::MAX,
+                ..
+            })
+        ));
+    }
+
+    /// T18: each wire type refuses a field it does not define (spec 07
+    /// §7.3.4, decoding), and still decodes without one.
+    #[test]
+    fn wire_types_refuse_an_undefined_field() {
+        fn refuses<T: serde::de::DeserializeOwned + Serialize>(name: &str, value: &T) {
+            let mut json = serde_json::to_value(value).unwrap();
+            serde_json::from_value::<T>(json.clone())
+                .unwrap_or_else(|e| panic!("{name} without an extra field: {e}"));
+            json.as_object_mut()
+                .unwrap()
+                .insert("undefined".to_owned(), json!(1));
+            let err = serde_json::from_value::<T>(json)
+                .err()
+                .unwrap_or_else(|| panic!("{name} accepted an undefined field"));
+            assert!(err.to_string().contains("unknown field"), "{name}: {err}");
+        }
+        let fx = fixture();
+        let (request, key) = fx.issue(FIXTURE_URI, cases(2)).unwrap();
+        let outputs: Vec<TestOutput> = request
+            .test_cases
+            .iter()
+            .map(|c| TestOutput {
+                test_id: c.test_id.clone(),
+                output: json!("ok"),
+            })
+            .collect();
+        let response = fx.respond(&request, 1, outputs.clone()).unwrap();
+        let auth = authenticate_challenge_response(
+            request.clone(),
+            response.clone(),
+            &fx.verifier.did,
+            &fx.resolver,
+        )
+        .unwrap();
+        let outcome = grade(&auth, &key, &BTreeMap::new(), &BTreeMap::new());
+        let record = challenge_verification_unsigned(&auth, &outcome, request.created_at + 1)
+            .unwrap()
+            .record()
+            .clone();
+        refuses("ChallengeCase", &request.test_cases[0]);
+        refuses("ChallengeRequest", &request);
+        refuses("TestOutput", &outputs[0]);
+        refuses("ChallengeResponse", &response);
+        refuses("ChallengeVerification", &record);
     }
 
     #[test]
@@ -2956,7 +3032,7 @@ mod tests {
         let response = fx.respond(&request, 1, outputs).unwrap();
         let verifier_alias = fx.verifier.padding_alias();
         noncanonical(
-            authenticate_challenge_response(&request, &response, &verifier_alias, &fx.resolver)
+            authenticate_challenge_response(request, response, &verifier_alias, &fx.resolver)
                 .map(|_| ()),
         );
 
@@ -3542,7 +3618,7 @@ mod tests {
         let (request, _) = fx.issue(FIXTURE_URI, cases(2)).unwrap();
         let response = fx.respond(&request, 1, ok_outputs(&request)).unwrap();
         let auth = |req: &ChallengeRequest, resp: &ChallengeResponse, challenger: &str| {
-            authenticate_challenge_response(req, resp, challenger, &fx.resolver)
+            authenticate_challenge_response(req.clone(), resp.clone(), challenger, &fx.resolver)
                 .map(|a| (a.request_digest(), a.response_digest()))
         };
         let (d, d_r) = auth(&request, &response, &fx.verifier.did).unwrap();
@@ -3588,9 +3664,13 @@ mod tests {
         let fx = fixture();
         let (request, key) = fx.issue(FIXTURE_URI, cases(2)).unwrap();
         let response = fx.respond(&request, 1, ok_outputs(&request)).unwrap();
-        let auth =
-            authenticate_challenge_response(&request, &response, &fx.verifier.did, &fx.resolver)
-                .unwrap();
+        let auth = authenticate_challenge_response(
+            request.clone(),
+            response,
+            &fx.verifier.did,
+            &fx.resolver,
+        )
+        .unwrap();
         let outcome = grade(&auth, &key, &BTreeMap::new(), &BTreeMap::new());
         challenge_verification_unsigned(&auth, &outcome, request.expires_at - 1).unwrap();
         for timestamp in [

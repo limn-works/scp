@@ -263,14 +263,26 @@ impl EvaluatorInvoker for TestInvoker {
 /// 20 cases of weight 500; the last `custom` are `CustomEval` on the judge,
 /// the rest `ExactMatch` on `"ok"`.
 fn cases_json(custom: usize) -> String {
+    cases_json_with(
+        (0..custom)
+            .map(|_| ExpectedOutput::CustomEval {
+                evaluator_outlet_id: OutletId::from(JUDGE),
+            })
+            .collect(),
+    )
+}
+
+/// 20 cases of weight 500; the last `tail.len()` expect `tail`, in order,
+/// the rest `ExactMatch` on `"ok"`.
+fn cases_json_with(tail: Vec<ExpectedOutput>) -> String {
+    let head = 20 - tail.len();
+    let mut tail = tail.into_iter();
     let cases: Vec<TestCase> = (0..20)
         .map(|i| TestCase {
             test_id: format!("t{i}"),
             input: json!({"prompt": i}),
-            expected: if i >= 20 - custom {
-                ExpectedOutput::CustomEval {
-                    evaluator_outlet_id: OutletId::from(JUDGE),
-                }
+            expected: if i >= head {
+                tail.next().unwrap()
             } else {
                 ExpectedOutput::ExactMatch { value: json!("ok") }
             },
@@ -374,6 +386,29 @@ impl Harness {
             &self.sup,
             &signer(1),
             Self::args_for(1, subject, custom, Some(EVAL_CTX)),
+            invoker,
+            &ProtocolOnlyDefinitions,
+        )
+        .await
+        .unwrap();
+        self.clock.advance(1);
+        request
+    }
+
+    /// Creates a challenge to `subject` whose last cases expect `tail`, then
+    /// advances the clock one second, as [`Self::create`] does.
+    async fn create_with(
+        &self,
+        subject: u8,
+        tail: Vec<ExpectedOutput>,
+        invoker: &TestInvoker,
+    ) -> ChallengeRequest {
+        let mut args = Self::args_for(1, subject, 0, Some(EVAL_CTX));
+        args.test_cases_json = cases_json_with(tail);
+        let request = create_challenge(
+            &self.sup,
+            &signer(1),
+            args,
             invoker,
             &ProtocolOnlyDefinitions,
         )
@@ -787,20 +822,63 @@ fn sleeping_handler(millis: u64) -> EvaluatorHandler {
     })
 }
 
-/// 13b: the budget is total per attempt: two 200 ms evaluators under a
-/// 300 ms budget, so the first passes and the second runs out of time.
+/// 13b: the budget is total per attempt: two 500 ms evaluators under a
+/// 750 ms budget, so the first passes with 250 ms to spare and the second
+/// would end 250 ms past the budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grading_budget_is_total_per_attempt() {
     let h = Harness::new(evaluator_params()).await;
-    let invoker = h.invoker(Some(registry()), Some(sleeping_handler(200)));
+    let invoker = h.invoker(Some(registry()), Some(sleeping_handler(500)));
     let request = h.create(2, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    let graded = h
+        .grade_within(&request, &response, &invoker, Duration::from_millis(750))
+        .await
+        .unwrap();
+    assert!(graded.reasons[18].passed, "{:?}", graded.reasons[18]);
+    assert_eq!(
+        graded.reasons[19].reason.as_deref(),
+        Some("budget_exceeded"),
+        "{:?}",
+        graded.reasons[19]
+    );
+}
+
+/// TQ7: a slow evaluator that started uses the budget up, so its case and
+/// the `SchemaMatch` case after it both fail with `budget_exceeded`, and the
+/// attempt is graded: neither is a fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_evaluator_cuts_off_the_schema_case_after_it() {
+    let h = Harness::new(evaluator_params()).await;
+    let invoker = h.invoker(Some(registry()), Some(sleeping_handler(1000)));
+    let request = h
+        .create_with(
+            2,
+            vec![
+                ExpectedOutput::CustomEval {
+                    evaluator_outlet_id: OutletId::from(JUDGE),
+                },
+                ExpectedOutput::SchemaMatch {
+                    schema: json!({"type": "string"}),
+                },
+            ],
+            &invoker,
+        )
+        .await;
     let response = h.respond(&request, 1).await;
     let graded = h
         .grade_within(&request, &response, &invoker, Duration::from_millis(300))
         .await
         .unwrap();
-    assert!(graded.reasons[18].passed, "{:?}", graded.reasons[18]);
-    assert!(!graded.reasons[19].passed, "{:?}", graded.reasons[19]);
+    assert_eq!(graded.record.attempt, 1);
+    for i in [18, 19] {
+        assert_eq!(
+            graded.reasons[i].reason.as_deref(),
+            Some("budget_exceeded"),
+            "case {i}: {:?}",
+            graded.reasons[i]
+        );
+    }
 }
 
 /// 13e: a handler error and a budget overrun fail the case, and the record
@@ -1042,14 +1120,16 @@ async fn invoke(h: &Harness, handler: EvaluatorHandler) -> EvaluatorOutcome {
             input: json!({"case": {}, "output": "ok"}),
             remaining: Duration::from_secs(5),
             permit,
+            started: Arc::new(AtomicBool::new(false)),
         },
     )
     .await
 }
 
-/// 13i: an error before the handler runs (the economy reserve, the rate
-/// limit) or after it returned a verdict (the settlement) is unavailable, a
-/// fault; an error of the handler itself fails the case.
+/// 13i: an error before the handler runs (a payment refusal) or after it
+/// returned a verdict (the settlement) is unavailable, a fault; a rate-limit
+/// refusal by the reserve is a capacity refusal; an error of the handler
+/// itself fails the case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evaluator_reserve_error_is_fault_execute_error_is_case_fail() {
     // A priced context refuses at reserve: the evaluator holds no spending
@@ -1063,7 +1143,7 @@ async fn evaluator_reserve_error_is_fault_execute_error_is_case_fail() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-    // The rate limit refuses the eleventh call at reserve.
+    // The rate limit refuses the eleventh call at reserve, for capacity.
     let h = Harness::new(evaluator_params()).await;
     for _ in 0..10 {
         let outcome = invoke(&h, passing_handler(&calls)).await;
@@ -1077,7 +1157,13 @@ async fn evaluator_reserve_error_is_fault_execute_error_is_case_fail() {
     }
     let outcome = invoke(&h, passing_handler(&calls)).await;
     assert!(
-        matches!(outcome, EvaluatorOutcome::Unavailable(_)),
+        matches!(
+            outcome,
+            EvaluatorOutcome::CapacityRefused {
+                cause: GradingCapacityCause::EvaluatorRateLimit,
+                ..
+            }
+        ),
         "{outcome:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 10);
@@ -1137,6 +1223,7 @@ async fn evaluator_input_refused_by_schema_fails_the_case() {
             input: json!({"case": {}, "output": "ok"}),
             remaining: Duration::from_secs(5),
             permit,
+            started: Arc::new(AtomicBool::new(false)),
         },
     )
     .await;
@@ -1145,6 +1232,405 @@ async fn evaluator_input_refused_by_schema_fails_the_case() {
         EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned())
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Capacity refusals, budget expiry, shutdown, permits and bounds
+// ---------------------------------------------------------------------------
+
+/// Waits up to 10 s for `done`, failing the test with `what` after that.
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A handler that counts its entries and spins until `release` is set.
+fn held_handler(entered: &Arc<AtomicUsize>, release: &Arc<AtomicBool>) -> EvaluatorHandler {
+    let (entered, release) = (Arc::clone(entered), Arc::clone(release));
+    Arc::new(move |_input| {
+        entered.fetch_add(1, Ordering::SeqCst);
+        while !release.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(verdict(true))
+    })
+}
+
+/// Takes every free grading permit of the challenger.
+async fn take_free_permits(h: &Harness) -> Vec<OwnedSemaphorePermit> {
+    let mut held = Vec::new();
+    while let Ok(permit) = h.sup.challenge_grading_permit(did(1).as_ref()).await {
+        held.push(permit);
+    }
+    held
+}
+
+/// T14: the evaluator context's rate limit refuses the reserve, so the
+/// grading is a capacity refusal (7146): the lease is released, and neither
+/// an attempt nor a fault is recorded. An immediate re-grade passes Begin
+/// (no `GradingInProgress`, no `CooldownActive`) and is refused for capacity
+/// again; once one token refills, still inside the cooldown a fault would
+/// start, the same attempt grades.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_rate_limit_refusal_releases_the_lease_and_records_nothing() {
+    let h = Harness::new(evaluator_params()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoker = h.invoker(Some(registry()), Some(passing_handler(&calls)));
+    let request = h.create(1, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    // The hard rate limit's burst is 10 calls; the clock does not move, so
+    // no token refills.
+    for _ in 0..10 {
+        let outcome = invoke(&h, passing_handler(&calls)).await;
+        assert!(
+            matches!(outcome, EvaluatorOutcome::Verdict { .. }),
+            "{outcome:?}"
+        );
+    }
+    for _ in 0..2 {
+        let err = h.grade(&request, &response, &invoker).await.unwrap_err();
+        let ChallengeOpError::Trust(trust) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            matches!(
+                trust,
+                TrustError::GradingCapacityExhausted {
+                    cause: GradingCapacityCause::EvaluatorRateLimit,
+                    ..
+                }
+            ),
+            "{trust:?}"
+        );
+        assert_eq!(
+            crate::error_codes::trust_error_code(trust),
+            crate::error_codes::VALID_7146
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
+    // One token refills every 5 s (200 per 1000 s).
+    assert!(u64::from(request.cooldown_secs) > 5);
+    h.clock.advance(5);
+    let graded = h.grade(&request, &response, &invoker).await.unwrap();
+    assert_eq!(graded.record.attempt, 1);
+    assert!(graded.record.passed);
+    assert_eq!(calls.load(Ordering::SeqCst), 11);
+}
+
+/// T14 (budget): a reserve that cannot price the call refuses it with the
+/// budget error, and the evaluator outcome is a capacity refusal naming the
+/// budget; the handler never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_budget_refusal_is_a_capacity_refusal() {
+    use scp_core::economy::{Coefficient, PricingFormula, PricingMetric, PricingVariable};
+    let mut params = priced_params();
+    if let Some(policy) = params.economic_policy.as_mut() {
+        policy.cost_schedule.per_outlet_call = None;
+        // `i64::MAX` times any time of day above 1 overflows, so the cost
+        // cannot be computed.
+        policy.pricing_formula = Some(PricingFormula {
+            base_cost: Amount::new(0),
+            variables: vec![PricingVariable::Linear {
+                metric: PricingMetric::TimeOfDay,
+                coefficient: Coefficient::new(i64::MAX),
+            }],
+            cap: None,
+            floor: None,
+        });
+    }
+    let h = Harness::new(params).await;
+    if scp_clock::Clock::now_secs(&*h.clock) % 86_400 < 2 {
+        h.clock.advance(2);
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let outcome = invoke(&h, passing_handler(&calls)).await;
+    assert!(
+        matches!(
+            outcome,
+            EvaluatorOutcome::CapacityRefused {
+                cause: GradingCapacityCause::EvaluatorBudget,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// T15: the grading budget expires while the evaluator's reserve is still
+/// waiting on the evaluator context, before the evaluator started: a fault,
+/// not a charged attempt. The same attempt is then refused by the fault's
+/// cooldown, where a charged attempt would return its stored record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budget_expiry_before_the_evaluator_started_is_a_fault() {
+    let h = Harness::new(evaluator_params()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoker = h.invoker(Some(registry()), Some(passing_handler(&calls)));
+    let request = h.create(1, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    let stall = h.sup.test_stall_actor(EVAL_CTX);
+    let err = h
+        .grade_within(&request, &response, &invoker, Duration::from_millis(300))
+        .await
+        .unwrap_err();
+    assert!(is_unavailable(&err), "{err:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let again = h
+        .grade_within(&request, &response, &invoker, Duration::from_millis(300))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            again,
+            ChallengeOpError::Trust(TrustError::CooldownActive { .. })
+        ),
+        "{again:?}"
+    );
+    drop(stall);
+}
+
+/// T16: a supervisor shutdown waits for an evaluator pipeline that has not
+/// settled, so storage never closes under an unsettled reserve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_waits_for_the_evaluator_settle() {
+    let h = Arc::new(Harness::new(evaluator_params()).await);
+    let release = Arc::new(AtomicBool::new(false));
+    let _release_on_exit = ReleaseOnDrop(Arc::clone(&release));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let invoker = Arc::new(h.invoker(Some(registry()), Some(held_handler(&entered, &release))));
+    let request = h.create(1, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    let grading = {
+        let (h, invoker) = (Arc::clone(&h), Arc::clone(&invoker));
+        tokio::spawn(async move {
+            h.grade_within(&request, &response, &invoker, Duration::from_secs(30))
+                .await
+        })
+    };
+    wait_until("the handler never started", || {
+        entered.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let shutdown = {
+        let sup = Arc::clone(&h.sup);
+        tokio::spawn(async move { sup.shutdown_all_contexts().await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown finished while an evaluator pipeline had not settled"
+    );
+    release.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(10), shutdown)
+        .await
+        .expect("shutdown never finished")
+        .unwrap();
+    // The settle ran against a stopped context; the outcome is not under test.
+    let _ = grading.await.unwrap();
+}
+
+/// T17: an evaluator call cut off after 1 ms keeps its permit on the
+/// handler's thread, so 7 of the 8 permits are free until the handler
+/// returns, and all 8 after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cut_off_evaluator_holds_one_permit_until_it_returns() {
+    let h = Harness::new(evaluator_params()).await;
+    let release = Arc::new(AtomicBool::new(false));
+    let _release_on_exit = ReleaseOnDrop(Arc::clone(&release));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let permit = Arc::new(
+        h.sup
+            .challenge_grading_permit(did(1).as_ref())
+            .await
+            .unwrap(),
+    );
+    let registry = registry();
+    let started = Arc::new(AtomicBool::new(false));
+    let outcome = invoke_evaluator_outlet(
+        &h.sup,
+        Some(&registry),
+        Some(held_handler(&entered, &release)),
+        EvaluatorCall {
+            evaluator_context_id: EVAL_CTX,
+            outlet_id: &OutletId::from(JUDGE),
+            challenger: &did(1),
+            input: json!({"case": {}, "output": "ok"}),
+            remaining: Duration::from_millis(1),
+            permit,
+            started: Arc::clone(&started),
+        },
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned())
+    );
+    assert!(started.load(Ordering::SeqCst));
+    wait_until("the handler never started", || {
+        entered.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let held = take_free_permits(&h).await;
+    assert_eq!(held.len(), MAX_CONCURRENT_GRADINGS_PER_CHALLENGER - 1);
+    drop(held);
+    release.store(true, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let held = take_free_permits(&h).await;
+        if held.len() == MAX_CONCURRENT_GRADINGS_PER_CHALLENGER {
+            break;
+        }
+        drop(held);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the permit never returned"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// T17: an evaluator input larger than `MAX_CHALLENGE_RESPONSE_BYTES`
+/// fails its case without a call; the reserve and the handler never run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversize_evaluator_input_fails_the_case_without_a_call() {
+    let h = Harness::new(evaluator_params()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let permit = Arc::new(
+        h.sup
+            .challenge_grading_permit(did(1).as_ref())
+            .await
+            .unwrap(),
+    );
+    let registry = registry();
+    let started = Arc::new(AtomicBool::new(false));
+    let outcome = invoke_evaluator_outlet(
+        &h.sup,
+        Some(&registry),
+        Some(passing_handler(&calls)),
+        EvaluatorCall {
+            evaluator_context_id: EVAL_CTX,
+            outlet_id: &OutletId::from(JUDGE),
+            challenger: &did(1),
+            input: json!({"case": {}, "output": "x".repeat(MAX_CHALLENGE_RESPONSE_BYTES)}),
+            remaining: Duration::from_secs(30),
+            permit,
+            started: Arc::clone(&started),
+        },
+    )
+    .await;
+    assert!(
+        matches!(outcome, EvaluatorOutcome::CaseFailed(_)),
+        "{outcome:?}"
+    );
+    assert!(!started.load(Ordering::SeqCst));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// T17: a resubmit of a graded attempt returns its stored record without a
+/// grading permit, so it succeeds while every permit is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stored_resubmit_takes_no_permit() {
+    let h = Harness::new(evaluator_params()).await;
+    let invoker = h.invoker(None, None);
+    let request = h.create(0, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    let graded = h.grade(&request, &response, &invoker).await.unwrap();
+    let held = take_free_permits(&h).await;
+    assert_eq!(held.len(), MAX_CONCURRENT_GRADINGS_PER_CHALLENGER);
+    let again = h.grade(&request, &response, &invoker).await.unwrap();
+    assert_eq!(again.record, graded.record);
+    drop(held);
+}
+
+/// T18: a request larger than `MAX_CHALLENGE_RESPONSE_BYTES` is refused
+/// with `ResponseTooLarge` (7143) by grade and by respond, before any
+/// resolution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversize_request_refused_before_resolution() {
+    let h = Harness::new(evaluator_params()).await;
+    let invoker = h.invoker(None, None);
+    let request = h.create(0, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    let mut oversize = serde_json::to_string(&request).unwrap();
+    oversize.push_str(&" ".repeat(MAX_CHALLENGE_RESPONSE_BYTES));
+    let before = h.resolver.calls();
+    let graded = grade_response(
+        &Grader {
+            sup: &h.sup,
+            signer: &signer(1),
+            resolver: Arc::clone(&h.resolver),
+            invoker: &invoker,
+        },
+        &h.repo,
+        &did(1),
+        &oversize,
+        &serde_json::to_string(&response).unwrap(),
+    )
+    .await;
+    let responded = respond_to_challenge(
+        &signer(2),
+        Arc::clone(&h.resolver),
+        did(2).0,
+        &oversize,
+        "[]",
+        1,
+    )
+    .await;
+    for result in [graded.map(|_| ()), responded.map(|_| ())] {
+        let err = result.unwrap_err();
+        let ChallengeOpError::Trust(trust) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            matches!(trust, TrustError::ResponseTooLarge { .. }),
+            "{trust:?}"
+        );
+        assert_eq!(
+            crate::error_codes::trust_error_code(trust),
+            crate::error_codes::VALID_7143
+        );
+    }
+    assert_eq!(h.resolver.calls(), before, "the refusal resolved a DID");
+}
+
+/// A grade at `created_at` is refused as not yet gradable (7153), naming
+/// `created_at + 1`, and the same attempt grades one second later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grade_at_created_at_is_not_yet_gradable() {
+    let h = Harness::new(evaluator_params()).await;
+    let invoker = h.invoker(None, None);
+    let request = create_challenge(
+        &h.sup,
+        &signer(1),
+        Harness::args(1, 0, None),
+        &invoker,
+        &ProtocolOnlyDefinitions,
+    )
+    .await
+    .unwrap();
+    let response = h.respond(&request, 1).await;
+    let err = h.grade(&request, &response, &invoker).await.unwrap_err();
+    let ChallengeOpError::Trust(trust) = &err else {
+        panic!("{err:?}");
+    };
+    assert!(
+        matches!(
+            trust,
+            TrustError::ChallengeNotYetGradable { retry_at, .. }
+                if *retry_at == request.created_at + 1
+        ),
+        "{trust:?}"
+    );
+    assert_eq!(
+        crate::error_codes::trust_error_code(trust),
+        crate::error_codes::VALID_7153
+    );
+    h.clock.advance(1);
+    let graded = h.grade(&request, &response, &invoker).await.unwrap();
+    assert_eq!(graded.record.attempt, 1);
 }
 
 // ---------------------------------------------------------------------------

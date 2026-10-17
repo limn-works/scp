@@ -275,8 +275,8 @@ impl Fixture {
             .collect();
         let response = self.respond(&request, 1, outputs)?;
         let auth = authenticate_challenge_response(
-            &request,
-            &response,
+            request.clone(),
+            response,
             &self.verifier.did,
             &self.resolver,
         )?;

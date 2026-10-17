@@ -15,6 +15,7 @@
 //! [`invoke_evaluator_outlet`], which hold the shared rules.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,6 +29,7 @@ use scp_core::context::supervisor::{
 use scp_core::store::ProtocolRepository;
 use scp_did::DID;
 use scp_platform::traits::Storage;
+use scp_protocol::context::outlets::error_codes::SLUG_ECONOMIC_BUDGET_EXCEEDED;
 use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::context::outlets::{
     OutletId, has_outlet_invocation_capability, sha256_json, validate_value_against_schema,
@@ -35,12 +37,12 @@ use scp_protocol::context::outlets::{
 use scp_protocol::trust::attestation::ActiveKeyResolver;
 use scp_protocol::trust::schema_gate::schema_verdict;
 use scp_protocol::trust::{
-    AdmissionCheck, AdmissionError, CHALLENGE_GRADING_BUDGET_SECS, CapabilityDefinitionSource,
-    CapabilityUri, CaseResult, ChallengePolicy, ChallengeRequest, ChallengeResponse,
-    ChallengeVerification, ExpectedOutput, NewChallenge, OwnedAuthenticatedResponse, PolicyPick,
-    ProtocolOnlyDefinitions, SchemaGate, SchemaVerdict, TestCase, TestOutput, TrustError,
-    authenticate_challenge_response, challenge_request_unsigned, challenge_response_unsigned,
-    check_response_bounds, grade,
+    AdmissionCheck, AdmissionError, AuthenticatedResponse, CHALLENGE_GRADING_BUDGET_SECS,
+    CapabilityDefinitionSource, CapabilityUri, CaseResult, ChallengePolicy, ChallengeRequest,
+    ChallengeResponse, ChallengeVerification, ExpectedOutput, GradingCapacityCause,
+    MAX_CHALLENGE_RESPONSE_BYTES, NewChallenge, PolicyPick, ProtocolOnlyDefinitions, SchemaGate,
+    SchemaVerdict, TestCase, TestOutput, TrustError, authenticate_challenge_response,
+    challenge_request_unsigned, challenge_response_unsigned, check_challenge_json_bounds, grade,
 };
 use serde_json::Value;
 use tokio::sync::OwnedSemaphorePermit;
@@ -171,6 +173,15 @@ pub enum EvaluatorOutcome {
     /// The evaluator could not run, or its settlement failed after a
     /// verdict: a challenger fault, which uses no attempt.
     Unavailable(String),
+    /// The evaluator context's reserve refused the call for its rate limit
+    /// or its budget before the evaluator ran: a capacity refusal, which
+    /// records neither an attempt nor a fault (spec 07 §7.3.4 step 3).
+    CapacityRefused {
+        /// Which limit refused the call.
+        cause: GradingCapacityCause,
+        /// The reserve's refusal.
+        reason: String,
+    },
 }
 
 /// The bridge side of a `CustomEval` evaluator.
@@ -197,15 +208,17 @@ pub trait EvaluatorInvoker: Send + Sync {
     ) -> Result<(), TrustError>;
 
     /// Runs the evaluator on `call.input` within `call.remaining`, holding
-    /// `call.permit` until the handler returns.
+    /// `call.permit` until the handler returns, and sets `call.started` when
+    /// the evaluator starts.
     async fn invoke(&self, call: EvaluatorCall<'_>) -> EvaluatorOutcome;
 }
 
 /// One evaluator invocation.
 ///
 /// It names the outlet in its evaluator context, the challenger invoking
-/// it, the case input, the time left in the grading budget, and the grading
-/// permit the handler holds until it returns.
+/// it, the case input, the time left in the grading budget, the grading
+/// permit the handler holds until it returns, and the flag that records
+/// whether the evaluator started.
 pub struct EvaluatorCall<'a> {
     /// The context the evaluator outlet is registered in.
     pub evaluator_context_id: &'a str,
@@ -219,6 +232,10 @@ pub struct EvaluatorCall<'a> {
     pub remaining: Duration,
     /// The challenger's grading permit.
     pub permit: Arc<OwnedSemaphorePermit>,
+    /// Set when the evaluator starts, after the economy reserve. The grader
+    /// owns it, so a budget that expires mid-call can tell a reserve that
+    /// never finished (a fault) from an evaluator that ran (a failed case).
+    pub started: Arc<AtomicBool>,
 }
 
 /// The shared body of [`EvaluatorInvoker::check_registered`].
@@ -296,13 +313,17 @@ fn parse_verdict(output: &Value) -> Option<EvaluatorVerdict> {
 /// [`Supervisor::invoke_outlet_with_economy`] on a blocking thread that
 /// holds `call.permit`, with `call.challenger` as the invoker.
 ///
-/// The phase of a failure decides its class, never the error's variant:
-/// - no handler, no registration, or any error before the executor
-///   started (the context state, the permission, the economy reserve, the
-///   rate limit) is [`EvaluatorOutcome::Unavailable`];
-/// - an input the evaluator's input schema refuses is
-///   [`EvaluatorOutcome::CaseFailed`], checked before the reserve because
-///   the input carries the subject's output;
+/// The phase of a failure decides its class:
+/// - a rate-limit or budget refusal by the reserve, before the executor
+///   started, is [`EvaluatorOutcome::CapacityRefused`] (see
+///   [`capacity_cause`]);
+/// - no handler, no registration, a refused spawn, or any other error
+///   before the executor started (the context state, the permission, a
+///   payment refusal) is [`EvaluatorOutcome::Unavailable`];
+/// - an input larger than `MAX_CHALLENGE_RESPONSE_BYTES`, or one the
+///   evaluator's input schema refuses, is [`EvaluatorOutcome::CaseFailed`],
+///   checked before the reserve because the input carries the subject's
+///   output;
 /// - an error after the executor started with no well-formed verdict (a
 ///   handler error, a panic, a timeout, an output the output schema
 ///   refuses) is [`EvaluatorOutcome::CaseFailed`];
@@ -311,10 +332,12 @@ fn parse_verdict(output: &Value) -> Option<EvaluatorVerdict> {
 ///   discarded: the challenger's own settlement never decides a subject's
 ///   case.
 ///
-/// The economy pipeline runs on its own task. A reserve holds budget, a
-/// rate-limit slot, and any escrow until its settle runs, so dropping the
-/// pipeline between the two would leak them; the task carries it to its
-/// settle when the grading budget expires or the caller is dropped.
+/// The economy pipeline runs on its own task on the supervisor's task
+/// tracker. A reserve holds budget, a rate-limit slot, and any escrow until
+/// its settle runs, so dropping the pipeline between the two would leak
+/// them; the task carries it to its settle when the grading budget expires
+/// or the caller is dropped, and a supervisor shutdown waits for that
+/// settle before storage closes.
 pub async fn invoke_evaluator_outlet(
     sup: &Arc<Supervisor>,
     registry: Option<&OutletRegistry>,
@@ -328,6 +351,7 @@ pub async fn invoke_evaluator_outlet(
         input,
         remaining,
         permit,
+        started,
     } = call;
     let Some(registry) = registry else {
         return EvaluatorOutcome::Unavailable("the evaluator context is not open".to_owned());
@@ -338,13 +362,15 @@ pub async fn invoke_evaluator_outlet(
     let Some(handler) = handler else {
         return EvaluatorOutcome::Unavailable("no host handler is registered".to_owned());
     };
-    if validate_value_against_schema(&input, &registration.schema.input_schema).is_err()
+    let oversize =
+        serde_json::to_vec(&input).map_or(true, |bytes| bytes.len() > MAX_CHALLENGE_RESPONSE_BYTES);
+    if oversize
+        || validate_value_against_schema(&input, &registration.schema.input_schema).is_err()
         || sha256_json(&input).is_err()
     {
         return EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned());
     }
     let output_schema = registration.schema.output_schema.clone();
-    let started = Arc::new(AtomicBool::new(false));
     let captured: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let executor = {
         let started = Arc::clone(&started);
@@ -368,26 +394,35 @@ pub async fn invoke_evaluator_outlet(
     let timeout_ms = u32::try_from(remaining.as_millis())
         .unwrap_or(u32::MAX)
         .max(1);
-    let pipeline = {
-        let sup = Arc::clone(sup);
+    let spawned = {
+        let pipeline_sup = Arc::clone(sup);
         let evaluator_context_id = evaluator_context_id.to_owned();
         let registry = registry.clone();
         let outlet_id = outlet_id.clone();
         let challenger = challenger.clone();
-        tokio::spawn(async move {
-            sup.invoke_outlet_with_economy(
-                &evaluator_context_id,
-                &registry,
-                &outlet_id,
-                input,
-                &challenger,
-                None,
-                None,
-                Some(timeout_ms),
-                executor,
-            )
-            .await
+        sup.spawn_evaluator_pipeline(async move {
+            pipeline_sup
+                .invoke_outlet_with_economy(
+                    &evaluator_context_id,
+                    &registry,
+                    &outlet_id,
+                    input,
+                    &challenger,
+                    None,
+                    None,
+                    Some(timeout_ms),
+                    executor,
+                )
+                .await
         })
+    };
+    let pipeline = match spawned {
+        Ok(pipeline) => pipeline,
+        Err(e) => {
+            return EvaluatorOutcome::Unavailable(format!(
+                "the evaluator pipeline did not start: {e}"
+            ));
+        }
     };
     let joined = pipeline
         .await
@@ -420,7 +455,13 @@ fn classify_evaluator_result(
                 reason: v.reason,
             },
         ),
-        Err(e) if !started.load(Ordering::SeqCst) => EvaluatorOutcome::Unavailable(e.to_string()),
+        Err(e) if !started.load(Ordering::SeqCst) => capacity_cause(&e).map_or_else(
+            || EvaluatorOutcome::Unavailable(e.to_string()),
+            |cause| EvaluatorOutcome::CapacityRefused {
+                cause,
+                reason: e.to_string(),
+            },
+        ),
         Err(e) => {
             let verdict_returned = captured
                 .lock()
@@ -439,6 +480,24 @@ fn classify_evaluator_result(
                 EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned())
             }
         }
+    }
+}
+
+/// The capacity limit behind a reserve refusal, for an error raised before
+/// the evaluator started; `None` for every other error, which is a fault.
+///
+/// The list is positive: the reserve's hard rate limit
+/// ([`ContextError::RateLimited`]) and its budget refusal (an outlet error
+/// with slug `economic.budget-exceeded`, raised for a missing budget, an
+/// unpriceable call, and an exhausted one). A payment refusal, a spending
+/// capability refusal, and an inactive context stay faults.
+fn capacity_cause(error: &ContextError) -> Option<GradingCapacityCause> {
+    match error {
+        ContextError::RateLimited { .. } => Some(GradingCapacityCause::EvaluatorRateLimit),
+        ContextError::Outlet(surface) if surface.slug == SLUG_ECONOMIC_BUDGET_EXCEEDED => {
+            Some(GradingCapacityCause::EvaluatorBudget)
+        }
+        _ => None,
     }
 }
 
@@ -558,6 +617,8 @@ pub async fn create_challenge(
 ///
 /// - [`ChallengeOpError::Context`] when the signer is not Ed25519 (before
 ///   any resolution or custody call), or the custody failure from signing.
+/// - [`ChallengeOpError::Trust`] with `ResponseTooLarge` when the request
+///   is larger than `MAX_CHALLENGE_RESPONSE_BYTES` or nested too deep.
 /// - [`ChallengeOpError::MalformedJson`] naming the first argument that
 ///   does not decode.
 /// - [`ChallengeOpError::Trust`] for every refusal of
@@ -575,6 +636,7 @@ where
     R: ActiveKeyResolver + Send + Sync + 'static,
 {
     signer.require_ed25519()?;
+    check_challenge_json_bounds(request_json.as_bytes())?;
     let request: ChallengeRequest = decode!(JsonInput::Challenge, request_json)?;
     let outputs: Vec<TestOutput> = decode!(JsonInput::Outputs, outputs_json)?;
     let unsigned = run_blocking_resolution(move |_scope| {
@@ -616,23 +678,27 @@ pub struct GradeResult {
 /// (spec 07 §7.3.4 steps 3 and 4). `verifier` is the challenger.
 ///
 /// Steps, in order:
-/// 1. the signer is Ed25519, and the raw response fits
-///    [`check_response_bounds`];
+/// 1. the signer is Ed25519, and the raw request and response each fit
+///    [`check_challenge_json_bounds`];
 /// 2. the request and response decode;
 /// 3. the ledger holds the challenge with this request digest and subject,
 ///    and, once it is closed, an attempt graded from this response (read
 ///    only, before any resolution);
 /// 4. [`authenticate_challenge_response`] on a blocking thread, so a forged
 ///    response takes no lease and records no fault;
-/// 5. one of the challenger's grading permits;
-/// 6. Begin: a resubmitted attempt returns its stored record, otherwise the
-///    caller holds the grading lease;
+/// 5. Begin: a resubmitted attempt returns its stored record and takes no
+///    permit, otherwise the caller holds the grading lease;
+/// 6. one of the challenger's grading permits; with none free, the lease is
+///    released and the grading refused with `GradingCapacityExhausted`;
 /// 7. the cases run one at a time within `CHALLENGE_GRADING_BUDGET_SECS`
-///    for the whole attempt; a case the budget cuts off fails with
-///    `budget_exceeded`;
-/// 8. a stored schema the gate refuses, or an unavailable evaluator, is a
-///    fault, which uses no attempt and restarts the cooldown; otherwise the
-///    ledger signs the record and commits it;
+///    for the whole attempt; a case the budget cuts off after its evaluator
+///    started, and every later case, fails with `budget_exceeded`;
+/// 8. a capacity refusal by an evaluator's reserve releases the lease and
+///    refuses with `GradingCapacityExhausted`, recording nothing; a stored
+///    schema the gate refuses, an unavailable evaluator, or a budget that
+///    expired before the evaluator in progress started, is a fault, which
+///    uses no attempt and restarts the cooldown; otherwise the ledger signs
+///    the record and commits it;
 /// 9. the record is written to `repo`, whose failure is returned as
 ///    [`GradeResult::trust_store_error`].
 ///
@@ -702,7 +768,8 @@ where
     let (sup, signer, invoker) = (*sup, *signer, *invoker);
     let resolver = Arc::clone(resolver);
     signer.require_ed25519()?;
-    check_response_bounds(response_json.as_bytes())?;
+    check_challenge_json_bounds(request_json.as_bytes())?;
+    check_challenge_json_bounds(response_json.as_bytes())?;
     let request: ChallengeRequest = decode!(JsonInput::Challenge, request_json)?;
     let response: ChallengeResponse = decode!(JsonInput::Response, response_json)?;
     let challenger = verifier.as_ref();
@@ -711,19 +778,25 @@ where
     let auth = {
         let challenger = challenger.to_owned();
         run_blocking_resolution(move |_scope| {
-            authenticate_challenge_response(&request, &response, &challenger, resolver.as_ref())
-                .map(|auth| auth.to_owned_response())
+            authenticate_challenge_response(request, response, &challenger, resolver.as_ref())
         })
         .await??
     };
     let auth = Arc::new(auth);
-    let permit = Arc::new(sup.challenge_grading_permit(challenger).await?);
     let lease = match sup
         .dispatch_challenge_begin_grade(challenger, Arc::clone(&auth))
         .await?
     {
         BeginOutcome::Stored(stored) => return Ok(store_graded(repo, *stored).await),
         BeginOutcome::Lease(lease) => lease,
+    };
+    let permit = match sup.challenge_grading_permit(challenger).await {
+        Ok(permit) => Arc::new(permit),
+        Err(refusal) => {
+            return Err(
+                release_lease(sup, challenger, &auth, lease.lease_id, refusal.into()).await,
+            );
+        }
     };
     let mut evaluated = CaseVerdicts::default();
     let run = async {
@@ -736,16 +809,27 @@ where
         };
         evaluate_cases(&auth, &lease.answer_key, &case_run, &mut evaluated).await;
     };
-    // On expiry the in-flight case and every later one have no verdict, so
-    // `grade` fails them with `budget_exceeded`.
-    let _ = tokio::time::timeout(budget, run).await;
+    // On expiry every case after the in-flight one has no verdict, so
+    // `grade` fails it with `budget_exceeded`; so does the in-flight case
+    // when its evaluator started. An evaluator that had not started was
+    // still in its reserve: challenger state, so a fault.
+    if tokio::time::timeout(budget, run).await.is_err() {
+        evaluated.expire_in_flight();
+    }
+    if let Some(cause) = evaluated.capacity.take() {
+        let refusal = TrustError::GradingCapacityExhausted {
+            challenger: challenger.to_owned(),
+            cause,
+        };
+        return Err(release_lease(sup, challenger, &auth, lease.lease_id, refusal.into()).await);
+    }
     if let Some(fault) = evaluated.fault.take() {
         sup.dispatch_challenge_fault(challenger, Arc::clone(&auth), lease.lease_id, fault.clone())
             .await?;
         return Err(fault.into());
     }
     let outcome = grade(
-        &auth.as_authenticated(),
+        &auth,
         &lease.answer_key,
         &evaluated.evals,
         &evaluated.schemas,
@@ -756,13 +840,72 @@ where
     Ok(store_graded(repo, committed).await)
 }
 
-/// The verdicts gathered for one attempt, and the fault that stopped it.
+/// Releases the grading lease of a capacity refusal and returns `refusal`,
+/// or the release's own error when the release fails: a lease that cannot
+/// be released is reported, never dropped, and it lapses at its deadline.
+async fn release_lease(
+    sup: &Supervisor,
+    challenger: &str,
+    auth: &Arc<AuthenticatedResponse>,
+    lease_id: u64,
+    refusal: ChallengeOpError,
+) -> ChallengeOpError {
+    match sup
+        .dispatch_challenge_release(challenger, Arc::clone(auth), lease_id)
+        .await
+    {
+        Ok(()) => refusal,
+        Err(release) => {
+            tracing::error!(
+                challenger,
+                error = %release,
+                refusal = %refusal,
+                "grading lease not released after a capacity refusal"
+            );
+            release.into()
+        }
+    }
+}
+
+/// The verdicts gathered for one attempt, and what stopped it.
 #[derive(Default)]
 struct CaseVerdicts {
     evals: BTreeMap<usize, CaseResult>,
     schemas: BTreeMap<usize, SchemaVerdict>,
     /// A challenger fault: `SchemaRejected` or `EvaluatorUnavailable`.
     fault: Option<TrustError>,
+    /// A capacity refusal by an evaluator's reserve.
+    capacity: Option<GradingCapacityCause>,
+    /// The evaluator call in progress, cleared when it returns.
+    in_flight: Option<InFlight>,
+}
+
+/// The evaluator call in progress, and whether its evaluator started.
+struct InFlight {
+    context_id: String,
+    outlet_id: OutletId,
+    started: Arc<AtomicBool>,
+}
+
+impl CaseVerdicts {
+    /// Applies a budget expiry: an in-flight evaluator that had not started
+    /// becomes a fault (spec 07 §7.3.4 step 3); one that started leaves its
+    /// case without a verdict, which `grade` fails with `budget_exceeded`.
+    fn expire_in_flight(&mut self) {
+        let Some(in_flight) = self.in_flight.take() else {
+            return;
+        };
+        if self.fault.is_none()
+            && self.capacity.is_none()
+            && !in_flight.started.load(Ordering::SeqCst)
+        {
+            self.fault = Some(TrustError::EvaluatorUnavailable {
+                context_id: in_flight.context_id,
+                outlet_id: in_flight.outlet_id,
+                reason: "the grading budget expired before the evaluator started".to_owned(),
+            });
+        }
+    }
 }
 
 /// How one attempt runs its evaluated cases: the evaluator context, the
@@ -806,19 +949,12 @@ async fn schema_case(
 /// Runs every `SchemaMatch` and `CustomEval` case of the attempt, one at a
 /// time, filling `out`. It stops at the first fault.
 async fn evaluate_cases(
-    auth: &OwnedAuthenticatedResponse,
+    auth: &AuthenticatedResponse,
     answer_key: &scp_protocol::trust::AnswerKey,
     run: &CaseRun<'_>,
     out: &mut CaseVerdicts,
 ) {
-    let CaseRun {
-        evaluator_context_id,
-        challenger,
-        invoker,
-        permit,
-        deadline,
-    } = *run;
-    let auth = auth.as_authenticated();
+    let permit = run.permit;
     let cases = &auth.request().test_cases;
     let outputs = &auth.response().outputs;
     for (i, ((expected, case), output)) in answer_key
@@ -843,61 +979,11 @@ async fn evaluate_cases(
             ExpectedOutput::CustomEval {
                 evaluator_outlet_id,
             } => {
-                let Some(context_id) = evaluator_context_id else {
-                    out.fault = Some(TrustError::EvaluatorUnavailable {
-                        context_id: String::new(),
-                        outlet_id: evaluator_outlet_id.clone(),
-                        reason: "the challenge names no evaluator context".to_owned(),
-                    });
-                    return;
-                };
-                let input = serde_json::json!({
-                    "case": {
-                        "test_id": case.test_id,
-                        "input": case.input,
-                        "category": case.category,
-                        "weight": case.weight,
-                    },
-                    "output": output.output,
-                });
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                match invoker
-                    .invoke(EvaluatorCall {
-                        evaluator_context_id: context_id,
-                        outlet_id: evaluator_outlet_id,
-                        challenger,
-                        input,
-                        remaining,
-                        permit: Arc::clone(permit),
-                    })
+                if eval_case(i, case, &output.output, evaluator_outlet_id, run, out)
                     .await
+                    .is_break()
                 {
-                    EvaluatorOutcome::Verdict { passed, reason } => {
-                        out.evals.insert(
-                            i,
-                            CaseResult {
-                                passed,
-                                reason: Some(reason),
-                            },
-                        );
-                    }
-                    EvaluatorOutcome::CaseFailed(reason) => {
-                        out.evals.insert(
-                            i,
-                            CaseResult {
-                                passed: false,
-                                reason: Some(reason),
-                            },
-                        );
-                    }
-                    EvaluatorOutcome::Unavailable(reason) => {
-                        out.fault = Some(TrustError::EvaluatorUnavailable {
-                            context_id: context_id.to_owned(),
-                            outlet_id: evaluator_outlet_id.clone(),
-                            reason,
-                        });
-                        return;
-                    }
+                    return;
                 }
             }
             ExpectedOutput::ExactMatch { .. }
@@ -905,6 +991,102 @@ async fn evaluate_cases(
             | ExpectedOutput::ContainsNone { .. } => {}
         }
     }
+}
+
+/// Runs one `CustomEval` case through the invoker and records its verdict,
+/// its fault or its capacity refusal in `out`. Breaks when the attempt
+/// stops at this case.
+async fn eval_case(
+    i: usize,
+    case: &scp_protocol::trust::ChallengeCase,
+    output: &Value,
+    evaluator_outlet_id: &OutletId,
+    run: &CaseRun<'_>,
+    out: &mut CaseVerdicts,
+) -> ControlFlow<()> {
+    let CaseRun {
+        evaluator_context_id,
+        challenger,
+        invoker,
+        permit,
+        deadline,
+    } = *run;
+    let Some(context_id) = evaluator_context_id else {
+        out.fault = Some(TrustError::EvaluatorUnavailable {
+            context_id: String::new(),
+            outlet_id: evaluator_outlet_id.clone(),
+            reason: "the challenge names no evaluator context".to_owned(),
+        });
+        return ControlFlow::Break(());
+    };
+    let input = serde_json::json!({
+        "case": {
+            "test_id": case.test_id,
+            "input": case.input,
+            "category": case.category,
+            "weight": case.weight,
+        },
+        "output": output,
+    });
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let started = Arc::new(AtomicBool::new(false));
+    out.in_flight = Some(InFlight {
+        context_id: context_id.to_owned(),
+        outlet_id: evaluator_outlet_id.clone(),
+        started: Arc::clone(&started),
+    });
+    let outcome = invoker
+        .invoke(EvaluatorCall {
+            evaluator_context_id: context_id,
+            outlet_id: evaluator_outlet_id,
+            challenger,
+            input,
+            remaining,
+            permit: Arc::clone(permit),
+            started,
+        })
+        .await;
+    out.in_flight = None;
+    match outcome {
+        EvaluatorOutcome::Verdict { passed, reason } => {
+            out.evals.insert(
+                i,
+                CaseResult {
+                    passed,
+                    reason: Some(reason),
+                },
+            );
+        }
+        EvaluatorOutcome::CaseFailed(reason) => {
+            out.evals.insert(
+                i,
+                CaseResult {
+                    passed: false,
+                    reason: Some(reason),
+                },
+            );
+        }
+        EvaluatorOutcome::Unavailable(reason) => {
+            out.fault = Some(TrustError::EvaluatorUnavailable {
+                context_id: context_id.to_owned(),
+                outlet_id: evaluator_outlet_id.clone(),
+                reason,
+            });
+            return ControlFlow::Break(());
+        }
+        EvaluatorOutcome::CapacityRefused { cause, reason } => {
+            tracing::info!(
+                context_id,
+                outlet_id = %evaluator_outlet_id,
+                %cause,
+                reason,
+                "evaluator reserve refused the call for capacity"
+            );
+            out.capacity = Some(cause);
+            return ControlFlow::Break(());
+        }
+    }
+    ControlFlow::Continue(())
 }
 
 /// Writes a graded attempt's record to the bridge's trust store. A write

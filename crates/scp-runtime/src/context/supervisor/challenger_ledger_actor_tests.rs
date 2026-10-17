@@ -17,10 +17,10 @@ use scp_clock::{Clock, TestClock};
 use scp_did::DID;
 use scp_protocol::trust::capability_definition::ProtocolOnlyDefinitions;
 use scp_protocol::trust::{
-    ActiveKeyResolver, AnswerKey, CanonicalIdentifier, ChallengeClosure, ChallengePolicy,
-    ChallengeRequest, ChallengeResponse, ExpectedOutput, GradeOutcome, NewChallenge,
-    OwnedAuthenticatedResponse, SchemaVerdict, TestCase, TestOutput, TrustError,
-    authenticate_challenge_response, challenge_request_signing_digest, challenge_request_unsigned,
+    ActiveKeyResolver, AnswerKey, AuthenticatedResponse, CanonicalIdentifier, ChallengeClosure,
+    ChallengePolicy, ChallengeRequest, ChallengeResponse, ExpectedOutput, GradeOutcome,
+    NewChallenge, SchemaVerdict, TestCase, TestOutput, TrustError, authenticate_challenge_response,
+    challenge_request_signing_digest, challenge_request_unsigned,
     challenge_response_signing_digest, challenge_response_unsigned,
     challenge_verification_signing_digest, grade,
 };
@@ -341,17 +341,16 @@ impl Harness {
         request: &ChallengeRequest,
         attempt: u32,
         answer: &str,
-    ) -> Arc<OwnedAuthenticatedResponse> {
+    ) -> Arc<AuthenticatedResponse> {
         let response = self.response_as(subject, request, attempt, answer);
         Arc::new(
             authenticate_challenge_response(
-                request,
-                &response,
+                request.clone(),
+                response,
                 &self.verifier,
                 &self.resolver_with(&subject.0, &subject.1),
             )
-            .unwrap()
-            .to_owned_response(),
+            .unwrap(),
         )
     }
 
@@ -375,7 +374,7 @@ impl Harness {
         request: &ChallengeRequest,
         attempt: u32,
         answer: &str,
-    ) -> Arc<OwnedAuthenticatedResponse> {
+    ) -> Arc<AuthenticatedResponse> {
         self.respond_as(&self.me(), request, attempt, answer)
     }
 
@@ -386,7 +385,7 @@ impl Harness {
         &self,
         request: &ChallengeRequest,
         attempt: u32,
-    ) -> Arc<OwnedAuthenticatedResponse> {
+    ) -> Arc<AuthenticatedResponse> {
         let honest = self.respond_response(request, 1, "ok");
         let mut response = ChallengeResponse {
             attempt,
@@ -396,26 +395,30 @@ impl Harness {
         let digest = challenge_response_signing_digest(&response).unwrap();
         response.subject_signature = self.subject_key.sign(&digest).to_bytes().to_vec();
         Arc::new(
-            authenticate_challenge_response(request, &response, &self.verifier, &self.resolver)
-                .unwrap()
-                .to_owned_response(),
+            authenticate_challenge_response(
+                request.clone(),
+                response,
+                &self.verifier,
+                &self.resolver,
+            )
+            .unwrap(),
         )
     }
 
     async fn begin(
         &self,
-        auth: &Arc<OwnedAuthenticatedResponse>,
+        auth: &Arc<AuthenticatedResponse>,
     ) -> Result<BeginOutcome, ChallengeLedgerError> {
         begin_on(&self.handle, auth).await
     }
 
-    async fn lease(&self, auth: &Arc<OwnedAuthenticatedResponse>) -> GradingLease {
+    async fn lease(&self, auth: &Arc<AuthenticatedResponse>) -> GradingLease {
         lease_on(&self.handle, auth).await
     }
 
     async fn commit_with(
         &self,
-        auth: &Arc<OwnedAuthenticatedResponse>,
+        auth: &Arc<AuthenticatedResponse>,
         lease_id: u64,
         key: &AnswerKey,
         signer: CommandSigner,
@@ -425,7 +428,7 @@ impl Harness {
 
     async fn commit(
         &self,
-        auth: &Arc<OwnedAuthenticatedResponse>,
+        auth: &Arc<AuthenticatedResponse>,
         lease_id: u64,
         key: &AnswerKey,
     ) -> Result<GradedAttempt, ChallengeLedgerError> {
@@ -443,7 +446,7 @@ impl Harness {
 
     async fn fault(
         &self,
-        auth: &Arc<OwnedAuthenticatedResponse>,
+        auth: &Arc<AuthenticatedResponse>,
         lease_id: u64,
     ) -> Result<(), ChallengeLedgerError> {
         fault_on(&self.handle, auth, lease_id).await
@@ -516,7 +519,7 @@ impl Harness {
 
 async fn begin_on(
     handle: &ChallengerLedgerHandle,
-    auth: &Arc<OwnedAuthenticatedResponse>,
+    auth: &Arc<AuthenticatedResponse>,
 ) -> Result<BeginOutcome, ChallengeLedgerError> {
     handle
         .send(|reply| ChallengerLedgerCommand::BeginGrade {
@@ -528,7 +531,7 @@ async fn begin_on(
 
 async fn lease_on(
     handle: &ChallengerLedgerHandle,
-    auth: &Arc<OwnedAuthenticatedResponse>,
+    auth: &Arc<AuthenticatedResponse>,
 ) -> GradingLease {
     match begin_on(handle, auth).await.unwrap() {
         BeginOutcome::Lease(lease) => lease,
@@ -538,7 +541,7 @@ async fn lease_on(
 
 async fn commit_on(
     handle: &ChallengerLedgerHandle,
-    auth: &Arc<OwnedAuthenticatedResponse>,
+    auth: &Arc<AuthenticatedResponse>,
     lease_id: u64,
     key: &AnswerKey,
     signer: CommandSigner,
@@ -557,7 +560,7 @@ async fn commit_on(
 
 async fn fault_on(
     handle: &ChallengerLedgerHandle,
-    auth: &Arc<OwnedAuthenticatedResponse>,
+    auth: &Arc<AuthenticatedResponse>,
     lease_id: u64,
 ) -> Result<(), ChallengeLedgerError> {
     handle
@@ -573,10 +576,10 @@ async fn fault_on(
         .await
 }
 
-fn outcome(auth: &OwnedAuthenticatedResponse, key: &AnswerKey) -> GradeOutcome {
+fn outcome(auth: &AuthenticatedResponse, key: &AnswerKey) -> GradeOutcome {
     let none_evals = BTreeMap::new();
     let none_schemas: BTreeMap<usize, SchemaVerdict> = BTreeMap::new();
-    grade(&auth.as_authenticated(), key, &none_evals, &none_schemas)
+    grade(auth, key, &none_evals, &none_schemas)
 }
 
 fn trust_err<T: std::fmt::Debug>(result: Result<T, ChallengeLedgerError>) -> TrustError {

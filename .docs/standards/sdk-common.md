@@ -290,6 +290,7 @@ constant).
 | `SCP-VALID-7150` | native FFI-common registry | A capability requirement breaks a shape rule of spec 07 §7.3.4.4 (`AdmissionError::InvalidRequirement`) |
 | `SCP-VALID-7151` | native FFI-common registry | The challenger's last challenge to this subject for this capability is inside its window; retry at that challenge's `expires_at` (`TrustError::ChallengeWindowOpen`, spec 07 §7.3.4 step 1) |
 | `SCP-VALID-7152` | Swift SDK (`Governance.swift`) | Site `deployRetentionCount` is outside 1 to 8 |
+| `SCP-VALID-7153` | native FFI-common registry | An attempt was graded at or before its challenge's `created_at`; resubmit it at `created_at + 1` (`TrustError::ChallengeNotYetGradable`, spec 07 §7.3.4 step 3) |
 | `SCP-VALID-7082` | SDK-wrapper native-loader guard (**one meaning in every SDK that loads a native bridge**; never minted by a bridge). ts-native SDK: `src/internal/native.ts`, `src/scp.ts`. Python SDK: `scp_sdk/__init__.py`, `scp_sdk/_extension.py`, `scp_sdk/scp.py` | A native bridge is installed and failed to load (`dlopen` error, ABI or architecture mismatch, missing shared library), or it loaded without an export the SDK calls. A test skip guard fails on it |
 
 The browser participant reuses **only** `SCP-CTX-2095` from the shared band —

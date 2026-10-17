@@ -56,14 +56,13 @@ pub use challenge::{
     MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT, MAX_CHALLENGE_JSON_DEPTH,
     MAX_CHALLENGE_RESPONSE_BYTES, MAX_CHALLENGE_SCHEMA_BYTES, MAX_CHALLENGE_WINDOW_SECS,
     MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT, MAX_VERIFICATION_VALIDITY_SECS, NewChallenge,
-    OwnedAuthenticatedResponse, PolicyPick, TOTAL_WEIGHT_BPS, TestCase, TestOutput,
-    UnsignedChallengeRequest, UnsignedChallengeResponse, UnsignedChallengeVerification,
-    authenticate_challenge_response, canonical_challenge_request_bytes,
-    canonical_challenge_response_bytes, canonical_challenge_verification_bytes,
-    challenge_request_signing_digest, challenge_request_unsigned,
-    challenge_response_signing_digest, challenge_response_unsigned, challenge_suite_digest,
-    challenge_verification_id, challenge_verification_signing_digest,
-    challenge_verification_unsigned, check_attempt, check_response_bounds, grade,
+    PolicyPick, TOTAL_WEIGHT_BPS, TestCase, TestOutput, UnsignedChallengeRequest,
+    UnsignedChallengeResponse, UnsignedChallengeVerification, authenticate_challenge_response,
+    canonical_challenge_request_bytes, canonical_challenge_response_bytes,
+    canonical_challenge_verification_bytes, challenge_request_signing_digest,
+    challenge_request_unsigned, challenge_response_signing_digest, challenge_response_unsigned,
+    challenge_suite_digest, challenge_verification_id, challenge_verification_signing_digest,
+    challenge_verification_unsigned, check_attempt, check_challenge_json_bounds, grade,
     min_category_cases, verify_challenge_verification,
 };
 #[cfg(any(test, feature = "testing"))]
@@ -156,6 +155,38 @@ impl std::fmt::Display for CaveatKind {
 // ---------------------------------------------------------------------------
 // TrustError
 // ---------------------------------------------------------------------------
+
+/// Which capacity a [`TrustError::GradingCapacityExhausted`] refusal ran out
+/// of (spec 07 §7.3.4 step 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradingCapacityCause {
+    /// Every grading permit of the challenger is held.
+    GradingPermits,
+    /// The evaluator context's rate limit refused an evaluator call before
+    /// the evaluator ran.
+    EvaluatorRateLimit,
+    /// The evaluator context's budget refused an evaluator call before the
+    /// evaluator ran.
+    EvaluatorBudget,
+}
+
+impl GradingCapacityCause {
+    /// The cause's stable name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GradingPermits => "grading_permits",
+            Self::EvaluatorRateLimit => "evaluator_rate_limit",
+            Self::EvaluatorBudget => "evaluator_budget",
+        }
+    }
+}
+
+impl std::fmt::Display for GradingCapacityCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Errors produced by trust engine operations.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -538,8 +569,26 @@ pub enum TrustError {
         expires_at: u64,
     },
 
-    /// The time is outside the challenge window (spec 07 §7.3.4 steps 2 and
-    /// 3).
+    /// The grading time is at or before the request's `created_at` (spec 07
+    /// §7.3.4 step 3, the attempt check). The window opens strictly after
+    /// `created_at`, so the caller may resubmit the same attempt at
+    /// `retry_at`.
+    #[error(
+        "challenge {challenge_id}: now {now} is not after created_at {created_at}; retry at {retry_at}"
+    )]
+    ChallengeNotYetGradable {
+        /// The challenge id (lowercase hex).
+        challenge_id: String,
+        /// The clock reading, in Unix seconds.
+        now: u64,
+        /// The request's `created_at`.
+        created_at: u64,
+        /// `created_at + 1`, the first second the attempt may be graded.
+        retry_at: u64,
+    },
+
+    /// The time is outside the challenge window (spec 07 §7.3.4 step 2), or
+    /// a grading time is at or after `expires_at` (step 3).
     #[error(
         "challenge {challenge_id}: now {now} is not strictly inside the window ({created_at}, {expires_at})"
     )]
@@ -647,12 +696,18 @@ pub enum TrustError {
         challenge_id: String,
     },
 
-    /// Every one of the challenger's `MAX_CONCURRENT_GRADINGS_PER_CHALLENGER`
-    /// grading permits is held (spec 09 §9.18.C).
-    #[error("challenger {challenger}: every grading permit is in use")]
+    /// The challenger cannot grade now (spec 07 §7.3.4 step 3): every one
+    /// of its `MAX_CONCURRENT_GRADINGS_PER_CHALLENGER` grading permits is
+    /// held (spec 09 §9.18.C), or the evaluator context's reserve step
+    /// refused an evaluator call on its rate limit or budget. The challenger
+    /// recorded neither an attempt nor a fault, so the subject may resubmit
+    /// the same attempt at once.
+    #[error("challenger {challenger} cannot grade now: {cause}")]
     GradingCapacityExhausted {
         /// The challenger.
         challenger: String,
+        /// Which capacity ran out.
+        cause: GradingCapacityCause,
     },
 
     /// A `CustomEval` evaluator cannot run: its outlet is unregistered, it
@@ -777,6 +832,7 @@ impl TrustError {
             | Self::CapabilityDefinitionUnavailable { .. }
             | Self::SchemaRejected { .. }
             | Self::ChallengeWindowInvalid { .. }
+            | Self::ChallengeNotYetGradable { .. }
             | Self::ChallengeExpired { .. }
             | Self::ChallengeClosed { .. }
             | Self::AttemptOutOfOrder { .. }

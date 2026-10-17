@@ -23,6 +23,9 @@
 //! - **`RecordFault`** records a challenger fault, which uses no attempt and
 //!   closes nothing: it sets `last_fault_at`, so the cooldown runs from the
 //!   later of the last attempt and the last fault.
+//! - **Release** drops a live lease and writes nothing, for a capacity
+//!   refusal: the grading records neither an attempt nor a fault, so the
+//!   subject may resubmit the same attempt at once.
 //!
 //! # Crash safety (ADR-049 §9, Class S)
 //!
@@ -54,9 +57,9 @@ use std::time::Duration;
 use scp_clock::Clock;
 use scp_protocol::context::ContextError;
 use scp_protocol::trust::{
-    AnswerKey, AttemptLedgerView, CHALLENGE_CLOCK_SKEW_SECS, CHALLENGE_GRADING_BUDGET_SECS,
-    CHALLENGE_LEASE_MARGIN_SECS, CanonicalIdentifier, CaseResult, ChallengeClosure,
-    ChallengeRequest, ChallengeVerification, GradeOutcome, OwnedAuthenticatedResponse, TrustError,
+    AnswerKey, AttemptLedgerView, AuthenticatedResponse, CHALLENGE_CLOCK_SKEW_SECS,
+    CHALLENGE_GRADING_BUDGET_SECS, CHALLENGE_LEASE_MARGIN_SECS, CanonicalIdentifier, CaseResult,
+    ChallengeClosure, ChallengeRequest, ChallengeVerification, GradeOutcome, TrustError,
     UnsignedChallengeRequest, challenge_verification_unsigned, check_attempt,
 };
 use serde::{Deserialize, Serialize};
@@ -93,6 +96,12 @@ pub const MAX_OPEN_CHALLENGES_PER_CHALLENGER: usize = 1024;
 /// The most gradings one challenger runs at once (spec 09 §9.18.C). A grading
 /// holds one permit until its future and every blocking closure it started
 /// have finished.
+///
+/// Why 8: a grading runs its cases one at a time, so it occupies at most one
+/// blocking-pool thread. A challenger whose evaluators never return therefore
+/// holds at most 8 of tokio's default 512 blocking threads, and the instance
+/// keeps the rest for its other challengers and for storage. At the 60-second
+/// grading budget, 8 permits still grade 8 subjects at once.
 pub const MAX_CONCURRENT_GRADINGS_PER_CHALLENGER: usize = 8;
 
 /// Seconds a grading lease lives after Begin.
@@ -283,14 +292,14 @@ pub enum ChallengerLedgerCommand {
     /// Begin grading an authenticated response.
     BeginGrade {
         /// The authenticated response.
-        auth: Arc<OwnedAuthenticatedResponse>,
+        auth: Arc<AuthenticatedResponse>,
         /// The stored record or the lease.
         reply: Reply<BeginOutcome>,
     },
     /// Record a graded attempt.
     Commit {
         /// The authenticated response graded.
-        auth: Arc<OwnedAuthenticatedResponse>,
+        auth: Arc<AuthenticatedResponse>,
         /// The lease Begin returned.
         lease_id: u64,
         /// The grading result.
@@ -303,12 +312,21 @@ pub enum ChallengerLedgerCommand {
     /// Record a challenger fault.
     RecordFault {
         /// The authenticated response whose grading faulted.
-        auth: Arc<OwnedAuthenticatedResponse>,
+        auth: Arc<AuthenticatedResponse>,
         /// The lease Begin returned.
         lease_id: u64,
         /// The fault: `SchemaRejected` or `EvaluatorUnavailable`.
         fault: TrustError,
         /// `Ok(())` once the fault is persisted.
+        reply: Reply<()>,
+    },
+    /// Release a grading lease and record nothing: a capacity refusal.
+    Release {
+        /// The authenticated response whose grading was refused.
+        auth: Arc<AuthenticatedResponse>,
+        /// The lease Begin returned.
+        lease_id: u64,
+        /// `Ok(())` once the lease is released.
         reply: Reply<()>,
     },
     /// Stop the actor.
@@ -576,6 +594,14 @@ impl ChallengerLedgerActor {
                 let result = self.handle_fault(&auth, lease_id, &fault).await;
                 let _ = reply.send(result);
             }
+            ChallengerLedgerCommand::Release {
+                auth,
+                lease_id,
+                reply,
+            } => {
+                let result = self.handle_release(&auth, lease_id).await;
+                let _ = reply.send(result);
+            }
             ChallengerLedgerCommand::Shutdown => {}
         }
     }
@@ -701,10 +727,9 @@ impl ChallengerLedgerActor {
 
     async fn handle_begin(
         &mut self,
-        auth: &OwnedAuthenticatedResponse,
+        a: &AuthenticatedResponse,
     ) -> Result<BeginOutcome, ChallengeLedgerError> {
         self.begin_turn().await?;
-        let a = auth.as_authenticated();
         let challenge_id = a.request().challenge_id;
         let attempt = a.response().attempt;
         let response_digest = a.response_digest();
@@ -768,13 +793,12 @@ impl ChallengerLedgerActor {
 
     async fn handle_commit(
         &mut self,
-        auth: &OwnedAuthenticatedResponse,
+        a: &AuthenticatedResponse,
         lease_id: u64,
         outcome: &GradeOutcome,
         signer: &CommandSigner,
     ) -> Result<GradedAttempt, ChallengeLedgerError> {
         self.begin_turn().await?;
-        let a = auth.as_authenticated();
         let challenge_id = a.request().challenge_id;
         let attempt = a.response().attempt;
         let response_digest = a.response_digest();
@@ -798,7 +822,7 @@ impl ChallengerLedgerActor {
             check_attempt(&entry.view(), attempt, t)?;
             // 4-5. Sign the record, then write it and any closure in one
             // write.
-            let unsigned = challenge_verification_unsigned(&a, outcome, t)?;
+            let unsigned = challenge_verification_unsigned(a, outcome, t)?;
             let signature = signer
                 .sign_bounded_ed25519(&unsigned.signing_digest())
                 .await?;
@@ -831,12 +855,11 @@ impl ChallengerLedgerActor {
 
     async fn handle_fault(
         &mut self,
-        auth: &OwnedAuthenticatedResponse,
+        a: &AuthenticatedResponse,
         lease_id: u64,
         fault: &TrustError,
     ) -> Result<(), ChallengeLedgerError> {
         self.begin_turn().await?;
-        let a = auth.as_authenticated();
         let challenge_id = a.request().challenge_id;
         let mut entry = self
             .entries()?
@@ -861,6 +884,28 @@ impl ChallengerLedgerActor {
             "challenger grading fault recorded; no attempt used, cooldown restarts"
         );
         self.entries_mut()?.insert(challenge_id, entry);
+        Ok(())
+    }
+
+    /// Releases the live lease of `a`'s attempt and writes nothing: the
+    /// grading was refused for capacity (spec 07 §7.3.4 step 3), so it uses
+    /// no attempt, records no fault and starts no cooldown.
+    async fn handle_release(
+        &mut self,
+        a: &AuthenticatedResponse,
+        lease_id: u64,
+    ) -> Result<(), ChallengeLedgerError> {
+        self.begin_turn().await?;
+        let challenge_id = a.request().challenge_id;
+        let now = self.clock.now_secs();
+        self.require_lease(
+            &challenge_id,
+            lease_id,
+            now,
+            a.response().attempt,
+            a.response_digest(),
+        )?;
+        self.leases.remove(&challenge_id);
         Ok(())
     }
 

@@ -5876,6 +5876,26 @@ impl Supervisor {
             .insert(context_id.to_owned(), ContextActorHandle::from_sender(tx));
     }
 
+    /// Test fixture: registers an actor handle for `context_id` whose mailbox
+    /// accepts a command that no task ever handles, so a caller's command is
+    /// enqueued and its reply never arrives: the actor turn stalls until
+    /// [`REPLY_TIMEOUT`](crate::context::actor::handle::REPLY_TIMEOUT).
+    ///
+    /// Returns the mailbox's receiving half. Holding it keeps the stall;
+    /// dropping it drops every queued command and its reply sender, so a
+    /// waiting caller fails at once.
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    #[must_use = "dropping the receiver ends the stall"]
+    pub fn test_stall_actor(&self, context_id: &str) -> Box<dyn std::any::Any + Send> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        self.actors
+            .insert(context_id.to_owned(), ContextActorHandle::from_sender(tx));
+        Box::new(rx)
+    }
+
     /// Map a per-context `lookup` miss to the right typed error (ADR-049
     /// §10). Three cases, in precedence order:
     ///
@@ -12744,6 +12764,7 @@ impl Supervisor {
         handle.grading_semaphore().try_acquire_owned().map_err(|_| {
             scp_protocol::trust::TrustError::GradingCapacityExhausted {
                 challenger: challenger.to_owned(),
+                cause: scp_protocol::trust::GradingCapacityCause::GradingPermits,
             }
             .into()
         })
@@ -12827,7 +12848,7 @@ impl Supervisor {
     pub async fn dispatch_challenge_begin_grade(
         &self,
         challenger: &str,
-        auth: Arc<scp_protocol::trust::OwnedAuthenticatedResponse>,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
     ) -> Result<
         crate::context::supervisor::challenger_ledger_actor::BeginOutcome,
         crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
@@ -12851,7 +12872,7 @@ impl Supervisor {
     pub async fn dispatch_challenge_commit(
         &self,
         challenger: &str,
-        auth: Arc<scp_protocol::trust::OwnedAuthenticatedResponse>,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
         lease_id: u64,
         outcome: scp_protocol::trust::GradeOutcome,
         signer: crate::context::actor::signer::CommandSigner,
@@ -12884,7 +12905,7 @@ impl Supervisor {
     pub async fn dispatch_challenge_fault(
         &self,
         challenger: &str,
-        auth: Arc<scp_protocol::trust::OwnedAuthenticatedResponse>,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
         lease_id: u64,
         fault: scp_protocol::trust::TrustError,
     ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
@@ -12898,6 +12919,51 @@ impl Supervisor {
                 reply,
             })
             .await
+    }
+
+    /// Releases the grading lease of `auth` and records nothing (spec 07
+    /// §7.3.4 step 3): the grading was refused for capacity, so it uses no
+    /// attempt, records no fault and starts no cooldown.
+    ///
+    /// # Errors
+    ///
+    /// `GradingLeaseLost` when the lease is not live for this
+    /// `(attempt, D_r)`, a load failure, or [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_release(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
+        lease_id: u64,
+    ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Release {
+                auth,
+                lease_id,
+                reply,
+            })
+            .await
+    }
+
+    /// Spawns a challenge evaluator's economy pipeline onto the Supervisor's
+    /// task tracker (ADR-049 Decision 16), so a shutdown waits for the
+    /// pipeline's settle and storage never closes under a reserve that has
+    /// not settled.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] once shutdown has begun; the
+    /// future is dropped without running.
+    pub fn spawn_evaluator_pipeline<F>(
+        &self,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, ContextError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_tracked("challenge evaluator pipeline", future)
     }
 
     /// Reads the context's live capability requirements (spec §8.10), the

@@ -1261,7 +1261,10 @@ pub const VALID_7143: &str = "SCP-VALID-7143";
 /// Two capability definitions with one URI disagree
 /// ([`TrustError::DefinitionEquivocation`](scp_protocol::trust::TrustError::DefinitionEquivocation)).
 pub const VALID_7144: &str = "SCP-VALID-7144";
-/// Every grading permit for this challenger is held
+/// The challenger cannot grade now; the attempt is not used.
+///
+/// Every grading permit is held, or an evaluator's reserve refused the call
+/// for its rate limit or budget. Resubmit the attempt
 /// ([`TrustError::GradingCapacityExhausted`](scp_protocol::trust::TrustError::GradingCapacityExhausted)).
 pub const VALID_7146: &str = "SCP-VALID-7146";
 /// An identifier is not the canonical spelling of its key.
@@ -1280,6 +1283,11 @@ pub const VALID_7149: &str = "SCP-VALID-7149";
 /// Retry at that challenge's `expires_at`
 /// ([`TrustError::ChallengeWindowOpen`](scp_protocol::trust::TrustError::ChallengeWindowOpen)).
 pub const VALID_7151: &str = "SCP-VALID-7151";
+/// An attempt was graded at or before its challenge's `created_at`.
+///
+/// Resubmit it at `created_at + 1`
+/// ([`TrustError::ChallengeNotYetGradable`](scp_protocol::trust::TrustError::ChallengeNotYetGradable)).
+pub const VALID_7153: &str = "SCP-VALID-7153";
 /// Governance vote validation error.
 pub const VALID_7216: &str = "SCP-VALID-7216";
 /// Media validation error.
@@ -1678,6 +1686,7 @@ pub const fn trust_error_code(e: &scp_protocol::trust::TrustError) -> &'static s
         E::NonCanonicalIdentifier { .. } => VALID_7147,
         E::GradingLeaseLost { .. } => VALID_7149,
         E::ChallengeWindowOpen { .. } => VALID_7151,
+        E::ChallengeNotYetGradable { .. } => VALID_7153,
         E::NoEventsForSubject { .. }
         | E::EmptyEventLog
         | E::InvalidEventData { .. }
