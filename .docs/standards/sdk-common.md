@@ -287,6 +287,12 @@ constant).
 | `SCP-VALID-7140` | native FFI-common registry | Recovery or custody-migration concurrency cap reached; back off and retry |
 | `SCP-VALID-7141` | Swift SDK (`Governance.swift`) | Site hostname is empty |
 | `SCP-VALID-7142` | Swift SDK (`Governance.swift`) | Site hostname exceeds 253 characters |
+| `SCP-VALID-7143` | native FFI-common registry | A challenge request or response exceeds its size bound (`TrustError::ResponseTooLarge`) |
+| `SCP-VALID-7144` | native FFI-common registry | Two capability definitions with one URI disagree (`TrustError::DefinitionEquivocation`) |
+| `SCP-VALID-7146` | native FFI-common registry | The challenger cannot grade now and the attempt is not used: every grading permit is held, or an evaluator's reserve refused the call for its rate limit or budget; resubmit the attempt (`TrustError::GradingCapacityExhausted`) |
+| `SCP-VALID-7147` | native FFI-common registry | An identifier is not the canonical spelling of its key (`TrustError::NonCanonicalIdentifier`, `AdmissionError::NonCanonicalIdentifier`) |
+| `SCP-VALID-7148` | native FFI-common registry | A context names more than `MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT` capability requirements (`AdmissionError::TooManyCapabilityRequirements`) |
+| `SCP-VALID-7149` | native FFI-common registry | A grading's lease expired or was replaced before its commit; nothing was written (`TrustError::GradingLeaseLost`) |
 | `SCP-VALID-7150` | native FFI-common registry | A capability requirement breaks a shape rule of spec 07 §7.3.4.4 (`AdmissionError::InvalidRequirement`) |
 | `SCP-VALID-7151` | native FFI-common registry | The challenger's last challenge to this subject for this capability is inside its window; retry at that challenge's `expires_at` (`TrustError::ChallengeWindowOpen`, spec 07 §7.3.4 step 1) |
 | `SCP-VALID-7152` | Swift SDK (`Governance.swift`) | Site `deployRetentionCount` is outside 1 to 8 |

@@ -28,6 +28,11 @@ use scp_core::context::supervisor::{
 };
 use scp_core::store::ProtocolRepository;
 use scp_did::DID;
+
+use crate::error_codes::{
+    CTX_2000, IDENT_1033, TrustFailureClass, admission_error_code, trust_error_code,
+    trust_error_message,
+};
 use scp_platform::traits::Storage;
 use scp_protocol::context::outlets::error_codes::SLUG_ECONOMIC_BUDGET_EXCEEDED;
 use scp_protocol::context::outlets::registry::OutletRegistry;
@@ -129,6 +134,138 @@ pub enum ChallengeOpError {
     /// The blocking resolution task panicked or was cancelled.
     #[error(transparent)]
     Blocking(#[from] BlockingResolutionFailed),
+    /// A DID, context id or result argument is refused before the operation
+    /// runs; `code` is the argument's code, the same on every bridge.
+    #[error("{message}")]
+    InvalidArgument {
+        /// The bridge error code.
+        code: &'static str,
+        /// What is wrong with the argument.
+        message: String,
+    },
+    /// This instance has no DID resolver, so `operation` cannot resolve a
+    /// key. The bridge reports `SCP-IDENT-1033`.
+    #[error("DID resolver not initialized — create an identity before calling {operation}")]
+    ResolverMissing {
+        /// The operation that needed the resolver.
+        operation: &'static str,
+    },
+}
+
+/// `SCP-VALID-7013` for an invalid DID argument of a challenge operation.
+///
+/// # Errors
+///
+/// [`ChallengeOpError::InvalidArgument`] when `did` is not a valid DID.
+pub fn validate_challenge_did(did: &str) -> Result<(), ChallengeOpError> {
+    crate::validate::validate_did(did).map_err(|e| ChallengeOpError::InvalidArgument {
+        code: crate::error_codes::VALID_7013,
+        message: e.message,
+    })
+}
+
+/// `SCP-VALID-7011` for an invalid context id argument of a challenge
+/// operation.
+///
+/// # Errors
+///
+/// [`ChallengeOpError::InvalidArgument`] when `context_id` is not valid.
+pub fn validate_challenge_context_id(context_id: &str) -> Result<(), ChallengeOpError> {
+    crate::validate::validate_context_id(context_id).map_err(|e| {
+        ChallengeOpError::InvalidArgument {
+            code: crate::error_codes::VALID_7011,
+            message: e.message,
+        }
+    })
+}
+
+/// A serialized challenge-operation result; `SCP-VALID-7015` when it did not
+/// serialize.
+///
+/// # Errors
+///
+/// [`ChallengeOpError::InvalidArgument`] carrying the serializer's message.
+pub fn challenge_json(
+    what: &str,
+    serialized: serde_json::Result<String>,
+) -> Result<String, ChallengeOpError> {
+    serialized.map_err(|e| ChallengeOpError::InvalidArgument {
+        code: crate::error_codes::VALID_7015,
+        message: format!("failed to serialize {what}: {e}"),
+    })
+}
+
+/// The instance's DID resolver, which `operation` needs.
+///
+/// # Errors
+///
+/// [`ChallengeOpError::ResolverMissing`] when the instance has none.
+pub fn required_did_resolver(
+    resolver: Option<Arc<crate::IdentityBackedDidResolver>>,
+    operation: &'static str,
+) -> Result<Arc<crate::IdentityBackedDidResolver>, ChallengeOpError> {
+    resolver.ok_or(ChallengeOpError::ResolverMissing { operation })
+}
+
+/// How a bridge reports a [`ChallengeOpError`].
+#[derive(Debug)]
+pub enum ChallengeFailure {
+    /// Report `code` as an error of `class`, with `message`.
+    Coded {
+        /// The bridge error code.
+        code: &'static str,
+        /// The bridge error class.
+        class: TrustFailureClass,
+        /// The message.
+        message: String,
+    },
+    /// Report the runtime error through the bridge's `ContextError`
+    /// conversion, which also carries a custody failure's kind.
+    Context(ContextError),
+}
+
+impl ChallengeOpError {
+    /// The code, class and message every bridge reports for this failure:
+    /// a JSON argument that does not parse takes its argument's code, a
+    /// protocol or ledger refusal [`trust_error_code`], an admission refusal
+    /// [`admission_error_code`], and a failed blocking task `SCP-CTX-2000`.
+    /// A runtime failure goes to the bridge's `ContextError` conversion.
+    #[must_use]
+    pub fn code_and_class(self) -> ChallengeFailure {
+        let coded = |code, class, message| ChallengeFailure::Coded {
+            code,
+            class,
+            message,
+        };
+        match self {
+            Self::MalformedJson { input, .. } => coded(
+                input.code(),
+                TrustFailureClass::Validation,
+                self.to_string(),
+            ),
+            Self::Trust(e) => coded(
+                trust_error_code(&e),
+                TrustFailureClass::Validation,
+                trust_error_message(&e),
+            ),
+            Self::Context(e) => ChallengeFailure::Context(e),
+            Self::Admission(e) => {
+                let (code, class) = admission_error_code(&e);
+                coded(
+                    code,
+                    class,
+                    format!("capability admission verification failed: {e}"),
+                )
+            }
+            Self::Blocking(e) => coded(CTX_2000, TrustFailureClass::Context, e.to_string()),
+            Self::InvalidArgument { code, message } => {
+                coded(code, TrustFailureClass::Validation, message)
+            }
+            Self::ResolverMissing { .. } => {
+                coded(IDENT_1033, TrustFailureClass::Identity, self.to_string())
+            }
+        }
+    }
 }
 
 impl From<ChallengeLedgerError> for ChallengeOpError {
@@ -671,7 +808,30 @@ pub struct GradeResult {
     /// Why the record could not be written to the bridge's trust store,
     /// when it could not. The record is signed and the attempt is used
     /// either way.
-    pub trust_store_error: Option<String>,
+    pub trust_store_error: Option<TrustStoreWriteError>,
+}
+
+/// A failed write of a graded record to the bridge's trust store, with the
+/// code every other trust-store write failure reports
+/// ([`TrustError::StoreError`] through [`trust_error_code`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustStoreWriteError {
+    /// The bridge error code.
+    pub code: &'static str,
+    /// The message.
+    pub message: String,
+}
+
+impl TrustStoreWriteError {
+    fn from_store_error(e: &scp_core::store::StoreError) -> Self {
+        let e = TrustError::StoreError {
+            reason: format!("graded challenge record not written: {e}"),
+        };
+        Self {
+            code: trust_error_code(&e),
+            message: trust_error_message(&e),
+        }
+    }
 }
 
 /// Grades the subject's response in `response_json` to the request in
@@ -1108,7 +1268,7 @@ async fn store_graded<S: Storage + 'static>(
                 error = %e,
                 "graded challenge record not written to the trust store"
             );
-            e.to_string()
+            TrustStoreWriteError::from_store_error(&e)
         });
     GradeResult {
         record,

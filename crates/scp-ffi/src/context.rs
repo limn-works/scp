@@ -1731,7 +1731,13 @@ fn build_core_context_params(
     // `PyContextParams::from_py_dict` already rejected an absent, `None`, or
     // empty ceiling, so `py_params.ceiling` holds the non-empty ceiling the
     // caller declared and this function passes it through unchanged.
-    build_context_params(&common).map_err(PyRuntimeError::new_err)
+    build_context_params(&common).map_err(|e| {
+        crate::error::ScpPyError::ValidationError {
+            message: e.to_string(),
+            code: e.code().to_owned(),
+        }
+        .into()
+    })
 }
 
 /// `default_ceiling()` rendered as the capability strings a Python caller
@@ -1764,6 +1770,36 @@ pub(crate) fn default_ceiling_strings() -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Governance proposal lifecycle (#621)
 // ---------------------------------------------------------------------------
+
+/// Validates and proposes a decoded governance action through the
+/// supervisor, for `governance_propose` and the typed proposal exports,
+/// each of which builds its wire string from the outcome.
+fn propose_governance_action(
+    py: Python<'_>,
+    bi: &crate::runtime::PyBridgeInstance,
+    handle: &PyContextHandle,
+    identity_did: &str,
+    action: scp_core::context::governance::GovernanceAction,
+) -> PyResult<scp_core::context::state::ProposalOutcome> {
+    let sup = crate::runtime::supervisor(bi)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        .clone();
+    let context_id = handle.context_id.clone();
+    let signer = resolve_signer(py, bi, identity_did)?;
+    let proposer_did = scp_did::DID(identity_did.to_owned());
+
+    crate::actor_wait::block_on_released(py, async move {
+        scp_ffi_common::validate::validate_governance_action_strings(&action)
+            .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message)))?;
+
+        let outcome = sup
+            .propose_governance_action_checked(&context_id, &proposer_did, action, &signer)
+            .await
+            .map_err(|e| typed_supervisor_failure("SCP-CTX-2041: governance proposal", &e))?;
+
+        Ok(outcome)
+    })?
+}
 
 /// Builds the identity's `#active` [`CommandSigner`] (ADR-049 Decision 7a).
 ///
@@ -4114,38 +4150,65 @@ impl crate::scp::PyScp {
     ) -> PyResult<String> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let sup =
-            crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let sup = sup.clone();
-        let context_id = handle.context_id.clone();
-        let action_json_owned = action_json.to_owned();
-        let signer = resolve_signer(py, bi, identity_did)?;
-        let proposer_did = scp_did::DID(identity_did.to_owned());
+        let action: scp_core::context::governance::GovernanceAction =
+            serde_json::from_str(action_json).map_err(|e| {
+                PyValueError::new_err(format!("SCP-CTX-2040: invalid governance action JSON: {e}"))
+            })?;
+        let outcome = propose_governance_action(py, bi, handle, identity_did, action)?;
+        Ok(
+            scp_ffi_common::governance_result::governance_propose_response(
+                &outcome.proposal.proposal_id,
+                &outcome.status,
+                outcome.execution_result.as_ref(),
+            ),
+        )
+    }
 
-        crate::actor_wait::block_on_released(py, async move {
-            let action: scp_core::context::governance::GovernanceAction =
-                serde_json::from_str(&action_json_owned).map_err(|e| {
-                    PyValueError::new_err(format!(
-                        "SCP-CTX-2040: invalid governance action JSON: {e}"
-                    ))
-                })?;
-
-            scp_ffi_common::validate::validate_governance_action_strings(&action)
-                .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message)))?;
-
-            let outcome = sup
-                .propose_governance_action_checked(&context_id, &proposer_did, action, &signer)
-                .await
-                .map_err(|e| typed_supervisor_failure("SCP-CTX-2041: governance proposal", &e))?;
-
-            Ok(
-                scp_ffi_common::governance_result::governance_propose_response(
-                    &outcome.proposal.proposal_id,
-                    &outcome.status,
-                    outcome.execution_result.as_ref(),
-                ),
-            )
-        })?
+    /// Proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4) for
+    /// voting, with the complete new list.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` -- The context handle.
+    /// * `identity_did` -- DID of the proposer.
+    /// * `requirements_json` -- The complete new list as a JSON array; `[]`
+    ///   clears it.
+    ///
+    /// # Returns
+    ///
+    /// The JSON string `governance_propose` returns.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` with `SCP-VALID-7000` for a malformed list,
+    /// and with the requirement's own code (7147, 7148, 7150) for a
+    /// requirement that breaks a §7.3.4.4 rule; otherwise fails as
+    /// `governance_propose` does.
+    #[pyo3(signature = (handle, identity_did, requirements_json))]
+    pub fn governance_modify_capability_requirements(
+        &self,
+        py: Python<'_>,
+        handle: &PyContextHandle,
+        identity_did: &str,
+        requirements_json: &str,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        crate::pyscp_check_handle!(&bi.core, handle);
+        let action = scp_ffi_common::context_params::modify_capability_requirements_action(
+            requirements_json,
+        )
+        .map_err(|e| crate::error::ScpPyError::ValidationError {
+            message: e.to_string(),
+            code: e.code().to_owned(),
+        })?;
+        let outcome = propose_governance_action(py, bi, handle, identity_did, action)?;
+        Ok(
+            scp_ffi_common::governance_result::governance_propose_response(
+                &outcome.proposal.proposal_id,
+                &outcome.status,
+                outcome.execution_result.as_ref(),
+            ),
+        )
     }
 
     /// Casts an approval vote on a pending governance proposal.

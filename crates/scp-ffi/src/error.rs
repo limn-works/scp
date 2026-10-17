@@ -840,15 +840,9 @@ impl From<scp_core::trust::TrustError> for ScpPyError {
     /// The code comes from the shared table, so a challenge refusal carries
     /// its own code on every bridge.
     fn from(e: scp_core::trust::TrustError) -> Self {
-        let code = scp_ffi_common::error_codes::trust_error_code(&e);
-        let message = if code == codes::VALID_7039 {
-            format!("{e} — supply at least the standard's minimum test cases")
-        } else {
-            format!("trust evaluation failed: {e}")
-        };
         Self::ValidationError {
-            message,
-            code: code.to_owned(),
+            message: scp_ffi_common::error_codes::trust_error_message(&e),
+            code: scp_ffi_common::error_codes::trust_error_code(&e).to_owned(),
         }
     }
 }

@@ -1252,9 +1252,6 @@ pub const VALID_7139: &str = "SCP-VALID-7139";
 /// worker-pool exhaustion (RED-PR5-002 / BLACK-PR5-002). Caller should back
 /// off and retry.
 pub const VALID_7140: &str = "SCP-VALID-7140";
-/// A capability requirement breaks a shape rule of spec 07 §7.3.4.4
-/// ([`AdmissionError::InvalidRequirement`](scp_protocol::trust::AdmissionError::InvalidRequirement)).
-pub const VALID_7141: &str = "SCP-VALID-7141";
 /// A challenge request or response exceeds its size bound
 /// ([`TrustError::ResponseTooLarge`](scp_protocol::trust::TrustError::ResponseTooLarge)).
 pub const VALID_7143: &str = "SCP-VALID-7143";
@@ -1278,6 +1275,9 @@ pub const VALID_7148: &str = "SCP-VALID-7148";
 /// written
 /// ([`TrustError::GradingLeaseLost`](scp_protocol::trust::TrustError::GradingLeaseLost)).
 pub const VALID_7149: &str = "SCP-VALID-7149";
+/// A capability requirement breaks a shape rule of spec 07 §7.3.4.4
+/// ([`AdmissionError::InvalidRequirement`](scp_protocol::trust::AdmissionError::InvalidRequirement)).
+pub const VALID_7150: &str = "SCP-VALID-7150";
 /// A challenge to this subject for this capability is inside its window.
 ///
 /// Retry at that challenge's `expires_at`
@@ -1651,6 +1651,21 @@ pub enum TrustFailureClass {
     /// An identity error: a key or definition needed for the check could not
     /// be obtained, so the decision is unknown.
     Identity,
+    /// A context error: the runtime could not run the operation, such as a
+    /// blocking task that panicked or was cancelled.
+    Context,
+}
+
+/// The message a bridge reports for a
+/// [`TrustError`](scp_protocol::trust::TrustError), one wording for the
+/// `PyO3`, napi-rs and `UniFFI` bridges.
+#[must_use]
+pub fn trust_error_message(e: &scp_protocol::trust::TrustError) -> String {
+    if trust_error_code(e) == VALID_7039 {
+        format!("{e} — supply at least the standard's minimum test cases")
+    } else {
+        format!("trust evaluation failed: {e}")
+    }
 }
 
 /// The bridge error code for a [`TrustError`](scp_protocol::trust::TrustError),
@@ -1737,7 +1752,7 @@ pub const fn admission_error_code(
         E::UntrustedVerifier { .. } => VALID_7121,
         E::SelfChallenge { .. } => VALID_7127,
         E::RetryCapExceeded { .. } => VALID_7137,
-        E::InvalidRequirement { .. } => VALID_7141,
+        E::InvalidRequirement { .. } => VALID_7150,
         E::NonCanonicalIdentifier { .. } => VALID_7147,
         E::TooManyCapabilityRequirements { .. } => VALID_7148,
         E::VerificationUnavailable { .. } => {

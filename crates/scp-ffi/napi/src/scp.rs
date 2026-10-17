@@ -2341,6 +2341,26 @@ impl Scp {
         .await
     }
 
+    /// Proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4):
+    /// `requirements_json` is the complete new list as a JSON array, and `[]`
+    /// clears it. A malformed list throws `SCP-VALID-7000`, a requirement
+    /// that breaks a §7.3.4.4 rule throws its own code (7147, 7148, 7150).
+    #[napi(js_name = "contextGovernanceModifyCapabilityRequirements")]
+    pub async fn context_governance_modify_capability_requirements(
+        &self,
+        handle: &NapiContextHandle,
+        requirements_json: String,
+        proposer_did: String,
+    ) -> napi::Result<String> {
+        crate::context::context_governance_modify_capability_requirements_on(
+            &self.inner,
+            handle,
+            requirements_json,
+            proposer_did,
+        )
+        .await
+    }
+
     /// Per-instance equivalent of the free-function `context_governance_approve`.
     #[napi(js_name = "contextGovernanceApprove")]
     pub async fn context_governance_approve(
@@ -3686,8 +3706,8 @@ impl Scp {
         subject: String,
         capability_uri: String,
         test_cases_json: String,
-        window_secs: u32,
         context_id: String,
+        window_secs: u32,
         evaluator_context_id: Option<String>,
         policy: Option<crate::trust::NapiPolicyPick>,
     ) -> napi::Result<NapiChallengeRequest> {
@@ -3697,8 +3717,8 @@ impl Scp {
             subject,
             capability_uri,
             test_cases_json,
-            window_secs,
             context_id,
+            window_secs,
             evaluator_context_id,
             policy,
         )

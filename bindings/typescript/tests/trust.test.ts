@@ -1365,15 +1365,16 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
       "did:dht:s",
       SCHEMA_URI,
       encodeTestCases(testCases),
-      3_600,
       "ctx-1",
+      3_600,
       "ctx-eval",
       { maxRetries: 1, cooldownSecs: 600 },
     ]);
 
     await scp.trustCreateChallenge("did:dht:v", "did:dht:s", SCHEMA_URI, testCases, "ctx-1", 60);
-    expect(native.__lastCall("trustCreateChallenge")?.args.slice(5)).toEqual([
+    expect(native.__lastCall("trustCreateChallenge")?.args.slice(4)).toEqual([
       "ctx-1",
+      60,
       undefined,
       undefined,
     ]);
@@ -1404,7 +1405,7 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
     native.__stub("trustGradeResponse", async () => ({
       recordJson: JSON.stringify(recordWire),
       reasonsJson: JSON.stringify([{ passed: false, reason: "mismatch" }]),
-      trustStoreError: "disk full",
+      trustStoreError: { code: "SCP-VALID-7003", message: "disk full" },
     }));
 
     const request = makeChallengeRequest();
@@ -1413,7 +1414,7 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
     expect(graded).toEqual({
       record: makeRecord(),
       caseResults: [{ passed: false, reason: "mismatch" }],
-      trustStoreError: "disk full",
+      trustStoreError: { code: "SCP-VALID-7003", message: "disk full" },
     });
     expect(native.__lastCall("trustGradeResponse")?.args).toEqual([
       "did:dht:verifier",

@@ -3938,8 +3938,8 @@ export class SCP {
           s: string,
           u: string,
           t: string,
-          secs: number,
           c: string,
+          secs: number,
           e: string | undefined,
           p: ChallengePolicy | undefined,
         ) => Promise<{ challengeId: string; requestJson: string }>
@@ -3948,8 +3948,8 @@ export class SCP {
         subject,
         capabilityUri,
         testCasesJson,
-        windowSecs,
         contextId,
+        windowSecs,
         options.evaluatorContextId,
         options.policy,
       );
@@ -4027,14 +4027,22 @@ export class SCP {
   ): Promise<GradedChallenge> {
     const requestJson = encodeChallengeRequest(request);
     const responseJson = encodeChallengeResponse(response);
-    let graded: { recordJson: string; reasonsJson: string; trustStoreError?: string | null };
+    let graded: {
+      recordJson: string;
+      reasonsJson: string;
+      trustStoreError?: { code: string; message: string } | null;
+    };
     try {
       graded = await (
         this.#native.trustGradeResponse as (
           v: string,
           r: string,
           s: string,
-        ) => Promise<{ recordJson: string; reasonsJson: string; trustStoreError?: string | null }>
+        ) => Promise<{
+          recordJson: string;
+          reasonsJson: string;
+          trustStoreError?: { code: string; message: string } | null;
+        }>
       )(verifier, requestJson, responseJson);
     } catch (err) {
       throw mapBridgeError(err);

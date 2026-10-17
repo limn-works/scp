@@ -2247,12 +2247,16 @@ public nonisolated struct GradedChallenge: Sendable, Equatable {
     public let record: ChallengeVerification
     /// One result per case, in case order.
     public let caseResults: [CaseResult]
-    /// Why the record was not written to this instance's trust store, or `nil`
-    /// when it was. The record is valid either way.
-    public let trustStoreError: String?
+    /// Why the record was not written to this instance's trust store, with its
+    /// error code, or `nil` when it was. The record is valid either way.
+    public let trustStoreError: TrustStoreWriteError?
 
     /// Memberwise initializer.
-    public init(record: ChallengeVerification, caseResults: [CaseResult], trustStoreError: String?) {
+    public init(
+        record: ChallengeVerification,
+        caseResults: [CaseResult],
+        trustStoreError: TrustStoreWriteError?
+    ) {
         self.record = record
         self.caseResults = caseResults
         self.trustStoreError = trustStoreError
@@ -2446,8 +2450,8 @@ public extension SCP {
                 subject: subject,
                 capabilityUri: capabilityUri,
                 testCasesJson: encodeTestCasesJson(testCases),
-                windowSecs: windowSecs,
                 contextId: contextId,
+                windowSecs: windowSecs,
                 evaluatorContextId: evaluatorContextId,
                 policy: policy
             ).requestJson

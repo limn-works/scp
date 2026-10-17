@@ -748,8 +748,8 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
 
     let core = scp_ffi_common::context_params::build_context_params(&common).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
-            message: e,
-            code: codes::VALID_7000.to_owned(),
+            message: e.to_string(),
+            code: e.code().to_owned(),
         })
     })?;
 
@@ -3920,7 +3920,61 @@ pub(crate) async fn context_governance_propose_on(
             code: codes::CTX_2040.to_owned(),
         })
     })?;
+    let outcome = propose_governance_action_on(bi, handle, action, proposer_did).await?;
+    Ok(
+        scp_ffi_common::governance_result::governance_propose_response(
+            &outcome.proposal.proposal_id,
+            &outcome.status,
+            outcome.execution_result.as_ref(),
+        ),
+    )
+}
 
+/// Per-bridge-instance implementation of
+/// [`Scp::context_governance_modify_capability_requirements`](crate::scp::Scp::context_governance_modify_capability_requirements):
+/// proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4) with the
+/// complete new list in `requirements_json`.
+///
+/// # Errors
+///
+/// A malformed list is a validation error with the code
+/// [`ContextParamsError::code`](scp_ffi_common::context_params::ContextParamsError::code)
+/// gives it (7000, 7147, 7148 or 7150); the proposal fails as
+/// [`context_governance_propose_on`] does.
+pub(crate) async fn context_governance_modify_capability_requirements_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    requirements_json: String,
+    proposer_did: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let action =
+        scp_ffi_common::context_params::modify_capability_requirements_action(&requirements_json)
+            .map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: e.to_string(),
+                code: e.code().to_owned(),
+            })
+        })?;
+    let outcome = propose_governance_action_on(bi, handle, action, proposer_did).await?;
+    Ok(
+        scp_ffi_common::governance_result::governance_propose_response(
+            &outcome.proposal.proposal_id,
+            &outcome.status,
+            outcome.execution_result.as_ref(),
+        ),
+    )
+}
+
+/// Validates and proposes a decoded governance action through the
+/// supervisor's governance shim; each caller builds its wire string from
+/// the outcome.
+async fn propose_governance_action_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    action: GovernanceAction,
+    proposer_did: String,
+) -> napi::Result<scp_core::context::state::ProposalOutcome> {
     // Defense-in-depth: validate user-controlled string fields at the FFI
     // boundary before the action reaches the ContextManager (#1601).
     scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
@@ -3977,14 +4031,7 @@ pub(crate) async fn context_governance_propose_on(
                 &e,
             ))
         })?;
-
-    Ok(
-        scp_ffi_common::governance_result::governance_propose_response(
-            &outcome.proposal.proposal_id,
-            &outcome.status,
-            outcome.execution_result.as_ref(),
-        ),
-    )
+    Ok(outcome)
 }
 
 /// Per-bridge-instance implementation of [`Scp::context_governance_approve`](crate::scp::Scp::context_governance_approve).

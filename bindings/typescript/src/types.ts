@@ -1679,7 +1679,7 @@ export interface RetryCap {
  * `ChallengeVerified` requirement names at least one trusted verifier DID;
  * only a record signed by one of them satisfies it. The bridge validates the
  * shape when a context is created, and refuses a malformed requirement with
- * `SCP-VALID-7141` (or {@link NON_CANONICAL_IDENTIFIER_CODE} for a verifier
+ * `SCP-VALID-7150` (or {@link NON_CANONICAL_IDENTIFIER_CODE} for a verifier
  * DID that is not the canonical spelling of its key).
  */
 export interface CapabilityRequirement {
@@ -2383,10 +2383,11 @@ export interface GradedChallenge {
   /** The per-case grades, in request order; not signed. */
   readonly caseResults: readonly CaseResult[];
   /**
-   * Why the record could not be written to this instance's trust store, when
-   * it could not. The record is signed and the attempt used either way.
+   * Why the record could not be written to this instance's trust store, with
+   * its error code, when it could not. The record is signed and the attempt
+   * used either way.
    */
-  readonly trustStoreError: string | null;
+  readonly trustStoreError: { readonly code: string; readonly message: string } | null;
 }
 
 /**

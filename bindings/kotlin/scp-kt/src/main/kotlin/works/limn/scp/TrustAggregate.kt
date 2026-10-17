@@ -506,13 +506,13 @@ data class CaseResult(
  * @property record The signed record of the graded attempt, pass or fail.
  * @property caseResults One result per case, in case order.
  * @property trustStoreError Why the record was not written to this
- *   instance's trust store, or `null` when it was. The record is valid
- *   either way.
+ *   instance's trust store, with its error code, or `null` when it was. The
+ *   record is valid either way.
  */
 data class GradedChallenge(
     val record: ChallengeVerification,
     val caseResults: List<CaseResult>,
-    val trustStoreError: String?,
+    val trustStoreError: uniffi.scp.TrustStoreWriteError?,
 )
 
 /**

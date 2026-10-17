@@ -157,7 +157,7 @@ pub(crate) async fn dispatch(
             reply,
         } => {
             let answer = queries_helpers::capability_requirements(state);
-            let _ = reply.send(Ok(answer));
+            let _ = reply.send(answer);
             Outcome::ok(())
         }
 

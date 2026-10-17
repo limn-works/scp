@@ -882,6 +882,67 @@ async fn welcome_joiner_does_not_install_the_genesis_outlet_declaration() {
     );
 }
 
+/// T21. A Welcome joiner holds no live capability-requirements list: the
+/// genesis list in `ContextParams` records no `ModifyCapabilityRequirements`
+/// governance made since (the creator may already have tightened it), so the
+/// joiner's admission read fails closed instead of answering from the
+/// declaration (spec 07 §7.3.4.4).
+#[tokio::test]
+async fn welcome_joiner_capability_requirements_await_replication() {
+    let genesis: scp_protocol::trust::CapabilityRequirements = vec![
+        scp_protocol::trust::RawCapabilityRequirement {
+            capability: "scp:capability:schema-validation/v1"
+                .parse()
+                .expect("capability URI"),
+            verification_level: scp_protocol::trust::VerificationLevel::SelfAttested,
+            trusted_verifiers: Vec::new(),
+            retry_cap: None,
+        }
+        .try_into()
+        .expect("valid requirement"),
+    ]
+    .try_into()
+    .expect("valid list");
+    let params = ContextParams {
+        capability_requirements: genesis,
+        ..joiner_params()
+    };
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        0x2e,
+        Some(Box::new(rec.clone())),
+        Some(params.clone()),
+        params.clone(),
+        None,
+    )
+    .await;
+    result.expect("welcome join succeeds");
+
+    let snapshot = rec
+        .store
+        .get(&j.ctx_id)
+        .map(|e| e.value().clone())
+        .expect("the joiner persisted a snapshot before spawning");
+    assert_eq!(
+        snapshot.capability_requirements,
+        crate::context::state::Replicated::AwaitingReplication,
+        "the joiner seeds no live list from the genesis declaration"
+    );
+    assert!(
+        !snapshot.context_params.capability_requirements.is_empty(),
+        "non-vacuity: the genesis list reached the joiner's params"
+    );
+    let err = j
+        .sup
+        .capability_requirements_checked(&j.ctx_id)
+        .await
+        .expect_err("the joiner's admission read fails closed");
+    assert!(
+        matches!(err, scp_protocol::context::ContextError::InvalidState(_)),
+        "{err:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test A1c — an over-cap genesis outlet declaration is rejected BEFORE the KP
 // consume (GitHub #2250).

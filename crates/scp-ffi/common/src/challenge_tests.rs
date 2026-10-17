@@ -767,6 +767,87 @@ async fn grade_signs_and_stores_the_record() {
     );
 }
 
+/// A [`Storage`] that refuses every write, so a graded record cannot reach
+/// the trust store.
+struct RefusingStorage;
+
+impl Storage for RefusingStorage {
+    fn store(
+        &self,
+        _key: &str,
+        _data: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), scp_platform::PlatformError>> + Send {
+        std::future::ready(Err(scp_platform::PlatformError::StorageError(
+            "disk full".to_owned(),
+        )))
+    }
+    fn retrieve(
+        &self,
+        _key: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, scp_platform::PlatformError>> + Send
+    {
+        std::future::ready(Ok(None))
+    }
+    fn delete(
+        &self,
+        _key: &str,
+    ) -> impl std::future::Future<Output = Result<(), scp_platform::PlatformError>> + Send {
+        std::future::ready(Ok(()))
+    }
+    fn list_keys(
+        &self,
+        _prefix: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, scp_platform::PlatformError>> + Send
+    {
+        std::future::ready(Ok(Vec::new()))
+    }
+    fn delete_prefix(
+        &self,
+        _prefix: &str,
+    ) -> impl std::future::Future<Output = Result<u64, scp_platform::PlatformError>> + Send {
+        std::future::ready(Ok(0))
+    }
+    fn exists(
+        &self,
+        _key: &str,
+    ) -> impl std::future::Future<Output = Result<bool, scp_platform::PlatformError>> + Send {
+        std::future::ready(Ok(false))
+    }
+}
+
+/// A graded record the trust store refuses comes back with the code every
+/// trust-store write failure reports, and the record and reasons intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_trust_store_write_is_a_coded_error() {
+    let h = Harness::new(evaluator_params()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoker = h.invoker(Some(registry()), Some(passing_handler(&calls)));
+    let request = h.create(1, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    let graded = h.grade(&request, &response, &invoker).await.unwrap();
+
+    let refusing = Arc::new(ProtocolRepository::new_for_testing(RefusingStorage));
+    let stored = store_graded(
+        &refusing,
+        GradedAttempt {
+            record: graded.record.clone(),
+            reasons: graded.reasons.clone(),
+        },
+    )
+    .await;
+    assert_eq!(stored.record, graded.record);
+    assert_eq!(stored.reasons, graded.reasons);
+    let error = stored
+        .trust_store_error
+        .expect("the refused write is reported");
+    let expected = TrustError::StoreError {
+        reason: String::new(),
+    };
+    assert_eq!(error.code, crate::error_codes::trust_error_code(&expected));
+    assert_eq!(error.code, crate::error_codes::VALID_7003);
+    assert!(error.message.contains("disk full"), "{error:?}");
+}
+
 /// 13: an evaluator outlet missing at grade time is a challenger fault: the
 /// attempt is not used and the challenge stays open, but the fault starts
 /// the cooldown (spec 07 §7.3.4 step 3), so a grade inside it is refused.

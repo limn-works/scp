@@ -827,8 +827,8 @@ class SCP:
         subject: str,
         capability_uri: str,
         test_cases_json: str,
-        window_secs: int,
         context_id: str,
+        window_secs: int,
         evaluator_context_id: str | None = ...,
         policy: dict[str, int] | None = ...,
     ) -> dict[str, str]: ...

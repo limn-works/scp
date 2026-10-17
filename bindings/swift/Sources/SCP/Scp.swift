@@ -1309,8 +1309,8 @@ public extension SCP {
         subject: String,
         capabilityUri: String,
         testCasesJson: String,
-        windowSecs: UInt32,
         contextId: String,
+        windowSecs: UInt32,
         evaluatorContextId: String?,
         policy: ChallengePolicy?
     ) async throws -> ChallengeResult {
@@ -1319,8 +1319,8 @@ public extension SCP {
             subject: subject,
             capabilityUri: capabilityUri,
             testCasesJson: testCasesJson,
-            windowSecs: windowSecs,
             contextId: contextId,
+            windowSecs: windowSecs,
             evaluatorContextId: evaluatorContextId,
             policy: policy
         )

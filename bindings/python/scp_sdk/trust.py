@@ -1939,9 +1939,10 @@ class GradedChallenge:
     record: ChallengeVerification
     #: One result per test case, in request order.
     case_results: list[CaseResult]
-    #: Why the record could not be stored in this instance's trust store, or
-    #: ``None`` when it was stored. The record is signed and valid either way.
-    trust_store_error: str | None
+    #: Why the record could not be stored in this instance's trust store, as a
+    #: ``{"code", "message"}`` dict, or ``None`` when it was stored. The record
+    #: is signed and valid either way.
+    trust_store_error: dict[str, str] | None
 
 
 async def trust_verify_attestation(

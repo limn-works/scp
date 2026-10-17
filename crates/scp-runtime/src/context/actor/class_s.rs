@@ -7859,7 +7859,8 @@ impl ClassSCell
                 .handle
                 .transition_to(&crate::context::ContextState::Active)
                 .expect("transition to Active");
-            state.governance.class_s.capability_requirements = old.clone();
+            state.governance.class_s.capability_requirements =
+                crate::context::state::Replicated::Live(old.clone());
             let mut cell = ClassSCell::new(state);
 
             let result =
@@ -7878,9 +7879,58 @@ impl ClassSCell
             );
             let expected = if tightening { &new } else { &old };
             assert_eq!(
-                &cell.governance.class_s.capability_requirements, expected,
+                &cell.governance.class_s.capability_requirements,
+                &crate::context::state::Replicated::Live(expected.clone()),
                 "tightening {tightening}: the live list after a failed persist"
             );
+        }
+    }
+
+    /// T21, after replication. A joiner awaiting the live list takes the list
+    /// a `ModifyCapabilityRequirements` sets, and admission then reads it; a
+    /// failed persist of that first list leaves the joiner awaiting.
+    #[tokio::test]
+    async fn awaiting_joiner_takes_the_list_governance_sets() {
+        let tightened = self_attested_requirements(&[
+            "scp:capability:schema-validation/v1",
+            "scp:capability:code-execution/v1",
+        ]);
+        for (byte, persistence, expected) in [
+            (
+                0x71_u8,
+                Box::new(crate::context::providers::persistence::InMemoryPersistence::new())
+                    as Box<dyn ContextPersistence>,
+                crate::context::state::Replicated::Live(tightened.clone()),
+            ),
+            (
+                0x72,
+                Box::new(FailPersistence),
+                crate::context::state::Replicated::AwaitingReplication,
+            ),
+        ] {
+            let deps = build_deps(persistence).await;
+            let mut state = fresh_state(byte);
+            state.handle = crate::context::ContextHandle::new(
+                ctx_hex(byte),
+                scp_protocol::context::params::ContextParams::default(),
+            );
+            state
+                .handle
+                .transition_to(&crate::context::ContextState::Active)
+                .expect("transition to Active");
+            state.governance.class_s.capability_requirements =
+                crate::context::state::Replicated::AwaitingReplication;
+            assert!(crate::context::queries_helpers::capability_requirements(&state).is_err());
+            let mut cell = ClassSCell::new(state);
+            let _ = crate::context::governance_helpers::execute_modify_capability_requirements(
+                &mut cell,
+                &deps,
+                &ctx_hex(byte),
+                &tightened,
+                ceiling_commit_meta(),
+            )
+            .await;
+            assert_eq!(cell.governance.class_s.capability_requirements, expected);
         }
     }
 

@@ -2554,6 +2554,20 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func governanceListProposals(handle: ContextHandle) async throws  -> String
     
     /**
+     * Proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4) with the
+     * complete new list in `requirements_json`, a JSON array; `[]` clears
+     * it.
+     *
+     * # Errors
+     *
+     * `ScpError::Validation` with `SCP-VALID-7000` for a malformed list, and
+     * with the requirement's own code (7147, 7148, 7150) for a requirement
+     * that breaks a §7.3.4.4 rule; otherwise fails as `governance_propose`
+     * does.
+     */
+    func governanceModifyCapabilityRequirements(handle: ContextHandle, proposerDid: String, requirementsJson: String) async throws  -> String
+    
+    /**
      * Per-instance equivalent of the free-function `governance_propose`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
@@ -3717,7 +3731,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
      * error when signing fails (`SCP-CRYPTO-4006` for a destroyed key).
      */
-    func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, windowSecs: UInt32, contextId: String, evaluatorContextId: String?, policy: ChallengePolicy?) async throws  -> ChallengeResult
+    func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, contextId: String, windowSecs: UInt32, evaluatorContextId: String?, policy: ChallengePolicy?) async throws  -> ChallengeResult
     
     /**
      * Grades the subject's `response_json` to `request_json` in `verifier`'s
@@ -5363,6 +5377,35 @@ open func governanceListProposals(handle: ContextHandle)async throws  -> String 
                 uniffi_scp_ffi_uniffi_fn_method_scp_governance_list_proposals(
                     self.uniffiClonePointer(),
                     FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4) with the
+     * complete new list in `requirements_json`, a JSON array; `[]` clears
+     * it.
+     *
+     * # Errors
+     *
+     * `ScpError::Validation` with `SCP-VALID-7000` for a malformed list, and
+     * with the requirement's own code (7147, 7148, 7150) for a requirement
+     * that breaks a §7.3.4.4 rule; otherwise fails as `governance_propose`
+     * does.
+     */
+open func governanceModifyCapabilityRequirements(handle: ContextHandle, proposerDid: String, requirementsJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_governance_modify_capability_requirements(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposerDid),FfiConverterString.lower(requirementsJson)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -7648,13 +7691,13 @@ open func transportStatus(manager: TransportManager)async throws  -> TransportSt
      * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
      * error when signing fails (`SCP-CRYPTO-4006` for a destroyed key).
      */
-open func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, windowSecs: UInt32, contextId: String, evaluatorContextId: String?, policy: ChallengePolicy?)async throws  -> ChallengeResult  {
+open func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, contextId: String, windowSecs: UInt32, evaluatorContextId: String?, policy: ChallengePolicy?)async throws  -> ChallengeResult  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_trust_create_challenge(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeIdentity_lower(verifier),FfiConverterString.lower(subject),FfiConverterString.lower(capabilityUri),FfiConverterString.lower(testCasesJson),FfiConverterUInt32.lower(windowSecs),FfiConverterString.lower(contextId),FfiConverterOptionString.lower(evaluatorContextId),FfiConverterOptionTypeChallengePolicy.lower(policy)
+                    FfiConverterTypeIdentity_lower(verifier),FfiConverterString.lower(subject),FfiConverterString.lower(capabilityUri),FfiConverterString.lower(testCasesJson),FfiConverterString.lower(contextId),FfiConverterUInt32.lower(windowSecs),FfiConverterOptionString.lower(evaluatorContextId),FfiConverterOptionTypeChallengePolicy.lower(policy)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -8978,7 +9021,7 @@ public struct ChallengeGradeResult {
      * when it could not; the record is signed and the attempt used either
      * way.
      */
-    public var trustStoreError: String?
+    public var trustStoreError: TrustStoreWriteError?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -8993,7 +9036,7 @@ public struct ChallengeGradeResult {
          * Why the record could not be written to this instance's trust store,
          * when it could not; the record is signed and the attempt used either
          * way.
-         */trustStoreError: String?) {
+         */trustStoreError: TrustStoreWriteError?) {
         self.recordJson = recordJson
         self.reasonsJson = reasonsJson
         self.trustStoreError = trustStoreError
@@ -9037,14 +9080,14 @@ public struct FfiConverterTypeChallengeGradeResult: FfiConverterRustBuffer {
             try ChallengeGradeResult(
                 recordJson: FfiConverterString.read(from: &buf), 
                 reasonsJson: FfiConverterString.read(from: &buf), 
-                trustStoreError: FfiConverterOptionString.read(from: &buf)
+                trustStoreError: FfiConverterOptionTypeTrustStoreWriteError.read(from: &buf)
         )
     }
 
     public static func write(_ value: ChallengeGradeResult, into buf: inout [UInt8]) {
         FfiConverterString.write(value.recordJson, into: &buf)
         FfiConverterString.write(value.reasonsJson, into: &buf)
-        FfiConverterOptionString.write(value.trustStoreError, into: &buf)
+        FfiConverterOptionTypeTrustStoreWriteError.write(value.trustStoreError, into: &buf)
     }
 }
 
@@ -13480,6 +13523,91 @@ public func FfiConverterTypeTrustScoreResult_lower(_ value: TrustScoreResult) ->
 
 
 /**
+ * A failed write of a graded record to this instance's trust store.
+ */
+public struct TrustStoreWriteError {
+    /**
+     * The error code, the one every trust-store write failure reports.
+     */
+    public var code: String
+    /**
+     * The message.
+     */
+    public var message: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The error code, the one every trust-store write failure reports.
+         */code: String, 
+        /**
+         * The message.
+         */message: String) {
+        self.code = code
+        self.message = message
+    }
+}
+
+#if compiler(>=6)
+extension TrustStoreWriteError: Sendable {}
+#endif
+
+
+extension TrustStoreWriteError: Equatable, Hashable {
+    public static func ==(lhs: TrustStoreWriteError, rhs: TrustStoreWriteError) -> Bool {
+        if lhs.code != rhs.code {
+            return false
+        }
+        if lhs.message != rhs.message {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(code)
+        hasher.combine(message)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrustStoreWriteError: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrustStoreWriteError {
+        return
+            try TrustStoreWriteError(
+                code: FfiConverterString.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TrustStoreWriteError, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.code, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustStoreWriteError_lift(_ buf: RustBuffer) throws -> TrustStoreWriteError {
+    return try FfiConverterTypeTrustStoreWriteError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustStoreWriteError_lower(_ value: TrustStoreWriteError) -> RustBuffer {
+    return FfiConverterTypeTrustStoreWriteError.lower(value)
+}
+
+
+/**
  * A UCAN token with metadata accessible to SDK consumers.
  *
  * See ADR-016 (UCAN Enforcement) and spec §10 (UCAN).
@@ -17201,6 +17329,30 @@ fileprivate struct FfiConverterOptionTypeReliabilityScoreRecord: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeTrustStoreWriteError: FfiConverterRustBuffer {
+    typealias SwiftType = TrustStoreWriteError?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTrustStoreWriteError.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTrustStoreWriteError.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]?
 
@@ -18687,6 +18839,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_list_proposals() != 5473) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_modify_capability_requirements() != 45235) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_propose() != 46255) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -18966,7 +19121,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_status() != 20055) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 1761) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 21846) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_grade_response() != 14844) {

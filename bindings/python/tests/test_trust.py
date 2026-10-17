@@ -1719,7 +1719,7 @@ class TestTrustChallengeMethods:
         args = scp._native.trust_create_challenge.call_args[0]
         assert args[:3] == ("did:dht:zV", "did:dht:zS", "example:capability/v1")
         assert json.loads(args[3]) == [case._to_wire() for case in cases]
-        assert args[4:] == (60, "ctx-1", "ctx-eval", {"max_retries": 1, "cooldown_secs": 30})
+        assert args[4:] == ("ctx-1", 60, "ctx-eval", {"max_retries": 1, "cooldown_secs": 30})
 
     def test_respond_and_grade_round_trip_the_wire_forms(self) -> None:
         from scp_sdk.scp import SCP

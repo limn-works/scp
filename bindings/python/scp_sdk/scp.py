@@ -2910,8 +2910,8 @@ class SCP:
                 subject,
                 capability_uri,
                 test_cases_json,
-                window_secs,
                 context_id,
+                window_secs,
                 evaluator_context_id,
                 policy_dict,
             )

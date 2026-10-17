@@ -3865,10 +3865,17 @@ pub async fn execute_modify_capability_requirements(
     } = meta;
     require_active(&cell.handle)?;
     let replace = |mut view: crate::context::actor::class_s::ClassSMut| {
-        view.governance_class_s_mut().capability_requirements = requirements.clone();
+        view.governance_class_s_mut().capability_requirements =
+            crate::context::state::Replicated::Live(requirements.clone());
         Ok::<(), ContextError>(())
     };
-    if requirements.is_tightening_of(&cell.governance.class_s.capability_requirements) {
+    // A joiner awaiting the live list has no old list to tighten, so its
+    // first replacement commits restore-direction.
+    let tightens = match &cell.governance.class_s.capability_requirements {
+        crate::context::state::Replicated::Live(old) => requirements.is_tightening_of(old),
+        crate::context::state::Replicated::AwaitingReplication => false,
+    };
+    if tightens {
         cell.commit_class_s_keep(deps, context_id, replace).await
     } else {
         cell.commit_class_s_restore(deps, context_id, replace).await

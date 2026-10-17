@@ -1513,6 +1513,19 @@
       ]
     },
     {
+      "canonical": "context_governance_modify_capability_requirements",
+      "category": "governance",
+      "pyo3": [
+        "governance_modify_capability_requirements"
+      ],
+      "uniffi": [
+        "governance_modify_capability_requirements"
+      ],
+      "napi": [
+        "context_governance_modify_capability_requirements"
+      ]
+    },
+    {
       "canonical": "context_governance_approve",
       "category": "governance",
       "pyo3": [

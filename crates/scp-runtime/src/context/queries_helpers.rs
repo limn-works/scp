@@ -243,12 +243,21 @@ pub fn context_params(state: &PerContextState) -> ContextParams {
 }
 
 /// Returns a clone of the context's live capability requirements, the
-/// Class-S governance field (spec §8.10).
-#[must_use]
+/// Class-S governance field (spec 07 §7.3.4.4).
+///
+/// # Errors
+///
+/// [`ContextError::InvalidState`] on a Welcome joiner that has not yet
+/// received the live list (see [`crate::context::state::Replicated`]).
 pub fn capability_requirements(
     state: &PerContextState,
-) -> scp_protocol::trust::CapabilityRequirements {
-    state.governance.class_s.capability_requirements.clone()
+) -> Result<scp_protocol::trust::CapabilityRequirements, scp_protocol::context::ContextError> {
+    state
+        .governance
+        .class_s
+        .capability_requirements
+        .live(state.handle.context_id(), "capability requirements")
+        .cloned()
 }
 
 /// Returns a clone of the role state for a context.
