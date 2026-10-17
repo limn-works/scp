@@ -25,14 +25,34 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from scp_sdk._extension import native_module
-from scp_sdk.errors import ContextError, ScpError, ValidationError
+from scp_sdk.errors import ContextError, ValidationError
+from scp_sdk.identity import Identity
 from scp_sdk.trust import (
-    ANSWER_KEY_MISMATCH_CODE,
+    ATTEMPT_OUT_OF_ORDER_CODE,
+    CAPABILITY_DEFINITION_UNAVAILABLE_CODE,
+    CHALLENGE_CLOSED_CODE,
+    CHALLENGE_EXPIRED_CODE,
+    CHALLENGE_NOT_OPEN_CODE,
+    CHALLENGE_NOT_YET_GRADABLE_CODE,
     CHALLENGE_SUITE_BELOW_MINIMUM_CODE,
+    CHALLENGE_WINDOW_OPEN_CODE,
+    COOLDOWN_ACTIVE_CODE,
+    DEFINITION_EQUIVOCATION_CODE,
+    EVALUATOR_UNAVAILABLE_CODE,
     GRADING_CAPACITY_EXHAUSTED_CODE,
+    GRADING_IN_PROGRESS_CODE,
     GRADING_LEASE_LOST_CODE,
+    INVALID_REQUIREMENT_CODE,
     NON_CANONICAL_IDENTIFIER_CODE,
+    OUTPUTS_MISMATCH_CODE,
+    POLICY_OUTSIDE_DEFINITION_CODE,
+    RESPONSE_TOO_LARGE_CODE,
+    RETRIES_EXHAUSTED_CODE,
+    SCHEMA_REJECTED_CODE,
+    SELF_CHALLENGE_CODE,
+    STANDARD_NOT_GRADABLE_CODE,
     TOO_MANY_CAPABILITY_REQUIREMENTS_CODE,
+    UNKNOWN_CHALLENGE_CODE,
     AttestationSummary,
     AttestorInfo,
     BehavioralRecord,
@@ -41,12 +61,15 @@ from scp_sdk.trust import (
     CapabilityRequirement,
     CapabilityValidation,
     CaseResult,
+    ChallengeCase,
     ChallengePolicy,
     ChallengeRequest,
     ChallengeResponse,
     ChallengeVerification,
+    ChallengeVerified,
     ContainsAll,
     ContainsNone,
+    CreateChallengeConfig,
     CustomEval,
     EventLogEntry,
     ExactMatch,
@@ -57,15 +80,18 @@ from scp_sdk.trust import (
     RequireParticipation,
     RetryCap,
     SchemaMatch,
+    SelfAttested,
     TestCase,
     TestOutput,
     TrustEvaluation,
-    VerificationLevel,
-    encode_capability_requirements,
+    _encode_capability_requirements,
     evaluate_trust,
+    is_retryable,
     participation_record,
+    retry_after,
     verify_participation_requirements,
 )
+from tests._native_doubles import native_identity
 from tests.conftest import skip_reason_if_extension_absent
 from tests.harness_custody import create_in_memory_identity
 
@@ -1533,7 +1559,6 @@ def _request_dict(**overrides: Any) -> dict[str, Any]:
                 "input": c.input,
                 "category": c.category,
                 "weight": c.weight,
-                "answer_commitment": "3f" * 32,
             }
             for c in _schema_cases(20)
         ],
@@ -1577,19 +1602,16 @@ class TestChallengeWireTypes:
             ),
             (ContainsAll(required=["a", "b"]), {"ContainsAll": {"required": ["a", "b"]}}),
             (ContainsNone(forbidden=["x"]), {"ContainsNone": {"forbidden": ["x"]}}),
-            (CustomEval(evaluator_outlet_id="o-1"), {"CustomEval": {"evaluator_outlet_id": "o-1"}}),
+            # The evaluator context goes to the bridge as its own argument;
+            # the Rust ``CustomEval`` wire form has no field for it.
+            (
+                CustomEval(evaluator_outlet_id="o-1", evaluator_context_id="ctx-eval"),
+                {"CustomEval": {"evaluator_outlet_id": "o-1"}},
+            ),
         ]
         for expected, wire in variants:
             case = TestCase(test_id="t", input=None, expected=expected, category="c", weight=1)
-            encoded = case._to_wire()
-            assert encoded["expected"] == wire
-            assert TestCase.from_dict(encoded) == case
-
-    def test_test_case_from_dict_rejects_unknown_variant(self) -> None:
-        with pytest.raises(ValueError, match="unknown ExpectedOutput variant"):
-            TestCase.from_dict(
-                {"test_id": "t", "input": 1, "expected": {"Nope": {}}, "category": "c", "weight": 1}
-            )
+            assert case._to_wire()["expected"] == wire
 
     def test_record_round_trips_through_the_bridge_shape(self) -> None:
         record = ChallengeVerification.from_dict(_record_dict())
@@ -1619,7 +1641,15 @@ class TestChallengeWireTypes:
 
     def test_request_and_response_round_trip(self) -> None:
         request = ChallengeRequest.from_dict(_request_dict())
-        assert request.test_cases[0].answer_commitment == "3f" * 32
+        assert [f.name for f in dataclasses.fields(ChallengeCase)] == [
+            "test_id",
+            "input",
+            "category",
+            "weight",
+        ]
+        assert request.test_cases[0] == ChallengeCase(
+            test_id="t0", input={"i": 0}, category="basic", weight=500
+        )
         assert request._to_wire() == _request_dict()
         response = ChallengeResponse.from_dict(_response_dict())
         assert response.outputs == [TestOutput(test_id="t0", output={"ok": True})]
@@ -1636,20 +1666,15 @@ class TestChallengeWireTypes:
             ChallengeResponse.from_dict(_response_dict(request_digest="5E" * 32))
 
     def test_capability_requirements_encode_verifiers_and_retry_cap(self) -> None:
-        encoded = encode_capability_requirements(
-            [
-                CapabilityRequirement(
-                    capability=_SCHEMA_URI,
-                    verification_level=VerificationLevel(name="ChallengeVerified"),
-                    trusted_verifiers=["did:dht:zVerifier"],
-                    retry_cap=RetryCap(max_retries=3, min_cooldown_secs=60),
-                ),
-                CapabilityRequirement(
-                    capability="scp:capability:summarization/v1",
-                    verification_level=VerificationLevel(name="SelfAttested"),
-                ),
-            ]
-        )
+        requirements: list[CapabilityRequirement] = [
+            ChallengeVerified(
+                capability=_SCHEMA_URI,
+                trusted_verifiers=["did:dht:zVerifier"],
+                retry_cap=RetryCap(max_retries=3, min_cooldown_secs=60),
+            ),
+            SelfAttested(capability="scp:capability:summarization/v1"),
+        ]
+        encoded = _encode_capability_requirements(requirements, "requirements")
         assert json.loads(encoded) == [
             {
                 "capability": _SCHEMA_URI,
@@ -1667,12 +1692,147 @@ class TestChallengeWireTypes:
         with pytest.raises(ValueError, match=r"RetryCap\.max_retries"):
             RetryCap(max_retries=-1, min_cooldown_secs=0)
 
+    def test_challenge_verified_without_a_verifier_fails_to_construct(self) -> None:
+        with pytest.raises(ValidationError) as empty:
+            ChallengeVerified(capability=_SCHEMA_URI, trusted_verifiers=[])
+        assert empty.value.code == INVALID_REQUIREMENT_CODE == "SCP-VALID-7150"
+        with pytest.raises(ValidationError) as not_a_list:
+            ChallengeVerified(capability=_SCHEMA_URI, trusted_verifiers="did:dht:zVerifier")  # type: ignore[arg-type]
+        assert not_a_list.value.code == INVALID_REQUIREMENT_CODE
+
+    def test_self_attested_has_no_verifier_or_retry_cap_field(self) -> None:
+        assert [f.name for f in dataclasses.fields(SelfAttested)] == ["capability"]
+        with pytest.raises(TypeError):
+            SelfAttested(capability=_SCHEMA_URI, trusted_verifiers=["did:dht:zV"])  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            '[{"capability": "x", "verification_level": "SelfAttested"}]',
+            [{"capability": "x", "verification_level": "SelfAttested"}],
+            SelfAttested(capability="x"),
+        ],
+    )
+    def test_encoder_refuses_untyped_requirements(self, raw: Any) -> None:
+        with pytest.raises(ValidationError) as info:
+            _encode_capability_requirements(raw, "requirements")
+        assert info.value.code == INVALID_REQUIREMENT_CODE
+
     def test_error_codes_match_the_bridge(self) -> None:
-        assert ANSWER_KEY_MISMATCH_CODE == "SCP-VALID-7145"
-        assert GRADING_CAPACITY_EXHAUSTED_CODE == "SCP-VALID-7146"
-        assert NON_CANONICAL_IDENTIFIER_CODE == "SCP-VALID-7147"
-        assert TOO_MANY_CAPABILITY_REQUIREMENTS_CODE == "SCP-VALID-7148"
-        assert GRADING_LEASE_LOST_CODE == "SCP-VALID-7149"
+        """Each constant holds the code ``scp-ffi-common``'s
+        ``trust_error_code`` and ``admission_error_code`` give its variant."""
+        assert {
+            CHALLENGE_SUITE_BELOW_MINIMUM_CODE: "SCP-VALID-7039",
+            CHALLENGE_NOT_OPEN_CODE: "SCP-VALID-7099",
+            CHALLENGE_EXPIRED_CODE: "SCP-VALID-7102",
+            ATTEMPT_OUT_OF_ORDER_CODE: "SCP-VALID-7103",
+            RETRIES_EXHAUSTED_CODE: "SCP-VALID-7104",
+            COOLDOWN_ACTIVE_CODE: "SCP-VALID-7105",
+            CHALLENGE_CLOSED_CODE: "SCP-VALID-7106",
+            UNKNOWN_CHALLENGE_CODE: "SCP-VALID-7107",
+            OUTPUTS_MISMATCH_CODE: "SCP-VALID-7108",
+            EVALUATOR_UNAVAILABLE_CODE: "SCP-VALID-7109",
+            SELF_CHALLENGE_CODE: "SCP-VALID-7127",
+            STANDARD_NOT_GRADABLE_CODE: "SCP-VALID-7128",
+            CAPABILITY_DEFINITION_UNAVAILABLE_CODE: "SCP-VALID-7129",
+            POLICY_OUTSIDE_DEFINITION_CODE: "SCP-VALID-7137",
+            SCHEMA_REJECTED_CODE: "SCP-VALID-7138",
+            GRADING_IN_PROGRESS_CODE: "SCP-VALID-7139",
+            RESPONSE_TOO_LARGE_CODE: "SCP-VALID-7143",
+            DEFINITION_EQUIVOCATION_CODE: "SCP-VALID-7144",
+            GRADING_CAPACITY_EXHAUSTED_CODE: "SCP-VALID-7146",
+            NON_CANONICAL_IDENTIFIER_CODE: "SCP-VALID-7147",
+            TOO_MANY_CAPABILITY_REQUIREMENTS_CODE: "SCP-VALID-7148",
+            GRADING_LEASE_LOST_CODE: "SCP-VALID-7149",
+            INVALID_REQUIREMENT_CODE: "SCP-VALID-7150",
+            CHALLENGE_WINDOW_OPEN_CODE: "SCP-VALID-7151",
+            CHALLENGE_NOT_YET_GRADABLE_CODE: "SCP-VALID-7153",
+        } == {
+            code: code
+            for code in (
+                CHALLENGE_SUITE_BELOW_MINIMUM_CODE,
+                CHALLENGE_NOT_OPEN_CODE,
+                CHALLENGE_EXPIRED_CODE,
+                ATTEMPT_OUT_OF_ORDER_CODE,
+                RETRIES_EXHAUSTED_CODE,
+                COOLDOWN_ACTIVE_CODE,
+                CHALLENGE_CLOSED_CODE,
+                UNKNOWN_CHALLENGE_CODE,
+                OUTPUTS_MISMATCH_CODE,
+                EVALUATOR_UNAVAILABLE_CODE,
+                SELF_CHALLENGE_CODE,
+                STANDARD_NOT_GRADABLE_CODE,
+                CAPABILITY_DEFINITION_UNAVAILABLE_CODE,
+                POLICY_OUTSIDE_DEFINITION_CODE,
+                SCHEMA_REJECTED_CODE,
+                GRADING_IN_PROGRESS_CODE,
+                RESPONSE_TOO_LARGE_CODE,
+                DEFINITION_EQUIVOCATION_CODE,
+                GRADING_CAPACITY_EXHAUSTED_CODE,
+                NON_CANONICAL_IDENTIFIER_CODE,
+                TOO_MANY_CAPABILITY_REQUIREMENTS_CODE,
+                GRADING_LEASE_LOST_CODE,
+                INVALID_REQUIREMENT_CODE,
+                CHALLENGE_WINDOW_OPEN_CODE,
+                CHALLENGE_NOT_YET_GRADABLE_CODE,
+            )
+        }
+
+    def test_is_retryable_over_every_challenge_code(self) -> None:
+        retryable = {
+            "SCP-VALID-7099",
+            "SCP-VALID-7105",
+            "SCP-VALID-7139",
+            "SCP-VALID-7146",
+            "SCP-VALID-7149",
+            "SCP-VALID-7151",
+            "SCP-VALID-7153",
+        }
+        every_code = [
+            f"SCP-VALID-{n}"
+            for n in (
+                7039,
+                7099,
+                7102,
+                7103,
+                7104,
+                7105,
+                7106,
+                7107,
+                7108,
+                7109,
+                7127,
+                7128,
+                7129,
+                7137,
+                7138,
+                7139,
+                7143,
+                7144,
+                7146,
+                7147,
+                7148,
+                7149,
+                7150,
+                7151,
+                7153,
+            )
+        ]
+        assert {code for code in every_code if is_retryable(code)} == retryable
+        assert not is_retryable("SCP-VALID-7076")
+
+    def test_retry_after_reads_the_message_suffix(self) -> None:
+        refusal = ValidationError(
+            "trust evaluation failed: cooldown active (retry_after=1700000300)",
+            COOLDOWN_ACTIVE_CODE,
+        )
+        assert retry_after(refusal) == 1_700_000_300
+        assert retry_after(str(refusal)) == 1_700_000_300
+        assert retry_after(RuntimeError("[SCP-VALID-7153] early (retry_after=5)")) == 5
+        assert retry_after(ValidationError("closed", CHALLENGE_CLOSED_CODE)) is None
+        # Only a suffix counts: the key in the middle of a message names no time.
+        assert retry_after("(retry_after=5) then more text") is None
+        assert retry_after("(retry_after=) ") is None
 
     def test_module_functions_are_gone(self) -> None:
         import scp_sdk
@@ -1693,33 +1853,159 @@ class TestTrustChallengeMethods:
     """The challenge methods encode their typed arguments for the bridge and
     decode its answer."""
 
-    def test_create_serializes_the_typed_cases_and_policy(self) -> None:
-        from scp_sdk.scp import SCP
+    @staticmethod
+    def _config(cases: list[TestCase], **overrides: Any) -> CreateChallengeConfig:
+        fields: dict[str, Any] = {
+            "verifier": Identity(native_identity(did="did:dht:zV")),
+            "subject": "did:dht:zS",
+            "capability_uri": "example:capability/v1",
+            "test_cases": cases,
+            "context_id": "ctx-1",
+            "window_secs": 60,
+        }
+        fields.update(overrides)
+        return CreateChallengeConfig(**fields)
 
+    @staticmethod
+    def _scp_creating() -> Any:
         scp = MagicMock()
         scp._native.trust_create_challenge.return_value = {
             "challenge_id": "ab" * 32,
             "request_json": json.dumps(_request_dict()),
         }
-        cases = _schema_cases(20)
+        return scp
+
+    def test_create_serializes_the_typed_cases_and_policy(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = self._scp_creating()
+        cases = [
+            *_schema_cases(19),
+            TestCase(
+                test_id="custom",
+                input=None,
+                expected=CustomEval(evaluator_outlet_id="o-1", evaluator_context_id="ctx-eval"),
+                category="basic",
+                weight=0,
+            ),
+        ]
         request = asyncio.run(
             SCP.trust_create_challenge(
                 scp,
-                "did:dht:zV",
-                "did:dht:zS",
-                "example:capability/v1",
-                cases,
-                "ctx-1",
-                60,
-                evaluator_context_id="ctx-eval",
-                policy=ChallengePolicy(max_retries=1, cooldown_secs=30),
+                self._config(cases, policy=ChallengePolicy(max_retries=1, cooldown_secs=30)),
             )
         )
         assert request == ChallengeRequest.from_dict(_request_dict())
         args = scp._native.trust_create_challenge.call_args[0]
         assert args[:3] == ("did:dht:zV", "did:dht:zS", "example:capability/v1")
         assert json.loads(args[3]) == [case._to_wire() for case in cases]
+        # The CustomEval case's context is lifted to the bridge's
+        # evaluator_context_id argument.
         assert args[4:] == ("ctx-1", 60, "ctx-eval", {"max_retries": 1, "cooldown_secs": 30})
+
+    @pytest.mark.parametrize(
+        ("policy", "bridge_policy"),
+        [
+            (None, None),
+            (ChallengePolicy(), {}),
+            (ChallengePolicy(cooldown_secs=3_600), {"cooldown_secs": 3_600}),
+            (ChallengePolicy(max_retries=0), {"max_retries": 0}),
+        ],
+    )
+    def test_create_sends_only_the_policy_fields_set(
+        self, policy: ChallengePolicy | None, bridge_policy: dict[str, int] | None
+    ) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = self._scp_creating()
+        asyncio.run(SCP.trust_create_challenge(scp, self._config(_schema_cases(20), policy=policy)))
+        args = scp._native.trust_create_challenge.call_args[0]
+        # No CustomEval case, so no evaluator context.
+        assert args[6:] == (None, bridge_policy)
+
+    def test_create_refuses_two_evaluator_contexts_before_the_bridge(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = self._scp_creating()
+        cases = [
+            TestCase(
+                test_id=f"c{i}",
+                input=None,
+                expected=CustomEval(evaluator_outlet_id="o-1", evaluator_context_id=ctx),
+                category="basic",
+                weight=5_000,
+            )
+            for i, ctx in enumerate(("ctx-a", "ctx-b"))
+        ]
+        with pytest.raises(ValidationError) as info:
+            asyncio.run(SCP.trust_create_challenge(scp, self._config(cases)))
+        assert info.value.code == "SCP-VALID-7001"
+        scp._native.trust_create_challenge.assert_not_called()
+
+    def test_signing_operations_refuse_a_did_string(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = self._scp_creating()
+        request = ChallengeRequest.from_dict(_request_dict())
+        response = ChallengeResponse.from_dict(_response_dict())
+        calls = [
+            SCP.trust_create_challenge(scp, self._config(_schema_cases(20), verifier="did:dht:zV")),
+            SCP.trust_respond_to_challenge(scp, "did:dht:zSubject", request, [], 1),  # type: ignore[arg-type]
+            SCP.trust_grade_response(scp, "did:dht:zVerifier", request, response),  # type: ignore[arg-type]
+        ]
+        for call in calls:
+            with pytest.raises(ValidationError) as info:
+                asyncio.run(call)
+            assert info.value.code == "SCP-VALID-7005"
+        scp._native.trust_create_challenge.assert_not_called()
+        scp._native.trust_respond_to_challenge.assert_not_called()
+        scp._native.trust_grade_response.assert_not_called()
+
+    def test_context_create_refuses_untyped_requirements_before_the_bridge(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        for raw in (
+            json.dumps([SelfAttested(capability=_SCHEMA_URI)._to_bridge_dict()]),
+            [SelfAttested(capability=_SCHEMA_URI)._to_bridge_dict()],
+        ):
+            with pytest.raises(ValidationError) as info:
+                asyncio.run(
+                    SCP.context_create(
+                        scp, "did:dht:zCreator", {"ceiling": ["x"], "capability_requirements": raw}
+                    )
+                )
+            assert info.value.code == INVALID_REQUIREMENT_CODE
+        scp._native.context_create.assert_not_called()
+
+    def test_governance_modify_encodes_the_typed_list(self) -> None:
+        from scp_sdk.context import Context
+        from scp_sdk.scp import SCP
+        from tests._native_doubles import native_context_handle
+
+        scp = MagicMock()
+        scp._native.governance_modify_capability_requirements.return_value = json.dumps(
+            {"proposal_id": "aa" * 32, "status": "Pending", "execution_result": None}
+        )
+        handle = Context(native_context_handle(), identity_did="did:dht:zCreator", scp=scp)
+        requirement = ChallengeVerified(capability=_SCHEMA_URI, trusted_verifiers=["did:dht:zV"])
+        asyncio.run(
+            SCP.governance_modify_capability_requirements(
+                scp, handle, "did:dht:zCreator", [requirement]
+            )
+        )
+        _, proposer, requirements_json = (
+            scp._native.governance_modify_capability_requirements.call_args[0]
+        )
+        assert proposer == "did:dht:zCreator"
+        assert json.loads(requirements_json) == [requirement._to_bridge_dict()]
+        with pytest.raises(ValidationError) as info:
+            asyncio.run(
+                SCP.governance_modify_capability_requirements(
+                    scp, handle, "did:dht:zCreator", [requirement._to_bridge_dict()]
+                )
+            )
+        assert info.value.code == INVALID_REQUIREMENT_CODE
 
     def test_respond_and_grade_round_trip_the_wire_forms(self) -> None:
         from scp_sdk.scp import SCP
@@ -1734,7 +2020,9 @@ class TestTrustChallengeMethods:
         request = ChallengeRequest.from_dict(_request_dict())
         outputs = [TestOutput(test_id="t0", output={"ok": True})]
         response = asyncio.run(
-            SCP.trust_respond_to_challenge(scp, "did:dht:zSubject", request, outputs, 1)
+            SCP.trust_respond_to_challenge(
+                scp, Identity(native_identity(did="did:dht:zSubject")), request, outputs, 1
+            )
         )
         assert response == ChallengeResponse.from_dict(_response_dict())
         subject, request_json, outputs_json, attempt = (
@@ -1744,7 +2032,11 @@ class TestTrustChallengeMethods:
         assert json.loads(request_json) == _request_dict()
         assert json.loads(outputs_json) == [{"test_id": "t0", "output": {"ok": True}}]
 
-        graded = asyncio.run(SCP.trust_grade_response(scp, "did:dht:zVerifier", request, response))
+        graded = asyncio.run(
+            SCP.trust_grade_response(
+                scp, Identity(native_identity(did="did:dht:zVerifier")), request, response
+            )
+        )
         assert graded == GradedChallenge(
             record=ChallengeVerification.from_dict(_record_dict()),
             case_results=[CaseResult(passed=True, reason=None)],
@@ -1768,7 +2060,7 @@ class TestTrustChallengeMethods:
             asyncio.run(
                 SCP.trust_grade_response(
                     scp,
-                    "did:dht:zVerifier",
+                    Identity(native_identity(did="did:dht:zVerifier")),
                     ChallengeRequest.from_dict(_request_dict()),
                     ChallengeResponse.from_dict(_response_dict()),
                 )
@@ -1778,7 +2070,7 @@ class TestTrustChallengeMethods:
         "code",
         [
             CHALLENGE_SUITE_BELOW_MINIMUM_CODE,
-            ANSWER_KEY_MISMATCH_CODE,
+            COOLDOWN_ACTIVE_CODE,
             GRADING_CAPACITY_EXHAUSTED_CODE,
             NON_CANONICAL_IDENTIFIER_CODE,
             TOO_MANY_CAPABILITY_REQUIREMENTS_CODE,
@@ -1794,7 +2086,7 @@ class TestTrustChallengeMethods:
             asyncio.run(
                 SCP.trust_grade_response(
                     scp,
-                    "did:dht:zVerifier",
+                    Identity(native_identity(did="did:dht:zVerifier")),
                     ChallengeRequest.from_dict(_request_dict()),
                     ChallengeResponse.from_dict(_response_dict()),
                 )
@@ -1806,29 +2098,59 @@ class TestTrustChallengeRealBridge:
     """The SDK methods against the native bridge."""
 
     @staticmethod
-    async def _requiring_context(scp: Any, verifier_did: str) -> str:
+    async def _context(scp: Any, requirements: list[CapabilityRequirement] | None) -> Any:
+        """A ``single_admin`` context whose governance holds ``requirements``,
+        and its creator."""
+        creator = await create_in_memory_identity(scp)
+        params: dict[str, Any] = {
+            "ceiling": ["messages:read", "messages:write", "governance:propose"],
+            "memory_scope": "ephemeral",
+            "governance": "single_admin",
+        }
+        if requirements is not None:
+            params["capability_requirements"] = requirements
+        return await scp.context_create(creator.did, params), creator
+
+    @classmethod
+    async def _requiring_context(cls, scp: Any, verifier_did: str) -> str:
         """A context whose governance requires ``_SCHEMA_URI`` graded by
         ``verifier_did``."""
-        creator = await create_in_memory_identity(scp)
-        ctx = await scp.context_create(
-            creator.did,
-            {
-                "ceiling": ["messages:read", "messages:write"],
-                "memory_scope": "ephemeral",
-                "governance": "single_admin",
-                "capability_requirements": encode_capability_requirements(
-                    [
-                        CapabilityRequirement(
-                            capability=_SCHEMA_URI,
-                            verification_level=VerificationLevel(name="ChallengeVerified"),
-                            trusted_verifiers=[verifier_did],
-                        )
-                    ]
-                ),
-            },
+        ctx, _ = await cls._context(
+            scp, [ChallengeVerified(capability=_SCHEMA_URI, trusted_verifiers=[verifier_did])]
         )
         context_id: str = ctx.context_id
         return context_id
+
+    @staticmethod
+    def _create(
+        verifier: Identity, subject: Identity, context_id: str, cases: list[TestCase]
+    ) -> CreateChallengeConfig:
+        return CreateChallengeConfig(
+            verifier=verifier,
+            subject=subject.did,
+            capability_uri=_SCHEMA_URI,
+            test_cases=cases,
+            context_id=context_id,
+            window_secs=3_600,
+        )
+
+    @classmethod
+    async def _graded_record(
+        cls, scp: Any, verifier: Identity, subject: Identity, context_id: str
+    ) -> ChallengeVerification:
+        """A passing record ``verifier`` graded for ``subject`` in ``context_id``."""
+        cases = _schema_cases(20)
+        request = await scp.trust_create_challenge(
+            cls._create(verifier, subject, context_id, cases)
+        )
+        await _past_creation_second(request)
+        response = await scp.trust_respond_to_challenge(
+            subject, request, [TestOutput(test_id=c.test_id, output={"ok": True}) for c in cases], 1
+        )
+        graded = await scp.trust_grade_response(verifier, request, response)
+        assert graded.record.passed
+        record: ChallengeVerification = graded.record
+        return record
 
     @pytest.mark.asyncio
     async def test_below_minimum_is_valid_7039(self, scp) -> None:  # type: ignore[no-untyped-def]
@@ -1839,9 +2161,81 @@ class TestTrustChallengeRealBridge:
         context_id = await self._requiring_context(scp, verifier.did)
         with pytest.raises(ValidationError) as info:
             await scp.trust_create_challenge(
-                verifier.did, subject.did, _SCHEMA_URI, _schema_cases(19), context_id, 3_600
+                self._create(verifier, subject, context_id, _schema_cases(19))
             )
         assert info.value.code == CHALLENGE_SUITE_BELOW_MINIMUM_CODE
+
+    @pytest.mark.asyncio
+    async def test_typed_requirement_round_trips_through_context_create(self, scp) -> None:  # type: ignore[no-untyped-def]
+        """A typed ``ChallengeVerified`` requirement passed to context_create
+        is the one admission reads: a subject with no record, or with only a
+        self-attested claim, is refused; a record from the trusted verifier
+        admits it; a record from another verifier does not."""
+        _require_native_extension()
+
+        verifier = await create_in_memory_identity(scp)
+        other = await create_in_memory_identity(scp)
+        subject = await create_in_memory_identity(scp)
+        context_id = await self._requiring_context(scp, verifier.did)
+
+        with pytest.raises(ValidationError) as no_record:
+            await scp.check_capability_requirements(context_id, subject.did, [_SCHEMA_URI], [])
+        assert no_record.value.code == "SCP-VALID-7076"
+
+        untrusted = await self._graded_record(scp, other, subject, context_id)
+        with pytest.raises(ValidationError) as wrong_verifier:
+            await scp.check_capability_requirements(context_id, subject.did, [], [untrusted])
+        assert wrong_verifier.value.code == "SCP-VALID-7121"
+
+        trusted = await self._graded_record(scp, verifier, subject, context_id)
+        await scp.check_capability_requirements(context_id, subject.did, [], [trusted])
+
+    @pytest.mark.asyncio
+    async def test_governance_modify_tightens_admission(self, scp) -> None:  # type: ignore[no-untyped-def]
+        """A subject that a ``SelfAttested`` requirement admits is refused
+        once a ``ChallengeVerified`` proposal for the same capability
+        executes."""
+        _require_native_extension()
+
+        subject = await create_in_memory_identity(scp)
+        ctx, creator = await self._context(scp, [SelfAttested(capability=_SCHEMA_URI)])
+        await scp.check_capability_requirements(ctx.context_id, subject.did, [_SCHEMA_URI], [])
+
+        outcome = json.loads(
+            await scp.governance_modify_capability_requirements(
+                ctx,
+                creator.did,
+                [ChallengeVerified(capability=_SCHEMA_URI, trusted_verifiers=[creator.did])],
+            )
+        )
+        assert outcome["execution_result"] is not None
+        with pytest.raises(ValidationError) as refused:
+            await scp.check_capability_requirements(ctx.context_id, subject.did, [_SCHEMA_URI], [])
+        assert refused.value.code == "SCP-VALID-7076"
+
+        # A list the bridge refuses keeps its own code.
+        too_many = [SelfAttested(capability=_SCHEMA_URI)] * 65
+        with pytest.raises(ValidationError) as refused_list:
+            await scp.governance_modify_capability_requirements(ctx, creator.did, too_many)
+        assert refused_list.value.code == TOO_MANY_CAPABILITY_REQUIREMENTS_CODE
+
+    @pytest.mark.asyncio
+    async def test_open_window_refusal_names_its_retry_time(self, scp) -> None:  # type: ignore[no-untyped-def]
+        """A second challenge to the same subject for the same capability is
+        refused while the first one's window is open, and the refusal names
+        the second that window ends."""
+        _require_native_extension()
+
+        verifier = await create_in_memory_identity(scp)
+        subject = await create_in_memory_identity(scp)
+        context_id = await self._requiring_context(scp, verifier.did)
+        config = self._create(verifier, subject, context_id, _schema_cases(20))
+        first = await scp.trust_create_challenge(config)
+        with pytest.raises(ValidationError) as info:
+            await scp.trust_create_challenge(config)
+        assert info.value.code == CHALLENGE_WINDOW_OPEN_CODE
+        assert is_retryable(info.value.code)
+        assert retry_after(info.value) == first.expires_at
 
     @pytest.mark.asyncio
     async def test_challenge_round_trip(self, scp) -> None:  # type: ignore[no-untyped-def]
@@ -1856,7 +2250,7 @@ class TestTrustChallengeRealBridge:
         cases = _schema_cases(20)
 
         request = await scp.trust_create_challenge(
-            verifier.did, subject.did, _SCHEMA_URI, cases, context_id, 3_600
+            self._create(verifier, subject, context_id, cases)
         )
         await _past_creation_second(request)
         assert request.verifier == verifier.did
@@ -1864,7 +2258,7 @@ class TestTrustChallengeRealBridge:
         assert request.context_id == context_id
         assert [c.test_id for c in request.test_cases] == [c.test_id for c in cases]
         assert request.expires_at - request.created_at == 3_600
-        # The request commits to each answer and never carries it.
+        # The request carries no answer.
         assert "ExactMatch" not in json.dumps(request._to_wire())
 
         with pytest.raises(ValidationError) as unmet:
@@ -1872,7 +2266,7 @@ class TestTrustChallengeRealBridge:
         assert unmet.value.code == "SCP-VALID-7076"
 
         response = await scp.trust_respond_to_challenge(
-            subject.did,
+            subject,
             request,
             [TestOutput(test_id=c.test_id, output={"ok": True}) for c in cases],
             1,
@@ -1881,7 +2275,7 @@ class TestTrustChallengeRealBridge:
         assert response.subject == subject.did
         assert response.attempt == 1
 
-        graded = await scp.trust_grade_response(verifier.did, request, response)
+        graded = await scp.trust_grade_response(verifier, request, response)
         assert graded.trust_store_error is None
         assert len(graded.case_results) == 20
         assert all(c.passed for c in graded.case_results)
@@ -1910,19 +2304,22 @@ class TestTrustChallengeRealBridge:
         context_id = await self._requiring_context(scp, verifier.did)
         cases = _schema_cases(20)
         request = await scp.trust_create_challenge(
-            verifier.did, subject.did, _SCHEMA_URI, cases, context_id, 3_600
+            self._create(verifier, subject, context_id, cases)
         )
         await _past_creation_second(request)
         response = await scp.trust_respond_to_challenge(
-            subject.did,
+            subject,
             request,
             [TestOutput(test_id=c.test_id, output={"ok": True}) for c in cases],
             1,
         )
         forged = dataclasses.replace(response, subject_signature=[0] * 64)
-        with pytest.raises(ScpError):
-            await scp.trust_grade_response(verifier.did, request, forged)
+        with pytest.raises(ValidationError) as info:
+            await scp.trust_grade_response(verifier, request, forged)
+        # ``TrustError::ChallengeSignatureInvalid`` keeps the generic trust
+        # code in ``trust_error_code``.
+        assert info.value.code == "SCP-VALID-7003"
         # The forgery took no attempt: the real response still grades as attempt 1.
-        graded = await scp.trust_grade_response(verifier.did, request, response)
+        graded = await scp.trust_grade_response(verifier, request, response)
         assert graded.record.attempt == 1
         assert graded.record.passed

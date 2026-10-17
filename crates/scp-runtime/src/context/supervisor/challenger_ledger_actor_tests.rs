@@ -19,8 +19,8 @@ use scp_protocol::trust::capability_definition::ProtocolOnlyDefinitions;
 use scp_protocol::trust::{
     ActiveKeyResolver, AnswerKey, AuthenticatedResponse, CanonicalIdentifier, ChallengeClosure,
     ChallengePolicy, ChallengeRequest, ChallengeResponse, ExpectedOutput, GradeOutcome,
-    NewChallenge, SchemaVerdict, TestCase, TestOutput, TrustError, authenticate_challenge_response,
-    challenge_request_signing_digest, challenge_request_unsigned,
+    NewChallenge, PolicyPick, SchemaVerdict, TestCase, TestOutput, TrustError,
+    authenticate_challenge_response, challenge_request_signing_digest, challenge_request_unsigned,
     challenge_response_signing_digest, challenge_response_unsigned,
     challenge_verification_signing_digest, grade,
 };
@@ -251,7 +251,8 @@ impl Harness {
     /// The unsigned request to `subject` for `uri`, created now, and its
     /// answer key.
     fn unsigned_for(&self, subject: &DID, uri: &str) -> (UnsignedChallengeRequest, AnswerKey) {
-        let policy = ChallengePolicy::resolve(&ProtocolOnlyDefinitions, uri, None).unwrap();
+        let policy =
+            ChallengePolicy::resolve(&ProtocolOnlyDefinitions, uri, PolicyPick::default()).unwrap();
         challenge_request_unsigned(NewChallenge {
             verifier: self.verifier.clone(),
             subject: subject.clone(),

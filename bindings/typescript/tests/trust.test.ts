@@ -21,11 +21,13 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Context } from "../src/context";
 import { ValidationError } from "../src/errors";
+import { Identity } from "../src/identity";
 import type { SCP } from "../src/scp";
 import type {
   AttestorInfo,
   CachedAttestation,
   CachedAttestationEnvelope,
+  CapabilityRequirement,
   CapabilityValidation,
   ChallengeRequest,
   ChallengeResponse,
@@ -38,11 +40,21 @@ import type {
   ThresholdRequirement,
 } from "../src/types";
 import {
-  ANSWER_KEY_MISMATCH_CODE,
+  ATTEMPT_OUT_OF_ORDER_CODE,
+  CAPABILITY_DEFINITION_UNAVAILABLE_CODE,
+  CHALLENGE_CLOSED_CODE,
+  CHALLENGE_EXPIRED_CODE,
+  CHALLENGE_NOT_OPEN_CODE,
+  CHALLENGE_NOT_YET_GRADABLE_CODE,
+  CHALLENGE_SUITE_BELOW_MINIMUM_CODE,
+  CHALLENGE_WINDOW_OPEN_CODE,
+  COOLDOWN_ACTIVE_CODE,
+  DEFINITION_EQUIVOCATION_CODE,
   decodeCaseResults,
   decodeChallengeRequest,
   decodeChallengeResponse,
   decodeChallengeVerification,
+  EVALUATOR_UNAVAILABLE_CODE,
   encodeAttestation,
   encodeAttestorSets,
   encodeCapabilityRequirements,
@@ -57,9 +69,21 @@ import {
   encodeTestOutputs,
   encodeThresholdRequirements,
   GRADING_CAPACITY_EXHAUSTED_CODE,
+  GRADING_IN_PROGRESS_CODE,
   GRADING_LEASE_LOST_CODE,
+  INVALID_REQUIREMENT_CODE,
+  isRetryable,
   NON_CANONICAL_IDENTIFIER_CODE,
+  OUTPUTS_MISMATCH_CODE,
+  POLICY_OUTSIDE_DEFINITION_CODE,
+  RESPONSE_TOO_LARGE_CODE,
+  RETRIES_EXHAUSTED_CODE,
+  retryAfter,
+  SCHEMA_REJECTED_CODE,
+  SELF_CHALLENGE_CODE,
+  STANDARD_NOT_GRADABLE_CODE,
   TOO_MANY_CAPABILITY_REQUIREMENTS_CODE,
+  UNKNOWN_CHALLENGE_CODE,
 } from "../src/types";
 import { createMockNativeScp, mockContext, mountMockScp } from "./mock-bridge";
 
@@ -653,11 +677,103 @@ function makeProfile(overrides: Partial<ParticipationProfile> = {}): Participati
   };
 }
 
+describe("typed capability requirements at the SCP boundary", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  const SCHEMA = "scp:capability:schema-validation/v1";
+  const typed: readonly CapabilityRequirement[] = [
+    { kind: "ChallengeVerified", capability: SCHEMA, trustedVerifiers: ["did:dht:zVerifier"] },
+  ];
+
+  it("contextCreate sends the typed requirements to the bridge in their wire form", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const creator = mockIdentity(scp, "did:dht:zCreator");
+    await scp
+      .contextCreate(
+        creator,
+        JSON.stringify({ ceiling: ["messages:read"], capabilityRequirements: typed }),
+      )
+      .catch(() => undefined);
+    const sent = JSON.parse(native.__lastCall("contextCreate")?.args[1] as string);
+    expect(sent.ceiling).toEqual(["messages:read"]);
+    expect(sent.capabilityRequirements).toBe(encodeCapabilityRequirements(typed));
+
+    // Params without requirements reach the bridge unchanged.
+    const plain = JSON.stringify({ ceiling: ["messages:read"] });
+    await scp.contextCreate(creator, plain).catch(() => undefined);
+    expect(native.__lastCall("contextCreate")?.args[1]).toBe(plain);
+  });
+
+  it("contextCreate refuses requirements that are not a typed list with no bridge call", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const creator = mockIdentity(scp, "did:dht:zCreator");
+    const cases: [unknown, string][] = [
+      [encodeCapabilityRequirements(typed), "SCP-VALID-7001"],
+      [JSON.parse(encodeCapabilityRequirements(typed)), "SCP-VALID-7001"],
+      [
+        [{ kind: "ChallengeVerified", capability: SCHEMA, trustedVerifiers: [] }],
+        INVALID_REQUIREMENT_CODE,
+      ],
+    ];
+    for (const [capabilityRequirements, code] of cases) {
+      const refused = await scp
+        .contextCreate(
+          creator,
+          JSON.stringify({ ceiling: ["messages:read"], capabilityRequirements }),
+        )
+        .catch((e: unknown) => e);
+      expect(refused).toBeInstanceOf(ValidationError);
+      expect((refused as ValidationError).code).toBe(code);
+    }
+    expect(native.__calls("contextCreate")).toHaveLength(0);
+  });
+
+  it("contextGovernanceModifyCapabilityRequirements sends the wire form and the proposer", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const ok = JSON.stringify({ status: "Approved", execution_result: "Executed" });
+    native.__stub("contextGovernanceModifyCapabilityRequirements", async () => ok);
+    const context = mockContext(scp);
+    expect(
+      await scp.contextGovernanceModifyCapabilityRequirements(context, typed, "did:dht:zA"),
+    ).toBe(ok);
+    const args = native.__lastCall("contextGovernanceModifyCapabilityRequirements")?.args;
+    expect(args?.slice(1)).toEqual([encodeCapabilityRequirements(typed), "did:dht:zA"]);
+
+    const refused = await scp
+      .contextGovernanceModifyCapabilityRequirements(
+        context,
+        [{ kind: "ChallengeVerified", capability: SCHEMA, trustedVerifiers: [] } as never],
+        "did:dht:zA",
+      )
+      .catch((e: unknown) => e);
+    expect((refused as ValidationError).code).toBe(INVALID_REQUIREMENT_CODE);
+    expect(native.__calls("contextGovernanceModifyCapabilityRequirements")).toHaveLength(1);
+  });
+});
+
 describe("encodeCapabilityRequirements", () => {
-  it("emits the snake_case requirement with empty verifiers and no cap by default", () => {
+  /** Runs `call` and returns the ValidationError it threw. */
+  function refusal(call: () => unknown): ValidationError {
+    try {
+      call();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ValidationError);
+      return err as ValidationError;
+    }
+    throw new Error("expected a ValidationError, got none");
+  }
+
+  it("emits a SelfAttested requirement with empty verifiers and no cap", () => {
     const parsed = JSON.parse(
       encodeCapabilityRequirements([
-        { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
+        { kind: "SelfAttested", capability: "scp:capability:schema-validation/v1" },
       ]),
     );
     expect(parsed).toEqual([
@@ -670,14 +786,19 @@ describe("encodeCapabilityRequirements", () => {
     ]);
   });
 
-  it("emits trusted verifiers and the retry cap", () => {
+  it("emits a ChallengeVerified requirement's verifiers and retry cap", () => {
     const parsed = JSON.parse(
       encodeCapabilityRequirements([
         {
+          kind: "ChallengeVerified",
           capability: "scp:capability:schema-validation/v1",
-          verificationLevel: "ChallengeVerified",
           trustedVerifiers: ["did:dht:zVerifier"],
           retryCap: { maxRetries: 1, minCooldownSecs: 600 },
+        },
+        {
+          kind: "ChallengeVerified",
+          capability: "scp:capability:multilingual/v1",
+          trustedVerifiers: ["did:dht:zA", "did:dht:zB"],
         },
       ]),
     );
@@ -688,20 +809,70 @@ describe("encodeCapabilityRequirements", () => {
         trusted_verifiers: ["did:dht:zVerifier"],
         retry_cap: { max_retries: 1, min_cooldown_secs: 600 },
       },
+      {
+        capability: "scp:capability:multilingual/v1",
+        verification_level: "ChallengeVerified",
+        trusted_verifiers: ["did:dht:zA", "did:dht:zB"],
+        retry_cap: null,
+      },
     ]);
   });
 
-  it("rejects a retry cap outside u32 before any bridge call", () => {
-    expect(() =>
-      encodeCapabilityRequirements([
-        {
-          capability: "scp:capability:schema-validation/v1",
-          verificationLevel: "ChallengeVerified",
-          trustedVerifiers: ["did:dht:zVerifier"],
-          retryCap: { maxRetries: -1, minCooldownSecs: 600 },
-        },
-      ]),
-    ).toThrow("RetryCap.maxRetries must be an integer");
+  it("a ChallengeVerified requirement with no trusted verifier fails with SCP-VALID-7150", () => {
+    const empty = {
+      kind: "ChallengeVerified",
+      capability: "scp:capability:schema-validation/v1",
+      // @ts-expect-error: trustedVerifiers is a non-empty tuple, so [] does not compile.
+      trustedVerifiers: [],
+    } satisfies CapabilityRequirement;
+    expect(INVALID_REQUIREMENT_CODE).toBe("SCP-VALID-7150");
+    expect(refusal(() => encodeCapabilityRequirements([empty])).code).toBe(
+      INVALID_REQUIREMENT_CODE,
+    );
+  });
+
+  it("a SelfAttested requirement that names verifiers or a retry cap fails with SCP-VALID-7150", () => {
+    for (const extra of [
+      { trustedVerifiers: ["did:dht:zVerifier"] },
+      { retryCap: { maxRetries: 0, minCooldownSecs: 0 } },
+    ]) {
+      const requirement = {
+        kind: "SelfAttested",
+        capability: "scp:capability:schema-validation/v1",
+        ...extra,
+      };
+      expect(refusal(() => encodeCapabilityRequirements([requirement])).code).toBe(
+        INVALID_REQUIREMENT_CODE,
+      );
+    }
+  });
+
+  it("refuses an untyped or malformed entry with SCP-VALID-7001 before any bridge call", () => {
+    for (const entry of [
+      // The snake_case wire form is not the typed requirement.
+      {
+        capability: "scp:capability:schema-validation/v1",
+        verification_level: "SelfAttested",
+        trusted_verifiers: [],
+        retry_cap: null,
+      },
+      { kind: "Other", capability: "scp:capability:schema-validation/v1" },
+      { kind: "SelfAttested", capability: 7 },
+      "scp:capability:schema-validation/v1",
+      {
+        kind: "ChallengeVerified",
+        capability: "scp:capability:schema-validation/v1",
+        trustedVerifiers: [7],
+      },
+      {
+        kind: "ChallengeVerified",
+        capability: "scp:capability:schema-validation/v1",
+        trustedVerifiers: ["did:dht:zVerifier"],
+        retryCap: { maxRetries: -1, minCooldownSecs: 600 },
+      },
+    ]) {
+      expect(refusal(() => encodeCapabilityRequirements([entry])).code).toBe("SCP-VALID-7001");
+    }
   });
 
   it("Layer 2 — non-context error propagates instead of swallowing to null", async () => {
@@ -1141,6 +1312,11 @@ function makeTestCases(n: number): TestCase[] {
   }));
 }
 
+/** An SDK `Identity` over a mock bridge handle for `did`. */
+function mockIdentity(scp: SCP, did: string): Identity {
+  return Identity._fromHandle(scp, { did, custodyType: "in_memory" });
+}
+
 /** A structurally-valid ChallengeRequest with a real 64-byte signature. */
 function makeChallengeRequest(overrides: Partial<ChallengeRequest> = {}): ChallengeRequest {
   return {
@@ -1152,7 +1328,6 @@ function makeChallengeRequest(overrides: Partial<ChallengeRequest> = {}): Challe
       input: c.input,
       category: c.category,
       weight: c.weight,
-      answerCommitment: "3f".repeat(32),
     })),
     createdAt: 1_700_000_000,
     expiresAt: 1_700_003_600,
@@ -1196,7 +1371,7 @@ describe("encodeAttestation", () => {
 });
 
 describe("encodeChallengeRequest / decodeChallengeRequest / encodeTestCases", () => {
-  it("emits the 13-field snake_case request whose cases carry commitments, never answers", () => {
+  it("emits the 13-field snake_case request whose cases carry no answers", () => {
     const encoded = JSON.parse(encodeChallengeRequest(makeChallengeRequest()));
     expect(Object.keys(encoded).sort()).toEqual([
       "capability_uri",
@@ -1218,7 +1393,6 @@ describe("encodeChallengeRequest / decodeChallengeRequest / encodeTestCases", ()
       input: { i: 1 },
       category: "basic",
       weight: 500,
-      answer_commitment: "3f".repeat(32),
     });
   });
 
@@ -1237,7 +1411,7 @@ describe("encodeChallengeRequest / decodeChallengeRequest / encodeTestCases", ()
       [{ kind: "ContainsAll", required: ["a", "b"] }, { ContainsAll: { required: ["a", "b"] } }],
       [{ kind: "ContainsNone", forbidden: ["x"] }, { ContainsNone: { forbidden: ["x"] } }],
       [
-        { kind: "CustomEval", evaluatorOutletId: "o-1" },
+        { kind: "CustomEval", evaluatorOutletId: "o-1", evaluatorContextId: "ctx-eval" },
         { CustomEval: { evaluator_outlet_id: "o-1" } },
       ],
     ];
@@ -1255,25 +1429,20 @@ describe("encodeChallengeRequest / decodeChallengeRequest / encodeTestCases", ()
     }
   });
 
-  it("rejects a wrong-length signature, a non-hex id or commitment before any bridge call", () => {
+  it("rejects a wrong-length signature or a non-hex id before any bridge call", () => {
     expect(() =>
       encodeChallengeRequest(makeChallengeRequest({ verifierSignature: [1, 2, 3] })),
     ).toThrow("ChallengeRequest.verifierSignature must be exactly 64 elements, got 3");
     expect(() => encodeChallengeRequest(makeChallengeRequest({ challengeId: "chal-1" }))).toThrow(
       "ChallengeRequest.challengeId must be 64 lowercase hex characters",
     );
-    const [first, ...rest] = makeChallengeRequest().testCases;
-    const badCase = { ...(first as ChallengeRequest["testCases"][number]), answerCommitment: "x" };
-    expect(() =>
-      encodeChallengeRequest(makeChallengeRequest({ testCases: [badCase, ...rest] })),
-    ).toThrow("ChallengeCase.answerCommitment must be 64 lowercase hex characters");
   });
 
-  it("decode refuses a case that carries no answer commitment", () => {
+  it("decode refuses a case with no weight", () => {
     const wire = JSON.parse(encodeChallengeRequest(makeChallengeRequest()));
-    delete wire.test_cases[0].answer_commitment;
+    delete wire.test_cases[0].weight;
     expect(() => decodeChallengeRequest(JSON.stringify(wire))).toThrow(
-      "ChallengeCase.answer_commitment must be 64 lowercase hex characters",
+      "ChallengeCase.weight must be an integer",
     );
   });
 });
@@ -1340,7 +1509,7 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
     expect(call?.args).toEqual(["ctx-1", encodeAttestation(attestationEnvelope)]);
   });
 
-  it("trustCreateChallenge passes the context, window and options and decodes the request", async () => {
+  it("trustCreateChallenge passes the config's fields and decodes the request", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
     const request = makeChallengeRequest();
@@ -1349,16 +1518,17 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
       requestJson: encodeChallengeRequest(request),
     }));
 
+    const verifier = mockIdentity(scp, "did:dht:v");
     const testCases = makeTestCases(20);
-    const created = await scp.trustCreateChallenge(
-      "did:dht:v",
-      "did:dht:s",
-      SCHEMA_URI,
+    const created = await scp.trustCreateChallenge({
+      verifier,
+      subject: "did:dht:s",
+      capabilityUri: SCHEMA_URI,
       testCases,
-      "ctx-1",
-      3_600,
-      { policy: { maxRetries: 1, cooldownSecs: 600 }, evaluatorContextId: "ctx-eval" },
-    );
+      contextId: "ctx-1",
+      windowSecs: 3_600,
+      policy: { maxRetries: 1, cooldownSecs: 600 },
+    });
     expect(created).toEqual(request);
     expect(native.__lastCall("trustCreateChallenge")?.args).toEqual([
       "did:dht:v",
@@ -1367,17 +1537,92 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
       encodeTestCases(testCases),
       "ctx-1",
       3_600,
-      "ctx-eval",
+      undefined,
       { maxRetries: 1, cooldownSecs: 600 },
     ]);
 
-    await scp.trustCreateChallenge("did:dht:v", "did:dht:s", SCHEMA_URI, testCases, "ctx-1", 60);
+    // A policy may name either field alone; an absent field takes the
+    // definition's value.
+    await scp.trustCreateChallenge({
+      verifier,
+      subject: "did:dht:s",
+      capabilityUri: SCHEMA_URI,
+      testCases,
+      contextId: "ctx-1",
+      windowSecs: 60,
+      policy: { cooldownSecs: 900 },
+    });
     expect(native.__lastCall("trustCreateChallenge")?.args.slice(4)).toEqual([
       "ctx-1",
       60,
       undefined,
-      undefined,
+      { cooldownSecs: 900 },
     ]);
+  });
+
+  it("trustCreateChallenge lifts the CustomEval cases' one evaluator context to the bridge", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const request = makeChallengeRequest();
+    native.__stub("trustCreateChallenge", async () => ({
+      challengeId: request.challengeId,
+      requestJson: encodeChallengeRequest(request),
+    }));
+    const custom = (testId: string, evaluatorContextId: string): TestCase => ({
+      testId,
+      input: null,
+      expected: { kind: "CustomEval", evaluatorOutletId: "o-1", evaluatorContextId },
+      category: "c",
+      weight: 5_000,
+    });
+    const config = {
+      verifier: mockIdentity(scp, "did:dht:v"),
+      subject: "did:dht:s",
+      capabilityUri: SCHEMA_URI,
+      contextId: "ctx-1",
+      windowSecs: 60,
+    };
+
+    await scp.trustCreateChallenge({
+      ...config,
+      testCases: [custom("a", "ctx-eval"), custom("b", "ctx-eval")],
+    });
+    expect(native.__lastCall("trustCreateChallenge")?.args[6]).toBe("ctx-eval");
+
+    const calls = native.__calls("trustCreateChallenge").length;
+    for (const testCases of [
+      [custom("a", "ctx-eval"), custom("b", "ctx-other")],
+      [custom("a", "")],
+    ]) {
+      const refused = await scp
+        .trustCreateChallenge({ ...config, testCases })
+        .catch((e: unknown) => e);
+      expect(refused).toBeInstanceOf(ValidationError);
+      expect((refused as ValidationError).code).toBe("SCP-VALID-7001");
+    }
+    expect(native.__calls("trustCreateChallenge")).toHaveLength(calls);
+  });
+
+  it("the signing operations refuse a signer that is not an SDK Identity with SCP-VALID-7005", async () => {
+    const { scp } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const did = "did:dht:v" as unknown as Identity;
+    const refusals = [
+      scp.trustCreateChallenge({
+        verifier: did,
+        subject: "did:dht:s",
+        capabilityUri: SCHEMA_URI,
+        testCases: makeTestCases(20),
+        contextId: "ctx-1",
+        windowSecs: 60,
+      }),
+      scp.trustRespondToChallenge(did, makeChallengeRequest(), [], 1),
+      scp.trustGradeResponse(did, makeChallengeRequest(), makeChallengeResponse()),
+    ];
+    for (const refusal of refusals) {
+      await expect(refusal).rejects.toBeInstanceOf(ValidationError);
+      await expect(refusal).rejects.toMatchObject({ code: "SCP-VALID-7005" });
+    }
   });
 
   it("trustRespondToChallenge serializes the request and outputs and decodes the response", async () => {
@@ -1388,9 +1633,9 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
 
     const request = makeChallengeRequest();
     const outputs = [{ testId: "t0", output: { ok: true } }];
-    expect(await scp.trustRespondToChallenge("did:dht:subject", request, outputs, 1)).toEqual(
-      response,
-    );
+    expect(
+      await scp.trustRespondToChallenge(mockIdentity(scp, "did:dht:subject"), request, outputs, 1),
+    ).toEqual(response);
     expect(native.__lastCall("trustRespondToChallenge")?.args).toEqual([
       "did:dht:subject",
       encodeChallengeRequest(request),
@@ -1410,7 +1655,11 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
 
     const request = makeChallengeRequest();
     const response = makeChallengeResponse();
-    const graded = await scp.trustGradeResponse("did:dht:verifier", request, response);
+    const graded = await scp.trustGradeResponse(
+      mockIdentity(scp, "did:dht:verifier"),
+      request,
+      response,
+    );
     expect(graded).toEqual({
       record: makeRecord(),
       caseResults: [{ passed: false, reason: "mismatch" }],
@@ -1426,23 +1675,107 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
   it("a bridge refusal keeps its code through each operation", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
-    for (const code of [
-      ANSWER_KEY_MISMATCH_CODE,
-      GRADING_CAPACITY_EXHAUSTED_CODE,
-      NON_CANONICAL_IDENTIFIER_CODE,
-      TOO_MANY_CAPABILITY_REQUIREMENTS_CODE,
-      GRADING_LEASE_LOST_CODE,
-    ]) {
+    for (const code of CHALLENGE_CODES) {
       native.__stub("trustGradeResponse", () => {
         throw new Error(`[${code}] refused`);
       });
       const refusal = scp.trustGradeResponse(
-        "did:dht:v",
+        mockIdentity(scp, "did:dht:v"),
         makeChallengeRequest(),
         makeChallengeResponse(),
       );
       await expect(refusal).rejects.toBeInstanceOf(ValidationError);
       await expect(refusal).rejects.toMatchObject({ code });
     }
+  });
+});
+
+/** Every challenge and admission code constant, with its Rust variant's code. */
+const CHALLENGE_CODE_VALUES: readonly [string, string][] = [
+  [CHALLENGE_SUITE_BELOW_MINIMUM_CODE, "SCP-VALID-7039"],
+  [CHALLENGE_NOT_OPEN_CODE, "SCP-VALID-7099"],
+  [CHALLENGE_EXPIRED_CODE, "SCP-VALID-7102"],
+  [ATTEMPT_OUT_OF_ORDER_CODE, "SCP-VALID-7103"],
+  [RETRIES_EXHAUSTED_CODE, "SCP-VALID-7104"],
+  [COOLDOWN_ACTIVE_CODE, "SCP-VALID-7105"],
+  [CHALLENGE_CLOSED_CODE, "SCP-VALID-7106"],
+  [UNKNOWN_CHALLENGE_CODE, "SCP-VALID-7107"],
+  [OUTPUTS_MISMATCH_CODE, "SCP-VALID-7108"],
+  [EVALUATOR_UNAVAILABLE_CODE, "SCP-VALID-7109"],
+  [SELF_CHALLENGE_CODE, "SCP-VALID-7127"],
+  [STANDARD_NOT_GRADABLE_CODE, "SCP-VALID-7128"],
+  [CAPABILITY_DEFINITION_UNAVAILABLE_CODE, "SCP-VALID-7129"],
+  [POLICY_OUTSIDE_DEFINITION_CODE, "SCP-VALID-7137"],
+  [SCHEMA_REJECTED_CODE, "SCP-VALID-7138"],
+  [GRADING_IN_PROGRESS_CODE, "SCP-VALID-7139"],
+  [RESPONSE_TOO_LARGE_CODE, "SCP-VALID-7143"],
+  [DEFINITION_EQUIVOCATION_CODE, "SCP-VALID-7144"],
+  [GRADING_CAPACITY_EXHAUSTED_CODE, "SCP-VALID-7146"],
+  [NON_CANONICAL_IDENTIFIER_CODE, "SCP-VALID-7147"],
+  [TOO_MANY_CAPABILITY_REQUIREMENTS_CODE, "SCP-VALID-7148"],
+  [GRADING_LEASE_LOST_CODE, "SCP-VALID-7149"],
+  [INVALID_REQUIREMENT_CODE, "SCP-VALID-7150"],
+  [CHALLENGE_WINDOW_OPEN_CODE, "SCP-VALID-7151"],
+  [CHALLENGE_NOT_YET_GRADABLE_CODE, "SCP-VALID-7153"],
+];
+
+const CHALLENGE_CODES: readonly string[] = CHALLENGE_CODE_VALUES.map(([code]) => code);
+
+describe("challenge codes, isRetryable and retryAfter", () => {
+  it("each constant names its Rust variant's code", () => {
+    for (const [constant, value] of CHALLENGE_CODE_VALUES) {
+      expect(constant).toBe(value);
+    }
+    expect(new Set(CHALLENGE_CODES).size).toBe(25);
+  });
+
+  it("isRetryable is true for exactly the seven retry-later codes", () => {
+    const retryable = new Set([
+      "SCP-VALID-7099",
+      "SCP-VALID-7105",
+      "SCP-VALID-7139",
+      "SCP-VALID-7146",
+      "SCP-VALID-7149",
+      "SCP-VALID-7151",
+      "SCP-VALID-7153",
+    ]);
+    for (const code of CHALLENGE_CODES) {
+      expect([code, isRetryable(code)]).toEqual([code, retryable.has(code)]);
+    }
+    for (const code of ["SCP-VALID-7076", "SCP-VALID-7003", "SCP-VALID-7121", ""]) {
+      expect(isRetryable(code)).toBe(false);
+    }
+  });
+
+  it("retryAfter reads the (retry_after=N) suffix and is null without one", () => {
+    const cooldown = "challenge ab: cooldown active, retry at 1700000600 (retry_after=1700000600)";
+    expect(retryAfter(new ValidationError(cooldown, COOLDOWN_ACTIVE_CODE))).toBe(1_700_000_600);
+    expect(retryAfter(cooldown)).toBe(1_700_000_600);
+    expect(retryAfter(new Error("challenge ab: closed"))).toBeNull();
+    expect(retryAfter("challenge ab: closed")).toBeNull();
+    expect(retryAfter("retry_after=5 without parentheses")).toBeNull();
+    expect(retryAfter(42)).toBeNull();
+    expect(retryAfter(null)).toBeNull();
+  });
+
+  it("retryAfter reads the suffix of a bridge refusal mapped to a ValidationError", async () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("trustGradeResponse", () => {
+      throw new Error(
+        `[${COOLDOWN_ACTIVE_CODE}] trust evaluation failed: cooldown active (retry_after=1700000900)`,
+      );
+    });
+    const refused = await scp
+      .trustGradeResponse(
+        mockIdentity(scp, "did:dht:v"),
+        makeChallengeRequest(),
+        makeChallengeResponse(),
+      )
+      .catch((e: unknown) => e);
+    expect(refused).toBeInstanceOf(ValidationError);
+    expect((refused as ValidationError).code).toBe(COOLDOWN_ACTIVE_CODE);
+    expect(isRetryable((refused as ValidationError).code)).toBe(true);
+    expect(retryAfter(refused)).toBe(1_700_000_900);
+    await scp.shutdown(0);
   });
 });

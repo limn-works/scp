@@ -1302,30 +1302,6 @@ public extension SCP {
         try await inner.transportStatus(manager: manager)
     }
 
-    /// Forwards to ``Scp/trustCreateChallenge`` on ``inner``. Prefer the typed
-    /// overload in `Trust.swift` (ADR-058), which returns a ``ChallengeRequest``.
-    func trustCreateChallenge(
-        verifier: Identity,
-        subject: String,
-        capabilityUri: String,
-        testCasesJson: String,
-        contextId: String,
-        windowSecs: UInt32,
-        evaluatorContextId: String?,
-        policy: ChallengePolicy?
-    ) async throws -> ChallengeResult {
-        try await inner.trustCreateChallenge(
-            verifier: verifier,
-            subject: subject,
-            capabilityUri: capabilityUri,
-            testCasesJson: testCasesJson,
-            contextId: contextId,
-            windowSecs: windowSecs,
-            evaluatorContextId: evaluatorContextId,
-            policy: policy
-        )
-    }
-
     // `trustQueryScore` moved to a UniFFI-generated free top-level function
     // under ADR-048 §1 + §7 Swift bullet. Call it directly:
     //   `try trustQueryScore(did:contextId:)`

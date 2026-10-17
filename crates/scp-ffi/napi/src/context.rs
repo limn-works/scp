@@ -681,18 +681,19 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         })?),
     };
 
-    // The admission capability requirements (spec §7.3.4.4): a JSON array, or
-    // a JSON-encoded string, normalized to a JSON string for the common
-    // builder, which parses it through the validating type.
+    // The admission capability requirements (spec §7.3.4.4): the JSON string
+    // the TypeScript SDK encodes from its typed requirements, which the
+    // common builder parses through the validating type. Any other JSON type
+    // is refused, so the bridge has one input shape.
     let capability_requirements_json: Option<String> = match &params["capabilityRequirements"] {
         serde_json::Value::Null => None,
         serde_json::Value::String(s) => Some(s.clone()),
-        other => Some(serde_json::to_string(other).map_err(|e| {
-            NapiError::from(ScpNapiError::Validation {
-                message: format!("invalid capabilityRequirements: {e}"),
+        _ => {
+            return Err(NapiError::from(ScpNapiError::Validation {
+                message: "capabilityRequirements must be a JSON string".to_owned(),
                 code: codes::VALID_7000.to_owned(),
-            })
-        })?),
+            }));
+        }
     };
 
     // Parse minProtocolVersion: [major, minor] array or null (spec §13.4).

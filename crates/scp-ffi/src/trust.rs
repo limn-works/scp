@@ -263,38 +263,43 @@ fn challenge_op_error(e: scp_ffi_common::challenge::ChallengeOpError) -> PyErr {
     .into()
 }
 
-/// Reads the optional `policy` dict of `trust_create_challenge`: both
+/// Reads the optional `policy` dict of `trust_create_challenge`: any of
 /// `max_retries` and `cooldown_secs`, as non-negative integers, and no other
-/// key. Anything else is `SCP-VALID-7002`, the code of a malformed challenge
-/// argument.
-fn policy_pick(
-    policy: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Option<scp_core::trust::PolicyPick>> {
+/// key. A key left out takes the definition's value. Anything else is
+/// `SCP-VALID-7002`, the code of a malformed challenge argument.
+fn policy_pick(policy: Option<&Bound<'_, PyDict>>) -> PyResult<scp_core::trust::PolicyPick> {
+    const KEYS: [&str; 2] = ["max_retries", "cooldown_secs"];
     let Some(policy) = policy else {
-        return Ok(None);
+        return Ok(scp_core::trust::PolicyPick::default());
     };
     let malformed =
         |what: String| -> PyErr { coded_validation_error(what, codes::VALID_7002).into() };
-    if policy.len() != 2 {
-        return Err(malformed(
-            "policy must hold exactly max_retries and cooldown_secs".to_owned(),
-        ));
+    for key in policy.keys() {
+        let known = key
+            .extract::<String>()
+            .is_ok_and(|k| KEYS.contains(&k.as_str()));
+        if !known {
+            return Err(malformed(format!(
+                "policy key {key} is not one of max_retries and cooldown_secs"
+            )));
+        }
     }
-    let field = |key: &str| -> PyResult<u32> {
+    let field = |key: &str| -> PyResult<Option<u32>> {
         policy
             .get_item(key)?
-            .ok_or_else(|| malformed(format!("policy is missing {key}")))?
-            .extract::<u32>()
-            .map_err(|e| {
-                malformed(format!(
-                    "policy {key} must be an integer in 0..=2^32-1: {e}"
-                ))
+            .map(|value| {
+                value.extract::<u32>().map_err(|e| {
+                    malformed(format!(
+                        "policy {key} must be an integer in 0..=2^32-1: {e}"
+                    ))
+                })
             })
+            .transpose()
     };
-    Ok(Some(scp_core::trust::PolicyPick {
-        max_retries: field("max_retries")?,
-        cooldown_secs: field("cooldown_secs")?,
-    }))
+    Ok(scp_core::trust::PolicyPick {
+        max_retries: field(KEYS[0])?,
+        cooldown_secs: field(KEYS[1])?,
+    })
 }
 
 /// The evaluator side of `CustomEval` grading on this bridge: the outlet
@@ -1723,13 +1728,48 @@ mod tests {
         });
     }
 
+    /// A policy dict may name either field alone; the other stays absent,
+    /// for the definition's value.
+    #[test]
+    fn policy_pick_takes_either_field_alone() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let pick = |entries: &[(&str, u32)]| {
+                let policy = PyDict::new(py);
+                for (k, v) in entries {
+                    policy.set_item(k, v).unwrap();
+                }
+                super::policy_pick(Some(&policy)).unwrap()
+            };
+            let none = scp_core::trust::PolicyPick::default();
+            assert_eq!(super::policy_pick(None).unwrap(), none);
+            assert_eq!(pick(&[]), none);
+            assert_eq!(
+                pick(&[("cooldown_secs", 7200)]),
+                scp_core::trust::PolicyPick {
+                    max_retries: None,
+                    cooldown_secs: Some(7200),
+                }
+            );
+            assert_eq!(
+                pick(&[("max_retries", 0)]),
+                scp_core::trust::PolicyPick {
+                    max_retries: Some(0),
+                    cooldown_secs: None,
+                }
+            );
+        });
+    }
+
     #[test]
     fn trust_create_challenge_rejects_malformed_policy() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             for keys in [
-                vec![("max_retries", 1_u32)],
+                vec![("extra", 1_i64)],
                 vec![("max_retries", 1), ("cooldown_secs", 1), ("extra", 1)],
+                vec![("max_retries", -1)],
+                vec![("cooldown_secs", 1_i64 << 32)],
             ] {
                 let policy = PyDict::new(py);
                 for (k, v) in keys {

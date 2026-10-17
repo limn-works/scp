@@ -82,14 +82,14 @@ if TYPE_CHECKING:
         BehavioralRecord,
         CachedAttestation,
         CachedAttestationEnvelope,
+        CapabilityRequirement,
         CapabilityValidation,
-        ChallengePolicy,
         ChallengeRequest,
         ChallengeResponse,
         ChallengeVerification,
+        CreateChallengeConfig,
         EventLogEntry,
         GradedChallenge,
-        TestCase,
         TestOutput,
         ThresholdRequirement,
         TrustEvaluation,
@@ -1409,11 +1409,28 @@ class SCP:
     async def context_create(self, identity_did: str, params: dict[str, Any]) -> Context:
         """Delegate to ``_scp_core.SCP.context_create`` (returns :class:`Context`).
 
-        ``params["capability_requirements"]``, when present, is the JSON that
-        :func:`scp_sdk.trust.encode_capability_requirements` returns; the
-        context's governance then holds those admission requirements.
-        """
+        ``params["capability_requirements"]`` is optional and defaults to no
+        requirement. When present, it is a list of
+        :class:`~scp_sdk.trust.SelfAttested` and
+        :class:`~scp_sdk.trust.ChallengeVerified`; the wrapper encodes the
+        list for the bridge, and the context's governance then holds those
+        admission requirements (spec 07 §7.3.4.4).
 
+        Raises:
+            ValidationError: :data:`scp_sdk.trust.INVALID_REQUIREMENT_CODE`
+                before any bridge call when ``capability_requirements`` is
+                not such a list (a JSON string or a list of dicts is refused).
+        """
+        from scp_sdk.trust import _encode_capability_requirements
+
+        requirements = params.get("capability_requirements")
+        if requirements is not None:
+            params = {
+                **params,
+                "capability_requirements": _encode_capability_requirements(
+                    requirements, 'context_create params["capability_requirements"]'
+                ),
+            }
         raw = await asyncio.to_thread(self._native.context_create, identity_did, params)
         return Context(raw, identity_did=identity_did, scp=self)
 
@@ -2267,6 +2284,57 @@ class SCP:
         # as a bridge error.
         return check_proposal_response(raw)
 
+    async def governance_modify_capability_requirements(
+        self,
+        handle: Context,
+        identity_did: str,
+        requirements: list[CapabilityRequirement],
+    ) -> Any:
+        """Propose replacing the context's capability requirements with
+        ``requirements`` (spec 07 §7.3.4.4).
+
+        Delegates to ``_scp_core.SCP.governance_modify_capability_requirements``
+        after encoding ``requirements``; an empty list clears them. Returns
+        what :meth:`governance_propose` returns: a ``single_admin`` context
+        executes the proposal at once, and other governance models wait for
+        votes.
+
+        Args:
+            handle: The context whose requirements change.
+            identity_did: DID of the proposer.
+            requirements: The complete new list.
+
+        Raises:
+            ValidationError: :data:`scp_sdk.trust.INVALID_REQUIREMENT_CODE`
+                before any bridge call when ``requirements`` is not a list of
+                :class:`~scp_sdk.trust.SelfAttested` and
+                :class:`~scp_sdk.trust.ChallengeVerified`;
+                :data:`scp_sdk.trust.NON_CANONICAL_IDENTIFIER_CODE` or
+                :data:`scp_sdk.trust.TOO_MANY_CAPABILITY_REQUIREMENTS_CODE`
+                from the bridge.
+            UnknownGovernanceOutcomeError: The response names a status,
+                reason, or outcome this SDK version does not carry
+                (``SCP-GOV-11040``).
+        """
+        from scp_sdk.trust import _encode_capability_requirements
+
+        native_handle = _unwrap_handle(
+            handle, Context, "governance_modify_capability_requirements", "handle"
+        )
+        requirements_json = _encode_capability_requirements(
+            requirements, "governance_modify_capability_requirements requirements"
+        )
+        try:
+            raw = await asyncio.to_thread(
+                self._native.governance_modify_capability_requirements,
+                native_handle,
+                identity_did,
+                requirements_json,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
+        return check_proposal_response(raw)
+
     async def governance_reject(
         self, handle: Context, identity_did: str, proposal_id_hex: str
     ) -> Any:
@@ -2849,69 +2917,80 @@ class SCP:
         """Delegate to ``_scp_core.SCP.trust_query_score``."""
         return await asyncio.to_thread(self._native.trust_query_score, did, context_id)
 
-    async def trust_create_challenge(
-        self,
-        verifier: str,
-        subject: str,
-        capability_uri: str,
-        test_cases: list[TestCase],
-        context_id: str,
-        window_secs: int,
-        *,
-        evaluator_context_id: str | None = None,
-        policy: ChallengePolicy | None = None,
-    ) -> ChallengeRequest:
-        """Issue a challenge request signed with ``verifier``'s ``#active`` key
-        and record it in the challenger's ledger (spec 07 §7.3.4, ADR-017).
+    async def trust_create_challenge(self, config: CreateChallengeConfig) -> ChallengeRequest:
+        """Issue a challenge request signed with ``config.verifier``'s
+        ``#active`` key and record it in the challenger's ledger (spec 07
+        §7.3.4 step 1, ADR-017).
 
-        The verifier writes the test cases and keeps their expected outputs;
-        the request carries only a commitment to each. A protocol capability
-        URI (``scp:capability:*``) must be in the protocol capability list, its
-        standard fixes the retries and cooldown, and the request must meet its
-        minimum case count.
+        The challenger writes the cases with their answers. The returned
+        request carries each case's input and never its answer; the
+        challenger's ledger keeps the answers to grade with. The capability
+        definition for ``config.capability_uri`` sets the pass threshold, the
+        retries and the cooldown; ``config.policy`` may only tighten them, on
+        any URI.
+
+        The wrapper passes the ``evaluator_context_id`` of the request's
+        :class:`~scp_sdk.trust.CustomEval` cases to the bridge as the context
+        whose outlets grade them.
 
         Args:
-            verifier: DID of an identity of this instance; its custody signs.
-            subject: DID of the identity being challenged.
-            capability_uri: The capability URI under test, in canonical form.
-            test_cases: The verifier-written cases; their weights sum to 10000.
-            context_id: The context the challenge is administered for.
-            window_secs: Seconds the subject has to respond.
-            evaluator_context_id: The context whose evaluator outlet grades
-                ``CustomEval`` cases, if any case uses one.
-            policy: The retry and cooldown standard for a non-protocol URI.
+            config: The verifier's :class:`~scp_sdk.identity.Identity`, the
+                subject's DID, the capability URI, the cases, the context,
+                ``window_secs`` (the grading window in seconds from creation)
+                and an optional stricter policy.
 
         Returns:
             The signed request, to send to the subject.
 
         Raises:
-            ValidationError: :data:`scp_sdk.trust.CHALLENGE_SUITE_BELOW_MINIMUM_CODE`
-                for too few cases;
+            ValidationError: ``SCP-VALID-7005`` when ``config.verifier`` is
+                not an :class:`~scp_sdk.identity.Identity`;
+                ``SCP-VALID-7001`` before any bridge call when two
+                ``CustomEval`` cases name different evaluator contexts;
+                :data:`scp_sdk.trust.CHALLENGE_SUITE_BELOW_MINIMUM_CODE` for
+                too few cases;
+                :data:`scp_sdk.trust.POLICY_OUTSIDE_DEFINITION_CODE` for a
+                policy looser than the definition;
+                :data:`scp_sdk.trust.CHALLENGE_WINDOW_OPEN_CODE` while the
+                verifier's last challenge to this subject for this capability
+                is inside its window (:func:`scp_sdk.trust.retry_after` reads
+                when it ends);
                 :data:`scp_sdk.trust.NON_CANONICAL_IDENTIFIER_CODE` for a DID,
                 URI or context id not in canonical form; another
                 ``SCP-VALID-*`` code for any other refusal (unknown protocol
                 URI, weights not summing to 10000, a duplicate ``test_id``, a
-                number outside I-JSON range, a policy on a protocol URI).
+                number outside I-JSON range).
             ScpError: ``SCP-CRYPTO-4006`` when the verifier's key is destroyed,
                 or another custody or storage failure.
         """
         import json
 
-        test_cases_json = json.dumps([case._to_wire() for case in test_cases])
-        policy_dict = (
-            None
-            if policy is None
-            else {"max_retries": policy.max_retries, "cooldown_secs": policy.cooldown_secs}
-        )
+        from scp_sdk.trust import CustomEval as _CustomEval
+
+        _unwrap_handle(config.verifier, Identity, "trust_create_challenge", "config.verifier")
+        evaluator_contexts = {
+            case.expected.evaluator_context_id
+            for case in config.test_cases
+            if isinstance(case.expected, _CustomEval)
+        }
+        if len(evaluator_contexts) > 1:
+            raise ValidationError(
+                "SCP.trust_create_challenge(): CustomEval cases name more than one "
+                f"evaluator context: {sorted(evaluator_contexts)}",
+                "SCP-VALID-7001",
+            )
+        evaluator_context_id = next(iter(evaluator_contexts), None)
+        test_cases_json = json.dumps([case._to_wire() for case in config.test_cases])
+        policy_dict = None if config.policy is None else config.policy._to_bridge_dict()
         try:
             created = await asyncio.to_thread(
                 self._native.trust_create_challenge,
-                verifier,
-                subject,
-                capability_uri,
+                config.verifier.did,
+                config.subject,
+                config.capability_uri,
                 test_cases_json,
-                context_id,
-                window_secs,
+                config.context_id,
+                config.window_secs,
                 evaluator_context_id,
                 policy_dict,
             )
@@ -2923,17 +3002,21 @@ class SCP:
 
     async def trust_respond_to_challenge(
         self,
-        subject: str,
+        subject: Identity,
         request: ChallengeRequest,
         outputs: list[TestOutput],
         attempt: int,
     ) -> ChallengeResponse:
         """Answer ``request`` with ``outputs``, signed with ``subject``'s
-        ``#active`` key (spec 07 §7.3.4).
+        ``#active`` key (spec 07 §7.3.4 step 2).
+
+        The challenger grades a response only inside the grading window,
+        which runs ``window_secs`` from the request's creation, so send the
+        response before ``request.expires_at``.
 
         Args:
-            subject: DID of an identity of this instance, the request's
-                subject; its custody signs.
+            subject: The request's subject, an identity of this instance; its
+                custody signs.
             request: The signed request the challenger sent.
             outputs: One output per test case.
             attempt: The attempt this response makes, starting at 1.
@@ -2942,18 +3025,21 @@ class SCP:
             The signed response, to send to the challenger.
 
         Raises:
-            ValidationError: When ``subject`` is not the request's subject,
-                the request's signature fails, or an output is malformed.
+            ValidationError: ``SCP-VALID-7005`` when ``subject`` is not an
+                :class:`~scp_sdk.identity.Identity`; another code when
+                ``subject`` is not the request's subject, the request's
+                signature fails, or an output is malformed.
             ScpError: A custody failure while signing.
         """
         import json
 
         from scp_sdk.trust import ChallengeResponse as _ChallengeResponse
 
+        _unwrap_handle(subject, Identity, "trust_respond_to_challenge", "subject")
         try:
             response_json = await asyncio.to_thread(
                 self._native.trust_respond_to_challenge,
-                subject,
+                subject.did,
                 json.dumps(request._to_wire()),
                 json.dumps([{"test_id": o.test_id, "output": o.output} for o in outputs]),
                 attempt,
@@ -2964,7 +3050,7 @@ class SCP:
 
     async def trust_grade_response(
         self,
-        verifier: str,
+        verifier: Identity,
         request: ChallengeRequest,
         response: ChallengeResponse,
     ) -> GradedChallenge:
@@ -2974,11 +3060,12 @@ class SCP:
 
         The challenger's ledger charges the subject one attempt per graded
         response and refuses a response that arrives too early, too late, or
-        past the retry limit.
+        past the retry limit. Attempts are graded only inside the grading
+        window, which runs ``window_secs`` from the request's creation.
 
         Args:
-            verifier: DID of the identity that issued ``request``; it must be
-                an identity of this instance.
+            verifier: The identity that issued ``request``, an identity of
+                this instance; its custody signs the record.
             request: The signed request.
             response: The subject's signed response.
 
@@ -2987,12 +3074,16 @@ class SCP:
             when the record could not be stored here.
 
         Raises:
-            ValidationError: When a signature, the request digest, the attempt
-                or the window fails;
-                :data:`scp_sdk.trust.ANSWER_KEY_MISMATCH_CODE`,
+            ValidationError: ``SCP-VALID-7005`` when ``verifier`` is not an
+                :class:`~scp_sdk.identity.Identity`; a challenge code from
+                :mod:`scp_sdk.trust` when a signature, the request digest, the
+                attempt or the window fails, for example
+                :data:`scp_sdk.trust.COOLDOWN_ACTIVE_CODE`; and
                 :data:`scp_sdk.trust.GRADING_CAPACITY_EXHAUSTED_CODE` or
                 :data:`scp_sdk.trust.GRADING_LEASE_LOST_CODE` when the
-                challenger cannot grade (the last two charge no attempt).
+                challenger cannot grade, which charges no attempt.
+                :func:`scp_sdk.trust.is_retryable` says whether a later call
+                can succeed.
             ScpError: A custody or storage failure.
         """
         import json
@@ -3001,10 +3092,11 @@ class SCP:
         from scp_sdk.trust import ChallengeVerification as _ChallengeVerification
         from scp_sdk.trust import GradedChallenge as _GradedChallenge
 
+        _unwrap_handle(verifier, Identity, "trust_grade_response", "verifier")
         try:
             graded = await asyncio.to_thread(
                 self._native.trust_grade_response,
-                verifier,
+                verifier.did,
                 json.dumps(request._to_wire()),
                 json.dumps(response._to_wire()),
             )

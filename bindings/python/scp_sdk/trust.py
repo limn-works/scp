@@ -30,13 +30,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import asdict, dataclass, field, fields
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from scp_sdk._extension import native_module
-from scp_sdk.errors import ContextError, _coded_bridge_error
+from scp_sdk.errors import ContextError, ScpError, ValidationError, _coded_bridge_error
 
 if TYPE_CHECKING:
+    from scp_sdk.identity import Identity
     from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
@@ -575,34 +577,11 @@ class RequireParticipation:
 # Capability admission types (spec §7.3.4.4, SCP-ACR-008, ADR-058)
 # ---------------------------------------------------------------------------
 
-#: Valid capability verification-level names, matching the Rust
-#: ``VerificationLevel`` enum variants in ``scp-core``.
-VERIFICATION_LEVELS: frozenset[str] = frozenset({"SelfAttested", "ChallengeVerified"})
-
-
-@dataclass
-class VerificationLevel:
-    """How a capability must be verified for admission.
-
-    Mirrors the Rust ``VerificationLevel`` enum (``scp-core``). Serializes as
-    the bare variant name string (``"SelfAttested"`` / ``"ChallengeVerified"``).
-
-    - ``"SelfAttested"`` -- the agent claims the capability (present in their
-      capability list); no challenge proof required.
-    - ``"ChallengeVerified"`` -- the capability was verified through the
-      challenge-response protocol. Also satisfies ``SelfAttested``.
-    """
-
-    #: The verification-level variant name.
-    name: str
-
-    def __post_init__(self) -> None:
-        if self.name not in VERIFICATION_LEVELS:
-            msg = (
-                f"Invalid VerificationLevel name {self.name!r}. "
-                f"Valid: {sorted(VERIFICATION_LEVELS)}"
-            )
-            raise ValueError(msg)
+#: The code a malformed capability requirement carries, the bridge's
+#: ``AdmissionError::InvalidRequirement`` code (spec 07 §7.3.4.4). A
+#: :class:`ChallengeVerified` without a trusted verifier raises it when it is
+#: constructed, and the bridge raises it for the same defect.
+INVALID_REQUIREMENT_CODE = "SCP-VALID-7150"
 
 
 @dataclass(frozen=True)
@@ -624,39 +603,68 @@ class RetryCap:
         _require_uint("RetryCap.min_cooldown_secs", self.min_cooldown_secs, 32)
 
 
-@dataclass
-class CapabilityRequirement:
-    """A single admission requirement: a capability URI, the minimum
-    verification level, and for ``ChallengeVerified`` the challengers whose
-    records count (spec 07 §7.3.4.4).
+@dataclass(frozen=True)
+class SelfAttested:
+    """A requirement the agent meets by listing ``capability`` among its own
+    capabilities; no challenge record is needed (spec 07 §7.3.4.4)."""
 
-    Mirrors the Rust ``RawCapabilityRequirement`` wire form. A context's
-    governance holds its requirements: pass them to ``context_create`` under
-    the ``capability_requirements`` key, encoded by
-    :func:`encode_capability_requirements`.
-    """
-
-    #: The capability URI that must be present.
+    #: The capability URI the agent must declare.
     capability: str
 
-    #: The minimum verification level required.
-    verification_level: VerificationLevel
-
-    #: DIDs of the challengers whose records meet a ``ChallengeVerified``
-    #: requirement. Required and non-empty for ``ChallengeVerified``; empty
-    #: for ``SelfAttested``. The bridge enforces both.
-    trusted_verifiers: list[str] = field(default_factory=list)
-
-    #: The retry and cooldown bounds a record's standard must meet, if any.
-    #: Only ``ChallengeVerified`` takes one.
-    retry_cap: RetryCap | None = None
+    def __post_init__(self) -> None:
+        _require_str("SelfAttested.capability", self.capability)
 
     def _to_bridge_dict(self) -> dict[str, Any]:
-        """Convert to a dict matching the Rust ``RawCapabilityRequirement``
-        serde JSON representation."""
+        """Convert to the Rust ``RawCapabilityRequirement`` serde JSON shape."""
         return {
             "capability": self.capability,
-            "verification_level": self.verification_level.name,
+            "verification_level": "SelfAttested",
+            "trusted_verifiers": [],
+            "retry_cap": None,
+        }
+
+
+@dataclass(frozen=True)
+class ChallengeVerified:
+    """A requirement the agent meets only with a passing challenge record
+    signed by one of ``trusted_verifiers`` (spec 07 §7.3.4.4).
+
+    Raises:
+        ValidationError: :data:`INVALID_REQUIREMENT_CODE` (``SCP-VALID-7150``)
+            when ``trusted_verifiers`` is empty, because a record from no
+            verifier can meet the requirement.
+    """
+
+    #: The capability URI the record must name.
+    capability: str
+    #: DIDs of the challengers whose records count. At least one.
+    trusted_verifiers: list[str]
+    #: The retry and cooldown bounds a record's standard must meet;
+    #: ``None`` leaves only the capability definition's bounds.
+    retry_cap: RetryCap | None = None
+
+    def __post_init__(self) -> None:
+        _require_str("ChallengeVerified.capability", self.capability)
+        if not isinstance(self.trusted_verifiers, list) or not all(
+            isinstance(v, str) for v in self.trusted_verifiers
+        ):
+            msg = (
+                "ChallengeVerified.trusted_verifiers must be a list of DID strings, "
+                f"got {self.trusted_verifiers!r}"
+            )
+            raise ValidationError(msg, INVALID_REQUIREMENT_CODE)
+        if not self.trusted_verifiers:
+            msg = "ChallengeVerified.trusted_verifiers must name at least one verifier"
+            raise ValidationError(msg, INVALID_REQUIREMENT_CODE)
+        if self.retry_cap is not None and not isinstance(self.retry_cap, RetryCap):
+            msg = f"ChallengeVerified.retry_cap must be a RetryCap, got {self.retry_cap!r}"
+            raise ValidationError(msg, INVALID_REQUIREMENT_CODE)
+
+    def _to_bridge_dict(self) -> dict[str, Any]:
+        """Convert to the Rust ``RawCapabilityRequirement`` serde JSON shape."""
+        return {
+            "capability": self.capability,
+            "verification_level": "ChallengeVerified",
             "trusted_verifiers": list(self.trusted_verifiers),
             "retry_cap": None
             if self.retry_cap is None
@@ -667,14 +675,28 @@ class CapabilityRequirement:
         }
 
 
-def encode_capability_requirements(requirements: list[CapabilityRequirement]) -> str:
-    """Encode ``requirements`` as the JSON string ``context_create`` reads from
-    its ``capability_requirements`` key.
+#: One admission requirement of a context (spec 07 §7.3.4.4): a capability
+#: the agent declares (:class:`SelfAttested`), or one a trusted challenger
+#: graded (:class:`ChallengeVerified`). Pass a list of them to
+#: :meth:`scp_sdk.SCP.context_create` under ``params["capability_requirements"]``,
+#: or to :meth:`scp_sdk.SCP.governance_modify_capability_requirements`.
+CapabilityRequirement = SelfAttested | ChallengeVerified
 
-    The bridge validates the requirements when the context is created and
-    refuses a ``ChallengeVerified`` requirement without a trusted verifier,
-    and a ``SelfAttested`` one with verifiers or a retry cap.
+
+def _encode_capability_requirements(requirements: Any, where: str) -> str:
+    """Encode ``requirements`` as the JSON array the bridge reads.
+
+    Raises:
+        ValidationError: :data:`INVALID_REQUIREMENT_CODE` before any bridge
+            call when ``requirements`` is not a list of
+            :class:`SelfAttested` and :class:`ChallengeVerified`; a JSON
+            string or a list of dicts is refused.
     """
+    if not isinstance(requirements, list) or not all(
+        isinstance(r, SelfAttested | ChallengeVerified) for r in requirements
+    ):
+        msg = f"{where} must be a list of SelfAttested and ChallengeVerified, got {requirements!r}"
+        raise ValidationError(msg, INVALID_REQUIREMENT_CODE)
     return json.dumps([r._to_bridge_dict() for r in requirements])
 
 
@@ -1557,31 +1579,119 @@ def verify_participation_requirements(
 # ---------------------------------------------------------------------------
 
 
-#: Code the bridge raises when a protocol capability URI's request has fewer
-#: test cases than the URI's standard requires (spec 07 §7.3.4.3; for
-#: ``scp:capability:multilingual/v1``, fewer than five cases in some
-#: ``category``). Maps from ``TrustError::ChallengeSuiteBelowMinimum``.
+# Codes the bridge raises for a challenge or an admission check. Each name is
+# the Rust ``TrustError`` or ``AdmissionError`` variant the code maps from in
+# ``scp-ffi-common``'s ``trust_error_code`` and ``admission_error_code``.
+
+#: A protocol capability URI's request has fewer test cases than the URI's
+#: standard requires (spec 07 §7.3.4.3; for ``scp:capability:multilingual/v1``,
+#: fewer than five cases in some ``category``).
 CHALLENGE_SUITE_BELOW_MINIMUM_CODE = "SCP-VALID-7039"
-
-#: Code the bridge raises when a test case's expected output does not match
-#: the answer commitment the request carries.
-ANSWER_KEY_MISMATCH_CODE = "SCP-VALID-7145"
-
-#: Code the bridge raises when the challenger has no grading capacity left;
-#: the subject is charged no attempt.
+#: The challenger's ledger already holds its maximum of open challenges.
+CHALLENGE_NOT_OPEN_CODE = "SCP-VALID-7099"
+#: The time is outside the challenge window, or grading ran at or after
+#: ``expires_at``.
+CHALLENGE_EXPIRED_CODE = "SCP-VALID-7102"
+#: The attempt is not the last graded attempt plus one.
+ATTEMPT_OUT_OF_ORDER_CODE = "SCP-VALID-7103"
+#: The attempt exceeds ``1 + max_retries``.
+RETRIES_EXHAUSTED_CODE = "SCP-VALID-7104"
+#: The cooldown since the last graded attempt has not passed; the message
+#: names the second the next attempt is accepted (:func:`retry_after`).
+COOLDOWN_ACTIVE_CODE = "SCP-VALID-7105"
+#: The challenge closed after a pass or after its last allowed attempt.
+CHALLENGE_CLOSED_CODE = "SCP-VALID-7106"
+#: The challenger's ledger holds no live challenge with this id, request
+#: digest and subject.
+UNKNOWN_CHALLENGE_CODE = "SCP-VALID-7107"
+#: The response answers another challenge, or its outputs do not match the
+#: request's cases one for one and in order.
+OUTPUTS_MISMATCH_CODE = "SCP-VALID-7108"
+#: A ``CustomEval`` evaluator outlet is unregistered, has no handler, or the
+#: challenger may not call it; the subject is charged no attempt.
+EVALUATOR_UNAVAILABLE_CODE = "SCP-VALID-7109"
+#: The verifier and the subject are the same identity.
+SELF_CHALLENGE_CODE = "SCP-VALID-7127"
+#: The capability URI names a standard whose pass condition cannot be
+#: computed from the subject's outputs, or a system capability.
+STANDARD_NOT_GRADABLE_CODE = "SCP-VALID-7128"
+#: No capability definition can be obtained for the URI.
+CAPABILITY_DEFINITION_UNAVAILABLE_CODE = "SCP-VALID-7129"
+#: A policy value lies outside the capability definition's limits, or a
+#: record exceeds a requirement's retry cap.
+POLICY_OUTSIDE_DEFINITION_CODE = "SCP-VALID-7137"
+#: A ``SchemaMatch`` schema breaks a schema limit.
+SCHEMA_REJECTED_CODE = "SCP-VALID-7138"
+#: Another grading of the same challenge holds a live lease.
+GRADING_IN_PROGRESS_CODE = "SCP-VALID-7139"
+#: A response exceeds the protocol's size or JSON depth limit.
+RESPONSE_TOO_LARGE_CODE = "SCP-VALID-7143"
+#: Two validly signed capability definitions for one URI differ.
+DEFINITION_EQUIVOCATION_CODE = "SCP-VALID-7144"
+#: The challenger has no grading capacity left; the subject is charged no
+#: attempt.
 GRADING_CAPACITY_EXHAUSTED_CODE = "SCP-VALID-7146"
-
-#: Code the bridge raises when a DID, capability URI or context id is not in
-#: canonical form.
+#: A DID, capability URI or context id is not in canonical form.
 NON_CANONICAL_IDENTIFIER_CODE = "SCP-VALID-7147"
-
-#: Code the bridge raises when a context declares more capability
-#: requirements than the protocol allows.
+#: A context declares more capability requirements than the protocol allows.
 TOO_MANY_CAPABILITY_REQUIREMENTS_CODE = "SCP-VALID-7148"
-
-#: Code the bridge raises when another grading of the same challenge took the
-#: grading lease first; the subject is charged no attempt.
+#: Another grading of the same challenge took the grading lease first; the
+#: subject is charged no attempt.
 GRADING_LEASE_LOST_CODE = "SCP-VALID-7149"
+#: The challenger's last challenge to this subject for this capability is
+#: still inside its window; the message names the second a new one may be
+#: created (:func:`retry_after`).
+CHALLENGE_WINDOW_OPEN_CODE = "SCP-VALID-7151"
+#: Grading ran at or before the request's ``created_at``; the message names
+#: the second the same attempt may be resubmitted (:func:`retry_after`).
+CHALLENGE_NOT_YET_GRADABLE_CODE = "SCP-VALID-7153"
+
+#: The codes a later call with the same arguments can succeed after: the
+#: refusal reports a busy challenger, a running grading, or a time that has
+#: not yet come.
+_RETRYABLE_CODES = frozenset(
+    {
+        CHALLENGE_NOT_OPEN_CODE,
+        COOLDOWN_ACTIVE_CODE,
+        GRADING_IN_PROGRESS_CODE,
+        GRADING_CAPACITY_EXHAUSTED_CODE,
+        GRADING_LEASE_LOST_CODE,
+        CHALLENGE_WINDOW_OPEN_CODE,
+        CHALLENGE_NOT_YET_GRADABLE_CODE,
+    }
+)
+
+#: The ``(retry_after=N)`` suffix ``scp-ffi-common`` appends to the message
+#: of a 7105, 7151 or 7153 refusal; ``N`` is a Unix second.
+_RETRY_AFTER_RE = re.compile(r"\(retry_after=([0-9]+)\)\s*\Z")
+
+
+def is_retryable(code: str) -> bool:
+    """Return whether a challenge refusal with ``code`` can succeed when the
+    caller repeats the call later.
+
+    ``True`` exactly for :data:`CHALLENGE_NOT_OPEN_CODE`,
+    :data:`COOLDOWN_ACTIVE_CODE`, :data:`GRADING_IN_PROGRESS_CODE`,
+    :data:`GRADING_CAPACITY_EXHAUSTED_CODE`, :data:`GRADING_LEASE_LOST_CODE`,
+    :data:`CHALLENGE_WINDOW_OPEN_CODE` and
+    :data:`CHALLENGE_NOT_YET_GRADABLE_CODE`. Every other code is final for the
+    same arguments.
+    """
+    return code in _RETRYABLE_CODES
+
+
+def retry_after(error: BaseException | str) -> int | None:
+    """Return the Unix second from which a refused call may succeed, or
+    ``None`` when the refusal names none.
+
+    The bridge appends ``(retry_after=N)`` to the message of a
+    :data:`COOLDOWN_ACTIVE_CODE`, :data:`CHALLENGE_WINDOW_OPEN_CODE` or
+    :data:`CHALLENGE_NOT_YET_GRADABLE_CODE` refusal. ``error`` is the raised
+    exception or its message.
+    """
+    message = error.message if isinstance(error, ScpError) else str(error)
+    match = _RETRY_AFTER_RE.search(message)
+    return None if match is None else int(match.group(1))
 
 
 @dataclass(frozen=True)
@@ -1634,10 +1744,24 @@ class ContainsNone:
 @dataclass(frozen=True)
 class CustomEval:
     """An evaluator outlet the challenger chooses scores the output; the SDK
-    ships none."""
+    ships none.
+
+    :meth:`scp_sdk.SCP.trust_create_challenge` passes
+    ``evaluator_context_id`` to the bridge as the context whose outlets grade
+    the request's ``CustomEval`` cases. Every ``CustomEval`` case of one
+    request names the same context. The wire form carries only
+    ``evaluator_outlet_id``.
+    """
 
     #: The evaluator outlet's identifier.
     evaluator_outlet_id: str
+    #: The context where the evaluator outlet is registered; the verifier must
+    #: be able to call the outlet there.
+    evaluator_context_id: str
+
+    def __post_init__(self) -> None:
+        _require_str("CustomEval.evaluator_outlet_id", self.evaluator_outlet_id)
+        _require_str("CustomEval.evaluator_context_id", self.evaluator_context_id)
 
     def _to_wire(self) -> dict[str, Any]:
         return {"CustomEval": {"evaluator_outlet_id": self.evaluator_outlet_id}}
@@ -1646,25 +1770,6 @@ class CustomEval:
 #: What a test case's output must satisfy. Serialized externally tagged,
 #: ``{"<Variant>": {<fields>}}``, the Rust ``ExpectedOutput`` wire form.
 ExpectedOutput = ExactMatch | SchemaMatch | ContainsAll | ContainsNone | CustomEval
-
-
-def _expected_output_from_wire(data: Any) -> ExpectedOutput:
-    if not isinstance(data, dict) or len(data) != 1:
-        msg = f"ExpectedOutput must be a single-key tagged object, got {data!r}"
-        raise ValueError(msg)
-    ((tag, body),) = data.items()
-    if tag == "ExactMatch":
-        return ExactMatch(value=body["value"])
-    if tag == "SchemaMatch":
-        return SchemaMatch(schema=body["schema"])
-    if tag == "ContainsAll":
-        return ContainsAll(required=list(body["required"]))
-    if tag == "ContainsNone":
-        return ContainsNone(forbidden=list(body["forbidden"]))
-    if tag == "CustomEval":
-        return CustomEval(evaluator_outlet_id=body["evaluator_outlet_id"])
-    msg = f"unknown ExpectedOutput variant {tag!r}"
-    raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -1703,42 +1808,63 @@ class TestCase:
             "weight": self.weight,
         }
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> TestCase:
-        """Build a test case from the Rust ``TestCase`` serde JSON shape.
-
-        Raises:
-            ValueError: If ``expected`` is not a known tagged variant.
-            KeyError: If a required field is absent.
-        """
-        return cls(
-            test_id=data["test_id"],
-            input=data["input"],
-            expected=_expected_output_from_wire(data["expected"]),
-            category=data["category"],
-            weight=data["weight"],
-        )
-
 
 @dataclass(frozen=True)
 class ChallengePolicy:
-    """The retry and cooldown standard a challenger sets for a non-protocol
-    capability URI (spec 07 §7.3.4). A protocol URI's standard fixes both."""
+    """A stricter retry policy than the capability definition's (spec 07
+    §7.3.4).
 
-    #: Retries allowed after the first attempt.
-    max_retries: int
-    #: Seconds a subject waits between attempts.
-    cooldown_secs: int
+    A policy may only tighten the definition, on any URI: at most the
+    definition's retries, and at least its cooldown. A field left ``None``
+    takes the definition's value. Omit the policy to take the definition's
+    values for both.
+    """
+
+    #: Retries after the first attempt; at most the definition's. ``None``
+    #: takes the definition's value.
+    max_retries: int | None = None
+    #: Seconds between graded attempts; at least the definition's. ``None``
+    #: takes the definition's value.
+    cooldown_secs: int | None = None
 
     def __post_init__(self) -> None:
-        _require_uint("ChallengePolicy.max_retries", self.max_retries, 32)
-        _require_uint("ChallengePolicy.cooldown_secs", self.cooldown_secs, 32)
+        if self.max_retries is not None:
+            _require_uint("ChallengePolicy.max_retries", self.max_retries, 32)
+        if self.cooldown_secs is not None:
+            _require_uint("ChallengePolicy.cooldown_secs", self.cooldown_secs, 32)
+
+    def _to_bridge_dict(self) -> dict[str, int]:
+        """The bridge's ``policy`` dict: only the fields this policy sets."""
+        picked = {"max_retries": self.max_retries, "cooldown_secs": self.cooldown_secs}
+        return {key: value for key, value in picked.items() if value is not None}
+
+
+@dataclass(frozen=True)
+class CreateChallengeConfig:
+    """The arguments of :meth:`scp_sdk.SCP.trust_create_challenge` (spec 07
+    §7.3.4 step 1)."""
+
+    #: The challenger, an identity of this instance; its custody signs.
+    verifier: Identity
+    #: DID of the identity being challenged.
+    subject: str
+    #: The capability URI under test, in canonical form.
+    capability_uri: str
+    #: The challenger-written cases; their weights sum to 10000.
+    test_cases: list[TestCase]
+    #: The context where the challenge is administered.
+    context_id: str
+    #: Seconds from creation during which attempts are graded.
+    window_secs: int
+    #: A stricter policy than the capability definition's; ``None`` takes the
+    #: definition's values.
+    policy: ChallengePolicy | None = None
 
 
 @dataclass(frozen=True)
 class ChallengeCase:
-    """One test case as the request carries it: the input and a commitment to
-    the expected output, never the expected output itself."""
+    """One test case as the request carries it: the input, never the expected
+    output, which the challenger's ledger keeps."""
 
     __test__ = False  # not a pytest class
 
@@ -1750,15 +1876,11 @@ class ChallengeCase:
     category: str
     #: Importance weight in basis points.
     weight: int
-    #: SHA-256 commitment to the expected output, as 64 lowercase hex
-    #: characters.
-    answer_commitment: str
 
     def __post_init__(self) -> None:
         _require_str("ChallengeCase.test_id", self.test_id)
         _require_str("ChallengeCase.category", self.category)
         _require_uint("ChallengeCase.weight", self.weight, 32)
-        _require_lower_hex_32("ChallengeCase.answer_commitment", self.answer_commitment)
 
     @classmethod
     def from_dict(cls, data: Any) -> ChallengeCase:
@@ -1780,7 +1902,7 @@ class ChallengeRequest:
     capability_uri: str
     #: Digest of the capability definition, as 64 lowercase hex characters.
     definition_digest: str
-    #: The test cases, each committing to its expected output.
+    #: The test cases, without their expected outputs.
     test_cases: list[ChallengeCase]
     #: Unix timestamp (seconds) when the request was created.
     created_at: int
@@ -1986,16 +2108,34 @@ async def trust_verify_attestation(
 
 
 __all__ = [
-    "ANSWER_KEY_MISMATCH_CODE",
+    "ATTEMPT_OUT_OF_ORDER_CODE",
     "ATTESTATION_TYPES",
+    "CAPABILITY_DEFINITION_UNAVAILABLE_CODE",
+    "CHALLENGE_CLOSED_CODE",
+    "CHALLENGE_EXPIRED_CODE",
+    "CHALLENGE_NOT_OPEN_CODE",
+    "CHALLENGE_NOT_YET_GRADABLE_CODE",
     "CHALLENGE_SUITE_BELOW_MINIMUM_CODE",
+    "CHALLENGE_WINDOW_OPEN_CODE",
+    "COOLDOWN_ACTIVE_CODE",
+    "DEFINITION_EQUIVOCATION_CODE",
+    "EVALUATOR_UNAVAILABLE_CODE",
     "GRADING_CAPACITY_EXHAUSTED_CODE",
+    "GRADING_IN_PROGRESS_CODE",
     "GRADING_LEASE_LOST_CODE",
+    "INVALID_REQUIREMENT_CODE",
     "NON_CANONICAL_IDENTIFIER_CODE",
+    "OUTPUTS_MISMATCH_CODE",
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
+    "POLICY_OUTSIDE_DEFINITION_CODE",
+    "RESPONSE_TOO_LARGE_CODE",
+    "RETRIES_EXHAUSTED_CODE",
+    "SCHEMA_REJECTED_CODE",
+    "SELF_CHALLENGE_CODE",
+    "STANDARD_NOT_GRADABLE_CODE",
     "TOO_MANY_CAPABILITY_REQUIREMENTS_CODE",
-    "VERIFICATION_LEVELS",
+    "UNKNOWN_CHALLENGE_CODE",
     "AttestationSummary",
     "AttestorInfo",
     "BehavioralRecord",
@@ -2009,8 +2149,10 @@ __all__ = [
     "ChallengeRequest",
     "ChallengeResponse",
     "ChallengeVerification",
+    "ChallengeVerified",
     "ContainsAll",
     "ContainsNone",
+    "CreateChallengeConfig",
     "CustomEval",
     "EventLogEntry",
     "EventLogEntryPayload",
@@ -2023,15 +2165,16 @@ __all__ = [
     "RequireParticipation",
     "RetryCap",
     "SchemaMatch",
+    "SelfAttested",
     "TestCase",
     "TestOutput",
     "ThresholdRequirement",
     "TrustEvaluation",
-    "VerificationLevel",
     "aggregate_trust_input",
-    "encode_capability_requirements",
     "evaluate_trust",
+    "is_retryable",
     "participation_record",
+    "retry_after",
     "trust_verify_attestation",
     "verify_participation_requirements",
 ]

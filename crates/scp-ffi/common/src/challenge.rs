@@ -658,9 +658,9 @@ pub struct CreateChallenge {
     pub window_secs: u64,
     /// The context the challenge is administered in.
     pub context_id: String,
-    /// Fewer retries or a longer cooldown than the definition's; `None`
-    /// takes the definition's values.
-    pub policy: Option<PolicyPick>,
+    /// Fewer retries or a longer cooldown than the definition's; a field
+    /// left absent takes the definition's value.
+    pub policy: PolicyPick,
     /// The context of the `CustomEval` evaluator outlets; required when a
     /// case is `CustomEval`.
     pub evaluator_context_id: Option<String>,

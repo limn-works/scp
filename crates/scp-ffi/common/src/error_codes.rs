@@ -1656,15 +1656,41 @@ pub enum TrustFailureClass {
     Context,
 }
 
-/// The message a bridge reports for a
-/// [`TrustError`](scp_protocol::trust::TrustError), one wording for the
-/// `PyO3`, napi-rs and `UniFFI` bridges.
+/// The key of the machine-readable retry time a trust error message ends
+/// with: `(retry_after=<unix seconds>)`. Every SDK's `retryAfter` reads it.
+pub const RETRY_AFTER_KEY: &str = "retry_after=";
+
+/// The first Unix second at which a refused call may succeed.
+///
+/// Three refusals name one: a cooldown ([`VALID_7105`]), a challenge window
+/// still open to this subject ([`VALID_7151`]), and an attempt graded at its
+/// challenge's `created_at` ([`VALID_7153`]).
+#[must_use]
+pub const fn trust_error_retry_after(e: &scp_protocol::trust::TrustError) -> Option<u64> {
+    use scp_protocol::trust::TrustError as E;
+    match e {
+        E::CooldownActive { retry_after, .. } => Some(*retry_after),
+        E::ChallengeWindowOpen { expires_at, .. } => Some(*expires_at),
+        E::ChallengeNotYetGradable { retry_at, .. } => Some(*retry_at),
+        _ => None,
+    }
+}
+
+/// The message a bridge reports for a [`TrustError`](scp_protocol::trust::TrustError).
+///
+/// The `PyO3`, napi-rs and `UniFFI` bridges share this wording. A refusal
+/// with a retry time ends with `(retry_after=<unix seconds>)`
+/// ([`RETRY_AFTER_KEY`]).
 #[must_use]
 pub fn trust_error_message(e: &scp_protocol::trust::TrustError) -> String {
-    if trust_error_code(e) == VALID_7039 {
+    let message = if trust_error_code(e) == VALID_7039 {
         format!("{e} — supply at least the standard's minimum test cases")
     } else {
         format!("trust evaluation failed: {e}")
+    };
+    match trust_error_retry_after(e) {
+        Some(at) => format!("{message} ({RETRY_AFTER_KEY}{at})"),
+        None => message,
     }
 }
 

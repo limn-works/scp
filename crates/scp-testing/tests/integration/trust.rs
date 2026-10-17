@@ -37,8 +37,8 @@ use scp_core::trust::{
     ContextSybilPolicy, CounterAttestation, CustodyViolationError, CustodyViolationType,
     EarnedCapacityLevel, EnforcementSeverity, ExpectedOutput, FreshnessStatus, FreshnessWeight,
     IdentityDepthAssessment, MinCases, NewChallenge, ParticipationFact, ParticipationInput,
-    ParticipationThreshold, ProtocolOnlyDefinitions, RequireParticipation, RevocationStatus,
-    ScpCustodyViolationAttestation, TestCase, TestOutput, ThresholdCheckInput,
+    ParticipationThreshold, PolicyPick, ProtocolOnlyDefinitions, RequireParticipation,
+    RevocationStatus, ScpCustodyViolationAttestation, TestCase, TestOutput, ThresholdCheckInput,
     ThresholdRequirement, TrustError, TrustSignal, TrustSignalCategory,
     authenticate_challenge_response, challenge_request_signing_digest,
     challenge_response_signing_digest, challenge_response_unsigned,
@@ -487,7 +487,7 @@ async fn challenge_request_response() {
     let subject_did = scp_did::did_dht_from_public_key(&subject_vk.to_bytes());
 
     let uri = "scp:capability:prompt-injection-resistance/v1";
-    let test_cases = injection_cases();
+    let policy = ChallengePolicy::resolve(&ProtocolOnlyDefinitions, uri, PolicyPick::default());
     // One second after `created_at`: grading is strictly inside the window
     // (spec 07 §7.3.4, RULING 5).
     let clock = FixedClock(2001);
@@ -495,11 +495,11 @@ async fn challenge_request_response() {
         NewChallenge {
             verifier: challenger_did.clone(),
             subject: subject_did.clone(),
-            test_cases,
+            test_cases: injection_cases(),
             created_at: 2000,
             window_secs: 300,
             context_id: "ctx-trust".to_owned(),
-            policy: ChallengePolicy::resolve(&ProtocolOnlyDefinitions, uri, None).unwrap(),
+            policy: policy.unwrap(),
         },
         &TestChallengeSigner(challenger_sk.clone()),
     )

@@ -147,7 +147,7 @@ async def test_broadcast_publish_signs_through_a_python_provider(scp) -> None:
 async def test_trust_create_challenge_signs_through_a_python_provider(scp) -> None:
     """A challenge request is signed through the verifier's provider, whose
     ``sign`` runs in Python, within the deadline (spec 07 §7.3.4)."""
-    from scp_sdk.trust import ExactMatch, TestCase
+    from scp_sdk.trust import CreateChallengeConfig, ExactMatch, TestCase
 
     provider = _SlowSignKeychain()
     verifier = await scp.identity_create_with_custody(provider)
@@ -171,12 +171,14 @@ async def test_trust_create_challenge_signs_through_a_python_provider(scp) -> No
 
     request = await asyncio.wait_for(
         scp.trust_create_challenge(
-            verifier.did,
-            subject.did,
-            "scp:capability:schema-validation/v1",
-            cases,
-            ctx.context_id,
-            3_600,
+            CreateChallengeConfig(
+                verifier=verifier,
+                subject=subject.did,
+                capability_uri="scp:capability:schema-validation/v1",
+                test_cases=cases,
+                context_id=ctx.context_id,
+                window_secs=3_600,
+            )
         ),
         timeout=_DEADLINE_S,
     )

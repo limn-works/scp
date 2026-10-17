@@ -20,8 +20,10 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Test
+import uniffi.scp.ScpException
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class TrustAggregateTest {
@@ -265,7 +267,6 @@ class ChallengeTrustInputTest {
                         input = buildJsonObject { put("i", 0) },
                         category = "basic",
                         weight = 10_000u,
-                        answerCommitment = "cd".repeat(32),
                     ),
                 ),
             createdAt = 1_700_000_000uL,
@@ -285,7 +286,7 @@ class ChallengeTrustInputTest {
          "capability_uri":"scp:capability:schema-validation/v1",
          "definition_digest":"${"ef".repeat(32)}",
          "test_cases":[{"test_id":"t0","input":{"i":0},"category":"basic",
-           "weight":10000,"answer_commitment":"${"cd".repeat(32)}"}],
+           "weight":10000}],
          "created_at":1700000000,
          "expires_at":1700003600,
          "max_retries":2,
@@ -363,12 +364,10 @@ class ChallengeTrustInputTest {
             decodeChallengeRequestJson(encode(request + ("timeout_secs" to Json.parseToJsonElement("300"))))
         }
         assertFailsWith<IllegalArgumentException> { decodeChallengeRequestJson(encode(request - "definition_digest")) }
-        assertEquals(
-            "ChallengeCase.answerCommitment must be 64 lowercase hex characters",
-            assertFailsWith<IllegalArgumentException> {
-                decodeChallengeRequestJson(challengeWire.replace("cd".repeat(32), "CD".repeat(32)))
-            }.message,
-        )
+        // A case carries no field beyond test_id, input, category and weight.
+        assertFailsWith<IllegalArgumentException> {
+            decodeChallengeRequestJson(challengeWire.replace("\"weight\":10000}", "\"weight\":10000,\"extra\":\"x\"}"))
+        }
     }
 
     @Test
@@ -381,7 +380,8 @@ class ChallengeTrustInputTest {
                     """{"SchemaMatch":{"schema":{"type":"object"}}}""",
                 ExpectedOutput.ContainsAll(listOf("a", "b")) to """{"ContainsAll":{"required":["a","b"]}}""",
                 ExpectedOutput.ContainsNone(listOf("x")) to """{"ContainsNone":{"forbidden":["x"]}}""",
-                ExpectedOutput.CustomEval("o-1") to """{"CustomEval":{"evaluator_outlet_id":"o-1"}}""",
+                ExpectedOutput.CustomEval(evaluatorOutletId = "o-1", evaluatorContextId = "ctx-eval") to
+                    """{"CustomEval":{"evaluator_outlet_id":"o-1"}}""",
             )
         for ((expected, wire) in variants) {
             val case =
@@ -397,6 +397,28 @@ class ChallengeTrustInputTest {
                 encodeTestCasesJson(listOf(case)),
             )
         }
+    }
+
+    @Test
+    fun `CustomEval cases lift their one evaluator context and refuse two with SCP-VALID-7001`() {
+        fun case(
+            id: String,
+            expected: ExpectedOutput,
+        ) = TestCase(
+            testId = id,
+            input = buildJsonObject { put("i", 0) },
+            expected = expected,
+            category = "c",
+            weight = 1u,
+        )
+        val exact = case("t0", ExpectedOutput.ExactMatch(buildJsonObject { put("ok", true) }))
+        val evalA = case("t1", ExpectedOutput.CustomEval(evaluatorOutletId = "o-1", evaluatorContextId = "ctx-a"))
+        val evalA2 = case("t2", ExpectedOutput.CustomEval(evaluatorOutletId = "o-2", evaluatorContextId = "ctx-a"))
+        val evalB = case("t3", ExpectedOutput.CustomEval(evaluatorOutletId = "o-1", evaluatorContextId = "ctx-b"))
+        assertNull(evaluatorContextOf(listOf(exact)))
+        assertEquals("ctx-a", evaluatorContextOf(listOf(exact, evalA, evalA2)))
+        val refused = assertFailsWith<ScpException.Validation> { evaluatorContextOf(listOf(evalA, evalB)) }
+        assertEquals("SCP-VALID-7001", refused.code)
     }
 
     @Test

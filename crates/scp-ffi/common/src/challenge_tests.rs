@@ -346,7 +346,7 @@ impl Harness {
             test_cases_json: cases_json(custom),
             window_secs: 3600,
             context_id: EVAL_CTX.to_owned(),
-            policy: None,
+            policy: PolicyPick::default(),
             evaluator_context_id: evaluator.map(str::to_owned),
         }
     }
@@ -1797,4 +1797,54 @@ async fn check_capability_requirements_reads_governance() {
             .await
             .unwrap_err();
     assert!(matches!(err, ChallengeOpError::Context(_)), "{err:?}");
+}
+
+/// A refusal with a retry time ends its message with
+/// `(retry_after=<unix seconds>)`, the suffix every SDK's `retryAfter`
+/// reads; a refusal without one carries no suffix.
+#[test]
+fn retry_time_reaches_the_bridge_message() {
+    let message = |e: TrustError| match ChallengeOpError::Trust(e).code_and_class() {
+        ChallengeFailure::Coded { code, message, .. } => (code, message),
+        ChallengeFailure::Context(e) => panic!("{e}"),
+    };
+    let id = || "ab".repeat(32);
+    for (error, code, at) in [
+        (
+            TrustError::CooldownActive {
+                challenge_id: id(),
+                retry_after: 1_700_000_100,
+            },
+            crate::error_codes::VALID_7105,
+            1_700_000_100,
+        ),
+        (
+            TrustError::ChallengeWindowOpen {
+                challenge_id: id(),
+                expires_at: 1_700_003_600,
+            },
+            crate::error_codes::VALID_7151,
+            1_700_003_600,
+        ),
+        (
+            TrustError::ChallengeNotYetGradable {
+                challenge_id: id(),
+                now: 1_700_000_000,
+                created_at: 1_700_000_000,
+                retry_at: 1_700_000_001,
+            },
+            crate::error_codes::VALID_7153,
+            1_700_000_001,
+        ),
+    ] {
+        let (got, text) = message(error);
+        assert_eq!(got, code);
+        assert!(text.ends_with(&format!("(retry_after={at})")), "{text}");
+    }
+    let (code, text) = message(TrustError::GradingCapacityExhausted {
+        challenger: "did:dht:x".to_owned(),
+        cause: GradingCapacityCause::GradingPermits,
+    });
+    assert_eq!(code, crate::error_codes::VALID_7146);
+    assert!(!text.contains("retry_after="), "{text}");
 }

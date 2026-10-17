@@ -27,7 +27,8 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import uniffi.scp.CeilingPolicy
 import uniffi.scp.ContextMode
-import uniffi.scp.ContextParams
+import uniffi.scp.ChallengePolicy
+import uniffi.scp.Identity
 import uniffi.scp.GovernanceModel
 import uniffi.scp.MemoryScope
 import uniffi.scp.ScpException
@@ -40,6 +41,12 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
+
+/**
+ * The code a forged subject signature is refused with: `TrustError::ChallengeSignatureInvalid`
+ * keeps the general trust code in `trust_error_code`.
+ */
+private const val FORGED_RESPONSE_CODE = "SCP-VALID-7003"
 
 class TrustAggregateFfiTest {
     private lateinit var scp: SCP
@@ -205,41 +212,46 @@ class TrustAggregateFfiTest {
         }
     }
 
+    /** Typed params for a context administered by its creator whose governance holds [requirements]. */
+    private fun paramsRequiring(requirements: List<CapabilityRequirement>): TypedContextParams =
+        TypedContextParams(
+            mode = ContextMode.ENCRYPTED,
+            ceiling = listOf("messages:read", "messages:write", "governance:propose"),
+            ceilingPolicy = CeilingPolicy.IMMUTABLE,
+            governance = GovernanceModel.SINGLE_ADMIN,
+            memoryScope = MemoryScope.EPHEMERAL,
+            ttlSeconds = 3600uL,
+            promotable = false,
+            consequenceRules = null,
+            consequenceConfig = null,
+            capabilityRequirements = requirements,
+        )
+
     /** A context on [scp] whose governance requires [schemaUri] graded by [verifierDid]. */
     private suspend fun requiringContext(verifierDid: String): String {
         val creator = scp.identityCreateInMemory()
-        val handle =
-            scp.contextCreate(
-                creator,
-                ContextParams(
-                    mode = ContextMode.ENCRYPTED,
-                    ceiling = listOf("messages:read", "messages:write"),
-                    ceilingPolicy = CeilingPolicy.IMMUTABLE,
-                    governance = GovernanceModel.SINGLE_ADMIN,
-                    memoryScope = MemoryScope.EPHEMERAL,
-                    ttlSeconds = 3600uL,
-                    promotable = false,
-                    minProtocolVersion = 0.toUShort(),
-                    maxChainDepth = null,
-                    maxNestingDepth = null,
-                    sessionCap = null,
-                    economicPolicy = null,
-                    consequenceRulesJson = null,
-                    consequenceConfigJson = null,
-                    capabilityRequirementsJson =
-                        encodeCapabilityRequirementsJson(
-                            listOf(
-                                CapabilityRequirement(
-                                    capability = schemaUri,
-                                    verificationLevel = VerificationLevel.CHALLENGE_VERIFIED,
-                                    trustedVerifiers = listOf(verifierDid),
-                                ),
-                            ),
-                        ),
-                ),
-            )
-        return handle.contextId()
+        val requirement =
+            CapabilityRequirement.ChallengeVerified(capability = schemaUri, trustedVerifiers = listOf(verifierDid))
+        return scp.contextCreate(creator, paramsRequiring(listOf(requirement))).contextId()
     }
+
+    /** Creates a challenge of [cases] from [verifier] to [subject] in [contextId] with a one-hour window. */
+    private suspend fun createChallenge(
+        verifier: Identity,
+        subject: Identity,
+        cases: List<TestCase>,
+        contextId: String,
+    ): ChallengeRequest =
+        scp.trustCreateChallenge(
+            CreateChallengeConfig(
+                verifier = verifier,
+                subject = subject.did(),
+                capabilityUri = schemaUri,
+                testCases = cases,
+                contextId = contextId,
+                windowSecs = 3_600u,
+            ),
+        )
 
     /** An output that passes every case [testCases] writes. */
     private fun passingOutputs(cases: List<TestCase>): List<TestOutput> =
@@ -254,7 +266,7 @@ class TrustAggregateFfiTest {
             val contextId = requiringContext(verifier.did())
             val error =
                 assertFailsWith<ScpException.Validation> {
-                    scp.trustCreateChallenge(verifier, subject.did(), schemaUri, testCases(19), contextId, 3_600u)
+                    createChallenge(verifier, subject, testCases(19), contextId)
                 }
             assertEquals(CHALLENGE_SUITE_BELOW_MINIMUM_CODE, error.code)
         }
@@ -273,7 +285,7 @@ class TrustAggregateFfiTest {
             val contextId = requiringContext(verifier.did())
             val cases = testCases(20)
 
-            val request = scp.trustCreateChallenge(verifier, subject.did(), schemaUri, cases, contextId, 3_600u)
+            val request = createChallenge(verifier, subject, cases, contextId)
             pastCreationSecond(request)
             assertEquals(verifier.did(), request.verifier)
             assertEquals(subject.did(), request.subject)
@@ -281,7 +293,7 @@ class TrustAggregateFfiTest {
             assertEquals(schemaUri, request.capabilityUri)
             assertEquals(cases.map { it.testId }, request.testCases.map { it.testId })
             assertEquals(3_600uL, request.expiresAt - request.createdAt)
-            // The request commits to each answer and never carries it.
+            // The request carries each case without its expected output.
             assertFalse(encodeChallengeRequestJson(request).contains("ExactMatch"))
 
             val refused =
@@ -332,22 +344,118 @@ class TrustAggregateFfiTest {
             val subject = scp.identityCreateInMemory()
             val contextId = requiringContext(verifier.did())
             val cases = testCases(20)
-            val request = scp.trustCreateChallenge(verifier, subject.did(), schemaUri, cases, contextId, 3_600u)
+            val request = createChallenge(verifier, subject, cases, contextId)
             pastCreationSecond(request)
             val response = scp.trustRespondToChallenge(subject, request, passingOutputs(cases), 1u)
-            assertFailsWith<ScpException> {
-                scp.trustGradeResponse(
-                    verifier,
-                    request,
-                    response.copy(subjectSignature = List(64) { 0.toUByte() }),
-                )
-            }
+            val forged =
+                assertFailsWith<ScpException.Validation> {
+                    scp.trustGradeResponse(
+                        verifier,
+                        request,
+                        response.copy(subjectSignature = List(64) { 0.toUByte() }),
+                    )
+                }
+            assertEquals(FORGED_RESPONSE_CODE, forged.code)
             // The forgery took no attempt: the real response still grades as attempt 1.
             val graded = scp.trustGradeResponse(verifier, request, response)
             assertEquals(1u, graded.record.attempt)
             assertTrue(graded.record.passed)
         }
     }
+
+    /**
+     * A second challenge to the same subject for the same capability while
+     * the first window is open is refused with [CHALLENGE_WINDOW_OPEN_CODE],
+     * and [retryAfter] reads the first window's end off the real refusal.
+     */
+    @Test
+    fun `trustCreateChallenge - open window refusal carries retryAfter`() {
+        runBlocking {
+            val verifier = scp.identityCreateInMemory()
+            val subject = scp.identityCreateInMemory()
+            val contextId = requiringContext(verifier.did())
+            val first = createChallenge(verifier, subject, testCases(20), contextId)
+            val refused =
+                assertFailsWith<ScpException.Validation> {
+                    scp.trustCreateChallenge(
+                        CreateChallengeConfig(
+                            verifier = verifier,
+                            subject = subject.did(),
+                            capabilityUri = schemaUri,
+                            testCases = testCases(20),
+                            contextId = contextId,
+                            windowSecs = 3_600u,
+                            policy = ChallengePolicy(maxRetries = 0u, cooldownSecs = null),
+                        ),
+                    )
+                }
+            assertEquals(CHALLENGE_WINDOW_OPEN_CODE, refused.code)
+            assertTrue(isRetryable(refused.code))
+            assertEquals(first.expiresAt, retryAfter(refused))
+        }
+    }
+
+    /** A policy that sets only the retries keeps the definition's cooldown. */
+    @Test
+    fun `trustCreateChallenge - a policy may set one field`() {
+        runBlocking {
+            val verifier = scp.identityCreateInMemory()
+            val subject = scp.identityCreateInMemory()
+            val contextId = requiringContext(verifier.did())
+            val request =
+                scp.trustCreateChallenge(
+                    CreateChallengeConfig(
+                        verifier = verifier,
+                        subject = subject.did(),
+                        capabilityUri = schemaUri,
+                        testCases = testCases(20),
+                        contextId = contextId,
+                        windowSecs = 3_600u,
+                        policy = ChallengePolicy(maxRetries = 0u, cooldownSecs = null),
+                    ),
+                )
+            assertEquals(0u, request.maxRetries)
+        }
+    }
+
+    /**
+     * After a `ModifyCapabilityRequirements` proposal executes, a subject the
+     * old list admitted is refused: the typed list reached the governance the
+     * admission check reads.
+     */
+    @Test
+    fun `governanceModifyCapabilityRequirements - tightening refuses a subject that passed`() {
+        runBlocking {
+            val creator = scp.identityCreateInMemory()
+            val verifier = scp.identityCreateInMemory()
+            val subject = scp.identityCreateInMemory()
+            val handle =
+                scp.contextCreate(
+                    creator,
+                    paramsRequiring(listOf(CapabilityRequirement.SelfAttested(capability = schemaUri))),
+                )
+            val contextId = handle.contextId()
+            scp.checkCapabilityRequirements(contextId, subject.did(), listOf(schemaUri), emptyList())
+
+            scp.governanceModifyCapabilityRequirements(
+                handle = handle,
+                proposerDid = creator.did(),
+                requirements =
+                    listOf(
+                        CapabilityRequirement.ChallengeVerified(
+                            capability = schemaUri,
+                            trustedVerifiers = listOf(verifier.did()),
+                        ),
+                    ),
+            )
+            val refused =
+                assertFailsWith<ScpException.Validation> {
+                    scp.checkCapabilityRequirements(contextId, subject.did(), listOf(schemaUri), emptyList())
+                }
+            assertEquals("SCP-VALID-7076", refused.code)
+        }
+    }
+}
 
 /**
  * Grading is strictly inside the challenge window (spec 07 §7.3.4), so a

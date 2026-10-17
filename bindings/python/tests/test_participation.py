@@ -14,6 +14,7 @@ See spec section 7.3.2.1 and SCP-BA-004.
 from __future__ import annotations
 
 import asyncio
+import typing
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,12 +24,14 @@ from scp_sdk.scp import SCP
 from scp_sdk.trust import (
     PARTICIPATION_FACT_VARIANTS,
     PARTICIPATION_THRESHOLD_OPERATORS,
+    CapabilityRequirement,
     ChallengeVerification,
+    ChallengeVerified,
     ParticipationFact,
     ParticipationProfile,
     ParticipationThreshold,
     RequireParticipation,
-    VerificationLevel,
+    SelfAttested,
     verify_participation_requirements,
 )
 
@@ -478,9 +481,10 @@ class TestCheckCapabilityRequirements:
         assert json.loads(args[3]) == [record._to_bridge_dict()]
         assert len(json.loads(args[3])[0]) == 23
 
-    def test_rejects_bad_verification_level(self) -> None:
-        with pytest.raises(ValueError, match="Invalid VerificationLevel"):
-            VerificationLevel("Nonexistent")
+    def test_requirement_is_one_of_two_variants(self) -> None:
+        # The variant is the verification level, so no level outside the
+        # two the protocol defines can be written.
+        assert typing.get_args(CapabilityRequirement) == (SelfAttested, ChallengeVerified)
 
     def test_rejects_wrong_signature_length(self) -> None:
         with pytest.raises(ValueError, match="verifier_signature must be exactly 64"):

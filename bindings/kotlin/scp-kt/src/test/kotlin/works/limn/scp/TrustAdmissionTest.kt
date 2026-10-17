@@ -18,6 +18,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import org.junit.jupiter.api.Test
+import uniffi.scp.ScpException
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 
@@ -59,23 +60,48 @@ class TrustAdmissionTest {
              {"capability":"scp:capability:schema-validation/v1",
               "verification_level":"ChallengeVerified",
               "trusted_verifiers":["did:dht:zVerifier"],
-              "retry_cap":{"max_retries":2,"min_cooldown_secs":60}}]
+              "retry_cap":{"max_retries":2,"min_cooldown_secs":60}},
+             {"capability":"scp:capability:content-safety/v1",
+              "verification_level":"ChallengeVerified",
+              "trusted_verifiers":["did:dht:zA","did:dht:zB"],
+              "retry_cap":null}]
             """.trimIndent(),
             encodeCapabilityRequirementsJson(
                 listOf(
-                    CapabilityRequirement(
-                        capability = "scp:capability:messages-write/v1",
-                        verificationLevel = VerificationLevel.SELF_ATTESTED,
-                    ),
-                    CapabilityRequirement(
+                    CapabilityRequirement.SelfAttested(capability = "scp:capability:messages-write/v1"),
+                    CapabilityRequirement.ChallengeVerified(
                         capability = "scp:capability:schema-validation/v1",
-                        verificationLevel = VerificationLevel.CHALLENGE_VERIFIED,
                         trustedVerifiers = listOf("did:dht:zVerifier"),
                         retryCap = RetryCap(maxRetries = 2u, minCooldownSecs = 60u),
+                    ),
+                    CapabilityRequirement.ChallengeVerified(
+                        capability = "scp:capability:content-safety/v1",
+                        trustedVerifiers = listOf("did:dht:zA", "did:dht:zB"),
                     ),
                 ),
             ),
         )
+    }
+
+    @Test
+    fun `ChallengeVerified with no trusted verifier fails to construct with SCP-VALID-7150`() {
+        val built =
+            assertFailsWith<ScpException.Validation> {
+                CapabilityRequirement.ChallengeVerified(
+                    capability = "scp:capability:schema-validation/v1",
+                    trustedVerifiers = emptyList(),
+                )
+            }
+        assertEquals("SCP-VALID-7150", built.code)
+        assertEquals(INVALID_REQUIREMENT_CODE, built.code)
+        // `copy` runs the same constructor, so it cannot empty the list either.
+        val valid =
+            CapabilityRequirement.ChallengeVerified(
+                capability = "scp:capability:schema-validation/v1",
+                trustedVerifiers = listOf("did:dht:zVerifier"),
+            )
+        val copied = assertFailsWith<ScpException.Validation> { valid.copy(trustedVerifiers = emptyList()) }
+        assertEquals("SCP-VALID-7150", copied.code)
     }
 
     @Test

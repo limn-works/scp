@@ -7537,13 +7537,13 @@ pub struct ChallengeResult {
 }
 
 /// A challenger's choice of fewer retries or a longer cooldown than the
-/// capability definition's.
+/// capability definition's. An absent field takes the definition's value.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct ChallengePolicy {
     /// Retries after the first attempt; at most the definition's.
-    pub max_retries: u32,
+    pub max_retries: Option<u32>,
     /// Seconds between graded attempts; at least the definition's.
-    pub cooldown_secs: u32,
+    pub cooldown_secs: Option<u32>,
 }
 
 /// A graded attempt, as `trust_grade_response` returns it.
@@ -7783,10 +7783,12 @@ async fn trust_create_challenge_impl(
             test_cases_json,
             window_secs,
             context_id,
-            policy: policy.map(|p| scp_core::trust::PolicyPick {
-                max_retries: p.max_retries,
-                cooldown_secs: p.cooldown_secs,
-            }),
+            policy: policy
+                .map(|p| scp_core::trust::PolicyPick {
+                    max_retries: p.max_retries,
+                    cooldown_secs: p.cooldown_secs,
+                })
+                .unwrap_or_default(),
             evaluator_context_id,
         },
         &UniffiEvaluatorInvoker { bi, sup },

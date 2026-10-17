@@ -37,21 +37,33 @@ private func assertJSONEqual(
     }
 }
 
+final class ChallengeVerifiedRequirementTests: XCTestCase {
+    /// A `ChallengeVerified` requirement with no trusted verifier cannot be
+    /// built: the initializer throws the bridge's code for the same defect.
+    func testChallengeVerifiedWithoutVerifiersFailsToConstructWith7150() {
+        XCTAssertThrowsError(
+            try ChallengeVerifiedRequirement(capability: "scp:capability:messages-write/v1", trustedVerifiers: [])
+        ) { error in
+            guard case let ScpError.Validation(_, code) = error else {
+                return XCTFail("expected ScpError.Validation, got \(error)")
+            }
+            XCTAssertEqual(code, "SCP-VALID-7150")
+            XCTAssertEqual(code, invalidRequirementCode)
+        }
+    }
+}
+
 final class TrustAdmissionEncoderTests: XCTestCase {
     // MARK: - CapabilityRequirement encoder
 
     func testCapabilityRequirementEncodesSnakeCaseAndBareLevel() throws {
-        let requirements = [
-            CapabilityRequirement(
+        let requirements: [CapabilityRequirement] = try [
+            .challengeVerified(ChallengeVerifiedRequirement(
                 capability: "scp:capability:messages-write/v1",
-                verificationLevel: .challengeVerified,
                 trustedVerifiers: ["did:dht:verifier"],
                 retryCap: RetryCap(maxRetries: 2, minCooldownSecs: 60)
-            ),
-            CapabilityRequirement(
-                capability: "scp:capability:outlet-invoke/v1",
-                verificationLevel: .selfAttested
-            )
+            )),
+            .selfAttested(capability: "scp:capability:outlet-invoke/v1")
         ]
         let json = try encodeCapabilityRequirementsJson(requirements)
         assertJSONEqual(
@@ -66,8 +78,6 @@ final class TrustAdmissionEncoderTests: XCTestCase {
             ]
             """
         )
-        let decoded = try JSONDecoder().decode([CapabilityRequirement].self, from: Data(json.utf8))
-        XCTAssertEqual(decoded, requirements)
     }
 
     // MARK: - RequireParticipation encoder
@@ -387,11 +397,8 @@ final class TrustAdmissionCallThroughTests: XCTestCase {
         try await super.tearDown()
     }
 
-    private let messagesWrite = [
-        CapabilityRequirement(
-            capability: "scp:capability:messages-write/v1",
-            verificationLevel: .selfAttested
-        )
+    private let messagesWrite: [CapabilityRequirement] = [
+        .selfAttested(capability: "scp:capability:messages-write/v1")
     ]
 
     /// A satisfied `SelfAttested` requirement admits the agent: the context's
@@ -444,11 +451,7 @@ final class TrustAdmissionCallThroughTests: XCTestCase {
         let subject = try await createInMemoryIdentity(scp)
         let capability = "scp:capability:schema-validation/v1"
         let contextId = try await contextRequiring(scp, [
-            CapabilityRequirement(
-                capability: capability,
-                verificationLevel: .challengeVerified,
-                trustedVerifiers: [verifier.did()]
-            )
+            .challengeVerified(ChallengeVerifiedRequirement(capability: capability, trustedVerifiers: [verifier.did()]))
         ])
         let now = UInt64(Date().timeIntervalSince1970)
         let record = ChallengeVerification(

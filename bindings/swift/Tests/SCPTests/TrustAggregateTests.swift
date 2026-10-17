@@ -263,18 +263,14 @@ private func makeTestCases(_ count: Int) -> [TestCase] {
 /// A structurally-valid `ChallengeRequest` with a real 64-byte signature.
 private func makeChallengeRequest(
     signature: [UInt8] = Array(repeating: 8, count: 64),
-    challengeId: String = String(repeating: "ab", count: 32),
-    answerCommitment: String = String(repeating: "cc", count: 32)
+    challengeId: String = String(repeating: "ab", count: 32)
 ) -> ChallengeRequest {
     ChallengeRequest(
         challengeId: challengeId,
         capabilityUri: schemaUri,
         definitionDigest: String(repeating: "dd", count: 32),
         testCases: [
-            ChallengeCase(
-                testId: "t0", input: ["i": 0], category: "basic", weight: 10000,
-                answerCommitment: answerCommitment
-            )
+            ChallengeCase(testId: "t0", input: ["i": 0], category: "basic", weight: 10000)
         ],
         createdAt: 1_700_000_000,
         expiresAt: 1_700_003_600,
@@ -350,8 +346,7 @@ final class ChallengeTrustInputEncoderTests: XCTestCase {
               "challenge_id": "\(String(repeating: "ab", count: 32))",
               "capability_uri": "scp:capability:schema-validation/v1",
               "definition_digest": "\(String(repeating: "dd", count: 32))",
-              "test_cases": [{"test_id": "t0", "input": {"i": 0}, "category": "basic", "weight": 10000,
-                "answer_commitment": "\(String(repeating: "cc", count: 32))"}],
+              "test_cases": [{"test_id": "t0", "input": {"i": 0}, "category": "basic", "weight": 10000}],
               "created_at": 1700000000,
               "expires_at": 1700003600,
               "max_retries": 2,
@@ -385,7 +380,10 @@ final class ChallengeTrustInputEncoderTests: XCTestCase {
             (.schemaMatch(schema: ["type": "object"]), #"{"SchemaMatch":{"schema":{"type":"object"}}}"#),
             (.containsAll(required: ["a", "b"]), #"{"ContainsAll":{"required":["a","b"]}}"#),
             (.containsNone(forbidden: ["x"]), #"{"ContainsNone":{"forbidden":["x"]}}"#),
-            (.customEval(evaluatorOutletId: "o-1"), #"{"CustomEval":{"evaluator_outlet_id":"o-1"}}"#)
+            (
+                .customEval(evaluatorOutletId: "o-1", evaluatorContextId: "ctx-eval"),
+                #"{"CustomEval":{"evaluator_outlet_id":"o-1"}}"#
+            )
         ]
         for (expected, wire) in variants {
             let testCase = TestCase(testId: "t0", input: ["i": 0], expected: expected, category: "basic", weight: 10000)
@@ -446,11 +444,6 @@ final class ChallengeTrustInputEncoderTests: XCTestCase {
         assertChallengeInputError("ChallengeRequest.challengeId must be 64 lowercase hex characters") {
             _ = try encodeChallengeRequestJson(makeChallengeRequest(challengeId: "chal-1"))
         }
-        assertChallengeInputError("ChallengeCase.answerCommitment must be 64 lowercase hex characters") {
-            _ = try encodeChallengeRequestJson(
-                makeChallengeRequest(answerCommitment: String(repeating: "CC", count: 32))
-            )
-        }
         assertChallengeInputError("ChallengeResponse.subjectSignature must be exactly 64 elements, got 63") {
             _ = try encodeChallengeResponseJson(
                 makeChallengeResponse(signature: Array(repeating: 4, count: 63))
@@ -459,6 +452,63 @@ final class ChallengeTrustInputEncoderTests: XCTestCase {
         assertChallengeInputError("ChallengeResponse.requestDigest must be 64 lowercase hex characters") {
             _ = try encodeChallengeResponseJson(makeChallengeResponse(requestDigest: "ee"))
         }
+    }
+}
+
+/// The retry helpers read only the code and the message, so they run without
+/// the bridge.
+final class ChallengeRetryHelperTests: XCTestCase {
+    func testIsRetryableIsTrueExactlyForTheRetryLaterCodes() {
+        let retryable = [
+            challengeNotOpenCode, cooldownActiveCode, gradingInProgressCode,
+            gradingCapacityExhaustedCode, gradingLeaseLostCode,
+            challengeWindowOpenCode, challengeNotYetGradableCode
+        ]
+        let final = [
+            challengeSuiteBelowMinimumCode, challengeExpiredCode, attemptOutOfOrderCode,
+            retriesExhaustedCode, challengeClosedCode, unknownChallengeCode,
+            outputsMismatchCode, evaluatorUnavailableCode, selfChallengeCode,
+            standardNotGradableCode, capabilityDefinitionUnavailableCode,
+            policyOutsideDefinitionCode, schemaRejectedCode, responseTooLargeCode,
+            definitionEquivocationCode, nonCanonicalIdentifierCode,
+            tooManyCapabilityRequirementsCode, invalidRequirementCode
+        ]
+        XCTAssertEqual(
+            retryable,
+            ["SCP-VALID-7099", "SCP-VALID-7105", "SCP-VALID-7139", "SCP-VALID-7146",
+             "SCP-VALID-7149", "SCP-VALID-7151", "SCP-VALID-7153"]
+        )
+        XCTAssertEqual(
+            final,
+            ["SCP-VALID-7039", "SCP-VALID-7102", "SCP-VALID-7103", "SCP-VALID-7104",
+             "SCP-VALID-7106", "SCP-VALID-7107", "SCP-VALID-7108", "SCP-VALID-7109",
+             "SCP-VALID-7127", "SCP-VALID-7128", "SCP-VALID-7129", "SCP-VALID-7137",
+             "SCP-VALID-7138", "SCP-VALID-7143", "SCP-VALID-7144", "SCP-VALID-7147",
+             "SCP-VALID-7148", "SCP-VALID-7150"]
+        )
+        for code in retryable {
+            XCTAssertTrue(isRetryable(code), code)
+        }
+        for code in final + ["SCP-VALID-7003", "SCP-VALID-7076", "SCP-CTX-2000", ""] {
+            XCTAssertFalse(isRetryable(code), code)
+        }
+    }
+
+    func testRetryAfterReadsTheSuffixAndNothingElse() {
+        XCTAssertEqual(
+            retryAfter(ScpError.Validation(
+                msg: "trust evaluation failed: cooldown active (retry_after=1700000123)",
+                code: cooldownActiveCode
+            )),
+            1_700_000_123
+        )
+        XCTAssertNil(retryAfter(ScpError.Validation(
+            msg: "trust evaluation failed: challenge closed", code: challengeClosedCode
+        )))
+        XCTAssertNil(retryAfter(ScpError.Validation(
+            msg: "trust evaluation failed: (retry_after=soon)", code: cooldownActiveCode
+        )))
+        XCTAssertNil(retryAfter(CocoaError(.fileNoSuchFile)))
     }
 }
 
@@ -485,11 +535,7 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
     /// `verifierDid`.
     private func requiringContext(verifierDid: String) async throws -> String {
         try await contextRequiring(scp, [
-            CapabilityRequirement(
-                capability: schemaUri,
-                verificationLevel: .challengeVerified,
-                trustedVerifiers: [verifierDid]
-            )
+            .challengeVerified(ChallengeVerifiedRequirement(capability: schemaUri, trustedVerifiers: [verifierDid]))
         ])
     }
 
@@ -500,10 +546,10 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
     private func gradableChallenge(
         _ verifier: Identity, _ subject: String, _ cases: [TestCase], _ contextId: String
     ) async throws -> ChallengeRequest {
-        let request = try await scp.trustCreateChallenge(
+        let request = try await scp.trustCreateChallenge(CreateChallengeConfig(
             verifier: verifier, subject: subject, capabilityUri: schemaUri,
             testCases: cases, contextId: contextId, windowSecs: 3600
-        )
+        ))
         while Date().timeIntervalSince1970 < Double(request.createdAt + 1) {
             try await Task.sleep(nanoseconds: 50_000_000)
         }
@@ -550,10 +596,10 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
         let subject = try await createInMemoryIdentity(scp)
         let contextId = try await requiringContext(verifierDid: verifier.did())
         await assertValidationCode(challengeSuiteBelowMinimumCode) {
-            _ = try await self.scp.trustCreateChallenge(
+            _ = try await self.scp.trustCreateChallenge(CreateChallengeConfig(
                 verifier: verifier, subject: subject.did(), capabilityUri: schemaUri,
                 testCases: makeTestCases(19), contextId: contextId, windowSecs: 3600
-            )
+            ))
         }
     }
 
@@ -573,7 +619,7 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
         XCTAssertEqual(request.capabilityUri, schemaUri)
         XCTAssertEqual(request.testCases.map(\.testId), cases.map(\.testId))
         XCTAssertEqual(request.expiresAt - request.createdAt, 3600)
-        // The request commits to each answer and never carries it.
+        // The request carries each case without its expected output.
         XCTAssertFalse(try encodeChallengeRequestJson(request).contains("ExactMatch"))
 
         await assertValidationCode("SCP-VALID-7076") {
@@ -632,14 +678,155 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
             subject: response.subject, attempt: response.attempt, outputs: response.outputs,
             subjectSignature: Array(repeating: 0, count: 64)
         )
-        do {
-            _ = try await scp.trustGradeResponse(verifier: verifier, request: request, response: forged)
-            XCTFail("a response with a forged signature must be refused")
-        } catch is ScpError {}
+        // A subject signature that does not verify is `ChallengeSignatureInvalid`,
+        // which every bridge reports as SCP-VALID-7003.
+        await assertValidationCode("SCP-VALID-7003") {
+            _ = try await self.scp.trustGradeResponse(verifier: verifier, request: request, response: forged)
+        }
         // The forgery took no attempt: the real response still grades as attempt 1.
         let graded = try await scp.trustGradeResponse(verifier: verifier, request: request, response: response)
         XCTAssertEqual(graded.record.attempt, 1)
         XCTAssertTrue(graded.record.passed)
+    }
+
+    /// A typed `ChallengeVerified` requirement set at context creation is the
+    /// requirement admission enforces: a subject with no record is refused,
+    /// and a passing record from the trusted verifier admits it.
+    func testTypedRequirementRoundTripsThroughContextCreate() async throws {
+        let verifier = try await createInMemoryIdentity(scp)
+        let subject = try await createInMemoryIdentity(scp)
+        let contextId = try await contextRequiring(scp, [
+            .challengeVerified(ChallengeVerifiedRequirement(
+                capability: schemaUri, trustedVerifiers: [verifier.did()]
+            ))
+        ])
+        await assertValidationCode("SCP-VALID-7076") {
+            try await self.scp.checkCapabilityRequirements(
+                contextId: contextId, subjectDid: subject.did(),
+                agentCapabilities: [schemaUri], challengeVerifications: []
+            )
+        }
+        let cases = makeTestCases(20)
+        let request = try await gradableChallenge(verifier, subject.did(), cases, contextId)
+        let response = try await scp.trustRespondToChallenge(
+            subject: subject, request: request, outputs: passingOutputs(cases), attempt: 1
+        )
+        let graded = try await scp.trustGradeResponse(verifier: verifier, request: request, response: response)
+        try await scp.checkCapabilityRequirements(
+            contextId: contextId, subjectDid: subject.did(),
+            agentCapabilities: [], challengeVerifications: [graded.record]
+        )
+    }
+
+    /// A `ModifyCapabilityRequirements` proposal replaces the list admission
+    /// reads: a subject admitted under a `SelfAttested` requirement is refused
+    /// once the proposal requires a challenge record it does not hold.
+    func testGovernanceModifyCapabilityRequirementsTightens() async throws {
+        let messagesWriteUri = "scp:capability:messages-write/v1"
+        let creator = try await createInMemoryIdentity(scp)
+        let subject = try await createInMemoryIdentity(scp)
+        let handle = try await scp.contextCreate(
+            identity: creator,
+            params: ContextParams(
+                mode: .encrypted,
+                ceiling: ["messages:read", "messages:write", "governance:propose"],
+                ceilingPolicy: .immutable,
+                governance: .singleAdmin,
+                memoryScope: .ephemeral,
+                ttlSeconds: 3600,
+                promotable: false,
+                consequenceRules: nil,
+                consequenceConfig: nil,
+                capabilityRequirements: [.selfAttested(capability: messagesWriteUri)]
+            )
+        )
+        let admit = {
+            try await self.scp.checkCapabilityRequirements(
+                contextId: handle.contextId(), subjectDid: subject.did(),
+                agentCapabilities: [messagesWriteUri], challengeVerifications: []
+            )
+        }
+        try await admit()
+        _ = try await scp.governanceModifyCapabilityRequirements(
+            handle: handle,
+            proposerDid: creator.did(),
+            requirements: [
+                .challengeVerified(ChallengeVerifiedRequirement(
+                    capability: messagesWriteUri, trustedVerifiers: [creator.did()]
+                ))
+            ]
+        )
+        await assertValidationCode("SCP-VALID-7076") { try await admit() }
+    }
+
+    /// A second challenge to the same subject for the same capability is
+    /// refused while the first is open, and the refusal names the second the
+    /// first closes.
+    func testChallengeWhileWindowOpenIsRetryableAt7151() async throws {
+        let verifier = try await createInMemoryIdentity(scp)
+        let subject = try await createInMemoryIdentity(scp)
+        let contextId = try await requiringContext(verifierDid: verifier.did())
+        let config = CreateChallengeConfig(
+            verifier: verifier, subject: subject.did(), capabilityUri: schemaUri,
+            testCases: makeTestCases(20), contextId: contextId, windowSecs: 600
+        )
+        let first = try await scp.trustCreateChallenge(config)
+        var refusal: Error?
+        do {
+            _ = try await scp.trustCreateChallenge(config)
+        } catch {
+            refusal = error
+        }
+        let error = try XCTUnwrap(refusal, "a second challenge while the first is open must be refused")
+        guard case let ScpError.Validation(_, code) = error else {
+            return XCTFail("expected ScpError.Validation, got \(error)")
+        }
+        XCTAssertEqual(code, challengeWindowOpenCode)
+        XCTAssertTrue(isRetryable(code))
+        XCTAssertEqual(retryAfter(error), first.expiresAt)
+    }
+
+    /// A policy that sets only the cooldown keeps the definition's retries.
+    func testPolicyWithOnlyACooldownKeepsTheDefinitionRetries() async throws {
+        let verifier = try await createInMemoryIdentity(scp)
+        let contextId = try await requiringContext(verifierDid: verifier.did())
+        let plain = try await scp.trustCreateChallenge(CreateChallengeConfig(
+            verifier: verifier, subject: createInMemoryIdentity(scp).did(), capabilityUri: schemaUri,
+            testCases: makeTestCases(20), contextId: contextId, windowSecs: 600
+        ))
+        let tightened = try await scp.trustCreateChallenge(CreateChallengeConfig(
+            verifier: verifier, subject: createInMemoryIdentity(scp).did(), capabilityUri: schemaUri,
+            testCases: makeTestCases(20), contextId: contextId, windowSecs: 3600,
+            policy: ChallengePolicy(maxRetries: nil, cooldownSecs: plain.cooldownSecs + 600)
+        ))
+        XCTAssertEqual(tightened.maxRetries, plain.maxRetries)
+        XCTAssertEqual(tightened.cooldownSecs, plain.cooldownSecs + 600)
+    }
+
+    /// `CustomEval` cases that name two evaluator contexts are refused before
+    /// the bridge, with SCP-VALID-7001.
+    func testCustomEvalCasesNamingTwoContextsAreRefused() async throws {
+        let verifier = try await createInMemoryIdentity(scp)
+        let cases = [
+            TestCase(
+                testId: "t0", input: ["i": 0],
+                expected: .customEval(evaluatorOutletId: "o-1", evaluatorContextId: "ctx-a"),
+                category: "basic", weight: 5000
+            ),
+            TestCase(
+                testId: "t1", input: ["i": 1],
+                expected: .customEval(evaluatorOutletId: "o-1", evaluatorContextId: "ctx-b"),
+                category: "basic", weight: 5000
+            )
+        ]
+        await assertValidationCode("SCP-VALID-7001") {
+            _ = try await self.scp.trustCreateChallenge(CreateChallengeConfig(
+                verifier: verifier, subject: "did:dht:zSubject", capabilityUri: schemaUri,
+                testCases: cases, contextId: "ctx-1", windowSecs: 600
+            ))
+        }
+        XCTAssertEqual(try evaluatorContextId(of: [cases[0], cases[0]]), "ctx-a")
+        XCTAssertNil(try evaluatorContextId(of: makeTestCases(2)))
     }
 }
 

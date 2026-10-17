@@ -75,13 +75,14 @@ import type {
   BehavioralRecord,
   CachedAttestation,
   CachedAttestationEnvelope,
+  CapabilityRequirement,
   CapabilityValidation,
   ChallengePolicy,
   ChallengeRequest,
   ChallengeResponse,
   ChallengeVerification,
   ConsequenceRule,
-  CreateChallengeOptions,
+  CreateChallengeConfig,
   EventLogEntry,
   GovernanceActionResult,
   GradedChallenge,
@@ -92,7 +93,6 @@ import type {
   RequireParticipation,
   SagaResult,
   SealedInvitation,
-  TestCase,
   TestOutput,
   ThresholdRequirement,
   TrustEvaluation,
@@ -106,6 +106,7 @@ import {
   encodeAttestation,
   encodeAttestorSets,
   encodeCachedAttestations,
+  encodeCapabilityRequirements,
   encodeChallengeRequest,
   encodeChallengeResponse,
   encodeChallengeVerifications,
@@ -117,6 +118,7 @@ import {
   encodeTestCases,
   encodeTestOutputs,
   encodeThresholdRequirements,
+  evaluatorContextOf,
   governanceActionResultFromBridge,
   memberRoleFromBridge,
 } from "./types";
@@ -212,6 +214,48 @@ function contextHandle(method: string, param: string, value: unknown): BridgeCon
 function identityHandle(method: string, param: string, value: unknown): BridgeIdentityHandle {
   if (!Identity._isIdentity(value)) throw invalidHandleError(method, param, "Identity", value);
   return value._rawHandle;
+}
+
+/**
+ * Returns the params JSON `contextCreate` sends to the bridge: `paramsJson`
+ * with its `capabilityRequirements`, a list of typed
+ * {@link CapabilityRequirement}s, replaced by the wire-form JSON string
+ * {@link encodeCapabilityRequirements} returns.
+ *
+ * Params JSON that does not parse to an object, or that names no
+ * requirements, goes to the bridge unchanged, so the bridge reports its
+ * other defects with its own codes.
+ *
+ * @throws ValidationError `SCP-VALID-7001` when `capabilityRequirements` is
+ *   not a list, such as a JSON string of the wire form;
+ *   {@link INVALID_REQUIREMENT_CODE} or `SCP-VALID-7001` for an entry
+ *   {@link encodeCapabilityRequirements} refuses.
+ */
+function encodeContextParamsJson(paramsJson: string): string {
+  let params: unknown;
+  try {
+    params = JSON.parse(paramsJson);
+  } catch {
+    return paramsJson;
+  }
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    return paramsJson;
+  }
+  const record = params as Record<string, unknown>;
+  const requirements = record.capabilityRequirements;
+  if (requirements === undefined || requirements === null) {
+    return paramsJson;
+  }
+  if (!Array.isArray(requirements)) {
+    throw new ValidationError(
+      `contextCreate() params.capabilityRequirements must be a list of CapabilityRequirement, got ${JSON.stringify(requirements)}`,
+      "SCP-VALID-7001",
+    );
+  }
+  return JSON.stringify({
+    ...record,
+    capabilityRequirements: encodeCapabilityRequirements(requirements),
+  });
 }
 
 /** Returns the bridge handle of a `TransportManager`, or throws `SCP-VALID-7005`. */
@@ -1709,12 +1753,27 @@ export class SCP {
   // Domain: Context
   // ───────────────────────────────────────────────────────────────────────
 
+  /**
+   * Creates a context owned by `identity` from `paramsJson`, the JSON of a
+   * {@link ContextParams}.
+   *
+   * The SDK encodes `capabilityRequirements` itself, from the typed
+   * {@link CapabilityRequirement}s, to the bridge's wire form.
+   *
+   * @throws ValidationError `SCP-VALID-7005` when `identity` is not an
+   *   `Identity` this SDK returned; {@link INVALID_REQUIREMENT_CODE} for a
+   *   `ChallengeVerified` requirement with no trusted verifier;
+   *   `SCP-VALID-7001` when `capabilityRequirements` is not a list of typed
+   *   requirements. The bridge refuses other malformed params with its own
+   *   codes.
+   */
   async contextCreate(identity: Identity, paramsJson: string): Promise<Context> {
     const rawIdentity = identityHandle("contextCreate", "identity", identity);
+    const bridgeParamsJson = encodeContextParamsJson(paramsJson);
     try {
       const raw = await (
         this.#native.contextCreate as (id: unknown, p: string) => Promise<unknown>
-      )(rawIdentity, paramsJson);
+      )(rawIdentity, bridgeParamsJson);
       return Context._fromHandle(this, raw as never, identity.did);
     } catch (err) {
       throw mapBridgeError(err);
@@ -2524,6 +2583,45 @@ export class SCP {
     return checkProposalResponse(
       await bridge.contextGovernancePropose(handle, actionJson, proposerDid),
     );
+  }
+
+  /**
+   * Proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4): replaces the
+   * context's admission capability requirements with `requirements`. An
+   * empty list clears them. The SDK encodes the typed list itself.
+   *
+   * @returns The bridge's JSON `{proposal_id, status, reason?, rejector?,
+   *   execution_result}` after {@link checkProposalResponse} checks every name
+   *   in it, as {@link contextGovernancePropose} returns it.
+   * @throws ValidationError {@link INVALID_REQUIREMENT_CODE} for a
+   *   `ChallengeVerified` requirement with no trusted verifier, before any
+   *   bridge call; {@link NON_CANONICAL_IDENTIFIER_CODE} or
+   *   {@link TOO_MANY_CAPABILITY_REQUIREMENTS_CODE} from the bridge.
+   */
+  async contextGovernanceModifyCapabilityRequirements(
+    context: Context,
+    requirements: readonly CapabilityRequirement[],
+    proposerDid: string,
+  ): Promise<string> {
+    const handle = contextHandle(
+      "contextGovernanceModifyCapabilityRequirements",
+      "context",
+      context,
+    );
+    const requirementsJson = encodeCapabilityRequirements(requirements);
+    let raw: string;
+    try {
+      raw = await (
+        this.#native.contextGovernanceModifyCapabilityRequirements as (
+          h: unknown,
+          r: string,
+          p: string,
+        ) => Promise<string>
+      )(handle, requirementsJson, proposerDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+    return checkProposalResponse(raw);
   }
 
   /**
@@ -3896,40 +3994,34 @@ export class SCP {
   }
 
   /**
-   * Issue a challenge request signed by `verifier`'s `#active` key (spec 07
-   * §7.3.4 step 1, ADR-017).
+   * Issue a challenge request signed by `config.verifier`'s `#active` key
+   * (spec 07 §7.3.4 step 1, ADR-017).
    *
    * The challenger writes the cases with their answers. The returned request
-   * carries a salted commitment to each answer and never the answer; the
-   * challenger's ledger keeps the answers to grade with. The capability
-   * definition for `capabilityUri` sets the pass threshold, the retries and
-   * the cooldown; `options.policy` may only tighten them.
+   * carries each case's input and never its answer; the challenger's ledger
+   * keeps the answers to grade with. The capability definition for
+   * `config.capabilityUri` sets the pass threshold, the retries and the
+   * cooldown; `config.policy` may only tighten them, on any URI.
    *
-   * @param verifier DID of an identity of this instance; its custody signs.
-   * @param subject DID of the identity being challenged.
-   * @param capabilityUri The capability URI under test, in canonical form.
-   * @param testCases The challenger-written cases; their weights sum to 10000.
-   * @param contextId The context where the challenge is administered.
-   * @param windowSecs Seconds from creation during which attempts are graded.
-   * @param options A stricter policy, and the evaluator context for
-   *   `CustomEval` cases.
-   * @throws ValidationError `SCP-VALID-7013` for a malformed DID;
-   *   {@link CHALLENGE_SUITE_BELOW_MINIMUM_CODE} (`SCP-VALID-7039`) for too few
-   *   cases; `SCP-VALID-7137` for a policy looser than the definition;
-   *   {@link NON_CANONICAL_IDENTIFIER_CODE} for a DID that is not canonical.
+   * The SDK passes the one evaluator context the `CustomEval` cases name to
+   * the bridge.
+   *
+   * @throws ValidationError `SCP-VALID-7005` when `config.verifier` is not an
+   *   `Identity` this SDK returned; `SCP-VALID-7001` when two `CustomEval`
+   *   cases name different evaluator contexts, before any bridge call;
+   *   `SCP-VALID-7013` for a malformed DID;
+   *   {@link CHALLENGE_SUITE_BELOW_MINIMUM_CODE} for too few cases;
+   *   {@link POLICY_OUTSIDE_DEFINITION_CODE} for a policy looser than the
+   *   definition; {@link NON_CANONICAL_IDENTIFIER_CODE} for a DID that is not
+   *   canonical; {@link CHALLENGE_WINDOW_OPEN_CODE} while the last challenge
+   *   to this subject for this capability is inside its window.
    * @throws ScpError `SCP-CRYPTO-4006` when the verifier's key is destroyed,
    *   or another custody failure.
    */
-  async trustCreateChallenge(
-    verifier: string,
-    subject: string,
-    capabilityUri: string,
-    testCases: readonly TestCase[],
-    contextId: string,
-    windowSecs: number,
-    options: CreateChallengeOptions = {},
-  ): Promise<ChallengeRequest> {
-    const testCasesJson = encodeTestCases(testCases);
+  async trustCreateChallenge(config: CreateChallengeConfig): Promise<ChallengeRequest> {
+    identityHandle("trustCreateChallenge", "config.verifier", config.verifier);
+    const evaluatorContextId = evaluatorContextOf(config.testCases);
+    const testCasesJson = encodeTestCases(config.testCases);
     let created: { challengeId: string; requestJson: string };
     try {
       created = await (
@@ -3944,14 +4036,14 @@ export class SCP {
           p: ChallengePolicy | undefined,
         ) => Promise<{ challengeId: string; requestJson: string }>
       )(
-        verifier,
-        subject,
-        capabilityUri,
+        config.verifier.did,
+        config.subject,
+        config.capabilityUri,
         testCasesJson,
-        contextId,
-        windowSecs,
-        options.evaluatorContextId,
-        options.policy,
+        config.contextId,
+        config.windowSecs,
+        evaluatorContextId,
+        config.policy,
       );
     } catch (err) {
       throw mapBridgeError(err);
@@ -3966,22 +4058,25 @@ export class SCP {
    * The challenger's signature on `request` is checked against the key this
    * instance's DID resolver returns before anything is signed.
    *
-   * @param subject DID of the challenged identity; it must be an identity of
-   *   this instance.
+   * @param subject The challenged identity, an identity of this instance;
+   *   its custody signs the response.
    * @param request The signed request, as the challenger sent it.
    * @param outputs One output per case.
    * @param attempt The attempt number, starting at 1.
-   * @throws ValidationError `SCP-VALID-7013` for a malformed DID, or a
-   *   refusal when the request's signature, subject or window does not hold.
+   * @throws ValidationError `SCP-VALID-7005` when `subject` is not an
+   *   `Identity` this SDK returned; `SCP-VALID-7013` for a malformed DID; or
+   *   a refusal when the request's signature, subject or window does not
+   *   hold, such as {@link CHALLENGE_EXPIRED_CODE}.
    * @throws IdentityError `SCP-IDENT-1033` when this instance has no DID
    *   resolver.
    */
   async trustRespondToChallenge(
-    subject: string,
+    subject: Identity,
     request: ChallengeRequest,
     outputs: readonly TestOutput[],
     attempt: number,
   ): Promise<ChallengeResponse> {
+    identityHandle("trustRespondToChallenge", "subject", subject);
     const requestJson = encodeChallengeRequest(request);
     const outputsJson = encodeTestOutputs(outputs);
     let responseJson: string;
@@ -3993,7 +4088,7 @@ export class SCP {
           o: string,
           a: number,
         ) => Promise<string>
-      )(subject, requestJson, outputsJson, attempt);
+      )(subject.did, requestJson, outputsJson, attempt);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -4009,22 +4104,27 @@ export class SCP {
    * against its stored answer, and signs a record for the attempt, pass or
    * fail. The record is also written to this instance's trust store.
    *
-   * @param verifier DID of the identity that issued `request`; it must be an
-   *   identity of this instance.
+   * @param verifier The identity that issued `request`, an identity of this
+   *   instance; its custody signs the record.
    * @param request The signed request.
    * @param response The subject's signed response.
-   * @throws ValidationError `SCP-VALID-7013` for a malformed DID, a refusal
-   *   when a signature or the attempt does not hold,
-   *   {@link GRADING_CAPACITY_EXHAUSTED_CODE}, {@link GRADING_LEASE_LOST_CODE}
-   *   or {@link ANSWER_KEY_MISMATCH_CODE} for a grading that used no attempt.
+   * @throws ValidationError `SCP-VALID-7005` when `verifier` is not an
+   *   `Identity` this SDK returned; `SCP-VALID-7013` for a malformed DID;
+   *   `SCP-VALID-7003` for a response whose signature does not verify; a
+   *   refusal when the attempt does not hold, such as
+   *   {@link COOLDOWN_ACTIVE_CODE}; or {@link GRADING_CAPACITY_EXHAUSTED_CODE},
+   *   {@link GRADING_IN_PROGRESS_CODE} or {@link GRADING_LEASE_LOST_CODE} for a
+   *   grading that used no attempt. {@link isRetryable} tells a refusal worth
+   *   retrying from a final one, and {@link retryAfter} reads when to retry.
    * @throws IdentityError `SCP-IDENT-1033` when this instance has no DID
    *   resolver.
    */
   async trustGradeResponse(
-    verifier: string,
+    verifier: Identity,
     request: ChallengeRequest,
     response: ChallengeResponse,
   ): Promise<GradedChallenge> {
+    identityHandle("trustGradeResponse", "verifier", verifier);
     const requestJson = encodeChallengeRequest(request);
     const responseJson = encodeChallengeResponse(response);
     let graded: {
@@ -4043,7 +4143,7 @@ export class SCP {
           reasonsJson: string;
           trustStoreError?: { code: string; message: string } | null;
         }>
-      )(verifier, requestJson, responseJson);
+      )(verifier.did, requestJson, responseJson);
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -4092,8 +4192,9 @@ export class SCP {
    * admission (spec 07 §7.3.4.4).
    *
    * The requirements are the ones the context's governance holds at the time
-   * of the call, set through {@link ContextParams.capabilityRequirements}; the
-   * caller cannot supply them. A `ChallengeVerified` requirement is met only
+   * of the call, set through {@link ContextParams.capabilityRequirements} or
+   * {@link contextGovernanceModifyCapabilityRequirements}; the caller cannot
+   * supply them. A `ChallengeVerified` requirement is met only
    * by a passing record signed by one of its trusted verifiers, for this
    * subject and context, within the requirement's retry cap.
    *

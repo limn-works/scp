@@ -53,14 +53,14 @@ pub struct NapiChallengeRequest {
 }
 
 /// A challenger's choice of fewer retries or a longer cooldown than the
-/// capability definition's.
+/// capability definition's. An absent field takes the definition's value.
 #[napi(object)]
 #[derive(Debug, Clone, Copy)]
 pub struct NapiPolicyPick {
     /// Retries after the first attempt; at most the definition's.
-    pub max_retries: u32,
+    pub max_retries: Option<u32>,
     /// Seconds between graded attempts; at least the definition's.
-    pub cooldown_secs: u32,
+    pub cooldown_secs: Option<u32>,
 }
 
 /// A graded attempt, as `trustGradeResponse` returns it.
@@ -454,10 +454,12 @@ pub(crate) async fn trust_create_challenge_on(
             test_cases_json,
             window_secs: u64::from(window_secs),
             context_id,
-            policy: policy.map(|p| scp_core::trust::PolicyPick {
-                max_retries: p.max_retries,
-                cooldown_secs: p.cooldown_secs,
-            }),
+            policy: policy
+                .map(|p| scp_core::trust::PolicyPick {
+                    max_retries: p.max_retries,
+                    cooldown_secs: p.cooldown_secs,
+                })
+                .unwrap_or_default(),
             evaluator_context_id,
         },
         &NapiEvaluatorInvoker { bi, sup },
@@ -1616,7 +1618,7 @@ mod tests {
                 "ceiling": ["messages:read", "messages:write"],
                 "memoryScope": "ephemeral",
                 "governance": "single_admin",
-                "capabilityRequirements": requirements,
+                "capabilityRequirements": requirements.to_string(),
             })
             .to_string();
             crate::context::context_create_on(&scp.inner, creator, params)
@@ -1641,6 +1643,25 @@ mod tests {
             ] {
                 assert!(context_with(&scp, &creator, bad).await.is_err());
             }
+            // The bridge takes the requirements only as the JSON string the
+            // SDK encodes; a raw array is refused, not normalized.
+            let params = serde_json::json!({
+                "ceiling": ["messages:read", "messages:write"],
+                "memoryScope": "ephemeral",
+                "governance": "single_admin",
+                "capabilityRequirements": self_attested(),
+            })
+            .to_string();
+            let msg = crate::context::context_create_on(&scp.inner, &creator, params)
+                .await
+                .map(|handle| handle.context_id())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                msg.contains(&format!("[{}]", codes::VALID_7000)),
+                "expected {}, got: {msg}",
+                codes::VALID_7000
+            );
         }
 
         /// A requirement list that breaks a spec 07 §7.3.4.4 rule refuses

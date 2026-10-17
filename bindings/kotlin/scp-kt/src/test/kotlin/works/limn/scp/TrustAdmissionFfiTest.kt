@@ -24,7 +24,6 @@ import org.junit.jupiter.api.assertDoesNotThrow
 import org.junit.jupiter.api.assertThrows
 import uniffi.scp.CeilingPolicy
 import uniffi.scp.ContextMode
-import uniffi.scp.ContextParams
 import uniffi.scp.GovernanceModel
 import uniffi.scp.MemoryScope
 import uniffi.scp.ScpException
@@ -61,7 +60,7 @@ class TrustAdmissionFfiTest {
         return scp
             .contextCreate(
                 creator,
-                ContextParams(
+                TypedContextParams(
                     mode = ContextMode.ENCRYPTED,
                     ceiling = listOf("messages:read", "messages:write"),
                     ceilingPolicy = CeilingPolicy.IMMUTABLE,
@@ -69,24 +68,16 @@ class TrustAdmissionFfiTest {
                     memoryScope = MemoryScope.EPHEMERAL,
                     ttlSeconds = 3600uL,
                     promotable = false,
-                    minProtocolVersion = 0.toUShort(),
-                    maxChainDepth = null,
-                    maxNestingDepth = null,
-                    sessionCap = null,
-                    economicPolicy = null,
-                    consequenceRulesJson = null,
-                    consequenceConfigJson = null,
-                    capabilityRequirementsJson = encodeCapabilityRequirementsJson(requirements),
+                    consequenceRules = null,
+                    consequenceConfig = null,
+                    capabilityRequirements = requirements,
                 ),
             ).contextId()
     }
 
     private val messagesWrite =
         listOf(
-            CapabilityRequirement(
-                capability = "scp:capability:messages-write/v1",
-                verificationLevel = VerificationLevel.SELF_ATTESTED,
-            ),
+            CapabilityRequirement.SelfAttested(capability = "scp:capability:messages-write/v1"),
         )
 
     @Test
@@ -162,9 +153,8 @@ class TrustAdmissionFfiTest {
             val contextId =
                 contextRequiring(
                     listOf(
-                        CapabilityRequirement(
+                        CapabilityRequirement.ChallengeVerified(
                             capability = capability,
-                            verificationLevel = VerificationLevel.CHALLENGE_VERIFIED,
                             trustedVerifiers = listOf(verifier.did()),
                         ),
                     ),

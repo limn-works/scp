@@ -46,12 +46,11 @@ final class ContextParamsTypedInitTests: XCTestCase {
         let params = try makeParams(
             ceiling: ["messages:read"],
             capabilityRequirements: [
-                CapabilityRequirement(
+                .challengeVerified(ChallengeVerifiedRequirement(
                     capability: "scp:cap:translate",
-                    verificationLevel: .challengeVerified,
                     trustedVerifiers: ["did:dht:verifier"],
                     retryCap: RetryCap(maxRetries: 2, minCooldownSecs: 60)
-                )
+                ))
             ]
         )
         let json = try XCTUnwrap(params.capabilityRequirementsJson)

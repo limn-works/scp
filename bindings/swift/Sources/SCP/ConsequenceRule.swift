@@ -443,6 +443,10 @@ public extension ContextParams {
     /// strings — it removes the round-trip through hand-rolled JSON and gives
     /// callers compile-time checks against the discriminated unions.
     ///
+    /// `capabilityRequirements` are the context's admission requirements
+    /// (spec 07 §7.3.4.4); `nil`, the default, sets none. The initializer
+    /// encodes them to `capabilityRequirementsJson`.
+    ///
     /// `ceiling` is forwarded as written. An empty list makes the create fail
     /// with `ScpError.Validation` code `SCP-VALID-7005` (construction.md M2);
     /// no default ceiling replaces it.
@@ -464,7 +468,7 @@ public extension ContextParams {
         economicPolicy: String? = nil,
         consequenceRules: [ConsequenceRule]?,
         consequenceConfig: ConsequenceConfig?,
-        capabilityRequirements: [CapabilityRequirement]?
+        capabilityRequirements: [CapabilityRequirement]? = nil
     ) throws {
         let rulesJson = try consequenceRules.map { try encodeConsequenceRulesJson($0) }
         let configJson = try consequenceConfig.map { try encodeConsequenceConfigJson($0) }

@@ -9109,27 +9109,27 @@ public func FfiConverterTypeChallengeGradeResult_lower(_ value: ChallengeGradeRe
 
 /**
  * A challenger's choice of fewer retries or a longer cooldown than the
- * capability definition's.
+ * capability definition's. An absent field takes the definition's value.
  */
 public struct ChallengePolicy {
     /**
      * Retries after the first attempt; at most the definition's.
      */
-    public var maxRetries: UInt32
+    public var maxRetries: UInt32?
     /**
      * Seconds between graded attempts; at least the definition's.
      */
-    public var cooldownSecs: UInt32
+    public var cooldownSecs: UInt32?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
          * Retries after the first attempt; at most the definition's.
-         */maxRetries: UInt32, 
+         */maxRetries: UInt32?, 
         /**
          * Seconds between graded attempts; at least the definition's.
-         */cooldownSecs: UInt32) {
+         */cooldownSecs: UInt32?) {
         self.maxRetries = maxRetries
         self.cooldownSecs = cooldownSecs
     }
@@ -9166,14 +9166,14 @@ public struct FfiConverterTypeChallengePolicy: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChallengePolicy {
         return
             try ChallengePolicy(
-                maxRetries: FfiConverterUInt32.read(from: &buf), 
-                cooldownSecs: FfiConverterUInt32.read(from: &buf)
+                maxRetries: FfiConverterOptionUInt32.read(from: &buf), 
+                cooldownSecs: FfiConverterOptionUInt32.read(from: &buf)
         )
     }
 
     public static func write(_ value: ChallengePolicy, into buf: inout [UInt8]) {
-        FfiConverterUInt32.write(value.maxRetries, into: &buf)
-        FfiConverterUInt32.write(value.cooldownSecs, into: &buf)
+        FfiConverterOptionUInt32.write(value.maxRetries, into: &buf)
+        FfiConverterOptionUInt32.write(value.cooldownSecs, into: &buf)
     }
 }
 

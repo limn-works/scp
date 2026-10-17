@@ -828,14 +828,17 @@ fn resolve_definition(
     Ok((definition, digest))
 }
 
-/// A challenger's choice of retries and cooldown, within the definition's
-/// limits: no more retries, and no shorter cooldown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A challenger's choice of retries and cooldown within the definition's limits.
+///
+/// A pick allows no more retries and no shorter cooldown than the definition.
+/// An absent field takes the definition's value, so a challenger tightens one
+/// field without restating the other; the default pick takes both.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PolicyPick {
     /// Retries after the first attempt; at most the definition's.
-    pub max_retries: u32,
+    pub max_retries: Option<u32>,
     /// Seconds between graded attempts; at least the definition's.
-    pub cooldown_secs: u32,
+    pub cooldown_secs: Option<u32>,
 }
 
 /// The signed policy of one challenge: the definition it follows and the
@@ -850,8 +853,8 @@ pub struct ChallengePolicy {
 
 impl ChallengePolicy {
     /// Obtains the definition of `capability_uri` from `defs` and fixes the
-    /// policy. With no `pick`, the definition's values apply; the threshold
-    /// is always the definition's.
+    /// policy. A field `pick` leaves absent takes the definition's value;
+    /// the threshold is always the definition's.
     ///
     /// # Errors
     ///
@@ -860,34 +863,32 @@ impl ChallengePolicy {
     pub fn resolve(
         defs: &dyn CapabilityDefinitionSource,
         capability_uri: &str,
-        pick: Option<PolicyPick>,
+        pick: PolicyPick,
     ) -> Result<Self, TrustError> {
         let (definition, definition_digest) = resolve_definition(defs, capability_uri)?;
-        let pick = pick.unwrap_or(PolicyPick {
-            max_retries: definition.max_retries,
-            cooldown_secs: definition.cooldown_secs,
-        });
+        let max_retries = pick.max_retries.unwrap_or(definition.max_retries);
+        let cooldown_secs = pick.cooldown_secs.unwrap_or(definition.cooldown_secs);
         let outside = |reason: String| TrustError::PolicyOutsideDefinition {
             uri: capability_uri.to_owned(),
             reason,
         };
-        if pick.max_retries > definition.max_retries {
+        if max_retries > definition.max_retries {
             return Err(outside(format!(
-                "max_retries {} exceeds the definition's {}",
-                pick.max_retries, definition.max_retries
+                "max_retries {max_retries} exceeds the definition's {}",
+                definition.max_retries
             )));
         }
-        if pick.cooldown_secs < definition.cooldown_secs {
+        if cooldown_secs < definition.cooldown_secs {
             return Err(outside(format!(
-                "cooldown_secs {} is below the definition's {}",
-                pick.cooldown_secs, definition.cooldown_secs
+                "cooldown_secs {cooldown_secs} is below the definition's {}",
+                definition.cooldown_secs
             )));
         }
         Ok(Self {
             definition,
             definition_digest,
-            max_retries: pick.max_retries,
-            cooldown_secs: pick.cooldown_secs,
+            max_retries,
+            cooldown_secs,
         })
     }
 
@@ -2638,7 +2639,7 @@ mod tests {
             fx.definitions.fixture_override = Some(bad);
             assert!(
                 matches!(
-                    ChallengePolicy::resolve(&fx.definitions, FIXTURE_URI, None),
+                    ChallengePolicy::resolve(&fx.definitions, FIXTURE_URI, PolicyPick::default()),
                     Err(TrustError::CapabilityDefinitionUnavailable { .. })
                 ),
                 "{what}: resolve"
@@ -3212,7 +3213,9 @@ mod tests {
         };
 
         // Create.
-        let mut new = fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap();
+        let mut new = fx
+            .new_challenge(FIXTURE_URI, cases(2), PolicyPick::default())
+            .unwrap();
         new.subject = DID::from(alias.as_str());
         noncanonical(challenge_request_unsigned(new).map(|_| ()));
 
@@ -3250,7 +3253,9 @@ mod tests {
 
         // Self-challenge: the subject is the verifier's key in another form.
         let same_key = DID::from(format!("did:key:{}", hex::encode(fx.verifier.public())));
-        let mut new = fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap();
+        let mut new = fx
+            .new_challenge(FIXTURE_URI, cases(2), PolicyPick::default())
+            .unwrap();
         new.subject = same_key.clone();
         assert!(matches!(
             challenge_request_unsigned(new),
@@ -3378,7 +3383,8 @@ mod tests {
         definition.cooldown_secs = u32::MAX;
         definition.validate().unwrap();
         fx.definitions.fixture_override = Some(definition);
-        let policy = ChallengePolicy::resolve(&fx.definitions, FIXTURE_URI, None).unwrap();
+        let policy =
+            ChallengePolicy::resolve(&fx.definitions, FIXTURE_URI, PolicyPick::default()).unwrap();
         assert_eq!(
             (policy.max_retries(), policy.cooldown_secs()),
             (u32::MAX, u32::MAX)
@@ -3421,10 +3427,10 @@ mod tests {
             ChallengePolicy::resolve(
                 &fx.definitions,
                 FIXTURE_URI,
-                Some(PolicyPick {
-                    max_retries,
-                    cooldown_secs,
-                }),
+                PolicyPick {
+                    max_retries: Some(max_retries),
+                    cooldown_secs: Some(cooldown_secs),
+                },
             )
         };
         let strict = pick(0, 7200).unwrap();
@@ -3441,13 +3447,38 @@ mod tests {
                 "{max_retries} {cooldown}"
             );
         }
-        let default = ChallengePolicy::resolve(&fx.definitions, FIXTURE_URI, None).unwrap();
+        let default =
+            ChallengePolicy::resolve(&fx.definitions, FIXTURE_URI, PolicyPick::default()).unwrap();
         assert_eq!((default.max_retries(), default.cooldown_secs()), (2, 3600));
+        // A pick that names one field takes the definition's other value.
+        let one = |pick| ChallengePolicy::resolve(&fx.definitions, FIXTURE_URI, pick).unwrap();
+        let longer = one(PolicyPick {
+            cooldown_secs: Some(7200),
+            ..PolicyPick::default()
+        });
+        assert_eq!((longer.max_retries(), longer.cooldown_secs()), (2, 7200));
+        let fewer = one(PolicyPick {
+            max_retries: Some(0),
+            ..PolicyPick::default()
+        });
+        assert_eq!((fewer.max_retries(), fewer.cooldown_secs()), (0, 3600));
+        assert!(matches!(
+            ChallengePolicy::resolve(
+                &fx.definitions,
+                FIXTURE_URI,
+                PolicyPick {
+                    cooldown_secs: Some(3599),
+                    ..PolicyPick::default()
+                }
+            ),
+            Err(TrustError::PolicyOutsideDefinition { .. })
+        ));
         // The signed request carries the stricter pick and the threshold.
         let new = NewChallenge {
             policy: strict,
             window_secs: 7200,
-            ..fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap()
+            ..fx.new_challenge(FIXTURE_URI, cases(2), PolicyPick::default())
+                .unwrap()
         };
         let (unsigned, _) = challenge_request_unsigned(new).unwrap();
         let request = unsigned.request();
@@ -3472,7 +3503,8 @@ mod tests {
         for window_secs in [0, MAX_CHALLENGE_WINDOW_SECS + 1] {
             let new = NewChallenge {
                 window_secs,
-                ..fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap()
+                ..fx.new_challenge(FIXTURE_URI, cases(2), PolicyPick::default())
+                    .unwrap()
             };
             assert!(matches!(
                 challenge_request_unsigned(new),
@@ -3481,7 +3513,8 @@ mod tests {
         }
         let new = NewChallenge {
             window_secs: MAX_CHALLENGE_WINDOW_SECS,
-            ..fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap()
+            ..fx.new_challenge(FIXTURE_URI, cases(2), PolicyPick::default())
+                .unwrap()
         };
         let (unsigned, _) = challenge_request_unsigned(new).unwrap();
         assert_eq!(
@@ -3490,7 +3523,8 @@ mod tests {
         );
         let new = NewChallenge {
             created_at: u64::MAX,
-            ..fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap()
+            ..fx.new_challenge(FIXTURE_URI, cases(2), PolicyPick::default())
+                .unwrap()
         };
         assert!(matches!(
             challenge_request_unsigned(new),
@@ -3503,11 +3537,14 @@ mod tests {
     #[test]
     fn request_rejects_window_shorter_than_cooldown() {
         let fx = fixture();
-        let template = fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap();
+        let template = fx
+            .new_challenge(FIXTURE_URI, cases(2), PolicyPick::default())
+            .unwrap();
         let cooldown = u64::from(template.policy.cooldown_secs());
         let short = NewChallenge {
             window_secs: cooldown - 1,
-            ..fx.new_challenge(FIXTURE_URI, cases(2), None).unwrap()
+            ..fx.new_challenge(FIXTURE_URI, cases(2), PolicyPick::default())
+                .unwrap()
         };
         assert!(matches!(
             challenge_request_unsigned(short),
@@ -3566,10 +3603,10 @@ mod tests {
             ChallengePolicy::resolve(
                 &fx.definitions,
                 PROTOCOL_URI,
-                Some(PolicyPick {
-                    max_retries: 3,
-                    cooldown_secs: 300
-                })
+                PolicyPick {
+                    max_retries: Some(3),
+                    cooldown_secs: Some(300)
+                }
             ),
             Err(TrustError::PolicyOutsideDefinition { .. })
         ));
@@ -3607,7 +3644,7 @@ mod tests {
             ChallengePolicy::resolve(
                 &fx.definitions,
                 "scp:capability:schema-validation/v01",
-                None
+                PolicyPick::default()
             ),
             Err(TrustError::UnknownChallengeCapability { .. })
         ));
@@ -3630,14 +3667,14 @@ mod tests {
         let other =
             "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:anything/v1";
         assert!(matches!(
-            ChallengePolicy::resolve(&fx.definitions, other, None),
+            ChallengePolicy::resolve(&fx.definitions, other, PolicyPick::default()),
             Err(TrustError::CapabilityDefinitionUnavailable { .. })
         ));
         assert!(matches!(
             ChallengePolicy::resolve(
                 &super::super::capability_definition::ProtocolOnlyDefinitions,
                 FIXTURE_URI,
-                None
+                PolicyPick::default()
             ),
             Err(TrustError::CapabilityDefinitionUnavailable { .. })
         ));
@@ -3660,7 +3697,7 @@ mod tests {
             if standard.grading == Grading::Refused {
                 assert!(
                     matches!(
-                        ChallengePolicy::resolve(&fx.definitions, uri, None),
+                        ChallengePolicy::resolve(&fx.definitions, uri, PolicyPick::default()),
                         Err(TrustError::StandardNotGradable { .. })
                     ),
                     "{uri}"
@@ -3723,7 +3760,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    ChallengePolicy::resolve(&fx.definitions, uri, None),
+                    ChallengePolicy::resolve(&fx.definitions, uri, PolicyPick::default()),
                     Err(TrustError::StandardNotGradable { .. })
                 ),
                 "{uri}"

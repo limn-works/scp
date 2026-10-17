@@ -16,10 +16,23 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { ScpError } from "../src/errors";
+import { ScpError, ValidationError } from "../src/errors";
+import type { Identity } from "../src/identity";
 import { SCP } from "../src/scp";
-import type { CachedAttestationEnvelope, EventLogEntry, TestCase } from "../src/types";
-import { CHALLENGE_SUITE_BELOW_MINIMUM_CODE, encodeCapabilityRequirements } from "../src/types";
+import type {
+  CachedAttestationEnvelope,
+  CapabilityRequirement,
+  CreateChallengeConfig,
+  EventLogEntry,
+  TestCase,
+} from "../src/types";
+import {
+  CHALLENGE_SUITE_BELOW_MINIMUM_CODE,
+  CHALLENGE_WINDOW_OPEN_CODE,
+  INVALID_REQUIREMENT_CODE,
+  isRetryable,
+  retryAfter,
+} from "../src/types";
 
 const SCHEMA_URI = "scp:capability:schema-validation/v1";
 
@@ -159,25 +172,49 @@ if (scp === null) {
       expect(result.errorMessage).toContain("signature");
     });
 
-    /** A context on `live` whose governance requires `SCHEMA_URI` graded by `verifier`. */
-    async function requiringContext(verifierDid: string): Promise<string> {
+    /**
+     * A context on `live` created through `SCP.contextCreate` with the typed
+     * `requirements`, and the identity that created it.
+     */
+    async function contextRequiring(
+      requirements: readonly CapabilityRequirement[],
+    ): Promise<{ context: Awaited<ReturnType<SCP["contextCreate"]>>; creator: Identity }> {
       const creator = await createInMemoryIdentity(live);
-      const ctx = await live.contextCreate(
+      const context = await live.contextCreate(
         creator,
         JSON.stringify({
-          ceiling: ["messages:read", "messages:write"],
+          ceiling: ["messages:read", "messages:write", "governance:propose"],
           memoryScope: "ephemeral",
           governance: "single_admin",
-          capabilityRequirements: encodeCapabilityRequirements([
-            {
-              capability: SCHEMA_URI,
-              verificationLevel: "ChallengeVerified",
-              trustedVerifiers: [verifierDid],
-            },
-          ]),
+          capabilityRequirements: requirements,
         }),
       );
-      return ctx.contextId;
+      return { context, creator };
+    }
+
+    /** A context on `live` whose governance requires `SCHEMA_URI` graded by `verifier`. */
+    async function requiringContext(verifierDid: string): Promise<string> {
+      const { context } = await contextRequiring([
+        { kind: "ChallengeVerified", capability: SCHEMA_URI, trustedVerifiers: [verifierDid] },
+      ]);
+      return context.contextId;
+    }
+
+    /** The config of a 20-case `SCHEMA_URI` challenge with a one-hour window. */
+    function challengeConfig(
+      verifier: Identity,
+      subject: Identity,
+      contextId: string,
+      cases: readonly TestCase[] = testCases(20),
+    ): CreateChallengeConfig {
+      return {
+        verifier,
+        subject: subject.did,
+        capabilityUri: SCHEMA_URI,
+        testCases: cases,
+        contextId,
+        windowSecs: 3_600,
+      };
     }
 
     test("trustCreateChallenge refuses a protocol suite below its minimum with SCP-VALID-7039", async () => {
@@ -187,12 +224,7 @@ if (scp === null) {
       let caught: unknown;
       try {
         await live.trustCreateChallenge(
-          verifier.did,
-          subject.did,
-          SCHEMA_URI,
-          testCases(19),
-          contextId,
-          3_600,
+          challengeConfig(verifier, subject, contextId, testCases(19)),
         );
       } catch (e) {
         caught = e;
@@ -211,12 +243,7 @@ if (scp === null) {
       const cases = testCases(20);
 
       const request = await live.trustCreateChallenge(
-        verifier.did,
-        subject.did,
-        SCHEMA_URI,
-        cases,
-        contextId,
-        3_600,
+        challengeConfig(verifier, subject, contextId, cases),
       );
       await pastCreationSecond(request);
       expect(request.verifier).toBe(verifier.did);
@@ -225,7 +252,7 @@ if (scp === null) {
       expect(request.capabilityUri).toBe(SCHEMA_URI);
       expect(request.testCases.map((c) => c.testId)).toEqual(cases.map((c) => c.testId));
       expect(request.expiresAt - request.createdAt).toBe(3_600);
-      // The request commits to each answer and never carries it.
+      // The request carries each case's input and never its answer.
       expect(JSON.stringify(request)).not.toContain("ExactMatch");
 
       await expect(
@@ -233,7 +260,7 @@ if (scp === null) {
       ).rejects.toMatchObject({ code: "SCP-VALID-7076" });
 
       const response = await live.trustRespondToChallenge(
-        subject.did,
+        subject,
         request,
         cases.map((c) => ({ testId: c.testId, output: { ok: true } })),
         1,
@@ -242,7 +269,7 @@ if (scp === null) {
       expect(response.subject).toBe(subject.did);
       expect(response.attempt).toBe(1);
 
-      const graded = await live.trustGradeResponse(verifier.did, request, response);
+      const graded = await live.trustGradeResponse(verifier, request, response);
       expect(graded.trustStoreError).toBeNull();
       expect(graded.caseResults).toHaveLength(20);
       expect(graded.caseResults.every((c) => c.passed)).toBe(true);
@@ -271,34 +298,179 @@ if (scp === null) {
       const contextId = await requiringContext(verifier.did);
       const cases = testCases(20);
       const request = await live.trustCreateChallenge(
-        verifier.did,
-        subject.did,
-        SCHEMA_URI,
-        cases,
-        contextId,
-        3_600,
+        challengeConfig(verifier, subject, contextId, cases),
       );
       await pastCreationSecond(request);
       const response = await live.trustRespondToChallenge(
-        subject.did,
+        subject,
         request,
         cases.map((c) => ({ testId: c.testId, output: { ok: true } })),
         1,
       );
       let caught: unknown;
       try {
-        await live.trustGradeResponse(verifier.did, request, {
+        await live.trustGradeResponse(verifier, request, {
           ...response,
           subjectSignature: Array.from({ length: 64 }, () => 0),
         });
       } catch (e) {
         caught = e;
       }
-      expect(caught).toBeInstanceOf(ScpError);
+      // `TrustError::ChallengeSignatureInvalid` keeps the generic trust code.
+      expect(caught).toBeInstanceOf(ValidationError);
+      expect((caught as ValidationError).code).toBe("SCP-VALID-7003");
       // The forgery took no attempt: the real response still grades as attempt 1.
-      const graded = await live.trustGradeResponse(verifier.did, request, response);
+      const graded = await live.trustGradeResponse(verifier, request, response);
       expect(graded.record.attempt).toBe(1);
       expect(graded.record.passed).toBe(true);
     });
+
+    test("contextCreate refuses a ChallengeVerified requirement with no verifier with SCP-VALID-7150", async () => {
+      const empty = {
+        kind: "ChallengeVerified",
+        capability: SCHEMA_URI,
+        trustedVerifiers: [],
+      } as unknown as CapabilityRequirement;
+      let caught: unknown;
+      try {
+        await contextRequiring([empty]);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(ValidationError);
+      expect((caught as ValidationError).code).toBe(INVALID_REQUIREMENT_CODE);
+    });
+
+    test("contextCreate refuses the wire-form JSON string of the requirements with SCP-VALID-7001", async () => {
+      const creator = await createInMemoryIdentity(live);
+      const wire = JSON.stringify([
+        { capability: SCHEMA_URI, verification_level: "SelfAttested", trusted_verifiers: [] },
+      ]);
+      let caught: unknown;
+      try {
+        await live.contextCreate(
+          creator,
+          JSON.stringify({ ceiling: ["messages:read"], capabilityRequirements: wire }),
+        );
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(ValidationError);
+      expect((caught as ValidationError).code).toBe("SCP-VALID-7001");
+    });
+
+    test("a typed requirement set at contextCreate is the one admission enforces", async () => {
+      const verifier = await createInMemoryIdentity(live);
+      const subject = await createInMemoryIdentity(live);
+      const outsider = await createInMemoryIdentity(live);
+      const contextId = await requiringContext(verifier.did);
+      const cases = testCases(20);
+
+      // No record: refused.
+      await expect(
+        live.checkCapabilityRequirements(contextId, subject.did, [SCHEMA_URI], []),
+      ).rejects.toMatchObject({ code: "SCP-VALID-7076" });
+
+      // A passing record from a verifier the requirement does not trust: refused.
+      const outsiderContext = (
+        await contextRequiring([
+          { kind: "ChallengeVerified", capability: SCHEMA_URI, trustedVerifiers: [outsider.did] },
+        ])
+      ).context.contextId;
+      const untrusted = await gradedRecord(outsider, subject, outsiderContext, cases);
+      expect(untrusted.passed).toBe(true);
+      await expect(
+        live.checkCapabilityRequirements(contextId, subject.did, [], [untrusted]),
+      ).rejects.toBeInstanceOf(ValidationError);
+
+      // A passing record from the trusted verifier: admitted.
+      const trusted = await gradedRecord(verifier, subject, contextId, cases);
+      await expect(
+        live.checkCapabilityRequirements(contextId, subject.did, [], [trusted]),
+      ).resolves.toBeUndefined();
+    });
+
+    test("contextGovernanceModifyCapabilityRequirements tightens admission", async () => {
+      const verifier = await createInMemoryIdentity(live);
+      const subject = await createInMemoryIdentity(live);
+      const { context, creator } = await contextRequiring([
+        { kind: "SelfAttested", capability: SCHEMA_URI },
+      ]);
+      // The self-attested capability meets the requirement the context was created with.
+      await expect(
+        live.checkCapabilityRequirements(context.contextId, subject.did, [SCHEMA_URI], []),
+      ).resolves.toBeUndefined();
+
+      const outcome = JSON.parse(
+        await live.contextGovernanceModifyCapabilityRequirements(
+          context,
+          [{ kind: "ChallengeVerified", capability: SCHEMA_URI, trustedVerifiers: [verifier.did] }],
+          creator.did,
+        ),
+      ) as { status: string };
+      expect(outcome.status).toBe("Approved");
+
+      // The same subject and capability list is now refused: a record is required.
+      await expect(
+        live.checkCapabilityRequirements(context.contextId, subject.did, [SCHEMA_URI], []),
+      ).rejects.toMatchObject({ code: "SCP-VALID-7076" });
+
+      // An empty verifier list never reaches the bridge.
+      let caught: unknown;
+      try {
+        await live.contextGovernanceModifyCapabilityRequirements(
+          context,
+          [
+            {
+              kind: "ChallengeVerified",
+              capability: SCHEMA_URI,
+              trustedVerifiers: [],
+            } as unknown as CapabilityRequirement,
+          ],
+          creator.did,
+        );
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(ValidationError);
+      expect((caught as ValidationError).code).toBe(INVALID_REQUIREMENT_CODE);
+    });
+
+    test("a second challenge inside the first one's window carries its retry time", async () => {
+      const verifier = await createInMemoryIdentity(live);
+      const subject = await createInMemoryIdentity(live);
+      const contextId = await requiringContext(verifier.did);
+      const first = await live.trustCreateChallenge(challengeConfig(verifier, subject, contextId));
+      let caught: unknown;
+      try {
+        await live.trustCreateChallenge(challengeConfig(verifier, subject, contextId));
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(ValidationError);
+      expect((caught as ValidationError).code).toBe(CHALLENGE_WINDOW_OPEN_CODE);
+      expect(isRetryable((caught as ValidationError).code)).toBe(true);
+      expect(retryAfter(caught)).toBe(first.expiresAt);
+    });
+
+    /** Runs one passing challenge of `subject` by `verifier` and returns its record. */
+    async function gradedRecord(
+      verifier: Identity,
+      subject: Identity,
+      contextId: string,
+      cases: readonly TestCase[],
+    ) {
+      const request = await live.trustCreateChallenge(
+        challengeConfig(verifier, subject, contextId, cases),
+      );
+      await pastCreationSecond(request);
+      const response = await live.trustRespondToChallenge(
+        subject,
+        request,
+        cases.map((c) => ({ testId: c.testId, output: { ok: true } })),
+        1,
+      );
+      return (await live.trustGradeResponse(verifier, request, response)).record;
+    }
   });
 }

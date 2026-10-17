@@ -1170,20 +1170,6 @@ public nonisolated struct ParticipationProfile: Codable, Sendable, Equatable {
 
 // MARK: - Capability admission types (§7.3.4.4, ADR-058)
 
-/// How a capability must be verified for admission.
-///
-/// Encodes to the bare variant name string (`"SelfAttested"` /
-/// `"ChallengeVerified"`) to match the Rust `VerificationLevel` enum's default
-/// serde representation. `ChallengeVerified` also satisfies `SelfAttested`.
-/// Mirrors the TypeScript SDK `VerificationLevel` union 1:1.
-public nonisolated enum VerificationLevel: String, Codable, Sendable, Equatable {
-    /// The agent claims the capability (present in its capability list); no
-    /// challenge proof required.
-    case selfAttested = "SelfAttested"
-    /// The capability was verified through the challenge-response protocol.
-    case challengeVerified = "ChallengeVerified"
-}
-
 /// The most retries and the least cooldown a context accepts from a
 /// challenger's standard (spec 07 §7.3.4.4). A record graded under more
 /// retries or a shorter cooldown does not meet the requirement.
@@ -1205,41 +1191,31 @@ public nonisolated struct RetryCap: Codable, Sendable, Equatable {
     }
 }
 
-/// A single admission requirement: a capability URI, the minimum verification
-/// level, and for `ChallengeVerified` the challengers whose records count
-/// (spec 07 §7.3.4.4).
-///
-/// A context's governance holds its requirements: set
-/// `ContextParams.capabilityRequirementsJson` to
-/// ``encodeCapabilityRequirementsJson(_:)`` of them when creating the context.
-/// The `CodingKeys` are the snake_case the Rust `RawCapabilityRequirement`
-/// deserializes. Mirrors the TypeScript, Kotlin and Python SDK
-/// `CapabilityRequirement` 1:1.
-public nonisolated struct CapabilityRequirement: Codable, Sendable, Equatable {
-    /// The capability URI that must be present.
-    public let capability: String
-    /// The minimum verification level required.
-    public let verificationLevel: VerificationLevel
-    /// DIDs of the challengers whose records meet a `ChallengeVerified`
-    /// requirement. Required and non-empty for `ChallengeVerified`; empty for
-    /// `SelfAttested`. The bridge enforces both.
-    public let trustedVerifiers: [String]
-    /// The retry and cooldown bounds a record's standard must meet, if any.
-    /// Only `ChallengeVerified` takes one.
-    public let retryCap: RetryCap?
+/// The error code ``ChallengeVerifiedRequirement/init(capability:trustedVerifiers:retryCap:)``
+/// and the bridges raise for a capability requirement that breaks a spec 07
+/// §7.3.4.4 rule, such as a `ChallengeVerified` requirement with no trusted
+/// verifier.
+public let invalidRequirementCode = "SCP-VALID-7150"
 
-    /// Memberwise initializer.
-    public init(
-        capability: String,
-        verificationLevel: VerificationLevel,
-        trustedVerifiers: [String] = [],
-        retryCap: RetryCap? = nil
-    ) {
-        self.capability = capability
-        self.verificationLevel = verificationLevel
-        self.trustedVerifiers = trustedVerifiers
-        self.retryCap = retryCap
-    }
+/// A single admission requirement of a context's governance (spec 07
+/// §7.3.4.4).
+///
+/// Pass a list of them as `capabilityRequirements` to the typed
+/// ``ContextParams`` initializer, or to
+/// ``SCP/governanceModifyCapabilityRequirements(handle:proposerDid:requirements:)``.
+/// Each case encodes to the Rust `RawCapabilityRequirement` wire object
+/// `{capability, verification_level, trusted_verifiers, retry_cap}`.
+/// `selfAttested` writes `trusted_verifiers: []` and `retry_cap: null`, so no
+/// case can express a `SelfAttested` requirement with verifiers or a retry
+/// cap. Mirrors the TypeScript union, the Kotlin sealed class and the Python
+/// dataclasses `CapabilityRequirement` 1:1.
+public nonisolated enum CapabilityRequirement: Encodable, Sendable, Equatable {
+    /// The agent lists `capability` among its own capabilities; no record is
+    /// needed.
+    case selfAttested(capability: String)
+    /// The agent holds a passing record for the capability from one of the
+    /// requirement's trusted verifiers.
+    case challengeVerified(ChallengeVerifiedRequirement)
 
     private enum CodingKeys: String, CodingKey {
         case capability
@@ -1248,15 +1224,53 @@ public nonisolated struct CapabilityRequirement: Codable, Sendable, Equatable {
         case retryCap = "retry_cap"
     }
 
-    /// Custom encoder so an absent `retryCap` serializes as explicit JSON
-    /// `null`, as `serde_json::to_string` of the Rust struct and the other SDK
-    /// encoders write it, rather than being omitted.
+    /// Writes the wire object. An absent `retryCap` encodes as explicit JSON
+    /// `null`, as `serde_json::to_string` of the Rust struct writes it.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(capability, forKey: .capability)
-        try container.encode(verificationLevel, forKey: .verificationLevel)
-        try container.encode(trustedVerifiers, forKey: .trustedVerifiers)
-        try container.encode(retryCap, forKey: .retryCap)
+        switch self {
+        case let .selfAttested(capability):
+            try container.encode(capability, forKey: .capability)
+            try container.encode("SelfAttested", forKey: .verificationLevel)
+            try container.encode([String](), forKey: .trustedVerifiers)
+            try container.encodeNil(forKey: .retryCap)
+        case let .challengeVerified(requirement):
+            try container.encode(requirement.capability, forKey: .capability)
+            try container.encode("ChallengeVerified", forKey: .verificationLevel)
+            try container.encode(requirement.trustedVerifiers, forKey: .trustedVerifiers)
+            try container.encode(requirement.retryCap, forKey: .retryCap)
+        }
+    }
+}
+
+/// The payload of ``CapabilityRequirement/challengeVerified(_:)``: the
+/// capability, the challengers whose records count, and an optional bound on
+/// their standards.
+public nonisolated struct ChallengeVerifiedRequirement: Sendable, Equatable {
+    /// The capability URI the record must name.
+    public let capability: String
+    /// DIDs of the challengers whose records meet the requirement; never
+    /// empty.
+    public let trustedVerifiers: [String]
+    /// The most retries and the least cooldown a record's standard may have;
+    /// `nil` leaves only the capability definition's bounds.
+    public let retryCap: RetryCap?
+
+    /// Builds the payload.
+    ///
+    /// - Throws: ``ScpError/Validation(msg:code:)`` with
+    ///   ``invalidRequirementCode`` (`SCP-VALID-7150`) when `trustedVerifiers`
+    ///   is empty, because no record could then meet the requirement.
+    public init(capability: String, trustedVerifiers: [String], retryCap: RetryCap? = nil) throws {
+        guard !trustedVerifiers.isEmpty else {
+            throw ScpError.Validation(
+                msg: "ChallengeVerified requirement for \(capability) names no trusted verifier",
+                code: invalidRequirementCode
+            )
+        }
+        self.capability = capability
+        self.trustedVerifiers = trustedVerifiers
+        self.retryCap = retryCap
     }
 }
 
@@ -1282,7 +1296,8 @@ public nonisolated struct ChallengeVerification: Codable, Sendable, Equatable {
     public let capabilityUri: String
     /// Digest of the capability definition, 64 lowercase hex characters.
     public let definitionDigest: String
-    /// Digest of the graded test cases, 64 lowercase hex characters.
+    /// Digest of the request's cases (`challenge_suite_digest`), 64 lowercase
+    /// hex characters.
     public let suiteDigest: String
     /// The graded request's id, 64 lowercase hex characters.
     public let challengeId: String
@@ -1469,12 +1484,11 @@ public func encodeParticipationProfileJson(_ profiles: [ParticipationProfile]) t
     return try encodeTrustAdmissionJson(profiles)
 }
 
-/// Encodes a typed ``CapabilityRequirement`` array to the JSON
-/// `ContextParams.capabilityRequirementsJson` carries
-/// (`Vec<RawCapabilityRequirement>`). `verificationLevel` serializes as the
-/// bare variant string; the bridge validates the list when the context is
-/// created.
-public func encodeCapabilityRequirementsJson(_ requirements: [CapabilityRequirement]) throws -> String {
+/// Encodes a typed ``CapabilityRequirement`` array to the JSON array
+/// (`Vec<RawCapabilityRequirement>`) that `ContextParams.capabilityRequirementsJson`
+/// and the bridge's `governanceModifyCapabilityRequirements` take. The bridge
+/// validates the list.
+func encodeCapabilityRequirementsJson(_ requirements: [CapabilityRequirement]) throws -> String {
     try encodeTrustAdmissionJson(requirements)
 }
 
@@ -1866,8 +1880,10 @@ public extension SCP {
     /// ``ChallengeVerification`` records to the serde wire shape (ADR-058).
     ///
     /// The requirements are the ones the context's governance holds at the time
-    /// of the call, set through `ContextParams.capabilityRequirementsJson`; the
-    /// caller cannot supply them. A `ChallengeVerified` requirement is met only
+    /// of the call, set through the typed ``ContextParams`` initializer's
+    /// `capabilityRequirements` or
+    /// ``SCP/governanceModifyCapabilityRequirements(handle:proposerDid:requirements:)``;
+    /// the caller cannot supply them. A `ChallengeVerified` requirement is met only
     /// by a passing record signed by one of its trusted verifiers, for
     /// `subjectDid` and `contextId`, within the requirement's retry cap. Each
     /// record's signature is checked against the verifier's `#active` key,
@@ -1899,40 +1915,170 @@ public extension SCP {
             challengeVerificationsJson: encodeChallengeVerificationsJson(challengeVerifications)
         )
     }
+
+    /// Propose replacing the capability requirements of `handle`'s context
+    /// with `requirements` (spec 07 §7.3.4.4, a `ModifyCapabilityRequirements`
+    /// governance action). The list is the complete new list; `[]` clears it.
+    ///
+    /// Encodes `requirements` to the wire JSON and calls
+    /// ``Scp/governanceModifyCapabilityRequirements(handle:proposerDid:requirementsJson:)``
+    /// on ``inner``. Admission reads the new list once the proposal executes.
+    ///
+    /// - Parameters:
+    ///   - handle: The context whose requirements change.
+    ///   - proposerDid: DID of the member that proposes the change, as in
+    ///     ``SCP/governancePropose(handle:proposerDid:actionJson:)``.
+    ///   - requirements: The new requirements.
+    /// - Returns: The bridge's proposal JSON after ``checkProposalResponse(_:)``
+    ///   checks every name in it.
+    /// - Throws: ``ScpError/Validation(msg:code:)`` with
+    ///   ``nonCanonicalIdentifierCode``, ``tooManyCapabilityRequirementsCode``
+    ///   or ``invalidRequirementCode`` for a requirement that breaks a
+    ///   §7.3.4.4 rule; otherwise fails as `governancePropose` does.
+    func governanceModifyCapabilityRequirements(
+        handle: ContextHandle,
+        proposerDid: String,
+        requirements: [CapabilityRequirement]
+    ) async throws -> String {
+        try await checkProposalResponse(
+            inner.governanceModifyCapabilityRequirements(
+                handle: handle,
+                proposerDid: proposerDid,
+                requirementsJson: encodeCapabilityRequirementsJson(requirements)
+            )
+        )
+    }
 }
 
 // MARK: - Challenge trust inputs (§7.3.4, ADR-058)
 
-/// The error code the bridges raise when a challenge for a protocol capability
-/// URI has fewer test cases than its standard's minimum (spec 07 §7.3.4.3).
+/// The error code the bridges raise when a challenge for a protocol capability URI has fewer test cases than its standard's minimum (spec 07 §7.3.4.3).
 public let challengeSuiteBelowMinimumCode = "SCP-VALID-7039"
 
-/// The error code the bridges raise when a stored answer key does not match
-/// the request's commitments.
-public let answerKeyMismatchCode = "SCP-VALID-7145"
+/// The error code the bridges raise when the challenger's ledger already holds the most open challenges it may hold, so it opens no new one; retry later.
+public let challengeNotOpenCode = "SCP-VALID-7099"
 
-/// The error code the bridges raise when the challenger cannot grade another
-/// attempt now; the attempt is not used.
+/// The error code the bridges raise when the challenge's window has closed; no attempt is graded.
+public let challengeExpiredCode = "SCP-VALID-7102"
+
+/// The error code the bridges raise when an attempt number is not the next one the challenger expects.
+public let attemptOutOfOrderCode = "SCP-VALID-7103"
+
+/// The error code the bridges raise when the subject has used every attempt the challenge allows.
+public let retriesExhaustedCode = "SCP-VALID-7104"
+
+/// The error code the bridges raise when the cooldown between attempts has not passed; ``retryAfter(_:)`` reads the first second a retry may succeed.
+public let cooldownActiveCode = "SCP-VALID-7105"
+
+/// The error code the bridges raise when the challenge is closed after a pass or its last allowed attempt.
+public let challengeClosedCode = "SCP-VALID-7106"
+
+/// The error code the bridges raise when the challenger's ledger holds no live challenge with the response's id, request digest and subject.
+public let unknownChallengeCode = "SCP-VALID-7107"
+
+/// The error code the bridges raise when the outputs do not answer the request's cases one for one.
+public let outputsMismatchCode = "SCP-VALID-7108"
+
+/// The error code the bridges raise when a `CustomEval` case names an evaluator outlet that is not registered in the evaluator context.
+public let evaluatorUnavailableCode = "SCP-VALID-7109"
+
+/// The error code the bridges raise when the verifier and the subject decode to the same key.
+public let selfChallengeCode = "SCP-VALID-7127"
+
+/// The error code the bridges raise when a capability URI names a standard whose pass condition cannot be computed from the subject's outputs, or names a system capability.
+public let standardNotGradableCode = "SCP-VALID-7128"
+
+/// The error code the bridges raise when no capability definition can be obtained for the URI.
+public let capabilityDefinitionUnavailableCode = "SCP-VALID-7129"
+
+/// The error code the bridges raise when a policy value or a requirement's retry cap lies outside the capability definition's limits or the protocol bounds.
+public let policyOutsideDefinitionCode = "SCP-VALID-7137"
+
+/// The error code the bridges raise when a `SchemaMatch` case carries a schema the protocol does not admit.
+public let schemaRejectedCode = "SCP-VALID-7138"
+
+/// The error code the bridges raise when another grading of the challenge holds a live lease; retry later.
+public let gradingInProgressCode = "SCP-VALID-7139"
+
+/// The error code the bridges raise when a response exceeds the protocol's response size or JSON depth limit.
+public let responseTooLargeCode = "SCP-VALID-7143"
+
+/// The error code the bridges raise when two validly signed capability definitions for one URI differ.
+public let definitionEquivocationCode = "SCP-VALID-7144"
+
+/// The error code the bridges raise when the challenger cannot grade another attempt now; the attempt is not used.
 public let gradingCapacityExhaustedCode = "SCP-VALID-7146"
 
-/// The error code the bridges raise for a DID or URI that is not canonical.
+/// The error code the bridges raise when a DID or URI is not canonical.
 public let nonCanonicalIdentifierCode = "SCP-VALID-7147"
 
-/// The error code the bridges raise when a context names more capability
-/// requirements than the protocol allows.
+/// The error code the bridges raise when a context names more capability requirements than the protocol allows.
 public let tooManyCapabilityRequirementsCode = "SCP-VALID-7148"
 
-/// The error code the bridges raise when the challenger lost its grading lease
-/// on an attempt; the attempt is not used.
+/// The error code the bridges raise when the challenger lost its grading lease on an attempt; the attempt is not used.
 public let gradingLeaseLostCode = "SCP-VALID-7149"
+
+/// The error code the bridges raise when a challenge to the same subject for the same capability is still open; ``retryAfter(_:)`` reads the second it closes.
+public let challengeWindowOpenCode = "SCP-VALID-7151"
+
+/// The error code the bridges raise when an attempt is graded at or before its challenge's `createdAt` second; ``retryAfter(_:)`` reads the first second grading may succeed.
+public let challengeNotYetGradableCode = "SCP-VALID-7153"
+
+/// Whether a refusal with `code` may succeed when the same call is made
+/// again later, unchanged.
+///
+/// True exactly for ``challengeNotOpenCode``, ``cooldownActiveCode``,
+/// ``gradingInProgressCode``, ``gradingCapacityExhaustedCode``,
+/// ``gradingLeaseLostCode``, ``challengeWindowOpenCode`` and
+/// ``challengeNotYetGradableCode``. Every other code is final for the call.
+public func isRetryable(_ code: String) -> Bool {
+    retryableChallengeCodes.contains(code)
+}
+
+private let retryableChallengeCodes: Set<String> = [
+    challengeNotOpenCode,
+    cooldownActiveCode,
+    gradingInProgressCode,
+    gradingCapacityExhaustedCode,
+    gradingLeaseLostCode,
+    challengeWindowOpenCode,
+    challengeNotYetGradableCode
+]
+
+/// The first Unix second at which a refused call may succeed, read from the
+/// `(retry_after=N)` suffix the bridges append to the message of a
+/// ``cooldownActiveCode``, ``challengeWindowOpenCode`` or
+/// ``challengeNotYetGradableCode`` refusal; `nil` when `error` carries none.
+public func retryAfter(_ error: Error) -> UInt64? {
+    let message: String
+    switch error {
+    case let ScpError.Identity(msg, _), let ScpError.Context(msg, _),
+         let ScpError.Permission(msg, _), let ScpError.Crypto(msg, _),
+         let ScpError.Transport(msg, _), let ScpError.Outlet(msg, _),
+         let ScpError.Validation(msg, _):
+        message = msg
+    default:
+        return nil
+    }
+    let key = "(retry_after="
+    guard let start = message.range(of: key, options: .backwards),
+          let end = message[start.upperBound...].firstIndex(of: ")")
+    else {
+        return nil
+    }
+    return UInt64(message[start.upperBound ..< end])
+}
 
 /// How a test case's output is judged (spec 07 §7.3.4.2).
 ///
 /// Encodes to the Rust `ExpectedOutput` enum's externally tagged serde shape,
-/// for example `{"ExactMatch":{"value":...}}`. Mirrors the TypeScript
+/// for example `{"ExactMatch":{"value":...}}`. `customEval` writes only
+/// `{"CustomEval":{"evaluator_outlet_id":...}}`, because the Rust type carries
+/// no context; ``SCP/trustCreateChallenge(_:)`` passes `evaluatorContextId` to
+/// the bridge as its evaluator context. Mirrors the TypeScript
 /// `ExpectedOutput` union, the Kotlin sealed class and the Python variant
 /// classes 1:1.
-public nonisolated enum ExpectedOutput: Codable, Sendable, Equatable {
+public nonisolated enum ExpectedOutput: Encodable, Sendable, Equatable {
     /// The output must equal `value`.
     case exactMatch(value: JSONValue)
     /// The output must validate against the JSON Schema `schema`.
@@ -1941,8 +2087,10 @@ public nonisolated enum ExpectedOutput: Codable, Sendable, Equatable {
     case containsAll(required: [String])
     /// The output must contain none of the strings in `forbidden`.
     case containsNone(forbidden: [String])
-    /// An outlet the verifier names judges the output.
-    case customEval(evaluatorOutletId: String)
+    /// The outlet `evaluatorOutletId`, registered in the context
+    /// `evaluatorContextId`, judges the output. Every `customEval` case of one
+    /// challenge names the same `evaluatorContextId`.
+    case customEval(evaluatorOutletId: String, evaluatorContextId: String)
 
     private enum VariantKeys: String, CodingKey {
         case exactMatch = "ExactMatch"
@@ -1975,40 +2123,15 @@ public nonisolated enum ExpectedOutput: Codable, Sendable, Equatable {
         case let .containsNone(forbidden):
             var fields = container.nestedContainer(keyedBy: FieldKeys.self, forKey: .containsNone)
             try fields.encode(forbidden, forKey: .forbidden)
-        case let .customEval(evaluatorOutletId):
+        case let .customEval(evaluatorOutletId, _):
             var fields = container.nestedContainer(keyedBy: FieldKeys.self, forKey: .customEval)
             try fields.encode(evaluatorOutletId, forKey: .evaluatorOutletId)
-        }
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: VariantKeys.self)
-        guard container.allKeys.count == 1, let variant = container.allKeys.first else {
-            throw DecodingError.dataCorrupted(DecodingError.Context(
-                codingPath: decoder.codingPath,
-                debugDescription: "ExpectedOutput must have exactly one known variant key"
-            ))
-        }
-        let fields = try container.nestedContainer(keyedBy: FieldKeys.self, forKey: variant)
-        switch variant {
-        case .exactMatch:
-            self = try .exactMatch(value: fields.decode(JSONValue.self, forKey: .value))
-        case .schemaMatch:
-            self = try .schemaMatch(schema: fields.decode(JSONValue.self, forKey: .schema))
-        case .containsAll:
-            self = try .containsAll(required: fields.decode([String].self, forKey: .required))
-        case .containsNone:
-            self = try .containsNone(forbidden: fields.decode([String].self, forKey: .forbidden))
-        case .customEval:
-            self = try .customEval(
-                evaluatorOutletId: fields.decode(String.self, forKey: .evaluatorOutletId)
-            )
         }
     }
 }
 
 /// One challenger-written test case (spec 07 §7.3.4.2).
-public nonisolated struct TestCase: Codable, Sendable, Equatable {
+public nonisolated struct TestCase: Encodable, Sendable, Equatable {
     /// Identifier unique within the challenge.
     public let testId: String
     /// The input the subject runs.
@@ -2039,8 +2162,9 @@ public nonisolated struct TestCase: Codable, Sendable, Equatable {
     }
 }
 
-/// One case as the subject sees it: the challenger's answer is replaced by a
-/// salted commitment to it (spec 07 §7.3.4.2).
+/// One case as the subject sees it: the test case without its expected output
+/// (spec 07 §7.3.4.2). The request carries no answer, and the challenger's
+/// ledger keeps the expected outputs to grade with.
 ///
 /// Mirrors the Rust `ChallengeCase` and the TypeScript, Kotlin and Python SDK
 /// `ChallengeCase` 1:1.
@@ -2053,16 +2177,13 @@ public nonisolated struct ChallengeCase: Codable, Sendable, Equatable {
     public let category: String
     /// The case's weight in basis points.
     public let weight: UInt32
-    /// The commitment to the case's answer, 64 lowercase hex characters.
-    public let answerCommitment: String
 
     /// Memberwise initializer.
-    public init(testId: String, input: JSONValue, category: String, weight: UInt32, answerCommitment: String) {
+    public init(testId: String, input: JSONValue, category: String, weight: UInt32) {
         self.testId = testId
         self.input = input
         self.category = category
         self.weight = weight
-        self.answerCommitment = answerCommitment
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -2070,13 +2191,12 @@ public nonisolated struct ChallengeCase: Codable, Sendable, Equatable {
         case input
         case category
         case weight
-        case answerCommitment = "answer_commitment"
     }
 }
 
 /// A signed challenge request (spec 07 §7.3.4 step 1, ADR-017).
 ///
-/// ``SCP/trustCreateChallenge(verifier:subject:capabilityUri:testCases:contextId:windowSecs:evaluatorContextId:policy:)``
+/// ``SCP/trustCreateChallenge(_:)``
 /// returns one. The verifier's signature covers every field, so a request with
 /// any field altered is refused when answered or graded. Mirrors the Rust
 /// `ChallengeRequest` and the TypeScript, Kotlin and Python models 1:1.
@@ -2273,7 +2393,7 @@ public func encodeAttestationJson(_ attestation: CachedAttestationEnvelope) thro
 }
 
 /// Encodes typed test cases to the JSON array
-/// ``SCP/trustCreateChallenge(verifier:subject:capabilityUri:testCases:contextId:windowSecs:evaluatorContextId:policy:)``
+/// ``SCP/trustCreateChallenge(_:)``
 /// passes to the bridge (`Vec<TestCase>`).
 public func encodeTestCasesJson(_ testCases: [TestCase]) throws -> String {
     try encodeTrustAdmissionJson(testCases)
@@ -2283,7 +2403,7 @@ public func encodeTestCasesJson(_ testCases: [TestCase]) throws -> String {
 /// deserializes (`ChallengeRequest`).
 ///
 /// - Throws: ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7098` if an
-///   id, digest or commitment is not 64 lowercase hex characters or the
+///   id or digest is not 64 lowercase hex characters or the
 ///   signature is not 64 bytes (before any bridge call).
 public func encodeChallengeRequestJson(_ request: ChallengeRequest) throws -> String {
     try requireChallengeRequest(request)
@@ -2294,8 +2414,8 @@ public func encodeChallengeRequestJson(_ request: ChallengeRequest) throws -> St
 /// ``ChallengeRequest``.
 ///
 /// - Throws: ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7098` if the
-///   JSON is not a request, an id, digest or commitment is not 64 lowercase
-///   hex characters, or the signature is not 64 bytes.
+///   JSON is not a request, an id or digest is not 64 lowercase hex
+///   characters, or the signature is not 64 bytes.
 public func decodeChallengeRequestJson(_ json: String) throws -> ChallengeRequest {
     let request: ChallengeRequest
     do {
@@ -2312,11 +2432,6 @@ private func requireChallengeRequest(_ request: ChallengeRequest) throws {
     try requireLowerHex32(
         "ChallengeRequest", "definitionDigest", request.definitionDigest, code: "SCP-VALID-7098"
     )
-    for testCase in request.testCases {
-        try requireLowerHex32(
-            "ChallengeCase", "answerCommitment", testCase.answerCommitment, code: "SCP-VALID-7098"
-        )
-    }
     try requireByteLength(
         "ChallengeRequest", "verifierSignature",
         expected: 64, actual: request.verifierSignature, code: "SCP-VALID-7098"
@@ -2378,6 +2493,72 @@ public func decodeCaseResultsJson(_ json: String) throws -> [CaseResult] {
     }
 }
 
+/// The parameters of ``SCP/trustCreateChallenge(_:)``. Mirrors the TypeScript,
+/// Kotlin and Python `CreateChallengeConfig` 1:1.
+public nonisolated struct CreateChallengeConfig: Sendable {
+    /// The challenger, whose `#active` key signs the request.
+    public let verifier: Identity
+    /// DID of the challenged identity.
+    public let subject: String
+    /// The capability URI under test.
+    public let capabilityUri: String
+    /// The challenger-written cases with their expected outputs; their
+    /// weights sum to 10000.
+    public let testCases: [TestCase]
+    /// The context the challenge is administered in and the record is bound
+    /// to.
+    public let contextId: String
+    /// The grading window: seconds from creation during which attempts are
+    /// graded.
+    public let windowSecs: UInt32
+    /// Fewer retries or a longer cooldown than the capability definition's.
+    /// A `nil` field of ``ChallengePolicy`` takes the definition's value, and
+    /// a `nil` policy keeps both. A policy may only tighten the definition, on
+    /// any URI.
+    public let policy: ChallengePolicy?
+
+    /// Memberwise initializer.
+    public init(
+        verifier: Identity,
+        subject: String,
+        capabilityUri: String,
+        testCases: [TestCase],
+        contextId: String,
+        windowSecs: UInt32,
+        policy: ChallengePolicy? = nil
+    ) {
+        self.verifier = verifier
+        self.subject = subject
+        self.capabilityUri = capabilityUri
+        self.testCases = testCases
+        self.contextId = contextId
+        self.windowSecs = windowSecs
+        self.policy = policy
+    }
+}
+
+/// The one evaluator context the `customEval` cases of `testCases` name, or
+/// `nil` when no case is `customEval`.
+///
+/// - Throws: ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7001` when two
+///   cases name different contexts, because the bridge grades one challenge on
+///   one evaluator context.
+func evaluatorContextId(of testCases: [TestCase]) throws -> String? {
+    var found: String?
+    for testCase in testCases {
+        guard case let .customEval(_, contextId) = testCase.expected else { continue }
+        if let earlier = found, earlier != contextId {
+            throw ScpError.Validation(
+                msg: "CustomEval cases name two evaluator contexts, \(earlier) and \(contextId); "
+                    + "one challenge has one evaluator context",
+                code: "SCP-VALID-7001"
+            )
+        }
+        found = contextId
+    }
+    return found
+}
+
 // MARK: - Typed challenge wrappers (ADR-058)
 
 public extension SCP {
@@ -2408,52 +2589,44 @@ public extension SCP {
         )
     }
 
-    /// Issue a challenge request for `capabilityUri` signed by `verifier`'s
-    /// `#active` key through custody (spec 07 §7.3.4 step 1, ADR-017).
+    /// Issue a challenge request for `config.capabilityUri`, signed by
+    /// `config.verifier`'s `#active` key through custody (spec 07 §7.3.4 step
+    /// 1, ADR-017).
     ///
-    /// The challenger writes `testCases` with their answers. The returned
-    /// request carries a salted commitment to each answer and never the
-    /// answer; the challenger's ledger keeps the answers to grade with. The
+    /// The challenger writes `config.testCases` with their expected outputs.
+    /// The returned request carries each case without its expected output;
+    /// the challenger's ledger keeps the expected outputs to grade with. The
     /// capability definition for `capabilityUri` sets the pass threshold, the
-    /// retries and the cooldown; `policy` may only tighten them.
+    /// retries and the cooldown; `config.policy` may only tighten them, on any
+    /// URI.
     ///
-    /// - Parameters:
-    ///   - verifier: The challenger's identity.
-    ///   - subject: DID of the challenged identity.
-    ///   - capabilityUri: The capability URI under test.
-    ///   - testCases: The challenger-written cases; their weights sum to 10000.
-    ///   - contextId: The context where the challenge is administered.
-    ///   - windowSecs: Seconds from creation during which attempts are graded.
-    ///   - evaluatorContextId: The context of the evaluator outlet that
-    ///     `CustomEval` cases name; `nil` when there are none.
-    ///   - policy: A stricter retry and cooldown policy; `nil` keeps the
-    ///     definition's.
-    /// - Throws: ``ScpError/Validation(msg:code:)`` with
-    ///   ``challengeSuiteBelowMinimumCode`` when the suite has fewer cases than
-    ///   the definition's minimum, `SCP-VALID-7002` for malformed test cases,
-    ///   `SCP-VALID-7137` for a policy looser than the definition,
-    ///   ``nonCanonicalIdentifierCode`` for a DID that is not canonical, and
+    /// The `evaluatorContextId` of the `customEval` cases is passed to the
+    /// bridge as the context whose outlets grade them.
+    ///
+    /// - Parameter config: The challenge to issue.
+    /// - Throws: ``ScpError/Validation(msg:code:)`` with `SCP-VALID-7001` when
+    ///   two `customEval` cases name different evaluator contexts (before any
+    ///   bridge call); ``challengeSuiteBelowMinimumCode`` when the suite has
+    ///   fewer cases than the definition's minimum; `SCP-VALID-7002` for
+    ///   malformed test cases; ``policyOutsideDefinitionCode`` for a policy
+    ///   looser than the definition; ``challengeWindowOpenCode`` while an
+    ///   earlier challenge to the same subject for the same capability is
+    ///   open; ``evaluatorUnavailableCode`` for an evaluator outlet that is not
+    ///   registered; ``selfChallengeCode`` when the verifier is the subject;
+    ///   ``nonCanonicalIdentifierCode`` for a DID that is not canonical; and
     ///   `SCP-VALID-7098` when the returned request is malformed.
-    func trustCreateChallenge(
-        verifier: Identity,
-        subject: String,
-        capabilityUri: String,
-        testCases: [TestCase],
-        contextId: String,
-        windowSecs: UInt32,
-        evaluatorContextId: String? = nil,
-        policy: ChallengePolicy? = nil
-    ) async throws -> ChallengeRequest {
-        try await decodeChallengeRequestJson(
-            trustCreateChallenge(
-                verifier: verifier,
-                subject: subject,
-                capabilityUri: capabilityUri,
-                testCasesJson: encodeTestCasesJson(testCases),
-                contextId: contextId,
-                windowSecs: windowSecs,
-                evaluatorContextId: evaluatorContextId,
-                policy: policy
+    func trustCreateChallenge(_ config: CreateChallengeConfig) async throws -> ChallengeRequest {
+        let evaluatorContext = try evaluatorContextId(of: config.testCases)
+        return try await decodeChallengeRequestJson(
+            inner.trustCreateChallenge(
+                verifier: config.verifier,
+                subject: config.subject,
+                capabilityUri: config.capabilityUri,
+                testCasesJson: encodeTestCasesJson(config.testCases),
+                contextId: config.contextId,
+                windowSecs: config.windowSecs,
+                evaluatorContextId: evaluatorContext,
+                policy: config.policy
             ).requestJson
         )
     }
@@ -2503,10 +2676,12 @@ public extension SCP {
     ///   - request: The signed request.
     ///   - response: The subject's signed response.
     /// - Throws: ``ScpError/Validation(msg:code:)`` when a signature or the
-    ///   attempt does not hold; with ``gradingCapacityExhaustedCode``,
-    ///   ``gradingLeaseLostCode`` or ``answerKeyMismatchCode`` for a grading
-    ///   that used no attempt; and with `SCP-VALID-7096` or `SCP-VALID-7098`
-    ///   for a malformed input or returned record.
+    ///   attempt does not hold; with ``gradingCapacityExhaustedCode`` or
+    ///   ``gradingLeaseLostCode`` for a grading that used no attempt; with
+    ///   ``cooldownActiveCode`` or ``challengeNotYetGradableCode`` for an
+    ///   attempt graded too early, whose retry second ``retryAfter(_:)``
+    ///   reads; and with `SCP-VALID-7096` or `SCP-VALID-7098` for a malformed
+    ///   input or returned record.
     func trustGradeResponse(
         verifier: Identity,
         request: ChallengeRequest,

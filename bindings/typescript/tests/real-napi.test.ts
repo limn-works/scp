@@ -2902,7 +2902,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
     }
 
     const selfAttested: readonly CapabilityRequirement[] = [
-      { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
+      { kind: "SelfAttested", capability: "scp:capability:schema-validation/v1" },
     ];
 
     /** A canonical subject DID: a fresh identity's. */
@@ -2954,15 +2954,26 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       ).rejects.toBeInstanceOf(ScpError);
     });
 
-    test("contextCreate refuses a ChallengeVerified requirement without a verifier", async () => {
+    test("the bridge refuses a wire ChallengeVerified requirement with no verifier with SCP-VALID-7150", async () => {
+      // The raw bridge call skips the SDK encoder, so the Rust check alone
+      // refuses the empty verifier list.
+      const creator = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
       await expect(
-        requiringContext([
-          {
-            capability: "scp:capability:schema-validation/v1",
-            verificationLevel: "ChallengeVerified",
-          },
-        ]),
-      ).rejects.toThrow("capability_requirements");
+        napi.contextCreate(
+          creator,
+          JSON.stringify({
+            ceiling: ["messages:read", "messages:write"],
+            capabilityRequirements: JSON.stringify([
+              {
+                capability: "scp:capability:schema-validation/v1",
+                verification_level: "ChallengeVerified",
+                trusted_verifiers: [],
+                retry_cap: null,
+              },
+            ]),
+          }),
+        ),
+      ).rejects.toThrow("SCP-VALID-7150");
     });
 
     test("verifyParticipationRequirements: valid profile + empty requirements round-trips", () => {

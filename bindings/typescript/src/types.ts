@@ -7,7 +7,8 @@
  * See ADR-022 in `.docs/adrs/phase-4.md` and `.docs/scaffold/typescript.md`.
  */
 
-import { UnknownGovernanceOutcomeError } from "./errors";
+import { UnknownGovernanceOutcomeError, ValidationError } from "./errors";
+import type { Identity } from "./identity";
 
 // ---------------------------------------------------------------------------
 // Capability strings
@@ -135,12 +136,15 @@ export interface ContextParams {
    */
   readonly consequenceConfig?: ConsequenceConfig;
   /**
-   * The context's admission capability requirements (spec 07 §7.3.4.4), as
-   * the JSON {@link encodeCapabilityRequirements} returns. The bridge
-   * validates them at creation; {@link SCP.checkCapabilityRequirements} reads
-   * them from the context's governance at each check. Omit for none.
+   * The context's admission capability requirements (spec 07 §7.3.4.4).
+   * Omit for none. {@link SCP.contextCreate} reads this field from the params
+   * JSON as typed {@link CapabilityRequirement}s and encodes them to the
+   * bridge's wire form itself; it refuses a JSON string or a snake_case wire
+   * list here with `SCP-VALID-7001`. {@link SCP.checkCapabilityRequirements}
+   * reads the requirements from the context's governance at each check, and
+   * {@link SCP.contextGovernanceModifyCapabilityRequirements} replaces them.
    */
-  readonly capabilityRequirements?: string;
+  readonly capabilityRequirements?: readonly CapabilityRequirement[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,26 +1676,44 @@ export interface RetryCap {
 }
 
 /**
- * A single admission requirement of a context (spec 07 §7.3.4.4).
- *
- * Mirrors the Rust `CapabilityRequirement` struct (`scp-core`). A
- * `SelfAttested` requirement names no verifiers and no retry cap. A
- * `ChallengeVerified` requirement names at least one trusted verifier DID;
- * only a record signed by one of them satisfies it. The bridge validates the
- * shape when a context is created, and refuses a malformed requirement with
- * `SCP-VALID-7150` (or {@link NON_CANONICAL_IDENTIFIER_CODE} for a verifier
- * DID that is not the canonical spelling of its key).
+ * An admission requirement that the subject's self-attested capability list
+ * meets (spec 07 §7.3.4.4). It names no verifiers and no retry cap.
  */
-export interface CapabilityRequirement {
+export interface SelfAttestedRequirement {
+  /** Discriminant. */
+  readonly kind: "SelfAttested";
   /** The capability URI that must be present. */
   readonly capability: string;
-  /** The minimum verification level required. */
-  readonly verificationLevel: VerificationLevel;
-  /** DIDs of the challengers whose records satisfy a `ChallengeVerified` requirement. */
-  readonly trustedVerifiers?: readonly string[];
-  /** The loosest retry policy a record may carry; absent accepts any. */
-  readonly retryCap?: RetryCap | null;
 }
+
+/**
+ * An admission requirement that only a passing challenge record signed by
+ * one of `trustedVerifiers` meets (spec 07 §7.3.4.4).
+ */
+export interface ChallengeVerifiedRequirement {
+  /** Discriminant. */
+  readonly kind: "ChallengeVerified";
+  /** The capability URI that must be verified. */
+  readonly capability: string;
+  /**
+   * DIDs of the challengers whose records satisfy the requirement; at least
+   * one. The SDK refuses an empty list with {@link INVALID_REQUIREMENT_CODE}
+   * before any bridge call.
+   */
+  readonly trustedVerifiers: readonly [string, ...string[]];
+  /** The loosest retry policy a record may carry; absent accepts any. */
+  readonly retryCap?: RetryCap;
+}
+
+/**
+ * A single admission requirement of a context (spec 07 §7.3.4.4): either
+ * {@link SelfAttestedRequirement} or {@link ChallengeVerifiedRequirement}.
+ *
+ * The SDK encodes it to the Rust `RawCapabilityRequirement` wire form. The
+ * bridge refuses a verifier DID that is not the canonical spelling of its key
+ * with {@link NON_CANONICAL_IDENTIFIER_CODE}.
+ */
+export type CapabilityRequirement = SelfAttestedRequirement | ChallengeVerifiedRequirement;
 
 /**
  * A signed record of one graded challenge attempt (spec 07 §7.3.4, ADR-017).
@@ -1715,7 +1737,7 @@ export interface ChallengeVerification {
   readonly capabilityUri: string;
   /** Digest of the capability definition the challenge followed, as 64 lowercase hex characters. */
   readonly definitionDigest: string;
-  /** Digest of the request's cases and answer commitments, as 64 lowercase hex characters. */
+  /** Digest of the request's cases, as 64 lowercase hex characters. */
   readonly suiteDigest: string;
   /** The graded request's id, as 64 lowercase hex characters. */
   readonly challengeId: string;
@@ -1754,39 +1776,97 @@ export interface ChallengeVerification {
 }
 
 /**
- * Encodes typed {@link CapabilityRequirement}s to the JSON wire shape the
- * Rust bridge deserializes (`Vec<CapabilityRequirement>`), the value of
- * {@link ContextParams.capabilityRequirements}.
+ * Encodes typed {@link CapabilityRequirement}s to the JSON wire form the Rust
+ * bridge deserializes (`Vec<RawCapabilityRequirement>`):
+ * `[{capability, verification_level, trusted_verifiers, retry_cap}]`, with
+ * `trusted_verifiers: []` and `retry_cap: null` for a `SelfAttested`
+ * requirement.
  *
- * @throws Error if a `retryCap` value is not an integer in the u32 range
- *   (before any bridge call).
+ * Internal to the SDK: {@link SCP.contextCreate} and
+ * {@link SCP.contextGovernanceModifyCapabilityRequirements} call it. It
+ * checks every value at runtime, because a JavaScript caller bypasses the
+ * types.
+ *
+ * @throws ValidationError {@link INVALID_REQUIREMENT_CODE} for a
+ *   `ChallengeVerified` requirement with no trusted verifier, or a
+ *   `SelfAttested` requirement that names verifiers or a retry cap;
+ *   `SCP-VALID-7001` for any other malformed value.
  */
-export function encodeCapabilityRequirements(
-  requirements: readonly CapabilityRequirement[],
-): string {
-  return JSON.stringify(
-    requirements.map((r) => {
-      const cap = r.retryCap ?? null;
-      return {
-        capability: r.capability,
-        verification_level: r.verificationLevel,
-        trusted_verifiers: r.trustedVerifiers ?? [],
-        retry_cap:
-          cap === null
-            ? null
-            : {
-                max_retries: requireUint("RetryCap", "maxRetries", cap.maxRetries, U32_MAX),
-                min_cooldown_secs: requireUint(
-                  "RetryCap",
-                  "minCooldownSecs",
-                  cap.minCooldownSecs,
-                  U32_MAX,
-                ),
-              },
-      };
-    }),
+export function encodeCapabilityRequirements(requirements: readonly unknown[]): string {
+  if (!Array.isArray(requirements)) {
+    throw malformedRequirement("the requirements must be an array", requirements);
+  }
+  return JSON.stringify(requirements.map(encodeCapabilityRequirement));
+}
+
+function malformedRequirement(what: string, value: unknown): ValidationError {
+  return new ValidationError(
+    `CapabilityRequirement: ${what}, got ${JSON.stringify(value)}`,
+    MALFORMED_SDK_INPUT_CODE,
   );
 }
+
+function encodeCapabilityRequirement(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw malformedRequirement("each requirement must be an object", value);
+  }
+  const r = value as Record<string, unknown>;
+  if (typeof r.capability !== "string") {
+    throw malformedRequirement("capability must be a string", r.capability);
+  }
+  switch (r.kind) {
+    case "SelfAttested":
+      if (r.trustedVerifiers !== undefined || r.retryCap !== undefined) {
+        throw new ValidationError(
+          "CapabilityRequirement: a SelfAttested requirement names no trusted verifiers and no retry cap",
+          INVALID_REQUIREMENT_CODE,
+        );
+      }
+      return {
+        capability: r.capability,
+        verification_level: "SelfAttested",
+        trusted_verifiers: [],
+        retry_cap: null,
+      };
+    case "ChallengeVerified": {
+      const verifiers = r.trustedVerifiers;
+      if (!Array.isArray(verifiers) || !verifiers.every((v) => typeof v === "string")) {
+        throw malformedRequirement("trustedVerifiers must be an array of DID strings", verifiers);
+      }
+      if (verifiers.length === 0) {
+        throw new ValidationError(
+          "CapabilityRequirement: a ChallengeVerified requirement names at least one trusted verifier",
+          INVALID_REQUIREMENT_CODE,
+        );
+      }
+      return {
+        capability: r.capability,
+        verification_level: "ChallengeVerified",
+        trusted_verifiers: verifiers,
+        retry_cap: r.retryCap === undefined ? null : encodeRetryCap(r.retryCap),
+      };
+    }
+    default:
+      throw malformedRequirement('kind must be "SelfAttested" or "ChallengeVerified"', r.kind);
+  }
+}
+
+function encodeRetryCap(value: unknown): unknown {
+  if (value === null || typeof value !== "object") {
+    throw malformedRequirement("retryCap must be an object", value);
+  }
+  const cap = value as Record<string, unknown>;
+  for (const field of ["maxRetries", "minCooldownSecs"] as const) {
+    const n = cap[field];
+    if (typeof n !== "number" || !Number.isInteger(n) || n < 0 || n > U32_MAX) {
+      throw malformedRequirement(`retryCap.${field} must be an integer in [0, ${U32_MAX}]`, n);
+    }
+  }
+  return { max_retries: cap.maxRetries, min_cooldown_secs: cap.minCooldownSecs };
+}
+
+/** The code the SDK gives a malformed typed input it refuses before the bridge. */
+const MALFORMED_SDK_INPUT_CODE = "SCP-VALID-7001";
 
 const U32_MAX = 0xffff_ffff;
 
@@ -2181,6 +2261,10 @@ export function encodeAttestorSets(
 // Challenge trust inputs (§7.3.4, ADR-058)
 // ---------------------------------------------------------------------------
 
+// Challenge and admission error codes. Each maps from the Rust variants its
+// comment names, through `trust_error_code` and `admission_error_code` in
+// `scp-ffi-common` (`error_codes.rs`).
+
 /**
  * Code the bridge raises when a protocol capability URI's request has fewer
  * test cases than the URI's standard requires (spec 07 §7.3.4.3; for
@@ -2190,22 +2274,129 @@ export function encodeAttestorSets(
 export const CHALLENGE_SUITE_BELOW_MINIMUM_CODE = "SCP-VALID-7039";
 
 /**
- * Code the bridge raises when a case opening does not match the commitment
- * the challenger signed. It is a grading fault: no attempt is used and no
- * record is signed. Maps from `TrustError::AnswerKeyMismatch`.
+ * Code the bridge raises when the challenger's ledger already holds the most
+ * open challenges it may hold, so it opens no new one; retry after one
+ * closes. Maps from `TrustError::ChallengeNotOpen`.
  */
-export const ANSWER_KEY_MISMATCH_CODE = "SCP-VALID-7145";
+export const CHALLENGE_NOT_OPEN_CODE = "SCP-VALID-7099";
 
 /**
- * Code the bridge raises when every grading permit of the challenger is
- * held; retry the grading later. Maps from
- * `TrustError::GradingCapacityExhausted`.
+ * Code the bridge raises when a response or a grading falls outside the
+ * challenge window. Maps from `TrustError::ChallengeExpired`.
+ */
+export const CHALLENGE_EXPIRED_CODE = "SCP-VALID-7102";
+
+/**
+ * Code the bridge raises when an attempt number is not the last graded
+ * attempt plus one. Maps from `TrustError::AttemptOutOfOrder`.
+ */
+export const ATTEMPT_OUT_OF_ORDER_CODE = "SCP-VALID-7103";
+
+/**
+ * Code the bridge raises when an attempt number exceeds `1 + maxRetries`.
+ * Maps from `TrustError::RetriesExhausted`.
+ */
+export const RETRIES_EXHAUSTED_CODE = "SCP-VALID-7104";
+
+/**
+ * Code the bridge raises when the cooldown since the last graded attempt or
+ * grading fault has not passed; {@link retryAfter} reads the first second the
+ * next attempt is accepted. Maps from `TrustError::CooldownActive`.
+ */
+export const COOLDOWN_ACTIVE_CODE = "SCP-VALID-7105";
+
+/**
+ * Code the bridge raises when the challenge closed after a pass or after its
+ * last allowed attempt. Maps from `TrustError::ChallengeClosed`.
+ */
+export const CHALLENGE_CLOSED_CODE = "SCP-VALID-7106";
+
+/**
+ * Code the bridge raises when the challenger's ledger holds no live challenge
+ * with the request's id, request digest and subject. Maps from
+ * `TrustError::UnknownChallenge`.
+ */
+export const UNKNOWN_CHALLENGE_CODE = "SCP-VALID-7107";
+
+/**
+ * Code the bridge raises when a response names another challenge or request
+ * digest, or its outputs do not match the cases one for one and in order.
+ * Maps from `TrustError::OutputsMismatch`.
+ */
+export const OUTPUTS_MISMATCH_CODE = "SCP-VALID-7108";
+
+/**
+ * Code the bridge raises when a `CustomEval` evaluator outlet is unregistered
+ * in its evaluator context, has no handler, or may not be called by the
+ * challenger. Maps from `TrustError::EvaluatorUnavailable`.
+ */
+export const EVALUATOR_UNAVAILABLE_CODE = "SCP-VALID-7109";
+
+/**
+ * Code the bridge raises when the challenger and the subject decode to the
+ * same key. Maps from `TrustError::SelfChallenge` and
+ * `AdmissionError::SelfChallenge`.
+ */
+export const SELF_CHALLENGE_CODE = "SCP-VALID-7127";
+
+/**
+ * Code the bridge raises when the capability URI names a standard whose pass
+ * condition cannot be computed from the subject's outputs, or a system
+ * capability (`scp:system:*`). Maps from `TrustError::StandardNotGradable`.
+ */
+export const STANDARD_NOT_GRADABLE_CODE = "SCP-VALID-7128";
+
+/**
+ * Code the bridge raises when no capability definition can be obtained for
+ * the capability URI; the code reports an outage, not a judgment on the
+ * subject. Maps from `TrustError::CapabilityDefinitionUnavailable`.
+ */
+export const CAPABILITY_DEFINITION_UNAVAILABLE_CODE = "SCP-VALID-7129";
+
+/**
+ * Code the bridge raises when a policy value lies outside the capability
+ * definition's limits or the protocol bounds, or a record allows more retries
+ * or a shorter cooldown than a requirement's retry cap. Maps from
+ * `TrustError::PolicyOutsideDefinition` and
+ * `AdmissionError::RetryCapExceeded`.
+ */
+export const POLICY_OUTSIDE_DEFINITION_CODE = "SCP-VALID-7137";
+
+/**
+ * Code the bridge raises when a `SchemaMatch` case's schema is not
+ * admissible. Maps from `TrustError::SchemaRejected`.
+ */
+export const SCHEMA_REJECTED_CODE = "SCP-VALID-7138";
+
+/**
+ * Code the bridge raises when another grading of the same challenge holds a
+ * live lease; retry later. Maps from `TrustError::GradingInProgress`.
+ */
+export const GRADING_IN_PROGRESS_CODE = "SCP-VALID-7139";
+
+/**
+ * Code the bridge raises when a response exceeds the protocol's byte or JSON
+ * depth limit. Maps from `TrustError::ResponseTooLarge`.
+ */
+export const RESPONSE_TOO_LARGE_CODE = "SCP-VALID-7143";
+
+/**
+ * Code the bridge raises when two validly signed capability definitions for
+ * one URI differ. Maps from `TrustError::DefinitionEquivocation`.
+ */
+export const DEFINITION_EQUIVOCATION_CODE = "SCP-VALID-7144";
+
+/**
+ * Code the bridge raises when every grading permit of the challenger is held;
+ * retry the grading later. Maps from `TrustError::GradingCapacityExhausted`.
  */
 export const GRADING_CAPACITY_EXHAUSTED_CODE = "SCP-VALID-7146";
 
 /**
  * Code the bridge raises when a DID is not the canonical spelling of its key
- * (a challenger, a subject, or a requirement's trusted verifier).
+ * (a challenger, a subject, or a requirement's trusted verifier). Maps from
+ * `TrustError::NonCanonicalIdentifier` and
+ * `AdmissionError::NonCanonicalIdentifier`.
  */
 export const NON_CANONICAL_IDENTIFIER_CODE = "SCP-VALID-7147";
 
@@ -2224,22 +2415,99 @@ export const TOO_MANY_CAPABILITY_REQUIREMENTS_CODE = "SCP-VALID-7148";
 export const GRADING_LEASE_LOST_CODE = "SCP-VALID-7149";
 
 /**
+ * Code the bridge raises when a capability requirement breaks a spec 07
+ * §7.3.4.4 rule, such as a `ChallengeVerified` requirement with no trusted
+ * verifier; the SDK raises it too, before the bridge. Maps from
+ * `AdmissionError::InvalidRequirement`.
+ */
+export const INVALID_REQUIREMENT_CODE = "SCP-VALID-7150";
+
+/**
+ * Code the bridge raises when the challenger's last challenge to this subject
+ * for this capability is still inside its window; {@link retryAfter} reads
+ * the second a new one may be created. Maps from
+ * `TrustError::ChallengeWindowOpen`.
+ */
+export const CHALLENGE_WINDOW_OPEN_CODE = "SCP-VALID-7151";
+
+/**
+ * Code the bridge raises when an attempt is graded in the second its
+ * challenge was created; {@link retryAfter} reads the first second grading
+ * may succeed. Maps from `TrustError::ChallengeNotYetGradable`.
+ */
+export const CHALLENGE_NOT_YET_GRADABLE_CODE = "SCP-VALID-7153";
+
+const RETRYABLE_CODES: ReadonlySet<string> = new Set([
+  CHALLENGE_NOT_OPEN_CODE,
+  COOLDOWN_ACTIVE_CODE,
+  GRADING_IN_PROGRESS_CODE,
+  GRADING_CAPACITY_EXHAUSTED_CODE,
+  GRADING_LEASE_LOST_CODE,
+  CHALLENGE_WINDOW_OPEN_CODE,
+  CHALLENGE_NOT_YET_GRADABLE_CODE,
+]);
+
+/**
+ * Reports whether a challenge refusal with `code` may succeed when the same
+ * call is made again later: true for {@link CHALLENGE_NOT_OPEN_CODE},
+ * {@link COOLDOWN_ACTIVE_CODE}, {@link GRADING_IN_PROGRESS_CODE},
+ * {@link GRADING_CAPACITY_EXHAUSTED_CODE}, {@link GRADING_LEASE_LOST_CODE},
+ * {@link CHALLENGE_WINDOW_OPEN_CODE} and {@link CHALLENGE_NOT_YET_GRADABLE_CODE},
+ * and false for every other code.
+ */
+export function isRetryable(code: string): boolean {
+  return RETRYABLE_CODES.has(code);
+}
+
+const RETRY_AFTER_SUFFIX = /\(retry_after=(\d+)\)/g;
+
+/**
+ * The first Unix second at which a refused challenge call may succeed, read
+ * from the `(retry_after=N)` suffix the bridge appends to the message of a
+ * {@link COOLDOWN_ACTIVE_CODE}, {@link CHALLENGE_WINDOW_OPEN_CODE} or
+ * {@link CHALLENGE_NOT_YET_GRADABLE_CODE} refusal. Returns `null` when the
+ * message of `error` (an `Error`, or a message string) carries no suffix.
+ */
+export function retryAfter(error: unknown): number | null {
+  const message = typeof error === "string" ? error : error instanceof Error ? error.message : null;
+  if (message === null) {
+    return null;
+  }
+  let seconds: number | null = null;
+  for (const match of message.matchAll(RETRY_AFTER_SUFFIX)) {
+    const n = Number(match[1]);
+    seconds = Number.isSafeInteger(n) ? n : null;
+  }
+  return seconds;
+}
+
+/**
  * What a test case's output must satisfy (spec 07 §7.3.4). Encoded
  * externally tagged, `{"<Variant>": {<fields>}}`, the Rust `ExpectedOutput`
- * wire form. `CustomEval` names an evaluator outlet the challenger chooses;
- * the SDK ships none.
+ * wire form. `CustomEval` names an evaluator outlet the challenger chooses,
+ * and the context where the challenger calls it; the SDK ships no evaluator.
  */
 export type ExpectedOutput =
   | { readonly kind: "ExactMatch"; readonly value: unknown }
   | { readonly kind: "SchemaMatch"; readonly schema: unknown }
   | { readonly kind: "ContainsAll"; readonly required: readonly string[] }
   | { readonly kind: "ContainsNone"; readonly forbidden: readonly string[] }
-  | { readonly kind: "CustomEval"; readonly evaluatorOutletId: string };
+  | {
+      readonly kind: "CustomEval";
+      /** The evaluator outlet that grades the case. */
+      readonly evaluatorOutletId: string;
+      /**
+       * The context where the challenger calls `evaluatorOutletId`. Every
+       * `CustomEval` case of one challenge names the same context; the
+       * wire form of the case does not carry it.
+       */
+      readonly evaluatorContextId: string;
+    };
 
 /**
  * One test case of a challenge with its answer, written by the challenger
  * (spec 07 §7.3.4). The answer never leaves the challenger: the request
- * carries a {@link ChallengeCase} with a commitment to it instead.
+ * carries a {@link ChallengeCase}, which has no answer.
  *
  * A request's weights sum to 10000. Numbers in `input` and in the expected
  * output must lie within ±(2^53 - 1) (I-JSON); the bridge refuses others.
@@ -2260,8 +2528,8 @@ export interface TestCase {
 }
 
 /**
- * One test case as the signed request carries it: the input and a
- * commitment to the answer, never the answer (spec 07 §7.3.4).
+ * One test case as the signed request carries it: the input, never the
+ * answer (spec 07 §7.3.4).
  *
  * Mirrors the Rust `ChallengeCase` struct (`scp-core`).
  */
@@ -2274,32 +2542,71 @@ export interface ChallengeCase {
   readonly category: string;
   /** Importance weight in basis points. */
   readonly weight: number;
-  /** The salted commitment to the case's answer, as 64 lowercase hex characters. */
-  readonly answerCommitment: string;
 }
 
 /**
- * A challenger's retry policy for one challenge (spec 07 §7.3.4.6): at most
- * the capability definition's retries, and at least its cooldown. Omit it
- * to take the definition's values.
+ * A challenger's retry policy for one challenge (spec 07 §7.3.4.6). A policy
+ * may only tighten the capability definition, on any URI: at most the
+ * definition's retries, and at least its cooldown. An absent field takes the
+ * definition's value, and omitting the policy takes both.
  */
 export interface ChallengePolicy {
   /** Retries after the first attempt; at most the definition's. */
-  readonly maxRetries: number;
+  readonly maxRetries?: number;
   /** Seconds between graded attempts; at least the definition's. */
-  readonly cooldownSecs: number;
+  readonly cooldownSecs?: number;
 }
 
-/** Options of {@link SCP.trustCreateChallenge}. */
-export interface CreateChallengeOptions {
-  /** A stricter retry policy than the capability definition's. */
-  readonly policy?: ChallengePolicy;
+/** The one argument of {@link SCP.trustCreateChallenge}. */
+export interface CreateChallengeConfig {
+  /** The challenger: an identity of this instance, whose custody signs the request. */
+  readonly verifier: Identity;
+  /** DID of the identity being challenged. */
+  readonly subject: string;
+  /** The capability URI under test, in canonical form. */
+  readonly capabilityUri: string;
   /**
-   * The context whose evaluator outlets grade `CustomEval` cases. Required
-   * when any case is `CustomEval`; the verifier must be able to call each
-   * named outlet there.
+   * The challenger-written cases, with their answers; their weights sum to
+   * 10000. Every `CustomEval` case names the same `evaluatorContextId`.
    */
-  readonly evaluatorContextId?: string;
+  readonly testCases: readonly TestCase[];
+  /** The context where the challenge is administered. */
+  readonly contextId: string;
+  /** The grading window: seconds from creation during which attempts are graded. */
+  readonly windowSecs: number;
+  /** A retry policy that tightens the capability definition's; omit to take the definition's. */
+  readonly policy?: ChallengePolicy;
+}
+
+/**
+ * The one evaluator context the `CustomEval` cases of `testCases` name, or
+ * `undefined` when no case is `CustomEval`.
+ *
+ * @throws ValidationError `SCP-VALID-7001` when two cases name different
+ *   evaluator contexts, or a `CustomEval` case names none.
+ */
+export function evaluatorContextOf(testCases: readonly TestCase[]): string | undefined {
+  let context: string | undefined;
+  for (const c of testCases) {
+    if (c.expected.kind !== "CustomEval") {
+      continue;
+    }
+    const id: unknown = c.expected.evaluatorContextId;
+    if (typeof id !== "string" || id.length === 0) {
+      throw new ValidationError(
+        `TestCase ${JSON.stringify(c.testId)}: a CustomEval case must name its evaluatorContextId`,
+        MALFORMED_SDK_INPUT_CODE,
+      );
+    }
+    if (context !== undefined && context !== id) {
+      throw new ValidationError(
+        `TestCase ${JSON.stringify(c.testId)}: CustomEval cases of one challenge name one evaluator context, got ${JSON.stringify(context)} and ${JSON.stringify(id)}`,
+        MALFORMED_SDK_INPUT_CODE,
+      );
+    }
+    context = id;
+  }
+  return context;
 }
 
 /**
@@ -2316,7 +2623,7 @@ export interface ChallengeRequest {
   readonly capabilityUri: string;
   /** Digest of the capability definition the challenge follows, as 64 lowercase hex characters. */
   readonly definitionDigest: string;
-  /** The cases, with answer commitments and no answers. */
+  /** The cases, without their answers. */
   readonly testCases: readonly ChallengeCase[];
   /** Unix seconds when the challenge was created. */
   readonly createdAt: number;
@@ -2446,8 +2753,8 @@ export function encodeTestOutputs(outputs: readonly TestOutput[]): string {
  * Encodes a typed {@link ChallengeRequest} to the JSON wire shape the Rust
  * bridge deserializes (`ChallengeRequest`).
  *
- * @throws Error if `verifierSignature` is not exactly 64 elements, an id,
- *   digest or commitment is not 64 lowercase hex characters, or a number is
+ * @throws Error if `verifierSignature` is not exactly 64 elements, an id
+ *   or digest is not 64 lowercase hex characters, or a number is
  *   out of its range (before any bridge call).
  */
 export function encodeChallengeRequest(request: ChallengeRequest): string {
@@ -2462,7 +2769,6 @@ export function encodeChallengeRequest(request: ChallengeRequest): string {
       input: c.input,
       category: c.category,
       weight: requireUint("ChallengeCase", "weight", c.weight, U32_MAX),
-      answer_commitment: requireLowerHex32("ChallengeCase", "answerCommitment", c.answerCommitment),
     })),
     created_at: requireUint(t, "createdAt", request.createdAt, Number.MAX_SAFE_INTEGER),
     expires_at: requireUint(t, "expiresAt", request.expiresAt, Number.MAX_SAFE_INTEGER),
@@ -2496,11 +2802,6 @@ export function decodeChallengeRequest(json: string): ChallengeRequest {
         input: c.input,
         category: requireString("ChallengeCase", "category", c.category),
         weight: requireUint("ChallengeCase", "weight", c.weight, U32_MAX),
-        answerCommitment: requireLowerHex32(
-          "ChallengeCase",
-          "answer_commitment",
-          c.answer_commitment,
-        ),
       };
     }),
     createdAt: requireUint(t, "created_at", raw.created_at, Number.MAX_SAFE_INTEGER),

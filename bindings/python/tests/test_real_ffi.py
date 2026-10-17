@@ -1089,12 +1089,7 @@ class TestTrust:
         the requirement the check reads.
         """
         from scp_sdk.errors import ValidationError
-        from scp_sdk.trust import (
-            NON_CANONICAL_IDENTIFIER_CODE,
-            CapabilityRequirement,
-            VerificationLevel,
-            encode_capability_requirements,
-        )
+        from scp_sdk.trust import NON_CANONICAL_IDENTIFIER_CODE, SelfAttested
         from tests.harness_custody import create_in_memory_identity
 
         creator = await create_in_memory_identity(scp)
@@ -1105,14 +1100,9 @@ class TestTrust:
                 "ceiling": ["messages:read", "messages:write"],
                 "memory_scope": "ephemeral",
                 "governance": "single_admin",
-                "capability_requirements": encode_capability_requirements(
-                    [
-                        CapabilityRequirement(
-                            capability="scp:capability:schema-validation/v1",
-                            verification_level=VerificationLevel("SelfAttested"),
-                        )
-                    ]
-                ),
+                "capability_requirements": [
+                    SelfAttested(capability="scp:capability:schema-validation/v1")
+                ],
             },
         )
         context_id = ctx.context_id

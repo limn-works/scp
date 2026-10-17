@@ -214,7 +214,7 @@ impl Fixture {
         &self,
         uri: &str,
         test_cases: Vec<TestCase>,
-        pick: Option<PolicyPick>,
+        pick: PolicyPick,
     ) -> Result<NewChallenge, TrustError> {
         Ok(NewChallenge {
             verifier: self.verifier.did.clone(),
@@ -233,7 +233,10 @@ impl Fixture {
         uri: &str,
         test_cases: Vec<TestCase>,
     ) -> Result<(ChallengeRequest, AnswerKey), TrustError> {
-        issue_challenge(self.new_challenge(uri, test_cases, None)?, &self.verifier)
+        issue_challenge(
+            self.new_challenge(uri, test_cases, PolicyPick::default())?,
+            &self.verifier,
+        )
     }
 
     /// The subject's signed response for `attempt`.

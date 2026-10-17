@@ -2,7 +2,7 @@
 // (ADR-058, the input-side analog of ADR-059).
 //
 // Mirrors `scp_protocol::trust::{admission, challenge, participation}`:
-// VerificationLevel / RetryCap / CapabilityRequirement (§7.3.4.4),
+// RetryCap / CapabilityRequirement (§7.3.4.4),
 // ChallengeVerification (§7.3.4, ADR-017), and
 // ParticipationFact / ParticipationThreshold / RequireParticipation /
 // ParticipationProfile (§7.3.2.1, SCP-BA-004). The SDK exposes typed shapes
@@ -28,53 +28,34 @@ import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonEncoder
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
+import uniffi.scp.ScpException
 
 /**
  * The one [Json] configuration for trust-admission and challenge wire
  * encoding.
  *
- * `encodeDefaults = true` so defaulted fields ([CapabilityRequirement.trustedVerifiers],
- * an absent [CapabilityRequirement.retryCap]) serialize explicitly, as
- * `serde_json::to_string` of the Rust struct and the Swift/TypeScript SDK
- * encoders write them, rather than being omitted as kotlinx.serialization
- * would do for defaulted fields. Decoding refuses an unknown key and a missing
- * field, so a shape the bridge did not write fails at the boundary.
+ * `encodeDefaults = true` so a defaulted field serializes explicitly, as
+ * `serde_json::to_string` of the Rust struct writes it, rather than being
+ * omitted as kotlinx.serialization would do. Decoding refuses an unknown key
+ * and a missing field, so a shape the bridge did not write fails at the
+ * boundary.
  */
 internal val trustAdmissionJson = Json { encodeDefaults = true }
 
 // ---------------------------------------------------------------------------
 // Capability admission types (§7.3.4.4, ADR-058)
 // ---------------------------------------------------------------------------
-
-/**
- * How a capability must be verified for admission.
- *
- * Encodes to the bare variant name string (`"SelfAttested"` /
- * `"ChallengeVerified"`) to match the Rust `VerificationLevel` enum's default
- * (externally-tagged) serde representation. `ChallengeVerified` also satisfies
- * `SelfAttested`. Mirrors the Swift SDK `VerificationLevel` enum and the
- * TypeScript SDK `VerificationLevel` union 1:1.
- */
-@Serializable
-enum class VerificationLevel {
-    /**
-     * The agent claims the capability (present in its capability list); no
-     * challenge proof required.
-     */
-    @SerialName("SelfAttested")
-    SELF_ATTESTED,
-
-    /** The capability was verified through the challenge-response protocol. */
-    @SerialName("ChallengeVerified")
-    CHALLENGE_VERIFIED,
-}
 
 /**
  * The most retries and the least cooldown a context accepts from a
@@ -85,39 +66,64 @@ enum class VerificationLevel {
  * @property minCooldownSecs The shortest cooldown, in seconds, the
  *   challenger's standard may set.
  */
-@Serializable
 data class RetryCap(
-    @SerialName("max_retries") val maxRetries: UInt,
-    @SerialName("min_cooldown_secs") val minCooldownSecs: UInt,
+    val maxRetries: UInt,
+    val minCooldownSecs: UInt,
 )
 
 /**
- * A single admission requirement: a capability URI, the minimum verification
- * level, and for `ChallengeVerified` the challengers whose records count
- * (spec 07 §7.3.4.4).
+ * A single admission requirement of a context (spec 07 §7.3.4.4): a
+ * capability URI and how a subject proves it.
  *
- * A context's governance holds its requirements: set
- * `ContextParams.capabilityRequirementsJson` to
- * [encodeCapabilityRequirementsJson] of them when creating the context. The
- * serial names are the snake_case the Rust `RawCapabilityRequirement`
- * deserializes. Mirrors the Swift SDK `CapabilityRequirement`, the TypeScript
- * SDK `CapabilityRequirement`, and the Python SDK `CapabilityRequirement`.
- *
- * @property capability The capability URI that must be present.
- * @property verificationLevel The minimum verification level required.
- * @property trustedVerifiers DIDs of the challengers whose records meet a
- *   `ChallengeVerified` requirement. Required and non-empty for
- *   `ChallengeVerified`; empty for `SelfAttested`. The bridge enforces both.
- * @property retryCap The retry and cooldown bounds a record's standard must
- *   meet, if any. Only `ChallengeVerified` takes one.
+ * A context's governance holds its requirements: pass them as
+ * [TypedContextParams.capabilityRequirements] when creating the context, or
+ * propose a new list with [SCP.governanceModifyCapabilityRequirements].
+ * [SelfAttested] carries no verifiers and no retry cap, and
+ * [ChallengeVerified] cannot be built without a trusted verifier, so every
+ * value the type can hold is a requirement the bridge accepts on those two
+ * rules. Mirrors the Swift SDK `CapabilityRequirement` enum, the TypeScript
+ * SDK `CapabilityRequirement` union, and the Python SDK `CapabilityRequirement`
+ * union.
  */
-@Serializable
-data class CapabilityRequirement(
-    val capability: String,
-    @SerialName("verification_level") val verificationLevel: VerificationLevel,
-    @SerialName("trusted_verifiers") val trustedVerifiers: List<String> = emptyList(),
-    @SerialName("retry_cap") val retryCap: RetryCap? = null,
-)
+sealed class CapabilityRequirement {
+    /** The capability URI that must be present. */
+    abstract val capability: String
+
+    /**
+     * The subject lists [capability] among its own capabilities; no challenge
+     * record is needed.
+     */
+    data class SelfAttested(
+        override val capability: String,
+    ) : CapabilityRequirement()
+
+    /**
+     * The subject holds a passing challenge record for [capability] signed by
+     * one of [trustedVerifiers]. It also meets a [SelfAttested] requirement
+     * for the same capability.
+     *
+     * @property trustedVerifiers DIDs of the challengers whose records count;
+     *   at least one.
+     * @property retryCap The retry and cooldown bounds a record's standard must
+     *   meet; `null` sets none beyond the definition's.
+     * @throws ScpException.Validation with code [INVALID_REQUIREMENT_CODE] when
+     *   [trustedVerifiers] is empty.
+     */
+    data class ChallengeVerified(
+        override val capability: String,
+        val trustedVerifiers: List<String>,
+        val retryCap: RetryCap? = null,
+    ) : CapabilityRequirement() {
+        init {
+            if (trustedVerifiers.isEmpty()) {
+                throw ScpException.Validation(
+                    msg = "a ChallengeVerified requirement for $capability names no trusted verifier",
+                    code = INVALID_REQUIREMENT_CODE,
+                )
+            }
+        }
+    }
+}
 
 /**
  * A signed record that a challenger graded a subject's response (spec 07
@@ -137,7 +143,7 @@ data class CapabilityRequirement(
  * @property capabilityUri The capability URI that was tested.
  * @property definitionDigest Digest of the capability definition, 64
  *   lowercase hex characters.
- * @property suiteDigest Digest of the graded test cases, 64 lowercase hex
+ * @property suiteDigest Digest of the request's cases, 64 lowercase hex
  *   characters.
  * @property challengeId The graded request's id, 64 lowercase hex characters.
  * @property attempt The attempt this record grades, starting at 1.
@@ -401,17 +407,44 @@ data class ParticipationProfile(
 // ---------------------------------------------------------------------------
 
 /**
- * Encodes a typed [CapabilityRequirement] list to the JSON
- * `ContextParams.capabilityRequirementsJson` carries
- * (`Vec<RawCapabilityRequirement>`). [CapabilityRequirement.verificationLevel]
- * serializes as the bare variant string; the bridge validates the list when
- * the context is created.
+ * Encodes typed requirements to the JSON array the bridge deserializes
+ * (`Vec<RawCapabilityRequirement>`): each element names `capability`,
+ * `verification_level` (`"SelfAttested"` or `"ChallengeVerified"`),
+ * `trusted_verifiers` (`[]` for `SelfAttested`) and `retry_cap`
+ * (`{"max_retries", "min_cooldown_secs"}` or `null`).
  */
-fun encodeCapabilityRequirementsJson(requirements: List<CapabilityRequirement>): String =
-    trustAdmissionJson.encodeToString(
-        ListSerializer(CapabilityRequirement.serializer()),
-        requirements,
+internal fun encodeCapabilityRequirementsJson(requirements: List<CapabilityRequirement>): String =
+    Json.encodeToString(
+        JsonArray.serializer(),
+        buildJsonArray { requirements.forEach { add(encodeCapabilityRequirementElement(it)) } },
     )
+
+private fun encodeCapabilityRequirementElement(requirement: CapabilityRequirement): JsonObject =
+    buildJsonObject {
+        put("capability", requirement.capability)
+        when (requirement) {
+            is CapabilityRequirement.SelfAttested -> {
+                put("verification_level", "SelfAttested")
+                put("trusted_verifiers", JsonArray(emptyList()))
+                put("retry_cap", JsonNull)
+            }
+            is CapabilityRequirement.ChallengeVerified -> {
+                put("verification_level", "ChallengeVerified")
+                put("trusted_verifiers", buildJsonArray { requirement.trustedVerifiers.forEach { add(it) } })
+                put("retry_cap", encodeRetryCapElement(requirement.retryCap))
+            }
+        }
+    }
+
+private fun encodeRetryCapElement(retryCap: RetryCap?): JsonElement =
+    if (retryCap == null) {
+        JsonNull
+    } else {
+        buildJsonObject {
+            put("max_retries", retryCap.maxRetries.toLong())
+            put("min_cooldown_secs", retryCap.minCooldownSecs.toLong())
+        }
+    }
 
 /** Expected element count of a 32-byte field (Rust `[u8; 32]`). */
 private const val BYTES_32 = 32

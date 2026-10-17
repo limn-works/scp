@@ -27,7 +27,6 @@ package works.limn.scp
 import uniffi.scp.AssetEntry
 import uniffi.scp.AttestationVerificationResult
 import uniffi.scp.BatchPublishResult
-import uniffi.scp.ChallengePolicy
 import uniffi.scp.Checkpoint
 import uniffi.scp.ContextHandle
 import uniffi.scp.ContextParams
@@ -559,6 +558,23 @@ class SCP internal constructor(
             identity = identity,
             params = params,
         )
+
+    /**
+     * Creates a context from typed parameters: the SDK encodes
+     * [TypedContextParams.consequenceRules],
+     * [TypedContextParams.consequenceConfig] and
+     * [TypedContextParams.capabilityRequirements] to the bridge's JSON and
+     * forwards to [NativeScp.contextCreate] on [inner].
+     *
+     * @throws uniffi.scp.ScpException.Validation with the requirement's code
+     *   ([NON_CANONICAL_IDENTIFIER_CODE], [TOO_MANY_CAPABILITY_REQUIREMENTS_CODE],
+     *   [INVALID_REQUIREMENT_CODE]) for a requirement list that breaks a spec 07
+     *   §7.3.4.4 rule; otherwise fails as the [ContextParams] overload does.
+     */
+    suspend fun contextCreate(
+        identity: Identity,
+        params: TypedContextParams,
+    ): ContextHandle = contextCreate(identity = identity, params = params.toContextParams())
 
     /** Forwards to [NativeScp.contextDrainEvents] on [inner]. */
     suspend fun contextDrainEvents(handle: ContextHandle): List<String> = inner.contextDrainEvents(handle = handle)
@@ -1130,6 +1146,33 @@ class SCP internal constructor(
                 handle = handle,
                 proposerDid = proposerDid,
                 actionJson = actionJson,
+            ),
+        )
+
+    /**
+     * Proposes that the context's governance replace its capability
+     * requirements with [requirements], the complete new list; an empty list
+     * clears it (spec 07 §7.3.4.4). Encodes [requirements] and forwards to
+     * [NativeScp.governanceModifyCapabilityRequirements] on [inner].
+     *
+     * Returns the bridge's JSON after [checkProposalResponse] checks every
+     * name in it. Admission reads the new list once the proposal executes.
+     *
+     * @throws ScpException.Validation with the requirement's code
+     *   ([NON_CANONICAL_IDENTIFIER_CODE], [TOO_MANY_CAPABILITY_REQUIREMENTS_CODE],
+     *   [INVALID_REQUIREMENT_CODE]) for a list that breaks a §7.3.4.4 rule;
+     *   otherwise fails as [governancePropose] does.
+     */
+    suspend fun governanceModifyCapabilityRequirements(
+        handle: ContextHandle,
+        proposerDid: String,
+        requirements: List<CapabilityRequirement>,
+    ): String =
+        checkProposalResponse(
+            inner.governanceModifyCapabilityRequirements(
+                handle = handle,
+                proposerDid = proposerDid,
+                requirementsJson = encodeCapabilityRequirementsJson(requirements),
             ),
         )
 
@@ -2071,54 +2114,42 @@ class SCP internal constructor(
     suspend fun transportStatus(manager: TransportManager): TransportStatus = inner.transportStatus(manager = manager)
 
     /**
-     * Issues a challenge request for [capabilityUri] signed by [verifier]'s
-     * `#active` key through custody (spec 07 §7.3.4 step 1, ADR-017).
+     * Issues a challenge request for [CreateChallengeConfig.capabilityUri],
+     * signed by [CreateChallengeConfig.verifier]'s `#active` key through
+     * custody (spec 07 §7.3.4 step 1, ADR-017).
      *
-     * The challenger writes [testCases] with their answers. The returned
-     * request carries a salted commitment to each answer and never the answer;
-     * the challenger's ledger keeps the answers to grade with. The capability
-     * definition for [capabilityUri] sets the pass threshold, the retries and
-     * the cooldown; [policy] may only tighten them.
+     * The challenger writes the test cases with their expected outputs. The
+     * returned request carries each case without its expected output; the
+     * challenger's ledger keeps the expected outputs to grade with. The
+     * capability definition sets the pass threshold, the retries and the
+     * cooldown; [CreateChallengeConfig.policy] may only tighten them, on any
+     * URI. The `CustomEval` cases' one evaluator context goes to the bridge
+     * as the context whose outlets grade them.
      *
-     * @param verifier The challenger's identity.
-     * @param subject DID of the challenged identity.
-     * @param capabilityUri The capability URI under test.
-     * @param testCases The challenger-written cases; their weights sum to 10000.
-     * @param contextId The context where the challenge is administered.
-     * @param windowSecs Seconds from creation during which attempts are graded.
-     * @param evaluatorContextId The context of the evaluator outlet that
-     *   `CustomEval` cases name; `null` when there are none.
-     * @param policy A stricter retry and cooldown policy; `null` keeps the
-     *   definition's.
      * @throws IllegalArgumentException when the returned request is malformed.
-     * @throws uniffi.scp.ScpException.Validation with code
-     *   [CHALLENGE_SUITE_BELOW_MINIMUM_CODE] when the suite has fewer cases
-     *   than the definition's minimum, `SCP-VALID-7002` for malformed test
-     *   cases, `SCP-VALID-7137` for a policy looser than the definition, and
+     * @throws uniffi.scp.ScpException.Validation with code `SCP-VALID-7001`,
+     *   before any bridge call, when `CustomEval` cases name two evaluator
+     *   contexts; with [CHALLENGE_SUITE_BELOW_MINIMUM_CODE] when the suite has
+     *   fewer cases than the definition's minimum, `SCP-VALID-7002` for
+     *   malformed test cases, [POLICY_OUTSIDE_DEFINITION_CODE] for a policy
+     *   looser than the definition, [SELF_CHALLENGE_CODE] when the subject is
+     *   the verifier, [EVALUATOR_UNAVAILABLE_CODE] for a `CustomEval` outlet
+     *   that cannot run, [CHALLENGE_WINDOW_OPEN_CODE] while the verifier's
+     *   last challenge to the subject is in its window, and
      *   [NON_CANONICAL_IDENTIFIER_CODE] for a DID that is not canonical.
      */
-    @Suppress("LongParameterList")
-    suspend fun trustCreateChallenge(
-        verifier: Identity,
-        subject: String,
-        capabilityUri: String,
-        testCases: List<TestCase>,
-        contextId: String,
-        windowSecs: UInt,
-        evaluatorContextId: String? = null,
-        policy: ChallengePolicy? = null,
-    ): ChallengeRequest =
+    suspend fun trustCreateChallenge(config: CreateChallengeConfig): ChallengeRequest =
         decodeChallengeRequestJson(
             inner
                 .trustCreateChallenge(
-                    verifier = verifier,
-                    subject = subject,
-                    capabilityUri = capabilityUri,
-                    testCasesJson = encodeTestCasesJson(testCases),
-                    windowSecs = windowSecs,
-                    contextId = contextId,
-                    evaluatorContextId = evaluatorContextId,
-                    policy = policy,
+                    verifier = config.verifier,
+                    subject = config.subject,
+                    capabilityUri = config.capabilityUri,
+                    testCasesJson = encodeTestCasesJson(config.testCases),
+                    contextId = config.contextId,
+                    windowSecs = config.windowSecs,
+                    evaluatorContextId = evaluatorContextOf(config.testCases),
+                    policy = config.policy,
                 ).requestJson,
         )
 
@@ -2192,7 +2223,8 @@ class SCP internal constructor(
      *
      * Both signatures are checked first. The challenger's ledger then checks
      * the attempt number, the cooldown and the window, grades each case against
-     * its stored answer, and signs a record for the attempt, pass or fail. The
+     * its stored expected output, and signs a record for the attempt, pass or
+     * fail. The
      * record is also written to this instance's trust store;
      * [GradedChallenge.trustStoreError] says why when that write failed.
      *
@@ -2202,9 +2234,10 @@ class SCP internal constructor(
      * @throws IllegalArgumentException on a malformed [request] or [response]
      *   before any bridge call, or when the returned record is malformed.
      * @throws uniffi.scp.ScpException.Validation when a signature or the
-     *   attempt does not hold, and with code [GRADING_CAPACITY_EXHAUSTED_CODE],
-     *   [GRADING_LEASE_LOST_CODE] or [ANSWER_KEY_MISMATCH_CODE] for a grading
-     *   that used no attempt.
+     *   attempt does not hold, and with a code [isRetryable] accepts
+     *   ([GRADING_CAPACITY_EXHAUSTED_CODE], [GRADING_LEASE_LOST_CODE],
+     *   [GRADING_IN_PROGRESS_CODE], [COOLDOWN_ACTIVE_CODE],
+     *   [CHALLENGE_NOT_YET_GRADABLE_CODE]) for a grading that used no attempt.
      */
     suspend fun trustGradeResponse(
         verifier: Identity,
@@ -2507,10 +2540,11 @@ class SCP internal constructor(
      * [inner].
      *
      * The requirements are the ones the context's governance holds at the time
-     * of the call, set through `ContextParams.capabilityRequirementsJson`; the
-     * caller cannot supply them. A `ChallengeVerified` requirement is met only
-     * by a passing record signed by one of its trusted verifiers, for
-     * [subjectDid] and [contextId], within the requirement's retry cap. Each
+     * of the call, set through [TypedContextParams.capabilityRequirements] or
+     * [governanceModifyCapabilityRequirements]; the caller cannot supply
+     * them. A `ChallengeVerified` requirement is met only by a passing
+     * record signed by one of its trusted verifiers, for [subjectDid] and
+     * [contextId], within the requirement's retry cap. Each
      * record's signature is checked against the verifier's `#active` key,
      * resolved through this instance's DID resolver.
      *
