@@ -1305,6 +1305,40 @@ impl CoreFields {
         }
     }
 
+    /// Removes `borrower` from this instance's borrower registry, matching by
+    /// allocation address, and returns whether an entry was removed.
+    ///
+    /// A bridge's node start calls this after it stopped a node whose
+    /// `Supervisor` wiring failed, so the instance no longer lists a node the
+    /// caller never received (construction.md §"Node start —
+    /// `NodeStartConfig`"). Recovers a poisoned `Mutex` for the reason
+    /// [`register_borrower`](Self::register_borrower) gives.
+    pub fn unregister_borrower<B: InstanceBorrower + 'static>(&self, borrower: &Arc<B>) -> bool {
+        let target = Arc::as_ptr(borrower).cast::<()>();
+        let mut registry = self
+            .borrowers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let before = registry.entries.len();
+        registry
+            .entries
+            .retain(|entry| entry.as_ptr().cast::<()>() != target);
+        registry.entries.len() != before
+    }
+
+    /// Returns whether this instance's borrower registry lists `borrower`,
+    /// matching by allocation address.
+    #[must_use]
+    pub fn has_borrower<B: InstanceBorrower + 'static>(&self, borrower: &Arc<B>) -> bool {
+        let target = Arc::as_ptr(borrower).cast::<()>();
+        self.borrowers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .iter()
+            .any(|entry| entry.as_ptr().cast::<()>() == target)
+    }
+
     /// Stops every live borrower this instance recorded, and refuses later
     /// registrations by stopping them on arrival.
     ///
@@ -3892,6 +3926,42 @@ mod tests {
         assert!(!instance.has_supervisor());
         assert!(instance.try_supervisor().is_none());
         assert!(!instance.is_shutdown());
+    }
+
+    /// `unregister_borrower` removes only the borrower it names, while the
+    /// caller still holds that borrower, and reports whether it removed one.
+    #[test]
+    fn unregister_borrower_removes_only_the_named_borrower() {
+        struct Borrower(std::sync::atomic::AtomicBool);
+        impl InstanceBorrower for Borrower {
+            fn stop(&self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            fn stopped(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let instance = CoreFields::new();
+        let a = Arc::new(Borrower(std::sync::atomic::AtomicBool::new(false)));
+        let b = Arc::new(Borrower(std::sync::atomic::AtomicBool::new(false)));
+        instance.register_borrower(&a);
+        instance.register_borrower(&b);
+        assert!(instance.has_borrower(&a) && instance.has_borrower(&b));
+
+        assert!(instance.unregister_borrower(&a));
+        assert!(!instance.has_borrower(&a));
+        assert!(instance.has_borrower(&b));
+        assert!(
+            !instance.unregister_borrower(&a),
+            "a second removal finds nothing"
+        );
+
+        instance.stop_borrowers();
+        assert!(
+            !a.stopped(),
+            "shutdown no longer reaches an unregistered borrower"
+        );
+        assert!(b.stopped());
     }
 
     /// A stream entry inserted before shutdown begins stays registered; one

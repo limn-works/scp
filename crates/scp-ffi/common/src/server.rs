@@ -134,6 +134,36 @@ pub enum ServerError {
     /// the bridge resolved from this `SCP` instance.
     #[error("operator identity is not available to the node")]
     OperatorIdentityUnavailable,
+
+    /// The node started, but the bridge could not wire the `SCP` instance's
+    /// `Supervisor` to it. [`wire_supervisor_to_node`] shut the node down and
+    /// removed it from the instance's node registry before returning this
+    /// error (sdk-common.md §"Node start error codes", `SCP-TRANS-5056`).
+    #[error("supervisor wiring failed: {0}")]
+    SupervisorWiring(#[from] SupervisorWiringError),
+}
+
+/// The step at which [`wire_supervisor_to_node`] failed to wire an `SCP`
+/// instance's `Supervisor` to a node it started.
+#[derive(Debug, thiserror::Error)]
+pub enum SupervisorWiringError {
+    /// The instance already holds a `Supervisor`, which the bridge cannot
+    /// replace, so that `Supervisor` would never reach this node's relay.
+    #[error("the instance already holds a Supervisor that is not wired to this node")]
+    SupervisorAlreadyAttached,
+    /// The connection to the node's relay failed.
+    #[error("connecting to the node's relay failed: {0}")]
+    RelayConnect(#[from] scp_transport::TransportError),
+    /// The instance refused the transport manager for the node's relay.
+    #[error("installing the node's relay transport failed: {0}")]
+    TransportInstall(String),
+    /// After the bridge's attach step, the instance holds no `Supervisor`
+    /// whose transport reports a connected relay.
+    #[error("the bridge attached no Supervisor with a connected relay transport")]
+    SupervisorNotConnected,
+    /// The `Supervisor` refused to register the operator DID as a local DID.
+    #[error("registering the operator DID as local failed: {0}")]
+    RegisterLocalDid(String),
 }
 
 impl ServerError {
@@ -162,6 +192,7 @@ impl ServerError {
             Self::OperatorIdentityUnavailable => {
                 "operator identity is not available to the node".to_owned()
             }
+            Self::SupervisorWiring(_) => "wiring the Supervisor to the node failed".to_owned(),
         }
     }
 }
@@ -1322,6 +1353,136 @@ pub fn register_node(core: &CoreFields, node: RunningNode) -> Arc<RunningNode> {
     let node = Arc::new(node);
     core.register_borrower(&node);
     node
+}
+
+/// Wires `core`'s `Supervisor` to a started, registered `node`, or stops and
+/// unregisters `node`.
+///
+/// On failure this shuts `node` down, removes it from `core`'s node registry,
+/// and returns [`ServerError::SupervisorWiring`] (construction.md §"Node
+/// start — `NodeStartConfig`").
+///
+/// Every bridge node-start path (`node_start_on`, `node_start_in_memory_*`,
+/// `node_start_local_*` on `PyO3`, napi-rs and `UniFFI`) runs this one wiring
+/// step. Each bridge passes `node.internal_relay_url()` as `relay_url`, and
+/// passes `attach`, which builds and sets that bridge's `Supervisor` from the
+/// operator DID and a connected relay adapter. `attach` stays in each bridge
+/// because each bridge builds its `Supervisor` from its own storage and
+/// event-log providers.
+///
+/// Steps, in order: refuse an instance that already holds a `Supervisor`;
+/// connect twice to the relay with the node's bearer token, one adapter for
+/// the `Supervisor`'s transport and one for the instance's transport manager,
+/// because an adapter is not `Clone`; install the transport manager; call
+/// `attach`; check that the attached `Supervisor`'s transport reports a
+/// connected relay; register the operator DID as a local DID. No step falls
+/// back to a `Supervisor` without relay transport.
+///
+/// # Errors
+///
+/// [`ServerError::SupervisorWiring`] naming the failed step.
+pub async fn wire_supervisor_to_node<A>(
+    core: &CoreFields,
+    node: &Arc<RunningNode>,
+    relay_url: &str,
+    attach: A,
+) -> Result<(), ServerError>
+where
+    A: FnOnce(&str, Box<dyn scp_transport::TransportAdapter>),
+{
+    let mut replaced = None;
+    let result = wire_steps(core, node, relay_url, attach, &mut replaced).await;
+    let Err(e) = result else {
+        return Ok(());
+    };
+    tracing::warn!(error = %e, "node start: Supervisor wiring failed; shutting the node down");
+    node.shutdown();
+    core.unregister_borrower(node);
+    // Put back the transport manager the instance held before this node
+    // start, so a failed start leaves no manager pointing at the stopped node.
+    if let Some(previous) = replaced {
+        let restored = previous.map_or_else(
+            || core.clear_transport(),
+            |previous| core.install_transport(previous),
+        );
+        if let Err(restore) = restored {
+            tracing::error!(
+                error = %restore,
+                "node start: restoring the instance's previous transport manager failed"
+            );
+        }
+    }
+    Err(ServerError::SupervisorWiring(e))
+}
+
+/// Returns whether `core` is wired to `node` as [`wire_supervisor_to_node`]
+/// leaves it.
+///
+/// Wired means `core`'s `Supervisor` reports a connected relay transport and
+/// `core`'s transport manager holds exactly `node`'s internal relay URL.
+#[must_use]
+pub fn supervisor_wired_to(core: &CoreFields, node: &RunningNode) -> bool {
+    core.try_supervisor()
+        .is_some_and(|s| s.transport_connected())
+        && core
+            .with_transport(scp_transport::TransportManager::relay_urls)
+            .is_ok_and(|urls| urls == [node.internal_relay_url()])
+}
+
+/// The transport manager an instance held before [`wire_steps`] replaced
+/// it: `None` until the replacement, then `Some` of the previous manager, if
+/// any.
+type ReplacedTransport = Option<Option<Arc<scp_transport::TransportManager>>>;
+
+/// The fallible steps of [`wire_supervisor_to_node`]; sets `replaced` once
+/// `core` holds the node's transport manager, so the caller restores the
+/// previous manager on a later failure.
+async fn wire_steps<A>(
+    core: &CoreFields,
+    node: &RunningNode,
+    relay_url: &str,
+    attach: A,
+    replaced: &mut ReplacedTransport,
+) -> Result<(), SupervisorWiringError>
+where
+    A: FnOnce(&str, Box<dyn scp_transport::TransportAdapter>),
+{
+    use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+    if core.has_supervisor() {
+        return Err(SupervisorWiringError::SupervisorAlreadyAttached);
+    }
+    let sourced = SourcedRelayUrl {
+        url: relay_url.to_owned(),
+        source: RelayUrlSource::Explicit,
+    };
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    // Bearer-authenticated relays are WebSocket-only (spec §10.14.3 item 4);
+    // the selector keeps this connect on the shared selection surface (ADR-037).
+    let selector = core.transport_selector();
+    let supervisor_adapter = selector
+        .select_and_connect_with_bearer(&sourced, Some(node.bridge_token_hex()), Some(&profile))
+        .await?;
+    let manager_adapter = selector
+        .select_and_connect_with_bearer(&sourced, Some(node.bridge_token_hex()), Some(&profile))
+        .await?;
+    let previous = core
+        .get_transport_arc()
+        .map_err(|e| SupervisorWiringError::TransportInstall(e.to_string()))?;
+    core.install_transport(Arc::new(scp_transport::TransportManager::new(
+        relay_url.to_owned(),
+        manager_adapter,
+    )))
+    .map_err(|e| SupervisorWiringError::TransportInstall(e.to_string()))?;
+    *replaced = Some(previous);
+    attach(node.did(), supervisor_adapter);
+    let supervisor = core
+        .try_supervisor()
+        .filter(|s| s.transport_connected())
+        .ok_or(SupervisorWiringError::SupervisorNotConnected)?;
+    supervisor
+        .register_local_did(node.did().to_owned().into())
+        .await
+        .map_err(|e| SupervisorWiringError::RegisterLocalDid(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------

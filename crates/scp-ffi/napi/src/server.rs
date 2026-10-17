@@ -61,111 +61,25 @@ fn node_err(e: NodeError) -> NapiError {
     coded(&ServerError::Node(e), "node operation failed".to_owned()).into()
 }
 
-/// Auto-wires the global `ContextManager` with relay transport after
-/// node startup.
+/// Wires `bi`'s `Supervisor` to the started, registered `node` through the
+/// relay at `relay_url`, which every production caller sets to
+/// `node.internal_relay_url()`.
 ///
-/// Connects to the node's local relay (with bearer token authentication)
-/// and initializes the `ContextManager` with `RelayTransportProvider` so
-/// that context operations (create, join, send) work immediately. If the
-/// `ContextManager` was already initialized (e.g., by a prior
-/// `configureLocalTransport` or `contextCreate` call), this is a no-op —
-/// the `OnceLock` ensures first-writer-wins semantics.
-///
-/// The `bridge_token` is required because `ApplicationNode` relays enforce
-/// `Authorization: Bearer <token>` on all WebSocket connections.
-///
-/// Best-effort: logs a warning if the relay connection fails rather than
-/// blocking node startup.
+/// Delegates to [`server::wire_supervisor_to_node`], which on any failure
+/// shuts `node` down, removes it from the instance's node registry, and
+/// returns `ServerError::SupervisorWiring` (`SCP-TRANS-5056`, sdk-common.md
+/// §"Node start error codes"). The attach step is napi's
+/// `init_supervisor_with_relay_transport`.
 async fn auto_wire_context_manager(
     bi: &Arc<NapiBridgeInstance>,
-    did: &str,
+    node: &Arc<RunningNode>,
     relay_url: &str,
-    bridge_token: Zeroizing<String>,
-) {
-    let sourced = scp_transport::relay::connection::SourcedRelayUrl {
-        url: relay_url.to_owned(),
-        source: scp_transport::relay::connection::RelayUrlSource::Explicit,
-    };
-    let token2 = bridge_token.clone();
-    let profile = scp_transport::profile::TransportProfile::platform_default();
-    match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
-        &sourced,
-        Some(bridge_token),
-        Some(&profile),
-    )
+) -> napi::Result<()> {
+    server::wire_supervisor_to_node(&bi.core, node, relay_url, |did, adapter| {
+        crate::runtime::init_supervisor_with_relay_transport(bi, did, adapter);
+    })
     .await
-    {
-        Ok(adapter) => {
-            // The bearer auto-wire path stays WebSocket-only (QUIC has no
-            // bearer-upgrade surface, spec §10.14.3 item 4), so it connects
-            // directly via `connect_sourced_with_bearer` rather than the QUIC
-            // selector. The shared `init_supervisor_with_relay_transport`
-            // helper now takes a `Box<dyn TransportAdapter>` (so the discovering
-            // connect sites can hand it the selector's boxed adapter); box the
-            // concrete bearer adapter here to match.
-            crate::runtime::init_supervisor_with_relay_transport(bi, did, Box::new(adapter));
-
-            // Also populate the BridgeInstance transport manager so that
-            // broadcast publish, context subscribe, and discovery probing
-            // work without a separate `transportConnect` call. This requires
-            // a second WebSocket connection because NativeRelayAdapter is not
-            // Clone and the first was consumed by RelayTransportProvider.
-            match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
-                &sourced,
-                Some(token2),
-                Some(&profile),
-            )
-            .await
-            {
-                Ok(relay_adapter) => {
-                    let manager = scp_transport::TransportManager::new(
-                        relay_url.to_owned(),
-                        Box::new(relay_adapter),
-                    );
-                    if let Err(e) = crate::transport::set_transport_manager_arc_on(
-                        bi,
-                        std::sync::Arc::new(manager),
-                    ) {
-                        tracing::warn!(
-                            error = %e,
-                            relay_url = %relay_url,
-                            "auto_wire_supervisor: transport install failed — the bridge holds \
-                             no transport manager and records no relay for a context it creates"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        relay_url = %relay_url,
-                        "auto_wire_supervisor: Supervisor wired but failed to \
-                         populate BridgeInstance transport manager — broadcast publish and \
-                         discovery may require a manual transportConnect call"
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                relay_url = %relay_url,
-                "auto_wire_context_manager: failed to connect to node relay — \
-                 context operations may fail until transport is configured manually"
-            );
-            // Fall back to initializing without transport so that at least
-            // the Supervisor exists (with NotConfiguredTransportProvider).
-            crate::runtime::init_supervisor(bi, did);
-        }
-    }
-    // Always register the node's DID as a local DID for defense-in-depth.
-    if let Ok(supervisor) = crate::runtime::supervisor(bi)
-        && let Err(e) = supervisor.register_local_did(did.to_owned().into()).await
-    {
-        tracing::debug!(
-            error = %e,
-            "auto_wire_context_manager: register_local_did skipped (supervisor not ready)"
-        );
-    }
+    .map_err(server_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -594,13 +508,7 @@ pub(crate) async fn node_start_on(
     // this node before it releases the storage the node holds
     // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
     let inner = server::register_node(&bi.core, node);
-    auto_wire_context_manager(
-        bi,
-        inner.did(),
-        &inner.internal_relay_url(),
-        inner.bridge_token_hex(),
-    )
-    .await;
+    auto_wire_context_manager(bi, &inner, &inner.internal_relay_url()).await?;
     increment_handle_count();
     Ok(NapiNodeHandle {
         inner,
@@ -660,15 +568,12 @@ pub(crate) async fn node_start_in_memory_on(
         .await
         .map_err(server_err)?;
 
-    let did = node.identity().did().to_owned();
-    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
-    let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
-
     // Register this node as a borrower of this instance's resources, so
     // `SCP.shutdown()` stops it before `bridge_specific_shutdown` releases
-    // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+    // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`), and so a
+    // failed wiring below can remove it again.
     let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
+    auto_wire_context_manager(bi, &inner, &inner.internal_relay_url()).await?;
 
     increment_handle_count();
     Ok(NapiNodeHandle {
@@ -723,10 +628,7 @@ pub(crate) async fn node_start_local_on(
     // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
     let inner = server::register_node(&bi.core, inner);
 
-    let did = inner.did().to_owned();
-    let relay_url = inner.internal_relay_url();
-    let bridge_token = inner.bridge_token_hex();
-    auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
+    auto_wire_context_manager(bi, &inner, &inner.internal_relay_url()).await?;
 
     increment_handle_count();
     Ok(NapiNodeHandle {
@@ -1015,6 +917,13 @@ mod tests {
                 codes::TRANS_5054,
             ),
             (
+                ServerError::SupervisorWiring(
+                    server::SupervisorWiringError::SupervisorNotConnected,
+                ),
+                "transport",
+                codes::TRANS_5056,
+            ),
+            (
                 ServerError::MissingPassphrase,
                 "validation",
                 codes::VALID_7004,
@@ -1059,11 +968,104 @@ mod tests {
         assert_eq!(node.did(), did);
         assert!(node.relay_port() > 0);
         assert!(
-            crate::runtime::supervisor(&scp.inner).is_ok(),
-            "node_start must wire the instance's Supervisor"
+            server::supervisor_wired_to(&scp.inner.core, &node.inner),
+            "node_start must wire the instance's Supervisor to the node's relay"
         );
         node.shutdown();
         assert!(node.is_shutdown());
+    }
+
+    /// A relay URL on a loopback port nothing listens on, so a connect to it
+    /// fails with a refused connection.
+    fn unreachable_relay_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("ws://127.0.0.1:{port}/scp/v1")
+    }
+
+    /// `node_start_on`'s wiring step, run on a real started and registered
+    /// node with a relay URL that refuses the connection, returns
+    /// `SCP-TRANS-5056`, shuts the node down, unregisters it, leaves no
+    /// fallback `Supervisor`, and leaves the transport manager the instance
+    /// held before the start in place. A second start on an instance that
+    /// already holds a `Supervisor` also returns `SCP-TRANS-5056`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_wiring_failure_returns_trans_5056_and_unregisters_the_node() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let relay = rt().block_on(scp.relay_start_in_memory()).unwrap();
+        let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+            url: relay.relay_url(),
+            source: scp_transport::relay::connection::RelayUrlSource::Explicit,
+        };
+        let adapter = rt()
+            .block_on(
+                scp_transport::TransportSelector::new()
+                    .select_and_connect_with_bearer(&sourced, None, None),
+            )
+            .unwrap();
+        scp.inner
+            .core
+            .install_transport(Arc::new(scp_transport::TransportManager::new(
+                relay.relay_url(),
+                adapter,
+            )))
+            .unwrap();
+        let identity = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let did = identity.did();
+        let cfg = NodeStartConfig::from_json(&start_json(&did, |_| {})).unwrap();
+        let node_identity = resolve_operator_identity(&scp.inner, &cfg.identity).unwrap();
+        let storage = crate::runtime::protocol_repository(&scp.inner).instance_storage();
+        let node = rt()
+            .block_on(server::node_start(cfg, node_identity, storage))
+            .unwrap();
+        let inner = server::register_node(&scp.inner.core, node);
+
+        let err = rt()
+            .block_on(auto_wire_context_manager(
+                &scp.inner,
+                &inner,
+                &unreachable_relay_url(),
+            ))
+            .expect_err("a refused relay connect must fail the node start");
+        assert_coded(
+            &err.reason,
+            "transport",
+            codes::TRANS_5056,
+            "refused connect",
+        );
+        assert!(
+            !scp.inner.core.has_borrower(&inner),
+            "the node stays registered"
+        );
+        assert!(inner.is_shutdown(), "the node keeps running");
+        assert!(
+            !scp.inner.core.has_supervisor(),
+            "a fallback Supervisor was attached"
+        );
+        assert_eq!(
+            scp.inner
+                .core
+                .with_transport(scp_transport::TransportManager::relay_urls)
+                .unwrap(),
+            [relay.relay_url()],
+            "the failed start must restore the instance's previous transport manager"
+        );
+
+        let node = rt()
+            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .unwrap();
+        assert!(server::supervisor_wired_to(&scp.inner.core, &node.inner));
+        let reason = start_error(
+            rt().block_on(scp.node_start(start_json(&did, |_| {}))),
+            "second node start",
+        );
+        assert_coded(&reason, "transport", codes::TRANS_5056, "second node start");
+        node.shutdown();
+        relay.shutdown();
     }
 
     /// Every sdk-common.md §"Node start error codes" row a napi-rs caller can

@@ -824,6 +824,9 @@ pub const TRANS_5051: &str = "SCP-TRANS-5051";
 pub const TRANS_5052: &str = "SCP-TRANS-5052";
 /// `UniFFI` transport node error.
 pub const TRANS_5054: &str = "SCP-TRANS-5054";
+/// Node start: the bridge could not wire the `SCP` instance's `Supervisor`
+/// to the node it started (sdk-common.md §"Node start error codes").
+pub const TRANS_5056: &str = "SCP-TRANS-5056";
 /// `UniFFI` transport relay connect error.
 pub const TRANS_5060: &str = "SCP-TRANS-5060";
 /// `UniFFI` transport relay send error.
@@ -1572,6 +1575,7 @@ pub const fn server_error_code(e: &crate::server::ServerError) -> &'static str {
         E::Node(N::Tls(_)) => TRANS_5052,
         E::Node(N::Serve(_) | N::Nat(_)) => TRANS_5054,
         E::Relay(_) => TRANS_5050,
+        E::SupervisorWiring(_) => TRANS_5056,
         E::DhtInit(_) => IDENT_1001,
         E::MissingPassphrase | E::AutoGenerateUnavailable => VALID_7004,
         E::Platform(_) => CTX_2053,
@@ -1590,7 +1594,8 @@ pub enum ServerErrorClass {
     /// An identity error: the operator identity is unavailable, or the DHT
     /// client could not be built.
     Identity,
-    /// A transport error: the relay, TLS, HTTP server or NAT traversal failed.
+    /// A transport error: the relay, TLS, HTTP server or NAT traversal failed,
+    /// or the bridge could not wire its `Supervisor` to a started node.
     Transport,
     /// A context error: a dev-pair `PlatformError`.
     Context,
@@ -1613,9 +1618,9 @@ pub const fn server_error_class(e: &crate::server::ServerError) -> ServerErrorCl
         E::OperatorIdentityUnavailable | E::Node(N::Identity(_)) | E::DhtInit(_) => {
             ServerErrorClass::Identity
         }
-        E::Node(N::Relay(_) | N::Tls(_) | N::Serve(_) | N::Nat(_)) | E::Relay(_) => {
-            ServerErrorClass::Transport
-        }
+        E::Node(N::Relay(_) | N::Tls(_) | N::Serve(_) | N::Nat(_))
+        | E::Relay(_)
+        | E::SupervisorWiring(_) => ServerErrorClass::Transport,
         E::Platform(_) => ServerErrorClass::Context,
     }
 }
@@ -1676,6 +1681,11 @@ mod server_error_tests {
                     "x".into(),
                 )),
                 TRANS_5050,
+                Transport,
+            ),
+            (
+                E::SupervisorWiring(crate::server::SupervisorWiringError::SupervisorNotConnected),
+                TRANS_5056,
                 Transport,
             ),
             (

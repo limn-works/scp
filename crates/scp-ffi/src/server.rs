@@ -31,7 +31,6 @@ use scp_ffi_common::server::{
 };
 use scp_identity::DidCache;
 use scp_node::NodeError;
-use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 use crate::error::ScpPyError;
 
@@ -71,129 +70,44 @@ fn node_err(e: NodeError) -> PyErr {
     coded(&ServerError::Node(e), "node operation failed".to_owned()).into()
 }
 
-/// Auto-wires the global `ContextManager` with relay transport after
-/// node startup.
+/// Wires `bi`'s `Supervisor` to the started, registered `node` through the
+/// relay at `relay_url`, which every production caller sets to
+/// `node.internal_relay_url()`.
 ///
-/// Connects to the node's local relay (with bearer token authentication)
-/// and initializes the `ContextManager` with `RelayTransportProvider` so
-/// that context operations (create, join, send) work immediately. If the
-/// `ContextManager` was already initialized (e.g., by a prior
-/// `configure_relay_transport` or `context_create` call), this is a no-op
-/// — the `OnceLock` ensures first-writer-wins semantics.
-///
-/// The `bridge_token` is required because `ApplicationNode` relays enforce
-/// `Authorization: Bearer <token>` on all WebSocket connections.
-///
-/// Best-effort: logs a warning if the relay connection fails rather than
-/// blocking node startup.
+/// Delegates to [`server::wire_supervisor_to_node`], which on any failure
+/// shuts `node` down, removes it from the instance's node registry, and
+/// returns `ServerError::SupervisorWiring` (`SCP-TRANS-5056`, sdk-common.md
+/// §"Node start error codes"). The attach step builds the `PyO3`
+/// `Supervisor` with a `RelayTransportProvider` over the connected adapter
+/// and the instance's persistent event-log provider: a `NoOp` event log would
+/// drop every governance, role and membership leaf that
+/// `Supervisor::participation_record` (§7.3.2) reads.
 fn auto_wire_context_manager(
     bi: &crate::runtime::PyBridgeInstance,
     py: Python<'_>,
     rt: &tokio::runtime::Runtime,
-    did: &str,
+    node: &Arc<RunningNode>,
     relay_url: &str,
-    bridge_token: Zeroizing<String>,
-) {
-    let sourced = SourcedRelayUrl {
-        url: relay_url.to_owned(),
-        source: RelayUrlSource::Explicit,
-    };
-    let did_owned = did.to_owned();
-    let token2 = bridge_token.clone();
-    let profile = scp_transport::profile::TransportProfile::platform_default();
-    // Route through the transport selector for a uniform connect surface (spec
-    // §10.14.3 item 4; ADR-037). Bearer-authenticated relays are WebSocket-only
-    // (QUIC has no bearer-upgrade surface), so the selector connects WebSocket
-    // here — but the routing keeps every connect site flowing through the same
-    // selection layer.
-    let selector = scp_transport::TransportSelector::new();
-    let selector2 = scp_transport::TransportSelector::new();
-    match py.allow_threads(|| {
-        rt.block_on(selector.select_and_connect_with_bearer(
-            &sourced,
-            Some(bridge_token),
-            Some(&profile),
-        ))
-    }) {
-        Ok(adapter) => {
-            let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
-                did_owned.clone(),
-                std::sync::Arc::new(scp_clock::SystemClock),
-            ));
-            let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
-            // The supervisor's own event log MUST be the persistent Merkle
-            // provider (sharing the bridge instance's single storage backend),
-            // NOT a NoOp — `Supervisor::participation_record` (§7.3.2) and other
-            // supervisor reads of the convergent log require entry/Merkle-root
-            // support. A NoOp silently dropped every governance/role/membership
-            // leaf. Matches `configure_relay_transport` and the local path.
-            let event_log = crate::runtime::build_event_log_provider(bi);
-            crate::runtime::init_context_manager_with(
-                bi, &did_owned, crypto, transport, event_log, None,
-            );
-
-            // Also populate the BridgeInstance transport manager so that
-            // broadcast publish, context subscribe, and discovery probing
-            // work without a separate `transport_connect` call. This requires
-            // a second WebSocket connection because NativeRelayAdapter is not
-            // Clone and the first was consumed by RelayTransportProvider.
-            match py.allow_threads(|| {
-                rt.block_on(selector2.select_and_connect_with_bearer(
-                    &sourced,
-                    Some(token2),
-                    Some(&profile),
-                ))
-            }) {
-                Ok(relay_adapter) => {
-                    let manager =
-                        scp_transport::TransportManager::new(relay_url.to_owned(), relay_adapter);
-                    if let Err(e) = bi.core.install_transport(std::sync::Arc::new(manager)) {
-                        tracing::warn!(
-                            error = %e,
-                            relay_url = %relay_url,
-                            "auto_wire: transport install failed — the bridge holds no transport \
-                             manager and records no relay for a context it creates"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        relay_url = %relay_url,
-                        "auto_wire_supervisor: Supervisor wired but failed to \
-                         populate BridgeInstance transport manager — broadcast publish and \
-                         discovery may require a manual transport_connect call"
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                relay_url = %relay_url,
-                "auto_wire_context_manager: failed to connect to node relay — \
-                 context operations may fail until transport is configured manually"
-            );
-            // Fall back to initializing without transport so that at least
-            // the Supervisor exists (with NotConfiguredTransportProvider).
-            crate::runtime::init_context_manager(bi, &did_owned);
-        }
-    }
-    // Always register the node's DID as a local DID for defense-in-depth.
+) -> Result<(), ScpPyError> {
     py.allow_threads(|| {
-        // Best-effort: log and continue if the supervisor reports
-        // `NotInitialized` (no manager attached yet) — the caller
-        // path above already attempted attach, and a duplicate
-        // failure is non-fatal for defense-in-depth registration.
-        if let Ok(supervisor) = crate::runtime::supervisor(bi)
-            && let Err(e) = rt.block_on(supervisor.register_local_did(did_owned.into()))
-        {
-            tracing::debug!(
-                error = %e,
-                "auto_wire_context_manager: register_local_did skipped (supervisor not ready)"
-            );
-        }
-    });
+        rt.block_on(server::wire_supervisor_to_node(
+            &bi.core,
+            node,
+            relay_url,
+            |did, adapter| {
+                let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
+                    did.to_owned(),
+                    Arc::new(scp_clock::SystemClock),
+                ));
+                let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
+                let event_log = crate::runtime::build_event_log_provider(bi);
+                crate::runtime::init_context_manager_with(
+                    bi, did, crypto, transport, event_log, None,
+                );
+            },
+        ))
+    })
+    .map_err(server_error)
 }
 
 // ---------------------------------------------------------------------------
@@ -620,7 +534,8 @@ fn instance_storage(bi: &crate::runtime::PyBridgeInstance) -> Result<InstanceSto
 ///
 /// Runs, in order: the config parse, the operator identity resolution, taking
 /// the instance storage, `server::node_start`, `server::register_node`,
-/// `auto_wire_context_manager`, and wrapping the handle.
+/// `auto_wire_context_manager` (which shuts the node down and unregisters it
+/// on failure), and wrapping the handle.
 ///
 /// # Errors
 ///
@@ -642,14 +557,7 @@ fn node_start_on(
     // this node before it releases the storage the node holds
     // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
     let inner = server::register_node(&bi.core, node);
-    auto_wire_context_manager(
-        bi,
-        py,
-        rt,
-        inner.did(),
-        &inner.internal_relay_url(),
-        inner.bridge_token_hex(),
-    );
+    auto_wire_context_manager(bi, py, rt, &inner, &inner.internal_relay_url())?;
     Ok(PyNodeHandle {
         instance_id: bi.core.instance_id(),
         inner,
@@ -751,22 +659,14 @@ impl crate::scp::PyScp {
                 .map_err(server_err)
         })?;
 
-        // Auto-wire the ContextManager with relay transport so that
-        // context operations work immediately after node startup.
-        // Use the internal loopback URL (ws://127.0.0.1:{port}/scp/v1) instead of
-        // node.relay_url() which returns the advertised URL (wss://localhost/scp/v1)
-        // that requires TLS and lacks the actual bound port.
-        // The bridge token is required because ApplicationNode relays enforce
-        // Authorization: Bearer <token> on all WebSocket connections.
-        let did = node.identity().did().to_owned();
-        let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
-        let bridge_token = node.bridge_token_hex();
-        auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
-
         // Register this node as a borrower of this instance's resources, so
         // `SCP.shutdown()` stops it before `bridge_specific_shutdown` releases
-        // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+        // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`), and
+        // so a failed wiring below can remove it again.
         let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
+        // Wire the Supervisor through the internal loopback URL: `relay_url()`
+        // is the advertised URL, which requires TLS and lacks the bound port.
+        auto_wire_context_manager(bi, py, rt, &inner, &inner.internal_relay_url())?;
 
         let instance_id = bi.core.instance_id();
         Ok(PyNodeHandle {
@@ -848,13 +748,9 @@ impl crate::scp::PyScp {
         // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
         let inner = server::register_node(&bi.core, inner);
 
-        // Auto-wire the ContextManager with relay transport so that
-        // context operations work immediately after node startup.
-        // Use the internal loopback URL — see comment in `node_start_in_memory`.
-        let did = inner.did().to_owned();
-        let relay_url = inner.internal_relay_url();
-        let bridge_token = inner.bridge_token_hex();
-        auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
+        // Wire the Supervisor through the internal loopback URL — see the
+        // comment in `node_start_in_memory`.
+        auto_wire_context_manager(bi, py, rt, &inner, &inner.internal_relay_url())?;
 
         let instance_id = bi.core.instance_id();
         Ok(PyNodeHandle {
@@ -1144,47 +1040,6 @@ mod tests {
         inner.shutdown();
     }
 
-    /// Verifies that auto-wiring a node's relay populates the `BridgeInstance`
-    /// transport manager so that broadcast publish, context subscribe,
-    /// and discovery probing work without a separate `transport_connect`.
-    #[test]
-    fn auto_wire_populates_transport_manager_global() {
-        use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
-
-        // Tests construct a fresh per-test bridge instance.
-        let bi_setup = std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py());
-        crate::runtime::init_context_manager_for_test(&bi_setup);
-
-        // Start a standalone relay to get a stable WebSocket endpoint.
-        let relay = rt().block_on(server::start_relay_in_memory()).unwrap();
-        let relay_url = relay.relay_url().to_owned();
-
-        // Connect to the relay and store in the global — mirrors what
-        // auto_wire_context_manager does after ContextManager init.
-        let sourced = SourcedRelayUrl {
-            url: relay_url,
-            source: RelayUrlSource::Explicit,
-        };
-        let selector = scp_transport::TransportSelector::new();
-        let adapter = rt()
-            .block_on(selector.select_and_connect(&sourced, None, None))
-            .expect("should connect to the relay");
-        let manager = scp_transport::TransportManager::new(sourced.url.clone(), adapter);
-        let bi = bi_setup;
-        crate::runtime::set_transport_manager(&bi, manager)
-            .expect("should store transport manager in global");
-
-        // Verify the global is populated.
-        assert!(
-            crate::runtime::has_transport_manager(&bi),
-            "BridgeInstance transport manager should be populated after auto-wire"
-        );
-
-        // Clean up.
-        crate::runtime::clear_transport_manager(&bi).ok();
-        relay.shutdown();
-    }
-
     /// A `NodeStartConfig` JSON naming `identity`, on loopback with plaintext,
     /// in-memory blobs and an OS-assigned relay port, with `edit` applied.
     fn start_json(identity: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
@@ -1286,6 +1141,13 @@ mod tests {
                 codes::TRANS_5054,
             ),
             (
+                ServerError::SupervisorWiring(
+                    server::SupervisorWiringError::SupervisorNotConnected,
+                ),
+                "transport",
+                codes::TRANS_5056,
+            ),
+            (
                 ServerError::MissingPassphrase,
                 "validation",
                 codes::VALID_7004,
@@ -1328,11 +1190,72 @@ mod tests {
             assert_eq!(node.did(), did);
             assert!(node.relay_port() > 0);
             assert!(
-                crate::runtime::supervisor(&scp.inner).is_ok(),
-                "node_start must wire the instance's Supervisor"
+                server::supervisor_wired_to(&scp.inner.core, &node.inner),
+                "node_start must wire the instance's Supervisor to the node's relay"
             );
             node.shutdown();
             assert!(node.is_shutdown());
+        });
+    }
+
+    /// A relay URL on a loopback port nothing listens on, so a connect to it
+    /// fails with a refused connection.
+    fn unreachable_relay_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("ws://127.0.0.1:{port}/scp/v1")
+    }
+
+    /// `node_start_on`'s wiring step, run on a real started and registered
+    /// node with a relay URL that refuses the connection, returns
+    /// `SCP-TRANS-5056`, shuts the node down, unregisters it, and leaves no
+    /// fallback `Supervisor`. A second start on an instance that already holds
+    /// a `Supervisor` also returns `SCP-TRANS-5056`.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_wiring_failure_returns_trans_5056_and_unregisters_the_node() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let identity = scp.identity_create(py, "in_memory", None).unwrap();
+            let did = identity.did().to_owned();
+            let bi = &*scp.inner;
+            let cfg = NodeStartConfig::from_json(&start_json(&did, |_| {})).unwrap();
+            let node_identity = resolve_operator_identity(bi, &cfg.identity).unwrap();
+            let storage = instance_storage(bi).unwrap();
+            let node = rt()
+                .block_on(server::node_start(cfg, node_identity, storage))
+                .unwrap();
+            let inner = server::register_node(&bi.core, node);
+
+            let err = auto_wire_context_manager(bi, py, rt(), &inner, &unreachable_relay_url())
+                .expect_err("a refused relay connect must fail the node start");
+            assert_eq!(
+                class_and_code(&err),
+                ("transport", codes::TRANS_5056),
+                "{err:?}"
+            );
+            assert!(!bi.core.has_borrower(&inner), "the node stays registered");
+            assert!(inner.is_shutdown(), "the node keeps running");
+            assert!(
+                !bi.core.has_supervisor(),
+                "a fallback Supervisor was attached"
+            );
+
+            let node = scp.node_start(py, &start_json(&did, |_| {})).unwrap();
+            assert!(server::supervisor_wired_to(&bi.core, &node.inner));
+            let err = start_error(
+                node_start_on(&scp.inner, py, rt(), &start_json(&did, |_| {})),
+                "second node start",
+            );
+            assert_eq!(
+                class_and_code(&err),
+                ("transport", codes::TRANS_5056),
+                "{err:?}"
+            );
+            node.shutdown();
         });
     }
 

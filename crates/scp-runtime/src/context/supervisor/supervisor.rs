@@ -11263,6 +11263,19 @@ impl Supervisor {
         Ok(crate::context::queries_helpers::is_local_did(self, did).await)
     }
 
+    /// Returns `true` when this `Supervisor` holds a transport provider whose
+    /// [`ContextTransportProvider::is_connected`] reports a reachable relay.
+    ///
+    /// `false` for a `Supervisor` built without providers and for one holding
+    /// the bridges' `NotConfiguredTransportProvider`. A bridge's node start
+    /// reads it after attaching the `Supervisor`, and fails with
+    /// `ServerError::SupervisorWiring` when it is `false` (sdk-common.md
+    /// §"Node start error codes").
+    #[must_use]
+    pub fn transport_connected(&self) -> bool {
+        self.transport_ref().is_some_and(|t| t.is_connected())
+    }
+
     /// Restore every persisted context from the configured persistence
     /// provider.
     ///
@@ -17977,6 +17990,14 @@ mod tests {
     use super::*;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::in_memory::InMemoryStorage;
+
+    /// A `Supervisor` with no transport provider reports no connected relay.
+    /// The bridges' node-start tests cover the connected case, where a
+    /// `RelayTransportProvider` reaches the node's relay.
+    #[test]
+    fn transport_connected_is_false_without_a_transport_provider() {
+        assert!(!Supervisor::for_query_shim().transport_connected());
+    }
 
     /// The escrow-reversal join log names a panic as a panic without its
     /// payload, and names a cancelled task as cancelled, never as panicked.
