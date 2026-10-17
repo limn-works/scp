@@ -20,6 +20,9 @@ import Foundation
 //   scp.nodeStartInMemory(identity:)
 //   scp.nodeStartLocal(dataDir:identity:passphrase:)
 //
+// The production node start, `scp.nodeStart(config:)`, is macOS-only and sits
+// at the end of this file.
+//
 // Factories therefore accept an `SCP` parameter so handles are stamped with
 // the caller's bridge instance, and the `ServerBridge` injectable-closure
 // namespace has been deleted along with the process-wide default.
@@ -325,3 +328,76 @@ public struct Node: Sendable {
         try await handle.disableSiteProjection(contextId: contextId)
     }
 }
+
+// MARK: - Production node start (macOS only)
+
+#if os(macOS)
+    // `NodeStartConfig` and its enums (`FfiReach`, `FfiBlobBackend`,
+    // `FfiTlsMode`, `FfiDhtMode`, `FfiCorsOrigins`, `FfiNat`) are the UniFFI
+    // record and enums in ScpBindings.swift, as `StorageConfig` is for
+    // `SCP.init(storage:)`. They carry the field names, arms and required and
+    // optional split of the bridge's `NodeStartConfig` (construction.md
+    // §"Node start — `NodeStartConfig`", ADR-052): a flat config with no
+    // builder, required fields with no default, and optional fields that
+    // default to `nil`. The UniFFI layer is platform-agnostic; the node start
+    // entry below is macOS-only, so an iOS build of the SDK has no node start.
+
+    extension Node {
+        /// Starts a node through `bridge`, the UniFFI `node_start` export,
+        /// passing `config` unchanged and wrapping the returned handle.
+        ///
+        /// ``SCP/nodeStart(config:)`` passes `inner.nodeStart(config:)`; the
+        /// tests pass a double that records the record it receives and throws
+        /// each node start error. Every `ScpError` the bridge throws reaches
+        /// the caller unchanged.
+        static func start(
+            config: NodeStartConfig,
+            bridge: (NodeStartConfig) async throws -> NodeHandle
+        ) async throws -> Node {
+            try await Node(handle: bridge(config))
+        }
+    }
+
+    public extension SCP {
+        /// Starts a production node from this instance under an operator
+        /// identity (construction.md §"Node start — `NodeStartConfig`").
+        ///
+        /// Delegates to the UniFFI `node_start` export. The node runs on this
+        /// instance's own storage, under the operator ``Identity`` in
+        /// `config.identity`, which this instance must have minted. Before the
+        /// call returns, the bridge binds this instance's `Supervisor` to the
+        /// node's relay; one running node at a time holds that binding. `dht`
+        /// takes `.disabled` only: the node runs its relay and publishes
+        /// nothing to a DHT.
+        ///
+        /// ```swift
+        /// let node = try await scp.nodeStart(config: NodeStartConfig(
+        ///     reach: .local,
+        ///     identity: operatorIdentity,
+        ///     blobStorage: .sqlite(path: "/var/lib/scp/blobs.sqlite"),
+        ///     tls: .plaintext,
+        ///     dht: .disabled,
+        ///     corsOrigins: .allowlist(origins: ["https://app.example.org"])
+        /// ))
+        /// ```
+        ///
+        /// - Parameter config: The node's flat configuration.
+        /// - Returns: The running ``Node``; its ``Node/did`` is the operator DID.
+        /// - Throws: ``ScpError`` with the code sdk-common.md §"Node start error
+        ///   codes" gives the failure, in the case the bridge's
+        ///   `server_error_class` selects. `.Validation`: `SCP-STORAGE-8007`
+        ///   (invalid config), `SCP-STORAGE-8008` (blob storage open or
+        ///   directory creation), `SCP-STORAGE-8009` (core node storage),
+        ///   `SCP-VALID-7004`. `.Identity`: `SCP-IDENT-1063` (operator
+        ///   identity unavailable), `SCP-IDENT-1001`. `.Transport`:
+        ///   `SCP-TRANS-5050`, `SCP-TRANS-5051` (relay start), `SCP-TRANS-5052`
+        ///   (TLS), `SCP-TRANS-5054` (serve or NAT), `SCP-TRANS-5055`,
+        ///   `SCP-TRANS-5056` (the bridge could not bind the `Supervisor` to
+        ///   the node and has shut the node down). `.Context`: `SCP-CTX-2053`.
+        ///   `.Permission` with `SCP-PERM-3030` when another ``SCP`` minted
+        ///   `config.identity`.
+        func nodeStart(config: NodeStartConfig) async throws -> Node {
+            try await Node.start(config: config, bridge: inner.nodeStart(config:))
+        }
+    }
+#endif
