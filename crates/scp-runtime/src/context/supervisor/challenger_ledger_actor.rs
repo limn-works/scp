@@ -48,7 +48,7 @@ use scp_protocol::trust::capability_definition::CapabilityDefinition;
 use scp_protocol::trust::{
     AnswerKey, AttemptLedgerView, CHALLENGE_CLOCK_SKEW_SECS, CHALLENGE_GRADING_BUDGET_SECS,
     CHALLENGE_LEASE_MARGIN_SECS, CanonicalIdentifier, CaseResult, ChallengeClosure,
-    ChallengeRequest, ChallengeVerification, GradeError, GradeOutcome, MAX_GRADING_FAULTS,
+    ChallengeRequest, ChallengeVerification, GradeOutcome, MAX_GRADING_FAULTS,
     OwnedAuthenticatedResponse, TrustError, UnsignedChallengeRequest,
     challenge_verification_signing_digest, challenge_verification_unsigned, check_attempt,
 };
@@ -221,8 +221,6 @@ struct Lease {
 /// attempt (spec 07 §7.3.4 step 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GradingFault {
-    /// An opening does not open its commitment.
-    AnswerKeyMismatch(GradeError),
     /// A `SchemaMatch` schema the answer key opens no longer passes the
     /// schema gate, so the challenger cannot grade the case.
     SchemaRejected {
@@ -245,7 +243,6 @@ pub enum GradingFault {
 impl From<GradingFault> for TrustError {
     fn from(fault: GradingFault) -> Self {
         match fault {
-            GradingFault::AnswerKeyMismatch(error) => error.into(),
             GradingFault::SchemaRejected { test_id, reason } => {
                 Self::SchemaRejected { test_id, reason }
             }
@@ -267,7 +264,7 @@ impl From<GradingFault> for TrustError {
 pub struct GradingLease {
     /// Names the lease in Commit and `RecordFault`.
     pub lease_id: u64,
-    /// The openings to grade against.
+    /// The expected outputs to grade against.
     pub answer_key: AnswerKey,
     /// The context of the `CustomEval` evaluators.
     pub evaluator_context_id: Option<String>,
@@ -306,7 +303,7 @@ pub enum ChallengerLedgerCommand {
     Create {
         /// The request to sign; its verifier is this ledger's identity.
         unsigned: Box<UnsignedChallengeRequest>,
-        /// The openings the challenger keeps.
+        /// The expected outputs the challenger keeps.
         answer_key: AnswerKey,
         /// The definition the request follows.
         definition: Box<CapabilityDefinition>,
@@ -633,8 +630,8 @@ impl ChallengerLedgerActor {
             }
             .into());
         }
-        let openings = answer_key.openings().len();
-        if openings != request.test_cases.len()
+        let key_cases = answer_key.expected().len();
+        if key_cases != request.test_cases.len()
             || definition.capability_uri != request.capability_uri
         {
             return Err(ContextError::InvalidState(

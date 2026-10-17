@@ -279,7 +279,7 @@ impl Fixture {
             &self.verifier.did,
             &self.resolver,
         )?;
-        let outcome = grade(&auth, &key, &BTreeMap::new(), &BTreeMap::new())?;
+        let outcome = grade(&auth, &key, &BTreeMap::new(), &BTreeMap::new());
         let unsigned = challenge_verification_unsigned(
             &auth,
             &outcome,

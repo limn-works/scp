@@ -1,9 +1,10 @@
 //! Challenge-response protocol for trust verification (spec 07 §7.3.4).
 //!
 //! A challenger tests a subject's claimed capability with test cases it
-//! writes. The subject sees each case's input and a salted commitment to its
-//! answer, never the answer. The challenger grades the outputs against the
-//! answers it kept and signs a record of the result for every graded attempt.
+//! writes. The subject sees each case's input, never its expected output,
+//! and nothing derived from it. The challenger grades the outputs against
+//! the expected outputs it kept and signs a record of the result for every
+//! graded attempt.
 //!
 //! # Flow
 //!
@@ -251,8 +252,8 @@ pub enum ExpectedOutput {
 // Wire structures (spec 07 §7.3.4)
 // ---------------------------------------------------------------------------
 
-/// One test case as the subject sees it: the answer is replaced by a salted
-/// commitment.
+/// One test case as the subject sees it: the case without its expected
+/// output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChallengeCase {
     /// Identifier, unique within the suite.
@@ -263,9 +264,6 @@ pub struct ChallengeCase {
     pub category: String,
     /// Weight in basis points.
     pub weight: u32,
-    /// [`answer_commitment`] of the case's answer, lowercase hex on the wire.
-    #[serde(with = "crate::identity::scpid::hex_serde_32")]
-    pub answer_commitment: [u8; 32],
 }
 
 /// A signed challenge request. Every field except `verifier_signature` is
@@ -286,9 +284,9 @@ pub struct ChallengeRequest {
     pub created_at: u64,
     /// Unix seconds; the window is at most `MAX_CHALLENGE_WINDOW_SECS`.
     pub expires_at: u64,
-    /// Retries after the first attempt; at most the definition's ceiling.
+    /// Retries after the first attempt; at most the definition's.
     pub max_retries: u32,
-    /// Seconds between graded attempts; at least the definition's floor.
+    /// Seconds between graded attempts; at least the definition's.
     pub cooldown_secs: u32,
     /// The definition's pass threshold, in basis points.
     pub pass_threshold_bps: u32,
@@ -401,10 +399,6 @@ pub const MAX_VERIFICATION_VALIDITY_SECS: u64 = 7_776_000;
 pub const CHALLENGE_CLOCK_SKEW_SECS: u64 = 300;
 /// The most trusted verifiers one requirement lists.
 pub const MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT: usize = 32;
-/// The largest retry count a definition or request carries.
-pub const MAX_CHALLENGE_RETRIES: u32 = 10;
-/// The longest cooldown a definition or request carries.
-pub const MAX_CHALLENGE_COOLDOWN_SECS: u64 = 604_800;
 /// The total evaluation time for one attempt.
 pub const CHALLENGE_GRADING_BUDGET_SECS: u64 = 60;
 /// Added to the budget to form a grading lease deadline.
@@ -422,8 +416,6 @@ pub const MAX_CAPABILITY_DESCRIPTION_BYTES: usize = 1024;
 /// The most capability requirements one context holds.
 pub const MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT: usize = 64;
 
-/// Domain separator of the answer commitment.
-const DOMAIN_CHALLENGE_COMMIT_V1: &[u8] = b"SCP-CHALLENGE-COMMIT-V1:";
 /// Domain separator of the request preimage `R`.
 const DOMAIN_CHALLENGE_REQ_V1: &[u8] = b"SCP-CHALLENGE-REQ-V1:";
 /// Domain separator of the response preimage `P`.
@@ -453,29 +445,8 @@ fn jcs(value: &impl Serialize, what: &str) -> Result<Vec<u8>, TrustError> {
     })
 }
 
-/// `SHA-256("SCP-CHALLENGE-COMMIT-V1:" ‖ Fixed32(salt) ‖ F(JCS(expected)))`,
-/// with `expected` in its externally tagged wire form.
-///
-/// # Errors
-///
-/// [`TrustError::CanonicalizationFailed`] if `expected` breaks I-JSON.
-pub fn answer_commitment(
-    salt: &[u8; 32],
-    expected: &ExpectedOutput,
-) -> Result<[u8; 32], TrustError> {
-    let expected = jcs(expected, "expected")?;
-    Ok(sha256(&encode(
-        DOMAIN_CHALLENGE_COMMIT_V1,
-        &[
-            CanonicalField::Fixed32(salt),
-            CanonicalField::VarBytes(&expected),
-        ],
-        "answer commitment",
-    )?))
-}
-
 /// The field `T`: `U32(n)`, then per case `F(test_id) ‖ F(JCS(input)) ‖
-/// F(category) ‖ U32(weight) ‖ Fixed32(answer_commitment)`. No separator.
+/// F(category) ‖ U32(weight)`. No separator.
 fn test_cases_field_bytes(cases: &[ChallengeCase]) -> Result<Vec<u8>, TrustError> {
     let count = u32::try_from(cases.len()).map_err(|_| TrustError::InvalidChallengeSuite {
         reason: format!("{} test cases exceed u32::MAX", cases.len()),
@@ -484,7 +455,7 @@ fn test_cases_field_bytes(cases: &[ChallengeCase]) -> Result<Vec<u8>, TrustError
         .iter()
         .map(|case| jcs(&case.input, &format!("test case {:?} input", case.test_id)))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut fields = Vec::with_capacity(1 + 5 * cases.len());
+    let mut fields = Vec::with_capacity(1 + 4 * cases.len());
     fields.push(CanonicalField::U32(count));
     for (case, input) in cases.iter().zip(&inputs) {
         fields.extend([
@@ -492,7 +463,6 @@ fn test_cases_field_bytes(cases: &[ChallengeCase]) -> Result<Vec<u8>, TrustError
             CanonicalField::VarBytes(input),
             CanonicalField::VarBytes(case.category.as_bytes()),
             CanonicalField::U32(case.weight),
-            CanonicalField::Fixed32(&case.answer_commitment),
         ]);
     }
     encode(b"", &fields, "test_cases")
@@ -785,47 +755,28 @@ impl UnsignedChallengeVerification {
 // Answer key
 // ---------------------------------------------------------------------------
 
-/// The opening of one case's commitment. The challenger keeps it; it never
-/// leaves the challenger except to an auditor the challenger chooses.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CaseOpening {
-    /// The case this opens.
-    pub test_id: String,
-    /// The 32-byte salt of the commitment.
-    #[serde(with = "crate::identity::scpid::hex_serde_32")]
-    pub salt: [u8; 32],
-    /// The answer.
-    pub expected: ExpectedOutput,
-}
-
-/// The challenger's openings, one per case in case order.
+/// The challenger's expected outputs, one per case in case order. It never
+/// leaves the challenger: no byte of the request derives from it (spec 07
+/// §7.3.4).
 ///
 /// `Debug` prints only the count, so a log line cannot leak an answer.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnswerKey {
-    openings: Vec<CaseOpening>,
+    expected: Vec<ExpectedOutput>,
 }
 
 impl AnswerKey {
-    /// The openings, in case order.
+    /// The expected outputs, in case order.
     #[must_use]
-    pub fn openings(&self) -> &[CaseOpening] {
-        &self.openings
-    }
-}
-
-impl std::fmt::Debug for CaseOpening {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CaseOpening")
-            .field("test_id", &self.test_id)
-            .finish_non_exhaustive()
+    pub fn expected(&self) -> &[ExpectedOutput] {
+        &self.expected
     }
 }
 
 impl std::fmt::Debug for AnswerKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnswerKey")
-            .field("openings", &self.openings.len())
+            .field("cases", &self.expected.len())
             .finish()
     }
 }
@@ -871,8 +822,7 @@ fn resolve_definition(
 pub struct PolicyPick {
     /// Retries after the first attempt; at most the definition's.
     pub max_retries: u32,
-    /// Seconds between graded attempts; at least the definition's and at
-    /// most `MAX_CHALLENGE_COOLDOWN_SECS`.
+    /// Seconds between graded attempts; at least the definition's.
     pub cooldown_secs: u32,
 }
 
@@ -894,8 +844,7 @@ impl ChallengePolicy {
     /// # Errors
     ///
     /// As [`resolve_definition`], and [`TrustError::PolicyOutsideDefinition`]
-    /// when `pick` asks for more retries, a shorter cooldown, or a cooldown
-    /// above `MAX_CHALLENGE_COOLDOWN_SECS`.
+    /// when `pick` asks for more retries or a shorter cooldown.
     pub fn resolve(
         defs: &dyn CapabilityDefinitionSource,
         capability_uri: &str,
@@ -920,12 +869,6 @@ impl ChallengePolicy {
             return Err(outside(format!(
                 "cooldown_secs {} is below the definition's {}",
                 pick.cooldown_secs, definition.cooldown_secs
-            )));
-        }
-        if u64::from(pick.cooldown_secs) > MAX_CHALLENGE_COOLDOWN_SECS {
-            return Err(outside(format!(
-                "cooldown_secs {} exceeds {MAX_CHALLENGE_COOLDOWN_SECS}",
-                pick.cooldown_secs
             )));
         }
         Ok(Self {
@@ -1107,7 +1050,7 @@ pub struct NewChallenge {
 /// 5. `0 < window_secs <= MAX_CHALLENGE_WINDOW_SECS`
 ///    ([`TrustError::ChallengeWindowInvalid`]).
 ///
-/// The challenge id and every salt are drawn from the OS random source.
+/// The challenge id is drawn from the OS random source.
 ///
 /// # Errors
 ///
@@ -1146,22 +1089,15 @@ pub fn challenge_request_unsigned(
 
     let challenge_id = random_32()?;
     let mut cases = Vec::with_capacity(new.test_cases.len());
-    let mut openings = Vec::with_capacity(new.test_cases.len());
+    let mut expected = Vec::with_capacity(new.test_cases.len());
     for case in new.test_cases {
-        let salt = random_32()?;
-        let answer_commitment = answer_commitment(&salt, &case.expected)?;
         cases.push(ChallengeCase {
-            test_id: case.test_id.clone(),
+            test_id: case.test_id,
             input: case.input,
             category: case.category,
             weight: case.weight,
-            answer_commitment,
         });
-        openings.push(CaseOpening {
-            test_id: case.test_id,
-            salt,
-            expected: case.expected,
-        });
+        expected.push(case.expected);
     }
 
     let request = ChallengeRequest {
@@ -1182,7 +1118,7 @@ pub fn challenge_request_unsigned(
     let digest = challenge_request_signing_digest(&request)?;
     Ok((
         UnsignedChallengeRequest { request, digest },
-        AnswerKey { openings },
+        AnswerKey { expected },
     ))
 }
 
@@ -1571,26 +1507,6 @@ pub struct GradeOutcome {
     pub min_category_cases: u32,
 }
 
-/// A grading fault: it depends only on the challenger, so it uses no
-/// attempt.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum GradeError {
-    /// An opening does not open its case's commitment.
-    #[error("answer key does not open the commitment of test case {test_id:?}")]
-    AnswerKeyMismatch {
-        /// The case whose commitment failed to open.
-        test_id: String,
-    },
-}
-
-impl From<GradeError> for TrustError {
-    fn from(error: GradeError) -> Self {
-        match error {
-            GradeError::AnswerKeyMismatch { test_id } => Self::AnswerKeyMismatch { test_id },
-        }
-    }
-}
-
 /// The haystacks of `ContainsAll` and `ContainsNone`: the output itself
 /// when it is a string, else every decoded string leaf and object key.
 fn string_haystacks(output: &serde_json::Value) -> Vec<&str> {
@@ -1612,27 +1528,6 @@ fn string_haystacks(output: &serde_json::Value) -> Vec<&str> {
     found
 }
 
-/// Checks every opening against its commitment, one opening per case.
-fn check_openings(cases: &[ChallengeCase], key: &AnswerKey) -> Result<(), GradeError> {
-    let opens = |case: &ChallengeCase, opening: &CaseOpening| {
-        opening.test_id == case.test_id
-            && answer_commitment(&opening.salt, &opening.expected)
-                .is_ok_and(|c| c == case.answer_commitment)
-    };
-    for i in 0..cases.len().max(key.openings.len()) {
-        let test_id = match (cases.get(i), key.openings.get(i)) {
-            (Some(case), Some(opening)) if opens(case, opening) => continue,
-            (Some(case), _) => &case.test_id,
-            (None, Some(opening)) => &opening.test_id,
-            (None, None) => continue,
-        };
-        return Err(GradeError::AnswerKeyMismatch {
-            test_id: test_id.clone(),
-        });
-    }
-    Ok(())
-}
-
 /// Grades one authenticated attempt (spec 07 §7.3.4 step 3).
 ///
 /// `schema_results` and `evals` hold the verdicts the caller computed
@@ -1646,27 +1541,26 @@ fn check_openings(cases: &[ChallengeCase], key: &AnswerKey) -> Result<(), GradeE
 /// - `ContainsAll` / `ContainsNone`: byte-exact, case-sensitive substring
 ///   search over [`string_haystacks`].
 ///
-/// # Errors
-///
-/// [`GradeError::AnswerKeyMismatch`] if an opening fails, checked before any
-/// case is graded.
+/// Grading cannot fail. A key that does not hold one expected output per
+/// case yields one result per expected output, and
+/// [`challenge_verification_unsigned`] refuses that outcome.
+#[must_use]
 pub fn grade(
     auth: &AuthenticatedResponse<'_>,
     key: &AnswerKey,
     evals: &BTreeMap<usize, CaseResult>,
     schema_results: &BTreeMap<usize, SchemaVerdict>,
-) -> Result<GradeOutcome, GradeError> {
+) -> GradeOutcome {
     let cases = &auth.request.test_cases;
-    check_openings(cases, key)?;
     let mut cut_off = false;
     let mut per_case = Vec::with_capacity(cases.len());
-    for (i, (opening, output)) in key.openings.iter().zip(&auth.response.outputs).enumerate() {
+    for (i, (expected, output)) in key.expected.iter().zip(&auth.response.outputs).enumerate() {
         if cut_off {
             per_case.push(CaseResult::fail("budget_exceeded"));
             continue;
         }
         let output = &output.output;
-        let result = match &opening.expected {
+        let result = match expected {
             ExpectedOutput::ExactMatch { value } => {
                 match (crate::jcs::to_vec(output), crate::jcs::to_vec(value)) {
                     (Ok(a), Ok(b)) if a == b => CaseResult::pass(),
@@ -1721,14 +1615,14 @@ pub fn grade(
             pass_count = pass_count.saturating_add(1);
         }
     }
-    Ok(GradeOutcome {
+    GradeOutcome {
         per_case,
         score,
         pass_count,
         test_count,
         passed: score >= auth.request.pass_threshold_bps,
         min_category_cases: min_category_cases(cases.iter().map(|c| c.category.as_str())),
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1914,8 +1808,9 @@ pub fn challenge_verification_unsigned(
 // Consume
 // ---------------------------------------------------------------------------
 
-/// Checks steps (f) and (g): the signed policy is within protocol bounds
-/// and within the definition's limits, and the counts meet its minimum.
+/// Checks steps (f) and (g): the attempt is within the signed retries, the
+/// signed policy is within the definition's limits, and the counts meet its
+/// minimum.
 fn check_record_policy(
     v: &ChallengeVerification,
     defs: &dyn CapabilityDefinitionSource,
@@ -1924,14 +1819,12 @@ fn check_record_policy(
         uri: v.capability_uri.clone(),
         reason,
     };
-    if v.attempt == 0
-        || u64::from(v.attempt) > 1 + u64::from(v.max_retries)
-        || v.max_retries > MAX_CHALLENGE_RETRIES
-        || u64::from(v.cooldown_secs) > MAX_CHALLENGE_COOLDOWN_SECS
-    {
+    if v.attempt == 0 || u64::from(v.attempt) - 1 > u64::from(v.max_retries) {
         return Err(outside(format!(
-            "attempt {} with max_retries {} and cooldown_secs {} is outside the protocol bounds",
-            v.attempt, v.max_retries, v.cooldown_secs
+            "attempt {} is outside 1..={} for max_retries {}",
+            v.attempt,
+            u64::from(v.max_retries) + 1,
+            v.max_retries
         )));
     }
     let (def, digest) = resolve_definition(defs, &v.capability_uri)?;
@@ -1985,8 +1878,8 @@ fn check_record_policy(
 ///   ([`TrustError::ChallengeVerificationFromFuture`]);
 /// - (e) `expires_at - timestamp <= MAX_VERIFICATION_VALIDITY_SECS`
 ///   ([`TrustError::ChallengeVerificationValidityTooLong`]);
-/// - (f) and (g) the policy within protocol bounds and the definition's
-///   limits ([`TrustError::PolicyOutsideDefinition`]; definition errors as
+/// - (f) and (g) the attempt within the signed retries and the policy
+///   within the definition's limits ([`TrustError::PolicyOutsideDefinition`]; definition errors as
 ///   [`ChallengePolicy::resolve`]);
 /// - (h) `passed == (score >= pass_threshold_bps)`, `score <=
 ///   TOTAL_WEIGHT_BPS`, `pass_count <= test_count`
@@ -2174,15 +2067,10 @@ mod tests {
         std::array::from_fn(|i| u8::try_from(i + 1).unwrap())
     }
 
-    fn v_salt() -> [u8; 32] {
-        std::array::from_fn(|i| u8::try_from(i + 0x21).unwrap())
-    }
-
-    fn v_expected() -> ExpectedOutput {
-        ExpectedOutput::SchemaMatch {
-            schema: json!({"type": "object", "required": ["name", "count"]}),
-        }
-    }
+    /// Spec 25 Vector 59 `T`.
+    const V_T: &str = "0000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d00000006736368656d6100002710";
+    /// Spec 25 Vector 59 `R`.
+    const V_R: &str = "5343502d4348414c4c454e47452d5245512d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000000587363703a7466676969616f33367a6c73656f32747a666f6933326b6e667836746f7070656433716c6f7863737562653567647666727167713a6361706162696c6974793a736368656d612d76616c69646174696f6e2f76311947de3173cb08e14fa71bd41bb256274ba2b62e0d0d9e73b83af1a971ee8f670000000100000015736368656d612d76616c69646174696f6e2d3030310000001b7b22636f756e74223a332c226e616d65223a22776964676574227d00000006736368656d6100002710000000006553f10000000000655542800000000200000e1000001f400000000f746573742d636f6e746578742d3031000000387363703a7673726d736f626632757a656a73626461616733747877617561736a72706e7435776c6b756c6861686262667774646661617061000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461";
 
     fn v_request() -> ChallengeRequest {
         ChallengeRequest {
@@ -2194,7 +2082,6 @@ mod tests {
                 input: json!({"name": "widget", "count": 3}),
                 category: "schema".to_owned(),
                 weight: 10_000,
-                answer_commitment: answer_commitment(&v_salt(), &v_expected()).unwrap(),
             }],
             created_at: 1_700_000_000,
             expires_at: 1_700_086_400,
@@ -2270,29 +2157,42 @@ mod tests {
         let request = v_request();
         assert_eq!(hex::encode(request.definition_digest), V_DEFINITION_DIGEST);
         let r = canonical_challenge_request_bytes(&request).unwrap();
-        assert_eq!(r.len(), 450);
+        assert_eq!(r.len(), 418);
         assert_eq!(
             hex::encode(challenge_request_signing_digest(&request).unwrap()),
-            "dc18665f0a48315ffdaeaa7cb55525240f7bbb289e29c3172ebf45d29fe9ba28"
+            "bf8a8adb49daf2eb0078296f1a4bd29a637b992aa1c795cf930a863978c0e7e2"
         );
     }
 
     /// Test 2.
     #[test]
-    fn vector_59_suite_digest_commits_answers() {
+    fn vector_59_suite_digest() {
         let request = v_request();
         assert_eq!(
-            hex::encode(request.test_cases[0].answer_commitment),
-            "b73317ea1cf075724a76d4454a3c777e10b4cf31a853d650f667398c6e52a2d8"
-        );
-        assert_eq!(
             test_cases_field_bytes(&request.test_cases).unwrap().len(),
-            106
+            74
         );
         assert_eq!(
             hex::encode(challenge_suite_digest(&request.test_cases).unwrap()),
-            "5b7643e58ef89237bb133984f100bc4d7228e51de8adf358c550a4db1813bf21"
+            "9cec9fc1c4c6a8a835e448fd94c33310692514aa51c4b52d2ba2d4a819f13cd8"
         );
+    }
+
+    /// The request preimage and its `T` match spec 25 byte for byte: each
+    /// case ends at its weight, with no commitment and no byte derived from
+    /// the expected output (spec 07 §7.3.4).
+    #[test]
+    fn request_preimage_has_no_commitment() {
+        let request = v_request();
+        let t = test_cases_field_bytes(&request.test_cases).unwrap();
+        assert_eq!(hex::encode(&t), V_T);
+        let r = canonical_challenge_request_bytes(&request).unwrap();
+        assert_eq!(hex::encode(&r), V_R);
+        let expected = ExpectedOutput::SchemaMatch {
+            schema: json!({"type": "object", "required": ["name", "count"]}),
+        };
+        let expected = crate::jcs::to_vec(&expected).unwrap();
+        assert!(!r.windows(expected.len()).any(|w| w == expected));
     }
 
     /// Test 3.
@@ -2303,11 +2203,11 @@ mod tests {
         assert_eq!(p1.len(), 200);
         assert_eq!(
             hex::encode(&p1),
-            "5343502d4348414c4c454e47452d524553502d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20dc18665f0a48315ffdaeaa7cb55525240f7bbb289e29c3172ebf45d29fe9ba28000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000010000000100000015736368656d612d76616c69646174696f6e2d303031000000117b226e616d65223a22776964676574227d"
+            "5343502d4348414c4c454e47452d524553502d56313a0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20bf8a8adb49daf2eb0078296f1a4bd29a637b992aa1c795cf930a863978c0e7e2000000387363703a6b7461726736617174736a75366d6832777333686b3774356b6d73766d636b71376435657177736d617735646933653370347461000000010000000100000015736368656d612d76616c69646174696f6e2d303031000000117b226e616d65223a22776964676574227d"
         );
         assert_eq!(
             hex::encode(challenge_response_signing_digest(&attempt_1).unwrap()),
-            "93dfe96c3f9d4973548c944fa0836291bf95458acb69707fa3d54f712d31e7ab"
+            "e2d6a7768d281382acb3573e23ba9c76f58c07509c2f7727a151b589a687a185"
         );
         let attempt_2 = v_response(2, json!({"count": 3, "name": "widget"}));
         assert_eq!(
@@ -2318,7 +2218,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(challenge_response_signing_digest(&attempt_2).unwrap()),
-            "0219d13a72f6310ae90df4cd269ce8104a111b422bacdda5c4e2ca3008e677fc"
+            "f6e06ef6438935719b8b784119b6f75e8095ea27ffdfb8c60efc1c88bddb4949"
         );
     }
 
@@ -2331,14 +2231,14 @@ mod tests {
                 1_700_000_600,
                 false,
                 "9554fd256e3c6bb5ee6c73e1ca28e72ade44785bde24d84c17869cb1da667b77",
-                "00d8282d8b49e2485955d9164678991f105e0ca9d909e49140c2e57969bf3aed",
+                "b4c5366bb9a106b8819cb974e602a6490a9b1b3f862497a6def7764d5bfa162d",
             ),
             (
                 2,
                 1_700_004_200,
                 true,
                 "5cec3cdef9ef548b71a346c713eead24381a8cac1e0d422e1a788cf524d99d63",
-                "3cb193fbe8242b331704a2d5fd25b66801b6f45eda72fba05bffe4c31df6379d",
+                "765bf9ca092df576175ae942aae2a0cc501fba5f899a96dbd065157f5e6c0fa3",
             ),
         ] {
             let record = v_record(attempt, timestamp, passed);
@@ -2356,22 +2256,34 @@ mod tests {
         }
     }
 
-    /// Test 5.
+    /// The challenge separators spec 09 §9.18.2 registers are exactly the
+    /// ones this module hashes under: a row the code no longer uses, or a
+    /// separator the registry lacks, fails.
     #[test]
-    fn answer_commitment_is_separated_and_salted() {
-        let expected = v_expected();
-        let c = answer_commitment(&v_salt(), &expected).unwrap();
-        let jcs_bytes = crate::jcs::to_vec(&expected).unwrap();
-        let len = u32::try_from(jcs_bytes.len()).unwrap().to_be_bytes();
-        let mut manual = DOMAIN_CHALLENGE_COMMIT_V1.to_vec();
-        manual.extend_from_slice(&v_salt());
-        manual.extend_from_slice(&len);
-        manual.extend_from_slice(&jcs_bytes);
-        assert_eq!(c, sha256(&manual));
-        // Another salt gives another commitment to the same answer.
-        assert_ne!(c, answer_commitment(&[0u8; 32], &expected).unwrap());
-        // No separator: the same bytes without the domain differ.
-        assert_ne!(c, sha256(&manual[DOMAIN_CHALLENGE_COMMIT_V1.len()..]));
+    fn challenge_domain_separators_match_spec_09_registry() {
+        const SPEC_09: &str = include_str!("../../../../.docs/specs/09-security-model.md");
+        let start = SPEC_09.find("#### 9.18.2 Domain Separators").unwrap();
+        let end = start + SPEC_09[start..].find("#### 9.18.3").unwrap();
+        let registered: std::collections::BTreeSet<&str> = SPEC_09[start..end]
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `\"SCP-CHALLENGE-"))
+            .filter_map(|rest| rest.split_once("\"`").map(|(name, _)| name))
+            .collect();
+        let used: std::collections::BTreeSet<&str> = [
+            DOMAIN_CHALLENGE_REQ_V1,
+            DOMAIN_CHALLENGE_RESP_V1,
+            DOMAIN_CHALLENGE_VERIFY_V1,
+        ]
+        .iter()
+        .map(|d| {
+            std::str::from_utf8(d)
+                .unwrap()
+                .strip_prefix("SCP-CHALLENGE-")
+                .unwrap()
+        })
+        .collect();
+        assert_eq!(registered, used);
+        assert!(!SPEC_09.contains("SCP-CHALLENGE-COMMIT"));
     }
 
     /// Test 6.
@@ -2388,7 +2300,7 @@ mod tests {
         assert!(!wire.contains("secret-answer"), "{wire}");
         assert!(!wire.contains("ContainsAll"), "{wire}");
         assert!(!format!("{key:?}").contains("secret-answer"));
-        assert_eq!(key.openings().len(), 2);
+        assert_eq!(key.expected().len(), 2);
     }
 
     // -----------------------------------------------------------------------
@@ -2417,7 +2329,7 @@ mod tests {
         let auth =
             authenticate_challenge_response(&request, &response, &fx.verifier.did, &fx.resolver)
                 .unwrap();
-        grade(&auth, &key, evals, schemas).unwrap()
+        grade(&auth, &key, evals, schemas)
     }
 
     fn one_case(expected: ExpectedOutput) -> Vec<TestCase> {
@@ -2484,25 +2396,34 @@ mod tests {
         assert_eq!(outcome.pass_count, 1);
     }
 
-    /// A missing verdict cuts the attempt off at that case.
+    /// Grading is total: a missing schema or evaluator verdict fails that
+    /// case and every later case with `budget_exceeded`, and never passes.
     #[test]
-    fn grade_missing_verdict_fails_the_rest_as_budget_exceeded() {
+    fn grade_is_total() {
         let fx = fixture();
-        let mut suite = cases(3);
-        suite[1].expected = ExpectedOutput::SchemaMatch {
-            schema: json!({"type": "string"}),
-        };
-        let outcome = graded(
-            &fx,
-            suite,
-            vec![json!("ok"), json!("x"), json!("ok")],
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        );
-        assert!(outcome.per_case[0].passed);
-        for result in &outcome.per_case[1..] {
-            assert!(!result.passed);
-            assert_eq!(result.reason.as_deref(), Some("budget_exceeded"));
+        for missing in [
+            ExpectedOutput::SchemaMatch {
+                schema: json!({"type": "string"}),
+            },
+            ExpectedOutput::CustomEval {
+                evaluator_outlet_id: "fixture-evaluator".to_owned(),
+            },
+        ] {
+            let mut suite = cases(3);
+            suite[1].expected = missing;
+            let outcome = graded(
+                &fx,
+                suite,
+                vec![json!("ok"), json!("x"), json!("ok")],
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            );
+            assert_eq!(outcome.per_case.len(), 3);
+            assert!(outcome.per_case[0].passed);
+            for result in &outcome.per_case[1..] {
+                assert!(!result.passed);
+                assert_eq!(result.reason.as_deref(), Some("budget_exceeded"));
+            }
         }
     }
 
@@ -2603,8 +2524,11 @@ mod tests {
         assert_eq!(min_category_cases(std::iter::empty()), 0);
     }
 
+    /// Grading has no error path. A key that holds fewer expected outputs
+    /// than the request has cases grades to an outcome with fewer results,
+    /// and the record builder refuses that outcome, so nothing is signed.
     #[test]
-    fn grade_refuses_a_key_that_does_not_open() {
+    fn short_key_grades_but_the_record_is_refused() {
         let fx = fixture();
         let (request, key) = fx.issue(FIXTURE_URI, cases(2)).unwrap();
         let outputs = request
@@ -2619,17 +2543,14 @@ mod tests {
         let auth =
             authenticate_challenge_response(&request, &response, &fx.verifier.did, &fx.resolver)
                 .unwrap();
-        let mut tampered = key.clone();
-        tampered.openings[1].expected = ExpectedOutput::ExactMatch { value: json!("no") };
-        assert_eq!(
-            grade(&auth, &tampered, &BTreeMap::new(), &BTreeMap::new()),
-            Err(GradeError::AnswerKeyMismatch {
-                test_id: "general-1".to_owned()
-            })
-        );
         let mut short = key;
-        short.openings.pop();
-        assert!(grade(&auth, &short, &BTreeMap::new(), &BTreeMap::new()).is_err());
+        short.expected.pop();
+        let outcome = grade(&auth, &short, &BTreeMap::new(), &BTreeMap::new());
+        assert_eq!(outcome.per_case.len(), 1);
+        assert!(matches!(
+            challenge_verification_unsigned(&auth, &outcome, request.created_at + 1),
+            Err(TrustError::ChallengeVerificationInconsistent { .. })
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -2835,7 +2756,7 @@ mod tests {
 
     /// Test 18.
     #[test]
-    fn verify_rejects_attempt_beyond_max_and_cooldown_beyond_bound() {
+    fn verify_rejects_attempt_beyond_max() {
         let fx = fixture();
         assert_outside(
             &fx,
@@ -2843,18 +2764,6 @@ mod tests {
             "attempt",
         );
         assert_outside(&fx, &edited(&fx, |v| v.attempt = 0), "attempt 0");
-        assert_outside(
-            &fx,
-            &edited(&fx, |v| {
-                v.cooldown_secs = u32::try_from(MAX_CHALLENGE_COOLDOWN_SECS + 1).unwrap();
-            }),
-            "cooldown",
-        );
-        assert_outside(
-            &fx,
-            &edited(&fx, |v| v.max_retries = MAX_CHALLENGE_RETRIES + 1),
-            "retries",
-        );
         // The last allowed attempt passes.
         verify(&fx, &edited(&fx, |v| v.attempt = v.max_retries + 1)).unwrap();
     }
@@ -3099,6 +3008,52 @@ mod tests {
     // Create
     // -----------------------------------------------------------------------
 
+    /// RULING 15(b): any `u32` retry count and cooldown is a valid
+    /// definition and policy, and the attempt check saturates instead of
+    /// overflowing when the cooldown runs past the end of time.
+    #[test]
+    fn definition_accepts_u32_max_retries_and_u32_max_cooldown() {
+        let mut fx = fixture();
+        let mut definition = fixture_definition();
+        definition.max_retries = u32::MAX;
+        definition.cooldown_secs = u32::MAX;
+        definition.validate().unwrap();
+        fx.definitions.fixture_override = Some(definition);
+        let policy = ChallengePolicy::resolve(&fx.definitions, FIXTURE_URI, None).unwrap();
+        assert_eq!(
+            (policy.max_retries(), policy.cooldown_secs()),
+            (u32::MAX, u32::MAX)
+        );
+        let last = u64::MAX - 10;
+        let view = AttemptLedgerView {
+            challenge_id: [7; 32],
+            created_at: 0,
+            expires_at: u64::MAX,
+            max_retries: u32::MAX,
+            cooldown_secs: u32::MAX,
+            last_attempt: u32::MAX - 1,
+            last_timestamp: Some(last),
+            closed: None,
+            faults: 0,
+        };
+        assert!(matches!(
+            check_attempt(&view, u32::MAX, last + 1),
+            Err(TrustError::CooldownActive {
+                retry_after: u64::MAX,
+                ..
+            })
+        ));
+        // With no prior attempt, the last allowed attempt number passes the
+        // range check: 1 + u32::MAX does not wrap.
+        let first = AttemptLedgerView {
+            last_attempt: 0,
+            last_timestamp: None,
+            ..view
+        };
+        check_attempt(&first, 1, 1).unwrap();
+        check_attempt_range(&[7; 32], u32::MAX, u32::MAX).unwrap();
+    }
+
     /// Test 19b.
     #[test]
     fn create_accepts_stricter_policy_refuses_looser() {
@@ -3116,9 +3071,9 @@ mod tests {
         let strict = pick(0, 7200).unwrap();
         assert_eq!((strict.max_retries(), strict.cooldown_secs()), (0, 7200));
         pick(2, 3600).unwrap();
-        let max_cooldown = u32::try_from(MAX_CHALLENGE_COOLDOWN_SECS).unwrap();
-        pick(2, max_cooldown).unwrap();
-        for (max_retries, cooldown) in [(3, 3600), (2, 3599), (2, max_cooldown + 1)] {
+        // RULING 15(b): no protocol ceiling on the cooldown.
+        pick(2, u32::MAX).unwrap();
+        for (max_retries, cooldown) in [(3, 3600), (2, 3599)] {
             assert!(
                 matches!(
                     pick(max_retries, cooldown),
@@ -3512,7 +3467,7 @@ mod tests {
         let auth =
             authenticate_challenge_response(&request, &response, &fx.verifier.did, &fx.resolver)
                 .unwrap();
-        let outcome = grade(&auth, &key, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        let outcome = grade(&auth, &key, &BTreeMap::new(), &BTreeMap::new());
         challenge_verification_unsigned(&auth, &outcome, request.expires_at).unwrap();
         for timestamp in [request.created_at - 1, request.expires_at + 1] {
             assert!(matches!(

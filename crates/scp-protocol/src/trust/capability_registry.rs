@@ -109,7 +109,8 @@ pub enum MinCases {
 /// outputs (spec 07 §7.3.4.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Grading {
-    /// A challenger grades the outputs against committed answers.
+    /// A challenger grades the outputs against the expected outputs it
+    /// keeps.
     FromOutputs,
     /// The standard needs timing the challenger observes or partial credit
     /// within a case; challenges for it are refused at creation and records
@@ -928,13 +929,11 @@ mod tests {
     }
 
     /// No retry on a row whose threshold is 10000, two elsewhere,
-    /// a 300-second cooldown everywhere, every value within the protocol
-    /// bounds, and exactly the five §7.3.4.7 rows refused.
+    /// a 300-second cooldown everywhere, and exactly the five §7.3.4.7 rows
+    /// refused.
     #[test]
     fn protocol_rows_follow_ruling_11() {
-        use crate::trust::challenge::{
-            MAX_CHALLENGE_COOLDOWN_SECS, MAX_CHALLENGE_RETRIES, TOTAL_WEIGHT_BPS,
-        };
+        use crate::trust::challenge::TOTAL_WEIGHT_BPS;
         const REFUSED: [&str; 5] = [
             "scp:capability:latency-compliance/v1",
             "scp:capability:rate-limit-compliance/v1",
@@ -953,11 +952,6 @@ mod tests {
             assert!(matches!(s.max_retries, 0 | 2), "{uri}");
             assert_eq!(s.cooldown_secs, 300, "{uri}");
             assert!((1..=10_000).contains(&s.pass_threshold_bps), "{uri}");
-            assert!(s.max_retries <= MAX_CHALLENGE_RETRIES, "{uri}");
-            assert!(
-                u64::from(s.cooldown_secs) <= MAX_CHALLENGE_COOLDOWN_SECS,
-                "{uri}"
-            );
             let min = match s.min_cases {
                 MinCases::Total(n) | MinCases::PerCategory(n) => n,
             };

@@ -20,8 +20,8 @@ use super::attestation::ActiveKeyResolver;
 use super::capability_definition::CapabilityDefinitionSource;
 use super::capability_uri::CapabilityUri;
 use super::challenge::{
-    ChallengeVerification, MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT, MAX_CHALLENGE_COOLDOWN_SECS,
-    MAX_CHALLENGE_RETRIES, MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT, verify_challenge_verification,
+    ChallengeVerification, MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT,
+    MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT, verify_challenge_verification,
 };
 use super::identifier::CanonicalIdentifier;
 
@@ -92,9 +92,10 @@ pub struct RawCapabilityRequirement {
 /// runs on deserialize, so every value holds:
 /// - under `ChallengeVerified`, 1 to [`MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT`]
 ///   trusted verifiers, each a canonical identifier, no two naming one key;
-/// - under `SelfAttested`, no trusted verifiers and no retry cap;
-/// - a retry cap within [`MAX_CHALLENGE_RETRIES`] and
-///   [`MAX_CHALLENGE_COOLDOWN_SECS`].
+/// - under `SelfAttested`, no trusted verifiers and no retry cap.
+///
+/// A retry cap takes any `u32` for both fields (RULING 15(b) sets no
+/// protocol ceiling).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     try_from = "RawCapabilityRequirement",
@@ -129,12 +130,6 @@ impl TryFrom<RawCapabilityRequirement> for CapabilityRequirement {
                     return Err(invalid("too many trusted verifiers"));
                 }
             }
-        }
-        if let Some(cap) = raw.retry_cap
-            && (cap.max_retries > MAX_CHALLENGE_RETRIES
-                || u64::from(cap.min_cooldown_secs) > MAX_CHALLENGE_COOLDOWN_SECS)
-        {
-            return Err(invalid("retry cap outside the protocol bounds"));
         }
         let mut trusted: Vec<CanonicalIdentifier> = Vec::with_capacity(raw.trusted_verifiers.len());
         for did in &raw.trusted_verifiers {
@@ -901,22 +896,10 @@ mod tests {
             ),
             Err(AdmissionError::NonCanonicalIdentifier { .. })
         ));
-        let cooldown_over = u32::try_from(MAX_CHALLENGE_COOLDOWN_SECS + 1).unwrap();
-        for cap in [
-            RetryCap {
-                max_retries: MAX_CHALLENGE_RETRIES + 1,
-                min_cooldown_secs: 0,
-            },
-            RetryCap {
-                max_retries: 0,
-                min_cooldown_secs: cooldown_over,
-            },
-        ] {
-            invalid(raw(verified, vec![fx.verifier.did.clone()], Some(cap)));
-        }
+        // A retry cap has no protocol ceiling.
         let cap_ok = RetryCap {
-            max_retries: MAX_CHALLENGE_RETRIES,
-            min_cooldown_secs: u32::try_from(MAX_CHALLENGE_COOLDOWN_SECS).unwrap(),
+            max_retries: u32::MAX,
+            min_cooldown_secs: u32::MAX,
         };
         raw(verified, vec![fx.verifier.did.clone()], Some(cap_ok)).unwrap();
         // SelfAttested names no verifiers and no cap.

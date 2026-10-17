@@ -1264,10 +1264,6 @@ pub const VALID_7143: &str = "SCP-VALID-7143";
 /// Two capability definitions with one URI disagree
 /// ([`TrustError::DefinitionEquivocation`](scp_protocol::trust::TrustError::DefinitionEquivocation)).
 pub const VALID_7144: &str = "SCP-VALID-7144";
-/// A case opening does not match the commitment the challenger signed: a
-/// grading fault, never a graded attempt
-/// ([`TrustError::AnswerKeyMismatch`](scp_protocol::trust::TrustError::AnswerKeyMismatch)).
-pub const VALID_7145: &str = "SCP-VALID-7145";
 /// Every grading permit for this challenger is held
 /// ([`TrustError::GradingCapacityExhausted`](scp_protocol::trust::TrustError::GradingCapacityExhausted)).
 pub const VALID_7146: &str = "SCP-VALID-7146";
@@ -1677,7 +1673,6 @@ pub const fn trust_error_code(e: &scp_protocol::trust::TrustError) -> &'static s
         E::GradingInProgress { .. } => VALID_7139,
         E::ResponseTooLarge { .. } => VALID_7143,
         E::DefinitionEquivocation { .. } => VALID_7144,
-        E::AnswerKeyMismatch { .. } => VALID_7145,
         E::GradingCapacityExhausted { .. } => VALID_7146,
         E::NonCanonicalIdentifier { .. } => VALID_7147,
         E::GradingLeaseLost { .. } => VALID_7149,

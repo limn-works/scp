@@ -18,11 +18,10 @@ use scp_did::DID;
 use scp_protocol::trust::capability_definition::ProtocolOnlyDefinitions;
 use scp_protocol::trust::{
     ActiveKeyResolver, AnswerKey, CanonicalIdentifier, ChallengeClosure, ChallengePolicy,
-    ChallengeRequest, ChallengeResponse, ExpectedOutput, GradeError, GradeOutcome,
-    MAX_GRADING_FAULTS, NewChallenge, OwnedAuthenticatedResponse, SchemaVerdict, TestCase,
-    TestOutput, TrustError, authenticate_challenge_response, challenge_request_unsigned,
-    challenge_response_signing_digest, challenge_response_unsigned,
-    challenge_verification_signing_digest, grade,
+    ChallengeRequest, ChallengeResponse, ExpectedOutput, GradeOutcome, MAX_GRADING_FAULTS,
+    NewChallenge, OwnedAuthenticatedResponse, SchemaVerdict, TestCase, TestOutput, TrustError,
+    authenticate_challenge_response, challenge_request_unsigned, challenge_response_signing_digest,
+    challenge_response_unsigned, challenge_verification_signing_digest, grade,
 };
 
 use super::*;
@@ -386,9 +385,10 @@ impl Harness {
             .send(|reply| ChallengerLedgerCommand::RecordFault {
                 challenge_id,
                 lease_id,
-                fault: GradingFault::AnswerKeyMismatch(GradeError::AnswerKeyMismatch {
+                fault: GradingFault::SchemaRejected {
                     test_id: "t0".to_owned(),
-                }),
+                    reason: "schema gate".to_owned(),
+                },
                 reply,
             })
             .await
@@ -425,7 +425,7 @@ impl Harness {
 fn outcome(auth: &OwnedAuthenticatedResponse, key: &AnswerKey) -> GradeOutcome {
     let none_evals = BTreeMap::new();
     let none_schemas: BTreeMap<usize, SchemaVerdict> = BTreeMap::new();
-    grade(&auth.as_authenticated(), key, &none_evals, &none_schemas).unwrap()
+    grade(&auth.as_authenticated(), key, &none_evals, &none_schemas)
 }
 
 fn trust_err<T: std::fmt::Debug>(result: Result<T, ChallengeLedgerError>) -> TrustError {

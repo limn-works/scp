@@ -732,16 +732,6 @@ where
             .await?;
         Err::<GradeResult, ChallengeOpError>(error.into())
     };
-    // An answer key that does not open is a fault before any evaluator runs.
-    let empty = BTreeMap::new();
-    if let Err(e) = grade(
-        &auth.as_authenticated(),
-        &lease.answer_key,
-        &empty,
-        &BTreeMap::new(),
-    ) {
-        return fault(GradingFault::AnswerKeyMismatch(e)).await;
-    }
     let mut evaluated = CaseVerdicts::default();
     let run = async {
         let case_run = CaseRun {
@@ -759,15 +749,12 @@ where
     if let Some(f) = evaluated.fault.take() {
         return fault(f).await;
     }
-    let outcome = match grade(
+    let outcome = grade(
         &auth.as_authenticated(),
         &lease.answer_key,
         &evaluated.evals,
         &evaluated.schemas,
-    ) {
-        Ok(outcome) => outcome,
-        Err(e) => return fault(GradingFault::AnswerKeyMismatch(e)).await,
-    };
+    );
     let committed = sup
         .dispatch_challenge_commit(challenger, auth, lease.lease_id, outcome, signer.clone())
         .await?;
@@ -838,14 +825,14 @@ async fn evaluate_cases(
     let auth = auth.as_authenticated();
     let cases = &auth.request().test_cases;
     let outputs = &auth.response().outputs;
-    for (i, ((opening, case), output)) in answer_key
-        .openings()
+    for (i, ((expected, case), output)) in answer_key
+        .expected()
         .iter()
         .zip(cases)
         .zip(outputs)
         .enumerate()
     {
-        match &opening.expected {
+        match expected {
             ExpectedOutput::SchemaMatch { schema } => {
                 match schema_case(Arc::clone(permit), &case.test_id, schema, &output.output).await {
                     Ok(verdict) => {

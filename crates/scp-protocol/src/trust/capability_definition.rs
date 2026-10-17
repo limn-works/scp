@@ -14,10 +14,7 @@ use scp_event_log::Ed25519Signature;
 use super::TrustError;
 use super::capability_registry::{Grading, MinCases, lookup_protocol_capability};
 use super::capability_uri::CapabilityUri;
-use super::challenge::{
-    MAX_CAPABILITY_DESCRIPTION_BYTES, MAX_CHALLENGE_COOLDOWN_SECS, MAX_CHALLENGE_RETRIES,
-    TOTAL_WEIGHT_BPS,
-};
+use super::challenge::{MAX_CAPABILITY_DESCRIPTION_BYTES, TOTAL_WEIGHT_BPS};
 use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
 /// Domain separator of the definition preimage `Def` (`09-security-model.md`
@@ -34,9 +31,10 @@ pub struct CapabilityDefinition {
     /// The pass threshold in basis points, `1..=10000`. A request and a
     /// record carry exactly this value.
     pub pass_threshold_bps: u32,
-    /// The retry ceiling, at most `MAX_CHALLENGE_RETRIES`.
+    /// The retry ceiling. Any `u32`: the protocol sets no ceiling.
     pub max_retries: u32,
-    /// The cooldown floor in seconds, at most `MAX_CHALLENGE_COOLDOWN_SECS`.
+    /// The cooldown floor in seconds. Any `u32`: the protocol sets no
+    /// ceiling.
     pub cooldown_secs: u32,
     /// UTF-8, at most `MAX_CAPABILITY_DESCRIPTION_BYTES`.
     pub description: String,
@@ -134,18 +132,6 @@ impl CapabilityDefinition {
             return invalid(format!(
                 "pass_threshold_bps {} is outside 1..={TOTAL_WEIGHT_BPS}",
                 self.pass_threshold_bps
-            ));
-        }
-        if self.max_retries > MAX_CHALLENGE_RETRIES {
-            return invalid(format!(
-                "max_retries {} exceeds {MAX_CHALLENGE_RETRIES}",
-                self.max_retries
-            ));
-        }
-        if u64::from(self.cooldown_secs) > MAX_CHALLENGE_COOLDOWN_SECS {
-            return invalid(format!(
-                "cooldown_secs {} exceeds {MAX_CHALLENGE_COOLDOWN_SECS}",
-                self.cooldown_secs
             ));
         }
         if self.description.len() > MAX_CAPABILITY_DESCRIPTION_BYTES {
@@ -332,19 +318,13 @@ mod tests {
         let (good, _) =
             CapabilityDefinition::protocol_row("scp:capability:schema-validation/v1").unwrap();
         good.validate().unwrap();
-        let mutations: [Mutation; 7] = [
+        let mutations: [Mutation; 5] = [
             ("min 0", |d| d.min_cases = MinCases::Total(0)),
             ("per-category min 0", |d| {
                 d.min_cases = MinCases::PerCategory(0);
             }),
             ("threshold 0", |d| d.pass_threshold_bps = 0),
             ("threshold above 10000", |d| d.pass_threshold_bps = 10_001),
-            ("retries above bound", |d| {
-                d.max_retries = MAX_CHALLENGE_RETRIES + 1;
-            }),
-            ("cooldown above bound", |d| {
-                d.cooldown_secs = u32::try_from(MAX_CHALLENGE_COOLDOWN_SECS).unwrap() + 1;
-            }),
             ("description too long", |d| {
                 d.description = "x".repeat(MAX_CAPABILITY_DESCRIPTION_BYTES + 1);
             }),
@@ -358,8 +338,8 @@ mod tests {
             );
         }
         let mut edge = good;
-        edge.max_retries = MAX_CHALLENGE_RETRIES;
-        edge.cooldown_secs = u32::try_from(MAX_CHALLENGE_COOLDOWN_SECS).unwrap();
+        edge.max_retries = u32::MAX;
+        edge.cooldown_secs = u32::MAX;
         edge.pass_threshold_bps = TOTAL_WEIGHT_BPS;
         edge.description = "x".repeat(MAX_CAPABILITY_DESCRIPTION_BYTES);
         edge.validate().unwrap();

@@ -2664,13 +2664,6 @@ def capability_definition_preimage(
     )
 
 
-def answer_commitment(salt: bytes, expected_jcs: bytes) -> bytes:
-    """§7.3.4's salted answer commitment under `SCP-CHALLENGE-COMMIT-V1:`."""
-    return sha256(canonical_preimage(
-        "SCP-CHALLENGE-COMMIT-V1:", fixed_field(salt), var_field(expected_jcs)
-    ))
-
-
 def emit_challenge_vectors() -> None:
     section("§25.30 Trust challenge request, response, record and definition (§7.3.4)")
     # An identifier-scoped URI: a protocol URI with one case is a request a
@@ -2698,20 +2691,17 @@ def emit_challenge_vectors() -> None:
 
     # --- Vector 59: the challenge request. ---
     challenge_id = bytes(range(1, 33))
-    salt = bytes(range(0x21, 0x41))
     test_input = {"name": "widget", "count": 3}
     expected = {
         "SchemaMatch": {"schema": {"type": "object", "required": ["name", "count"]}}
     }
     input_jcs = jcs(test_input)
     expected_jcs = jcs(expected)
-    commitment = answer_commitment(salt, expected_jcs)
     test_case = (
         var_field("schema-validation-001")
         + var_field(input_jcs)
         + var_field("schema")
         + u32(10000)
-        + fixed_field(commitment)
     )
     test_cases_field = u32(1) + test_case
     suite_digest = sha256(test_cases_field)
@@ -2738,14 +2728,13 @@ def emit_challenge_vectors() -> None:
     emit("vector_59.subject", ID_SUBJECT)
     emit("vector_59.input_jcs", input_jcs.decode())
     emit("vector_59.expected_jcs", expected_jcs.decode())
-    emit_hex("vector_59.salt", salt)
-    emit_hex("vector_59.answer_commitment", commitment)
     emit("vector_59.test_case_field_len", len(test_cases_field))
     emit_hex("vector_59.test_case_field", test_cases_field)
     emit_hex("vector_59.suite_digest", suite_digest)
     emit("vector_59.preimage_len", len(pre59))
     emit_hex("vector_59.preimage", pre59)
     emit_hex("vector_59.digest", request_digest)
+    # No byte of the request derives from the expected output (§7.3.4).
     assert expected_jcs not in pre59
 
     # --- Responses: attempt 1 (fails the schema) and Vector 62 (attempt 2). ---

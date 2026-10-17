@@ -532,8 +532,7 @@ async fn challenge_request_response() {
         &answer_key,
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
-    )
-    .unwrap();
+    );
     let unsigned_record = challenge_verification_unsigned(&auth, &outcome, 2000).unwrap();
     let record_digest = unsigned_record.signing_digest();
     let verification = unsigned_record

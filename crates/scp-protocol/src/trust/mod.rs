@@ -50,16 +50,15 @@ pub use caveats::{
 };
 pub use challenge::{
     AnswerKey, AttemptLedgerView, AuthenticatedResponse, CHALLENGE_CLOCK_SKEW_SECS,
-    CHALLENGE_GRADING_BUDGET_SECS, CHALLENGE_LEASE_MARGIN_SECS, CaseOpening, CaseResult,
-    ChallengeCase, ChallengeClosure, ChallengePolicy, ChallengeRequest, ChallengeResponse,
-    ChallengeType, ChallengeVerification, ExpectedOutput, GradeError, GradeOutcome,
-    MAX_CAPABILITY_DESCRIPTION_BYTES, MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT,
-    MAX_CHALLENGE_COOLDOWN_SECS, MAX_CHALLENGE_JSON_DEPTH, MAX_CHALLENGE_RESPONSE_BYTES,
-    MAX_CHALLENGE_RETRIES, MAX_CHALLENGE_SCHEMA_BYTES, MAX_CHALLENGE_WINDOW_SECS,
+    CHALLENGE_GRADING_BUDGET_SECS, CHALLENGE_LEASE_MARGIN_SECS, CaseResult, ChallengeCase,
+    ChallengeClosure, ChallengePolicy, ChallengeRequest, ChallengeResponse, ChallengeType,
+    ChallengeVerification, ExpectedOutput, GradeOutcome, MAX_CAPABILITY_DESCRIPTION_BYTES,
+    MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT, MAX_CHALLENGE_JSON_DEPTH,
+    MAX_CHALLENGE_RESPONSE_BYTES, MAX_CHALLENGE_SCHEMA_BYTES, MAX_CHALLENGE_WINDOW_SECS,
     MAX_GRADING_FAULTS, MAX_TRUSTED_VERIFIERS_PER_REQUIREMENT, MAX_VERIFICATION_VALIDITY_SECS,
     NewChallenge, OwnedAuthenticatedResponse, PolicyPick, TOTAL_WEIGHT_BPS, TestCase, TestOutput,
     UnsignedChallengeRequest, UnsignedChallengeResponse, UnsignedChallengeVerification,
-    answer_commitment, authenticate_challenge_response, canonical_challenge_request_bytes,
+    authenticate_challenge_response, canonical_challenge_request_bytes,
     canonical_challenge_response_bytes, canonical_challenge_verification_bytes,
     challenge_request_signing_digest, challenge_request_unsigned,
     challenge_response_signing_digest, challenge_response_unsigned, challenge_suite_digest,
@@ -659,14 +658,6 @@ pub enum TrustError {
         reason: String,
     },
 
-    /// A case's opening does not match its answer commitment: a challenger
-    /// fault, never an attempt (spec 07 §7.3.4 step 3).
-    #[error("answer key does not open the commitment of test case {test_id:?}")]
-    AnswerKeyMismatch {
-        /// The test case whose opening fails.
-        test_id: String,
-    },
-
     /// The record's `timestamp` lies outside its signed challenge window
     /// (spec 07 §7.3.4 step 5(c)).
     #[error(
@@ -784,7 +775,6 @@ impl TrustError {
             | Self::ChallengeFaulted { .. }
             | Self::OutputsMismatch { .. }
             | Self::ResponseTooLarge { .. }
-            | Self::AnswerKeyMismatch { .. }
             | Self::ChallengeNotOpen { .. }
             | Self::UnknownChallenge { .. }
             | Self::GradingInProgress { .. }
