@@ -663,7 +663,10 @@ pub enum FfiNat {
 ///
 /// construction.md §"Node start — `NodeStartConfig`", ADR-052. `identity` is
 /// the operator's [`Identity`] handle, minted by the same `Scp`; the socket
-/// addresses are `host:port` strings.
+/// addresses are `host:port` strings. Each optional field defaults to `None`
+/// in the generated Swift and Kotlin initializers, so a caller omits it as the
+/// Python and TypeScript SDKs do (construction.md, the same required and
+/// optional split in every language).
 #[derive(uniffi::Record)]
 pub struct NodeStartConfig {
     /// How the node is reached.
@@ -679,12 +682,16 @@ pub struct NodeStartConfig {
     /// The HTTP CORS origins the node allows.
     pub cors_origins: FfiCorsOrigins,
     /// The relay's bind address (`host:port`); the core picks one when `None`.
+    #[uniffi(default = None)]
     pub bind_addr: Option<String>,
     /// The HTTP server's bind address (`host:port`).
+    #[uniffi(default = None)]
     pub http_bind_addr: Option<String>,
     /// The NAT traversal strategy.
+    #[uniffi(default = None)]
     pub nat: Option<FfiNat>,
     /// The projection rate limit, greater than 0.
+    #[uniffi(default = None)]
     pub projection_rate_limit: Option<u32>,
 }
 

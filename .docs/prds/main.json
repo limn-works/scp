@@ -11709,10 +11709,13 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/swift/Sources/SCP/Server.swift",
-        "bindings/swift/Tests/SCPTests/NodeStartTests.swift"
+        "bindings/swift/Tests/SCPTests/NodeStartTests.swift",
+        "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
+        "crates/scp-ffi/uniffi/src/server.rs",
+        "crates/scp-ffi/common/tests/fixtures/node_start_config.json"
       ],
       "description": "The Swift SDK mirrors `NodeStartConfig` (construction.md §\"Node start — `NodeStartConfig`\") as a struct with enums carrying associated values, under the five-language equivalence table of construction.md, and calls the UniFFI `node_start` export from SCP-322 with an `Identity` handle as the operator. The `#if os(macOS)` guard goes on the hand-written wrapper in `bindings/swift/Sources/SCP/Server.swift`, so the capability is absent on iOS. The UniFFI-generated layer needs no guard. Each code of sdk-common.md §\"Node start error codes\" reaches the caller as the typed error of its category.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C8.",
       "acceptanceCriteria": [
