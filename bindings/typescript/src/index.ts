@@ -346,6 +346,7 @@ export type {
 } from "./types";
 
 export {
+  ADMISSION_REQUIREMENT_UNMET_CODE,
   ATTEMPT_OUT_OF_ORDER_CODE,
   allValid,
   BUILT_IN_ROLES,
@@ -360,10 +361,12 @@ export {
   COOLDOWN_ACTIVE_CODE,
   checkProposalResponse,
   DEFINITION_EQUIVOCATION_CODE,
+  DID_RESOLUTION_FAILED_CODE,
   decodeCaseResults,
   decodeChallengeRequest,
   decodeChallengeResponse,
   decodeChallengeVerification,
+  EMPTY_SUBJECT_DID_CODE,
   EVALUATOR_UNAVAILABLE_CODE,
   encodeChallengeRequest,
   encodeChallengeResponse,
@@ -377,6 +380,9 @@ export {
   governanceActionResultFromBridge,
   INVALID_REQUIREMENT_CODE,
   isRetryable,
+  JSON_SCHEMA_VALIDATION_FAILED_CODE,
+  MALFORMED_AGENT_CAPABILITIES_CODE,
+  MALFORMED_CHALLENGE_VERIFICATIONS_CODE,
   memberRoleFromBridge,
   NON_CANONICAL_IDENTIFIER_CODE,
   OUTPUTS_MISMATCH_CODE,
@@ -395,6 +401,7 @@ export {
   STANDARD_NOT_GRADABLE_CODE,
   TOO_MANY_CAPABILITY_REQUIREMENTS_CODE,
   UNKNOWN_CHALLENGE_CODE,
+  UNTRUSTED_VERIFIER_CODE,
   validateAdmission,
   validateBroadcastKeyHex,
   validateSiteConfig,

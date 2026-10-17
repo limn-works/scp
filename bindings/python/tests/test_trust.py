@@ -28,6 +28,7 @@ from scp_sdk._extension import native_module
 from scp_sdk.errors import ContextError, ValidationError
 from scp_sdk.identity import Identity
 from scp_sdk.trust import (
+    ADMISSION_REQUIREMENT_UNMET_CODE,
     ATTEMPT_OUT_OF_ORDER_CODE,
     CAPABILITY_DEFINITION_UNAVAILABLE_CODE,
     CHALLENGE_CLOSED_CODE,
@@ -38,11 +39,16 @@ from scp_sdk.trust import (
     CHALLENGE_WINDOW_OPEN_CODE,
     COOLDOWN_ACTIVE_CODE,
     DEFINITION_EQUIVOCATION_CODE,
+    DID_RESOLUTION_FAILED_CODE,
+    EMPTY_SUBJECT_DID_CODE,
     EVALUATOR_UNAVAILABLE_CODE,
     GRADING_CAPACITY_EXHAUSTED_CODE,
     GRADING_IN_PROGRESS_CODE,
     GRADING_LEASE_LOST_CODE,
     INVALID_REQUIREMENT_CODE,
+    JSON_SCHEMA_VALIDATION_FAILED_CODE,
+    MALFORMED_AGENT_CAPABILITIES_CODE,
+    MALFORMED_CHALLENGE_VERIFICATIONS_CODE,
     NON_CANONICAL_IDENTIFIER_CODE,
     OUTPUTS_MISMATCH_CODE,
     POLICY_OUTSIDE_DEFINITION_CODE,
@@ -53,6 +59,7 @@ from scp_sdk.trust import (
     STANDARD_NOT_GRADABLE_CODE,
     TOO_MANY_CAPABILITY_REQUIREMENTS_CODE,
     UNKNOWN_CHALLENGE_CODE,
+    UNTRUSTED_VERIFIER_CODE,
     AttestationSummary,
     AttestorInfo,
     BehavioralRecord,
@@ -1722,6 +1729,13 @@ class TestChallengeWireTypes:
         """Each constant holds the code ``scp-ffi-common``'s
         ``trust_error_code`` and ``admission_error_code`` give its variant."""
         assert {
+            DID_RESOLUTION_FAILED_CODE: "SCP-IDENT-1033",
+            JSON_SCHEMA_VALIDATION_FAILED_CODE: "SCP-VALID-7003",
+            MALFORMED_AGENT_CAPABILITIES_CODE: "SCP-VALID-7074",
+            MALFORMED_CHALLENGE_VERIFICATIONS_CODE: "SCP-VALID-7075",
+            ADMISSION_REQUIREMENT_UNMET_CODE: "SCP-VALID-7076",
+            EMPTY_SUBJECT_DID_CODE: "SCP-VALID-7077",
+            UNTRUSTED_VERIFIER_CODE: "SCP-VALID-7121",
             CHALLENGE_SUITE_BELOW_MINIMUM_CODE: "SCP-VALID-7039",
             CHALLENGE_NOT_OPEN_CODE: "SCP-VALID-7099",
             CHALLENGE_EXPIRED_CODE: "SCP-VALID-7102",
@@ -1750,6 +1764,13 @@ class TestChallengeWireTypes:
         } == {
             code: code
             for code in (
+                DID_RESOLUTION_FAILED_CODE,
+                JSON_SCHEMA_VALIDATION_FAILED_CODE,
+                MALFORMED_AGENT_CAPABILITIES_CODE,
+                MALFORMED_CHALLENGE_VERIFICATIONS_CODE,
+                ADMISSION_REQUIREMENT_UNMET_CODE,
+                EMPTY_SUBJECT_DID_CODE,
+                UNTRUSTED_VERIFIER_CODE,
                 CHALLENGE_SUITE_BELOW_MINIMUM_CODE,
                 CHALLENGE_NOT_OPEN_CODE,
                 CHALLENGE_EXPIRED_CODE,

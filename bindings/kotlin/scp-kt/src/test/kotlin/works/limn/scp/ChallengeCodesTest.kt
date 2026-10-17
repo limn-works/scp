@@ -15,6 +15,13 @@ class ChallengeCodesTest {
     /** Every challenge and admission code constant, with its Rust variant's value. */
     private val codes =
         mapOf(
+            DID_RESOLUTION_FAILED_CODE to "SCP-IDENT-1033",
+            JSON_SCHEMA_VALIDATION_FAILED_CODE to "SCP-VALID-7003",
+            MALFORMED_AGENT_CAPABILITIES_CODE to "SCP-VALID-7074",
+            MALFORMED_CHALLENGE_VERIFICATIONS_CODE to "SCP-VALID-7075",
+            ADMISSION_REQUIREMENT_UNMET_CODE to "SCP-VALID-7076",
+            EMPTY_SUBJECT_DID_CODE to "SCP-VALID-7077",
+            UNTRUSTED_VERIFIER_CODE to "SCP-VALID-7121",
             CHALLENGE_SUITE_BELOW_MINIMUM_CODE to "SCP-VALID-7039",
             CHALLENGE_NOT_OPEN_CODE to "SCP-VALID-7099",
             CHALLENGE_EXPIRED_CODE to "SCP-VALID-7102",
@@ -44,7 +51,7 @@ class ChallengeCodesTest {
 
     @Test
     fun `every code constant carries its Rust variant's value`() {
-        assertEquals(25, codes.size)
+        assertEquals(32, codes.size)
         for ((constant, value) in codes) {
             assertEquals(value, constant)
         }

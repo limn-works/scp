@@ -11,8 +11,52 @@ package works.limn.scp
 
 import uniffi.scp.ScpException
 
+/**
+ * A signer's key could not be resolved: the instance has no DID resolver, or a
+ * supplied `ChallengeVerification` could not be checked (DID resolution
+ * failed, spec 03). Maps from `AdmissionError::VerificationUnavailable` and a
+ * missing instance resolver.
+ */
+const val DID_RESOLUTION_FAILED_CODE: String = "SCP-IDENT-1033"
+
+/**
+ * The registry's JSON schema validation error, which the bridges also raise
+ * for every trust error without a code of its own: a challenge, response or
+ * verification whose signature does not verify, a record bound to another
+ * verifier, subject, context or window, a caller who is not a member or has
+ * not opted in, or a failed ledger write. Maps from each `TrustError` variant
+ * `trust_error_code` does not name.
+ */
+const val JSON_SCHEMA_VALIDATION_FAILED_CODE: String = "SCP-VALID-7003"
+
 /** A protocol suite has fewer test cases than its standard's minimum. */
 const val CHALLENGE_SUITE_BELOW_MINIMUM_CODE: String = "SCP-VALID-7039"
+
+/**
+ * The agent capabilities JSON of a capability admission check does not decode
+ * as a list of capability URIs.
+ */
+const val MALFORMED_AGENT_CAPABILITIES_CODE: String = "SCP-VALID-7074"
+
+/**
+ * The challenge verifications JSON of a capability admission check does not
+ * decode as a list of `ChallengeVerification` records.
+ */
+const val MALFORMED_CHALLENGE_VERIFICATIONS_CODE: String = "SCP-VALID-7075"
+
+/**
+ * A capability requirement is unmet: the subject lacks a required capability,
+ * or a `ChallengeVerified` requirement has no record that admits the subject.
+ * Maps from `AdmissionError::MissingCapability` and
+ * `AdmissionError::VerificationRequired`.
+ */
+const val ADMISSION_REQUIREMENT_UNMET_CODE: String = "SCP-VALID-7076"
+
+/**
+ * A capability admission check names an empty subject DID. Maps from
+ * `AdmissionError::EmptySubjectDid`.
+ */
+const val EMPTY_SUBJECT_DID_CODE: String = "SCP-VALID-7077"
 
 /** The challenger already holds the most open challenges it may; retry later. */
 const val CHALLENGE_NOT_OPEN_CODE: String = "SCP-VALID-7099"
@@ -40,6 +84,13 @@ const val OUTPUTS_MISMATCH_CODE: String = "SCP-VALID-7108"
 
 /** A `CustomEval` evaluator cannot run: unregistered, without a handler, or not callable by the challenger. */
 const val EVALUATOR_UNAVAILABLE_CODE: String = "SCP-VALID-7109"
+
+/**
+ * A required capability has no passing record from a trusted challenger: the
+ * only passing record comes from a verifier the requirement does not trust.
+ * Maps from `AdmissionError::UntrustedVerifier`.
+ */
+const val UNTRUSTED_VERIFIER_CODE: String = "SCP-VALID-7121"
 
 /** The verifier and the subject are the same identity. */
 const val SELF_CHALLENGE_CODE: String = "SCP-VALID-7127"

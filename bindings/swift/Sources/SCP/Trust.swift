@@ -1952,8 +1952,26 @@ public extension SCP {
 
 // MARK: - Challenge trust inputs (§7.3.4, ADR-058)
 
+/// A signer's key could not be resolved: the instance has no DID resolver, or a supplied `ChallengeVerification` could not be checked (DID resolution failed, spec 03). Maps from `AdmissionError::VerificationUnavailable` and a missing instance resolver.
+public let didResolutionFailedCode = "SCP-IDENT-1033"
+
+/// The registry's JSON schema validation error, which the bridges also raise for every trust error without a code of its own: a challenge, response or verification whose signature does not verify, a record bound to another verifier, subject, context or window, a caller who is not a member or has not opted in, or a failed ledger write. Maps from each `TrustError` variant `trust_error_code` does not name.
+public let jsonSchemaValidationFailedCode = "SCP-VALID-7003"
+
 /// The error code the bridges raise when a challenge for a protocol capability URI has fewer test cases than its standard's minimum (spec 07 §7.3.4.3).
 public let challengeSuiteBelowMinimumCode = "SCP-VALID-7039"
+
+/// The agent capabilities JSON of a capability admission check does not decode as a list of capability URIs.
+public let malformedAgentCapabilitiesCode = "SCP-VALID-7074"
+
+/// The challenge verifications JSON of a capability admission check does not decode as a list of `ChallengeVerification` records.
+public let malformedChallengeVerificationsCode = "SCP-VALID-7075"
+
+/// A capability requirement is unmet: the subject lacks a required capability, or a `ChallengeVerified` requirement has no record that admits the subject. Maps from `AdmissionError::MissingCapability` and `AdmissionError::VerificationRequired`.
+public let admissionRequirementUnmetCode = "SCP-VALID-7076"
+
+/// A capability admission check names an empty subject DID. Maps from `AdmissionError::EmptySubjectDid`.
+public let emptySubjectDidCode = "SCP-VALID-7077"
 
 /// The error code the bridges raise when the challenger's ledger already holds the most open challenges it may hold, so it opens no new one; retry later.
 public let challengeNotOpenCode = "SCP-VALID-7099"
@@ -1981,6 +1999,9 @@ public let outputsMismatchCode = "SCP-VALID-7108"
 
 /// The error code the bridges raise when a `CustomEval` case names an evaluator outlet that is not registered in the evaluator context.
 public let evaluatorUnavailableCode = "SCP-VALID-7109"
+
+/// A required capability has no passing record from a trusted challenger: the only passing record comes from a verifier the requirement does not trust. Maps from `AdmissionError::UntrustedVerifier`.
+public let untrustedVerifierCode = "SCP-VALID-7121"
 
 /// The error code the bridges raise when the verifier and the subject decode to the same key.
 public let selfChallengeCode = "SCP-VALID-7127"

@@ -2266,12 +2266,56 @@ export function encodeAttestorSets(
 // `scp-ffi-common` (`error_codes.rs`).
 
 /**
+ * A signer's key could not be resolved: the instance has no DID resolver, or a
+ * supplied `ChallengeVerification` could not be checked (DID resolution
+ * failed, spec 03). Maps from `AdmissionError::VerificationUnavailable` and a
+ * missing instance resolver.
+ */
+export const DID_RESOLUTION_FAILED_CODE = "SCP-IDENT-1033";
+
+/**
+ * The registry's JSON schema validation error, which the bridges also raise
+ * for every trust error without a code of its own: a challenge, response or
+ * verification whose signature does not verify, a record bound to another
+ * verifier, subject, context or window, a caller who is not a member or has
+ * not opted in, or a failed ledger write. Maps from each `TrustError` variant
+ * `trust_error_code` does not name.
+ */
+export const JSON_SCHEMA_VALIDATION_FAILED_CODE = "SCP-VALID-7003";
+
+/**
  * Code the bridge raises when a protocol capability URI's request has fewer
  * test cases than the URI's standard requires (spec 07 §7.3.4.3; for
  * `scp:capability:multilingual/v1`, fewer than five cases in some
  * `category`). Maps from `TrustError::ChallengeSuiteBelowMinimum`.
  */
 export const CHALLENGE_SUITE_BELOW_MINIMUM_CODE = "SCP-VALID-7039";
+
+/**
+ * The agent capabilities JSON of a capability admission check does not decode
+ * as a list of capability URIs.
+ */
+export const MALFORMED_AGENT_CAPABILITIES_CODE = "SCP-VALID-7074";
+
+/**
+ * The challenge verifications JSON of a capability admission check does not
+ * decode as a list of `ChallengeVerification` records.
+ */
+export const MALFORMED_CHALLENGE_VERIFICATIONS_CODE = "SCP-VALID-7075";
+
+/**
+ * A capability requirement is unmet: the subject lacks a required capability,
+ * or a `ChallengeVerified` requirement has no record that admits the subject.
+ * Maps from `AdmissionError::MissingCapability` and
+ * `AdmissionError::VerificationRequired`.
+ */
+export const ADMISSION_REQUIREMENT_UNMET_CODE = "SCP-VALID-7076";
+
+/**
+ * A capability admission check names an empty subject DID. Maps from
+ * `AdmissionError::EmptySubjectDid`.
+ */
+export const EMPTY_SUBJECT_DID_CODE = "SCP-VALID-7077";
 
 /**
  * Code the bridge raises when the challenger's ledger already holds the most
@@ -2331,6 +2375,13 @@ export const OUTPUTS_MISMATCH_CODE = "SCP-VALID-7108";
  * challenger. Maps from `TrustError::EvaluatorUnavailable`.
  */
 export const EVALUATOR_UNAVAILABLE_CODE = "SCP-VALID-7109";
+
+/**
+ * A required capability has no passing record from a trusted challenger: the
+ * only passing record comes from a verifier the requirement does not trust.
+ * Maps from `AdmissionError::UntrustedVerifier`.
+ */
+export const UNTRUSTED_VERIFIER_CODE = "SCP-VALID-7121";
 
 /**
  * Code the bridge raises when the challenger and the subject decode to the

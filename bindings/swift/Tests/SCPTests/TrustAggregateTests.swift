@@ -471,7 +471,10 @@ final class ChallengeRetryHelperTests: XCTestCase {
             standardNotGradableCode, capabilityDefinitionUnavailableCode,
             policyOutsideDefinitionCode, schemaRejectedCode, responseTooLargeCode,
             definitionEquivocationCode, nonCanonicalIdentifierCode,
-            tooManyCapabilityRequirementsCode, invalidRequirementCode
+            tooManyCapabilityRequirementsCode, invalidRequirementCode,
+            didResolutionFailedCode, jsonSchemaValidationFailedCode,
+            malformedAgentCapabilitiesCode, malformedChallengeVerificationsCode,
+            admissionRequirementUnmetCode, emptySubjectDidCode, untrustedVerifierCode
         ]
         XCTAssertEqual(
             retryable,
@@ -484,12 +487,14 @@ final class ChallengeRetryHelperTests: XCTestCase {
              "SCP-VALID-7106", "SCP-VALID-7107", "SCP-VALID-7108", "SCP-VALID-7109",
              "SCP-VALID-7127", "SCP-VALID-7128", "SCP-VALID-7129", "SCP-VALID-7137",
              "SCP-VALID-7138", "SCP-VALID-7143", "SCP-VALID-7144", "SCP-VALID-7147",
-             "SCP-VALID-7148", "SCP-VALID-7150"]
+             "SCP-VALID-7148", "SCP-VALID-7150", "SCP-IDENT-1033", "SCP-VALID-7003",
+             "SCP-VALID-7074", "SCP-VALID-7075", "SCP-VALID-7076", "SCP-VALID-7077",
+             "SCP-VALID-7121"]
         )
         for code in retryable {
             XCTAssertTrue(isRetryable(code), code)
         }
-        for code in final + ["SCP-VALID-7003", "SCP-VALID-7076", "SCP-CTX-2000", ""] {
+        for code in final + ["SCP-CTX-2000", ""] {
             XCTAssertFalse(isRetryable(code), code)
         }
     }

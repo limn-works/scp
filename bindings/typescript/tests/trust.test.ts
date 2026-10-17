@@ -20,7 +20,7 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Context } from "../src/context";
-import { ValidationError } from "../src/errors";
+import { IdentityError, ValidationError } from "../src/errors";
 import { Identity } from "../src/identity";
 import type { SCP } from "../src/scp";
 import type {
@@ -40,6 +40,7 @@ import type {
   ThresholdRequirement,
 } from "../src/types";
 import {
+  ADMISSION_REQUIREMENT_UNMET_CODE,
   ATTEMPT_OUT_OF_ORDER_CODE,
   CAPABILITY_DEFINITION_UNAVAILABLE_CODE,
   CHALLENGE_CLOSED_CODE,
@@ -50,10 +51,12 @@ import {
   CHALLENGE_WINDOW_OPEN_CODE,
   COOLDOWN_ACTIVE_CODE,
   DEFINITION_EQUIVOCATION_CODE,
+  DID_RESOLUTION_FAILED_CODE,
   decodeCaseResults,
   decodeChallengeRequest,
   decodeChallengeResponse,
   decodeChallengeVerification,
+  EMPTY_SUBJECT_DID_CODE,
   EVALUATOR_UNAVAILABLE_CODE,
   encodeAttestation,
   encodeAttestorSets,
@@ -73,6 +76,9 @@ import {
   GRADING_LEASE_LOST_CODE,
   INVALID_REQUIREMENT_CODE,
   isRetryable,
+  JSON_SCHEMA_VALIDATION_FAILED_CODE,
+  MALFORMED_AGENT_CAPABILITIES_CODE,
+  MALFORMED_CHALLENGE_VERIFICATIONS_CODE,
   NON_CANONICAL_IDENTIFIER_CODE,
   OUTPUTS_MISMATCH_CODE,
   POLICY_OUTSIDE_DEFINITION_CODE,
@@ -84,6 +90,7 @@ import {
   STANDARD_NOT_GRADABLE_CODE,
   TOO_MANY_CAPABILITY_REQUIREMENTS_CODE,
   UNKNOWN_CHALLENGE_CODE,
+  UNTRUSTED_VERIFIER_CODE,
 } from "../src/types";
 import { createMockNativeScp, mockContext, mountMockScp } from "./mock-bridge";
 
@@ -707,6 +714,31 @@ describe("typed capability requirements at the SCP boundary", () => {
     const plain = JSON.stringify({ ceiling: ["messages:read"] });
     await scp.contextCreate(creator, plain).catch(() => undefined);
     expect(native.__lastCall("contextCreate")?.args[1]).toBe(plain);
+  });
+
+  it("contextCreate replaces only the requirements and keeps every other params byte", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const creator = mockIdentity(scp, "did:dht:zCreator");
+    // 2^53 + 1 does not survive a JSON.parse round trip; a nested
+    // `capabilityRequirements` key is not the params field and stays as written.
+    const head =
+      '{ "ceiling": ["messages:read"], "limit": 9007199254740993,\n  "capabilityRequirements" : ';
+    const tail = ', "extra": { "capabilityRequirements": 1, "n": -12345678901234567890e0 } }';
+    await scp
+      .contextCreate(creator, `${head}${JSON.stringify(typed)}${tail}`)
+      .catch(() => undefined);
+    expect(native.__lastCall("contextCreate")?.args[1]).toBe(
+      `${head}${JSON.stringify(encodeCapabilityRequirements(typed))}${tail}`,
+    );
+
+    // A key spelled with an escape is the same field, as JSON.parse reads it.
+    const escaped =
+      '{"capabilityRequirement\\u0073":' + JSON.stringify(typed) + ',"big":18446744073709551615}';
+    await scp.contextCreate(creator, escaped).catch(() => undefined);
+    expect(native.__lastCall("contextCreate")?.args[1]).toBe(
+      `{"capabilityRequirement\\u0073":${JSON.stringify(encodeCapabilityRequirements(typed))},"big":18446744073709551615}`,
+    );
   });
 
   it("contextCreate refuses requirements that are not a typed list with no bridge call", async () => {
@@ -1684,7 +1716,10 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
         makeChallengeRequest(),
         makeChallengeResponse(),
       );
-      await expect(refusal).rejects.toBeInstanceOf(ValidationError);
+      // SCP-IDENT-1033 is an identity failure; every other code a validation one.
+      await expect(refusal).rejects.toBeInstanceOf(
+        code.startsWith("SCP-IDENT-") ? IdentityError : ValidationError,
+      );
       await expect(refusal).rejects.toMatchObject({ code });
     }
   });
@@ -1692,6 +1727,13 @@ describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeRespons
 
 /** Every challenge and admission code constant, with its Rust variant's code. */
 const CHALLENGE_CODE_VALUES: readonly [string, string][] = [
+  [DID_RESOLUTION_FAILED_CODE, "SCP-IDENT-1033"],
+  [JSON_SCHEMA_VALIDATION_FAILED_CODE, "SCP-VALID-7003"],
+  [MALFORMED_AGENT_CAPABILITIES_CODE, "SCP-VALID-7074"],
+  [MALFORMED_CHALLENGE_VERIFICATIONS_CODE, "SCP-VALID-7075"],
+  [ADMISSION_REQUIREMENT_UNMET_CODE, "SCP-VALID-7076"],
+  [EMPTY_SUBJECT_DID_CODE, "SCP-VALID-7077"],
+  [UNTRUSTED_VERIFIER_CODE, "SCP-VALID-7121"],
   [CHALLENGE_SUITE_BELOW_MINIMUM_CODE, "SCP-VALID-7039"],
   [CHALLENGE_NOT_OPEN_CODE, "SCP-VALID-7099"],
   [CHALLENGE_EXPIRED_CODE, "SCP-VALID-7102"],
@@ -1726,7 +1768,7 @@ describe("challenge codes, isRetryable and retryAfter", () => {
     for (const [constant, value] of CHALLENGE_CODE_VALUES) {
       expect(constant).toBe(value);
     }
-    expect(new Set(CHALLENGE_CODES).size).toBe(25);
+    expect(new Set(CHALLENGE_CODES).size).toBe(32);
   });
 
   it("isRetryable is true for exactly the seven retry-later codes", () => {

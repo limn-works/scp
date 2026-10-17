@@ -216,11 +216,81 @@ function identityHandle(method: string, param: string, value: unknown): BridgeId
   return value._rawHandle;
 }
 
+/** The params field the SDK encodes before `contextCreate` reaches the bridge. */
+const CAPABILITY_REQUIREMENTS_FIELD = "capabilityRequirements";
+
+/** Returns the index of the first non-whitespace character at or after `i`. */
+function skipJsonWhitespace(text: string, i: number): number {
+  let at = i;
+  while (at < text.length && " \t\n\r".includes(text.charAt(at))) at++;
+  return at;
+}
+
+/** Returns the index just past the JSON string whose opening quote is at `i`. */
+function endOfJsonString(text: string, i: number): number {
+  let at = i + 1;
+  while (text.charAt(at) !== '"') at += text.charAt(at) === "\\" ? 2 : 1;
+  return at + 1;
+}
+
+/**
+ * Returns the index just past the JSON value that starts at `i` in `text`,
+ * which the caller has already checked parses. A string ends at its closing
+ * quote; an object or array at its matching bracket; a number or literal at
+ * the next delimiter.
+ */
+function endOfJsonValue(text: string, i: number): number {
+  let depth = 0;
+  let at = i;
+  while (at < text.length) {
+    const ch = text.charAt(at);
+    if (ch === '"') {
+      at = endOfJsonString(text, at);
+      if (depth === 0) return at;
+      continue;
+    }
+    if (ch === "{" || ch === "[") {
+      depth++;
+    } else if (ch === "}" || ch === "]") {
+      if (depth <= 1) return depth === 0 ? at : at + 1;
+      depth--;
+    } else if (depth === 0 && (ch === "," || " \t\n\r".includes(ch))) {
+      return at;
+    }
+    at++;
+  }
+  return at;
+}
+
+/**
+ * Returns the `[start, end)` source span of each value the top-level object
+ * in `text` holds under `key`, comparing keys as `JSON.parse` decodes them.
+ * `text` must already parse as a JSON object.
+ */
+function topLevelValueSpans(text: string, key: string): [number, number][] {
+  const spans: [number, number][] = [];
+  let at = skipJsonWhitespace(text, 0) + 1;
+  for (;;) {
+    at = skipJsonWhitespace(text, at);
+    if (text.charAt(at) === "}") return spans;
+    const keyEnd = endOfJsonValue(text, at);
+    const name: unknown = JSON.parse(text.slice(at, keyEnd));
+    at = skipJsonWhitespace(text, keyEnd) + 1;
+    const valueStart = skipJsonWhitespace(text, at);
+    const valueEnd = endOfJsonValue(text, valueStart);
+    if (name === key) spans.push([valueStart, valueEnd]);
+    at = skipJsonWhitespace(text, valueEnd);
+    if (text.charAt(at) === ",") at++;
+  }
+}
+
 /**
  * Returns the params JSON `contextCreate` sends to the bridge: `paramsJson`
- * with its `capabilityRequirements`, a list of typed
+ * with the value of its top-level `capabilityRequirements`, a list of typed
  * {@link CapabilityRequirement}s, replaced by the wire-form JSON string
- * {@link encodeCapabilityRequirements} returns.
+ * {@link encodeCapabilityRequirements} returns. Every other byte of
+ * `paramsJson` reaches the bridge as the caller wrote it, so an integer
+ * above 2^53 keeps its value.
  *
  * Params JSON that does not parse to an object, or that names no
  * requirements, goes to the bridge unchanged, so the bridge reports its
@@ -241,21 +311,25 @@ function encodeContextParamsJson(paramsJson: string): string {
   if (params === null || typeof params !== "object" || Array.isArray(params)) {
     return paramsJson;
   }
-  const record = params as Record<string, unknown>;
-  const requirements = record.capabilityRequirements;
-  if (requirements === undefined || requirements === null) {
-    return paramsJson;
+  let encoded = paramsJson;
+  // Right to left, so each replacement leaves the earlier spans in place.
+  for (const [start, end] of topLevelValueSpans(
+    paramsJson,
+    CAPABILITY_REQUIREMENTS_FIELD,
+  ).reverse()) {
+    // Only the requirements are parsed: they are typed SDK values, which
+    // encodeCapabilityRequirements reads as JavaScript values.
+    const requirements: unknown = JSON.parse(paramsJson.slice(start, end));
+    if (requirements === null) continue;
+    if (!Array.isArray(requirements)) {
+      throw new ValidationError(
+        `contextCreate() params.capabilityRequirements must be a list of CapabilityRequirement, got ${JSON.stringify(requirements)}`,
+        "SCP-VALID-7001",
+      );
+    }
+    encoded = `${encoded.slice(0, start)}${JSON.stringify(encodeCapabilityRequirements(requirements))}${encoded.slice(end)}`;
   }
-  if (!Array.isArray(requirements)) {
-    throw new ValidationError(
-      `contextCreate() params.capabilityRequirements must be a list of CapabilityRequirement, got ${JSON.stringify(requirements)}`,
-      "SCP-VALID-7001",
-    );
-  }
-  return JSON.stringify({
-    ...record,
-    capabilityRequirements: encodeCapabilityRequirements(requirements),
-  });
+  return encoded;
 }
 
 /** Returns the bridge handle of a `TransportManager`, or throws `SCP-VALID-7005`. */
