@@ -73,7 +73,7 @@ Tried in order:
 
 2. **Peer request.** If relays have expired some Commits (blob_ttl elapsed), the reconnecting member broadcasts a `CommitRangeRequest` as an MLS application message (using their current epoch keys -- they can still encrypt at their stale epoch). Online members who have persisted the Commit messages respond with the missing Commits. This is best-effort -- members are not required to retain raw Commit messages beyond the MLS grace window.
 
-3. **Welcome-based fast-forward.** If the epoch gap is too large (> 100 epochs or no member can provide the full Commit chain), the reconnecting member is treated as a new joiner. An online admin (or any member with `MemberInvite` capability) generates a fresh Welcome message for the reconnecting member's pre-published KeyPackage, effectively re-adding them to the group at the current epoch. The member's old leaf node is removed. This preserves membership and context continuity, but the member loses access to messages encrypted in epochs between their stale epoch and the current epoch (forward secrecy is maintained).
+3. **Welcome-based fast-forward.** If the epoch gap is too large (> 100 epochs or no member can provide the full Commit chain), the reconnecting member is treated as a new joiner. An online admin (or any member with `MemberInvite` capability) generates a fresh Welcome message for the reconnecting member's pre-published KeyPackage, effectively re-adding them to the group at the current epoch. The member's old leaf node is removed in the same Commit, which records the re-add as one `MemberReset` leaf and leaves the member's join point, role, and governance state unchanged (`07-trust-validation-and-capabilities.md` §7.3.1.1). The committer holds the re-add while another member has a governance transfer staged, as §7.3.1.1 'Adds wait for staged transfers' states. This preserves membership and context continuity, but the member loses access to messages encrypted in epochs between their stale epoch and the current epoch (forward secrecy is maintained).
 
 ### 23.4.2 Epoch Catch-Up Limits
 
@@ -114,7 +114,7 @@ Any one of the following triggers a group state reset:
    - **(b) Timestamp freshness.** Reject requests where `|relay_clock - timestamp| > 30 seconds` (matching the freshness window used for SenderKeyRequest in section 9.16.2 and AccessKeyRequest in section 9.17).
    - **(c) Nonce uniqueness.** Maintain a deduplication cache of `(member_did, nonce)` pairs with a 60-second TTL. Reject any request whose nonce has been seen within the TTL window. The 60-second TTL is 2x the freshness window to prevent replay after nonce eviction at the window boundary. Cache capacity: bounded at 10,000 entries with oldest-first eviction.
 
-2. An online member with `MemberRemove` + `MemberInvite` capabilities (typically admin) processes the reset: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) immediately re-adds the member using a fresh KeyPackage via MLS `add_member()`, (c) distributes the new Welcome message via relay.
+2. An online member with `MemberRemove` + `MemberInvite` capabilities (typically admin) processes the reset, holding it while another member has a governance transfer staged as `07-trust-validation-and-capabilities.md` §7.3.1.1 'Adds wait for staged transfers' states: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) immediately re-adds the member using a fresh KeyPackage via MLS `add_member()`, (c) distributes the new Welcome message via relay.
 3. The reconnecting member processes the Welcome, joining the group at the current epoch. They request sender keys for all current members via the pull-based protocol (ADR-007).
 4. The reconnecting member's outbound queue is drained using the new epoch's key schedule.
 5. A `MemberReset` event (distinct from `MemberLeft` + `MemberJoined`) is appended to the event log, recording the reset reason, old epoch, new epoch, and the admin who processed it.
@@ -124,7 +124,7 @@ Any one of the following triggers a group state reset:
 **What the reset member loses:**
 
 - Access to messages encrypted in epochs between their last known epoch and the current epoch. Forward secrecy is preserved -- old epoch keys were destroyed per ADR-001.
-- Any pending governance proposals they initiated while offline (proposals reference specific epochs).
+- The standing of their pending governance proposals and votes until they re-sign them: the reset replaces their leaf key, so a carried proposal or vote signed under the old key no longer matches their leaf (`07-trust-validation-and-capabilities.md` §7.3.1.1). A re-signed proposal keeps its `anchor_seq` and `proposal_id` (`05-contexts.md` §5.9.1). The reset is not a departure: their join point and every governance conflict key that names them are unchanged.
 - Queue entries that reference the old epoch (re-queued messages are re-encrypted with the new epoch).
 
 **What the reset member retains:**

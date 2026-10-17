@@ -86,7 +86,7 @@ The following is the complete enumeration of the **built-in** capability categor
 | `outlet:query:{outlet_id}` | Invoke a specific Query outlet (parameterized) | Role permission |
 | `outlet:call:*` | Invoke any registered Action outlet (§5.4.2) | Role permission |
 | `outlet:call:{outlet_id}` | Invoke a specific Action outlet (parameterized) | Role permission |
-| `member:invite` | Invite new members to the context | Role permission |
+| `member:invite` | Invite new members to the context | Role permission + governance |
 | `member:remove` | Remove members from the context | Role permission + governance |
 | `member:ban` | Ban members (revoke read access) | Role permission + governance |
 | `role:assign` | Assign or change member roles | Role permission + governance |
@@ -823,11 +823,13 @@ Contexts support multiple governance models for who can change roles, settings, 
 
 The governance model is declared at creation and visible to all. Governance implementations are **pluggable** — the protocol defines the `GovernanceEngine` trait (propose, approve, reject) with four concrete models: `SingleAdmin` (single-admin authority), `Threshold` (M-of-N approval), `Majority` (majority vote), and `Unanimity` (full consensus). See ADR-008 (context lifecycle state machine with single-admin governance), ADR-009 (role assignment and capability ceiling enforcement), and ADR-031 (multi-admin governance models) for full specification. Context creators select a governance model at creation; the selection is visible in context metadata (§5.7) and cannot be changed after creation unless the model itself defines a governance transition mechanism.
 
-**Governance execution invariants.** When the runtime executes an approved governance action, two protocol-level invariants MUST hold:
+**Governance execution invariants.** When the runtime executes an approved governance action, three protocol-level invariants MUST hold:
 
 1. **Proposal-context binding.** A governance proposal's `context_id` MUST match the context it is submitted to for execution. A proposal approved for context A MUST NOT be executable against context B. This prevents cross-context proposal injection — an attacker who obtains an approved proposal from one context cannot replay it against a different context.
 
-2. **Proposal replay protection.** Each context MUST track the set of executed proposal IDs. A proposal that has already been executed MUST be rejected on subsequent submission. This prevents double-execution of approved proposals — even when the underlying operation is idempotent (e.g., blocking an already-blocked author returns `MemberNotFound`), explicit replay detection provides a clean error path and prevents side effects from re-executing event log entries or notifications.
+2. **Proposal replay protection.** Each context MUST track the set of executed proposal IDs. A proposal that has already been executed MUST be rejected on subsequent submission. This prevents double-execution of approved proposals — even when the underlying operation is idempotent (e.g., blocking an already-blocked author returns `MemberNotFound`), explicit replay detection provides a clean error path and prevents side effects from re-executing event log entries or notifications. The set is part of the governance state a checkpoint's `ContextStateSnapshot` carries (ADR-030, amended by ADR-066), so a member rebuilt from a checkpoint holds the same set as a member that processed every Commit.
+
+3. **Commit carriage.** In an encrypted context, the executing member sends the action as an MLS Commit whose authenticated data carries the proposal, the signed approving votes, and every event-log leaf it appends for the action, and every other member applies the action only by processing that Commit: it verifies the proposal, the votes, and the leaves, checks the quorum and the committer's authority against its own pre-Commit governance state, and appends the leaves, in that order (`07-trust-validation-and-capabilities.md` §7.3.1.1, ADR-066). A member that has not verified the leaf that grants another member a role grants that member nothing, and never assumes a default role for it.
 
 **Content access governance.** Governance controls five content access actions that decouple membership from access (see ADR-031, §9.17):
 
@@ -878,6 +880,62 @@ Implementations MUST return an error (e.g., `LimitExceeded`) when an append woul
 | `purpose` | `ApproveSpend` | 4096 bytes | Control chars, HTML-special |
 | Context `name` | `PublicMetadata`, `RuntimeMetadata` | 256 bytes | Control chars, HTML-special |
 | Context `description` | `PublicMetadata`, `RuntimeMetadata` | 4096 bytes | Control chars, HTML-special |
+
+### 5.9.1 Governance Proposal and Vote Messages
+
+In an encrypted context, a governance proposal and a governance vote each travel as an MLS application message to the context's group (ADR-031 §8). The messages let members see and approve a proposal; they change no member's rights. Only the Commit that executes the proposal changes rights, and it carries the proposal and the approving votes in its governance leaf block (`07-trust-validation-and-capabilities.md` §7.3.1.1). ADR-066 records the decision.
+
+**Message types.** The `InnerEnvelope` `message_type` (`09-security-model.md` §9.5.2) takes two values for governance:
+
+| Value | `MessageType` | Payload |
+|-------|---------------|---------|
+| `0x06` | `GovernanceProposal` | One proposal record. |
+| `0x07` | `GovernanceVote` | A MessagePack array of two items: the 32-byte `proposal_id` as a binary string, then one vote record. |
+
+**Proposal record.** A MessagePack array of five items, each with the shortest MessagePack header that holds it:
+
+| # | Field | MessagePack type | Content |
+|---|-------|------------------|---------|
+| 1 | `proposer_did` | string | The proposer's identifier in text form (`03-identity.md` §3.1), 56 bytes. |
+| 2 | `action_bytes` | binary | The RFC 8785 canonical JSON of the `GovernanceAction`, at most `MAX_GOVERNANCE_ACTION_BYTES` (8,192) bytes. |
+| 3 | `anchor_seq` | unsigned integer | The commit-ordered event-log leaf count the proposer held when it created the proposal (`07-trust-validation-and-capabilities.md` §7.3.1.1). |
+| 4 | `leaf_key_hash` | binary, 32 bytes | SHA-256 of the 65-byte uncompressed SEC1 `signature_key` of the proposer's MLS leaf that signs field 5. |
+| 5 | `signature` | binary, 64 bytes | The raw `r ‖ s` P-256 signature (`09-security-model.md` §9.5) over the `GovernanceProposal` preimage of §9.5.2. |
+
+A proposal record is at most 171 bytes plus the length of `action_bytes`. The `proposal_id` is the `GovernanceProposal ID` hash of §9.5.2 over the context's `context_id`, `proposer_did`, `action_bytes`, and `anchor_seq`. It travels in no proposal record, and every receiver recomputes it. The record carries no time. Each member's engine starts its own voting window, `voting_window_secs` long (ADR-031 §5), when it accepts the proposal, and uses it only to decide locally when to stop waiting for votes; no receiver's verdict on a Commit reads it.
+
+`MAX_GOVERNANCE_ACTION_BYTES` is 8,192 because a Commit carries the proposal whole in the first part of its transfer, and the `GovernanceActionExecuted` leaf, which holds the action, whole in the last part beside the action's other leaves (`07-trust-validation-and-capabilities.md` §7.3.1.1). A `ReconfigureGovernance` action that names 64 signers takes about 4 KB.
+
+**Vote record.** A MessagePack array of five items, each with the shortest MessagePack header that holds it:
+
+| # | Field | MessagePack type | Content |
+|---|-------|------------------|---------|
+| 1 | `voter_did` | string | The voter's identifier in text form, 56 bytes. |
+| 2 | `vote` | unsigned integer | `0` Approve, `1` Reject, `2` Withdraw. |
+| 3 | `leaf_key_hash` | binary, 32 bytes | SHA-256 of the 65-byte uncompressed SEC1 `signature_key` of the voter's MLS leaf that signs field 5. |
+| 4 | `expires_epoch` | unsigned integer | The last MLS epoch whose Commit may carry this vote (`07-trust-validation-and-capabilities.md` §7.3.1.1). |
+| 5 | `signature` | binary, 64 bytes | The raw `r ‖ s` P-256 signature over the `SignedVote` preimage of §9.5.2. |
+
+A vote record is at most 1 + 58 + 1 + 34 + 9 + 66 = 169 bytes. A Commit carries only Approve records; `Reject` and `Withdraw` appear only in vote messages.
+
+**Signatures and the key that verifies them.** The proposer or voter signs with the private key of its own MLS leaf `signature_key`, the leaf key the §9.7.1 KeyPackage attestation (`0xFF03`) binds to its identifier. The vote preimage covers the domain separator, the `context_id`, the `proposal_id` (which commits to the proposer, the full action, and `anchor_seq`), the choice, the voter's identifier, `leaf_key_hash`, and `expires_epoch`. A verifier accepts a proposal or vote signature only under the signer's leaf in the verifier's own ratchet tree whose `signature_key` hashes to `leaf_key_hash` and whose verified `0xFF03` attestation binds `proposer_did` or `voter_did`. Every member processes the same Commits, so every member holds the same tree for an epoch, and no verifier resolves a key over the network for this check.
+
+ECDSA signs the 32-byte §9.5.1 canonical hash as a prehashed digest: the hash is the ECDSA message digest itself, with no second SHA-256 over it, and RFC 6979 runs with that digest as `h1` (`09-security-model.md` §9.5, `25-test-vectors.md`). The same leaf key also signs MLS content under RFC 9420 `SignWithLabel`, where ECDSA hashes the `SignContent` bytes with SHA-256 to form its digest. `SignContent` begins with a variable-length size and the label `MLS 1.0 `, and an SCP canonical-hash preimage begins with an `SCP-` domain separator, so the two preimages always differ. A signature of one kind verifies as the other only when the two preimages have the same SHA-256 digest, which is a SHA-256 collision.
+
+**Re-signing after a key change.** A member whose leaf `signature_key` changes, by its own Update or by a Commit that carries its UpdatePath, sends again each pending proposal it made and each vote it cast and has not withdrawn whose `expires_epoch` has not passed, signed under the new key. A re-signed proposal keeps its `anchor_seq`, so its `proposal_id` is unchanged. No Commit can carry a signature under a leaf key that is no longer in the tree. A signature that a merged part of a transfer already carried stops counting at the final part once the signer's key changes, and a later part that carries the re-signed vote replaces it (`07-trust-validation-and-capabilities.md` §7.3.1.1).
+
+**Withdrawing an approval.** A voter withdraws an approval by sending a `Withdraw` vote message and committing an UpdatePath for its own leaf in the same step. The `Withdraw` message tells the other engines to drop the approval from their tallies; the new leaf key is what stops a Commit from carrying it, because a receiver never sees the `Withdraw` message.
+
+**Receive path.** A member that receives a `GovernanceProposal` or `GovernanceVote` message hands it to its governance engine, which accepts it only when all of these hold:
+
+1. The `InnerEnvelope` sender, `proposer_did` or `voter_did`, and the identifier that the verified `0xFF03` attestation on the MLS sender leaf binds are one identifier. The identity the MLS credential asserts is never used.
+2. `leaf_key_hash` is the SHA-256 of the MLS sender leaf's `signature_key`, and the signature verifies under that key.
+3. For a proposal: `action_bytes` is at most `MAX_GOVERNANCE_ACTION_BYTES`, decodes as one `GovernanceAction`, and re-encodes to the same bytes under RFC 8785 with every integer inside the I-JSON range below; `anchor_seq` is at most the receiver's commit-ordered leaf count; the proposer holds `GovernancePropose`; the recomputed `proposal_id` is not in the executed-proposal set.
+4. For a vote: the voter holds `GovernanceVote`; `expires_epoch` is at or after the epoch of the message that carries the vote.
+
+The engine records an accepted proposal as pending with its local voting window, and an accepted vote against it. A vote for a proposal the engine does not yet hold is kept until the proposal arrives or the group's epoch passes the vote's `expires_epoch`, at most `MAX_GOVERNANCE_ORPHAN_VOTES` (256) per context, the oldest dropped first. A later vote from the same voter for the same proposal, later in that sender's MLS order (§9.8.3), replaces the earlier one, and `Withdraw` removes it. Each accepted message is recorded as a local `ContextEvent` (`GovernanceProposalCreated`, `GovernanceVoteCast`, or `GovernanceVoteWithdrawn`), never as a canonical leaf. A member's tally of these messages tells its executor when an action is executable; it never decides a receiver's verdict on a Commit, which the Commit's contents alone decide.
+
+**The I-JSON bound on `action_bytes`.** RFC 8785 canonical JSON is defined over I-JSON (RFC 7493), which limits every number to an IEEE 754 double. An integer beyond 2^53 has no unique double, so two actions that differ only in such an integer can canonicalize to one byte string and share one `proposal_id`, and an approval for one would execute the other. Every integer in a `GovernanceAction` MUST therefore lie in the range −(2^53 − 1) to 2^53 − 1, and a proposer and every receiver reject an action that holds one outside it. The implementation's `jcs::to_vec` (`crates/scp-protocol/src/jcs.rs`) does not enforce this bound today.
 
 ## 5.10 Context TTL (Time-to-Live)
 
