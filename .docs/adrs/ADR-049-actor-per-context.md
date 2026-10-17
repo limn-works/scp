@@ -5,6 +5,7 @@
 **Phase:** Runtime concurrency redesign
 **Amended by ADR-055 (2026-06-29):** the WASM bridge is removed (browser clients are remote thin clients to a server-side `scp-node`). The §10 note about a WASM-specific `scp_init` panic-hook in the now-deleted `crates/scp-ffi/wasm/src/lib.rs`, and the dead `cargo check -p scp-ffi-wasm` verification command, have been removed. The actor/watchdog model and its native payload-free panic-redaction principle are unchanged; `scp-protocol` still compiles to `wasm32-unknown-unknown` (it is the pure sync core, not the deleted bridge), so that compile check stays.
 **Amended 2026-10-04 (Decision 16, supervisor task drain):** every task in the Supervisor's hierarchy that can write through the store spawns through one supervisor-owned task tracker, `shutdown_all_contexts` refuses new spawns as Decision 16 item 2 states and awaits that tracker, and every back-reference to the Supervisor is a `Weak<Supervisor>`. Decision 2 gains one sentence that points at Decision 16.
+**Amended 2026-10-17 (Decision 17, bridge instance actor and lock ban):** each SDK instance's bridge state moves to a Supervisor-owned instance actor, to the context actor, or to a per-object task; `crates/scp-ffi/clippy.toml` bans `std::sync::Mutex`, `std::sync::RwLock`, `tokio::sync::Mutex`, `tokio::sync::RwLock` and `std::sync::mpsc::Receiver` in the bridge crates; and Decision 12's "FFI sync boundaries" allow-list entry now points at Decision 17's named exceptions.
 **Related:** ADR-034 (WASM Constraints), ADR-046 (Bridge Parity Harness), ADR-047 (Bridge Symmetry Enforcement), ADR-048 (SCP Multi-Instance), ADR-055 (WASM bridge removal). Plan: `~/.claude/plans/generic-moseying-lightning.md`.
 
 ## Context
@@ -318,7 +319,7 @@ Allow-list (sites that actually carry a `tokio::sync::Mutex`). Every site below 
 - `Supervisor::bootstrap_spawn_lock: tokio::sync::Mutex<()>` — serializes the same-id bootstrap-spawn sequence (all three lifecycle bootstrap variants: `create_context`, `import_context`, standing-recreate). Cold bootstrap path, not a per-command read.
 - `ProductionMlsBackend::join_gate: tokio::sync::Mutex<()>` — serializes the `join_from_welcome` consumed-init-key retrieve→join→store sequence (TOCTOU guard). Acquired only on a join, not on a per-command read path.
 - OpenMLS storage adapter internals (sync upstream trait).
-- FFI sync boundaries.
+- The FFI bridge crates: Decision 17 moves their state to owners that need no lock and bans the lock types in `crates/scp-ffi/clippy.toml`; its item 6 names the only exceptions, test code (E1) and the `testing`-feature full-stack harness (E2).
 - Test-only mock/store locks in `#[cfg(test)]` modules — the `InMemoryCredentialStore` (`economy/credentials.rs`), and the governance-engine share in the timeout-callback tests (`context/governance/timeout.rs`). Not runtime read paths.
 
 The clippy rule lands in commit 13 of the ADR-049 ladder (Phase 3 of the post-review-round-1 plan); commit 12 already conforms to the rule.
@@ -419,6 +420,145 @@ Cross-refs: §1 (actor owns state by move), §6 (`ContextCryptoProvider` *trait*
 - `shutdown_all_contexts` can block for as long as its slowest tracked task takes to exit, which is why the bridge bounds it.
 
 **Verification.** A unit test in `crates/scp-runtime/src/context/supervisor/supervisor.rs` holds a `Weak<Supervisor>` probe, runs `shutdown_all_contexts`, drops the owning `Arc`, and asserts that the probe fails to upgrade. A test in `scp-platform` asserts that a closed `SqliteStorage` rejects every further operation with the typed closed-store error.
+
+### 17. Bridge instance actor and the bridge lock ban (2026-10-17)
+
+**Problem.** Decisions 1, 2, 12 and 16 removed locks from `scp-runtime`, but the four FFI bridge crates kept their own state behind locks. Those crates are `scp-ffi-common` (`crates/scp-ffi/common`), the PyO3 bridge `scp-ffi` (`crates/scp-ffi/src`), `scp-ffi-napi` (`crates/scp-ffi/napi`) and `scp-ffi-uniffi` (`crates/scp-ffi/uniffi`). Decision 12's allow-list exempted them with one entry, "FFI sync boundaries", which named no site. No clippy configuration under `crates/scp-ffi/` bans a lock type, so a new lock in a bridge passes CI. A read of every lock site on `main` on 2026-10-17 found 520 lock declarations and acquisitions in the four crates, plus 38 acquisitions made through wrapper helpers. Of the 520, 305 sit in production code, 194 sit in `#[cfg(test)]` modules and `tests/` files, and 21 sit in the full-stack harness that the `testing` feature compiles. The 305 production sites carry these defects:
+
+- **Copies of runtime state.** Each bridge's context handle caches the context's lifecycle state in a `state` lock beside the actor's `ArcSwap`. The UniFFI context handle copies the actor's `registered_outlets` into `outlet_registry` and the actor's economic policy into `economic_policy`. The PyO3 bridge copies the bridge transport's relay URL into `connected_relay_url`, and the NAPI and UniFFI transport objects copy the connection flag and relay URL into `status`. `crates/scp-ffi/AGENTS.md` forbids such a copy: "a bridge adds FFI state, never a second copy of supervisor state."
+- **A comment-enforced lock order.** `CoreFields` acquires `node_binding`, then `transport`, then `relay_urls`, and only a doc comment states that order.
+- **Locks held across `.await`.** UniFFI `context_close` holds the context handle's `state` lock across awaits. UniFFI holds `session_store` across `context_params().await`. `outlet_session_invoke` reads a session, awaits the invocation, and writes the session back, so two concurrent calls lose one update. Each outlet stream holds a tokio lock on its control handle across the runtime's cancel await.
+- **A drain that misses tasks.** The `tasks` `JoinSet` in `CoreFields` enrols only the NAPI subscribe task, so the PyO3 and UniFFI tasks escape Decision 16's drain.
+- **Release marks.** Each bridge keeps a `std::sync::Mutex<HashMap<String, ReleaseMark>>` to order a context's close against its readmission into the bridge's UCAN state map. That map holds each context's UCAN revocation list, UCAN nonce tracker and a mirror of the context's event log, all three of them per-context state.
+- **Std channels on sync paths.** The PyO3 and UniFFI outlet handler paths run the application handler on a detached `std::thread` and wait on a `std::sync::mpsc` receiver with `recv_timeout`. When the timeout fires, the thread keeps running.
+
+**Decision.**
+
+1. **One instance actor per SDK instance, owned by the Supervisor.** `crates/scp-ffi/common/src/instance_actor/` defines `InstanceActor` once, and all three bridges use that one definition. Each bridge instance (one SDK `SCP` object, ADR-048, SCP as a first-class multi-instance SDK object) builds one `InstanceActor` in its constructor and passes the actor's handle into `CoreFields` through the `CoreFields` initializer. The bridge spawns the actor through `Supervisor::spawn_owned_task`, a new public Supervisor method. That method spawns the task onto Decision 16's tracker, hands the task a child of the Supervisor's shutdown token, and returns `ContextError::SupervisorShutDown` (`SCP-CTX-2138`) once shutdown has begun. The Supervisor therefore owns the actor's task, and Decision 16's drain awaits it.
+   - **Mailbox.** A bounded `tokio::sync::mpsc` channel of capacity `ACTOR_MAILBOX_CAPACITY` (256) carries `InstanceCommand` values. Each command that returns a value carries a `tokio::sync::oneshot` reply sender. A sender waits at most `SEND_TIMEOUT` (30 seconds) for mailbox capacity and at most `REPLY_TIMEOUT` (2 minutes) for the reply, the same constants the context actor's handle uses.
+   - **In-memory handlers.** No handler awaits network, storage, process or application-callback I/O. A bridge method that needs I/O performs it outside the actor and then sends the actor the result. For example, `transport_connect` dials the relay and then sends `InstallTransport`, and the handler installs the dialled transport only when the binding generation in the command still matches the actor's.
+   - **Snapshots for readers.** The actor publishes every field that a sync FFI method or a per-command path reads as an `ArcSwap` snapshot that `CoreFields` holds. A reader loads the snapshot with no mailbox round trip. Only writes travel through the mailbox, and the handler for each write publishes a new snapshot before it replies.
+   - **Message set.**
+
+     | Command | Fields it writes | Reply |
+     |---|---|---|
+     | `InstallTransport { transport, relay_url, generation }` | transport, relay URLs | `Result<(), InstanceError>`; a stale generation returns `InstanceError::StaleBinding` |
+     | `ClearTransport { generation }` | transport | `Option<Arc<TransportManager>>`, the removed transport, which the caller closes |
+     | `SetRelayUrls { urls }`, `AddRelayUrl { url }`, `RemoveRelayUrl { url }` | relay URLs | the new list |
+     | `BeginReconnect` | reconnect token | a child `CancellationToken` of the actor's root token; the handler cancels the previous reconnect token first |
+     | `BindNode { binding }`, `UnbindNode` | node binding, transport, relay URLs | the binding generation; one handler replaces the three-lock order |
+     | `RegisterShutdownHook { hook }` | shutdown hooks | `()` |
+     | `RegisterBorrower { borrower }`, `ReleaseBorrower { id }` | borrowers | `()` |
+     | `PetnameSet`, `PetnameRemove`, `PetnameSetContext`, `PetnameRemoveContext`, `PetnameApplyEvent` | petname maps | the operation's existing result type |
+     | `HandleRegister`, `HandleDeregister`, `ScopeRegister`, `ScopeDeregister` | handle and scope registries | the operation's existing result type |
+     | `SetMcpAllowlist { allowlist }`, `AllowMcpCommand`, `RevokeMcpCommand` | MCP stdio allowlist | `()` |
+     | `RecordRotation { event }` | rotation events | none; the resolver sends it with `try_send` |
+     | `DrainRotations` | rotation events | the drained events |
+     | `Shutdown` | every field | the borrowers and shutdown hooks, which the bridge then stops and runs |
+
+   - **Shutdown.** `BridgeInstanceCore::shutdown` sends `Shutdown` before `shutdown_core_async` drains the Supervisor. The actor replies and returns, so the Supervisor's tracker no longer waits on it. The Supervisor's shutdown token stops the actor when a path skips `shutdown`.
+   - **Drop.** `CoreFields`'s `Drop` cancels the actor's root `CancellationToken`. Every reconnect token is a child of that root, so the cancellation reaches every reconnect loop, and `Drop` takes no lock. The `try_lock` on `tasks` in `emergency_cancel_tasks` goes away with `tasks` (item 2).
+   - **Difference from the rejected per-identity actor.** The rejected alternative "Introduce an `IdentityActor` per local identity" lost because it would serialize unrelated per-identity subsystems behind one mailbox, reverse the per-`SCP` typed fields that cozy-fluttering-rose Phase 4 chose for petnames, handles and scopes, and duplicate the KeyPackage pool's own actor. The instance actor keeps those fields per `SCP` instance, and the actor's handlers do in-memory work only, so no handler waits on another subsystem's I/O. The KeyPackage pool keeps its own actor.
+
+2. **Ownership rules.** The scope of the invariant a field carries decides the field's owner:
+   - (a) Per-context protocol state belongs to the context actor (Decision 1). The bridge reaches the state through a Supervisor method, and a new method goes through the integration checklist in AGENTS.md.
+   - (b) State that copies something the runtime already owns is deleted, and the bridge reads the runtime's copy.
+   - (c) Per-`SCP`-instance state that carries an invariant across fields, or that a caller updates by read-modify-write, belongs to the instance actor.
+   - (d) State that belongs to one FFI object (one outlet stream, one streaming saga, one MCP connection, one context's PyO3 message queue) belongs to a task that owns the state by move. `Supervisor::spawn_owned_task` spawns that task, and callers send it requests on its channel. A keyed lookup with no read-modify-write across an `.await` uses a `DashMap`, and a single replaceable value uses an `ArcSwap`, which Decision 12 lists as allowed read primitives.
+   - (e) A value that only the constructor writes becomes an initializer field.
+   - (f) Every task a bridge spawns goes onto the Supervisor's tracker through `Supervisor::spawn_owned_task`.
+
+3. **Per-field owners.** The table lists every production lock field that the 2026-10-17 read found. Line numbers refer to `main` on that date.
+
+   | Field (declaration) | Owner | Disposition |
+   |---|---|---|
+   | `CoreFields.transport` (`common/src/bridge_instance.rs:520`) | instance actor | actor field and snapshot |
+   | `CoreFields.relay_urls` (`bridge_instance.rs:674`) | instance actor | actor field and snapshot |
+   | `CoreFields.reconnect_cancel` (`bridge_instance.rs:710`) | instance actor | child token of the actor's root token |
+   | `CoreFields.node_binding` (`bridge_instance.rs:794`) | instance actor | actor field; `BindNode` and `UnbindNode` replace the lock order |
+   | `CoreFields.shutdown_hooks` (`bridge_instance.rs:627`) | instance actor | actor field |
+   | `CoreFields.borrowers` (`bridge_instance.rs:790`) | instance actor | actor field |
+   | `CoreFields.petname_maps` (`bridge_instance.rs:730`) | instance actor | actor field and snapshot |
+   | `CoreFields.handle_registries` (`bridge_instance.rs:733`), `CoreFields.scope_registries` (`bridge_instance.rs:738`), `LocalHandleQuerier.registries` (`common/src/petname_helpers.rs:359`) | instance actor | actor fields and snapshots; §22.3.1 (Handle Outlets) and §22.3.5 (Scope Outlets) of the human-readable addressing spec make handle and scope outlets a convention a context opts into, and the bridge hosts them as per-`SCP` fields |
+   | `CoreFields.mcp_allowlist` (`bridge_instance.rs:755`), the allowlist parameters of the stdio spawn functions (PyO3 `src/mcp.rs:101`, NAPI `napi/src/mcp.rs:356`, UniFFI `uniffi/src/bridge.rs:5158`) | instance actor | actor field; the stdio spawn validates against the snapshot |
+   | `IdentityBackedDidResolver.rotation_events` (`common/src/resolvers.rs:214`) | instance actor | actor field holding at most 1,024 events; a full buffer drops the oldest event |
+   | `CoreFields.persona_source` (`bridge_instance.rs:775`) | initializer | no production code writes it after construction |
+   | `CoreFields.tasks` (`bridge_instance.rs:716`) | Supervisor | deleted; every bridge task spawns through `Supervisor::spawn_owned_task` |
+   | PyO3 `PyBridgeInstance.connected_relay_url` (`src/runtime.rs:506`) | instance actor | deleted as a copy; `transport_status` reads the transport snapshot |
+   | NAPI `NapiTransportManager.status` (`napi/src/transport.rs:133`), UniFFI `TransportManager.status` (`uniffi/src/bridge.rs:3765`) | instance actor | the connection flag and relay URL are deleted as copies and read from the transport snapshot; the latency figure becomes an `AtomicU64` on the transport object |
+   | Context handle `state` in NAPI (`napi/src/context.rs:110`), PyO3 (`src/context.rs:325`) and UniFFI (`uniffi/src/bridge.rs:3523`) | context actor | deleted as a copy; readers call `Supervisor::read_context_state_checked` |
+   | UniFFI `ContextHandle.outlet_registry` (`uniffi/src/bridge.rs:3552`), and the unlocked `outlet_registry` in each PyO3 and NAPI per-context bridge state | context actor | deleted as copies of `registered_outlets`; the Supervisor's outlet invocation and stream-open methods resolve the registration inside the actor and drop their `registry` parameter, and a new `Supervisor::read_registered_outlets` serves listing |
+   | UniFFI `ContextHandle.economic_policy` (`uniffi/src/bridge.rs:3561`) | context actor | deleted as a copy; a new `Supervisor::read_economic_policy` serves reads |
+   | UniFFI `ContextHandle.session_store` (`uniffi/src/bridge.rs:3559`), and the unlocked `session_store` in each PyO3 and NAPI per-context bridge state | context actor | moves into `PerContextState`, because §6.2.1 (Stateful Outlet Sessions) of the cross-context communication spec places session state in the outlet's context; the outlets command domain gains session create, invoke and close commands, and the invoke handler applies the session update in the same handler that reads it; sessions stay unpersisted, as today |
+   | `released_contexts` in NAPI (`napi/src/runtime.rs:246`), PyO3 (`src/runtime.rs:481`) and UniFFI (`uniffi/src/runtime.rs:306`), with the unlocked `ucan_registry` map each guards | context actor | deleted; the UCAN revocation list and UCAN nonce tracker move into the context actor's Class S state beside the spending-nonce tracker (Decision 9), and the actor persists each nonce under the `context/{context_id}/nonce/` key that §17.3 (Key Convention) of the persistence and storage spec defines; the event-log mirror is deleted, and proof and root queries read the actor's event log |
+   | Outlet stream `StreamEntry.handle` and `StreamEntry.receiver` in each bridge (`src/outlet_stream.rs:98`, `napi/src/outlet_stream.rs:113`, `uniffi/src/outlet_stream.rs:127`, with their `ControlHandle` aliases) | per-object task | one task per stream owns the `StreamSessionHandle` and the chunk receiver; it selects over control requests and, while a poll waits, over the receiver, so a credit grant reaches the runtime while a poll waits |
+   | `StreamingSagaEntry.receiver` (`common/src/streaming_saga.rs:56`) | per-object task | one task per saga owns the receiver |
+   | PyO3 per-context message receiver (`src/runtime.rs:1524`, `src/context.rs:1444`, `src/context.rs:1514`, `src/context.rs:3622`, `src/runtime.rs:2559`, `src/runtime.rs:2612`) | per-object task | one task per context owns a bounded queue; a full queue drops the oldest message, which replaces the `blocking_lock` in `deliver_message` |
+   | MCP client state: `LiveMcpClient.client` and `McpClientEntry.client` in each bridge, stdio transport `inner` and `child`, and the stop-path `slot` | per-object task | one task per MCP connection owns the client; `scp-mcp`'s `McpTransport` and `ContextProvider` become async traits, and the stdio transport spawns its server with `tokio::process::Command` and `kill_on_drop(true)` |
+   | `CallbackKeyRegistry.entries` (`common/src/callback_custody.rs:173`) | per-object | `DashMap` |
+   | `IdentityBackedDidResolver.seen_sequences` (`common/src/resolvers.rs:211`) | per-object | `DashMap`, which serves the sync `resolve_public_key` methods of `DidResolver` and `DidPublicKeyResolver` |
+   | NAPI `NapiContextHandle.subscription_cancel` (`napi/src/context.rs:148`) | per-object | `ArcSwap<CancellationToken>` |
+   | UniFFI `ContextHandle.outlet_handlers` (`uniffi/src/bridge.rs:3557`) | per-object | `DashMap` keyed by outlet id; the PyO3 and NAPI bridges keep the same map inside their per-context `DashMap` entry |
+
+   The production sites divide among owners as follows, counting declarations and direct acquisitions: 133 sites move to the instance actor, 67 to the context actor, 97 to per-object tasks or lock-free primitives, 6 to the Supervisor's tracker, and 2 to an initializer field, for 305 in all.
+
+4. **One wait helper for sync callers.** A sync FFI method that waits on an actor reply or a task reply waits through `scp_ffi_common::bridge_wait::block_on_reply(fallback, deadline, future)`, which replaces `ucan_durable_state::block_on_storage`. The helper returns `BridgeWaitError::NoBlockingContext` when it is called on a current-thread runtime, or outside any runtime with no fallback handle. It returns `BridgeWaitError::DeadlineElapsed` when the deadline passes, and `BridgeWaitError::ReplyDropped` when the reply sender drops unanswered. Each bridge maps `BridgeWaitError` to its own typed error. Every bridge channel receiver is a `tokio::sync` receiver. The two `std::sync::mpsc` outlet handler waits become `tokio::time::timeout(deadline, tokio::task::spawn_blocking(handler))` inside the async `ContextProvider`.
+
+5. **The ban.** `crates/scp-ffi/clippy.toml` bans the lock types for every crate under `crates/scp-ffi/`. Clippy reads the configuration file nearest to a crate's manifest and stops at the first one it finds, so this file governs `scp-ffi`, `scp-ffi-common`, `scp-ffi-napi`, `scp-ffi-uniffi` and `scp-ffi-napi-test-stubs`, and it repeats every entry of the workspace `.clippy.toml`, which would otherwise stop applying to those crates.
+
+   ```toml
+   cognitive-complexity-threshold = 25
+   stack-size-threshold = 900000
+   future-size-threshold = 16512
+
+   disallowed-types = [
+       { path = "std::sync::Mutex", reason = "ADR-049 §Decision 17: bridge state belongs to the context actor, the instance actor, or a per-object task. Exceptions carry #[allow(clippy::disallowed_types, reason = \"ADR-049 §Decision 17 E<n>: …\")]." },
+       { path = "std::sync::RwLock", reason = "ADR-049 §Decision 17: publish read state as an ArcSwap snapshot from its owner. Exceptions carry #[allow(clippy::disallowed_types, reason = \"ADR-049 §Decision 17 E<n>: …\")]." },
+       { path = "tokio::sync::Mutex", reason = "ADR-049 §Decisions 12 and 17: forbidden in the bridges; move the state to its owner by Decision 17's rules." },
+       { path = "tokio::sync::RwLock", reason = "ADR-049 §Decisions 12 and 17: forbidden in the bridges; move the state to its owner by Decision 17's rules." },
+       { path = "std::sync::mpsc::Receiver", reason = "ADR-049 §Decision 17: bridge channels are tokio channels, and sync callers wait through scp_ffi_common::bridge_wait::block_on_reply." },
+   ]
+
+   disallowed-methods = [
+       # the three entries of the workspace .clippy.toml, verbatim
+   ]
+   ```
+
+   The ban covers the two std lock types and the std channel receiver. It also covers the two tokio lock types, which extends Decision 12's tokio ban from `scp-runtime` to the bridges.
+
+6. **Named exceptions.** Each exception is an `#[allow(clippy::disallowed_types, reason = "ADR-049 §Decision 17 E<n>: <why>")]`. The attribute sits on the `#[cfg(test)]` module, on the `testing`-gated module, or at the top of the `tests/` file, so one attribute covers one module or file.
+   - **E1, test code.** `#[cfg(test)]` modules and files under a crate's `tests/` directory. Test hosts, probes and fake stores lock their own fixtures, and no production path reaches them.
+   - **E2, the full-stack test harness.** The `network` slot of the PyO3 and NAPI bridge instances and the `handles` map of `PyFullStackNode` and `NapiFullStackNode`. Only the `testing` feature compiles them.
+
+   No production exception exists. The OS-level advisory file lock on a SQLite store is a file lock, not a `disallowed-types` entry, and it lives in `scp-platform`, outside the bridges.
+
+7. **The gate.** Three checks make the ban hold in all three bridges and in `scp-ffi-common`:
+   - The `rust-clippy` CI job already runs `cargo clippy --workspace --all-targets -- -D warnings`, so every `disallowed_types` warning in a bridge crate fails CI once the configuration file exists.
+   - Each of the four crates carries one control test holding `#[expect(clippy::disallowed_types, reason = "control: proves crates/scp-ffi/clippy.toml bans std::sync::Mutex in this crate")]` on a `std::sync::Mutex` binding. When the ban stops reaching the crate, the expectation goes unfulfilled and clippy fails, the same pattern as `signer_store_is_disallowed_and_refused` in `scp-runtime`.
+   - `scripts/check-bridge-lock-ban.py` fails when `crates/scp-ffi/clippy.toml` lacks one of the five `disallowed-types` entries or one entry of the workspace `.clippy.toml`, when any directory under `crates/scp-ffi/` other than `crates/scp-ffi/` itself holds a `clippy.toml` or `.clippy.toml`, when a `disallowed_types` allow or expect in `crates/scp-ffi/` has a reason that names no exception from item 6, when an E1 allow sits outside a `#[cfg(test)]` item or a `tests/` file, when an E2 allow sits outside a `testing`-gated item, or when one of the four control tests is missing. Its `--self-test` runs it against fixtures that break each of those conditions, and every fixture must fail. CI runs the script and its self-test.
+
+8. **Migration order.** The work lands as ten pull requests, and each one compiles and passes its tests alone. The order is the wait helper; `Supervisor::spawn_owned_task` and the removal of `tasks`; the instance actor with the transport, relay, reconnect, node-binding, shutdown-hook, borrower and `persona_source` fields; the instance actor's petname, handle, scope, allowlist and rotation fields; async `McpTransport` and `ContextProvider` with per-connection MCP tasks; deletion of the context-state, outlet-registry and economic-policy copies; outlet sessions in the context actor; UCAN revocation and nonce state in the context actor with the release marks and the event-log mirror deleted; per-object tasks for streams, sagas and the PyO3 message queue, together with the `DashMap` and `ArcSwap` conversions; and last, the ban and its gate. The wait-helper pull request also lands `scripts/check-bridge-lock-ban.py` in a ratchet mode: the script fails when a bridge file's count of production lock mentions rises above or falls below a checked-in baseline, so no slice adds a lock and each slice lowers the baseline by the locks it removed. The last pull request deletes the baseline and switches the script to the checks in item 7. The plan of record lists each pull request's sites, the tests that fail before it, and its gate additions. Each pull request that deletes a lock carries the Shuttle or stress test that Decision 13 requires.
+
+**Reasoning.** The bridges hold three kinds of state, and each kind already has an owner that serializes it without a lock. Per-context state already lives in the context actor, so a bridge copy can only diverge from the actor's state. A bridge cannot reach the Supervisor's transport slot for relay-client state, because `scp-runtime` depends on neither `scp-transport` nor `scp-mcp`, and the ADR-029 addendum "Reconnection driver location after the ADR-049 actor refactor" in `phase-6.md` places the relay client at the FFI layer. That state needs an owner at the FFI layer, and the instance actor is that owner. One instance actor replaces the comment-enforced lock order with one handler, and Decision 16's tracker drains it with the rest of the hierarchy. Per-object state needs no shared owner, because only one FFI object touches it. A clippy ban with named exceptions turns the remaining rule into a build error, which Decision 12's unnamed "FFI sync boundaries" entry never did.
+
+**Alternatives rejected.**
+
+- **`ArcSwap` and `DashMap` per field, with no instance actor.** Each field becomes a lock-free primitive, and a read-modify-write becomes an `ArcSwap::rcu` loop. Three of the instance actor's fields (node binding, transport and relay URLs) change together, and an `rcu` loop on one of them cannot keep the other two consistent, so the lock order would come back as a retry protocol across three cells. The per-object fields in item 3 use these primitives because each one changes alone.
+- **Keep the locks and name each one in an allow-list.** This alternative keeps the copies of runtime state, the locks held across awaits, the lost session update and the release-mark race, and it adds about 300 named allows that each new bridge feature would extend.
+- **The Supervisor owns the bridge's transport state.** The Supervisor already holds a `TransportSlot` for the context actors' send path. Moving the bridge's `TransportManager` into it would add `scp-transport` to the manifest of `scp-runtime`, which names neither `scp-transport` nor `scp-mcp` today, and the ADR-029 addendum places the relay client at the FFI layer.
+- **The instance actor owns the UCAN state map and the release marks.** The release marks order operations on the UCAN state map, so they need the same owner as the map. The nonce check persists each nonce to storage before it answers, so an instance-actor handler would await storage on every UCAN-authorized command, which item 1 forbids. The context actor already owns a `NonceTracker`, the spending-nonce tracker, and already persists Class S state before it answers.
+- **Ban only the std lock types.** A tokio lock in a bridge carries the same hold-across-await hazard that Decision 12 bans in `scp-runtime`, and the outlet stream control lock is a tokio lock held across the runtime's cancel await.
+
+**Consequences.**
+
+- `scp-runtime` gains `Supervisor::spawn_owned_task`, `Supervisor::read_registered_outlets`, `Supervisor::read_economic_policy`, outlet session commands, UCAN admission and revocation commands, and event-log proof queries. Each new public function backs an existing FFI export or carries a `[cross-layer: pub-crate-visibility]` marker in its pull request.
+- The Supervisor's outlet invocation and stream-open methods drop their `registry` parameter, so a bridge can no longer invoke an outlet that the context's governance has not registered.
+- `scp-mcp`'s `McpTransport` and `ContextProvider` become async traits, which changes every implementation in the three bridges.
+- A sync FFI method that writes instance state waits for one mailbox round trip. A sync read loads a snapshot and waits for nothing.
+- An outlet handler that never returns keeps one blocking-pool thread busy after its timeout fires, because a sync application callback cannot be cancelled. The caller receives the timeout error at the deadline.
+- `crates/scp-ffi/clippy.toml` must repeat every later change to the workspace `.clippy.toml`, and `scripts/check-bridge-lock-ban.py` fails when it does not.
+
+**Verification.** `cargo clippy --workspace --all-targets` with CI's feature list reports no `disallowed_types` warning. `python3.12 scripts/check-bridge-lock-ban.py` and `python3.12 scripts/check-bridge-lock-ban.py --self-test` pass. `git grep -n 'std::sync::Mutex\|std::sync::RwLock\|tokio::sync::Mutex\|tokio::sync::RwLock' -- crates/scp-ffi` lists only lines inside E1 and E2 items. A test in each bridge proves that concurrent `node_start`, `transport_connect` and `transport_disconnect` leave one transport and one relay URL list that agree. A test in each bridge proves that two concurrent calls to one outlet session apply both updates.
 
 ## Rejected alternatives
 
