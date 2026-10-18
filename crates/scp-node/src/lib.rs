@@ -133,11 +133,50 @@ pub fn bound_relay_ws_url(mut addr: SocketAddr) -> String {
     format!("ws://{addr}/scp/v1")
 }
 
-/// The public HTTP port a node advertises and hands to NAT tier selection:
-/// the configured [`NodeConfig::http_bind_addr`] port, or
-/// [`DEFAULT_HTTP_PORT`] when none is configured.
-fn advertised_http_port(http_bind_addr: Option<SocketAddr>) -> u16 {
-    http_bind_addr.map_or(DEFAULT_HTTP_PORT, |addr| addr.port())
+/// The public HTTP address a no-domain node advertises and hands to NAT tier
+/// selection.
+///
+/// A configured [`NodeConfig::http_bind_addr`] with port 0 asks the operating
+/// system for a port, which exists only once something binds it. So
+/// [`AdvertisedHttp::resolve`] binds the public TCP listener first and
+/// advertises the port the system assigned, and the node later serves on that
+/// listener ([`http::NodeState::take_or_bind_public`]). Any other configured
+/// address advertises its own port, and no configured address advertises
+/// [`DEFAULT_HTTP_PORT`]. No published URL or NAT mapping therefore names port
+/// 0, which has no §9.18.2 canonical form.
+struct AdvertisedHttp {
+    /// The configured address, with port 0 replaced by the bound port.
+    bind_addr: Option<SocketAddr>,
+    /// The listener bound for a configured port 0, else `None`.
+    listener: Option<tokio::net::TcpListener>,
+}
+
+impl AdvertisedHttp {
+    /// Binds the public listener when `configured` requests port 0.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Serve`] when that bind fails or its address cannot be read.
+    async fn resolve(configured: Option<SocketAddr>) -> Result<Self, NodeError> {
+        match configured {
+            Some(addr) if addr.port() == 0 => {
+                let (listener, bound) = http::bind_public_tcp(addr).await?;
+                Ok(Self {
+                    bind_addr: Some(bound),
+                    listener: Some(listener),
+                })
+            }
+            bind_addr => Ok(Self {
+                bind_addr,
+                listener: None,
+            }),
+        }
+    }
+
+    /// The port the node advertises.
+    fn port(&self) -> u16 {
+        self.bind_addr.map_or(DEFAULT_HTTP_PORT, |addr| addr.port())
+    }
 }
 
 /// The address `serve_background*` binds: the caller's `requested` address,
@@ -888,13 +927,16 @@ impl<S: Storage> ApplicationNode<S> {
 
         // Bind the TCP listener before spawning so we can report errors
         // and the bound address synchronously.
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-            // Reset serving flag on bind failure.
-            self.serving.store(false, Ordering::SeqCst);
-            NodeError::Serve(format!(
-                "failed to bind background HTTP server on {addr}: {e}"
-            ))
-        })?;
+        // A node that advertised the port of a listener it bound at start
+        // serves on that listener.
+        let (listener, _) = self
+            .state
+            .take_or_bind_public(addr)
+            .await
+            .inspect_err(|_| {
+                // Reset serving flag on bind failure.
+                self.serving.store(false, Ordering::SeqCst);
+            })?;
         self.spawn_background_server(listener, surface, tls_config)
             .await
     }
@@ -3483,6 +3525,9 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         relay_config,
         start_time: std::time::Instant::now(),
         http_bind_addr,
+        // A domain node advertises `wss://<domain>/scp/v1`, which names no
+        // port, so it binds its public listener only when it serves.
+        prebound_public: std::sync::Mutex::new(None),
         shutdown_token: CancellationToken::new(),
         cors_origins,
         projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -3688,8 +3733,14 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     #[cfg(feature = "quic")] did_slot_registry: scp_transport::native::did_slot::DidSlotRegistry,
     skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError> {
-    // NAT strategy needs the public HTTP port, not the internal relay port (#641).
-    let http_port = advertised_http_port(http_bind_addr);
+    // NAT strategy needs the public HTTP port, not the internal relay port
+    // (#641), and the port the node serves, never a configured port 0.
+    let advertised = AdvertisedHttp::resolve(http_bind_addr).await?;
+    let http_port = advertised.port();
+    let AdvertisedHttp {
+        bind_addr: http_bind_addr,
+        listener: prebound_public,
+    } = advertised;
 
     // When `skip_nat_probe` is set (operator opted out — e.g. behind a
     // tunnel/proxy that terminates on `localhost`), the STUN/NAT probe is dead
@@ -3793,6 +3844,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         relay_config,
         start_time: std::time::Instant::now(),
         http_bind_addr,
+        prebound_public: std::sync::Mutex::new(prebound_public),
         shutdown_token: CancellationToken::new(),
         cors_origins,
         projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -5560,6 +5612,64 @@ mod tests {
         .unwrap();
         assert_eq!(unconfigured.relay_url(), "ws://127.0.0.1:8443/scp/v1");
         unconfigured.shutdown();
+    }
+
+    /// A configured `http_bind_addr` with port 0 publishes the port the node
+    /// bound, never port 0, and the background server serves on that port.
+    #[tokio::test]
+    async fn advertised_relay_url_reads_the_bound_port_for_a_port_zero_bind() {
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+        let node = Node::start_for_testing(NodeConfig {
+            reach: Reach::Local,
+            dht: DhtMode::Disabled,
+            http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            ..no_domain_config(tier)
+        })
+        .await
+        .expect("a port-0 http_bind_addr starts");
+
+        let url = node.relay_url();
+        let port: u16 = url
+            .strip_prefix("ws://127.0.0.1:")
+            .and_then(|rest| rest.strip_suffix("/scp/v1"))
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("loopback relay URL with a port: {url}"));
+        assert_ne!(port, 0);
+
+        let served = node
+            .serve_background(None)
+            .await
+            .expect("serves on the configured address");
+        assert_eq!(served.port(), port, "the node serves the port it published");
+        node.shutdown();
+    }
+
+    /// NAT tier selection receives the bound port of a port-0 `http_bind_addr`,
+    /// and [`ApplicationNode::bind`] binds that same port.
+    #[tokio::test]
+    async fn nat_tier_selection_reads_the_bound_port_for_a_port_zero_bind() {
+        let received_port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+        let node = Node::start_for_testing(NodeConfig {
+            http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            nat: NatSlot::Custom(Arc::new(PortRecordingNatStrategy {
+                received_port: Arc::clone(&received_port),
+                tier: tier.clone(),
+            })),
+            ..no_domain_config(tier)
+        })
+        .await
+        .expect("a port-0 http_bind_addr starts");
+
+        let port = received_port.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(port, 0, "tier selection never sees port 0");
+
+        let bound = node.bind().await.expect("binds the advertised port");
+        assert_eq!(bound.http_addr().port(), port);
     }
 
     #[tokio::test]

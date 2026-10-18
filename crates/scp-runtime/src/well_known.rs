@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use scp_did::RelayEndpoint;
 use scp_identity::DidMethod;
 use scp_protocol::economy::types::{Amount, CurrencyCode, PaymentAdapterRef};
 
@@ -229,6 +230,13 @@ pub enum WellKnownValidationError {
         did: String,
     },
 
+    /// The relay URL in `.well-known/scp` fails the `SCPRelay` URL rules of
+    /// `18-addressability-and-deployment.md` §18.2.1, so it has no §9.18.2
+    /// canonical form to compare with the document's entries. The error's URL
+    /// has its user information removed.
+    #[error("relay URL in .well-known/scp is invalid: {0}")]
+    InvalidRelayUrl(#[source] scp_did::DidError),
+
     /// The operator DID in `.well-known/scp` does not match the resolved
     /// DID document's subject.
     #[error(
@@ -264,8 +272,11 @@ impl WellKnownScp {
     ///   be resolved.
     /// - [`WellKnownValidationError::OperatorDidMismatch`] if the resolved
     ///   document subject does not match the claimed operator DID.
-    /// - [`WellKnownValidationError::RelayMismatch`] if the relay URL is not
-    ///   found in any `SCPRelay` service entry.
+    /// - [`WellKnownValidationError::InvalidRelayUrl`] if the relay URL has no
+    ///   §9.18.2 canonical form or its canonical path does not end in
+    ///   `/scp/v1` (§18.2.1).
+    /// - [`WellKnownValidationError::RelayMismatch`] if the relay URL's
+    ///   canonical form is not any `SCPRelay` service entry's URL.
     pub async fn verify_against_did<M: DidMethod>(
         &self,
         did_method: &M,
@@ -286,11 +297,16 @@ impl WellKnownScp {
             });
         }
 
-        // Step 3: Extract SCPRelay service endpoint URLs from the resolved document.
+        // Step 3: Extract SCPRelay service endpoint URLs from the resolved
+        // document. Each is already in its §9.18.2 canonical form.
         let relay_urls = document.relay_service_urls();
 
-        // Step 4: Verify the .well-known/scp relay URL matches at least one entry.
-        if !relay_urls.iter().any(|url| url == &self.relay) {
+        // Step 4: Verify the .well-known/scp relay URL matches at least one
+        // entry. Two spellings of one relay share a canonical form, so the
+        // claimed URL is canonicalized before the comparison.
+        let claimed =
+            RelayEndpoint::new(&self.relay).map_err(WellKnownValidationError::InvalidRelayUrl)?;
+        if !relay_urls.iter().any(|url| url == claimed.as_str()) {
             return Err(WellKnownValidationError::RelayMismatch {
                 relay_url: self.relay.clone(),
                 did: self.did.clone(),
@@ -340,7 +356,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use scp_did::{DidDocument, Service};
+    use scp_did::{DidDocument, DidError, RelayEntryUrlError, RelayUrlError, Service};
     use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 
     use scp_platform::PreRotationKeyHandle;
@@ -1024,6 +1040,87 @@ mod tests {
                 assert_eq!(err_did, did);
             }
             other => panic!("expected RelayMismatch, got: {other:?}"),
+        }
+    }
+
+    /// `.well-known/scp` for `did` naming `relay`.
+    fn well_known_with_relay(did: &str, relay: &str) -> WellKnownScp {
+        WellKnownScp {
+            version: 1,
+            did: did.to_owned(),
+            relay: relay.to_owned(),
+            contexts: None,
+            relay_config: None,
+            handles: None,
+        }
+    }
+
+    /// The document's entry is read in its §9.18.2 canonical form, so a
+    /// `.well-known` relay spelled exactly as the entry, in a non-canonical
+    /// spelling, still validates (§18.3.2).
+    #[tokio::test]
+    async fn verify_against_did_passes_with_the_same_non_canonical_spelling() {
+        let did = "did:dht:zOperator123";
+        let spelling = "wss://relay.example.com:443/scp/v1";
+
+        let mock = MockDidMethod::resolves_to(did_document_with_relays(did, &[spelling]));
+
+        well_known_with_relay(did, spelling)
+            .verify_against_did(&mock)
+            .await
+            .expect("one spelling on both sides names one relay");
+    }
+
+    /// Two spellings of one canonical URL name one relay (§9.18.2).
+    #[tokio::test]
+    async fn verify_against_did_passes_with_differing_spellings_of_one_relay() {
+        let did = "did:dht:zOperator123";
+
+        let mock = MockDidMethod::resolves_to(did_document_with_relays(
+            did,
+            &["WSS://Relay.Example.com/scp/v1/"],
+        ));
+
+        well_known_with_relay(did, "wss://relay.example.com:443/scp/v1")
+            .verify_against_did(&mock)
+            .await
+            .expect("both spellings canonicalize to wss://relay.example.com/scp/v1");
+    }
+
+    /// A `.well-known` relay with no canonical form fails with a typed error
+    /// naming the §18.2.1 rule, before any comparison.
+    #[tokio::test]
+    async fn verify_against_did_rejects_a_relay_with_no_canonical_form() {
+        let did = "did:dht:zOperator123";
+        let mock = MockDidMethod::resolves_to(did_document_with_relays(
+            did,
+            &["wss://relay.example.com/scp/v1"],
+        ));
+
+        for (relay, expected) in [
+            (
+                "wss://user:pw@relay.example.com/scp/v1?x=1",
+                RelayEntryUrlError::Canonical(RelayUrlError::QueryOrFragment),
+            ),
+            (
+                "wss://relay.example.com/other",
+                RelayEntryUrlError::PathNotScpV1,
+            ),
+        ] {
+            let err = well_known_with_relay(did, relay)
+                .verify_against_did(&mock)
+                .await
+                .expect_err("no canonical SCPRelay form");
+            match err {
+                WellKnownValidationError::InvalidRelayUrl(DidError::InvalidRelayUrl {
+                    url,
+                    reason,
+                }) => {
+                    assert_eq!(reason, expected, "{relay}");
+                    assert!(!url.contains("pw@"), "user information echoed: {url}");
+                }
+                other => panic!("expected InvalidRelayUrl for {relay}, got: {other:?}"),
+            }
         }
     }
 

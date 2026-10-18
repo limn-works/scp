@@ -308,8 +308,8 @@ pub struct Service {
     /// identity routing ID the bridge relay forwards to. Only an `SCPRelay`
     /// entry carries it. A [`DidDocument`]'s deserializer drops an entry whose
     /// value is not 64 lowercase hex digits, is `null`, equals
-    /// [`ABSENT_BRIDGE_TARGET`], or sits on an entry of another type, and
-    /// keeps the document.
+    /// [`ABSENT_BRIDGE_TARGET`], sits on an entry of another type, or sits on
+    /// an entry whose URL is not `wss` (§10.12.7), and keeps the document.
     #[serde(
         rename = "bridgeTarget",
         default,
@@ -2003,6 +2003,16 @@ mod tests {
         ));
         doc.add_relay_service(&relay("wss://plain.example.com/scp/v1"));
         let parsed = DidDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        // The parse drops the entry itself (§18.2.1, §10.12.7), so no reader
+        // of `service` sees it.
+        assert!(
+            !parsed
+                .service
+                .iter()
+                .any(|s| s.service_endpoint == "ws://bridge.example.com/scp/v1"),
+            "{:?}",
+            parsed.service
+        );
         assert_eq!(
             parsed.relay_services(),
             [relay("wss://plain.example.com/scp/v1")]

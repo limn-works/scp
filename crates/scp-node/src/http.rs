@@ -118,7 +118,19 @@ pub struct NodeState {
     /// no address: [`NodeState::public_bind_addr`] then falls back to
     /// `0.0.0.0:8443` for `serve`, and `serve_background*` falls back to
     /// loopback `127.0.0.1:8443` (SCP-320).
+    ///
+    /// A no-domain node never holds port 0 here: when the caller configured
+    /// port 0, `Node::start` binds the public listener first and stores its
+    /// bound address, so the port the node advertises is the port it serves.
     pub(crate) http_bind_addr: Option<SocketAddr>,
+    /// The public TCP listener `Node::start` bound for a configured
+    /// `http_bind_addr` with port 0, or `None`.
+    ///
+    /// The node advertised this listener's port, so the first bind of
+    /// [`http_bind_addr`](Self::http_bind_addr) takes it through
+    /// [`NodeState::take_or_bind_public`] instead of binding a second,
+    /// unrelated port.
+    pub(crate) prebound_public: std::sync::Mutex<Option<tokio::net::TcpListener>>,
     /// Shared cancellation token for graceful shutdown of both the public
     /// HTTPS listener and the dev API listener. Cancelled by
     /// [`ApplicationNode::shutdown`].
@@ -286,6 +298,37 @@ impl NodeState {
     /// falls back to loopback instead.
     pub(crate) fn public_bind_addr(&self) -> SocketAddr {
         self.http_bind_addr.unwrap_or(crate::DEFAULT_HTTP_BIND_ADDR)
+    }
+
+    /// A public TCP listener on `requested` and its bound address.
+    ///
+    /// When `requested` is the address of the listener `Node::start` bound
+    /// for a port-0 `http_bind_addr` ([`prebound_public`](Self::prebound_public)),
+    /// this takes that listener, because the node already advertised its port.
+    /// Any other address binds a new listener.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Serve`] when the bind fails or the bound address cannot be
+    /// read.
+    pub(crate) async fn take_or_bind_public(
+        &self,
+        requested: SocketAddr,
+    ) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
+        let prebound = {
+            let mut slot = self
+                .prebound_public
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let matches = slot
+                .as_ref()
+                .is_some_and(|l| l.local_addr().is_ok_and(|bound| bound == requested));
+            if matches { slot.take() } else { None }
+        };
+        match prebound {
+            Some(listener) => Ok((listener, requested)),
+            None => bind_public_tcp(requested).await,
+        }
     }
 }
 
@@ -936,7 +979,7 @@ async fn bind_public_listeners(
     {
         let mut draws: u32 = 1;
         loop {
-            let (listener, local_addr) = bind_public_tcp(requested).await?;
+            let (listener, local_addr) = state.take_or_bind_public(requested).await?;
             // The QUIC listener binds after the TCP listener so that, when
             // `http_bind_addr` requests port 0, QUIC binds the port the OS
             // assigned to TCP rather than a second, unrelated port. It shares
@@ -970,13 +1013,13 @@ async fn bind_public_listeners(
     }
     #[cfg(not(feature = "quic"))]
     {
-        let (listener, local_addr) = bind_public_tcp(requested).await?;
+        let (listener, local_addr) = state.take_or_bind_public(requested).await?;
         Ok((listener, local_addr, None))
     }
 }
 
 /// Binds the public TCP listener on `requested` and reads its bound address.
-async fn bind_public_tcp(
+pub(crate) async fn bind_public_tcp(
     requested: SocketAddr,
 ) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
     let listener = tokio::net::TcpListener::bind(requested)
@@ -1336,6 +1379,7 @@ mod tests {
             ),
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
+            prebound_public: std::sync::Mutex::new(None),
             shutdown_token: CancellationToken::new(),
             cors_origins,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -1538,6 +1582,7 @@ mod vhost_tests {
             ),
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
+            prebound_public: std::sync::Mutex::new(None),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
