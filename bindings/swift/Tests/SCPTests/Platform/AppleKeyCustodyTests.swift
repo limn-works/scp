@@ -796,8 +796,8 @@
             try await provider.destroyKey(keyId: keyId)
         }
 
-        /// The bridge's `ed25519_to_x25519_agree` calls `dhAgree` with an
-        /// Ed25519 key id. The seed is RFC 8032 §7.1 test 1 and the peer is
+        /// `dhAgree` with an Ed25519 key id uses the converted X25519
+        /// scalar. The seed is RFC 8032 §7.1 test 1 and the peer is
         /// RFC 7748 §6.1 Alice; the expected secret is X25519 of Alice's
         /// scalar and the seed's converted public key, computed independently.
         @Test("dhAgree on an Ed25519 key uses the SHA-512(seed) X25519 scalar")

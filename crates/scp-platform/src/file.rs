@@ -1457,24 +1457,6 @@ impl FileKeyCustody {
         Ok(Pseudonym::new(derive_pseudonym(&ikm, context_id, version)))
     }
 
-    /// Decrypts an Ed25519 signing key from the file for the given handle.
-    ///
-    /// Holds the `handle_map` lock across both the lookup and the file read to
-    /// prevent a concurrent `destroy_key` from rewriting the file between the
-    /// two operations (TOCTOU).
-    async fn decrypt_ed25519_key(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<(Zeroizing<[u8; KEY_LEN]>, SigningKey), PlatformError> {
-        match self.load_key(handle.id()).await? {
-            LoadedKey::Ed25519(key_bytes) => {
-                let signing_key = SigningKey::from_bytes(&key_bytes);
-                Ok((key_bytes, signing_key))
-            }
-            other => Err(wrong_type(other.key_type(), KeyType::Ed25519)),
-        }
-    }
-
     /// The Ed25519 seed of a pseudonym-derivation source, after the role and
     /// (until SCP-315) curve check, read under a `handle_map` lock the caller
     /// holds.
@@ -1865,22 +1847,6 @@ impl KeyCustody for FileKeyCustody {
         }
     }
 
-    fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
-        let handle = *ed25519_handle;
-        let peer = *peer_x25519_public;
-        async move {
-            let (_key_bytes, signing_key) = self.decrypt_ed25519_key(&handle).await?;
-            Ok(crate::traits::x25519_agree_from_ed25519(
-                &signing_key,
-                &peer,
-            ))
-        }
-    }
-
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::Software
     }
@@ -1917,10 +1883,10 @@ impl KeyCustody for FileKeyCustody {
             // Hold `handle_map.lock()` across the entire scan-and-insert
             // path so that two concurrent imports of the same seed
             // cannot both observe a non-matching snapshot and both
-            // append. We do NOT call `self.decrypt_ed25519_key` from
-            // here (that method re-acquires `handle_map` and would
-            // deadlock). Instead, read the file once and decrypt
-            // candidate Ed25519 entries directly via `decrypt_entry`.
+            // append. We do NOT call `self.load_key` from here (that
+            // method re-acquires `handle_map` and would deadlock).
+            // Instead, read the file once and decrypt candidate Ed25519
+            // entries directly via `decrypt_entry`.
             //
             // The scan walks the file's entries rather than this object's
             // handle map, because a second custody object over the same path

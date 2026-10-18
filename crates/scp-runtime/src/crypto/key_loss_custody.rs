@@ -115,16 +115,6 @@ impl KeyCustody for KeyLossCustody {
             .await
     }
 
-    async fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> Result<SharedSecret, PlatformError> {
-        self.inner
-            .ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-            .await
-    }
-
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         self.inner.custody_type(key)
     }

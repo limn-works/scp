@@ -168,16 +168,6 @@ impl KeyCustody for OpaqueInMemoryKeyCustody {
             .await
     }
 
-    async fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> Result<SharedSecret, PlatformError> {
-        self.0
-            .ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-            .await
-    }
-
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         self.0.custody_type(key)
     }
@@ -803,22 +793,6 @@ impl KeyCustody for CallbackKeyCustody {
         .await
     }
 
-    async fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> Result<SharedSecret, PlatformError> {
-        let p = &*self.provider;
-        scp_ffi_common::callback_custody::ed25519_to_x25519_agree(
-            &self.registry,
-            ed25519_handle,
-            peer_x25519_public,
-            |key_id, peer| async move { p.dh_agree(key_id, peer).await.map_err(host_err("dh_agree")) },
-            |key_id| host_public_key(p, key_id),
-        )
-        .await
-    }
-
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         let type_str = self.provider.custody_type(key.id().to_string());
         match type_str.as_str() {
@@ -1058,28 +1032,6 @@ impl KeyCustody for UniffiKeyCustody {
             }
             Self::File(kc) => {
                 kc.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
-                    .await
-            }
-        }
-    }
-
-    async fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> Result<SharedSecret, PlatformError> {
-        match self {
-            #[cfg(feature = "testing")]
-            Self::InMemory(kc) => {
-                kc.0.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-                    .await
-            }
-            Self::Callback(kc) => {
-                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-                    .await
-            }
-            Self::File(kc) => {
-                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
                     .await
             }
         }
@@ -24876,48 +24828,6 @@ mod tests {
             .derive_pseudonym(&identity, b"ctx")
             .await
             .expect("an identity derives");
-    }
-
-    /// `ed25519_to_x25519_agree` refuses a P-256 handle with `WrongKeyType`
-    /// before any host agreement call, whether the adapter minted the handle
-    /// or resolves it.
-    #[tokio::test]
-    async fn callback_custody_ed25519_only_paths_refuse_p256() {
-        use scp_platform::KeyCustody;
-        use scp_platform::error::PlatformError;
-
-        let host = Arc::new(scp_ffi_common::callback_custody::fake_host::FakeHost::default());
-        let custody = CallbackKeyCustody::new(Box::new(FakeHostProvider::over(&host)));
-        let minted = custody
-            .generate_keypair(KeyType::P256Signing)
-            .await
-            .expect("p256 generation");
-        let resolved = KeyHandle::new(
-            host.generate_keypair(KeyType::P256Signing, scp_platform::KeyRole::Operational)
-                .expect("host-side key")
-                .parse()
-                .expect("numeric id"),
-        );
-        for handle in [minted, resolved] {
-            assert!(matches!(
-                custody.ed25519_to_x25519_agree(&handle, &[9u8; 32]).await,
-                Err(PlatformError::WrongKeyType { .. })
-            ));
-        }
-        assert_eq!(host.calls("dh_agree"), 0);
-
-        // The Ed25519 control: the same path reaches the host. The fake host
-        // agrees with HPKE keys only, so its refusal is a custody error.
-        let ed = custody
-            .generate_keypair(KeyType::Ed25519)
-            .await
-            .expect("ed25519 generation");
-        let agreed = custody.ed25519_to_x25519_agree(&ed, &[9u8; 32]).await;
-        assert!(
-            matches!(agreed, Err(PlatformError::CustodyError(_))),
-            "{agreed:?}"
-        );
-        assert_eq!(host.calls("dh_agree"), 1);
     }
 
     /// For `UniFFI`: the rotatable derivation reaches the host's

@@ -310,8 +310,8 @@ interface PushProvider {
  *   `crates/scp-ffi/uniffi/src/lib.rs` except `custody_type`, and it names the callback's
  *   `get_public_key` [publicKey], the name the Rust trait's `public_key` takes in Kotlin. The
  *   Rust `KeyCustody` trait in `crates/scp-platform/src/traits.rs` also declares
- *   `custody_type`, `ed25519_to_x25519_agree`, `import_ed25519_signing_key` and
- *   `generate_ephemeral_ed25519_seed`, which this interface lacks. No method of this interface
+ *   `custody_type`, `import_ed25519_signing_key` and `generate_ephemeral_ed25519_seed`, which
+ *   this interface lacks. No method of this interface
  *   returns a private key (ADR-027 acceptance criterion 14, private key isolation).
  * - Parameters: its methods name a key by a [KeyHandle], a data class of a `String` id and a
  *   [CustodyType]. The Rust trait's `KeyHandle` is a different type, an opaque `u64`, and the

@@ -373,12 +373,13 @@ class AndroidKeyCustody internal constructor(
      *
      * X25519 wrapping keys are always software-managed (Bouncy Castle); this class does not use
      * the X25519 key agreement Android Keystore offers from API 33. A software Ed25519 key
-     * agrees through its X25519 scalar `SHA-512(seed)[0..32]`, the birational conversion the
-     * bridge's `ed25519_to_x25519_agree` asks for and Rust's `x25519_agree_from_ed25519`
-     * computes. The scalar multiplication happens inside this class, every local copy of the
-     * seed, hash and scalar is wiped, and no public method of this class returns an X25519
-     * private key. The `internal` [softwareKeys] map still holds the key pair, readable by any
-     * code in this module and by Java code through the map's mangled public JVM getter.
+     * agrees through its X25519 scalar `SHA-512(seed)[0..32]`, the birational Ed25519-to-X25519
+     * conversion. No SCP bridge call sends an Ed25519 key here: the custody interface has no
+     * Ed25519-to-X25519 agreement (ADR-021, 2026-10-18 amendment). The scalar multiplication
+     * happens inside this class, every local copy of the seed, hash and scalar is wiped, and no
+     * public method of this class returns an X25519 private key. The `internal` [softwareKeys] map
+     * still holds the key pair, readable by any code in this module and by Java code through the
+     * map's mangled public JVM getter.
      *
      * @param keyHandle Handle to an X25519 or software Ed25519 key from [generateKeypair].
      * @param peerPublic 32-byte X25519 public key of the peer.

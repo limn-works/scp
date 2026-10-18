@@ -906,9 +906,9 @@ public extension AppleKeyCustody {
     /// Retrieves the private key bytes from Keychain and computes the shared
     /// secret with `peerPublic`. For an X25519 key the stored bytes are the
     /// scalar. For an Ed25519 key the scalar is `SHA-512(seed)[0..32]`, the
-    /// birational Ed25519-to-X25519 conversion the bridge's
-    /// `ed25519_to_x25519_agree` asks for and Rust's
-    /// `x25519_agree_from_ed25519` computes (`SigningKey::to_scalar_bytes`).
+    /// birational Ed25519-to-X25519 conversion. No SCP bridge call sends an
+    /// Ed25519 key here: the custody interface has no Ed25519-to-X25519
+    /// agreement (ADR-021, 2026-10-18 amendment).
     /// The private key never crosses the `AppleKeyCustody` boundary -- the
     /// scalar multiplication happens entirely within this method, and every
     /// local copy of the seed, hash and scalar is wiped.
