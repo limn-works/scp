@@ -1025,10 +1025,11 @@ where
     // when its evaluator started. An evaluator that had not started was
     // still in its reserve: challenger state, so a fault.
     //
-    // The budget has one deadline. A case that returns at or after it
-    // stops the run and keeps its in-flight marker, so the expiry does
-    // not depend on whether this timer or the case's own timer is polled
-    // first.
+    // The budget has one deadline. A case whose verdict returns at or
+    // after it stops the run and keeps its in-flight marker, so the expiry
+    // does not depend on whether this timer or the case's own timer is
+    // polled first. A fault or a capacity refusal is recorded whenever it
+    // returns, so neither is charged to the subject.
     if tokio::time::timeout_at(deadline, run).await.is_err() || evaluated.in_flight.is_some() {
         evaluated.expire_in_flight();
     }
@@ -1189,20 +1190,9 @@ async fn evaluate_cases(
                     &output.output,
                 )
                 .await;
-                // A verdict that arrives at or after the deadline is over
-                // budget: `grade` fails this case and every later one with
-                // `budget_exceeded`.
-                if tokio::time::Instant::now() >= run.deadline {
+                let past_deadline = tokio::time::Instant::now() >= run.deadline;
+                if record_schema(i, verdict, past_deadline, out).is_break() {
                     return;
-                }
-                match verdict {
-                    Ok(verdict) => {
-                        out.schemas.insert(i, verdict);
-                    }
-                    Err(fault) => {
-                        out.fault = Some(fault);
-                        return;
-                    }
                 }
             }
             ExpectedOutput::CustomEval {
@@ -1275,40 +1265,60 @@ async fn eval_case(
             started,
         })
         .await;
-    // An outcome at or after the deadline is a budget expiry, whatever the
-    // call returned: the in-flight marker stays set and the run stops, and
-    // the grader expires the call.
-    if tokio::time::Instant::now() >= deadline {
-        return ControlFlow::Break(());
+    let past_deadline = tokio::time::Instant::now() >= deadline;
+    record_eval(
+        i,
+        outcome,
+        past_deadline,
+        (context_id, evaluator_outlet_id),
+        out,
+    )
+}
+
+/// Records one `SchemaMatch` verdict in `out`; breaks when the attempt
+/// stops at this case.
+///
+/// A refused stored schema is the challenger's fault whenever it arrives, so
+/// it is recorded even at or after the deadline and never charged to the
+/// subject. A verdict at or after the deadline is over budget: it is
+/// dropped, and `grade` fails this case and every later one with
+/// `budget_exceeded`.
+fn record_schema(
+    i: usize,
+    verdict: Result<SchemaVerdict, TrustError>,
+    past_deadline: bool,
+    out: &mut CaseVerdicts,
+) -> ControlFlow<()> {
+    match verdict {
+        Err(fault) => {
+            out.fault = Some(fault);
+            ControlFlow::Break(())
+        }
+        Ok(_) if past_deadline => ControlFlow::Break(()),
+        Ok(verdict) => {
+            out.schemas.insert(i, verdict);
+            ControlFlow::Continue(())
+        }
     }
-    out.in_flight = None;
+}
+
+/// Records one `CustomEval` outcome in `out`; breaks when the attempt stops
+/// at this case. `evaluator` is the evaluator context and outlet.
+///
+/// The outcome's class decides first, whatever the time: a capacity refusal
+/// is no fault and uses no attempt, and an unavailable evaluator is the
+/// challenger's fault, so neither is charged to the subject when it arrives
+/// at or after the deadline. A verdict or a failed case at or after the
+/// deadline is a budget expiry: the in-flight marker stays set, the run
+/// stops, and the grader expires the call.
+fn record_eval(
+    i: usize,
+    outcome: EvaluatorOutcome,
+    past_deadline: bool,
+    (context_id, evaluator_outlet_id): (&str, &OutletId),
+    out: &mut CaseVerdicts,
+) -> ControlFlow<()> {
     match outcome {
-        EvaluatorOutcome::Verdict { passed, reason } => {
-            out.evals.insert(
-                i,
-                CaseResult {
-                    passed,
-                    reason: Some(reason),
-                },
-            );
-        }
-        EvaluatorOutcome::CaseFailed(reason) => {
-            out.evals.insert(
-                i,
-                CaseResult {
-                    passed: false,
-                    reason: Some(reason),
-                },
-            );
-        }
-        EvaluatorOutcome::Unavailable(reason) => {
-            out.fault = Some(TrustError::EvaluatorUnavailable {
-                context_id: context_id.to_owned(),
-                outlet_id: evaluator_outlet_id.clone(),
-                reason,
-            });
-            return ControlFlow::Break(());
-        }
         EvaluatorOutcome::CapacityRefused { cause, reason } => {
             tracing::info!(
                 context_id,
@@ -1317,11 +1327,45 @@ async fn eval_case(
                 reason,
                 "evaluator reserve refused the call for capacity"
             );
+            out.in_flight = None;
             out.capacity = Some(cause);
-            return ControlFlow::Break(());
+            ControlFlow::Break(())
+        }
+        EvaluatorOutcome::Unavailable(reason) => {
+            out.in_flight = None;
+            out.fault = Some(TrustError::EvaluatorUnavailable {
+                context_id: context_id.to_owned(),
+                outlet_id: evaluator_outlet_id.clone(),
+                reason,
+            });
+            ControlFlow::Break(())
+        }
+        EvaluatorOutcome::Verdict { .. } | EvaluatorOutcome::CaseFailed(_) if past_deadline => {
+            ControlFlow::Break(())
+        }
+        EvaluatorOutcome::Verdict { passed, reason } => {
+            out.in_flight = None;
+            out.evals.insert(
+                i,
+                CaseResult {
+                    passed,
+                    reason: Some(reason),
+                },
+            );
+            ControlFlow::Continue(())
+        }
+        EvaluatorOutcome::CaseFailed(reason) => {
+            out.in_flight = None;
+            out.evals.insert(
+                i,
+                CaseResult {
+                    passed: false,
+                    reason: Some(reason),
+                },
+            );
+            ControlFlow::Continue(())
         }
     }
-    ControlFlow::Continue(())
 }
 
 /// Writes a graded attempt's record to the bridge's trust store. A write

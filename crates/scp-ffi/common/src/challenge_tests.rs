@@ -961,6 +961,151 @@ async fn grading_deadline_decides_expiry_when_the_runtime_stalls() {
     );
 }
 
+/// A `CustomEval` case in flight whose evaluator `started` or not.
+fn in_flight(started: bool) -> CaseVerdicts {
+    CaseVerdicts {
+        in_flight: Some(InFlight {
+            context_id: EVAL_CTX.to_owned(),
+            outlet_id: OutletId::from(JUDGE),
+            started: Arc::new(AtomicBool::new(started)),
+        }),
+        ..CaseVerdicts::default()
+    }
+}
+
+/// Records `outcome` for case 19 as `eval_case` does, then expires the call
+/// as the grader does when the run stopped with a case in flight.
+fn record_and_expire(
+    outcome: EvaluatorOutcome,
+    past_deadline: bool,
+    started: bool,
+) -> CaseVerdicts {
+    let mut out = in_flight(started);
+    let flow = record_eval(
+        19,
+        outcome,
+        past_deadline,
+        (EVAL_CTX, &OutletId::from(JUDGE)),
+        &mut out,
+    );
+    assert!(flow.is_break(), "the attempt stops at this case");
+    if out.in_flight.is_some() {
+        out.expire_in_flight();
+    }
+    out
+}
+
+/// A capacity refusal is a no-fault `GradingCapacityExhausted` whether it
+/// returns before or after the deadline: a late one is not expired into an
+/// `EvaluatorUnavailable` fault (spec 07 §7.3.4 step 3).
+#[test]
+fn a_capacity_refusal_is_no_fault_before_or_after_the_deadline() {
+    for past_deadline in [false, true] {
+        let out = record_and_expire(
+            EvaluatorOutcome::CapacityRefused {
+                cause: GradingCapacityCause::EvaluatorRateLimit,
+                reason: "rate limited".to_owned(),
+            },
+            past_deadline,
+            false,
+        );
+        assert_eq!(
+            out.capacity,
+            Some(GradingCapacityCause::EvaluatorRateLimit),
+            "past_deadline = {past_deadline}"
+        );
+        assert!(
+            out.fault.is_none(),
+            "past_deadline = {past_deadline}: {:?}",
+            out.fault
+        );
+    }
+}
+
+/// An unavailable evaluator, a settlement failure after a verdict included,
+/// is the challenger's fault whenever it returns: one at or after the
+/// deadline is recorded as the fault, not charged to the subject as
+/// `budget_exceeded`.
+#[test]
+fn an_unavailable_evaluator_at_the_deadline_is_the_fault() {
+    for past_deadline in [false, true] {
+        let out = record_and_expire(
+            EvaluatorOutcome::Unavailable("settlement failed".to_owned()),
+            past_deadline,
+            true,
+        );
+        assert!(
+            matches!(
+                &out.fault,
+                Some(TrustError::EvaluatorUnavailable { reason, .. }) if reason == "settlement failed"
+            ),
+            "past_deadline = {past_deadline}: {:?}",
+            out.fault
+        );
+        assert!(out.evals.is_empty());
+    }
+}
+
+/// A verdict at or after the deadline is over budget: it is dropped and the
+/// started call stays without a verdict, which `grade` fails with
+/// `budget_exceeded`; before the deadline it is recorded.
+#[test]
+fn a_verdict_at_the_deadline_is_over_budget() {
+    let late = record_and_expire(
+        EvaluatorOutcome::Verdict {
+            passed: true,
+            reason: "judged".to_owned(),
+        },
+        true,
+        true,
+    );
+    assert!(late.evals.is_empty() && late.fault.is_none() && late.capacity.is_none());
+    let mut out = in_flight(true);
+    let flow = record_eval(
+        19,
+        EvaluatorOutcome::Verdict {
+            passed: true,
+            reason: "judged".to_owned(),
+        },
+        false,
+        (EVAL_CTX, &OutletId::from(JUDGE)),
+        &mut out,
+    );
+    assert!(flow.is_continue());
+    assert!(out.in_flight.is_none());
+    assert!(out.evals[&19].passed);
+}
+
+/// A `SchemaRejected` fault returned at or after the deadline is recorded
+/// as the fault, not charged to the subject as `budget_exceeded`; a schema
+/// verdict at or after the deadline is dropped as over budget.
+#[test]
+fn a_schema_fault_at_the_deadline_is_the_fault() {
+    for past_deadline in [false, true] {
+        let mut out = CaseVerdicts::default();
+        let flow = record_schema(
+            19,
+            Err(TrustError::SchemaRejected {
+                test_id: "t19".to_owned(),
+                reason: "schema gate".to_owned(),
+            }),
+            past_deadline,
+            &mut out,
+        );
+        assert!(flow.is_break());
+        assert!(
+            matches!(out.fault, Some(TrustError::SchemaRejected { .. })),
+            "past_deadline = {past_deadline}: {:?}",
+            out.fault
+        );
+    }
+    let mut out = CaseVerdicts::default();
+    assert!(record_schema(19, Ok(SchemaVerdict::Pass), true, &mut out).is_break());
+    assert!(out.schemas.is_empty() && out.fault.is_none());
+    assert!(record_schema(19, Ok(SchemaVerdict::Pass), false, &mut out).is_continue());
+    assert_eq!(out.schemas[&19], SchemaVerdict::Pass);
+}
+
 /// TQ7: a slow evaluator that started uses the budget up, so its case and
 /// the `SchemaMatch` case after it both fail with `budget_exceeded`, and the
 /// attempt is graded: neither is a fault.
