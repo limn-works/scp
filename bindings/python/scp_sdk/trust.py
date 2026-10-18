@@ -32,7 +32,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field, fields
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict
 
 from scp_sdk._extension import native_module
 from scp_sdk.errors import ContextError, ScpError, ValidationError, _coded_bridge_error
@@ -680,7 +680,7 @@ class ChallengeVerified:
 #: graded (:class:`ChallengeVerified`). Pass a list of them to
 #: :meth:`scp_sdk.SCP.context_create` under ``params["capability_requirements"]``,
 #: or to :meth:`scp_sdk.SCP.governance_modify_capability_requirements`.
-CapabilityRequirement = SelfAttested | ChallengeVerified
+CapabilityRequirement: TypeAlias = SelfAttested | ChallengeVerified
 
 
 def _encode_capability_requirements(requirements: Any, where: str) -> str:
@@ -1799,7 +1799,7 @@ class CustomEval:
 
 #: What a test case's output must satisfy. Serialized externally tagged,
 #: ``{"<Variant>": {<fields>}}``, the Rust ``ExpectedOutput`` wire form.
-ExpectedOutput = ExactMatch | SchemaMatch | ContainsAll | ContainsNone | CustomEval
+ExpectedOutput: TypeAlias = ExactMatch | SchemaMatch | ContainsAll | ContainsNone | CustomEval
 
 
 @dataclass(frozen=True)

@@ -535,9 +535,10 @@ async fn lease_on(
     auth: &Arc<AuthenticatedResponse>,
 ) -> GradingLease {
     match begin_on(handle, auth).await.unwrap() {
-        BeginOutcome::Lease(lease) => lease,
-        BeginOutcome::Stored(_) => panic!("expected a lease, got a stored record"),
+        BeginOutcome::Lease(lease) => Ok(lease),
+        BeginOutcome::Stored(stored) => Err(stored),
     }
+    .expect("expected a lease, got a stored record")
 }
 
 async fn commit_on(
@@ -585,9 +586,10 @@ fn outcome(auth: &AuthenticatedResponse, key: &AnswerKey) -> GradeOutcome {
 
 fn trust_err<T: std::fmt::Debug>(result: Result<T, ChallengeLedgerError>) -> TrustError {
     match result {
-        Err(ChallengeLedgerError::Trust(e)) => e,
-        other => panic!("expected a TrustError, got {other:?}"),
+        Err(ChallengeLedgerError::Trust(e)) => Ok(e),
+        other => Err(other),
     }
+    .expect("expected a TrustError")
 }
 
 fn is_persistence_failure<T: std::fmt::Debug>(result: &Result<T, ChallengeLedgerError>) -> bool {
@@ -636,12 +638,12 @@ async fn fault_uses_no_attempt_and_starts_the_cooldown() {
     let fault_at = h.now();
     h.fault(&auth, lease.lease_id).await.unwrap();
     h.clock.advance(COOLDOWN - 1);
-    match trust_err(h.begin(&auth).await) {
-        TrustError::CooldownActive { retry_after, .. } => {
-            assert_eq!(retry_after, fault_at + COOLDOWN);
-        }
-        other => panic!("expected CooldownActive, got {other:?}"),
-    }
+    let refusal = trust_err(h.begin(&auth).await);
+    assert!(
+        matches!(refusal, TrustError::CooldownActive { retry_after, .. } if retry_after == fault_at + COOLDOWN),
+        "expected CooldownActive until {}, got {refusal:?}",
+        fault_at + COOLDOWN
+    );
     h.clock.advance(1);
     let lease = h.lease(&auth).await;
     let graded = h.commit(&auth, lease.lease_id, &issued.key).await.unwrap();
@@ -671,12 +673,12 @@ async fn four_faults_leave_the_challenge_open() {
     assert_eq!(graded.record.attempt, 1);
     let second = h.respond(&issued.request, 2, "ok");
     h.clock.advance(COOLDOWN - 1);
-    match trust_err(h.begin(&second).await) {
-        TrustError::CooldownActive { retry_after, .. } => {
-            assert_eq!(retry_after, graded.record.timestamp + COOLDOWN);
-        }
-        other => panic!("expected CooldownActive, got {other:?}"),
-    }
+    let refusal = trust_err(h.begin(&second).await);
+    assert!(
+        matches!(refusal, TrustError::CooldownActive { retry_after, .. } if retry_after == graded.record.timestamp + COOLDOWN),
+        "expected CooldownActive until {}, got {refusal:?}",
+        graded.record.timestamp + COOLDOWN
+    );
     h.clock.advance(1);
     h.lease(&second).await;
 }
@@ -783,13 +785,13 @@ async fn ledger_cooldown_boundary() {
     let first = h.graded(&issued, 1, "no").await;
     let auth = h.respond(&issued.request, 2, "ok");
     h.clock.advance(COOLDOWN - 1);
-    match trust_err(h.begin(&auth).await) {
-        TrustError::CooldownActive { retry_after, .. } => {
-            assert_eq!(retry_after, first.record.timestamp + COOLDOWN);
-            assert!(first.record.timestamp > issued.request.created_at + 100);
-        }
-        other => panic!("expected CooldownActive, got {other:?}"),
-    }
+    let refusal = trust_err(h.begin(&auth).await);
+    assert!(
+        matches!(refusal, TrustError::CooldownActive { retry_after, .. } if retry_after == first.record.timestamp + COOLDOWN),
+        "expected CooldownActive until {}, got {refusal:?}",
+        first.record.timestamp + COOLDOWN
+    );
+    assert!(first.record.timestamp > issued.request.created_at + 100);
     h.clock.advance(1);
     let lease = h.lease(&auth).await;
     let graded = h.commit(&auth, lease.lease_id, &issued.key).await.unwrap();
@@ -839,10 +841,11 @@ async fn ledger_resubmit_checked_first_returns_stored() {
     let graded = h.commit(&auth, lease.lease_id, &issued.key).await.unwrap();
     h.clock.advance(10);
     let writes = h.storage.writes();
-    match h.begin(&auth).await.unwrap() {
-        BeginOutcome::Stored(stored) => assert_eq!(*stored, graded),
-        BeginOutcome::Lease(_) => panic!("a resubmit must not take a lease"),
-    }
+    let resubmit = h.begin(&auth).await.unwrap();
+    assert!(
+        matches!(&resubmit, BeginOutcome::Stored(stored) if **stored == graded),
+        "a resubmit must return the stored record and take no lease, got {resubmit:?}"
+    );
     assert_eq!(h.storage.writes(), writes, "a resubmit writes nothing");
 }
 
@@ -1218,15 +1221,13 @@ async fn create_refuses_while_the_latest_window_is_open() {
         .unwrap();
     let expires_at = first.request.expires_at;
     h.clock.set(expires_at - 1);
-    let window_open = |e: TrustError| match e {
-        TrustError::ChallengeWindowOpen {
-            challenge_id,
-            expires_at: until,
-        } => {
-            assert_eq!(challenge_id, hex::encode(first.request.challenge_id));
-            assert_eq!(until, expires_at);
-        }
-        other => panic!("expected ChallengeWindowOpen, got {other:?}"),
+    let open_id = hex::encode(first.request.challenge_id);
+    let window_open = |e: TrustError| {
+        assert!(
+            matches!(&e, TrustError::ChallengeWindowOpen { challenge_id, expires_at: until }
+                if *challenge_id == open_id && *until == expires_at),
+            "expected ChallengeWindowOpen for {open_id} until {expires_at}, got {e:?}"
+        );
     };
     window_open(trust_err(
         h.create_as(&h.handle, h.signer(), &h.subject, URI).await,

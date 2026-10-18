@@ -198,9 +198,9 @@ pub mod context_params;
 pub mod event_log;
 
 // Trust store shared across PyO3, napi-rs, and UniFFI bridges.
-// Requires scp-core (behind `resolvers` feature).
-/// The challenge create and verify operations the three bridges share
-/// (spec 07 §7.3.4).
+// Requires scp-core (behind `resolvers` feature). The module's own `//!`
+// docs describe it: an outer `///` here would merge with them, and rustdoc
+// would resolve their intra-doc links from this crate root.
 #[cfg(feature = "resolvers")]
 pub mod challenge;
 

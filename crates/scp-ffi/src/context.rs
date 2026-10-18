@@ -1885,7 +1885,9 @@ fn propose_governance_action(
     })?
 }
 
-/// Builds the identity's `#active` [`CommandSigner`] (ADR-049 Decision 7a).
+/// Builds the identity's `#active`
+/// [`CommandSigner`](scp_core::context::actor::CommandSigner) (ADR-049
+/// Decision 7a).
 ///
 /// The private key stays in custody: the signer signs each digest through it.
 /// The custody `Arc` and key handle are cloned out of the `with_identity`

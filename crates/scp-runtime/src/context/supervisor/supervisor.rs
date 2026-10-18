@@ -6819,8 +6819,8 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::ChannelClosed`] or a mailbox error when the actor
-    ///   is registered but cannot take the command. An absent, poisoned or
+    /// - [`ContextError::ActorBusy`] when the actor is registered but its
+    ///   mailbox is full, closed, or times out. An absent, poisoned or
     ///   crashed actor is reported on the command's reply channel.
     pub async fn dispatch_broadcast_command(
         &self,

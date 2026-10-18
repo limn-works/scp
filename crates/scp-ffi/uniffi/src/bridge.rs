@@ -22996,9 +22996,11 @@ mod tests {
         assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7011);
     }
 
+    #[cfg(feature = "testing")]
     const SCHEMA_URI: &str = "scp:capability:schema-validation/v1";
 
     /// `n` exact-match test cases whose weights sum to 10000.
+    #[cfg(feature = "testing")]
     fn challenge_cases_json(n: usize) -> String {
         let weight = 10_000 / n;
         let cases: Vec<scp_core::trust::TestCase> = (0..n)
@@ -23196,6 +23198,7 @@ mod tests {
     }
 
     /// A requirement for `SCHEMA_URI` verified by `verifier_did`.
+    #[cfg(feature = "testing")]
     fn challenge_requirement(verifier_did: &str) -> serde_json::Value {
         serde_json::json!([{
             "capability": SCHEMA_URI,
@@ -23763,6 +23766,7 @@ mod tests {
         assert_error_code(result, codes::VALID_7011);
     }
 
+    #[cfg(feature = "testing")]
     fn self_attested() -> serde_json::Value {
         serde_json::json!([{
             "capability": SCHEMA_URI,

@@ -2,9 +2,10 @@
 //!
 //! Every context declares a governance model at creation time. All governance
 //! models implement the [`GovernanceEngine`] trait, which defines the
-//! three-method contract: [`propose`](GovernanceEngine::propose),
-//! [`approve`](GovernanceEngine::approve), and
-//! [`reject`](GovernanceEngine::reject).
+//! three-method contract: [`propose_signed`](GovernanceEngine::propose_signed),
+//! [`approve_signed`](GovernanceEngine::approve_signed), and
+//! [`reject_signed`](GovernanceEngine::reject_signed), each behind a
+//! precheck.
 //!
 //! Proposals follow a state machine lifecycle:
 //! `Pending -> Approved | Rejected | Expired | Cancelled | Invalidated`.
@@ -1308,7 +1309,7 @@ impl ProposalStatus {
 
 /// A governance proposal with full lifecycle tracking.
 ///
-/// Created by [`GovernanceEngine::propose`], stored in the event log and in
+/// Created by [`GovernanceEngine::propose_signed`], stored in the event log and in
 /// the protocol repository for active tracking. The proposal tracks all votes and
 /// the current status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
