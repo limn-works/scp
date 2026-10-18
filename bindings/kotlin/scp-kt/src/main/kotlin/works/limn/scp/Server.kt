@@ -321,7 +321,7 @@ class Relay internal constructor(
         /**
          * Starts a relay with in-memory blob storage on an OS-assigned port.
          *
-         * @param bridge The [ServerBridge] providing FFI access.
+         * @param bridge The [ServerBridge] providing access to the caller-supplied [ServerBindings].
          * @return A [Relay] whose [relayUrl] property contains the WebSocket URL.
          */
         suspend fun startInMemory(bridge: ServerBridge): Relay = bridge.startRelayInMemory()
@@ -329,7 +329,7 @@ class Relay internal constructor(
         /**
          * Starts a relay with redb-backed blob storage on an OS-assigned port.
          *
-         * @param bridge The [ServerBridge] providing FFI access.
+         * @param bridge The [ServerBridge] providing access to the caller-supplied [ServerBindings].
          * @param dataDir Directory for persistent blob storage.
          * @return A [Relay] whose [relayUrl] property contains the WebSocket URL.
          */
