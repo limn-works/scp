@@ -66,7 +66,7 @@
 //!
 //! The KP private signer-state lives ENTIRELY inside the opaque
 //! [`SignerState`] blob returned by
-//! [`MlsBackend::generate_key_package`] (a fresh isolated OpenMLS provider per
+//! [`MlsBackend::finish_key_package`] (a fresh isolated OpenMLS provider per
 //! KP, serialized) — it is NOT written to any shared OpenMLS keystore. The
 //! actor (in memory) and the durable KP record (at rest) are the only homes
 //! for that material; deleting the KP record on consume/cancel makes a
@@ -121,11 +121,12 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use crate::context::builder::ContextTransportProvider;
+use crate::crypto::mls::attestation_signer::{
+    KeyPackageAttestationSigner, mint_attested_key_package,
+};
 use crate::crypto::mls::backend::{MlsBackend, SignerState};
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 use crate::crypto::wrapping::IdentityWrappingKey;
-use scp_did::SigningKeyId;
-use scp_mls::credential::ScpCredential;
 use scp_mls::error::MlsError;
 use scp_mls::group::ScpMlsGroup;
 
@@ -436,7 +437,16 @@ pub enum KeyPackageCommand {
     /// just took. Returns a fresh `ReservationId` plus the KP's PUBLIC bytes,
     /// exactly like [`Self::Reserve`]; the private signer-state never leaves the
     /// actor.
+    ///
+    /// The command carries the owner's attestation signer (§9.7.1). The
+    /// handler checks it against the owner's resolved `#active` key before
+    /// anything else; on a failed check it replies with the check's error,
+    /// keeps its previous signer, and reserves nothing. On success the actor
+    /// keeps the signer and every `KeyPackage` it mints from then on carries an
+    /// attestation the signer made.
     ReserveAny {
+        /// The owner's attestation signer.
+        signer: Arc<KeyPackageAttestationSigner>,
         /// Oneshot reply: `(ReservationId, public KP bytes)` on success.
         reply: oneshot::Sender<Result<(ReservationId, Vec<u8>), ContextError>>,
     },
@@ -734,6 +744,11 @@ pub(in crate::context) struct KeyPackageStoreDeps {
     /// the supervisor. Every KeyPackage publishes its public point in
     /// `0xFF01`.
     pub wrapping_key: Arc<IdentityWrappingKey>,
+    /// The owner's `KeyPackage` attestation signer (§9.7.1), when one is known
+    /// at spawn. The supervisor passes `None`: a signer arrives with the
+    /// first [`KeyPackageCommand::ReserveAny`], and until then the actor
+    /// mints nothing.
+    pub attestation_signer: Option<Arc<KeyPackageAttestationSigner>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -749,10 +764,9 @@ pub(in crate::context) struct KeyPackageStoreDeps {
 pub struct KeyPackageStoreActor {
     /// The identity this actor owns the pool for.
     identity: DID,
-    /// Credential used to generate KeyPackages (built once at spawn).
-    /// `None` only on a malformed-DID wiring bug, in which case replenish
-    /// fail-closes rather than pooling inert KPs.
-    credential: Option<ScpCredential>,
+    /// The owner's `KeyPackage` attestation signer (§9.7.1). Without one the
+    /// actor mints nothing, so it never pools an unattested `KeyPackage`.
+    attestation_signer: Option<Arc<KeyPackageAttestationSigner>>,
     /// The owning identity's wrapping key (§9.16.1), whose public point every
     /// KeyPackage publishes.
     wrapping_key: Arc<IdentityWrappingKey>,
@@ -816,16 +830,9 @@ impl KeyPackageStoreActor {
     fn new(identity: DID, deps: KeyPackageStoreDeps) -> (KeyPackageStoreHandle, Self) {
         let (tx, rx) = mpsc::channel::<KeyPackageCommand>(KP_MAILBOX_CAPACITY);
 
-        // Build the credential once. The DID is a genuine local participant
-        // (the supervisor resolves it from `local_dids`); credential
-        // construction only fails on a malformed DID, which would be a
-        // supervisor wiring bug — surface it as a degraded actor whose
-        // replenish FAIL-CLOSES (typed errors), never pooling inert KPs.
-        let credential = ScpCredential::new(identity.0.clone(), None, SigningKeyId::Active).ok();
-
         let actor = Self {
             identity,
-            credential,
+            attestation_signer: deps.attestation_signer,
             wrapping_key: deps.wrapping_key,
             mls: deps.mls,
             mls_storage: deps.mls_storage,
@@ -1122,8 +1129,11 @@ impl KeyPackageStoreActor {
                 // successful reserve drops the pool.
                 self.maybe_replenish().await;
             }
-            KeyPackageCommand::ReserveAny { reply } => {
-                let result = self.handle_reserve_first_pooled().await;
+            KeyPackageCommand::ReserveAny { signer, reply } => {
+                let result = match self.install_attestation_signer(signer) {
+                    Ok(()) => self.handle_reserve_first_pooled().await,
+                    Err(e) => Err(e),
+                };
                 let _ = reply.send(result);
                 // Auto-replenish (and sweep expired reservations) after a
                 // successful reserve drops the pool.
@@ -1268,6 +1278,28 @@ impl KeyPackageStoreActor {
         }
 
         Ok((reservation_id, public_bytes))
+    }
+
+    /// Installs `signer` as the owner's attestation signer after checking it
+    /// names this actor's identity and holds the owner's resolved `#active`
+    /// key. On a failed check the previous signer stays.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::InvalidState`] when `signer` attests another identity.
+    /// - The errors of [`KeyPackageAttestationSigner::check_active`].
+    fn install_attestation_signer(
+        &mut self,
+        signer: Arc<KeyPackageAttestationSigner>,
+    ) -> Result<(), ContextError> {
+        if signer.owner() != &self.identity {
+            return Err(ContextError::InvalidState(
+                "attestation signer owner mismatch".to_owned(),
+            ));
+        }
+        signer.check_active()?;
+        self.attestation_signer = Some(signer);
+        Ok(())
     }
 
     /// Atomically reserve the FIRST pooled KP: replenish-if-empty, pick the
@@ -1774,8 +1806,12 @@ impl KeyPackageStoreActor {
     /// `KeyPackageBuffer::replenish`) else `Err(CryptoFailed)`. New pool
     /// entries are persisted as KP records (Class-C-acceptable: a lost
     /// unreserved KP is just regenerated; only reserved/consumed transitions
-    /// are Class S). Fail-closes if the credential is absent (malformed-DID
-    /// wiring bug) rather than pooling inert KPs.
+    /// are Class S). Every `KeyPackage` carries a `0xFF03` attestation signed by
+    /// the owner's `#active` key (§9.7.1): without an attestation signer the
+    /// call returns [`ContextError::NotInitialized`] and mints nothing, a
+    /// signer for another identity returns [`ContextError::InvalidState`], and
+    /// a signer whose key is no longer the owner's resolved `#active` key fails
+    /// the first mint, so nothing is minted.
     ///
     /// # Index/pool consistency (per-KP index persist)
     ///
@@ -1790,13 +1826,18 @@ impl KeyPackageStoreActor {
     /// [`Self::reconcile_from_storage`] is the robust backstop for any residual
     /// drift, but the source-side per-KP persist closes the leak at the write.
     async fn replenish_to_min(&mut self) -> Result<usize, ContextError> {
-        let Some(credential) = self.credential.clone() else {
-            return Err(ContextError::CryptoFailed(
-                "key-package actor has no valid credential (malformed owning DID); \
-                 refusing to generate inert key packages"
+        let Some(signer) = self.attestation_signer.clone() else {
+            return Err(ContextError::NotInitialized(
+                "key-package actor has no attestation signer; no KeyPackage is minted until \
+                 a reserve supplies the owner's #active signer"
                     .to_owned(),
             ));
         };
+        if signer.owner() != &self.identity {
+            return Err(ContextError::InvalidState(
+                "attestation signer owner mismatch".to_owned(),
+            ));
+        }
 
         let current = self.pool.len() + self.reserved.len();
         if current >= MIN_BUFFER {
@@ -1812,11 +1853,7 @@ impl KeyPackageStoreActor {
             // inserted, so every KeyPackage this store generates carries the
             // same key.
             let wrapping_public_key = *self.wrapping_key.public();
-            match self
-                .mls
-                .generate_key_package(&credential, &wrapping_public_key)
-                .await
-            {
+            match mint_attested_key_package(&*self.mls, &signer, &wrapping_public_key).await {
                 Ok(generated_kp) => {
                     let kp_ref = Self::derive_kp_ref(&generated_kp.key_package_bytes);
                     // Persist the KP record (public + private signer-state).
@@ -1863,9 +1900,7 @@ impl KeyPackageStoreActor {
                     generated += 1;
                 }
                 Err(e) => {
-                    first_err = Some(ContextError::CryptoFailed(format!(
-                        "generating key package: {e}"
-                    )));
+                    first_err = Some(e);
                     break;
                 }
             }

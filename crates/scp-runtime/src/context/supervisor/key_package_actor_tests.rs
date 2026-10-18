@@ -26,23 +26,29 @@ use super::{
     KeyPackageCommand, KeyPackageStoreActor, KeyPackageStoreDeps, KeyPackageStoreHandle, KpRef,
     MIN_BUFFER, ReservationId,
 };
+use crate::context::actor::CommandSigner;
 use crate::context::builder::{
     ContextCreationError, ContextTransportProvider, NotConfiguredTransportProvider,
 };
 use crate::context::supervisor::faulty_storage::FaultyStorage;
+use crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner;
 use crate::crypto::mls::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
 };
 use crate::crypto::mls::production_backend::ProductionMlsBackend;
 use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
+use crate::crypto::mls::test_support::MintAttestedForTest as _;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use openmls::prelude::LeafNodeIndex;
+use scp_mls::attested_key_package::KeyPackageDraft;
 use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::DecryptedContent;
 use scp_mls::error::MlsError;
 use scp_mls::group::ScpMlsGroup;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::traits::Storage;
+use scp_protocol::context::governance::KeyResolver;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -50,6 +56,36 @@ use scp_platform::traits::Storage;
 
 fn alice() -> DID {
     DID("did:dht:z6MkAliceKeyPackages".to_owned())
+}
+
+/// Alice's fixed `#active` key, the key [`alice_resolver`] names.
+fn alice_identity_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xA7; 32])
+}
+
+/// Resolves `alice()` at `#active` to [`alice_identity_key`], and every other
+/// identity to nothing.
+fn alice_resolver() -> KeyResolver {
+    let alice_vk = alice_identity_key().verifying_key();
+    Arc::new(move |did: &DID, _| (did == &alice()).then_some(alice_vk))
+}
+
+/// An attestation signer for `owner` over `key`, checked against `resolver`.
+fn attestation_signer(
+    owner: DID,
+    key: SigningKey,
+    resolver: KeyResolver,
+) -> Arc<KeyPackageAttestationSigner> {
+    Arc::new(KeyPackageAttestationSigner::new(
+        owner,
+        CommandSigner::local_ed25519(key),
+        resolver,
+    ))
+}
+
+/// Alice's attestation signer, over her resolved `#active` key.
+fn alice_attestation_signer() -> Arc<KeyPackageAttestationSigner> {
+    attestation_signer(alice(), alice_identity_key(), alice_resolver())
 }
 
 fn real_backend() -> Arc<dyn MlsBackend> {
@@ -95,6 +131,7 @@ async fn deps_with(
         transport,
         clock: Arc::new(SystemClock) as Arc<dyn Clock>,
         wrapping_key: test_wrapping_key_in_memory().await,
+        attestation_signer: Some(alice_attestation_signer()),
     }
 }
 
@@ -381,7 +418,7 @@ async fn second_join_same_init_key_rejected_at_backend() {
     // consumes the init key durably; the second must be rejected.
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls
-        .generate_key_package(
+        .mint_attested_for_test(
             &joiner,
             &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
         )
@@ -430,7 +467,7 @@ async fn join_without_consumed_store_fails_closed() {
 
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls
-        .generate_key_package(
+        .mint_attested_for_test(
             &joiner,
             &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
         )
@@ -462,7 +499,7 @@ async fn join_with_mismatched_public_bytes_rejected() {
 
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls
-        .generate_key_package(
+        .mint_attested_for_test(
             &joiner,
             &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
         )
@@ -470,7 +507,7 @@ async fn join_with_mismatched_public_bytes_rejected() {
         .unwrap();
     // A DIFFERENT KP — its public bytes do not match `generated.signer_state`.
     let other = mls
-        .generate_key_package(
+        .mint_attested_for_test(
             &joiner,
             &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
         )
@@ -650,10 +687,10 @@ async fn replenish_partial_retain_returns_count_on_late_failure() {
 }
 
 /// A KP actor whose owning DID is malformed has NO valid credential (the
-/// `ScpCredential::new(...).ok()` in `spawn` yields `None`). `replenish_to_min`
-/// must FAIL CLOSED — refuse to generate/pool inert KeyPackages (which would be
-/// signed against a non-existent credential) — rather than silently pooling
-/// them. Pins the credential-absent guard.
+/// mint's `ScpCredential::new` fails). `replenish_to_min` must FAIL CLOSED —
+/// refuse to generate/pool inert `KeyPackages` (which would be signed against a
+/// non-existent credential) — rather than silently pooling them. Pins the
+/// credential-absent guard.
 #[tokio::test]
 async fn replenish_fails_closed_when_credential_absent() {
     // A DID that `ScpCredential::new` rejects (not `did:dht:z*` / `did:test:` /
@@ -667,9 +704,17 @@ async fn replenish_fails_closed_when_credential_absent() {
 
     let storage = in_memory_storage();
     let mls = backend_with_consumed_set(&storage);
+    let any_key = alice_identity_key().verifying_key();
     let (handle, _join) = KeyPackageStoreActor::spawn(
         malformed.clone(),
-        deps_with(mls, Arc::clone(&storage), no_transport()).await,
+        KeyPackageStoreDeps {
+            attestation_signer: Some(attestation_signer(
+                malformed.clone(),
+                alice_identity_key(),
+                Arc::new(move |_: &DID, _| Some(any_key)),
+            )),
+            ..deps_with(mls, Arc::clone(&storage), no_transport()).await
+        },
     );
 
     let err = handle
@@ -2635,6 +2680,7 @@ async fn expired_reservation_is_swept_and_kp_burned() {
             transport: no_transport(),
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
             wrapping_key: test_wrapping_key_in_memory().await,
+            attestation_signer: Some(alice_attestation_signer()),
         };
         KeyPackageStoreActor::spawn(alice(), deps)
     };
@@ -3270,7 +3316,7 @@ async fn confirm_with_bad_welcome_keeps_reservation_for_retry() {
 // Test backends / transports / storage / clocks
 // ---------------------------------------------------------------------------
 
-/// An `MlsBackend` that succeeds `n` `generate_key_package` calls then fails
+/// An `MlsBackend` whose `prepare_key_package` succeeds `n` times then fails
 /// every subsequent call. Delegates all other methods to a real backend.
 struct FailingBackend {
     inner: ProductionMlsBackend,
@@ -3339,11 +3385,11 @@ impl MlsBackend for FailingBackend {
             .validate_key_package(key_package_bytes, clock)
             .await
     }
-    async fn generate_key_package(
+    async fn prepare_key_package(
         &self,
         credential: &ScpCredential,
         wrapping_pubkey: &[u8; 65],
-    ) -> Result<GeneratedKeyPackage, MlsError> {
+    ) -> Result<KeyPackageDraft, MlsError> {
         loop {
             let cur = self.remaining.load(Ordering::Acquire);
             if cur == 0 {
@@ -3360,7 +3406,16 @@ impl MlsBackend for FailingBackend {
             }
         }
         self.inner
-            .generate_key_package(credential, wrapping_pubkey)
+            .prepare_key_package(credential, wrapping_pubkey)
+            .await
+    }
+    async fn finish_key_package(
+        &self,
+        draft: KeyPackageDraft,
+        attestation_signature: [u8; 64],
+    ) -> Result<GeneratedKeyPackage, MlsError> {
+        self.inner
+            .finish_key_package(draft, attestation_signature)
             .await
     }
     async fn join_from_welcome(
@@ -3508,11 +3563,17 @@ async fn reserve_any_returns_distinct_reservations() {
     let (handle, _join) = spawn_filled(Arc::clone(&storage)).await;
 
     let (rid1, public1) = handle
-        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: alice_attestation_signer(),
+            reply,
+        })
         .await
         .expect("first ReserveAny succeeds");
     let (rid2, public2) = handle
-        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: alice_attestation_signer(),
+            reply,
+        })
         .await
         .expect("second ReserveAny succeeds despite the first holding a reservation");
 
@@ -3548,7 +3609,10 @@ async fn reserve_any_replenishes_empty_pool_then_reserves() {
     );
 
     let (_rid, public_bytes) = handle
-        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: alice_attestation_signer(),
+            reply,
+        })
         .await
         .expect("ReserveAny fills the pool and reserves in one command");
     assert!(
@@ -3648,12 +3712,15 @@ fn kp_record_encodes_like_plain_fields() {
     );
 }
 
-/// Spec 09 §9.16.1: every KeyPackage the store actor mints on replenish
-/// publishes, in its leaf's `0xFF01` extension, the public point of the owner's
-/// wrapping key as custody holds it.
+/// Spec 09 §9.7.1 and §9.16.1: every `KeyPackage` the store actor mints on
+/// replenish carries a `0xFF03` attestation that verifies, as an Add, against
+/// the owner's resolved `#active` key, and publishes in `0xFF01` the public
+/// point of the owner's wrapping key as custody holds it.
 #[tokio::test]
-async fn replenished_key_packages_carry_the_custody_wrapping_public_key() {
-    use openmls::prelude::{OpenMlsProvider as _, ProtocolVersion};
+async fn store_minted_key_packages_carry_a_verifying_attestation() {
+    use crate::crypto::mls::attestation_verification::{
+        AttestationAddGroundTruth, verify_add_attestation,
+    };
     use scp_platform::traits::KeyCustody as _;
     let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let wrapping_key = crate::crypto::wrapping::test_wrapping_key(&custody)
@@ -3681,18 +3748,219 @@ async fn replenished_key_packages_carry_the_custody_wrapping_public_key() {
         .await
         .expect("list pooled succeeds");
     assert!(pooled.len() >= MIN_BUFFER, "the pool is filled");
-    let provider = scp_mls::InMemoryMlsProvider::default();
+    let mls = real_backend();
+    let resolver = alice_resolver();
     for (_ref, public_bytes) in &pooled {
-        let verified = scp_mls::wire::parse_key_package_in(public_bytes)
-            .unwrap()
-            .validate(provider.crypto(), ProtocolVersion::Mls10)
-            .unwrap();
-        let published =
-            scp_mls::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())
-                .unwrap()
-                .expect("every minted KeyPackage publishes 0xFF01");
-        assert_eq!(published.as_bytes().as_slice(), custody_public.as_bytes());
+        let validated = mls
+            .validate_key_package(public_bytes, &SystemClock)
+            .await
+            .expect("a minted KeyPackage validates");
+        let leaf = &validated.leaf;
+        let wrapping = leaf
+            .wrapping_key
+            .expect("every minted KeyPackage publishes 0xFF01");
+        assert_eq!(wrapping.as_slice(), custody_public.as_bytes());
+        let attestation = leaf
+            .attestation
+            .as_ref()
+            .expect("every minted KeyPackage carries 0xFF03");
+        verify_add_attestation(
+            &resolver,
+            &SystemClock,
+            attestation,
+            &AttestationAddGroundTruth {
+                credential: &leaf.credential,
+                leaf_signature_key: &leaf.signature_key,
+                leaf_encryption_key: &leaf.encryption_key,
+                leaf_wrapping_key: &wrapping,
+                leaf_lifetime_not_before: leaf.not_before,
+                leaf_lifetime_not_after: leaf.not_after,
+                kp_init_key: &leaf.init_key,
+            },
+        )
+        .expect("the attestation verifies against alice's resolved #active key");
     }
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// Spec 09 §9.7.1: a store with no attestation signer mints nothing. Its
+/// replenish returns `NotInitialized`, a reserve finds an empty pool, and no
+/// `KeyPackage` record or index entry is written.
+#[tokio::test]
+async fn replenish_without_a_signer_mints_nothing() {
+    let storage = in_memory_storage();
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        KeyPackageStoreDeps {
+            attestation_signer: None,
+            ..deps_with(real_backend(), Arc::clone(&storage), no_transport()).await
+        },
+    );
+    let err = handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect_err("a store without a signer mints nothing");
+    assert!(
+        matches!(err, ContextError::NotInitialized(_)),
+        "got {err:?}"
+    );
+    let pooled = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds");
+    assert!(
+        pooled.is_empty(),
+        "no KeyPackage is pooled without a signer"
+    );
+    assert!(live_index(&storage, &alice()).await.is_empty());
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// A signer for Bob, checked against a resolver that names Bob's key, so its
+/// `#active` check passes and only the owner check can refuse it in Alice's
+/// store.
+fn bob_attestation_signer() -> Arc<KeyPackageAttestationSigner> {
+    let bob = DID("did:dht:z6MkBobKeyPackages".to_owned());
+    let bob_key = SigningKey::from_bytes(&[0xB0; 32]);
+    let bob_vk = bob_key.verifying_key();
+    let resolver: KeyResolver = {
+        let bob = bob.clone();
+        Arc::new(move |did: &DID, _| (did == &bob).then_some(bob_vk))
+    };
+    attestation_signer(bob, bob_key, resolver)
+}
+
+/// Spec 09 §9.7.1: a reserve that supplies a signer for another identity is
+/// refused with `InvalidState` before anything is minted, and the signer is
+/// not installed, so the store still mints nothing.
+#[tokio::test]
+async fn reserve_any_rejects_a_signer_for_another_identity() {
+    let storage = in_memory_storage();
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        KeyPackageStoreDeps {
+            attestation_signer: None,
+            ..deps_with(real_backend(), Arc::clone(&storage), no_transport()).await
+        },
+    );
+    let err = handle
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: bob_attestation_signer(),
+            reply,
+        })
+        .await
+        .expect_err("a signer for another identity is refused");
+    assert!(
+        matches!(&err, ContextError::InvalidState(m) if m.contains("owner mismatch")),
+        "got {err:?}"
+    );
+    let err = handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect_err("the refused signer was not installed");
+    assert!(
+        matches!(err, ContextError::NotInitialized(_)),
+        "got {err:?}"
+    );
+    assert!(live_index(&storage, &alice()).await.is_empty());
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// Spec 09 §9.7.1: a store whose signer attests another identity's
+/// `KeyPackages` refuses to replenish with `InvalidState` and pools nothing.
+#[tokio::test]
+async fn replenish_with_a_signer_for_another_identity_mints_nothing() {
+    let storage = in_memory_storage();
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        KeyPackageStoreDeps {
+            attestation_signer: Some(bob_attestation_signer()),
+            ..deps_with(real_backend(), Arc::clone(&storage), no_transport()).await
+        },
+    );
+    let err = handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect_err("a signer for another identity mints nothing");
+    assert!(
+        matches!(&err, ContextError::InvalidState(m) if m.contains("owner mismatch")),
+        "got {err:?}"
+    );
+    let pooled = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds");
+    assert!(pooled.is_empty(), "no KeyPackage is pooled");
+    assert!(live_index(&storage, &alice()).await.is_empty());
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// Spec 09 §9.12, rotation is revocation: once the owner's DID document names
+/// another `#active` key, the store's signer stops signing, so a replenish
+/// fails with `AttestationSignerNotActiveKey` and pools nothing new.
+#[tokio::test]
+async fn replenish_mints_nothing_after_the_resolved_active_key_rotates() {
+    let current: Arc<std::sync::Mutex<VerifyingKey>> =
+        Arc::new(std::sync::Mutex::new(alice_identity_key().verifying_key()));
+    let resolver: KeyResolver = {
+        let current = Arc::clone(&current);
+        Arc::new(move |did: &DID, _| (did == &alice()).then(|| *current.lock().unwrap()))
+    };
+    let storage = in_memory_storage();
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        KeyPackageStoreDeps {
+            attestation_signer: Some(attestation_signer(alice(), alice_identity_key(), resolver)),
+            ..deps_with(real_backend(), Arc::clone(&storage), no_transport()).await
+        },
+    );
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("before the rotation the store mints");
+
+    *current.lock().unwrap() = SigningKey::from_bytes(&[0x7E; 32]).verifying_key();
+    let pooled = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds");
+    assert_eq!(pooled.len(), MIN_BUFFER, "the pre-rotation pool is full");
+    // A cancelled reservation burns its KeyPackage, so the pool falls below
+    // MIN_BUFFER and the next replenish has a deficit to mint.
+    let (kp_ref, _public) = pooled.into_iter().next().unwrap();
+    let (reservation_id, _public) = handle
+        .send(|reply| KeyPackageCommand::Reserve { kp_ref, reply })
+        .await
+        .expect("a pooled KeyPackage reserves");
+    handle
+        .send(|reply| KeyPackageCommand::CancelReservation {
+            reservation_id,
+            reply,
+        })
+        .await
+        .expect("the reservation cancels");
+
+    let err = handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect_err("after the rotation the store mints nothing");
+    assert!(
+        matches!(err, ContextError::AttestationSignerNotActiveKey),
+        "got {err:?}"
+    );
+    let pooled = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds");
+    assert_eq!(
+        pooled.len(),
+        MIN_BUFFER - 1,
+        "no KeyPackage is minted after the rotation"
+    );
 
     handle.send_shutdown().await.unwrap();
 }

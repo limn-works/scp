@@ -83,58 +83,6 @@ use scp_ffi_common::validate::{
 
 use crate::{decrement_handle_count, increment_handle_count, runtime};
 
-/// Generates a real MLS key package for a joining member.
-///
-/// Mirrors the NAPI bridge's `generate_mls_key_package_bytes`: builds an
-/// [`ScpCredential`](scp_core::crypto::mls::credential::ScpCredential) from the joiner's DID and TLS-serializes a fresh
-/// `KeyPackage` bundle produced by `generate_key_package_with_context_params`.
-/// The output bytes are what `NodeMlsFactory::validate_key_package` and
-/// `NodeMlsFactory::add_member` require — the old `FfiBridgeCrypto` stub
-/// used to accept `None`, but real MLS rejects it.
-///
-/// The leaf **declares the `0xFF02` (`scp_context_params`) capability** —
-/// mandatory to be added to an encrypted context group (`valn0502`, §5.13.3) —
-/// and carries `wrapping_public` as its `0xFF01` extension: the identity's
-/// wrapping public key, whose secret the supervisor holds (spec 09 §9.16.1).
-/// The base `generate_key_package` declares no `0xFF02` capability, so real
-/// MLS rejects it from a context group.
-///
-/// # Errors
-///
-/// Returns `ScpError::Crypto` if the DID format is invalid (must be
-/// `did:dht:z…`), key package generation fails, or TLS serialization fails.
-fn generate_mls_key_package_bytes(
-    did: &str,
-    wrapping_public: &[u8; 65],
-) -> Result<Vec<u8>, ScpError> {
-    use scp_core::crypto::mls::credential::ScpCredential;
-    use scp_core::crypto::mls::group::generate_key_package_with_context_params;
-    use tls_codec::Serialize as TlsSerializeTrait;
-
-    let cred =
-        ScpCredential::new(did.to_owned(), None, scp_did::SigningKeyId::Active).map_err(|e| {
-            ScpError::Crypto {
-                msg: format!("failed to create SCP credential for MLS key package: {e}"),
-                code: codes::CRYPTO_4010.to_owned(),
-            }
-        })?;
-
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, wrapping_public, &scp_clock::SystemClock)
-            .map_err(|e| ScpError::Crypto {
-            msg: format!("MLS key package generation failed: {e}"),
-            code: codes::CRYPTO_4011.to_owned(),
-        })?;
-
-    kp_bundle
-        .key_package()
-        .tls_serialize_detached()
-        .map_err(|e| ScpError::Crypto {
-            msg: format!("MLS key package TLS serialization failed: {e}"),
-            code: codes::CRYPTO_4012.to_owned(),
-        })
-}
-
 /// Outlet handler function type: maps JSON input to JSON output (or error string).
 type OutletHandlerMap = std::collections::HashMap<
     String,
@@ -6906,6 +6854,20 @@ async fn event_log_checkpoint_by_did_impl(
 // Free functions — governance proposal lifecycle (#621)
 // ---------------------------------------------------------------------------
 
+/// Mints the `KeyPackage` `identity` joins a context with: its leaf carries the
+/// identity's wrapping key (`0xFF01`) and a `0xFF03` attestation signed
+/// through the identity's `#active` custody key (spec 09 §9.7.1). A mint
+/// failure keeps its typed `ContextError` code.
+async fn mint_self_join_key_package(
+    sup: &scp_core::context::supervisor::Supervisor,
+    identity: &Identity,
+) -> Result<Vec<u8>, ScpError> {
+    let active_signer = resolve_identity_signer(identity).await?;
+    sup.mint_attested_key_package(&identity.did.clone().into(), &active_signer)
+        .await
+        .map_err(ScpError::from)
+}
+
 /// Builds the `#active` [`CommandSigner`](scp_core::context::actor::CommandSigner)
 /// over an `Identity`'s retained custody (ADR-049 Decision 7a). The private
 /// key stays in custody.
@@ -10794,8 +10756,11 @@ impl Scp {
 
                 let sup = bi.context_manager_or_error()?;
                 let owning = scp_did::DID(identity.did.clone());
+                // Every pooled KeyPackage carries a `0xFF03` attestation signed
+                // through the identity's `#active` custody key (§9.7.1).
+                let active_signer = resolve_identity_signer(&identity).await?;
                 let (reservation_id, key_package_public) = sup
-                    .reserve_key_package(owning)
+                    .reserve_key_package(owning, &active_signer)
                     .await
                     .map_err(ScpError::from)?;
                 Ok(ReservedKeyPackage {
@@ -11219,11 +11184,7 @@ impl Scp {
                 // `NodeMlsFactory` requires `Some(bytes)` — the old DID-less
                 // `FfiBridgeCrypto` stub accepted `None`, but commit 4 replaced
                 // it with real MLS crypto across every bridge entry point.
-                let wrapping_public = sup
-                    .wrapping_public_key(&identity.did.clone().into())
-                    .await
-                    .map_err(ScpError::from)?;
-                let kp_bytes = generate_mls_key_package_bytes(&identity.did, &wrapping_public)?;
+                let kp_bytes = mint_self_join_key_package(sup, &identity).await?;
                 let key_package = KeyPackage {
                     owner_did: identity.did.clone().into(),
                     mls_key_package_bytes: Some(kp_bytes),
@@ -20006,6 +19967,39 @@ mod tests {
             ("send", send),
             ("subscribe", subscribe),
         ]
+    }
+
+    /// The `KeyPackage` a plain join mints verifies as an adder verifies it
+    /// (§9.7.1): its `0xFF03` attestation verifies against the identity's
+    /// resolved `#active` key, and its `0xFF01` is the identity's custody
+    /// wrapping key.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn self_join_key_package_carries_a_verifying_attestation() {
+        let rt = runtime();
+        let scp = scp_test();
+        let identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        // A plain join runs on an attached supervisor; attach it as the
+        // bridge's first context operation does.
+        scp.inner.init_context_manager_with_did(&identity.did);
+        let sup = Arc::clone(scp.inner.context_manager_or_error().expect("supervisor"));
+        let owner: scp_did::DID = identity.did.clone().into();
+        let (verified, custody_wrap) = rt.block_on(async {
+            let kp = super::mint_self_join_key_package(&sup, &identity)
+                .await
+                .expect("the self-join mint succeeds");
+            (
+                sup.verify_key_package_attestation(&owner, &kp).await,
+                sup.wrapping_public_key(&owner).await,
+            )
+        });
+        assert_eq!(
+            verified.expect("the attestation verifies against the identity's #active key"),
+            custody_wrap.expect("the identity has a custody wrapping key"),
+            "0xFF01 is the identity's custody wrapping key"
+        );
     }
 
     /// Join, leave, send, and subscribe read the supervisor actor, so a

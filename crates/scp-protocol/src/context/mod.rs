@@ -390,6 +390,20 @@ pub enum ContextError {
     #[error("the stored wrapping key handle is not held by the identity's custody")]
     WrappingKeyHandleInvalid,
 
+    /// A `KeyPackage` attestation (`09-security-model.md` §9.7.1) cannot be
+    /// signed because the owner's `#active` verification method does not
+    /// resolve, so no `KeyPackage` is minted. The caller holds the identity, so
+    /// the error names none.
+    #[error("the KeyPackage owner's #active key does not resolve")]
+    AttestationSignerActiveKeyUnresolved,
+
+    /// A `KeyPackage` attestation (`09-security-model.md` §9.7.1) cannot be
+    /// signed because the custody handle supplied to sign it is not the
+    /// owner's resolved `#active` key, so no `KeyPackage` is minted. The caller
+    /// holds the identity, so the error names none.
+    #[error("the attestation signing handle is not the owner's resolved #active key")]
+    AttestationSignerNotActiveKey,
+
     /// A transport operation failed during messaging.
     #[error("transport operation failed: {0}")]
     TransportFailed(String),

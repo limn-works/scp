@@ -16,8 +16,8 @@
 //!
 //! # Method contracts
 //!
-//! - `validate_key_package` / `generate_key_package` are cancel-safe and
-//!   side-effect-free on `ScpMlsGroup`. They construct fresh values; no
+//! - `validate_key_package`, `prepare_key_package` and `finish_key_package`
+//!   are cancel-safe and side-effect-free on `ScpMlsGroup`. They construct fresh values; no
 //!   caller state changes if the future is dropped mid-flight.
 //! - All other mutating methods are **cancel-hostile** on `&mut ScpMlsGroup`:
 //!   the group's internal epoch state may advance (via `merge_pending_commit`
@@ -46,6 +46,7 @@ use openmls::prelude::LeafNodeIndex;
 
 use super::storage_adapter::OpenMlsStorageAdapter;
 use scp_clock::Clock;
+use scp_mls::attested_key_package::KeyPackageDraft;
 use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::DecryptedContent;
 use scp_mls::error::MlsError;
@@ -111,9 +112,14 @@ pub struct ValidatedKeyPackage {
     /// against the expected owner / member DID to bind the `KeyPackage` to an
     /// identity, with no second validation pass.
     pub credential_did: String,
+    /// The facts the same validated leaf states: its credential, its four
+    /// keys, its lifetime window, and its `0xFF01` wrapping key and `0xFF03`
+    /// attestation when it carries them (§9.7.1). An add path verifies the
+    /// attestation against these facts.
+    pub leaf: scp_mls::keypackage_attestation::KeyPackageLeafFacts,
 }
 
-/// Output of `generate_key_package` — pairs the wire bytes with the opaque
+/// Output of `finish_key_package` — pairs the wire bytes with the opaque
 /// signer state the caller must retain to later join from a Welcome.
 #[derive(Debug, Clone)]
 pub struct GeneratedKeyPackage {
@@ -131,7 +137,7 @@ pub struct GeneratedKeyPackage {
     pub signer_state: SignerState,
 }
 
-/// Opaque signer-state handle produced by `generate_key_package` and consumed
+/// Opaque signer-state handle produced by `finish_key_package` and consumed
 /// by `join_from_welcome`.
 ///
 /// The byte layout is defined by the [`MlsBackend`] implementation. Callers
@@ -179,7 +185,8 @@ impl std::fmt::Debug for SignerState {
 ///
 /// # Cancel-safety
 ///
-/// - `validate_key_package`, `generate_key_package`: cancel-safe,
+/// - `validate_key_package`, `prepare_key_package`, `finish_key_package`:
+///   cancel-safe,
 ///   side-effect-free on external state.
 /// - All other methods: cancel-hostile on `&mut ScpMlsGroup`. The supervisor
 ///   layer owns the rollback discipline (see saga journal).
@@ -297,22 +304,42 @@ pub trait MlsBackend: Send + Sync {
         clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError>;
 
-    /// Generates a fresh `KeyPackage` for `credential` whose leaf carries
-    /// `wrapping_pubkey` as its `scp_wrapping_key` extension. Returns the TLS-serialized KP
-    /// bytes plus an opaque signer-state handle the caller retains to later
-    /// join a group from a Welcome addressed to this KP.
+    /// Plans a fresh `KeyPackage` for `credential` whose leaf will carry
+    /// `wrapping_pubkey` as its `0xFF01` extension and a `0xFF03` attestation
+    /// over its keys (§9.7.1), with a lifetime read from the backend's
+    /// injected clock. The identity key named by the credential signs the
+    /// draft's [`KeyPackageDraft::signing_hash`]; [`Self::finish_key_package`]
+    /// builds the `KeyPackage` with that signature. No unattested `KeyPackage`
+    /// can be minted through this trait.
     ///
     /// # Errors
     ///
-    /// See [`MlsError`]. Side-effect-free on external state.
-    async fn generate_key_package(
+    /// See [`scp_mls::attested_key_package::prepare_key_package`].
+    /// Side-effect-free on external state.
+    async fn prepare_key_package(
         &self,
         credential: &ScpCredential,
         wrapping_pubkey: &[u8; 65],
+    ) -> Result<KeyPackageDraft, MlsError>;
+
+    /// Builds the `KeyPackage` `draft` planned, with `signature` in its
+    /// `0xFF03` attestation, and returns the TLS-serialized bytes plus an
+    /// opaque signer-state handle the caller retains to later join a group
+    /// from a Welcome addressed to this KP. The caller verifies `signature`
+    /// against the identity key before it calls this.
+    ///
+    /// # Errors
+    ///
+    /// See [`KeyPackageDraft::finish`], and [`MlsError`] when the bundle does
+    /// not serialize. Side-effect-free on external state.
+    async fn finish_key_package(
+        &self,
+        draft: KeyPackageDraft,
+        signature: [u8; 64],
     ) -> Result<GeneratedKeyPackage, MlsError>;
 
     /// Joins a group from a TLS-serialized MLS Welcome message using the
-    /// opaque `signer_state` previously returned by `generate_key_package`.
+    /// opaque `signer_state` previously returned by `finish_key_package`.
     ///
     /// `key_package_public_bytes` is the TLS-serialized public `KeyPackage`
     /// this signer-state was generated for. It is the single-use anchor's

@@ -281,7 +281,10 @@ fn stand_up_two_party_blocking(ctx_str: &str, alice_did: &str, bob_did: &str) ->
             // key read back from his supervisor. The KP also declares `0xFF02`
             // (`scp_context_params`) unconditionally.
             let (reservation_id, kp_public_bytes) = bob_sup
-                .reserve_key_package(bob.clone())
+                .reserve_key_package(
+                    bob.clone(),
+                    &crate::context::actor::CommandSigner::local_ed25519(bob_signing_key()),
+                )
                 .await
                 .expect("bob reserves a real KeyPackage from his own store");
             let bob_wrapping = bob_sup

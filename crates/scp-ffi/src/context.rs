@@ -1604,57 +1604,6 @@ fn resolve_future(
 }
 
 // ---------------------------------------------------------------------------
-// MLS key package generation helper (#1324)
-// ---------------------------------------------------------------------------
-
-/// Generates serialized MLS key package bytes for a given DID.
-///
-/// Ported from the NAPI bridge (`generate_mls_key_package_bytes` in
-/// `napi/src/context.rs`) as part of issue #1324. Creates an SCP credential
-/// for the DID, generates a fresh MLS key package, and returns the
-/// TLS-serialized bytes suitable for passing to
-/// `ContextManager::join_context`.
-///
-/// Uses [`generate_key_package_with_context_params`](scp_core::crypto::mls::group::generate_key_package_with_context_params) with `None` so the leaf
-/// **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
-/// be added to an encrypted context group (`valn0502`, §5.13.3). The base
-/// `generate_key_package` (which declares no `0xFF02` capability) produces a KP
-/// that real MLS rejects from a context group ("the capabilities of the add
-/// proposal are insufficient for this group"). The leaf carries `wrapping_public`
-/// as its `0xFF01` extension: the identity's wrapping public key, whose secret
-/// the supervisor holds (spec 09 §9.16.1).
-fn generate_mls_key_package_bytes(
-    did: &str,
-    wrapping_public: &[u8; 65],
-) -> Result<Vec<u8>, crate::error::ScpPyError> {
-    use scp_core::crypto::mls::credential::ScpCredential;
-    use scp_core::crypto::mls::group::generate_key_package_with_context_params;
-    use tls_codec::Serialize as TlsSerializeTrait;
-
-    let cred =
-        ScpCredential::new(did.to_owned(), None, scp_did::SigningKeyId::Active).map_err(|e| {
-            crate::error::ScpPyError::crypto(format!(
-                "failed to create SCP credential for MLS key package: {e}"
-            ))
-        })?;
-
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, wrapping_public, &scp_clock::SystemClock)
-            .map_err(|e| {
-            crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
-        })?;
-
-    kp_bundle
-        .key_package()
-        .tls_serialize_detached()
-        .map_err(|e| {
-            crate::error::ScpPyError::crypto(format!(
-                "MLS key package TLS serialization failed: {e}"
-            ))
-        })
-}
-
-// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -1913,6 +1862,24 @@ pub(crate) fn resolve_signer(
     )?
     .map_err(crate::error::ScpPyError::from)?;
     Ok(signer)
+}
+
+/// Mints the `KeyPackage` `identity_did` joins a context with: its leaf carries
+/// the identity's wrapping key (`0xFF01`) and a `0xFF03` attestation signed
+/// through the identity's `#active` custody key (spec 09 §9.7.1). A mint
+/// failure keeps its typed `ContextError` code.
+fn mint_self_join_key_package(
+    py: Python<'_>,
+    bi: &crate::runtime::PyBridgeInstance,
+    sup: &scp_core::context::supervisor::Supervisor,
+    identity_did: &str,
+) -> PyResult<Vec<u8>> {
+    let active_signer = resolve_signer(py, bi, identity_did)?;
+    crate::actor_wait::block_on_released(
+        py,
+        sup.mint_attested_key_package(&scp_did::DID(identity_did.to_owned()), &active_signer),
+    )?
+    .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))
 }
 
 /// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
@@ -2991,15 +2958,11 @@ impl crate::scp::PyScp {
             // The key package contains the joiner's SCP credential (DID) and is
             // validated by NodeMlsFactory::validate_key_package before MLS
             // group addition. It runs after derivation, so a joiner with no
-            // key material fails with derivation's `SCP-IDENT-1054` first; a
-            // wrapping-key failure keeps its typed `ContextError` code.
-            let wrapping_public = crate::actor_wait::block_on_released(
-                py,
-                sup.wrapping_public_key(&scp_did::DID(member_did.clone())),
-            )?
-            .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
-            let kp_bytes = generate_mls_key_package_bytes(identity_did, &wrapping_public)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // key material fails with derivation's `SCP-IDENT-1054` first. The
+            // leaf carries the identity's wrapping key (`0xFF01`) and a `0xFF03`
+            // attestation signed through its `#active` custody key (spec 09
+            // §9.7.1); a mint failure keeps its typed `ContextError` code.
+            let kp_bytes = mint_self_join_key_package(py, bi, &sup, identity_did)?;
 
             let key_package = scp_core::context::membership::KeyPackage {
                 owner_did: scp_did::DID(member_did.clone()),
@@ -3144,8 +3107,11 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
         let owning = scp_did::DID(owning_did.to_owned());
+        // Every pooled KeyPackage carries a `0xFF03` attestation signed through
+        // the identity's `#active` custody key (spec 09 §9.7.1).
+        let active_signer = resolve_signer(py, bi, owning_did)?;
         let (reservation_id, kp_public) = crate::actor_wait::block_on_released(py, async move {
-            sup.reserve_key_package(owning).await
+            sup.reserve_key_package(owning, &active_signer).await
         })?
         .map_err(|e| typed_supervisor_failure("reserve_key_package", &e))?;
         Ok((reservation_id.to_string(), kp_public))
@@ -7427,6 +7393,40 @@ mod tests {
             assert!(
                 for_joiner.iter().any(|(cid, _)| cid == &ctx_id),
                 "plain join must register the joiner's known-context entry for discovery"
+            );
+        });
+    }
+
+    /// The `KeyPackage` a plain join mints verifies as an adder verifies it
+    /// (§9.7.1): its `0xFF03` attestation verifies against the identity's
+    /// resolved `#active` key, and its `0xFF01` is the identity's custody
+    /// wrapping key.
+    #[test]
+    fn self_join_key_package_carries_a_verifying_attestation() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let joiner = scp.identity_create(py, "in_memory", None).unwrap();
+            let did = joiner.did().to_owned();
+            crate::runtime::init_context_manager_for_test(&bi);
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+
+            let kp = super::mint_self_join_key_package(py, &bi, &sup, &did)
+                .expect("the self-join mint succeeds");
+            let owner = scp_did::DID(did);
+            let (verified, custody_wrap) = crate::actor_wait::block_on_released(py, async {
+                (
+                    sup.verify_key_package_attestation(&owner, &kp).await,
+                    sup.wrapping_public_key(&owner).await,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                verified.expect("the attestation verifies against the identity's #active key"),
+                custody_wrap.expect("the identity has a custody wrapping key"),
+                "0xFF01 is the identity's custody wrapping key"
             );
         });
     }

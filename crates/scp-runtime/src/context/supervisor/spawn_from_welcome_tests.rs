@@ -50,6 +50,7 @@ use zeroize::Zeroizing;
 
 use super::key_package_actor::{KeyPackageCommand, ReservationId};
 use super::{InviteMemberOutcome, MessageSigner, Supervisor, WelcomeJoinRequest};
+use crate::context::actor::CommandSigner;
 use crate::context::builder::{
     ContextEventLogProvider, ContextTransportProvider, NotConfiguredTransportProvider,
 };
@@ -437,26 +438,15 @@ async fn reserve_bob_kp(
     sup: &Arc<Supervisor>,
     bob: &DID,
 ) -> (super::key_package_actor::ReservationId, Vec<u8>) {
-    let store = sup
-        .key_package_store_for_loaded(bob)
-        .await
-        .expect("bob's key-package store spawns");
-    store
-        .send(|reply| KeyPackageCommand::Replenish { reply })
-        .await
-        .expect("replenish barrier");
-    let pooled = store
-        .send(|reply| KeyPackageCommand::ListPooled { reply })
-        .await
-        .expect("list pooled KPs");
-    let (kp_ref, _public) = pooled
-        .into_iter()
-        .next()
-        .expect("the auto-replenished pool holds at least one KP");
-    store
-        .send(|reply| KeyPackageCommand::Reserve { kp_ref, reply })
+    sup.reserve_key_package(bob.clone(), &bob_signer())
         .await
         .expect("reserve a pooled KP for join")
+}
+
+/// Bob's `#active` signer, over the key [`pair_resolver`] maps `BOB_DID` to.
+/// It signs the `0xFF03` attestation on every `KeyPackage` Bob's store mints.
+fn bob_signer() -> CommandSigner {
+    CommandSigner::local_ed25519(bob_signing_key())
 }
 
 /// The joiner-side outcome of the shared bootstrap: everything a test needs to
@@ -2096,7 +2086,7 @@ async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
     // replenish barrier, list, reserve) — bare DID; in production the FFI bridge
     // enforces that the DID is locally custodied.
     let (reservation_id, kp_public_bytes) = sup
-        .reserve_key_package(bob.clone())
+        .reserve_key_package(bob.clone(), &bob_signer())
         .await
         .expect("reserve_key_package yields a reservation for the identity");
 
@@ -2166,7 +2156,7 @@ async fn spawn_under_a_different_did_is_rejected() {
 
     // Bob reserves under HIS OWN DID; Alice builds the Welcome for that KP.
     let (reservation_id, kp_public_bytes) = sup
-        .reserve_key_package(bob.clone())
+        .reserve_key_package(bob.clone(), &bob_signer())
         .await
         .expect("bob reserves a KP under his own DID");
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
@@ -4353,4 +4343,335 @@ async fn a_welcome_joiner_admits_no_interval_rotation_without_the_creators_t0() 
         Some(0),
         "a membership-only policy needs no T0: the next epoch is 0"
     );
+}
+
+// ---------------------------------------------------------------------------
+// F1 — the inviter verifies the invitee's KeyPackage attestation (§9.7.1)
+// before it adds the invitee or seals the invitation.
+// ---------------------------------------------------------------------------
+
+/// A transport whose broadcasts succeed and which counts invitation
+/// deliveries addressed to `watched`.
+struct InvitationDeliveryCounter {
+    watched: [u8; 32],
+    deliveries: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ContextTransportProvider for InvitationDeliveryCounter {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    async fn publish_context(
+        &self,
+        _context_id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    async fn delete_published(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        Ok(())
+    }
+
+    async fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), crate::context::ContextError> {
+        Ok(())
+    }
+
+    async fn send_to_routing_id(
+        &self,
+        routing_id: &[u8; 32],
+        _payload: &[u8],
+        _ttl: u32,
+    ) -> Result<(), crate::context::ContextError> {
+        if routing_id == &self.watched {
+            self.deliveries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+/// Alice's creator supervisor over `resolver`, with a transport that counts
+/// invitation deliveries to Bob's `scp-invitations` routing id. Returns the
+/// supervisor and the delivery counter.
+fn alice_supervisor_counting_bob_deliveries(
+    resolver: KeyResolver,
+) -> (Arc<Supervisor>, Arc<std::sync::atomic::AtomicUsize>) {
+    let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let transport = InvitationDeliveryCounter {
+        watched: scp_protocol::crypto::envelope_seal::derive_invitation_routing_id(BOB_DID),
+        deliveries: Arc::clone(&deliveries),
+    };
+    let crypto = Arc::new(NodeMlsFactory::new(
+        ALICE_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
+    let event_log: Box<dyn ContextEventLogProvider> = Box::new(MerkleEventLogProvider::new());
+    let sup = Supervisor::with_providers(
+        crypto,
+        Box::new(transport),
+        event_log,
+        resolver,
+        None,
+        None,
+        None,
+        None,
+        fresh_mls_storage(),
+    );
+    (sup, deliveries)
+}
+
+/// A wrapping public key Mallory controls: the public half of an `HpkeP256`
+/// key in Mallory's own test custody.
+async fn mallory_wrapping_public_key() -> [u8; 65] {
+    let custody = InMemoryKeyCustody::new();
+    let handle = custody
+        .generate_keypair(KeyType::HpkeP256)
+        .await
+        .expect("mallory's custody makes an HpkeP256 key");
+    let public = custody
+        .public_key(&handle)
+        .await
+        .expect("mallory's custody holds the key");
+    <[u8; 65]>::try_from(public.as_bytes()).expect("an HpkeP256 public key is 65 bytes")
+}
+
+fn bob_credential() -> scp_mls::credential::ScpCredential {
+    scp_mls::credential::ScpCredential::new(BOB_DID.to_owned(), None, SigningKeyId::Active)
+        .expect("bob's credential")
+}
+
+/// Mallory's `KeyPackage` in Bob's name, with Mallory's wrapping key in `0xFF01`
+/// and no `0xFF03`.
+fn unattested_key_package_for_bob(mallory_wrap: &[u8; 65]) -> Vec<u8> {
+    use openmls::prelude::tls_codec::Serialize as _;
+    let (bundle, _signer, _provider) = scp_mls::group::generate_key_package_with_context_params(
+        &bob_credential(),
+        mallory_wrap,
+        &scp_clock::SystemClock,
+    )
+    .expect("an unattested KeyPackage builds");
+    bundle.key_package().tls_serialize_detached().unwrap()
+}
+
+/// Mallory's `KeyPackage` in Bob's name, with Mallory's wrapping key in `0xFF01`
+/// and an `0xFF03` that names Bob but is signed by Mallory's `#active` key.
+async fn mallory_signed_key_package_for_bob(mallory_wrap: &[u8; 65]) -> Vec<u8> {
+    use crate::crypto::mls::test_support::MintAttestedForTest as _;
+    crate::crypto::mls::production_backend::ProductionMlsBackend::new(Arc::new(
+        scp_clock::SystemClock,
+    ))
+    .mint_attested_with_key_for_test(&bob_credential(), mallory_wrap, &mallory_signing_key())
+    .await
+    .expect("mallory mints a KeyPackage")
+    .key_package_bytes
+}
+
+/// Mallory's `KeyPackage` in Bob's name, with Mallory's leaf keys and wrapping
+/// key, carrying the `0xFF03` attestation copied from Bob's genuine
+/// `KeyPackage` `bob_kp`.
+fn grafted_key_package_for_bob(bob_kp: &[u8], mallory_wrap: &[u8; 65]) -> Vec<u8> {
+    use openmls::prelude::tls_codec::Serialize as _;
+    use openmls::prelude::{
+        BasicCredential, CredentialWithKey, Extensions, KeyPackage, OpenMlsProvider as _,
+        ProtocolVersion,
+    };
+    use openmls_basic_credential::SignatureKeyPair;
+    let provider = scp_mls::InMemoryMlsProvider::default();
+    let genuine = scp_mls::wire::parse_key_package_in(bob_kp)
+        .unwrap()
+        .validate(provider.crypto(), ProtocolVersion::Mls10)
+        .unwrap();
+    let bob_attestation = scp_mls::keypackage_attestation::leaf_facts(&genuine)
+        .unwrap()
+        .attestation
+        .expect("bob's genuine KeyPackage carries 0xFF03");
+
+    let signer = SignatureKeyPair::new(scp_mls::SCP_CIPHERSUITE.signature_algorithm()).unwrap();
+    let extensions = Extensions::from_vec(vec![
+        scp_mls::wrapping_extension::make_wrapping_key_extension(mallory_wrap),
+        bob_attestation.make_attestation_extension(),
+    ])
+    .unwrap();
+    let credential_with_key = CredentialWithKey {
+        credential: BasicCredential::new(bob_credential().to_bytes().unwrap()).into(),
+        signature_key: signer.to_public_vec().into(),
+    };
+    let bundle = KeyPackage::builder()
+        .leaf_node_capabilities(
+            scp_mls::keypackage_attestation::scp_capabilities_with_context_params_and_attestation(),
+        )
+        .leaf_node_extensions(extensions)
+        .build(
+            scp_mls::SCP_CIPHERSUITE,
+            &provider,
+            &signer,
+            credential_with_key,
+        )
+        .unwrap();
+    bundle.key_package().tls_serialize_detached().unwrap()
+}
+
+/// Alice creates an encrypted context on `alice_sup`, offers `key_package` as
+/// Bob's, and returns `invite_member`'s error after asserting that the
+/// invitation failed before any add, seal or delivery: the roster and epoch
+/// are unchanged and nothing reached Bob's invitation routing id.
+async fn invite_bob_expecting_rejection(
+    alice_sup: &Arc<Supervisor>,
+    deliveries: &std::sync::atomic::AtomicUsize,
+    seed: u8,
+    key_package: Vec<u8>,
+) -> crate::context::ContextError {
+    let ctx_id = ctx_hex(seed);
+    let alice = DID::from(ALICE_DID);
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+            Vec::new(),
+        )
+        .await
+        .expect("alice creates the encrypted context");
+    let epoch_before = alice_sup.local_mls_epoch(&ctx_id).await;
+
+    let result = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice,
+            DID::from(BOB_DID),
+            key_package,
+            &CommandSigner::local_ed25519(alice_signing_key()),
+        )
+        .await;
+    let Err(err) = result else {
+        panic!("a substituted KeyPackage must not yield a sealed invitation");
+    };
+    assert_eq!(
+        alice_sup.member_count(&ctx_id).await,
+        Some(1),
+        "the roster is unchanged"
+    );
+    assert_eq!(
+        alice_sup.local_mls_epoch(&ctx_id).await,
+        epoch_before,
+        "the epoch is unchanged"
+    );
+    assert_eq!(
+        deliveries.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing is delivered to bob's invitation routing id"
+    );
+    err
+}
+
+/// F1: `invite_member` refuses a `KeyPackage` offered in Bob's name that Bob's
+/// `#active` key did not attest, before it adds Bob or seals anything:
+/// (1) no `0xFF03`; (2) an `0xFF03` naming Bob signed by Mallory's key;
+/// (3) Bob's genuine `0xFF03` grafted onto Mallory's `KeyPackage`. Each carries
+/// Mallory's wrapping key in `0xFF01`, the key an accepted invitation would be
+/// sealed to.
+#[tokio::test]
+async fn invite_member_rejects_a_substituted_key_package_before_any_seal() {
+    let mallory_wrap = mallory_wrapping_public_key().await;
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation, bob_kp) = reserve_bob_kp(&bob_sup, &DID::from(BOB_DID)).await;
+
+    let cases: [(&str, Vec<u8>, &str); 3] = [
+        (
+            "no 0xFF03",
+            unattested_key_package_for_bob(&mallory_wrap),
+            "carries no attestation (0xFF03)",
+        ),
+        (
+            "0xFF03 signed by mallory",
+            mallory_signed_key_package_for_bob(&mallory_wrap).await,
+            "attestation rejected",
+        ),
+        (
+            "bob's 0xFF03 grafted onto mallory's KeyPackage",
+            grafted_key_package_for_bob(&bob_kp, &mallory_wrap),
+            "attestation rejected",
+        ),
+    ];
+    for (seed, (case, key_package, reason)) in (0xf1..).zip(cases) {
+        let (alice_sup, deliveries) = alice_supervisor_counting_bob_deliveries(pair_resolver());
+        let err = invite_bob_expecting_rejection(&alice_sup, &deliveries, seed, key_package).await;
+        match err {
+            crate::context::ContextError::InvalidKeyPackage(msg) => {
+                assert!(msg.contains(reason), "{case}: {msg}");
+            }
+            other => panic!("{case}: expected InvalidKeyPackage, got {other:?}"),
+        }
+    }
+}
+
+/// F1: a `KeyPackage` Bob's previous `#active` key attested is refused once
+/// Bob's DID document names another key (§9.12, rotation is revocation).
+#[tokio::test]
+async fn invite_member_rejects_a_key_package_signed_by_a_rotated_away_key() {
+    use crate::crypto::mls::attestation_verification::AttestationRuntimeVerifyError;
+    use scp_mls::AttestationResolutionVerifyError;
+    use scp_mls::keypackage_attestation::AttestationVerifyError;
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation, bob_kp) = reserve_bob_kp(&bob_sup, &DID::from(BOB_DID)).await;
+
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+    let alice_vk = alice_signing_key().verifying_key();
+    let rotated_vk = SigningKey::from_bytes(&[0xB7; 32]).verifying_key();
+    let resolver: KeyResolver = Arc::new(move |did: &DID, _: SigningKeyId| {
+        if did == &alice {
+            Some(alice_vk)
+        } else {
+            (did == &bob).then_some(rotated_vk)
+        }
+    });
+    let (alice_sup, deliveries) = alice_supervisor_counting_bob_deliveries(resolver);
+    let err = invite_bob_expecting_rejection(&alice_sup, &deliveries, 0xf4, bob_kp).await;
+    let expected = AttestationRuntimeVerifyError::Verify(
+        AttestationResolutionVerifyError::Delegated(AttestationVerifyError::SignatureInvalid),
+    )
+    .to_string();
+    match err {
+        crate::context::ContextError::InvalidKeyPackage(msg) => {
+            assert!(msg.ends_with(&expected), "{msg}");
+        }
+        other => panic!("expected InvalidKeyPackage, got {other:?}"),
+    }
+}
+
+/// F1: a `KeyPackage` whose signer's `#active` key does not resolve is refused,
+/// fail-closed (§9.7.1 "Resolution failure policy", Add).
+#[tokio::test]
+async fn invite_member_rejects_a_key_package_whose_key_does_not_resolve() {
+    use crate::crypto::mls::attestation_verification::AttestationRuntimeVerifyError;
+
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_reservation, bob_kp) = reserve_bob_kp(&bob_sup, &DID::from(BOB_DID)).await;
+
+    let alice = DID::from(ALICE_DID);
+    let alice_vk = alice_signing_key().verifying_key();
+    let resolver: KeyResolver =
+        Arc::new(move |did: &DID, _: SigningKeyId| (did == &alice).then_some(alice_vk));
+    let (alice_sup, deliveries) = alice_supervisor_counting_bob_deliveries(resolver);
+    let err = invite_bob_expecting_rejection(&alice_sup, &deliveries, 0xf5, bob_kp).await;
+    let expected = AttestationRuntimeVerifyError::ResolutionNotFound.to_string();
+    match err {
+        crate::context::ContextError::InvalidKeyPackage(msg) => {
+            assert!(msg.ends_with(&expected), "{msg}");
+        }
+        other => panic!("expected InvalidKeyPackage, got {other:?}"),
+    }
 }

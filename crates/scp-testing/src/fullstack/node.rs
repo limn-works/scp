@@ -377,10 +377,14 @@ impl FullStackNode {
         //    supervisor (its KeyPackageStoreActor mints + retains the private
         //    signer state; only the reservation id + public bytes come back).
         //    The KeyPackage carries the joiner identity's wrapping key in
-        //    `0xFF01`, which its supervisor loads or creates on first use.
+        //    `0xFF01`, which its supervisor loads or creates on first use, and
+        //    a `0xFF03` attestation signed by the joiner's `#active` key.
+        let joiner_signer = scp_core::context::actor::CommandSigner::local_ed25519(
+            ed25519_dalek::SigningKey::from_bytes(&did_to_seed(&DID::from(member_did))),
+        );
         let (reservation_id, kp_bytes) = joiner
             .manager
-            .reserve_key_package(DID::from(member_did))
+            .reserve_key_package(DID::from(member_did), &joiner_signer)
             .await?;
 
         // 3. Capture the set of existing members BEFORE the add — they need the
