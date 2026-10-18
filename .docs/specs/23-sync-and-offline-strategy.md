@@ -460,7 +460,7 @@ Sent through a relay as plaintext, because the member cannot encrypt at the curr
 | `timestamp` | u64 | Unix seconds |
 | `signature` | bytes (64) | P-256 signature under `"SCP-RESET-REQUEST-V2:"` over the `ResetRequest` preimage of `09-security-model.md` §9.5.2 |
 
-`ResetReason` is a tagged enum: `ExtendedOffline` carrying the offline duration in seconds, and `CatchUpFailed` carrying the sources attempted. A reset that governance orders is a `ResetMember` action and carries no request, so no request carries a governance reason.
+`ResetReason` is a tagged enum: `ExtendedOffline` carrying the offline duration in seconds, and `CatchUpFailed` carrying the non-empty set of §23.4.1 sources the member attempted: relay backfill, peer request, and Welcome-based fast-forward, named `relay-backfill`, `peer-request`, and `welcome-fast-forward` in the text form `09-security-model.md` §9.5.2 defines. A reset that governance orders is a `ResetMember` action and carries no request, so no request carries a governance reason.
 
 ### 23.16.8 Signed Context Export
 

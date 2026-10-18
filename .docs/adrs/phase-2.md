@@ -149,6 +149,7 @@ Invalid transitions (must return error):
    - If memory scope is `Summary`: triggers summary generation and verification window.
    - If memory scope is `Ephemeral` or `Summary`: schedules key destruction.
    - Appends `ContextClosing` event to event log.
+   - **Amendment (2026-10-18, ADR-066):** in an encrypted context the close executes as a `CloseContext` governance action, whose Commit carries its `GovernanceActionExecuted` leaf and no `ContextClosing` leaf (ADR-011 amendment below).
 
 6. **`finalize_close(handle: &ContextHandle) -> Result<(), ContextError>`**
    - Called after all members have processed the close notification.
@@ -401,6 +402,7 @@ pub struct RoleDefinition {
    - Distributes tokens to the member via MLS application message.
    - Revokes any previous tokens for this member (role change).
    - Appends `RoleAssigned` event to event log.
+   - **Amendment (2026-10-18, ADR-066):** in an encrypted context a role is assigned by the `AddMember` or `ChangeRole` governance action, whose Commit carries the `MemberJoined` leaf naming the role or the `GovernanceActionExecuted` leaf, and no `RoleAssigned` leaf (ADR-011 amendment below).
    - Returns the minted tokens.
 
 4. **`validate_ucan(context: &ContextHandle, token: &UcanToken, required_capability: &Capability) -> Result<(), UcanError>`**
@@ -879,7 +881,7 @@ pub enum EventType {
 }
 ```
 
-   **Amendment (2026-10-18, ADR-066): which leaf records an executed governance action.** The per-action variants above stay in the closed set, but the Commit that executes a governance action carries only the leaves every receiver derives from the action and the Commit (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6): `MemberJoined` for `AddMember`, `MemberLeft` for `RemoveMember`, `MemberReset` for `ResetMember`, `TtlExtended` for `ExtendTtl`, and then the `GovernanceActionExecuted` leaf, which records every action as its exact `action_bytes`. It carries no `RoleAssigned`, `AdminTransferred`, `ChildContextCreated`, `SignerAdded`, or other per-action leaf, and a receiver rejects a Commit that carries one. A consumer that read a per-action variant for an executed governance action reads the `GovernanceActionExecuted` leaf's `action_type` and `action_bytes` instead (`07-trust-validation-and-capabilities.md` §7.3.2, participation facts).
+   **Amendment (2026-10-18, ADR-066): which leaf records an executed governance action.** The per-action variants above stay in the closed set, but the Commit that executes a governance action carries only the leaves every receiver derives from the action and the Commit (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6): `MemberJoined` for `AddMember`, `MemberLeft` for `RemoveMember`, `MemberReset` for `ResetMember`, `TtlExtended` for `ExtendTtl`, and then the `GovernanceActionExecuted` leaf, which records every action as its exact `action_bytes`. It carries no `RoleAssigned`, `AdminTransferred`, `ChildContextCreated`, `SignerAdded`, `ContextClosing`, `ContextPromoted`, or other per-action leaf, and a receiver rejects a Commit that carries one. A consumer that read a per-action variant for an executed governance action reads the `GovernanceActionExecuted` leaf's `action_type` and `action_bytes` instead (`07-trust-validation-and-capabilities.md` §7.3.2, participation facts).
 
    `EventType` is a closed set with no catch-all variant: every protocol action
    that produces a verifiable history entry in the Merkle event log is one of the
