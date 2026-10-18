@@ -391,6 +391,54 @@ async def test_start_local_with_passphrase() -> None:
     assert scp._native.local_calls == [("/tmp/test-dir", None, "my-secret")]
 
 
+#: The error a shipped extension's dev pair raises (SCP-327), in the form the
+#: PyO3 bridge renders it.
+_DEV_START_UNAVAILABLE = (
+    "[SCP-TRANS-5055] transport error: "
+    "development node start is unavailable in this build; use node_start"
+)
+
+
+class _ShippedDevPairNative:
+    """The dev pair of a shipped extension: both calls raise SCP-TRANS-5055."""
+
+    def __init__(self) -> None:
+        self.error = Exception(_DEV_START_UNAVAILABLE)
+
+    def node_start_in_memory(self, identity_did: str | None = None) -> _MockNodeHandle:
+        raise self.error
+
+    def node_start_local(
+        self,
+        data_dir: str,
+        identity_did: str | None = None,
+        passphrase: str | None = None,
+    ) -> _MockNodeHandle:
+        raise self.error
+
+
+@pytest.mark.asyncio
+async def test_dev_pair_on_a_shipped_extension_raises_transport_error_5055() -> None:
+    """A shipped extension refuses the dev pair with SCP-TRANS-5055, and the SDK
+    raises it as ``TransportError`` with the code preserved and the bridge
+    error as its cause."""
+    from scp_sdk.scp import SCP
+
+    scp = _MockSCP()
+    native = _ShippedDevPairNative()
+    scp._native = native  # type: ignore[assignment]
+    calls = [
+        SCP.node_start_in_memory(scp),  # type: ignore[arg-type]
+        SCP.node_start_local(scp, "/tmp/test-dir", None, "my-secret"),  # type: ignore[arg-type]
+    ]
+    for call in calls:
+        with pytest.raises(ScpError) as raised:
+            await call
+        assert type(raised.value) is TransportError
+        assert raised.value.code == "SCP-TRANS-5055"
+        assert raised.value.__cause__ is native.error
+
+
 # ---------------------------------------------------------------------------
 # enable_site_projection validation (#1405)
 # ---------------------------------------------------------------------------
@@ -803,6 +851,29 @@ async def test_node_start_starts_and_stops_a_node_on_the_extension(
         assert node.relay_port > 0
         assert node.relay_url.startswith("ws://127.0.0.1:")
         assert node.is_shutdown is False
+    finally:
+        await node.shutdown()
+    assert node.is_shutdown is True
+
+
+@pytest.mark.asyncio
+async def test_dev_pair_starts_a_node_on_the_testing_extension(
+    scp: Any, operator: Identity, tmp_path: Path
+) -> None:
+    """The SDK suite runs against an extension built with ``testing``, where the
+    dev pair still starts a node (SCP-327 cuts it only from shipped builds)."""
+    node = await scp.node_start_in_memory()
+    try:
+        assert node.did.startswith("did:")
+        assert node.relay_port > 0
+    finally:
+        await node.shutdown()
+    assert node.is_shutdown is True
+
+    node = await scp.node_start_local(str(tmp_path / "node"), operator.did)
+    try:
+        assert node.did == operator.did
+        assert node.relay_port > 0
     finally:
         await node.shutdown()
     assert node.is_shutdown is True

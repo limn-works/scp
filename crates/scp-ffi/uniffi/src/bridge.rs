@@ -17061,11 +17061,14 @@ impl Scp {
         crate::server::node_start_on(&self.inner, config).await
     }
 
-    /// Per-instance equivalent of the free-function `node_start_in_memory`.
+    /// Starts a development node on encrypted in-memory storage.
     ///
-    /// Starts an in-memory application node. If `identity` is supplied, it
-    /// must have been minted by this `Scp` (cross-instance handles are
-    /// rejected via the `CoreFields::check_handle` call).
+    /// **Development only** (SCP-327): a library built with `testing` starts
+    /// the node; a shipped library returns `SCP-TRANS-5055`
+    /// (`DevStartUnavailable`) and starts nothing. Production callers use
+    /// `node_start`. If `identity` is supplied, it must have been minted by
+    /// this `Scp` (cross-instance handles are rejected via the
+    /// `CoreFields::check_handle` call) on either build.
     #[cfg(feature = "server")]
     pub async fn node_start_in_memory(
         &self,
@@ -17080,10 +17083,13 @@ impl Scp {
         crate::server::node_start_in_memory_on(&self.inner, identity).await
     }
 
-    /// Per-instance equivalent of the free-function `node_start_local`.
+    /// Starts a development node on this instance's own storage.
     ///
-    /// Starts a file-backed application node at `data_dir`. If `identity`
-    /// is supplied, it must have been minted by this `Scp`.
+    /// **Development only** (SCP-327): a library built with `testing` starts
+    /// the node, keeping its blobs and any generated key under `data_dir`; a
+    /// shipped library returns `SCP-TRANS-5055` (`DevStartUnavailable`) and
+    /// creates nothing. Production callers use `node_start`. If `identity` is
+    /// supplied, it must have been minted by this `Scp`.
     #[cfg(feature = "server")]
     pub async fn node_start_local(
         &self,

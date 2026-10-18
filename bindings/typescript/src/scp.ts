@@ -4392,6 +4392,17 @@ export class SCP {
     }
   }
 
+  /**
+   * Starts a development node on encrypted in-memory storage.
+   *
+   * Development only: an addon built with the bridge's `testing` feature
+   * starts the node; a shipped addon starts nothing. Production callers use
+   * {@link SCP.nodeStart}.
+   *
+   * @throws {TransportError} `SCP-TRANS-5055` on a shipped addon.
+   * @throws The typed error of any other code the bridge returns, with the
+   *   code preserved.
+   */
   async nodeStartInMemory(identityDid?: string | null): Promise<Node> {
     try {
       const raw = await (this.#native.nodeStartInMemory as (d: string | null) => Promise<unknown>)(
@@ -4404,6 +4415,18 @@ export class SCP {
     }
   }
 
+  /**
+   * Starts a development node on this instance's own storage.
+   *
+   * Development only: an addon built with the bridge's `testing` feature
+   * starts the node, keeping its blobs and any generated key under
+   * `dataDir`; a shipped addon creates nothing. Production callers use
+   * {@link SCP.nodeStart}.
+   *
+   * @throws {TransportError} `SCP-TRANS-5055` on a shipped addon.
+   * @throws The typed error of any other code the bridge returns, with the
+   *   code preserved.
+   */
   async nodeStartLocal(
     dataDir: string,
     identityDid?: string | null,

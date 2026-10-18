@@ -3719,19 +3719,48 @@ class SCP:
         return Node(raw)
 
     async def node_start_in_memory(self, identity_did: str | None = None) -> Node:
-        """Delegate to ``_scp_core.SCP.node_start_in_memory`` (returns :class:`Node`)."""
+        """Start a development node on encrypted in-memory storage.
 
-        raw = await asyncio.to_thread(self._native.node_start_in_memory, identity_did)
+        Development only: an extension built with the bridge's ``testing``
+        feature starts the node; a shipped extension starts nothing and raises
+        ``TransportError`` with ``SCP-TRANS-5055``. Production callers use
+        :meth:`node_start`.
+
+        Raises:
+            TransportError: ``SCP-TRANS-5055`` on a shipped extension.
+            ScpError: the typed error of any other code the bridge raises,
+                with the code preserved.
+        """
+
+        try:
+            raw = await asyncio.to_thread(self._native.node_start_in_memory, identity_did)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Node(raw)
 
     async def node_start_local(
         self, data_dir: str, identity_did: str | None = None, passphrase: str | None = None
     ) -> Node:
-        """Delegate to ``_scp_core.SCP.node_start_local`` (returns :class:`Node`)."""
+        """Start a development node on this instance's own storage.
 
-        raw = await asyncio.to_thread(
-            self._native.node_start_local, data_dir, identity_did, passphrase
-        )
+        Development only: an extension built with the bridge's ``testing``
+        feature starts the node, keeping its blobs and any generated key under
+        ``data_dir``; a shipped extension creates nothing and raises
+        ``TransportError`` with ``SCP-TRANS-5055``. Production callers use
+        :meth:`node_start`.
+
+        Raises:
+            TransportError: ``SCP-TRANS-5055`` on a shipped extension.
+            ScpError: the typed error of any other code the bridge raises,
+                with the code preserved.
+        """
+
+        try:
+            raw = await asyncio.to_thread(
+                self._native.node_start_local, data_dir, identity_did, passphrase
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Node(raw)
 
     async def relay_start_in_memory(self) -> Relay:

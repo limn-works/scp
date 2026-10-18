@@ -1,12 +1,14 @@
 //! Shared relay and application node startup code for FFI bridges.
 //!
-//! Provides [`RunningRelay`] for standalone relay startup and
-//! [`start_node_in_memory`] / [`start_node_local`] for full application node
-//! startup. Both bind with sensible defaults and expose bound addresses for
-//! FFI consumers. All functions bind to `127.0.0.1:0` (OS-assigned port) so
-//! tests can run in parallel without port conflicts.
+//! Provides [`RunningRelay`] for standalone relay startup, [`node_start`] for
+//! production node startup from an `SCP` instance, and the development pair
+//! `start_node_in_memory` / `start_node_local`, which compile only under
+//! `test` or `feature = "testing"` (a bridge built without its own `testing`
+//! feature returns [`ServerError::DevStartUnavailable`] from its dev-pair
+//! exports). The relay and dev-pair starts bind `127.0.0.1:0` (OS-assigned
+//! port) so tests can run in parallel without port conflicts.
 //!
-//! [`start_node_local`] does not select or open a protocol-storage backend.
+//! `start_node_local` does not select or open a protocol-storage backend.
 //! A caller selected one when it constructed its bridge instance
 //! (`SCP.with_storage({...})` → `StorageConfig::InMemory` or
 //! `StorageConfig::Sqlite`), and passes that same handle here, so a node's
@@ -40,11 +42,6 @@ use crate::dht::{DhtInitError, FfiDhtClient};
 use crate::node_start_config::{
     FfiBlobBackend, FfiCorsOrigins, FfiDhtMode, FfiNat, FfiReach, FfiTlsMode, NodeStartConfig,
 };
-// `ClientDhtConfig` is only referenced by the production (non-test) fail-closed
-// node DHT client in `start_node_local`; the test-harness build uses the
-// in-memory double instead, so the import would otherwise be unused.
-#[cfg(not(any(test, feature = "testing")))]
-use crate::dht::ClientDhtConfig;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorageBackend, StorageError};
 use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
@@ -67,8 +64,8 @@ pub type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>;
 /// the identity, its DID document, and a configured DID method instance
 /// with signing capability.
 ///
-/// When `Some(NodeIdentity)` is passed to [`start_node_in_memory`] or
-/// [`start_node_local`], the node uses this identity instead of generating
+/// When `Some(NodeIdentity)` is passed to `start_node_in_memory` or
+/// `start_node_local`, the node uses this identity instead of generating
 /// a fresh one. This enables identity portability — the same DID persists
 /// across node restarts and can be shared across FFI bridge instances.
 pub struct NodeIdentity {
@@ -121,10 +118,13 @@ pub enum ServerError {
     #[error("DHT init error: {0}")]
     DhtInit(#[from] DhtInitError),
 
-    /// A node identity auto-generation was requested on a shipped build, where
-    /// the in-memory test-harness node is not compiled (fail-closed; ADR-062).
-    #[error("auto-generated in-memory node identity is unavailable in this build")]
-    AutoGenerateUnavailable,
+    /// A dev-pair constructor (`node_start_in_memory`, `node_start_local`) was
+    /// called on a bridge built without its `testing` feature. The dev pair is
+    /// for development only, so a shipped bridge keeps the exported symbols and
+    /// returns this error from each (sdk-common.md §"Node start error codes",
+    /// `SCP-TRANS-5055`); `node_start` is the production entry.
+    #[error("development node start is unavailable in this build; use node_start")]
+    DevStartUnavailable,
 
     /// A [`NodeStartConfig`](crate::node_start_config::NodeStartConfig) failed
     /// to parse or failed a field check in [`node_start`]. The message names the
@@ -184,8 +184,8 @@ impl ServerError {
                 "passphrase required for persistent node identity".to_owned()
             }
             Self::DhtInit(_) => "DHT client initialization failed".to_owned(),
-            Self::AutoGenerateUnavailable => {
-                "auto-generated in-memory node identity is unavailable in this build".to_owned()
+            Self::DevStartUnavailable => {
+                "development node start is unavailable in this build; use node_start".to_owned()
             }
             // The message names a field and a rule, never a path or an OS error.
             Self::InvalidConfig(msg) => format!("invalid node start config: {msg}"),
@@ -399,7 +399,7 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 // ApplicationNode startup
 // ---------------------------------------------------------------------------
 
-/// Ephemeral storage backend for [`start_node_in_memory`]: a durability-only
+/// Ephemeral storage backend for `start_node_in_memory`: a durability-only
 /// [`InMemoryStorage`] wrapped in an [`EncryptingAdapter`] under a per-node
 /// `OsRng` AES-256-GCM key.
 ///
@@ -411,7 +411,7 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// [`build_event_log_provider`](crate::bridge_runtime::build_event_log_provider).
 /// A bridge instance that selected in-memory storage holds
 /// `Arc<EncryptedInMemoryStorage>`, so a node built here and a node built by
-/// [`start_node_local`] on such an instance carry one `ApplicationNode` type and
+/// `start_node_local` on such an instance carry one `ApplicationNode` type and
 /// land in one [`RunningNode`] variant.
 ///
 /// **Do not copy this key lifetime onto a durable backend.** A per-node `OsRng`
@@ -430,15 +430,19 @@ pub type EncryptedInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
 /// `EncryptedStorage` bound. Nothing on this path reaches
 /// `Node::start_for_testing`.
 ///
-/// When `identity` is `None` (auto-generate): available ONLY in a `testing`
-/// build via a test-harness `ApplicationNode::dev` (in-memory key custody and
-/// an [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
-/// network; its storage is that same encrypted in-memory backend). A shipped
-/// (no-`testing`) build FAILS CLOSED with
-/// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
-/// node (ADR-062 §Decision 1/6); production callers pass an explicit
-/// `Some(NodeIdentity)`. Self-signed TLS (localhost); relay bound to
-/// `127.0.0.1:0` (OS-assigned port).
+/// **Development only.** Alec ruled on 2026-08-10: "start local/start in mem
+/// are for dev. all sdks still expose. we cut them from prod." This body
+/// compiles only under `test` or `feature = "testing"`. Each bridge keeps its
+/// exported `node_start_in_memory` symbol and, built without its own `testing`
+/// feature, returns [`ServerError::DevStartUnavailable`] (`SCP-TRANS-5055`)
+/// without calling here. Production callers use [`node_start`].
+///
+/// When `identity` is `None` (auto-generate), the node is a test-harness
+/// `ApplicationNode::dev` (in-memory key custody and an
+/// [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
+/// network; its storage is that same encrypted in-memory backend).
+/// Self-signed TLS (localhost); relay bound to `127.0.0.1:0` (OS-assigned
+/// port).
 ///
 /// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
 /// identity instead of generating a fresh one. This enables identity
@@ -450,7 +454,7 @@ pub type EncryptedInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
 /// cache, credentials — that its database never receives and that process exit
 /// discards, while that instance's supervisor, event log, and saga journal keep
 /// writing to `SQLCipher`. A caller wanting one backend for both calls
-/// [`start_node_local`] instead; this front door exists for callers who want an
+/// `start_node_local` instead; this front door exists for callers who want an
 /// ephemeral node whatever their instance holds.
 ///
 /// The relay is started during construction. The HTTP server is **not** started;
@@ -460,18 +464,14 @@ pub type EncryptedInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
 ///
 /// Returns [`ServerError::Node`] if relay binding, identity generation, or TLS
 /// provisioning fails.
+#[cfg(any(test, feature = "testing"))]
 pub async fn start_node_in_memory(
     identity: Option<NodeIdentity>,
 ) -> Result<scp_node::ApplicationNode<Arc<EncryptedInMemoryStorage>>, ServerError> {
     let node = match identity {
         // Auto-generate uses the test-harness `ApplicationNode::dev` (in-memory
         // DHT nullifier), compiled only under `testing` (ADR-062 §Decision 1).
-        // A shipped build fails closed rather than running a nullifier-backed
-        // node; callers pass an explicit `Some(NodeIdentity)` in production.
-        #[cfg(any(test, feature = "testing"))]
         None => scp_node::ApplicationNode::dev(0).await?,
-        #[cfg(not(any(test, feature = "testing")))]
-        None => return Err(ServerError::AutoGenerateUnavailable),
         Some(id) => {
             // Migrated to the ADR-052 flat-config front door (Phase B-P2).
             // The dropped explicit `SelfSignedTlsProvider::new("localhost")` is
@@ -529,7 +529,7 @@ pub async fn start_node_in_memory(
 
 /// Logs a warning when `data_dir` holds a `storage/` subdirectory.
 ///
-/// Earlier revisions of [`start_node_local`] opened a plaintext
+/// Earlier revisions of `start_node_local` opened a plaintext
 /// `FilesystemStorage` there. This revision reads no such directory, so one left
 /// behind by an earlier run is plaintext protocol state that no code path opens
 /// and no upgrade converts. Silence would make an operator believe their
@@ -538,6 +538,7 @@ pub async fn start_node_in_memory(
 ///
 /// A warning rather than an error: `storage/` is an ordinary directory name, and
 /// refusing to start would break a caller who put something unrelated there.
+#[cfg(any(test, feature = "testing"))]
 fn warn_on_stale_plaintext_store(data_dir: &Path) {
     let stale = data_dir.join("storage");
     if stale.is_dir() {
@@ -553,7 +554,7 @@ fn warn_on_stale_plaintext_store(data_dir: &Path) {
 
 /// Logs a warning when `data_dir` grants group or other any access on Unix.
 ///
-/// [`start_node_local`] creates `data_dir` at mode `0o700`, and that mode
+/// `start_node_local` creates `data_dir` at mode `0o700`, and that mode
 /// applies only to a directory this call creates. When `data_dir` already
 /// exists, its existing mode stands, so `blobs.redb` — which carries blob
 /// identifiers, sizes, timestamps, and TTLs in plaintext — can land in a
@@ -562,7 +563,7 @@ fn warn_on_stale_plaintext_store(data_dir: &Path) {
 ///
 /// A warning rather than a `chmod`: tightening a directory a caller created
 /// could break an operator who deliberately shares it with a backup account.
-#[cfg(unix)]
+#[cfg(all(unix, any(test, feature = "testing")))]
 fn warn_on_permissive_data_dir(data_dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -585,10 +586,18 @@ fn warn_on_permissive_data_dir(data_dir: &Path) {
 ///
 /// Windows expresses directory access through ACLs rather than through a mode
 /// word, so a mode check has nothing to read there.
-#[cfg(not(unix))]
+#[cfg(all(not(unix), any(test, feature = "testing")))]
 const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
 
 /// Starts a full application node on a caller's own protocol-storage handle.
+///
+/// **Development only**, like `start_node_in_memory`: this body, and with it
+/// the [`FileKeyCustody`] at `<data_dir>/identity.key` that the no-identity
+/// arm builds, compiles only under `test` or `feature = "testing"`. A bridge
+/// built without its own `testing` feature returns
+/// [`ServerError::DevStartUnavailable`] (`SCP-TRANS-5055`) from its exported
+/// `node_start_local` without calling here. Production callers use
+/// [`node_start`].
 ///
 /// A caller chose its storage backend when it constructed its bridge instance
 /// (`SCP.with_storage({...})` — encrypted in-memory or `SQLCipher`), and passes
@@ -652,7 +661,7 @@ const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
 /// fresh DID per process, because that backend keeps nothing across process
 /// exit; a caller whose instance selected `SQLCipher` keeps its DID.
 ///
-/// For fully ephemeral setups use [`start_node_in_memory`].
+/// For fully ephemeral setups use `start_node_in_memory`.
 ///
 /// # Errors
 ///
@@ -664,6 +673,7 @@ const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
 ///   ([`ServerError::MissingPassphrase`]); this check runs before the data
 ///   directory or any file in it is created
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
+#[cfg(any(test, feature = "testing"))]
 pub async fn start_node_local<S>(
     data_dir: &Path,
     storage: S,
@@ -761,19 +771,12 @@ where
             .map_err(std::io::Error::from)??,
         );
 
-        // Build the node's DHT client for its DID method. A shipped build uses
-        // the real Mainline Pkarr client, fail-closed (never an in-memory
-        // substitution; ADR-062 §Decision 1) — the node's dht gateways would
-        // thread in here; the local path uses direct Mainline DHT (no gateways).
-        // A test-harness build (`testing`) uses the in-memory §17.17.3 double so
+        // Build the node's DHT client for its DID method: the in-memory
+        // §17.17.3 double, because this body compiles only under `testing`, so
         // the startup publish stays offline instead of timing out against live
         // Mainline. `Node::start` publishes, and fails on a failed publish,
-        // because this call selects `DhtMode::Production` below; it skips the
-        // publish under `DhtMode::Disabled`. The client backs both this node's DID
-        // publication and its `did:dht` resolution.
-        #[cfg(not(any(test, feature = "testing")))]
-        let dht_client = Arc::new(ClientDhtConfig::default().into_client()?);
-        #[cfg(any(test, feature = "testing"))]
+        // because this call selects `DhtMode::Production` below. The client
+        // backs both this node's DID publication and its `did:dht` resolution.
         let dht_client = Arc::new(FfiDhtClient::InMemory(scp_dht::InMemoryDhtClient::new()));
         let cache = Arc::new(DidCache::new());
         let sign_fn = ConcreteDidMethod::make_sign_fn(Arc::clone(&key_custody));
@@ -1143,18 +1146,18 @@ pub async fn node_start(
 /// can hold: an encrypted in-memory handle and a `SQLCipher` handle. Each
 /// mirrors one arm of a bridge's `StorageConfig` selector, so no third arm can
 /// appear here without a matching selector arm a caller can choose.
-/// [`start_node_in_memory`] builds its own encrypted in-memory handle and lands
+/// `start_node_in_memory` builds its own encrypted in-memory handle and lands
 /// in that first variant, because both handles carry one type.
 ///
 /// [`RunningRelay`] established this pattern — shared in `scp-ffi-common` so
 /// each FFI bridge wraps one enum rather than duplicating it and its dispatch
 /// methods.
 pub enum RunningNode {
-    /// An encrypted in-memory handle: either one [`start_node_in_memory`]
-    /// builds for itself, or one [`start_node_local`] receives from a
+    /// An encrypted in-memory handle: either one `start_node_in_memory`
+    /// builds for itself, or one `start_node_local` receives from a
     /// `StorageConfig::InMemory` bridge instance. Both are ephemeral.
     InMemoryEncrypted(scp_node::ApplicationNode<Arc<EncryptedInMemoryStorage>>),
-    /// A caller's `SQLCipher` handle, produced by [`start_node_local`] on a
+    /// A caller's `SQLCipher` handle, produced by `start_node_local` on a
     /// `StorageConfig::Sqlite` bridge instance.
     Sqlite(scp_node::ApplicationNode<Arc<SqliteStorage>>),
 }

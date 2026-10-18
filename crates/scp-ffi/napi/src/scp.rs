@@ -4324,7 +4324,12 @@ impl Scp {
         crate::server::relay_start_local_on(&self.inner, data_dir).await
     }
 
-    /// Per-instance equivalent of the free-function `node_start_in_memory`.
+    /// Starts a development node on encrypted in-memory storage.
+    ///
+    /// **Development only** (SCP-327): an addon built with `testing` starts
+    /// the node; a shipped addon rejects with `SCP-TRANS-5055`
+    /// (`DevStartUnavailable`) and starts nothing. Production callers use
+    /// `nodeStart`.
     #[napi(js_name = "nodeStartInMemory")]
     pub async fn node_start_in_memory(
         &self,
@@ -4333,7 +4338,12 @@ impl Scp {
         crate::server::node_start_in_memory_on(&self.inner, identity_did).await
     }
 
-    /// Per-instance equivalent of the free-function `node_start_local`.
+    /// Starts a development node on this instance's own storage.
+    ///
+    /// **Development only** (SCP-327): an addon built with `testing` starts
+    /// the node; a shipped addon rejects with `SCP-TRANS-5055`
+    /// (`DevStartUnavailable`) and creates nothing under `data_dir`.
+    /// Production callers use `nodeStart`.
     #[napi(js_name = "nodeStartLocal")]
     pub async fn node_start_local(
         &self,
