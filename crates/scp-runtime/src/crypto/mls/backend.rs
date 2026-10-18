@@ -51,6 +51,7 @@ use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::DecryptedContent;
 use scp_mls::error::MlsError;
 use scp_mls::group::ScpMlsGroup;
+use scp_protocol::crypto::hpke::p256::P256Point;
 
 // ---------------------------------------------------------------------------
 // Wrapper output types
@@ -337,6 +338,23 @@ pub trait MlsBackend: Send + Sync {
         draft: KeyPackageDraft,
         signature: [u8; 64],
     ) -> Result<GeneratedKeyPackage, MlsError>;
+
+    /// Returns the `0xFF01` `scp_wrapping_key` (§9.16.1) of the `KeyPackage`
+    /// that `signer_state` was generated for, read from the signer state's own
+    /// locally built `KeyPackageBundle`, or `None` when that leaf carries no
+    /// `0xFF01`. It parses no externally supplied `KeyPackage` and runs no
+    /// lifetime check, so a reservation's key reads the same whenever it is
+    /// asked.
+    ///
+    /// # Errors
+    ///
+    /// See [`MlsError`]: an unreadable signer state, a signer state with no
+    /// bundle for its own `KeyPackage`, or an `0xFF01` that is not a valid
+    /// P-256 point.
+    async fn reserved_wrapping_key(
+        &self,
+        signer_state: &SignerState,
+    ) -> Result<Option<P256Point>, MlsError>;
 
     /// Joins a group from a TLS-serialized MLS Welcome message using the
     /// opaque `signer_state` previously returned by `finish_key_package`.

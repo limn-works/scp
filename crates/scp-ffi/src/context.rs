@@ -1224,7 +1224,7 @@ impl PyContextParams {
 /// it from the field names plus one example, with no positional-argument
 /// footgun. Mirrors the runtime wire type
 /// [`SealedInvitation`](scp_core::context::invitation_helpers::SealedInvitation):
-/// `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and `ciphertext` is
+/// `enc` is the RFC 9180 DHKEM(P-256) encapsulated key (65 bytes) and `ciphertext` is
 /// the HPKE ciphertext (`ct = ciphertext || tag`) of the serialized, signed
 /// `InvitationBundle`. Both are opaque bytes — the joiner does not interpret
 /// them; the runtime opens the bundle and authenticates it.
@@ -1235,8 +1235,9 @@ pub struct PySealedInvitation {
     context_id: String,
     /// Binding hint: the creator DID the bundle was sealed by.
     creator_did: String,
-    /// RFC 9180 HPKE encapsulated key (`enc`). Length is validated to be
-    /// exactly 32 bytes at the join boundary (fail-closed).
+    /// RFC 9180 DHKEM(P-256) encapsulated key (`enc`): a 65-byte
+    /// uncompressed point. The join validates it before any custody call
+    /// (spec 09 §9.16.2, fail-closed).
     enc: Vec<u8>,
     /// RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`).
     ciphertext: Vec<u8>,
@@ -3209,14 +3210,6 @@ impl crate::scp::PyScp {
         // KeyPackage is consumed.
         let local_pseudonym = derive_member_pseudonym(py, bi, &owning_did, &sealed.context_id)?;
 
-        // Fail-closed: the HPKE encapsulated key (`enc`) MUST be exactly 32
-        // bytes. Reject a malformed length BEFORE any registry mutation or the
-        // irreversible KeyPackage consume, rather than letting a short/long
-        // buffer fail deep inside the HPKE open.
-        let sealed_bundle_enc =
-            scp_ffi_common::custody_parse::expect_32("sealed_bundle_enc", &sealed.enc)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
         // Reconstruct the opaque reservation id via its sanctioned transparent
         // serde form (a bare string): the id round-trips through the FFI as a
         // string. It is a lookup key, not a capability — a bogus id simply fails
@@ -3232,15 +3225,14 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
 
-        // Resolve the joiner's OWN custody provider + `#active` KeyHandle (the
-        // same locally-custodied identity the pseudonym was derived from). The
-        // runtime needs these to open the sealed bundle and drive the join under
-        // the joiner's key material — private keys never cross the FFI, only the
-        // opaque custody handle + KeyHandle do (ADR-006).
-        let (custody, active_handle) = crate::runtime::with_identity(bi, &owning_did, |entry| {
-            Ok((entry.custody.clone(), entry.identity.active_signing_key))
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Resolve the joiner's OWN custody provider (the same locally-custodied
+        // identity the pseudonym was derived from). The runtime opens the
+        // sealed bundle with `dh_agree` on the identity's wrapping key handle
+        // in this custody; no private key crosses the FFI (ADR-006, spec 09
+        // §9.16.2).
+        let custody =
+            crate::runtime::with_identity(bi, &owning_did, |entry| Ok(entry.custody.clone()))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         // A pre-existing FFI-state entry for this id fails the join here, before
         // `spawn_actor_from_welcome` consumes the single-use `KeyPackage`, and
@@ -3253,7 +3245,7 @@ impl crate::scp::PyScp {
         let req = scp_core::context::supervisor::WelcomeJoinRequest {
             creator_did: scp_did::DID(sealed.creator_did.clone()),
             context_id: sealed.context_id.clone(),
-            sealed_bundle_enc,
+            sealed_bundle_enc: sealed.enc.clone(),
             sealed_bundle_ct: sealed.ciphertext.clone(),
             reservation_id: reservation,
             local_pseudonym: Some(local_pseudonym),
@@ -3263,11 +3255,12 @@ impl crate::scp::PyScp {
         // register the context actor. Nothing is registered on this bridge
         // before the spawn succeeds, so a failed spawn leaves the id's bridge
         // state and release mark as they were.
-        // A typed custody failure keeps its custody code (a destroyed
-        // `#active` key is `SCP-CRYPTO-4006`) through `typed_supervisor_failure`.
+        // A typed custody failure keeps its custody code (a wrapping key the
+        // custody cannot agree with is `SCP-CRYPTO-4006`) through
+        // `typed_supervisor_failure`.
         let joined = crate::actor_wait::block_on_released(
             py,
-            sup.spawn_actor_from_welcome(owning, &*custody, &active_handle, req),
+            sup.spawn_actor_from_welcome(owning, &*custody, req),
         )?
         .map_err(|e| typed_supervisor_failure("context_join_from_welcome", &e))?;
 
@@ -6956,13 +6949,12 @@ mod tests {
                 inner: std::sync::Arc::clone(&bi_arc),
             };
             let err = Python::with_gil(|_py| {
-                // A well-formed 32-byte `enc` so the failure isolates the custody
-                // gate (which runs BEFORE the enc-length check), not a length
-                // rejection.
+                // A valid 65-byte P-256 `enc`, so the failure isolates the
+                // custody gate rather than the runtime's enc validation.
                 let sealed = __sealed(
                     &"0".repeat(64),
                     "did:dht:z6MkSomeCreator",
-                    vec![0u8; 32],
+                    scp_crypto::p256::testing::valid_uncompressed_point(1).to_vec(),
                     b"not-a-real-bundle".to_vec(),
                 );
                 scp.context_join_from_welcome(
@@ -6981,52 +6973,53 @@ mod tests {
         });
     }
 
-    /// ADR-049 Phase 2J / FFI-02 Option A (reshape): the reshaped
-    /// `context_join_from_welcome` no longer takes caller `params`, so there is
-    /// no `mode` field to inspect — broadcast rejection moved INSIDE the runtime
-    /// (a broadcast context carries no MLS Welcome, spec §5.14, so it fails at
-    /// the fused `ConfirmConsume`). The NEW bridge-level fail-closed boundary is
-    /// the HPKE `enc` length: it MUST be exactly 32 bytes (RFC 9180 X25519
-    /// encapsulated key). A wrong-length `enc` is rejected BEFORE the irreversible
-    /// `KeyPackage` consume.
+    /// Spec 09 §9.16.2 Open step 1: the join validates the HPKE `enc` as a
+    /// 65-byte uncompressed P-256 point before any custody call or the
+    /// irreversible `KeyPackage` consume. The bridge passes `enc` through
+    /// unchanged; the runtime's rejection reaches the caller and the failed
+    /// join leaves no FFI state.
     ///
-    /// Not false-green: a locally-custodied joiner is used so the custody gate
-    /// SUCCEEDS and control reaches the enc-length check; were that check removed,
-    /// the malformed `enc` would instead fail deep inside the HPKE open with a
-    /// different message, not the exact "expected 32" surfaced here.
+    /// Each §9.5 must-fail form is driven through the real entry point with a
+    /// locally-custodied joiner, so the custody gate passes. Were the runtime
+    /// check removed, every row would instead fail at the bogus reservation
+    /// with a different message, not "invitation enc".
     #[test]
     #[cfg(feature = "testing")]
-    fn context_join_from_welcome_rejects_non_32_byte_enc() {
+    fn context_join_from_welcome_rejects_a_malformed_enc() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
         Python::with_gil(|py| {
             let scp = crate::scp::PyScp::new_in_memory_for_test();
-
-            // Locally-custodied joiner so the pseudonym-derivation custody gate
-            // passes and control reaches the fail-closed enc-length check.
+            let bi = Arc::clone(&scp.inner);
             let joiner = scp.identity_create(py, "in_memory", None).unwrap();
             let joiner_did = joiner.did().to_owned();
+            let ctx_id = "c".repeat(64);
 
-            // 31-byte `enc` — one short of the required 32.
-            let sealed = __sealed(
-                &"c".repeat(64),
-                "did:dht:z6MkEncLenCreator",
-                vec![0u8; 31],
-                b"bogus-ciphertext".to_vec(),
-            );
-            let err = scp
-                .context_join_from_welcome(
-                    py,
-                    joiner_did,
-                    sealed,
-                    "bogus-reservation-id".to_owned(),
-                )
-                .expect_err("a non-32-byte HPKE enc must be rejected at the bridge boundary")
-                .to_string();
-            assert!(
-                err.contains("expected 32"),
-                "expected a fail-closed 32-byte enc-length rejection, got: {err}"
-            );
+            for (name, enc) in scp_crypto::p256::testing::invalid_point_encodings(2) {
+                let sealed = __sealed(
+                    &ctx_id,
+                    "did:dht:z6MkEncLenCreator",
+                    enc,
+                    b"bogus-ciphertext".to_vec(),
+                );
+                let err = scp
+                    .context_join_from_welcome(
+                        py,
+                        joiner_did.clone(),
+                        sealed,
+                        "bogus-reservation-id".to_owned(),
+                    )
+                    .expect_err("a malformed HPKE enc must be rejected")
+                    .to_string();
+                assert!(
+                    err.contains("invitation enc"),
+                    "{name}: expected the runtime's enc rejection, got: {err}"
+                );
+                assert!(
+                    crate::runtime::with_ffi_state(&bi, &ctx_id, |_| Ok(())).is_err(),
+                    "{name}: FFI state must NOT survive a failed join"
+                );
+            }
         });
     }
 
@@ -7068,13 +7061,12 @@ mod tests {
                     in_flight: false,
                 },
             );
-            // A well-formed 32-byte `enc` passes the bridge enc-length check, so
-            // the failure is the runtime join itself (bogus reservation +
-            // ciphertext).
+            // A valid 65-byte P-256 `enc`, so the failure is the runtime join
+            // itself (bogus reservation + ciphertext).
             let sealed = __sealed(
                 &ctx_id,
                 "did:dht:z6MkRollbackCreator",
-                vec![0u8; 32],
+                scp_crypto::p256::testing::valid_uncompressed_point(3).to_vec(),
                 b"bogus-bundle-ciphertext".to_vec(),
             );
 
@@ -7115,14 +7107,17 @@ mod tests {
         });
     }
 
-    /// A join whose `#active` key custody no longer holds fails at the
-    /// runtime's invitation KEM agreement (the first step of the join) with a
-    /// typed custody failure, which the bridge reports as `SCP-CRYPTO-4006`
-    /// through `typed_supervisor_failure` and still rolls its reversible state
-    /// back.
+    /// A join whose custody no longer holds the identity's wrapping key fails
+    /// at the runtime's custody check of that key (spec 09 §9.16.2 Open step
+    /// 2) with a typed custody failure, which the bridge reports as
+    /// `SCP-CRYPTO-4006` through `typed_supervisor_failure`, and still rolls
+    /// its reversible state back.
+    ///
+    /// The reservation is real, so the join reaches the custody call; the
+    /// wrapping key is destroyed after the reservation loaded it.
     #[test]
     #[cfg(feature = "testing")]
-    fn join_from_welcome_with_a_destroyed_active_key_is_crypto_4006() {
+    fn join_from_welcome_with_a_destroyed_wrapping_key_is_crypto_4006() {
         use scp_platform::KeyCustody as _;
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
@@ -7131,33 +7126,40 @@ mod tests {
             let bi = Arc::clone(&scp.inner);
             let joiner = scp.identity_create(py, "in_memory", None).unwrap();
             let joiner_did = joiner.did().to_owned();
-            let (custody, active) = crate::runtime::with_identity(&bi, &joiner_did, |entry| {
-                Ok((
-                    Arc::clone(&entry.custody),
-                    entry.identity.active_signing_key,
-                ))
+            let (reservation, _kp) = scp
+                .reserve_key_package(py, &joiner_did)
+                .expect("the joiner reserves a KeyPackage");
+            let custody = crate::runtime::with_identity(&bi, &joiner_did, |entry| {
+                Ok(Arc::clone(&entry.custody))
             })
             .expect("registered identity");
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            let owner = scp_did::DID(joiner_did.clone());
             crate::runtime()
                 .unwrap()
-                .block_on(custody.destroy_key(&active))
+                .block_on(async {
+                    let wrapping = sup.wrapping_public_key(&owner).await.unwrap();
+                    for id in 0..64 {
+                        let handle = scp_platform::KeyHandle::new(id);
+                        let held = custody.public_key(&handle).await;
+                        if held.is_ok_and(|pk| pk.as_bytes() == &wrapping[..]) {
+                            return custody.destroy_key(&handle).await;
+                        }
+                    }
+                    panic!("the wrapping key is not among the custody's first 64 handles");
+                })
                 .expect("destroy_key should succeed");
 
             let ctx_id = "b".repeat(64);
             let sealed = __sealed(
                 &ctx_id,
-                "did:dht:z6MkDestroyedActiveCreator",
-                vec![0u8; 32],
+                "did:dht:z6MkDestroyedWrappingCreator",
+                scp_crypto::p256::testing::valid_uncompressed_point(5).to_vec(),
                 b"bogus-bundle-ciphertext".to_vec(),
             );
             let err = scp
-                .context_join_from_welcome(
-                    py,
-                    joiner_did,
-                    sealed,
-                    "bogus-reservation-id".to_owned(),
-                )
-                .expect_err("a join under a destroyed #active key must fail")
+                .context_join_from_welcome(py, joiner_did, sealed, reservation)
+                .expect_err("a join under a destroyed wrapping key must fail")
                 .to_string();
             assert!(
                 err.contains("SCP-CRYPTO-4006"),
@@ -7198,13 +7200,12 @@ mod tests {
             crate::runtime::register_context(&bi, &ctx_id, "did:dht:z6MkOccupiedCreator", &[])
                 .unwrap();
 
-            // A well-formed 32-byte `enc` so control passes the bridge
-            // enc-length check and reaches the occupancy check (which runs
-            // BEFORE the KeyPackage consume).
+            // A valid 65-byte P-256 `enc`, so the only defect is the occupied
+            // slot, checked BEFORE the KeyPackage consume.
             let sealed = __sealed(
                 &ctx_id,
                 "did:dht:z6MkOccupiedCreator",
-                vec![0u8; 32],
+                scp_crypto::p256::testing::valid_uncompressed_point(4).to_vec(),
                 b"bogus-bundle-ciphertext".to_vec(),
             );
 
@@ -7424,7 +7425,9 @@ mod tests {
             })
             .unwrap();
             assert_eq!(
-                verified.expect("the attestation verifies against the identity's #active key"),
+                *verified
+                    .expect("the attestation verifies against the identity's #active key")
+                    .as_bytes(),
                 custody_wrap.expect("the identity has a custody wrapping key"),
                 "0xFF01 is the identity's custody wrapping key"
             );

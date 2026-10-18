@@ -1101,7 +1101,7 @@ pub struct NapiKeyPackageReservation {
 /// named-field object per the agent-first API tenet, mirroring the `PyO3`
 /// reference bridge's `PySealedInvitation` and the runtime wire type
 /// [`SealedInvitation`](scp_core::context::invitation_helpers::SealedInvitation):
-/// `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and `ciphertext` is
+/// `enc` is the RFC 9180 DHKEM(P-256) encapsulated key (65 bytes) and `ciphertext` is
 /// the HPKE ciphertext (`ct = ciphertext || tag`) of the serialized, signed
 /// `InvitationBundle`. Both are opaque bytes — the joiner does not interpret
 /// them; the runtime opens the bundle and authenticates it. `context_id` /
@@ -1113,8 +1113,9 @@ pub struct NapiSealedInvitation {
     pub context_id: String,
     /// Binding hint: the creator DID the bundle was sealed by.
     pub creator_did: String,
-    /// RFC 9180 HPKE encapsulated key (`enc`). Length is validated to be
-    /// exactly 32 bytes at the join boundary (fail-closed).
+    /// RFC 9180 DHKEM(P-256) encapsulated key (`enc`): a 65-byte
+    /// uncompressed point. The join validates it before any custody call
+    /// (spec 09 §9.16.2, fail-closed).
     pub enc: Vec<u8>,
     /// RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`).
     pub ciphertext: Vec<u8>,
@@ -1408,20 +1409,6 @@ pub(crate) async fn context_join_from_welcome_on(
     let local_pseudonym =
         derive_member_pseudonym_required(bi, &owning_did, &sealed.context_id).await?;
 
-    // Fail-closed: the HPKE encapsulated key (`enc`) MUST be exactly 32 bytes.
-    // Reject a malformed length BEFORE any registry mutation or the irreversible
-    // KeyPackage consume, rather than letting a short/long buffer fail deep
-    // inside the HPKE open.
-    let sealed_bundle_enc =
-        scp_ffi_common::custody_parse::expect_32("sealed_bundle_enc", &sealed.enc).map_err(
-            |e| {
-                NapiError::from(ScpNapiError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7005.to_owned(),
-                })
-            },
-        )?;
-
     // Reconstruct the opaque reservation id via its sanctioned transparent serde
     // form (a bare string). It is a lookup key, not a capability — a bogus id
     // simply fails the fused consume match downstream, it grants nothing. Parsed
@@ -1447,10 +1434,10 @@ pub(crate) async fn context_join_from_welcome_on(
 
     // Resolve the joiner's OWN custody provider + `#active` KeyHandle (the same
     // locally-custodied identity the pseudonym was derived from). The runtime
-    // needs these to open the sealed bundle and drive the join under the joiner's
-    // key material — private keys never cross the FFI, only the opaque custody
-    // handle + KeyHandle do (ADR-006). Retained (custody `Arc` cloned,
-    // `KeyHandle` is `Copy`) so the returned handle can sign subsequent ops.
+    // opens the sealed bundle with `dh_agree` on the identity's wrapping key
+    // handle in this custody; no private key crosses the FFI (ADR-006, spec 09
+    // §9.16.2). Both are retained (custody `Arc` cloned, `KeyHandle` is `Copy`)
+    // so the returned handle can sign subsequent ops.
     let (custody, active_handle) = crate::runtime::with_identity(bi, &owning_did, |entry| {
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })
@@ -1475,7 +1462,7 @@ pub(crate) async fn context_join_from_welcome_on(
     let req = scp_core::context::supervisor::WelcomeJoinRequest {
         creator_did: DID(sealed.creator_did.clone()),
         context_id: sealed.context_id.clone(),
-        sealed_bundle_enc,
+        sealed_bundle_enc: sealed.enc.clone(),
         sealed_bundle_ct: sealed.ciphertext.clone(),
         reservation_id: reservation,
         local_pseudonym: Some(local_pseudonym),
@@ -1487,14 +1474,15 @@ pub(crate) async fn context_join_from_welcome_on(
     // discovery entry) back so an errored join leaves no orphaned bridge state
     // beside a runtime that never committed.
     let core_handle = match sup
-        .spawn_actor_from_welcome(DID(owning_did.clone()), &*custody, &active_handle, req)
+        .spawn_actor_from_welcome(DID(owning_did.clone()), &*custody, req)
         .await
     {
         Ok(handle) => handle,
         Err(e) => {
             crate::runtime::remove_context(bi, &sealed.context_id);
-            // A typed custody failure keeps its custody code (a destroyed
-            // `#active` key is `SCP-CRYPTO-4006`) through `typed_supervisor_failure`.
+            // A typed custody failure keeps its custody code (a wrapping key
+            // the custody cannot agree with is `SCP-CRYPTO-4006`) through
+            // `typed_supervisor_failure`.
             return Err(NapiError::from(typed_supervisor_failure(
                 "context_join_from_welcome",
                 codes::CTX_2013,
@@ -6022,12 +6010,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_from_welcome_rejects_non_locally_custodied_joiner() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        // A well-formed 32-byte `enc` so the failure isolates the custody gate
-        // (which runs BEFORE the enc-length check), not a length rejection.
+        // A valid 65-byte P-256 `enc`, so the failure isolates the custody
+        // gate rather than the runtime's enc validation.
         let sealed = super::NapiSealedInvitation {
             context_id: "0".repeat(64),
             creator_did: "did:dht:z6MkSomeNapiCreator".to_owned(),
-            enc: vec![0u8; 32],
+            enc: scp_crypto::p256::testing::valid_uncompressed_point(1).to_vec(),
             ciphertext: b"not-a-real-bundle".to_vec(),
         };
         let Err(err) = super::context_join_from_welcome_on(
@@ -6048,49 +6036,50 @@ mod tests {
         );
     }
 
-    /// ADR-049 Phase 2J / FFI-02 Option A (reshape): the reshaped
-    /// `context_join_from_welcome` no longer takes caller `params`, so there is no
-    /// `mode` field to inspect — broadcast rejection moved INSIDE the runtime (a
-    /// broadcast context carries no MLS Welcome, spec §5.14, so it fails at the
-    /// fused `ConfirmConsume`). The NEW bridge-level fail-closed boundary is the
-    /// HPKE `enc` length: it MUST be exactly 32 bytes (RFC 9180 X25519
-    /// encapsulated key). A wrong-length `enc` is rejected BEFORE the irreversible
-    /// `KeyPackage` consume.
+    /// Spec 09 §9.16.2 Open step 1: the join validates the HPKE `enc` as a
+    /// 65-byte uncompressed P-256 point before any custody call or the
+    /// irreversible `KeyPackage` consume. The bridge passes `enc` through
+    /// unchanged; the runtime's rejection reaches the caller and the failed
+    /// join leaves no FFI state.
     ///
-    /// Not false-green: a locally-custodied joiner is used so the custody gate
-    /// SUCCEEDS and control reaches the enc-length check; were that check removed,
-    /// the malformed `enc` would instead fail deep inside the HPKE open with a
-    /// different message, not the exact "expected 32" surfaced here.
+    /// Each §9.5 must-fail form is driven through the real entry point with a
+    /// locally-custodied joiner, so the custody gate passes. Were the runtime
+    /// check removed, every row would instead fail at the bogus reservation
+    /// with a different message, not "invitation enc".
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn context_join_from_welcome_rejects_non_32_byte_enc() {
+    async fn context_join_from_welcome_rejects_a_malformed_enc() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        // Locally-custodied joiner so the pseudonym-derivation custody gate passes
-        // and control reaches the fail-closed enc-length check.
         let joiner_did = register_in_memory_joiner(&bi).await;
+        let ctx_id = "c".repeat(64);
 
-        // 31-byte `enc` — one short of the required 32.
-        let sealed = super::NapiSealedInvitation {
-            context_id: "c".repeat(64),
-            creator_did: "did:dht:z6MkNapiEncLenCreator".to_owned(),
-            enc: vec![0u8; 31],
-            ciphertext: b"bogus-ciphertext".to_vec(),
-        };
-        let Err(err) = super::context_join_from_welcome_on(
-            &bi,
-            joiner_did,
-            sealed,
-            "bogus-reservation-id".to_owned(),
-        )
-        .await
-        else {
-            panic!("a non-32-byte HPKE enc must be rejected at the bridge boundary");
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("expected 32"),
-            "expected a fail-closed 32-byte enc-length rejection, got: {msg}"
-        );
+        for (name, enc) in scp_crypto::p256::testing::invalid_point_encodings(2) {
+            let sealed = super::NapiSealedInvitation {
+                context_id: ctx_id.clone(),
+                creator_did: "did:dht:z6MkNapiEncLenCreator".to_owned(),
+                enc,
+                ciphertext: b"bogus-ciphertext".to_vec(),
+            };
+            let Err(err) = super::context_join_from_welcome_on(
+                &bi,
+                joiner_did.clone(),
+                sealed,
+                "bogus-reservation-id".to_owned(),
+            )
+            .await
+            else {
+                panic!("{name}: a malformed HPKE enc must be rejected");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("invitation enc"),
+                "{name}: expected the runtime's enc rejection, got: {msg}"
+            );
+            assert!(
+                crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
+                "{name}: FFI (UCAN) state must NOT survive a failed join"
+            );
+        }
     }
 
     /// ADR-049 Phase 2J (orphaned-success fix): `context_join_from_welcome`
@@ -6119,13 +6108,13 @@ mod tests {
         let _closed_handle = active_handle_for(&bi, &ctx_id, "did:dht:z6MkNapiRollbackCreator");
         crate::runtime::release_context(&bi, &ctx_id);
 
-        // A well-formed 32-byte `enc` passes the bridge enc-length check, so the
-        // failure is the runtime join itself (bogus reservation + ciphertext) —
-        // exactly the register -> spawn seam the rollback guards.
+        // A valid 65-byte P-256 `enc`, so the failure is the runtime join
+        // itself (bogus reservation + ciphertext) — exactly the register ->
+        // spawn seam the rollback guards.
         let sealed = super::NapiSealedInvitation {
             context_id: ctx_id.clone(),
             creator_did: "did:dht:z6MkNapiRollbackCreator".to_owned(),
-            enc: vec![0u8; 32],
+            enc: scp_crypto::p256::testing::valid_uncompressed_point(3).to_vec(),
             ciphertext: b"bogus-bundle-ciphertext".to_vec(),
         };
         let Err(err) = super::context_join_from_welcome_on(
@@ -6391,43 +6380,74 @@ mod tests {
         );
     }
 
-    /// A join whose `#active` key custody no longer holds fails at the
-    /// runtime's invitation KEM agreement (the first step of the join) with a
-    /// typed custody failure, which the bridge reports as `SCP-CRYPTO-4006`
-    /// through `typed_supervisor_failure` and still rolls its reversible state
-    /// back.
+    /// A join whose custody no longer holds the identity's wrapping key fails
+    /// at the runtime's custody check of that key (spec 09 §9.16.2 Open step
+    /// 2) with a typed custody failure, which the bridge reports as
+    /// `SCP-CRYPTO-4006` through `typed_supervisor_failure`, and still rolls
+    /// its reversible state back.
+    ///
+    /// The reservation is real, so the join reaches the custody call; the
+    /// wrapping key is destroyed after the reservation loaded it.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn join_from_welcome_with_a_destroyed_active_key_is_crypto_4006() {
-        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        let joiner_did = register_in_memory_joiner(&bi).await;
-        let (custody, active) = crate::runtime::with_identity(&bi, &joiner_did, |entry| {
-            Ok((entry.custody.clone(), entry.identity.active_signing_key))
-        })
-        .expect("the joiner is registered");
-        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &active)
+    async fn join_from_welcome_with_a_destroyed_wrapping_key_is_crypto_4006() {
+        use scp_platform::traits::KeyCustody as _;
+        // `identity_create` installs the resolver the reservation's
+        // attestation signer reads, as production does.
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let joiner_did = scp
+            .identity_create("in_memory".to_owned(), None)
             .await
-            .expect("destroy_key should succeed");
+            .expect("identity_create succeeds")
+            .inner
+            .did
+            .clone();
+        let reservation = super::reserve_key_package_on(&bi, joiner_did.clone())
+            .await
+            .expect("the joiner reserves a KeyPackage")
+            .reservation_id;
+        let custody =
+            crate::runtime::with_identity(&bi, &joiner_did, |entry| Ok(entry.custody.clone()))
+                .expect("the joiner is registered");
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+        let wrapping = sup
+            .wrapping_public_key(&DID(joiner_did.clone()))
+            .await
+            .expect("the reservation loaded the wrapping key");
+        let mut destroyed = false;
+        for id in 0..64 {
+            let handle = scp_platform::KeyHandle::new(id);
+            let held = custody.public_key(&handle).await;
+            if held.is_ok_and(|pk| pk.as_bytes() == &wrapping[..]) {
+                custody
+                    .destroy_key(&handle)
+                    .await
+                    .expect("destroy_key should succeed");
+                destroyed = true;
+                break;
+            }
+        }
+        assert!(
+            destroyed,
+            "the wrapping key is among the custody's first 64 handles"
+        );
+
         let ctx_id = "b".repeat(64);
         let sealed = super::NapiSealedInvitation {
             context_id: ctx_id.clone(),
-            creator_did: "did:dht:z6MkNapiDestroyedActiveCreator".to_owned(),
-            enc: vec![0u8; 32],
+            creator_did: "did:dht:z6MkNapiDestroyedWrappingCreator".to_owned(),
+            enc: scp_crypto::p256::testing::valid_uncompressed_point(5).to_vec(),
             ciphertext: b"bogus-bundle-ciphertext".to_vec(),
         };
-        let Err(err) = super::context_join_from_welcome_on(
-            &bi,
-            joiner_did,
-            sealed,
-            "bogus-reservation-id".to_owned(),
-        )
-        .await
+        let Err(err) =
+            super::context_join_from_welcome_on(&bi, joiner_did, sealed, reservation).await
         else {
-            panic!("a join under a destroyed #active key must fail");
+            panic!("a join under a destroyed wrapping key must fail");
         };
         assert!(
             err.reason.contains(codes::CRYPTO_4006),
-            "expected CRYPTO_4006 for a destroyed #active key, got: {}",
+            "expected CRYPTO_4006 for a destroyed wrapping key, got: {}",
             err.reason
         );
         assert!(
@@ -6467,7 +6487,7 @@ mod tests {
             .await
             .expect("the attestation verifies against the identity's #active key");
         assert_eq!(
-            wrap,
+            *wrap.as_bytes(),
             sup.wrapping_public_key(&owner)
                 .await
                 .expect("the identity has a custody wrapping key"),
@@ -6495,13 +6515,13 @@ mod tests {
         // Pre-occupy the FFI-state slot for this context id.
         crate::runtime::register_test_context(&bi, &ctx_id);
 
-        // A well-formed 32-byte `enc` so control passes the bridge enc-length
-        // check and reaches the `register_ffi_state` Occupied precheck (which runs
-        // BEFORE the KeyPackage consume).
+        // A valid 65-byte P-256 `enc`, so the only defect is the occupied
+        // slot, checked by the `register_ffi_state` precheck BEFORE the
+        // KeyPackage consume.
         let sealed = super::NapiSealedInvitation {
             context_id: ctx_id.clone(),
             creator_did: "did:dht:z6MkNapiOccupiedCreator".to_owned(),
-            enc: vec![0u8; 32],
+            enc: scp_crypto::p256::testing::valid_uncompressed_point(4).to_vec(),
             ciphertext: b"bogus-bundle-ciphertext".to_vec(),
         };
         let Err(err) = super::context_join_from_welcome_on(

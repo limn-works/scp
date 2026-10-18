@@ -78,8 +78,7 @@ pub fn seal(
 ///
 /// `pkRm` (the recipient public key needed for `kem_context = enc || pkRm`) is
 /// derived internally from `recipient_sk` via the X25519 basepoint
-/// multiplication. For custody-held secrets use
-/// [`custody::open_with_external_dh`] instead.
+/// multiplication.
 ///
 /// # Errors
 ///
@@ -184,55 +183,6 @@ fn decap_and_open(
     let shared_secret = dhkem_extract_and_expand(kem_suite_id(), dh_bytes, &kem_context)?;
     let ks = key_schedule_base(&hpke_suite_id(), &shared_secret, info)?;
     aead_open(&ks, aad, ct)
-}
-
-/// HPKE open paths for recipient keys held inside a `KeyCustody` boundary.
-pub mod custody {
-    use super::{HPKE_ENC_LEN, HpkeError, X25519_LEN, decap_and_open};
-
-    /// Single-shot Base-mode HPKE open where the KEM Diffie-Hellman output was
-    /// computed inside a `KeyCustody` boundary.
-    ///
-    /// RFC 9180 DHKEM Decap is `shared_secret = ExtractAndExpand(dh, enc ||
-    /// pkRm)` where `dh = DH(skR, enc)`. The scalar multiplication `DH(skR,
-    /// enc)` is the only step that must touch the non-extractable recipient
-    /// secret; everything after it (`ExtractAndExpand`, `KeySchedule`, AEAD open)
-    /// is pure. This function takes that custody-computed `dh` plus the
-    /// recipient public key `pkRm` and completes the open in software, so the
-    /// wrapping private key never leaves custody.
-    ///
-    /// # Caller contract (load-bearing — read this)
-    ///
-    /// The ONLY sound inputs are, for one and the same custody key handle `h`
-    /// and one and the same encapsulated key `enc`:
-    ///
-    /// - `dh` = `KeyCustody::dh_agree(h, enc)` — the raw X25519 DH output for
-    ///   `h` against this exact `enc`.
-    /// - `recipient_pk` (`pkRm`) = `KeyCustody::public_key(h)` — the X25519
-    ///   public key of that same handle `h`.
-    /// - `enc` — the exact encapsulated key the seal produced and the same one
-    ///   passed to `dh_agree`.
-    ///
-    /// Same handle, same `enc`, throughout. A mismatched `dh`, `pkRm`, or `enc`
-    /// fails closed (AEAD tag mismatch), but indistinguishably from a
-    /// wrong-key error — there is no separate signal. Binding `enc || pkRm`
-    /// into the shared secret closes the unknown-key-share gap: a ciphertext
-    /// sealed to one recipient cannot be reinterpreted as sealed to another.
-    ///
-    /// # Errors
-    ///
-    /// [`HpkeError::OpenFailed`] if the KDF or AEAD verification fails (wrong
-    /// `dh`/`pkRm`/`enc`/`info`/`aad`, or tampered `ct`).
-    pub fn open_with_external_dh(
-        dh: &[u8; X25519_LEN],
-        recipient_pk: &[u8; 32],
-        enc: &[u8; HPKE_ENC_LEN],
-        info: &[u8],
-        aad: &[u8],
-        ct: &[u8],
-    ) -> Result<Vec<u8>, HpkeError> {
-        decap_and_open(dh, recipient_pk, enc, info, aad, ct)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -345,29 +295,6 @@ mod tests {
         Ok(())
     }
 
-    /// A.1: custody-path open (external DH = `DH(skRm, enc)`) recovers the
-    /// plaintext from the same RFC vector.
-    #[test]
-    fn a1_custody_open_recovers_pt() -> TestResult {
-        let info = hex::decode(A1_INFO)?;
-        let aad = hex::decode(A1_AAD)?;
-        let enc = arr32(A1_PKEM)?;
-        let ct = hex::decode(A1_CT)?;
-        let pk_rm = arr32(A1_PKRM)?;
-
-        // Simulate KeyCustody::dh_agree(handle, enc) = DH(skRm, enc).
-        let sk_rm = StaticSecret::from(arr32(A1_SKRM)?);
-        let dh = sk_rm.diffie_hellman(&X25519Pub::from(enc));
-
-        let pt = custody::open_with_external_dh(dh.as_bytes(), &pk_rm, &enc, &info, &aad, &ct)?;
-        assert_eq!(
-            hex::encode(&pt),
-            A1_PT,
-            "A.1 custody open plaintext mismatch"
-        );
-        Ok(())
-    }
-
     /// Randomized roundtrip: software seal → software open.
     #[test]
     fn roundtrip_seal_open() -> TestResult {
@@ -383,28 +310,6 @@ mod tests {
             let got = open(&sk.to_bytes(), &enc, info, aad, &ct)?;
             assert_eq!(got, pt, "roundtrip len {len}");
         }
-        Ok(())
-    }
-
-    /// Randomized roundtrip: software seal → custody-path open.
-    #[test]
-    fn roundtrip_seal_custody_open() -> TestResult {
-        let sk = StaticSecret::random_from_rng(OsRng);
-        let pk = X25519Pub::from(&sk);
-        let pt = b"the quick brown fox jumps over the lazy dog";
-
-        let (enc, ct) = seal(&pk.to_bytes(), b"info", b"aad", pt)?;
-
-        let dh = sk.diffie_hellman(&X25519Pub::from(enc));
-        let got = custody::open_with_external_dh(
-            dh.as_bytes(),
-            &pk.to_bytes(),
-            &enc,
-            b"info",
-            b"aad",
-            &ct,
-        )?;
-        assert_eq!(got.as_slice(), pt);
         Ok(())
     }
 
@@ -458,31 +363,6 @@ mod tests {
         let pk = X25519Pub::from(&sk);
         let (enc, ct) = seal(&pk.to_bytes(), b"i", b"aad-a", b"secret")?;
         assert!(open(&sk.to_bytes(), &enc, b"i", b"aad-b", &ct).is_err());
-        Ok(())
-    }
-
-    /// Negative: custody open with the wrong `pkRm` (right `dh`) fails — the
-    /// `kem_context` binding catches the mismatch.
-    #[test]
-    fn custody_wrong_pkrm_fails() -> TestResult {
-        let sk = StaticSecret::random_from_rng(OsRng);
-        let pk = X25519Pub::from(&sk);
-        let (enc, ct) = seal(&pk.to_bytes(), b"i", b"a", b"secret")?;
-
-        let dh = sk.diffie_hellman(&X25519Pub::from(enc));
-
-        let wrong_pk = X25519Pub::from(&StaticSecret::random_from_rng(OsRng));
-        assert!(
-            custody::open_with_external_dh(
-                dh.as_bytes(),
-                &wrong_pk.to_bytes(),
-                &enc,
-                b"i",
-                b"a",
-                &ct
-            )
-            .is_err()
-        );
         Ok(())
     }
 }
@@ -595,41 +475,6 @@ mod hpke_rs_oracle {
             let recovered = open(&sk.to_bytes(), &enc_arr, info, aad, &ct)?;
             assert_eq!(recovered.as_slice(), *pt, "case {idx}: plaintext mismatch");
         }
-        Ok(())
-    }
-
-    /// Reference `seal` → our custody-path `open` (external DH). Confirms the
-    /// custody Decap variant interops with the reference too.
-    #[test]
-    fn reference_seal_opens_under_custody() -> TestResult {
-        let (sk, pk) = fresh_keypair();
-        let info = b"scp-broadcast-key-v1";
-        let aad = b"ctx||author||epoch";
-        let pt = b"broadcast key material 32 bytes!";
-
-        let (enc, ct) = ref_hpke()
-            .seal(
-                &HpkePublicKey::new(pk.to_vec()),
-                info,
-                aad,
-                pt,
-                None,
-                None,
-                None,
-            )
-            .map_err(|e| format!("reference seal failed: {e:?}"))?;
-        let enc_arr: [u8; 32] = enc
-            .as_slice()
-            .try_into()
-            .map_err(|_| "reference enc is not 32 bytes")?;
-
-        // Simulate KeyCustody::dh_agree(handle, enc) = DH(skR, enc) and
-        // KeyCustody::public_key(handle) = pkR.
-        let dh = sk.diffie_hellman(&X25519Pub::from(enc_arr));
-
-        let recovered =
-            custody::open_with_external_dh(dh.as_bytes(), &pk, &enc_arr, info, aad, &ct)?;
-        assert_eq!(recovered.as_slice(), pt);
         Ok(())
     }
 }

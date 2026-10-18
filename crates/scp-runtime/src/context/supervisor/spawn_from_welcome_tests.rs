@@ -38,15 +38,15 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use scp_did::{DID, SigningKeyId};
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_platform::{KeyCustody, KeyHandle, KeyType};
+use scp_platform::{KeyCustody, KeyType};
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling};
 use scp_protocol::context::{
     CeilingPolicy, ContextMode, ContextParams, GovernanceModel, InvitationBundle,
     InvitationKeyMaterial, ScpContextExtension,
 };
-use scp_protocol::crypto::envelope_seal::{ed25519_pubkey_to_x25519, hpke_seal_invitation};
-use zeroize::Zeroizing;
+use scp_protocol::crypto::envelope_seal::hpke_seal_invitation;
+use scp_protocol::crypto::hpke::p256::P256Point;
 
 use super::key_package_actor::{KeyPackageCommand, ReservationId};
 use super::{InviteMemberOutcome, MessageSigner, Supervisor, WelcomeJoinRequest};
@@ -76,11 +76,9 @@ fn alice_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0xA1; 32])
 }
 
-/// Bob (invitee) fixed signing key. Used by the `invite_member` round-trip
-/// (Test M): `BOB_DID` resolves to its verifying key via [`pair_resolver`], and
-/// Bob's #active custody imports the SAME seed (see [`bob_imported_custody`]) so
-/// the key the creator seals to (resolved from `BOB_DID`) is exactly the key
-/// Bob's custody can open with.
+/// Bob (invitee) fixed signing key. `BOB_DID` resolves to its verifying key via
+/// [`pair_resolver`], so the `0xFF03` attestation Bob's store signs with it
+/// verifies at the inviter (§9.7.1).
 fn bob_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0xB0; 32])
 }
@@ -96,9 +94,10 @@ fn mallory_signing_key() -> SigningKey {
 
 /// Resolves `ALICE_DID` / `BOB_DID` to their fixed #active verifying keys (all
 /// else `None`). The joiner verifies the creator (`ALICE`) signature; the
-/// inviter (`invite_member`) seals to the invitee (`BOB`) #active key. One
-/// resolver serves both roles — resolving the extra DID is inert on the joiner
-/// path (only `bundle.creator_did` is ever resolved there).
+/// inviter (`invite_member`) verifies the invitee (`BOB`) KeyPackage's `0xFF03`
+/// attestation against Bob's #active key. One resolver serves both roles —
+/// resolving the extra DID is inert on the joiner path (only
+/// `bundle.creator_did` is ever resolved there).
 fn pair_resolver() -> KeyResolver {
     let alice = DID::from(ALICE_DID);
     let bob = DID::from(BOB_DID);
@@ -115,34 +114,27 @@ fn pair_resolver() -> KeyResolver {
     })
 }
 
-/// Bob's #active custody with a FRESH random Ed25519 key. Returns
-/// `(custody, handle, recipient_x25519)` where `recipient_x25519` is the
-/// birational X25519 mapping of the #active public key — the value a creator
-/// seals an invitation to. The joiner spawn opens via
-/// `custody.ed25519_to_x25519_agree(handle, enc)`, which reconstructs the SAME
-/// DH, so a bundle sealed to `recipient_x25519` opens. Resolver identity is
-/// irrelevant here (`BOB` is never resolved on the joiner path); only Test M
-/// needs a resolver-matching key (see [`bob_imported_custody`]).
-async fn bob_active_custody() -> (InMemoryKeyCustody, KeyHandle, [u8; 32]) {
-    let custody = InMemoryKeyCustody::new();
-    let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-    let pk = custody.public_key(&handle).await.unwrap();
-    let pk_bytes: [u8; 32] = pk.as_bytes().try_into().unwrap();
-    let x = ed25519_pubkey_to_x25519(&pk_bytes).unwrap();
-    (custody, handle, x)
+/// The custody holding `owner`'s wrapping key in `sup`, and that key's public
+/// point: the `0xFF01` every KeyPackage `owner`'s store mints carries, which a
+/// creator seals an invitation to (§9.16.2). The join opens through this
+/// custody.
+async fn wrapping_custody_and_key(
+    sup: &Arc<Supervisor>,
+    owner: &DID,
+) -> (Arc<InMemoryKeyCustody>, P256Point) {
+    let custody = sup
+        .testing_wrapping_custody()
+        .expect("the test supervisor's in-memory wrapping custody");
+    (custody, wrapping_point(sup, owner).await)
 }
 
-/// Bob's #active custody holding the FIXED [`bob_signing_key`] seed, so
-/// `custody.public_key(handle)` equals the verifying key [`pair_resolver`]
-/// returns for `BOB_DID`. Test M's `invite_member` seals to that resolved key;
-/// Bob must open with the identical private key.
-async fn bob_imported_custody() -> (InMemoryKeyCustody, KeyHandle) {
-    let custody = InMemoryKeyCustody::new();
-    let handle = custody
-        .import_ed25519_signing_key(&Zeroizing::new(bob_signing_key().to_bytes()))
+/// `owner`'s wrapping key public point in `sup`, as an HPKE recipient.
+async fn wrapping_point(sup: &Arc<Supervisor>, owner: &DID) -> P256Point {
+    let key = sup
+        .load_wrapping_key(owner)
         .await
-        .unwrap();
-    (custody, handle)
+        .expect("the owner's wrapping key loads");
+    P256Point::try_from(*key.public()).expect("a wrapping key is a valid P-256 point")
 }
 
 /// Builds a signed [`InvitationBundle`] (creator = `signer`) carrying `params`,
@@ -204,19 +196,19 @@ fn signed_bundle(
 /// through (use `None` to drive the BLACK-2J-04 precheck).
 fn seal_bundle(
     bundle: &InvitationBundle,
-    recipient_x25519: &[u8; 32],
+    recipient: &P256Point,
     hint_ctx: &str,
     hint_creator: &DID,
     reservation_id: ReservationId,
     local_pseudonym: Option<[u8; 32]>,
 ) -> WelcomeJoinRequest {
     let wire = bundle.to_wire_bytes().expect("bundle serializes");
-    let (ct, enc) = hpke_seal_invitation(&wire, recipient_x25519, hint_ctx, hint_creator.as_ref())
-        .expect("HPKE seal");
+    let (ct, enc) =
+        hpke_seal_invitation(&wire, recipient, hint_ctx, hint_creator.as_ref()).expect("HPKE seal");
     WelcomeJoinRequest {
         context_id: hint_ctx.to_owned(),
         creator_did: hint_creator.clone(),
-        sealed_bundle_enc: enc,
+        sealed_bundle_enc: enc.as_bytes().to_vec(),
         sealed_bundle_ct: ct,
         reservation_id,
         local_pseudonym,
@@ -236,7 +228,7 @@ fn seal_join_request(
     bundle_context_id: &str,
     bundle_params: &ContextParams,
     welcome_bytes: Vec<u8>,
-    recipient_x25519: &[u8; 32],
+    recipient: &P256Point,
     hint_ctx: &str,
     hint_creator: &DID,
     reservation_id: ReservationId,
@@ -250,7 +242,7 @@ fn seal_join_request(
     );
     seal_bundle(
         &bundle,
-        recipient_x25519,
+        recipient,
         hint_ctx,
         hint_creator,
         reservation_id,
@@ -376,6 +368,32 @@ fn bob_supervisor(
     bob_supervisor_with_resolver(persistence, pair_resolver())
 }
 
+/// Builds Bob's joiner `Supervisor` over `mls_storage`, whose wrapping keys
+/// live in `custody`. Two supervisors built over one storage and one custody
+/// model a node restart.
+fn bob_supervisor_over<C: KeyCustody + 'static>(
+    persistence: Option<Box<dyn ContextPersistence>>,
+    mls_storage: Arc<dyn OpenMlsStorageAdapter>,
+    custody: &Arc<C>,
+) -> Arc<Supervisor> {
+    let crypto = Arc::new(NodeMlsFactory::new(
+        BOB_DID.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
+    Supervisor::with_providers_and_wrapping_custody(
+        crypto,
+        Box::new(NotConfiguredTransportProvider),
+        Box::new(MerkleEventLogProvider::new()),
+        pair_resolver(),
+        persistence,
+        None,
+        None,
+        None,
+        mls_storage,
+        crate::crypto::wrapping::single_custody_source(Arc::clone(custody)),
+    )
+}
+
 /// Builds Bob's joiner `Supervisor` with a caller-supplied [`KeyResolver`] — used
 /// by the creator-substitution regression, which needs a resolver that also
 /// resolves `MALLORY_DID` (see [`trio_resolver`]).
@@ -407,7 +425,7 @@ fn bob_supervisor_with_resolver(
 /// not-configured transport, in-memory event log + MLS storage, the
 /// [`pair_resolver`] that resolves BOTH `ALICE`/`BOB` #active keys). Used by the
 /// `invite_member` round-trip (Test M), which resolves the INVITEE (`BOB`)
-/// #active to seal to. Returns the supervisor and a clone of Alice's crypto
+/// #active to verify his KeyPackage attestation. Returns the supervisor and a clone of Alice's crypto
 /// provider (so the test can drive the installed group).
 fn alice_supervisor() -> (Arc<Supervisor>, Arc<NodeMlsFactory>) {
     let crypto = Arc::new(NodeMlsFactory::new(
@@ -462,6 +480,12 @@ struct Joined {
     sup: Arc<Supervisor>,
     ctx_id: String,
     ctx_bytes: [u8; 32],
+    /// The reservation the join named.
+    reservation_id: super::key_package_actor::ReservationId,
+    /// The joiner's MLS storage, which holds its wrapping key record.
+    mls_storage: Arc<dyn OpenMlsStorageAdapter>,
+    /// The wrapping custody a [`WrappingKeyLoss`] join installed.
+    loss_custody: Option<Arc<crate::crypto::key_loss_custody::KeyLossCustody>>,
 }
 
 /// Runs the full reserve → creator-add → Welcome → `spawn_actor_from_welcome`
@@ -492,7 +516,7 @@ async fn run_join_with(
     Result<crate::context::ContextHandle, crate::context::ContextError>,
     Joined,
 ) {
-    run_join_with_active_key(
+    run_join_with_wrapping_key_loss(
         seed,
         persistence,
         committed,
@@ -503,25 +527,26 @@ async fn run_join_with(
     .await
 }
 
-/// When a join test makes Bob's custody lose his `#active` key.
+/// When a join test makes Bob's wrapping custody lose his wrapping key.
 #[derive(Clone, Copy)]
-enum ActiveKeyLoss {
-    /// After the bundle is sealed to the key and before the spawn, so the
-    /// spawn's KEM agreement is key-not-found.
-    BeforeSpawn,
-    /// Inside the spawn, right after the KEM agreement used the key, so the
-    /// spawn's read of the `#active` public key is key-not-found.
+enum WrappingKeyLoss {
+    /// The join's KEM agreement (`dh_agree`) reports key-not-found without
+    /// agreeing.
+    CannotAgree,
+    /// The join's KEM agreement agrees, then custody destroys the key, so
+    /// every later custody call on the handle is key-not-found.
     AfterAgree,
 }
 
-/// [`run_join_with`], with Bob's custody losing his `#active` key at `loss`.
-async fn run_join_with_active_key(
+/// [`run_join_with`], with Bob's wrapping custody losing his wrapping key at
+/// `loss`.
+async fn run_join_with_wrapping_key_loss(
     seed: u8,
     persistence: Option<Box<dyn ContextPersistence>>,
     committed: Option<ContextParams>,
     request_params: ContextParams,
     request_ctx_id: Option<String>,
-    loss: Option<ActiveKeyLoss>,
+    loss: Option<WrappingKeyLoss>,
 ) -> (
     Result<crate::context::ContextHandle, crate::context::ContextError>,
     Joined,
@@ -533,7 +558,36 @@ async fn run_join_with_active_key(
     // `bob_crypto` (the joiner's provider) is emptied onto the live actor by the
     // spawn below, so the realigned tests assert reachable joiner state through
     // `sup`, not the provider — it is not retained in `Joined`.
-    let (sup, _bob_crypto) = bob_supervisor(persistence);
+    let loss_custody = loss.map(|loss| {
+        Arc::new(crate::crypto::key_loss_custody::KeyLossCustody::new(
+            match loss {
+                WrappingKeyLoss::CannotAgree => crate::crypto::key_loss_custody::KeyLoss::OnDhAgree,
+                WrappingKeyLoss::AfterAgree => {
+                    crate::crypto::key_loss_custody::KeyLoss::AfterDhAgree
+                }
+            },
+        ))
+    });
+    let mls_storage = fresh_mls_storage();
+    let sup = if let Some(custody) = &loss_custody {
+        bob_supervisor_over(persistence, Arc::clone(&mls_storage), custody)
+    } else {
+        let crypto = Arc::new(NodeMlsFactory::new(
+            BOB_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
+        Supervisor::with_providers(
+            crypto,
+            Box::new(NotConfiguredTransportProvider),
+            Box::new(MerkleEventLogProvider::new()),
+            pair_resolver(),
+            persistence,
+            None,
+            None,
+            None,
+            Arc::clone(&mls_storage),
+        )
+    };
 
     // Bob reserves a real KP from his own store (private signer-state stays in
     // the actor; only the reservation id + public bytes come back). This also
@@ -574,11 +628,12 @@ async fn run_join_with_active_key(
     let request_ctx_id = request_ctx_id.unwrap_or_else(|| group_ctx_id.clone());
     let request_ctx_bytes = context_id_to_bytes(&request_ctx_id);
 
-    // Seal the creator-signed §5.12.3 bundle to Bob's #active. The bundle carries
+    // Seal the creator-signed §5.12.3 bundle to the `0xFF01` of Bob's reserved
+    // KeyPackage, his wrapping key (§9.16.2). The bundle carries
     // the (possibly divergent) `request_params` / `request_ctx_id`; the hints
     // equal them so the open succeeds and the §5.13.3 `0xFF02` cross-check against
     // the committed group is what accepts or rejects.
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let bob_recipient = wrapping_point(&sup, &bob).await;
     let req = seal_join_request(
         &alice_signing_key(),
         &DID::from(ALICE_DID),
@@ -588,24 +643,16 @@ async fn run_join_with_active_key(
         &bob_recipient,
         &request_ctx_id,
         &DID::from(ALICE_DID),
-        reservation_id,
+        reservation_id.clone(),
     );
-    if matches!(loss, Some(ActiveKeyLoss::BeforeSpawn)) {
-        bob_custody
-            .destroy_key(&bob_handle)
-            .await
-            .expect("bob's custody destroys his #active key");
-    }
-
-    let result = if matches!(loss, Some(ActiveKeyLoss::AfterAgree)) {
-        let custody = crate::crypto::key_loss_custody::KeyLossCustody {
-            inner: bob_custody,
-            loss: crate::crypto::key_loss_custody::KeyLoss::AfterEd25519Agree,
-        };
-        sup.spawn_actor_from_welcome(bob, &custody, &bob_handle, req)
+    let result = if let Some(custody) = &loss_custody {
+        sup.spawn_actor_from_welcome(bob, custody.as_ref(), req)
             .await
     } else {
-        sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        let custody = sup
+            .testing_wrapping_custody()
+            .expect("the test supervisor's in-memory wrapping custody");
+        sup.spawn_actor_from_welcome(bob, custody.as_ref(), req)
             .await
     };
     (
@@ -614,6 +661,9 @@ async fn run_join_with_active_key(
             sup,
             ctx_id: request_ctx_id,
             ctx_bytes: request_ctx_bytes,
+            reservation_id,
+            mls_storage,
+            loss_custody,
         },
     )
 }
@@ -637,60 +687,6 @@ async fn join_bob(
         None,
     )
     .await
-}
-
-/// A joiner whose `#active` key its custody no longer holds fails the
-/// invitation KEM agreement with the typed custody failure, so every bridge
-/// reports key-not-found as `SCP-CRYPTO-4006` rather than a crypto text error.
-#[tokio::test]
-async fn spawn_from_welcome_carries_a_destroyed_active_key_as_custody_key_not_found() {
-    let (result, _j) = run_join_with_active_key(
-        0x5e,
-        None,
-        Some(joiner_params()),
-        joiner_params(),
-        None,
-        Some(ActiveKeyLoss::BeforeSpawn),
-    )
-    .await;
-    // `assert!` rather than `panic!`: `check-handler-no-panic.sh` reads file
-    // contents and cannot see this file's `#[cfg(test)]` gate (see the
-    // over-cap outlet test below).
-    let failure = match &result {
-        Err(crate::context::ContextError::Custody(failure)) => Some(failure),
-        _ => None,
-    };
-    assert!(
-        failure.is_some_and(scp_crypto::CustodyFailure::is_key_not_found),
-        "a join under a destroyed #active key must fail with ContextError::Custody key-not-found, got {:?}",
-        result.as_ref().err()
-    );
-}
-
-/// A joiner whose custody loses the `#active` key between the KEM agreement
-/// and the read of its public key fails that read with the typed custody
-/// failure, so every bridge reports `SCP-CRYPTO-4006` there too.
-#[tokio::test]
-async fn spawn_from_welcome_carries_an_active_key_lost_after_agreement_as_custody_key_not_found() {
-    let (result, _j) = run_join_with_active_key(
-        0x5f,
-        None,
-        Some(joiner_params()),
-        joiner_params(),
-        None,
-        Some(ActiveKeyLoss::AfterAgree),
-    )
-    .await;
-    // `assert!` rather than `panic!`, as in the test above.
-    let failure = match &result {
-        Err(crate::context::ContextError::Custody(failure)) => Some(failure),
-        _ => None,
-    };
-    assert!(
-        failure.is_some_and(scp_crypto::CustodyFailure::is_key_not_found),
-        "a join whose #active key is lost after the KEM agreement must fail with ContextError::Custody key-not-found, got {:?}",
-        result.as_ref().err()
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,7 +1023,7 @@ async fn over_cap_genesis_outlets_are_rejected_before_the_kp_consume() {
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
 
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
     let params_with = |count: usize| ContextParams {
         outlets: (0..count)
             .map(|i| genesis_outlet(&format!("outlet-{i}")))
@@ -1054,7 +1050,7 @@ async fn over_cap_genesis_outlets_are_rejected_before_the_kp_consume() {
 
     let over_cap = crate::context::state::MAX_REGISTERED_OUTLETS + 1;
     let err = sup
-        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, make_req(over_cap))
+        .spawn_actor_from_welcome(bob.clone(), bob_custody.as_ref(), make_req(over_cap))
         .await
         .expect_err("an over-cap genesis outlet declaration must be refused on the joiner");
     // `assert!(matches!(..))` + `let-else { return }` rather than a
@@ -1087,7 +1083,7 @@ async fn over_cap_genesis_outlets_are_rejected_before_the_kp_consume() {
     // cross-check runs against that committed set; the 2-outlet join in Test A1b
     // shows the joiner accepts a non-empty declaration, so the refusal above is a
     // bound on the count, not a refusal of outlets.
-    sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, make_req(0))
+    sup.spawn_actor_from_welcome(bob, bob_custody.as_ref(), make_req(0))
         .await
         .expect("the within-cap retry succeeds — the KeyPackage was never burned");
     assert_eq!(
@@ -1308,10 +1304,10 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
     let welcome = add_output.welcome_bytes;
 
-    // Both spawns present Bob's SAME #active custody (the replay opens an
+    // Both spawns present Bob's SAME wrapping custody (the replay opens an
     // identically-sealed bundle); the single-use anchor tested is the reservation
     // journal, not the opening key.
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
     let make_req = |context_id: &str, welcome_bytes: Vec<u8>| {
         seal_join_request(
             &alice_signing_key(),
@@ -1329,8 +1325,7 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     // First join succeeds and consumes the reservation's single-use KP.
     sup.spawn_actor_from_welcome(
         bob.clone(),
-        &bob_custody,
-        &bob_handle,
+        bob_custody.as_ref(),
         make_req(&ctx_id, welcome.clone()),
     )
     .await
@@ -1341,12 +1336,7 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     // is rejected at the fused ConfirmConsume — the reservation journal no longer
     // holds it.
     let replay = sup
-        .spawn_actor_from_welcome(
-            bob,
-            &bob_custody,
-            &bob_handle,
-            make_req(&replay_ctx_id, welcome),
-        )
+        .spawn_actor_from_welcome(bob, bob_custody.as_ref(), make_req(&replay_ctx_id, welcome))
         .await
         .expect_err("a consumed reservation must not spawn a second actor");
     assert!(
@@ -1422,7 +1412,7 @@ async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
 
     // A validly-signed bundle (so the open + creator-signature verify PASS and
     // control reaches Precheck B); only the request's `local_pseudonym` varies.
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
     let bundle = signed_bundle(
         &alice_signing_key(),
         &DID::from(ALICE_DID),
@@ -1443,7 +1433,7 @@ async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
 
     // `None` is rejected up front (CreationFailed), no context stands up.
     let err = sup
-        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, make_req(None))
+        .spawn_actor_from_welcome(bob.clone(), bob_custody.as_ref(), make_req(None))
         .await
         .expect_err("a None pseudonym must be rejected on the encrypted join surface");
     assert!(
@@ -1461,7 +1451,7 @@ async fn missing_pseudonym_is_rejected_before_the_kp_consume() {
 
     // KP NOT burned: the same reservation + Welcome now succeed WITH a real
     // pseudonym — the reject happened before `ConfirmConsume`.
-    sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, make_req(some_pseudonym()))
+    sup.spawn_actor_from_welcome(bob, bob_custody.as_ref(), make_req(some_pseudonym()))
         .await
         .expect("the retry with a real pseudonym succeeds — the KP was never burned");
     assert_eq!(
@@ -1532,7 +1522,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
     // The colliding join is rejected UP FRONT — before the consume. The bundle
     // opens + verifies (valid alice signature) so control reaches Precheck A,
     // which is the live-registry collision guard under test.
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
     let colliding_req = seal_join_request(
         &alice_signing_key(),
         &DID::from(ALICE_DID),
@@ -1545,7 +1535,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         reservation_id.clone(),
     );
     let err = sup
-        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, colliding_req)
+        .spawn_actor_from_welcome(bob.clone(), bob_custody.as_ref(), colliding_req)
         .await
         .expect_err("a join colliding with a live context id must be rejected");
     assert!(
@@ -1585,7 +1575,7 @@ async fn colliding_broadcast_context_id_is_rejected_before_the_kp_consume() {
         &DID::from(ALICE_DID),
         reservation_id,
     );
-    sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, fresh_req)
+    sup.spawn_actor_from_welcome(bob, bob_custody.as_ref(), fresh_req)
         .await
         .expect("the fresh-id retry succeeds — the KP was never burned by the collision");
     assert_eq!(
@@ -1664,7 +1654,7 @@ async fn non_durable_crypto_export_fails_closed_without_standing_up_an_actor() {
 
     // A valid bundle (open + signature + §5.13.3 all pass) so control reaches the
     // step-3b durability check, which is where the armed seam fires.
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
     let req = seal_join_request(
         &alice_signing_key(),
         &DID::from(ALICE_DID),
@@ -1685,7 +1675,7 @@ async fn non_durable_crypto_export_fails_closed_without_standing_up_an_actor() {
     sup.arm_welcome_export_failure_once();
 
     let err = sup
-        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .spawn_actor_from_welcome(bob, bob_custody.as_ref(), req)
         .await
         .expect_err("a non-durable crypto export must fail the spawn closed");
     assert!(
@@ -1779,29 +1769,26 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
 
     let rec = RecordingPersistence::default();
 
-    // ONE Bob #active custody opens every bundle here (seed + target reject +
-    // target retry); the property under test is durable first-writer-wins, not
-    // the opening key, so a single custody sealed-to across supervisors is faithful.
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
-
     // --- Seed: a first supervisor persists a REAL snapshot for `ctx_id` via a
     //     successful join. It shares the recording store; the spawn persists the
     //     joiner's initial Class-S snapshot under `ctx_id`.
     let (seed_sup, _seed_crypto) = bob_supervisor(Some(Box::new(rec.clone())));
     let (seed_res, seed_kp) = reserve_bob_kp(&seed_sup, &bob).await;
+    // Each supervisor holds its own wrapping key; a bundle is sealed to the
+    // joining supervisor's.
+    let (seed_custody, seed_recipient) = wrapping_custody_and_key(&seed_sup, &bob).await;
     let (_seed_alice, seed_welcome) = alice_welcome_for(&ctx_id, &seed_kp);
     seed_sup
         .spawn_actor_from_welcome(
             bob.clone(),
-            &bob_custody,
-            &bob_handle,
+            seed_custody.as_ref(),
             seal_join_request(
                 &alice_signing_key(),
                 &DID::from(ALICE_DID),
                 &ctx_id,
                 &joiner_params(),
                 seed_welcome,
-                &bob_recipient,
+                &seed_recipient,
                 &ctx_id,
                 &DID::from(ALICE_DID),
                 seed_res,
@@ -1826,6 +1813,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
 
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&target_sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&target_sup, &bob).await;
     let make_req = |reservation_id: ReservationId, welcome_bytes: Vec<u8>| {
         seal_join_request(
             &alice_signing_key(),
@@ -1843,8 +1831,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
     let err = target_sup
         .spawn_actor_from_welcome(
             bob.clone(),
-            &bob_custody,
-            &bob_handle,
+            bob_custody.as_ref(),
             make_req(reservation_id.clone(), welcome.clone()),
         )
         .await
@@ -1888,12 +1875,7 @@ async fn durable_snapshot_collision_is_rejected_without_clobbering_or_burning_kp
     rec.store.remove(&ctx_id);
     rec.deletes.clear();
     target_sup
-        .spawn_actor_from_welcome(
-            bob,
-            &bob_custody,
-            &bob_handle,
-            make_req(reservation_id, welcome),
-        )
+        .spawn_actor_from_welcome(bob, bob_custody.as_ref(), make_req(reservation_id, welcome))
         .await
         .expect("the retry after clearing the snapshot succeeds — the KP was never burned");
     assert_eq!(
@@ -1945,6 +1927,8 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
     let _ctx_bytes = context_id_to_bytes(&ctx_id);
 
     let (sup, _bob_crypto) = bob_supervisor(None);
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
+    let reserved = bob_recipient;
 
     // Inject a fake key-package store for Bob whose `ConfirmConsume` handler
     // holds the reply channel open and sleeps far past `LIFECYCLE_TIMEOUT`
@@ -1956,12 +1940,21 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<KeyPackageCommand>(8);
     let fake_actor = tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
-            if let KeyPackageCommand::ConfirmConsume { reply, .. } = cmd {
-                // Keep `reply` alive (so the caller's reply await stays pending,
-                // not an immediate channel-closed error) but never answer within
-                // the join's budget — the entrypoint timeout wins first.
-                tokio::time::sleep(Duration::from_hours(1)).await;
-                drop(reply);
+            match cmd {
+                // The open reads the reservation's `0xFF01` before the lock;
+                // the fake answers with Bob's wrapping key, so the open passes.
+                KeyPackageCommand::ReservedWrappingKey { reply, .. } => {
+                    let _ = reply.send(Ok(reserved));
+                }
+                KeyPackageCommand::ConfirmConsume { reply, .. } => {
+                    // Keep `reply` alive (so the caller's reply await stays
+                    // pending, not an immediate channel-closed error) but never
+                    // answer within the join's budget — the entrypoint timeout
+                    // wins first.
+                    tokio::time::sleep(Duration::from_hours(1)).await;
+                    drop(reply);
+                }
+                _ => {}
             }
         }
     });
@@ -1978,7 +1971,6 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
     // ignores `reservation_id` / `welcome_message`, so both may be junk). No Alice
     // group is needed — §5.13.3 runs only AFTER ConfirmConsume returns, which it
     // never does here.
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
     let req = seal_join_request(
         &alice_signing_key(),
         &DID::from(ALICE_DID),
@@ -1992,7 +1984,7 @@ async fn slow_confirm_consume_times_out_rolls_back_and_releases_the_lock() {
     );
 
     let err = sup
-        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+        .spawn_actor_from_welcome(bob.clone(), bob_custody.as_ref(), req)
         .await
         .expect_err("a ConfirmConsume exceeding LIFECYCLE_TIMEOUT must fail the join closed");
     assert!(
@@ -2095,12 +2087,11 @@ async fn reserve_then_spawn_via_supervisor_yields_a_live_send_capable_actor() {
 
     // Spawn via the PUBLIC `Supervisor` entrypoint — the reservation feeds
     // straight in through the creator-signed, sealed bundle.
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
     let joined = sup
         .spawn_actor_from_welcome(
             bob.clone(),
-            &bob_custody,
-            &bob_handle,
+            bob_custody.as_ref(),
             seal_join_request(
                 &alice_signing_key(),
                 &DID::from(ALICE_DID),
@@ -2161,10 +2152,10 @@ async fn spawn_under_a_different_did_is_rejected() {
         .expect("bob reserves a KP under his own DID");
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
 
-    // Both spawns open the SAME bundle sealed to Bob's #active custody; the
+    // Both spawns open the SAME bundle sealed to Bob's wrapping key; the
     // identity binding under test is the reservation's per-identity KeyPackage
     // store (via `owning_did`), independent of the bundle-opening key.
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
     let make_req = |reservation_id: ReservationId, welcome_bytes: Vec<u8>| {
         seal_join_request(
             &alice_signing_key(),
@@ -2185,8 +2176,7 @@ async fn spawn_under_a_different_did_is_rejected() {
     let err = sup
         .spawn_actor_from_welcome(
             charlie,
-            &bob_custody,
-            &bob_handle,
+            bob_custody.as_ref(),
             make_req(reservation_id.clone(), welcome.clone()),
         )
         .await
@@ -2202,14 +2192,9 @@ async fn spawn_under_a_different_did_is_rejected() {
 
     // Non-vacuity: bob's OWN DID now spawns the joiner with the same reservation
     // + Welcome — Charlie's rejected attempt burned nothing.
-    sup.spawn_actor_from_welcome(
-        bob,
-        &bob_custody,
-        &bob_handle,
-        make_req(reservation_id, welcome),
-    )
-    .await
-    .expect("bob's own DID spawns the joiner — the reservation stayed bound to him");
+    sup.spawn_actor_from_welcome(bob, bob_custody.as_ref(), make_req(reservation_id, welcome))
+        .await
+        .expect("bob's own DID spawns the joiner — the reservation stayed bound to him");
     assert_eq!(
         sup.member_count(&ctx_id).await,
         Some(2),
@@ -2437,7 +2422,7 @@ async fn non_creator_signed_bundle_is_rejected_before_kp_consume() {
     let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
 
     // Signed by an ATTACKER key, NOT alice's — `bundle.verify(alice_vk)` fails.
     let attacker = SigningKey::from_bytes(&[0xEE; 32]);
@@ -2453,7 +2438,7 @@ async fn non_creator_signed_bundle_is_rejected_before_kp_consume() {
         reservation_id.clone(),
     );
     let err = sup
-        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, forged)
+        .spawn_actor_from_welcome(bob.clone(), bob_custody.as_ref(), forged)
         .await
         .expect_err("a bundle NOT signed by the creator's #active key must be rejected");
     assert!(
@@ -2486,7 +2471,7 @@ async fn non_creator_signed_bundle_is_rejected_before_kp_consume() {
         &DID::from(ALICE_DID),
         reservation_id,
     );
-    sup.spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, honest)
+    sup.spawn_actor_from_welcome(bob, bob_custody.as_ref(), honest)
         .await
         .expect("the retry with a creator-signed bundle succeeds — the KP was never burned");
     assert_eq!(
@@ -2509,7 +2494,7 @@ async fn tampered_ciphertext_fails_aead_open() {
     let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
 
     let mut req = seal_join_request(
         &alice_signing_key(),
@@ -2526,7 +2511,7 @@ async fn tampered_ciphertext_fails_aead_open() {
     req.sealed_bundle_ct[0] ^= 0xFF;
 
     let err = sup
-        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .spawn_actor_from_welcome(bob, bob_custody.as_ref(), req)
         .await
         .expect_err("a tampered ciphertext must fail the AEAD open");
     assert!(
@@ -2558,7 +2543,7 @@ async fn tampered_bundle_signature_is_rejected() {
     let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
 
     let mut bundle = signed_bundle(
         &alice_signing_key(),
@@ -2580,7 +2565,7 @@ async fn tampered_bundle_signature_is_rejected() {
     );
 
     let err = sup
-        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .spawn_actor_from_welcome(bob, bob_custody.as_ref(), req)
         .await
         .expect_err("a corrupted bundle signature must be rejected");
     assert!(
@@ -2615,7 +2600,7 @@ async fn structurally_inconsistent_bundle_is_rejected() {
     let (sup, _bob_crypto) = bob_supervisor(None);
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
     let (_alice, welcome) = alice_welcome_for(&ctx_id, &kp_public_bytes);
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
 
     // Hand-build a bundle whose structural governance diverges from the params
     // governance (bypassing `build_metadata_snapshot`, which copies structural
@@ -2658,7 +2643,7 @@ async fn structurally_inconsistent_bundle_is_rejected() {
     );
 
     let err = sup
-        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .spawn_actor_from_welcome(bob, bob_custody.as_ref(), req)
         .await
         .expect_err("a structurally inconsistent bundle must be rejected");
     assert!(
@@ -2694,8 +2679,9 @@ async fn structurally_inconsistent_bundle_is_rejected() {
 /// pins: (i) the CREATOR's own `role_state` reflects Bob after the in-actor add
 /// (`alice_sup.member_count == Some(2)` — the split-brain the old off-mailbox add
 /// left behind is closed); (ii) the invited joiner comes up registered on its OWN
-/// supervisor. Bob's #active custody holds the SAME key `pair_resolver` returns
-/// for `BOB_DID`, so the invitation (sealed to that resolved #active) opens.
+/// supervisor. Bob's KeyPackage carries his custody wrapping key as `0xFF01`,
+/// attested by the #active key `pair_resolver` returns for `BOB_DID`, so the
+/// invitation (sealed to that `0xFF01`) opens through his wrapping handle.
 ///
 /// # Bidirectional round-trip relocated to fullstack (ADR-049 PR-7, SCP-CRYPTOMOVE-001)
 ///
@@ -2735,8 +2721,8 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
 
     // (c) Alice invites Bob: the add is routed through the context actor's
     //     governance gate (SingleAdmin → auto-executes the real in-actor MLS
-    //     add), then the returned Welcome is signed + sealed into a §5.12.3
-    //     bundle with alice's #active key.
+    //     add), then the returned Welcome is signed with alice's #active key
+    //     and sealed into a §5.12.3 bundle to Bob's `0xFF01` wrapping key.
     let outcome = alice_sup
         .invite_member(
             ctx_id.clone(),
@@ -2751,10 +2737,15 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
     // deferral). The `Sealed` bundle is the SAME `SealedInvitation` wire type the
     // joiner consumes below — directly usable as the join input with no re-boxing
     // (the runtime `WelcomeJoinRequest` reads its `enc`/`ciphertext` straight off
-    // the bundle). `enc` is validated to be exactly 32 bytes at the seal.
+    // the bundle). The enc is a 65-byte uncompressed DHKEM(P-256) point (§9.16.2).
     let InviteMemberOutcome::Sealed { bundle, .. } = outcome;
-    let enc =
-        <[u8; 32]>::try_from(bundle.enc.as_slice()).expect("sealed bundle enc is exactly 32 bytes");
+    assert_eq!(
+        bundle.enc.len(),
+        65,
+        "the sealed enc is a 65-byte P-256 point"
+    );
+    assert_eq!(bundle.enc[0], 0x04, "the sealed enc is uncompressed SEC1");
+    let enc = bundle.enc;
     let ciphertext = bundle.ciphertext;
 
     // (c') The creator's OWN role_state now reflects Bob (the split-brain the
@@ -2765,9 +2756,10 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
         "the in-actor governance add updates the CREATOR's membership/role_state"
     );
 
-    // (d) Bob joins. His #active custody holds the fixed BOB seed = the key
-    //     `pair_resolver` returns for BOB, which is what `invite_member` sealed to.
-    let (bob_custody, bob_handle) = bob_imported_custody().await;
+    // (d) Bob joins, opening through the custody that holds his wrapping key:
+    //     the `0xFF01` of his reserved KeyPackage, which `invite_member` sealed
+    //     to after verifying the KeyPackage's `0xFF03` attestation.
+    let (bob_custody, _) = wrapping_custody_and_key(&bob_sup, &bob).await;
     let req = WelcomeJoinRequest {
         context_id: ctx_id.clone(),
         creator_did: alice.clone(),
@@ -2777,7 +2769,7 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
         local_pseudonym: some_pseudonym(),
     };
     let handle = bob_sup
-        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+        .spawn_actor_from_welcome(bob.clone(), bob_custody.as_ref(), req)
         .await
         .expect("bob joins from alice's real invitation");
     assert_eq!(handle.context_id(), ctx_id);
@@ -2845,10 +2837,9 @@ async fn invite_member_seals_the_creators_stored_relay_set() {
         )
         .await
         .expect("alice seals an invitation for bob");
-    let enc =
-        <[u8; 32]>::try_from(bundle.enc.as_slice()).expect("sealed bundle enc is exactly 32 bytes");
+    let enc = bundle.enc;
 
-    let (bob_custody, bob_handle) = bob_imported_custody().await;
+    let (bob_custody, _) = wrapping_custody_and_key(&bob_sup, &bob).await;
     let req = WelcomeJoinRequest {
         context_id: ctx_id.clone(),
         creator_did: alice.clone(),
@@ -2858,7 +2849,7 @@ async fn invite_member_seals_the_creators_stored_relay_set() {
         local_pseudonym: some_pseudonym(),
     };
     bob_sup
-        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+        .spawn_actor_from_welcome(bob.clone(), bob_custody.as_ref(), req)
         .await
         .expect("bob joins from alice's invitation");
     assert_eq!(
@@ -3302,7 +3293,7 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
     // params = Alice's REAL params. Hints == Mallory so the HPKE open succeeds and
     // the §5.13.3 rule-8 binding is what rejects (not the open or the signature).
     let mallory = DID::from(MALLORY_DID);
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
     let bundle = signed_bundle(
         &mallory_signing_key(),
         &mallory,
@@ -3320,7 +3311,7 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
     );
 
     let err = sup
-        .spawn_actor_from_welcome(bob, &bob_custody, &bob_handle, req)
+        .spawn_actor_from_welcome(bob, bob_custody.as_ref(), req)
         .await
         .expect_err("a creator-substituted bundle must be rejected");
 
@@ -4104,8 +4095,8 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
         .expect("alice creates the SCP context group (0xFF02)");
     let add_output = alice_welcome_for_bob(&group_ctx_bytes, alice_owned, &kp_public_bytes);
 
-    // Seal the creator-signed §5.12.3 bundle to Bob's #active and spawn.
-    let (bob_custody, bob_handle, bob_recipient) = bob_active_custody().await;
+    // Seal the creator-signed §5.12.3 bundle to Bob's wrapping key and spawn.
+    let (bob_custody, bob_recipient) = wrapping_custody_and_key(&sup, &bob).await;
     let req = seal_join_request(
         &alice_signing_key(),
         &alice,
@@ -4118,7 +4109,7 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
         reservation_id,
     );
     let handle = sup
-        .spawn_actor_from_welcome(bob.clone(), &bob_custody, &bob_handle, req)
+        .spawn_actor_from_welcome(bob.clone(), bob_custody.as_ref(), req)
         .await
         .expect("spawn_actor_from_welcome succeeds on a valid Welcome");
 
@@ -4674,4 +4665,611 @@ async fn invite_member_rejects_a_key_package_whose_key_does_not_resolve() {
         }
         other => panic!("expected InvalidKeyPackage, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The invitation seal and open over the invitee's wrapping key (SCP-307,
+// spec 05 §5.12.3.1, spec 09 §9.16.1-§9.16.2).
+// ---------------------------------------------------------------------------
+
+/// Alice's supervisor with an encrypted context `ctx_id`, Bob's KeyPackage
+/// reserved from `bob_sup`, and Alice's sealed invitation for it. Returns the
+/// reservation and the join request that carries the invitation.
+async fn alice_invites_bob(
+    ctx_id: &str,
+    bob_sup: &Arc<Supervisor>,
+) -> (ReservationId, Vec<u8>, WelcomeJoinRequest) {
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+    let (alice_sup, _alice_crypto) = alice_supervisor();
+    alice_sup
+        .create_context(
+            ctx_id.to_owned(),
+            joiner_params(),
+            alice.clone(),
+            some_pseudonym(),
+            Vec::new(),
+        )
+        .await
+        .expect("alice creates the encrypted context");
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(bob_sup, &bob).await;
+    let InviteMemberOutcome::Sealed { bundle, .. } = alice_sup
+        .invite_member(
+            ctx_id.to_owned(),
+            alice.clone(),
+            bob,
+            kp_public_bytes.clone(),
+            &CommandSigner::local_ed25519(alice_signing_key()),
+        )
+        .await
+        .expect("alice seals an invitation for bob");
+    let req = WelcomeJoinRequest {
+        context_id: ctx_id.to_owned(),
+        creator_did: alice,
+        sealed_bundle_enc: bundle.enc,
+        sealed_bundle_ct: bundle.ciphertext,
+        reservation_id: reservation_id.clone(),
+        local_pseudonym: some_pseudonym(),
+    };
+    (reservation_id, kp_public_bytes, req)
+}
+
+/// A copy of `req`: `WelcomeJoinRequest` is consumed by the join, and a test
+/// that retries one invitation joins with copies.
+fn copy_request(req: &WelcomeJoinRequest) -> WelcomeJoinRequest {
+    WelcomeJoinRequest {
+        context_id: req.context_id.clone(),
+        creator_did: req.creator_did.clone(),
+        sealed_bundle_enc: req.sealed_bundle_enc.clone(),
+        sealed_bundle_ct: req.sealed_bundle_ct.clone(),
+        reservation_id: req.reservation_id.clone(),
+        local_pseudonym: req.local_pseudonym,
+    }
+}
+
+/// Whether `reservation_id` is still a live, unconsumed reservation in
+/// `owner`'s KeyPackage store. A consumed or unknown reservation answers
+/// `InvalidState`. The store already running is asked directly, so the probe
+/// works while the owner's wrapping key cannot load; otherwise the store is
+/// spawned after loading the key.
+async fn reservation_is_live(
+    sup: &Arc<Supervisor>,
+    owner: &DID,
+    reservation_id: &ReservationId,
+) -> bool {
+    let running = sup.key_package_stores.get(owner).map(|h| h.value().clone());
+    let store = match running {
+        Some(store) => store,
+        None => sup
+            .key_package_store_for_loaded(owner)
+            .await
+            .expect("the owner's KeyPackage store"),
+    };
+    match store
+        .send(|reply| KeyPackageCommand::ReservedWrappingKey {
+            reservation_id: reservation_id.clone(),
+            reply,
+        })
+        .await
+    {
+        Ok(_) => true,
+        Err(crate::context::ContextError::InvalidState(_)) => false,
+        Err(e) => panic!("unexpected reservation lookup error: {e:?}"),
+    }
+}
+
+/// Asserts a failed join consumed nothing and stood nothing up: the
+/// reservation is live and no actor or group exists for the context.
+async fn assert_join_left_no_trace(
+    sup: &Arc<Supervisor>,
+    owner: &DID,
+    reservation_id: &ReservationId,
+    ctx_id: &str,
+) {
+    assert!(
+        reservation_is_live(sup, owner, reservation_id).await,
+        "a join that failed before the consume leaves the reservation live"
+    );
+    assert!(sup.lookup(ctx_id).is_none(), "no actor is registered");
+    assert!(
+        sup.local_mls_epoch(ctx_id).await.is_none(),
+        "no group is installed"
+    );
+}
+
+/// `invite_member` seals the invitation to the `0xFF01` of the invitee's
+/// KeyPackage, which is the invitee's wrapping key, with a 65-byte
+/// uncompressed DHKEM(P-256) enc. The ciphertext opens with an agreement on
+/// that key's custody handle and with no other key of the same custody.
+#[tokio::test]
+async fn invite_member_seals_to_the_invitee_key_package_wrapping_key() {
+    let ctx_id = ctx_hex(0xe1);
+    let bob = DID::from(BOB_DID);
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (_, kp_public_bytes, req) = alice_invites_bob(&ctx_id, &bob_sup).await;
+
+    let wrapping_key = bob_sup
+        .load_wrapping_key(&bob)
+        .await
+        .expect("bob's wrapping key");
+    let advertised = bob_sup
+        .verify_key_package_attestation(&bob, &kp_public_bytes)
+        .await
+        .expect("bob's KeyPackage verifies and carries 0xFF01");
+    assert_eq!(
+        advertised.as_bytes(),
+        wrapping_key.public(),
+        "the KeyPackage's 0xFF01 is bob's wrapping key"
+    );
+
+    assert_eq!(req.sealed_bundle_enc.len(), 65, "the enc is a P-256 point");
+    assert_eq!(
+        req.sealed_bundle_enc[0], 0x04,
+        "the enc is uncompressed SEC1"
+    );
+    let enc = scp_protocol::crypto::hpke::p256::validate_enc(&req.sealed_bundle_enc)
+        .expect("the enc is on the curve");
+
+    let custody = bob_sup
+        .testing_wrapping_custody()
+        .expect("the test supervisor's in-memory wrapping custody");
+    let open_with = |dh: scp_platform::traits::SharedSecret, public: [u8; 65]| {
+        scp_protocol::crypto::envelope_seal::hpke_open_invitation_with_external_dh(
+            &req.sealed_bundle_ct,
+            dh.as_bytes(),
+            &public,
+            &enc,
+            &ctx_id,
+            ALICE_DID,
+        )
+    };
+
+    let dh = custody
+        .dh_agree(wrapping_key.handle(), enc.as_bytes())
+        .await
+        .expect("the wrapping handle agrees");
+    let wire =
+        open_with(dh, *wrapping_key.public()).expect("the wrapping key opens the invitation");
+    let bundle = scp_protocol::context::InvitationBundle::from_wire_bytes(&wire)
+        .expect("the plaintext is the invitation bundle");
+    assert_eq!(bundle.creator_did, DID::from(ALICE_DID));
+
+    let other = custody
+        .generate_keypair(KeyType::HpkeP256)
+        .await
+        .expect("a second P-256 key");
+    let other_public: [u8; 65] = custody
+        .public_key(&other)
+        .await
+        .expect("its public key")
+        .as_bytes()
+        .try_into()
+        .expect("65 bytes");
+    let other_dh = custody
+        .dh_agree(&other, enc.as_bytes())
+        .await
+        .expect("the other handle agrees");
+    assert!(
+        open_with(other_dh, other_public).is_err(),
+        "another P-256 key of the same custody cannot open the invitation"
+    );
+}
+
+/// The join opens only through the handle of the joiner's own wrapping key,
+/// read from its record. (i) The record names another P-256 key of the same
+/// custody: the three-way check refuses it as `InvalidKeyPackage`, since the
+/// reserved `0xFF01` differs. (ii) The record names an Ed25519 handle: the
+/// load refuses it as `WrappingKeyHandleInvalid`, since custody reports a
+/// 32-byte key, not the record's 65-byte point. (iii) The record is right and
+/// the ciphertext is tampered: the AEAD refuses it as `CryptoFailed`. Each
+/// leaves the reservation live, and the untampered invitation then joins.
+#[tokio::test]
+async fn sealed_invitation_opens_only_through_the_invitee_wrapping_handle() {
+    let ctx_id = ctx_hex(0xe2);
+    let bob = DID::from(BOB_DID);
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &bob_sup).await;
+    let custody = bob_sup
+        .testing_wrapping_custody()
+        .expect("the test supervisor's in-memory wrapping custody");
+    let storage = Arc::clone(bob_sup.mls_storage_ref().expect("bob's MLS storage"));
+    let genuine = bob_sup
+        .load_wrapping_key(&bob)
+        .await
+        .expect("bob's wrapping key");
+    let (genuine_handle, genuine_public) = (*genuine.handle(), *genuine.public());
+    let point_record = |handle: scp_platform::traits::KeyHandle, public: [u8; 65]| {
+        let storage = Arc::clone(&storage);
+        let bob_sup = Arc::clone(&bob_sup);
+        let bob = bob.clone();
+        async move {
+            bob_sup.wrapping_keys.remove(&bob);
+            crate::store::wrapping_key::store_wrapping_key_handle(
+                storage.as_ref(),
+                &bob,
+                &handle,
+                &public,
+            )
+            .await
+            .expect("the record is rewritten");
+        }
+    };
+
+    // (i) Another P-256 key of the same custody.
+    let other = custody
+        .generate_keypair(KeyType::HpkeP256)
+        .await
+        .expect("a second P-256 key");
+    let other_public: [u8; 65] = custody
+        .public_key(&other)
+        .await
+        .expect("its public key")
+        .as_bytes()
+        .try_into()
+        .expect("65 bytes");
+    point_record(other, other_public).await;
+    let err = bob_sup
+        .spawn_actor_from_welcome(bob.clone(), custody.as_ref(), copy_request(&req))
+        .await
+        .expect_err("another P-256 key cannot open the invitation");
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidKeyPackage(_)),
+        "(i) expected InvalidKeyPackage, got {err:?}"
+    );
+    assert_join_left_no_trace(&bob_sup, &bob, &reservation_id, &ctx_id).await;
+
+    // (ii) An Ed25519 handle in the record.
+    let ed25519 = custody
+        .generate_keypair(KeyType::Ed25519)
+        .await
+        .expect("an Ed25519 key");
+    point_record(ed25519, genuine_public).await;
+    let err = bob_sup
+        .spawn_actor_from_welcome(bob.clone(), custody.as_ref(), copy_request(&req))
+        .await
+        .expect_err("an Ed25519 handle cannot open the invitation");
+    assert!(
+        matches!(err, crate::context::ContextError::WrappingKeyHandleInvalid),
+        "(ii) expected WrappingKeyHandleInvalid, got {err:?}"
+    );
+    assert_join_left_no_trace(&bob_sup, &bob, &reservation_id, &ctx_id).await;
+
+    // (iii) The genuine handle and a tampered ciphertext.
+    point_record(genuine_handle, genuine_public).await;
+    let mut tampered = copy_request(&req);
+    let last = tampered.sealed_bundle_ct.len() - 1;
+    tampered.sealed_bundle_ct[last] ^= 0x01;
+    let err = bob_sup
+        .spawn_actor_from_welcome(bob.clone(), custody.as_ref(), tampered)
+        .await
+        .expect_err("a tampered ciphertext fails the AEAD");
+    assert!(
+        matches!(err, crate::context::ContextError::CryptoFailed(_)),
+        "(iii) expected CryptoFailed, got {err:?}"
+    );
+    assert_join_left_no_trace(&bob_sup, &bob, &reservation_id, &ctx_id).await;
+
+    bob_sup
+        .spawn_actor_from_welcome(bob.clone(), custody.as_ref(), req)
+        .await
+        .expect("the genuine handle opens the untampered invitation");
+    assert!(
+        !reservation_is_live(&bob_sup, &bob, &reservation_id).await,
+        "the successful join consumed the reservation"
+    );
+}
+
+/// When the custody reports a wrapping public key other than the reserved
+/// KeyPackage's `0xFF01` and the record's, the join refuses before any
+/// agreement as `InvalidKeyPackage`, and the reservation stays live.
+#[tokio::test]
+async fn join_rejects_a_reservation_whose_wrapping_key_differs_from_the_custody_key_before_consume()
+{
+    let ctx_id = ctx_hex(0xe3);
+    let bob = DID::from(BOB_DID);
+    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let bob_sup = bob_supervisor_over(None, fresh_mls_storage(), &custody);
+    let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &bob_sup).await;
+
+    let substitute = custody
+        .inner
+        .generate_keypair(KeyType::HpkeP256)
+        .await
+        .expect("a substitute P-256 key");
+    let substitute_public = custody
+        .inner
+        .public_key(&substitute)
+        .await
+        .expect("its public key");
+    custody.set_public_key_fault(Some(
+        crate::crypto::dh_counting_custody::PublicKeyFault::Bytes(
+            substitute_public.as_bytes().to_vec(),
+        ),
+    ));
+    let err = bob_sup
+        .spawn_actor_from_welcome(bob.clone(), custody.as_ref(), copy_request(&req))
+        .await
+        .expect_err("a custody key other than the reserved 0xFF01 cannot open");
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidKeyPackage(_)),
+        "expected InvalidKeyPackage, got {err:?}"
+    );
+    assert_eq!(custody.dh_calls(), 0, "no agreement runs");
+    assert_join_left_no_trace(&bob_sup, &bob, &reservation_id, &ctx_id).await;
+
+    custody.set_public_key_fault(None);
+    bob_sup
+        .spawn_actor_from_welcome(bob, custody.as_ref(), req)
+        .await
+        .expect("with the custody answering truthfully, the same invitation joins");
+}
+
+/// A join handed a custody other than the one registered for the identity
+/// fails before any agreement: as `Custody` key-not-found when that custody
+/// holds no key under the recorded handle, and as `InvalidKeyPackage` when it
+/// holds a different key under it. The reservation stays live.
+#[tokio::test]
+async fn join_with_a_custody_other_than_the_registered_one_fails_before_consume() {
+    let ctx_id = ctx_hex(0xe4);
+    let bob = DID::from(BOB_DID);
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &bob_sup).await;
+
+    // A custody holding no key under the recorded handle.
+    let foreign = crate::crypto::dh_counting_custody::DhCountingCustody::new();
+    let err = bob_sup
+        .spawn_actor_from_welcome(bob.clone(), &foreign, copy_request(&req))
+        .await
+        .expect_err("a foreign custody cannot open the invitation");
+    assert!(
+        matches!(
+            &err,
+            crate::context::ContextError::Custody(failure) if failure.is_key_not_found()
+        ),
+        "expected Custody key-not-found, got {err:?}"
+    );
+    assert_join_left_no_trace(&bob_sup, &bob, &reservation_id, &ctx_id).await;
+
+    // A custody holding a different P-256 key under the recorded handle.
+    let recorded = *bob_sup
+        .load_wrapping_key(&bob)
+        .await
+        .expect("bob's wrapping key")
+        .handle();
+    // In-memory custodies number their handles from one, so the foreign
+    // custody reaches the recorded handle within a few keys.
+    for _ in 0..64 {
+        if foreign.generated_handles().contains(&recorded) {
+            break;
+        }
+        foreign
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("the foreign custody generates a P-256 key");
+    }
+    assert!(
+        foreign.generated_handles().contains(&recorded),
+        "the foreign custody holds a key under the recorded handle"
+    );
+    let err = bob_sup
+        .spawn_actor_from_welcome(bob.clone(), &foreign, copy_request(&req))
+        .await
+        .expect_err("a foreign key under the same handle cannot open the invitation");
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidKeyPackage(_)),
+        "expected InvalidKeyPackage, got {err:?}"
+    );
+    assert_eq!(foreign.dh_calls(), 0, "no agreement runs");
+    assert_join_left_no_trace(&bob_sup, &bob, &reservation_id, &ctx_id).await;
+
+    let registered = bob_sup
+        .testing_wrapping_custody()
+        .expect("the test supervisor's in-memory wrapping custody");
+    bob_sup
+        .spawn_actor_from_welcome(bob, registered.as_ref(), req)
+        .await
+        .expect("the registered custody opens the same invitation");
+}
+
+/// A custody that cannot agree with the wrapping key fails the join as
+/// `Custody` key-not-found, which every bridge reports as 4006. Nothing is
+/// consumed and nothing stands up.
+#[tokio::test]
+async fn join_fails_closed_when_custody_cannot_agree() {
+    let (result, joined) = run_join_with_wrapping_key_loss(
+        0xe5,
+        None,
+        Some(joiner_params()),
+        joiner_params(),
+        None,
+        Some(WrappingKeyLoss::CannotAgree),
+    )
+    .await;
+    let err = result.expect_err("a custody that cannot agree fails the join");
+    assert!(
+        matches!(
+            &err,
+            crate::context::ContextError::Custody(failure) if failure.is_key_not_found()
+        ),
+        "expected Custody key-not-found, got {err:?}"
+    );
+    assert_join_left_no_trace(
+        &joined.sup,
+        &DID::from(BOB_DID),
+        &joined.reservation_id,
+        &joined.ctx_id,
+    )
+    .await;
+}
+
+/// No custody call follows the join's agreement, so a custody that destroys
+/// the wrapping key right after agreeing still lets the join finish. The loss
+/// surfaces at the next load: a supervisor rebuilt over the same storage and
+/// custody refuses the record as `WrappingKeyHandleInvalid`.
+#[tokio::test]
+async fn join_succeeds_when_custody_loses_the_wrapping_key_after_agree_and_a_reload_reports_it() {
+    let (result, joined) = run_join_with_wrapping_key_loss(
+        0xe6,
+        None,
+        Some(joiner_params()),
+        joiner_params(),
+        None,
+        Some(WrappingKeyLoss::AfterAgree),
+    )
+    .await;
+    result.expect("the join completes once the agreement has run");
+    assert_eq!(joined.sup.member_count(&joined.ctx_id).await, Some(2));
+
+    let custody = joined.loss_custody.expect("the loss custody");
+    let rebuilt = bob_supervisor_over(None, joined.mls_storage, &custody);
+    let err = rebuilt
+        .load_wrapping_key(&DID::from(BOB_DID))
+        .await
+        .expect_err("the record names a key the custody destroyed");
+    assert!(
+        matches!(err, crate::context::ContextError::WrappingKeyHandleInvalid),
+        "expected WrappingKeyHandleInvalid, got {err:?}"
+    );
+}
+
+/// A joiner restarted between the invitation and the join reloads its
+/// wrapping key's handle from the record and opens with it: the custody
+/// generated one key in all, and the join ran exactly one agreement.
+#[tokio::test]
+async fn invite_then_restart_joiner_then_join_opens_with_the_reloaded_custody_handle() {
+    let ctx_id = ctx_hex(0xe7);
+    let bob = DID::from(BOB_DID);
+    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let storage = fresh_mls_storage();
+    let before = bob_supervisor_over(None, Arc::clone(&storage), &custody);
+    let (_, _, req) = alice_invites_bob(&ctx_id, &before).await;
+    assert_eq!(custody.generate_calls(), 1, "one wrapping key exists");
+    let generated = custody.generated_handles();
+    drop(before);
+
+    let after = bob_supervisor_over(None, storage, &custody);
+    let dh_before = custody.dh_calls();
+    after
+        .spawn_actor_from_welcome(bob.clone(), custody.as_ref(), req)
+        .await
+        .expect("the restarted joiner opens the invitation");
+    assert_eq!(custody.dh_calls() - dh_before, 1, "the join agrees once");
+    assert_eq!(custody.generate_calls(), 1, "the restart generated no key");
+    let reloaded = after
+        .load_wrapping_key(&bob)
+        .await
+        .expect("the reloaded key");
+    assert_eq!(
+        generated,
+        vec![*reloaded.handle()],
+        "the join used the handle generated before the restart"
+    );
+    assert_eq!(after.member_count(&ctx_id).await, Some(2));
+}
+
+/// A joiner restarted over a custody that no longer holds its wrapping key
+/// fails the join at the key load as `WrappingKeyHandleInvalid`, before any
+/// agreement, and the reservation stays live.
+#[tokio::test]
+async fn join_after_restart_with_a_custody_that_lost_the_wrapping_key_fails_before_consume() {
+    let ctx_id = ctx_hex(0xe8);
+    let bob = DID::from(BOB_DID);
+    let storage = fresh_mls_storage();
+    let original = Arc::new(InMemoryKeyCustody::new());
+    let before = bob_supervisor_over(None, Arc::clone(&storage), &original);
+    let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &before).await;
+    drop(before);
+
+    let lost = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let after = bob_supervisor_over(None, Arc::clone(&storage), &lost);
+    let err = after
+        .spawn_actor_from_welcome(bob.clone(), lost.as_ref(), req)
+        .await
+        .expect_err("a custody without the wrapping key cannot open");
+    assert!(
+        matches!(err, crate::context::ContextError::WrappingKeyHandleInvalid),
+        "expected WrappingKeyHandleInvalid, got {err:?}"
+    );
+    assert_eq!(lost.dh_calls(), 0, "no agreement runs");
+    assert_eq!(
+        lost.generate_calls(),
+        0,
+        "the load generates no replacement key"
+    );
+    assert!(after.lookup(&ctx_id).is_none(), "no actor is registered");
+    drop(after);
+
+    // The reservation is durable: a supervisor over the same storage and the
+    // custody that holds the key finds it live.
+    let recovered = bob_supervisor_over(None, storage, &original);
+    assert!(
+        reservation_is_live(&recovered, &bob, &reservation_id).await,
+        "the failed join left the reservation live"
+    );
+}
+
+/// Every malformed enc form fails the join as `CryptoFailed` before any
+/// custody call of any kind, so the reservation stays live; the well-formed
+/// enc then joins.
+#[tokio::test]
+async fn join_rejects_a_malformed_enc_before_keypackage_consumption() {
+    let ctx_id = ctx_hex(0xe9);
+    let bob = DID::from(BOB_DID);
+    let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+    let bob_sup = bob_supervisor_over(None, fresh_mls_storage(), &custody);
+    let (reservation_id, _, req) = alice_invites_bob(&ctx_id, &bob_sup).await;
+    let good: [u8; 65] = req
+        .sealed_bundle_enc
+        .as_slice()
+        .try_into()
+        .expect("a 65-byte enc");
+
+    // p, the P-256 field prime.
+    let p: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff,
+    ];
+    let with = |edit: &dyn Fn(&mut [u8; 65])| {
+        let mut enc = good;
+        edit(&mut enc);
+        enc.to_vec()
+    };
+    let compressed = |tag: u8| [&[tag][..], &good[1..33]].concat();
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("32 bytes", good[..32].to_vec()),
+        ("64 bytes", good[1..].to_vec()),
+        ("66 bytes", [good.as_slice(), &[0]].concat()),
+        ("a single 0x00", vec![0x00]),
+        ("65 bytes led by 0x00", with(&|e| e[0] = 0x00)),
+        ("33-byte 0x02 compressed", compressed(0x02)),
+        ("33-byte 0x03 compressed", compressed(0x03)),
+        ("x = p", with(&|e| e[1..33].copy_from_slice(&p))),
+        ("y = p", with(&|e| e[33..65].copy_from_slice(&p))),
+        ("off the curve", with(&|e| e[64] ^= 0x01)),
+    ];
+    let calls_before = custody.calls();
+    for (name, enc) in cases {
+        let mut malformed = copy_request(&req);
+        malformed.sealed_bundle_enc = enc;
+        let err = bob_sup
+            .spawn_actor_from_welcome(bob.clone(), custody.as_ref(), malformed)
+            .await
+            .expect_err("a malformed enc fails the join");
+        assert!(
+            matches!(err, crate::context::ContextError::CryptoFailed(_)),
+            "{name}: expected CryptoFailed, got {err:?}"
+        );
+        assert_eq!(
+            custody.calls(),
+            calls_before,
+            "{name}: the join made no custody call"
+        );
+        assert_join_left_no_trace(&bob_sup, &bob, &reservation_id, &ctx_id).await;
+    }
+
+    bob_sup
+        .spawn_actor_from_welcome(bob, custody.as_ref(), req)
+        .await
+        .expect("the well-formed enc joins");
 }

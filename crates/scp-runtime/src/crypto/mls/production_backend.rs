@@ -575,6 +575,17 @@ impl MlsBackend for ProductionMlsBackend {
         })
     }
 
+    async fn reserved_wrapping_key(
+        &self,
+        signer_state: &SignerState,
+    ) -> Result<Option<scp_protocol::crypto::hpke::p256::P256Point>, MlsError> {
+        let wrapper = parse_signer_state(signer_state)?;
+        let own_key_package_bytes = wrapper.key_package_public_bytes.clone();
+        let (_signer, provider) = signer_and_provider_from_wrapper(wrapper)?;
+        let own_key_package = Self::own_key_package(&provider, &own_key_package_bytes)?;
+        scp_mls::wrapping_extension::extract_wrapping_key(own_key_package.leaf_node().extensions())
+    }
+
     async fn join_from_welcome(
         &self,
         welcome_bytes: &[u8],

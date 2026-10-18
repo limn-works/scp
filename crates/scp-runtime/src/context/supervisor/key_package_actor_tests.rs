@@ -3418,6 +3418,12 @@ impl MlsBackend for FailingBackend {
             .finish_key_package(draft, attestation_signature)
             .await
     }
+    async fn reserved_wrapping_key(
+        &self,
+        signer_state: &SignerState,
+    ) -> Result<Option<scp_protocol::crypto::hpke::p256::P256Point>, MlsError> {
+        self.inner.reserved_wrapping_key(signer_state).await
+    }
     async fn join_from_welcome(
         &self,
         welcome_bytes: &[u8],

@@ -1,4 +1,5 @@
-//! Test custody that counts `dh_agree` and `generate_keypair` calls, so a
+//! Test custody that counts its calls, `dh_agree` and `generate_keypair` calls
+//! separately, so a
 //! round-trip test can prove the access-key open path performs exactly one key
 //! agreement, and a restart test can prove a wrapping key is generated once.
 //! It records every handle it generates and can be told to refuse
@@ -20,6 +21,7 @@ use scp_platform::traits::{
 /// unchanged.
 pub struct DhCountingCustody {
     pub inner: InMemoryKeyCustody,
+    calls: AtomicUsize,
     dh_calls: AtomicUsize,
     generate_calls: AtomicUsize,
     generate_gate: Option<GenerateGate>,
@@ -48,6 +50,7 @@ impl DhCountingCustody {
     pub fn new() -> Self {
         Self {
             inner: InMemoryKeyCustody::new(),
+            calls: AtomicUsize::new(0),
             dh_calls: AtomicUsize::new(0),
             generate_calls: AtomicUsize::new(0),
             generate_gate: None,
@@ -64,6 +67,12 @@ impl DhCountingCustody {
             ..Self::new()
         };
         (custody, gate)
+    }
+
+    /// The number of calls of every [`KeyCustody`] method so far, whatever
+    /// their outcome.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 
     /// The number of `dh_agree` calls so far, whatever their outcome.
@@ -96,6 +105,7 @@ impl DhCountingCustody {
 
 impl KeyCustody for DhCountingCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.generate_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(gate) = &self.generate_gate {
             gate.entered.notify_one();
@@ -110,14 +120,17 @@ impl KeyCustody for DhCountingCustody {
     }
 
     async fn generate_identity_keypair(&self) -> Result<KeyHandle, PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.generate_identity_keypair().await
     }
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.sign(key, data).await
     }
 
     async fn public_key(&self, key: &KeyHandle) -> Result<PublicKey, PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let fault = self
             .public_key_fault
             .read()
@@ -131,6 +144,7 @@ impl KeyCustody for DhCountingCustody {
     }
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.destroy_key(key).await
     }
 
@@ -139,6 +153,7 @@ impl KeyCustody for DhCountingCustody {
         key: &KeyHandle,
         peer_public: &[u8],
     ) -> Result<SharedSecret, PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.dh_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.dh_agree(key, peer_public).await
     }
@@ -148,6 +163,7 @@ impl KeyCustody for DhCountingCustody {
         key: &KeyHandle,
         context_id: &[u8],
     ) -> Result<Pseudonym, PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.derive_pseudonym(key, context_id).await
     }
 
@@ -157,6 +173,7 @@ impl KeyCustody for DhCountingCustody {
         context_id: &[u8],
         pseudonym_epoch: u64,
     ) -> Result<Pseudonym, PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner
             .derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
             .await
@@ -167,12 +184,14 @@ impl KeyCustody for DhCountingCustody {
         ed25519_handle: &KeyHandle,
         peer_x25519_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner
             .ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
             .await
     }
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.custody_type(key)
     }
 }

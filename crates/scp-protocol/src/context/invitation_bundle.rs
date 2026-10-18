@@ -50,7 +50,7 @@ use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use scp_did::DID;
 
@@ -125,6 +125,53 @@ pub struct InvitationKeyMaterial {
     /// Initial sender-key seed material (Broadcast contexts only; `None`
     /// otherwise).
     pub sender_key_seed: Option<Vec<u8>>,
+}
+
+impl InvitationKeyMaterial {
+    /// `SHA-256(RFC-8785-JCS(self))`, streamed into the hasher.
+    ///
+    /// Both fields are secret, and a JCS encoder builds the canonical text in
+    /// a heap buffer that is freed without a wipe. This writes the same text,
+    /// `{"context_metadata_key":[d,…],"sender_key_seed":null|[d,…]}`, straight
+    /// into SHA-256, so no copy of the key material is left behind; the
+    /// hasher's partial block of at most 63 bytes stays on the stack. Keys
+    /// appear in JCS order, and each byte is an integer in its shortest
+    /// decimal form, as RFC 8785 serializes it.
+    fn jcs_sha256(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"{\"context_metadata_key\":");
+        hash_jcs_byte_array(&mut hasher, &self.context_metadata_key);
+        hasher.update(b",\"sender_key_seed\":");
+        match &self.sender_key_seed {
+            None => hasher.update(b"null"),
+            Some(seed) => hash_jcs_byte_array(&mut hasher, seed),
+        }
+        hasher.update(b"}");
+        hasher.finalize().into()
+    }
+}
+
+/// Writes `bytes` into `hasher` as a JCS array of integers, `[d,d,…]`.
+fn hash_jcs_byte_array(hasher: &mut Sha256, bytes: &[u8]) {
+    let mut digits = Zeroizing::new([0u8; 3]);
+    hasher.update(b"[");
+    for (i, &byte) in bytes.iter().enumerate() {
+        if i > 0 {
+            hasher.update(b",");
+        }
+        let mut n = byte;
+        let mut start = digits.len();
+        loop {
+            start -= 1;
+            digits[start] = b'0' + n % 10;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        hasher.update(&digits[start..]);
+    }
+    hasher.update(b"]");
 }
 
 impl fmt::Debug for InvitationKeyMaterial {
@@ -214,7 +261,7 @@ impl InvitationBundle {
     pub fn invitation_bundle_signing_hash(&self) -> Result<[u8; 32], InvitationBundleError> {
         let relay_urls_hash = jcs_sha256(&self.relay_urls)?;
         let welcome_message_hash = jcs_sha256(&self.welcome_message)?;
-        let key_material_hash = jcs_sha256(&self.key_material)?;
+        let key_material_hash = self.key_material.jcs_sha256();
         let genesis_params_hash = jcs_sha256(&self.context_params)?;
         let metadata_snapshot_hash = jcs_sha256(&self.metadata_snapshot)?;
 
@@ -355,11 +402,30 @@ impl InvitationBundle {
     /// (`rmp_serde::to_vec_named`, spec §17.5). This is the wire form the
     /// runtime layer HPKE-encrypts; it never enters the signature.
     ///
+    /// The encoding holds the plaintext key material, so it is written into
+    /// one [`Zeroizing`] buffer sized by a counting pass first: a growing
+    /// `Vec` would free each outgrown buffer, holding part of the key
+    /// material, without a wipe.
+    ///
     /// # Errors
     ///
-    /// Returns [`InvitationBundleError::Wire`] on serialization failure.
-    pub fn to_wire_bytes(&self) -> Result<Vec<u8>, InvitationBundleError> {
-        rmp_serde::to_vec_named(self).map_err(|e| InvitationBundleError::Wire(e.to_string()))
+    /// Returns [`InvitationBundleError::Wire`] on serialization failure, or if
+    /// the encoding outgrew the buffer the counting pass sized.
+    pub fn to_wire_bytes(&self) -> Result<Zeroizing<Vec<u8>>, InvitationBundleError> {
+        let wire = |e: rmp_serde::encode::Error| InvitationBundleError::Wire(e.to_string());
+        let mut counter = ByteCounter(0);
+        rmp_serde::encode::write_named(&mut counter, self).map_err(wire)?;
+        let capacity = counter.0;
+        let mut out = Zeroizing::new(Vec::with_capacity(capacity));
+        rmp_serde::encode::write_named(&mut *out, self).map_err(wire)?;
+        if out.capacity() != capacity {
+            // The buffer reallocated, so an unwiped fragment may already be in
+            // freed memory; refuse rather than return it.
+            return Err(InvitationBundleError::Wire(format!(
+                "invitation bundle encoding outgrew its {capacity}-byte buffer"
+            )));
+        }
+        Ok(out)
     }
 
     /// Deserializes a bundle from its `MessagePack` transport envelope.
@@ -508,6 +574,23 @@ impl JoinResponse {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// A writer that only counts the bytes written to it, to size a buffer before
+/// the real encoding.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(buf.len()).ok_or_else(|| {
+            std::io::Error::other("invitation bundle encoding length overflows usize")
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Computes `SHA-256(RFC-8785-JCS(value))` — the per-field hash used in the
 /// signature preimage. Mirrors the §5.13.3 `0xFF02` extension's `jcs_sha256`.
@@ -882,6 +965,87 @@ mod tests {
             InvitationBundle::from_wire_bytes(b"not messagepack"),
             Err(InvitationBundleError::Wire(_))
         ));
+    }
+
+    /// The wire encoding round-trips, and its buffer was sized once: its
+    /// capacity equals its length, so no outgrown buffer holding key material
+    /// was freed. Covers an empty and a large Welcome, with and without a
+    /// sender-key seed.
+    #[test]
+    fn to_wire_bytes_round_trips_and_never_reallocates() {
+        for (welcome_len, seed) in [
+            (0usize, None),
+            (15, Some(vec![9u8; 4])),
+            (100_000, Some(vec![0xA5u8; 300])),
+        ] {
+            let mut bundle = fixture_bundle();
+            bundle.welcome_message = vec![0x42; welcome_len];
+            bundle.key_material.sender_key_seed = seed;
+            let bytes = bundle.to_wire_bytes().unwrap();
+            assert_eq!(bytes.capacity(), bytes.len(), "welcome {welcome_len}");
+            assert_eq!(
+                bytes.as_slice(),
+                rmp_serde::to_vec_named(&bundle).unwrap().as_slice(),
+                "the counted encoding equals the library encoding"
+            );
+            assert_eq!(InvitationBundle::from_wire_bytes(&bytes).unwrap(), bundle);
+        }
+    }
+
+    /// The streamed key-material hash equals SHA-256 over the library JCS
+    /// encoding, across seed shapes and the byte values whose decimal forms
+    /// change length (0, 9, 10, 99, 100, 255).
+    #[test]
+    fn key_material_jcs_hash_equals_library_jcs() {
+        const EDGE_BYTES: [u8; 6] = [0, 9, 10, 99, 100, 255];
+        let seeds: Vec<Option<Vec<u8>>> = vec![
+            None,
+            Some(vec![]),
+            Some(vec![EDGE_BYTES[1]]),
+            Some(EDGE_BYTES.iter().copied().cycle().take(32).collect()),
+            Some(EDGE_BYTES.iter().copied().cycle().take(100).collect()),
+        ];
+        for edge in EDGE_BYTES {
+            for seed in &seeds {
+                let mut key = [edge; 32];
+                key[31] = EDGE_BYTES[usize::from(edge) % EDGE_BYTES.len()];
+                let km = InvitationKeyMaterial {
+                    context_metadata_key: key,
+                    sender_key_seed: seed.clone(),
+                };
+                assert_eq!(
+                    km.jcs_sha256(),
+                    jcs_sha256(&km).unwrap(),
+                    "key byte {edge}, seed {:?}",
+                    seed.as_ref().map(Vec::len)
+                );
+            }
+        }
+    }
+
+    /// The bundle's signing hash, computed with the streamed key-material
+    /// hash, equals the same construction over the library JCS encoding.
+    #[test]
+    fn bundle_signing_hash_is_unchanged_by_the_streamed_key_material_hash() {
+        for seed in [None, Some(vec![9u8, 9, 9, 9])] {
+            let mut bundle = fixture_bundle();
+            bundle.key_material.sender_key_seed = seed;
+            let creator_did: &str = &bundle.creator_did;
+            let library = canonical_hash(
+                INVITATION_BUNDLE_DOMAIN,
+                &[
+                    CanonicalField::VarBytes(bundle.context_id.as_bytes()),
+                    CanonicalField::VarBytes(creator_did.as_bytes()),
+                    CanonicalField::Fixed32(&jcs_sha256(&bundle.relay_urls).unwrap()),
+                    CanonicalField::Fixed32(&jcs_sha256(&bundle.welcome_message).unwrap()),
+                    CanonicalField::Fixed32(&jcs_sha256(&bundle.key_material).unwrap()),
+                    CanonicalField::Fixed32(&jcs_sha256(&bundle.context_params).unwrap()),
+                    CanonicalField::Fixed32(&jcs_sha256(&bundle.metadata_snapshot).unwrap()),
+                ],
+            )
+            .unwrap();
+            assert_eq!(bundle.invitation_bundle_signing_hash().unwrap(), library);
+        }
     }
 
     // -- Secret hygiene --------------------------------------------------------

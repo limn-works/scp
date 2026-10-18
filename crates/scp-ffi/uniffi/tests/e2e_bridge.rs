@@ -534,11 +534,13 @@ async fn context_send_message() {
 /// The Kotlin suite asserts the same outcome through the generated bindings
 /// (`bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/JoinFromWelcomeTest.kt`),
 /// and `cargo nextest run --workspace` runs no Kotlin. This test therefore
-/// carries the claim: sealing resolves the invitee's `#active` key from a DID
-/// document, and `identity_create` publishes that document into the same DHT
-/// client the per-instance resolver reads. Were that publish to stop happening,
-/// the invite would fail at the `#active`-key resolution seam and this test
-/// would report it, rather than a Kotlin job that CI does not run.
+/// carries the claim: sealing verifies the invitee `KeyPackage`'s attestation
+/// against the invitee's `#active` key, resolved from a DID document, and seals
+/// to the attested `0xFF01` wrapping key (spec 05 §5.12.3.1). `identity_create`
+/// publishes that document into the same DHT client the per-instance resolver
+/// reads. Were that publish to stop happening, the invite would fail at the
+/// `#active`-key resolution seam and this test would report it, rather than a
+/// Kotlin job that CI does not run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_member_seals_for_a_locally_minted_invitee() {
     use scp_ffi_uniffi::bridge::InviteMemberOutcome;
@@ -593,8 +595,12 @@ async fn invite_member_seals_for_a_locally_minted_invitee() {
     );
     assert_eq!(
         bundle.enc.len(),
-        32,
-        "RFC 9180 HPKE encapsulates a 32-byte key"
+        65,
+        "DHKEM(P-256) encapsulates a 65-byte uncompressed point (spec 05 §5.12.3.1)"
+    );
+    assert_eq!(
+        bundle.enc[0], 0x04,
+        "the encapsulated key is an uncompressed SEC1 point"
     );
     assert!(
         !bundle.ciphertext.is_empty(),

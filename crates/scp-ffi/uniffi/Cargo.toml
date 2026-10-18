@@ -117,6 +117,9 @@ libc = "0.2"
 scp-mcp = { path = "../../scp-mcp", features = ["testing"] }
 # Tests need InMemoryKeyCustody — enable the `testing` feature for dev-deps.
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
+# `scp_crypto::p256::testing` supplies the valid and malformed P-256 `enc`
+# fixtures the join tests drive.
+scp-crypto = { path = "../../scp-crypto", features = ["testing"] }
 # Test seams (`install_seedable_resolver`) construct
 # `FfiDhtClient::InMemory(..)`, whose arm is gated behind
 # `scp-ffi-common/testing`; enable it for this crate's test build. The normal

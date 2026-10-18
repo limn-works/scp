@@ -115,6 +115,7 @@ use std::time::Duration;
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::crypto::hpke::p256::P256Point;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
@@ -594,6 +595,20 @@ pub enum KeyPackageCommand {
         /// Oneshot reply: the pooled `(KpRef, public KP bytes)` pairs. Empty
         /// when the pool is empty.
         reply: oneshot::Sender<Result<PooledKeyPackages, ContextError>>,
+    },
+    /// Read the `0xFF01` `scp_wrapping_key` of a reserved KeyPackage
+    /// (§9.16.1), from the KeyPackage bundle in the reservation's own signer
+    /// state. Read-only: the reservation stays live. The joiner checks it
+    /// against its custody wrapping key before it opens an invitation or
+    /// consumes the reservation (spec 05 §5.12.3.1, §9.16.2 Open step 2).
+    ReservedWrappingKey {
+        /// The reservation to read.
+        reservation_id: ReservationId,
+        /// Oneshot reply: the reserved KeyPackage's `0xFF01`. An unknown or
+        /// consumed reservation is [`ContextError::InvalidState`]; a
+        /// KeyPackage without `0xFF01`, or an unreadable signer state, is
+        /// [`ContextError::InvalidKeyPackage`].
+        reply: oneshot::Sender<Result<P256Point, ContextError>>,
     },
     /// Test-only fault-injection seam: panic the actor task so the watchdog's
     /// crash/poison/respawn path can be exercised deterministically. Gated
@@ -1166,6 +1181,13 @@ impl KeyPackageStoreActor {
             KeyPackageCommand::ListPooled { reply } => {
                 let _ = reply.send(Ok(self.handle_list_pooled()));
             }
+            KeyPackageCommand::ReservedWrappingKey {
+                reservation_id,
+                reply,
+            } => {
+                let result = self.handle_reserved_wrapping_key(reservation_id).await;
+                let _ = reply.send(result);
+            }
             // Shutdown + TestInducePanic are handled in `run()`; included for
             // exhaustiveness.
             KeyPackageCommand::Shutdown => {}
@@ -1375,6 +1397,35 @@ impl KeyPackageStoreActor {
     /// A replay-driven own-prior-completion retry (see the `ConfirmConsume`
     /// doc) has no group to re-produce, so it completes the durable consume and
     /// returns `Err(InvalidState)` rather than a groupless `Ok`.
+    /// Reads the `0xFF01` of the reserved KeyPackage from the reservation's
+    /// signer state, leaving the reservation in place.
+    async fn handle_reserved_wrapping_key(
+        &self,
+        reservation_id: ReservationId,
+    ) -> Result<P256Point, ContextError> {
+        let Some(reserved) = self.reserved.get(&reservation_id) else {
+            return Err(ContextError::InvalidState(
+                "unknown or already-consumed reservation".to_owned(),
+            ));
+        };
+        let signer_state = SignerState {
+            bytes: Zeroizing::new(reserved.signer_state.to_vec()),
+        };
+        self.mls
+            .reserved_wrapping_key(&signer_state)
+            .await
+            .map_err(|e| {
+                ContextError::InvalidKeyPackage(format!(
+                    "reserved KeyPackage wrapping key unreadable: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ContextError::InvalidKeyPackage(
+                    "reserved KeyPackage carries no scp_wrapping_key (0xFF01)".to_owned(),
+                )
+            })
+    }
+
     async fn handle_confirm(
         &mut self,
         reservation_id: ReservationId,

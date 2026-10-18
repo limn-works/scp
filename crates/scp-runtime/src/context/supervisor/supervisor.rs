@@ -1620,8 +1620,11 @@ pub struct WelcomeJoinRequest {
     /// UNTRUSTED binding hint: the creator did used to build the HPKE
     /// `info`/`aad`. Cross-checked against `bundle.creator_did` after the open.
     pub creator_did: DID,
-    /// RFC 9180 HPKE encapsulated key (`enc`) of the sealed invitation bundle.
-    pub sealed_bundle_enc: [u8; 32],
+    /// RFC 9180 HPKE encapsulated key (`enc`) of the sealed invitation
+    /// bundle: the 65-byte uncompressed DHKEM(P-256) point (§9.16.2). The
+    /// join validates it before any custody call; any other form is
+    /// [`ContextError::CryptoFailed`].
+    pub sealed_bundle_enc: Vec<u8>,
     /// RFC 9180 HPKE ciphertext (`ct`) of the MessagePack-serialized
     /// [`InvitationBundle`](scp_protocol::context::InvitationBundle).
     pub sealed_bundle_ct: Vec<u8>,
@@ -15285,8 +15288,8 @@ impl Supervisor {
     /// validates, its credential names `owner`, its leaf carries `0xFF01` and
     /// `0xFF03`, and the `0xFF03` attestation verifies against `owner`'s
     /// `#active` key resolved through this supervisor's key resolver. Returns
-    /// the leaf's `0xFF01` wrapping key. `invite_member` seals to that key
-    /// only after this returns.
+    /// the leaf's `0xFF01` wrapping key as a validated P-256 point.
+    /// `invite_member` seals to that key only after this returns.
     ///
     /// # Errors
     ///
@@ -15294,14 +15297,15 @@ impl Supervisor {
     ///   resolver, crypto provider, or clock.
     /// - [`ContextError::InvalidKeyPackage`] when the `KeyPackage` does not
     ///   validate, names another identity, carries no `0xFF01` or no
-    ///   `0xFF03`, or its attestation does not verify; the message ends with
+    ///   `0xFF03`, its `0xFF01` is not a valid P-256 point, or its
+    ///   attestation does not verify; the message ends with
     ///   the [`AttestationRuntimeVerifyError`](crate::crypto::mls::attestation_verification::AttestationRuntimeVerifyError)
     ///   in the last case.
     pub async fn verify_key_package_attestation(
         &self,
         owner: &DID,
         key_package: &[u8],
-    ) -> Result<[u8; 65], ContextError> {
+    ) -> Result<scp_protocol::crypto::hpke::p256::P256Point, ContextError> {
         use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
         use crate::crypto::mls::attestation_verification::{
             AttestationAddGroundTruth, verify_add_attestation,
@@ -15353,7 +15357,11 @@ impl Supervisor {
         .map_err(|e| {
             ContextError::InvalidKeyPackage(format!("KeyPackage attestation rejected: {e}"))
         })?;
-        Ok(wrapping_key)
+        scp_protocol::crypto::hpke::p256::P256Point::try_from(wrapping_key).map_err(|e| {
+            ContextError::InvalidKeyPackage(format!(
+                "KeyPackage scp_wrapping_key (0xFF01) is not a valid P-256 point: {e}"
+            ))
+        })
     }
 
     /// Produces, signs, HPKE-seals, and (best-effort) delivers a §5.12.3 signed
@@ -15369,9 +15377,11 @@ impl Supervisor {
     ///    MLS-Welcome invitation flow stands up an encrypted context
     ///    (spawn-from-Welcome builds Encrypted mode and rejects Broadcast), so a
     ///    Broadcast context is refused here.
-    /// 2. Resolves the invitee's `#active` verifying key via the
-    ///    `key_resolver` and maps it to X25519 (RFC
-    ///    7748) as the HPKE recipient key.
+    /// 2. Verifies the invitee's KeyPackage (§9.7.1) through
+    ///    [`Self::verify_key_package_attestation`]: its `0xFF03` attestation
+    ///    must verify against the invitee's resolved `#active` key. The
+    ///    HPKE recipient key is the leaf's attested `0xFF01` DHKEM(P-256)
+    ///    wrapping key (§9.16.2).
     /// 3. Only a `SingleAdmin` context is supported (a voting model returns
     ///    `Err(ContextError::InvalidState)` up front — no proposal, no add —
     ///    because governed-context invitations are not yet implemented). Routes
@@ -15400,8 +15410,9 @@ impl Supervisor {
     ///    gate authorized. The actor holds no custody key; the raw key is
     ///    supplied by the FFI boundary (same trust model as the governance
     ///    proposal path, which also takes a raw `&SigningKey`).
-    /// 6. HPKE-seals the MessagePack-serialized bundle to the invitee (RFC 9180
-    ///    Base mode, `info`/`aad` per §5.12.3.1).
+    /// 6. HPKE-seals the MessagePack-serialized bundle to the invitee's
+    ///    `0xFF01` key (RFC 9180 Base mode, DHKEM(P-256), `info`/`aad` per
+    ///    §5.12.3.1).
     /// 7. Fork C: publishes the sealed
     ///    [`SealedInvitation`](crate::context::invitation_helpers::SealedInvitation)
     ///    to the invitee's `scp-invitations` routing id when the transport
@@ -15434,8 +15445,9 @@ impl Supervisor {
     /// - [`ContextError::ContextNotRegistered`] if `context_id` has no live
     ///   context; [`ContextError::InvalidState`] for a voting-governed context
     ///   (governed-context invitations are not yet implemented);
-    ///   [`ContextError::CryptoFailed`] for a Broadcast context, an
-    ///   unresolvable invitee `#active` key, an invalid key mapping, a signing or
+    ///   [`ContextError::InvalidKeyPackage`] if the invitee's KeyPackage does
+    ///   not verify (see [`Self::verify_key_package_attestation`]);
+    ///   [`ContextError::CryptoFailed`] for a Broadcast context, a signing or
     ///   HPKE-seal failure, or a serialization fault;
     ///   [`ContextError::MembershipFailed`] if the MLS add-member produces no
     ///   Welcome; [`ContextError::NotInitialized`] if no key resolver is wired;
@@ -15509,25 +15521,10 @@ impl Supervisor {
         //     `#active` key. A supervisor without a key resolver refuses here,
         //     before any verification. `execute_add_member` validates the
         //     KeyPackage again in-actor; this pass is the attestation gate.
-        self.verify_key_package_attestation(&invitee_did, &invitee_key_package)
+        // 2. The verified leaf's `0xFF01` is the HPKE recipient (§9.16.2).
+        let recipient = self
+            .verify_key_package_attestation(&invitee_did, &invitee_key_package)
             .await?;
-
-        // 2. Resolve the invitee's #active key -> X25519 recipient.
-        let resolver = self.key_resolver_ref().ok_or_else(|| {
-            ContextError::NotInitialized("invite_member: key resolver not configured".to_owned())
-        })?;
-        let invitee_vk =
-            resolver(&invitee_did, scp_did::SigningKeyId::Active).ok_or_else(|| {
-                ContextError::CryptoFailed(format!(
-                    "invite_member: cannot resolve #active key for invitee '{invitee_did}'"
-                ))
-            })?;
-        let recipient_x25519 = envelope_seal::ed25519_pubkey_to_x25519(invitee_vk.as_bytes())
-            .map_err(|e| {
-                ContextError::CryptoFailed(format!(
-                    "invite_member: invitee #active key has no valid X25519 mapping: {e}"
-                ))
-            })?;
 
         // 3. Drive the member-add THROUGH THE CONTEXT ACTOR's governance gate
         //    (structural — replaces the prior off-mailbox `deps.crypto.add_member`
@@ -15617,10 +15614,12 @@ impl Supervisor {
             let metadata_snapshot =
                 crate::context::invitation_helpers::build_metadata_snapshot(&params, facts);
 
-            let mut metadata_key = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut metadata_key);
+            // The key is drawn into a `Zeroizing` buffer and copied once into
+            // the bundle's `InvitationKeyMaterial`, which wipes itself on drop.
+            let mut metadata_key = Zeroizing::new([0u8; 32]);
+            rand::rngs::OsRng.fill_bytes(metadata_key.as_mut());
             let key_material = InvitationKeyMaterial {
-                context_metadata_key: metadata_key,
+                context_metadata_key: *metadata_key,
                 sender_key_seed: None,
             };
 
@@ -15649,15 +15648,16 @@ impl Supervisor {
             // A custody refusal or timeout keeps its typed custody error.
             bundle.set_signature(proposer_signer.sign_bounded_ed25519(&bundle_hash).await?);
 
-            // 6. HPKE-seal the serialized bundle to the invitee. `wire` carries
-            //    the plaintext `context_metadata_key` (§9.10.4.B) — hold it in
-            //    `Zeroizing` so the serialized bundle zeroes on drop.
-            let wire = zeroize::Zeroizing::new(bundle.to_wire_bytes().map_err(|e| {
+            // 6. HPKE-seal the serialized bundle to the invitee's `0xFF01`.
+            //    `wire` carries the plaintext `context_metadata_key`
+            //    (§9.10.4.B); `to_wire_bytes` writes it into one `Zeroizing`
+            //    buffer that zeroes on drop.
+            let wire = bundle.to_wire_bytes().map_err(|e| {
                 ContextError::CryptoFailed(format!("invite_member: bundle serialize failed: {e}"))
-            })?);
+            })?;
             let (ciphertext, enc) = envelope_seal::hpke_seal_invitation(
                 &wire,
-                &recipient_x25519,
+                &recipient,
                 &context_id,
                 creator_did.as_ref(),
             )
@@ -15671,7 +15671,7 @@ impl Supervisor {
             let sealed = crate::context::invitation_helpers::SealedInvitation {
                 context_id: context_id.clone(),
                 creator_did: creator_did.clone(),
-                enc: enc.to_vec(),
+                enc: enc.as_bytes().to_vec(),
                 ciphertext,
             };
             let payload = sealed.to_wire_bytes().map_err(|e| {
@@ -15867,7 +15867,6 @@ impl Supervisor {
         self: &Arc<Self>,
         owning_did: DID,
         custody: &C,
-        active_key_handle: &scp_platform::KeyHandle,
         req: WelcomeJoinRequest,
     ) -> Result<crate::context::ContextHandle, ContextError> {
         use crate::context::supervisor::key_package_actor::KeyPackageCommand;
@@ -15881,105 +15880,94 @@ impl Supervisor {
             local_pseudonym,
         } = req;
 
-        // Serialize the WHOLE join against every other bootstrap for this id (the
-        // `CreateContext` / `ImportContext` / `RestoreContext` dispatch arms, the
-        // `standing_context` path, and the off-mailbox watchdog
-        // `respawn_from_snapshot`) by holding `bootstrap_spawn_lock` across the
-        // entire entrypoint body — exactly as those four peer bootstraps do.
-        //
-        // Without this guard the off-mailbox watchdog `respawn_from_snapshot` can
-        // race the join: a victim actor panics → the watchdog despawns it from
-        // `self.actors` before `restore_context` re-inserts it → this join's
-        // Precheck-A `lookup` MISSES the mid-despawn victim → both paths write
-        // crypto (`restore_crypto_state` does a blind `contexts.insert`) and this
-        // join's rollback `delete_context` can destroy the victim's freshly
-        // restored snapshot. Taking the lock at the very top makes Precheck A (and
-        // its durable companion below) atomic w.r.t. every other bootstrap + the
-        // respawn, so the first writer wins deterministically.
-        //
-        // Lock order is always `bootstrap_spawn_lock` → `write_lock` (the register
-        // in `spawn_actor_with_state` below takes `write_lock` INSIDE this guard,
-        // identical to create/import/standing/respawn); neither `build_actor_deps`,
-        // the crypto ops, nor `spawn_actor_with_state` re-acquires
-        // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free.
-        // The joiner's wrapping key loads first, outside both locks, so no
-        // custody call for it runs under either.
-        self.load_wrapping_key(&owning_did).await?;
-        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
-
-        // ---- OPEN + VERIFY the signed §5.12.3 invitation bundle (FFI-02) ------
-        // This is the FIRST thing the join does — before any precheck, the
-        // irreversible KeyPackage consume, or any state build — so authority
+        // ---- OPEN the sealed §5.12.3 invitation bundle (§9.16.2 Open) --------
+        // The open is the FIRST thing the join does, before any precheck, the
+        // irreversible KeyPackage consume, or any state build, so authority
         // derives ONLY from the creator-signed, HPKE-sealed bundle, never from
         // attacker-injectable caller params (BLACK-2J10-001 admin-hijack).
         //
-        // The joiner's #active private key never leaves custody: the KEM
-        // Diffie-Hellman `DH(sk_active_x25519, enc)` is computed INSIDE custody
-        // via `ed25519_to_x25519_agree`; the rest of the RFC 9180 open
-        // (`ExtractAndExpand`, `KeySchedule`, AEAD) is pure software (ADR-006,
-        // split custody). `info`/`aad` are rebuilt from the UNTRUSTED
-        // `hint_context_id` / `hint_creator_did`; a successful AEAD open PROVES
-        // the sealer used identical values (they are AEAD-authenticated), and the
-        // signed bundle is cross-checked against them below.
-        // The two custody `.await`s (KEM DH agreement + reading the joiner's
-        // #active public key) hit an external custody device whose latency the
-        // runtime does not control. They run UNDER the global
-        // `bootstrap_spawn_lock`, so a slow or hostile custody device would pin
-        // that lock and wedge every other bootstrap (create / join / import /
-        // restore / respawn) node-wide — a bootstrap DoS. Bound them under
-        // `LIFECYCLE_TIMEOUT` (same budget as the consume region below). This is
-        // a SEPARATE timeout from the post-consume region on purpose: nothing is
-        // consumed or persisted here, so an elapse has nothing to roll back and
-        // the reversible-precheck ordering is preserved.
-        let (dh_bytes, active_pub_bytes): (zeroize::Zeroizing<[u8; 32]>, [u8; 32]) =
-            match tokio::time::timeout(Self::LIFECYCLE_TIMEOUT, async {
-                let dh = custody
-                    .ed25519_to_x25519_agree(active_key_handle, &sealed_bundle_enc)
-                    .await
-                    .map_err(|e| ContextError::Custody(e.into()))?;
-                let dh_bytes: zeroize::Zeroizing<[u8; 32]> =
-                    zeroize::Zeroizing::new(*dh.as_bytes());
-                // pkRm = the joiner's OWN #active public key mapped to X25519.
-                let active_pub = custody
-                    .public_key(active_key_handle)
-                    .await
-                    .map_err(|e| ContextError::Custody(e.into()))?;
-                let active_pub_bytes: [u8; 32] =
-                    active_pub.as_bytes().try_into().map_err(|_| {
-                        ContextError::CryptoFailed(
-                            "spawn-from-Welcome: joiner #active public key is not 32 bytes"
-                                .to_owned(),
-                        )
-                    })?;
-                Ok::<_, ContextError>((dh_bytes, active_pub_bytes))
+        // Every step of the open only reads, so it runs before
+        // `bootstrap_spawn_lock`: a slow or hostile custody device cannot pin
+        // that lock and wedge every other bootstrap node-wide. A concurrent
+        // consume of the same reservation is still caught under the lock, by
+        // the `ConfirmConsume` below. Each custody call is bounded by the
+        // custody budget (`SIGN_TIMEOUT`, ADR-049 Decision 7a); a failure here
+        // has consumed nothing.
+        //
+        // 1. The enc is validated before any custody call (§9.16.2 Open step
+        //    1): a malformed point is rejected without touching the wrapping
+        //    key or the reservation.
+        let enc =
+            scp_protocol::crypto::hpke::p256::validate_enc(&sealed_bundle_enc).map_err(|e| {
+                ContextError::CryptoFailed(format!("spawn-from-Welcome: invitation enc: {e}"))
+            })?;
+        // 2. The joiner's wrapping key, loaded from its custody handle record.
+        let wrapping_key = self.load_wrapping_key(&owning_did).await?;
+        // 3. The `0xFF01` the inviter sealed to: the reserved KeyPackage's own.
+        let reserved_wrapping_key = self
+            .key_package_store_for(&owning_did)
+            .await?
+            .send(|reply| KeyPackageCommand::ReservedWrappingKey {
+                reservation_id: reservation_id.clone(),
+                reply,
             })
+            .await?;
+        // 4. The three keys must agree (§9.16.2 Open step 2): the reserved
+        //    `0xFF01`, the public key of the handle in the custody the caller
+        //    passed (`pkRm`), and the supervisor's recorded wrapping key. A
+        //    disagreement means the reservation, the custody, or the record
+        //    names another key; nothing is opened or consumed.
+        let pk_rm: [u8; scp_protocol::crypto::hpke::p256::PUBLIC_KEY_LEN] =
+            match tokio::time::timeout(
+                crate::context::actor::SIGN_TIMEOUT,
+                custody.public_key(wrapping_key.handle()),
+            )
             .await
             {
-                Ok(result) => result?,
-                Err(_elapsed) => {
-                    return Err(ContextError::TransportTimeout(format!(
-                        "spawn-from-Welcome: custody key operations exceeded {:?} — refusing \
-                         to hold the global bootstrap lock (nothing consumed)",
-                        Self::LIFECYCLE_TIMEOUT
-                    )));
+                Ok(Ok(public)) => public.as_bytes().try_into().map_err(|_| {
+                    ContextError::InvalidKeyPackage(
+                        "spawn-from-Welcome: the custody wrapping key is not a 65-byte P-256 point"
+                            .to_owned(),
+                    )
+                })?,
+                Ok(Err(e)) => return Err(ContextError::Custody(e.into())),
+                Err(_) => {
+                    return Err(crate::context::actor::signer::custody_timed_out(
+                        "public_key",
+                    ));
                 }
             };
-        let pk_rm =
-            scp_protocol::crypto::envelope_seal::ed25519_pubkey_to_x25519(&active_pub_bytes)
-                .map_err(|e| {
-                    ContextError::CryptoFailed(format!(
-                        "spawn-from-Welcome: joiner #active key has no valid X25519 mapping: {e}"
-                    ))
-                })?;
-        // `bundle_wire` is the decrypted, serialized InvitationBundle — it holds
-        // the plaintext `context_metadata_key` (§9.10.4.B). Hold it in
-        // `Zeroizing` so it zeroes on drop once decoded.
-        let bundle_wire = zeroize::Zeroizing::new(
+        if reserved_wrapping_key.as_bytes() != &pk_rm || &pk_rm != wrapping_key.public() {
+            return Err(ContextError::InvalidKeyPackage(
+                "spawn-from-Welcome: the reserved KeyPackage's scp_wrapping_key, the custody \
+                 wrapping key, and the recorded wrapping key disagree"
+                    .to_owned(),
+            ));
+        }
+        // 5. The KEM Diffie-Hellman runs inside custody on the wrapping handle;
+        //    no wrapping scalar exists in the runtime (C-a).
+        let dh: Zeroizing<[u8; 32]> = match tokio::time::timeout(
+            crate::context::actor::SIGN_TIMEOUT,
+            custody.dh_agree(wrapping_key.handle(), enc.as_bytes()),
+        )
+        .await
+        {
+            Ok(Ok(shared)) => Zeroizing::new(*shared.as_bytes()),
+            Ok(Err(e)) => return Err(ContextError::Custody(e.into())),
+            Err(_) => return Err(crate::context::actor::signer::custody_timed_out("dh_agree")),
+        };
+        // 6. The rest of the RFC 9180 open (`ExtractAndExpand`, `KeySchedule`,
+        //    AEAD) is software. `info`/`aad` are rebuilt from the UNTRUSTED
+        //    `hint_context_id` / `hint_creator_did`; a successful AEAD open
+        //    PROVES the sealer used identical values, and the signed bundle is
+        //    cross-checked against them below. `bundle_wire` holds the
+        //    plaintext `context_metadata_key` (§9.10.4.B) and zeroes on drop.
+        let bundle_wire =
             scp_protocol::crypto::envelope_seal::hpke_open_invitation_with_external_dh(
                 &sealed_bundle_ct,
-                &dh_bytes,
+                &dh,
                 &pk_rm,
-                &sealed_bundle_enc,
+                &enc,
                 &hint_context_id,
                 hint_creator_did.as_ref(),
             )
@@ -15987,8 +15975,33 @@ impl Supervisor {
                 ContextError::CryptoFailed(format!(
                     "spawn-from-Welcome: invitation open failed: {e}"
                 ))
-            })?,
-        );
+            })?;
+        drop(dh);
+
+        // 7. Serialize the rest of the join against every other bootstrap for
+        // this id (the `CreateContext` / `ImportContext` / `RestoreContext`
+        // dispatch arms, the `standing_context` path, and the off-mailbox
+        // watchdog `respawn_from_snapshot`) by holding `bootstrap_spawn_lock`
+        // from here to the end of the entrypoint, exactly as those four peer
+        // bootstraps do.
+        //
+        // Without this guard the off-mailbox watchdog `respawn_from_snapshot` can
+        // race the join: a victim actor panics → the watchdog despawns it from
+        // `self.actors` before `restore_context` re-inserts it → this join's
+        // Precheck-A `lookup` MISSES the mid-despawn victim → both paths write
+        // crypto (`restore_crypto_state` does a blind `contexts.insert`) and this
+        // join's rollback `delete_context` can destroy the victim's freshly
+        // restored snapshot. Taking the lock before Precheck A makes it (and
+        // its durable companion below) atomic w.r.t. every other bootstrap + the
+        // respawn, so the first writer wins deterministically.
+        //
+        // Lock order is always `bootstrap_spawn_lock` → `write_lock` (the register
+        // in `spawn_actor_with_state` below takes `write_lock` INSIDE this guard,
+        // identical to create/import/standing/respawn); neither `build_actor_deps`,
+        // the crypto ops, nor `spawn_actor_with_state` re-acquires
+        // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free. No
+        // custody call for the wrapping key runs under either lock.
+        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
         let bundle = scp_protocol::context::InvitationBundle::from_wire_bytes(&bundle_wire)
             .map_err(|e| {
                 ContextError::CryptoFailed(format!(
@@ -28385,11 +28398,79 @@ mod tests {
         out
     }
 
+    /// The join driver of
+    /// [`no_wrapping_custody_call_runs_under_write_lock_or_bootstrap_spawn_lock`]:
+    /// opens a sealed invitation for `identity` with no wrapping key loaded,
+    /// so the open reaches custody.
+    async fn drive_join_open_before_spawn_lock(
+        sup: &Arc<Supervisor>,
+        custody: &Arc<LockCheckingCustody>,
+        identity: &DID,
+    ) {
+        use crate::context::supervisor::key_package_actor::{
+            KeyPackageCommand, KeyPackageStoreHandle, ReservationId,
+        };
+        // The join reads the reservation's `0xFF01` from the owner's
+        // KeyPackage store. This supervisor's resolver names no `#active` key,
+        // so no store can mint; a store stand-in answers with the owner's own
+        // wrapping key. The sealed bytes are no bundle, so the join fails at
+        // the bundle decode, under `bootstrap_spawn_lock`, after the open.
+        let owner_key = sup.load_wrapping_key(identity).await.unwrap();
+        let reserved =
+            scp_protocol::crypto::hpke::p256::P256Point::try_from(*owner_key.public()).unwrap();
+        let (store_tx, mut store_rx) = tokio::sync::mpsc::channel(4);
+        let store = tokio::spawn(async move {
+            while let Some(cmd) = store_rx.recv().await {
+                if let KeyPackageCommand::ReservedWrappingKey { reply, .. } = cmd {
+                    let _ = reply.send(Ok(reserved));
+                }
+            }
+        });
+        sup.key_package_stores.insert(
+            identity.clone(),
+            KeyPackageStoreHandle::from_sender(store_tx),
+        );
+        sup.wrapping_keys.clear();
+        let join_ctx = hex::encode([0xD2u8; 32]);
+        let creator = "did:example:lock-discipline-creator";
+        let (ct, enc) = scp_protocol::crypto::envelope_seal::hpke_seal_invitation(
+            b"not an invitation bundle",
+            &reserved,
+            &join_ctx,
+            creator,
+        )
+        .unwrap();
+        let joined = assert_custody_called(
+            custody,
+            "spawn_actor_from_welcome",
+            sup.spawn_actor_from_welcome(
+                identity.clone(),
+                custody.as_ref(),
+                WelcomeJoinRequest {
+                    context_id: join_ctx,
+                    creator_did: DID(creator.to_owned()),
+                    sealed_bundle_enc: enc.as_bytes().to_vec(),
+                    sealed_bundle_ct: ct,
+                    reservation_id: ReservationId::new_random(),
+                    local_pseudonym: None,
+                },
+            ),
+        )
+        .await;
+        assert!(
+            matches!(&joined, Err(ContextError::CryptoFailed(m)) if m.contains("bundle decode")),
+            "the join opened the invitation and failed at the decode: {joined:?}"
+        );
+        store.abort();
+    }
+
     /// Spec 09 §9.16.1 and ADR-049: a host custody call may wait on a user
     /// prompt, so no wrapping custody call runs under `write_lock` or
     /// `bootstrap_spawn_lock`. Each driver below starts with no key loaded, so
     /// it reaches custody: CreateContext, Restore, Import, `standing_context`,
-    /// `reserve_key_package` and `clear_poison`.
+    /// `reserve_key_package`, `clear_poison` and `spawn_actor_from_welcome`,
+    /// whose invitation open (`public_key`, `dh_agree`) runs before it takes
+    /// `bootstrap_spawn_lock`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_wrapping_custody_call_runs_under_write_lock_or_bootstrap_spawn_lock() {
         let (sup, custody) = lock_checking_supervisor();
@@ -28486,6 +28567,8 @@ mod tests {
             Box::pin(sup.clear_poison(&ctx, &identity)),
         )
         .await;
+
+        drive_join_open_before_spawn_lock(&sup, &custody, &identity).await;
 
         let held: Vec<String> = custody
             .held

@@ -8,9 +8,8 @@
 //! agree itself, with the key still loaded. Four further calls cannot be
 //! reached by destroying a key from outside, because the protocol obtains or
 //! uses the key inside one function: `generate_keypair` itself, `public_key`
-//! on the key `generate_keypair` just returned, any call on the wrapping key
-//! after `dh_agree` used it, and `public_key` on the joiner's `#active` key
-//! after `ed25519_to_x25519_agree` used it to open an invitation. [`KeyLoss`]
+//! on the key `generate_keypair` just returned, and any call on the wrapping
+//! key after `dh_agree` used it (an invitation open among them). [`KeyLoss`]
 //! names each of those steps.
 
 use scp_platform::PlatformError;
@@ -33,9 +32,6 @@ pub enum KeyLoss {
     /// that handle (the next `dh_agree`, a reload's `public_key`) is
     /// key-not-found.
     AfterDhAgree,
-    /// `ed25519_to_x25519_agree` destroys its key after agreeing, so the next
-    /// `public_key` on that handle is key-not-found.
-    AfterEd25519Agree,
 }
 
 /// [`InMemoryKeyCustody`] that loses a key at the step [`KeyLoss`] names and
@@ -63,7 +59,7 @@ impl KeyCustody for KeyLossCustody {
                 self.inner.destroy_key(&handle).await?;
                 Ok(handle)
             }
-            KeyLoss::OnDhAgree | KeyLoss::AfterDhAgree | KeyLoss::AfterEd25519Agree => {
+            KeyLoss::OnDhAgree | KeyLoss::AfterDhAgree => {
                 self.inner.generate_keypair(key_type).await
             }
         }
@@ -124,14 +120,9 @@ impl KeyCustody for KeyLossCustody {
         ed25519_handle: &KeyHandle,
         peer_x25519_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
-        let shared = self
-            .inner
+        self.inner
             .ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-            .await?;
-        if matches!(self.loss, KeyLoss::AfterEd25519Agree) {
-            self.inner.destroy_key(ed25519_handle).await?;
-        }
-        Ok(shared)
+            .await
     }
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
