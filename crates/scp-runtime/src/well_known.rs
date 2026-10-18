@@ -938,6 +938,32 @@ mod tests {
         assert!(well_known.verify_against_did(&mock).await.is_ok());
     }
 
+    /// A tier 3 entry's URL is the bridge relay's, and §18.3.2 compares the
+    /// `.well-known` relay against every `SCPRelay` entry's URL (§18.2.1), so
+    /// a relay equal to a bridge entry's URL validates.
+    #[tokio::test]
+    async fn verify_against_did_passes_with_a_bridge_entry_url() {
+        let did = "did:dht:zOperator123";
+        let bridge_url = "wss://bridge.example.com/scp/v1";
+
+        let mut doc = did_document_with_relays(did, &["wss://relay.example.com/scp/v1"]);
+        doc.add_relay_service(
+            scp_did::RelayService::new(bridge_url, Some([0x42; 32])).expect("canonical bridge URL"),
+        );
+        let mock = MockDidMethod::resolves_to(doc);
+
+        let well_known = WellKnownScp {
+            version: 1,
+            did: did.to_owned(),
+            relay: bridge_url.to_owned(),
+            contexts: None,
+            relay_config: None,
+            handles: None,
+        };
+
+        assert!(well_known.verify_against_did(&mock).await.is_ok());
+    }
+
     #[tokio::test]
     async fn verify_against_did_passes_with_multiple_relays() {
         let did = "did:dht:zOperator123";

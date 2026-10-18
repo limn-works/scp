@@ -37,3 +37,66 @@ pub fn approved_proposal(
         created_at_epoch: None,
     }
 }
+
+/// The `bridgeTarget` the fixture's accepted bridge entry carries.
+pub const FIXTURE_BRIDGE_TARGET: [u8; 32] = [0x42; 32];
+
+/// The `serviceEndpoint`s of the entries
+/// [`scp_did::DidDocument::accepted_services`] keeps from
+/// [`document_with_rejected_services`], in record order.
+pub const FIXTURE_ACCEPTED_ENDPOINTS: [&str; 2] = [
+    "wss://bridge.example.com/scp/v1",
+    "wss://relay.example.com/scp/v1",
+];
+
+/// A DID document mixing entries §18.2.1 accepts and rejects.
+///
+/// It accepts a tier 3 bridge `SCPRelay` entry carrying
+/// [`FIXTURE_BRIDGE_TARGET`] and a plain `SCPRelay` entry. It rejects an
+/// `SCPRelay` entry whose URL carries a query and a non-relay entry that
+/// carries `bridgeTarget` (`18-addressability-and-deployment.md` §18.2.1).
+/// Bridge projections must show only the two accepted entries.
+#[must_use]
+pub fn document_with_rejected_services() -> scp_did::DidDocument {
+    let did = "did:dht:zFixtureRejectedServices";
+    let entry = |n: &str, ty: &str, endpoint: &str, bridge_target| scp_did::Service {
+        id: format!("{did}#{n}"),
+        service_type: ty.to_owned(),
+        service_endpoint: endpoint.to_owned(),
+        bridge_target,
+    };
+    scp_did::DidDocument {
+        context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+        id: did.to_owned(),
+        verification_method: Vec::new(),
+        authentication: Vec::new(),
+        assertion_method: Vec::new(),
+        also_known_as: Vec::new(),
+        service: vec![
+            entry(
+                "scp-relay-1",
+                "SCPRelay",
+                FIXTURE_ACCEPTED_ENDPOINTS[0],
+                Some(FIXTURE_BRIDGE_TARGET),
+            ),
+            entry(
+                "scp-relay-2",
+                "SCPRelay",
+                "wss://query.example.com/scp/v1?bridge_target=00",
+                None,
+            ),
+            entry(
+                "pre-rotation",
+                "PreRotationCommitment",
+                "sha256:00",
+                Some(FIXTURE_BRIDGE_TARGET),
+            ),
+            entry(
+                "scp-relay-3",
+                "SCPRelay",
+                FIXTURE_ACCEPTED_ENDPOINTS[1],
+                None,
+            ),
+        ],
+    }
+}
