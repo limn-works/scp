@@ -396,6 +396,47 @@ mod tests {
         );
     }
 
+    // ---- SCPRelay entry rejection on the shared relay-record path (SCP-328) ----
+
+    /// `verify_relay_record`, the path every relay-served record takes, keeps
+    /// a record whose `SCPRelay` entry carries the retired `?bridge_target=`
+    /// query and leaves that entry out of `relay_services()` (§18.2.1: reject
+    /// the entry, keep the record). The DHT path is covered in `dht.rs`.
+    #[test]
+    fn resolve_rejects_a_query_bearing_relay_entry() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let did = format!("did:dht:z{}", zbase32::encode(&public_key));
+
+        let mut doc = scp_did::DidDocument::new(&did, &public_key, &[2u8; 32], &[3u8; 32]);
+        let plain = scp_did::RelayService::direct(
+            scp_did::RelayEndpoint::new("wss://plain.example.com/scp/v1").unwrap(),
+        );
+        doc.add_relay_service(&plain);
+        doc.service.push(scp_did::Service {
+            id: format!("{did}#scp-relay-2"),
+            service_type: "SCPRelay".to_owned(),
+            service_endpoint: format!(
+                "wss://bridge.example.com/scp/v1?bridge_target={}",
+                "ab".repeat(32)
+            ),
+            bridge_target: None,
+        });
+
+        let value = serde_json::to_vec(&doc).unwrap();
+        let seq = 3;
+        let payload = scp_dht::bep44_signable(&value, seq);
+        let signature: ed25519_dalek::Signature =
+            ed25519_dalek::Signer::sign(&signing_key, &payload);
+
+        let resolved =
+            super::verify_relay_record(&did, &public_key, &value, &signature.to_bytes(), seq)
+                .expect("the record resolves");
+        // The resolver drops the query-bearing entry and keeps the others.
+        assert_eq!(resolved.service.len(), doc.service.len() - 1);
+        assert_eq!(resolved.relay_services(), [plain]);
+    }
+
     // ---- InMemoryRelayQuerier Vec-contract tests ----
 
     /// The querier returns EVERY co-located record at a routing ID (append

@@ -35,7 +35,8 @@
 //! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md`.
 
 use super::attestation::{IdentityLinkServiceEntry, ScpKeyCustodyAttestation};
-use serde::{Deserialize, Serialize};
+use crate::relay_url::{BridgeEndpoint, RelayEndpoint, RelayEntryUrlError};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Synchronous, wasm-safe errors produced by the DID-document, verification-
 /// method, attestation, and multibase-decoding closure (ADR-057).
@@ -66,9 +67,22 @@ pub enum DidError {
     #[error("DID document deserialization error: {0}")]
     DocumentDeserializationError(String),
 
-    /// An invalid relay URL was provided (must use wss:// scheme and /scp/v1 path).
-    #[error("invalid relay URL: {0}")]
-    InvalidRelayUrl(String),
+    /// A relay URL fails `18-addressability-and-deployment.md` §18.2.1: it
+    /// has no `09-security-model.md` §9.18.2 canonical form, its canonical
+    /// path does not end in `/scp/v1`, or it names a bridge relay over `ws`.
+    #[error("invalid relay URL {url:?}: {reason}")]
+    InvalidRelayUrl {
+        /// The rejected URL with any user information removed.
+        url: String,
+        /// Which rule the URL fails.
+        reason: RelayEntryUrlError,
+    },
+
+    /// A relay entry's `bridgeTarget` equals `SHA-256(0x00)`, the bytes
+    /// `03-identity.md` §3.10.13 signs for an absent `bridgeTarget`, which
+    /// §18.2.1 forbids as a present value.
+    #[error("bridgeTarget equals SHA-256(0x00), the absent-value encoding")]
+    AbsentSentinelBridgeTarget,
 
     /// An `#agent` verification method already exists in the DID document.
     #[error("agent key already exists in DID document")]
@@ -143,6 +157,50 @@ mod serde_hex_array {
             deserialize_impl::<32, D>(d)
         }
     }
+
+    /// An optional 32-byte field whose only spelling is 64 lowercase hex
+    /// digits (`18-addressability-and-deployment.md` §18.2.1 `bridgeTarget`).
+    ///
+    /// `hex::decode` also accepts uppercase, so the spelling is checked byte
+    /// by byte before decoding ([`lower_hex32`]). A present key must hold a
+    /// string: `null` fails, and an absent key is `None` through
+    /// `#[serde(default)]`. A [`super::DidDocument`] does not read its
+    /// entries through this: its deserializer drops an entry whose
+    /// `bridgeTarget` this rejects and keeps the document.
+    pub mod option32_lower {
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        // serde's `serialize_with` passes `&Option<T>`, so the reference is
+        // fixed by the attribute and cannot be `Option<&T>`.
+        #[allow(clippy::ref_option)]
+        pub fn serialize<S: Serializer>(v: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error> {
+            match v {
+                Some(bytes) => s.serialize_str(&hex::encode(bytes)),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 32]>, D::Error> {
+            let text = String::deserialize(d)?;
+            super::lower_hex32(&text)
+                .map(Some)
+                .ok_or_else(|| serde::de::Error::custom(super::MALFORMED_BRIDGE_TARGET))
+        }
+    }
+
+    /// Why a `bridgeTarget` string is not 64 lowercase hex digits.
+    pub const MALFORMED_BRIDGE_TARGET: &str =
+        "bridgeTarget must be exactly 64 lowercase hex digits";
+
+    /// Decodes `text` when it is exactly 64 lowercase hex digits.
+    pub fn lower_hex32(text: &str) -> Option<[u8; 32]> {
+        if text.len() != 64 || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        hex::decode_to_slice(text, &mut out).ok()?;
+        Some(out)
+    }
 }
 
 /// A W3C DID Document for an SCP identity.
@@ -195,7 +253,15 @@ pub struct DidDocument {
     pub also_known_as: Vec<String>,
 
     /// Services associated with this DID (e.g., `PreRotationCommitment`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Deserializing drops every entry `18-addressability-and-deployment.md`
+    /// §18.2.1 rejects and keeps the document, so a resolved document never
+    /// holds one.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_accepted_services"
+    )]
     pub service: Vec<Service>,
 }
 
@@ -222,8 +288,9 @@ pub struct VerificationMethod {
 
 /// A service entry within a DID Document.
 ///
-/// Used for the `PreRotationCommitment` service that publishes the SHA-256
-/// hash of the next identity key's public key.
+/// A [`DidDocument`] read from JSON or `MessagePack` holds no entry
+/// `18-addressability-and-deployment.md` §18.2.1 rejects; its deserializer
+/// drops each one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Service {
     /// The full URI of this service (e.g., `did:dht:z...#pre-rotation`).
@@ -236,6 +303,310 @@ pub struct Service {
     /// The service endpoint (e.g., `sha256:<hex>`).
     #[serde(rename = "serviceEndpoint")]
     pub service_endpoint: String,
+
+    /// A tier 3 bridge entry's routing target (§18.2.1 `bridgeTarget`): the
+    /// identity routing ID the bridge relay forwards to. Only an `SCPRelay`
+    /// entry carries it. A [`DidDocument`]'s deserializer drops an entry whose
+    /// value is not 64 lowercase hex digits, is `null`, equals
+    /// [`ABSENT_BRIDGE_TARGET`], sits on an entry of another type, or sits on
+    /// an entry whose URL is not `wss` (§10.12.7), and keeps the document.
+    #[serde(
+        rename = "bridgeTarget",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_hex_array::option32_lower"
+    )]
+    pub bridge_target: Option<[u8; 32]>,
+}
+
+/// `SHA-256(0x00)`, the 32 trailing bytes of an `SCPRelay` entry that names no
+/// `bridgeTarget`.
+///
+/// `03-identity.md` §3.10.13 reads these bytes there as "no target", and
+/// §18.2.1 forbids a writer to name them as a target, so they decode one way.
+pub const ABSENT_BRIDGE_TARGET: [u8; 32] = [
+    0x6e, 0x34, 0x0b, 0x9c, 0xff, 0xb3, 0x7a, 0x98, 0x9c, 0xa5, 0x44, 0xe6, 0xbb, 0x78, 0x0a, 0x2c,
+    0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76, 0x85, 0x11, 0xa3, 0x06, 0x17, 0xaf, 0xa0, 0x1d,
+];
+
+/// A tier 3 bridge entry's routing target: 32 bytes other than
+/// [`ABSENT_BRIDGE_TARGET`] (§18.2.1).
+///
+/// [`BridgeTarget::new`] is the only constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BridgeTarget([u8; 32]);
+
+impl BridgeTarget {
+    /// Accepts `bytes` as a bridge target.
+    ///
+    /// # Errors
+    ///
+    /// [`DidError::AbsentSentinelBridgeTarget`] when `bytes` equals
+    /// [`ABSENT_BRIDGE_TARGET`], which §3.10.13 reads as "no target".
+    pub fn new(bytes: [u8; 32]) -> Result<Self, DidError> {
+        if bytes == ABSENT_BRIDGE_TARGET {
+            Err(DidError::AbsentSentinelBridgeTarget)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    /// The 32 target bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// One `SCPRelay` entry a reader accepts under §18.2.1.
+///
+/// `18-addressability-and-deployment.md` §18.2.1 requires a relay URL with a
+/// §9.18.2 canonical form whose path ends in `/scp/v1`, and allows an optional
+/// tier 3 `bridgeTarget` that is not [`ABSENT_BRIDGE_TARGET`] on a `wss` bridge
+/// relay URL (§10.12.7). [`RelayService::direct`] and [`RelayService::bridge`]
+/// build one from values that already passed those rules, so neither fails.
+/// The URL is the canonical form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayService {
+    endpoint: RelayEndpoint,
+    bridge_target: Option<BridgeTarget>,
+}
+
+impl RelayService {
+    /// An entry routing to the relay at `endpoint`, with no `bridgeTarget`.
+    #[must_use]
+    pub const fn direct(endpoint: RelayEndpoint) -> Self {
+        Self {
+            endpoint,
+            bridge_target: None,
+        }
+    }
+
+    /// A tier 3 bridge entry: the bridge relay's URL and the routing ID it
+    /// forwards to (§10.12.4, §18.2.1).
+    #[must_use]
+    pub fn bridge(endpoint: BridgeEndpoint, target: BridgeTarget) -> Self {
+        Self {
+            endpoint: endpoint.into_endpoint(),
+            bridge_target: Some(target),
+        }
+    }
+
+    /// The relay URL, in its §9.18.2 canonical form.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        self.endpoint.as_str()
+    }
+
+    /// The relay endpoint.
+    #[must_use]
+    pub const fn endpoint(&self) -> &RelayEndpoint {
+        &self.endpoint
+    }
+
+    /// The tier 3 bridge routing target, or `None` for a relay that is not a
+    /// bridge.
+    #[must_use]
+    pub fn bridge_target(&self) -> Option<[u8; 32]> {
+        self.bridge_target.map(BridgeTarget::to_bytes)
+    }
+
+    /// Validates an `SCPRelay` entry's URL and target as a reader does.
+    fn from_parts(url: &str, bridge_target: Option<[u8; 32]>) -> Result<Self, DidError> {
+        let endpoint = RelayEndpoint::new(url)?;
+        match bridge_target {
+            None => Ok(Self::direct(endpoint)),
+            Some(bytes) => Ok(Self::bridge(
+                BridgeEndpoint::from_endpoint(endpoint)?,
+                BridgeTarget::new(bytes)?,
+            )),
+        }
+    }
+
+    /// The service entry for this relay, numbered `n` within `did`.
+    fn entry(&self, did: &str, n: usize) -> Service {
+        Service {
+            id: format!("{did}#scp-relay-{n}"),
+            service_type: SCP_RELAY_SERVICE_TYPE.to_owned(),
+            service_endpoint: self.url().to_owned(),
+            bridge_target: self.bridge_target(),
+        }
+    }
+}
+
+/// A service entry as a document holds it before §18.2.1 is applied.
+///
+/// `bridgeTarget` is read in any form, so that a malformed value rejects the
+/// entry and not the document.
+#[derive(Deserialize)]
+struct RawService {
+    id: String,
+    #[serde(rename = "type")]
+    service_type: String,
+    #[serde(rename = "serviceEndpoint")]
+    service_endpoint: String,
+    #[serde(rename = "bridgeTarget", default)]
+    bridge_target: RawBridgeTarget,
+}
+
+/// A `bridgeTarget` key as written: absent, or present with its 32 bytes or
+/// the reason its value is not 64 lowercase hex digits.
+#[derive(Default)]
+enum RawBridgeTarget {
+    #[default]
+    Absent,
+    Present(Result<[u8; 32], &'static str>),
+}
+
+impl<'de> Deserialize<'de> for RawBridgeTarget {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(RawBridgeTargetVisitor)
+    }
+}
+
+/// Reads a present `bridgeTarget` of any type, consuming a nested value whole
+/// so the rest of the entry still parses.
+struct RawBridgeTargetVisitor;
+
+impl<'de> serde::de::Visitor<'de> for RawBridgeTargetVisitor {
+    type Value = RawBridgeTarget;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a bridgeTarget value")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(RawBridgeTarget::Present(
+            serde_hex_array::lower_hex32(v).ok_or(serde_hex_array::MALFORMED_BRIDGE_TARGET),
+        ))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(RawBridgeTarget::Present(Err("bridgeTarget is null")))
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        self.visit_unit()
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(not_a_string())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(not_a_string())
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(not_a_string())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(not_a_string())
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, _: &[u8]) -> Result<Self::Value, E> {
+        Ok(not_a_string())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(not_a_string())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(not_a_string())
+    }
+}
+
+const fn not_a_string() -> RawBridgeTarget {
+    RawBridgeTarget::Present(Err("bridgeTarget is not a string"))
+}
+
+/// Why §18.2.1 rejects a service entry.
+///
+/// Its `Display` escapes every string the entry supplied.
+enum EntryRejection {
+    /// An entry of a type other than `SCPRelay` carries `bridgeTarget`.
+    BridgeTargetOnNonRelay,
+    /// The `bridgeTarget` value is not 64 lowercase hex digits.
+    MalformedBridgeTarget(&'static str),
+    /// The `SCPRelay` entry's URL or target fails [`RelayService`].
+    Relay(DidError),
+}
+
+impl std::fmt::Display for EntryRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BridgeTargetOnNonRelay => {
+                f.write_str("bridgeTarget on an entry that is not SCPRelay")
+            }
+            Self::MalformedBridgeTarget(why) => f.write_str(why),
+            Self::Relay(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl RawService {
+    /// Why §18.2.1 rejects the entry, or the bytes of its accepted
+    /// `bridgeTarget`.
+    fn rejection(&self) -> Result<Option<[u8; 32]>, EntryRejection> {
+        let is_relay = self.service_type == SCP_RELAY_SERVICE_TYPE;
+        let bridge_target = match &self.bridge_target {
+            RawBridgeTarget::Absent => None,
+            RawBridgeTarget::Present(_) if !is_relay => {
+                return Err(EntryRejection::BridgeTargetOnNonRelay);
+            }
+            RawBridgeTarget::Present(Err(why)) => {
+                return Err(EntryRejection::MalformedBridgeTarget(why));
+            }
+            RawBridgeTarget::Present(Ok(bytes)) => Some(*bytes),
+        };
+        if is_relay {
+            RelayService::from_parts(&self.service_endpoint, bridge_target)
+                .map_err(EntryRejection::Relay)?;
+        }
+        Ok(bridge_target)
+    }
+
+    /// The entry, or `None` after logging why §18.2.1 rejects it. The log
+    /// escapes every string the entry supplied.
+    fn accept(self) -> Option<Service> {
+        match self.rejection() {
+            Ok(bridge_target) => Some(Service {
+                id: self.id,
+                service_type: self.service_type,
+                service_endpoint: self.service_endpoint,
+                bridge_target,
+            }),
+            Err(reason) => {
+                tracing::warn!(
+                    entry = ?self.id,
+                    service_type = ?self.service_type,
+                    %reason,
+                    "dropping a service entry that 18-addressability-and-deployment.md §18.2.1 rejects"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Deserializes [`DidDocument::service`], dropping each entry §18.2.1 rejects
+/// and keeping the others in order. Each drop is logged once.
+fn deserialize_accepted_services<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<Service>, D::Error> {
+    let raw = Vec::<RawService>::deserialize(d)?;
+    Ok(raw.into_iter().filter_map(RawService::accept).collect())
 }
 
 /// The W3C DID Document JSON-LD context URI.
@@ -248,7 +619,7 @@ const ED25519_CONTEXT: &str = "https://w3id.org/security/suites/ed25519-2020/v1"
 const ED25519_VERIFICATION_KEY_TYPE: &str = "Ed25519VerificationKey2020";
 
 /// The service type string for `SCPRelay` entries (§18.2.1).
-const SCP_RELAY_SERVICE_TYPE: &str = "SCPRelay";
+pub const SCP_RELAY_SERVICE_TYPE: &str = "SCPRelay";
 
 /// The service type string for `SCPBroadcastContext` entries (§18.2.2).
 ///
@@ -258,12 +629,6 @@ const SCP_RELAY_SERVICE_TYPE: &str = "SCPRelay";
 ///
 ///   `scp:context:<context_id_hex>?relay=<url1>&relay=<url2>`
 const SCP_BROADCAST_CONTEXT_SERVICE_TYPE: &str = "SCPBroadcastContext";
-
-/// The required URL scheme for `SCPRelay` entries.
-const SCP_RELAY_SCHEME: &str = "wss://";
-
-/// The required path suffix for `SCPRelay` entries.
-const SCP_RELAY_PATH: &str = "/scp/v1";
 
 /// The service type string for `ScpDeviceAttestation` entries (§9.3).
 ///
@@ -374,6 +739,7 @@ impl DidDocument {
             id: format!("{did}#pre-rotation"),
             service_type: "PreRotationCommitment".to_owned(),
             service_endpoint: format!("sha256:{}", hex::encode(pre_rotation_commitment)),
+            bridge_target: None,
         };
 
         Self {
@@ -425,100 +791,115 @@ impl DidDocument {
 
     /// Adds an `SCPRelay` service entry to this DID document.
     ///
-    /// The URL must use the `wss://` scheme and end with the `/scp/v1` path,
-    /// per §18.2.1. Multiple relay entries are allowed for suppression
-    /// resistance (§18.2.3). Entries preserve insertion order — the first
-    /// entry is the preferred relay.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DidError::InvalidRelayUrl`] if the URL does not use
-    /// `wss://` scheme or does not contain the `/scp/v1` path.
-    pub fn add_relay_service(&mut self, url: &str) -> Result<(), DidError> {
-        if !url.starts_with(SCP_RELAY_SCHEME) {
-            return Err(DidError::InvalidRelayUrl(format!(
-                "URL must use wss:// scheme, got: {url}"
-            )));
-        }
-        if !url.ends_with(SCP_RELAY_PATH) {
-            return Err(DidError::InvalidRelayUrl(format!(
-                "URL must end with /scp/v1 path, got: {url}"
-            )));
-        }
-
-        let relay_count = self
-            .service
-            .iter()
-            .filter(|s| s.service_type == SCP_RELAY_SERVICE_TYPE)
-            .count();
-
-        let service = Service {
-            id: format!("{}#scp-relay-{}", self.id, relay_count + 1),
-            service_type: SCP_RELAY_SERVICE_TYPE.to_owned(),
-            service_endpoint: url.to_owned(),
-        };
-
-        self.service.push(service);
-        Ok(())
+    /// [`RelayService`] already satisfies §18.2.1, so this cannot fail.
+    /// Multiple relay entries are allowed for suppression resistance
+    /// (§18.2.3). Entries preserve insertion order — the first entry is the
+    /// preferred relay.
+    pub fn add_relay_service(&mut self, relay: &RelayService) {
+        let entry = relay.entry(&self.id, self.relay_entry_count() + 1);
+        self.service.push(entry);
     }
 
-    /// Returns all `SCPRelay` service endpoint URLs, in insertion order.
+    /// Makes `relay` the preferred relay (§18.2.3): rewrites the first
+    /// `SCPRelay` entry's `serviceEndpoint` and `bridgeTarget` to `relay`'s,
+    /// keeping its `id` and position, or inserts `relay`'s entry when the
+    /// document has no `SCPRelay` entry.
     ///
-    /// The first entry is the preferred relay per §18.2.3. Only `SCPRelay`
-    /// service entries are returned; other service types are filtered out.
-    #[must_use]
-    pub fn relay_service_urls(&self) -> Vec<String> {
+    /// Keying on position, not on an address, makes a repeated call with one
+    /// `relay` a no-op and keeps a retried rewrite from appending a duplicate.
+    /// Moving from a bridge entry to a direct one clears `bridgeTarget`.
+    pub fn set_preferred_relay(&mut self, relay: &RelayService) {
+        match self
+            .service
+            .iter_mut()
+            .find(|s| s.service_type == SCP_RELAY_SERVICE_TYPE)
+        {
+            Some(entry) => {
+                relay.url().clone_into(&mut entry.service_endpoint);
+                entry.bridge_target = relay.bridge_target();
+            }
+            None => self.insert_preferred_relay(relay),
+        }
+    }
+
+    /// Inserts `relay`'s entry ahead of every existing `SCPRelay` entry, so it
+    /// becomes the preferred relay (§18.2.3) and the other relays keep their
+    /// order, entries and `id`s.
+    ///
+    /// The new entry's `id` is `<did>#scp-relay-<n>` with `n` one more than the
+    /// number of relay entries already present; existing `id`s are left alone,
+    /// because third parties may reference them.
+    pub fn insert_preferred_relay(&mut self, relay: &RelayService) {
+        let insert_at = self
+            .service
+            .iter()
+            .position(|s| s.service_type == SCP_RELAY_SERVICE_TYPE)
+            .unwrap_or(self.service.len());
+        let entry = relay.entry(&self.id, self.relay_entry_count() + 1);
+        self.service.insert(insert_at, entry);
+    }
+
+    /// The number of `SCPRelay` entries, valid or not.
+    fn relay_entry_count(&self) -> usize {
         self.service
             .iter()
             .filter(|s| s.service_type == SCP_RELAY_SERVICE_TYPE)
-            .map(|s| s.service_endpoint.clone())
+            .count()
+    }
+
+    /// The `SCPRelay` entries a reader accepts under §18.2.1, in record order.
+    ///
+    /// The first entry is the preferred relay per §18.2.3. A deserialized
+    /// document holds no rejected entry; an `SCPRelay` entry a caller pushed
+    /// onto [`Self::service`] in memory that fails §18.2.1 is left out and
+    /// logged, and the remaining entries keep their order.
+    #[must_use]
+    pub fn relay_services(&self) -> Vec<RelayService> {
+        self.service
+            .iter()
+            .filter(|s| s.service_type == SCP_RELAY_SERVICE_TYPE)
+            .filter_map(|s| match RelayService::from_parts(&s.service_endpoint, s.bridge_target) {
+                Ok(relay) => Some(relay),
+                Err(e) => {
+                    tracing::warn!(
+                        did = ?self.id,
+                        entry = ?s.id,
+                        error = ?e,
+                        "skipping SCPRelay entry that 18-addressability-and-deployment.md §18.2.1 rejects"
+                    );
+                    None
+                }
+            })
             .collect()
     }
 
-    /// Replaces all `SCPRelay` service entries with the given URLs.
+    /// The URLs of the entries [`Self::relay_services`] accepts, in record
+    /// order.
+    #[must_use]
+    pub fn relay_service_urls(&self) -> Vec<String> {
+        self.relay_services()
+            .into_iter()
+            .map(|relay| relay.url().to_owned())
+            .collect()
+    }
+
+    /// Replaces all `SCPRelay` service entries with the given relays.
     ///
-    /// Removes any existing `SCPRelay` entries and adds new ones for each URL.
-    /// Non-relay services (e.g., `PreRotationCommitment`) are preserved. Each
-    /// URL is validated per §18.2.1 (`wss://` scheme, `/scp/v1` path).
+    /// Removes any existing `SCPRelay` entries and adds one entry per relay,
+    /// in order. Non-relay services (e.g., `PreRotationCommitment`) are
+    /// preserved. Each [`RelayService`] already satisfies §18.2.1, so the
+    /// replacement cannot fail part-way.
     ///
     /// This is used during relay list updates (§18.5) to atomically replace the
     /// relay set before republishing with an incremented BEP44 sequence number
     /// (§9.6.3).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DidError::InvalidRelayUrl`] if any URL fails validation.
-    /// On error, no entries are modified (all-or-nothing).
-    pub fn set_relay_services(&mut self, urls: &[&str]) -> Result<(), DidError> {
-        // Validate all URLs before modifying state (all-or-nothing).
-        for url in urls {
-            if !url.starts_with(SCP_RELAY_SCHEME) {
-                return Err(DidError::InvalidRelayUrl(format!(
-                    "URL must use wss:// scheme, got: {url}"
-                )));
-            }
-            if !url.ends_with(SCP_RELAY_PATH) {
-                return Err(DidError::InvalidRelayUrl(format!(
-                    "URL must end with /scp/v1 path, got: {url}"
-                )));
-            }
-        }
-
-        // Remove existing SCPRelay entries.
+    pub fn set_relay_services(&mut self, relays: &[RelayService]) {
         self.service
             .retain(|s| s.service_type != SCP_RELAY_SERVICE_TYPE);
-
-        // Add new entries.
-        for (i, url) in urls.iter().enumerate() {
-            let service = Service {
-                id: format!("{}#scp-relay-{}", self.id, i + 1),
-                service_type: SCP_RELAY_SERVICE_TYPE.to_owned(),
-                service_endpoint: (*url).to_owned(),
-            };
-            self.service.push(service);
+        for (i, relay) in relays.iter().enumerate() {
+            let entry = relay.entry(&self.id, i + 1);
+            self.service.push(entry);
         }
-
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -570,6 +951,7 @@ impl DidDocument {
             id: format!("{}#scp-broadcast-ctx-{}", self.id, bc_count + 1),
             service_type: SCP_BROADCAST_CONTEXT_SERVICE_TYPE.to_owned(),
             service_endpoint: endpoint,
+            bridge_target: None,
         };
 
         self.service.push(service);
@@ -624,6 +1006,7 @@ impl DidDocument {
                 use base64::Engine;
                 base64::engine::general_purpose::STANDARD.encode(token_bytes)
             },
+            bridge_target: None,
         };
         self.service.push(service);
     }
@@ -854,6 +1237,7 @@ impl DidDocument {
             id: format!("{}#device-attestation", self.id),
             service_type: DEVICE_ATTESTATION_SERVICE_TYPE.to_owned(),
             service_endpoint: endpoint,
+            bridge_target: None,
         };
         self.service.push(service);
     }
@@ -1353,6 +1737,7 @@ fn parse_broadcast_context_endpoint(endpoint: &str) -> Option<(String, Vec<Strin
 )]
 mod tests {
     use super::*;
+    use crate::relay_url::RelayUrlError;
 
     #[test]
     fn document_has_correct_structure() {
@@ -1435,160 +1820,544 @@ mod tests {
         assert_eq!(base58btc_encode(&[0x01]), "2");
     }
 
-    // --- SCPRelay tests (SCP-140) ---
+    // --- SCPRelay tests (SCP-140, SCP-328) ---
+
+    fn relay(url: &str) -> RelayService {
+        RelayService::direct(RelayEndpoint::new(url).unwrap())
+    }
+
+    fn bridge(url: &str, target: [u8; 32]) -> RelayService {
+        RelayService::bridge(
+            BridgeEndpoint::new(url).unwrap(),
+            BridgeTarget::new(target).unwrap(),
+        )
+    }
+
+    fn relay_doc(did: &str) -> DidDocument {
+        DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32])
+    }
+
+    /// A raw `SCPRelay` entry that bypasses `RelayService`, as a resolved
+    /// record written by another implementation can hold.
+    fn raw_relay_entry(did: &str, n: usize, url: &str, bridge_target: Option<[u8; 32]>) -> Service {
+        Service {
+            id: format!("{did}#scp-relay-{n}"),
+            service_type: "SCPRelay".to_owned(),
+            service_endpoint: url.to_owned(),
+            bridge_target,
+        }
+    }
+
+    /// The reason of a [`DidError::InvalidRelayUrl`], or `None` for any other
+    /// result.
+    fn url_reason<T>(result: &Result<T, DidError>) -> Option<RelayEntryUrlError> {
+        match result {
+            Err(DidError::InvalidRelayUrl { reason, .. }) => Some(*reason),
+            _ => None,
+        }
+    }
+
+    const BRIDGE_URL: &str = "wss://bridge.example.com/scp/v1";
+    const TARGET: [u8; 32] = [0xab; 32];
 
     #[test]
     fn mixed_services_roundtrip() {
-        let did = "did:dht:zMixedServices";
-        let identity_pk = [1u8; 32];
-        let active_pk = [2u8; 32];
-        let commitment = [3u8; 32];
-
-        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
-        doc.add_relay_service("wss://relay1.example.com/scp/v1")
-            .unwrap();
-        doc.add_relay_service("wss://relay2.example.com/scp/v1")
-            .unwrap();
+        let mut doc = relay_doc("did:dht:zMixedServices");
+        doc.add_relay_service(&relay("wss://relay1.example.com/scp/v1"));
+        doc.add_relay_service(&relay("wss://relay2.example.com/scp/v1"));
 
         // Should have PreRotationCommitment + 2 SCPRelay entries.
         assert_eq!(doc.service.len(), 3);
 
-        // Roundtrip through JSON.
         let json = doc.to_json().unwrap();
         let parsed = DidDocument::from_json(&json).unwrap();
         assert_eq!(doc, parsed);
-
-        // Verify service types survive roundtrip.
         assert!(parsed.pre_rotation_service().is_some());
         assert_eq!(parsed.relay_service_urls().len(), 2);
     }
 
     #[test]
     fn relay_service_urls_filters_correctly() {
-        let did = "did:dht:zRelayFilter";
-        let identity_pk = [1u8; 32];
-        let active_pk = [2u8; 32];
-        let commitment = [3u8; 32];
+        let mut doc = relay_doc("did:dht:zRelayFilter");
+        doc.add_relay_service(&relay("wss://relay.example.com/scp/v1"));
 
-        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
-        doc.add_relay_service("wss://relay.example.com/scp/v1")
-            .unwrap();
-
-        let urls = doc.relay_service_urls();
-        assert_eq!(urls.len(), 1);
-        assert_eq!(urls[0], "wss://relay.example.com/scp/v1");
-
-        // Pre-rotation service should NOT appear in relay URLs.
+        assert_eq!(doc.relay_service_urls(), ["wss://relay.example.com/scp/v1"]);
+        // The pre-rotation entry is not a relay entry.
         assert!(doc.pre_rotation_service().is_some());
     }
 
     #[test]
-    fn add_relay_service_rejects_non_wss_scheme() {
-        let did = "did:dht:zInvalidScheme";
-        let identity_pk = [1u8; 32];
-        let active_pk = [2u8; 32];
-        let commitment = [3u8; 32];
-
-        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
-
-        // http:// should be rejected.
-        let result = doc.add_relay_service("http://relay.example.com/scp/v1");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("wss://"));
-
-        // ws:// should be rejected.
-        let result = doc.add_relay_service("ws://relay.example.com/scp/v1");
-        assert!(result.is_err());
-
-        // https:// should be rejected.
-        let result = doc.add_relay_service("https://relay.example.com/scp/v1");
-        assert!(result.is_err());
-
-        // No services added.
-        assert_eq!(doc.relay_service_urls().len(), 0);
+    fn relay_endpoint_accepts_ws_address_literal() {
+        for url in [
+            "ws://192.0.2.7:8080/scp/v1",
+            "ws://[2001:db8::1]:9000/scp/v1",
+            "wss://relay.example.com/scp/v1",
+        ] {
+            let relay = relay(url);
+            assert_eq!(relay.url(), url);
+            assert_eq!(relay.bridge_target(), None);
+        }
+        for url in [
+            "http://relay.example.com/scp/v1",
+            "https://relay.example.com/scp/v1",
+        ] {
+            assert_eq!(
+                url_reason(&RelayEndpoint::new(url)),
+                Some(RelayEntryUrlError::Canonical(
+                    RelayUrlError::UnsupportedScheme
+                )),
+                "{url}"
+            );
+        }
     }
 
     #[test]
-    fn add_relay_service_rejects_invalid_path() {
-        let did = "did:dht:zInvalidPath";
-        let identity_pk = [1u8; 32];
-        let active_pk = [2u8; 32];
-        let commitment = [3u8; 32];
+    fn relay_endpoint_holds_the_canonical_form() {
+        let endpoint = RelayEndpoint::new("WSS://Relay.Example.com:443/scp/v1/").unwrap();
+        assert_eq!(endpoint.as_str(), "wss://relay.example.com/scp/v1");
+        assert_eq!(
+            endpoint,
+            RelayEndpoint::new("wss://relay.example.com/scp/v1").unwrap()
+        );
+    }
 
-        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+    #[test]
+    fn relay_endpoint_new_rejects_a_path_without_scp_v1() {
+        // `wss://scp/v1` has host `scp` and path `/v1`: the whole string ends
+        // in `/scp/v1`, but its path does not.
+        for url in [
+            "wss://relay.example.com/other",
+            "wss://relay.example.com",
+            "wss://scp/v1",
+        ] {
+            assert_eq!(
+                url_reason(&RelayEndpoint::new(url)),
+                Some(RelayEntryUrlError::PathNotScpV1),
+                "{url}"
+            );
+        }
+        // A trailing `/` canonicalizes away, so the path still ends in /scp/v1.
+        assert!(RelayEndpoint::new("wss://relay.example.com/scp/v1/").is_ok());
+    }
 
-        // Missing /scp/v1 path.
-        let result = doc.add_relay_service("wss://relay.example.com/other");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("/scp/v1"));
+    #[test]
+    fn relay_endpoint_new_rejects_query_fragment_and_userinfo() {
+        let query = format!("{BRIDGE_URL}?bridge_target={}", "ab".repeat(32));
+        for (url, want) in [
+            (query.as_str(), RelayUrlError::QueryOrFragment),
+            (
+                "wss://bridge.example.com/scp/v1#x",
+                RelayUrlError::QueryOrFragment,
+            ),
+            ("wss://u@h/scp/v1", RelayUrlError::UserInfo),
+        ] {
+            assert_eq!(
+                url_reason(&RelayEndpoint::new(url)),
+                Some(RelayEntryUrlError::Canonical(want)),
+                "{url}"
+            );
+        }
+        // The error never repeats user information.
+        let err = RelayEndpoint::new("wss://user:secret@h.example/scp/v1").unwrap_err();
+        let DidError::InvalidRelayUrl { url, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(url, "wss://h.example/scp/v1");
+        assert!(!err.to_string().contains("secret"), "{err}");
+    }
 
-        // Root path.
-        let result = doc.add_relay_service("wss://relay.example.com");
-        assert!(result.is_err());
+    #[test]
+    fn invalid_relay_url_error_escapes_control_characters() {
+        let err =
+            RelayEndpoint::new("wss://relay.example.com/scp/v1\n\u{1b}[31mforged").unwrap_err();
+        let shown = err.to_string();
+        assert!(
+            !shown.contains('\n') && !shown.contains('\u{1b}'),
+            "{shown:?}"
+        );
+    }
 
-        // No services added.
-        assert_eq!(doc.relay_service_urls().len(), 0);
+    #[test]
+    fn bridge_endpoint_rejects_plaintext_ws() {
+        assert_eq!(
+            url_reason(&BridgeEndpoint::new("ws://bridge.example.com/scp/v1")),
+            Some(RelayEntryUrlError::PlaintextBridge)
+        );
+        assert_eq!(
+            url_reason(&BridgeEndpoint::new("ws://192.0.2.7:8080/scp/v1")),
+            Some(RelayEntryUrlError::PlaintextBridge)
+        );
+        assert_eq!(
+            BridgeEndpoint::new(BRIDGE_URL).unwrap().as_str(),
+            BRIDGE_URL
+        );
+
+        // A resolved ws:// entry carrying a target is dropped; the record stays.
+        let did = "did:dht:zPlainBridge";
+        let mut doc = relay_doc(did);
+        doc.service.push(raw_relay_entry(
+            did,
+            1,
+            "ws://bridge.example.com/scp/v1",
+            Some(TARGET),
+        ));
+        doc.add_relay_service(&relay("wss://plain.example.com/scp/v1"));
+        let parsed = DidDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        // The parse drops the entry itself (§18.2.1, §10.12.7), so no reader
+        // of `service` sees it.
+        assert!(
+            !parsed
+                .service
+                .iter()
+                .any(|s| s.service_endpoint == "ws://bridge.example.com/scp/v1"),
+            "{:?}",
+            parsed.service
+        );
+        assert_eq!(
+            parsed.relay_services(),
+            [relay("wss://plain.example.com/scp/v1")]
+        );
+    }
+
+    #[test]
+    fn bridge_target_new_rejects_the_absent_sentinel() {
+        use sha2::{Digest, Sha256};
+        let sentinel: [u8; 32] = Sha256::digest([0u8]).into();
+        assert_eq!(ABSENT_BRIDGE_TARGET, sentinel);
+
+        assert_eq!(
+            BridgeTarget::new(sentinel),
+            Err(DidError::AbsentSentinelBridgeTarget)
+        );
+        assert_eq!(BridgeTarget::new(TARGET).unwrap().to_bytes(), TARGET);
+
+        // A resolved record carrying the sentinel loses that entry and keeps
+        // its other entries.
+        let did = "did:dht:zSentinel";
+        let mut doc = relay_doc(did);
+        doc.service
+            .push(raw_relay_entry(did, 1, BRIDGE_URL, Some(sentinel)));
+        doc.add_relay_service(&relay("wss://plain.example.com/scp/v1"));
+        let parsed = DidDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        assert_eq!(
+            parsed.relay_services(),
+            [relay("wss://plain.example.com/scp/v1")]
+        );
+        assert!(
+            parsed
+                .service
+                .iter()
+                .all(|s| s.bridge_target != Some(sentinel))
+        );
+        assert!(parsed.pre_rotation_service().is_some());
+    }
+
+    #[test]
+    fn bridge_relay_service_round_trips_through_json() {
+        let did = "did:dht:zBridgeRoundTrip";
+        let mut doc = relay_doc(did);
+        let plain = relay("wss://plain.example.com/scp/v1");
+        let bridge = bridge(BRIDGE_URL, TARGET);
+        doc.add_relay_service(&plain);
+        doc.add_relay_service(&bridge);
+
+        let json = doc.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let entries: Vec<&serde_json::Value> = value["service"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "SCPRelay")
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].get("bridgeTarget").is_none());
+        assert_eq!(entries[1]["serviceEndpoint"], BRIDGE_URL);
+        assert_eq!(entries[1]["bridgeTarget"], "ab".repeat(32));
+
+        let parsed = DidDocument::from_json(&json).unwrap();
+        assert_eq!(parsed, doc);
+        assert_eq!(parsed.relay_services(), [plain, bridge]);
+    }
+
+    #[test]
+    fn bridge_target_rejects_uppercase_wrong_length_and_non_hex() {
+        let did = "did:dht:zBadSpelling";
+        let mut doc = relay_doc(did);
+        doc.add_relay_service(&relay("wss://first.example.com/scp/v1"));
+        doc.add_relay_service(&bridge(BRIDGE_URL, TARGET));
+        doc.add_relay_service(&relay("wss://third.example.com/scp/v1"));
+        let good = doc.to_json().unwrap();
+        let good_hex = "ab".repeat(32);
+        assert_eq!(DidDocument::from_json(&good).unwrap(), doc);
+
+        for bad in [
+            format!("\"{}\"", "ab".repeat(31)),
+            format!("\"{}\"", "AB".repeat(32)),
+            format!("\"{}\"", "ab".repeat(33)),
+            format!("\"{}\"", "zz".repeat(32)),
+            "null".to_owned(),
+            "171".to_owned(),
+            "[\"ab\", {\"x\": [1, 2]}]".to_owned(),
+            "{\"hex\": \"ab\"}".to_owned(),
+        ] {
+            let json = good.replace(&format!("\"{good_hex}\""), &bad);
+            assert_ne!(json, good);
+            let parsed = DidDocument::from_json(&json).unwrap_or_else(|e| panic!("{bad}: {e}"));
+            assert_eq!(
+                parsed.relay_service_urls(),
+                [
+                    "wss://first.example.com/scp/v1",
+                    "wss://third.example.com/scp/v1"
+                ],
+                "{bad}"
+            );
+            assert_eq!(parsed.service.len(), 3, "{bad}");
+            assert!(parsed.pre_rotation_service().is_some(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn relay_services_skips_an_entry_whose_url_carries_bridge_target() {
+        let did = "did:dht:zQueryEntry";
+        let mut doc = relay_doc(did);
+        doc.add_relay_service(&relay("wss://first.example.com/scp/v1"));
+        let query = format!("{BRIDGE_URL}?bridge_target={}", "ab".repeat(32));
+        doc.service.push(raw_relay_entry(did, 2, &query, None));
+        doc.add_relay_service(&relay("wss://third.example.com/scp/v1"));
+
+        // An in-memory document still holds the entry, and relay_services()
+        // leaves it out.
+        assert_eq!(
+            doc.relay_services(),
+            [
+                relay("wss://first.example.com/scp/v1"),
+                relay("wss://third.example.com/scp/v1")
+            ]
+        );
+
+        // Deserializing drops it and keeps the record.
+        let parsed = DidDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        assert_eq!(parsed.service.len(), 3, "pre-rotation plus two relays");
+        assert_eq!(
+            parsed.relay_service_urls(),
+            [
+                "wss://first.example.com/scp/v1",
+                "wss://third.example.com/scp/v1"
+            ]
+        );
+        assert!(parsed.service.iter().all(|s| s.service_endpoint != query));
+    }
+
+    /// One row per service type with a typed accessor: an entry of that type
+    /// carrying `bridgeTarget` is dropped at deserialization, the accessor
+    /// reports nothing, and the record's other entries remain.
+    #[test]
+    fn bridge_target_on_a_non_relay_entry_drops_the_entry() {
+        use crate::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
+
+        type Absent = fn(&DidDocument) -> bool;
+        let rows: [(&str, Absent); 5] = [
+            ("PreRotationCommitment", |d| {
+                d.pre_rotation_service().is_none()
+            }),
+            ("SCPBroadcastContext", |d| {
+                d.broadcast_context_entries().is_empty()
+            }),
+            ("ScpKeyCustodyAttestation", |d| {
+                d.custody_attestation().unwrap().is_none()
+            }),
+            ("ScpIdentityLinkAttestation", |d| {
+                d.identity_link_attestations().is_empty()
+                    && d.identity_link_attestation_count() == 0
+            }),
+            ("ScpDeviceAttestation", |d| {
+                !d.has_device_attestation() && d.device_attestation_token().unwrap().is_none()
+            }),
+        ];
+
+        let did = "did:dht:zNonRelayTarget";
+        let mut doc = relay_doc(did);
+        doc.add_relay_service(&relay("wss://relay.example.com/scp/v1"));
+        doc.add_broadcast_context_service("c0ffee", &["wss://relay.example.com/scp/v1".to_owned()]);
+        doc.set_custody_attestation(&ScpKeyCustodyAttestation {
+            active_key_custody: KeyCustodyModel::HardwareBiometric,
+            agent_key_custody: None,
+            platform: Platform::Ios,
+            platform_attestation: None,
+            created_at: 1_700_000_000,
+        })
+        .unwrap();
+        doc.set_identity_link_attestation("github.com", "abc123")
+            .unwrap();
+        doc.set_device_attestation_token(b"token");
+        let clean = DidDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        for (service_type, absent) in rows {
+            assert!(
+                !absent(&clean),
+                "{service_type}: the fixture must carry the entry"
+            );
+        }
+
+        for (service_type, absent) in rows {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&doc.to_json().unwrap()).unwrap();
+            let mut tagged = 0;
+            for entry in value["service"].as_array_mut().unwrap() {
+                if entry["type"] == service_type {
+                    entry["bridgeTarget"] = serde_json::Value::String("ab".repeat(32));
+                    tagged += 1;
+                }
+            }
+            assert_eq!(tagged, 1, "{service_type}");
+
+            let parsed = DidDocument::from_json(&value.to_string()).unwrap();
+            assert!(
+                absent(&parsed),
+                "{service_type}: the accessor still reads the entry"
+            );
+            assert!(
+                parsed
+                    .service
+                    .iter()
+                    .all(|s| s.service_type != service_type),
+                "{service_type}"
+            );
+            assert_eq!(
+                parsed.service.len(),
+                clean.service.len() - 1,
+                "{service_type}"
+            );
+            assert_eq!(
+                parsed.relay_service_urls(),
+                ["wss://relay.example.com/scp/v1"],
+                "{service_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_entry_is_dropped_from_a_messagepack_document() {
+        let did = "did:dht:zMsgpack";
+        let mut doc = relay_doc(did);
+        doc.add_relay_service(&bridge(BRIDGE_URL, TARGET));
+        doc.service.push(raw_relay_entry(
+            did,
+            2,
+            BRIDGE_URL,
+            Some(ABSENT_BRIDGE_TARGET),
+        ));
+        let bytes = rmp_serde::to_vec_named(&doc).unwrap();
+        let parsed: DidDocument = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.relay_services(), [bridge(BRIDGE_URL, TARGET)]);
+        assert_eq!(parsed.service.len(), 2);
+    }
+
+    #[test]
+    fn set_preferred_relay_repoints_the_first_relay_entry() {
+        let did = "did:dht:zPreferred";
+        let mut doc = relay_doc(did);
+        // With no relay entry, the relay is inserted.
+        doc.set_preferred_relay(&bridge(BRIDGE_URL, TARGET));
+        assert_eq!(doc.relay_services(), [bridge(BRIDGE_URL, TARGET)]);
+        doc.add_relay_service(&relay("wss://second.example.com/scp/v1"));
+
+        // A move to a direct relay rewrites the first entry in place and
+        // clears its bridgeTarget; the id and the second entry stay.
+        doc.set_preferred_relay(&relay("ws://192.0.2.7:8080/scp/v1"));
+        let first = doc
+            .service
+            .iter()
+            .find(|s| s.service_type == SCP_RELAY_SERVICE_TYPE)
+            .unwrap();
+        assert_eq!(first.id, format!("{did}#scp-relay-1"));
+        assert_eq!(first.bridge_target, None);
+        assert_eq!(
+            doc.relay_services(),
+            [
+                relay("ws://192.0.2.7:8080/scp/v1"),
+                relay("wss://second.example.com/scp/v1")
+            ]
+        );
+
+        // Repeating the call changes nothing.
+        let before = doc.clone();
+        doc.set_preferred_relay(&relay("ws://192.0.2.7:8080/scp/v1"));
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn insert_preferred_relay_goes_ahead_of_existing_relays() {
+        let did = "did:dht:zInsert";
+        let mut doc = relay_doc(did);
+        doc.add_relay_service(&relay("wss://callers.example.com/scp/v1"));
+        doc.insert_preferred_relay(&bridge(BRIDGE_URL, TARGET));
+        assert_eq!(
+            doc.relay_services(),
+            [
+                bridge(BRIDGE_URL, TARGET),
+                relay("wss://callers.example.com/scp/v1")
+            ]
+        );
+        let ids: Vec<&str> = doc
+            .service
+            .iter()
+            .filter(|s| s.service_type == SCP_RELAY_SERVICE_TYPE)
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [format!("{did}#scp-relay-2"), format!("{did}#scp-relay-1")]
+        );
     }
 
     #[test]
     fn multiple_relay_entries_preserve_insertion_order() {
         let did = "did:dht:zOrderTest";
-        let identity_pk = [1u8; 32];
-        let active_pk = [2u8; 32];
-        let commitment = [3u8; 32];
+        let mut doc = relay_doc(did);
+        doc.add_relay_service(&relay("wss://preferred.example.com/scp/v1"));
+        doc.add_relay_service(&relay("wss://secondary.example.com/scp/v1"));
+        doc.add_relay_service(&relay("wss://tertiary.example.com/scp/v1"));
 
-        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
-        doc.add_relay_service("wss://preferred.example.com/scp/v1")
-            .unwrap();
-        doc.add_relay_service("wss://secondary.example.com/scp/v1")
-            .unwrap();
-        doc.add_relay_service("wss://tertiary.example.com/scp/v1")
-            .unwrap();
-
-        let urls = doc.relay_service_urls();
-        assert_eq!(urls.len(), 3);
         // First entry = preferred relay per §18.2.3.
-        assert_eq!(urls[0], "wss://preferred.example.com/scp/v1");
-        assert_eq!(urls[1], "wss://secondary.example.com/scp/v1");
-        assert_eq!(urls[2], "wss://tertiary.example.com/scp/v1");
+        assert_eq!(
+            doc.relay_service_urls(),
+            [
+                "wss://preferred.example.com/scp/v1",
+                "wss://secondary.example.com/scp/v1",
+                "wss://tertiary.example.com/scp/v1"
+            ]
+        );
 
-        // Verify service IDs are sequential.
-        let relay_services: Vec<_> = doc
+        let ids: Vec<&str> = doc
             .service
             .iter()
             .filter(|s| s.service_type == "SCPRelay")
+            .map(|s| s.id.as_str())
             .collect();
-        assert_eq!(relay_services[0].id, format!("{did}#scp-relay-1"));
-        assert_eq!(relay_services[1].id, format!("{did}#scp-relay-2"));
-        assert_eq!(relay_services[2].id, format!("{did}#scp-relay-3"));
+        assert_eq!(
+            ids,
+            [
+                format!("{did}#scp-relay-1"),
+                format!("{did}#scp-relay-2"),
+                format!("{did}#scp-relay-3")
+            ]
+        );
     }
 
     #[test]
     fn scp_relay_is_distinct_from_other_service_types() {
-        let did = "did:dht:zDistinct";
-        let identity_pk = [1u8; 32];
-        let active_pk = [2u8; 32];
-        let commitment = [3u8; 32];
+        let mut doc = relay_doc("did:dht:zDistinct");
+        doc.add_relay_service(&relay("wss://relay.example.com/scp/v1"));
 
-        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
-        doc.add_relay_service("wss://relay.example.com/scp/v1")
-            .unwrap();
-
-        // Verify SCPRelay type string is distinct.
         let relay_svc = doc
             .service
             .iter()
             .find(|s| s.service_type == "SCPRelay")
             .unwrap();
         let pre_rot_svc = doc.pre_rotation_service().unwrap();
-
         assert_ne!(relay_svc.service_type, pre_rot_svc.service_type);
-        assert_eq!(relay_svc.service_type, "SCPRelay");
         assert_eq!(pre_rot_svc.service_type, "PreRotationCommitment");
 
-        // JSON serialization should show distinct type strings.
         let json = doc.to_json().unwrap();
         assert!(json.contains("\"SCPRelay\""));
         assert!(json.contains("\"PreRotationCommitment\""));
@@ -1598,76 +2367,29 @@ mod tests {
 
     #[test]
     fn set_relay_services_replaces_existing_relay_entries() {
-        let did = "did:dht:zSetRelay";
-        let identity_pk = [1u8; 32];
-        let active_pk = [2u8; 32];
-        let commitment = [3u8; 32];
+        let mut doc = relay_doc("did:dht:zSetRelay");
+        doc.add_relay_service(&relay("wss://old-relay.example.com/scp/v1"));
 
-        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
+        let bridge = bridge(BRIDGE_URL, TARGET);
+        doc.set_relay_services(&[relay("wss://new1.example.com/scp/v1"), bridge.clone()]);
 
-        // Add initial relay entries via add_relay_service.
-        doc.add_relay_service("wss://old-relay.example.com/scp/v1")
-            .unwrap();
-        assert_eq!(doc.relay_service_urls().len(), 1);
-
-        // Replace with set_relay_services.
-        doc.set_relay_services(&[
-            "wss://new1.example.com/scp/v1",
-            "wss://new2.example.com/scp/v1",
-        ])
-        .unwrap();
-
-        let urls = doc.relay_service_urls();
-        assert_eq!(urls.len(), 2);
-        assert_eq!(urls[0], "wss://new1.example.com/scp/v1");
-        assert_eq!(urls[1], "wss://new2.example.com/scp/v1");
-
-        // PreRotationCommitment should still be present.
+        assert_eq!(
+            doc.relay_services(),
+            [relay("wss://new1.example.com/scp/v1"), bridge]
+        );
         assert!(doc.pre_rotation_service().is_some());
     }
 
     #[test]
     fn set_relay_services_with_empty_removes_all() {
-        let did = "did:dht:zSetEmpty";
-        let identity_pk = [1u8; 32];
-        let active_pk = [2u8; 32];
-        let commitment = [3u8; 32];
+        let mut doc = relay_doc("did:dht:zSetEmpty");
+        doc.add_relay_service(&relay("wss://relay.example.com/scp/v1"));
 
-        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
-        doc.add_relay_service("wss://relay.example.com/scp/v1")
-            .unwrap();
-        assert_eq!(doc.relay_service_urls().len(), 1);
-
-        doc.set_relay_services(&[]).unwrap();
+        doc.set_relay_services(&[]);
         assert!(doc.relay_service_urls().is_empty());
-
-        // Only PreRotationCommitment should remain.
+        // Only PreRotationCommitment remains.
         assert_eq!(doc.service.len(), 1);
         assert!(doc.pre_rotation_service().is_some());
-    }
-
-    #[test]
-    fn set_relay_services_validates_all_urls_before_modifying() {
-        let did = "did:dht:zSetValidation";
-        let identity_pk = [1u8; 32];
-        let active_pk = [2u8; 32];
-        let commitment = [3u8; 32];
-
-        let mut doc = DidDocument::new(did, &identity_pk, &active_pk, &commitment);
-        doc.add_relay_service("wss://existing.example.com/scp/v1")
-            .unwrap();
-
-        // One valid URL + one invalid URL. Should fail and not modify state.
-        let result = doc.set_relay_services(&[
-            "wss://valid.example.com/scp/v1",
-            "http://invalid.example.com/scp/v1",
-        ]);
-        assert!(result.is_err());
-
-        // Original relay entry should still be present (all-or-nothing).
-        let urls = doc.relay_service_urls();
-        assert_eq!(urls.len(), 1);
-        assert_eq!(urls[0], "wss://existing.example.com/scp/v1");
     }
 
     // --- MigrationProof.signature [u8; 64] hex-string tests ---
@@ -2250,8 +2972,7 @@ mod tests {
 
         let did = "did:dht:zPreserveServices";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
-        doc.add_relay_service("wss://relay.example.com/scp/v1")
-            .unwrap();
+        doc.add_relay_service(&relay("wss://relay.example.com/scp/v1"));
 
         let attestation = ScpKeyCustodyAttestation {
             active_key_custody: KeyCustodyModel::HardwareBiometric,
@@ -2507,8 +3228,7 @@ mod tests {
     #[test]
     fn identity_link_preserves_other_services() {
         let mut doc = DidDocument::new("did:dht:zIdLink9", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
-        doc.add_relay_service("wss://relay.example.com/scp/v1")
-            .unwrap();
+        doc.add_relay_service(&relay("wss://relay.example.com/scp/v1"));
 
         doc.set_identity_link_attestation("github.com", "abc123")
             .unwrap();

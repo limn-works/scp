@@ -268,8 +268,12 @@ pub enum NatSlot {
     Tuned {
         /// Override the STUN endpoint used for NAT type probing (§10.12.8).
         stun_server: Option<String>,
-        /// Override the bridge relay used for Tier 3 fallback (§10.12.8).
-        bridge_relay: Option<String>,
+        /// Override the bridge relay used for Tier 3 fallback (§10.12.8): the
+        /// bridge relay's own `wss` URL ending in `/scp/v1` (§10.12.7). The
+        /// node publishes it as its entry's `serviceEndpoint` and names
+        /// itself in `bridgeTarget` (§18.2.1). [`scp_did::BridgeEndpoint::new`]
+        /// rejects any other URL where the operator builds the value.
+        bridge_relay: Option<scp_did::BridgeEndpoint>,
         /// Optional UPnP/NAT-PMP port mapper for Tier 1 (spec 10.12.2).
         port_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
         /// Optional reachability probe for self-test (SCP-242).
@@ -679,7 +683,9 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
 /// - `Auto` constructs the default strategy (no overrides).
 /// - `Custom(strategy)` uses the caller-supplied strategy verbatim.
 /// - `Tuned { .. }` feeds the STUN / bridge / port-mapper / reachability-probe
-///   overrides into [`resolve_nat`], which builds a `DefaultNatStrategy`.
+///   overrides into [`resolve_nat`], which builds a `DefaultNatStrategy`. Its
+///   `bridge_relay` is a [`scp_did::BridgeEndpoint`], which already satisfies
+///   §18.2.1 and §10.12.7, so lowering it cannot fail.
 fn resolve_nat_slot(nat: NatSlot) -> Arc<dyn NatStrategy> {
     match nat {
         NatSlot::Auto => resolve_nat(None, None, None, None, None),
@@ -984,6 +990,8 @@ where
     #[cfg(feature = "quic")]
     let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start().await?;
+    // Every `?` from here until the node is built shuts the relay down.
+    let relay_guard = crate::RelayShutdownGuard::new(shutdown_handle);
     let dev_token = local_api.map(generate_dev_token);
 
     let tls_provider = resolve_tls(
@@ -1011,7 +1019,7 @@ where
                 // published unconditionally + fatally, ignoring `config.dht`.
                 dht,
                 protocol_repository,
-                shutdown_handle,
+                relay_guard,
                 bound_addr,
                 bridge_secret,
                 dev_token,
@@ -1049,7 +1057,7 @@ where
                 // keeps that publish fail-closed instead of silently dropped.
                 dht,
                 protocol_repository,
-                shutdown_handle,
+                relay_guard,
                 bound_addr,
                 strategy,
                 bridge_secret,
@@ -1142,6 +1150,8 @@ where
     #[cfg(feature = "quic")]
     let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start_with_listener(listener).await?;
+    // Every `?` from here until the node is built shuts the relay down.
+    let relay_guard = crate::RelayShutdownGuard::new(shutdown_handle);
 
     // 4. Generate dev API token if local_api was configured.
     let dev_token = local_api.map(generate_dev_token);
@@ -1155,7 +1165,7 @@ where
         did_method,
         dht,
         protocol_repository,
-        shutdown_handle,
+        relay_guard,
         bound_addr,
         strategy,
         bridge_secret,
@@ -1914,7 +1924,9 @@ mod tests {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             nat: NatSlot::Tuned {
                 stun_server: Some("127.0.0.1:3478".to_owned()),
-                bridge_relay: Some("wss://bridge.example.test/scp/v1".to_owned()),
+                bridge_relay: Some(
+                    scp_did::BridgeEndpoint::new("wss://bridge.example.test/scp/v1").unwrap(),
+                ),
                 port_mapper: None,
                 reachability_probe: None,
             },

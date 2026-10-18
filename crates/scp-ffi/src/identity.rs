@@ -722,9 +722,12 @@ impl PyDIDDocument {
         Ok(list)
     }
 
-    /// Returns the service entries as a list of Python dicts.
+    /// Returns the document's service entries as a list of Python dicts.
     ///
-    /// Each dict contains `id`, `type`, and `service_endpoint`.
+    /// Each dict contains `id`, `type`, `service_endpoint`, and
+    /// `bridge_target`: the tier 3 routing ID as 64 lowercase hex characters,
+    /// or `None` (§18.2.1). A deserialized document holds no entry §18.2.1
+    /// rejects, so none appears here.
     #[getter]
     fn services<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
@@ -733,6 +736,7 @@ impl PyDIDDocument {
             dict.set_item("id", &svc.id)?;
             dict.set_item("type", &svc.service_type)?;
             dict.set_item("service_endpoint", &svc.service_endpoint)?;
+            dict.set_item("bridge_target", svc.bridge_target.map(hex::encode))?;
             list.append(dict)?;
         }
         Ok(list)
@@ -2890,6 +2894,52 @@ mod tests {
 
     fn default_scp() -> crate::scp::PyScp {
         crate::scp::PyScp::new_in_memory_for_test()
+    }
+
+    /// `services` shows only the entries §18.2.1 accepts, and each dict's
+    /// `bridge_target` is the routing ID in lowercase hex, or `None`.
+    #[test]
+    fn py_services_carry_bridge_target_and_skip_rejected_entries() {
+        use scp_ffi_common::test_helpers::{
+            FIXTURE_ACCEPTED_ENDPOINTS, FIXTURE_BRIDGE_TARGET, document_with_rejected_services,
+        };
+        setup();
+        let doc = PyDIDDocument {
+            inner: document_with_rejected_services(),
+            instance_id: 0,
+        };
+        Python::with_gil(|py| {
+            let services = doc.services(py).expect("services getter");
+            let rows: Vec<(String, Option<String>)> = services
+                .iter()
+                .map(|item| {
+                    let dict = item.downcast::<PyDict>().expect("each entry is a dict");
+                    let endpoint: String = dict
+                        .get_item("service_endpoint")
+                        .expect("get_item")
+                        .expect("service_endpoint key")
+                        .extract()
+                        .expect("service_endpoint is a str");
+                    let bridge_target: Option<String> = dict
+                        .get_item("bridge_target")
+                        .expect("get_item")
+                        .expect("bridge_target key is always present")
+                        .extract()
+                        .expect("bridge_target is a str or None");
+                    (endpoint, bridge_target)
+                })
+                .collect();
+            assert_eq!(
+                rows,
+                vec![
+                    (
+                        FIXTURE_ACCEPTED_ENDPOINTS[0].to_owned(),
+                        Some(hex::encode(FIXTURE_BRIDGE_TARGET)),
+                    ),
+                    (FIXTURE_ACCEPTED_ENDPOINTS[1].to_owned(), None),
+                ],
+            );
+        });
     }
 
     /// `encrypted_file` custody refuses an unset, empty or relative `HOME`

@@ -17537,8 +17537,7 @@ impl Supervisor {
             for relay_url in routes.relay_urls {
                 // §9.18.2: a URL that a step rejects has no canonical URL, so
                 // the client derives no reserved push routing ID for it.
-                let Ok(canonical) = scp_protocol::discovery::push::canonical_relay_url(&relay_url)
-                else {
+                let Ok(canonical) = scp_did::canonical_relay_url(&relay_url) else {
                     continue;
                 };
                 by_relay

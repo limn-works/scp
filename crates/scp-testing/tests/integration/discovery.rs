@@ -348,33 +348,33 @@ async fn did_document_relay_services() {
     // Initially no relay services.
     assert!(doc.relay_service_urls().is_empty());
 
+    let relay =
+        |url: &str| scp_did::RelayService::direct(scp_did::RelayEndpoint::new(url).unwrap());
+
     // Add a relay service.
-    doc.add_relay_service("wss://relay1.example.com/scp/v1")
-        .unwrap();
+    doc.add_relay_service(&relay("wss://relay1.example.com/scp/v1"));
     let urls = doc.relay_service_urls();
     assert_eq!(urls.len(), 1);
     assert_eq!(urls[0], "wss://relay1.example.com/scp/v1");
 
     // Add a second relay service.
-    doc.add_relay_service("wss://relay2.example.com/scp/v1")
-        .unwrap();
+    doc.add_relay_service(&relay("wss://relay2.example.com/scp/v1"));
     let urls = doc.relay_service_urls();
     assert_eq!(urls.len(), 2);
     assert_eq!(urls[1], "wss://relay2.example.com/scp/v1");
 
     // Replace all relay services.
     doc.set_relay_services(&[
-        "wss://new-relay.example.com/scp/v1",
-        "wss://backup-relay.example.com/scp/v1",
-    ])
-    .unwrap();
+        relay("wss://new-relay.example.com/scp/v1"),
+        relay("wss://backup-relay.example.com/scp/v1"),
+    ]);
     let urls = doc.relay_service_urls();
     assert_eq!(urls.len(), 2);
     assert_eq!(urls[0], "wss://new-relay.example.com/scp/v1");
     assert_eq!(urls[1], "wss://backup-relay.example.com/scp/v1");
 
     // Invalid URL rejected.
-    assert!(doc.add_relay_service("http://bad.example.com").is_err());
+    assert!(scp_did::RelayEndpoint::new("http://bad.example.com").is_err());
 }
 
 // ---------------------------------------------------------------------------

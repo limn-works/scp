@@ -1341,6 +1341,39 @@ pub struct NapiDIDDocument {
     pub agent_public_key: Option<String>,
 }
 
+impl From<&DidDocument> for NapiDIDDocument {
+    /// The one projection of a resolved document. A deserialized document
+    /// holds no entry §18.2.1 rejects, so JS never sees one in
+    /// `service_endpoints`.
+    fn from(document: &DidDocument) -> Self {
+        Self {
+            id: document.id.clone(),
+            verification_methods: document
+                .verification_method
+                .iter()
+                .map(|vm| NapiVerificationMethod {
+                    id: vm.id.clone(),
+                    method_type: vm.method_type.clone(),
+                    controller: vm.controller.clone(),
+                    public_key_multibase: vm.public_key_multibase.clone(),
+                })
+                .collect(),
+            authentication: document.authentication.clone(),
+            assertion_methods: document.assertion_method.clone(),
+            also_known_as: document.also_known_as.clone(),
+            service_endpoints: document
+                .service
+                .iter()
+                .map(|s| s.service_endpoint.clone())
+                .collect(),
+            has_agent_key: document.has_agent_key(),
+            agent_public_key: document
+                .agent_verification_method()
+                .map(|vm| vm.public_key_multibase.clone()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
@@ -1757,6 +1790,16 @@ mod tests {
         );
     }
 
+    /// `service_endpoints` lists only the entries §18.2.1 accepts.
+    #[test]
+    fn napi_did_document_skips_rejected_service_entries() {
+        let document = scp_ffi_common::test_helpers::document_with_rejected_services();
+        assert_eq!(
+            NapiDIDDocument::from(&document).service_endpoints,
+            scp_ffi_common::test_helpers::FIXTURE_ACCEPTED_ENDPOINTS,
+        );
+    }
+
     #[test]
     fn napi_did_document_contains_full_verification_methods() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -1768,37 +1811,7 @@ mod tests {
             .as_ref()
             .expect("identity must have a document");
 
-        // Build NapiDIDDocument the same way identity_resolve does.
-        let has_agent_key = document.has_agent_key();
-        let agent_public_key = document
-            .agent_verification_method()
-            .map(|vm| vm.public_key_multibase.clone());
-
-        let verification_methods: Vec<NapiVerificationMethod> = document
-            .verification_method
-            .iter()
-            .map(|vm| NapiVerificationMethod {
-                id: vm.id.clone(),
-                method_type: vm.method_type.clone(),
-                controller: vm.controller.clone(),
-                public_key_multibase: vm.public_key_multibase.clone(),
-            })
-            .collect();
-
-        let napi_doc = NapiDIDDocument {
-            id: document.id.clone(),
-            verification_methods,
-            authentication: document.authentication.clone(),
-            assertion_methods: document.assertion_method.clone(),
-            also_known_as: document.also_known_as.clone(),
-            service_endpoints: document
-                .service
-                .iter()
-                .map(|s| s.service_endpoint.clone())
-                .collect(),
-            has_agent_key,
-            agent_public_key,
-        };
+        let napi_doc = NapiDIDDocument::from(document);
 
         // Verification methods must be non-empty.
         assert!(

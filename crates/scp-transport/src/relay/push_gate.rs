@@ -26,13 +26,12 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+use scp_did::canonical_relay_url;
 #[cfg(feature = "push-store")]
 use scp_identity::push_verify::{PushMessage, PushSignatureVerifier};
 #[cfg(feature = "push-store")]
 use scp_protocol::discovery::push::{PushDeregistration, PushPlatform, PushRegistration};
-use scp_protocol::discovery::push::{
-    PushMessageError, canonical_relay_url, push_registration_routing_id,
-};
+use scp_protocol::discovery::push::{PushMessageError, push_registration_routing_id};
 use scp_relay_client::{RelayMessage, code};
 
 #[cfg(feature = "push-store")]
@@ -89,6 +88,19 @@ impl RelayUrl {
     #[must_use]
     pub const fn push_routing_id(&self) -> [u8; 32] {
         self.push_routing_id
+    }
+}
+
+impl From<&scp_did::RelayService> for RelayUrl {
+    /// The relay URL of an `SCPRelay` entry, which holds its §9.18.2
+    /// canonical form by construction, so the conversion cannot fail.
+    fn from(relay: &scp_did::RelayService) -> Self {
+        Self {
+            canonical: relay.url().to_owned(),
+            push_routing_id: scp_protocol::discovery::push::relay_endpoint_push_routing_id(
+                relay.endpoint(),
+            ),
+        }
     }
 }
 
@@ -530,6 +542,17 @@ pub(crate) fn test_relay_url() -> LiveRelayUrl {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_url_from_relay_service_matches_relay_url_new() {
+        let service = scp_did::RelayService::direct(
+            scp_did::RelayEndpoint::new("WSS://Relay.Example:443/scp/v1").unwrap(),
+        );
+        assert_eq!(
+            RelayUrl::from(&service),
+            RelayUrl::new("wss://relay.example/scp/v1").unwrap()
+        );
+    }
 
     #[test]
     fn relay_url_canonicalizes_and_derives_the_reserved_routing_id() {

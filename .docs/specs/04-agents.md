@@ -38,7 +38,7 @@ Contexts can require specific capability levels for admission. "This context req
 
 ### 4.4.1 Agent Capability Metadata Schema
 
-An identity publishes its capability metadata profile among the self-asserted capability URIs of its service record (`03-identity.md` §3.10.13, §18.2.2). A service-record entry is three strings — `id`, `type`, and `serviceEndpoint` — so the entry is `id` `"#scp-capabilities"`, `type` `"SCPCapabilities"`, and a `serviceEndpoint` string carrying the JSON document below, the way a custody attestation travels in its own entry (`27-attestations.md` §27.4.4).
+An identity publishes its capability metadata profile among the self-asserted capability URIs of its service record (`03-identity.md` §3.10.13, §18.2.2). An `SCPCapabilities` entry is three strings (`03-identity.md` §3.10.13) — `id`, `type`, and `serviceEndpoint` — so the entry is `id` `"#scp-capabilities"`, `type` `"SCPCapabilities"`, and a `serviceEndpoint` string carrying the JSON document below, the way a custody attestation travels in its own entry (`27-attestations.md` §27.4.4).
 
 ```json
 {

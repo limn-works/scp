@@ -559,7 +559,7 @@ The dev API serves endpoints for identity info, context management, relay status
 |------|--------|-----------------|
 | **Tier 1** | UPnP/NAT-PMP port mapping | `ws://<external-ip>:<port>/scp/v1` |
 | **Tier 2** | STUN hole punching (non-symmetric NAT) | `ws://<external-ip>:<port>/scp/v1` |
-| **Tier 3** | Bridge relay (symmetric NAT fallback) | `wss://<bridge>/scp/v1?bridge_target=<hex>` |
+| **Tier 3** | Bridge relay (symmetric NAT fallback) | `wss://<bridge>/scp/v1` plus the entry's `bridgeTarget` |
 | **Tier 4** | Domain mode with TLS | `wss://<domain>/scp/v1` |
 
 The `DefaultNatStrategy` (defined in `crates/scp-node/src/lib.rs`) implements the tier selection algorithm using STUN probing. Each tier includes a reachability self-test before acceptance.

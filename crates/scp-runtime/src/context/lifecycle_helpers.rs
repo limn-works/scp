@@ -124,7 +124,7 @@ pub fn normalize_relay_urls(relay_urls: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::with_capacity(relay_urls.len());
     relay_urls
         .into_iter()
-        .map(|url| scp_protocol::discovery::push::canonical_relay_url(&url).unwrap_or(url))
+        .map(|url| scp_did::canonical_relay_url(&url).unwrap_or(url))
         .filter(|url| seen.insert(url.clone()))
         .collect()
 }

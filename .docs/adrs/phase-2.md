@@ -1337,6 +1337,8 @@ This test proves: context lifecycle works, roles enforce, outlets invoke, event 
 
 **Amended 2026-09-10.** ADR-063, inception-derived self-certifying identity over a key-event log, moved every `SCPRelay` entry below into the identity's service record, which its designated operational key signs and which carries its own monotonic sequence (`03-identity.md` §3.10.13). `18-addressability-and-deployment.md` §18.2.1 defines the entry type and §18.5.1 states the bootstrap order.
 
+**Amended 2026-10-18.** A tier 3 bridge entry's routing target becomes its own field of the `SCPRelay` entry, `bridgeTarget`, and the entry's `serviceEndpoint` is the bridge relay's own URL. Alec wrote, on 2026-10-17: "Yes you can add push reg to the canonical form but maybe it's better as its own field..?" The push session reported that he then confirmed the separate field. He named no wire key and no preimage layout. The orchestrator chose the key `bridgeTarget`, matching the entry's other camelCase keys, and the signed layout of `03-identity.md` §3.10.13, in which only an `SCPRelay` entry signs the 32-byte target. `18-addressability-and-deployment.md` §18.2.1 defines `bridgeTarget` and the canonical-URL rule every `SCPRelay` entry's URL meets.
+
 ### Context
 
 SCP's protocol layer (identity, contexts, relays, encryption) is fully specified. What's missing is how things get found and how complete applications get deployed. Today:
@@ -1375,9 +1377,9 @@ Implement a complete addressability and deployment layer as specified in §18:
 
 ### Acceptance Criteria
 
-1. **`SCPRelay` entry type** exists in the service record. `add_relay_service(url)` adds an entry. `relay_service_urls()` returns all relay URLs. Serde roundtrip preserves `SCPRelay` entries alongside the other entry types `18-addressability-and-deployment.md` §18.2.2 lists. `PreRotationCommitment` is retired as an entry type, because the commitment is a field of the inception event and of every reveal-authorized event.
+1. **`SCPRelay` entry type** exists in the service record. `add_relay_service(relay)` adds an entry carrying a URL and, for a bridge, its `bridge_target`. `relay_services()` returns the entries a reader accepts under `18-addressability-and-deployment.md` §18.2.1, and `relay_service_urls()` returns their URLs. Serde roundtrip preserves `SCPRelay` entries alongside the other entry types `18-addressability-and-deployment.md` §18.2.2 lists. `PreRotationCommitment` is retired as an entry type, because the commitment is a field of the inception event and of every reveal-authorized event.
 
-2. **Service-record publish flow** accepts optional `relay_urls: Vec<Url>`. When provided, relay URLs appear as `SCPRelay` entries in the published service record. The record's signature covers the entries, and the record's own monotonic sequence orders relay-list updates.
+2. **Service-record publish flow** accepts optional relay entries, each a URL and an optional `bridge_target`. When provided, the entries appear as `SCPRelay` entries in the published service record. The record's signature covers the entries, and the record's own monotonic sequence orders relay-list updates.
 
 3. **`ScpUri` type** parses and serializes the universal context URI format: `scp://context/<hex>?relay=<url>[&relay=<url2>][&mode=...][&name=...]`. Legacy `scp://broadcast/<hex>?relay=<url>` accepted as alias. Invalid URIs return typed errors. Percent-encoding per RFC 3986. Parse/serialize roundtrip.
 

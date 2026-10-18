@@ -104,7 +104,7 @@ pub async fn build_well_known_scp(state: &NodeState) -> WellKnownScp {
     // address, so a NAT tier change landing mid-build cannot produce a document
     // that advertises two different endpoints. See
     // [`LiveSlot`](crate::LiveSlot).
-    let relay_url = state.live_state.get().relay_url;
+    let relay_url = state.live_state.get().relay.url().to_owned();
 
     let contexts = {
         let guard = state.broadcast_contexts.read().await;

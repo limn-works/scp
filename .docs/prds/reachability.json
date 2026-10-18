@@ -39,7 +39,8 @@
         "SCP-243",
         "SCP-244",
         "SCP-246",
-        "SCP-247"
+        "SCP-247",
+        "SCP-328"
       ]
     }
   ],
@@ -773,6 +774,119 @@
         "crate": "scp-transport"
       },
       "result": "Signature verification for BRIDGE_REGISTER: domain-separated payload SCP-BRIDGE-REGISTER-V1: || routing_id || timestamp, 60s replay window, routing ID ownership validation via did_routing_id derivation. Tests: valid_signature_accepted, invalid_signature_rejected, expired_timestamp_rejected."
+    },
+    {
+      "id": "SCP-328",
+      "title": "Publish a bridge's routing target as the SCPRelay entry's bridgeTarget field",
+      "gate": "gate-reachability-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "done",
+      "files": [
+        "bindings/python/scp_sdk/identity.py",
+        "crates/scp-did/Cargo.toml",
+        "crates/scp-did/src/attestation.rs",
+        "crates/scp-did/src/document.rs",
+        "crates/scp-did/src/lib.rs",
+        "crates/scp-did/src/relay_url.rs",
+        "crates/scp-ffi/common/src/attestation.rs",
+        "crates/scp-ffi/common/src/test_helpers.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-identity/src/cache.rs",
+        "crates/scp-identity/src/dht.rs",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-identity/src/resolution.rs",
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/src/dev_api.rs",
+        "crates/scp-node/src/http.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/projection.rs",
+        "crates/scp-node/src/published_state.rs",
+        "crates/scp-node/src/republish.rs",
+        "crates/scp-node/src/well_known.rs",
+        "crates/scp-protocol/src/discovery/push.rs",
+        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
+        "crates/scp-runtime/src/context/pseudonym_rotation_runtime_tests.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/discovery/did_capabilities.rs",
+        "crates/scp-runtime/src/trust/participation_service.rs",
+        "crates/scp-runtime/src/well_known.rs",
+        "crates/scp-testing/tests/integration/discovery.rs",
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/relay/bridge.rs",
+        "crates/scp-transport/src/relay/connection.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "docs/guides/relay-operations.md",
+        "fuzz/Cargo.lock",
+        "scripts/gen-test-vectors-p256.py"
+      ],
+      "description": "A tier 3 bridge entry carried its routing target as a `?bridge_target=` query on the bridge relay's URL. §18.2.1 now gives the `SCPRelay` entry a `bridgeTarget` property: 64 lowercase hex digits naming the identity routing ID of §10.12.4.1, and the entry's `serviceEndpoint` is the bridge relay's own URL (§10.12.4 step 4, §10.12.7). §3.10.13 signs an `SCPRelay` entry's 32 trailing bytes as its `bridgeTarget`, and SHA-256(0x00) there means \"no target\", so a writer never names SHA-256(0x00) as a target. Every `SCPRelay` URL has a §9.18.2 canonical form whose path ends in /scp/v1, and a reader of the did:dht JSON document rejects an entry that fails §18.2.1 and keeps the record: a malformed, null or SHA-256(0x00) `bridgeTarget`, or a `bridgeTarget` on an entry whose type is not `SCPRelay`, rejects that entry only, and in every form a `bridgeTarget` on an entry whose URL is not `wss` rejects that entry only (§10.12.7). This story adds the validated `RelayEndpoint`, `BridgeEndpoint` and `BridgeTarget` types and `RelayService` to scp-did, so a relay entry a node publishes satisfies §18.2.1 by construction; moves the §9.18.2 canonicalizer from scp-protocol into scp-did so those constructors can call it; makes `DidDocument` drop every entry §18.2.1 rejects while it deserializes, so no reader sees one; makes the scp-node tier 3 publisher write the bridge relay's URL with `bridge_target`; and deletes the query-string bridge parser from scp-transport. The node publishes the routing ID that `verify_bridge_registration` checks today; the identifier-bytes value §10.12.4.1 defines arrives with SCP-315, the key-event-log identity cut-over. Sending `BRIDGE_REGISTER` from the node is not this story.",
+      "acceptanceCriteria": [
+        "Unit test bridge_relay_service_round_trips_through_json: a document holding one plain and one bridge SCPRelay entry survives a JSON round trip, and only the bridge entry's JSON carries bridgeTarget",
+        "Unit test relay_endpoint_new_rejects_query_fragment_and_userinfo: RelayEndpoint::new returns DidError::InvalidRelayUrl whose reason is RelayEntryUrlError::Canonical(QueryOrFragment) for a URL carrying ?bridge_target=<64 hex> and for a URL carrying #x, and Canonical(UserInfo) for wss://u@h/scp/v1, and the error's url holds no user information",
+        "Unit test bridge_target_rejects_uppercase_wrong_length_and_non_hex: DidDocument::from_json accepts a document whose SCPRelay entry's bridgeTarget holds 62 hex digits, 64 uppercase hex digits, 66 hex digits, non-hex characters, or null, drops that entry, and keeps the record's other entries in their order",
+        "Unit test bridge_target_new_rejects_the_absent_sentinel: BridgeTarget::new returns DidError::AbsentSentinelBridgeTarget for SHA-256(0x00), and DidDocument::from_json drops an SCPRelay entry whose bridgeTarget is SHA-256(0x00)",
+        "Unit test relay_services_skips_an_entry_whose_url_carries_bridge_target: from_json accepts a document whose SCPRelay serviceEndpoint is wss://bridge.example.com/scp/v1?bridge_target=<64 hex>, and relay_services() and relay_service_urls() leave that entry out while the remaining entries keep their order",
+        "Unit test bridge_target_on_a_non_relay_entry_drops_the_entry: for each service type with a typed accessor, DidDocument::from_json drops an entry of that type carrying bridgeTarget, and the accessor returns none, empty or zero, while the record's other entries remain",
+        "Unit test relay_endpoint_accepts_ws_address_literal: RelayEndpoint::new accepts ws:// with an address literal and rejects http and https with reason Canonical(UnsupportedScheme)",
+        "Unit test publish_and_resolve_round_trips_a_bridge_entry: publishing a record with a plain and a bridge entry and resolving it returns relay_services() equal to the published entries",
+        "Unit test resolve_rejects_a_query_bearing_relay_entry: on both the DHT resolve path and the shared relay-record path, a resolved record's query-bearing SCPRelay entry is absent from relay_services() and the record still resolves",
+        "Unit test no_domain_build_with_bridge_publishes_bridge_target: a no-domain node on a bridge tier publishes serviceEndpoint exactly wss://bridge.example.com/scp/v1, and verify_bridge_registration accepts a BRIDGE_REGISTER signed by the node's key whose routing ID is the published bridge_target",
+        "Unit test tier_change_to_a_bridge_entry_publishes_it_and_keeps_the_reserved_id: a tier change to a bridge entry republishes the entry with its bridge_target and leaves the reserved push routing ID where it was",
+        "Unit test tier_change_from_bridge_to_stun_clears_bridge_target: a tier change from a bridge entry to a STUN entry publishes an entry with no bridge_target",
+        "Unit test tier_reevaluation_sees_no_change_for_an_identical_bridge_entry: re-evaluation that derives the published bridge entry again republishes nothing",
+        "Unit test bridge_endpoint_rejects_plaintext_ws: BridgeEndpoint::new returns DidError::InvalidRelayUrl with reason RelayEntryUrlError::PlaintextBridge for ws://bridge.example.com/scp/v1 (§10.12.7), DidDocument::from_json drops a ws:// SCPRelay entry carrying bridgeTarget and keeps the record's other entries, and NatSlot::Tuned.bridge_relay is typed BridgeEndpoint, so a malformed bridge URL fails where the operator builds it, before Node::start",
+        "Unit test node_start_rejects_a_non_ascii_domain: Node::start returns a typed error when Reach::Domain holds a non-ASCII host, because the relay URL built from it has no §9.18.2 canonical form; main already rejected such a domain, and the test pins that behavior",
+        "Unit test persisted_identity_round_trips_a_bridge_entry: a PersistedIdentity whose document holds a bridge entry survives a MessagePack named-map round trip with its bridge_target",
+        "scp-transport no longer defines BRIDGE_TARGET_PARAM, parse_bridge_target or is_bridge_url, and no test asserts that a relay URL carrying a bridge_target query is accepted",
+        "Test: the PyO3 identity `services` list carries a bridge_target key on every entry (lowercase hex for a bridge entry, None otherwise) and omits an SCPRelay entry the document dropped at deserialization",
+        "Test: the NAPI and UniFFI service_endpoints projections omit an SCPRelay entry the document dropped at deserialization",
+        "Test: a .well-known/scp relay equal to a bridge entry's serviceEndpoint validates against the resolved service record",
+        "Unit tests verify_against_did_passes_with_the_same_non_canonical_spelling and verify_against_did_passes_with_differing_spellings_of_one_relay: a .well-known/scp relay validates when its §9.18.2 canonical form equals an SCPRelay entry's URL, whatever either side's spelling, and verify_against_did_rejects_a_relay_with_no_canonical_form returns WellKnownValidationError::InvalidRelayUrl naming the §18.2.1 reason",
+        "Unit tests advertised_relay_url_reads_the_bound_port_for_a_port_zero_bind and nat_tier_selection_reads_the_bound_port_for_a_port_zero_bind: a no-domain node whose http_bind_addr requests port 0 publishes and hands NAT tier selection the port it bound, and serves on that port",
+        "Spec 25 Vector 48 carries a bridge entry, and python3.12 scripts/check-test-vectors-p256.py passes",
+        "Unit test did_capabilities_and_participation_ignore_a_bridge_target_entry: scp-runtime's DID capability and participation readers see none of an entry the document dropped for carrying bridgeTarget on a non-SCPRelay type",
+        "Unit test a_failed_nat_traversal_start_leaves_no_listener: when Node::start fails after the relay server started, the relay's listener on bind_addr is closed",
+        "Unit test set_preferred_relay_repoints_the_first_relay_entry: DidDocument::set_preferred_relay rewrites the first SCPRelay entry's serviceEndpoint and bridgeTarget, and inserts an entry ahead of the other services' relays when none exists",
+        "scp-did declares relay_url as a private module, and ApplicationNode has no relay_service method",
+        "fuzz/Cargo.lock resolves the branch's scp-did and scp-transport, and `cd fuzz && cargo fetch --locked` exits 0"
+      ],
+      "actionItems": [
+        "Move canonical_relay_url, split_host_port and RelayUrlError from scp-protocol discovery/push.rs into scp-did relay_url.rs, and import them from scp_did at every caller with no re-export",
+        "Add Service.bridge_target with a lowercase-only hex serde helper, the validated RelayEndpoint, BridgeEndpoint and BridgeTarget types, RelayService::direct and RelayService::bridge, relay_services(), set_preferred_relay, a DidDocument deserializer that drops every entry §18.2.1 rejects, and the new add_relay_service and set_relay_services signatures to scp-did",
+        "Make scp-node derive a RelayService per reachability tier, publish bridge_target on the bridge tier, compare RelayService values on re-evaluation, and leave the reserved push routing ID in place for a bridge entry",
+        "Delete the query-string bridge parser and its tests from scp-transport",
+        "Project PyO3, NAPI and UniFFI service entries from the document's service list, which holds no rejected entry, and add bridge_target to the PyO3 services dict",
+        "Hold the relay server's ShutdownHandle in a guard that shuts the relay down when Node::start fails after the relay started, in both build paths"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.1 SCPRelay"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.4 Tier 3: Relay Bridging"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.7 Service-Record Relay URL Encoding"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.13 The Service Record"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-032: Addressability and Deployment"
+        }
+      ],
+      "details": {},
+      "result": "Service gains bridge_target (bridgeTarget, 64 lowercase hex). scp-did's RelayEndpoint (a §9.18.2 canonical URL ending in /scp/v1), BridgeEndpoint (a wss RelayEndpoint) and BridgeTarget (32 bytes other than SHA-256(0x00)) validate at construction, and RelayService::direct and RelayService::bridge build an SCPRelay entry from them without failing. DidDocument drops each service entry §18.2.1 rejects while it deserializes and keeps the record, so every typed accessor and every FFI projection reads the filtered list. The §9.18.2 canonicalizer moved from scp-protocol into scp-did with no re-export of the module. scp-node takes the bridge relay as a BridgeEndpoint, holds the advertised RelayService in its live slot, publishes the bridge relay URL with bridgeTarget = did_routing_id(did) on tier 3 (Stub — see SCP-315 for the §10.12.4.1 identifier-bytes value), clears it on a move off tier 3, keeps its relay's reserved push routing ID for a bridge entry, and shuts its relay down when Node::start fails after starting it. Node::start already rejected a non-ASCII domain on main; this story adds a test for it. scp-transport's query-string bridge parser is deleted. PyO3 services carry bridge_target. Each acceptance-criterion test named above exists, and each was seen failing with its behavior removed."
     }
   ]
 }

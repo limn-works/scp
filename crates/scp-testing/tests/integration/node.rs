@@ -45,7 +45,7 @@ async fn domain_mode_builder() {
 #[tokio::test]
 async fn no_domain_mode_builder() {
     let tier = ReachabilityTier::Bridge {
-        bridge_url: "wss://bridge.example.com/scp/v1".to_owned(),
+        bridge_url: scp_did::BridgeEndpoint::new("wss://bridge.example.com/scp/v1").unwrap(),
     };
     let node = Node::start_for_testing(helpers::test_no_domain_node_config(tier))
         .await

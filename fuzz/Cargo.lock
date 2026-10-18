@@ -2651,6 +2651,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "thiserror 2.0.18",
+ "tracing",
  "z-base-32",
 ]
 
@@ -2894,6 +2895,7 @@ dependencies = [
  "scp-core",
  "scp-crypto",
  "scp-dht",
+ "scp-did",
  "scp-identity",
  "scp-protocol",
  "scp-relay-client",

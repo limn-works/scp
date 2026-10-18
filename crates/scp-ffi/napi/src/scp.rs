@@ -624,8 +624,6 @@ impl Scp {
         &self,
         did: String,
     ) -> napi::Result<crate::identity::NapiDIDDocument> {
-        use crate::identity::NapiVerificationMethod;
-
         if !did.starts_with("did:dht:") {
             return Err(ScpNapiError::Identity {
                 message: format!("unsupported DID method: {did} — only did:dht is supported"),
@@ -648,36 +646,7 @@ impl Scp {
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?
         };
 
-        let has_agent_key = document.has_agent_key();
-        let agent_public_key = document
-            .agent_verification_method()
-            .map(|vm| vm.public_key_multibase.clone());
-
-        let verification_methods = document
-            .verification_method
-            .iter()
-            .map(|vm| NapiVerificationMethod {
-                id: vm.id.clone(),
-                method_type: vm.method_type.clone(),
-                controller: vm.controller.clone(),
-                public_key_multibase: vm.public_key_multibase.clone(),
-            })
-            .collect();
-
-        Ok(crate::identity::NapiDIDDocument {
-            id: document.id.clone(),
-            verification_methods,
-            authentication: document.authentication.clone(),
-            assertion_methods: document.assertion_method.clone(),
-            also_known_as: document.also_known_as.clone(),
-            service_endpoints: document
-                .service
-                .iter()
-                .map(|s| s.service_endpoint.clone())
-                .collect(),
-            has_agent_key,
-            agent_public_key,
-        })
+        Ok(crate::identity::NapiDIDDocument::from(&document))
     }
 
     /// Per-instance equivalent of `identity_create_link_attestation`.

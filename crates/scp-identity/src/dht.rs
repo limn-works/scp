@@ -40,7 +40,8 @@ use scp_dht::DhtClient;
 #[cfg(any(test, feature = "testing"))]
 use scp_dht::InMemoryDhtClient;
 use scp_did::{
-    DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, decode_multibase_key,
+    DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, RelayService,
+    decode_multibase_key,
 };
 
 /// The `did:dht` DID method prefix.
@@ -902,9 +903,9 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         })
     }
 
-    /// Publishes a DID document to the DHT with optional relay URLs.
+    /// Publishes a DID document to the DHT with optional relay entries.
     ///
-    /// When `relay_urls` is non-empty, `SCPRelay` service entries are added to
+    /// When `relays` is non-empty, `SCPRelay` service entries are added to
     /// the document before signing and publishing. The BEP44 signature covers
     /// the complete document including relay entries (existing §9.6.3 property).
     ///
@@ -913,43 +914,43 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::InvalidRelayUrl`] if any URL fails validation.
     /// Returns [`IdentityError::DhtPublishFailed`] if the DHT publish fails.
-    pub async fn publish_with_relay_urls(
+    /// Each [`RelayService`] already satisfies §18.2.1, so the entries
+    /// themselves cannot fail.
+    pub async fn publish_with_relay_services(
         &self,
         identity: &ScpIdentity,
         document: &DidDocument,
-        relay_urls: &[&str],
+        relays: &[RelayService],
     ) -> Result<DidDocument, IdentityError> {
         let mut doc = document.clone();
-        doc.set_relay_services(relay_urls)?;
+        doc.set_relay_services(relays);
         self.publish_document(identity, &doc).await?;
         Ok(doc)
     }
 
-    /// Updates the relay URL list for an already-published identity.
+    /// Updates the relay list for an already-published identity.
     ///
     /// Replaces all existing `SCPRelay` service entries in the document with the
-    /// provided URLs, then publishes the updated document with an incremented
+    /// provided relays, then publishes the updated document with an incremented
     /// BEP44 sequence number (§9.6.3 monotonicity). The BEP44 signature covers
     /// the complete updated document.
     ///
     /// Callers SHOULD use this method instead of manually modifying the document
-    /// and calling `publish_document`, because this method ensures the relay
-    /// entries are validated and the sequence number is incremented atomically.
+    /// and calling `publish_document`, because this method replaces the relay
+    /// entries and increments the sequence number atomically.
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::InvalidRelayUrl`] if any URL fails validation.
     /// Returns [`IdentityError::DhtPublishFailed`] if the DHT publish fails.
-    pub async fn update_relay_urls(
+    pub async fn update_relay_services(
         &self,
         identity: &ScpIdentity,
         document: &DidDocument,
-        relay_urls: &[&str],
+        relays: &[RelayService],
     ) -> Result<DidDocument, IdentityError> {
         let mut doc = document.clone();
-        doc.set_relay_services(relay_urls)?;
+        doc.set_relay_services(relays);
         self.publish_document(identity, &doc).await?;
         Ok(doc)
     }
@@ -5320,7 +5321,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn publish_with_relay_urls_includes_scp_relay_entries() {
+    async fn publish_with_relay_services_includes_scp_relay_entries() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
@@ -5329,13 +5330,13 @@ mod tests {
         let (identity, document, _pre_rotation_handle) =
             dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
-        let relay_urls = &[
+        let relay_urls = &relays(&[
             "wss://relay1.example.com/scp/v1",
             "wss://relay2.example.com/scp/v1",
-        ];
+        ]);
 
         let published_doc = dht
-            .publish_with_relay_urls(&identity, &document, relay_urls)
+            .publish_with_relay_services(&identity, &document, relay_urls)
             .await
             .unwrap();
 
@@ -5366,7 +5367,7 @@ mod tests {
 
         // Publish without relay URLs (empty slice).
         let published_doc = dht
-            .publish_with_relay_urls(&identity, &document, &[])
+            .publish_with_relay_services(&identity, &document, &[])
             .await
             .unwrap();
 
@@ -5380,7 +5381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_relay_urls_returns_new_urls_and_increments_sequence() {
+    async fn update_relay_services_returns_new_urls_and_increments_sequence() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
@@ -5391,7 +5392,11 @@ mod tests {
 
         // Initial publish with one relay URL.
         let initial_doc = dht
-            .publish_with_relay_urls(&identity, &document, &["wss://relay1.example.com/scp/v1"])
+            .publish_with_relay_services(
+                &identity,
+                &document,
+                &relays(&["wss://relay1.example.com/scp/v1"]),
+            )
             .await
             .unwrap();
 
@@ -5400,14 +5405,14 @@ mod tests {
 
         // Update to a different set of relay URLs.
         let updated_doc = dht
-            .update_relay_urls(
+            .update_relay_services(
                 &identity,
                 &initial_doc,
-                &[
+                &relays(&[
                     "wss://new-relay1.example.com/scp/v1",
                     "wss://new-relay2.example.com/scp/v1",
                     "wss://new-relay3.example.com/scp/v1",
-                ],
+                ]),
             )
             .await
             .unwrap();
@@ -5434,30 +5439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_with_relay_urls_rejects_invalid_url() {
-        let custody = Arc::new(InMemoryKeyCustody::new());
-        let dht = make_dht_with_custody(&custody);
-
-        let pre_rotation_custody =
-            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-        let (identity, document, _pre_rotation_handle) =
-            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
-
-        // Invalid scheme.
-        let result = dht
-            .publish_with_relay_urls(&identity, &document, &["http://relay.example.com/scp/v1"])
-            .await;
-        assert!(matches!(result, Err(IdentityError::InvalidRelayUrl(_))));
-
-        // Invalid path.
-        let result = dht
-            .publish_with_relay_urls(&identity, &document, &["wss://relay.example.com/other"])
-            .await;
-        assert!(matches!(result, Err(IdentityError::InvalidRelayUrl(_))));
-    }
-
-    #[tokio::test]
-    async fn update_relay_urls_preserves_non_relay_services() {
+    async fn update_relay_services_preserves_non_relay_services() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
@@ -5471,7 +5453,11 @@ mod tests {
 
         // Publish with relay URLs.
         let published_doc = dht
-            .publish_with_relay_urls(&identity, &document, &["wss://relay.example.com/scp/v1"])
+            .publish_with_relay_services(
+                &identity,
+                &document,
+                &relays(&["wss://relay.example.com/scp/v1"]),
+            )
             .await
             .unwrap();
 
@@ -5481,10 +5467,10 @@ mod tests {
 
         // Update relay URLs.
         let updated_doc = dht
-            .update_relay_urls(
+            .update_relay_services(
                 &identity,
                 &published_doc,
-                &["wss://new-relay.example.com/scp/v1"],
+                &relays(&["wss://new-relay.example.com/scp/v1"]),
             )
             .await
             .unwrap();
@@ -5499,7 +5485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_relay_urls_to_empty_removes_all_relay_entries() {
+    async fn update_relay_services_to_empty_removes_all_relay_entries() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
@@ -5510,14 +5496,18 @@ mod tests {
 
         // Publish with relay URLs.
         let published_doc = dht
-            .publish_with_relay_urls(&identity, &document, &["wss://relay.example.com/scp/v1"])
+            .publish_with_relay_services(
+                &identity,
+                &document,
+                &relays(&["wss://relay.example.com/scp/v1"]),
+            )
             .await
             .unwrap();
         assert_eq!(published_doc.relay_service_urls().len(), 1);
 
         // Update to empty relay list.
         let updated_doc = dht
-            .update_relay_urls(&identity, &published_doc, &[])
+            .update_relay_services(&identity, &published_doc, &[])
             .await
             .unwrap();
 
@@ -5539,8 +5529,8 @@ mod tests {
         let (identity, document, _pre_rotation_handle) =
             dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
-        let relay_urls = &["wss://relay.example.com/scp/v1"];
-        dht.publish_with_relay_urls(&identity, &document, relay_urls)
+        let relay_urls = &relays(&["wss://relay.example.com/scp/v1"]);
+        dht.publish_with_relay_services(&identity, &document, relay_urls)
             .await
             .unwrap();
 
@@ -5558,6 +5548,79 @@ mod tests {
             resolved.document.relay_service_urls()[0],
             "wss://relay.example.com/scp/v1"
         );
+    }
+
+    /// Plain relay entries for `urls`, each without a `bridgeTarget`.
+    fn relays(urls: &[&str]) -> Vec<RelayService> {
+        urls.iter()
+            .map(|url| RelayService::direct(scp_did::RelayEndpoint::new(url).unwrap()))
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-328 tests — the SCPRelay bridgeTarget field (§18.2.1)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_and_resolve_round_trips_a_bridge_entry() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
+
+        let published = vec![
+            RelayService::direct(
+                scp_did::RelayEndpoint::new("wss://plain.example.com/scp/v1").unwrap(),
+            ),
+            RelayService::bridge(
+                scp_did::BridgeEndpoint::new("wss://bridge.example.com/scp/v1").unwrap(),
+                scp_did::BridgeTarget::new([0x42; 32]).unwrap(),
+            ),
+        ];
+        dht.publish_with_relay_services(&identity, &document, &published)
+            .await
+            .unwrap();
+
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        assert_eq!(resolved.document.relay_services(), published);
+    }
+
+    /// The DHT resolve path keeps a record whose `SCPRelay` entry carries the
+    /// retired `?bridge_target=` query and leaves that entry out of
+    /// `relay_services()` (§18.2.1: reject the entry, keep the record). The
+    /// shared relay-record path is covered in `resolution.rs`.
+    #[tokio::test]
+    async fn resolve_rejects_a_query_bearing_relay_entry() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, mut document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
+
+        let plain = RelayService::direct(
+            scp_did::RelayEndpoint::new("wss://plain.example.com/scp/v1").unwrap(),
+        );
+        document.add_relay_service(&plain);
+        document.service.push(scp_did::Service {
+            id: format!("{}#scp-relay-2", identity.did),
+            service_type: "SCPRelay".to_owned(),
+            service_endpoint: format!(
+                "wss://bridge.example.com/scp/v1?bridge_target={}",
+                "ab".repeat(32)
+            ),
+            bridge_target: None,
+        });
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        dht.cache().remove(&identity.did).await;
+        let resolved = dht.resolve_did(&identity.did).await.unwrap();
+        // The resolver drops the query-bearing entry and keeps the others.
+        assert_eq!(resolved.document.service.len(), document.service.len() - 1);
+        assert_eq!(resolved.document.relay_services(), [plain]);
     }
 
     // -----------------------------------------------------------------------

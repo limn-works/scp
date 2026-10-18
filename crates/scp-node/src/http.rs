@@ -118,7 +118,20 @@ pub struct NodeState {
     /// no address: [`NodeState::public_bind_addr`] then falls back to
     /// `0.0.0.0:8443` for `serve`, and `serve_background*` falls back to
     /// loopback `127.0.0.1:8443` (SCP-320).
+    ///
+    /// A no-domain node never holds port 0 here: when the caller configured
+    /// port 0, `Node::start` binds the public listener first and stores its
+    /// bound address, so the port the node advertises is the port it serves.
     pub(crate) http_bind_addr: Option<SocketAddr>,
+    /// The public TCP listener `Node::start` bound for a configured
+    /// `http_bind_addr` with port 0, or `None`.
+    ///
+    /// The node advertised this listener's port, so a bind of
+    /// [`http_bind_addr`](Self::http_bind_addr), or of port 0 on its IP, takes
+    /// it through [`NodeState::take_or_bind_public`] instead of binding a
+    /// second, unrelated port. A serve on any other address and
+    /// [`ApplicationNode::shutdown`](crate::ApplicationNode::shutdown) close it.
+    pub(crate) prebound_public: std::sync::Mutex<Option<tokio::net::TcpListener>>,
     /// Shared cancellation token for graceful shutdown of both the public
     /// HTTPS listener and the dev API listener. Cancelled by
     /// [`ApplicationNode::shutdown`].
@@ -287,6 +300,82 @@ impl NodeState {
     pub(crate) fn public_bind_addr(&self) -> SocketAddr {
         self.http_bind_addr.unwrap_or(crate::DEFAULT_HTTP_BIND_ADDR)
     }
+
+    /// A public TCP listener on `requested` and its bound address.
+    ///
+    /// When `Node::start` bound a listener for a port-0 `http_bind_addr`
+    /// ([`prebound_public`](Self::prebound_public)), the node already
+    /// advertised that listener's port, so the listener leaves the slot on
+    /// every successful call:
+    ///
+    /// - A request for the listener's address, or for port 0 on its IP (the
+    ///   address the caller configured), takes that listener.
+    /// - Any other request binds a new listener and closes the pre-bound one,
+    ///   because the node now serves elsewhere and the advertised port would
+    ///   otherwise accept connections nothing ever answers.
+    ///
+    /// A failed bind leaves the pre-bound listener in place, unless the node
+    /// has shut down.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Serve`] when the bind fails or the bound address cannot be
+    /// read.
+    pub(crate) async fn take_or_bind_public(
+        &self,
+        requested: SocketAddr,
+    ) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
+        let prebound = self
+            .prebound_public
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(prebound) = prebound else {
+            return bind_public_tcp(requested).await;
+        };
+        if let Ok(bound) = prebound.local_addr()
+            && serves_request(bound, requested)
+        {
+            return Ok((prebound, bound));
+        }
+        match bind_public_tcp(requested).await {
+            Ok(fresh) => Ok(fresh),
+            Err(e) => {
+                // The check runs under the slot lock, and `shutdown` cancels
+                // the token before it takes that lock, so a listener is never
+                // restored after `close_prebound_public` ran.
+                let mut slot = self
+                    .prebound_public
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !self.shutdown_token.is_cancelled() {
+                    *slot = Some(prebound);
+                }
+                drop(slot);
+                Err(e)
+            }
+        }
+    }
+
+    /// Closes the pre-bound public listener, if one is still unserved.
+    ///
+    /// Called by [`ApplicationNode::shutdown`](crate::ApplicationNode::shutdown)
+    /// after it cancels the shutdown token: a stopped node serves nothing, so its advertised port must refuse
+    /// connections rather than queue them in a backlog no task accepts.
+    pub(crate) fn close_prebound_public(&self) {
+        drop(
+            self.prebound_public
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
+
+/// Whether a listener bound to `bound` serves a request for `requested`: the
+/// same address, or port 0 on the same IP.
+fn serves_request(bound: SocketAddr, requested: SocketAddr) -> bool {
+    bound == requested || (requested.port() == 0 && requested.ip() == bound.ip())
 }
 
 // ---------------------------------------------------------------------------
@@ -936,7 +1025,7 @@ async fn bind_public_listeners(
     {
         let mut draws: u32 = 1;
         loop {
-            let (listener, local_addr) = bind_public_tcp(requested).await?;
+            let (listener, local_addr) = state.take_or_bind_public(requested).await?;
             // The QUIC listener binds after the TCP listener so that, when
             // `http_bind_addr` requests port 0, QUIC binds the port the OS
             // assigned to TCP rather than a second, unrelated port. It shares
@@ -970,13 +1059,13 @@ async fn bind_public_listeners(
     }
     #[cfg(not(feature = "quic"))]
     {
-        let (listener, local_addr) = bind_public_tcp(requested).await?;
+        let (listener, local_addr) = state.take_or_bind_public(requested).await?;
         Ok((listener, local_addr, None))
     }
 }
 
 /// Binds the public TCP listener on `requested` and reads its bound address.
-async fn bind_public_tcp(
+pub(crate) async fn bind_public_tcp(
     requested: SocketAddr,
 ) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
     let listener = tokio::net::TcpListener::bind(requested)
@@ -1309,7 +1398,7 @@ mod tests {
         Arc::new(NodeState {
             did: "did:dht:cors_test".to_owned(),
             live_state: crate::LiveSlot::new(crate::NodePublishedState {
-                relay_url: "wss://localhost/scp/v1".to_owned(),
+                relay: crate::published_state::test_relay("wss://localhost/scp/v1"),
                 record: None,
                 document: scp_did::DidDocument {
                     context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
@@ -1336,6 +1425,7 @@ mod tests {
             ),
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
+            prebound_public: std::sync::Mutex::new(None),
             shutdown_token: CancellationToken::new(),
             cors_origins,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(
@@ -1511,7 +1601,7 @@ mod vhost_tests {
         Arc::new(NodeState {
             did: "did:dht:vhost_test".to_owned(),
             live_state: crate::LiveSlot::new(crate::NodePublishedState {
-                relay_url: "wss://localhost/scp/v1".to_owned(),
+                relay: crate::published_state::test_relay("wss://localhost/scp/v1"),
                 record: None,
                 document: scp_did::DidDocument {
                     context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
@@ -1538,6 +1628,7 @@ mod vhost_tests {
             ),
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
+            prebound_public: std::sync::Mutex::new(None),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(

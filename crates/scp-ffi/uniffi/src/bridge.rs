@@ -2252,6 +2252,25 @@ pub struct DIDDocument {
     pub service_endpoints: Vec<String>,
 }
 
+impl From<&CoreDidDocument> for DIDDocument {
+    /// The one projection of a resolved document. A deserialized document
+    /// holds no entry §18.2.1 rejects, so Swift and Kotlin never see one in
+    /// `service_endpoints`.
+    fn from(document: &CoreDidDocument) -> Self {
+        Self {
+            id: document.id.clone(),
+            authentication: document.authentication.clone(),
+            assertion_methods: document.assertion_method.clone(),
+            also_known_as: document.also_known_as.clone(),
+            service_endpoints: document
+                .service
+                .iter()
+                .map(|s| s.service_endpoint.clone())
+                .collect(),
+        }
+    }
+}
+
 /// Context creation parameters.
 ///
 /// See ADR-008 (Context Lifecycle) and spec §5 (Contexts).
@@ -4642,17 +4661,7 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
             let did_method = DidDht::with_client(Arc::new(build_ffi_dht_client()?));
             let document = did_method.resolve(&did).await.map_err(ScpError::from)?;
 
-            Ok(DIDDocument {
-                id: document.id.clone(),
-                authentication: document.authentication.clone(),
-                assertion_methods: document.assertion_method.clone(),
-                also_known_as: document.also_known_as.clone(),
-                service_endpoints: document
-                    .service
-                    .iter()
-                    .map(|s| s.service_endpoint.clone())
-                    .collect(),
-            })
+            Ok(DIDDocument::from(&document))
         })
         .await
         .map_err(|e| ScpError::Identity {
@@ -19382,6 +19391,16 @@ impl Scp {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// `service_endpoints` lists only the entries §18.2.1 accepts.
+    #[test]
+    fn did_document_projection_skips_rejected_service_entries() {
+        let document = scp_ffi_common::test_helpers::document_with_rejected_services();
+        assert_eq!(
+            DIDDocument::from(&document).service_endpoints,
+            scp_ffi_common::test_helpers::FIXTURE_ACCEPTED_ENDPOINTS,
+        );
+    }
 
     /// Returns a fresh `Scp` instance for tests. Phase 4 PR 4 demolition
     /// (#1549) deleted the free-function façade; tests now drive bridge
