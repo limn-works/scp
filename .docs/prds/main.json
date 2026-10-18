@@ -11680,7 +11680,7 @@
         "`bun run lint` and `bun test tests/server.test.ts` pass in `bindings/typescript`"
       ],
       "actionItems": [
-        "Add the options interface and the node start entry to `bindings/typescript/src/server.ts`",
+        "Add the options interface to `bindings/typescript/src/server.ts` and the node start entry `SCP.nodeStart` to `bindings/typescript/src/scp.ts`",
         "Declare `node_start` in `src/internal/native.ts`",
         "Add wire-shape and error-mapping tests"
       ],
