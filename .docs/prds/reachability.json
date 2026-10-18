@@ -39,7 +39,8 @@
         "SCP-243",
         "SCP-244",
         "SCP-246",
-        "SCP-247"
+        "SCP-247",
+        "SCP-328"
       ]
     }
   ],
@@ -773,6 +774,90 @@
         "crate": "scp-transport"
       },
       "result": "Signature verification for BRIDGE_REGISTER: domain-separated payload SCP-BRIDGE-REGISTER-V1: || routing_id || timestamp, 60s replay window, routing ID ownership validation via did_routing_id derivation. Tests: valid_signature_accepted, invalid_signature_rejected, expired_timestamp_rejected."
+    },
+    {
+      "id": "SCP-328",
+      "title": "Publish a bridge's routing target as the SCPRelay entry's bridgeTarget field",
+      "gate": "gate-reachability-3",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-did/Cargo.toml",
+        "crates/scp-did/src/document.rs",
+        "crates/scp-did/src/lib.rs",
+        "crates/scp-did/src/relay_url.rs",
+        "crates/scp-protocol/src/discovery/push.rs",
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/relay/bridge.rs",
+        "crates/scp-transport/src/relay/connection.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-identity/src/dht.rs",
+        "crates/scp-identity/src/resolution.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/published_state.rs",
+        "crates/scp-node/src/republish.rs",
+        "crates/scp-runtime/src/discovery/well_known.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "bindings/python/scp_sdk/identity.py"
+      ],
+      "description": "A tier 3 bridge entry carried its routing target as a `?bridge_target=` query on the bridge relay's URL. §18.2.1 now gives the `SCPRelay` entry a `bridgeTarget` property: 64 lowercase hex digits naming the identity routing ID of §10.12.4.1, and the entry's `serviceEndpoint` is the bridge relay's own URL (§10.12.4 step 4, §10.12.7). §3.10.13 signs `bridgeTarget` as 32 bare bytes after an `SCPRelay` entry's three strings, absent as SHA-256(0x00). Every `SCPRelay` URL has a §9.18.2 canonical form whose path ends in /scp/v1, and a reader rejects an entry that fails §18.2.1 and keeps the record. This story adds `RelayService { url, bridge_target }` to scp-did as the one validating constructor for publishers and readers, moves the §9.18.2 canonicalizer into scp-did so that constructor can call it, makes the scp-node tier 3 publisher write the bridge relay's URL with `bridge_target`, deletes the query-string bridge parser from scp-transport, and makes every FFI projection of service entries skip an `SCPRelay` entry the reader rejects. The node publishes the routing ID that `verify_bridge_registration` checks today; the identifier-bytes value §10.12.4.1 defines arrives with SCP-315, the key-event-log identity cut-over. Sending `BRIDGE_REGISTER` from the node is not this story.",
+      "acceptanceCriteria": [
+        "Unit test bridge_relay_service_round_trips_through_json: a document holding one plain and one bridge SCPRelay entry survives a JSON round trip, and only the bridge entry's JSON carries bridgeTarget",
+        "Unit test relay_service_new_rejects_query_fragment_and_userinfo: RelayService::new returns DidError::InvalidRelayUrl for a URL carrying ?bridge_target=<64 hex>, a URL carrying #x, and wss://u@h/scp/v1",
+        "Unit test bridge_target_rejects_uppercase_wrong_length_and_non_hex: deserializing a bridgeTarget of 62 hex digits, 64 uppercase hex digits, 66 hex digits, or a string holding non-hex characters fails",
+        "Unit test relay_service_rejects_the_absent_sentinel_as_bridge_target: RelayService::new and relay_services() reject a bridge_target equal to SHA-256(0x00)",
+        "Unit test relay_services_skips_an_entry_whose_url_carries_bridge_target: from_json accepts a document whose SCPRelay serviceEndpoint is wss://bridge.example.com/scp/v1?bridge_target=<64 hex>, and relay_services() and relay_service_urls() leave that entry out while the remaining entries keep their order",
+        "Unit test bridge_target_on_a_non_relay_entry_is_rejected: an entry of a type other than SCPRelay that carries bridgeTarget is left out of every relay projection, and validation reports it",
+        "Unit test relay_service_accepts_ws_address_literal: RelayService::new accepts ws:// with an address literal and rejects http and https",
+        "Unit test publish_and_resolve_round_trips_a_bridge_entry: publishing a record with a plain and a bridge entry and resolving it returns relay_services() equal to the published entries",
+        "Unit test resolve_rejects_a_query_bearing_relay_entry: on both the DHT resolve path and the shared relay-record path, a resolved record's query-bearing SCPRelay entry is absent from relay_services() and the record still resolves",
+        "Unit test no_domain_build_with_bridge_publishes_bridge_target: a no-domain node on a bridge tier publishes serviceEndpoint exactly wss://bridge.example.com/scp/v1, bridge_target equal to the routing ID verify_bridge_registration checks for the node's identity, and relay_url() returns the bridge URL",
+        "Unit test tier_change_to_a_bridge_entry_publishes_it_and_keeps_the_reserved_id: a tier change to a bridge entry republishes the entry with its bridge_target and leaves the reserved push routing ID where it was",
+        "Unit test tier_change_from_bridge_to_stun_clears_bridge_target: a tier change from a bridge entry to a STUN entry publishes an entry with no bridge_target",
+        "Unit test tier_reevaluation_sees_no_change_for_an_identical_bridge_entry: re-evaluation that derives the published bridge entry again republishes nothing",
+        "Unit test node_start_rejects_a_bridge_relay_with_a_query: Node::start returns a typed NodeError before any probe when bridge_relay carries a query",
+        "Unit test node_start_rejects_a_non_ascii_domain: Node::start returns a typed error when Reach::Domain holds a non-ASCII host, because the relay URL built from it has no §9.18.2 canonical form",
+        "Unit test persisted_identity_round_trips_a_bridge_entry: a PersistedIdentity whose document holds a bridge entry survives a MessagePack named-map round trip with its bridge_target",
+        "scp-transport no longer defines BRIDGE_TARGET_PARAM, parse_bridge_target or is_bridge_url, and no test asserts that a relay URL carrying a bridge_target query is accepted",
+        "Test: the PyO3 identity `services` list carries a bridge_target key on every entry (lowercase hex for a bridge entry, None otherwise) and omits an SCPRelay entry relay_services() rejects",
+        "Test: the NAPI and UniFFI service_endpoints projections omit an SCPRelay entry relay_services() rejects",
+        "Test: a .well-known/scp relay equal to a bridge entry's serviceEndpoint validates against the resolved service record",
+        "Spec 25 Vector 48 carries a bridge entry, and python3.12 scripts/check-test-vectors-p256.py passes"
+      ],
+      "actionItems": [
+        "Move canonical_relay_url, split_host_port and RelayUrlError from scp-protocol discovery/push.rs into scp-did relay_url.rs, and import them from scp_did at every caller with no re-export",
+        "Add Service.bridge_target with a lowercase-only hex serde helper, RelayService::new, relay_services(), and the new add_relay_service and set_relay_services signatures to scp-did",
+        "Make scp-node derive a RelayService per reachability tier, publish bridge_target on the bridge tier, compare RelayService values on re-evaluation, and leave the reserved push routing ID in place for a bridge entry",
+        "Delete the query-string bridge parser and its tests from scp-transport",
+        "Filter rejected SCPRelay entries out of the PyO3, NAPI and UniFFI service projections, and add bridge_target to the PyO3 services dict"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.1 SCPRelay"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.4 Tier 3: Relay Bridging"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.7 Service-Record Relay URL Encoding"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.13 The Service Record"
+        },
+        {
+          "file": ".docs/adrs/phase-2.md",
+          "section": "## ADR-032: Addressability and Deployment"
+        }
+      ],
+      "details": {}
     }
   ]
 }

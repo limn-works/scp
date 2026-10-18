@@ -7639,20 +7639,20 @@
       "description": "PATCH to SCP-006 (done). SCP-006 created DidDocument with only PreRotationCommitment service. §18.2 defines SCPRelay as a service record entry type for relay transport URLs — the endpoints where TransportManager (ADR-012) routes encrypted blobs to the identity. This story extends document.rs to support SCPRelay entries. This patch is considered more recent than SCP-006.\n\nThe SCPRelay service endpoint type declares transport-layer relay URLs. URL format: wss://<host>/scp/v1 (ADR-004). TLS 1.3 required (§9.13). Multiple entries allowed for suppression resistance (§9.9.2, ADR-012). The designated operational key signs the record, whose sequence is monotonic (§3.10.13).\n\nSCPRelay is distinct from SCPCapabilities (ADR-020): SCPRelay = transport layer (where to send encrypted blobs, consumed by TransportManager), SCPCapabilities = application layer (what outlets/capabilities an agent offers, consumed by Discovery Engine).",
       "acceptanceCriteria": [
         "SCPRelay variant exists in service entry types in DidDocument",
-        "add_relay_service(url: Url) method on DidDocument adds an SCPRelay service entry",
-        "relay_service_urls() -> Vec<Url> accessor returns all SCPRelay URLs",
+        "add_relay_service(relay: RelayService) method on DidDocument adds an SCPRelay service entry carrying the relay's URL and, for a tier 3 bridge, its bridge_target",
+        "relay_service_urls() accessor returns the URLs of the entries relay_services() accepts under §18.2.1",
         "Serde roundtrip preserves SCPRelay entries alongside existing PreRotationCommitment and IdentityPrivateState service types",
-        "SCPRelay entries use wss:// scheme and /scp/v1 path format",
+        "Every SCPRelay entry URL has a §9.18.2 canonical form, under the ws or wss scheme, whose path ends in /scp/v1",
         "SCPRelay is structurally distinct from SCPCapabilities — different enum variant, different type string in serialized form",
         "Unit test: DidDocument with mixed service types (PreRotationCommitment + SCPRelay) serializes and deserializes correctly",
         "Unit test: relay_service_urls returns only SCPRelay entries, not other service types",
-        "Unit test: add_relay_service with invalid URL (non-wss scheme) returns error",
+        "Unit test: RelayService::new rejects a URL whose scheme is neither ws nor wss, or which has no §9.18.2 canonical form",
         "Multiple SCPRelay entries preserve insertion order (first entry = preferred relay per §18.2.3)"
       ],
       "actionItems": [
         "Add SCPRelay variant to the service entry type enum in document.rs",
-        "Implement add_relay_service(url: Url) method on DidDocument — validates wss:// scheme, creates SCPRelay service entry with auto-generated ID",
-        "Implement relay_service_urls() -> Vec<Url> accessor that filters service entries by SCPRelay type",
+        "Implement add_relay_service(relay: RelayService) method on DidDocument — RelayService::new validates the URL's canonical form and the bridge_target, and the method creates an SCPRelay service entry with an auto-generated ID",
+        "Implement relay_services() -> Vec<RelayService>, which returns the SCPRelay entries a reader accepts, and relay_service_urls() over it",
         "Update Serde Serialize/Deserialize implementations to handle SCPRelay entries with type string \"SCPRelay\"",
         "Write unit tests for roundtrip serialization, URL filtering, and URL validation"
       ],
@@ -7677,7 +7677,7 @@
       ],
       "details": {
         "patchContext": "SCP-006 (done) created DidDocument with only PreRotationCommitment service. This story extends it with SCPRelay. This is a patch to SCP-006's behavior and is considered more recent.",
-        "serviceEndpointFormat": "```json\n{\n  \"id\": \"#scp-relay-1\",\n  \"type\": \"SCPRelay\",\n  \"serviceEndpoint\": \"wss://relay.example.com/scp/v1\"\n}\n```",
+        "serviceEndpointFormat": "```json\n{\n  \"id\": \"#scp-relay-1\",\n  \"type\": \"SCPRelay\",\n  \"serviceEndpoint\": \"wss://relay.example.com/scp/v1\"\n}\n```\n\nA tier 3 bridge entry adds `bridgeTarget`, 64 lowercase hex digits naming the identity routing ID of §10.12.4.1, and its `serviceEndpoint` is the bridge relay's own URL (§18.2.1):\n\n```json\n{\n  \"id\": \"#scp-relay-2\",\n  \"type\": \"SCPRelay\",\n  \"serviceEndpoint\": \"wss://bridge.example.com/scp/v1\",\n  \"bridgeTarget\": \"<64 lowercase hex digits>\"\n}\n```",
         "crossReferenceTable": "| Type | Purpose | Consumer |\n|------|---------|----------|\n| SCPRelay | Transport-layer relay URLs | TransportManager (ADR-012) |\n| SCPCapabilities | Application-layer capability endpoints | Discovery Engine (§6.2.2) |\n| IdentityPrivateState | Relay URLs storing identity private state | Identity Manager |\n| PreRotationCommitment | SHA-256 commitment for pre-rotation key | Identity Manager (§9.12) |\n| SCPBroadcastContext | Broadcast context ID + relay URLs | Discovery Engine |",
         "multipleRelayEntries": "An identity SHOULD publish at least 3 SCPRelay entries for suppression resistance (§9.9.2). Relay entries are ordered by preference (first entry = preferred relay). Clients SHOULD respect ordering when selecting a subset. When adding or removing relays, the identity updates its service record and publishes it at an incremented sequence. Peers that re-resolve the service record discover the updated relay list."
       }
@@ -7694,15 +7694,15 @@
       ],
       "description": "PATCH to SCP-007 (done). SCP-007 publishes service records without relay URL entries. §18.2 and §18.5 require relay URLs in published service records so peers can discover relays via identity resolution. This story extends the publish flow to accept optional relay_urls and include them as SCPRelay service entries before the record is signed. This patch is considered more recent than SCP-007.\n\nRelay URLs are added as SCPRelay service entries before signing, so the designated operational key's signature covers them (§3.10.13 — no new crypto needed). The record's monotonic sequence applies to relay list updates.",
       "acceptanceCriteria": [
-        "Identity creation flow accepts optional relay_urls: Vec<Url>",
-        "service record update flow accepts optional relay_urls: Vec<Url>",
-        "When relay_urls provided, published service records include SCPRelay service entries for each URL",
+        "Identity creation flow accepts optional relay entries: Vec<RelayService>, each a URL and an optional bridge_target",
+        "service record update flow accepts optional relay entries: Vec<RelayService>",
+        "When relay entries are provided, published service records include an SCPRelay service entry for each, carrying its URL and bridge_target",
         "The service record's signature covers the relay entries (no new crypto — existing §3.10.13 property)",
         "Sequence number is incremented on relay list updates (§9.6.3 monotonicity)",
         "identity resolution returns relay URLs from SCPRelay service entries",
-        "Unit test: publish with relay_urls -> resolve -> relay_service_urls returns the published URLs",
-        "Unit test: publish without relay_urls -> resolve -> relay_service_urls returns empty",
-        "Unit test: update relay_urls -> resolve -> returns new URLs, sequence number incremented"
+        "Unit test: publish with relay entries -> resolve -> relay_services returns the published entries",
+        "Unit test: publish without relay entries -> resolve -> relay_service_urls returns empty",
+        "Unit test: update relay entries -> resolve -> returns the new entries, sequence number incremented"
       ],
       "actionItems": [
         "Extend identity creation function signature to accept optional relay_urls: Vec<Url>",
