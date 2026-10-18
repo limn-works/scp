@@ -530,7 +530,7 @@ class Node internal constructor(
          * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
          * not forever. we can add impls later".
          *
-         * @param bridge The [ServerBridge] providing FFI access.
+         * @param bridge The [ServerBridge] providing access to the caller-supplied [ServerBindings].
          * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
@@ -558,7 +558,7 @@ class Node internal constructor(
          * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
          * not forever. we can add impls later".
          *
-         * @param bridge The [ServerBridge] providing FFI access.
+         * @param bridge The [ServerBridge] providing access to the caller-supplied [ServerBindings].
          * @param dataDir Directory for persistent storage.
          * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
          * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
