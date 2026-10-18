@@ -2992,7 +2992,7 @@ def emit_challenge_vectors() -> None:
     max_retries, cooldown_secs, threshold = 2, 3600, 8000
 
     # --- Vector 65: the capability definition the fixture URI follows. ---
-    pre63 = capability_definition_preimage(
+    pre65 = capability_definition_preimage(
         capability_uri,
         0,
         1,
@@ -3001,9 +3001,9 @@ def emit_challenge_vectors() -> None:
         cooldown_secs,
         "Fixture definition for spec 25 vectors 59-62.",
     )
-    definition_digest = sha256(pre63)
-    emit("vector_65.preimage_len", len(pre63))
-    emit_hex("vector_65.preimage", pre63)
+    definition_digest = sha256(pre65)
+    emit("vector_65.preimage_len", len(pre65))
+    emit_hex("vector_65.preimage", pre65)
     emit_hex("vector_65.definition_digest", definition_digest)
 
     # --- Vector 61: the challenge request. ---
@@ -3022,7 +3022,7 @@ def emit_challenge_vectors() -> None:
     )
     test_cases_field = u32(1) + test_case
     suite_digest = sha256(test_cases_field)
-    pre59 = canonical_preimage(
+    pre61 = canonical_preimage(
         "SCP-CHALLENGE-REQ-V1:",
         fixed_field(challenge_id),
         var_field(capability_uri),
@@ -3037,7 +3037,7 @@ def emit_challenge_vectors() -> None:
         var_field(ID_VERIFIER),
         var_field(ID_SUBJECT),
     )
-    request_digest = sha256(pre59)
+    request_digest = sha256(pre61)
     emit_hex("vector_61.challenge_id", challenge_id)
     emit("vector_61.verifier", ID_VERIFIER)
     emit("vector_61.definer", ID_DEFINER)
@@ -3048,11 +3048,11 @@ def emit_challenge_vectors() -> None:
     emit("vector_61.test_case_field_len", len(test_cases_field))
     emit_hex("vector_61.test_case_field", test_cases_field)
     emit_hex("vector_61.suite_digest", suite_digest)
-    emit("vector_61.preimage_len", len(pre59))
-    emit_hex("vector_61.preimage", pre59)
+    emit("vector_61.preimage_len", len(pre61))
+    emit_hex("vector_61.preimage", pre61)
     emit_hex("vector_61.digest", request_digest)
     # No byte of the request derives from the expected output (§7.3.4).
-    assert expected_jcs not in pre59
+    assert expected_jcs not in pre61
 
     # --- Responses: attempt 1 (fails the schema) and Vector 64 (attempt 2). ---
     response_digests = {}

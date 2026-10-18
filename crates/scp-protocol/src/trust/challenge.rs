@@ -2191,7 +2191,7 @@ mod tests {
 
     /// Test 1.
     #[test]
-    fn vector_59_challenge_request() {
+    fn vector_61_challenge_request() {
         let request = v_request();
         assert_eq!(hex::encode(request.definition_digest), V_DEFINITION_DIGEST);
         let r = canonical_challenge_request_bytes(&request).unwrap();
@@ -2204,7 +2204,7 @@ mod tests {
 
     /// Test 2.
     #[test]
-    fn vector_59_suite_digest() {
+    fn vector_61_suite_digest() {
         let request = v_request();
         assert_eq!(
             test_cases_field_bytes(&request.test_cases).unwrap().len(),
@@ -2235,7 +2235,7 @@ mod tests {
 
     /// Test 3.
     #[test]
-    fn vector_62_challenge_response() {
+    fn vector_64_challenge_response() {
         let attempt_1 = v_response(1, json!({"name": "widget"}));
         let p1 = canonical_challenge_response_bytes(&attempt_1).unwrap();
         assert_eq!(p1.len(), 200);
@@ -2262,7 +2262,7 @@ mod tests {
 
     /// Test 4.
     #[test]
-    fn vector_60_61_record_matches_spec() {
+    fn vector_62_63_record_matches_spec() {
         for (attempt, timestamp, passed, vid, d_v) in [
             (
                 1,

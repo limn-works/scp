@@ -241,7 +241,7 @@ mod tests {
 
     /// Spec 25 Vector 65: the fixture definition's `Def` and digest.
     #[test]
-    fn vector_63_capability_definition() {
+    fn vector_65_capability_definition() {
         let definition = CapabilityDefinition {
             capability_uri: "scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq:capability:schema-validation/v1".to_owned(),
             min_cases: MinCases::Total(1),
