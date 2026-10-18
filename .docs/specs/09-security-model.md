@@ -2985,7 +2985,6 @@ Both seeds go through the `"SCP-PSEUDONYM-P256-V1"` seed-to-scalar step above. T
 | Constant | Value | Notes | Spec Reference |
 |----------|-------|-------|----------------|
 | Max outlet interfaces per context | 256 | Hard cap on registered outlet interfaces | §6.2 |
-| Ceiling change notification period | 259,200s (72h) | Members notified before ceiling change takes effect | §5.3.2 |
 | Freeze timeout | 172,800s (48h) | Frozen context auto-unfreezes after this period | §5.6 |
 | Default context verification window | 300s (5 min) | Grace period for context close verification | §5.6 |
 | Outlet lifecycle default timeout | 30,000ms (30s) | Default outlet invocation timeout | §6.2 |
