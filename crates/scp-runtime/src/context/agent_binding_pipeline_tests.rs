@@ -187,7 +187,7 @@ fn alice_identity() -> (SigningKey, SigningKey, DidDocument) {
 /// [`build_encrypted_envelope`] helper, signed by `signing_key` and stamped
 /// with `signing_key_id`. The recipient wrap addresses both Alice and Bob (so
 /// Bob can unwrap with `bob_access_key`). Returns the sealed wire blob.
-fn build_send_blob(
+async fn build_send_blob(
     alice_state: &mut PerContextState,
     ctx_str: &str,
     signing_key: &SigningKey,
@@ -208,9 +208,11 @@ fn build_send_blob(
     // Pair the chosen persona with the signing key so the stamped
     // `signing_key_id` and the key that signs come from one source — this is
     // exactly the invariant the #agent-persona slice asserts.
+    let command_signer =
+        crate::context::actor::signer::CommandSigner::local_ed25519(signing_key.clone());
     let signer = match signing_key_id {
-        SigningKeyId::Active => MessageSigner::Active(signing_key),
-        SigningKeyId::Agent => MessageSigner::Agent(signing_key),
+        SigningKeyId::Active => MessageSigner::Active(&command_signer),
+        SigningKeyId::Agent => MessageSigner::Agent(&command_signer),
     };
 
     // Drive the PRODUCTION actor app-data seal `build_encrypted_envelope_actor`
@@ -236,6 +238,7 @@ fn build_send_blob(
         None,
         MessageType::Content,
     )
+    .await
     .expect("build_encrypted_envelope_actor")
 }
 
@@ -275,8 +278,8 @@ fn receive_via_verify_and_unwrap(
 //     pipeline against the document-derived agent key.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn agent_signed_message_verifies_through_live_pipeline() {
+#[tokio::test]
+async fn agent_signed_message_verifies_through_live_pipeline() {
     let ctx_str = "ctx-agent-binding-pipeline-agent";
     let (mut alice_state, mut bob_state, _ctx_bytes) = setup_two_party(ctx_str);
     let (_active_sk, agent_sk, alice_doc) = alice_identity();
@@ -290,7 +293,8 @@ fn agent_signed_message_verifies_through_live_pipeline() {
         SigningKeyId::Agent,
         &bob_access_key,
         b"hello from the agent persona",
-    );
+    )
+    .await;
 
     let plaintext =
         receive_via_verify_and_unwrap(&mut bob_state, ctx_str, &blob, &resolver, &bob_access_key)
@@ -307,8 +311,8 @@ fn agent_signed_message_verifies_through_live_pipeline() {
 // (b) Negative: resolver returns the WRONG key for #agent ⇒ verification fails.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn agent_signed_message_rejected_when_resolver_returns_wrong_agent_key() {
+#[tokio::test]
+async fn agent_signed_message_rejected_when_resolver_returns_wrong_agent_key() {
     let ctx_str = "ctx-agent-binding-pipeline-wrongkey";
     let (mut alice_state, mut bob_state, _ctx_bytes) = setup_two_party(ctx_str);
     let (_active_sk, agent_sk, alice_doc) = alice_identity();
@@ -324,7 +328,8 @@ fn agent_signed_message_rejected_when_resolver_returns_wrong_agent_key() {
         SigningKeyId::Agent,
         &bob_access_key,
         b"agent message that must be rejected",
-    );
+    )
+    .await;
 
     let wrong_agent_key = SigningKey::from_bytes(&[0x99; 32]).verifying_key();
     let bad_resolver = document_backed_resolver(&alice_doc, Some(wrong_agent_key));
@@ -352,8 +357,8 @@ fn agent_signed_message_rejected_when_resolver_returns_wrong_agent_key() {
 //     did not break the human-key default path).
 // ---------------------------------------------------------------------------
 
-#[test]
-fn active_signed_message_still_verifies_through_live_pipeline() {
+#[tokio::test]
+async fn active_signed_message_still_verifies_through_live_pipeline() {
     let ctx_str = "ctx-agent-binding-pipeline-active";
     let (mut alice_state, mut bob_state, _ctx_bytes) = setup_two_party(ctx_str);
     let (active_sk, _agent_sk, alice_doc) = alice_identity();
@@ -367,7 +372,8 @@ fn active_signed_message_still_verifies_through_live_pipeline() {
         SigningKeyId::Active,
         &bob_access_key,
         b"hello from the human persona",
-    );
+    )
+    .await;
 
     let plaintext =
         receive_via_verify_and_unwrap(&mut bob_state, ctx_str, &blob, &resolver, &bob_access_key)
@@ -771,9 +777,11 @@ mod live_supervisor_send {
         // THE PUBLIC SEND. Persona chosen by `signing_key_id`; the signing key
         // is Alice's matching (#agent or #active) key. `MessageSigner` pairs the
         // two so the stamped persona cannot disagree with the key that signs.
+        let command_signer =
+            crate::context::actor::signer::CommandSigner::local_ed25519(signing_key.clone());
         let signer = match signing_key_id {
-            SigningKeyId::Active => MessageSigner::Active(signing_key),
-            SigningKeyId::Agent => MessageSigner::Agent(signing_key),
+            SigningKeyId::Active => MessageSigner::Active(&command_signer),
+            SigningKeyId::Agent => MessageSigner::Agent(&command_signer),
         };
         sup.send_message(&handle, &DID::from(ALICE_DID), payload, signer, None, None)
             .await

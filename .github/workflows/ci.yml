@@ -457,6 +457,12 @@ jobs:
               - '.docs/standards/sdk-capability-matrix.json'
               - '.docs/adrs/**'
               - '.docs/prds/**'
+              # `crates/scp-testing/tests/integration/trust.rs` compiles in spec 07 to
+              # check its protocol capability minimums against the compiled-in constants.
+              - '.docs/specs/07-trust-validation-and-capabilities.md'
+              # `crates/scp-protocol/src/trust/challenge.rs` compiles in spec 09 in a
+              # unit test that checks the spec against the challenge code.
+              - '.docs/specs/09-security-model.md'
               - 'tests/conformance/**'
               - 'bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json'
               - 'scripts/pure-helpers-allowlist.txt'
@@ -1303,6 +1309,12 @@ jobs:
         run: python3.12 scripts/check-block-in-place.py --self-test
       - name: Real scan
         run: python3.12 scripts/check-block-in-place.py
+      # ADR-049 Decision 7a: `bridge_block_on` is the only bridge wait, and
+      # only listed callers reach it. Self-test first, as above.
+      - name: Bridge block_on self-test
+        run: python3.12 scripts/check-bridge-block-on.py --self-test
+      - name: Bridge block_on whitelist + caller list
+        run: python3.12 scripts/check-bridge-block-on.py
 
   # Every `§N.M` citation in the artifacts that tell an agent how to write and how to
   # work names a heading its spec file carries. It runs on every pull request, without a
@@ -1325,6 +1337,36 @@ jobs:
         run: python3.12 scripts/check-doc-citations.py --self-test
       - name: Real scan
         run: python3.12 scripts/check-doc-citations.py
+
+  # `.docs/specs/25-test-vectors.md` §25 says `scripts/gen-test-vectors-p256.py`
+  # produces every keyed byte it prints. This job regenerates the vectors and fails when
+  # spec 25 or a Rust vector test (`crates/scp-runtime/tests/test_vectors.rs`,
+  # `crates/scp-event-log/tests/test_vectors.rs`) holds a value the generator no longer
+  # emits, or when spec 25 lacks a value the generator emits. It runs on every pull
+  # request, without a paths filter, because the `ci` aggregator counts a skipped job as
+  # a pass.
+  test-vectors:
+    needs: check-draft
+    if: github.event_name != 'push'
+    name: Docs / spec 25 test vectors match the generator
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The generator cross-checks every key and signature through `cryptography` when it
+      # imports, so CI installs it to run the stronger check.
+      - name: Install generator dependencies
+        run: python3.12 -m pip install 'cryptography>=44,<51'
+      # Self-test MUST run first: it plants a changed digit in spec 25 and in a Rust
+      # vector test and asserts the check names each one, so a green real scan means the
+      # check compared the files rather than that it can no longer fail.
+      - name: Self-test vector check
+        run: python3.12 scripts/check-test-vectors-p256.py --self-test
+      - name: Real check
+        run: python3.12 scripts/check-test-vectors-p256.py
 
   # A `[mirror]` site of the identity-substrate plan carries an include directive and
   # the Owner's bytes, and this job re-runs the resolver into a temporary tree and
@@ -1379,6 +1421,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-deleted-primitives.sh
+      - name: Run deleted-primitives fixture tests
+        run: bash scripts/tests/deleted-primitives/run-tests.sh
 
   handler-no-panic:
     needs: check-draft
@@ -5101,6 +5145,7 @@ jobs:
       - noop-spelling
       - saga-gating-granularity
       - doc-citations
+      - test-vectors
       - doc-includes
       - agent-verdict-criterion
       - deleted-primitives

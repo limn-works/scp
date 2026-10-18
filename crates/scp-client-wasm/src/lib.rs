@@ -963,8 +963,8 @@ pub fn outlet_stream_verify_chunk_signature(
 /// A browser invoker authors credit grants for a node-hosted stream: each grant
 /// authorizes the executor to emit `grant` additional billable chunks. This
 /// reconstructs the invoker's `SigningKey` from `signingKeySeed`, signs the
-/// §5.4.5 credit-grant preimage via
-/// [`scp_protocol::context::outlets::stream::sign_credit_grant`], assembles the
+/// §5.4.5 credit-grant preimage from
+/// [`scp_protocol::context::outlets::stream::compute_credit_sig_preimage`], assembles the
 /// [`OutletStreamCredit`](scp_protocol::context::outlets::stream::OutletStreamCredit) (`request_id` ‖ `grant` ‖ `monotonic_seq` ‖ `sig`),
 /// and returns its JSON encoding.
 ///
@@ -995,24 +995,21 @@ pub fn outlet_stream_sign_credit(
     stream_epoch: u64,
     caveats_binding: Vec<u8>,
 ) -> Result<Vec<u8>, JsValue> {
-    use scp_protocol::context::outlets::stream::{
-        CreditGrantSigningInputs, OutletStreamCredit, sign_credit_grant,
-    };
+    use ed25519_dalek::Signer as _;
+    use scp_protocol::context::outlets::stream::{OutletStreamCredit, compute_credit_sig_preimage};
     let signing_key = signing_key_from_seed(signing_key_seed)?;
     let request_id = request_id_16(&request_id)?;
     let binding = caveats_binding_32(&caveats_binding)?;
-    let sig = sign_credit_grant(
-        &signing_key,
-        &CreditGrantSigningInputs {
-            context_id: &context_id,
-            outlet_id: &outlet_id,
-            request_id: &request_id,
-            grant,
-            monotonic_seq,
-            stream_epoch,
-            caveats_binding: &binding,
-        },
+    let preimage = compute_credit_sig_preimage(
+        &context_id,
+        &outlet_id,
+        &request_id,
+        grant,
+        monotonic_seq,
+        stream_epoch,
+        &binding,
     );
+    let sig = signing_key.sign(&preimage).to_bytes();
     let credit = OutletStreamCredit {
         request_id,
         grant,

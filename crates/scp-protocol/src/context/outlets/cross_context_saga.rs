@@ -40,7 +40,9 @@
 //! - `"SCP-XCTX-STREAM-RECEIPT-V1:"` — cross-context streaming-saga receipt signing.
 //! - `"SCP-XCTX-DIVERGENCE-V1:"` — cross-context divergence marker signing.
 
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+#[cfg(any(test, feature = "testing"))]
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -267,10 +269,21 @@ impl CrossContextOutletReceipt {
     ///
     /// Returns [`CrossContextSagaError::PreimageConstruction`] if the preimage
     /// cannot be built (unreachable in practice; §9.10.3 bounds messages to 256 KB).
+    #[cfg(any(test, feature = "testing"))]
     pub fn sign(
         target_signing_key: &SigningKey,
         fields: CrossContextOutletReceiptFields,
     ) -> Result<Self, CrossContextSagaError> {
+        let receipt = Self::unsigned(fields);
+        let preimage = receipt.signing_preimage()?;
+        Ok(receipt.with_signature(target_signing_key.sign_prehashed_preimage(&preimage)))
+    }
+
+    /// Build the receipt with an all-zero signature, for signing through a
+    /// custody signer (ADR-049 Decision 7a): sign [`Self::signing_preimage`],
+    /// then attach the signature with [`Self::with_signature`].
+    #[must_use]
+    pub fn unsigned(fields: CrossContextOutletReceiptFields) -> Self {
         let CrossContextOutletReceiptFields {
             caller_context_id,
             target_context_id,
@@ -282,7 +295,7 @@ impl CrossContextOutletReceipt {
             chain_depth,
             timestamp_ms,
         } = fields;
-        let mut receipt = Self {
+        Self {
             caller_context_id,
             target_context_id,
             caller_did,
@@ -293,10 +306,15 @@ impl CrossContextOutletReceipt {
             chain_depth,
             timestamp_ms,
             signature: [0u8; 64],
-        };
-        let preimage = receipt.signing_preimage()?;
-        receipt.signature = target_signing_key.sign_prehashed_preimage(&preimage);
-        Ok(receipt)
+        }
+    }
+
+    /// Attach `signature`, the signer's Ed25519 signature over
+    /// [`Self::signing_preimage`].
+    #[must_use]
+    pub const fn with_signature(mut self, signature: [u8; 64]) -> Self {
+        self.signature = signature;
+        self
     }
 
     /// Verify a cross-context outlet receipt (§6.2.4).
@@ -480,10 +498,21 @@ impl CrossContextOutletStreamReceipt {
     ///
     /// Returns [`CrossContextSagaError::PreimageConstruction`] if the preimage
     /// cannot be built (unreachable in practice; §9.10.3 bounds messages to 256 KB).
+    #[cfg(any(test, feature = "testing"))]
     pub fn sign(
         target_signing_key: &SigningKey,
         fields: CrossContextOutletStreamReceiptFields,
     ) -> Result<Self, CrossContextSagaError> {
+        let receipt = Self::unsigned(fields);
+        let preimage = receipt.signing_preimage()?;
+        Ok(receipt.with_signature(target_signing_key.sign_prehashed_preimage(&preimage)))
+    }
+
+    /// Build the streaming receipt with an all-zero signature, for signing through a
+    /// custody signer (ADR-049 Decision 7a): sign [`Self::signing_preimage`],
+    /// then attach the signature with [`Self::with_signature`].
+    #[must_use]
+    pub fn unsigned(fields: CrossContextOutletStreamReceiptFields) -> Self {
         let CrossContextOutletStreamReceiptFields {
             caller_context_id,
             target_context_id,
@@ -495,7 +524,7 @@ impl CrossContextOutletStreamReceipt {
             chain_depth,
             timestamp_ms,
         } = fields;
-        let mut receipt = Self {
+        Self {
             caller_context_id,
             target_context_id,
             caller_did,
@@ -506,10 +535,15 @@ impl CrossContextOutletStreamReceipt {
             chain_depth,
             timestamp_ms,
             signature: [0u8; 64],
-        };
-        let preimage = receipt.signing_preimage()?;
-        receipt.signature = target_signing_key.sign_prehashed_preimage(&preimage);
-        Ok(receipt)
+        }
+    }
+
+    /// Attach `signature`, the signer's Ed25519 signature over
+    /// [`Self::signing_preimage`].
+    #[must_use]
+    pub const fn with_signature(mut self, signature: [u8; 64]) -> Self {
+        self.signature = signature;
+        self
     }
 
     /// Verify a cross-context streaming outlet receipt (ADR-061, §6.2.5).
@@ -622,26 +656,42 @@ impl CrossContextDivergenceMarker {
     ///
     /// Returns [`CrossContextSagaError::PreimageConstruction`] if the preimage
     /// cannot be built (unreachable in practice).
+    #[cfg(any(test, feature = "testing"))]
     pub fn sign(
         signing_key: &SigningKey,
         fields: CrossContextDivergenceMarkerFields,
     ) -> Result<Self, CrossContextSagaError> {
+        let marker = Self::unsigned(fields);
+        let preimage = marker.signing_preimage()?;
+        Ok(marker.with_signature(signing_key.sign_prehashed_preimage(&preimage)))
+    }
+
+    /// Build the divergence marker with an all-zero signature, for signing through a
+    /// custody signer (ADR-049 Decision 7a): sign [`Self::signing_preimage`],
+    /// then attach the signature with [`Self::with_signature`].
+    #[must_use]
+    pub fn unsigned(fields: CrossContextDivergenceMarkerFields) -> Self {
         let CrossContextDivergenceMarkerFields {
             saga_id,
             nonce,
             committed_side,
             committed_event_id,
         } = fields;
-        let mut marker = Self {
+        Self {
             saga_id,
             nonce,
             committed_side,
             committed_event_id,
             signature: [0u8; 64],
-        };
-        let preimage = marker.signing_preimage()?;
-        marker.signature = signing_key.sign_prehashed_preimage(&preimage);
-        Ok(marker)
+        }
+    }
+
+    /// Attach `signature`, the signer's Ed25519 signature over
+    /// [`Self::signing_preimage`].
+    #[must_use]
+    pub const fn with_signature(mut self, signature: [u8; 64]) -> Self {
+        self.signature = signature;
+        self
     }
 
     /// Verify a divergence marker against the emitting side's authorized signing key.
@@ -675,10 +725,12 @@ impl CrossContextDivergenceMarker {
 /// same pattern as the broadcast envelope, which signs the `[u8; 32]` returned
 /// by `build_broadcast_signing_payload`). Verification mirrors this by calling
 /// `verify_strict(&preimage, &sig)`.
+#[cfg(any(test, feature = "testing"))]
 trait SignPrehashedPreimage {
     fn sign_prehashed_preimage(&self, preimage: &[u8; 32]) -> [u8; 64];
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl SignPrehashedPreimage for SigningKey {
     fn sign_prehashed_preimage(&self, preimage: &[u8; 32]) -> [u8; 64] {
         use ed25519_dalek::Signer;
@@ -1363,5 +1415,98 @@ mod tests {
         assert_eq!(receipt, back);
         back.verify(&sk.verifying_key())
             .expect("round-tripped streaming receipt still verifies");
+    }
+
+    // ---- Signature-in construction (ADR-049 Decision 7a) ----
+
+    /// Sign `preimage` the way a custody signer does: Ed25519 over the 32 bytes.
+    fn custody_style_signature(sk: &SigningKey, preimage: &[u8; 32]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        sk.sign(preimage).to_bytes()
+    }
+
+    #[test]
+    fn receipt_with_signature_matches_sign() {
+        let sk = test_signing_key(0xAA);
+        let signed = fixed_receipt(&sk);
+        let unsigned = CrossContextOutletReceipt::unsigned(CrossContextOutletReceiptFields {
+            caller_context_id: signed.caller_context_id,
+            target_context_id: signed.target_context_id,
+            caller_did: signed.caller_did.clone(),
+            nonce: signed.nonce,
+            outlet_registration_id: signed.outlet_registration_id.clone(),
+            output_jcs: signed.output_jcs.clone(),
+            outlet_invoked_event_id: signed.outlet_invoked_event_id.clone(),
+            chain_depth: signed.chain_depth,
+            timestamp_ms: signed.timestamp_ms,
+        });
+        assert_eq!(unsigned.signature, [0u8; 64]);
+        let preimage = unsigned.signing_preimage().expect("preimage");
+        let assembled = unsigned.with_signature(custody_style_signature(&sk, &preimage));
+        assert_eq!(assembled, signed);
+        assembled
+            .verify(&sk.verifying_key())
+            .expect("assembled receipt verifies");
+    }
+
+    #[test]
+    fn stream_receipt_with_signature_matches_sign() {
+        let sk = test_signing_key(0xAB);
+        let signed = fixed_stream_receipt(&sk);
+        let unsigned =
+            CrossContextOutletStreamReceipt::unsigned(CrossContextOutletStreamReceiptFields {
+                caller_context_id: signed.caller_context_id,
+                target_context_id: signed.target_context_id,
+                caller_did: signed.caller_did.clone(),
+                nonce: signed.nonce,
+                outlet_registration_id: signed.outlet_registration_id.clone(),
+                stream_manifest_hash: signed.stream_manifest_hash,
+                outlet_invoked_event_id: signed.outlet_invoked_event_id.clone(),
+                chain_depth: signed.chain_depth,
+                timestamp_ms: signed.timestamp_ms,
+            });
+        let preimage = unsigned.signing_preimage().expect("preimage");
+        let assembled = unsigned.with_signature(custody_style_signature(&sk, &preimage));
+        assert_eq!(assembled, signed);
+        assembled
+            .verify(&sk.verifying_key())
+            .expect("assembled stream receipt verifies");
+    }
+
+    #[test]
+    fn marker_with_signature_matches_sign() {
+        let sk = test_signing_key(0xCC);
+        let fields = || CrossContextDivergenceMarkerFields {
+            saga_id: "saga-123".to_owned(),
+            nonce: [0x44; 16],
+            committed_side: CommittedSide::Caller,
+            committed_event_id: "evt-committed-9".to_owned(),
+        };
+        let signed = CrossContextDivergenceMarker::sign(&sk, fields()).expect("sign");
+        let unsigned = CrossContextDivergenceMarker::unsigned(fields());
+        let preimage = unsigned.signing_preimage().expect("preimage");
+        let assembled = unsigned.with_signature(custody_style_signature(&sk, &preimage));
+        assert_eq!(assembled, signed);
+        assembled
+            .verify(&sk.verifying_key())
+            .expect("assembled marker verifies");
+    }
+
+    #[test]
+    fn wrong_signer_signature_fails_verification() {
+        let target = test_signing_key(0xAA);
+        let other = test_signing_key(0xAD);
+        let unsigned = CrossContextDivergenceMarker::unsigned(CrossContextDivergenceMarkerFields {
+            saga_id: "saga-123".to_owned(),
+            nonce: [0x44; 16],
+            committed_side: CommittedSide::Target,
+            committed_event_id: "evt-committed-9".to_owned(),
+        });
+        let preimage = unsigned.signing_preimage().expect("preimage");
+        let assembled = unsigned.with_signature(custody_style_signature(&other, &preimage));
+        assert!(matches!(
+            assembled.verify(&target.verifying_key()),
+            Err(CrossContextSagaError::SignatureInvalid(_))
+        ));
     }
 }

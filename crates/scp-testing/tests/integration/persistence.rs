@@ -974,7 +974,12 @@ async fn executed_proposals_survive_restart_and_accumulate() {
         // proposal auto-approves and EXECUTES — marking `executed_proposals` and
         // persisting the Class-S snapshot fail-closed.
         let (proposal, _events, execution) = sup1
-            .propose_governance_action(ctx_id, &creator, first_action.clone(), &signing_key)
+            .propose_governance_action(
+                ctx_id,
+                &creator,
+                first_action.clone(),
+                &scp_core::context::actor::CommandSigner::local_ed25519(signing_key.clone()),
+            )
             .await
             .expect("propose_governance_action (pre-restart)");
         assert!(
@@ -1049,7 +1054,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
                 amount: Amount::new(2_000),
                 purpose: "restore-replay durability probe (post-restart)".to_owned(),
             },
-            &signing_key,
+            &scp_core::context::actor::CommandSigner::local_ed25519(signing_key.clone()),
         )
         .await
         .expect("propose_governance_action (post-restart)");
@@ -1109,7 +1114,12 @@ async fn executed_proposals_survive_restart_and_accumulate() {
     // marker (or stopped consulting it) would let this auto-execute a SECOND
     // time and return `Ok`, failing the assertion below.
     let replay = sup2
-        .propose_governance_action(ctx_id, &creator, first_action.clone(), &signing_key)
+        .propose_governance_action(
+            ctx_id,
+            &creator,
+            first_action.clone(),
+            &scp_core::context::actor::CommandSigner::local_ed25519(signing_key.clone()),
+        )
         .await;
     let err = replay.expect_err(
         "replaying the pre-restart proposal after restore must be REJECTED — the rehydrated \
@@ -1242,7 +1252,7 @@ async fn expired_context_is_not_resurrected_and_refuses_operations() {
                 amount: Amount::new(1),
                 purpose: "operation against an expired context (must be refused)".to_owned(),
             },
-            &signing_key,
+            &scp_core::context::actor::CommandSigner::local_ed25519(signing_key.clone()),
         )
         .await;
     let err = refused

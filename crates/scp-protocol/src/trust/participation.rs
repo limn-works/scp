@@ -131,7 +131,7 @@ pub struct ParticipationRecord {
 /// Rust core so the bridges and SDKs RECEIVE the facts rather than recompute
 /// them.
 ///
-/// The flattening matches [`produce_participation_profile`]'s fact derivation
+/// The flattening matches [`participation_profile_unsigned`]'s fact derivation
 /// exactly (the same `.len()` / `.values().sum()` reductions), so a
 /// `ParticipationFacts` and a [`ParticipationProfile`] computed from the same
 /// record carry identical fact values — the difference is that
@@ -225,7 +225,7 @@ pub struct ParticipationFacts {
 impl From<&ParticipationRecord> for ParticipationFacts {
     /// Flattens a [`ParticipationRecord`]'s collections into scalar counts.
     ///
-    /// This is the SAME reduction [`produce_participation_profile`] applies when
+    /// This is the SAME reduction [`participation_profile_unsigned`] applies when
     /// building a signed [`ParticipationProfile`] (`.len()` over the governance /
     /// role / attestation `Vec`s; `.values().sum()` over the `outlet_invocations`
     /// `HashMap`); `outlet_invocation_count_anchored` is `false` until ADR-051
@@ -814,7 +814,9 @@ impl ParticipationProfile {
 ///
 /// Used as the HKDF info string when deriving a context-specific Ed25519
 /// signing key. Different contexts produce different keys from the same seed,
-/// preventing verifiers from correlating signers across contexts.
+/// preventing verifiers from correlating signers across contexts. Its only
+/// reader is the test-only raw derivation.
+#[cfg(any(test, feature = "testing"))]
 const PARTICIPATION_KEY_DOMAIN: &[u8] = b"scp-participation-statement-v1";
 
 /// Maximum tolerated clock skew for a statement's `updated_at` relative to the
@@ -847,10 +849,16 @@ const MAX_PARTICIPATION_FUTURE_SKEW_SECS: u64 = 5 * 60;
 /// An `ed25519_dalek::SigningKey` derived deterministically from the inputs.
 /// Two different `context_id` values produce distinct keys from the same seed.
 ///
+/// Test-only: it returns raw key bytes, and a production participation key
+/// stays in custody (ADR-049 Decision 7a). Production code builds the profile
+/// with [`participation_profile_unsigned`] and signs its
+/// [`UnsignedParticipationProfile::signable_bytes`] in custody.
+///
 /// # Errors
 ///
 /// Returns [`TrustError::InvalidEventData`] if HKDF expansion fails (should
 /// not happen with valid inputs and SHA-256).
+#[cfg(any(test, feature = "testing"))]
 pub fn derive_participation_signing_key(
     context_seed: &[u8; 32],
     context_id: &str,
@@ -1147,7 +1155,7 @@ fn verify_statement_signature(
 /// This is the core protocol operation where a context produces a profile
 /// attesting to a member's verifiable participation facts. Key properties:
 ///
-/// Inputs for [`produce_participation_profile`].
+/// Inputs for [`participation_profile_unsigned`].
 ///
 /// Groups the event log snapshot and membership preconditions to keep the
 /// function signature under the 7-argument clippy limit.
@@ -1195,6 +1203,7 @@ pub struct ParticipationInput<'a> {
 /// - [`TrustError::InvalidEventData`] if HKDF key derivation fails.
 ///
 /// See §7.3.2.1.
+#[cfg(any(test, feature = "testing"))]
 pub fn produce_participation_profile(
     context_key_material: &[u8; 32],
     context_id: &str,
@@ -1203,6 +1212,65 @@ pub fn produce_participation_profile(
 ) -> Result<ParticipationProfile, TrustError> {
     use ed25519_dalek::Signer;
 
+    let signing_key = derive_participation_signing_key(context_key_material, context_id)?;
+    let unsigned =
+        participation_profile_unsigned(member_did, signing_key.verifying_key().to_bytes(), input)?;
+    let signature = signing_key.sign(&unsigned.signable_bytes());
+    Ok(unsigned.with_signature(signature.to_bytes()))
+}
+
+/// A [`ParticipationProfile`] whose fields are final and whose signature is
+/// not yet applied.
+///
+/// The context signs [`Self::signable_bytes`] with its participation key in
+/// custody and attaches the result with [`Self::with_signature`], so no
+/// `ParticipationProfile` exists before its signature does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsignedParticipationProfile(ParticipationProfile);
+
+impl UnsignedParticipationProfile {
+    /// The bytes the participation key signs, identical to
+    /// [`ParticipationProfile::signable_bytes`] of the signed profile.
+    #[must_use]
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        self.0.signable_bytes()
+    }
+
+    /// Attaches the Ed25519 signature over [`Self::signable_bytes`] made by
+    /// the key whose public half the profile already carries.
+    #[must_use]
+    pub fn with_signature(self, signature: [u8; 64]) -> ParticipationProfile {
+        ParticipationProfile {
+            signature,
+            ..self.0
+        }
+    }
+}
+
+/// Builds the unsigned participation profile for `member_did` over the
+/// context's event log (§7.3.2.1), naming `signer_public_key` as the context's
+/// participation key.
+///
+/// The participation key's raw derivation is test-only, so production code
+/// cannot name it:
+///
+#[cfg_attr(not(feature = "testing"), doc = "```compile_fail,E0425")]
+#[cfg_attr(feature = "testing", doc = "```")]
+/// let key = scp_protocol::trust::participation::derive_participation_signing_key(&[7; 32], "ctx")
+///     .expect("HKDF-SHA256 expands 32 bytes");
+/// assert_eq!(key.verifying_key().to_bytes().len(), 32);
+/// ```
+///
+/// # Errors
+///
+/// - [`TrustError::NotAMember`] if `input.is_member` is false.
+/// - [`TrustError::NotOptedIn`] if `input.is_opted_in` is false.
+/// - [`TrustError::EmptyEventLog`] if `input.events` is empty.
+pub fn participation_profile_unsigned(
+    member_did: &str,
+    signer_public_key: [u8; 32],
+    input: &ParticipationInput<'_>,
+) -> Result<UnsignedParticipationProfile, TrustError> {
     if !input.is_member {
         return Err(TrustError::NotAMember {
             did: member_did.to_owned(),
@@ -1215,9 +1283,8 @@ pub fn produce_participation_profile(
         });
     }
 
-    // Compute participation facts from the event log. We use a dummy
-    // context_id for the record since ParticipationProfile intentionally
-    // omits it — the real context_id is only used for key derivation.
+    // ParticipationProfile omits the context ID (privacy), so the record is
+    // computed under a fixed internal ID; the facts do not depend on it.
     let record = compute_participation_record(
         input.events,
         member_did,
@@ -1227,18 +1294,12 @@ pub fn produce_participation_profile(
         input.accessible_attestations,
     )?;
 
-    // Derive the context-specific signing key using the unified public API.
-    // This uses HKDF-SHA256 with context_id as salt, ensuring the same
-    // construction used by derive_participation_signing_key.
-    let signing_key = derive_participation_signing_key(context_key_material, context_id)?;
-    let verifying_key = signing_key.verifying_key();
-
     // Flatten the record's collections into scalar facts via the single
     // canonical reduction (shared with `ParticipationFacts`), so the signed
     // profile and the unsigned facts view can never drift in how they count.
     let facts = ParticipationFacts::from(&record);
 
-    let mut profile = ParticipationProfile {
+    Ok(UnsignedParticipationProfile(ParticipationProfile {
         subject_did: member_did.into(),
         participation_duration_secs: facts.participation_duration_secs,
         governance_actions_against: facts.governance_actions_against,
@@ -1252,16 +1313,11 @@ pub fn produce_participation_profile(
         attestation_count: facts.attestation_count,
         updated_at: input.current_time,
         event_log_root: input.merkle_root,
-        signer_public_key: verifying_key.to_bytes(),
-        signature: [0u8; 64], // placeholder, overwritten below
-    };
-
-    // Sign the profile.
-    let signable = profile.signable_bytes();
-    let sig = signing_key.sign(&signable);
-    profile.signature = sig.to_bytes();
-
-    Ok(profile)
+        signer_public_key,
+        // Never observable: `with_signature` replaces it, and the newtype
+        // exposes no field.
+        signature: [0u8; 64],
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2927,6 +2983,61 @@ mod tests {
     // -----------------------------------------------------------------------
     // produce_participation_profile tests (SCP-BA-005)
     // -----------------------------------------------------------------------
+
+    /// The unsigned constructor signed by the participation key yields the
+    /// same profile, byte for byte, as the test-only producer, and its
+    /// signature verifies under the profile's `signer_public_key`.
+    #[test]
+    fn unsigned_profile_signed_equals_the_produced_profile() {
+        use ed25519_dalek::{Signer, Verifier};
+
+        let events = make_member_events("did:key:alice");
+        let input = ParticipationInput {
+            events: &events,
+            merkle_root: [0xAB; 32],
+            is_member: true,
+            is_opted_in: true,
+            current_time: 5000,
+            accessible_attestations: &[],
+        };
+        let key = derive_participation_signing_key(&[42u8; 32], "ctx-test").unwrap();
+        let unsigned =
+            participation_profile_unsigned("did:key:alice", key.verifying_key().to_bytes(), &input)
+                .unwrap();
+        let signature = key.sign(&unsigned.signable_bytes());
+        let signed = unsigned.with_signature(signature.to_bytes());
+
+        let produced =
+            produce_participation_profile(&[42u8; 32], "ctx-test", "did:key:alice", &input)
+                .unwrap();
+        assert_eq!(signed, produced);
+        key.verifying_key()
+            .verify(&signed.signable_bytes(), &signature)
+            .unwrap();
+    }
+
+    /// The unsigned constructor applies the same membership and opt-in
+    /// preconditions as the producer.
+    #[test]
+    fn unsigned_profile_refuses_a_non_member_and_a_non_opted_in_member() {
+        let events = make_member_events("did:key:alice");
+        let input = |is_member, is_opted_in| ParticipationInput {
+            events: &events,
+            merkle_root: [0xAB; 32],
+            is_member,
+            is_opted_in,
+            current_time: 5000,
+            accessible_attestations: &[],
+        };
+        assert!(matches!(
+            participation_profile_unsigned("did:key:alice", [1; 32], &input(false, true)),
+            Err(TrustError::NotAMember { .. })
+        ));
+        assert!(matches!(
+            participation_profile_unsigned("did:key:alice", [1; 32], &input(true, false)),
+            Err(TrustError::NotOptedIn { .. })
+        ));
+    }
 
     fn make_member_events(actor_did: &str) -> Vec<Event> {
         vec![

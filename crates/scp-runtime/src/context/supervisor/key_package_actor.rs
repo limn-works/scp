@@ -237,8 +237,7 @@ const KP_INDEX_PREFIX: &str = "scp-kp-index";
 /// A newtype (not a bare `String` alias) so it cannot be transposed with a
 /// [`KpRef`] at a call boundary — the two are distinct domains (a reservation
 /// handle vs. a KeyPackage content hash) and the type system rejects passing
-/// one where the other is expected. Mirrors the sibling
-/// [`BroadcastReservationId`](crate::context::actor::state::BroadcastReservationId).
+/// one where the other is expected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ReservationId(String);

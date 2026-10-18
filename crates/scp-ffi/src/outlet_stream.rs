@@ -186,23 +186,23 @@ impl StreamSigner for BridgeCustodyStreamSigner {
 /// Clones the custody `Arc` + key handle OUT of the identity-registry shard
 /// guard, then performs the (potentially slow) `public_key` export OFF the
 /// guard — the same clone-then-drop discipline as
-/// [`crate::context::resolve_signing_key`] (issue #1940).
+/// [`crate::context::resolve_signer`].
 fn resolve_stream_signer(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     identity_did: &str,
 ) -> PyResult<BridgeCustodyStreamSigner> {
-    let rt = crate::runtime()?;
     let (custody, handle) = crate::runtime::with_identity(bi, identity_did, |entry| {
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })?;
-    let public_key = rt
-        .block_on(async { custody.public_key(&handle).await })
-        .map_err(|e| {
-            ScpPyError::custody_failure(
-                format!("failed to resolve stream signing key for '{identity_did}': {e}"),
-                &scp_crypto::CustodyFailure::from(&e),
-            )
-        })?;
+    let public_key =
+        crate::actor_wait::block_on_released(py, async { custody.public_key(&handle).await })?
+            .map_err(|e| {
+                ScpPyError::custody_failure(
+                    format!("failed to resolve stream signing key for '{identity_did}': {e}"),
+                    &scp_crypto::CustodyFailure::from(&e),
+                )
+            })?;
     let verifying_key = scp_ffi_common::export_verify::verifying_key_from_public_key(&public_key)
         .ok_or_else(|| {
         ScpPyError::context(format!(
@@ -405,6 +405,7 @@ fn authorized_control(
 #[allow(clippy::needless_pass_by_value)] // PyO3 owned Option params.
 #[allow(clippy::too_many_lines)] // UCAN validate + caveat binding + full OpenStreamParams build.
 fn outlet_stream_open_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     outlet_id: &str,
@@ -435,6 +436,7 @@ fn outlet_stream_open_impl(
     // the same withheld text as every other non-`Active` state — see
     // `crate::outlets::active_outlet_role_state`.
     let role_state = crate::outlets::active_outlet_role_state(
+        py,
         bi,
         context_id,
         "open outlet stream in context",
@@ -510,8 +512,8 @@ fn outlet_stream_open_impl(
             .ok_or_else(|| ScpPyError::context(format!("outlet '{outlet_id}' not registered")))
     })?;
     let operator_signer: Arc<dyn StreamSigner> =
-        Arc::new(resolve_stream_signer(bi, &operator_did)?);
-    let invoker_pk = *resolve_stream_signer(bi, caller_did)?.verifying_key();
+        Arc::new(resolve_stream_signer(py, bi, &operator_did)?);
+    let invoker_pk = *resolve_stream_signer(py, bi, caller_did)?.verifying_key();
 
     // Snapshot the registry + handler under the context guard, OUTSIDE the
     // runtime call (lock-split discipline from `outlet_invoke_impl`).
@@ -524,8 +526,7 @@ fn outlet_stream_open_impl(
 
     let stream_epoch = {
         let supervisor = crate::runtime::supervisor(bi)?;
-        let rt = crate::runtime()?;
-        rt.block_on(supervisor.local_mls_epoch(context_id))
+        crate::actor_wait::block_on_released(py, supervisor.local_mls_epoch(context_id))?
             .unwrap_or(0)
     };
 
@@ -597,27 +598,25 @@ fn outlet_stream_open_impl(
     let supervisor = crate::runtime::supervisor(bi)?;
     let outlet_id_typed: scp_core::context::outlets::OutletId = outlet_id.to_owned();
     let invoker_did_typed: scp_did::DID = caller_did.to_owned().into();
-    let rt = crate::runtime()?;
-    let mut handle = rt
-        .block_on(async {
-            supervisor
-                .open_outlet_stream(
-                    context_id,
-                    &registry,
-                    &outlet_id_typed,
-                    input_json,
-                    &invoker_did_typed,
-                    timeout_ms,
-                    executor,
-                    None,
-                    None,
-                    None,
-                    value_caveat_binding,
-                    params,
-                )
-                .await
-        })
-        .map_err(|rejection| open_rejection_to_err(&rejection))?;
+    let mut handle = crate::actor_wait::block_on_released(py, async {
+        supervisor
+            .open_outlet_stream(
+                context_id,
+                &registry,
+                &outlet_id_typed,
+                input_json,
+                &invoker_did_typed,
+                timeout_ms,
+                executor,
+                None,
+                None,
+                None,
+                value_caveat_binding,
+                params,
+            )
+            .await
+    })?
+    .map_err(|rejection| open_rejection_to_err(&rejection))?;
 
     // Detach the receiver (data plane) into its own lock so `poll_next` never
     // contends with the control plane.
@@ -719,9 +718,10 @@ fn outlet_stream_poll_next_impl(
         };
         Arc::clone(&entry.receiver)
     };
-    let rt = crate::runtime()?;
     // Release the GIL across the blocking recv (see the CRITICAL note above).
-    let chunk = py.allow_threads(|| rt.block_on(async { receiver.lock().await.recv().await }));
+    let chunk = crate::actor_wait::block_on_released(py, async {
+        async { receiver.lock().await.recv().await }.await
+    })?;
     if let Some(chunk) = chunk {
         // Evict on the TERMINAL chunk so a run-to-terminal-without-draining
         // caller cannot leak the entry. The pump releases the admission counter
@@ -872,11 +872,10 @@ fn outlet_stream_grant_credit_impl(
 
     // Resolve the invoker's custody-backed signer (the key never enters the
     // runtime address space — ADR-006). Done off the DashMap ref.
-    let signer = resolve_stream_signer(bi, caller_did)?;
+    let signer = resolve_stream_signer(py, bi, caller_did)?;
 
     let supervisor = crate::runtime::supervisor(bi)?.clone();
     let invoker_did_typed: scp_did::DID = caller_did.to_owned().into();
-    let rt = crate::runtime()?;
 
     // Durable-seq → sign (via custody) → reserve (DEBIT) → apply →
     // reverse-on-reject, all with the GIL released: the reserve routes through
@@ -884,8 +883,8 @@ fn outlet_stream_grant_credit_impl(
     // to produce chunks (the same deadlock surface as `poll_next`). Every value
     // below is `Ungil` (Arc / String / arrays / DID / the plain `ScpPyError`);
     // the `PyErr` conversion happens outside `allow_threads`.
-    let outcome: Result<(), ScpPyError> = py.allow_threads(|| {
-        rt.block_on(async {
+    let outcome: Result<(), ScpPyError> = crate::actor_wait::block_on_released(py, async {
+        async {
             // Hold the per-stream control lock across the WHOLE grant: the
             // durable seq read-modify-write, the sign, the reserve, and the
             // apply. This serializes seq-assign with apply so two concurrent
@@ -998,8 +997,9 @@ fn outlet_stream_grant_credit_impl(
                     })
                 }
             }
-        })
-    });
+        }
+        .await
+    })?;
     outcome.map_err(PyErr::from)?;
     Ok(())
 }
@@ -1022,28 +1022,28 @@ fn outlet_stream_cancel_impl(
     validate::validate_did(caller_did)?;
     let (handle, context_id, outlet_id, caveats_binding) =
         authorized_control(bi, handle_id, caller_did)?;
-    let signer = resolve_stream_signer(bi, caller_did)?;
+    let signer = resolve_stream_signer(py, bi, caller_did)?;
     let cancel_identity = CancelIdentity {
         context_id,
         outlet_id,
         caveats_binding,
     };
-    let rt = crate::runtime()?;
     // Release the GIL across the runtime handle op (defense-in-depth). The
     // cancel signs via custody (no GIL) and wakes the pump — which reacquires
     // the GIL to produce its terminal chunk — so holding the GIL here while the
     // woken pump blocks on it is the same deadlock surface as `poll_next`. The
     // `StreamSignerError` inside the closure is `Ungil`; the caller-side signer
     // resolution (its own `block_on` never touches Python) stays outside.
-    let cancel_result = py.allow_threads(|| {
-        rt.block_on(async {
+    let cancel_result = crate::actor_wait::block_on_released(py, async {
+        async {
             handle
                 .lock()
                 .await
                 .apply_outlet_cancel_signed(&signer, &cancel_identity)
                 .await
-        })
-    });
+        }
+        .await
+    })?;
     cancel_result.map_err(|e| cancel_rejected_error(&e))?;
     Ok(())
 }
@@ -1094,20 +1094,20 @@ fn outlet_stream_terminate_impl(
     })?;
     let (handle, _ctx, _outlet, _binding) = authorized_control(bi, handle_id, caller_did)?;
     let message_override = (!message.is_empty()).then(|| message.to_owned());
-    let rt = crate::runtime()?;
     // Release the GIL across the runtime handle op (defense-in-depth; the forced
     // terminal wakes the pump, which reacquires the GIL). `AlreadyPending` /
     // `AlreadyTerminated` are the documented idempotent outcomes (the SDK treats
     // them as "stream already closing") — surface both as success so a
     // receiver-side recheck loop stops cleanly.
-    let _ = py.allow_threads(|| {
-        rt.block_on(async {
+    let _ = crate::actor_wait::block_on_released(py, async {
+        async {
             handle
                 .lock()
                 .await
                 .terminate_with_error(reason, message_override)
-        })
-    });
+        }
+        .await
+    })?;
     Ok(())
 }
 
@@ -1200,9 +1200,9 @@ fn no_active_saga_err(saga_id: &str) -> ScpPyError {
 ///   (c) `validate_outlet_ucan` against the TARGET context B (where the outlet
 ///       is registered), then resolve the effective §7.3.8 caveats + `ucan_cid`
 ///       and compute the §5.4.5 `caveats_binding` from a FRESH `request_id`;
-///   (d) resolve `SagaSigningKeys { target, caller }` from each context's
-///       Active Signing Key (via custody — the key never enters the runtime,
-///       ADR-006);
+///   (d) resolve `SagaSigners { target, caller }`, each context's Active
+///       Signing Key custody signer (the key stays in custody, ADR-049
+///       Decision 7a);
 ///   (e) build the executor over the TARGET handler;
 ///   (f) drive the saga to the Commit-transition;
 ///   (g) register the receiver and return the `saga_id`.
@@ -1219,6 +1219,7 @@ fn no_active_saga_err(saga_id: &str) -> ScpPyError {
 #[allow(clippy::needless_pass_by_value)] // PyO3 owned Option params.
 #[allow(clippy::too_many_lines)] // UCAN validate + caveat binding + full OpenStreamParams + saga drive.
 fn outlet_streaming_saga_open_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     caller_context_id: &str,
     target_context_id: &str,
@@ -1257,7 +1258,6 @@ fn outlet_streaming_saga_open_impl(
     let input_json = crate::types::py_dict_to_json(input)?;
 
     let supervisor = crate::runtime::supervisor(bi)?;
-    let rt = crate::runtime()?;
 
     // ----- (a2) lifecycle gate: both contexts MUST be Active ------------------
     //
@@ -1290,12 +1290,14 @@ fn outlet_streaming_saga_open_impl(
     // target role state answers the UCAN validation, and each role state's
     // creator names the key that context signs under.
     let caller_role = crate::outlets::active_outlet_role_state(
+        py,
         bi,
         caller_context_id,
         "start cross-context streaming saga from caller context",
         scp_ffi_common::error_codes::OUTLET_6010,
     )?;
     let target_role = crate::outlets::active_outlet_role_state(
+        py,
         bi,
         target_context_id,
         "start cross-context streaming saga into target context",
@@ -1304,9 +1306,9 @@ fn outlet_streaming_saga_open_impl(
 
     // ----- (b) caller-principal binding (CALLER axis) — BEFORE the saga runs --
     crate::outlets::enforce_caller_principal_binding(
+        py,
         bi,
         supervisor,
-        rt,
         caller_context_id,
         caller_did,
     )?;
@@ -1389,13 +1391,12 @@ fn outlet_streaming_saga_open_impl(
     // outer wire; the INVOKER (caller) pubkey verifies grants + cancels. Both
     // resolved through this instance's custody (co-resident single-tenant).
     let operator_signer: Arc<dyn StreamSigner> =
-        Arc::new(resolve_stream_signer(bi, &operator_did)?);
-    let invoker_pk = *resolve_stream_signer(bi, caller_did)?.verifying_key();
+        Arc::new(resolve_stream_signer(py, bi, &operator_did)?);
+    let invoker_pk = *resolve_stream_signer(py, bi, caller_did)?.verifying_key();
 
     let stream_epoch = {
         let supervisor = crate::runtime::supervisor(bi)?;
-        let rt = crate::runtime()?;
-        rt.block_on(supervisor.local_mls_epoch(target_context_id))
+        crate::actor_wait::block_on_released(py, supervisor.local_mls_epoch(target_context_id))?
             .unwrap_or(0)
     };
 
@@ -1465,8 +1466,8 @@ fn outlet_streaming_saga_open_impl(
     };
 
     // ----- (d) signing keys: each co-resident context's Active Signing Key ----
-    let target_signing_key = crate::context::resolve_signing_key(bi, &target_role.creator_did)?;
-    let caller_signing_key = crate::context::resolve_signing_key(bi, &caller_role.creator_did)?;
+    let target_signer = crate::context::resolve_signer(py, bi, &target_role.creator_did)?;
+    let caller_signer = crate::context::resolve_signer(py, bi, &caller_role.creator_did)?;
 
     // ----- Chokepoint (ADR-056): id STRING → [u8; 32] -------------------------
     let caller_context_bytes = scp_core::context::state::context_id_to_bytes(caller_context_id);
@@ -1483,34 +1484,32 @@ fn outlet_streaming_saga_open_impl(
     // `asyncio.to_thread`, so we are not inside a tokio context (matches the
     // unary saga export).
     let supervisor = crate::runtime::supervisor(bi)?.clone();
-    let rt = crate::runtime()?;
-    let handle = rt
-        .block_on(async {
-            supervisor
-                .start_cross_context_streaming_outlet_invocation_saga(
-                    caller_context_bytes,
-                    target_context_bytes,
-                    caller_did_typed,
-                    outlet_registration_id.to_owned(),
-                    ucan_proof_id,
-                    &registry,
-                    &outlet_id_typed,
-                    input_json,
-                    chain_depth,
-                    asserted_nonce,
-                    timestamp_ms,
-                    timeout_ms,
-                    executor,
-                    value_caveat_binding,
-                    scp_core::context::supervisor::SagaSigningKeys {
-                        target: &target_signing_key,
-                        caller: &caller_signing_key,
-                    },
-                    params,
-                )
-                .await
-        })
-        .map_err(crate::outlets::map_saga_error)?;
+    let handle = crate::actor_wait::block_on_released(py, async {
+        supervisor
+            .start_cross_context_streaming_outlet_invocation_saga(
+                caller_context_bytes,
+                target_context_bytes,
+                caller_did_typed,
+                outlet_registration_id.to_owned(),
+                ucan_proof_id,
+                &registry,
+                &outlet_id_typed,
+                input_json,
+                chain_depth,
+                asserted_nonce,
+                timestamp_ms,
+                timeout_ms,
+                executor,
+                value_caveat_binding,
+                scp_core::context::supervisor::SagaSigners {
+                    target: target_signer,
+                    caller: caller_signer,
+                },
+                params,
+            )
+            .await
+    })?
+    .map_err(crate::outlets::map_saga_error)?;
 
     // ----- (g) register the promptly-returned receiver ------------------------
     //
@@ -1569,9 +1568,10 @@ fn outlet_streaming_saga_poll_next_impl(
         };
         Arc::clone(&entry.receiver)
     };
-    let rt = crate::runtime()?;
     // Release the GIL across the blocking recv (see the deadlock note above).
-    let chunk = py.allow_threads(|| rt.block_on(async { receiver.lock().await.recv().await }));
+    let chunk = crate::actor_wait::block_on_released(py, async {
+        async { receiver.lock().await.recv().await }.await
+    })?;
     if let Some(chunk) = chunk {
         let (bytes, terminal) = scp_ffi_common::streaming_saga::serialize_saga_chunk(&chunk)
             .map_err(|e| {
@@ -1631,6 +1631,7 @@ fn outlet_streaming_saga_poll_next_impl(
 /// EVICTED (the saga is now Committed; a second recover surfaces "no active saga"
 /// rather than re-driving the settle).
 fn outlet_streaming_saga_recover_truncated_close_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     saga_id: &str,
     caller_did: &str,
@@ -1674,20 +1675,17 @@ fn outlet_streaming_saga_recover_truncated_close_impl(
 
     // Resolve the TARGET context's Active Signing Key per-call from custody
     // (never envelope-asserted) and seal via the shared recovery driver.
-    let target_key = crate::outlets::resolve_context_signing_key(bi, &target_context_id)?;
-    let signing_key =
-        scp_core::context::actor::commands::SigningKeyBytes::from_signing_key(&target_key);
+    let target_signer = crate::outlets::resolve_context_signer(py, bi, &target_context_id)?;
     let supervisor = crate::runtime::supervisor(bi)?.clone();
-    let rt = crate::runtime()?;
-    rt.block_on(async {
+    crate::actor_wait::block_on_released(py, async {
         scp_ffi_common::streaming_saga::drive_recover_truncated_close(
             &supervisor,
             saga_id_typed,
             &target_context_id,
-            signing_key,
+            target_signer,
         )
         .await
-    })
+    })?
     .map_err(crate::outlets::map_saga_error)?;
 
     // Evict on SUCCESS (MUST FIX #2): the saga is now `Committed` and its prefix
@@ -1731,6 +1729,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     pub fn outlet_stream_open(
         &self,
+        py: Python<'_>,
         context_id: &str,
         outlet_id: &str,
         input: &Bound<'_, pyo3::types::PyDict>,
@@ -1742,6 +1741,7 @@ impl crate::scp::PyScp {
         estimated_chunk_count: Option<u32>,
     ) -> PyResult<String> {
         outlet_stream_open_impl(
+            py,
             &self.inner,
             context_id,
             outlet_id,
@@ -1913,6 +1913,7 @@ impl crate::scp::PyScp {
     #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     pub fn outlet_streaming_saga_open(
         &self,
+        py: Python<'_>,
         caller_context_id: &str,
         target_context_id: &str,
         caller_did: &str,
@@ -1928,6 +1929,7 @@ impl crate::scp::PyScp {
         estimated_chunk_count: Option<u32>,
     ) -> PyResult<String> {
         outlet_streaming_saga_open_impl(
+            py,
             &self.inner,
             caller_context_id,
             target_context_id,
@@ -1985,10 +1987,11 @@ impl crate::scp::PyScp {
     #[pyo3(name = "outlet_streaming_saga_recover_truncated_close")]
     pub fn outlet_streaming_saga_recover_truncated_close(
         &self,
+        py: Python<'_>,
         saga_id: &str,
         caller_did: &str,
     ) -> PyResult<()> {
-        outlet_streaming_saga_recover_truncated_close_impl(&self.inner, saga_id, caller_did)
+        outlet_streaming_saga_recover_truncated_close_impl(py, &self.inner, saga_id, caller_did)
     }
 }
 
@@ -2137,7 +2140,7 @@ mod custody_error_tests {
                 .expect("runtime")
                 .block_on(custody.destroy_key(&active))
                 .expect("destroy_key should succeed");
-            let err = resolve_stream_signer(&bi, &did)
+            let err = resolve_stream_signer(py, &bi, &did)
                 .err()
                 .expect("a destroyed #active key must not resolve a stream signer")
                 .to_string();

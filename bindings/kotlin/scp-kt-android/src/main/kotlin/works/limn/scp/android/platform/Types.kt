@@ -155,16 +155,15 @@ enum class DestructionMethod {
  *
  * Error codes follow the pattern `SCP-{DOMAIN}-{NUMBER}`:
  * - `SCP-CRYPTO-4006`: Key not found (a software or Keystore lookup, any key type, X25519
- *   included, or a Keystore identity's pseudonym secret), with one exception:
- *   [KeyCustodyProvider.exportSigningKeyBytes] throws `SCP-CRYPTO-4005` for a Keystore handle
- *   ([CustodyType.HARDWARE]) whether or not its key exists
+ *   included, or a Keystore identity's pseudonym secret)
  * - `SCP-CRYPTO-4003`: Wrong key type for operation, or a [KeyCustodyProvider.dhAgree] peer
  *   public key that is not 32 bytes long. [KeyCustodyProvider.dhAgree] raises it for a wrong
  *   key type only when the handle names a software Ed25519 key.
  * - `SCP-CRYPTO-4004`: Key destruction failed
- * - `SCP-CRYPTO-4005`: Signing key export refused, because the handle is a Keystore handle
- *   (thrown only by [KeyCustodyProvider.exportSigningKeyBytes], from [KeyHandle.custodyType]
- *   before any key lookup, so a destroyed Keystore handle also gets it; retrying cannot succeed)
+ * - `SCP-CRYPTO-4005`: Key agreement refused, because the handle is a Keystore handle
+ *   (thrown only by [KeyCustodyProvider.dhAgree], from [KeyHandle.custodyType] before any key
+ *   lookup: Keystore never releases the Ed25519 seed the X25519 scalar comes from; retrying
+ *   cannot succeed)
  * - `SCP-TRANS-5080`: Wake payload invalid: the push payload has no `scp` field, or its
  *   `scp` field is not `"1"`
  * - `SCP-STORAGE-8001`: Storage key not found. Defined as `AndroidStorage.ERROR_KEY_NOT_FOUND`
@@ -310,10 +309,10 @@ interface PushProvider {
  * - Method set: it declares the methods of the UniFFI `KeyCustodyProvider` callback interface in
  *   `crates/scp-ffi/uniffi/src/lib.rs` except `custody_type`, and it names the callback's
  *   `get_public_key` [publicKey], the name the Rust trait's `public_key` takes in Kotlin. The
- *   Rust `KeyCustody` trait in `crates/scp-platform/src/traits.rs` does not declare
- *   `export_signing_key_bytes`, and it also declares `custody_type`, `ed25519_to_x25519_agree`,
- *   `import_ed25519_signing_key` and `generate_ephemeral_ed25519_seed`, which this interface
- *   lacks.
+ *   Rust `KeyCustody` trait in `crates/scp-platform/src/traits.rs` also declares
+ *   `custody_type`, `ed25519_to_x25519_agree`, `import_ed25519_signing_key` and
+ *   `generate_ephemeral_ed25519_seed`, which this interface lacks. No method of this interface
+ *   returns a private key (ADR-027 acceptance criterion 14, private key isolation).
  * - Parameters: its methods name a key by a [KeyHandle], a data class of a `String` id and a
  *   [CustodyType]. The Rust trait's `KeyHandle` is a different type, an opaque `u64`, and the
  *   UniFFI callback's methods take a `String` key ID. [generateKeypair] takes a [KeyType] enum,
@@ -368,7 +367,7 @@ interface PushProvider {
  *   `KeyStoreException` from `containsAlias`. A `KeyStoreException` from `deleteEntry` is
  *   thrown as `SCP-CRYPTO-4004`.
  *
- * [dhAgree] and [exportSigningKeyBytes] do not reach Keystore. [dhAgree] still lets one
+ * [dhAgree] does not reach Keystore, and it still lets one
  * non-[ScpException] escape, and remote input causes it: [dhAgree] passes a 32-byte peer key to
  * Bouncy Castle with no point-order check, so a low-order peer key, such as 32 zero bytes, makes
  * Bouncy Castle throw `IllegalStateException` ("X25519 agreement failed") because the shared
@@ -431,11 +430,9 @@ interface KeyCustodyProvider {
      * Destroy key material associated with a handle.
      *
      * After this call, operations with the same handle on the same [AndroidKeyCustody] instance
-     * throw [ScpException] with code `SCP-CRYPTO-4006`, with two exceptions: [dhAgree] throws
+     * throw [ScpException] with code `SCP-CRYPTO-4006`, with one exception: [dhAgree] throws
      * `SCP-CRYPTO-4003` when its peer key is not 32 bytes, because it checks the peer key's
-     * length before any key lookup; and [exportSigningKeyBytes] on a Keystore handle
-     * ([CustodyType.HARDWARE]) throws `SCP-CRYPTO-4005`, because it refuses on
-     * [KeyHandle.custodyType] before any key lookup.
+     * length before any key lookup.
      * Each [AndroidKeyCustody] instance holds its own map of software keys and restores every
      * persisted software Ed25519 seed into it when constructed, so another instance in the same
      * process that already holds a software key keeps signing with it after this call. The
@@ -473,7 +470,7 @@ interface KeyCustodyProvider {
      * Perform X25519 Diffie-Hellman key agreement.
      *
      * Returns the 32-byte shared secret. No method of this interface returns the X25519 private
-     * key: [exportSigningKeyBytes] throws `SCP-CRYPTO-4003` for an X25519 handle. See
+     * key. See
      * [AndroidKeyCustody.dhAgree] for where the software implementation holds the key.
      *
      * @param keyHandle Handle to an X25519 key, or to a software Ed25519 key, which agrees
@@ -566,35 +563,6 @@ interface KeyCustodyProvider {
         contextId: ByteArray,
         pseudonymEpoch: Long,
     ): ByteArray
-
-    /**
-     * Export the raw Ed25519 private key bytes (32 bytes) for a key handle.
-     *
-     * A software-backed key ([CustodyType.SOFTWARE]) exports its 32-byte seed. Keystore keys
-     * ([CustodyType.HARDWARE]) are non-extractable, so the method MUST throw `SCP-CRYPTO-4005`
-     * for a Keystore handle. The refusal covers every use of the key bytes, not one caller:
-     * its message states that Keystore keys are non-extractable and that ADR-063's curve
-     * slice, which removes every key-export accessor, has not landed.
-     *
-     * ADR-063's curve slice requires every core function that takes a raw signing key to
-     * take a signer instead, and every key-export accessor, this method included, to leave
-     * the custody adapters and all three bridges. That slice has not landed, so this method
-     * still exports the seed of a software key. ADR-027 acceptance criterion 14 (private key
-     * isolation) says the Rust engine receives only signatures and public keys, never private
-     * key material, and through [UniffiKeyCustody] the UniFFI `KeyCustodyProvider` callback's
-     * `export_signing_key_bytes` carries this seed to Rust, so this method's design diverges
-     * from criterion 14.
-     *
-     * @param keyHandle Handle to an Ed25519 key.
-     * @return 32-byte raw Ed25519 private key bytes.
-     * @throws ScpException with code `SCP-CRYPTO-4006` if the handle is a software handle
-     *   and no software key is found under it.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
-     * @throws ScpException with code `SCP-CRYPTO-4005` if the handle is a Keystore handle
-     *   ([CustodyType.HARDWARE]), checked before any key lookup, so a destroyed or unknown
-     *   Keystore handle also gets this code (Keystore keys are non-extractable).
-     */
-    fun exportSigningKeyBytes(keyHandle: KeyHandle): ByteArray
 }
 
 /**

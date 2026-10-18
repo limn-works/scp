@@ -776,10 +776,6 @@
             let verifier = try Curve25519.Signing.PublicKey(rawRepresentation: reported.publicKey)
             #expect(verifier.isValidSignature(signature, for: message))
 
-            let exported = try await provider.exportSigningKeyBytes(keyId: keyId)
-            let rebuilt = try Curve25519.Signing.PrivateKey(rawRepresentation: exported)
-            #expect(rebuilt.publicKey.rawRepresentation == reported.publicKey)
-
             #expect(provider.custodyType(keyId: keyId) == "software")
             try await provider.destroyKey(keyId: keyId)
         }
@@ -858,7 +854,6 @@
             #expect(await cryptoCode {
                 _ = try await provider.deriveRotatablePseudonym(keyId: unknown, contextId: context, pseudonymEpoch: 1)
             } == notFound)
-            #expect(await cryptoCode { _ = try await provider.exportSigningKeyBytes(keyId: unknown) } == notFound)
             #expect(provider.custodyType(keyId: unknown) == "unknown")
         }
 

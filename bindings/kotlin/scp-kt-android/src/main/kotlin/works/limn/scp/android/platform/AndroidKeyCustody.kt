@@ -12,25 +12,17 @@
 // Android Keystore does not hand a Keystore-held Ed25519 private key to the app. This class never
 // reads KeyInfo.securityLevel, so it does not know whether Keystore put the key in the TEE or in
 // software, and it reports CustodyType.HARDWARE for every Keystore key. This class performs all signing
-// and DH itself and returns signatures, shared secrets and pseudonym points. One path hands a
-// caller a software private key:
-// - exportSigningKeyBytes returns the 32-byte private seed of a software Ed25519 identity key,
-//   which generateKeypair creates on API 26-32. That seed is also the HKDF input of the
-//   identity's software pseudonym secret, so its holder derives every pseudonym of the identity.
-//   ADR-027 acceptance criterion 14 (private key isolation) says the Rust engine receives only
-//   signatures and public keys, never private key material. The UniFFI KeyCustodyProvider
-//   callback declares export_signing_key_bytes, which would carry this seed to Rust, so this
-//   method's design diverges from criterion 14.
+// and DH itself and returns signatures, shared secrets and pseudonym points; no public method
+// returns a private key (ADR-027 acceptance criterion 14, private key isolation).
 // The pseudonym secret of a Keystore identity is a Keystore HMAC-SHA256 key that never leaves
-// Keystore, and no pseudonym has a private key this class holds. No other public method returns
-// a software private key, and no public method returns an X25519 private key. The softwareKeys
+// Keystore, and no pseudonym has a private key this class holds. The softwareKeys
 // map is not behind that boundary: it is `internal`, so any code in this module reads every
 // software key pair, X25519 included, and Kotlin compiles it to a public JVM getter with a
 // mangled name that Java code in an app can call.
 // This class implements this package's own [KeyCustodyProvider]. UniffiKeyCustody wraps it as the
 // `scp-ffi-uniffi` bridge's `uniffi.scp.KeyCustodyProvider`, so the `os_keystore` custody of
 // spec 03 §3.2.2 reaches Keystore through `SCP.identityCreateWithCustody(UniffiKeyCustody(it))`.
-// Through that adapter, exportSigningKeyBytes carries a software identity's seed to Rust.
+// No key leaves custody through that adapter: Rust asks it for signatures, never for a seed.
 //
 // Software Ed25519 keys that generateKeypair creates (API 26-32 fallback) are persisted to
 // EncryptedSharedPreferences (Jetpack Security) so they survive process death once the write
@@ -352,10 +344,8 @@ class AndroidKeyCustody internal constructor(
      * (§9.10.4.A).
      *
      * After this call, operations with the same handle on the same instance throw [ScpException]
-     * with code `SCP-CRYPTO-4006`, with two exceptions: [dhAgree] throws `SCP-CRYPTO-4003` when its
-     * peer key is not 32 bytes, because it checks the peer key's length before any key lookup;
-     * and [exportSigningKeyBytes] on a Keystore handle ([CustodyType.HARDWARE]) throws
-     * `SCP-CRYPTO-4005`, because it refuses on [KeyHandle.custodyType] before any key lookup.
+     * with code `SCP-CRYPTO-4006`, with one exception: [dhAgree] throws `SCP-CRYPTO-4003` when its
+     * peer key is not 32 bytes, because it checks the peer key's length before any key lookup.
      * Each instance holds its own [softwareKeys] map and restores every persisted software Ed25519
      * seed into it when constructed, so another instance in the same process that already holds a
      * software key keeps signing with it after this call.
@@ -528,68 +518,6 @@ class AndroidKeyCustody internal constructor(
         } finally {
             seed.fill(0)
         }
-    }
-
-    /**
-     * Exports the raw 32-byte Ed25519 private key bytes for governance vote signing.
-     *
-     * For software-backed keys ([CustodyType.SOFTWARE]): extracts the 32-byte seed from
-     * the Bouncy Castle [Ed25519PrivateKeyParameters] and returns a copy. That covers a
-     * [generateKeypair] key on API 26-32; no pseudonym has a stored key to export.
-     *
-     * For Keystore keys ([CustodyType.HARDWARE]): throws an error because Keystore does
-     * not hand the private key bytes to the app, so this method cannot hand a Keystore key's
-     * bytes to a core function that takes a raw signing key. ADR-063's curve slice requires
-     * every core function that takes a raw signing key to take a signer instead, and every
-     * key-export accessor to leave the custody adapters and all three bridges. That slice
-     * has not landed, so this accessor still exports the seed of a software key. ADR-027
-     * acceptance criterion 14 (private key isolation) already says the Rust engine receives
-     * only signatures and public keys, never private key material, and the UniFFI
-     * `KeyCustodyProvider` callback's `export_signing_key_bytes` carries this seed to Rust
-     * through [UniffiKeyCustody], so this method's design diverges from criterion 14.
-     *
-     * @param keyHandle Handle naming an Ed25519 key held in software, which [generateKeypair]
-     *   returned. The method checks only [KeyHandle.custodyType] and the stored key type.
-     * @return 32-byte raw Ed25519 private key bytes.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if the key is not Ed25519.
-     * @throws ScpException with code `SCP-CRYPTO-4005` if the handle is a Keystore handle
-     *   ([CustodyType.HARDWARE]), checked before any key lookup, so a destroyed or unknown
-     *   Keystore handle also gets this code (Keystore does not hand its private key bytes to
-     *   the app).
-     * @throws ScpException with code `SCP-CRYPTO-4006` if the handle is a software handle and
-     *   no software key is found under it.
-     */
-    override fun exportSigningKeyBytes(keyHandle: KeyHandle): ByteArray {
-        if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            throw ScpException(
-                "Cannot export signing key bytes from Android Keystore custody " +
-                    "(handle '${keyHandle.id}'). Keystore keys are non-extractable. " +
-                    "ADR-063's curve slice requires every core function that takes a raw " +
-                    "signing key to take a signer instead, and every key-export accessor to " +
-                    "leave the custody adapters and all three bridges; that slice has not landed.",
-                "SCP-CRYPTO-4005",
-            )
-        }
-
-        val storedType = softwareKeyTypes[keyHandle.id]
-        if (storedType != null && storedType != KeyType.ED25519) {
-            throw ScpException(
-                "exportSigningKeyBytes requires an Ed25519 key; handle '${keyHandle.id}' is X25519",
-                "SCP-CRYPTO-4003",
-            )
-        }
-
-        val keyPair = softwareKeys[keyHandle.id]
-            ?: throw ScpException(
-                "Key not found: ${keyHandle.id}",
-                "SCP-CRYPTO-4006",
-            )
-
-        val privateParams = keyPair.private as Ed25519PrivateKeyParameters
-        val seed = privateParams.encoded
-        val result = seed.copyOf()
-        seed.fill(0)
-        return result
     }
 
     // -----------------------------------------------------------------------

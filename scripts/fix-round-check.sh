@@ -129,6 +129,7 @@
 #      `scripts/tests/fix-round-check/run-tests.sh` in `fix-round-check-selftest`;
 #      `scripts/tests/agent-verdict-criterion/run-tests.sh` in `agent-verdict-criterion`;
 #      `scripts/tests/examples-compile/run-tests.sh` in `rust-clippy`;
+#      `scripts/tests/deleted-primitives/run-tests.sh` in `deleted-primitives`;
 #      `scripts/tests/ci-gate/run-tests.sh` in `ci-workflow-selftest-docs` and
 #      `ci-workflow-selftest`; and `scripts/tests/signing-guard/run-tests.sh` in
 #      `ci-workflow-selftest`. The
@@ -526,7 +527,7 @@ UNRUN_LANES=(
     "bindings/swift/|SwiftLint, SwiftFormat and swift build, which the swift-lint and swift-build-test jobs of .github/workflows/ci.yml run"
     "fuzz/|cargo check inside fuzz/ on the nightly fuzz/rust-toolchain.toml names, which the fuzz-build job of .github/workflows/ci.yml runs"
     ".github/|scripts/tests/ci-gate/run-tests.sh, whose docs group the ci-workflow-selftest-docs job and whose rest group the ci-workflow-selftest job of .github/workflows/ci.yml run and whose ci_gate_selftest.py asserts the job structure this repository's own workflow files declare, scripts/tests/fix-round-check/run-tests.sh, which the fix-round-check-selftest job runs and whose case 23 reads .github/workflows/ci.yml itself, so adding a suite invocation to that file turns that case red, scripts/tests/rust-toolchain-action/run-tests.sh, which the toolchain-wiring-cases job runs against .github/actions/rust-toolchain/install.sh, the toolchain install step every Rust job of .github/workflows/ci.yml runs, and scripts/tests/cargo-fetch-action/run-tests.sh, which the toolchain-wiring-cases job runs against .github/actions/cargo-fetch/fetch.sh, the step every Rust job runs to download its crates and take cargo offline. Those four are every suite a change under .github/ can turn red: every other suite the ci-workflow-selftest and toolchain-wiring-cases jobs run feeds its gate a workflow file its own fixture wrote. Three gates this run did start read a workflow file, each for rules of its own and none as coverage of a workflow edit: scripts/check-workflow-compile-steps.py reads every workflow for its cache-group and bindgen rules, scripts/check-toolchain-wiring.sh reads them for its container-build and paths-filter rules, and scripts/check-shipped-feature-graph.sh reads build-matrix.yml and release.yml for the cargo invocations that ship an artifact"
-    "scripts/|the suites that .github/workflows/ci.yml runs over this directory: scripts/check-test-shard-features.py and its --self-test in the rust-test job, scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py, scripts/tests/call-invariants/ and scripts/tests/summarize-cargo-timings/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh, scripts/tests/rust-toolchain-action/run-tests.sh, scripts/tests/cargo-fetch-action/run-tests.sh, scripts/tests/pre-commit-clippy-scope/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring-cases job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, scripts/tests/examples-compile/run-tests.sh in the rust-clippy job, scripts/tests/examples-typecheck/run-tests.sh in the examples-typecheck job, scripts/tests/ci-gate/run-tests.sh in the ci-workflow-selftest-docs and ci-workflow-selftest jobs, and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Two more programs under this directory run in a job of .github/workflows/ci.yml and are neither a gate nor a suite: scripts/generate-uniffi-kotlin.sh, which the uniffi-cdylib-linux job starts to generate the Kotlin bindings of artifact uniffi-kotlin-linux, and scripts/ci-aggregate-result.py, which the ci job starts to judge every other job's result and which scripts/tests/ci-gate/run-tests.sh tests. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
+    "scripts/|the suites that .github/workflows/ci.yml runs over this directory: scripts/check-test-shard-features.py and its --self-test in the rust-test job, scripts/tests/cross-layer/run-tests.sh in the cross-layer job, scripts/tests/bridge-symmetry/run-tests.sh in the bridge-symmetry job, scripts/test_check_sdk_coverage.py, scripts/tests/call-invariants/ and scripts/tests/summarize-cargo-timings/ in the sdk-coverage job, scripts/tests/toolchain-wiring/run-tests.sh, scripts/tests/pre-commit-merge/run-tests.sh, scripts/tests/rust-toolchain-action/run-tests.sh, scripts/tests/cargo-fetch-action/run-tests.sh, scripts/tests/pre-commit-clippy-scope/run-tests.sh and scripts/tests/workflow-compile-steps/run-tests.sh in the toolchain-wiring-cases job, scripts/tests/fix-round-check/run-tests.sh in the fix-round-check-selftest job, scripts/tests/agent-verdict-criterion/run-tests.sh in the agent-verdict-criterion job, scripts/tests/examples-compile/run-tests.sh in the rust-clippy job, scripts/tests/examples-typecheck/run-tests.sh in the examples-typecheck job, scripts/tests/deleted-primitives/run-tests.sh in the deleted-primitives job, scripts/tests/ci-gate/run-tests.sh in the ci-workflow-selftest-docs and ci-workflow-selftest jobs, and scripts/tests/signing-guard/run-tests.sh in the ci-workflow-selftest job. Two more programs under this directory run in a job of .github/workflows/ci.yml and are neither a gate nor a suite: scripts/generate-uniffi-kotlin.sh, which the uniffi-cdylib-linux job starts to generate the Kotlin bindings of artifact uniffi-kotlin-linux, and scripts/ci-aggregate-result.py, which the ci job starts to judge every other job's result and which scripts/tests/ci-gate/run-tests.sh tests. Running a gate below against this repository's own files is not running that gate's fixture suite, which is the program that proves the gate still rejects what it exists to reject"
 )
 
 if [[ $changed_rc -eq 0 ]]; then
@@ -916,9 +917,16 @@ run_step format cargo fmt --all -- --check
 # `examples-typecheck` job: it runs mypy and the TypeScript compiler over the Python and
 # TypeScript sites under `docs/examples/`, `scaffolds/` and `templates/`, compiles no
 # crate, and needs `bun install` run in `bindings/typescript` first.
+# `scripts/check-test-vectors-p256.py` joined with the `test-vectors` job: it runs
+# `scripts/gen-test-vectors-p256.py` with the standard library (and `cryptography` when
+# it imports) and reads spec 25 and two Rust test files.
+# `scripts/check-bridge-block-on.py` joined beside `scripts/check-block-in-place.py`, in
+# the same job of `.github/workflows/ci.yml`, which runs it with no argument as this loop
+# does: it reads the bridge crates' Rust sources and imports that gate's tree-sitter scanner.
 GATES=(
     scripts/check-agent-verdict-criterion.sh
     scripts/check-block-in-place.py
+    scripts/check-bridge-block-on.py
     scripts/check-bridge-instance-lifecycle.py
     scripts/check-bridge-symmetry.sh
     scripts/check-call-invariants.py
@@ -948,6 +956,7 @@ GATES=(
     scripts/check-sdk-coverage.py
     scripts/check-shipped-feature-graph.sh
     scripts/check-test-shard-features.py
+    scripts/check-test-vectors-p256.py
     scripts/check-toolchain-wiring.sh
     scripts/check-vendored-openssl-scope.sh
     scripts/check-wiping-allocator.sh

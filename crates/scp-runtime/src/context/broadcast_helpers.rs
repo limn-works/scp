@@ -37,9 +37,8 @@ use scp_protocol::crypto::ucan::validate::{
 
 use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::{
-    BroadcastReservationId, PendingBroadcastPublish, PerContextState,
-};
+use crate::context::actor::signer::CommandSigner;
+use crate::context::actor::state::PerContextState;
 use crate::context::state::{context_id_to_bytes, require_active, strip_event_payload};
 
 // ---------------------------------------------------------------------------
@@ -316,50 +315,41 @@ pub async fn unsubscribe_broadcast(
 }
 
 // ---------------------------------------------------------------------------
-// Two-phase broadcast publish (reserve + apply)
+// Broadcast publish (one actor turn)
 // ---------------------------------------------------------------------------
 //
-// `KeyCustody` is an RPITIT trait and is not `dyn`-safe, so the signer
-// cannot cross the actor mailbox; and the actor must not hold `&mut
-// PerContextState` across an arbitrary-duration host-language
-// `custody.sign().await`. The publish is therefore split into two
-// mailbox commands, each holding `&mut state` only briefly:
-//
-//   1. `reserve_broadcast_publish` (phase 1) reserves the broadcast
-//      sequence, builds the signing payload, and stores a
-//      `PendingBroadcastPublish`. Returns the signing payload + the
-//      reservation id.
-//   2. The caller signs the payload with its own custody, OUTSIDE the
-//      actor.
-//   3. `apply_broadcast_publish` (phase 2) validates the reservation,
-//      seals with the RESERVED sequence, emits the event, sends on the
-//      transport, appends to the event log, and removes the reservation.
-//
-// A reservation that is never applied (signing failed, caller dropped)
-// is released by `release_broadcast_reservation` so the sequence is not
-// burned — matching the legacy single-phase path, where a signing
-// failure occurred before any sequence increment. Concurrent publishes
-// each reserve a distinct sequence, closing the double-sequence /
-// signature-mismatch hazard the single-phase shim had under
-// decomposition.
+// The publish command carries the author's `CommandSigner` (ADR-049 Decision
+// 7a), so a publish completes in one actor turn: reserve the author's
+// broadcast sequence, sign the 32-byte broadcast signing payload through
+// `CommandSigner::sign_bounded_ed25519`, and seal. No other command runs inside the turn, so the
+// reserved sequence is still the author's head when a failed sign or seal
+// rolls it back, and two publishes, serialized by the mailbox, never share a
+// sequence. After a successful seal the sequence is consumed even if
+// transport delivery fails.
 
-/// Outcome of [`reserve_broadcast_publish`] (phase 1). Carries the
-/// reservation id (echoed back at apply) and the exact bytes the caller
-/// must sign with its key custody.
-#[derive(Debug, Clone)]
-pub struct BroadcastPublishReservationOutcome {
-    /// Identifier of the stored reservation. Pass back to
-    /// [`apply_broadcast_publish`] to seal the reserved sequence.
-    pub reservation_id: BroadcastReservationId,
-    /// Canonical broadcast signing-payload digest (32-byte hash) to hand
-    /// to `KeyCustody::sign`. Matches the legacy single-phase signer
-    /// input exactly.
-    pub signing_payload: [u8; 32],
+/// What the seal needs from the reservation: the sequence, timestamp and
+/// nonce the signature binds, captured when the sequence was reserved.
+#[derive(Debug)]
+struct PendingBroadcastPublish {
+    /// Author DID the sequence was reserved for.
+    author_did: DID,
+    /// The broadcast sequence reserved for this publish.
+    reserved_sequence: u64,
+    /// The author's broadcast key epoch at reservation time.
+    key_epoch: u64,
+    /// Unix-ms timestamp bound into the signed payload.
+    timestamp: u64,
+    /// AES-256-GCM nonce bound into the signed payload.
+    nonce: [u8; 12],
 }
 
-/// Phase 1 of the two-phase broadcast publish: reserve the sequence and
-/// build the signing payload. Holds `&mut state` only for this call —
-/// never across the caller's async sign.
+/// Publishes `payload` to the broadcast context in one actor turn: reserves
+/// the author's broadcast sequence, signs the broadcast signing payload
+/// through `signer` within [`SIGN_TIMEOUT`](crate::context::actor::signer::SIGN_TIMEOUT),
+/// seals, emits the local `MessageSent` event, and sends the envelope.
+///
+/// Every error before the seal rolls the reserved sequence back, so a
+/// refused or timed-out sign leaves the author's next sequence unchanged.
 ///
 /// # Errors
 ///
@@ -368,11 +358,56 @@ pub struct BroadcastPublishReservationOutcome {
 ///   context.
 /// - [`ContextError::PermissionDenied`] if the sender is not an author or
 ///   write access is suspended.
-pub fn reserve_broadcast_publish(
+/// - [`ContextError::Custody`] with the custody's own kind when custody
+///   refuses the sign, or with kind `TimedOut` (`SCP-CRYPTO-4062`) when it
+///   does not answer within `SIGN_TIMEOUT`.
+/// - [`ContextError::CryptoFailed`] when the signer is not Ed25519, or the
+///   signing payload or the seal fails.
+/// - The transport's error when delivery fails after the seal.
+pub async fn publish_broadcast_in_turn(
+    cell: &mut ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    author_did: &DID,
+    payload: &[u8],
+    signer: &CommandSigner,
+) -> Result<BroadcastEnvelope, ContextError> {
+    // Broadcast envelopes carry an Ed25519 signature (§5.14.5). Reject any
+    // other signer before a sequence is reserved.
+    signer.require_ed25519()?;
+
+    let (pending, signing_payload) = reserve_publish(cell, deps, author_did)?;
+
+    // `reserve_publish` has released its Class-C view borrow; only `cell`
+    // itself, which the handler owns for the whole turn, spans the await.
+    let signature = match signer.sign_bounded_ed25519(&signing_payload).await {
+        Ok(signature) => signature,
+        Err(e) => {
+            release_reserved(cell, &pending);
+            return Err(e);
+        }
+    };
+
+    let routing_id = broadcast_publish_routing_id(context_id);
+    apply_guarded(
+        cell,
+        deps,
+        context_id,
+        &routing_id,
+        &pending,
+        &signature,
+        payload,
+    )
+    .await
+}
+
+/// Reserves the author's broadcast sequence and builds the 32-byte signing
+/// payload. A failure after the reservation rolls it back before returning.
+fn reserve_publish(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     author_did: &DID,
-) -> Result<BroadcastPublishReservationOutcome, ContextError> {
+) -> Result<(PendingBroadcastPublish, [u8; 32]), ContextError> {
     require_active(&cell.handle)?;
 
     // Suspension-aware capability check (§9.17, ADR-038). In broadcast
@@ -395,22 +430,19 @@ pub fn reserve_broadcast_publish(
 
     let timestamp = deps.clock.now_millis();
     let nonce = scp_protocol::crypto::sender_keys::generate_broadcast_nonce();
+    let provenance_hash = scp_protocol::crypto::sender_keys::compute_provenance_hash(None)
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-    // Reserve the broadcast sequence + build the signing payload. Both the
-    // broadcast metadata reservation and the pending-publish insert are
-    // Class-C (the handler reports `mutated`; the run loop coalesce-persists)
-    // — routed through the non-persisting Class-C view (ADR-049 §9).
+    // The sequence reservation is Class-C (the handler reports `mutated`; the
+    // run loop coalesce-persists), routed through the non-persisting Class-C
+    // view (ADR-049 §9). The view borrow ends when this function returns.
     let mut view = cell.class_c_view();
     let mut bc = view
         .broadcast_class_c_mut()
         .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-    // Reserve the broadcast sequence atomically. A concurrent publish on
-    // the same author gets the next number, never this one.
     let reservation = bc.reserve_publish(author_did.as_ref())?;
 
-    let provenance_hash = scp_protocol::crypto::sender_keys::compute_provenance_hash(None)
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
     let signing_payload = scp_protocol::crypto::sender_keys::build_broadcast_signing_payload(
         &scp_protocol::crypto::sender_keys::SigningPayloadFields {
             version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
@@ -422,12 +454,16 @@ pub fn reserve_broadcast_publish(
             nonce: &nonce,
             provenance_hash: &provenance_hash,
         },
-    )
-    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+    );
+    let signing_payload = match signing_payload {
+        Ok(digest) => digest,
+        Err(e) => {
+            bc.rollback_reserved_publish(author_did.as_ref(), reservation.reserved_sequence);
+            return Err(ContextError::CryptoFailed(e.to_string()));
+        }
+    };
 
-    let reservation_id = BroadcastReservationId::new_random();
-    view.pending_broadcast_publishes_mut().insert(
-        reservation_id.clone(),
+    Ok((
         PendingBroadcastPublish {
             author_did: author_did.clone(),
             reserved_sequence: reservation.reserved_sequence,
@@ -435,72 +471,8 @@ pub fn reserve_broadcast_publish(
             timestamp,
             nonce,
         },
-    );
-
-    Ok(BroadcastPublishReservationOutcome {
-        reservation_id,
         signing_payload,
-    })
-}
-
-/// Phase 2 of the two-phase broadcast publish: seal the reserved
-/// sequence with the caller-produced `signature`, emit the event, send
-/// on the transport, and append to the event log. Holds `&mut state`
-/// only for this call.
-///
-/// On any failure before the seal succeeds the reservation is released
-/// (sequence returned to the author's counter if still the head) so the
-/// sequence is not burned. After the seal succeeds the sequence is
-/// permanently consumed even if transport delivery fails — matching the
-/// legacy path, which also burned the broadcast sequence on a
-/// post-seal transport failure.
-///
-/// # Errors
-///
-/// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-/// - [`ContextError::InvalidState`] if `reservation_id` does not match a
-///   live reservation (already applied, expired, or never issued).
-/// - [`ContextError::MembershipFailed`] if the actor is not a broadcast
-///   context.
-/// - [`ContextError::CryptoFailed`] on a signature-length mismatch, an
-///   epoch change between phases, or a seal failure.
-pub async fn apply_broadcast_publish(
-    cell: &mut ClassSCell,
-    deps: &ActorDeps,
-    context_id: &str,
-    reservation_id: &BroadcastReservationId,
-    signature: &[u8],
-    payload: &[u8],
-) -> Result<BroadcastEnvelope, ContextError> {
-    let routing_id = broadcast_publish_routing_id(context_id);
-
-    // Resolve the reservation first so a stale/duplicate apply is a
-    // clean typed error and never touches sequence state. Class-C
-    // pending-publish map (coalesced persist) — non-persisting Class-C view.
-    let pending = cell
-        .class_c_view()
-        .pending_broadcast_publishes_mut()
-        .remove(reservation_id)
-        .ok_or_else(|| {
-            ContextError::InvalidState(format!(
-                "no live broadcast-publish reservation for id {}",
-                reservation_id.0
-            ))
-        })?;
-
-    // From here on, any early return must release the reserved sequence
-    // (it was consumed at phase 1 but never sealed). `apply_guarded`
-    // owns that rollback discipline.
-    apply_guarded(
-        cell,
-        deps,
-        context_id,
-        &routing_id,
-        &pending,
-        signature,
-        payload,
-    )
-    .await
+    ))
 }
 
 /// Relay routing id under which a sealed broadcast envelope is published.
@@ -521,16 +493,16 @@ fn broadcast_publish_routing_id(context_id: &str) -> [u8; 32] {
     scp_protocol::context::broadcast_routing_id(context_id)
 }
 
-/// Inner apply body. Separated so the caller-facing
-/// [`apply_broadcast_publish`] can guarantee the reserved sequence is
-/// released on every error path.
+/// Seals the reserved sequence with `signature`, emits the event, and sends
+/// the envelope. A seal failure rolls the reserved sequence back; after the
+/// seal the sequence is consumed.
 async fn apply_guarded(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     routing_id: &[u8; 32],
     pending: &PendingBroadcastPublish,
-    signature: &[u8],
+    signature: &[u8; 64],
     payload: &[u8],
 ) -> Result<BroadcastEnvelope, ContextError> {
     // Seal under the reserved sequence. On any failure before the seal
@@ -544,9 +516,9 @@ async fn apply_guarded(
     };
 
     // Seal succeeded — the broadcast sequence is now permanently consumed
-    // (matches legacy: a post-seal transport failure burns it too). The
-    // per-sender sequence bump is Class-C structural bookkeeping (exposed on
-    // the restricted `MembershipClassCMut`) — non-persisting Class-C view.
+    // (a post-seal transport failure burns it too). The per-sender sequence
+    // bump is Class-C structural bookkeeping (exposed on the restricted
+    // `MembershipClassCMut`) — non-persisting Class-C view.
     let seq = cell
         .class_c_view()
         .membership_class_c_mut()
@@ -585,18 +557,12 @@ async fn apply_guarded(
 fn seal_reserved(
     cell: &mut ClassSCell,
     pending: &PendingBroadcastPublish,
-    signature: &[u8],
+    signature: &[u8; 64],
     payload: &[u8],
 ) -> Result<BroadcastEnvelope, ContextError> {
     require_active(&cell.handle)?;
 
-    let sig_bytes: [u8; 64] = signature.try_into().map_err(|_| {
-        ContextError::CryptoFailed(format!(
-            "custody signature has wrong length: expected 64, got {}",
-            signature.len()
-        ))
-    })?;
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let signature = ed25519_dalek::Signature::from_bytes(signature);
 
     // Broadcast metadata seal is Class-C (coalesced persist) — non-persisting
     // Class-C view (ADR-049 §9).
@@ -605,17 +571,15 @@ fn seal_reserved(
         .broadcast_class_c_mut()
         .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-    // Detect a key rotation between reserve and apply — sealing under a
-    // rotated key would produce a ciphertext whose epoch the signed
-    // payload no longer matches.
-    let current_epoch = bc.publish_metadata(pending.author_did.as_ref())?.key_epoch;
-    if current_epoch != pending.key_epoch {
-        return Err(ContextError::CryptoFailed(format!(
-            "broadcast key epoch changed between reserve and apply for {} \
-             (reserved at {}, now {})",
-            pending.author_did, pending.key_epoch, current_epoch
-        )));
-    }
+    // The reservation, the sign and the seal run in one actor turn, so no
+    // key rotation can intervene between them.
+    debug_assert_eq!(
+        bc.publish_metadata(pending.author_did.as_ref())
+            .map(|m| m.key_epoch)
+            .ok(),
+        Some(pending.key_epoch),
+        "the author's broadcast key epoch cannot change inside one actor turn"
+    );
 
     bc.apply_reserved_publish(
         pending.author_did.as_ref(),
@@ -630,8 +594,8 @@ fn seal_reserved(
     )
 }
 
-/// Roll back the reserved sequence for a pending publish that will not be
-/// applied. No-op if the context is no longer a broadcast context.
+/// Roll back the reserved sequence for a publish that will not be sealed.
+/// No-op if the context is no longer a broadcast context.
 fn release_reserved(cell: &mut ClassSCell, pending: &PendingBroadcastPublish) {
     // Broadcast metadata rollback is Class-C (coalesced persist) — view.
     if let Some(mut bc) = cell.class_c_view().broadcast_class_c_mut() {
@@ -639,28 +603,39 @@ fn release_reserved(cell: &mut ClassSCell, pending: &PendingBroadcastPublish) {
     }
 }
 
-/// Release a broadcast-publish reservation that will never be applied
-/// (the caller's signing failed, or the caller is aborting). Removes the
-/// stored reservation and rolls the reserved sequence back if it is still
-/// the head. No-op if the reservation id is unknown.
-pub fn release_broadcast_reservation(
-    cell: &mut ClassSCell,
-    reservation_id: &BroadcastReservationId,
-) {
-    // Both the pending-publish map and the broadcast metadata are Class-C
-    // (coalesced persist) — route through the non-persisting Class-C view.
-    // Separate the two `&mut` reaches (remove the reservation, then roll the
-    // sequence back) so each view borrow is short-lived (ADR-049 §9).
-    let Some(pending) = cell
-        .class_c_view()
-        .pending_broadcast_publishes_mut()
-        .remove(reservation_id)
-    else {
-        return;
+/// Checks that `envelope`'s signature verifies under `key` over the broadcast
+/// signing payload rebuilt from the envelope's own fields.
+///
+/// # Errors
+///
+/// A message naming the step that failed: the provenance hash, the signing
+/// payload, or the signature check.
+#[cfg(test)]
+pub fn check_envelope_signed_by(
+    envelope: &BroadcastEnvelope,
+    key: &ed25519_dalek::VerifyingKey,
+) -> Result<(), String> {
+    use scp_protocol::crypto::sender_keys::{
+        SigningPayloadFields, build_broadcast_signing_payload, compute_provenance_hash,
     };
-    if let Some(mut bc) = cell.class_c_view().broadcast_class_c_mut() {
-        bc.rollback_reserved_publish(pending.author_did.as_ref(), pending.reserved_sequence);
-    }
+    let provenance_hash = compute_provenance_hash(envelope.provenance.as_ref())
+        .map_err(|e| format!("provenance hash: {e}"))?;
+    let digest = build_broadcast_signing_payload(&SigningPayloadFields {
+        version: envelope.version,
+        context_id: &envelope.context_id,
+        author_did: &envelope.author_did,
+        sequence: envelope.sequence,
+        key_epoch: envelope.key_epoch,
+        timestamp: envelope.timestamp,
+        nonce: &envelope.nonce,
+        provenance_hash: &provenance_hash,
+    })
+    .map_err(|e| format!("signing payload: {e}"))?;
+    key.verify_strict(
+        &digest,
+        &ed25519_dalek::Signature::from_bytes(&envelope.signature),
+    )
+    .map_err(|e| format!("the envelope signature does not verify under the key: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,7 +977,7 @@ mod broadcast_routing_tests {
     /// MUST address the relay under the broadcast ROUTING id
     /// (`SHA-256(context_id)`), NOT the canonical context-identity digest that
     /// `context_id_to_bytes` decodes for a real 64-hex id. Before this guard,
-    /// `apply_broadcast_publish` routed the `send_message` slot through
+    /// the broadcast publish routed the `send_message` slot through
     /// `context_id_to_bytes`. On `main` that incidentally equalled
     /// `SHA-256(id)`; ADR-056 broke the equality, so publish stored a blob at a
     /// slot the projection (`compute_routing_id` = `SHA-256(id)`) never reads —

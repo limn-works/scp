@@ -286,6 +286,7 @@ fn streaming_context_params(ceiling: &[&str]) -> crate::bridge::ContextParams {
         economic_policy: None,
         consequence_rules_json: None,
         consequence_config_json: None,
+        capability_requirements_json: None,
         pseudonym_rotation: None,
     }
 }
@@ -1270,17 +1271,17 @@ mod xctx_streaming_saga_tests {
              handle's creator_did at creation — a divergence would let streaming-saga recover \
              seal under a different context's Active Signing Key"
         );
-        super::resolve_context_active_signing_key_by_id(&bi, &handle.context_id)
+        super::resolve_context_signer_by_id(&bi, &handle.context_id)
             .await
-            .expect("a live actor whose creator this bridge hosts resolves the signing key");
+            .expect("a live actor whose creator this bridge hosts resolves the signer");
 
         bi.context_manager_or_error()
             .expect("supervisor")
             .despawn_actor(&handle.context_id)
             .await;
-        let err = super::resolve_context_active_signing_key_by_id(&bi, &handle.context_id)
+        let err = super::resolve_context_signer_by_id(&bi, &handle.context_id)
             .await
-            .expect_err("a context no actor serves must not resolve a signing key");
+            .expect_err("a context no actor serves must not resolve a signer");
         assert!(
             err.to_string().contains("no live supervisor role state"),
             "the refusal must come from the live role-state read: {err}"

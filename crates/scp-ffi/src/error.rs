@@ -837,12 +837,12 @@ impl From<scp_core::provenance::ProvenanceError> for ScpPyError {
 // Trust errors → ScpPyError::ValidationError
 
 impl From<scp_core::trust::TrustError> for ScpPyError {
+    /// The code comes from the shared table, so a challenge refusal carries
+    /// its own code on every bridge.
     fn from(e: scp_core::trust::TrustError) -> Self {
         Self::ValidationError {
-            message: format!(
-                "trust evaluation failed: {e} — check event log data and attestation validity"
-            ),
-            code: codes::VALID_7003.to_owned(),
+            message: scp_ffi_common::error_codes::trust_error_message(&e),
+            code: scp_ffi_common::error_codes::trust_error_code(&e).to_owned(),
         }
     }
 }

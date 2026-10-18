@@ -388,16 +388,15 @@ pub(crate) fn economy_antispam_escalated_cost_on(
 /// failure. `ok` means the adapter *responded* — NOT that the payment is
 /// valid; callers scanning for failures must inspect `valid`/`all_valid`.
 ///
-/// Runs synchronously on a libuv worker thread — there is no ambient tokio
-/// context, so the actual dispatch is driven via the shared runtime's
-/// `block_on`.
+/// Async: the supervisor dispatch and its reply are awaited on the napi
+/// tokio runtime, so the JS thread never blocks on the context actor.
 ///
 /// # Errors
 ///
 /// Returns a `Validation` error if `receipts_json` is malformed, a suspended
 /// `Context` error if the bridge is suspended, or a `Context` error if the
 /// supervisor dispatch fails or the reply channel is dropped.
-pub(crate) fn economy_verify_payment_receipts_on(
+pub(crate) async fn economy_verify_payment_receipts_on(
     bi: &NapiBridgeInstance,
     receipts_json: String,
 ) -> napi::Result<String> {
@@ -418,36 +417,32 @@ pub(crate) fn economy_verify_payment_receipts_on(
         )));
     }
 
-    let rt = crate::runtime();
+    use scp_core::context::actor::commands::EconomyCommand;
+
     let sup = crate::runtime::supervisor(bi)?.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = EconomyCommand::VerifyPaymentReceipts {
+        receipts: Box::new(receipts),
+        reply: tx,
+    };
+    sup.dispatch_economy_command(cmd).await.map_err(|e| {
+        napi::Error::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_economy_command failed: {e}"),
+            code: codes::ECON_12091.to_owned(),
+        })
+    })?;
+    let results = rx.await.map_err(|e| {
+        napi::Error::from(ScpNapiError::Context {
+            message: format!("verify_payment_receipts shim reply dropped: {e}"),
+            code: codes::ECON_12091.to_owned(),
+        })
+    })?;
 
-    rt.block_on(async move {
-        use scp_core::context::actor::commands::EconomyCommand;
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = EconomyCommand::VerifyPaymentReceipts {
-            receipts: Box::new(receipts),
-            reply: tx,
-        };
-        sup.dispatch_economy_command(cmd).await.map_err(|e| {
-            napi::Error::from(ScpNapiError::Context {
-                message: format!("supervisor dispatch_economy_command failed: {e}"),
-                code: codes::ECON_12091.to_owned(),
-            })
-        })?;
-        let results = rx.await.map_err(|e| {
-            napi::Error::from(ScpNapiError::Context {
-                message: format!("verify_payment_receipts shim reply dropped: {e}"),
-                code: codes::ECON_12091.to_owned(),
-            })
-        })?;
-
-        // Serialize via the single canonical helper shared by all bridges,
-        // so the JSON contract (string currency, numeric amount, `ok` vs
-        // `valid`/`all_valid` semantics) cannot drift across PyO3, napi, and
-        // UniFFI. See `scp_runtime::economy::receipt::verification_results_to_json`.
-        Ok(scp_core::economy::verification_results_to_json(results))
-    })
+    // Serialize via the single canonical helper shared by all bridges, so
+    // the JSON contract (string currency, numeric amount, `ok` vs
+    // `valid`/`all_valid` semantics) cannot drift across PyO3, napi, and
+    // UniFFI. See `scp_runtime::economy::receipt::verification_results_to_json`.
+    Ok(scp_core::economy::verification_results_to_json(results))
 }
 
 // ---------------------------------------------------------------------------
@@ -581,38 +576,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verify_payment_receipts_rejects_malformed_json() {
+    #[tokio::test]
+    async fn verify_payment_receipts_rejects_malformed_json() {
         // The invalid-JSON path is reached before any supervisor lookup,
         // so a bare `new_napi()` instance (no supervisor) suffices.
         let bi = NapiBridgeInstance::new_napi();
-        let err = economy_verify_payment_receipts_on(&bi, "not json".to_owned()).unwrap_err();
+        let err = economy_verify_payment_receipts_on(&bi, "not json".to_owned())
+            .await
+            .unwrap_err();
         assert!(
             err.reason.contains("invalid receipts JSON"),
             "error should mention 'invalid receipts JSON': {err:?}"
         );
     }
 
-    #[test]
-    fn verify_payment_receipts_empty_batch_returns_all_valid_true() {
+    #[tokio::test]
+    async fn verify_payment_receipts_empty_batch_returns_all_valid_true() {
         // An empty receipt batch is the clean supervisor-backed happy path —
         // it needs no payment adapter but still dispatches an `EconomyCommand`
         // to the supervisor, so a supervisor must be attached first. The new
         // output contract returns `{"all_valid":true,"results":[]}` —
         // `all_valid` is vacuously `true` for an empty batch.
-        //
-        // `economy_verify_payment_receipts_on` drives its own `block_on`, so
-        // it is exercised from a plain `#[test]` (no ambient tokio runtime,
-        // mirroring the libuv worker-thread execution context).
         let bi = NapiBridgeInstance::new_napi();
         crate::runtime::init_supervisor_for_test_on(&bi);
 
-        let out = economy_verify_payment_receipts_on(&bi, "[]".to_owned()).unwrap();
+        let out = economy_verify_payment_receipts_on(&bi, "[]".to_owned())
+            .await
+            .unwrap();
         assert_eq!(out, r#"{"all_valid":true,"results":[]}"#);
     }
 
-    #[test]
-    fn verify_payment_receipts_rejects_oversized_batch() {
+    #[tokio::test]
+    async fn verify_payment_receipts_rejects_oversized_batch() {
         use scp_core::economy::{
             Amount, CurrencyCode, MAX_RECEIPT_BATCH, PaidActionType, PaymentReceipt,
         };
@@ -642,7 +637,9 @@ mod tests {
         let receipts_json = serde_json::to_string(&receipts).unwrap();
 
         let bi = NapiBridgeInstance::new_napi();
-        let err = economy_verify_payment_receipts_on(&bi, receipts_json).unwrap_err();
+        let err = economy_verify_payment_receipts_on(&bi, receipts_json)
+            .await
+            .unwrap_err();
         assert!(
             err.reason.contains("receipt batch too large"),
             "error should mention 'receipt batch too large': {err:?}"

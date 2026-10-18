@@ -894,6 +894,67 @@ async fn welcome_joiner_does_not_install_the_genesis_outlet_declaration() {
     );
 }
 
+/// T21. A Welcome joiner holds no live capability-requirements list: the
+/// genesis list in `ContextParams` records no `ModifyCapabilityRequirements`
+/// governance made since (the creator may already have tightened it), so the
+/// joiner's admission read fails closed instead of answering from the
+/// declaration (spec 07 §7.3.4.4).
+#[tokio::test]
+async fn welcome_joiner_capability_requirements_await_replication() {
+    let genesis: scp_protocol::trust::CapabilityRequirements = vec![
+        scp_protocol::trust::RawCapabilityRequirement {
+            capability: "scp:capability:schema-validation/v1"
+                .parse()
+                .expect("capability URI"),
+            verification_level: scp_protocol::trust::VerificationLevel::SelfAttested,
+            trusted_verifiers: Vec::new(),
+            retry_cap: None,
+        }
+        .try_into()
+        .expect("valid requirement"),
+    ]
+    .try_into()
+    .expect("valid list");
+    let params = ContextParams {
+        capability_requirements: genesis,
+        ..joiner_params()
+    };
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        0x30,
+        Some(Box::new(rec.clone())),
+        Some(params.clone()),
+        params.clone(),
+        None,
+    )
+    .await;
+    result.expect("welcome join succeeds");
+
+    let snapshot = rec
+        .store
+        .get(&j.ctx_id)
+        .map(|e| e.value().clone())
+        .expect("the joiner persisted a snapshot before spawning");
+    assert_eq!(
+        snapshot.capability_requirements,
+        crate::context::state::Replicated::AwaitingReplication,
+        "the joiner seeds no live list from the genesis declaration"
+    );
+    assert!(
+        !snapshot.context_params.capability_requirements.is_empty(),
+        "non-vacuity: the genesis list reached the joiner's params"
+    );
+    let err = j
+        .sup
+        .capability_requirements_checked(&j.ctx_id)
+        .await
+        .expect_err("the joiner's admission read fails closed");
+    assert!(
+        matches!(err, scp_protocol::context::ContextError::InvalidState(_)),
+        "{err:?}"
+    );
+}
+
 /// Runs a Welcome join of a bundle naming [`BUNDLE_RELAY_URLS`] and returns
 /// the relay set of the persisted Class-S snapshot, which the spawn writes
 /// from the joiner's live state (§5.12.3.1 `relay_urls`, PUSH-025). The join
@@ -2683,7 +2744,7 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect("alice seals an invitation for bob");
@@ -2781,7 +2842,7 @@ async fn invite_member_seals_the_creators_stored_relay_set() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect("alice seals an invitation for bob");
@@ -2925,7 +2986,7 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect("alice invites bob");
@@ -2988,7 +3049,7 @@ async fn invite_member_into_voting_context_is_rejected() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect_err("a voting context refuses a unilateral invite with an error");
@@ -3057,7 +3118,7 @@ async fn invite_member_by_non_admin_is_rejected() {
             bob.clone(),
             bob.clone(),
             kp_public_bytes,
-            &bob_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(bob_signing_key().clone()),
         )
         .await;
 
@@ -3163,7 +3224,7 @@ async fn invite_member_rolls_back_the_add_on_delivery_failure() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await;
 
@@ -4079,7 +4140,9 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
             &handle,
             &bob,
             b"joiner send after welcome (\xc2\xa79b)",
-            MessageSigner::Active(&bob_signing_key()),
+            MessageSigner::Active(&crate::context::actor::CommandSigner::local_ed25519(
+                bob_signing_key(),
+            )),
             None,
             None,
         )

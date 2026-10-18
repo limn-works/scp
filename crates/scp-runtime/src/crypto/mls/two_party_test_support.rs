@@ -242,8 +242,23 @@ pub struct TwoPartyPair {
 // One cohesive bootstrap flow (reserve → owned-birth alice → actor add_member →
 // confirm-join → owned-birth bob → §9.16.2 pull) driven end to end; splitting it
 // would obscure the linear join narrative, so allow the length.
-#[allow(clippy::too_many_lines)]
 pub fn stand_up_two_party(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoPartyPair {
+    // The fixture blocks on its own runtime. An async caller's thread is
+    // already driving a runtime and cannot block on a nested one, so the
+    // fixture then runs on a thread of its own.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::scope(|scope| {
+            scope
+                .spawn(|| stand_up_two_party_blocking(ctx_str, alice_did, bob_did))
+                .join()
+                .expect("two-party fixture thread")
+        });
+    }
+    stand_up_two_party_blocking(ctx_str, alice_did, bob_did)
+}
+
+#[allow(clippy::too_many_lines)]
+fn stand_up_two_party_blocking(ctx_str: &str, alice_did: &str, bob_did: &str) -> TwoPartyPair {
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_str);
 
     tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only two-party fixture drives async MLS provider calls from sync #[test] callers; not a production async bridge

@@ -181,6 +181,17 @@ impl From<ScpNapiError> for napi::Error {
 // From<scp-core error types> for ScpNapiError
 // ---------------------------------------------------------------------------
 
+/// A bridge wait that could not drive its future (`scp_ffi_common::block_on`)
+/// reports `SCP-CTX-2001`, as the `PyO3` bridge does.
+impl From<scp_ffi_common::bridge_wait::BridgeBlockOnError> for ScpNapiError {
+    fn from(e: scp_ffi_common::bridge_wait::BridgeBlockOnError) -> Self {
+        Self::Context {
+            message: e.to_string(),
+            code: codes::CTX_2001.to_owned(),
+        }
+    }
+}
+
 impl From<scp_identity::IdentityError> for ScpNapiError {
     fn from(e: scp_identity::IdentityError) -> Self {
         use scp_identity::IdentityError as IE;
@@ -599,12 +610,12 @@ impl From<scp_core::provenance::ProvenanceError> for ScpNapiError {
 }
 
 impl From<scp_core::trust::TrustError> for ScpNapiError {
+    /// The code comes from the shared table, so a challenge refusal carries
+    /// its own code on every bridge.
     fn from(e: scp_core::trust::TrustError) -> Self {
         Self::Validation {
-            message: format!(
-                "trust evaluation failed: {e} — check event log data and attestation validity"
-            ),
-            code: codes::VALID_7003.to_owned(),
+            message: scp_ffi_common::error_codes::trust_error_message(&e),
+            code: scp_ffi_common::error_codes::trust_error_code(&e).to_owned(),
         }
     }
 }
@@ -667,22 +678,6 @@ impl ScpNapiError {
             _ => Self::Context {
                 message,
                 code: codes::CTX_2023.to_owned(),
-            },
-        }
-    }
-
-    /// A failed inner-envelope signing: a custody failure keeps its custody
-    /// code ([`Self::custody_failure`]), and any other envelope failure is
-    /// `SCP-CRYPTO-4001`.
-    pub(crate) fn inner_envelope_error(e: &scp_core::envelope::EnvelopeError) -> Self {
-        let message = format!("inner envelope signing failed: {e}");
-        match e {
-            scp_core::envelope::EnvelopeError::Custody(failure) => {
-                Self::custody_failure(message, failure)
-            }
-            _ => Self::Crypto {
-                message,
-                code: codes::CRYPTO_4001.to_owned(),
             },
         }
     }

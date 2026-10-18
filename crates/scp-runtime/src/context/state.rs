@@ -727,12 +727,17 @@ pub struct ContextSnapshot {
     /// Established cross-context outlet interfaces (§6.2).
     #[serde(default)]
     pub outlet_interfaces: Vec<OutletInterface>,
-    /// Governance threshold signers (for `ThresholdApproval` model).
-    #[serde(default)]
+    /// Governance threshold signers (for `ThresholdApproval` model). No
+    /// default: a snapshot without it fails to decode, so restore never
+    /// reads an absent signer set as an empty one.
     pub threshold_signers: Vec<DID>,
-    /// Governance threshold value (quorum requirement).
-    #[serde(default)]
+    /// Governance threshold value (quorum requirement). No default, for the
+    /// same reason.
     pub threshold_value: u32,
+    /// The live capability requirements (spec 07 §7.3.4.4), seeded from
+    /// `context_params` by the creator, held as awaiting by a Welcome
+    /// joiner, and replaced only by `ModifyCapabilityRequirements`.
+    pub capability_requirements: Replicated<scp_protocol::trust::CapabilityRequirements>,
     /// Pruning policy override (ADR-030 §6).
     #[serde(default)]
     pub pruning_policy: Option<PruningPolicy>,
@@ -1503,6 +1508,12 @@ pub(crate) struct GovernanceClassS {
     /// replay attacks where a valid spending UCAN is resubmitted.
     pub(crate) spending_nonce_tracker:
         scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
+    /// The live capability requirements (spec 07 §7.3.4.4). Admission reads
+    /// this list, never `ContextParams`; only `ModifyCapabilityRequirements`
+    /// replaces it, so the snapshot a Class-S combinator takes restores it.
+    /// A Welcome joiner holds [`Replicated::AwaitingReplication`] until that
+    /// action reaches it.
+    pub(crate) capability_requirements: Replicated<scp_protocol::trust::CapabilityRequirements>,
 }
 
 /// Lossless, `Clone`-able mirror of [`GovernanceClassS`] (ADR-049 §9).
@@ -1532,6 +1543,8 @@ pub(crate) struct GovernanceClassSSnapshot {
     /// `(nonce → (first_seen_secs, token_expiry_secs))` entries of the
     /// `spending_nonce_tracker`, projected via `snapshot_entries`.
     pub(crate) spending_nonce_tracker_entries: HashMap<String, (u64, u64)>,
+    /// Mirror of [`GovernanceClassS::capability_requirements`].
+    pub(crate) capability_requirements: Replicated<scp_protocol::trust::CapabilityRequirements>,
 }
 
 #[allow(
@@ -1549,6 +1562,7 @@ impl GovernanceClassS {
             threshold_value: self.threshold_value,
             spending_nonce_tracker_context_id: self.spending_nonce_tracker.context_id().to_owned(),
             spending_nonce_tracker_entries: self.spending_nonce_tracker.snapshot_entries(),
+            capability_requirements: self.capability_requirements.clone(),
         }
     }
 
@@ -1568,6 +1582,7 @@ impl GovernanceClassS {
             threshold_value,
             spending_nonce_tracker_context_id,
             spending_nonce_tracker_entries,
+            capability_requirements,
         } = snap;
         *self = Self {
             executed_proposals,
@@ -1578,6 +1593,7 @@ impl GovernanceClassS {
                 Arc::clone(clock),
                 spending_nonce_tracker_entries,
             ),
+            capability_requirements,
         };
     }
 }
@@ -1758,6 +1774,9 @@ impl GovernanceState {
                 spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
                     context_id.to_owned(),
                     clock,
+                ),
+                capability_requirements: Replicated::Live(
+                    scp_protocol::trust::CapabilityRequirements::default(),
                 ),
             },
         }
@@ -1961,6 +1980,40 @@ pub(crate) fn create_governance_engine(
             let engine = UnanimityEngine::new(eligible_voters.clone(), 172_800, key_resolver)
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
             Ok(Box::new(engine))
+        }
+    }
+}
+
+/// Governance state a member holds, or has not yet read.
+///
+/// A Welcome joiner starts from the genesis `ContextParams`, which record no
+/// governance change made after genesis. A field governance can change is
+/// therefore [`Replicated::AwaitingReplication`] on the joiner until a
+/// governance action sets it, and every reader goes through
+/// [`Replicated::live`], which fails closed, so no reader can mistake the
+/// absent value for the genesis one or for an empty one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Replicated<T> {
+    /// The member's live value.
+    Live(T),
+    /// The member has not applied a governance action that sets the value.
+    AwaitingReplication,
+}
+
+impl<T> Replicated<T> {
+    /// The live value.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::InvalidState`] naming `what` and `context_id` while
+    /// the value awaits replication.
+    pub fn live(&self, context_id: &str, what: &str) -> Result<&T, ContextError> {
+        match self {
+            Self::Live(value) => Ok(value),
+            Self::AwaitingReplication => Err(ContextError::InvalidState(format!(
+                "context '{context_id}' has not yet received its live {what}: this member \
+                 joined through a Welcome and no governance action has set them since"
+            ))),
         }
     }
 }
@@ -2201,6 +2254,17 @@ pub(crate) fn fresh_governance_state(
                 context_id.to_owned(),
                 clock,
             ),
+            // Spec 07 §7.3.4.4: the creator seeds the governance-held list
+            // from the genesis declaration. A Welcome joiner cannot: the
+            // declaration records no `ModifyCapabilityRequirements` made
+            // since, so the joiner's admission check fails closed until one
+            // reaches it, for the reason `OutletRegistrySeed` gives.
+            capability_requirements: match outlet_seed {
+                OutletRegistrySeed::GenesisDeclaration => {
+                    Replicated::Live(params.capability_requirements.clone())
+                }
+                OutletRegistrySeed::AwaitingLeafReplication => Replicated::AwaitingReplication,
+            },
         },
     }
 }

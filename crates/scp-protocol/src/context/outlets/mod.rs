@@ -94,9 +94,11 @@ pub use stream::{
     SCP_OUTLET_CHUNK_V1, SCP_OUTLET_CREDIT_V1, SessionState, StreamRejection, StreamTerminalStatus,
     compute_cancel_sig_preimage, compute_caveats_binding, compute_chunk_sig_preimage,
     compute_credit_sig_preimage, evaluate_open_pinning, evaluate_revocation_recheck,
-    evaluate_session_open, sign_cancel, sign_chunk, sign_credit_grant, verify_cancel_signature,
-    verify_chunk_signature, verify_credit_signature,
+    evaluate_session_open, verify_cancel_signature, verify_chunk_signature,
+    verify_credit_signature,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use stream::{sign_cancel, sign_chunk, sign_credit_grant};
 
 // ---------------------------------------------------------------------------
 // OutletKind
@@ -425,9 +427,11 @@ pub enum OutletError {
     ///
     /// A convergent identity/hash must never be silently computed over
     /// defaulted-empty bytes: the error is surfaced instead of substituting an
-    /// empty preimage. Unreachable for well-formed `serde_json::Value` inputs
-    /// (which always canonicalize), but propagated as defense-in-depth for any
-    /// serializable value whose `Serialize` impl can fail.
+    /// empty preimage. A `serde_json::Value` reaches it when it carries an
+    /// integer beyond 2^53 or another number outside I-JSON (RFC 7493), whose
+    /// canonical bytes would also stand for a different number
+    /// ([`crate::jcs::require_i_json`]); any value whose `Serialize` impl fails
+    /// reaches it too.
     #[error("canonicalization failed: {reason}")]
     CanonicalizationFailed {
         /// Human-readable description of the serialization failure.

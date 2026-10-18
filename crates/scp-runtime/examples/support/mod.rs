@@ -27,6 +27,28 @@ pub fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&seed)
 }
 
+/// A custody-backed signer for `did`: imports the key from [`signing_key_for`]
+/// into an [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
+/// and signs through a [`CustodySigner`](scp_platform::CustodySigner), the
+/// shape a production host uses over its own custody (ADR-049 Decision 7a).
+///
+/// # Errors
+///
+/// Returns the custody's error when the import or the public-key read fails.
+pub async fn command_signer_for(
+    did: &DID,
+) -> Result<scp_runtime::context::actor::CommandSigner, scp_platform::error::PlatformError> {
+    use scp_platform::traits::KeyCustody;
+    let custody = std::sync::Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+    let seed = zeroize::Zeroizing::new(signing_key_for(did).to_bytes());
+    let handle = custody.import_ed25519_signing_key(&seed).await?;
+    let signer =
+        scp_platform::CustodySigner::new(custody, handle, scp_crypto::SigAlg::Ed25519).await?;
+    Ok(scp_runtime::context::actor::CommandSigner::from_custody(
+        signer,
+    ))
+}
+
 /// Convenience constructor: real `NodeMlsFactory` bound to a DID.
 pub fn example_crypto(did: &str) -> std::sync::Arc<NodeMlsFactory> {
     std::sync::Arc::new(NodeMlsFactory::new(

@@ -28,10 +28,14 @@
 //!
 //! # Not migrated as commands
 //!
-//! `verify_attestation`, `create_challenge`, `verify_challenge_response`
-//! are pure-CPU helpers with no state mutation; they live elsewhere in
-//! the runtime (DID resolver + clock only) and are not exercised through
-//! the actor mailbox.
+//! The trust operations read and mutate no per-context state, so none goes
+//! through a per-context actor mailbox. `verify_attestation` (`scp-protocol`)
+//! is a pure-CPU check over a DID resolver and a clock. The challenge
+//! operations keep per-challenger state, the attempt ledger, which the
+//! per-identity `ChallengerLedgerActor`
+//! (`supervisor/challenger_ledger_actor.rs`) owns: `Supervisor::dispatch_challenge_*`
+//! reaches it, and it signs the request and record digests inside its turn
+//! through the verifier's custody.
 
 // Module-level allow:
 //
@@ -367,7 +371,7 @@ pub async fn recovery_send_notification(
     sender_did: &str,
     payload: &[u8],
     sequence: u64,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &crate::context::actor::signer::CommandSigner,
 ) -> Result<(), ContextError> {
     let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -393,8 +397,9 @@ pub async fn recovery_send_notification(
         signing_key_id: scp_did::SigningKeyId::Active,
     };
 
-    let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+    // ADR-049 Decision 7a: signed through custody within the signing budget,
+    // before any send-tracker state is touched.
+    let inner = crate::envelope::inner::sign::create_inner_envelope_signed(&params, signer).await?;
 
     // Use domain-separated routing ID for relay routing, distinct from the
     // chokepoint-resolved 32-byte digest `context_id_bytes` (per ADR-056,
@@ -485,9 +490,9 @@ pub async fn recovery_notify_contact(
     recovering_did: &str,
     contact_did: &str,
     payload: &[u8],
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &crate::context::actor::signer::CommandSigner,
 ) -> Result<(), ContextError> {
-    use crate::context::actor::commands::{RecoverySendNotificationPayload, SigningKeyBytes};
+    use crate::context::actor::commands::RecoverySendNotificationPayload;
 
     let shared_context_id = deps
         .supervisor
@@ -502,7 +507,7 @@ pub async fn recovery_notify_contact(
                 sender_did: recovering_did.to_owned(),
                 payload: payload.to_vec(),
                 sequence: 4,
-                signing_key: SigningKeyBytes::from_signing_key(signing_key),
+                signer: signer.clone(),
             };
             deps.supervisor
                 .dispatch_recovery_send_notification(send_payload)

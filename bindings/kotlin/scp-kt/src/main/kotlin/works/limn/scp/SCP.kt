@@ -27,7 +27,6 @@ package works.limn.scp
 import uniffi.scp.AssetEntry
 import uniffi.scp.AttestationVerificationResult
 import uniffi.scp.BatchPublishResult
-import uniffi.scp.ChallengeResult
 import uniffi.scp.Checkpoint
 import uniffi.scp.ContextHandle
 import uniffi.scp.ContextParams
@@ -55,6 +54,7 @@ import uniffi.scp.StorageConfig
 import uniffi.scp.SyncPolicyResult
 import uniffi.scp.TransportManager
 import uniffi.scp.TransportStatus
+import uniffi.scp.TrustAggregationInputs
 import uniffi.scp.TrustScoreResult
 import uniffi.scp.UcanToken
 import works.limn.scp.bridge.CoroutineBridge
@@ -352,7 +352,7 @@ class SCP internal constructor(
      *   any bridge call).
      */
     @Suppress("LongParameterList")
-    fun aggregateTrustInput(
+    suspend fun aggregateTrustInput(
         contextId: String,
         subjectDid: String,
         events: List<EventLogEntry>,
@@ -366,13 +366,16 @@ class SCP internal constructor(
         inner.aggregateTrustInput(
             contextId = contextId,
             subjectDid = subjectDid,
-            eventsJson = encodeEventLogEntriesJson(events),
-            merkleRootJson = encodeMerkleRootJson(merkleRoot),
-            consequenceRulesJson = encodeConsequenceRulesJson(consequenceRules),
-            thresholdRequirementsJson = encodeThresholdRequirementsJson(thresholdRequirements),
-            attestorSetsJson = encodeAttestorSetsJson(attestorSets),
-            cachedAttestationsJson = encodeCachedAttestationsJson(cachedAttestations),
-            challengeResultsJson = encodeChallengeVerificationsJson(challengeResults),
+            inputs =
+                TrustAggregationInputs(
+                    eventsJson = encodeEventLogEntriesJson(events),
+                    merkleRootJson = encodeMerkleRootJson(merkleRoot),
+                    consequenceRulesJson = encodeConsequenceRulesJson(consequenceRules),
+                    thresholdRequirementsJson = encodeThresholdRequirementsJson(thresholdRequirements),
+                    attestorSetsJson = encodeAttestorSetsJson(attestorSets),
+                    cachedAttestationsJson = encodeCachedAttestationsJson(cachedAttestations),
+                    challengeResultsJson = encodeChallengeVerificationsJson(challengeResults),
+                ),
         )
 
     /** Forwards to [NativeScp.applyPendingCeilingModification] on [inner]. */
@@ -555,6 +558,23 @@ class SCP internal constructor(
             identity = identity,
             params = params,
         )
+
+    /**
+     * Creates a context from typed parameters: the SDK encodes
+     * [TypedContextParams.consequenceRules],
+     * [TypedContextParams.consequenceConfig] and
+     * [TypedContextParams.capabilityRequirements] to the bridge's JSON and
+     * forwards to [NativeScp.contextCreate] on [inner].
+     *
+     * @throws uniffi.scp.ScpException.Validation with the requirement's code
+     *   ([NON_CANONICAL_IDENTIFIER_CODE], [TOO_MANY_CAPABILITY_REQUIREMENTS_CODE],
+     *   [INVALID_REQUIREMENT_CODE]) for a requirement list that breaks a spec 07
+     *   §7.3.4.4 rule; otherwise fails as the [ContextParams] overload does.
+     */
+    suspend fun contextCreate(
+        identity: Identity,
+        params: TypedContextParams,
+    ): ContextHandle = contextCreate(identity = identity, params = params.toContextParams())
 
     /** Forwards to [NativeScp.contextDrainEvents] on [inner]. */
     suspend fun contextDrainEvents(handle: ContextHandle): List<String> = inner.contextDrainEvents(handle = handle)
@@ -1126,6 +1146,33 @@ class SCP internal constructor(
                 handle = handle,
                 proposerDid = proposerDid,
                 actionJson = actionJson,
+            ),
+        )
+
+    /**
+     * Proposes that the context's governance replace its capability
+     * requirements with [requirements], the complete new list; an empty list
+     * clears it (spec 07 §7.3.4.4). Encodes [requirements] and forwards to
+     * [NativeScp.governanceModifyCapabilityRequirements] on [inner].
+     *
+     * Returns the bridge's JSON after [checkProposalResponse] checks every
+     * name in it. Admission reads the new list once the proposal executes.
+     *
+     * @throws ScpException.Validation with the requirement's code
+     *   ([NON_CANONICAL_IDENTIFIER_CODE], [TOO_MANY_CAPABILITY_REQUIREMENTS_CODE],
+     *   [INVALID_REQUIREMENT_CODE]) for a list that breaks a §7.3.4.4 rule;
+     *   otherwise fails as [governancePropose] does.
+     */
+    suspend fun governanceModifyCapabilityRequirements(
+        handle: ContextHandle,
+        proposerDid: String,
+        requirements: List<CapabilityRequirement>,
+    ): String =
+        checkProposalResponse(
+            inner.governanceModifyCapabilityRequirements(
+                handle = handle,
+                proposerDid = proposerDid,
+                requirementsJson = encodeCapabilityRequirementsJson(requirements),
             ),
         )
 
@@ -2066,8 +2113,78 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.transportStatus] on [inner]. */
     suspend fun transportStatus(manager: TransportManager): TransportStatus = inner.transportStatus(manager = manager)
 
-    /** Forwards to [NativeScp.trustCreateChallenge] on [inner]. */
-    fun trustCreateChallenge(targetDid: String): ChallengeResult = inner.trustCreateChallenge(targetDid = targetDid)
+    /**
+     * Issues a challenge request for [CreateChallengeConfig.capabilityUri],
+     * signed by [CreateChallengeConfig.verifier]'s `#active` key through
+     * custody (spec 07 §7.3.4 step 1, ADR-017).
+     *
+     * The challenger writes the test cases with their expected outputs. The
+     * returned request carries each case without its expected output; the
+     * challenger's ledger keeps the expected outputs to grade with. The
+     * capability definition sets the pass threshold, the retries and the
+     * cooldown; [CreateChallengeConfig.policy] may only tighten them, on any
+     * URI. The `CustomEval` cases' one evaluator context goes to the bridge
+     * as the context whose outlets grade them.
+     *
+     * @throws IllegalArgumentException when the returned request is malformed.
+     * @throws uniffi.scp.ScpException.Validation with code `SCP-VALID-7001`,
+     *   before any bridge call, when `CustomEval` cases name two evaluator
+     *   contexts; with [CHALLENGE_SUITE_BELOW_MINIMUM_CODE] when the suite has
+     *   fewer cases than the definition's minimum, `SCP-VALID-7002` for
+     *   malformed test cases, [POLICY_OUTSIDE_DEFINITION_CODE] for a policy
+     *   looser than the definition, [SELF_CHALLENGE_CODE] when the subject is
+     *   the verifier, [EVALUATOR_UNAVAILABLE_CODE] for a `CustomEval` outlet
+     *   that cannot run, [CHALLENGE_WINDOW_OPEN_CODE] while the verifier's
+     *   last challenge to the subject is in its window, and
+     *   [NON_CANONICAL_IDENTIFIER_CODE] for a DID that is not canonical.
+     */
+    suspend fun trustCreateChallenge(config: CreateChallengeConfig): ChallengeRequest =
+        decodeChallengeRequestJson(
+            inner
+                .trustCreateChallenge(
+                    verifier = config.verifier,
+                    subject = config.subject,
+                    capabilityUri = config.capabilityUri,
+                    testCasesJson = encodeTestCasesJson(config.testCases),
+                    contextId = config.contextId,
+                    windowSecs = config.windowSecs,
+                    evaluatorContextId = evaluatorContextOf(config.testCases),
+                    policy = config.policy,
+                ).requestJson,
+        )
+
+    /**
+     * Answers [request] for [attempt], signed by [subject]'s `#active` key
+     * (spec 07 §7.3.4 step 2, ADR-017).
+     *
+     * The challenger's signature on [request] is checked against the key this
+     * instance's DID resolver returns before anything is signed.
+     *
+     * @param subject The challenged identity.
+     * @param request The signed request, as the challenger sent it.
+     * @param outputs One output per case.
+     * @param attempt The attempt number, starting at 1.
+     * @throws IllegalArgumentException on a malformed [request] before any
+     *   bridge call, or when the returned response is malformed.
+     * @throws uniffi.scp.ScpException.Validation when the request's signature,
+     *   subject or window does not hold.
+     * @throws uniffi.scp.ScpException.Identity with code `SCP-IDENT-1033` when
+     *   this instance has no DID resolver.
+     */
+    suspend fun trustRespondToChallenge(
+        subject: Identity,
+        request: ChallengeRequest,
+        outputs: List<TestOutput>,
+        attempt: UInt,
+    ): ChallengeResponse =
+        decodeChallengeResponseJson(
+            inner.trustRespondToChallenge(
+                subject = subject,
+                requestJson = encodeChallengeRequestJson(request),
+                outputsJson = encodeTestOutputsJson(outputs),
+                attempt = attempt,
+            ),
+        )
 
     /**
      * Routes through the UniFFI-generated free function
@@ -2091,7 +2208,7 @@ class SCP internal constructor(
      * on [inner]. A revocation list that cannot be read throws; it never reads
      * as `valid = false`.
      */
-    fun trustVerifyAttestation(
+    suspend fun trustVerifyAttestation(
         contextId: String,
         attestation: CachedAttestationEnvelope,
     ): AttestationVerificationResult =
@@ -2101,24 +2218,44 @@ class SCP internal constructor(
         )
 
     /**
-     * Verifies a challenge response against its original challenge request
-     * (ADR-017, §7.3.4). Takes the typed [ChallengeRequest] /
-     * [ChallengeResponse] and serializes them to the serde wire shapes
-     * internally (ADR-058), then forwards to [NativeScp.trustVerifyResponse]
-     * on [inner] unchanged. Returns `true` if the response is valid (correct
-     * responder, within timeout, valid signature), `false` otherwise.
+     * Grades [response] to [request] and returns the record, signed by
+     * [verifier]'s `#active` key (spec 07 §7.3.4 steps 3 and 4, ADR-017).
      *
-     * @throws IllegalArgumentException on a wrong-length signature (before
-     *   any bridge call).
+     * Both signatures are checked first. The challenger's ledger then checks
+     * the attempt number, the cooldown and the window, grades each case against
+     * its stored expected output, and signs a record for the attempt, pass or
+     * fail. The
+     * record is also written to this instance's trust store;
+     * [GradedChallenge.trustStoreError] says why when that write failed.
+     *
+     * @param verifier The identity that issued [request].
+     * @param request The signed request.
+     * @param response The subject's signed response.
+     * @throws IllegalArgumentException on a malformed [request] or [response]
+     *   before any bridge call, or when the returned record is malformed.
+     * @throws uniffi.scp.ScpException.Validation when a signature or the
+     *   attempt does not hold, and with a code [isRetryable] accepts
+     *   ([GRADING_CAPACITY_EXHAUSTED_CODE], [GRADING_LEASE_LOST_CODE],
+     *   [GRADING_IN_PROGRESS_CODE], [COOLDOWN_ACTIVE_CODE],
+     *   [CHALLENGE_NOT_YET_GRADABLE_CODE]) for a grading that used no attempt.
      */
-    fun trustVerifyResponse(
-        challenge: ChallengeRequest,
+    suspend fun trustGradeResponse(
+        verifier: Identity,
+        request: ChallengeRequest,
         response: ChallengeResponse,
-    ): Boolean =
-        inner.trustVerifyResponse(
-            challengeJson = encodeChallengeRequestJson(challenge),
-            responseJson = encodeChallengeResponseJson(response),
+    ): GradedChallenge {
+        val graded =
+            inner.trustGradeResponse(
+                verifier = verifier,
+                requestJson = encodeChallengeRequestJson(request),
+                responseJson = encodeChallengeResponseJson(response),
+            )
+        return GradedChallenge(
+            record = decodeChallengeVerificationJson(graded.recordJson),
+            caseResults = decodeCaseResultsJson(graded.reasonsJson),
+            trustStoreError = graded.trustStoreError,
         )
+    }
 
     /**
      * Read-only, structured counterpart to [ucanValidate].
@@ -2187,7 +2324,7 @@ class SCP internal constructor(
      * [NO_PARTICIPATION_FACTS_CODE]; callers wanting the empty-log case as a
      * zeroed record (rather than an exception) should use [evaluateTrust].
      */
-    fun participationRecord(
+    suspend fun participationRecord(
         contextId: String,
         subjectDid: String,
         cachedAttestations: List<CachedAttestation> = emptyList(),
@@ -2397,39 +2534,39 @@ class SCP internal constructor(
 
     /**
      * Verifies that an agent meets a context's capability requirements for
-     * admission (spec §7.3.4.4, SCP-ACR-008). Serializes the typed
-     * [CapabilityRequirement] / [ChallengeVerification] values (and the agent
-     * capability URIs) to the serde wire shape (ADR-058) and routes through
-     * the UniFFI-generated free function
-     * [uniffi.scp.checkCapabilityRequirements] unchanged. ADR-048 §1 + §7
-     * Kotlin bullet.
+     * admission (spec 07 §7.3.4.4). Serializes the agent capability URIs and
+     * the typed [ChallengeVerification] records to the serde wire shape
+     * (ADR-058) and forwards to [NativeScp.checkCapabilityRequirements] on
+     * [inner].
      *
-     * [subjectDid]/[contextId] bind challenge verifications to the agent and
-     * context being admitted: a [ChallengeVerification] only satisfies a
-     * requirement when its signed `subject_did`/`context_id` equal these
-     * values, closing cross-subject and cross-context attribution.
+     * The requirements are the ones the context's governance holds at the time
+     * of the call, set through [TypedContextParams.capabilityRequirements] or
+     * [governanceModifyCapabilityRequirements]; the caller cannot supply
+     * them. A `ChallengeVerified` requirement is met only by a passing
+     * record signed by one of its trusted verifiers, for [subjectDid] and
+     * [contextId], within the requirement's retry cap. Each
+     * record's signature is checked against the verifier's `#active` key,
+     * resolved through this instance's DID resolver.
      *
-     * Returns normally when all requirements are satisfied; the bridge throws
-     * on any unmet requirement or malformed input.
+     * Returns normally when all requirements are satisfied.
      *
-     * Security caveat — authenticity is not authorization: a passing
-     * `ChallengeVerified` check proves the verifier's signature is authentic
-     * and bound to this subject/context, NOT that the verifier is *trusted*.
-     * Because `verifier_did` is self-certifying, a subject can present a
-     * genuinely-signed result from a verifier it controls. Establish verifier
-     * legitimacy separately and MUST NOT treat success as authorization.
+     * @throws IllegalArgumentException on a malformed record before any bridge
+     *   call.
+     * @throws uniffi.scp.ScpException.Validation with code `SCP-VALID-7076`
+     *   for an unmet requirement, `SCP-VALID-7000` for a malformed DID, and
+     *   [NON_CANONICAL_IDENTIFIER_CODE] for a DID that is not canonical.
+     * @throws uniffi.scp.ScpException.Identity with code `SCP-IDENT-1033` when
+     *   a record must be verified and this instance has no DID resolver.
      */
-    fun checkCapabilityRequirements(
+    suspend fun checkCapabilityRequirements(
         contextId: String,
         subjectDid: String,
-        requirements: List<CapabilityRequirement>,
         agentCapabilities: List<String>,
         challengeVerifications: List<ChallengeVerification>,
     ) {
-        uniffi.scp.checkCapabilityRequirements(
+        inner.checkCapabilityRequirements(
             contextId = contextId,
             subjectDid = subjectDid,
-            requirementsJson = encodeCapabilityRequirementsJson(requirements),
             agentCapabilitiesJson = encodeAgentCapabilitiesJson(agentCapabilities),
             challengeVerificationsJson = encodeChallengeVerificationsJson(challengeVerifications),
         )

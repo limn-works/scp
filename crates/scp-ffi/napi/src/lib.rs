@@ -200,6 +200,25 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Drives `fut` to completion on the calling thread through
+/// [`scp_ffi_common::bridge_wait::bridge_block_on`], with this bridge's shared
+/// runtime for a thread outside every runtime (a napi-rs or libuv worker).
+/// Inside a current-thread runtime it refuses, because the awaited work may
+/// need the thread the wait would block.
+///
+/// # Errors
+///
+/// `SCP-CTX-2001` when the wait cannot drive `fut`.
+pub(crate) fn block_on_shared<F>(fut: F) -> Result<F::Output, crate::error::ScpNapiError>
+where
+    F: std::future::Future,
+{
+    Ok(scp_ffi_common::bridge_wait::bridge_block_on(
+        || Ok(runtime()),
+        fut,
+    )?)
+}
+
 // ---------------------------------------------------------------------------
 // Handle reference counter — shutdown ordering
 //

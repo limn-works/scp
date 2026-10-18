@@ -3775,27 +3775,26 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "crates/scp-core/trust/challenge.rs"
+        "crates/scp-protocol/src/trust/challenge.rs",
+        "crates/scp-runtime/src/context/supervisor/challenger_ledger_actor.rs",
+        "crates/scp-ffi/common/src/challenge.rs"
       ],
-      "description": "Implement challenge-response protocol that enables verification of testable capabilities. Standard challenge suites include prompt injection resistance, schema validation, and rate limit compliance. Challenge-response distinguishes self-attested vs challenge-verified in metadata.",
+      "description": "Implement the challenge-response protocol that verifies a testable capability (`07-trust-validation-and-capabilities.md` §7.3.4): the challenger writes a test suite and keeps its answer key, the subject submits outputs only, and the challenger grades them and signs a `ChallengeVerification` record for every graded attempt. A context counts a record toward admission only through its capability requirements (§7.3.4.4), where a passed challenge-verified record also meets a self-attested requirement.",
       "acceptanceCriteria": [
-        "ChallengeRequest struct defined with fields: challenge_id (String), challenge_type (ChallengeType), challenger_did (DID), subject_did (DID), parameters (serde_json::Value), timeout (Duration), signature (Ed25519Signature)",
-        "ChallengeResponse struct defined with fields: challenge_id (String), responder_did (DID), result (serde_json::Value), completed_at (u64), signature (Ed25519Signature)",
-        "issue_challenge(challenger_did, subject_did, challenge_type, params) -> ChallengeRequest constructs and signs a challenge request",
-        "Standard challenge suites defined: prompt injection resistance, schema validation, rate limit compliance",
-        "verify_challenge_response(request, response) -> Result<ChallengeVerification, TrustError> verifies response signature against responder's identifier",
-        "verify_challenge_response validates response matches the challenge parameters",
-        "verify_challenge_response distinguishes self-attested vs challenge-verified in metadata"
+        "ChallengeRequest struct defined as `07-trust-validation-and-capabilities.md` §7.3.4 specifies: challenge_id, verifier, subject, capability_uri, definition_digest, test_cases (each carrying test_id, input, category and weight, and nothing derived from its expected output), created_at, expires_at, max_retries, cooldown_secs, pass_threshold_bps, context_id and verifier_signature (amended 2026-10-13: challenge_type, parameters and timeout are replaced; amended 2026-10-17: the per-case answer commitment is removed)",
+        "ChallengeResponse struct defined as `07-trust-validation-and-capabilities.md` §7.3.4 specifies: challenge_id, request_digest, subject, attempt, outputs and subject_signature (amended 2026-10-13: responder_did, result and completed_at are replaced)",
+        "`create_challenge` builds the request through `challenge_request_unsigned(NewChallenge { verifier, subject, test_cases, created_at, window_secs, context_id, policy })`, and the challenger's ledger signs its digest through the verifier's custody signer and persists the signed request with its answer key before returning it (amended 2026-10-13: timeout_secs is replaced by the signed time window)",
+        "`respond_to_challenge` verifies the request signature against the verifier's `#active` key, checks that the request names the caller as subject and that the request window is open, builds one output per case in case order, and signs the response through the subject's custody signer",
+        "`grade_response` authenticates the response (its request digest, the request's verifier and subject, and the subject's signature over `D_r`), grades every output against the answer key in the challenger's ledger, and returns a signed `ChallengeVerification` for every graded attempt, passed or failed",
+        "`check_capability_requirements` counts a `ChallengeVerification` only when `verify_challenge_verification` accepts it under `07-trust-validation-and-capabilities.md` §7.3.4 step 5, and a `SelfAttested` requirement is met by a self-asserted capability URI or by a passed record for that URI",
+        "The protocol publishes no test suite: the challenger writes every suite, and a challenge for a protocol capability URI with fewer cases than its §7.3.4.3 minimum is refused with `ChallengeSuiteBelowMinimum`"
       ],
       "actionItems": [
-        "Create crates/scp-core/trust/challenge.rs with ChallengeRequest, ChallengeResponse, ChallengeType, ChallengeVerification types",
-        "Define ChallengeType enum with standard suites (PromptInjectionResistance, SchemaValidation, RateLimitCompliance) and custom variant",
-        "Implement issue_challenge that constructs request, generates challenge_id, and signs with challenger's key",
-        "Implement verify_challenge_response with signature verification against responder's identifier",
-        "Implement challenge parameter matching validation",
-        "Implement self-attested vs challenge-verified distinction in ChallengeVerification metadata",
-        "Implement timeout checking for expired challenges",
-        "Write unit tests for challenge issuance, response verification, and timeout handling"
+        "Define ChallengeRequest, ChallengeCase, ChallengeResponse, TestOutput and ChallengeVerification in crates/scp-protocol/src/trust/challenge.rs with their §7.3.4 canonical encodings",
+        "Implement challenge_request_unsigned, challenge_response_unsigned, authenticate_challenge_response, grade and verify_challenge_verification",
+        "Implement the challenger's attempt ledger as a per-identity actor that signs and persists each request and record",
+        "Export create_challenge, respond_to_challenge, grade_response and check_capability_requirements from scp-ffi-common to every bridge",
+        "Write unit tests for issuance, response, grading, record verification and admission"
       ],
       "blockedBy": [
         "SCP-006"
@@ -3807,14 +3806,14 @@
         }
       ],
       "details": {
-        "module": "scp-core/trust/challenge.rs",
-        "estimatedFunctions": "~3 public functions, ~2 internal helpers",
+        "module": "scp-protocol/src/trust/challenge.rs",
+        "estimatedFunctions": "~8 public functions, ~10 internal helpers",
         "rustTypes": {
-          "ChallengeRequest": "pub struct ChallengeRequest { pub challenge_id: String, pub challenge_type: ChallengeType, pub challenger_did: DID, pub subject_did: DID, pub parameters: serde_json::Value, pub timeout: Duration, pub signature: Ed25519Signature }",
-          "ChallengeResponse": "pub struct ChallengeResponse { pub challenge_id: String, pub responder_did: DID, pub result: serde_json::Value, pub completed_at: u64, pub signature: Ed25519Signature }"
+          "ChallengeRequest": "pub struct ChallengeRequest { pub challenge_id: [u8; 32], pub verifier: String, pub subject: String, pub capability_uri: String, pub definition_digest: [u8; 32], pub test_cases: Vec<ChallengeCase>, pub created_at: u64, pub expires_at: u64, pub max_retries: u32, pub cooldown_secs: u32, pub pass_threshold_bps: u32, pub context_id: String, pub verifier_signature: Vec<u8> } (07-trust-validation-and-capabilities.md §7.3.4)",
+          "ChallengeResponse": "pub struct ChallengeResponse { pub challenge_id: [u8; 32], pub request_digest: [u8; 32], pub subject: String, pub attempt: u32, pub outputs: Vec<TestOutput>, pub subject_signature: Vec<u8> } (07-trust-validation-and-capabilities.md §7.3.4)"
         }
       },
-      "result": "Challenge-response protocol with 3 standard suites. 15 new tests."
+      "result": "Challenger-graded challenge-response protocol: challenger-written suites, a signed record per graded attempt, and admission through context capability requirements."
     },
     {
       "id": "SCP-064",
@@ -10678,6 +10677,7 @@
         "crates/scp-protocol/src/crypto/ucan/mod.rs",
         "crates/scp-protocol/src/envelope/mod.rs",
         "crates/scp-protocol/src/provenance/attach.rs",
+        "crates/scp-runtime/src/context/actor/signer.rs",
         "crates/scp-runtime/src/context/export_import.rs",
         "crates/scp-runtime/src/context/outlets/signer.rs",
         "crates/scp-runtime/src/context/outlets/stream.rs",
@@ -10690,7 +10690,6 @@
         "crates/scp-runtime/src/crypto/ucan/mint.rs",
         "crates/scp-runtime/src/envelope/inner/sign.rs",
         "crates/scp-runtime/src/envelope/pseudonym.rs",
-        "crates/scp-runtime/src/event_log/mod.rs",
         "crates/scp-runtime/tests/governance_integration.rs",
         "crates/scp-runtime/tests/test_vectors.rs",
         "crates/scp-testing/Cargo.toml",
@@ -10792,9 +10791,24 @@
         "The §25.19 Vector 30 and 31 points reproduce in Rust, Swift and Kotlin custody and through the TypeScript and Python software-host export; the Vector 30 v1 routing id reproduces through each bridge's callback adapter, for PyO3 and UniFFI in the Rust test `callback_pseudonym_routing_id_is_spec_25_19_vector_30` (`crates/scp-ffi/src/custody.rs`, `crates/scp-ffi/uniffi/src/bridge.rs`) and for napi in the TypeScript test \"the host receives the caller's context and epoch unchanged and the bridge returns the §25.19 Vector 30 routing ids\" (`bindings/typescript/tests/custody-bridge-checks.test.ts`), which runs through the addon's `TestingCallbackCustody` because a napi Rust unit test cannot host a JavaScript callback; scp-crypto's §25.19 KAT covers every routing id (`25-test-vectors.md` §25.19)",
         "No unwrap() or expect() in library code",
         "No custody stores a pseudonym key. After an identity is destroyed, deriving its v1 or v2 pseudonym fails with `SCP-CRYPTO-4006`, while another identity's pseudonyms still derive, in the file, SQLite, test, Apple and Android custodies. On Android hardware custody, a destroy that fails part-way leaves the identity destroyable, and a retry deletes the pseudonym secret: a test per custody (`09-security-model.md` §9.10.4.A)",
-        "A failed `KeyCustody` call keeps its kind across every layer: `EnvelopeError`, `ContextError`, `SenderKeyError`, `AccessKeyError`, `UcanError` and `EventLogError` carry it as a typed `CustodyFailure`, and the PyO3, napi and UniFFI bridges report key-not-found as `SCP-CRYPTO-4006`, a rejected host pseudonym as `SCP-IDENT-1055` and every other custody failure as `SCP-CRYPTO-4060`, whether it arrives as a `PlatformError` or as a `CustodyFailure`: one table test per bridge (ADR-006 2026-09-29 amendment, `sdk-common.md`)",
+        "A failed `KeyCustody` call keeps its kind across every layer: `EnvelopeError`, `ContextError`, `SenderKeyError`, `AccessKeyError`, `UcanError` and `EventLogError` carry it as a typed `CustodyFailure`, and the PyO3, napi and UniFFI bridges report key-not-found as `SCP-CRYPTO-4006`, a rejected host pseudonym as `SCP-IDENT-1055`, a custody sign past the ADR-049 Decision 7a signing budget (`CustodyFailureKind::TimedOut`) as `SCP-CRYPTO-4062`, and every other custody failure as `SCP-CRYPTO-4060`, whether it arrives as a `PlatformError` or as a `CustodyFailure`: one table test per bridge (ADR-006 2026-09-29 and 2026-10-11 amendments, `sdk-common.md`)",
+        "The context actor holds no key material: a command that needs a signature carries a `CommandSigner` over the identity's custody, and the handler awaits `CommandSigner::sign_bounded_ed25519` once per signature within `SIGN_TIMEOUT` (30 seconds). A custody sign that does not answer within that budget fails the turn as `CustodyFailureKind::TimedOut`, which every native bridge reports as `SCP-CRYPTO-4062` and never as a transport timeout, and a signer whose algorithm the signed structure does not accept fails before custody is called: a test with a custody that never answers asserts `SCP-CRYPTO-4062` within the budget (ADR-049 Decision 7a, ADR-006 2026-10-11 amendment)",
+        "No custody, bridge or SDK exports signing key bytes: the platform and testing accessors, the bridge exports, the host export callbacks of the four SDKs and `SigningKeyBytes` are deleted, and `scripts/check-deleted-primitives.sh` fails on `export_signing_key_bytes` in any crate source file or on `export_signing_key_bytes` or `exportSigningKeyBytes` in any binding source file",
+        "Challenge requests and `ChallengeVerification` records follow `07-trust-validation-and-capabilities.md` §7.3.4 as amended 2026-10-13: `25-test-vectors.md` §25 Vectors 61 to 65 reproduce through the production encoders, and a consumer rejects each record that fails a §7.3.4 step 5 check, with one test per rejection",
         "`python3.12 scripts/gen-test-vectors-p256.py` reproduces every value `25-test-vectors.md` §25 prints, and each fixture party's identifier inside a §25 signed or hashed structure is the 56-character `scp:` text form of `SHA-256(\"SCP test vector identifier <role>\")` for a role §25.1 lists (`25-test-vectors.md` §25.1)",
-        "Every §25 vector the regeneration changed is asserted by a Rust test that computes it through the production function that builds that structure, with these exceptions, each checked against the printed bytes with the `scp-crypto` P-256 primitives and carrying a comment that names the change which moves its production path: the Vector 5-8, 26, 34 and 37 signatures, the Vector 32 append and Vector 33 until slice S12 moves production signing to P-256; Vector 37 until S0 PR4; Vectors 20 and 38 until the root-set slice replaces `compute_key_continuity_fingerprint`"
+        "Every §25 vector the regeneration changed is asserted by a Rust test that computes it through the production function that builds that structure, with these exceptions, each checked against the printed bytes with the `scp-crypto` P-256 primitives and carrying a comment that names the change which moves its production path: the Vector 5-8, 26, 34 and 37 signatures, the Vector 32 append and Vector 33 until slice S12 moves production signing to P-256; Vector 37 until S0 PR4; Vectors 20 and 38 until the root-set slice replaces `compute_key_continuity_fingerprint`",
+        "A challenge request carries `created_at`, `expires_at`, `max_retries`, `cooldown_secs`, `pass_threshold_bps`, `definition_digest` and `context_id` under its signature, and nothing derived from a case's expected output: a test asserts that the serialized request has no `expected` key, and the §25.31 Vector 61 request preimage carries no per-case commitment (`07-trust-validation-and-capabilities.md` §7.3.4)",
+        "Attempt state persists across a restart through the supervisor's encrypted storage and is pruned after `expires_at + CHALLENGE_CLOCK_SKEW_SECS`; a prune whose delete fails refuses no turn. The challenger signs a request or a record before the ledger writes it, and a sign failure or a write failure leaves no entry and no attempt: a test per persist site (index, entry, attempt, fault, prune). The test does not assert signature bytes, because nonce rule B allows random nonces (`07-trust-validation-and-capabilities.md` §7.3.4 steps 1 and 4, §7.3.4.5)",
+        "Before any DID resolution, the challenger looks up the challenge without changing its ledger and refuses with `UnknownChallenge` when the entry is missing, its stored request digest differs from the digest of the request the caller supplied, its stored subject differs from the request's subject by canonical key, or the challenge is closed and no stored attempt has the response's `D_r`; a test asserts that the resolver is never called. The challenger then refuses, before any grading work and again at commit, an attempt at a time not strictly after `created_at` and strictly before `expires_at`, out of order, beyond `1 + max_retries`, inside `cooldown_secs` of the later of the last graded attempt and the last fault, or after a pass, each with its own error code. A response that fails authentication takes no lease and records no fault, and every graded attempt yields a signed record carrying `attempt` and `response_digest` (`07-trust-validation-and-capabilities.md` §7.3.4 step 3)",
+        "A `CustomEval` case is graded through the challenger's evaluator outlet. Whether the evaluator started decides the outcome: a rate-limit or budget refusal by the evaluator context's economy reserve step is a capacity refusal that releases the lease, records neither an attempt nor a fault and returns `GradingCapacityExhausted`; a missing outlet, or any other error before the evaluator started (a missing context registration or a denied permission), is a grading fault; an evaluator error after it started (a handler error, a schema mismatch, a schema backtrack limit, a panic, a malformed verdict or a timeout) fails the case; and a settle or capture error after the handler returned a well-formed verdict is a fault that discards the verdict. A grading fault uses no attempt, leaves the challenge open and starts the cooldown from its time, and a test asserts that four faults leave the challenge open. A test per outcome (`07-trust-validation-and-capabilities.md` §7.3.4 step 3)",
+        "Admission counts a challenge record only when it matches its capability definition (`max_retries` at most the definition's ceiling, `cooldown_secs` at least its floor, the threshold equal to the definition's), its verifier is in the requirement's `trusted_verifiers`, it respects the requirement's `retry_cap`, and its verifier and subject differ by canonical key. A context's capability requirements are set only through `ModifyCapabilityRequirements` or context creation, and a change that loosens them restores the old list when its persist fails (`07-trust-validation-and-capabilities.md` §7.3.4.4)",
+        "The five standards `07-trust-validation-and-capabilities.md` §7.3.4.7 lists are refused at create and at consume with `StandardNotGradable`, and identifier-scoped capability URIs are refused with `CapabilityDefinitionUnavailable` until a definition source ships",
+        "Concurrent gradings per challenger identity are bounded by `MAX_CONCURRENT_GRADINGS_PER_CHALLENGER`, and an evaluator thread that times out holds its permit until it returns: a test holds the bound and asserts the next grading is refused (`09-security-model.md` §9.18.C)",
+        "The challenger refuses to create a challenge with `ChallengeWindowOpen` (`SCP-VALID-7151`) while its last challenge to the same subject, compared by canonical key, for the same capability URI is inside its window, whether that challenge is closed or not, and creates one at that challenge's `expires_at`: a test per case, including after a pass and after a restart (`07-trust-validation-and-capabilities.md` §7.3.4 step 1)",
+        "A capability definition, a challenge policy and a `retry_cap` accept every `u32` for `max_retries` and `cooldown_secs`, no protocol constant bounds either, and every sum of a time and a cooldown saturates: a test at `u32::MAX` for each (`07-trust-validation-and-capabilities.md` §7.3.4.6)",
+        "Create refuses a window shorter than the policy's `cooldown_secs` with `ChallengeWindowInvalid`, a consumer refuses a record whose window is shorter than its definition's `cooldown_secs` with `PolicyOutsideDefinition`, and admission refuses a record whose window is shorter than the requirement's `retry_cap.min_cooldown_secs` with `RetryCapExceeded`: a test per check (`07-trust-validation-and-capabilities.md` §7.3.4 steps 1 and 5(g), §7.3.4.4)",
+        "A consumer rejects a record unless `challenge_created_at < timestamp < challenge_expires_at`, and the ledger grades an attempt only at a time strictly inside the window: a test at `created_at`, `created_at + 1`, `expires_at - 1` and `expires_at` for each check (`07-trust-validation-and-capabilities.md` §7.3.4 steps 3 and 5(c))",
+        "`MAX_OPEN_CHALLENGES_PER_CHALLENGER` counts only the challenges that are not closed: a test creates a challenge beside that many closed ones (`09-security-model.md` §9.18.C)"
       ],
       "actionItems": [
         "Add P-256 verification, low-s, point validation, DER-to-raw conversion and SHA-256 to `scp-crypto`.",

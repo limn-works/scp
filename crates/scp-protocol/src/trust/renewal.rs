@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use super::TrustError;
 use super::attestation::{
-    Attestation, AttestationRevocationChecker, DidPublicKeyResolver, verify_attestation,
+    ActiveKeyResolver, Attestation, AttestationRevocationChecker, verify_attestation,
 };
 use scp_clock::Clock;
 
@@ -101,7 +101,7 @@ pub enum RenewalError {
 /// - [`RenewalError::VerificationFailed`] if [`verify_attestation`] fails.
 pub fn renew_attestation(
     attestation: &Attestation,
-    resolver: &impl DidPublicKeyResolver,
+    resolver: &impl ActiveKeyResolver,
     clock: &impl Clock,
     revocation_checker: &dyn AttestationRevocationChecker,
 ) -> Result<Attestation, RenewalError> {
@@ -218,8 +218,8 @@ mod tests {
         }
     }
 
-    impl DidPublicKeyResolver for TestResolver {
-        fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+    impl ActiveKeyResolver for TestResolver {
+        fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
             self.keys
                 .get(did)
                 .cloned()

@@ -87,18 +87,15 @@ fn node_err(e: NodeError) -> PyErr {
 fn auto_wire_context_manager(
     bi: &crate::runtime::PyBridgeInstance,
     py: Python<'_>,
-    rt: &tokio::runtime::Runtime,
     node: &Arc<RunningNode>,
     relay_url: &str,
 ) -> Result<(), ScpPyError> {
-    py.allow_threads(|| {
-        rt.block_on(server::wire_supervisor_to_node(
-            &bi.core,
-            node,
-            relay_url,
-            |did| crate::runtime::init_context_manager(bi, did),
-        ))
-    })
+    crate::actor_wait::block_on_released(
+        py,
+        server::wire_supervisor_to_node(&bi.core, node, relay_url, |did| {
+            crate::runtime::init_context_manager(bi, did);
+        }),
+    )?
     .map_err(server_error)
 }
 
@@ -276,7 +273,6 @@ impl PyNodeHandle {
         if let Some(ref did) = author_did {
             crate::validate::validate_did(did)?;
         }
-        let rt = crate::runtime()?;
 
         // Resolve broadcast key: explicit or auto-lookup via Supervisor.
         // `PyNodeHandle` carries a reference to the bridge instance that
@@ -286,16 +282,17 @@ impl PyNodeHandle {
                 "broadcast key auto-lookup failed: {e}"
             ))
         })?);
-        let resolved = py.allow_threads(|| {
-            rt.block_on(server::resolve_broadcast_key(
+        let resolved = crate::actor_wait::block_on_released(py, async {
+            server::resolve_broadcast_key(
                 broadcast_key_hex,
                 author_did,
                 self.inner.did(),
                 &supervisor,
                 &context_id,
-            ))
+            )
+            .await
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-        })?;
+        })??;
         let broadcast_key = resolved.into_broadcast_key();
 
         let adm = match admission.to_lowercase().as_str() {
@@ -323,15 +320,17 @@ impl PyNodeHandle {
             csp_override,
         };
 
-        py.allow_threads(|| {
-            rt.block_on(self.inner.enable_broadcast_projection_with_site(
-                &context_id,
-                broadcast_key,
-                adm,
-                Some(site_config),
-            ))
-            .map_err(node_err)
-        })
+        crate::actor_wait::block_on_released(py, async {
+            self.inner
+                .enable_broadcast_projection_with_site(
+                    &context_id,
+                    broadcast_key,
+                    adm,
+                    Some(site_config),
+                )
+                .await
+                .map_err(node_err)
+        })?
     }
 
     /// Commits a deploy for a projected context (§18.11.11).
@@ -349,11 +348,12 @@ impl PyNodeHandle {
     ) -> PyResult<usize> {
         crate::validate::validate_context_id(&context_id)?;
         crate::validate::validate_deploy_id(&deploy_id)?;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            rt.block_on(self.inner.commit_deploy(&context_id, &deploy_id))
+        crate::actor_wait::block_on_released(py, async {
+            self.inner
+                .commit_deploy(&context_id, &deploy_id)
+                .await
                 .map_err(node_err)
-        })
+        })?
     }
 
     /// Rolls back to a previous deploy for a projected context (§18.11.11).
@@ -368,11 +368,12 @@ impl PyNodeHandle {
     ) -> PyResult<()> {
         crate::validate::validate_context_id(&context_id)?;
         crate::validate::validate_deploy_id(&deploy_id)?;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            rt.block_on(self.inner.rollback_deploy(&context_id, &deploy_id))
+        crate::actor_wait::block_on_released(py, async {
+            self.inner
+                .rollback_deploy(&context_id, &deploy_id)
+                .await
                 .map_err(node_err)
-        })
+        })?
     }
 
     /// Deactivates HTTP broadcast projection for the given context.
@@ -381,11 +382,10 @@ impl PyNodeHandle {
     /// retained epoch keys.
     fn disable_site_projection(&self, py: Python<'_>, context_id: String) -> PyResult<()> {
         crate::validate::validate_context_id(&context_id)?;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            rt.block_on(self.inner.disable_broadcast_projection(&context_id));
+        crate::actor_wait::block_on_released(py, async {
+            self.inner.disable_broadcast_projection(&context_id).await;
             Ok(())
-        })
+        })?
     }
 
     /// Starts the HTTP server in the background on the given bind address.
@@ -416,12 +416,13 @@ impl PyNodeHandle {
                 })
             })
             .transpose()?;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            rt.block_on(self.inner.serve_background(addr))
+        crate::actor_wait::block_on_released(py, async {
+            self.inner
+                .serve_background(addr)
+                .await
                 .map(|a| a.to_string())
                 .map_err(node_err)
-        })
+        })?
     }
 
     /// Returns the HTTP URL of the background server, or ``None`` if not serving.
@@ -430,8 +431,9 @@ impl PyNodeHandle {
     /// server was bound to the unspecified address.
     #[pyo3(name = "http_url")]
     fn http_url(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        let rt = crate::runtime()?;
-        Ok(py.allow_threads(|| rt.block_on(self.inner.http_url())))
+        Ok(crate::actor_wait::block_on_released(py, async {
+            self.inner.http_url().await
+        })?)
     }
 
     fn __repr__(&self) -> String {
@@ -539,7 +541,6 @@ fn instance_storage(bi: &crate::runtime::PyBridgeInstance) -> Result<InstanceSto
 fn node_start_on(
     bi_arc: &Arc<crate::runtime::PyBridgeInstance>,
     py: Python<'_>,
-    rt: &tokio::runtime::Runtime,
     config_json: &str,
     operator_did: &str,
 ) -> Result<PyNodeHandle, ScpPyError> {
@@ -553,14 +554,14 @@ fn node_start_on(
         return Err(server_error(ServerError::OperatorIdentityUnavailable));
     }
     let storage = instance_storage(bi)?;
-    let node = py
-        .allow_threads(|| rt.block_on(server::node_start(cfg, identity, storage)))
-        .map_err(server_error)?;
+    let node =
+        crate::actor_wait::block_on_released(py, server::node_start(cfg, identity, storage))?
+            .map_err(server_error)?;
     // Registered before anything else can fail, so `SCP.shutdown()` stops
     // this node before it releases the storage the node holds
     // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
     let inner = server::register_node(&bi.core, node);
-    auto_wire_context_manager(bi, py, rt, &inner, &inner.internal_relay_url())?;
+    auto_wire_context_manager(bi, py, &inner, &inner.internal_relay_url())?;
     Ok(PyNodeHandle {
         instance_id: bi.core.instance_id(),
         inner,
@@ -593,8 +594,7 @@ impl crate::scp::PyScp {
         identity: &crate::identity::PyIdentity,
     ) -> PyResult<PyNodeHandle> {
         crate::pyscp_check_handle!(&self.inner.core, identity);
-        let rt = crate::runtime()?;
-        node_start_on(&self.inner, py, rt, config_json, identity.did()).map_err(PyErr::from)
+        node_start_on(&self.inner, py, config_json, identity.did()).map_err(PyErr::from)
     }
 
     /// Starts a relay with in-memory blob storage on an OS-assigned port.
@@ -604,17 +604,14 @@ impl crate::scp::PyScp {
     #[pyo3(name = "relay_start_in_memory")]
     pub fn relay_start_in_memory(&self, py: Python<'_>) -> PyResult<PyRelayHandle> {
         let bi = &*self.inner;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            let relay = rt
-                .block_on(server::start_relay_in_memory())
-                .map_err(server_err)?;
+        crate::actor_wait::block_on_released(py, async {
+            let relay = server::start_relay_in_memory().await.map_err(server_err)?;
             let instance_id = bi.core.instance_id();
             Ok(PyRelayHandle {
                 inner: relay,
                 instance_id,
             })
-        })
+        })?
     }
 
     /// Starts a relay with redb-backed blob storage on an OS-assigned port.
@@ -623,17 +620,16 @@ impl crate::scp::PyScp {
     #[pyo3(name = "relay_start_local")]
     pub fn relay_start_local(&self, py: Python<'_>, data_dir: String) -> PyResult<PyRelayHandle> {
         let bi = &*self.inner;
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            let relay = rt
-                .block_on(server::start_relay_local(std::path::Path::new(&data_dir)))
+        crate::actor_wait::block_on_released(py, async {
+            let relay = server::start_relay_local(std::path::Path::new(&data_dir))
+                .await
                 .map_err(server_err)?;
             let instance_id = bi.core.instance_id();
             Ok(PyRelayHandle {
                 inner: relay,
                 instance_id,
             })
-        })
+        })?
     }
 
     /// Starts a development node with encrypted in-memory storage.
@@ -729,7 +725,6 @@ fn node_start_in_memory_on(
     identity_did: Option<String>,
 ) -> PyResult<PyNodeHandle> {
     let bi = &**bi_arc;
-    let rt = crate::runtime()?;
     let node_identity = match identity_did {
         Some(ref did) => {
             crate::validate::validate_did(did)?;
@@ -737,10 +732,11 @@ fn node_start_in_memory_on(
         }
         None => None,
     };
-    let node = py.allow_threads(|| {
-        rt.block_on(server::start_node_in_memory(node_identity))
+    let node = crate::actor_wait::block_on_released(py, async {
+        server::start_node_in_memory(node_identity)
+            .await
             .map_err(server_err)
-    })?;
+    })??;
 
     // Register this node as a borrower of this instance's resources, so
     // `SCP.shutdown()` stops it before `bridge_specific_shutdown` releases
@@ -749,7 +745,7 @@ fn node_start_in_memory_on(
     let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
     // Wire the Supervisor through the internal loopback URL: `relay_url()`
     // is the advertised URL, which requires TLS and lacks the bound port.
-    auto_wire_context_manager(bi, py, rt, &inner, &inner.internal_relay_url())?;
+    auto_wire_context_manager(bi, py, &inner, &inner.internal_relay_url())?;
 
     let instance_id = bi.core.instance_id();
     Ok(PyNodeHandle {
@@ -771,7 +767,6 @@ fn node_start_local_on(
     passphrase: Option<String>,
 ) -> PyResult<PyNodeHandle> {
     let bi = &**bi_arc;
-    let rt = crate::runtime()?;
     let node_identity = match identity_did {
         Some(ref did) => {
             crate::validate::validate_did(did)?;
@@ -781,32 +776,26 @@ fn node_start_local_on(
     };
     let zeroized_passphrase = passphrase.map(zeroize::Zeroizing::new);
     // Clone this instance's chosen backend out (a cheap `Arc` clone) before
-    // crossing into `allow_threads`. `get_storage` fails closed when an
+    // crossing into `block_on_released`. `get_storage` fails closed when an
     // instance was built without a storage selection, rather than letting a
     // node open a store of its own (SCP-CAPSEL-8000, spec §17.6).
     let storage = crate::runtime::get_storage(bi)?.clone();
-    let inner = py.allow_threads(|| {
+    let inner = crate::actor_wait::block_on_released(py, async {
         let data_dir = std::path::Path::new(&data_dir);
         match storage {
-            crate::runtime::StorageProvider::InMemoryEncrypted(s) => rt
-                .block_on(server::start_node_local(
-                    data_dir,
-                    s,
-                    node_identity,
-                    zeroized_passphrase,
-                ))
-                .map(RunningNode::InMemoryEncrypted),
-            crate::runtime::StorageProvider::Sqlite(s) => rt
-                .block_on(server::start_node_local(
-                    data_dir,
-                    s,
-                    node_identity,
-                    zeroized_passphrase,
-                ))
-                .map(RunningNode::Sqlite),
+            crate::runtime::StorageProvider::InMemoryEncrypted(s) => {
+                server::start_node_local(data_dir, s, node_identity, zeroized_passphrase)
+                    .await
+                    .map(RunningNode::InMemoryEncrypted)
+            }
+            crate::runtime::StorageProvider::Sqlite(s) => {
+                server::start_node_local(data_dir, s, node_identity, zeroized_passphrase)
+                    .await
+                    .map(RunningNode::Sqlite)
+            }
         }
         .map_err(server_err)
-    })?;
+    })??;
     // This node holds a clone of this instance's storage `Arc`, so register
     // it before anything else: `SCP.shutdown()` must stop this node before
     // the durable store closer closes that `SQLCipher` handle and drops
@@ -816,7 +805,7 @@ fn node_start_local_on(
 
     // Wire the Supervisor through the internal loopback URL — see the
     // comment in the `testing` `node_start_in_memory_on`.
-    auto_wire_context_manager(bi, py, rt, &inner, &inner.internal_relay_url())?;
+    auto_wire_context_manager(bi, py, &inner, &inner.internal_relay_url())?;
 
     let instance_id = bi.core.instance_id();
     Ok(PyNodeHandle {
@@ -1157,7 +1146,7 @@ mod tests {
             let probe = "did:dht:z6MkNodeStartOperatorProbe";
             let json = start_json(probe, |_| {});
             let err = start_error(
-                node_start_on(&scp.inner, py, rt(), &json, probe),
+                node_start_on(&scp.inner, py, &json, probe),
                 "unregistered operator",
             );
             assert_eq!(
@@ -1294,7 +1283,7 @@ mod tests {
             let passed = scp.identity_create(py, "in_memory", None).unwrap();
             let json = start_json(named.did(), |_| {});
             let err = start_error(
-                node_start_on(&scp.inner, py, rt(), &json, passed.did()),
+                node_start_on(&scp.inner, py, &json, passed.did()),
                 "config names another operator",
             );
             assert_eq!(
@@ -1428,7 +1417,7 @@ mod tests {
                 .unwrap();
             let inner = server::register_node(&bi.core, node);
 
-            let err = auto_wire_context_manager(bi, py, rt(), &inner, &unreachable_relay_url())
+            let err = auto_wire_context_manager(bi, py, &inner, &unreachable_relay_url())
                 .expect_err("a refused relay connect must fail the node start");
             assert_eq!(
                 class_and_code(&err),
@@ -1447,7 +1436,7 @@ mod tests {
                 .unwrap();
             assert!(server::supervisor_wired_to(&bi.core, &node.inner));
             let err = start_error(
-                node_start_on(&scp.inner, py, rt(), &start_json(&did, |_| {}), &did),
+                node_start_on(&scp.inner, py, &start_json(&did, |_| {}), &did),
                 "second node start",
             );
             assert_eq!(
@@ -1549,7 +1538,7 @@ mod tests {
                 ),
             ];
             for (label, json, class, code) in cases {
-                let err = start_error(node_start_on(&scp.inner, py, rt(), &json, &did), label);
+                let err = start_error(node_start_on(&scp.inner, py, &json, &did), label);
                 assert_eq!(class_and_code(&err), (class, code), "{label}: {err:?}");
             }
         });
@@ -1603,7 +1592,7 @@ mod tests {
             let params = pyo3::types::PyDict::new(py);
             params.set_item("mode", "encrypted").unwrap();
             params.set_item("ceiling", vec!["messages:read"]).unwrap();
-            scp.context_create(&did, &params)
+            scp.context_create(py, &did, &params)
                 .expect("context_create must succeed");
             let core = &scp.inner.core;
             let attached = Arc::clone(

@@ -278,8 +278,8 @@ public extension SCP {
 
     // swiftlint:disable function_parameter_count
     /// Forwards to ``Scp/aggregateTrustInput`` on ``inner``.
-    func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String) throws -> String {
-        try inner.aggregateTrustInput(contextId: contextId, subjectDid: subjectDid, eventsJson: eventsJson, merkleRootJson: merkleRootJson, consequenceRulesJson: consequenceRulesJson, thresholdRequirementsJson: thresholdRequirementsJson, attestorSetsJson: attestorSetsJson, cachedAttestationsJson: cachedAttestationsJson, challengeResultsJson: challengeResultsJson)
+    func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String) async throws -> String {
+        try await inner.aggregateTrustInput(contextId: contextId, subjectDid: subjectDid, inputs: TrustAggregationInputs(eventsJson: eventsJson, merkleRootJson: merkleRootJson, consequenceRulesJson: consequenceRulesJson, thresholdRequirementsJson: thresholdRequirementsJson, attestorSetsJson: attestorSetsJson, cachedAttestationsJson: cachedAttestationsJson, challengeResultsJson: challengeResultsJson))
     }
 
     // swiftlint:enable function_parameter_count
@@ -1237,9 +1237,11 @@ public extension SCP {
             assertedNonceHex: assertedNonceHex,
             timestampMs: timestampMs,
             chainDepth: chainDepth,
-            ucanToken: ucanToken,
-            proofTokens: proofTokens,
-            ucanProofId: ucanProofId,
+            authority: OutletStreamAuthority(
+                ucanToken: ucanToken,
+                proofTokens: proofTokens,
+                ucanProofId: ucanProofId
+            ),
             timeoutMs: timeoutMs,
             estimatedChunkCount: estimatedChunkCount
         )
@@ -1299,19 +1301,39 @@ public extension SCP {
         try await inner.transportStatus(manager: manager)
     }
 
-    /// Forwards to ``Scp/trustCreateChallenge`` on ``inner``.
-    func trustCreateChallenge(targetDid: String) throws -> ChallengeResult {
-        try inner.trustCreateChallenge(targetDid: targetDid)
-    }
-
     // `trustQueryScore` moved to a UniFFI-generated free top-level function
     // under ADR-048 §1 + §7 Swift bullet. Call it directly:
     //   `try trustQueryScore(did:contextId:)`
     // `trustVerifyAttestation(contextId:attestation:)` lives in Trust.swift.
 
-    /// Forwards to ``Scp/trustVerifyResponse`` on ``inner``.
-    func trustVerifyResponse(challengeJson: String, responseJson: String) throws -> Bool {
-        try inner.trustVerifyResponse(challengeJson: challengeJson, responseJson: responseJson)
+    /// Forwards to ``Scp/trustRespondToChallenge`` on ``inner``. Prefer the
+    /// typed overload in `Trust.swift` (ADR-058).
+    func trustRespondToChallenge(
+        subject: Identity,
+        requestJson: String,
+        outputsJson: String,
+        attempt: UInt32
+    ) async throws -> String {
+        try await inner.trustRespondToChallenge(
+            subject: subject,
+            requestJson: requestJson,
+            outputsJson: outputsJson,
+            attempt: attempt
+        )
+    }
+
+    /// Forwards to ``Scp/trustGradeResponse`` on ``inner``. Prefer the typed
+    /// overload in `Trust.swift` (ADR-058), which returns a ``GradedChallenge``.
+    func trustGradeResponse(
+        verifier: Identity,
+        requestJson: String,
+        responseJson: String
+    ) async throws -> ChallengeGradeResult {
+        try await inner.trustGradeResponse(
+            verifier: verifier,
+            requestJson: requestJson,
+            responseJson: responseJson
+        )
     }
 
     /// Forwards to ``Scp/ucanDelegate`` on ``inner``.
@@ -1338,17 +1360,31 @@ public extension SCP {
         try await inner.ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 
-    // `verifyParticipationRequirements` and `checkCapabilityRequirements` are
-    // UniFFI-generated free top-level functions (ADR-048 §1 + §7 Swift bullet,
-    // §7.3.2.1 / §7.3.4.4, SCP-ACR-008). The SDK also exposes typed free-function
-    // overloads in `Trust.swift` (ADR-058) that take typed `RequireParticipation`
-    // / `ParticipationProfile` / `CapabilityRequirement` / `ChallengeVerification`
-    // values and serialize them to the serde wire shape internally — prefer those
-    // over hand-rolled JSON:
+    /// Forwards to ``Scp/checkCapabilityRequirements`` on ``inner``. Prefer the
+    /// typed overload in `Trust.swift` (ADR-058), which serializes typed
+    /// ``ChallengeVerification`` values.
+    func checkCapabilityRequirements(
+        contextId: String,
+        subjectDid: String,
+        agentCapabilitiesJson: String,
+        challengeVerificationsJson: String
+    ) async throws {
+        try await inner.checkCapabilityRequirements(
+            contextId: contextId,
+            subjectDid: subjectDid,
+            agentCapabilitiesJson: agentCapabilitiesJson,
+            challengeVerificationsJson: challengeVerificationsJson
+        )
+    }
+
+    // `verifyParticipationRequirements` is a UniFFI-generated free top-level
+    // function (ADR-048 §1 + §7 Swift bullet, §7.3.2.1). The SDK also exposes a
+    // typed free-function overload in `Trust.swift` (ADR-058) that takes typed
+    // `RequireParticipation` / `ParticipationProfile` values and serializes them
+    // to the serde wire shape internally — prefer it over hand-rolled JSON:
     //   `try verifyParticipationRequirements(expectedSubject:requirements:profiles:)`
-    //   `try checkCapabilityRequirements(contextId:subjectDid:requirements:agentCapabilities:challengeVerifications:)`
-    // (`expectedSubject` — and `subjectDid`/`contextId` — bind the accounting to
-    // the agent/context being admitted; a genuine profile/result minted for
-    // another subject/context cannot admit this agent). See those wrappers'
-    // doc-comments for the full authenticity-is-not-authorization caveat.
+    // (`expectedSubject` binds the accounting to the agent being admitted; a
+    // genuine profile minted for another subject cannot admit this agent). See
+    // that wrapper's doc-comment for the full authenticity-is-not-authorization
+    // caveat.
 }

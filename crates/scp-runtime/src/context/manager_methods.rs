@@ -293,6 +293,7 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         outlet_interfaces: ctx.governance.outlet_interfaces.clone(),
         threshold_signers: ctx.governance.class_s.threshold_signers.clone(),
         threshold_value: ctx.governance.class_s.threshold_value,
+        capability_requirements: ctx.governance.class_s.capability_requirements.clone(),
         pruning_policy: ctx.governance.pruning_policy.clone(),
         governance_model_config: Some(ctx.governance.engine.model_config()),
         economic_policy: ctx.governance.economic_policy.clone(),

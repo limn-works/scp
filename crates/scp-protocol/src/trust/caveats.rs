@@ -615,9 +615,9 @@ impl InvocationCaveats {
     /// special-value encoding).
     pub fn to_canonical_json_bytes(&self) -> Result<Vec<u8>, CaveatSerError> {
         let value = serde_json::to_value(self).map_err(|e| CaveatSerError::Json(e.to_string()))?;
-        serde_json_canonicalizer::to_string(&value)
+        crate::jcs::to_string(&value)
             .map(String::into_bytes)
-            .map_err(|e| CaveatSerError::Json(e.to_string()))
+            .map_err(CaveatSerError::Json)
     }
 
     /// Validates that `child` is a legitimate attenuation of `self` (the
@@ -1092,11 +1092,8 @@ fn schema_nesting_depth(value: &serde_json::Value) -> usize {
 /// Validates the `input_schema` size and depth caps. The size check uses the
 /// canonical (JCS) byte length so the limit is reproducible across SDKs.
 fn check_input_schema_size_and_depth(value: &serde_json::Value) -> Result<(), CaveatMintError> {
-    let canonical = serde_json_canonicalizer::to_string(value).map_err(|e| {
-        CaveatMintError::SchemaSerializationFailed {
-            reason: e.to_string(),
-        }
-    })?;
+    let canonical = crate::jcs::to_string(value)
+        .map_err(|reason| CaveatMintError::SchemaSerializationFailed { reason })?;
     let size = canonical.len();
     if size > MAX_INPUT_SCHEMA_BYTES {
         return Err(CaveatMintError::SchemaTooLarge {

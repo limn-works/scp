@@ -128,8 +128,8 @@ class _FakeKeychain:
     """In-memory :class:`KeyCustodyProvider` backed by real Ed25519 keys.
 
     Stands in for a platform keystore. Key ids are numeric strings; the seed
-    bytes never leave this object except via ``export_signing_key_bytes`` /
-    ``sign``, mirroring how a real keychain would behave.
+    bytes never leave this object, which only signs, agrees and derives,
+    mirroring how a real keychain would behave.
     """
 
     def __init__(
@@ -205,9 +205,6 @@ class _FakeKeychain:
         # path.
         self.derive_calls.append((key_id, bytes(context_id)))
         return self._point(key_id, context_id, pseudonym_epoch)
-
-    def export_signing_key_bytes(self, key_id: str) -> bytes:
-        return self._seeds[key_id]
 
     def custody_type(self, key_id: str) -> str:
         return "software"

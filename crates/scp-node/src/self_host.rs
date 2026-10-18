@@ -5,7 +5,7 @@
 //! [`Supervisor`](scp_core::context::supervisor::Supervisor) connected to the
 //! node's **own loopback relay**, publishing the static site assets as
 //! encrypted [`BroadcastContent`](scp_core::context::BroadcastContent)
-//! messages through the real two-phase broadcast publish path, enabling
+//! messages through the actor's one-turn broadcast publish path, enabling
 //! broadcast site projection, and committing the deploy.
 //!
 //! The binary shell (`main.rs`) handles the binary-only concerns: CLI/env
@@ -89,6 +89,10 @@ pub enum SelfHostError {
     /// Failed to resolve the broadcast key for the local author.
     #[error("failed to resolve broadcast key: {0}")]
     BroadcastKey(String),
+    /// Failed to build the author's signer over custody (the key is absent,
+    /// or is not the Ed25519 key a broadcast envelope needs).
+    #[error("failed to build the author's signer: {0}")]
+    Signer(String),
     /// Failed to build the site config.
     #[error("failed to build site config: {0}")]
     SiteConfig(String),
@@ -245,8 +249,10 @@ pub struct DeploySiteParams<'a, C: KeyCustody> {
     /// [`DualLayerResolver`](scp_identity::DualLayerResolver) that shares the
     /// node's [`DidCache`](scp_identity::DidCache); never the `|_, _| None` stub.
     pub key_resolver: scp_core::context::governance::KeyResolver,
-    /// The caller's key custody backend. Borrowed for the publish dispatch.
-    pub custody: &'a C,
+    /// The caller's key custody backend. The deploy builds one
+    /// `CommandSigner` over it, and every publish signs through that signer
+    /// inside the actor turn (ADR-049 Decision 7a).
+    pub custody: &'a Arc<C>,
     /// The loopback supervisor's durable providers — the saga journal + the
     /// `OpenMLS` `mls_storage` view bound into one
     /// [`DurableProviders`](scp_core::context::supervisor::DurableProviders)
@@ -369,7 +375,7 @@ fn inject_did_meta(html: &str, did: &str) -> String {
 /// Deploys the site through the full broadcast publish + projection pipeline.
 ///
 /// Builds an in-process supervisor on the node's loopback relay, publishes
-/// every asset through the real two-phase broadcast publish path, enables
+/// every asset through the actor's one-turn broadcast publish path, enables
 /// broadcast site projection, and commits the deploy.
 ///
 /// Returns the number of assets committed on success (always equal to
@@ -397,7 +403,7 @@ pub async fn deploy_site<S, C>(
 ) -> Result<usize, SelfHostError>
 where
     S: Storage + 'static,
-    C: KeyCustody,
+    C: KeyCustody + 'static,
 {
     let DeploySiteParams {
         node_did,
@@ -604,12 +610,12 @@ impl SelfHostDeployer {
         &self,
         node: &ApplicationNode<S>,
         deploy_id: &str,
-        custody: &C,
+        custody: &Arc<C>,
         assets: &[Asset],
     ) -> Result<usize, SelfHostError>
     where
         S: Storage + 'static,
-        C: KeyCustody,
+        C: KeyCustody + 'static,
     {
         publish_assets(
             &self.supervisor,
@@ -854,20 +860,36 @@ where
 }
 
 /// Publishes each asset as a sealed [`BroadcastContent`](scp_core::context::BroadcastContent)
-/// message through the real two-phase broadcast publish path.
+/// message through the actor's broadcast publish, which signs inside the actor
+/// turn through one `CommandSigner` over `custody` (ADR-049 Decision 7a).
+///
+/// # Errors
+///
+/// [`SelfHostError::Publish`] naming the first asset whose publish fails, and
+/// [`SelfHostError::Signer`] when the author's signer cannot be built.
 async fn publish_assets<C>(
     supervisor: &scp_core::context::supervisor::Supervisor,
     context_id: &str,
     author_did: &scp_did::DID,
     deploy_id: &str,
     signing_key_handle: scp_platform::KeyHandle,
-    custody: &C,
+    custody: &Arc<C>,
     assets: &[Asset],
 ) -> Result<(), SelfHostError>
 where
-    C: KeyCustody,
+    C: KeyCustody + 'static,
 {
     use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
+
+    let signer = scp_core::context::actor::CommandSigner::from_custody(
+        scp_platform::CustodySigner::new(
+            Arc::clone(custody),
+            signing_key_handle,
+            scp_crypto::SigAlg::Ed25519,
+        )
+        .await
+        .map_err(|e| SelfHostError::Signer(e.to_string()))?,
+    );
 
     for asset in assets {
         let content_path = scp_core::context::ContentPath::new(asset.path.clone())
@@ -895,12 +917,12 @@ where
                 context_id: context_id.to_owned(),
                 author_did: author_did.clone(),
                 content,
-                signing_key_handle,
+                signer: signer.clone(),
             }),
             reply: reply_tx,
         };
         supervisor
-            .dispatch_broadcast_command_with_custody(cmd, custody)
+            .dispatch_broadcast_command(cmd)
             .await
             .map_err(|e| SelfHostError::Publish {
                 path: asset.path.clone(),
@@ -1818,7 +1840,7 @@ where
 
     // -- Initial deploy BEFORE the bound public listener serves. --
     if let Err(e) = deployer
-        .deploy(node.as_ref(), &mint_deploy_id(), custody.as_ref(), &assets)
+        .deploy(node.as_ref(), &mint_deploy_id(), &custody, &assets)
         .await
     {
         release_self_host_mappings(upnp_mapper, natpmp_mapper, port).await;
@@ -2844,7 +2866,7 @@ where
                 }
                 _ = interval.tick() => {
                     match deployer
-                        .deploy(node.as_ref(), &mint_deploy_id(), custody.as_ref(), &assets)
+                        .deploy(node.as_ref(), &mint_deploy_id(), &custody, &assets)
                         .await
                     {
                         Ok(committed) => tracing::info!(

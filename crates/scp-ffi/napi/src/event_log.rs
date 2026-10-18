@@ -486,15 +486,18 @@ pub(crate) fn event_log_checkpoint_on(
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
         let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
-            let signer = scp_core::event_log::KeyCustodySigner {
-                custody: custody.as_ref(),
-                key: &scp_id.active_signing_key,
-            };
-
-            // generate_checkpoint is async — this sync NAPI function runs on
-            // a libuv worker thread (not inside tokio), so we use the stored
-            // runtime to block_on the future.
-            crate::runtime().block_on(async {
+            // Waits on no context actor; signs through custody on the JS
+            // thread, so a JS callback custody cannot complete here (known
+            // defect, reported separately).
+            crate::block_on_shared(async {
+                // The bounded, key-type-checked sign of ADR-049 Decision 7a:
+                // a custody that never answers fails with SCP-CRYPTO-4062.
+                let signer = scp_ffi_common::signer::identity_command_signer(
+                    std::sync::Arc::clone(custody),
+                    scp_id.active_signing_key,
+                )
+                .await
+                .map_err(ScpNapiError::from)?;
                 scp_event_log::checkpoint::generate_checkpoint(
                     &rt.core.event_log,
                     &sender_did,
@@ -503,7 +506,7 @@ pub(crate) fn event_log_checkpoint_on(
                 )
                 .await
                 .map_err(|e| ScpNapiError::checkpoint_error(&e))
-            })
+            })?
         })
         .map_err(napi::Error::from)?;
 
@@ -545,12 +548,18 @@ pub(crate) fn event_log_checkpoint_by_did_on(
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
         let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
-            let signer = scp_core::event_log::KeyCustodySigner {
-                custody: custody.as_ref(),
-                key: &scp_id.active_signing_key,
-            };
-
-            crate::runtime().block_on(async {
+            // Waits on no context actor; signs through custody on the JS
+            // thread, so a JS callback custody cannot complete here (known
+            // defect, reported separately).
+            crate::block_on_shared(async {
+                // The bounded, key-type-checked sign of ADR-049 Decision 7a:
+                // a custody that never answers fails with SCP-CRYPTO-4062.
+                let signer = scp_ffi_common::signer::identity_command_signer(
+                    std::sync::Arc::clone(&custody),
+                    scp_id.active_signing_key,
+                )
+                .await
+                .map_err(ScpNapiError::from)?;
                 scp_event_log::checkpoint::generate_checkpoint(
                     &rt.core.event_log,
                     &sender_did,
@@ -559,7 +568,7 @@ pub(crate) fn event_log_checkpoint_by_did_on(
                 )
                 .await
                 .map_err(|e| ScpNapiError::checkpoint_error(&e))
-            })
+            })?
         })
         .map_err(napi::Error::from)?;
 
@@ -695,9 +704,8 @@ mod tests {
     }
 
     /// An identity whose `#active` key custody no longer holds fails the
-    /// checkpoint with `SCP-CRYPTO-4006`: `KeyCustodySigner` carries the
-    /// signing failure as `EventLogError::Custody`, and the bridge maps its
-    /// kind.
+    /// checkpoint with `SCP-CRYPTO-4006`: building the `#active` signer finds
+    /// the key gone, and the bridge maps the custody's kind.
     #[cfg(feature = "testing")]
     #[test]
     fn event_log_checkpoint_with_a_destroyed_signing_key_is_crypto_4006() {

@@ -287,9 +287,8 @@ use std::ops::Deref;
 use super::deps::ActorDeps;
 use super::sequence::SendSequenceTracker;
 use super::state::{
-    BroadcastReservationId, ClassSState, ContextEventLog, ContextLifecycleState, ContextModeState,
-    ContextRouting, PendingBroadcastPublish, PerContextState, RecvSequenceTracker,
-    WelcomeProcessing,
+    ClassSState, ContextEventLog, ContextLifecycleState, ContextModeState, ContextRouting,
+    PerContextState, RecvSequenceTracker, WelcomeProcessing,
 };
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::DeadlockDetectionState;
@@ -620,8 +619,6 @@ pub(crate) struct ClassCMut<'a> {
     /// §6.2.4). Interface state repopulated when the outlet interface is
     /// re-established — explicitly NOT the Class-S freshness/replay witness.
     xctx_ucan_proofs: &'a mut InMemoryProofResolver,
-    /// `&mut` to the in-flight broadcast-publish reservations (Class-C).
-    pending_broadcast_publishes: &'a mut HashMap<BroadcastReservationId, PendingBroadcastPublish>,
     /// `&mut` to the multi-step Welcome scratchpad (Class-C / structural).
     welcome_scratchpad: &'a mut Option<WelcomeProcessing>,
     /// `&mut` to the actor-internal lifecycle state (Class-C / structural).
@@ -2160,7 +2157,7 @@ impl<'a> ConsequenceStateSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_class_c_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`, `consequence_split`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_class_c_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`, `consequence_split`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
     /// Wrap a borrowed [`PerContextState`] by DESTRUCTURING it into the disjoint
@@ -2212,7 +2209,6 @@ impl<'a> ClassCMut<'a> {
             send_tracker,
             recv_tracker,
             xctx_ucan_proofs,
-            pending_broadcast_publishes,
             welcome_scratchpad,
             lifecycle_state,
             mode,
@@ -2246,7 +2242,6 @@ impl<'a> ClassCMut<'a> {
             send_tracker,
             recv_tracker,
             xctx_ucan_proofs,
-            pending_broadcast_publishes,
             welcome_scratchpad,
             lifecycle_state,
             mode,
@@ -2550,15 +2545,6 @@ impl<'a> ClassCMut<'a> {
     /// (`class_s.xctx_nonce_dedup`), so best-effort rollback is acceptable.
     pub(crate) const fn xctx_ucan_proofs_mut(&mut self) -> &mut InMemoryProofResolver {
         self.xctx_ucan_proofs
-    }
-
-    /// `&mut` access to the in-flight broadcast-publish reservations (Class-C).
-    /// Best-effort rollback acceptable; an unapplied reservation rolls its
-    /// sequence back by design.
-    pub(crate) const fn pending_broadcast_publishes_mut(
-        &mut self,
-    ) -> &mut HashMap<BroadcastReservationId, PendingBroadcastPublish> {
-        self.pending_broadcast_publishes
     }
 
     /// `&mut` access to the multi-step Welcome scratchpad (Class-C / structural).
@@ -6143,8 +6129,8 @@ impl ClassSCell
 
         // Drive the PRODUCTION paid send. `Some(nonce_token)` models the burned
         // spending-nonce obligation (the exact stand-in the production send-path
-        // fail-closed tests use). `signing_key = None` skips checkpoint creation;
-        // the consequence path runs regardless.
+        // fail-closed tests use). The send signs any due checkpoint through a
+        // local test signer; the consequence path runs regardless.
         let paid = crate::context::messaging_helpers::finalize_send(
             &mut cell,
             &deps,
@@ -6153,7 +6139,11 @@ impl ClassSCell
             &sender,
             0,
             b"paid-with-suspension",
-            None,
+            crate::context::supervisor::MessageSigner::Active(
+                &crate::context::actor::signer::CommandSigner::local_ed25519(
+                    ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+                ),
+            ),
             Some(ClassSCommitToken::new_for_test(&ctx)),
             /* is_broadcast = */ false,
         )
@@ -7817,6 +7807,130 @@ impl ClassSCell
             pid: [7u8; 32],
             actor_did: "did:example:admin",
             timestamp_secs: 1_700_000_000,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // execute_modify_capability_requirements — the direction a failed
+    // persist leaves the live list in is chosen by the delta (spec 07
+    // §7.3.4.4): a tightening stays in force, anything else is restored.
+    // ------------------------------------------------------------------
+
+    fn self_attested_requirements(uris: &[&str]) -> scp_protocol::trust::CapabilityRequirements {
+        let list: Vec<scp_protocol::trust::CapabilityRequirement> = uris
+            .iter()
+            .map(|uri| {
+                scp_protocol::trust::RawCapabilityRequirement {
+                    capability: uri.parse().expect("capability URI"),
+                    verification_level: scp_protocol::trust::VerificationLevel::SelfAttested,
+                    trusted_verifiers: Vec::new(),
+                    retry_cap: None,
+                }
+                .try_into()
+                .expect("valid requirement")
+            })
+            .collect();
+        list.try_into().expect("valid requirement list")
+    }
+
+    /// A failed persist keeps a tightening in force and restores the old list
+    /// for a loosening and for a mixed change.
+    #[tokio::test]
+    async fn governance_modify_capability_requirements_failure_direction() {
+        let deps = build_deps(Box::new(FailPersistence)).await;
+        let schema = "scp:capability:schema-validation/v1";
+        let safety = "scp:capability:content-safety/v1";
+        // (old list, new list, whether the new list is a tightening)
+        let cases: [(&[&str], &[&str], bool); 3] = [
+            (&[schema], &[schema, safety], true),
+            (&[schema, safety], &[schema], false),
+            (&[schema], &[safety], false),
+        ];
+        for (byte, (old, new, tightening)) in (0xD0u8..).zip(cases) {
+            let old = self_attested_requirements(old);
+            let new = self_attested_requirements(new);
+            assert_eq!(new.is_tightening_of(&old), tightening);
+            let mut state = fresh_state(byte);
+            state.handle = crate::context::ContextHandle::new(
+                ctx_hex(byte),
+                scp_protocol::context::params::ContextParams::default(),
+            );
+            state
+                .handle
+                .transition_to(&crate::context::ContextState::Active)
+                .expect("transition to Active");
+            state.governance.class_s.capability_requirements =
+                crate::context::state::Replicated::Live(old.clone());
+            let mut cell = ClassSCell::new(state);
+
+            let result =
+                crate::context::governance_helpers::execute_modify_capability_requirements(
+                    &mut cell,
+                    &deps,
+                    &ctx_hex(byte),
+                    &new,
+                    ceiling_commit_meta(),
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(ContextError::PersistenceFailed(_))),
+                "a failed persist surfaces; got {result:?}"
+            );
+            let expected = if tightening { &new } else { &old };
+            assert_eq!(
+                &cell.governance.class_s.capability_requirements,
+                &crate::context::state::Replicated::Live(expected.clone()),
+                "tightening {tightening}: the live list after a failed persist"
+            );
+        }
+    }
+
+    /// T21, after replication. A joiner awaiting the live list takes the list
+    /// a `ModifyCapabilityRequirements` sets, and admission then reads it; a
+    /// failed persist of that first list leaves the joiner awaiting.
+    #[tokio::test]
+    async fn awaiting_joiner_takes_the_list_governance_sets() {
+        let tightened = self_attested_requirements(&[
+            "scp:capability:schema-validation/v1",
+            "scp:capability:code-execution/v1",
+        ]);
+        for (byte, persistence, expected) in [
+            (
+                0x71_u8,
+                Box::new(crate::context::providers::persistence::InMemoryPersistence::new())
+                    as Box<dyn ContextPersistence>,
+                crate::context::state::Replicated::Live(tightened.clone()),
+            ),
+            (
+                0x72,
+                Box::new(FailPersistence),
+                crate::context::state::Replicated::AwaitingReplication,
+            ),
+        ] {
+            let deps = build_deps(persistence).await;
+            let mut state = fresh_state(byte);
+            state.handle = crate::context::ContextHandle::new(
+                ctx_hex(byte),
+                scp_protocol::context::params::ContextParams::default(),
+            );
+            state
+                .handle
+                .transition_to(&crate::context::ContextState::Active)
+                .expect("transition to Active");
+            state.governance.class_s.capability_requirements =
+                crate::context::state::Replicated::AwaitingReplication;
+            assert!(crate::context::queries_helpers::capability_requirements(&state).is_err());
+            let mut cell = ClassSCell::new(state);
+            let _ = crate::context::governance_helpers::execute_modify_capability_requirements(
+                &mut cell,
+                &deps,
+                &ctx_hex(byte),
+                &tightened,
+                ceiling_commit_meta(),
+            )
+            .await;
+            assert_eq!(cell.governance.class_s.capability_requirements, expected);
         }
     }
 

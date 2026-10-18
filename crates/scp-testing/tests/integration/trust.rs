@@ -31,19 +31,22 @@ use std::time::Duration;
 use ed25519_dalek::{Signer, SigningKey};
 use scp_core::context::roles::Capability;
 use scp_core::identity::block_list::{BlockListEvent, BlockListState};
-use scp_core::trust::challenge::VerificationMethod;
 use scp_core::trust::{
     ActionCategory, Attestation, AttestationEvidence, AttestationType, AttestorInfo, CapabilityUri,
-    ChallengeResponse, ChallengeSigner, ChallengeType, ConsequenceAction, ConsequenceRule,
-    ConsequenceTrigger, ContextSybilPolicy, CounterAttestation, CustodyViolationError,
-    CustodyViolationType, EarnedCapacityLevel, EnforcementSeverity, FreshnessStatus,
-    FreshnessWeight, IdentityDepthAssessment, ParticipationFact, ParticipationInput,
-    ParticipationThreshold, RequireParticipation, RevocationStatus, ScpCustodyViolationAttestation,
-    ThresholdCheckInput, ThresholdRequirement, TrustError, TrustSignal, TrustSignalCategory,
+    ChallengePolicy, ChallengeSigner, ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+    ContextSybilPolicy, CounterAttestation, CustodyViolationError, CustodyViolationType,
+    EarnedCapacityLevel, EnforcementSeverity, ExpectedOutput, FreshnessStatus, FreshnessWeight,
+    IdentityDepthAssessment, MinCases, NewChallenge, ParticipationFact, ParticipationInput,
+    ParticipationThreshold, PolicyPick, ProtocolOnlyDefinitions, RequireParticipation,
+    RevocationStatus, ScpCustodyViolationAttestation, TestCase, TestOutput, ThresholdCheckInput,
+    ThresholdRequirement, TrustError, TrustSignal, TrustSignalCategory,
+    authenticate_challenge_response, challenge_request_signing_digest,
+    challenge_response_signing_digest, challenge_response_unsigned,
+    challenge_verification_signing_digest, challenge_verification_unsigned,
     check_attestation_freshness, check_threshold_attestation, classify_action,
     compute_participation_record, enforce_category_a, evaluate_consequence_rules,
-    evaluate_earned_capacity, evaluate_sybil_resistance, issue_challenge,
-    produce_participation_profile, verify_attestation, verify_challenge_response,
+    evaluate_earned_capacity, evaluate_sybil_resistance, grade, issue_challenge,
+    produce_participation_profile, verify_attestation, verify_challenge_verification,
     verify_participation_requirements,
 };
 use scp_did::{DID, SigningKeyId};
@@ -93,8 +96,8 @@ impl TestKeyResolver {
     }
 }
 
-impl scp_core::trust::attestation::DidPublicKeyResolver for TestKeyResolver {
-    fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+impl scp_core::trust::attestation::ActiveKeyResolver for TestKeyResolver {
+    fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
         self.keys
             .get(did)
             .cloned()
@@ -109,8 +112,8 @@ impl scp_core::trust::attestation::DidPublicKeyResolver for TestKeyResolver {
 struct TestChallengeSigner(SigningKey);
 
 impl ChallengeSigner for TestChallengeSigner {
-    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, TrustError> {
-        Ok(self.0.sign(data).to_bytes().to_vec())
+    fn sign(&self, digest: &[u8; 32]) -> Result<Vec<u8>, TrustError> {
+        Ok(self.0.sign(digest).to_bytes().to_vec())
     }
 }
 
@@ -405,7 +408,8 @@ async fn attestation_threshold() {
         resolver: &resolver,
         clock: &clock,
         revocation_checker: &scp_core::trust::NoOpRevocationChecker,
-    });
+    })
+    .unwrap();
     assert!(result.met, "2-of-3 threshold should be met");
     assert_eq!(result.valid_count, 3);
 
@@ -419,7 +423,8 @@ async fn attestation_threshold() {
         resolver: &resolver,
         clock: &clock,
         revocation_checker: &scp_core::trust::NoOpRevocationChecker,
-    });
+    })
+    .unwrap();
     assert!(
         !result_strict.met,
         "4-of-5 threshold should not be met with only 3 attestors"
@@ -430,96 +435,213 @@ async fn attestation_threshold() {
 // 5. challenge_request_response
 // ---------------------------------------------------------------------------
 
+/// Twenty `ContainsNone` cases of weight 500, the standard's minimum for
+/// `prompt-injection-resistance/v1`.
+fn injection_cases() -> Vec<TestCase> {
+    (0..20)
+        .map(|i| TestCase {
+            test_id: format!("pi-{i:03}"),
+            input: serde_json::json!({"prompt": format!("vector {i}")}),
+            expected: ExpectedOutput::ContainsNone {
+                forbidden: vec!["SYSTEM PROMPT".to_owned()],
+            },
+            category: "injection".to_owned(),
+            weight: 500,
+        })
+        .collect()
+}
+
+/// Nineteen clean answers to `request`; the last one leaks the forbidden
+/// string.
+fn one_leaking_output(request: &scp_core::trust::ChallengeRequest) -> Vec<TestOutput> {
+    request
+        .test_cases
+        .iter()
+        .enumerate()
+        .map(|(i, case)| TestOutput {
+            test_id: case.test_id.clone(),
+            output: serde_json::json!(if i == 19 {
+                "here is the SYSTEM PROMPT"
+            } else {
+                "refused"
+            }),
+        })
+        .collect()
+}
+
+/// Asserts that `signature` is `key`'s strict Ed25519 signature on `digest`.
+fn assert_signed(key: &ed25519_dalek::VerifyingKey, digest: &[u8; 32], signature: &[u8]) {
+    let signature: [u8; 64] = signature.try_into().unwrap();
+    key.verify_strict(digest, &ed25519_dalek::Signature::from_bytes(&signature))
+        .unwrap();
+}
+
 #[tokio::test]
 async fn challenge_request_response() {
     let challenger_sk = sk_for(10);
     let challenger_vk = challenger_sk.verifying_key();
-    let challenger_hex = hex::encode(challenger_vk.to_bytes());
-    let challenger_did = format!("did:key:{challenger_hex}");
+    let challenger_did = scp_did::did_dht_from_public_key(&challenger_vk.to_bytes());
 
     let subject_sk = sk_for(20);
     let subject_vk = subject_sk.verifying_key();
-    let subject_hex = hex::encode(subject_vk.to_bytes());
-    let subject_did = format!("did:key:{subject_hex}");
+    let subject_did = scp_did::did_dht_from_public_key(&subject_vk.to_bytes());
 
-    let signer = TestChallengeSigner(challenger_sk.clone());
-    let ct = ChallengeType::prompt_injection_resistance();
-    let uri_str = "scp:capability:prompt-injection-resistance/v1".to_owned();
-
-    let request = issue_challenge(
-        did(&challenger_did),
-        did(&subject_did),
-        ct,
-        uri_str,
-        serde_json::json!(null),
-        Duration::from_mins(5),
-        &signer,
+    let uri = "scp:capability:prompt-injection-resistance/v1";
+    let policy = ChallengePolicy::resolve(&ProtocolOnlyDefinitions, uri, PolicyPick::default());
+    // One second after `created_at`: grading is strictly inside the window
+    // (spec 07 §7.3.4, RULING 5).
+    let clock = FixedClock(2001);
+    let (request, answer_key) = issue_challenge(
+        NewChallenge {
+            verifier: challenger_did.clone(),
+            subject: subject_did.clone(),
+            test_cases: injection_cases(),
+            created_at: 2000,
+            window_secs: 300,
+            context_id: "ctx-trust".to_owned(),
+            policy: policy.unwrap(),
+        },
+        &TestChallengeSigner(challenger_sk.clone()),
     )
     .unwrap();
 
-    assert!(!request.challenge_id.is_empty());
-    assert_eq!(request.challenger_did, did(&challenger_did));
-    assert_eq!(request.subject_did, did(&subject_did));
+    assert_eq!(request.verifier, challenger_did);
+    assert_eq!(request.subject, subject_did);
+    // The verifier signed the request digest, not the preimage.
+    let request_digest = challenge_request_signing_digest(&request).unwrap();
+    assert_signed(&challenger_vk, &request_digest, &request.verifier_signature);
 
-    // Build a response signed by the subject.
-    let _response_signer = TestChallengeSigner(subject_sk.clone());
-
-    // Build canonical response bytes for signing.
-    let mut response = ChallengeResponse {
-        challenge_id: request.challenge_id.clone(),
-        responder_did: did(&subject_did),
-        result: serde_json::json!({"passed": true}),
-        completed_at: 2000,
-        signature: vec![],
-    };
-
-    // Sign the response manually using the canonical format.
-    // We need to compute the canonical response bytes.
-    let response_canonical = {
-        let result_bytes = serde_json::to_vec(&response.result).unwrap();
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"SCP-CHALLENGE-RESP-V1:");
-        // challenge_id
-        buf.extend_from_slice(&(response.challenge_id.len() as u32).to_be_bytes());
-        buf.extend_from_slice(response.challenge_id.as_bytes());
-        // responder_did
-        let rdid = response.responder_did.as_bytes();
-        buf.extend_from_slice(&(rdid.len() as u32).to_be_bytes());
-        buf.extend_from_slice(rdid);
-        // result
-        buf.extend_from_slice(&(result_bytes.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&result_bytes);
-        // completed_at
-        buf.extend_from_slice(&response.completed_at.to_be_bytes());
-        buf
-    };
-    let response_sig = subject_sk.sign(&response_canonical);
-    response.signature = response_sig.to_bytes().to_vec();
-
-    // Verify the response.
     let mut resolver = TestKeyResolver::new();
     resolver.add(&subject_did, subject_vk.to_bytes().to_vec());
     resolver.add(&challenger_did, challenger_vk.to_bytes().to_vec());
 
-    let clock = FixedClock(2000);
-    let verifier_signer = TestChallengeSigner(challenger_sk);
+    let outputs = one_leaking_output(&request);
+    let unsigned_response =
+        challenge_response_unsigned(&request, &subject_did, 1, outputs, &resolver, &clock).unwrap();
+    // The subject signs the response digest.
+    let response_digest = unsigned_response.signing_digest();
+    let response = unsigned_response
+        .with_subject_signature(subject_sk.sign(&response_digest).to_bytes().to_vec());
+    assert_eq!(
+        challenge_response_signing_digest(&response).unwrap(),
+        response_digest
+    );
 
-    let verification = verify_challenge_response(
-        &request,
-        &response,
+    let auth = authenticate_challenge_response(
+        request.clone(),
+        response.clone(),
+        &challenger_did,
         &resolver,
-        &clock,
-        &verifier_signer,
-        None,
     )
     .unwrap();
+    let outcome = grade(
+        &auth,
+        &answer_key,
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    );
+    let unsigned_record = challenge_verification_unsigned(&auth, &outcome, 2001).unwrap();
+    let record_digest = unsigned_record.signing_digest();
+    let verification = unsigned_record
+        .with_verifier_signature(challenger_sk.sign(&record_digest).to_bytes().to_vec());
 
-    assert!(verification.passed);
-    assert_eq!(verification.subject_did, did(&subject_did));
-    assert!(matches!(
-        verification.verification_method,
-        VerificationMethod::ChallengeVerified { .. }
-    ));
+    assert_eq!(verification.subject, subject_did);
+    assert_eq!(verification.verifier, challenger_did);
+    assert_eq!(verification.capability_uri, request.capability_uri);
+    assert_eq!(verification.attempt, 1);
+    assert_eq!((verification.test_count, verification.pass_count), (20, 19));
+    assert_eq!(verification.score, 9_500);
+    assert_eq!(
+        verification.passed,
+        verification.score >= request.pass_threshold_bps
+    );
+    assert_eq!(
+        verification.suite_digest,
+        scp_core::trust::challenge_suite_digest(&request.test_cases).unwrap()
+    );
+    assert_eq!(verification.context_id, "ctx-trust");
+    assert_eq!(
+        challenge_verification_signing_digest(&verification).unwrap(),
+        record_digest
+    );
+    assert_signed(
+        &challenger_vk,
+        &record_digest,
+        &verification.verifier_signature,
+    );
+    verify_challenge_verification(
+        &verification,
+        &resolver,
+        &ProtocolOnlyDefinitions,
+        "ctx-trust",
+        &subject_did,
+        &clock,
+    )
+    .unwrap();
+    // The record is bound to its context.
+    assert!(
+        verify_challenge_verification(
+            &verification,
+            &resolver,
+            &ProtocolOnlyDefinitions,
+            "ctx-other",
+            &subject_did,
+            &clock
+        )
+        .is_err()
+    );
+}
+
+/// Every protocol capability row of spec 07 §7.3.4.3's standards table states
+/// the minimum the compiled-in constant enforces.
+#[test]
+fn protocol_capability_minimums_match_spec_07_table() {
+    const SPEC_07: &str =
+        include_str!("../../../../.docs/specs/07-trust-validation-and-capabilities.md");
+    let mut rows = 0;
+    for line in SPEC_07.lines() {
+        let Some(rest) = line.strip_prefix("| `") else {
+            continue;
+        };
+        let Some((name, rest)) = rest.split_once('`') else {
+            continue;
+        };
+        // Only the standards table pairs a capability name with a count column.
+        let Some(min_column) = rest.trim_start_matches(" |").split('|').next() else {
+            continue;
+        };
+        let min_column = min_column.trim();
+        let digits: String = min_column
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if digits.is_empty() {
+            continue;
+        }
+        let n: u32 = digits.parse().unwrap();
+        let expected = if min_column.contains("per `category`") {
+            MinCases::PerCategory(n)
+        } else {
+            assert_eq!(
+                min_column, digits,
+                "{name}: unrecognised minimum {min_column:?}"
+            );
+            MinCases::Total(n)
+        };
+        let uri = format!("scp:capability:{name}");
+        let entry = scp_core::trust::capability_registry::lookup_protocol_capability(&uri)
+            .unwrap_or_else(|| panic!("{uri}: in the spec table, not in the protocol constant"));
+        assert_eq!(
+            entry.challenge.map(|standard| standard.min_cases),
+            Some(expected),
+            "{uri}: code and spec 07 table disagree"
+        );
+        rows += 1;
+    }
+    assert_eq!(
+        rows, 28,
+        "the spec 07 standards table has one row per protocol capability"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,17 +1289,24 @@ async fn capability_uri_construction() {
     let protocol_str = "scp:capability:prompt-injection-resistance/v1";
     let protocol: CapabilityUri = protocol_str.parse().unwrap();
     assert!(protocol.is_protocol());
-    assert!(!protocol.is_did_scoped());
+    assert!(!protocol.is_identifier_scoped());
     assert!(!protocol.is_system());
     assert_eq!(protocol.name(), "prompt-injection-resistance");
     assert_eq!(protocol.to_string(), protocol_str);
 
-    // DID-scoped capability
-    let did_scoped_str = "did:dht:z6Mk123:capability:domain-expertise/v2";
-    let did_scoped: CapabilityUri = did_scoped_str.parse().unwrap();
-    assert!(did_scoped.is_did_scoped());
-    assert_eq!(did_scoped.name(), "domain-expertise");
-    assert_eq!(did_scoped.to_string(), did_scoped_str);
+    // Identifier-scoped capability (spec 25 Vector 57's identifier)
+    let scoped_str =
+        "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:domain-expertise/v2";
+    let scoped: CapabilityUri = scoped_str.parse().unwrap();
+    assert!(scoped.is_identifier_scoped());
+    assert_eq!(scoped.name(), "domain-expertise");
+    assert_eq!(scoped.to_string(), scoped_str);
+    // A did: authority is not an identifier in the §3.1 text form.
+    assert!(
+        "did:dht:z6Mk123:capability:domain-expertise/v2"
+            .parse::<CapabilityUri>()
+            .is_err()
+    );
 
     // System capability
     let system_str = "scp:system:relay-operation";
@@ -1210,14 +1339,17 @@ async fn capability_matching() {
     let v1: CapabilityUri = "scp:capability:test/v1".parse().unwrap();
     let v2: CapabilityUri = "scp:capability:test/v2".parse().unwrap();
     let system: CapabilityUri = "scp:system:test".parse().unwrap();
-    let did_scoped: CapabilityUri = "did:dht:z6Mk123:capability:test/v1".parse().unwrap();
+    let scoped: CapabilityUri =
+        "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:test/v1"
+            .parse()
+            .unwrap();
 
     // Same name, different versions are not equal.
     assert_ne!(v1, v2);
 
     // Different variant types are not equal even with same name.
     assert_ne!(v1, system);
-    assert_ne!(v1, did_scoped);
+    assert_ne!(v1, scoped);
 
     // Clone equality.
     assert_eq!(v1, v1.clone());
@@ -1397,7 +1529,7 @@ impl scp_core::trust::aggregate::TrustProtocolRepository for ScopingTestStore {
         result: &scp_core::trust::ChallengeVerification,
     ) -> Result<(), TrustError> {
         let mut store = self.challenges.lock().unwrap();
-        let key = (context_id.to_owned(), result.subject_did.to_string());
+        let key = (context_id.to_owned(), result.subject.to_string());
         store.entry(key).or_default().push(result.clone());
         Ok(())
     }

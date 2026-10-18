@@ -75,7 +75,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   trap "cp '${BACKUP}' '${PYI}'; rm -f '${BACKUP}'" EXIT
 
   # Transpose the first two positional parameters of the
-  # `check_capability_requirements` free function. Their names differ, so the
+  # `SCP.check_capability_requirements` method. Their names differ, so the
   # generator's name-keyed reconciliation heals the order back to the Rust
   # signature and the byte comparison against the on-disk (transposed) stub
   # fails — exactly the drift this gate must catch.
@@ -85,14 +85,16 @@ import sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
 old = (
-    "def check_capability_requirements(\n"
-    "    context_id: str,\n"
-    "    subject_did: str,\n"
+    "    def check_capability_requirements(\n"
+    "        self,\n"
+    "        context_id: str,\n"
+    "        subject_did: str,\n"
 )
 new = (
-    "def check_capability_requirements(\n"
-    "    subject_did: str,\n"
-    "    context_id: str,\n"
+    "    def check_capability_requirements(\n"
+    "        self,\n"
+    "        subject_did: str,\n"
+    "        context_id: str,\n"
 )
 if old not in text:
     sys.exit(

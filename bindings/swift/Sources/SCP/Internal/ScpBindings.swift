@@ -1339,10 +1339,10 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
      *
      * Providing `broadcast_key_hex` without `author_did` is an error.
      *
-     * `admission` is `"open"` or `"gated"`. `hostname` is the virtual
-     * host (RFC 1123).
+     * `admission` is `"open"` or `"gated"`. `site` carries the virtual
+     * host (RFC 1123) and the serving limits.
      */
-    func enableSiteProjection(contextId: String, admission: String, hostname: String, broadcastKeyHex: String?, authorDid: String?, indexPath: String?, maxAssetsPerDeploy: UInt32?, maxDeploySizeBytes: UInt64?, deployRetentionCount: UInt32?, cspOverride: String?) async throws 
+    func enableSiteProjection(contextId: String, admission: String, broadcastKeyHex: String?, authorDid: String?, site: SiteProjectionSettings) async throws 
     
     /**
      * Returns the HTTP URL of the background server, or `None` if not serving.
@@ -1523,16 +1523,16 @@ open func disableSiteProjection(contextId: String)async throws   {
      *
      * Providing `broadcast_key_hex` without `author_did` is an error.
      *
-     * `admission` is `"open"` or `"gated"`. `hostname` is the virtual
-     * host (RFC 1123).
+     * `admission` is `"open"` or `"gated"`. `site` carries the virtual
+     * host (RFC 1123) and the serving limits.
      */
-open func enableSiteProjection(contextId: String, admission: String, hostname: String, broadcastKeyHex: String?, authorDid: String?, indexPath: String?, maxAssetsPerDeploy: UInt32?, maxDeploySizeBytes: UInt64?, deployRetentionCount: UInt32?, cspOverride: String?)async throws   {
+open func enableSiteProjection(contextId: String, admission: String, broadcastKeyHex: String?, authorDid: String?, site: SiteProjectionSettings)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_nodehandle_enable_site_projection(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(contextId),FfiConverterString.lower(admission),FfiConverterString.lower(hostname),FfiConverterOptionString.lower(broadcastKeyHex),FfiConverterOptionString.lower(authorDid),FfiConverterOptionString.lower(indexPath),FfiConverterOptionUInt32.lower(maxAssetsPerDeploy),FfiConverterOptionUInt64.lower(maxDeploySizeBytes),FfiConverterOptionUInt32.lower(deployRetentionCount),FfiConverterOptionString.lower(cspOverride)
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(admission),FfiConverterOptionString.lower(broadcastKeyHex),FfiConverterOptionString.lower(authorDid),FfiConverterTypeSiteProjectionSettings_lower(site)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -1993,11 +1993,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Per-instance equivalent of the free-function `aggregate_trust_input`.
      *
      * Routes through `&*self.inner` — trust data is populated against
-     * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
-     * falling back to an ephemeral in-memory store when no repository
-     * is attached.
+     * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`).
+     * The JSON inputs arrive as one [`TrustAggregationInputs`] record.
      */
-    func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String) throws  -> String
+    func aggregateTrustInput(contextId: String, subjectDid: String, inputs: TrustAggregationInputs) async throws  -> String
     
     /**
      * Per-instance equivalent of the free-function
@@ -2109,6 +2108,37 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `instance_id` does not match this `SCP`'s.
      */
     func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rotateKeys: Bool) async throws 
+    
+    /**
+     * Checks an agent against the capability requirements in `context_id`'s
+     * governance state, read at call time (spec 07 §7.3.4.4).
+     *
+     * Inputs:
+     * - `context_id`: the context the agent is being admitted to. A record
+     * only counts when its signed `context_id` equals this value.
+     * - `subject_did`: the DID of the agent being admitted. Only records whose
+     * signed `subject` equals this value count.
+     * - `agent_capabilities_json`: JSON array of capability-URI strings.
+     * - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+     * records. Each counts only if its signature verifies against the
+     * verifier's `#active` key, resolved through this instance's DID
+     * resolver on the blocking pool, and it comes from a verifier the
+     * requirement trusts, within the requirement's retry cap.
+     *
+     * # Errors
+     *
+     * - `SCP-VALID-7000` for an invalid `subject_did`, `SCP-VALID-7011` for
+     * an invalid `context_id`.
+     * - `SCP-VALID-7074` / `7075` for malformed agent-capabilities or
+     * challenge-verifications JSON.
+     * - The admission code of the refusal: `SCP-VALID-7076` for an unmet
+     * requirement, `SCP-VALID-7121` for an untrusted verifier,
+     * `SCP-VALID-7137` past the retry cap.
+     * - `SCP-IDENT-1033` when a record must be verified and this instance has
+     * no DID resolver, or its backend is unreachable.
+     * - The `ContextError` code when the context's governance cannot be read.
+     */
+    func checkCapabilityRequirements(contextId: String, subjectDid: String, agentCapabilitiesJson: String, challengeVerificationsJson: String) async throws 
     
     /**
      * Per-instance equivalent of the free-function `configure_local_transport`.
@@ -2526,6 +2556,20 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `instance_id` does not match this `SCP`'s.
      */
     func governanceListProposals(handle: ContextHandle) async throws  -> String
+    
+    /**
+     * Proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4) with the
+     * complete new list in `requirements_json`, a JSON array; `[]` clears
+     * it.
+     *
+     * # Errors
+     *
+     * `ScpError::Validation` with `SCP-VALID-7000` for a malformed list, and
+     * with the requirement's own code (7147, 7148, 7150) for a requirement
+     * that breaks a §7.3.4.4 rule; otherwise fails as `governance_propose`
+     * does.
+     */
+    func governanceModifyCapabilityRequirements(handle: ContextHandle, proposerDid: String, requirementsJson: String) async throws  -> String
     
     /**
      * Per-instance equivalent of the free-function `governance_propose`.
@@ -3324,7 +3368,8 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `caller_did` is bound to this bridge instance's channel-authenticated
      * principal (§6.2.4) and must be a member of `source_handle`'s context — a
      * mismatch returns `ScpError::SagaAborted` (SCP-SAGA-13050) BEFORE the saga
-     * runs, so the receiver is never handed out.
+     * runs, so the receiver is never handed out. `authority` carries the UCAN,
+     * its proof chain, and the spending proof id.
      *
      * # Errors
      *
@@ -3334,7 +3379,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Prepare/Commit-transition is rejected; `ScpError::Validation` if an
      * id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
      */
-    func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanToken: String, proofTokens: [String]?, ucanProofId: String?, timeoutMs: UInt32?, estimatedChunkCount: UInt32?) async throws  -> String
+    func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, authority: OutletStreamAuthority, timeoutMs: UInt32?, estimatedChunkCount: UInt32?) async throws  -> String
     
     /**
      * Drains one chunk from a live cross-context streaming saga, awaiting until
@@ -3391,7 +3436,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Returns the flattened typed [`ParticipationRecordView`] so the
      * Swift/Kotlin SDKs never re-aggregate. See ADR-017, spec §7.3.2.
      */
-    func participationRecord(contextId: String, subjectDid: String, cachedAttestationsJson: String) throws  -> ParticipationRecordView
+    func participationRecord(contextId: String, subjectDid: String, cachedAttestationsJson: String) async throws  -> ParticipationRecordView
     
     /**
      * Applies a serialized petname event to the owner's petname map.
@@ -3688,11 +3733,77 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func transportStatus(manager: TransportManager) async throws  -> TransportStatus
     
     /**
-     * Per-instance equivalent of the free-function [`trust_create_challenge`].
+     * Creates a challenge in `verifier`'s ledger and returns the request the
+     * ledger signed with `verifier`'s `#active` key (spec 07 §7.3.4 step 1,
+     * ADR-017).
      *
-     * Stateless helper — uses an ephemeral signing key per call.
+     * `test_cases_json` is the challenger-written JSON array of `TestCase`,
+     * with their answers; the request carries only their commitments. The
+     * subject answers within `window_secs`. `context_id` is the context the
+     * record will be bound to. `evaluator_context_id` names the context whose
+     * outlets grade `CustomEval` cases. `policy` picks fewer retries or a
+     * longer cooldown than the capability definition's.
+     *
+     * # Errors
+     *
+     * - The handle check's error when `verifier` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid verifier or subject DID,
+     * `SCP-VALID-7011` for an invalid context id.
+     * - `SCP-VALID-7002` for malformed `test_cases_json`.
+     * - The `TrustError` code of the refusal: a suite below the definition's
+     * minimum, a policy looser than the definition's, a self-challenge, or
+     * a `CustomEval` evaluator that is not registered.
+     * - `SCP-CTX-2000` when this instance has no supervisor.
+     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+     * error when signing fails (`SCP-CRYPTO-4006` for a destroyed key).
      */
-    func trustCreateChallenge(targetDid: String) throws  -> ChallengeResult
+    func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, contextId: String, windowSecs: UInt32, evaluatorContextId: String?, policy: ChallengePolicy?) async throws  -> ChallengeResult
+    
+    /**
+     * Grades the subject's `response_json` to `request_json` in `verifier`'s
+     * ledger and returns the record it signed with `verifier`'s `#active`
+     * key (spec 07 §7.3.4 steps 3 and 4, ADR-017).
+     *
+     * `CustomEval` cases run on the outlets of the evaluator context's handle
+     * in this `Scp`. The record is written to this instance's protocol
+     * repository; a write failure is reported in `trust_store_error`, since
+     * the attempt is used either way.
+     *
+     * # Errors
+     *
+     * - The handle check's error when `verifier` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid verifier DID.
+     * - `SCP-VALID-7002` for a malformed request or response JSON.
+     * - `SCP-IDENT-1033` when this instance has no DID resolver.
+     * - The `TrustError` code when the response is refused: an unknown
+     * challenge, a bad subject signature, an attempt out of turn, a
+     * cooldown not yet over, an expired window, or the grading capacity
+     * exhausted.
+     * - `SCP-CTX-2000` when this instance has no supervisor.
+     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+     * error when signing fails.
+     */
+    func trustGradeResponse(verifier: Identity, requestJson: String, responseJson: String) async throws  -> ChallengeGradeResult
+    
+    /**
+     * Answers a challenge: checks the challenger's signature on
+     * `request_json` through this instance's DID resolver, and returns the
+     * `ChallengeResponse` JSON of `outputs_json` for `attempt`, signed with
+     * `subject`'s `#active` key (spec 07 §7.3.4 step 2, ADR-017).
+     *
+     * # Errors
+     *
+     * - The handle check's error when `subject` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid subject DID.
+     * - `SCP-VALID-7002` for a malformed request or outputs JSON.
+     * - `SCP-IDENT-1033` when this instance has no DID resolver.
+     * - The `TrustError` code when the request is refused: a bad signature,
+     * another subject, an expired window, or outputs that do not match its
+     * cases.
+     * - `SCP-IDENT-1054` when `subject` has no custodied key, and the custody
+     * error when signing fails.
+     */
+    func trustRespondToChallenge(subject: Identity, requestJson: String, outputsJson: String, attempt: UInt32) async throws  -> String
     
     /**
      * Verifies an attestation's Ed25519 signature, evidence, expiry, and its
@@ -3701,14 +3812,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * reason; a revocation list that cannot be read is an error
      * (`VALID_7052`), never a verdict. See ADR-017 Layer 3 (Attestation).
      */
-    func trustVerifyAttestation(contextId: String, attestationJson: String) throws  -> AttestationVerificationResult
-    
-    /**
-     * Per-instance equivalent of the free-function [`trust_verify_response`].
-     *
-     * Stateless helper — uses an ephemeral verification signer per call.
-     */
-    func trustVerifyResponse(challengeJson: String, responseJson: String) throws  -> Bool
+    func trustVerifyAttestation(contextId: String, attestationJson: String) async throws  -> AttestationVerificationResult
     
     /**
      * Per-instance equivalent of the free-function `ucan_delegate`.
@@ -4007,24 +4111,24 @@ open func addressResolve(ownerDid: String, address: String, knownContextsJson: S
      * Per-instance equivalent of the free-function `aggregate_trust_input`.
      *
      * Routes through `&*self.inner` — trust data is populated against
-     * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
-     * falling back to an ephemeral in-memory store when no repository
-     * is attached.
+     * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`).
+     * The JSON inputs arrive as one [`TrustAggregationInputs`] record.
      */
-open func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_aggregate_trust_input(self.uniffiClonePointer(),
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(subjectDid),
-        FfiConverterString.lower(eventsJson),
-        FfiConverterString.lower(merkleRootJson),
-        FfiConverterString.lower(consequenceRulesJson),
-        FfiConverterString.lower(thresholdRequirementsJson),
-        FfiConverterString.lower(attestorSetsJson),
-        FfiConverterString.lower(cachedAttestationsJson),
-        FfiConverterString.lower(challengeResultsJson),$0
-    )
-})
+open func aggregateTrustInput(contextId: String, subjectDid: String, inputs: TrustAggregationInputs)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_aggregate_trust_input(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(subjectDid),FfiConverterTypeTrustAggregationInputs_lower(inputs)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -4311,6 +4415,52 @@ open func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rot
                 uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_unsubscribe(
                     self.uniffiClonePointer(),
                     FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterBool.lower(rotateKeys)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Checks an agent against the capability requirements in `context_id`'s
+     * governance state, read at call time (spec 07 §7.3.4.4).
+     *
+     * Inputs:
+     * - `context_id`: the context the agent is being admitted to. A record
+     * only counts when its signed `context_id` equals this value.
+     * - `subject_did`: the DID of the agent being admitted. Only records whose
+     * signed `subject` equals this value count.
+     * - `agent_capabilities_json`: JSON array of capability-URI strings.
+     * - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+     * records. Each counts only if its signature verifies against the
+     * verifier's `#active` key, resolved through this instance's DID
+     * resolver on the blocking pool, and it comes from a verifier the
+     * requirement trusts, within the requirement's retry cap.
+     *
+     * # Errors
+     *
+     * - `SCP-VALID-7000` for an invalid `subject_did`, `SCP-VALID-7011` for
+     * an invalid `context_id`.
+     * - `SCP-VALID-7074` / `7075` for malformed agent-capabilities or
+     * challenge-verifications JSON.
+     * - The admission code of the refusal: `SCP-VALID-7076` for an unmet
+     * requirement, `SCP-VALID-7121` for an untrusted verifier,
+     * `SCP-VALID-7137` past the retry cap.
+     * - `SCP-IDENT-1033` when a record must be verified and this instance has
+     * no DID resolver, or its backend is unreachable.
+     * - The `ContextError` code when the context's governance cannot be read.
+     */
+open func checkCapabilityRequirements(contextId: String, subjectDid: String, agentCapabilitiesJson: String, challengeVerificationsJson: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_check_capability_requirements(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(subjectDid),FfiConverterString.lower(agentCapabilitiesJson),FfiConverterString.lower(challengeVerificationsJson)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -5253,6 +5403,35 @@ open func governanceListProposals(handle: ContextHandle)async throws  -> String 
                 uniffi_scp_ffi_uniffi_fn_method_scp_governance_list_proposals(
                     self.uniffiClonePointer(),
                     FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4) with the
+     * complete new list in `requirements_json`, a JSON array; `[]` clears
+     * it.
+     *
+     * # Errors
+     *
+     * `ScpError::Validation` with `SCP-VALID-7000` for a malformed list, and
+     * with the requirement's own code (7147, 7148, 7150) for a requirement
+     * that breaks a §7.3.4.4 rule; otherwise fails as `governance_propose`
+     * does.
+     */
+open func governanceModifyCapabilityRequirements(handle: ContextHandle, proposerDid: String, requirementsJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_governance_modify_capability_requirements(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposerDid),FfiConverterString.lower(requirementsJson)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -6779,7 +6958,8 @@ open func outletStreamVerifyChunkSignature(chunkBytes: Data, operatorPk: Data, c
      * `caller_did` is bound to this bridge instance's channel-authenticated
      * principal (§6.2.4) and must be a member of `source_handle`'s context — a
      * mismatch returns `ScpError::SagaAborted` (SCP-SAGA-13050) BEFORE the saga
-     * runs, so the receiver is never handed out.
+     * runs, so the receiver is never handed out. `authority` carries the UCAN,
+     * its proof chain, and the spending proof id.
      *
      * # Errors
      *
@@ -6789,13 +6969,13 @@ open func outletStreamVerifyChunkSignature(chunkBytes: Data, operatorPk: Data, c
      * Prepare/Commit-transition is rejected; `ScpError::Validation` if an
      * id/DID/outlet-id is malformed or `asserted_nonce_hex` is not 16 bytes.
      */
-open func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanToken: String, proofTokens: [String]?, ucanProofId: String?, timeoutMs: UInt32?, estimatedChunkCount: UInt32?)async throws  -> String  {
+open func outletStreamingSagaOpen(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, authority: OutletStreamAuthority, timeoutMs: UInt32?, estimatedChunkCount: UInt32?)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_outlet_streaming_saga_open(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(callerDid),FfiConverterString.lower(outletRegistrationId),FfiConverterString.lower(inputJson),FfiConverterString.lower(assertedNonceHex),FfiConverterUInt64.lower(timestampMs),FfiConverterUInt8.lower(chainDepth),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(ucanProofId),FfiConverterOptionUInt32.lower(timeoutMs),FfiConverterOptionUInt32.lower(estimatedChunkCount)
+                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(callerDid),FfiConverterString.lower(outletRegistrationId),FfiConverterString.lower(inputJson),FfiConverterString.lower(assertedNonceHex),FfiConverterUInt64.lower(timestampMs),FfiConverterUInt8.lower(chainDepth),FfiConverterTypeOutletStreamAuthority_lower(authority),FfiConverterOptionUInt32.lower(timeoutMs),FfiConverterOptionUInt32.lower(estimatedChunkCount)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -6906,14 +7086,21 @@ open func outletVerify(handle: ContextHandle, outletId: String)async throws  -> 
      * Returns the flattened typed [`ParticipationRecordView`] so the
      * Swift/Kotlin SDKs never re-aggregate. See ADR-017, spec §7.3.2.
      */
-open func participationRecord(contextId: String, subjectDid: String, cachedAttestationsJson: String)throws  -> ParticipationRecordView  {
-    return try  FfiConverterTypeParticipationRecordView_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_participation_record(self.uniffiClonePointer(),
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(subjectDid),
-        FfiConverterString.lower(cachedAttestationsJson),$0
-    )
-})
+open func participationRecord(contextId: String, subjectDid: String, cachedAttestationsJson: String)async throws  -> ParticipationRecordView  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_participation_record(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(subjectDid),FfiConverterString.lower(cachedAttestationsJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeParticipationRecordView_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -7543,16 +7730,121 @@ open func transportStatus(manager: TransportManager)async throws  -> TransportSt
 }
     
     /**
-     * Per-instance equivalent of the free-function [`trust_create_challenge`].
+     * Creates a challenge in `verifier`'s ledger and returns the request the
+     * ledger signed with `verifier`'s `#active` key (spec 07 §7.3.4 step 1,
+     * ADR-017).
      *
-     * Stateless helper — uses an ephemeral signing key per call.
+     * `test_cases_json` is the challenger-written JSON array of `TestCase`,
+     * with their answers; the request carries only their commitments. The
+     * subject answers within `window_secs`. `context_id` is the context the
+     * record will be bound to. `evaluator_context_id` names the context whose
+     * outlets grade `CustomEval` cases. `policy` picks fewer retries or a
+     * longer cooldown than the capability definition's.
+     *
+     * # Errors
+     *
+     * - The handle check's error when `verifier` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid verifier or subject DID,
+     * `SCP-VALID-7011` for an invalid context id.
+     * - `SCP-VALID-7002` for malformed `test_cases_json`.
+     * - The `TrustError` code of the refusal: a suite below the definition's
+     * minimum, a policy looser than the definition's, a self-challenge, or
+     * a `CustomEval` evaluator that is not registered.
+     * - `SCP-CTX-2000` when this instance has no supervisor.
+     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+     * error when signing fails (`SCP-CRYPTO-4006` for a destroyed key).
      */
-open func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
-    return try  FfiConverterTypeChallengeResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_trust_create_challenge(self.uniffiClonePointer(),
-        FfiConverterString.lower(targetDid),$0
-    )
-})
+open func trustCreateChallenge(verifier: Identity, subject: String, capabilityUri: String, testCasesJson: String, contextId: String, windowSecs: UInt32, evaluatorContextId: String?, policy: ChallengePolicy?)async throws  -> ChallengeResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_trust_create_challenge(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(verifier),FfiConverterString.lower(subject),FfiConverterString.lower(capabilityUri),FfiConverterString.lower(testCasesJson),FfiConverterString.lower(contextId),FfiConverterUInt32.lower(windowSecs),FfiConverterOptionString.lower(evaluatorContextId),FfiConverterOptionTypeChallengePolicy.lower(policy)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeChallengeResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Grades the subject's `response_json` to `request_json` in `verifier`'s
+     * ledger and returns the record it signed with `verifier`'s `#active`
+     * key (spec 07 §7.3.4 steps 3 and 4, ADR-017).
+     *
+     * `CustomEval` cases run on the outlets of the evaluator context's handle
+     * in this `Scp`. The record is written to this instance's protocol
+     * repository; a write failure is reported in `trust_store_error`, since
+     * the attempt is used either way.
+     *
+     * # Errors
+     *
+     * - The handle check's error when `verifier` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid verifier DID.
+     * - `SCP-VALID-7002` for a malformed request or response JSON.
+     * - `SCP-IDENT-1033` when this instance has no DID resolver.
+     * - The `TrustError` code when the response is refused: an unknown
+     * challenge, a bad subject signature, an attempt out of turn, a
+     * cooldown not yet over, an expired window, or the grading capacity
+     * exhausted.
+     * - `SCP-CTX-2000` when this instance has no supervisor.
+     * - `SCP-IDENT-1054` when `verifier` has no custodied key, and the custody
+     * error when signing fails.
+     */
+open func trustGradeResponse(verifier: Identity, requestJson: String, responseJson: String)async throws  -> ChallengeGradeResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_trust_grade_response(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(verifier),FfiConverterString.lower(requestJson),FfiConverterString.lower(responseJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeChallengeGradeResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Answers a challenge: checks the challenger's signature on
+     * `request_json` through this instance's DID resolver, and returns the
+     * `ChallengeResponse` JSON of `outputs_json` for `attempt`, signed with
+     * `subject`'s `#active` key (spec 07 §7.3.4 step 2, ADR-017).
+     *
+     * # Errors
+     *
+     * - The handle check's error when `subject` belongs to another `Scp`.
+     * - `SCP-VALID-7013` for an invalid subject DID.
+     * - `SCP-VALID-7002` for a malformed request or outputs JSON.
+     * - `SCP-IDENT-1033` when this instance has no DID resolver.
+     * - The `TrustError` code when the request is refused: a bad signature,
+     * another subject, an expired window, or outputs that do not match its
+     * cases.
+     * - `SCP-IDENT-1054` when `subject` has no custodied key, and the custody
+     * error when signing fails.
+     */
+open func trustRespondToChallenge(subject: Identity, requestJson: String, outputsJson: String, attempt: UInt32)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_trust_respond_to_challenge(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(subject),FfiConverterString.lower(requestJson),FfiConverterString.lower(outputsJson),FfiConverterUInt32.lower(attempt)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -7562,27 +7854,21 @@ open func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
      * reason; a revocation list that cannot be read is an error
      * (`VALID_7052`), never a verdict. See ADR-017 Layer 3 (Attestation).
      */
-open func trustVerifyAttestation(contextId: String, attestationJson: String)throws  -> AttestationVerificationResult  {
-    return try  FfiConverterTypeAttestationVerificationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_attestation(self.uniffiClonePointer(),
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(attestationJson),$0
-    )
-})
-}
-    
-    /**
-     * Per-instance equivalent of the free-function [`trust_verify_response`].
-     *
-     * Stateless helper — uses an ephemeral verification signer per call.
-     */
-open func trustVerifyResponse(challengeJson: String, responseJson: String)throws  -> Bool  {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_response(self.uniffiClonePointer(),
-        FfiConverterString.lower(challengeJson),
-        FfiConverterString.lower(responseJson),$0
-    )
-})
+open func trustVerifyAttestation(contextId: String, attestationJson: String)async throws  -> AttestationVerificationResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_attestation(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(attestationJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeAttestationVerificationResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -8782,29 +9068,218 @@ public func FfiConverterTypeCapabilityValidationRecord_lower(_ value: Capability
 
 
 /**
- * Result of creating a challenge request.
+ * A graded attempt, as `trust_grade_response` returns it.
  */
-public struct ChallengeResult {
+public struct ChallengeGradeResult {
     /**
-     * The unique challenge ID (UUID v4).
+     * The signed `ChallengeVerification` (JSON).
      */
-    public var challengeId: String
+    public var recordJson: String
     /**
-     * The serialized challenge request (JSON).
+     * The per-case results (JSON array of `CaseResult`), never signed.
      */
-    public var challengeJson: String
+    public var reasonsJson: String
+    /**
+     * Why the record could not be written to this instance's trust store,
+     * when it could not; the record is signed and the attempt used either
+     * way.
+     */
+    public var trustStoreError: TrustStoreWriteError?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
-         * The unique challenge ID (UUID v4).
+         * The signed `ChallengeVerification` (JSON).
+         */recordJson: String, 
+        /**
+         * The per-case results (JSON array of `CaseResult`), never signed.
+         */reasonsJson: String, 
+        /**
+         * Why the record could not be written to this instance's trust store,
+         * when it could not; the record is signed and the attempt used either
+         * way.
+         */trustStoreError: TrustStoreWriteError?) {
+        self.recordJson = recordJson
+        self.reasonsJson = reasonsJson
+        self.trustStoreError = trustStoreError
+    }
+}
+
+#if compiler(>=6)
+extension ChallengeGradeResult: Sendable {}
+#endif
+
+
+extension ChallengeGradeResult: Equatable, Hashable {
+    public static func ==(lhs: ChallengeGradeResult, rhs: ChallengeGradeResult) -> Bool {
+        if lhs.recordJson != rhs.recordJson {
+            return false
+        }
+        if lhs.reasonsJson != rhs.reasonsJson {
+            return false
+        }
+        if lhs.trustStoreError != rhs.trustStoreError {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(recordJson)
+        hasher.combine(reasonsJson)
+        hasher.combine(trustStoreError)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeChallengeGradeResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChallengeGradeResult {
+        return
+            try ChallengeGradeResult(
+                recordJson: FfiConverterString.read(from: &buf), 
+                reasonsJson: FfiConverterString.read(from: &buf), 
+                trustStoreError: FfiConverterOptionTypeTrustStoreWriteError.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ChallengeGradeResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.recordJson, into: &buf)
+        FfiConverterString.write(value.reasonsJson, into: &buf)
+        FfiConverterOptionTypeTrustStoreWriteError.write(value.trustStoreError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChallengeGradeResult_lift(_ buf: RustBuffer) throws -> ChallengeGradeResult {
+    return try FfiConverterTypeChallengeGradeResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChallengeGradeResult_lower(_ value: ChallengeGradeResult) -> RustBuffer {
+    return FfiConverterTypeChallengeGradeResult.lower(value)
+}
+
+
+/**
+ * A challenger's choice of fewer retries or a longer cooldown than the
+ * capability definition's. An absent field takes the definition's value.
+ */
+public struct ChallengePolicy {
+    /**
+     * Retries after the first attempt; at most the definition's.
+     */
+    public var maxRetries: UInt32?
+    /**
+     * Seconds between graded attempts; at least the definition's.
+     */
+    public var cooldownSecs: UInt32?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Retries after the first attempt; at most the definition's.
+         */maxRetries: UInt32?, 
+        /**
+         * Seconds between graded attempts; at least the definition's.
+         */cooldownSecs: UInt32?) {
+        self.maxRetries = maxRetries
+        self.cooldownSecs = cooldownSecs
+    }
+}
+
+#if compiler(>=6)
+extension ChallengePolicy: Sendable {}
+#endif
+
+
+extension ChallengePolicy: Equatable, Hashable {
+    public static func ==(lhs: ChallengePolicy, rhs: ChallengePolicy) -> Bool {
+        if lhs.maxRetries != rhs.maxRetries {
+            return false
+        }
+        if lhs.cooldownSecs != rhs.cooldownSecs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(maxRetries)
+        hasher.combine(cooldownSecs)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeChallengePolicy: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ChallengePolicy {
+        return
+            try ChallengePolicy(
+                maxRetries: FfiConverterOptionUInt32.read(from: &buf), 
+                cooldownSecs: FfiConverterOptionUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ChallengePolicy, into buf: inout [UInt8]) {
+        FfiConverterOptionUInt32.write(value.maxRetries, into: &buf)
+        FfiConverterOptionUInt32.write(value.cooldownSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChallengePolicy_lift(_ buf: RustBuffer) throws -> ChallengePolicy {
+    return try FfiConverterTypeChallengePolicy.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeChallengePolicy_lower(_ value: ChallengePolicy) -> RustBuffer {
+    return FfiConverterTypeChallengePolicy.lower(value)
+}
+
+
+/**
+ * Result of creating a challenge request.
+ */
+public struct ChallengeResult {
+    /**
+     * The challenge ID: lowercase hex of its 32 random bytes.
+     */
+    public var challengeId: String
+    /**
+     * The signed `ChallengeRequest` (JSON), which carries no answers.
+     */
+    public var requestJson: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The challenge ID: lowercase hex of its 32 random bytes.
          */challengeId: String, 
         /**
-         * The serialized challenge request (JSON).
-         */challengeJson: String) {
+         * The signed `ChallengeRequest` (JSON), which carries no answers.
+         */requestJson: String) {
         self.challengeId = challengeId
-        self.challengeJson = challengeJson
+        self.requestJson = requestJson
     }
 }
 
@@ -8818,7 +9293,7 @@ extension ChallengeResult: Equatable, Hashable {
         if lhs.challengeId != rhs.challengeId {
             return false
         }
-        if lhs.challengeJson != rhs.challengeJson {
+        if lhs.requestJson != rhs.requestJson {
             return false
         }
         return true
@@ -8826,7 +9301,7 @@ extension ChallengeResult: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(challengeId)
-        hasher.combine(challengeJson)
+        hasher.combine(requestJson)
     }
 }
 
@@ -8840,13 +9315,13 @@ public struct FfiConverterTypeChallengeResult: FfiConverterRustBuffer {
         return
             try ChallengeResult(
                 challengeId: FfiConverterString.read(from: &buf), 
-                challengeJson: FfiConverterString.read(from: &buf)
+                requestJson: FfiConverterString.read(from: &buf)
         )
     }
 
     public static func write(_ value: ChallengeResult, into buf: inout [UInt8]) {
         FfiConverterString.write(value.challengeId, into: &buf)
-        FfiConverterString.write(value.challengeJson, into: &buf)
+        FfiConverterString.write(value.requestJson, into: &buf)
     }
 }
 
@@ -9110,6 +9585,11 @@ public struct ContextParams {
      */
     public var consequenceConfigJson: String?
     /**
+     * The admission capability requirements as a JSON array of
+     * `CapabilityRequirement` (spec §7.3.4.4). `None` means none.
+     */
+    public var capabilityRequirementsJson: String?
+    /**
      * Pseudonym rotation policy (spec 09 §9.10.4.1). `None` disables
      * rotation: members keep one routing ID for the context's lifetime. A
      * set policy must name at least one trigger, and a set
@@ -9183,6 +9663,10 @@ public struct ContextParams {
          * governance only).
          */consequenceConfigJson: String?, 
         /**
+         * The admission capability requirements as a JSON array of
+         * `CapabilityRequirement` (spec §7.3.4.4). `None` means none.
+         */capabilityRequirementsJson: String?, 
+        /**
          * Pseudonym rotation policy (spec 09 §9.10.4.1). `None` disables
          * rotation: members keep one routing ID for the context's lifetime. A
          * set policy must name at least one trigger, and a set
@@ -9203,6 +9687,7 @@ public struct ContextParams {
         self.economicPolicy = economicPolicy
         self.consequenceRulesJson = consequenceRulesJson
         self.consequenceConfigJson = consequenceConfigJson
+        self.capabilityRequirementsJson = capabilityRequirementsJson
         self.pseudonymRotation = pseudonymRotation
     }
 }
@@ -9256,6 +9741,9 @@ extension ContextParams: Equatable, Hashable {
         if lhs.consequenceConfigJson != rhs.consequenceConfigJson {
             return false
         }
+        if lhs.capabilityRequirementsJson != rhs.capabilityRequirementsJson {
+            return false
+        }
         if lhs.pseudonymRotation != rhs.pseudonymRotation {
             return false
         }
@@ -9277,6 +9765,7 @@ extension ContextParams: Equatable, Hashable {
         hasher.combine(economicPolicy)
         hasher.combine(consequenceRulesJson)
         hasher.combine(consequenceConfigJson)
+        hasher.combine(capabilityRequirementsJson)
         hasher.combine(pseudonymRotation)
     }
 }
@@ -9304,6 +9793,7 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
                 economicPolicy: FfiConverterOptionString.read(from: &buf), 
                 consequenceRulesJson: FfiConverterOptionString.read(from: &buf), 
                 consequenceConfigJson: FfiConverterOptionString.read(from: &buf), 
+                capabilityRequirementsJson: FfiConverterOptionString.read(from: &buf), 
                 pseudonymRotation: FfiConverterOptionTypePseudonymRotationPolicy.read(from: &buf)
         )
     }
@@ -9323,6 +9813,7 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.economicPolicy, into: &buf)
         FfiConverterOptionString.write(value.consequenceRulesJson, into: &buf)
         FfiConverterOptionString.write(value.consequenceConfigJson, into: &buf)
+        FfiConverterOptionString.write(value.capabilityRequirementsJson, into: &buf)
         FfiConverterOptionTypePseudonymRotationPolicy.write(value.pseudonymRotation, into: &buf)
     }
 }
@@ -11167,6 +11658,113 @@ public func FfiConverterTypeOutletDefinition_lower(_ value: OutletDefinition) ->
 
 
 /**
+ * The invocation authority of one [`Scp::outlet_streaming_saga_open`] call
+ * (§6.2.4).
+ *
+ * It travels as one record so that the export takes seven buffer arguments:
+ * JNA on darwin-aarch64 corrupts a by-value `RustBuffer` argument of some
+ * calls that pass nine or more of them, and the `ffi_buffer_arg_bound` test
+ * holds every export to eight.
+ */
+public struct OutletStreamAuthority {
+    /**
+     * The invocation UCAN, validated once at open against the target context.
+     */
+    public var ucanToken: String
+    /**
+     * The delegation-chain proof tokens, if the UCAN is delegated.
+     */
+    public var proofTokens: [String]?
+    /**
+     * The id of the spending proof, resolved on the target side at
+     * Prepare-B, if the invocation spends.
+     */
+    public var ucanProofId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The invocation UCAN, validated once at open against the target context.
+         */ucanToken: String, 
+        /**
+         * The delegation-chain proof tokens, if the UCAN is delegated.
+         */proofTokens: [String]?, 
+        /**
+         * The id of the spending proof, resolved on the target side at
+         * Prepare-B, if the invocation spends.
+         */ucanProofId: String?) {
+        self.ucanToken = ucanToken
+        self.proofTokens = proofTokens
+        self.ucanProofId = ucanProofId
+    }
+}
+
+#if compiler(>=6)
+extension OutletStreamAuthority: Sendable {}
+#endif
+
+
+extension OutletStreamAuthority: Equatable, Hashable {
+    public static func ==(lhs: OutletStreamAuthority, rhs: OutletStreamAuthority) -> Bool {
+        if lhs.ucanToken != rhs.ucanToken {
+            return false
+        }
+        if lhs.proofTokens != rhs.proofTokens {
+            return false
+        }
+        if lhs.ucanProofId != rhs.ucanProofId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ucanToken)
+        hasher.combine(proofTokens)
+        hasher.combine(ucanProofId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletStreamAuthority: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletStreamAuthority {
+        return
+            try OutletStreamAuthority(
+                ucanToken: FfiConverterString.read(from: &buf), 
+                proofTokens: FfiConverterOptionSequenceString.read(from: &buf), 
+                ucanProofId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutletStreamAuthority, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.ucanToken, into: &buf)
+        FfiConverterOptionSequenceString.write(value.proofTokens, into: &buf)
+        FfiConverterOptionString.write(value.ucanProofId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletStreamAuthority_lift(_ buf: RustBuffer) throws -> OutletStreamAuthority {
+    return try FfiConverterTypeOutletStreamAuthority.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletStreamAuthority_lower(_ value: OutletStreamAuthority) -> RustBuffer {
+    return FfiConverterTypeOutletStreamAuthority.lower(value)
+}
+
+
+/**
  * Result of verifying an outlet against its test vectors.
  *
  * See ADR-010 (Outlet Registry).
@@ -12427,6 +13025,153 @@ public func FfiConverterTypeSealedInvitation_lower(_ value: SealedInvitation) ->
 
 
 /**
+ * The site settings of one [`NodeHandle::enable_site_projection`] call
+ * (section 18.11).
+ *
+ * They travel as one record so that the export takes five buffer
+ * arguments: JNA on darwin-aarch64 corrupts a by-value `RustBuffer`
+ * argument of some calls that pass nine or more of them, and the
+ * `ffi_buffer_arg_bound` test holds every export to eight.
+ */
+public struct SiteProjectionSettings {
+    /**
+     * The virtual host (RFC 1123).
+     */
+    public var hostname: String
+    /**
+     * The path served at `/`; `None` serves `/index.html`.
+     */
+    public var indexPath: String?
+    /**
+     * The most assets one deploy may hold; `None` allows 10 000.
+     */
+    public var maxAssetsPerDeploy: UInt32?
+    /**
+     * The largest total deploy size in bytes; `None` allows 512 MiB.
+     */
+    public var maxDeploySizeBytes: UInt64?
+    /**
+     * How many past deploys are kept; `None` keeps 2.
+     */
+    public var deployRetentionCount: UInt32?
+    /**
+     * A Content-Security-Policy header replacing the default.
+     */
+    public var cspOverride: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The virtual host (RFC 1123).
+         */hostname: String, 
+        /**
+         * The path served at `/`; `None` serves `/index.html`.
+         */indexPath: String?, 
+        /**
+         * The most assets one deploy may hold; `None` allows 10 000.
+         */maxAssetsPerDeploy: UInt32?, 
+        /**
+         * The largest total deploy size in bytes; `None` allows 512 MiB.
+         */maxDeploySizeBytes: UInt64?, 
+        /**
+         * How many past deploys are kept; `None` keeps 2.
+         */deployRetentionCount: UInt32?, 
+        /**
+         * A Content-Security-Policy header replacing the default.
+         */cspOverride: String?) {
+        self.hostname = hostname
+        self.indexPath = indexPath
+        self.maxAssetsPerDeploy = maxAssetsPerDeploy
+        self.maxDeploySizeBytes = maxDeploySizeBytes
+        self.deployRetentionCount = deployRetentionCount
+        self.cspOverride = cspOverride
+    }
+}
+
+#if compiler(>=6)
+extension SiteProjectionSettings: Sendable {}
+#endif
+
+
+extension SiteProjectionSettings: Equatable, Hashable {
+    public static func ==(lhs: SiteProjectionSettings, rhs: SiteProjectionSettings) -> Bool {
+        if lhs.hostname != rhs.hostname {
+            return false
+        }
+        if lhs.indexPath != rhs.indexPath {
+            return false
+        }
+        if lhs.maxAssetsPerDeploy != rhs.maxAssetsPerDeploy {
+            return false
+        }
+        if lhs.maxDeploySizeBytes != rhs.maxDeploySizeBytes {
+            return false
+        }
+        if lhs.deployRetentionCount != rhs.deployRetentionCount {
+            return false
+        }
+        if lhs.cspOverride != rhs.cspOverride {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hostname)
+        hasher.combine(indexPath)
+        hasher.combine(maxAssetsPerDeploy)
+        hasher.combine(maxDeploySizeBytes)
+        hasher.combine(deployRetentionCount)
+        hasher.combine(cspOverride)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSiteProjectionSettings: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SiteProjectionSettings {
+        return
+            try SiteProjectionSettings(
+                hostname: FfiConverterString.read(from: &buf), 
+                indexPath: FfiConverterOptionString.read(from: &buf), 
+                maxAssetsPerDeploy: FfiConverterOptionUInt32.read(from: &buf), 
+                maxDeploySizeBytes: FfiConverterOptionUInt64.read(from: &buf), 
+                deployRetentionCount: FfiConverterOptionUInt32.read(from: &buf), 
+                cspOverride: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SiteProjectionSettings, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.hostname, into: &buf)
+        FfiConverterOptionString.write(value.indexPath, into: &buf)
+        FfiConverterOptionUInt32.write(value.maxAssetsPerDeploy, into: &buf)
+        FfiConverterOptionUInt64.write(value.maxDeploySizeBytes, into: &buf)
+        FfiConverterOptionUInt32.write(value.deployRetentionCount, into: &buf)
+        FfiConverterOptionString.write(value.cspOverride, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSiteProjectionSettings_lift(_ buf: RustBuffer) throws -> SiteProjectionSettings {
+    return try FfiConverterTypeSiteProjectionSettings.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSiteProjectionSettings_lower(_ value: SiteProjectionSettings) -> RustBuffer {
+    return FfiConverterTypeSiteProjectionSettings.lower(value)
+}
+
+
+/**
  * Sync policy parameters record.
  *
  * Contains the default sync policy values. Returned by `sync_get_policy`.
@@ -12701,6 +13446,166 @@ public func FfiConverterTypeTransportStatus_lower(_ value: TransportStatus) -> R
 
 
 /**
+ * The JSON inputs of one [`Scp::aggregate_trust_input`] call (spec §7.3).
+ *
+ * They travel as one record so that the export takes three buffer
+ * arguments: JNA on darwin-aarch64 corrupts a by-value `RustBuffer`
+ * argument of some calls that pass nine or more of them, and the
+ * `ffi_buffer_arg_bound` test holds every export to eight.
+ */
+public struct TrustAggregationInputs {
+    /**
+     * The subject's event-log entries, as a JSON array of `Event`.
+     */
+    public var eventsJson: String
+    /**
+     * The log's 32-byte Merkle root, as a JSON array of bytes.
+     */
+    public var merkleRootJson: String
+    /**
+     * The context's consequence rules, as a JSON array.
+     */
+    public var consequenceRulesJson: String
+    /**
+     * Threshold requirements keyed by attestation type, as a JSON object.
+     */
+    public var thresholdRequirementsJson: String
+    /**
+     * Attestor sets keyed by attestation type, as a JSON object.
+     */
+    public var attestorSetsJson: String
+    /**
+     * Cached attestations to verify and store, as a JSON array.
+     */
+    public var cachedAttestationsJson: String
+    /**
+     * Signed challenge verification records, as a JSON array.
+     */
+    public var challengeResultsJson: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The subject's event-log entries, as a JSON array of `Event`.
+         */eventsJson: String, 
+        /**
+         * The log's 32-byte Merkle root, as a JSON array of bytes.
+         */merkleRootJson: String, 
+        /**
+         * The context's consequence rules, as a JSON array.
+         */consequenceRulesJson: String, 
+        /**
+         * Threshold requirements keyed by attestation type, as a JSON object.
+         */thresholdRequirementsJson: String, 
+        /**
+         * Attestor sets keyed by attestation type, as a JSON object.
+         */attestorSetsJson: String, 
+        /**
+         * Cached attestations to verify and store, as a JSON array.
+         */cachedAttestationsJson: String, 
+        /**
+         * Signed challenge verification records, as a JSON array.
+         */challengeResultsJson: String) {
+        self.eventsJson = eventsJson
+        self.merkleRootJson = merkleRootJson
+        self.consequenceRulesJson = consequenceRulesJson
+        self.thresholdRequirementsJson = thresholdRequirementsJson
+        self.attestorSetsJson = attestorSetsJson
+        self.cachedAttestationsJson = cachedAttestationsJson
+        self.challengeResultsJson = challengeResultsJson
+    }
+}
+
+#if compiler(>=6)
+extension TrustAggregationInputs: Sendable {}
+#endif
+
+
+extension TrustAggregationInputs: Equatable, Hashable {
+    public static func ==(lhs: TrustAggregationInputs, rhs: TrustAggregationInputs) -> Bool {
+        if lhs.eventsJson != rhs.eventsJson {
+            return false
+        }
+        if lhs.merkleRootJson != rhs.merkleRootJson {
+            return false
+        }
+        if lhs.consequenceRulesJson != rhs.consequenceRulesJson {
+            return false
+        }
+        if lhs.thresholdRequirementsJson != rhs.thresholdRequirementsJson {
+            return false
+        }
+        if lhs.attestorSetsJson != rhs.attestorSetsJson {
+            return false
+        }
+        if lhs.cachedAttestationsJson != rhs.cachedAttestationsJson {
+            return false
+        }
+        if lhs.challengeResultsJson != rhs.challengeResultsJson {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(eventsJson)
+        hasher.combine(merkleRootJson)
+        hasher.combine(consequenceRulesJson)
+        hasher.combine(thresholdRequirementsJson)
+        hasher.combine(attestorSetsJson)
+        hasher.combine(cachedAttestationsJson)
+        hasher.combine(challengeResultsJson)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrustAggregationInputs: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrustAggregationInputs {
+        return
+            try TrustAggregationInputs(
+                eventsJson: FfiConverterString.read(from: &buf), 
+                merkleRootJson: FfiConverterString.read(from: &buf), 
+                consequenceRulesJson: FfiConverterString.read(from: &buf), 
+                thresholdRequirementsJson: FfiConverterString.read(from: &buf), 
+                attestorSetsJson: FfiConverterString.read(from: &buf), 
+                cachedAttestationsJson: FfiConverterString.read(from: &buf), 
+                challengeResultsJson: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TrustAggregationInputs, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.eventsJson, into: &buf)
+        FfiConverterString.write(value.merkleRootJson, into: &buf)
+        FfiConverterString.write(value.consequenceRulesJson, into: &buf)
+        FfiConverterString.write(value.thresholdRequirementsJson, into: &buf)
+        FfiConverterString.write(value.attestorSetsJson, into: &buf)
+        FfiConverterString.write(value.cachedAttestationsJson, into: &buf)
+        FfiConverterString.write(value.challengeResultsJson, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustAggregationInputs_lift(_ buf: RustBuffer) throws -> TrustAggregationInputs {
+    return try FfiConverterTypeTrustAggregationInputs.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustAggregationInputs_lower(_ value: TrustAggregationInputs) -> RustBuffer {
+    return FfiConverterTypeTrustAggregationInputs.lower(value)
+}
+
+
+/**
  * Aggregated trust inputs for agent-level evaluation.
  *
  * See ADR-017 (Trust Engine) and spec §7 (Trust).
@@ -12943,6 +13848,91 @@ public func FfiConverterTypeTrustScoreResult_lift(_ buf: RustBuffer) throws -> T
 #endif
 public func FfiConverterTypeTrustScoreResult_lower(_ value: TrustScoreResult) -> RustBuffer {
     return FfiConverterTypeTrustScoreResult.lower(value)
+}
+
+
+/**
+ * A failed write of a graded record to this instance's trust store.
+ */
+public struct TrustStoreWriteError {
+    /**
+     * The error code, the one every trust-store write failure reports.
+     */
+    public var code: String
+    /**
+     * The message.
+     */
+    public var message: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The error code, the one every trust-store write failure reports.
+         */code: String, 
+        /**
+         * The message.
+         */message: String) {
+        self.code = code
+        self.message = message
+    }
+}
+
+#if compiler(>=6)
+extension TrustStoreWriteError: Sendable {}
+#endif
+
+
+extension TrustStoreWriteError: Equatable, Hashable {
+    public static func ==(lhs: TrustStoreWriteError, rhs: TrustStoreWriteError) -> Bool {
+        if lhs.code != rhs.code {
+            return false
+        }
+        if lhs.message != rhs.message {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(code)
+        hasher.combine(message)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrustStoreWriteError: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrustStoreWriteError {
+        return
+            try TrustStoreWriteError(
+                code: FfiConverterString.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TrustStoreWriteError, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.code, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustStoreWriteError_lift(_ buf: RustBuffer) throws -> TrustStoreWriteError {
+    return try FfiConverterTypeTrustStoreWriteError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrustStoreWriteError_lower(_ value: TrustStoreWriteError) -> RustBuffer {
+    return FfiConverterTypeTrustStoreWriteError.lower(value)
 }
 
 
@@ -15693,40 +16683,6 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     func deriveRotatablePseudonym(keyId: String, contextId: Data, pseudonymEpoch: UInt64) async throws  -> Data
     
     /**
-     * Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
-     *
-     * The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
-     * governance vote signing among them, build that key from the returned
-     * bytes. A key held in hardware or in Android Keystore does not export its
-     * bytes, and ADR-063 requires every key-export accessor, this callback
-     * included, to leave the custody adapters and all three bridges, because
-     * hardware custody on the governance path is impossible until then.
-     *
-     * # Default
-     *
-     * Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-     * implemented. A host that needs it overrides it. `AppleKeyCustody` and
-     * `UniffiKeyCustody` override it for a software Ed25519 key, and fail
-     * for a key Android Keystore holds. Third-party
-     * `KeyCustodyProvider` implementations that do not need governance vote
-     * signing may rely on the default until they add support.
-     *
-     * **Note:** `UniFFI` callback interfaces require foreign implementations to
-     * define all methods. The generated Swift protocol / Kotlin interface will
-     * include this method. The default here applies only to Rust-side callers.
-     *
-     * # Errors
-     *
-     * The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
-     * destroyed or never existed, and the caller receives key-not-found
-     * (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
-     * `SCP-CTX-2050` and a key that is not exportable or not Ed25519, reaches
-     * the caller as the custody error `SCP-CRYPTO-4060` carrying the host's
-     * code and message.
-     */
-    func exportSigningKeyBytes(keyId: String) async throws  -> Data
-    
-    /**
      * Return the custody type for `key_id`: `"hardware"`, `"software"`, or
      * `"in_memory"`. Stays sync — no I/O required.
      */
@@ -16026,49 +16982,6 @@ fileprivate struct UniffiCallbackInterfaceKeyCustodyProvider {
                      keyId: try FfiConverterString.lift(keyId),
                      contextId: try FfiConverterData.lift(contextId),
                      pseudonymEpoch: try FfiConverterUInt64.lift(pseudonymEpoch)
-                )
-            }
-
-            let uniffiHandleSuccess = { (returnValue: Data) in
-                uniffiFutureCallback(
-                    uniffiCallbackData,
-                    UniffiForeignFutureStructRustBuffer(
-                        returnValue: FfiConverterData.lower(returnValue),
-                        callStatus: RustCallStatus()
-                    )
-                )
-            }
-            let uniffiHandleError = { (statusCode, errorBuf) in
-                uniffiFutureCallback(
-                    uniffiCallbackData,
-                    UniffiForeignFutureStructRustBuffer(
-                        returnValue: RustBuffer.empty(),
-                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
-                    )
-                )
-            }
-            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
-                makeCall: makeCall,
-                handleSuccess: uniffiHandleSuccess,
-                handleError: uniffiHandleError,
-                lowerError: FfiConverterTypeScpError_lower
-            )
-            uniffiOutReturn.pointee = uniffiForeignFuture
-        },
-        exportSigningKeyBytes: { (
-            uniffiHandle: UInt64,
-            keyId: RustBuffer,
-            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
-            uniffiCallbackData: UInt64,
-            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
-        ) in
-            let makeCall = {
-                () async throws -> Data in
-                guard let uniffiObj = try? FfiConverterCallbackInterfaceKeyCustodyProvider.handleMap.get(handle: uniffiHandle) else {
-                    throw UniffiInternalError.unexpectedStaleHandle
-                }
-                return try await uniffiObj.exportSigningKeyBytes(
-                     keyId: try FfiConverterString.lift(keyId)
                 )
             }
 
@@ -17197,6 +18110,30 @@ fileprivate struct FfiConverterOptionTypeIdentity: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeChallengePolicy: FfiConverterRustBuffer {
+    typealias SwiftType = ChallengePolicy?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeChallengePolicy.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeChallengePolicy.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeDataProvenance: FfiConverterRustBuffer {
     typealias SwiftType = DataProvenance?
 
@@ -17285,6 +18222,30 @@ fileprivate struct FfiConverterOptionTypeReliabilityScoreRecord: FfiConverterRus
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeReliabilityScoreRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeTrustStoreWriteError: FfiConverterRustBuffer {
+    typealias SwiftType = TrustStoreWriteError?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTrustStoreWriteError.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTrustStoreWriteError.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -17688,45 +18649,6 @@ public func broadcastOpenKey(sealedJson: String, wrappingSecret: Data)throws  ->
         FfiConverterData.lower(wrappingSecret),$0
     )
 })
-}
-/**
- * Verifies that an agent meets a context's capability requirements for
- * admission, bound to the agent and context being admitted.
- *
- * Inputs:
- * - `context_id`: the context the agent is being admitted to. A challenge
- * verification only satisfies a requirement when its signed `context_id`
- * equals this value.
- * - `subject_did`: the DID of the agent being admitted. Only challenge
- * verifications whose signed `subject_did` equals this value can satisfy a
- * requirement (cross-subject attribution is rejected).
- * - `requirements_json`: JSON array of `CapabilityRequirement` objects.
- * - `agent_capabilities_json`: JSON array of capability-URI strings.
- * - `challenge_verifications_json`: JSON array of `ChallengeVerification`
- * records; each is signature-verified and only counts if authentic,
- * in-context, in-subject, passed, and unexpired.
- *
- * Uses the production `IdentityDidPublicKeyResolver` for verifier-DID key
- * resolution and the fail-closed system clock for expiry. Returns without error
- * (unit) if all requirements are satisfied, throws `ScpError` with a diagnostic
- * message if any requirement is unmet or if the JSON is malformed.
- *
- * Security caveat — authenticity is not authorization: a passing
- * `ChallengeVerified` check proves the verifier's signature is authentic and
- * bound to this subject/context, NOT that the verifier is trusted. Establish
- * verifier legitimacy separately (spec §7.3.4.4 / §7.4).
- *
- * See §7.3.4.4.
- */
-public func checkCapabilityRequirements(contextId: String, subjectDid: String, requirementsJson: String, agentCapabilitiesJson: String, challengeVerificationsJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_check_capability_requirements(
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(subjectDid),
-        FfiConverterString.lower(requirementsJson),
-        FfiConverterString.lower(agentCapabilitiesJson),
-        FfiConverterString.lower(challengeVerificationsJson),$0
-    )
-}
 }
 /**
  * Discovers contexts from a DID string or `scp://` URI.
@@ -18366,18 +19288,6 @@ public func templateGetParams(templateId: String)throws  -> String  {
 })
 }
 /**
- * Creates a challenge request for capability verification.
- *
- * See ADR-017 Layer 3 (Challenge-Response).
- */
-public func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
-    return try  FfiConverterTypeChallengeResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_trust_create_challenge(
-        FfiConverterString.lower(targetDid),$0
-    )
-})
-}
-/**
  * Queries a trust score for the given DID in the given context.
  *
  * Trust event counts are queried from the module-level helper (a
@@ -18392,19 +19302,6 @@ public func trustQueryScore(did: String, contextId: String)throws  -> TrustScore
     uniffi_scp_ffi_uniffi_fn_func_trust_query_score(
         FfiConverterString.lower(did),
         FfiConverterString.lower(contextId),$0
-    )
-})
-}
-/**
- * Verifies a challenge response against its original challenge request.
- *
- * See ADR-017 Layer 3 (Challenge-Response).
- */
-public func trustVerifyResponse(challengeJson: String, responseJson: String)throws  -> Bool  {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_trust_verify_response(
-        FfiConverterString.lower(challengeJson),
-        FfiConverterString.lower(responseJson),$0
     )
 })
 }
@@ -18475,9 +19372,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_open_key() != 2915) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_check_capability_requirements() != 55898) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_discover() != 49364) {
@@ -18600,13 +19494,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_template_get_params() != 28014) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_trust_create_challenge() != 37813) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_query_score() != 58685) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_response() != 47639) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_validate_against_template() != 37474) {
@@ -18666,7 +19554,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_disable_site_projection() != 49517) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_enable_site_projection() != 59651) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_enable_site_projection() != 31205) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_http_url() != 26199) {
@@ -18717,7 +19605,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 23956) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 37504) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 58051) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_apply_pending_ceiling_modification() != 41792) {
@@ -18754,6 +19642,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 16701) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_check_capability_requirements() != 25379) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_local_transport() != 46239) {
@@ -18871,6 +19762,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_list_proposals() != 5473) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_modify_capability_requirements() != 45235) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_propose() != 46255) {
@@ -19044,7 +19938,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_stream_verify_chunk_signature() != 15888) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_open() != 5447) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_open() != 34415) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_streaming_saga_poll_next() != 45714) {
@@ -19056,7 +19950,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_verify() != 31142) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_participation_record() != 20243) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_participation_record() != 55185) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_apply_event() != 32223) {
@@ -19155,13 +20049,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_status() != 20055) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 25481) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 21846) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_attestation() != 39312) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_grade_response() != 14844) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_respond_to_challenge() != 25925) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_attestation() != 54259) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 59265) {
@@ -19248,10 +20145,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_rotatable_pseudonym() != 54334) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_export_signing_key_bytes() != 33720) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 30807) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_custody_type() != 59116) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_messagelistener_on_message() != 11557) {

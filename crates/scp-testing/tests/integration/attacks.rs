@@ -24,7 +24,7 @@ use scp_core::context::broadcast::SubscriptionResult;
 use scp_core::context::governance::majority::MajorityVoteEngine;
 use scp_core::context::governance::multisig::ThresholdEngine;
 use scp_core::context::governance::{
-    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, KeyResolver,
+    GovernanceAction, GovernanceContext, GovernanceEngineRawKey as _, GovernanceError, KeyResolver,
     ProposalStatus, RejectionReason, VoteType, sign_vote, verify_vote,
 };
 use scp_core::context::params::Capability;

@@ -44,6 +44,7 @@ pub mod handlers;
 pub mod outcome;
 pub mod pseudonym_rotation;
 pub mod sequence;
+pub mod signer;
 pub mod state;
 
 pub use commands::{
@@ -59,6 +60,7 @@ pub use handle::{ContextActorHandle, REPLY_TIMEOUT, SEND_TIMEOUT};
 pub(crate) use handle::{BoundedReplyError, bounded_reply_await};
 pub use outcome::Outcome;
 pub use sequence::{SendSequenceTracker, SequenceReservation};
+pub use signer::{CommandSigner, SIGN_TIMEOUT};
 pub use state::{
     AuthorKeyEntry, BroadcastRecvTracker, BroadcastState, ContextCryptoState, ContextEventLog,
     ContextLifecycleState, ContextModeState, ContextRouting, PendingBroadcastKeyRotation,

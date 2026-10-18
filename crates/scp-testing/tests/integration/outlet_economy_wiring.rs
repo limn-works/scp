@@ -181,7 +181,7 @@ async fn grant_budget(
                 amount,
                 purpose: "outlet-economy wiring test budget".to_owned(),
             },
-            admin_key,
+            &scp_core::context::actor::CommandSigner::local_ed25519(admin_key.clone()),
         )
         .await
         .expect("ApproveSpend proposal");

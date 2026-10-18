@@ -338,6 +338,28 @@ struct FfiBridgeProvider {
     agent_proof_tokens: Option<Vec<String>>,
 }
 
+/// Drives `fut` from the MCP provider, which runs on the MCP transport
+/// task and never on a Python thread, so it holds no GIL to release.
+///
+/// # Errors
+///
+/// Fails from a current-thread runtime, which would have to run the awaited
+/// work on the thread this call blocks, and when the bridge runtime cannot
+/// start.
+fn block_on_provider_task<F>(fut: F) -> Result<F::Output, String>
+where
+    F: std::future::Future,
+{
+    // Inside the MCP transport task the awaited work runs on the runtime's
+    // other workers while this one blocks. Outside every runtime (direct
+    // calls from Rust tests) the shared runtime drives it.
+    scp_ffi_common::bridge_wait::bridge_block_on(
+        || crate::runtime().map_err(|e| e.to_string()),
+        fut,
+    )
+    .map_err(|e| e.to_string())
+}
+
 impl FfiBridgeProvider {
     /// Upgrades the stored [`Weak`](std::sync::Weak) to a live [`Arc<PyBridgeInstance>`].
     ///
@@ -448,26 +470,19 @@ impl FfiBridgeProvider {
                 .await
                 .map_err(|e| format!("role state of context '{id}' could not be read: {e}"))
         };
-        match tokio::runtime::Handle::try_current() {
-            // Inside the MCP transport task: the actor runs on this runtime's
-            // other workers while this one blocks.
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| handle.block_on(query))
-            }
-            // A current-thread runtime would have to run the actor on the
-            // thread this call blocks.
-            Ok(_) => Err(format!(
-                "cannot read the role state of context '{context_id}' from a \
-                 current-thread runtime"
-            )),
-            Err(_) => crate::runtime()
-                .map_err(|e| format!("{e}"))?
-                .block_on(query),
-        }
+        block_on_provider_task(query)
+            .map_err(|e| format!("cannot read the role state of context '{context_id}': {e}"))?
     }
 
     /// Asks the supervisor actor whether `context_id` is `Active` (ADR-049
-    /// §10), through [`crate::runtime::active_role_state_before_authz`].
+    /// §10), under the refusal rule of
+    /// [`crate::runtime::active_role_state_before_authz`].
+    ///
+    /// The provider runs on the MCP transport task, which holds no GIL, so it
+    /// cannot take the `Python` token that function's wait needs. It runs the
+    /// same two reads, the lifecycle state read and then the role-state read,
+    /// through [`block_on_provider_task`], and applies the same refusal rule
+    /// through [`crate::runtime::withhold_before_authz`].
     ///
     /// # Errors
     ///
@@ -483,10 +498,37 @@ impl FfiBridgeProvider {
         context_id: &str,
     ) -> Result<(), scp_mcp::server::AccessRefusal> {
         use scp_mcp::server::AccessRefusal;
+        let sup = Arc::clone(
+            crate::runtime::supervisor(bi)
+                .map_err(|e| AccessRefusal::Unreadable(format!("{e}")))?,
+        );
+        let lifecycle_sup = Arc::clone(&sup);
+        let lifecycle_id = context_id.to_owned();
+        let state = block_on_provider_task(async move {
+            lifecycle_sup
+                .read_context_state_checked(&lifecycle_id)
+                .await
+        })
+        .map_err(AccessRefusal::Unreadable)?
+        .map_err(ScpPyError::from);
         let withheld = std::cell::Cell::new(false);
-        crate::runtime::active_role_state_before_authz(
-            bi,
-            context_id,
+        crate::runtime::withhold_before_authz(
+            state,
+            || {
+                let role_id = context_id.to_owned();
+                let answer =
+                    block_on_provider_task(
+                        async move { sup.get_role_state_checked(&role_id).await },
+                    )
+                    .map_err(ScpPyError::context)?;
+                Ok(answer.map_err(ScpPyError::from).and_then(|role_state| {
+                    role_state.ok_or_else(|| {
+                        ScpPyError::context(format!(
+                            "context '{context_id}' has no live supervisor role state"
+                        ))
+                    })
+                }))
+            },
             "invoke outlet in context",
             |message| {
                 withheld.set(true);
@@ -896,10 +938,11 @@ impl FfiBridgeProvider {
         //
         // Handler execution is bounded by `outlet_timeout_ms` to prevent a
         // misbehaving handler from blocking the tokio runtime indefinitely.
-        // Uses std::thread::spawn + mpsc::recv_timeout (sync timeout) because
-        // ContextProvider::invoke_outlet is a sync trait method. See issue #123.
+        // Uses std::thread::spawn plus a tokio timeout on a oneshot, driven by
+        // `bridge_block_on_off_thread`, because ContextProvider::invoke_outlet
+        // is a sync trait method. See issue #123.
         //
-        // KNOWN LIMITATION — thread leak on timeout: When `recv_timeout`
+        // KNOWN LIMITATION — thread leak on timeout: When the timeout
         // expires, the spawned `std::thread` continues running in the
         // background until the handler returns naturally. Rust threads
         // cannot be forcibly cancelled — there is no `pthread_cancel`
@@ -1003,7 +1046,13 @@ impl FfiBridgeProvider {
 
             // Clone handler Arc and output schema so we can release the lock.
             // Compute input hash before dispatch (arguments may be consumed).
-            let input_hash = scp_core::context::outlets::sha256_json(&arguments);
+            // An input with no canonical form (a number outside I-JSON) has
+            // no hash, so it fails input validation.
+            let input_hash = scp_core::context::outlets::sha256_json(&arguments).map_err(|e| {
+                ScpPyError::validation(format!(
+                    "input validation failed for outlet '{outlet_name}': {e}"
+                ))
+            })?;
 
             let dispatch = rt
                 .outlet_handlers
@@ -1030,12 +1079,14 @@ impl FfiBridgeProvider {
         // concurrent same-context operations are not blocked during Python
         // GIL acquisition and handler execution. Handler execution is
         // bounded by `outlet_timeout_ms` (issue #123).
-        let output = {
+        let (output, output_hash) = {
             let (handler, output_schema) = dispatch;
             // Run the handler on a dedicated thread with a timeout to
             // prevent indefinite blocking. The handler is Send + Sync
-            // (Arc<dyn Fn>), so it is safe to move across threads.
-            let (tx, rx) = std::sync::mpsc::channel();
+            // (Arc<dyn Fn>), so it is safe to move across threads. The wait
+            // is an async timeout driven by the bridge wait, because no
+            // bridge code blocks outside `bridge_wait`.
+            let (tx, rx) = tokio::sync::oneshot::channel();
             std::thread::spawn(move || {
                 let result = handler(arguments);
                 // If the receiver has been dropped (timeout elapsed), the
@@ -1043,7 +1094,24 @@ impl FfiBridgeProvider {
                 let _ = tx.send(result);
             });
 
-            let handler_result = rx.recv_timeout(timeout).map_err(|_| {
+            // The handler runs on its own thread, so the wait needs no worker
+            // of the ambient runtime: on a current-thread runtime it runs on
+            // a private runtime off this thread, as `UniFFI`'s `run_outlet`
+            // does, so the handler is waited on in every regime. A timeout,
+            // or a handler thread that ended without sending (it panicked),
+            // is reported as the timeout, as before.
+            let handler_result = scp_ffi_common::bridge_wait::bridge_block_on_off_thread(
+                || crate::runtime().map_err(|e| e.to_string()),
+                async move { tokio::time::timeout(timeout, rx).await },
+            )
+            .map_err(|e| {
+                refund(format!(
+                    "outlet handler for '{outlet_name}' wait failed: {e}"
+                ))
+            })?
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| {
                 refund(format!(
                     "outlet handler for '{outlet_name}' timed out after {}ms",
                     timeout.as_millis()
@@ -1063,8 +1131,15 @@ impl FfiBridgeProvider {
                     "output validation failed for outlet '{outlet_name}': {msg}"
                 ))
             })?;
+            // An output with no canonical form has no hash, so it fails output
+            // validation, with the same refund, before any event is appended.
+            let output_hash = scp_core::context::outlets::sha256_json(&output).map_err(|e| {
+                refund(format!(
+                    "output validation failed for outlet '{outlet_name}': {e}"
+                ))
+            })?;
 
-            output
+            (output, output_hash)
         };
 
         // Phase 3: Append OutletInvokedEvent to the event log (ADR-010
@@ -1087,8 +1162,6 @@ impl FfiBridgeProvider {
                 millis as u64
             }
         };
-
-        let output_hash = scp_core::context::outlets::sha256_json(&output);
 
         let outlet_event = scp_core::context::outlets::OutletInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -1159,11 +1232,11 @@ impl FfiBridgeProvider {
                 // is Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolRepository
                 // requires an owned Storage impl. The key convention matches
                 // ProtocolRepository's event_data_key format.
-                if let Ok(storage) = crate::runtime::get_storage(&bi)
-                    && let Ok(rt) = crate::runtime()
-                {
+                if let Ok(storage) = crate::runtime::get_storage(&bi) {
                     let key = format!("context/{context_id}/event_data/{sequence:020}");
-                    if let Err(e) = rt.block_on(storage.store(&key, &event_bytes)) {
+                    let stored = block_on_provider_task(storage.store(&key, &event_bytes))
+                        .and_then(|r| r.map_err(|e| e.to_string()));
+                    if let Err(e) = stored {
                         tracing::warn!(
                             outlet = %outlet_name,
                             context = %context_id,
@@ -1779,12 +1852,9 @@ impl crate::scp::PyScp {
 
         // Block on the task handle if we have one.
         if let Some(task) = task_handle {
-            let rt = crate::runtime()?;
-            py.allow_threads(|| {
-                rt.block_on(async {
-                    let _ = task.await;
-                });
-            });
+            crate::actor_wait::block_on_released(py, async {
+                let _ = task.await;
+            })?;
         }
 
         Ok(())
@@ -2193,13 +2263,13 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         validate::validate_did(identity_did)?;
         // Step 1: Collect contexts from the local runtime registry.
-        let local_contexts = crate::runtime::member_context_role_states(bi, identity_did)?;
+        let local_contexts = crate::runtime::member_context_role_states(py, bi, identity_did)?;
 
         // Step 2: Collect contexts from the known-contexts registry.
         let known = crate::runtime::known_contexts_for_member_on(bi, identity_did);
 
         // Step 3: Probe relay for known routing IDs (if connected).
-        let relay_active_set = probe_relay_for_known_contexts(bi, &known);
+        let relay_active_set = probe_relay_for_known_contexts(py, bi, &known);
 
         // Step 4: Build deduplicated result set.
         let mut seen = std::collections::HashSet::new();
@@ -2262,6 +2332,7 @@ impl crate::scp::PyScp {
 /// Falls back to an empty set if no relay connection is available or if
 /// queries fail (graceful degradation).
 fn probe_relay_for_known_contexts(
+    py: Python<'_>,
     bi: &crate::runtime::PyBridgeInstance,
     known: &[(String, crate::runtime::KnownContext)],
 ) -> std::collections::HashSet<String> {
@@ -2273,13 +2344,10 @@ fn probe_relay_for_known_contexts(
         return active;
     }
 
-    // Check if a transport manager is available. If not, return empty set.
-    if !crate::runtime::has_transport_manager(bi) {
-        return active;
-    }
-
-    // Get the tokio runtime for blocking on async queries.
-    let Ok(rt) = crate::runtime() else {
+    // Take the transport manager out of its lock: a GIL-released wait that
+    // held the lock would deadlock against a Python thread that blocks on
+    // the lock while holding the GIL. No manager returns the empty set.
+    let Ok(Some(manager)) = bi.core.get_transport_arc() else {
         return active;
     };
 
@@ -2288,10 +2356,12 @@ fn probe_relay_for_known_contexts(
     // first adapter (Phase 1 single-adapter mode).
     for (ctx_id, known_ctx) in known {
         let routing_id = RoutingId::new(known_ctx.routing_id);
-        let query_result = crate::runtime::with_transport_manager(bi, |manager| {
-            rt.block_on(manager.query(&routing_id, None)).map_err(|e| {
-                crate::error::ScpPyError::transport(format!("relay probe failed: {e}"))
-            })
+        let query_result = crate::actor_wait::block_on_released(
+            py,
+            manager.query(&routing_id, None),
+        )
+        .and_then(|r| {
+            r.map_err(|e| crate::error::ScpPyError::transport(format!("relay probe failed: {e}")))
         });
 
         match query_result {
@@ -3065,6 +3135,7 @@ mod tests {
     /// the actor's role state, so the ceiling carries `outlet:register`; it
     /// grants no outlet call or query stem.
     fn setup_query_outlet_context(
+        py: Python<'_>,
         bi: &crate::runtime::PyBridgeInstance,
         creator: &str,
         ceiling: &[&str],
@@ -3072,7 +3143,7 @@ mod tests {
         let mut held = ceiling.to_vec();
         held.push("outlet:register");
         let ctx_id = setup_supervised_context(bi, creator, false, &held);
-        let role_state = crate::runtime::live_role_state(bi, &ctx_id).unwrap();
+        let role_state = crate::runtime::live_role_state(py, bi, &ctx_id).unwrap();
         crate::runtime::with_context(bi, &ctx_id, |rt| {
             let registration = scp_core::context::outlets::OutletRegistration {
                 outlet_id: "lookup".to_owned(),
@@ -3121,38 +3192,41 @@ mod tests {
     /// agent the role-state check refuses gets "insufficient permissions".
     #[test]
     fn ffi_bridge_provider_validate_capability_query_kind_selects_query_stem() {
-        let creator = "did:dht:z6MkCreatorQueryStem";
-        let bi = __bi();
-        let validate = |ctx_id: &str| {
-            FfiBridgeProvider {
-                bi: Arc::downgrade(&bi),
-                agent_did: creator.to_owned(),
-                context_ids: vec![ctx_id.to_owned()],
-                outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
-                agent_ucan_token: Some("not-a-ucan".to_owned()),
-                agent_proof_tokens: None,
-            }
-            .validate_capability(ctx_id, "lookup", scp_mcp::server::CapabilityCheck::Probe)
-            .unwrap_err()
-        };
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkCreatorQueryStem";
+            let bi = __bi();
+            let validate = |ctx_id: &str| {
+                FfiBridgeProvider {
+                    bi: Arc::downgrade(&bi),
+                    agent_did: creator.to_owned(),
+                    context_ids: vec![ctx_id.to_owned()],
+                    outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+                    agent_ucan_token: Some("not-a-ucan".to_owned()),
+                    agent_proof_tokens: None,
+                }
+                .validate_capability(ctx_id, "lookup", scp_mcp::server::CapabilityCheck::Probe)
+                .unwrap_err()
+            };
 
-        let call_only =
-            setup_query_outlet_context(&bi, creator, &["messages:read", "outlet:call:*"]);
-        let err = validate(&call_only);
-        assert!(
-            matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg == "insufficient permissions to invoke outlet"),
-            "a Query outlet must be denied to an agent holding only the Action stem: {err}"
-        );
+            let call_only =
+                setup_query_outlet_context(py, &bi, creator, &["messages:read", "outlet:call:*"]);
+            let err = validate(&call_only);
+            assert!(
+                matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg == "insufficient permissions to invoke outlet"),
+                "a Query outlet must be denied to an agent holding only the Action stem: {err}"
+            );
 
-        let query = setup_query_outlet_context(&bi, creator, &["messages:read", "outlet:query:*"]);
-        let err = validate(&query);
-        assert!(
-            matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN authorization failed")),
-            "an agent holding the Query stem must pass the role-state check: {err}"
-        );
+            let query =
+                setup_query_outlet_context(py, &bi, creator, &["messages:read", "outlet:query:*"]);
+            let err = validate(&query);
+            assert!(
+                matches!(&err, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN authorization failed")),
+                "an agent holding the Query stem must pass the role-state check: {err}"
+            );
 
-        crate::runtime::remove_context(&bi, &call_only);
-        crate::runtime::remove_context(&bi, &query);
+            crate::runtime::remove_context(&bi, &call_only);
+            crate::runtime::remove_context(&bi, &query);
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -3273,6 +3347,46 @@ mod tests {
             final_count, 2,
             "event log should have 2 events after two invocations"
         );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// Called from a task on a current-thread runtime, `run_outlet` still
+    /// waits for the handler (on a private runtime off the blocked thread)
+    /// and returns its result, where a refusal of the current-thread wait
+    /// would report a failed call for an outlet that ran.
+    #[test]
+    fn run_outlet_waits_for_the_handler_on_a_current_thread_runtime() {
+        let creator = "did:dht:z6MkCreatorCurrentThreadOutlet";
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
+        register_sum_handler(&bi, &ctx_id);
+        let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+        let host = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime builds");
+        let result = host.block_on(async {
+            invoke_granted(
+                &provider,
+                &ctx_id,
+                "calculator",
+                serde_json::json!({"a": 2, "b": 5}),
+            )
+        });
+        assert_eq!(
+            result,
+            Ok(serde_json::json!({"result": 7.0})),
+            "the handler result must arrive on a current-thread runtime"
+        );
+        assert_eq!(event_count(&bi, &ctx_id), 1, "the call must log its event");
 
         crate::runtime::remove_context(&bi, &ctx_id);
     }
@@ -3629,44 +3743,46 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn outlet_grant_withholds_the_state_of_an_unreachable_actor() {
-        let creator = "did:dht:z6MkCreatorUnreachableActor";
-        let bi = __bi();
-        let ctx_id =
-            setup_supervised_context(&bi, creator, true, &["messages:read", "outlet:call:*"]);
-        let mut provider = pyo3_mcp_provider(&bi, &ctx_id, creator);
-        provider.agent_ucan_token = Some("not-a-ucan".to_owned());
-        let role_state = crate::runtime::live_role_state(&bi, &ctx_id).unwrap();
-        let grant = || {
-            provider.outlet_grant(
-                &bi,
-                &role_state,
-                &ctx_id,
-                "calculator",
-                scp_mcp::server::CapabilityCheck::Probe,
-            )
-        };
-        let reached = grant().unwrap_err();
-        assert!(
-            matches!(&reached, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN authorization failed")),
-            "precondition: with the actor answering, the grant reaches the UCAN step: {reached}"
-        );
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkCreatorUnreachableActor";
+            let bi = __bi();
+            let ctx_id =
+                setup_supervised_context(&bi, creator, true, &["messages:read", "outlet:call:*"]);
+            let mut provider = pyo3_mcp_provider(&bi, &ctx_id, creator);
+            provider.agent_ucan_token = Some("not-a-ucan".to_owned());
+            let role_state = crate::runtime::live_role_state(py, &bi, &ctx_id).unwrap();
+            let grant = || {
+                provider.outlet_grant(
+                    &bi,
+                    &role_state,
+                    &ctx_id,
+                    "calculator",
+                    scp_mcp::server::CapabilityCheck::Probe,
+                )
+            };
+            let reached = grant().unwrap_err();
+            assert!(
+                matches!(&reached, scp_mcp::server::AccessRefusal::Denied(msg) if msg.contains("UCAN authorization failed")),
+                "precondition: with the actor answering, the grant reaches the UCAN step: {reached}"
+            );
 
-        crate::runtime::supervisor(&bi)
-            .unwrap()
-            .test_make_actor_unreachable(&ctx_id);
-        let refusal = grant().unwrap_err();
-        assert!(
-            matches!(
-                &refusal,
-                scp_mcp::server::AccessRefusal::Denied(msg)
-                    if msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
-                        && msg.contains(scp_ffi_common::error_codes::CTX_2023)
-                        && !msg.contains("SCP-CTX-2130")
-                        && !msg.contains(&ctx_id)
-            ),
-            "an unreachable actor must read as the withheld denial: {refusal}"
-        );
-        crate::runtime::remove_context(&bi, &ctx_id);
+            crate::runtime::supervisor(&bi)
+                .unwrap()
+                .test_make_actor_unreachable(&ctx_id);
+            let refusal = grant().unwrap_err();
+            assert!(
+                matches!(
+                    &refusal,
+                    scp_mcp::server::AccessRefusal::Denied(msg)
+                        if msg.contains(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD)
+                            && msg.contains(scp_ffi_common::error_codes::CTX_2023)
+                            && !msg.contains("SCP-CTX-2130")
+                            && !msg.contains(&ctx_id)
+                ),
+                "an unreachable actor must read as the withheld denial: {refusal}"
+            );
+            crate::runtime::remove_context(&bi, &ctx_id);
+        });
     }
 
     /// `outlet_grant` passes a missing supervisor through its lifecycle check
@@ -3890,27 +4006,29 @@ mod tests {
 
     #[test]
     fn load_contexts_returns_local_contexts() {
-        let creator = "did:dht:z6MkCreatorLoadCtx";
-        let bi = __bi();
-        let ctx_id = setup_supervised_context(&bi, creator, true, &["messages:read"]);
+        pyo3::Python::with_gil(|py| {
+            let creator = "did:dht:z6MkCreatorLoadCtx";
+            let bi = __bi();
+            let ctx_id = setup_supervised_context(&bi, creator, true, &["messages:read"]);
 
-        // Since py_mcp_load_contexts requires Python, we test the underlying
-        // runtime function directly.
-        let states = crate::runtime::member_context_role_states(&bi, creator).unwrap();
-        assert!(
-            states.iter().any(|(id, _)| id == &ctx_id),
-            "creator should be a member of the context"
-        );
+            // Since py_mcp_load_contexts requires Python, we test the underlying
+            // runtime function directly.
+            let states = crate::runtime::member_context_role_states(py, &bi, creator).unwrap();
+            assert!(
+                states.iter().any(|(id, _)| id == &ctx_id),
+                "creator should be a member of the context"
+            );
 
-        // Non-member should not see the context.
-        let other_states =
-            crate::runtime::member_context_role_states(&bi, "did:dht:z6MkNobody").unwrap();
-        assert!(
-            !other_states.iter().any(|(id, _)| id == &ctx_id),
-            "non-member should not see the context"
-        );
+            // Non-member should not see the context.
+            let other_states =
+                crate::runtime::member_context_role_states(py, &bi, "did:dht:z6MkNobody").unwrap();
+            assert!(
+                !other_states.iter().any(|(id, _)| id == &ctx_id),
+                "non-member should not see the context"
+            );
 
-        crate::runtime::remove_context(&bi, &ctx_id);
+            crate::runtime::remove_context(&bi, &ctx_id);
+        });
     }
 
     /// `py_mcp_load_contexts` lists a context by the membership the supervisor
@@ -4042,29 +4160,33 @@ mod tests {
 
     #[test]
     fn probe_relay_with_no_connection_returns_empty() {
-        // When no relay connection is active, probing should return an empty set.
-        let known = vec![(
-            "test-ctx".to_owned(),
-            crate::runtime::KnownContext {
-                routing_id: [0xBB; 32],
-                relay_url: Some("ws://127.0.0.1:9000/scp/v1".to_owned()),
-                member_did: "did:dht:z6MkTest".to_owned(),
-                last_seen: 1_700_000_000,
-            },
-        )];
+        pyo3::Python::with_gil(|py| {
+            // When no relay connection is active, probing should return an empty set.
+            let known = vec![(
+                "test-ctx".to_owned(),
+                crate::runtime::KnownContext {
+                    routing_id: [0xBB; 32],
+                    relay_url: Some("ws://127.0.0.1:9000/scp/v1".to_owned()),
+                    member_did: "did:dht:z6MkTest".to_owned(),
+                    last_seen: 1_700_000_000,
+                },
+            )];
 
-        let active = probe_relay_for_known_contexts(&__bi(), &known);
-        assert!(
-            active.is_empty(),
-            "should return empty set when no relay is connected"
-        );
+            let active = probe_relay_for_known_contexts(py, &__bi(), &known);
+            assert!(
+                active.is_empty(),
+                "should return empty set when no relay is connected"
+            );
+        });
     }
 
     #[test]
     fn probe_relay_with_empty_known_returns_empty() {
-        let known: Vec<(String, crate::runtime::KnownContext)> = vec![];
-        let active = probe_relay_for_known_contexts(&__bi(), &known);
-        assert!(active.is_empty(), "should return empty set for empty input");
+        pyo3::Python::with_gil(|py| {
+            let known: Vec<(String, crate::runtime::KnownContext)> = vec![];
+            let active = probe_relay_for_known_contexts(py, &__bi(), &known);
+            assert!(active.is_empty(), "should return empty set for empty input");
+        });
     }
 
     // -----------------------------------------------------------------------

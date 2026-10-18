@@ -2,13 +2,10 @@
 //!
 //! Extends the exact-match [`verify_outlet`](super::verify_outlet) with
 //! schema-based verification that checks structural compatibility (same keys,
-//! compatible types) rather than exact value equality. Produces
-//! [`ChallengeVerification`] results for integration with the trust subsystem.
+//! compatible types) rather than exact value equality.
 //!
 //! Also provides [`VerificationScheduler`] for periodic re-verification
 //! with configurable intervals per outlet.
-//!
-//! See issue #367.
 
 use std::collections::HashMap;
 
@@ -16,9 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{OutletError, OutletId, OutletRegistry, OutletVerificationResult, VectorResult};
-use crate::trust::challenge::{ChallengeType, ChallengeVerification, VerificationMethod};
 use scp_clock::Clock;
-use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Schema compatibility checking
@@ -105,9 +100,10 @@ pub struct SchemaVerificationResult {
 /// compatible* with the expected output: same keys, compatible types,
 /// recursive matching. Extra keys in the actual output are allowed.
 ///
-/// Returns a [`ChallengeVerification`] that can be stored in the trust
-/// subsystem, plus a [`SchemaVerificationResult`] with detailed per-vector
-/// results.
+/// Returns a [`SchemaVerificationResult`] with detailed per-vector results.
+/// It produces no trust record: a `ChallengeVerification` is signed by its
+/// verifier over a challenge request (spec 07 §7.3.4), which this local check
+/// does not have.
 ///
 /// # Errors
 ///
@@ -115,10 +111,8 @@ pub struct SchemaVerificationResult {
 pub fn verify_outlet_integrity<F>(
     registry: &OutletRegistry,
     outlet_id: &str,
-    verifier_did: &DID,
-    clock: &dyn Clock,
     executor: F,
-) -> Result<(ChallengeVerification, SchemaVerificationResult), OutletError>
+) -> Result<SchemaVerificationResult, OutletError>
 where
     F: Fn(&Value) -> Value,
 {
@@ -128,7 +122,6 @@ where
             outlet_id: outlet_id.to_owned(),
         })?;
 
-    let operator_did = registration.operator_did.clone();
     let mut vector_results = Vec::with_capacity(registration.test_vectors.len());
 
     for vector in &registration.test_vectors {
@@ -156,45 +149,13 @@ where
     let passed_count = vector_results.iter().filter(|r| r.passed).count();
     let integrity_ok = passed_count == vector_results.len();
 
-    let now = clock.now_secs();
-
-    let challenge_id = format!("outlet-integrity-{outlet_id}-{now}");
-
-    let verification = ChallengeVerification {
-        verification_id: challenge_id,
-        verifier_did: verifier_did.clone(),
-        subject_did: operator_did,
-        capability_uri: "scp:capability:outlet-integrity/v1".to_string(),
-        context_id: None, // Outlet integrity checks are context-independent
-        challenge_type: ChallengeType::outlet_integrity(),
-        verification_method: VerificationMethod::ChallengeVerified {
-            challenge_type: ChallengeType::outlet_integrity(),
-        },
-        passed: integrity_ok,
-        score: None,
-        #[allow(clippy::cast_possible_truncation)] // vector count bounded well below u32::MAX
-        test_count: vector_results.len() as u32,
-        #[allow(clippy::cast_possible_truncation)] // subset of vector count, bounded well below u32::MAX
-        pass_count: passed_count as u32,
-        result: serde_json::json!({
-            "outlet_id": outlet_id,
-            "vectors_passed": passed_count,
-            "vectors_total": vector_results.len(),
-            "integrity_ok": integrity_ok,
-        }),
-        completed_at: now,
-        verified_at: now,
-        expires_at: now + 86400, // 24h validity
-        verifier_signature: Vec::new(), // Populated by signing layer
-    };
-
     let schema_result = SchemaVerificationResult {
         outlet_id: outlet_id.to_owned(),
         vector_results,
         integrity_ok,
     };
 
-    Ok((verification, schema_result))
+    Ok(schema_result)
 }
 
 /// Converts a [`SchemaVerificationResult`] to a [`OutletVerificationResult`]
@@ -347,6 +308,7 @@ mod tests {
     use super::*;
     use crate::context::outlets::registry::{OutletRegistration, OutletSchema, OutletTestVector};
     use scp_clock::Clock;
+    use scp_did::DID;
     use serde_json::json;
 
     fn make_registry(outlet_id: &str, test_vectors: Vec<OutletTestVector>) -> OutletRegistry {
@@ -445,14 +407,10 @@ mod tests {
             description: "basic test".to_owned(),
         }];
         let registry = make_registry("calc", vectors);
-        let verifier = DID::from("did:dht:verifier");
 
-        let clock = scp_clock::SystemClock;
-        let (verification, result) = verify_outlet_integrity(
+        let result = verify_outlet_integrity(
             &registry,
             "calc",
-            &verifier,
-            &clock,
             |_input| json!({"result": 99, "status": "done", "extra_field": true}),
         )
         .unwrap();
@@ -460,15 +418,6 @@ mod tests {
         assert!(result.integrity_ok);
         assert_eq!(result.vector_results.len(), 1);
         assert!(result.vector_results[0].passed);
-        assert!(
-            verification
-                .verification_id
-                .starts_with("outlet-integrity-calc-")
-        );
-        assert_eq!(
-            verification.challenge_type,
-            ChallengeType::outlet_integrity()
-        );
     }
 
     #[test]
@@ -479,14 +428,10 @@ mod tests {
             description: "expects number".to_owned(),
         }];
         let registry = make_registry("calc", vectors);
-        let verifier = DID::from("did:dht:verifier");
 
-        let clock = scp_clock::SystemClock;
-        let (verification, result) = verify_outlet_integrity(
+        let result = verify_outlet_integrity(
             &registry,
             "calc",
-            &verifier,
-            &clock,
             |_input| json!({"result": "not a number"}),
         )
         .unwrap();
@@ -494,24 +439,13 @@ mod tests {
         assert!(!result.integrity_ok);
         assert!(!result.vector_results[0].passed);
         assert!(result.vector_results[0].mismatch_detail.is_some());
-        assert!(
-            !verification
-                .result
-                .get("integrity_ok")
-                .unwrap()
-                .as_bool()
-                .unwrap()
-        );
     }
 
     #[test]
     fn verify_integrity_outlet_not_found() {
         let registry = OutletRegistry::new();
-        let verifier = DID::from("did:dht:verifier");
 
-        let clock = scp_clock::SystemClock;
-        let err = verify_outlet_integrity(&registry, "missing", &verifier, &clock, |_| json!({}))
-            .unwrap_err();
+        let err = verify_outlet_integrity(&registry, "missing", |_| json!({})).unwrap_err();
 
         match err {
             OutletError::OutletNotFound { outlet_id } => assert_eq!(outlet_id, "missing"),
@@ -534,12 +468,8 @@ mod tests {
             },
         ];
         let registry = make_registry("multi", vectors);
-        let verifier = DID::from("did:dht:v");
 
-        let clock = scp_clock::SystemClock;
-        let (_, result) =
-            verify_outlet_integrity(&registry, "multi", &verifier, &clock, |_| json!({"a": 1}))
-                .unwrap();
+        let result = verify_outlet_integrity(&registry, "multi", |_| json!({"a": 1})).unwrap();
 
         assert!(result.integrity_ok);
     }

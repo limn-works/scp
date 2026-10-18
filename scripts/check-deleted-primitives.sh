@@ -58,7 +58,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# SCP_DELETED_PRIMITIVES_ROOT overrides the scanned root, for the fixture
+# tests in scripts/tests/deleted-primitives/.
+REPO_ROOT="${SCP_DELETED_PRIMITIVES_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$REPO_ROOT"
 
 # ---------------------------------------------------------------------------
@@ -150,6 +152,24 @@ BAN_ENTRIES=(
     "serde_pubkey_65|crates|*.rs|Type the field as scp_protocol::crypto::hpke::p256::P256Point, which validates at decode"
     "serde_wrapping_key_list_65|crates|*.rs|Type the list as Vec<(String, P256Point)>, which validates each key at decode"
     "validate_uncompressed_point|crates|*.rs|Parse a wire point with P256Point::try_from (or validate_enc for an HPKE enc), the one P-256 wire-point parser"
+    # ADR-049 Decision 7a: every signing path signs through custody in the
+    # actor turn (CommandSigner), so no key-export accessor, host export
+    # callback, or raw-seed command field exists, and broadcast publish has
+    # one signing pattern.
+    "export_ed25519_signing_key|crates|*.rs|Sign through KeyCustody::sign (a CommandSigner); no custody exports a private key"
+    "export_signing_key_bytes|crates|*.rs|Custody providers sign and never export a seed; the host export callback is deleted"
+    "export_signing_key_bytes|bindings|*.py|Custody providers sign and never export a seed; the host export callback is deleted"
+    "export_signing_key_bytes|bindings|*.swift|Custody providers sign and never export a seed; the host export callback is deleted"
+    "exportSigningKeyBytes|bindings|*.ts|Custody providers sign and never export a seed; the host export callback is deleted"
+    "exportSigningKeyBytes|bindings|*.kt|Custody providers sign and never export a seed; the host export callback is deleted"
+    "exportSigningKeyBytes|bindings|*.swift|Custody providers sign and never export a seed; the host export callback is deleted"
+    # Either spelling in any binding file: a generated header, a Kotlin
+    # build script or a JavaScript shim reintroduces the callback as surely as
+    # a source file.
+    "export_signing_key_bytes|bindings|*|Custody providers sign and never export a seed; the host export callback is deleted"
+    "exportSigningKeyBytes|bindings|*|Custody providers sign and never export a seed; the host export callback is deleted"
+    "SigningKeyBytes|crates|*.rs|Carry a CommandSigner in the command; no command carries raw key bytes"
+    "dispatch_broadcast_command_with_custody|crates|*.rs|Broadcast publish signs in the actor turn through CommandSigner; the reserve/sign-outside/apply pattern is deleted"
     # #2148 (birth-into-actor): the six provider-dissolution symbols
     # (take_crypto_state / with_context / create_group_into_slot method defs, and
     # the contexts / taken_context_ids / broadcast_keys fields) are NOT banned

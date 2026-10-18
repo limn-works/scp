@@ -51,11 +51,11 @@ use scp_did::DID;
 
 use scp_clock::Clock;
 
-use super::AttestationType;
 use super::attestation::{
-    AttestationRevocationChecker, AttestorInfo, DidPublicKeyResolver, ThresholdCheckInput,
+    ActiveKeyResolver, AttestationRevocationChecker, AttestorInfo, ThresholdCheckInput,
     ThresholdRequirement, check_threshold_attestation,
 };
+use super::{AttestationType, TrustError};
 
 // ---------------------------------------------------------------------------
 // TrustSignalCategory — the 6 composable signal types from §9.3
@@ -730,6 +730,13 @@ pub enum SybilResistanceError {
         /// Required attestation count (for debug/logging only).
         required_count: u32,
     },
+
+    /// An endorsement could not be verified for a reason other than a
+    /// rejection of the endorsement itself, such as an unreachable key
+    /// resolution layer. The check made no judgement, so a caller retries
+    /// rather than reading this as an insufficient endorsement set.
+    #[error("endorsement verification unavailable: {0}")]
+    EndorsementVerificationUnavailable(#[source] TrustError),
 }
 
 // ---------------------------------------------------------------------------
@@ -748,9 +755,9 @@ pub struct EndorsementEvidence<'a> {
     /// The candidate endorsers, before deduplication and verification.
     pub attestors: &'a [AttestorInfo],
 
-    /// Resolves each endorser's DID to the Ed25519 public key that must have
+    /// Resolves each endorser's DID to its `#active` key, which must have
     /// signed that endorser's attestation.
-    pub resolver: &'a dyn DidPublicKeyResolver,
+    pub resolver: &'a dyn ActiveKeyResolver,
 
     /// Supplies the time that decides each endorsement's expiry. A caller that
     /// also passes `current_time` to [`evaluate_sybil_resistance`] reads both
@@ -931,7 +938,8 @@ fn check_endorsement_independence(
             resolver: evidence.resolver,
             clock: evidence.clock,
             revocation_checker: evidence.revocation_checker,
-        });
+        })
+        .map_err(SybilResistanceError::EndorsementVerificationUnavailable)?;
         if !result.met {
             let count_ok = result.valid_count >= result.required_count;
             let reason = if count_ok {
@@ -1040,8 +1048,8 @@ mod tests {
     /// Resolver that derives each DID's public key with [`key_for_did`].
     struct DerivedKeyResolver;
 
-    impl DidPublicKeyResolver for DerivedKeyResolver {
-        fn resolve_public_key(&self, resolved_did: &str) -> Result<Vec<u8>, TrustError> {
+    impl ActiveKeyResolver for DerivedKeyResolver {
+        fn resolve_active_key(&self, resolved_did: &str) -> Result<Vec<u8>, TrustError> {
             Ok(key_for_did(resolved_did)
                 .verifying_key()
                 .to_bytes()
@@ -1561,6 +1569,46 @@ mod tests {
                 Some(&harness.evidence(&attestors))
             )
             .is_ok()
+        );
+    }
+
+    /// A resolver whose backend is down: every lookup is an infrastructure
+    /// fault, never a judgment on the endorsement.
+    struct UnreachableResolver;
+
+    impl ActiveKeyResolver for UnreachableResolver {
+        fn resolve_active_key(&self, resolved_did: &str) -> Result<Vec<u8>, TrustError> {
+            Err(TrustError::KeyResolutionUnavailable {
+                did: resolved_did.to_owned(),
+                reason: "all resolution layers down".to_owned(),
+            })
+        }
+    }
+
+    /// A key-resolution outage while verifying endorsements surfaces as
+    /// `EndorsementVerificationUnavailable`, not as an independence shortfall
+    /// that would read as a verdict on the subject.
+    #[test]
+    fn endorsement_key_resolution_outage_propagates() {
+        let assessment = make_deep_assessment(now());
+        let policy = ContextSybilPolicy::high_trust();
+        let attestors = make_independent_attestors(now());
+        let clock = TestClock::new(now());
+        let evidence = EndorsementEvidence {
+            attestors: &attestors,
+            resolver: &UnreachableResolver,
+            clock: &clock,
+            revocation_checker: &NoOpRevocationChecker,
+        };
+        let result = evaluate_sybil_resistance(&assessment, &policy, now(), Some(&evidence));
+        assert!(
+            matches!(
+                result,
+                Err(SybilResistanceError::EndorsementVerificationUnavailable(
+                    TrustError::KeyResolutionUnavailable { .. }
+                ))
+            ),
+            "{result:?}"
         );
     }
 

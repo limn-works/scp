@@ -18,6 +18,10 @@
 //!
 //! See §3.10.10, §9.5, §7.4.1, §22.3.1, §22.4, §22.8 in `.docs/specs/`.
 
+// The one module under `crates/scp-ffi/` allowed to block a thread
+// (ADR-049 Decision 7a; `scripts/check-bridge-block-on.py`).
+#[cfg(feature = "resolvers")]
+pub mod bridge_wait;
 pub mod custody_request;
 pub mod error_codes;
 pub mod outlet_id;
@@ -176,6 +180,11 @@ pub mod ucan_durable_state;
 #[cfg(feature = "resolvers")]
 pub mod streaming_saga;
 
+// The bridges' one way to build the `CommandSigner` a runtime command carries
+// (ADR-049 Decision 7a). Requires scp-core + scp-platform (behind `resolvers`).
+#[cfg(feature = "resolvers")]
+pub mod signer;
+
 // Shared context-parameter builder for all FFI bridges.
 // Requires scp-core (behind `resolvers` feature).
 #[cfg(feature = "resolvers")]
@@ -189,7 +198,12 @@ pub mod context_params;
 pub mod event_log;
 
 // Trust store shared across PyO3, napi-rs, and UniFFI bridges.
-// Requires scp-core (behind `resolvers` feature).
+// Requires scp-core (behind `resolvers` feature). The module's own `//!`
+// docs describe it: an outer `///` here would merge with them, and rustdoc
+// would resolve their intra-doc links from this crate root.
+#[cfg(feature = "resolvers")]
+pub mod challenge;
+
 #[cfg(feature = "resolvers")]
 pub mod trust_store;
 

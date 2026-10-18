@@ -18,7 +18,7 @@
 //!    persona for the next send. Injected per bridge instance (like custody —
 //!    no singletons). [`default_persona_source`] always returns
 //!    [`SigningKeyId::Active`].
-//! 2. [`ResolvedMessageSigner`] — an owned `(key, persona)` pair resolved
+//! 2. [`ResolvedMessageSigner`] — an owned `(signer, persona)` pair resolved
 //!    together from ONE persona, whose [`ResolvedMessageSigner::message_signer`]
 //!    derives the [`MessageSigner`] variant from that same persona. This makes
 //!    an `#agent`-stamped-but-`#active`-signed message (or the reverse)
@@ -41,6 +41,7 @@
 
 use std::sync::Arc;
 
+use scp_core::context::actor::CommandSigner;
 use scp_core::context::supervisor::MessageSigner;
 use scp_did::SigningKeyId;
 
@@ -63,51 +64,45 @@ pub fn default_persona_source() -> PersonaSource {
     Arc::new(|| SigningKeyId::Active)
 }
 
-/// An owned `(signing key, persona)` pair resolved together from ONE persona.
+/// An owned `(signer, persona)` pair resolved together from ONE persona.
 ///
 /// Constructed by each bridge's persona-aware resolver, which matches on the
 /// requested [`SigningKeyId`] exactly once to pick BOTH the key handle (active
 /// vs agent, fail-closed when `#agent` has no agent key) AND the persona stored
 /// here. [`Self::message_signer`] derives the [`MessageSigner`] variant from
-/// that same stored persona and borrows the stored key — so the persona stamped
-/// on the wire and the key that signs are one source of truth, and an
+/// that same stored persona and borrows the stored signer — so the persona
+/// stamped on the wire and the key that signs are one source of truth, and an
 /// `#agent`-stamped-but-`#active`-signed message is unrepresentable.
+///
+/// The signer signs through the identity's custody (ADR-049 Decision 7a); the
+/// pair holds no private key material.
+#[derive(Debug)]
 pub struct ResolvedMessageSigner {
-    key: ed25519_dalek::SigningKey,
+    signer: CommandSigner,
     persona: SigningKeyId,
 }
 
-impl std::fmt::Debug for ResolvedMessageSigner {
-    /// Redacts the signing key — private key material must never reach logs or
-    /// panic messages (ADR-006).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedMessageSigner")
-            .field("persona", &self.persona)
-            .field("key", &"<redacted>")
-            .finish()
-    }
-}
-
 impl ResolvedMessageSigner {
-    /// Pairs an exported signing key with the persona it was resolved for.
+    /// Pairs a custody-backed signer with the persona it was resolved for.
     ///
-    /// The caller MUST pass the key that belongs to `persona` (the active key
-    /// for [`SigningKeyId::Active`], the agent key for [`SigningKeyId::Agent`]).
-    /// The bridge `resolve_*` helpers enforce this by selecting the key handle
-    /// and the persona in a single match, so the two cannot drift apart.
+    /// The caller MUST pass the signer over the key that belongs to `persona`
+    /// (the active key for [`SigningKeyId::Active`], the agent key for
+    /// [`SigningKeyId::Agent`]). The bridge `resolve_*` helpers enforce this by
+    /// selecting the key handle and the persona in a single match, so the two
+    /// cannot drift apart.
     #[must_use]
-    pub const fn new(key: ed25519_dalek::SigningKey, persona: SigningKeyId) -> Self {
-        Self { key, persona }
+    pub const fn new(signer: CommandSigner, persona: SigningKeyId) -> Self {
+        Self { signer, persona }
     }
 
     /// The atomic [`MessageSigner`]: the variant is derived from the stored
-    /// persona and borrows the stored key, so the stamp and the key are one
+    /// persona and borrows the stored signer, so the stamp and the key are one
     /// source of truth.
     #[must_use]
     pub const fn message_signer(&self) -> MessageSigner<'_> {
         match self.persona {
-            SigningKeyId::Active => MessageSigner::Active(&self.key),
-            SigningKeyId::Agent => MessageSigner::Agent(&self.key),
+            SigningKeyId::Active => MessageSigner::Active(&self.signer),
+            SigningKeyId::Agent => MessageSigner::Agent(&self.signer),
         }
     }
 
@@ -128,9 +123,15 @@ mod tests {
         assert_eq!(source(), SigningKeyId::Active);
     }
 
+    fn local_signer(seed: u8) -> CommandSigner {
+        CommandSigner::new(Arc::new(scp_crypto::LocalEd25519Signer::new(
+            ed25519_dalek::SigningKey::from_bytes(&[seed; 32]),
+        )))
+    }
+
     #[test]
     fn message_signer_variant_matches_persona() {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let key = local_signer(7);
 
         let active = ResolvedMessageSigner::new(key.clone(), SigningKeyId::Active);
         assert_eq!(active.persona(), SigningKeyId::Active);
@@ -148,17 +149,17 @@ mod tests {
 
     #[test]
     fn message_signer_and_key_share_one_key() {
-        // The NAPI decomposition path takes `.key()` and `.signing_key_id()`
-        // from the same `message_signer()`; assert repeated derivations of it
-        // reference the same key bytes.
-        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        // A bridge that decomposes the pair takes `.signer()` and
+        // `.signing_key_id()` from the same `message_signer()`; assert repeated
+        // derivations of it expose the same public key.
+        let key = local_signer(9);
         let resolved = ResolvedMessageSigner::new(key.clone(), SigningKeyId::Agent);
         let signer = resolved.message_signer();
         assert_eq!(
-            signer.key().to_bytes(),
-            resolved.message_signer().key().to_bytes(),
+            signer.signer().public_key(),
+            resolved.message_signer().signer().public_key(),
             "repeated message_signer() derivations must expose the same key"
         );
-        assert_eq!(signer.key().to_bytes(), key.to_bytes());
+        assert_eq!(signer.signer().public_key(), key.public_key());
     }
 }

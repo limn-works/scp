@@ -552,7 +552,7 @@ pub fn compute_canonical_hash(
     params: &InnerEnvelopeParams<'_>,
     payload_hash: &[u8; 32],
     provenance_hash: &[u8; 32],
-) -> Result<Vec<u8>, EnvelopeError> {
+) -> Result<[u8; 32], EnvelopeError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     // Field order per §13.2.1: version, message_type (discriminator byte),
@@ -562,7 +562,7 @@ pub fn compute_canonical_hash(
     // version from params is field 1 per §13.2.1 — part of the signature
     // commitment. message_type follows as a discriminator byte to prevent
     // type-flipping attacks (issue #290).
-    Ok(canonical_hash(
+    canonical_hash(
         "SCP-INNER-ENVELOPE-V1:",
         &[
             CanonicalField::U16(params.version),
@@ -578,8 +578,7 @@ pub fn compute_canonical_hash(
             CanonicalField::VarBytes(params.signing_key_id.as_bytes()),
         ],
     )
-    .map_err(|e| EnvelopeError::SerializationFailed(e.to_string()))?
-    .to_vec())
+    .map_err(|e| EnvelopeError::SerializationFailed(e.to_string()))
 }
 
 #[cfg(test)]
@@ -765,11 +764,13 @@ mod tests {
         };
 
         assert_ne!(
-            hash_with_domain, hash_without_domain,
+            hash_with_domain.as_slice(),
+            hash_without_domain.as_slice(),
             "domain separator must change hash vs. no separator"
         );
         assert_ne!(
-            hash_with_domain, hash_alt_domain,
+            hash_with_domain.as_slice(),
+            hash_alt_domain.as_slice(),
             "different domain separator must produce different hash"
         );
     }

@@ -28,7 +28,7 @@ categories = ["cryptography", "network-programming"]
 # default or non-testing list, and no shipped artifact resolves
 # `scp-runtime/testing`, so `scripts/check-shipped-feature-graph.sh` keeps
 # proving `InMemoryDhtClient` absent from every shipped feature graph.
-testing = ["allow_unencrypted_storage", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing", "scp-dht/testing"]
+testing = ["allow_unencrypted_storage", "scp-crypto/testing", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing", "scp-dht/testing"]
 # Gates `ProtocolRepository::new_for_testing()` — accepts any `Storage` backend
 # without the `EncryptedStorage` bound. Production `ProtocolRepository::new()`
 # requires `EncryptedStorage`. Follows the test-harness feature-gating pattern
@@ -84,7 +84,6 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 serde_bytes = { workspace = true }
 serde_json = { workspace = true }
-serde_json_canonicalizer = { workspace = true }
 z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
@@ -92,7 +91,6 @@ x25519-dalek = { workspace = true }
 base64 = { workspace = true }
 bs58 = { workspace = true }
 uuid = { workspace = true }
-jsonschema = { workspace = true, features = ["resolve-http", "resolve-file"] }
 lru = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true, features = ["serde"] }
