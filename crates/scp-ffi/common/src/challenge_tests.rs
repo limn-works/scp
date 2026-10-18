@@ -1239,12 +1239,59 @@ fn a_schema_fault_keeps_its_class_only_before_the_deadline() {
     assert!(flow.is_continue());
 }
 
-/// Polls `inner`, and on its first poll after `gate` is set blocks the
-/// polling thread for `stall` first: a grader that observes nothing while
-/// the work it waits on completes elsewhere.
+/// What [`StallOnce`] and the handler it gates share: the handler records
+/// its start and blocks until `released`; the grader's wrapper releases it
+/// only from a poll that returned `Pending`, so the grader is parked.
+#[derive(Default)]
+struct StallGate {
+    state: std::sync::Mutex<StallState>,
+    released: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct StallState {
+    started: bool,
+    released: bool,
+    /// The parked grader's waker, so a start after its last poll wakes it.
+    waker: Option<std::task::Waker>,
+}
+
+impl StallGate {
+    /// Called by the gated handler: records its start, wakes the parked
+    /// grader, and blocks until the grader releases it. The wait is
+    /// bounded, so a grader that never parks fails the case instead of
+    /// hanging the test.
+    fn enter(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.started = true;
+        let waker = state.waker.take();
+        drop(state);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        let (state, wait) = self
+            .released
+            .wait_timeout_while(self.state.lock().unwrap(), Duration::from_secs(30), |s| {
+                !s.released
+            })
+            .unwrap();
+        drop(state);
+        assert!(!wait.timed_out(), "the grader never parked");
+    }
+}
+
+/// Polls `inner`. Once a poll returns `Pending` after the gated handler
+/// started, it releases the handler and blocks the polling thread for
+/// `stall`: a grader that observes nothing while the work it waits on
+/// completes elsewhere.
+///
+/// The release comes only from a poll that returned `Pending`, so the
+/// grader cannot see the handler's outcome in the poll that starts the
+/// stall: the outcome needs the handler to return, and it returns only
+/// after the release.
 struct StallOnce<F> {
     inner: std::pin::Pin<Box<F>>,
-    gate: Arc<AtomicBool>,
+    gate: Arc<StallGate>,
     stall: Duration,
     stalled: bool,
 }
@@ -1253,39 +1300,54 @@ impl<F: std::future::Future> std::future::Future for StallOnce<F> {
     type Output = F::Output;
 
     fn poll(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<F::Output> {
-        if !self.stalled && self.gate.load(Ordering::SeqCst) {
-            self.stalled = true;
-            std::thread::sleep(self.stall);
+        let this = self.get_mut();
+        let polled = this.inner.as_mut().poll(cx);
+        if polled.is_pending() && !this.stalled {
+            let mut state = this.gate.state.lock().unwrap();
+            if state.started {
+                state.released = true;
+                drop(state);
+                this.gate.released.notify_all();
+                this.stalled = true;
+                std::thread::sleep(this.stall);
+                cx.waker().wake_by_ref();
+            } else {
+                state.waker = Some(cx.waker().clone());
+            }
         }
-        self.inner.as_mut().poll(cx)
+        polled
     }
 }
 
 /// An evaluator outcome reached before the deadline keeps its class when
-/// the grader observes it only after the deadline: case 18's handler
-/// returns at once, its pipeline task stamps the verdict on a runtime
-/// worker, and the grader, polled on the test thread, stalls past the
-/// deadline before it sees the verdict. Case 18 passes on that verdict;
+/// the grader observes it only after the deadline: case 18's handler runs
+/// while the grader is parked, its pipeline task stamps the verdict on a
+/// runtime worker, and the grader, polled on the test thread, stalls past
+/// the deadline before it sees the verdict. Case 18 passes on that verdict;
 /// case 19 never starts, so it fails with `budget_exceeded`.
 ///
-/// The stall starts after case 18's handler returned and lasts the whole
+/// Every step is ordered by the gate, not by when the scheduler runs the
+/// grader: case 18's handler returns only after the grader parked and
+/// stalled, so the grader cannot record case 18 and start case 19 in one
+/// poll. The stall starts after the handler started and lasts the whole
 /// budget, and the deadline was set before the handler ran, so the grader
 /// resumes after the deadline. The pipeline task does not wait on the
-/// grader, so it stamps before the deadline.
+/// grader, so it stamps within the budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_outcome_reached_before_the_deadline_keeps_its_class_when_seen_after_it() {
     const BUDGET: Duration = Duration::from_secs(2);
     let h = Harness::new(evaluator_params()).await;
-    let returned = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(StallGate::default());
     let calls = Arc::new(AtomicUsize::new(0));
     let handler: EvaluatorHandler = {
-        let (returned, calls) = (Arc::clone(&returned), Arc::clone(&calls));
+        let (gate, calls) = (Arc::clone(&gate), Arc::clone(&calls));
         Arc::new(move |_input| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            returned.store(true, Ordering::SeqCst);
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                gate.enter();
+            }
             Ok(verdict(true))
         })
     };
@@ -1294,8 +1356,8 @@ async fn an_outcome_reached_before_the_deadline_keeps_its_class_when_seen_after_
     let response = h.respond(&request, 1).await;
     let graded = StallOnce {
         inner: Box::pin(h.grade_within(&request, &response, &invoker, BUDGET)),
-        gate: returned,
-        stall: BUDGET + Duration::from_millis(50),
+        gate,
+        stall: BUDGET,
         stalled: false,
     }
     .await
