@@ -92,19 +92,19 @@ class ScpShutdownTest {
     @Test
     fun `a shutdown that leaves the store locked propagates and marks the instance shut down`() {
         runTest(testDispatcher) {
-            engine.onShutdown = { throw ScpException.Validation(msg = "store open", code = "SCP-STORAGE-8005") }
-            val err = assertFailsWith<ScpException.Validation> { scp.shutdown(bridge) }
+            engine.onShutdown = { throw ScpException.Storage(msg = "store open", code = "SCP-STORAGE-8005") }
+            val err = assertFailsWith<ScpException.Storage> { scp.shutdown(bridge) }
             assertEquals("SCP-STORAGE-8005", err.code)
             assertTrue(scp.isShutdown)
         }
     }
 
-    // Any other validation failure is an engine failure, so the instance stays recorded as live.
+    // Any other storage failure is an engine failure, so the instance stays recorded as live.
     @Test
-    fun `a shutdown failing with another validation code leaves the instance live`() {
+    fun `a shutdown failing with another storage code leaves the instance live`() {
         runTest(testDispatcher) {
-            engine.onShutdown = { throw ScpException.Validation(msg = "bad deadline", code = "SCP-VALID-7001") }
-            assertFailsWith<ScpException.Validation> { scp.shutdown(bridge) }
+            engine.onShutdown = { throw ScpException.Storage(msg = "store refused", code = "SCP-STORAGE-8004") }
+            assertFailsWith<ScpException.Storage> { scp.shutdown(bridge) }
             assertFalse(scp.isShutdown)
         }
     }

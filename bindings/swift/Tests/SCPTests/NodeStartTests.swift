@@ -245,6 +245,7 @@
         case let .Transport(_, code): ("Transport", code)
         case let .Outlet(_, code): ("Outlet", code)
         case let .Validation(_, code): ("Validation", code)
+        case let .Storage(_, code): ("Storage", code)
         default: ("other", "\(scpError)")
         }
     }
@@ -255,6 +256,7 @@
         case "Identity": .Identity(msg: "node start failed", code: code)
         case "Context": .Context(msg: "node start failed", code: code)
         case "Transport": .Transport(msg: "node start failed", code: code)
+        case "Storage": .Storage(msg: "node start failed", code: code)
         default: .Validation(msg: "node start failed", code: code)
         }
     }
@@ -272,11 +274,12 @@
     }
 
     /// Every row of sdk-common.md §"Node start error codes": the code and the
-    /// `ScpError` case the bridge's `server_error_class` selects for it.
+    /// `ScpError` case the bridge gives it: `.Storage` for every `SCP-STORAGE-`
+    /// code, otherwise the case `server_error_class` selects.
     private let nodeStartCodes: [(code: String, errorCase: String)] = [
-        ("SCP-STORAGE-8007", "Validation"),
-        ("SCP-STORAGE-8008", "Validation"),
-        ("SCP-STORAGE-8009", "Validation"),
+        ("SCP-STORAGE-8007", "Storage"),
+        ("SCP-STORAGE-8008", "Storage"),
+        ("SCP-STORAGE-8009", "Storage"),
         ("SCP-IDENT-1063", "Identity"),
         ("SCP-TRANS-5051", "Transport"),
         ("SCP-TRANS-5052", "Transport"),
@@ -399,7 +402,7 @@
             let error = await startError {
                 try await Node.start(config: config) { record in
                     received.append(record)
-                    throw scpError("Validation", code: "SCP-STORAGE-8007")
+                    throw scpError("Storage", code: "SCP-STORAGE-8007")
                 }
             }
             #expect(error?.1 == "SCP-STORAGE-8007")
@@ -483,7 +486,7 @@
             var error = await startError {
                 try await scp.nodeStart(config: localConfig(identity, bindAddr: "not-an-address"))
             }
-            #expect(error?.0 == "Validation")
+            #expect(error?.0 == "Storage")
             #expect(error?.1 == "SCP-STORAGE-8007")
 
             // A blob directory that cannot be created under a regular file.
@@ -491,7 +494,7 @@
             error = await startError {
                 try await scp.nodeStart(config: localConfig(identity, blobStorage: .redb(path: blobPath)))
             }
-            #expect(error?.0 == "Validation")
+            #expect(error?.0 == "Storage")
             #expect(error?.1 == "SCP-STORAGE-8008")
 
             // A second start while a running node holds the binding.
@@ -513,8 +516,8 @@
 
             // An operator identity another instance minted.
             error = await startError { try await other.nodeStart(config: localConfig(identity)) }
-            #expect(error?.0 == "Permission")
-            #expect(error?.1 == "SCP-PERM-3030")
+            #expect(error?.0 == "Identity")
+            #expect(error?.1 == "SCP-IDENT-1063")
 
             node.shutdown()
             try await other.shutdown(timeoutMillis: 1000)

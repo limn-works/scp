@@ -1284,6 +1284,13 @@ pub enum ScpError {
     #[error("validation error [{code}]: {msg}")]
     Validation { msg: String, code: String },
 
+    /// A storage operation failed: every `SCP-STORAGE-` code (sdk-common.md
+    /// §Registered SCP-STORAGE- codes), as Python's `StorageError` and the
+    /// TypeScript SDK's storage class receive it. [`ScpError::coded`] is the
+    /// one place that picks this variant, from the code's prefix.
+    #[error("storage error [{code}]: {msg}")]
+    Storage { msg: String, code: String },
+
     /// A §6.2.4 cross-context outlet-invocation saga aborted.
     ///
     /// The code tells its causes apart.
@@ -1350,10 +1357,191 @@ impl ScpError {
             | Self::Transport { code, .. }
             | Self::Outlet { code, .. }
             | Self::Validation { code, .. }
+            | Self::Storage { code, .. }
             | Self::SagaAborted { code, .. }
             | Self::SagaNeedsRepair { code, .. }
             | Self::SagaBusy { code, .. } => code,
         }
+    }
+
+    /// The error carrying `code` and `msg`. A `SCP-STORAGE-` code is always
+    /// [`ScpError::Storage`], whatever `class` says, so no call site chooses
+    /// the variant of a storage code; `class` places every other code.
+    pub(crate) fn coded(class: ErrorClass, code: &str, msg: String) -> Self {
+        let code = code.to_owned();
+        if code.starts_with(STORAGE_CODE_PREFIX) {
+            return Self::Storage { msg, code };
+        }
+        match class {
+            ErrorClass::Identity => Self::Identity { msg, code },
+            ErrorClass::Context => Self::Context { msg, code },
+            ErrorClass::Crypto => Self::Crypto { msg, code },
+            ErrorClass::Transport => Self::Transport { msg, code },
+            ErrorClass::Validation => Self::Validation { msg, code },
+        }
+    }
+
+    /// The error for a code that is always a `SCP-STORAGE-` code, such as a
+    /// durable store's open or lock failure. Routed through
+    /// [`ScpError::coded`], so the prefix, not this name, picks the variant.
+    pub(crate) fn storage(code: &'static str, msg: String) -> Self {
+        Self::coded(ErrorClass::Validation, code, msg)
+    }
+}
+
+/// The prefix of every `SCP-STORAGE-` code, which [`ScpError::coded`] maps to
+/// [`ScpError::Storage`].
+pub(crate) const STORAGE_CODE_PREFIX: &str = "SCP-STORAGE-";
+
+/// The [`ScpError`] variant a caller names for a code outside `SCP-STORAGE-`:
+/// a shared class function (`server_error_class`, `custody_failure_class`) or
+/// the `PermissionDenied` fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorClass {
+    Identity,
+    Context,
+    Crypto,
+    Transport,
+    Validation,
+}
+
+#[cfg(test)]
+mod storage_code_tests {
+    use super::{ErrorClass, STORAGE_CODE_PREFIX, ScpError};
+    use scp_crypto::{CustodyFailure, CustodyFailureKind as Kind};
+    use scp_ffi_common::error_codes as codes;
+
+    const CLASSES: [ErrorClass; 5] = [
+        ErrorClass::Identity,
+        ErrorClass::Context,
+        ErrorClass::Crypto,
+        ErrorClass::Transport,
+        ErrorClass::Validation,
+    ];
+
+    /// Every registered `SCP-STORAGE-` code in `error_codes.rs`.
+    const STORAGE_CODES: [&str; 7] = [
+        codes::STORAGE_8000,
+        codes::STORAGE_8004,
+        codes::STORAGE_8005,
+        codes::STORAGE_8006,
+        codes::STORAGE_8007,
+        codes::STORAGE_8008,
+        codes::STORAGE_8009,
+    ];
+
+    /// Every custody failure kind; the match fails to compile when a kind is
+    /// added, so the kind cannot escape the check below.
+    fn every_kind() -> Vec<Kind> {
+        let kinds = vec![
+            Kind::KeyNotFound,
+            Kind::PseudonymRejected,
+            Kind::StorageClosed,
+            Kind::StorageLockHeld,
+            Kind::AttestationFailed,
+            Kind::Unsupported,
+            Kind::PushWakePayloadInvalid,
+            Kind::PushRegistrationRejected,
+            Kind::PushVerifierUnavailable,
+            Kind::PushPlatformUnavailable,
+            Kind::PushProviderFailed,
+            Kind::Failed,
+        ];
+        for kind in &kinds {
+            match kind {
+                Kind::KeyNotFound
+                | Kind::PseudonymRejected
+                | Kind::StorageClosed
+                | Kind::StorageLockHeld
+                | Kind::AttestationFailed
+                | Kind::Unsupported
+                | Kind::PushWakePayloadInvalid
+                | Kind::PushRegistrationRejected
+                | Kind::PushVerifierUnavailable
+                | Kind::PushPlatformUnavailable
+                | Kind::PushProviderFailed
+                | Kind::Failed => {}
+            }
+        }
+        kinds
+    }
+
+    /// Fails when `err` carries a `SCP-STORAGE-` code in any variant other
+    /// than `Storage`, or a `Storage` variant carries any other code.
+    fn assert_storage_iff_storage_code(err: &ScpError, label: &str) {
+        let is_storage_code = err.code().starts_with(STORAGE_CODE_PREFIX);
+        assert_eq!(
+            matches!(err, ScpError::Storage { .. }),
+            is_storage_code,
+            "{label}: {err:?}"
+        );
+    }
+
+    #[test]
+    fn every_storage_code_maps_to_the_storage_variant_on_every_route() {
+        // The constructor: a storage code is `Storage` whatever class the
+        // caller names, and a code of any other category keeps its class.
+        for code in STORAGE_CODES {
+            for class in CLASSES {
+                let err = ScpError::coded(class, code, "x".to_owned());
+                assert_storage_iff_storage_code(&err, &format!("{class:?} {code}"));
+            }
+            assert_storage_iff_storage_code(&ScpError::storage(code, "x".to_owned()), code);
+        }
+        let other = ScpError::coded(ErrorClass::Validation, codes::VALID_7004, "x".to_owned());
+        assert!(matches!(other, ScpError::Validation { .. }), "{other:?}");
+
+        // Custody failures, the route of the custody store's 8005 and 8006.
+        for kind in every_kind() {
+            let failure = CustodyFailure {
+                kind,
+                detail: "x".to_owned(),
+            };
+            let err = ScpError::custody_failure("x".to_owned(), &failure);
+            assert_storage_iff_storage_code(&err, &format!("{kind:?}"));
+        }
+        for platform in [
+            scp_platform::PlatformError::StorageClosed,
+            scp_platform::PlatformError::StorageLockHeld {
+                dir: "/d".into(),
+                lock_path: "/d/scp.db.lock".into(),
+            },
+        ] {
+            let label = format!("{platform:?}");
+            let err = ScpError::from(platform);
+            assert_storage_iff_storage_code(&err, &label);
+            assert!(matches!(err, ScpError::Storage { .. }), "{label}");
+        }
+
+        // A durable store's open failures, 8004 and 8005.
+        for init in [
+            crate::runtime::StorageInitError::SqliteOpen {
+                path: "/d".into(),
+                message: "x".into(),
+            },
+            crate::runtime::StorageInitError::LockHeld {
+                path: "/d".into(),
+                message: "x".into(),
+            },
+        ] {
+            let err = ScpError::from(init);
+            assert!(matches!(err, ScpError::Storage { .. }), "{err:?}");
+        }
+
+        // A code the runtime embeds in a `PermissionDenied` message.
+        for code in STORAGE_CODES {
+            let err = ScpError::from(scp_core::context::ContextError::PermissionDenied(format!(
+                "{code}: store refused"
+            )));
+            assert!(
+                matches!(&err, ScpError::Storage { code: c, .. } if c == code),
+                "{err:?}"
+            );
+        }
+        let ctx = ScpError::from(scp_core::context::ContextError::PermissionDenied(
+            "SCP-CTX-2000: refused".to_owned(),
+        ));
+        assert!(matches!(ctx, ScpError::Context { .. }), "{ctx:?}");
     }
 }
 
@@ -1585,10 +1773,9 @@ impl From<scp_core::context::ContextError> for ScpError {
                         code,
                     }
                 } else {
-                    Self::Context {
-                        msg: format!("{e}"),
-                        code,
-                    }
+                    // `coded` gives an embedded `SCP-STORAGE-` code the Storage
+                    // variant; every other code stays a Context error.
+                    Self::coded(ErrorClass::Context, &code, format!("{e}"))
                 }
             }
             // SCP-OUT-031 PR-2a: outlet invocation errors now arrive as the
@@ -1848,13 +2035,13 @@ impl ScpError {
     /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code).
     pub(crate) fn custody_failure(msg: String, e: &scp_crypto::CustodyFailure) -> Self {
         use scp_ffi_common::error_codes::{self as ec, CustodyFailureClass as Class};
-        let code = ec::custody_failure_code(e).to_owned();
-        match ec::custody_failure_class(e.kind) {
-            Class::Identity => Self::Identity { msg, code },
-            Class::Validation => Self::Validation { msg, code },
-            Class::Crypto => Self::Crypto { msg, code },
-            Class::Transport => Self::Transport { msg, code },
-        }
+        let class = match ec::custody_failure_class(e.kind) {
+            Class::Identity => ErrorClass::Identity,
+            Class::Validation => ErrorClass::Validation,
+            Class::Crypto => ErrorClass::Crypto,
+            Class::Transport => ErrorClass::Transport,
+        };
+        Self::coded(class, ec::custody_failure_code(e), msg)
     }
 }
 
@@ -16859,9 +17046,9 @@ impl Scp {
     ///
     /// # Errors
     ///
-    /// `SCP-PERM-3030` when another `Scp` minted `config.identity`; otherwise
-    /// the code sdk-common.md §"Node start error codes" gives the failure,
-    /// such as `SCP-IDENT-1063` for an identity loaded with no custody.
+    /// The code sdk-common.md §"Node start error codes" gives the failure,
+    /// such as `SCP-IDENT-1063` for an identity another `Scp` minted or one
+    /// loaded with no custody.
     #[cfg(feature = "server")]
     pub async fn node_start(
         &self,
@@ -28870,12 +29057,12 @@ mod tests {
         }
         .into();
         assert!(
-            matches!(&held, ScpError::Validation { code, .. } if code == codes::STORAGE_8005),
+            matches!(&held, ScpError::Storage { code, .. } if code == codes::STORAGE_8005),
             "{held:?}"
         );
         let closed: ScpError = scp_platform::PlatformError::StorageClosed.into();
         assert!(
-            matches!(&closed, ScpError::Validation { code, .. } if code == codes::STORAGE_8006),
+            matches!(&closed, ScpError::Storage { code, .. } if code == codes::STORAGE_8006),
             "{closed:?}"
         );
         let other: ScpError = scp_platform::PlatformError::StorageError("io".to_owned()).into();
@@ -28974,6 +29161,7 @@ mod tests {
                 ScpError::Identity { code, .. } => ("identity", code.clone()),
                 ScpError::Crypto { code, .. } => ("crypto", code.clone()),
                 ScpError::Validation { code, .. } => ("validation", code.clone()),
+                ScpError::Storage { code, .. } => ("storage", code.clone()),
                 ScpError::Transport { code, .. } => ("transport", code.clone()),
                 other => panic!("unexpected custody error variant: {other:?}"),
             }
@@ -29008,7 +29196,7 @@ mod tests {
         );
         assert_eq!(
             variant_and_code(&wrapped(&closed)),
-            ("validation", codes::STORAGE_8006.to_owned())
+            ("storage", codes::STORAGE_8006.to_owned())
         );
 
         for error in [
@@ -29062,11 +29250,11 @@ mod tests {
             let expected_message = error.to_string();
             let bare: ScpError = error.into();
             match bare {
-                ScpError::Validation { msg, code } => {
+                ScpError::Storage { msg, code } => {
                     assert_eq!(msg, expected_message);
                     assert_eq!(code, expected_code);
                 }
-                other => panic!("expected a validation error, got {other:?}"),
+                other => panic!("expected a storage error, got {other:?}"),
             }
         }
     }

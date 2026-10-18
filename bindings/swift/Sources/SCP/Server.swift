@@ -384,18 +384,18 @@ public struct Node: Sendable {
         /// - Parameter config: The node's flat configuration.
         /// - Returns: The running ``Node``; its ``Node/did`` is the operator DID.
         /// - Throws: ``ScpError`` with the code sdk-common.md §"Node start error
-        ///   codes" gives the failure, in the case the bridge's
-        ///   `server_error_class` selects. `.Validation`: `SCP-STORAGE-8007`
-        ///   (invalid config), `SCP-STORAGE-8008` (blob storage open or
-        ///   directory creation), `SCP-STORAGE-8009` (core node storage),
-        ///   `SCP-VALID-7004`. `.Identity`: `SCP-IDENT-1063` (operator
-        ///   identity unavailable), `SCP-IDENT-1001`. `.Transport`:
-        ///   `SCP-TRANS-5050`, `SCP-TRANS-5051` (relay start), `SCP-TRANS-5052`
-        ///   (TLS), `SCP-TRANS-5054` (serve or NAT), `SCP-TRANS-5055`,
+        ///   codes" gives the failure. Every `SCP-STORAGE-` code is
+        ///   `.Storage`; the bridge's `server_error_class` selects the case of
+        ///   every other code. `.Storage`: `SCP-STORAGE-8007` (invalid
+        ///   config), `SCP-STORAGE-8008` (blob storage open or directory
+        ///   creation), `SCP-STORAGE-8009` (core node storage).
+        ///   `.Validation`: `SCP-VALID-7004`. `.Identity`: `SCP-IDENT-1063`
+        ///   (operator identity unavailable, including one another ``SCP``
+        ///   minted), `SCP-IDENT-1001`. `.Transport`: `SCP-TRANS-5050`,
+        ///   `SCP-TRANS-5051` (relay start), `SCP-TRANS-5052` (TLS),
+        ///   `SCP-TRANS-5054` (serve or NAT), `SCP-TRANS-5055`,
         ///   `SCP-TRANS-5056` (the bridge could not bind the `Supervisor` to
         ///   the node and has shut the node down). `.Context`: `SCP-CTX-2053`.
-        ///   `.Permission` with `SCP-PERM-3030` when another ``SCP`` minted
-        ///   `config.identity`.
         func nodeStart(config: NodeStartConfig) async throws -> Node {
             try await Node.start(config: config, bridge: inner.nodeStart(config:))
         }

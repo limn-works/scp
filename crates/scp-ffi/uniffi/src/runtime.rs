@@ -237,10 +237,7 @@ impl From<StorageInitError> for crate::ScpError {
             // `SCP-CTX-2000` here said "context error" for a storage-selection
             // failure that no context took part in.
             StorageInitError::SqliteOpen { .. } | StorageInitError::LockHeld { .. } => {
-                Self::Validation {
-                    msg: err.to_string(),
-                    code: err.code().to_owned(),
-                }
+                Self::storage(err.code(), err.to_string())
             }
         }
     }

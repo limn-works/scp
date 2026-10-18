@@ -77,7 +77,7 @@ impl Scp {
     /// FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
     /// opened — bad key/passphrase, permission denied, corrupt file, or a
     /// salt-sidecar fail-closed condition — this returns
-    /// `ScpError::Validation` with `SCP-STORAGE-8004`, or with
+    /// `ScpError::Storage` with `SCP-STORAGE-8004`, or with
     /// `SCP-STORAGE-8005` when another store holds the directory's advisory
     /// lock, rather than silently degrading to in-memory storage. Surfaces to Swift
     /// as `throws` and Kotlin as a thrown exception.
@@ -143,7 +143,7 @@ impl Scp {
     ///
     /// # Errors
     ///
-    /// Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
+    /// Returns [`ScpError::Storage`] with `SCP-STORAGE-8005` when the
     /// durable store still holds its advisory lock after the call.
     pub async fn shutdown(&self, timeout_millis: u64) -> Result<(), ScpError> {
         let timeout = Duration::from_millis(timeout_millis);
@@ -184,10 +184,7 @@ impl Drop for Scp {
 /// per Durable Directory"): a durable store the shutdown left holding its
 /// advisory lock raises `SCP-STORAGE-8005`.
 fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), ScpError> {
-    sdk_shutdown_result(result).map_err(|msg| ScpError::Validation {
-        msg,
-        code: codes::STORAGE_8005.to_owned(),
-    })
+    sdk_shutdown_result(result).map_err(|msg| ScpError::storage(codes::STORAGE_8005, msg))
 }
 
 #[cfg(test)]
@@ -203,21 +200,21 @@ mod sdk_shutdown_tests {
             durable_store_open: true,
         }));
         assert!(
-            matches!(&timed_out, Err(ScpError::Validation { code, .. }) if code == codes::STORAGE_8005),
+            matches!(&timed_out, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8005),
             "{timed_out:?}"
         );
         let refused = sdk_shutdown(Err(ShutdownError::DurableStoreClose(
             scp_platform::PlatformError::StorageError("close refused".to_owned()),
         )));
         assert!(
-            matches!(&refused, Err(ScpError::Validation { code, .. }) if code == codes::STORAGE_8005),
+            matches!(&refused, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8005),
             "{refused:?}"
         );
         let repeat = sdk_shutdown(Err(ShutdownError::AlreadyShutDown {
             durable_store_open: true,
         }));
         assert!(
-            matches!(&repeat, Err(ScpError::Validation { code, .. }) if code == codes::STORAGE_8005),
+            matches!(&repeat, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8005),
             "{repeat:?}"
         );
     }

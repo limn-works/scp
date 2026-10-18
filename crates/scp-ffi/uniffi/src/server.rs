@@ -35,13 +35,14 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// the `PyO3`, napi-rs and `UniFFI` bridges share (sdk-common.md §"Node start
 /// error codes").
 fn coded(e: &ServerError, msg: String) -> ScpError {
-    let code = codes::server_error_code(e).to_owned();
-    match codes::server_error_class(e) {
-        codes::ServerErrorClass::Validation => ScpError::Validation { msg, code },
-        codes::ServerErrorClass::Identity => ScpError::Identity { msg, code },
-        codes::ServerErrorClass::Transport => ScpError::Transport { msg, code },
-        codes::ServerErrorClass::Context => ScpError::Context { msg, code },
-    }
+    use crate::bridge::ErrorClass;
+    let class = match codes::server_error_class(e) {
+        codes::ServerErrorClass::Validation => ErrorClass::Validation,
+        codes::ServerErrorClass::Identity => ErrorClass::Identity,
+        codes::ServerErrorClass::Transport => ErrorClass::Transport,
+        codes::ServerErrorClass::Context => ErrorClass::Context,
+    };
+    ScpError::coded(class, codes::server_error_code(e), msg)
 }
 
 impl From<ServerError> for ScpError {
@@ -778,15 +779,20 @@ fn lower_node_start_config(
 ///
 /// # Errors
 ///
-/// `SCP-PERM-3030` when another `Scp` minted `cfg.identity`; otherwise the
-/// code sdk-common.md §"Node start error codes" gives the failure.
+/// The code sdk-common.md §"Node start error codes" gives the failure. An
+/// identity another `Scp` minted is not registered on this instance, so it is
+/// `OperatorIdentityUnavailable` (`SCP-IDENT-1063`), as on the `PyO3` and
+/// napi-rs bridges.
 pub(crate) async fn node_start_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     cfg: NodeStartConfig,
 ) -> Result<Arc<NodeHandle>, ScpError> {
+    // The handle check stays first, so a foreign handle reaches no other step;
+    // its failure goes through the shared table instead of the bridge-wide
+    // `SCP-PERM-3030`, which would give this one failure a UniFFI-only code.
     bi.core
         .check_handle(cfg.identity.instance_id())
-        .map_err(ScpError::from)?;
+        .map_err(|_| ScpError::from(ServerError::OperatorIdentityUnavailable))?;
     let (cfg, identity) = lower_node_start_config(cfg)?;
     let node_identity = build_node_identity_from_uniffi(&identity)?;
     let storage = bi.protocol_repository().instance_storage();
@@ -1171,6 +1177,7 @@ mod tests {
             ScpError::Permission { .. } => "permission",
             ScpError::Transport { .. } => "transport",
             ScpError::Validation { .. } => "validation",
+            ScpError::Storage { .. } => "storage",
             other => panic!("unexpected error class: {other:?}"),
         };
         (class, e.code())
@@ -1204,17 +1211,17 @@ mod tests {
         let cases: Vec<(ServerError, &str, &str)> = vec![
             (
                 ServerError::InvalidConfig("x".into()),
-                "validation",
+                "storage",
                 codes::STORAGE_8007,
             ),
             (
                 ServerError::Io(std::io::Error::other("/secret/path")),
-                "validation",
+                "storage",
                 codes::STORAGE_8008,
             ),
             (
                 ServerError::Node(NodeError::Storage("x".into())),
-                "validation",
+                "storage",
                 codes::STORAGE_8009,
             ),
             (
@@ -1251,11 +1258,11 @@ mod tests {
 
         let err = ScpError::from(NodeError::InvalidConfig("/secret/path/data.db".into()));
         match err {
-            ScpError::Validation { msg, code } => {
+            ScpError::Storage { msg, code } => {
                 assert_eq!(msg, "node operation failed");
                 assert_eq!(code, codes::STORAGE_8007);
             }
-            other => panic!("expected Validation, got: {other:?}"),
+            other => panic!("expected Storage, got: {other:?}"),
         }
     }
 
@@ -1383,7 +1390,7 @@ mod tests {
                     };
                     c.tls = FfiTlsMode::SelfSigned;
                 }),
-                "validation",
+                "storage",
                 codes::STORAGE_8007,
             ),
             (
@@ -1393,13 +1400,13 @@ mod tests {
                         origins: vec!["*".to_owned()],
                     };
                 }),
-                "validation",
+                "storage",
                 codes::STORAGE_8007,
             ),
             (
                 "malformed bind_addr (InvalidConfig)",
                 Box::new(|c| c.bind_addr = Some("not-an-address".to_owned())),
-                "validation",
+                "storage",
                 codes::STORAGE_8007,
             ),
             (
@@ -1410,7 +1417,7 @@ mod tests {
                     };
                     c.tls = FfiTlsMode::Plaintext;
                 }),
-                "validation",
+                "storage",
                 codes::STORAGE_8007,
             ),
             (
@@ -1423,7 +1430,7 @@ mod tests {
                         };
                     }
                 }),
-                "validation",
+                "storage",
                 codes::STORAGE_8008,
             ),
             (
@@ -1432,7 +1439,7 @@ mod tests {
                     let path = dir.display().to_string();
                     move |c| c.blob_storage = FfiBlobBackend::Redb { path: path.clone() }
                 }),
-                "validation",
+                "storage",
                 codes::STORAGE_8008,
             ),
             (
@@ -1456,11 +1463,13 @@ mod tests {
         drop(taken);
     }
 
-    /// An operator identity another `Scp` minted fails the handle check with
-    /// `SCP-PERM-3030` before any other step.
+    /// An operator identity another `Scp` minted is not registered on this
+    /// instance, so `node_start` returns `SCP-IDENT-1063` through the shared
+    /// table, the code the `PyO3` and napi-rs bridges return, not the
+    /// bridge-wide handle-affinity code `SCP-PERM-3030`.
     #[test]
     #[cfg(feature = "testing")]
-    fn node_start_rejects_another_instances_identity_with_perm_3030() {
+    fn node_start_rejects_another_instances_identity_with_ident_1063() {
         let minting = crate::scp::Scp::new_in_memory_for_test();
         let identity = rt()
             .block_on(minting.identity_create("in_memory".to_owned(), None))
@@ -1472,8 +1481,22 @@ mod tests {
         );
         assert_eq!(
             class_and_code(&err),
-            ("permission", codes::PERM_3030),
+            ("identity", codes::IDENT_1063),
             "{err:?}"
+        );
+        // Every other operation keeps the handle-affinity code: the dev-pair
+        // start still refuses the same foreign handle with `SCP-PERM-3030`.
+        let id = rt()
+            .block_on(minting.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let dev_err = start_error(
+            rt().block_on(other.node_start_in_memory(Some(id))),
+            "foreign identity, dev pair",
+        );
+        assert_eq!(
+            class_and_code(&dev_err),
+            ("permission", codes::PERM_3030),
+            "{dev_err:?}"
         );
     }
 
