@@ -875,8 +875,11 @@ impl ChallengerLedgerActor {
             a.response_digest(),
         )?;
         entry.last_fault_at = Some(now);
-        self.persist_entry(&entry).await?;
+        // The lease is released on every outcome, as Commit releases it: a
+        // failed write records no fault and leaves the attempt gradable now.
+        let persisted = self.persist_entry(&entry).await;
         self.leases.remove(&challenge_id);
+        persisted?;
         tracing::warn!(
             actor_kind = "challenger_ledger",
             challenge_id = %hex::encode(challenge_id),

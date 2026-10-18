@@ -1018,6 +1018,26 @@ async fn fault_write_failure_records_nothing() {
     lease_on(&restarted, &auth).await;
 }
 
+/// A failed fault write releases the lease, as a failed Commit does: the
+/// same actor, without a respawn, grants the next Begin a new lease, and no
+/// cooldown runs because no fault was recorded.
+#[tokio::test]
+async fn fault_write_failure_releases_the_lease() {
+    let h = harness();
+    let issued = h.create().await.unwrap();
+    let auth = h.respond(&issued.request, 1, "ok");
+    let lease = h.lease(&auth).await;
+    h.storage.allow_stores(0);
+    assert!(is_persistence_failure(
+        &h.fault(&auth, lease.lease_id).await
+    ));
+    h.storage.allow_stores(-1);
+    let next = h.lease(&auth).await;
+    assert_ne!(next.lease_id, lease.lease_id);
+    let graded = h.commit(&auth, next.lease_id, &issued.key).await.unwrap();
+    assert_eq!(graded.record.attempt, 1);
+}
+
 /// Two challenges such that, at the returned time, the first is past its
 /// prune point and the second is strictly inside its window.
 async fn prunable_and_live(h: &Harness) -> (Issued, Issued, u64) {
