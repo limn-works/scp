@@ -252,7 +252,7 @@ context_id is NOT included — the vote is bound to a context via the proposal_i
 
 ## 25.6 Reset Request Signing Vectors (§23.5.2)
 
-Domain: `"SCP-RESET-REQUEST-V1:"`
+Domain: `"SCP-RESET-REQUEST-V2:"`
 
 ### Vector 8: Reset Request
 
@@ -262,29 +262,33 @@ Input:
   member_did:       "scp:ufveadjgygwpujfense3z6e6jwthxmug26owvhrjnvzdfjkjrq5q"
                     (the identifier SHA-256("SCP test vector identifier sync member") in text form)
   last_known_epoch: 42
-  reason:           "extended offline (8 days)" (ResetReason::ExtendedOffline { offline_duration_secs: 691200 } → Display string)
+  reset_counter:    3
+  member_since:     7
+  reason:           "extended offline (8 days)" (ExtendedOffline with 691200 seconds, in the text form of 09-security-model.md §9.5.2)
   nonce:            0x01020304050607080910111213141516 (16 bytes)
   timestamp:        1700000000
 
-Canonical hash input (per §23.5.2, field order from code):
-  "SCP-RESET-REQUEST-V1:"                     (21 bytes)
+Canonical hash input (the ResetRequest preimage of 09-security-model.md §9.5.2):
+  "SCP-RESET-REQUEST-V2:"                     (21 bytes)
   || BE32(17) || "sync-test-context"           (4 + 17 = 21 bytes)
   || BE32(56) || member_did                    (4 + 56 = 60 bytes)
   || BE64(42)                                  (8 bytes — last_known_epoch)
+  || BE64(3)                                   (8 bytes — reset_counter)
+  || BE64(7)                                   (8 bytes — member_since)
   || BE32(25) || "extended offline (8 days)"   (4 + 25 = 29 bytes — reason)
   || nonce                                     (16 bytes, fixed-length, no length prefix)
   || BE64(1700000000)                          (8 bytes)
 
-Total: 21 + 21 + 60 + 8 + 29 + 16 + 8 = 163 bytes
+Total: 21 + 21 + 60 + 8 + 8 + 8 + 29 + 16 + 8 = 179 bytes
 
-Preimage (hex, 163 bytes):
-  5343502d52455345542d524551554553542d56313a0000001173796e632d746573742d636f6e74657874000000387363703a7566766561646a6779677770756a66656e7365337a3665366a777468786d756732366f777668726a6e767a64666a6b6a72713571000000000000002a00000019657874656e646564206f66666c696e6520283820646179732901020304050607080910111213141516000000006553f100
+Preimage (hex, 179 bytes):
+  5343502d52455345542d524551554553542d56323a0000001173796e632d746573742d636f6e74657874000000387363703a7566766561646a6779677770756a66656e7365337a3665366a777468786d756732366f777668726a6e767a64666a6b6a72713571000000000000002a0000000000000003000000000000000700000019657874656e646564206f66666c696e6520283820646179732901020304050607080910111213141516000000006553f100
 
 Canonical hash SHA-256(preimage) (32 bytes):
-  0x1c0dc57c74a1b6f1072d65aa87c8d2de3ed3ed921c22d6754e5d6f8137ae8b6e
+  0x4c039aa7bbb86a2f6c00093bd290ce6214643e2ee66e5494225ee88e5cab6726
 
 RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
-  0xadfb7ae6be806d4e7bef5f97a7e996d5b071e31d488ca331b144928119cd137a21071a52305eea42a704daef9cc498e09eec8dec0720ab76bcdb7d88f85dfed2
+  0xdae33519504f03a75636905fba1639a649e78de410224e3b02d90967bc12fd363a8b875bcaba1e6b2c9edd7e8c3449bcc0f3ded42c7245b3c8f31171ae5e7eb3
 
 Verification vector:
   public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
@@ -293,7 +297,7 @@ Verification vector:
   verdict:    accept
 ```
 
-The `nonce` above carries 16 bytes, which is the width the field list states and the width the 163-byte total assumes. Before 2026-09-10 this vector printed a 17-byte literal beside the label "16 bytes", so an implementer following §25.17 step 3 would have measured one byte more than the stated total and read a correct encoding as wrong.
+The `nonce` above carries 16 bytes, which is the width the field list states and the width the 179-byte total assumes. Before 2026-09-10 this vector printed a 17-byte literal beside the label "16 bytes", so an implementer following §25.17 step 3 would have measured one byte more than the stated total and read a correct encoding as wrong.
 
 ## 25.7 Envelope Padding Vectors (§9.10)
 

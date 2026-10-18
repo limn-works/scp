@@ -879,6 +879,8 @@ pub enum EventType {
 }
 ```
 
+   **Amendment (2026-10-18, ADR-066): which leaf records an executed governance action.** The per-action variants above stay in the closed set, but the Commit that executes a governance action carries only the leaves every receiver derives from the action and the Commit (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6): `MemberJoined` for `AddMember`, `MemberLeft` for `RemoveMember`, `MemberReset` for `ResetMember`, `TtlExtended` for `ExtendTtl`, and then the `GovernanceActionExecuted` leaf, which records every action as its exact `action_bytes`. It carries no `RoleAssigned`, `AdminTransferred`, `ChildContextCreated`, `SignerAdded`, or other per-action leaf, and a receiver rejects a Commit that carries one. A consumer that read a per-action variant for an executed governance action reads the `GovernanceActionExecuted` leaf's `action_type` and `action_bytes` instead (`07-trust-validation-and-capabilities.md` §7.3.2, participation facts).
+
    `EventType` is a closed set with no catch-all variant: every protocol action
    that produces a verifiable history entry in the Merkle event log is one of the
    enumerated variants above. The payment, economic-policy, spending-UCAN,

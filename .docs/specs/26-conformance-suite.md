@@ -261,7 +261,7 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | §23.5 |
 | **Preconditions** | Member was offline for > 7 days. Epoch drift > 1000. |
-| **Steps** | 1. Member sends ResetRequest (signed per `"SCP-RESET-REQUEST-V1:"`). 2. Admin processes reset request. 3. Admin sends MLS Welcome. 4. Member processes Welcome within 60s timeout (§9.18.9). 5. Member joins as fresh member. |
+| **Steps** | 1. Member sends ResetRequest (signed over the `"SCP-RESET-REQUEST-V2:"` preimage of `09-security-model.md` §9.5.2). 2. Admin processes reset request. 3. Admin sends MLS Welcome. 4. Member processes Welcome within 60s timeout (§9.18.9). 5. Member joins as fresh member. |
 | **Expected Outcome** | Member is re-admitted to the MLS group. Fresh epoch state. Historical messages not accessible (re-join, not restore). |
 
 ### CONF-022: Equivocation Detection
