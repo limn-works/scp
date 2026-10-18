@@ -186,7 +186,7 @@ public final class SCP: @unchecked Sendable {
     /// Shuts down this instance with a graceful deadline (seconds).
     ///
     /// Awaits in-flight tasks up to `timeout` seconds, aborts any
-    /// remaining tasks, then runs typed-field cleanup. Permanent. Throws `ScpError.Validation` with
+    /// remaining tasks, then runs typed-field cleanup. Permanent. Throws `ScpError.Storage` with
     /// `SCP-STORAGE-8005` when the durable store still holds its advisory
     /// lock after the call.
     ///

@@ -1,5 +1,5 @@
 {
-  "description": "Wire shape of NodeStartConfig (construction.md, Node start). arms lists every arm of every sum-typed field with all its fields set; optional_arm_fields names the arm fields a caller may omit or send as null; fields lists the top-level fields in declaration order; config is a full config with every field set; optional_fields names the top-level fields a caller may omit or send as null. The node_start_config.rs unit tests check this file against the Rust types, and the Python SDK's test_server.py checks its NodeStartConfig against this file.",
+  "description": "Wire shape of NodeStartConfig (construction.md, Node start). arms lists every arm of every sum-typed field with all its fields set; optional_arm_fields names the arm fields a caller may omit or send as null; fields lists the top-level fields in declaration order; config is a full config with every field set; optional_fields names the top-level fields a caller may omit or send as null. The node_start_config.rs unit tests check this file against the Rust types, the Python SDK's test_server.py checks its NodeStartConfig against this file, and the Swift SDK's NodeStartTests.swift checks the UniFFI NodeStartConfig record against it.",
   "arms": {
     "reach": [
       {"kind": "domain", "domain": "node.example.org"},

@@ -1390,7 +1390,9 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
     func serve(bindAddr: String?) async throws  -> String
     
     /**
-     * Signals the node to stop (relay + background tasks).
+     * Signals the node to stop (relay + background tasks), and unbinds the
+     * instance's `Supervisor` transport from this node when it holds the
+     * binding.
      */
     func shutdown() 
     
@@ -1648,7 +1650,9 @@ open func serve(bindAddr: String?)async throws  -> String  {
 }
     
     /**
-     * Signals the node to stop (relay + background tasks).
+     * Signals the node to stop (relay + background tasks), and unbinds the
+     * instance's `Supervisor` transport from this node when it holds the
+     * binding.
      */
 open func shutdown()  {try! rustCall() {
     uniffi_scp_ffi_uniffi_fn_method_nodehandle_shutdown(self.uniffiClonePointer(),$0
@@ -3006,6 +3010,20 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func migrationState(handle: ContextHandle) async throws  -> String?
     
     /**
+     * Starts a production node from this `Scp` (construction.md §"Node start
+     * — `NodeStartConfig`"): the node runs under the operator identity
+     * `config.identity`, which this `Scp` must have minted, and on this
+     * instance's own storage.
+     *
+     * # Errors
+     *
+     * The code sdk-common.md §"Node start error codes" gives the failure:
+     * `SCP-PERM-3030` when another `Scp` minted `config.identity` (ADR-048),
+     * `SCP-IDENT-1063` for an identity loaded with no custody.
+     */
+    func nodeStart(config: NodeStartConfig) async throws  -> NodeHandle
+    
+    /**
      * Per-instance equivalent of the free-function `node_start_in_memory`.
      *
      * Starts an in-memory application node. If `identity` is supplied, it
@@ -3585,7 +3603,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
+     * Returns [`ScpError::Storage`] with `SCP-STORAGE-8005` when the
      * durable store still holds its advisory lock after the call.
      */
     func shutdown(timeoutMillis: UInt64) async throws 
@@ -3856,7 +3874,7 @@ open class Scp: ScpProtocol, @unchecked Sendable {
      * FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
      * opened — bad key/passphrase, permission denied, corrupt file, or a
      * salt-sidecar fail-closed condition — this returns
-     * `ScpError::Validation` with `SCP-STORAGE-8004`, or with
+     * `ScpError::Storage` with `SCP-STORAGE-8004`, or with
      * `SCP-STORAGE-8005` when another store holds the directory's advisory
      * lock, rather than silently degrading to in-memory storage. Surfaces to Swift
      * as `throws` and Kotlin as a thrown exception.
@@ -6141,6 +6159,35 @@ open func migrationState(handle: ContextHandle)async throws  -> String?  {
 }
     
     /**
+     * Starts a production node from this `Scp` (construction.md §"Node start
+     * — `NodeStartConfig`"): the node runs under the operator identity
+     * `config.identity`, which this `Scp` must have minted, and on this
+     * instance's own storage.
+     *
+     * # Errors
+     *
+     * The code sdk-common.md §"Node start error codes" gives the failure:
+     * `SCP-PERM-3030` when another `Scp` minted `config.identity` (ADR-048),
+     * `SCP-IDENT-1063` for an identity loaded with no custody.
+     */
+open func nodeStart(config: NodeStartConfig)async throws  -> NodeHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_node_start(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeNodeStartConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeNodeHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Per-instance equivalent of the free-function `node_start_in_memory`.
      *
      * Starts an in-memory application node. If `identity` is supplied, it
@@ -7311,7 +7358,7 @@ open func setEconomicPolicy(handle: ContextHandle, policyJson: String)throws   {
      *
      * # Errors
      *
-     * Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
+     * Returns [`ScpError::Storage`] with `SCP-STORAGE-8005` when the
      * durable store still holds its advisory lock after the call.
      */
 open func shutdown(timeoutMillis: UInt64)async throws   {
@@ -10652,6 +10699,160 @@ public func FfiConverterTypeMessage_lower(_ value: Message) -> RustBuffer {
 
 
 /**
+ * The `UniFFI` form of `scp_ffi_common::node_start_config::NodeStartConfig`.
+ *
+ * construction.md §"Node start — `NodeStartConfig`", ADR-052. `identity` is
+ * the operator's [`Identity`] handle, minted by the same `Scp`; the socket
+ * addresses are `host:port` strings. Each optional field defaults to `None`
+ * in the generated Swift and Kotlin initializers, so a caller omits it as the
+ * Python and TypeScript SDKs do (construction.md, the same required and
+ * optional split in every language).
+ */
+public struct NodeStartConfig {
+    /**
+     * How the node is reached.
+     */
+    public var reach: FfiReach
+    /**
+     * The operator identity the node runs under.
+     */
+    public var identity: Identity
+    /**
+     * The node's blob storage backend.
+     */
+    public var blobStorage: FfiBlobBackend
+    /**
+     * How the node provisions TLS.
+     */
+    public var tls: FfiTlsMode
+    /**
+     * The node's DHT mode.
+     */
+    public var dht: FfiDhtMode
+    /**
+     * The HTTP CORS origins the node allows.
+     */
+    public var corsOrigins: FfiCorsOrigins
+    /**
+     * The relay's bind address (`host:port`); the core picks one when `None`.
+     */
+    public var bindAddr: String?
+    /**
+     * The HTTP server's bind address (`host:port`).
+     */
+    public var httpBindAddr: String?
+    /**
+     * The NAT traversal strategy.
+     */
+    public var nat: FfiNat?
+    /**
+     * The projection rate limit, greater than 0.
+     */
+    public var projectionRateLimit: UInt32?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * How the node is reached.
+         */reach: FfiReach, 
+        /**
+         * The operator identity the node runs under.
+         */identity: Identity, 
+        /**
+         * The node's blob storage backend.
+         */blobStorage: FfiBlobBackend, 
+        /**
+         * How the node provisions TLS.
+         */tls: FfiTlsMode, 
+        /**
+         * The node's DHT mode.
+         */dht: FfiDhtMode, 
+        /**
+         * The HTTP CORS origins the node allows.
+         */corsOrigins: FfiCorsOrigins, 
+        /**
+         * The relay's bind address (`host:port`); the core picks one when `None`.
+         */bindAddr: String? = nil, 
+        /**
+         * The HTTP server's bind address (`host:port`).
+         */httpBindAddr: String? = nil, 
+        /**
+         * The NAT traversal strategy.
+         */nat: FfiNat? = nil, 
+        /**
+         * The projection rate limit, greater than 0.
+         */projectionRateLimit: UInt32? = nil) {
+        self.reach = reach
+        self.identity = identity
+        self.blobStorage = blobStorage
+        self.tls = tls
+        self.dht = dht
+        self.corsOrigins = corsOrigins
+        self.bindAddr = bindAddr
+        self.httpBindAddr = httpBindAddr
+        self.nat = nat
+        self.projectionRateLimit = projectionRateLimit
+    }
+}
+
+#if compiler(>=6)
+extension NodeStartConfig: Sendable {}
+#endif
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNodeStartConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NodeStartConfig {
+        return
+            try NodeStartConfig(
+                reach: FfiConverterTypeFfiReach.read(from: &buf), 
+                identity: FfiConverterTypeIdentity.read(from: &buf), 
+                blobStorage: FfiConverterTypeFfiBlobBackend.read(from: &buf), 
+                tls: FfiConverterTypeFfiTlsMode.read(from: &buf), 
+                dht: FfiConverterTypeFfiDhtMode.read(from: &buf), 
+                corsOrigins: FfiConverterTypeFfiCorsOrigins.read(from: &buf), 
+                bindAddr: FfiConverterOptionString.read(from: &buf), 
+                httpBindAddr: FfiConverterOptionString.read(from: &buf), 
+                nat: FfiConverterOptionTypeFfiNat.read(from: &buf), 
+                projectionRateLimit: FfiConverterOptionUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NodeStartConfig, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiReach.write(value.reach, into: &buf)
+        FfiConverterTypeIdentity.write(value.identity, into: &buf)
+        FfiConverterTypeFfiBlobBackend.write(value.blobStorage, into: &buf)
+        FfiConverterTypeFfiTlsMode.write(value.tls, into: &buf)
+        FfiConverterTypeFfiDhtMode.write(value.dht, into: &buf)
+        FfiConverterTypeFfiCorsOrigins.write(value.corsOrigins, into: &buf)
+        FfiConverterOptionString.write(value.bindAddr, into: &buf)
+        FfiConverterOptionString.write(value.httpBindAddr, into: &buf)
+        FfiConverterOptionTypeFfiNat.write(value.nat, into: &buf)
+        FfiConverterOptionUInt32.write(value.projectionRateLimit, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNodeStartConfig_lift(_ buf: RustBuffer) throws -> NodeStartConfig {
+    return try FfiConverterTypeNodeStartConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNodeStartConfig_lower(_ value: NodeStartConfig) -> RustBuffer {
+    return FfiConverterTypeNodeStartConfig.lower(value)
+}
+
+
+/**
  * Per-invocation cost metadata for an outlet (spec §5.4.1).
  */
 public struct OutletCostDefinition {
@@ -13558,6 +13759,536 @@ extension DiscoveryMethod: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * The node's blob storage backend; mirrors
+ * `scp_ffi_common::node_start_config::FfiBlobBackend`.
+ */
+
+public enum FfiBlobBackend {
+    
+    /**
+     * Blobs in process memory, lost on drop.
+     */
+    case inMemory
+    /**
+     * A redb database file at `path`.
+     */
+    case redb(
+        /**
+         * The database file path; its parent directory is created.
+         */path: String
+    )
+    /**
+     * A `SQLite` database file at `path`.
+     */
+    case sqlite(
+        /**
+         * The database file path; its parent directory is created.
+         */path: String
+    )
+}
+
+
+#if compiler(>=6)
+extension FfiBlobBackend: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiBlobBackend: FfiConverterRustBuffer {
+    typealias SwiftType = FfiBlobBackend
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiBlobBackend {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .inMemory
+        
+        case 2: return .redb(path: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .sqlite(path: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiBlobBackend, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .inMemory:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .redb(path):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(path, into: &buf)
+            
+        
+        case let .sqlite(path):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(path, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiBlobBackend_lift(_ buf: RustBuffer) throws -> FfiBlobBackend {
+    return try FfiConverterTypeFfiBlobBackend.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiBlobBackend_lower(_ value: FfiBlobBackend) -> RustBuffer {
+    return FfiConverterTypeFfiBlobBackend.lower(value)
+}
+
+
+extension FfiBlobBackend: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The HTTP CORS origins the node allows; mirrors
+ * `scp_ffi_common::node_start_config::FfiCorsOrigins`.
+ */
+
+public enum FfiCorsOrigins {
+    
+    /**
+     * Any origin (`*`), selected only by naming it.
+     */
+    case anyOrigin
+    /**
+     * These `scheme://host` origins.
+     */
+    case allowlist(
+        /**
+         * The allowed origins; `*` is rejected.
+         */origins: [String]
+    )
+}
+
+
+#if compiler(>=6)
+extension FfiCorsOrigins: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCorsOrigins: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCorsOrigins
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCorsOrigins {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .anyOrigin
+        
+        case 2: return .allowlist(origins: try FfiConverterSequenceString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiCorsOrigins, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .anyOrigin:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .allowlist(origins):
+            writeInt(&buf, Int32(2))
+            FfiConverterSequenceString.write(origins, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCorsOrigins_lift(_ buf: RustBuffer) throws -> FfiCorsOrigins {
+    return try FfiConverterTypeFfiCorsOrigins.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCorsOrigins_lower(_ value: FfiCorsOrigins) -> RustBuffer {
+    return FfiConverterTypeFfiCorsOrigins.lower(value)
+}
+
+
+extension FfiCorsOrigins: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The node's DHT mode; mirrors `scp_ffi_common::node_start_config::FfiDhtMode`.
+ * `Disabled` is the one arm (keri's scope ruling of 2026-10-13).
+ */
+
+public enum FfiDhtMode {
+    
+    /**
+     * The node publishes nothing to a DHT.
+     */
+    case disabled
+}
+
+
+#if compiler(>=6)
+extension FfiDhtMode: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiDhtMode: FfiConverterRustBuffer {
+    typealias SwiftType = FfiDhtMode
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiDhtMode {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .disabled
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiDhtMode, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .disabled:
+            writeInt(&buf, Int32(1))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDhtMode_lift(_ buf: RustBuffer) throws -> FfiDhtMode {
+    return try FfiConverterTypeFfiDhtMode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiDhtMode_lower(_ value: FfiDhtMode) -> RustBuffer {
+    return FfiConverterTypeFfiDhtMode.lower(value)
+}
+
+
+extension FfiDhtMode: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The node's NAT traversal strategy; mirrors
+ * `scp_ffi_common::node_start_config::FfiNat`.
+ */
+
+public enum FfiNat {
+    
+    /**
+     * The core's automatic strategy.
+     */
+    case auto
+}
+
+
+#if compiler(>=6)
+extension FfiNat: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiNat: FfiConverterRustBuffer {
+    typealias SwiftType = FfiNat
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiNat {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .auto
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiNat, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .auto:
+            writeInt(&buf, Int32(1))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiNat_lift(_ buf: RustBuffer) throws -> FfiNat {
+    return try FfiConverterTypeFfiNat.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiNat_lower(_ value: FfiNat) -> RustBuffer {
+    return FfiConverterTypeFfiNat.lower(value)
+}
+
+
+extension FfiNat: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How the node is reached; mirrors `scp_ffi_common::node_start_config::FfiReach`
+ * (construction.md §"Node start — `NodeStartConfig`").
+ */
+
+public enum FfiReach {
+    
+    /**
+     * A public DNS name the node serves under.
+     */
+    case domain(
+        /**
+         * The DNS name, with no scheme, port or path.
+         */domain: String
+    )
+    /**
+     * No domain; the node discovers a public address through NAT traversal.
+     */
+    case natTraversal
+    /**
+     * Loopback only.
+     */
+    case local
+}
+
+
+#if compiler(>=6)
+extension FfiReach: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiReach: FfiConverterRustBuffer {
+    typealias SwiftType = FfiReach
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiReach {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .domain(domain: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .natTraversal
+        
+        case 3: return .local
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiReach, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .domain(domain):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(domain, into: &buf)
+            
+        
+        case .natTraversal:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .local:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiReach_lift(_ buf: RustBuffer) throws -> FfiReach {
+    return try FfiConverterTypeFfiReach.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiReach_lower(_ value: FfiReach) -> RustBuffer {
+    return FfiConverterTypeFfiReach.lower(value)
+}
+
+
+extension FfiReach: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How the node provisions TLS; mirrors
+ * `scp_ffi_common::node_start_config::FfiTlsMode`.
+ */
+
+public enum FfiTlsMode {
+    
+    /**
+     * A self-signed certificate.
+     */
+    case selfSigned
+    /**
+     * An ACME certificate for the `Domain` reach.
+     */
+    case acme(
+        /**
+         * The ACME account contact address, if any.
+         */email: String?
+    )
+    /**
+     * No TLS.
+     */
+    case plaintext
+    /**
+     * TLS terminated in front of the node.
+     */
+    case terminated
+}
+
+
+#if compiler(>=6)
+extension FfiTlsMode: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTlsMode: FfiConverterRustBuffer {
+    typealias SwiftType = FfiTlsMode
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTlsMode {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .selfSigned
+        
+        case 2: return .acme(email: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 3: return .plaintext
+        
+        case 4: return .terminated
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiTlsMode, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .selfSigned:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .acme(email):
+            writeInt(&buf, Int32(2))
+            FfiConverterOptionString.write(email, into: &buf)
+            
+        
+        case .plaintext:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .terminated:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTlsMode_lift(_ buf: RustBuffer) throws -> FfiTlsMode {
+    return try FfiConverterTypeFfiTlsMode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTlsMode_lower(_ value: FfiTlsMode) -> RustBuffer {
+    return FfiConverterTypeFfiTlsMode.lower(value)
+}
+
+
+extension FfiTlsMode: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Governance model for context administration.
  *
  * See spec §5.3 (Capability Ceiling Governance).
@@ -13972,6 +14703,14 @@ public enum ScpError: Swift.Error {
     case Validation(msg: String, code: String
     )
     /**
+     * A storage operation failed: every `SCP-STORAGE-` code (sdk-common.md
+     * §Registered SCP-STORAGE- codes), as Python's `StorageError` and the
+     * TypeScript SDK's storage class receive it. [`ScpError::coded`] is the
+     * one place that picks this variant, from the code's prefix.
+     */
+    case Storage(msg: String, code: String
+    )
+    /**
      * A §6.2.4 cross-context outlet-invocation saga aborted.
      *
      * The code tells its causes apart.
@@ -14077,17 +14816,21 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
-        case 8: return .SagaAborted(
+        case 8: return .Storage(
+            msg: try FfiConverterString.read(from: &buf), 
+            code: try FfiConverterString.read(from: &buf)
+            )
+        case 9: return .SagaAborted(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf), 
             retryAfterMs: try FfiConverterOptionUInt64.read(from: &buf)
             )
-        case 9: return .SagaNeedsRepair(
+        case 10: return .SagaNeedsRepair(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf), 
             sagaId: try FfiConverterString.read(from: &buf)
             )
-        case 10: return .SagaBusy(
+        case 11: return .SagaBusy(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf), 
             contendedContext: try FfiConverterString.read(from: &buf)
@@ -14146,22 +14889,28 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
             FfiConverterString.write(code, into: &buf)
             
         
-        case let .SagaAborted(msg,code,retryAfterMs):
+        case let .Storage(msg,code):
             writeInt(&buf, Int32(8))
+            FfiConverterString.write(msg, into: &buf)
+            FfiConverterString.write(code, into: &buf)
+            
+        
+        case let .SagaAborted(msg,code,retryAfterMs):
+            writeInt(&buf, Int32(9))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             FfiConverterOptionUInt64.write(retryAfterMs, into: &buf)
             
         
         case let .SagaNeedsRepair(msg,code,sagaId):
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(10))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             FfiConverterString.write(sagaId, into: &buf)
             
         
         case let .SagaBusy(msg,code,contendedContext):
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(11))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             FfiConverterString.write(contendedContext, into: &buf)
@@ -16532,6 +17281,30 @@ fileprivate struct FfiConverterOptionTypeReliabilityScoreRecord: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiNat: FfiConverterRustBuffer {
+    typealias SwiftType = FfiNat?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiNat.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiNat.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]?
 
@@ -17902,7 +18675,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_serve() != 23236) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_shutdown() != 24736) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_shutdown() != 47117) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_relayhandle_is_shutdown() != 45597) {
@@ -18199,6 +18972,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_migration_state() != 34622) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start() != 24911) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_in_memory() != 58945) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -18346,7 +19122,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_set_economic_policy() != 12223) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 20138) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 41184) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 57088) {
@@ -18430,7 +19206,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_token_id() != 51675) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 22077) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 28869) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 18976) {

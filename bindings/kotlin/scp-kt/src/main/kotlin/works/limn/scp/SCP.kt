@@ -177,7 +177,7 @@ class SCP internal constructor(
      * Shuts down this instance with a graceful deadline.
      *
      * Awaits in-flight tasks up to [timeout], aborts any remaining
-     * tasks, then runs typed-field cleanup. Throws `ScpException.Validation` with `SCP-STORAGE-8005`
+     * tasks, then runs typed-field cleanup. Throws `ScpException.Storage` with `SCP-STORAGE-8005`
      * when the durable store still holds its advisory lock after the call.
      *
      * Converted to unsigned milliseconds for the UniFFI boundary after
@@ -202,7 +202,7 @@ class SCP internal constructor(
         bridge.ffiCallSuspend {
             try {
                 inner.shutdown(timeoutMillis = millis)
-            } catch (e: ScpException.Validation) {
+            } catch (e: ScpException.Storage) {
                 // `SCP-STORAGE-8005` is raised after the teardown ran, so the instance is
                 // recorded as shut down.
                 if (e.code == STORAGE_LOCK_HELD_CODE) shutdownRecorded.set(true)
