@@ -2006,7 +2006,7 @@ pub struct ContextStateSnapshot {
 }
 ```
 
-**Amendment (2026-10-17, ADR-066).** The snapshot carries the governance state a receiver reads when it authorizes a governance Commit (`07-trust-validation-and-capabilities.md` §7.3.1.1): `member_since`, `governance_change_seqs`, `executed_proposals`, `reset_counter_floors`, and `ttl_deadline_unix`. Without them, a member rebuilt from a checkpoint could not compute a member's join point, the conflict check, proposal replay protection, or reset-request replay protection, or the `old_deadline_unix` of an `ExtendTtl` Commit's `TtlExtended` leaf, because the leaves those values come from may lie before the checkpoint. `GovernanceConflictKey` is one of `role:X`, `read:X`, `write:X`, or `ceiling`, where X is a member's identifier, as §7.3.1.1 defines. Replaying a post-checkpoint leaf updates the first three fields from the leaf's own `sequence`, and `reset_counter_floors` from checked leaf values only: a `MemberJoined` leaf sets the joining member's floor to 0, a `MemberReset` leaf with a `reset_counter` sets the member's floor to that counter, which step 1.7 checked against the signed request, a `MemberReset` leaf that a `ResetMember` action derived leaves it unchanged, and a `MemberLeft` leaf removes the member's entry. A `TtlExtended` leaf sets `ttl_deadline_unix` to its `new_deadline_unix`, and the `GovernanceActionExecuted` leaf of a `PromoteContext` action sets it to nil. A member adopts a snapshot only when its `ttl_deadline_unix` equals the deadline the latest such leaf at or before the checkpoint gives, or the creation timestamp plus `ttl` when there is none (`05-contexts.md` §5.10), so the checkpoint quorum cannot extend or remove the TTL. **Amendment (2026-10-18, ADR-066):** `ttl_deadline_unix` replaces `ttl_remaining_secs`, a relative value that differed with the time each member serialized it, and it is the absolute deadline every member holds (`05-contexts.md` §5.10). A `MemberReset` leaf, which records an ADR-029 Tier 3 reset or a Tier 2 Welcome-based fast-forward of a member that stays in the group, changes none of the first three: a reset is not a departure, and the member keeps its join point and every conflict key that names it. **Amendment (2026-10-18, ADR-066):** the field was `reset_floors`, an epoch floor that a request's `last_known_epoch` had to exceed and that the reset Commit's epoch set. It is replaced by the counter floor, because the epoch that floor read was a leaf value no request signed (ADR-066 decision 12).
+**Amendment (2026-10-17, ADR-066).** The snapshot carries the governance state a receiver reads when it authorizes a governance Commit (`07-trust-validation-and-capabilities.md` §7.3.1.1): `member_since`, `governance_change_seqs`, `executed_proposals`, `reset_counter_floors`, and `ttl_deadline_unix`. Without them, a member rebuilt from a checkpoint could not compute a member's join point, the conflict check, proposal replay protection, or reset-request replay protection, or the `old_deadline_unix` of an `ExtendTtl` Commit's `TtlExtended` leaf, because the leaves those values come from may lie before the checkpoint. `GovernanceConflictKey` is one of `role:X`, `read:X`, `write:X`, or `ceiling`, where X is a member's identifier, as §7.3.1.1 defines. Replaying a post-checkpoint leaf updates the first three fields from the leaf's own `sequence`, and `reset_counter_floors` from checked leaf values only: a `MemberJoined` leaf sets the joining member's floor to 0, a `MemberReset` leaf with a `reset_counter` sets the member's floor to that counter, which step 1.7 checked against the signed request, a `MemberReset` leaf that a `ResetMember` action derived leaves it unchanged, and a `MemberLeft` leaf removes the member's entry. A `TtlExtended` leaf sets `ttl_deadline_unix` to its `new_deadline_unix`, and the `GovernanceActionExecuted` leaf of a `PromoteContext` action sets it to nil. A member adopts the snapshot of the checkpoint it rebuilds from, the latest checkpoint whose quorum it verified, only when its `ttl_deadline_unix` equals the deadline the latest such leaf at or before that checkpoint gives, or the creation timestamp plus `ttl` when there is none (`05-contexts.md` §5.10), so the checkpoint quorum cannot extend or remove the TTL. An earlier checkpoint that the chain walk below uses only to count the next checkpoint's quorum is not checked against a TTL leaf, because no member reads its `ttl_deadline_unix`: every member takes the deadline from the latest TTL leaf, and the walk takes only the voters and the governance configuration from an earlier checkpoint. Pruning invariant 6 keeps the leaf that the adopted checkpoint's check needs. **Amendment (2026-10-18, ADR-066):** `ttl_deadline_unix` replaces `ttl_remaining_secs`, a relative value that differed with the time each member serialized it, and it is the absolute deadline every member holds (`05-contexts.md` §5.10). A `MemberReset` leaf, which records an ADR-029 Tier 3 reset or a Tier 2 Welcome-based fast-forward of a member that stays in the group, changes none of the first three: a reset is not a departure, and the member keeps its join point and every conflict key that names it. **Amendment (2026-10-18, ADR-066):** the field was `reset_floors`, an epoch floor that a request's `last_known_epoch` had to exceed and that the reset Commit's epoch set. It is replaced by the counter floor, because the epoch that floor read was a leaf value no request signed (ADR-066 decision 12).
 
 The five fields follow the canonical MessagePack encoding the snapshot already uses, with integers in their shortest MessagePack form, and each list is sorted so that every member serializes the same state to the same bytes:
 
@@ -2082,7 +2082,7 @@ Event-type retention interacts with time-based pruning: the effective retention 
 3. Pruning never removes checkpoint events themselves. Checkpoints are retained indefinitely (they are small and serve as trust anchors).
 4. Pruning is always local. A member's decision to prune does not affect other members' logs. Members who need full history can retain it regardless of the context's pruning policy.
 5. The hash chain is preserved: even when event payloads are pruned, the `prev_hash` chain continuity is maintained through retained leaf hashes.
-6. **Amendment (2026-10-18, ADR-066).** Pruning never removes a context's latest TTL leaf: its latest `TtlExtended` leaf or `GovernanceActionExecuted` leaf of a `PromoteContext` action. Every member derives the TTL deadline from that leaf (`05-contexts.md` §5.10), so a member that pruned it would derive a shorter deadline than the other members and destroy its keys early. An earlier `TtlExtended` leaf may be pruned once a later TTL leaf lies behind a valid checkpoint.
+6. **Amendment (2026-10-18, ADR-066).** Pruning never removes a context's latest TTL leaf: its latest `TtlExtended` leaf or `GovernanceActionExecuted` leaf of a `PromoteContext` action. Every member derives the TTL deadline from that leaf (`05-contexts.md` §5.10), so a member that pruned it would derive a shorter deadline than the other members and destroy its keys early. An earlier `TtlExtended` leaf may be pruned once a later TTL leaf has a sequence at or below a valid checkpoint's. The latest TTL leaf at or before the latest valid checkpoint is then never pruned: a later TTL leaf at or below a valid checkpoint would itself be that leaf. That is the leaf a rebuilt member's snapshot check reads (§1 amendment), and that check applies only to the checkpoint the member adopts.
 
 #### 3. Checkpoint Scheduling
 
@@ -2552,7 +2552,7 @@ pub trait GovernanceEngine: Send + Sync {
     /// The proposer must hold `GovernancePropose` capability (UCAN-validated).
     fn propose(
         &self,
-        proposer: &[u8; 32],
+        proposer: &DID,
         action: GovernanceAction,
         context: &GovernanceContext,
     ) -> Result<ProposalId, GovernanceError>;
@@ -2562,7 +2562,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn approve(
         &self,
         proposal_id: &ProposalId,
-        voter: &[u8; 32],
+        voter: &DID,
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2571,7 +2571,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn reject(
         &self,
         proposal_id: &ProposalId,
-        voter: &[u8; 32],
+        voter: &DID,
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2580,7 +2580,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn withdraw_vote(
         &self,
         proposal_id: &ProposalId,
-        voter: &[u8; 32],
+        voter: &DID,
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2590,7 +2590,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn cancel(
         &self,
         proposal_id: &ProposalId,
-        proposer: &[u8; 32],
+        proposer: &DID,
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2606,7 +2606,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn model_config(&self) -> GovernanceModelConfig;
 
     /// Return the set of identifiers eligible to vote on proposals in this model.
-    fn eligible_voters(&self, context: &GovernanceContext) -> Vec<[u8; 32]>;
+    fn eligible_voters(&self, context: &GovernanceContext) -> Vec<DID>;
 }
 
 /// Read-only context snapshot provided to the governance engine.
@@ -2614,8 +2614,8 @@ pub trait GovernanceEngine: Send + Sync {
 /// that the ContextManager executes.
 pub struct GovernanceContext {
     pub context_id: ContextId,
-    pub members: Vec<([u8; 32], RoleName)>,
-    pub admin_dids: Vec<[u8; 32]>,
+    pub members: Vec<(DID, RoleName)>,
+    pub admin_dids: Vec<DID>,
     pub current_epoch: Option<u64>,
     pub now: u64,
 }
@@ -2634,7 +2634,7 @@ pub enum GovernanceModelConfig {
     /// The creator is the initial (and only) admin. Admin transfer is
     /// a governance action that replaces the admin.
     SingleAdmin {
-        admin_did: [u8; 32],
+        admin_did: DID,
     },
 
     /// M-of-N threshold approval. A fixed set of designated signers;
@@ -2644,7 +2644,7 @@ pub enum GovernanceModelConfig {
     Threshold {
         /// The set of identifiers authorized to vote. These identifiers must hold
         /// the `GovernanceVote` capability.
-        signers: Vec<[u8; 32]>,
+        signers: Vec<DID>,
         /// Minimum number of approvals required. Must satisfy:
         /// 1 <= threshold <= signers.len().
         threshold: u32,
@@ -2700,7 +2700,7 @@ pub type ProposalId = [u8; 32];
 pub struct GovernanceProposal {
     pub proposal_id: ProposalId,
     pub context_id: ContextId,
-    pub proposer_did: [u8; 32],
+    pub proposer_did: DID,
     pub action: GovernanceAction,
     pub status: ProposalStatus,
     pub created_at: u64,
@@ -2717,7 +2717,7 @@ pub struct GovernanceProposal {
 /// A signed vote on a proposal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedVote {
-    pub voter_did: [u8; 32],
+    pub voter_did: DID,
     pub vote: VoteType,
     pub timestamp: u64,
     pub signature: P256Signature,
@@ -2751,7 +2751,7 @@ pub enum RejectionReason {
     /// More rejections than approvals (Majority model).
     MajorityRejected,
     /// Any single rejection (Unanimity model).
-    UnanimityBroken { rejector: [u8; 32] },
+    UnanimityBroken { rejector: DID },
     /// Threshold of rejections reached making approval impossible
     /// (Threshold model: rejections > signers - threshold).
     ApprovalImpossible,
@@ -2860,7 +2860,7 @@ pub enum RevocationScope {
 }
 ```
 
-**Amendment (2026-10-18, ADR-066): identifier fields are text-form identifiers.** Every identifier field of `GovernanceAction` (`did`, `new_admin`, `spender`) has the type `DID`, the identifier in its 56-byte text form (`03-identity.md` §3.1), which RFC 8785 serializes as a JSON string in `action_bytes`. The enum above typed them `[u8; 32]`, which RFC 8785 would serialize as an array of integers and which no receiver could check against `05-contexts.md` §5.9.1 check 3. A proposer and every receiver reject an action whose identifier field is not a valid 56-byte text form.
+**Amendment (2026-10-18, ADR-066): identifier fields are text-form identifiers.** Every identifier in this ADR's types has the type `DID`, the identifier in its 56-byte text form (`03-identity.md` §3.1), which RFC 8785 serializes as a JSON string in `action_bytes`. That covers the direct fields of `GovernanceAction` (`did`, `new_admin`, `spender`); the fields nested inside an action's `action_bytes`, which are `GovernanceReconfigAction::RemoveInactiveSigner.did`, `DeadlockJustification.unavailable_dids` and the identifier of each `missed_windows` pair (§10), and the `admin_did` and `signers` of a `GovernanceModel`; and the identifiers of the engine, record, and event types (`proposer`, `voter`, `members`, `admin_dids`, `proposer_did`, `voter_did`, `rejector`, `executor_did`). `ProposalId` alone stays `[u8; 32]`, because it is a hash. The types in this ADR typed these identifiers `[u8; 32]`, which RFC 8785 would serialize as an array of integers and which no receiver could check against `05-contexts.md` §5.9.1 check 3. A proposer and every receiver reject an action whose identifier field is not a valid 56-byte text form.
 
 #### 4. Proposal Resolution Rules Per Model
 
@@ -3021,7 +3021,7 @@ Deadlock occurs when the governance model requires votes from members that are p
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceReconfigAction {
     /// Remove an inactive signer (Threshold model).
-    RemoveInactiveSigner { did: [u8; 32] },
+    RemoveInactiveSigner { did: DID },
     /// Reduce the threshold (Threshold model). New value must be
     /// >= 1 and <= remaining active signers.
     ReduceThreshold { new_threshold: u32 },
@@ -3030,9 +3030,9 @@ pub enum GovernanceReconfigAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadlockJustification {
     /// The identifiers that are unavailable.
-    pub unavailable_dids: Vec<[u8; 32]>,
+    pub unavailable_dids: Vec<DID>,
     /// Evidence of unavailability: consecutive missed voting windows.
-    pub missed_windows: Vec<([u8; 32], u32)>,
+    pub missed_windows: Vec<(DID, u32)>,
     /// Timestamp of deadlock detection.
     pub detected_at: u64,
 }
@@ -3149,23 +3149,23 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
 // Additions to EventType in scp-core/event_log/
 GovernanceProposalCreated {
     proposal_id: ProposalId,
-    proposer_did: [u8; 32],
+    proposer_did: DID,
     action: GovernanceAction,
     voting_deadline: u64,
 },
 GovernanceVoteCast {
     proposal_id: ProposalId,
-    voter_did: [u8; 32],
+    voter_did: DID,
     vote: VoteType,
 },
 GovernanceVoteWithdrawn {
     proposal_id: ProposalId,
-    voter_did: [u8; 32],
+    voter_did: DID,
 },
 GovernanceProposalResolved {
     proposal_id: ProposalId,
     status: ProposalStatus,
-    executor_did: Option<[u8; 32]>,
+    executor_did: Option<DID>,
     resulting_epoch: Option<u64>,
 },
 GovernanceConflictDetected {
@@ -3183,7 +3183,7 @@ GovernanceDeadlockRecovery {
 GovernanceActionExecuted {
     proposal_id: ProposalId,
     action: GovernanceAction,
-    executor_did: [u8; 32],
+    executor_did: DID,
     resulting_epoch: Option<u64>,
 },
 ```
@@ -3980,8 +3980,8 @@ Alec ruled on 2026-10-17: the event log is the source of a member's role and rig
 12. **A reset needs the member's own request, which executes once.** A `MemberReset` leaf that executes no proposal is authorized only when the Commit's block carries the reset member's own signed `ResetRequest`, whose one preimage `09-security-model.md` §9.5.2 defines under `"SCP-RESET-REQUEST-V2:"`, and every receiver verifies it under the member's `#active` identity key; the committer holds both `member:invite` and `member:remove`; and the re-added leaf's `0xFF03` attestation is newer than the leaf it replaces. The request carries `reset_counter`, which the member raises with every request it signs during a membership, and `member_since`, its join point. A receiver accepts it only when `reset_counter` exceeds the member's `reset_counter_floor`, `member_since` equals the member's join point, and `last_known_epoch` is at most the Commit's sending epoch; executing it sets the floor to its `reset_counter` (the coordinator's call of 2026-10-18). A floor set from the reset Commit's epoch would read a value no request signs, and a request signed during an earlier membership would match a new one's epoch range. The `MemberReset` leaf repeats only signed values: the member, `last_known_epoch`, `reset_counter`, and `reason`. A reset that a `ResetMember` governance action orders executes as that action, under the model's approvals. A member holding only `member:invite` can no longer reset a voter onto a consumed KeyPackage.
 13. **The action travels once.** The executing Commit's `GovernanceActionExecuted` leaf carries the proposal's exact `action_bytes`, and the block carries the proposal as a block proposal record without them (`05-contexts.md` §5.9.1). A receiver takes `action_bytes` from that leaf as received, runs the RFC 8785 and I-JSON checks on those bytes, never on a re-encoding, recomputes `proposal_id` from them, and verifies the proposer's signature and every vote against that `proposal_id`; a Commit carrying a proposal without exactly one such leaf is rejected. The `GovernanceProposal` message (`0x06`) still carries `action_bytes`, so a voter reads the action before it votes. A committer therefore can no longer execute an action that differs from the one the voters signed: the bytes every member applies are the bytes `proposal_id` hashes.
 14. **Every leaf is derived.** A receiver derives the exact leaves a Commit must carry from the decoded action, the Commit's MLS proposals, the carried reset requests, and its own pre-Commit state, and rejects a Commit whose leaves differ from them in count, order, type, or any field but the signature it verifies and the timestamp it does not read (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6). With a proposal, `AddMember` derives one `MemberJoined`, `RemoveMember` one `MemberLeft`, `ResetMember` one `MemberReset`, and `ExtendTtl` one `TtlExtended`, each fixing the Add and Remove proposals the Commit may carry, and the `GovernanceActionExecuted` leaf comes last; every other action carries no Add or Remove and only that leaf. With no proposal, a Remove and an Add of the same member derive a `MemberReset` from the carried request, any other Remove derives a `MemberLeft`, and an unpaired Add is rejected. The `GovernanceActionExecuted` payload is `[target_did, action_type, proposal_id, action_bytes]`, every field derived from the proposal; it holds no executor or resulting epoch, because no receiver could check them. A committer can then add no leaf the action did not approve, such as a `RoleAssigned` beside a `ChangeRole`, and every value rebuilt from the log was checked when the leaf was accepted.
-15. **Every member approves a TTL extension or a promotion.** On 2026-10-18 Alec picked the option "Every member", which read: "Keep the spec's rule. Members joined expecting the context to expire, so none of them can have it extended or made permanent without their approval. The cost: every context with a TTL is limited to 96 members, including members who have no vote." `ExtendTtl` and `PromoteContext` need a signed approval from every current member, carried in the executing Commit, in every model, `Threshold` included, and a member that holds no `GovernanceVote` approves them with the same §5.9.1 vote record (`07-trust-validation-and-capabilities.md` §7.3.1.1). Every context with a TTL has at most 96 members, enforced at creation, at every action that adds a member, and by every receiver (`05-contexts.md` §5.9 invariant 4). The carried approvals replace the `TTLExtensionConsent` message and its 24-hour consent deadline, which no receiver could check: a member that does not approve blocks the action, and its approval lapses at its `expires_epoch` (`05-contexts.md` §5.10.1). Every member derives the TTL deadline from the context's latest TTL leaf, which no member prunes, and a rebuilt member adopts a checkpoint snapshot only when its `ttl_deadline_unix` matches that leaf, so a live member, a restarted member, and a rebuilt member derive the same `TtlExtended` leaf, and no checkpoint quorum can extend or remove the TTL (ADR-049 amendment, ADR-030 pruning invariant 6). A proposer re-sends a pending `ExtendTtl` or `PromoteContext` proposal after every Commit that adds a member, so the added member can approve it (`05-contexts.md` §5.9.1), and every receiver rejects a `PromoteContext` in a `no_promotion` context or one with no TTL.
-16. **The `0xFF02` extension commits the TTL and the promotion policy.** The extension gains `ttl_secs` and `promotion_policy`, and every member installs the TTL-deadline base and the promotion policy from them, never from an invitation bundle or a snapshot (`05-contexts.md` §5.13.3 rule 10). No Commit may change them, or `context_id`, `creator_did`, or `creation_timestamp_secs`: a receiver rejects a GroupContextExtensions proposal that does (rule 11). Decision 15's deadline equality and the `PromoteContext` policy check both read these values, and before this decision a joiner took them from the bundle, which only the inviter signed, so one malicious member could give a joiner a TTL base or a policy no other member holds. The coordinator required the values to be authenticated by the group context on 2026-10-18; the choice of two committed fields over a hash, and the extension of rule 11 to the three genesis fields already in the extension, are the architect agent's.
+15. **Every member approves a TTL extension or a promotion.** On 2026-10-18 Alec picked the option "Every member", which read: "Keep the spec's rule. Members joined expecting the context to expire, so none of them can have it extended or made permanent without their approval. The cost: every context with a TTL is limited to 96 members, including members who have no vote." `ExtendTtl` and `PromoteContext` need a signed approval from every current member, carried in the executing Commit, in every model, `Threshold` included, and a member that holds no `GovernanceVote` approves them with the same §5.9.1 vote record (`07-trust-validation-and-capabilities.md` §7.3.1.1). Every context with a TTL has at most 96 members, enforced at creation, at every action that adds a member, and by every receiver (`05-contexts.md` §5.9 invariant 4). The carried approvals replace the `TTLExtensionConsent` message and its 24-hour consent deadline, which no receiver could check: a member that does not approve blocks the action, and its approval lapses at its `expires_epoch` (`05-contexts.md` §5.10.1). Every member derives the TTL deadline from the context's latest TTL leaf, which no member prunes, and a rebuilt member adopts a checkpoint snapshot only when its `ttl_deadline_unix` matches that leaf, so a live member, a restarted member, and a rebuilt member derive the same `TtlExtended` leaf, and no checkpoint quorum can extend or remove the TTL (ADR-049 amendment, ADR-030 pruning invariant 6). A proposer re-sends every pending proposal after every Commit that adds a member, so an added member that the requirement counts can approve it (`05-contexts.md` §5.9.1), and every receiver rejects a `PromoteContext` in a `no_promotion` context or one with no TTL.
+16. **The `0xFF02` extension commits the TTL and the promotion policy.** The extension gains `ttl_secs` and `promotion_policy`, and every member installs the TTL-deadline base and the promotion policy from them, never from an invitation bundle or a snapshot (`05-contexts.md` §5.13.3 rule 10). A Commit changes the extension only as its derived leaves require (rule 11): the Commit that executes an action changing the governance policy or the ceiling carries the GroupContextExtensions proposal that updates `governance_policy_hash` or `ceiling_hash` to the value every receiver derives from the action, no other Commit carries one, and every other field, `ttl_secs`, `promotion_policy`, `context_id`, `creator_did`, `creation_timestamp_secs`, `context_mode`, `ceiling_policy`, and the parent lineage, never changes. A Welcome joiner checks the two hashes against the state it rebuilds, because its bundle carries the genesis parameters. Decision 15's deadline equality and the `PromoteContext` policy check both read these values, and before this decision a joiner took them from the bundle, which only the inviter signed, so one malicious member could give a joiner a TTL base or a policy no other member holds. The coordinator required the values to be authenticated by the group context on 2026-10-18; the coordinator required the hash updates and the immutable fields of rule 11 on the same date; the choice of two committed fields over a hash, deriving the expected extension from the Commit's leaves, and moving the joiner's hash check to its rebuilt state are the architect agent's.
 
 ### Rejected Alternatives
 
