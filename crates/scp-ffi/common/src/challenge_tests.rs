@@ -958,6 +958,9 @@ enum StallSignal {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn grading_deadline_decides_expiry_when_the_runtime_stalls() {
     const BUDGET: Duration = Duration::from_secs(2);
+    // Every signal wait is bounded, so a signal that never comes fails the
+    // test instead of hanging it.
+    const SIGNAL_WAIT: Duration = Duration::from_secs(30);
     let h = Harness::new(evaluator_params()).await;
     let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel::<StallSignal>();
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<StallSignal>();
@@ -984,10 +987,20 @@ async fn grading_deadline_decides_expiry_when_the_runtime_stalls() {
     let request = h.create(2, &invoker).await;
     let response = h.respond(&request, 1).await;
     let stall = tokio::spawn(async move {
-        assert_eq!(async_rx.recv().await, Some(StallSignal::Case18Returned));
-        assert_eq!(async_rx.recv().await, Some(StallSignal::Case19Started));
-        // Blocks the only worker until case 19's handler returns.
-        assert_eq!(sync_rx.recv(), Ok(StallSignal::Case19Returned));
+        let next = tokio::time::timeout(SIGNAL_WAIT, async_rx.recv());
+        let signal = next.await.expect("case 18's handler never returned");
+        assert_eq!(signal, Some(StallSignal::Case18Returned));
+        let next = tokio::time::timeout(SIGNAL_WAIT, async_rx.recv());
+        let signal = next.await.expect("case 19's handler never started");
+        assert_eq!(signal, Some(StallSignal::Case19Started));
+        // Blocks the only worker until case 19's handler returns. The wait
+        // is synchronous, so it is bounded by its own timeout.
+        let signal = sync_rx.recv_timeout(SIGNAL_WAIT);
+        assert_eq!(
+            signal,
+            Ok(StallSignal::Case19Returned),
+            "case 19's handler never returned"
+        );
     });
     let graded = h
         .grade_within(&request, &response, &invoker, BUDGET)
