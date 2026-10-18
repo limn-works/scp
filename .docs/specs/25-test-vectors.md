@@ -252,9 +252,11 @@ context_id is NOT included — the vote is bound to a context via the proposal_i
 
 ## 25.6 Reset Request Signing Vectors (§23.5.2)
 
-Domain: `"SCP-RESET-REQUEST-V2:"`
+Domain: `"SCP-RESET-REQUEST-V1:"`
 
 ### Vector 8: Reset Request
+
+**V1 vector.** This vector shows the `"SCP-RESET-REQUEST-V1:"` preimage that the code still implements. `09-security-model.md` §9.5.2 retires that form for `"SCP-RESET-REQUEST-V2:"`, which adds `reset_counter` and `member_since`, and SCP-331 replaces this vector with the V2 form when it changes the code.
 
 ```
 Input:
@@ -262,33 +264,29 @@ Input:
   member_did:       "scp:ufveadjgygwpujfense3z6e6jwthxmug26owvhrjnvzdfjkjrq5q"
                     (the identifier SHA-256("SCP test vector identifier sync member") in text form)
   last_known_epoch: 42
-  reset_counter:    3
-  member_since:     7
-  reason:           "extended offline (8 days)" (ExtendedOffline with 691200 seconds, in the text form of 09-security-model.md §9.5.2)
+  reason:           "extended offline (8 days)" (ResetReason::ExtendedOffline { offline_duration_secs: 691200 } → Display string)
   nonce:            0x01020304050607080910111213141516 (16 bytes)
   timestamp:        1700000000
 
-Canonical hash input (the ResetRequest preimage of 09-security-model.md §9.5.2):
-  "SCP-RESET-REQUEST-V2:"                     (21 bytes)
+Canonical hash input (per §23.5.2, field order from code):
+  "SCP-RESET-REQUEST-V1:"                     (21 bytes)
   || BE32(17) || "sync-test-context"           (4 + 17 = 21 bytes)
   || BE32(56) || member_did                    (4 + 56 = 60 bytes)
   || BE64(42)                                  (8 bytes — last_known_epoch)
-  || BE64(3)                                   (8 bytes — reset_counter)
-  || BE64(7)                                   (8 bytes — member_since)
   || BE32(25) || "extended offline (8 days)"   (4 + 25 = 29 bytes — reason)
   || nonce                                     (16 bytes, fixed-length, no length prefix)
   || BE64(1700000000)                          (8 bytes)
 
-Total: 21 + 21 + 60 + 8 + 8 + 8 + 29 + 16 + 8 = 179 bytes
+Total: 21 + 21 + 60 + 8 + 29 + 16 + 8 = 163 bytes
 
-Preimage (hex, 179 bytes):
-  5343502d52455345542d524551554553542d56323a0000001173796e632d746573742d636f6e74657874000000387363703a7566766561646a6779677770756a66656e7365337a3665366a777468786d756732366f777668726a6e767a64666a6b6a72713571000000000000002a0000000000000003000000000000000700000019657874656e646564206f66666c696e6520283820646179732901020304050607080910111213141516000000006553f100
+Preimage (hex, 163 bytes):
+  5343502d52455345542d524551554553542d56313a0000001173796e632d746573742d636f6e74657874000000387363703a7566766561646a6779677770756a66656e7365337a3665366a777468786d756732366f777668726a6e767a64666a6b6a72713571000000000000002a00000019657874656e646564206f66666c696e6520283820646179732901020304050607080910111213141516000000006553f100
 
 Canonical hash SHA-256(preimage) (32 bytes):
-  0x4c039aa7bbb86a2f6c00093bd290ce6214643e2ee66e5494225ee88e5cab6726
+  0x1c0dc57c74a1b6f1072d65aa87c8d2de3ed3ed921c22d6754e5d6f8137ae8b6e
 
 RFC 6979 signature over the canonical hash, reference key, 64-byte raw r || s:
-  0xdae33519504f03a75636905fba1639a649e78de410224e3b02d90967bc12fd363a8b875bcaba1e6b2c9edd7e8c3449bcc0f3ded42c7245b3c8f31171ae5e7eb3
+  0xadfb7ae6be806d4e7bef5f97a7e996d5b071e31d488ca331b144928119cd137a21071a52305eea42a704daef9cc498e09eec8dec0720ab76bcdb7d88f85dfed2
 
 Verification vector:
   public key: 0x033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f3027
@@ -297,7 +295,7 @@ Verification vector:
   verdict:    accept
 ```
 
-The `nonce` above carries 16 bytes, which is the width the field list states and the width the 179-byte total assumes. Before 2026-09-10 this vector printed a 17-byte literal beside the label "16 bytes", so an implementer following §25.17 step 3 would have measured one byte more than the stated total and read a correct encoding as wrong.
+The `nonce` above carries 16 bytes, which is the width the field list states and the width the 163-byte total assumes. Before 2026-09-10 this vector printed a 17-byte literal beside the label "16 bytes", so an implementer following §25.17 step 3 would have measured one byte more than the stated total and read a correct encoding as wrong.
 
 ## 25.7 Envelope Padding Vectors (§9.10)
 
@@ -713,9 +711,11 @@ An implementation that concatenates the caller's own block first computes two di
 
 ## 25.11 Proposal ID Vectors (§9.5.2)
 
-Domain: `"SCP-PROPOSAL-V2:"`
+Domain: `"SCP-PROPOSAL-V1:"`
 
 ### Vector 23: Governance Proposal ID
+
+**V1 vector.** This vector shows the `"SCP-PROPOSAL-V1:"` preimage that the code still implements, with the proposer-chosen `timestamp` in field 4. `09-security-model.md` §9.5.2 retires that form for `"SCP-PROPOSAL-V2:"`, which takes `anchor_seq` in field 4, and SCP-331 replaces this vector with the V2 form when it changes the code.
 
 ```
 Input:
@@ -726,31 +726,31 @@ Input:
                 (96 bytes — the compact JSON of GovernanceAction::AddMember, whose
                  "did" is the fixture identifier new member, §25.1)
                 hex: 0x7b224164644d656d626572223a7b22646964223a227363703a796b637a3378336479636e7463366c6b787a6265336e697876643777356333377269616f776c6832366c637a646e6335766d6a61222c22726f6c65223a226d656d626572227d7d
-  anchor_seq:   42
+  timestamp:    1700000000
 
 Canonical hash input (per §9.5.2 GovernanceProposal ID):
-  "SCP-PROPOSAL-V2:"                           (16 bytes)
+  "SCP-PROPOSAL-V1:"                           (16 bytes)
   || BE32(20) || "gov-proposal-context"         (4 + 20 = 24 bytes)
   || BE32(56) || proposer_did                  (4 + 56 = 60 bytes)
   || BE32(96) || action_bytes                   (4 + 96 = 100 bytes, length-prefixed)
-  || BE64(42)                                   (8 bytes)
+  || BE64(1700000000)                           (8 bytes)
 
 Total: 16 + 24 + 60 + 100 + 8 = 208 bytes
 
 Preimage (hex, 208 bytes):
-  5343502d50524f504f53414c2d56323a00000014676f762d70726f706f73616c2d636f6e74657874000000387363703a666c726b66677936656872776a3335617935377033366c64666661726c636d68326d6a37736d7237726175797670726579716661000000607b224164644d656d626572223a7b22646964223a227363703a796b637a3378336479636e7463366c6b787a6265336e697876643777356333377269616f776c6832366c637a646e6335766d6a61222c22726f6c65223a226d656d626572227d7d000000000000002a
+  5343502d50524f504f53414c2d56313a00000014676f762d70726f706f73616c2d636f6e74657874000000387363703a666c726b66677936656872776a3335617935377033366c64666661726c636d68326d6a37736d7237726175797670726579716661000000607b224164644d656d626572223a7b22646964223a227363703a796b637a3378336479636e7463366c6b787a6265336e697876643777356333377269616f776c6832366c637a646e6335766d6a61222c22726f6c65223a226d656d626572227d7d000000006553f100
 
 Proposal ID:
-  0xdb29972554562daa98f8f267f2bba151c8dfec980a5de5b1a6c35ea1604b0e38
+  0x15ff55609885bc70e5c7828697ce978af7c09b8d12d058fee276822d1d34e7f6
 
 Note: action_bytes is the canonical JSON serialization of the GovernanceAction
 enum (compact, no whitespace — equivalent to serde_json::to_vec in Rust or
 json.dumps(separators=(',', ':')) in Python). JSON is used rather than
-MessagePack for cross-implementation determinism (see §9.5.2). Field order:
-context_id, proposer_did, action_bytes, anchor_seq.
+MessagePack for cross-implementation determinism (see §9.5.2). Field order
+matches code: context_id, proposer_did, action_bytes, timestamp.
 ```
 
-Before 2026-09-10 this vector carried `0xdeadbeef01020304` labelled a placeholder, together with a note telling a later author to substitute real JSON. Those eight bytes are not a JSON serialization of any `GovernanceAction`, so the vector pinned no proposal ID and its stated 85-byte total measured a preimage no conforming producer builds. The `AddMember` action above is a real variant of the enum §9.5.2 names, stated literally, so this vector now derives from its own printed inputs. The domain separator is 16 ASCII bytes, not the 17 the vector previously stated. On 2026-10-17 ADR-066 retired `"SCP-PROPOSAL-V1:"` and its proposer-chosen `timestamp` field; this vector now uses `"SCP-PROPOSAL-V2:"` with `anchor_seq` 42 in field 4.
+Before 2026-09-10 this vector carried `0xdeadbeef01020304` labelled a placeholder, together with a note telling a later author to substitute real JSON. Those eight bytes are not a JSON serialization of any `GovernanceAction`, so the vector pinned no proposal ID and its stated 85-byte total measured a preimage no conforming producer builds. The `AddMember` action above is a real variant of the enum §9.5.2 names, stated literally, so this vector now derives from its own printed inputs. The domain separator is 16 ASCII bytes, not the 17 the vector previously stated.
 
 ## 25.12 HPKE Key Distribution Vectors
 
