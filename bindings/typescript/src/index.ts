@@ -208,7 +208,16 @@ export type { SyncPolicy } from "./sync";
 // Server (relay + node lifecycle)
 // ---------------------------------------------------------------------------
 
-export { Node, Relay } from "./server";
+export type {
+  BlobBackend,
+  CorsOrigins,
+  DhtMode,
+  Nat,
+  NodeStartConfig,
+  Reach,
+  TlsMode,
+} from "./server";
+export { NODE_START_INVALID_CONFIG_CODE, Node, Relay } from "./server";
 
 // ---------------------------------------------------------------------------
 // Lifecycle

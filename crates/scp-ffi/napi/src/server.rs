@@ -490,8 +490,12 @@ fn resolve_operator_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result
 /// node on `bi`'s storage under the operator identity the config names
 /// (construction.md §"Node start — `NodeStartConfig`").
 ///
-/// Runs, in order: the config parse, the operator identity resolution, taking
-/// the instance storage, `server::node_start`, `server::register_node`,
+/// `operator_did` is the DID of the operator handle the caller passed, on
+/// which `Scp::node_start` already ran the ADR-048 handle check.
+///
+/// Runs, in order: the config parse, the operator identity resolution, the
+/// check that the config names `operator_did`, taking the instance storage,
+/// `server::node_start`, `server::register_node`,
 /// `auto_wire_context_manager`, and wrapping the handle.
 ///
 /// # Errors
@@ -500,9 +504,16 @@ fn resolve_operator_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result
 pub(crate) async fn node_start_on(
     bi: &Arc<NapiBridgeInstance>,
     config_json: String,
+    operator_did: &str,
 ) -> napi::Result<NapiNodeHandle> {
     let cfg = NodeStartConfig::from_json(&config_json).map_err(server_err)?;
     let identity = resolve_operator_identity(bi, &cfg.identity)?;
+    // The config names its operator by DID; the caller also passed the
+    // operator handle the ADR-048 check ran on. A config naming any other
+    // identity would run the node under an operator that check never saw.
+    if cfg.identity != operator_did {
+        return Err(server_err(ServerError::OperatorIdentityUnavailable));
+    }
     let storage = crate::runtime::protocol_repository(bi).instance_storage();
     let node = server::node_start(cfg, identity, storage)
         .await
@@ -873,18 +884,94 @@ mod tests {
         );
     }
 
+    /// An operator handle for `did` minted by `scp` that holds no key
+    /// material and is not in `scp`'s identity registry, as an externally
+    /// loaded identity is; a shipped build can mint it, since it needs no
+    /// custody.
+    fn external_identity(scp: &crate::scp::Scp, did: &str) -> crate::identity::NapiIdentity {
+        // Balances the decrement in `NapiIdentity`'s `Drop`, as every handle
+        // constructor does.
+        crate::increment_handle_count();
+        crate::identity::NapiIdentity {
+            inner: Arc::new(crate::identity::NapiIdentityInner {
+                did: did.to_owned(),
+                custody_type: "external".to_owned(),
+                scp_identity: None,
+                custody: None,
+                document: None,
+                bi: Arc::clone(&scp.inner),
+                verifying_key_hex: None,
+                instance_id: scp.inner.instance_id(),
+                rotation_event_json: None,
+            }),
+        }
+    }
+
     /// A well-formed operator DID that no identity on this instance holds
     /// returns `SCP-IDENT-1063` on a shipped build as on a `testing` build.
     #[test]
     fn node_start_with_unregistered_operator_did_returns_ident_1063() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
-        let json = start_json("did:dht:z6MkNodeStartOperatorProbe", |_| {});
-        let reason = start_error(rt().block_on(scp.node_start(json)), "unregistered operator");
+        let probe = "did:dht:z6MkNodeStartOperatorProbe";
+        let handle = external_identity(&scp, probe);
+        let json = start_json(probe, |_| {});
+        let reason = start_error(
+            rt().block_on(scp.node_start(json, &handle)),
+            "unregistered operator",
+        );
         assert_coded(
             &reason,
             "identity",
             codes::IDENT_1063,
             "unregistered operator",
+        );
+    }
+
+    /// An operator handle another `SCP` minted fails the ADR-048 handle check
+    /// with `SCP-PERM-3030` before the config is read, so even a config that
+    /// cannot parse returns `SCP-PERM-3030`.
+    #[test]
+    fn node_start_refuses_another_instances_identity_with_perm_3030() {
+        let minting = crate::scp::Scp::new_in_memory_for_test();
+        let other = crate::scp::Scp::new_in_memory_for_test();
+        let did = "did:dht:z6MkNodeStartForeignProbe";
+        let foreign = external_identity(&minting, did);
+        for json in [start_json(did, |_| {}), "{not json".to_owned()] {
+            let reason = start_error(
+                rt().block_on(other.node_start(json, &foreign)),
+                "foreign operator handle",
+            );
+            assert_coded(
+                &reason,
+                "permission",
+                codes::PERM_3030,
+                "foreign operator handle",
+            );
+        }
+    }
+
+    /// A config naming a DID other than the operator handle's returns
+    /// `SCP-IDENT-1063`: the node never runs under an operator the handle
+    /// check did not see.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_refuses_a_config_naming_another_operator_with_ident_1063() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let named = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let passed = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let reason = start_error(
+            rt().block_on(scp.node_start(start_json(&named.did(), |_| {}), &passed)),
+            "config names another operator",
+        );
+        assert_coded(
+            &reason,
+            "identity",
+            codes::IDENT_1063,
+            "config names another operator",
         );
     }
 
@@ -963,7 +1050,7 @@ mod tests {
             .unwrap();
         let did = identity.did();
         let node = rt()
-            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .block_on(scp.node_start(start_json(&did, |_| {}), &identity))
             .unwrap();
 
         assert_eq!(node.did(), did);
@@ -1060,17 +1147,17 @@ mod tests {
         );
 
         let node = rt()
-            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .block_on(scp.node_start(start_json(&did, |_| {}), &identity))
             .unwrap();
         assert!(server::supervisor_wired_to(&scp.inner.core, &node.inner));
         let reason = start_error(
-            rt().block_on(scp.node_start(start_json(&did, |_| {}))),
+            rt().block_on(scp.node_start(start_json(&did, |_| {}), &identity)),
             "second node start",
         );
         assert_coded(&reason, "transport", codes::TRANS_5056, "second node start");
         node.shutdown();
         let restarted = rt()
-            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .block_on(scp.node_start(start_json(&did, |_| {}), &identity))
             .expect("a start after the bound node stops binds again");
         assert!(server::supervisor_wired_to(
             &scp.inner.core,
@@ -1172,7 +1259,7 @@ mod tests {
             ),
         ];
         for (label, json, class, code) in cases {
-            let reason = start_error(rt().block_on(scp.node_start(json)), label);
+            let reason = start_error(rt().block_on(scp.node_start(json, &identity)), label);
             assert_coded(&reason, class, code, label);
         }
         drop(taken);

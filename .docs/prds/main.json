@@ -11659,11 +11659,16 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/typescript/src/server.ts",
+        "bindings/typescript/src/scp.ts",
+        "bindings/typescript/src/index.ts",
         "bindings/typescript/src/internal/native.ts",
-        "bindings/typescript/tests/server.test.ts"
+        "bindings/typescript/tests/server.test.ts",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/napi/src/server.rs",
+        "crates/scp-ffi/common/tests/fixtures/node_start_config.json"
       ],
       "description": "The TypeScript SDK mirrors `NodeStartConfig` (construction.md §\"Node start — `NodeStartConfig`\") as an options interface with discriminated unions tagged `kind`, under the five-language equivalence table of construction.md, and calls the napi-rs `node_start` export from SCP-322. Each code of sdk-common.md §\"Node start error codes\" reaches the caller as the typed error of its category.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C7.",
       "acceptanceCriteria": [
