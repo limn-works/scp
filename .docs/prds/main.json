@@ -325,7 +325,8 @@
         "SCP-334",
         "SCP-335",
         "SCP-336",
-        "SCP-337"
+        "SCP-337",
+        "SCP-338"
       ]
     }
   ],
@@ -12215,7 +12216,7 @@
         "crates/scp-protocol/src/context/governance/mod.rs",
         "crates/scp-event-log/src/lib.rs"
       ],
-      "description": "Per the governance-state, conflict, approval-cap, and receiver-step rules of §7.3.1.1 of the trust spec, this story builds in `scp-protocol` the pure check every receiver runs on one decoded block body before it merges a Commit, and the governance state the check reads. The governance state holds the membership and roles, `member_since` (each member's join point: the `sequence` of the `MemberJoined` leaf that added it as a non-member; a `MemberReset` leaf leaves it unchanged), `change_seq` per `GovernanceConflictKey` (`role:X`, `read:X`, `write:X`, `ceiling`), the executed-proposal set, `reset_counter_floor` per member (0 when a `MemberJoined` leaf adds it, set to the `reset_counter` of a `MemberReset` leaf that executes its request, unchanged by a `MemberReset` a `ResetMember` action derives, dropped when it leaves), and `ttl_deadline` (derived from the latest TTL leaf, the latest `TtlExtended` leaf or `PromoteContext` `GovernanceActionExecuted` leaf: none after a promotion, the leaf's `new_deadline_unix` after an extension, `creation_timestamp_secs` plus `ttl` when there is neither), with a function that applies a leaf to it and reads only values the check verified. The check takes the body, the sender's identifier, the sending epoch E, a pre-Commit tree view, the receiver's commit-ordered leaf count N, the governance state, and, for each `MemberReset` leaf, the verified `0xFF03` attestations of the replaced and re-added leaves and the `#active` key the caller resolved, and reads nothing else: no clock and no leaf timestamp. When a proposal is present it requires exactly one `GovernanceActionExecuted` leaf, takes that leaf's `action_bytes` as received, checks their length and their RFC 8785 and I-JSON form on those exact bytes, recomputes the `\"SCP-PROPOSAL-V2:\"` `proposal_id` from them and the block proposal record, checks it against the leaf's `proposal_id`, and checks the executed set, `anchor_seq ≤ N`, `GovernancePropose`, and the signature in the tree view; checks each vote is `Approve`, from a voter with no other approval in the Commit, who holds `GovernanceVote` (and is a `Threshold` signer), or for an `ExtendTtl` or `PromoteContext` action is any current member, with `E ≤ expires_epoch` and a signature under that voter's leaf in the tree view whose `0xFF03` binds the voter, rejecting the Commit on any failure; counts the approvals against the requirement computed from the current state, every current member for `ExtendTtl` and `PromoteContext` under every model; checks every identifier field of the action is a valid 56-byte text form; derives the exact leaves the Commit must carry from the decoded action, the Commit's Add and Remove proposals, the carried reset requests, and the state (§7.3.1.1 step 1.6: `MemberJoined`, `MemberLeft`, `MemberReset`, or `TtlExtended` as the action requires, then the `GovernanceActionExecuted` leaf `[target_did, action_type, proposal_id, action_bytes]`; with no proposal, `MemberReset` for each paired Remove and Add and `MemberLeft` for each other Remove) and rejects a Commit whose leaves differ in count, order, type, or any field but `signature` and `timestamp`, or whose received leaf bytes are not the encoding of the decoded `Event`; rejects an action that raises the eligible voters past the context's voter limit or adds a 97th member to a context with a TTL, and a `ReconfigureGovernance` whose resulting configuration breaks the §5.9 invariant 4 limits; and applies the conflict rule (a key with `change_seq ≥ anchor_seq`, or a subject X with `member_since[X] ≥ anchor_seq`). A `MemberReset` leaf in a Commit with no proposal needs no approvals and is authorized only when the committer holds both `member:invite` and `member:remove`, the paired reset-request record verifies over the §9.5.2 `ResetRequest` preimage under X's `#active` key with `member_since` equal to `member_since[X]`, `reset_counter > reset_counter_floor[X]`, `last_known_epoch ≤ E`, and a `reason` that is one of the two §9.5.2 text forms; rejects a `PromoteContext` whose `ttl_deadline` is none or whose context's promotion policy is `no_promotion`; and the re-added leaf's `0xFF03` `issued_at` is later than the replaced leaf's; one in a Commit with a proposal is authorized only as the executed `ResetMember` action. Under epoch order the governance freeze for mutual removal and simultaneous commit cannot arise (ADR-031 §7 amendment), so this story deletes `ResolveConflict`, `ConflictResolution`, and the `GovernanceConflictDetected` and `GovernanceConflictResolved` event types with every caller. Leaf signature checks are SCP-330's.",
+      "description": "Per the governance-state, conflict, approval-cap, and receiver-step rules of §7.3.1.1 of the trust spec, this story builds in `scp-protocol` the pure check every receiver runs on one decoded block body before it merges a Commit, and the governance state the check reads. The governance state holds the membership and roles, `member_since` (each member's join point: the `sequence` of the `MemberJoined` leaf that added it as a non-member; a `MemberReset` leaf leaves it unchanged), `change_seq` per `GovernanceConflictKey` (`role:X`, `read:X`, `write:X`, `ceiling`), the executed-proposal set, `reset_counter_floor` per member (0 when a `MemberJoined` leaf adds it, set to the `reset_counter` of a `MemberReset` leaf that executes its request, unchanged by a `MemberReset` a `ResetMember` action derives, dropped when it leaves), and `ttl_deadline` (derived from the latest TTL leaf, the latest `TtlExtended` leaf or `PromoteContext` `GovernanceActionExecuted` leaf: none after a promotion, the leaf's `new_deadline_unix` after an extension, `creation_timestamp_secs` plus `ttl` when there is neither, both read from the committed `0xFF02` extension, SCP-338), with a function that applies a leaf to it and reads only values the check verified. The check takes the body, the sender's identifier, the sending epoch E, a pre-Commit tree view, the receiver's commit-ordered leaf count N, the governance state, and, for each `MemberReset` leaf, the verified `0xFF03` attestations of the replaced and re-added leaves and the `#active` key the caller resolved, and reads nothing else: no clock and no leaf timestamp. When a proposal is present it requires exactly one `GovernanceActionExecuted` leaf, takes that leaf's `action_bytes` as received, checks their length and their RFC 8785 and I-JSON form on those exact bytes, recomputes the `\"SCP-PROPOSAL-V2:\"` `proposal_id` from them and the block proposal record, checks it against the leaf's `proposal_id`, and checks the executed set, `anchor_seq ≤ N`, `GovernancePropose`, and the signature in the tree view; checks each vote is `Approve`, from a voter with no other approval in the Commit, who holds `GovernanceVote` (and is a `Threshold` signer), or for an `ExtendTtl` or `PromoteContext` action is any current member, with `E ≤ expires_epoch` and a signature under that voter's leaf in the tree view whose `0xFF03` binds the voter, rejecting the Commit on any failure; counts the approvals against the requirement computed from the current state, every current member for `ExtendTtl` and `PromoteContext` under every model; checks every identifier field of the action is a valid 56-byte text form; derives the exact leaves the Commit must carry from the decoded action, the Commit's Add and Remove proposals, the carried reset requests, and the state (§7.3.1.1 step 1.6: `MemberJoined`, `MemberLeft`, `MemberReset`, or `TtlExtended` as the action requires, then the `GovernanceActionExecuted` leaf `[target_did, action_type, proposal_id, action_bytes]`; with no proposal, `MemberReset` for each paired Remove and Add and `MemberLeft` for each other Remove) and rejects a Commit whose leaves differ in count, order, type, or any field but `signature` and `timestamp`, or whose received leaf bytes are not the encoding of the decoded `Event`; rejects an action that raises the eligible voters past the context's voter limit or adds a 97th member to a context with a TTL, and a `ReconfigureGovernance` whose resulting configuration breaks the §5.9 invariant 4 limits; and applies the conflict rule (a key with `change_seq ≥ anchor_seq`, or a subject X with `member_since[X] ≥ anchor_seq`). A `MemberReset` leaf in a Commit with no proposal needs no approvals and is authorized only when the committer holds both `member:invite` and `member:remove`, the paired reset-request record verifies over the §9.5.2 `ResetRequest` preimage under X's `#active` key with `member_since` equal to `member_since[X]`, `reset_counter > reset_counter_floor[X]`, `last_known_epoch ≤ E`, and a `reason` that is one of the two §9.5.2 text forms; rejects a `PromoteContext` whose `ttl_deadline` is none or whose context's promotion policy, read from the committed `0xFF02` `promotion_policy` field and never from the bundle, is `no_promotion`; and the re-added leaf's `0xFF03` `issued_at` is later than the replaced leaf's; one in a Commit with a proposal is authorized only as the executed `ResetMember` action. Under epoch order the governance freeze for mutual removal and simultaneous commit cannot arise (ADR-031 §7 amendment), so this story deletes `ResolveConflict`, `ConflictResolution`, and the `GovernanceConflictDetected` and `GovernanceConflictResolved` event types with every caller. Leaf signature checks are SCP-330's.",
       "acceptanceCriteria": [
         "Given a valid body for each model, the check returns `Authorized`; one test per rejection returns a typed reason: a `proposal_id` in the executed set; `anchor_seq` above N; a `Reject` record; a voter with two approvals in one Commit; a voter without `GovernanceVote`; `expires_epoch` below E; a vote whose `leaf_key_hash` matches no leaf of the voter in the tree view; a leaf key whose `0xFF03` binds another identifier; one approval too few",
         "In a `Unanimity` context of 96 eligible voters, a body carrying 96 approvals is authorized; an `AddMember` action in that context, and a `ChangeRole` that grants `GovernanceVote` to a 97th member, are each rejected for exceeding the voter limit, as is an `AddMember` that takes a `Majority` context from 191 to 192 eligible voters, and an `AddMember` that takes a `Threshold` context with a TTL from 96 to 97 members",
@@ -12241,7 +12242,8 @@
       ],
       "blockedBy": [
         "SCP-331",
-        "SCP-332"
+        "SCP-332",
+        "SCP-338"
       ],
       "sources": [
         {
@@ -12387,6 +12389,7 @@
         "In a context with a TTL, after two `ExtendTtl` Commits, a checkpoint, and the pruning of both `TtlExtended` leaves, a member rebuilt from the checkpoint holds the same `ttl_deadline` as a live member, accepts the next honest `ExtendTtl` Commit with the same derived `old_deadline_unix`, and arms its TTL timer at the same deadline; the rebuild rejects a quorum-signed snapshot whose `ttl_deadline_unix` is later than the latest `TtlExtended` leaf's `new_deadline_unix`, one that is nil when no `PromoteContext` leaf exists, and one that is a value after a `PromoteContext` leaf, and in a `SingleAdmin` context the admin's checkpoint signature does not change that verdict",
         "Pruning never removes the latest `TtlExtended` leaf or a `PromoteContext` `GovernanceActionExecuted` leaf, and removes an earlier `TtlExtended` leaf once a later TTL leaf is behind a valid checkpoint; a live member that prunes both earlier `TtlExtended` leaves against a checkpoint it never adopted, then restarts, re-arms its TTL timer at the deadline of the latest `TtlExtended` leaf, the same deadline as a member that never pruned, and accepts the next honest `ExtendTtl` Commit",
         "`cargo test -p scp-event-log --features testing` passes",
+        "A joiner rebuilt from a checkpoint takes the create base `creation_timestamp_secs` plus `ttl_secs` from the committed `0xFF02` extension (SCP-338): a test whose bundle carries a `ttl` of 7,200 s against a committed `ttl_secs` of 3,600 is rejected before the rebuild, and a matching bundle yields a deadline equal to every live member's.",
         "CI-feature `cargo clippy` over the touched crates and their tests pass"
       ],
       "actionItems": [
@@ -12398,7 +12401,8 @@
       ],
       "blockedBy": [
         "SCP-335",
-        "SCP-336"
+        "SCP-336",
+        "SCP-338"
       ],
       "sources": [
         {
@@ -12412,6 +12416,63 @@
         {
           "file": ".docs/specs/23-sync-and-offline-strategy.md",
           "section": "## 23.13 Event Verification During Reconciliation"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-338",
+      "title": "Commit the TTL and the promotion policy in the 0xFF02 extension and check them at every member",
+      "gate": "gate-gov-commit",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/group_context_extension.rs",
+        "crates/scp-protocol/src/context/params.rs",
+        "crates/scp-mls/src/context_extension.rs",
+        "crates/scp-mls/src/group.rs",
+        "crates/scp-runtime/src/crypto/mls/backend.rs",
+        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
+        "crates/scp-runtime/src/context/export_import.rs",
+        "crates/scp-runtime/src/context/ttl_close_helpers.rs",
+        "crates/scp-runtime/src/context/supervisor/spawn_from_welcome_tests.rs"
+      ],
+      "description": "Implements the `ttl_secs` and `promotion_policy` fields of the `0xFF02` SCP Context Parameters MLS group-context extension and validation rules 10 and 11 of `05-contexts.md` §5.13.3 (ADR-066 decision 16). The TTL deadline equality of ADR-066 decision 15 and the `PromoteContext` policy check of `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6 both read the context's `ttl` and its promotion policy. Before this story a joiner took both from the invitation bundle's `context_params`, which only the inviter signs, so one member could give a joiner a TTL base or a promotion policy that no other member holds. The joiner would then reject every honest `ExtendTtl` Commit, destroy its keys at another time, or accept a `PromoteContext` the other members reject. The creator writes `ttl_secs` (the `ttl` in whole seconds, or none) and `promotion_policy` (0 = `NoPromotion`, 1 = `Promotable`) into the extension at creation, and rejects a `ttl` with a fractional second or above 2^53 − 1. `ScpContextExtension::verify_against` rejects a bundle's or snapshot's parameters whose `ttl` or promotion policy differ from the committed values, on Welcome join, import and restore, before any governance engine, admin set, or TTL timer is installed. Every member installs the TTL-deadline base and the promotion policy from the committed extension. A receiver rejects, before merge, a Commit carrying a GroupContextExtensions proposal that removes the `0xFF02` extension or changes its `context_id`, `creator_did`, `creation_timestamp_secs`, `ttl_secs`, or `promotion_policy` (rule 11), and the committer's SDK never builds one. The fields are required: SCP has no users, so no transition path accepts an extension without them. PUSH-031 adds `creation_timestamp_secs` to the same struct and the same install paths, so this story follows it. File locations are indicators.",
+      "acceptanceCriteria": [
+        "Creator writes the fields (§5.13.3 'TTL and promotion policy'): a context created with a `ttl` of 3,600 s and `Promotable` carries a `0xFF02` extension whose JCS bytes include `\"ttl_secs\":3600` and `\"promotion_policy\":1`; a context with no TTL and `NoPromotion` carries `\"ttl_secs\":null` and `\"promotion_policy\":0`; both values are unchanged in the extension after a later AddMember Commit. Creation rejects a `ttl` of 3,600.5 s and a `ttl` above 2^53 − 1 s with a typed error.",
+        "Forged bundle rejected (§5.13.3 rule 10): a Welcome joiner receives a bundle, validly signed by an in-context member, whose `context_params` carry a `ttl` of 7,200 s while the committed `ttl_secs` is 3,600, and the join fails with a typed `TtlMismatch` error; a second test whose bundle carries `Promotable` while the committed `promotion_policy` is 0 fails with `PromotionPolicyMismatch`; a third whose bundle carries a `ttl` while the committed `ttl_secs` is null fails with `TtlMismatch`. Each rejection installs no governance engine, no admin set, and no TTL timer, and leaves no context registered.",
+        "Forged snapshot rejected (§5.13.3 rule 10): an import and a restore whose snapshot parameters differ from the committed extension in `ttl` or in promotion policy are each rejected with the same typed errors before any authority is installed.",
+        "Install from the extension (§5.10, §5.13.3 rule 10): after a Welcome join whose bundle matches, the joiner's TTL-deadline base equals the committed `creation_timestamp_secs` plus `ttl_secs`, and its governance state's promotion policy equals the committed `promotion_policy`; a test that changes the bundle's display `metadata_snapshot` alone shows neither value moves.",
+        "No Commit changes a genesis field (§5.13.3 rule 11): a receiver rejects, before merge, a Commit carrying a GroupContextExtensions proposal whose `0xFF02` extension changes `ttl_secs`, one that changes `promotion_policy` from 0 to 1, one that changes `creation_timestamp_secs`, one that changes `creator_did`, one that changes `context_id`, and one that omits the `0xFF02` extension, one test each; each leaves the receiver's epoch, event log, and governance state unchanged. The committer-side API offers no operation that builds such a proposal.",
+        "Missing field rejected (§5.13.3 rule 1): a Welcome join, an import, and a restore each reject an MLS group whose `0xFF02` extension omits `ttl_secs` or `promotion_policy`, or carries a `promotion_policy` other than 0 or 1, or a `ttl_secs` above 2^53 − 1."
+      ],
+      "actionItems": [
+        "Add the required `ttl_secs: Option<u64>` and `promotion_policy: u8` to `ScpContextExtension`, its builders, and its JCS serialization, with the 2^53 − 1 bound and the whole-second check at creation",
+        "Extend `verify_against` with the rule 10 checks and typed `TtlMismatch` and `PromotionPolicyMismatch` errors",
+        "Install the TTL-deadline base and the promotion policy from the committed extension on Welcome join, import, and restore",
+        "Reject a Commit whose GroupContextExtensions proposal changes a genesis field, at the receiver before merge",
+        "Add the tests the criteria name"
+      ],
+      "blockedBy": [
+        "PUSH-031"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.13.3 Creation"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "#### 5.12.3.1 InvitationBundle Wire Format"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.1.1 Governance Leaves Carried in the Commit"
+        },
+        {
+          "file": ".docs/adrs/phase-6.md",
+          "section": "## ADR-066: Governance Leaves Ride the MLS Commit"
         }
       ],
       "details": {}
