@@ -31,8 +31,26 @@ thread-blocking call. Anywhere else these fail:
   - `recv` and `wait` called without `.await` (a sync channel's receive, a
     `Condvar` or `Barrier` wait); an awaited call, and the future of a
     `select!` arm, are tokio's async forms and pass;
+  - `wait_for`, `wait_until`, `wait_while_for` and `wait_while_until`
+    called without `.await` (`parking_lot`'s `Condvar` timed waits); an
+    awaited call passes, and so does tokio's one-argument
+    `watch::Receiver::wait_for(f)` (`h.wait_for(f)` or
+    `Receiver::wait_for(h, f)`), whose future may reach `.await` through a
+    combinator such as `timeout`;
   - `Condvar`'s `wait_while`, `wait_timeout`, `wait_timeout_ms` and
     `wait_timeout_while`;
+  - iterating a sync channel's receiver: `.iter()` or `.into_iter()` called
+    on, or a `for` loop over (`for m in rx`, `for m in &rx`,
+    `for m in self.rx`), an identifier or field named `rx`, `receiver`, or
+    either with a `<word>_` prefix (`event_rx`); `try_iter` does not block
+    and passes;
+  - any `std::sync::mpsc` (a `std::sync::mpsc` or bare `sync::mpsc` path, a
+    `use std::sync::{mpsc, ..}`, the same tokens in a macro, or a glob
+    `use std::sync::*` that would let a bare `mpsc` past) and any
+    `crossbeam_channel` identifier: a bridge channel is tokio's, so no
+    production wait can hide in a sync channel's `recv`;
+  - tokio `Runtime::shutdown_timeout`, which blocks until the runtime's
+    tasks stop or the timeout passes, and `std::thread::sleep_ms`;
   - tokio's `blocking_recv`, `blocking_recv_many`, `blocking_send`,
     `blocking_lock`, `blocking_lock_owned`, `blocking_read` and
     `blocking_write`;
@@ -166,6 +184,8 @@ ALWAYS_BLOCKING = frozenset(
     {
         "recv_timeout",
         "recv_deadline",
+        "shutdown_timeout",
+        "sleep_ms",
         "wait_while",
         "wait_timeout",
         "wait_timeout_ms",
@@ -182,6 +202,20 @@ ALWAYS_BLOCKING = frozenset(
 # These block when called without `.await`: a sync channel's `recv` and a
 # `Condvar`'s (or `Barrier`'s) `wait`. Awaited, they are tokio's async forms.
 UNAWAITED_BLOCKING = frozenset({"recv", "wait"})
+# `parking_lot`'s `Condvar` timed waits, which block when called without
+# `.await`. tokio's `watch::Receiver::wait_for(f)` takes only the predicate
+# and returns a future that may reach `.await` through a combinator such as
+# `timeout(d, rx.wait_for(f))`, so a `wait_for` call with that one argument
+# passes; `parking_lot`'s takes a guard and a timeout.
+UNAWAITED_TIMED_WAITS = frozenset(
+    {"wait_for", "wait_until", "wait_while_for", "wait_while_until"}
+)
+# A sync channel's receiver, by name: iterating one blocks on every item.
+RECEIVER_RE = re.compile(r"^(?:\w+_)?(?:rx|receiver)$")
+# The iterator methods that block on a sync channel's receiver.
+RECEIVER_ITER_FNS = frozenset({"iter", "into_iter"})
+# A path that names `std::sync` (or a bare `sync` imported from it).
+STD_SYNC_PATH_RE = re.compile(r"^(?:::)?(?:std::)?sync$")
 # Blocking functions of `std::thread`, flagged as a `thread::` path or an
 # import from `thread`, with the shape each reports.
 THREAD_FNS = {
@@ -513,6 +547,166 @@ def _path_ends_in_thread(node, source: bytes) -> bool:
     return False
 
 
+def _is_tokio_watch_wait_for(node, source: bytes) -> bool:
+    """True when `node` (a `wait_for`) is called with tokio's
+    `watch::Receiver::wait_for` arity: one argument after `.`, two after
+    `::`. `parking_lot`'s `Condvar::wait_for` takes a guard and a timeout."""
+    if SCANNER.node_text(node, source) != "wait_for":
+        return False
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "token_tree":
+        before, after = _prev_token(node), _next_token(node)
+        if before is None or after is None or after.type != "token_tree":
+            return False
+        want = {".": 1, "::": 2}.get(SCANNER.node_text(before, source))
+        return want is not None and _token_tree_args(after, source) == want
+    want = {"field_expression": 1, "scoped_identifier": 2}.get(parent.type)
+    call = parent.parent
+    return (
+        want is not None
+        and call is not None
+        and call.type == "call_expression"
+        and _call_args(call) == want
+    )
+
+
+def _is_receiver_iter(node, source: bytes) -> bool:
+    """True when `node` (an `iter` or `into_iter`) is a method call on an
+    identifier or field named like a receiver (`RECEIVER_RE`): `rx.iter()`,
+    `self.event_rx.into_iter()`, in parsed code or a macro's tokens."""
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "token_tree":
+        dot, after = _prev_token(node), _next_token(node)
+        if dot is None or SCANNER.node_text(dot, source) != ".":
+            return False
+        if after is None or after.type != "token_tree":
+            return False
+        if not SCANNER.node_text(after, source).startswith("("):
+            return False
+        recv = _prev_token(dot)
+        return recv is not None and (
+            RECEIVER_RE.match(SCANNER.node_text(recv, source)) is not None
+        )
+    if parent.type != "field_expression" or parent.child_by_field_name("field") != node:
+        return False
+    call = parent.parent
+    if call is None or call.type != "call_expression":
+        return False
+    if call.child_by_field_name("function") != parent:
+        return False
+    value = parent.child_by_field_name("value")
+    if value is None:
+        return False
+    if value.type == "field_expression":
+        value = value.child_by_field_name("field")
+    return (
+        value is not None
+        and value.type in ("identifier", "field_identifier")
+        and RECEIVER_RE.match(SCANNER.node_text(value, source)) is not None
+    )
+
+
+def _is_receiver_for_loop(node, source: bytes) -> bool:
+    """True when `node` (an identifier or field named like a receiver) is
+    what a `for` loop iterates: `for m in rx`, `for m in &rx`,
+    `for m in &mut self.rx`, in parsed code or a macro's tokens."""
+    if RECEIVER_RE.match(SCANNER.node_text(node, source)) is None:
+        return False
+    parent = node.parent
+    if parent is None:
+        return False
+    if parent.type == "token_tree":
+        before = _prev_token(node)
+        if before is not None and SCANNER.node_text(before, source) == ".":
+            owner = _prev_token(before)
+            before = _prev_token(owner) if owner is not None else None
+        while before is not None and SCANNER.node_text(before, source) in ("&", "mut"):
+            before = _prev_token(before)
+        if before is None or SCANNER.node_text(before, source) != "in":
+            return False
+        after = _next_token(node)
+        return (
+            after is not None
+            and after.type == "token_tree"
+            and (SCANNER.node_text(after, source).startswith("{"))
+        )
+    expr = node
+    if parent.type == "field_expression":
+        if parent.child_by_field_name("field") != node:
+            return False
+        expr = parent
+    while expr.parent is not None and expr.parent.type == "reference_expression":
+        expr = expr.parent
+    loop = expr.parent
+    return (
+        loop is not None
+        and loop.type == "for_expression"
+        and loop.child_by_field_name("value") == expr
+    )
+
+
+def _is_std_mpsc(node, source: bytes) -> bool:
+    """True when `node` (an `mpsc`) names `std::sync::mpsc`: the last segment
+    of a `std::sync::mpsc` or bare `sync::mpsc` path, an item of a
+    `use std::sync::{mpsc, ..}`, or the same tokens in a macro. tokio's
+    `tokio::sync::mpsc` passes."""
+    if SCANNER.node_text(node, source) != "mpsc":
+        return False
+    parent = node.parent
+    if parent is None:
+        return False
+    if (
+        parent.type == "scoped_identifier"
+        and parent.child_by_field_name("name") == node
+    ):
+        path = parent.child_by_field_name("path")
+        return path is not None and (
+            STD_SYNC_PATH_RE.match(SCANNER.node_text(path, source)) is not None
+        )
+    if parent.type == "use_list":
+        scoped = parent.parent
+        if scoped is not None and scoped.type == "scoped_use_list":
+            path = scoped.child_by_field_name("path")
+            return path is not None and (
+                STD_SYNC_PATH_RE.match(SCANNER.node_text(path, source)) is not None
+            )
+        return False
+    if parent.type == "token_tree":
+        sep = _prev_token(node)
+        if sep is None or SCANNER.node_text(sep, source) != "::":
+            return False
+        sync = _prev_token(sep)
+        if sync is None or SCANNER.node_text(sync, source) != "sync":
+            return False
+        sep = _prev_token(sync)
+        if sep is None or SCANNER.node_text(sep, source) != "::":
+            return True
+        root = _prev_token(sep)
+        return root is None or SCANNER.node_text(root, source) == "std"
+    return False
+
+
+def _is_std_sync_glob(node, source: bytes) -> bool:
+    """True when `node` is the `sync` of a `use std::sync::*`, which would
+    let a bare `mpsc::channel()` past the path rule."""
+    if SCANNER.node_text(node, source) != "sync":
+        return False
+    parent = node.parent
+    if parent is None or parent.type != "scoped_identifier":
+        return False
+    if parent.child_by_field_name("name") != node:
+        return False
+    path = parent.child_by_field_name("path")
+    if path is None or SCANNER.node_text(path, source) not in ("std", "::std"):
+        return False
+    use = parent.parent
+    return use is not None and use.type == "use_wildcard"
+
+
 def _blocking_shape(node, source: bytes) -> str | None:
     """The blocking-call shape `node` names, if any. Only an
     identifier is ever a site, so a macro's tokens are read the same way as
@@ -532,6 +726,22 @@ def _blocking_shape(node, source: bytes) -> str | None:
         return "glob `use` of std::thread"
     if name in UNAWAITED_BLOCKING and _is_unawaited_call(node, source):
         return f"un-awaited `{name}`"
+    if (
+        name in UNAWAITED_TIMED_WAITS
+        and _is_unawaited_call(node, source)
+        and not _is_tokio_watch_wait_for(node, source)
+    ):
+        return f"un-awaited `{name}`"
+    if name in RECEIVER_ITER_FNS and _is_receiver_iter(node, source):
+        return f"sync receiver `{name}`"
+    if _is_receiver_for_loop(node, source):
+        return "`for` loop over a sync receiver"
+    if _is_std_mpsc(node, source):
+        return "std::sync::mpsc"
+    if _is_std_sync_glob(node, source):
+        return "glob `use` of std::sync"
+    if name == "crossbeam_channel":
+        return "crossbeam_channel"
     return None
 
 
@@ -996,6 +1206,64 @@ def _real_scan_fixture_trees() -> list[str]:
         extra[f"a `std::thread::park` in the {bridge} bridge"] = (
             {root + "park.rs": park_site},
             1,
+        )
+        extra[f"a `std::sync::mpsc` channel in the {bridge} bridge"] = (
+            {
+                root
+                + "mpsc.rs": "pub fn f() { let _ = std::sync::mpsc::channel::<u8>(); }\n"
+            },
+            1,
+        )
+        extra[f"a `crossbeam_channel` in the {bridge} bridge"] = (
+            {
+                root
+                + "cb.rs": "pub fn f() { let _ = crossbeam_channel::bounded::<u8>(1); }\n"
+            },
+            1,
+        )
+        extra[f"a `for` loop over a receiver in the {bridge} bridge"] = (
+            {root + "rxloop.rs": "pub fn f(rx: Rx) { for m in rx { drop(m); } }\n"},
+            1,
+        )
+        extra[f"a receiver `.iter()` in the {bridge} bridge"] = (
+            {root + "rxiter.rs": "pub fn f(rx: &Rx) { for _ in rx.iter() {} }\n"},
+            1,
+        )
+        extra[f"a `shutdown_timeout` in the {bridge} bridge"] = (
+            {root + "shut.rs": "pub fn f(rt: Rt) { rt.shutdown_timeout(D); }\n"},
+            1,
+        )
+        extra[f"a `std::thread::sleep_ms` in the {bridge} bridge"] = (
+            {root + "sleepms.rs": "pub fn f() { std::thread::sleep_ms(1); }\n"},
+            1,
+        )
+        extra[f"a `Condvar::wait_for` in the {bridge} bridge"] = (
+            {
+                root
+                + "cv.rs": "pub fn f(cv: &Cv, g: &mut G) { let _ = cv.wait_for(g, D); }\n"
+            },
+            1,
+        )
+        extra[f"a `Condvar::wait_until` in the {bridge} bridge"] = (
+            {
+                root
+                + "cvu.rs": "pub fn f(cv: &Cv, g: &mut G) { let _ = cv.wait_until(g, I); }\n"
+            },
+            1,
+        )
+        extra[f"a tokio watch `wait_for` under `timeout` in the {bridge} bridge"] = (
+            {
+                root
+                + "watch.rs": "pub async fn f(rx: &mut W) { let _ = tokio::time::timeout(D, rx.wait_for(|s| *s)).await; }\n"
+            },
+            0,
+        )
+        extra[f"a `tokio::sync::mpsc` channel in the {bridge} bridge"] = (
+            {
+                root
+                + "tmpsc.rs": "pub fn f() { let _ = tokio::sync::mpsc::channel::<u8>(1); }\n"
+            },
+            0,
         )
         extra[f"a `vec.join(sep)` in the {bridge} bridge"] = (
             {root + "strjoin.rs": 'pub fn f(v: &[String]) -> String { v.join(",") }\n'},

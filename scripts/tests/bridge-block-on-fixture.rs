@@ -326,8 +326,138 @@ async fn pass_tokio_sleep() {
     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 }
 
-fn pass_try_recv(rx: &std::sync::mpsc::Receiver<u8>) {
+fn pass_try_recv(rx: &Receiver<u8>) {
     let _ = rx.try_recv();
+}
+
+fn flag_receiver_iter(rx: &Receiver<u8>) {
+    for _ in rx.iter() {}
+}
+
+fn flag_field_receiver_into_iter(s: State) {
+    let _: Vec<u8> = s.event_rx.into_iter().collect();
+}
+
+fn flag_receiver_iter_in_a_macro(rx: &Receiver<u8>) {
+    drop(vec![rx.iter().count()]);
+}
+
+fn flag_for_loop_over_receiver(rx: Receiver<u8>) {
+    for m in rx {
+        drop(m);
+    }
+}
+
+fn flag_for_loop_over_borrowed_receiver(receiver: &Receiver<u8>) {
+    for m in &receiver {
+        drop(m);
+    }
+}
+
+fn flag_for_loop_over_field_receiver(&mut self) {
+    for m in &mut self.cmd_rx {
+        drop(m);
+    }
+}
+
+fn flag_for_loop_over_receiver_in_a_macro(rx: Receiver<u8>) {
+    run!({ for m in rx { drop(m); } });
+}
+
+fn pass_vec_iter(v: &[u8]) {
+    for _ in v.iter() {}
+    for _ in v {}
+}
+
+fn pass_receiver_try_iter(rx: &Receiver<u8>) {
+    for _ in rx.try_iter() {}
+}
+
+fn flag_shutdown_timeout(rt: tokio::runtime::Runtime) {
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+}
+
+fn flag_thread_sleep_ms() {
+    std::thread::sleep_ms(1);
+}
+
+fn flag_parking_lot_wait_for(cv: &parking_lot::Condvar, g: &mut parking_lot::MutexGuard<'_, u8>) {
+    let _ = cv.wait_for(g, std::time::Duration::from_millis(1));
+}
+
+fn flag_parking_lot_wait_until(cv: &parking_lot::Condvar, g: &mut parking_lot::MutexGuard<'_, u8>) {
+    let _ = cv.wait_until(g, std::time::Instant::now());
+}
+
+fn flag_parking_lot_wait_while_for(cv: &parking_lot::Condvar, g: &mut parking_lot::MutexGuard<'_, u8>) {
+    cv.wait_while_for(g, |v| *v == 0, std::time::Duration::from_millis(1));
+}
+
+fn flag_parking_lot_wait_while_until(cv: &parking_lot::Condvar, g: &mut parking_lot::MutexGuard<'_, u8>) {
+    cv.wait_while_until(g, |v| *v == 0, std::time::Instant::now());
+}
+
+fn flag_ufcs_condvar_wait_for(cv: &parking_lot::Condvar, g: &mut parking_lot::MutexGuard<'_, u8>) {
+    let _ = parking_lot::Condvar::wait_for(cv, g, std::time::Duration::from_millis(1));
+}
+
+fn flag_condvar_wait_for_in_a_macro(cv: &parking_lot::Condvar, g: &mut parking_lot::MutexGuard<'_, u8>) {
+    drop(vec![cv.wait_for(g, std::time::Duration::from_millis(1))]);
+}
+
+async fn pass_tokio_watch_wait_for(rx: &mut tokio::sync::watch::Receiver<u8>) {
+    let _ = rx.wait_for(|v| *v == 1).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx.wait_for(|v| *v == 1)).await;
+    let _ = tokio::sync::watch::Receiver::wait_for(rx, |v| *v == 1).await;
+}
+
+async fn pass_tokio_watch_wait_for_in_a_macro(rx: &mut tokio::sync::watch::Receiver<u8>) {
+    drop(vec![tokio::time::timeout(std::time::Duration::from_secs(1), rx.wait_for(|v| *v == 1))]);
+}
+
+fn flag_std_mpsc_path() {
+    let (_tx, _rx) = std::sync::mpsc::channel::<u8>();
+}
+
+fn flag_std_mpsc_type(_rx: std::sync::mpsc::Receiver<u8>) {}
+
+fn flag_bare_sync_mpsc_path() {
+    let (_tx, _rx) = sync::mpsc::sync_channel::<u8>(1);
+}
+
+fn flag_std_mpsc_in_a_macro() {
+    drop(vec![std::sync::mpsc::channel::<u8>()]);
+}
+
+fn flag_use_std_mpsc() {
+    use std::sync::mpsc::channel;
+}
+
+fn flag_use_list_std_mpsc() {
+    use std::sync::{Mutex, mpsc};
+}
+
+fn flag_glob_use_of_std_sync() {
+    use std::sync::*;
+}
+
+fn flag_crossbeam_channel() {
+    let (_tx, _rx) = crossbeam_channel::unbounded::<u8>();
+}
+
+fn flag_use_crossbeam_channel() {
+    use crossbeam_channel::Receiver;
+}
+
+fn pass_tokio_mpsc() {
+    use tokio::sync::{Mutex, mpsc};
+    let (_tx, _rx) = tokio::sync::mpsc::channel::<u8>(1);
+    drop(vec![tokio::sync::mpsc::unbounded_channel::<u8>()]);
+}
+
+fn pass_std_mutex_lock(m: &std::sync::Mutex<u8>) {
+    use std::sync::{Arc, Mutex};
+    let _ = m.lock();
 }
 
 #[cfg(all(test, feature = "testing"))]
