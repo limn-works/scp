@@ -144,8 +144,9 @@ public struct Node: Sendable {
     ///
     /// **Development only.** A library built with the UniFFI bridge's
     /// `testing` feature starts the node; a shipped library starts nothing
-    /// and throws `ScpError.Transport` with `SCP-TRANS-5055`. Production
-    /// callers use `scp.nodeStart(config:)`.
+    /// and throws `ScpError.Transport` with `SCP-TRANS-5055`.
+    /// Production callers on macOS use `scp.nodeStart(config:)`; iOS has no
+    /// production node start.
     ///
     /// On a `testing` build the node auto-wires encrypted in-memory storage
     /// (ephemeral), self-signed TLS, and a relay on an OS-assigned port. When
@@ -172,8 +173,9 @@ public struct Node: Sendable {
     ///
     /// **Development only.** A library built with the UniFFI bridge's
     /// `testing` feature starts the node; a shipped library creates nothing
-    /// and throws `ScpError.Transport` with `SCP-TRANS-5055`. Production
-    /// callers use `scp.nodeStart(config:)`.
+    /// and throws `ScpError.Transport` with `SCP-TRANS-5055`.
+    /// Production callers on macOS use `scp.nodeStart(config:)`; iOS has no
+    /// production node start.
     ///
     /// On a `testing` build, when `identity` is provided, the node uses the
     /// pre-existing identity.

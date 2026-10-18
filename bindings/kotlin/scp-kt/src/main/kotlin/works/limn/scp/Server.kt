@@ -24,9 +24,12 @@ import works.limn.scp.bridge.CoroutineBridge
  *
  * No production class implements [ServerBindings]. The only implementer is
  * `StubServerBindings` in the test source set. Because no production Kotlin
- * code reaches these operations, all ten `Server` operations in
- * `.docs/standards/sdk-capability-matrix.json` carry `"kotlin": false` with a
- * matching `exemptions.kotlin` reason.
+ * code reaches these operations, the ten `Server` operations that
+ * [ServerBindings] declares carry `"kotlin": false` in
+ * `.docs/standards/sdk-capability-matrix.json`, each with a matching
+ * `exemptions.kotlin` reason.
+ * `node_start` is false for Kotlin because scp-kt has no production
+ * node-start wrapper.
  *
  * [ServerBindings] and [ServerBridge] stay in scp-kt because Alec ruled on
  * 2026-08-17: "let's keep kotlin false but not forever. we can add impls
@@ -41,7 +44,7 @@ import works.limn.scp.bridge.CoroutineBridge
  * CGNAT with no routable address, and Doze plus Android's
  * background-execution limits kill a persistent listener.
  *
- * Whoever implements [ServerBindings] flips those ten matrix cells back to
+ * Whoever implements [ServerBindings] flips those matrix cells back to
  * `true` and removes their exemptions.
  */
 interface ServerBindings {
@@ -61,11 +64,14 @@ interface ServerBindings {
     fun relayStartLocal(dataDir: String): String
 
     /**
-     * Starts a development node with encrypted in-memory storage.
+     * Declares the development node start with encrypted in-memory storage.
      *
-     * **Development only.** A library built with the UniFFI bridge's
-     * `testing` feature starts the node; a shipped library starts nothing and
-     * throws `ScpException.Transport` with `SCP-TRANS-5055`.
+     * scp-kt ships no implementation of this method (see the note on this
+     * interface), so a call runs whatever the caller-supplied
+     * [ServerBindings] does.
+     * [ServerBindings.nodeStartInMemory] mirrors the UniFFI export `Scp.nodeStartInMemory`.
+     * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
+     * wrapper reaches it yet.
      * The Kotlin SDK has no production node start yet. The `node_start` row
      * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
      * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
@@ -77,11 +83,14 @@ interface ServerBindings {
     fun nodeStartInMemory(identityDid: String? = null): String
 
     /**
-     * Starts a development node on this instance's own storage backend.
+     * Declares the development node start on the instance's own storage backend.
      *
-     * **Development only.** A library built with the UniFFI bridge's
-     * `testing` feature starts the node; a shipped library creates nothing and
-     * throws `ScpException.Transport` with `SCP-TRANS-5055`.
+     * scp-kt ships no implementation of this method (see the note on this
+     * interface), so a call runs whatever the caller-supplied
+     * [ServerBindings] does.
+     * [ServerBindings.nodeStartLocal] mirrors the UniFFI export `Scp.nodeStartLocal`.
+     * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
+     * wrapper reaches it yet.
      * The Kotlin SDK has no production node start yet. The `node_start` row
      * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
      * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
@@ -491,22 +500,19 @@ class Node internal constructor(
 
     companion object {
         /**
-         * Starts a development node with encrypted in-memory storage.
+         * Starts a node through [ServerBridge.startNodeInMemory].
          *
-         * **Development only.** A library built with the UniFFI bridge's
-         * `testing` feature starts the node; a shipped library starts nothing
-         * and throws `ScpException.Transport` with `SCP-TRANS-5055`.
+         * Calls [ServerBridge.startNodeInMemory] on [bridge], which passes
+         * [identityDid] to the caller-supplied [ServerBindings.nodeStartInMemory].
+         * scp-kt ships no implementation of [ServerBindings], so the node is
+         * whatever that implementation starts.
+         * [ServerBindings.nodeStartInMemory] mirrors the UniFFI export `Scp.nodeStartInMemory`.
+         * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
+         * wrapper reaches it yet.
          * The Kotlin SDK has no production node start yet. The `node_start` row
          * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
          * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
          * not forever. we can add impls later".
-         *
-         * On a `testing` build the node auto-wires encrypted in-memory storage
-         * (ephemeral), self-signed TLS, and a relay on an OS-assigned port.
-         * When [identityDid] is provided, the node uses that pre-existing
-         * identity, its DID method, and the production DHT mode. When it is
-         * `null`, the node generates a fresh identity under in-memory key
-         * custody and an in-memory DHT client.
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
@@ -518,22 +524,19 @@ class Node internal constructor(
         ): Node = bridge.startNodeInMemory(identityDid)
 
         /**
-         * Starts a development node on this instance's own storage backend.
+         * Starts a node through [ServerBridge.startNodeLocal].
          *
-         * **Development only.** A library built with the UniFFI bridge's
-         * `testing` feature starts the node; a shipped library creates nothing
-         * and throws `ScpException.Transport` with `SCP-TRANS-5055`.
+         * Calls [ServerBridge.startNodeLocal] on [bridge], which passes [dataDir],
+         * [identityDid] and [passphrase] to the caller-supplied
+         * [ServerBindings.nodeStartLocal]. scp-kt ships no implementation of
+         * [ServerBindings], so the node is whatever that implementation starts.
+         * [ServerBindings.nodeStartLocal] mirrors the UniFFI export `Scp.nodeStartLocal`.
+         * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
+         * wrapper reaches it yet.
          * The Kotlin SDK has no production node start yet. The `node_start` row
          * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
          * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
          * not forever. we can add impls later".
-         *
-         * On a `testing` build, when [identityDid] is provided, the node uses the pre-existing
-         * identity. When `null`, the node creates or reloads a persistent
-         * identity via `FileKeyCustody`. The [passphrase] parameter is
-         * required in this mode.
-         *
-         * No passphrase is required when [identityDid] is provided.
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param dataDir Directory for persistent storage.
@@ -561,15 +564,18 @@ class Node internal constructor(
  *
  * [ServerBridge] delegates to [ServerBindings], and no production class
  * implements [ServerBindings] — see the note on that interface for the full
- * state. All ten `Server` operations in
- * `.docs/standards/sdk-capability-matrix.json` therefore carry
- * `"kotlin": false` with a matching `exemptions.kotlin` reason.
+ * state. The ten `Server` operations that [ServerBindings] declares
+ * therefore carry `"kotlin": false` in
+ * `.docs/standards/sdk-capability-matrix.json`, each with a matching
+ * `exemptions.kotlin` reason.
+ * `node_start` is false for Kotlin because scp-kt has no production
+ * node-start wrapper.
  *
  * [ServerBridge] stays in scp-kt because Alec ruled on 2026-08-17: "let's keep
  * kotlin false but not forever. we can add impls later." Do not delete this
  * class, and do not read it as a working capability. A JVM implementation of
  * [ServerBindings] makes every method here live, and whoever writes it flips
- * those ten matrix cells back to `true` and removes their exemptions.
+ * those matrix cells back to `true` and removes their exemptions.
  */
 class ServerBridge internal constructor(
     private val bindings: ServerBindings,
@@ -611,18 +617,19 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Starts a development node with encrypted in-memory storage.
+     * Starts a node through the caller-supplied [ServerBindings.nodeStartInMemory].
      *
-     * **Development only.** A library built with the UniFFI bridge's
-     * `testing` feature starts the node; a shipped library starts nothing and
-     * throws `ScpException.Transport` with `SCP-TRANS-5055`.
+     * Calls the caller-supplied [ServerBindings.nodeStartInMemory] with
+     * [identityDid] on the IO dispatcher and parses the JSON it returns into a
+     * [Node]. scp-kt ships no implementation of [ServerBindings], so the node
+     * is whatever that implementation starts.
+     * [ServerBindings.nodeStartInMemory] mirrors the UniFFI export `Scp.nodeStartInMemory`.
+     * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
+     * wrapper reaches it yet.
      * The Kotlin SDK has no production node start yet. The `node_start` row
      * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
      * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
      * not forever. we can add impls later".
-     *
-     * On a `testing` build, when [identityDid] is provided, the node uses the
-     * pre-existing identity instead of generating a fresh one.
      *
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
@@ -641,11 +648,15 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Starts a development node on this instance's own storage backend.
+     * Starts a node through the caller-supplied [ServerBindings.nodeStartLocal].
      *
-     * **Development only.** A library built with the UniFFI bridge's
-     * `testing` feature starts the node; a shipped library creates nothing and
-     * throws `ScpException.Transport` with `SCP-TRANS-5055`.
+     * Calls the caller-supplied [ServerBindings.nodeStartLocal] with [dataDir],
+     * [identityDid] and [passphrase] on the IO dispatcher and parses the JSON
+     * it returns into a [Node]. scp-kt ships no implementation of
+     * [ServerBindings], so the node is whatever that implementation starts.
+     * [ServerBindings.nodeStartLocal] mirrors the UniFFI export `Scp.nodeStartLocal`.
+     * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
+     * wrapper reaches it yet.
      * The Kotlin SDK has no production node start yet. The `node_start` row
      * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
      * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
