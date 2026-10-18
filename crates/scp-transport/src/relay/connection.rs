@@ -315,16 +315,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wss_with_bridge_query_param() {
-        // Tier 3 bridge URLs use wss:// with query params (§10.12.7).
-        let result = validate_relay_url(
-            "wss://bridge.example.com/scp/v1?bridge_target=deadbeef",
-            &RelayUrlSource::DhtResolved,
-        );
-        assert!(result.is_ok());
-    }
-
     // --- Loopback ws:// exemption ---
 
     #[test]

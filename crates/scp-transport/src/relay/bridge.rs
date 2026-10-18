@@ -46,10 +46,12 @@
 //! - **Multiple bridges.** A self-hosted relay MAY register with multiple
 //!   bridge relays simultaneously for availability.
 //!
-//! # URL format (section 10.12.7)
+//! # Service-record entry (section 18.2.1)
 //!
-//! Bridge URLs in DID documents use the format:
-//! `wss://bridge.example.com/scp/v1?bridge_target=<hex-routing-hint>`
+//! A tier 3 node publishes one `SCPRelay` entry for its bridge:
+//! `serviceEndpoint` is this bridge's URL (`wss://bridge.example.com/scp/v1`,
+//! no query), and `bridgeTarget` names the registered routing ID in 64
+//! lowercase hex characters (section 10.12.7).
 //!
 //! See ADR-004 and spec section 10.12.4 for the full specification.
 
@@ -65,11 +67,6 @@ use crate::error::TransportError;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Query parameter name used in bridge relay URLs (section 10.12.7).
-///
-/// Example: `wss://bridge.example.com/scp/v1?bridge_target=deadbeef...`
-pub const BRIDGE_TARGET_PARAM: &str = "bridge_target";
 
 /// Error message string used by [`BridgeRegistry::register`] when
 /// authentication fails (SCP-247). Exported so callers can match on it
@@ -518,48 +515,6 @@ impl Default for BridgeRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge URL parsing (section 10.12.7)
-// ---------------------------------------------------------------------------
-
-/// Parses a bridge relay URL and extracts the `bridge_target` routing ID.
-///
-/// Bridge URLs follow the format specified in section 10.12.7:
-/// `wss://bridge.example.com/scp/v1?bridge_target=<hex-routing-id>`
-///
-/// Returns `None` if the URL does not contain a `bridge_target` parameter,
-/// if the hex encoding is invalid, or if the decoded value is not exactly
-/// 32 bytes (routing IDs are `[u8; 32]` throughout the protocol).
-#[must_use]
-pub fn parse_bridge_target(url: &str) -> Option<[u8; 32]> {
-    let query_start = url.find('?')?;
-    let query = &url[query_start + 1..];
-
-    for param in query.split('&') {
-        if let Some(value) = param.strip_prefix("bridge_target=") {
-            let bytes = hex::decode(value).ok()?;
-            let arr: [u8; 32] = bytes.try_into().ok()?;
-            return Some(arr);
-        }
-    }
-
-    None
-}
-
-/// Returns `true` if the given relay URL is a bridge URL (contains
-/// `bridge_target` query parameter in the query string).
-#[must_use]
-pub fn is_bridge_url(url: &str) -> bool {
-    // Only match bridge_target= in the query string portion (after '?'),
-    // not in the path, fragment, or userinfo components. Truncate at '#'
-    // to exclude the fragment.
-    url.find('?').is_some_and(|pos| {
-        let query = &url[pos..];
-        let query = query.split('#').next().unwrap_or(query);
-        query.contains("bridge_target=")
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -990,57 +945,6 @@ mod tests {
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received, blob);
-    }
-
-    // -- URL parsing --
-
-    #[test]
-    fn parse_bridge_target_valid_32_bytes() {
-        let routing_id = [0x42; 32];
-        let hex_id = hex::encode(routing_id);
-        let url = format!("wss://bridge.example.com/scp/v1?bridge_target={hex_id}");
-        let target = parse_bridge_target(&url).unwrap();
-        assert_eq!(target, routing_id);
-    }
-
-    #[test]
-    fn parse_bridge_target_wrong_length_returns_none() {
-        // 4 bytes is not a valid routing ID (needs 32).
-        let url = "wss://bridge.example.com/scp/v1?bridge_target=aabbccdd";
-        assert!(parse_bridge_target(url).is_none());
-    }
-
-    #[test]
-    fn parse_bridge_target_no_param() {
-        let url = "wss://bridge.example.com/scp/v1";
-        assert!(parse_bridge_target(url).is_none());
-    }
-
-    #[test]
-    fn parse_bridge_target_invalid_hex() {
-        let url = "wss://bridge.example.com/scp/v1?bridge_target=xyz";
-        assert!(parse_bridge_target(url).is_none());
-    }
-
-    #[test]
-    fn parse_bridge_target_with_other_params() {
-        let routing_id = [0xDE; 32];
-        let hex_id = hex::encode(routing_id);
-        let url = format!("wss://bridge.example.com/scp/v1?foo=bar&bridge_target={hex_id}&baz=1");
-        let target = parse_bridge_target(&url).unwrap();
-        assert_eq!(target, routing_id);
-    }
-
-    #[test]
-    fn is_bridge_url_true() {
-        assert!(is_bridge_url(
-            "wss://bridge.example.com/scp/v1?bridge_target=aabb"
-        ));
-    }
-
-    #[test]
-    fn is_bridge_url_false() {
-        assert!(!is_bridge_url("wss://relay.example.com/scp/v1"));
     }
 
     #[tokio::test]
