@@ -11765,7 +11765,7 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "minor",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/standards/sdk-capability-matrix.json"
       ],

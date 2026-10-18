@@ -970,6 +970,14 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["relayShutdown"],
         "swift": ["shutdown"],
     },
+    # The production node start is a method on the `SCP` class of each SDK that
+    # has one; the class-qualified name pins that wrapper and no other symbol that
+    # shares the bare name. The Swift extension sits inside `#if os(macOS)`.
+    ("Server", "node_start"): {
+        "python": ["SCP.node_start"],
+        "typescript": ["SCP.nodeStart"],
+        "swift": ["SCP.nodeStart"],
+    },
     ("Server", "node_start_in_memory"): {
         "python": ["node_start_in_memory", "start_in_memory"],
         "typescript": ["nodeStartInMemory", "startInMemory"],
