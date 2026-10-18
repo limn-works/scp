@@ -1,10 +1,12 @@
 // Server.kt -- Kotlin SDK wrappers for relay and application node lifecycle
 //
-// Wraps server-related UniFFI bridge functions as suspend functions with
-// proper dispatcher assignment per ADR-028. Provides Relay and Node types
-// that expose relay URL, DID, and one suspending `shutdown()` each. Neither
-// type implements AutoCloseable: a synchronous `close()` would have to block a
-// calling thread on a coroutine whose dispatcher neither type controls. See
+// Wraps the server operations that `ServerBindings` declares as suspend
+// functions dispatched per ADR-028. scp-kt ships no implementation of
+// `ServerBindings`, so these wrappers reach no UniFFI function. Provides Relay
+// and Node types that expose relay URL, DID, and one suspending `shutdown()`
+// each. Neither type implements AutoCloseable: a synchronous `close()` would
+// have to block a calling thread on a coroutine whose dispatcher neither type
+// controls. See
 // `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
 //
 // Provenance: crates/scp-ffi-common/src/server.rs, crates/scp-ffi/uniffi/src/server.rs
@@ -17,8 +19,9 @@ import works.limn.scp.bridge.CoroutineBridge
 /**
  * Native binding functions for server lifecycle operations.
  *
- * All methods are blocking JNA calls into Rust and must be dispatched
- * on [kotlinx.coroutines.Dispatchers.IO].
+ * The methods are blocking: [ServerBridge] calls each one on the coroutine
+ * bridge's IO dispatcher, which defaults to
+ * [kotlinx.coroutines.Dispatchers.IO].
  *
  * ## This interface has no production implementer, and that is deliberate
  *
@@ -44,8 +47,9 @@ import works.limn.scp.bridge.CoroutineBridge
  * CGNAT with no routable address, and Doze plus Android's
  * background-execution limits kill a persistent listener.
  *
- * Whoever implements [ServerBindings] flips those matrix cells back to
- * `true` and removes their exemptions.
+ * Whoever implements [ServerBindings] flips those ten matrix cells back to
+ * `true` and removes their exemptions; `node_start` stays false until a
+ * Kotlin node-start wrapper exists.
  */
 interface ServerBindings {
     /**
@@ -69,7 +73,11 @@ interface ServerBindings {
      * scp-kt ships no implementation of this method (see the note on this
      * interface), so a call runs whatever the caller-supplied
      * [ServerBindings] does.
-     * [ServerBindings.nodeStartInMemory] mirrors the UniFFI export `Scp.nodeStartInMemory`.
+     * [ServerBindings.nodeStartInMemory] corresponds to the UniFFI export `Scp.nodeStartInMemory`, but
+     * the two differ. The export takes an `Identity` handle, returns a
+     * `NodeHandle`, and rejects an identity that another `Scp` minted (the
+     * ADR-048 handle check). [ServerBindings.nodeStartInMemory] takes a DID string,
+     * returns the handle as JSON, and declares no such check.
      * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
      * wrapper reaches it yet.
      * The Kotlin SDK has no production node start yet. The `node_start` row
@@ -88,7 +96,11 @@ interface ServerBindings {
      * scp-kt ships no implementation of this method (see the note on this
      * interface), so a call runs whatever the caller-supplied
      * [ServerBindings] does.
-     * [ServerBindings.nodeStartLocal] mirrors the UniFFI export `Scp.nodeStartLocal`.
+     * [ServerBindings.nodeStartLocal] corresponds to the UniFFI export `Scp.nodeStartLocal`, but
+     * the two differ. The export takes an `Identity` handle, returns a
+     * `NodeHandle`, and rejects an identity that another `Scp` minted (the
+     * ADR-048 handle check). [ServerBindings.nodeStartLocal] takes a DID string,
+     * returns the handle as JSON, and declares no such check.
      * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
      * wrapper reaches it yet.
      * The Kotlin SDK has no production node start yet. The `node_start` row
@@ -506,7 +518,11 @@ class Node internal constructor(
          * [identityDid] to the caller-supplied [ServerBindings.nodeStartInMemory].
          * scp-kt ships no implementation of [ServerBindings], so the node is
          * whatever that implementation starts.
-         * [ServerBindings.nodeStartInMemory] mirrors the UniFFI export `Scp.nodeStartInMemory`.
+         * [ServerBindings.nodeStartInMemory] corresponds to the UniFFI export `Scp.nodeStartInMemory`, but
+         * the two differ. The export takes an `Identity` handle, returns a
+         * `NodeHandle`, and rejects an identity that another `Scp` minted (the
+         * ADR-048 handle check). [ServerBindings.nodeStartInMemory] takes a DID string,
+         * returns the handle as JSON, and declares no such check.
          * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
          * wrapper reaches it yet.
          * The Kotlin SDK has no production node start yet. The `node_start` row
@@ -530,7 +546,11 @@ class Node internal constructor(
          * [identityDid] and [passphrase] to the caller-supplied
          * [ServerBindings.nodeStartLocal]. scp-kt ships no implementation of
          * [ServerBindings], so the node is whatever that implementation starts.
-         * [ServerBindings.nodeStartLocal] mirrors the UniFFI export `Scp.nodeStartLocal`.
+         * [ServerBindings.nodeStartLocal] corresponds to the UniFFI export `Scp.nodeStartLocal`, but
+         * the two differ. The export takes an `Identity` handle, returns a
+         * `NodeHandle`, and rejects an identity that another `Scp` minted (the
+         * ADR-048 handle check). [ServerBindings.nodeStartLocal] takes a DID string,
+         * returns the handle as JSON, and declares no such check.
          * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
          * wrapper reaches it yet.
          * The Kotlin SDK has no production node start yet. The `node_start` row
@@ -556,9 +576,11 @@ class Node internal constructor(
 /**
  * Kotlin SDK wrapper for server lifecycle operations.
  *
- * All operations delegate through the coroutine bridge to UniFFI-generated
- * Rust functions. Provides relay and application node startup/shutdown as
- * suspend functions with proper dispatcher assignment.
+ * Each suspend operation here calls one method of the caller-supplied
+ * [ServerBindings] inside the coroutine bridge's `ffiCall`, which runs it on
+ * the bridge's IO dispatcher ([kotlinx.coroutines.Dispatchers.IO] unless the
+ * bridge was built with another). No operation here calls a UniFFI-generated
+ * function.
  *
  * ## Every method here runs against a [ServerBindings] that only tests supply
  *
@@ -575,7 +597,8 @@ class Node internal constructor(
  * kotlin false but not forever. we can add impls later." Do not delete this
  * class, and do not read it as a working capability. A JVM implementation of
  * [ServerBindings] makes every method here live, and whoever writes it flips
- * those matrix cells back to `true` and removes their exemptions.
+ * those ten matrix cells back to `true` and removes their exemptions;
+ * `node_start` stays false until a Kotlin node-start wrapper exists.
  */
 class ServerBridge internal constructor(
     private val bindings: ServerBindings,
@@ -623,7 +646,11 @@ class ServerBridge internal constructor(
      * [identityDid] on the IO dispatcher and parses the JSON it returns into a
      * [Node]. scp-kt ships no implementation of [ServerBindings], so the node
      * is whatever that implementation starts.
-     * [ServerBindings.nodeStartInMemory] mirrors the UniFFI export `Scp.nodeStartInMemory`.
+     * [ServerBindings.nodeStartInMemory] corresponds to the UniFFI export `Scp.nodeStartInMemory`, but
+     * the two differ. The export takes an `Identity` handle, returns a
+     * `NodeHandle`, and rejects an identity that another `Scp` minted (the
+     * ADR-048 handle check). [ServerBindings.nodeStartInMemory] takes a DID string,
+     * returns the handle as JSON, and declares no such check.
      * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
      * wrapper reaches it yet.
      * The Kotlin SDK has no production node start yet. The `node_start` row
@@ -654,7 +681,11 @@ class ServerBridge internal constructor(
      * [identityDid] and [passphrase] on the IO dispatcher and parses the JSON
      * it returns into a [Node]. scp-kt ships no implementation of
      * [ServerBindings], so the node is whatever that implementation starts.
-     * [ServerBindings.nodeStartLocal] mirrors the UniFFI export `Scp.nodeStartLocal`.
+     * [ServerBindings.nodeStartLocal] corresponds to the UniFFI export `Scp.nodeStartLocal`, but
+     * the two differ. The export takes an `Identity` handle, returns a
+     * `NodeHandle`, and rejects an identity that another `Scp` minted (the
+     * ADR-048 handle check). [ServerBindings.nodeStartLocal] takes a DID string,
+     * returns the handle as JSON, and declares no such check.
      * That export returns `SCP-TRANS-5055` on a shipped build, and no Kotlin
      * wrapper reaches it yet.
      * The Kotlin SDK has no production node start yet. The `node_start` row
