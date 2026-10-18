@@ -26,13 +26,12 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+use scp_did::canonical_relay_url;
 #[cfg(feature = "push-store")]
 use scp_identity::push_verify::{PushMessage, PushSignatureVerifier};
 #[cfg(feature = "push-store")]
 use scp_protocol::discovery::push::{PushDeregistration, PushPlatform, PushRegistration};
-use scp_protocol::discovery::push::{
-    PushMessageError, canonical_relay_url, push_registration_routing_id,
-};
+use scp_protocol::discovery::push::{PushMessageError, push_registration_routing_id};
 use scp_relay_client::{RelayMessage, code};
 
 #[cfg(feature = "push-store")]

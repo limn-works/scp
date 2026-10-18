@@ -855,6 +855,7 @@ mod link_verification_tests {
             id: format!("{DID}#scp-attestation-revocations"),
             service_type: SERVICE_TYPE_ATTESTATION_REVOCATIONS.to_owned(),
             service_endpoint: "https://relay.example.com/scp/v1/revocations/alice".to_owned(),
+            bridge_target: None,
         });
         let resolver = FixedResolver(Some(doc));
         let key_hex = hex::encode(active.verifying_key().to_bytes());

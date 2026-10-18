@@ -453,6 +453,7 @@ mod tests {
             service_endpoint: "sha256:0000000000000000000000000000000000000000\
                 000000000000000000000000"
                 .to_owned(),
+            bridge_target: None,
         }];
 
         for (i, url) in relay_urls.iter().enumerate() {
@@ -460,6 +461,7 @@ mod tests {
                 id: format!("{did}#scp-relay-{}", i + 1),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: (*url).to_owned(),
+                bridge_target: None,
             });
         }
 

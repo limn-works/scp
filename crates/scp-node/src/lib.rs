@@ -3284,12 +3284,12 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let relay_url = domain_relay_url(&domain);
-    // `add_relay_service` now returns the wasm-safe `DidError`
-    // (ADR-057); route it through `IdentityError` so it lands in the
-    // existing `NodeError::Identity` variant, preserving prior behavior.
-    document
-        .add_relay_service(&relay_url)
-        .map_err(IdentityError::from)?;
+    // A domain whose relay URL has no §9.18.2 canonical form (a non-ASCII
+    // host among the causes) fails here with `NodeError::Identity(
+    // IdentityError::InvalidRelayUrl)`, before anything is published.
+    document.add_relay_service(
+        scp_did::RelayService::new(&relay_url, None).map_err(IdentityError::from)?,
+    );
     // Publish the domain→DID binding per the configured `DhtMode` (NOT
     // unconditionally). `DhtMode::Disabled` — the fail-safe default, and a
     // LEGITIMATE more-private `Domain + Disabled` config per construction.md M2
@@ -3471,6 +3471,7 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
             id: format!("{}#scp-relay-{}", document.id, existing_relays + 1),
             service_type: "SCPRelay".to_owned(),
             service_endpoint: relay_url.to_owned(),
+            bridge_target: None,
         },
     );
 }
@@ -6253,6 +6254,7 @@ mod tests {
                 id: "did:dht:test123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+                bridge_target: None,
             }],
         };
 
@@ -6345,6 +6347,7 @@ mod tests {
                 id: "did:dht:testnet123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+                bridge_target: None,
             }],
         };
 
@@ -6437,6 +6440,7 @@ mod tests {
                 id: "did:dht:unchanged123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+                bridge_target: None,
             }],
         };
 
@@ -6539,6 +6543,7 @@ mod tests {
                 id: "did:dht:resilient123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: format!("ws://{addr}/scp/v1"),
+                bridge_target: None,
             }],
         };
 
@@ -7497,6 +7502,7 @@ mod tests {
                     id: format!("did:dht:slottest#scp-relay-{}", i + 1),
                     service_type: "SCPRelay".to_owned(),
                     service_endpoint: (*endpoint).to_owned(),
+                    bridge_target: None,
                 })
                 .collect(),
         }

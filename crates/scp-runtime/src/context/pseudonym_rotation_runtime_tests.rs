@@ -515,7 +515,7 @@ async fn push_routing_ids_follow_a_rotation() {
         )
         .await
         .expect("create_context");
-    let relay = scp_protocol::discovery::push::canonical_relay_url(RELAY).expect("canonical");
+    let relay = scp_did::canonical_relay_url(RELAY).expect("canonical");
     let routes = |ids: [u8; 32]| {
         std::collections::BTreeMap::from([(
             relay.clone(),

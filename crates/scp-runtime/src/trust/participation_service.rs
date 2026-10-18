@@ -33,6 +33,7 @@ pub fn add_participation_service(document: &mut DidDocument, service_endpoint: &
         id: format!("{}#{PARTICIPATION_STATEMENTS_FRAGMENT}", document.id),
         service_type: PARTICIPATION_STATEMENTS_SERVICE_TYPE.to_owned(),
         service_endpoint: service_endpoint.to_owned(),
+        bridge_target: None,
     };
     document.service.push(service);
 }
@@ -54,8 +55,7 @@ pub fn remove_participation_service(document: &mut DidDocument) {
 #[must_use]
 pub fn extract_participation_service_endpoint(document: &DidDocument) -> Option<&str> {
     document
-        .service
-        .iter()
+        .accepted_services()
         .find(|s| s.service_type == PARTICIPATION_STATEMENTS_SERVICE_TYPE)
         .map(|s| s.service_endpoint.as_str())
 }

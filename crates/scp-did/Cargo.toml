@@ -26,9 +26,13 @@ base64 = { workspace = true }
 bs58 = { workspace = true }
 z-base-32 = { workspace = true }
 thiserror = { workspace = true }
+# relay_services() logs each SCPRelay entry it skips (§18.2.1).
+tracing = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+# Checks the absent-bridgeTarget sentinel against SHA-256(0x00) (§3.10.13).
+sha2 = { workspace = true }
 rmp-serde = { workspace = true }
 
 [lints]

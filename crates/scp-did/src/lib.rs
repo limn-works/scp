@@ -18,11 +18,13 @@
 
 pub mod attestation;
 pub mod document;
+pub mod relay_url;
 
 pub use document::{
-    DidDocument, DidError, DidRotationEvent, MigrationProof, PreRotationProof, Service,
-    VerificationMethod, decode_multibase_key,
+    ABSENT_BRIDGE_TARGET, DidDocument, DidError, DidRotationEvent, MigrationProof,
+    PreRotationProof, RelayService, Service, VerificationMethod, decode_multibase_key,
 };
+pub use relay_url::{RelayUrlError, canonical_relay_url};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

@@ -50,6 +50,9 @@ scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
 # the leaf directly (rather than only via scp-core) is acyclic — scp-protocol has
 # no scp-transport edge (SCP-RELAYRES-002).
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+# The push gate canonicalizes its own relay URL (09-security-model.md §9.18.2)
+# through scp-did, which owns the canonical relay URL.
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 # BEP44 signable-payload construction + Ed25519 signature verification for the
 # OPTIONAL validating-relay DID-record path (SCP-RELAYRES-003, §3.10.2). Default
 # features only — the `testing` feature (which compiles the InMemoryDhtClient
@@ -182,10 +185,8 @@ scp-core = { path = "../scp-core" }
 ed25519-dalek = { workspace = true }
 scp-platform = { path = "../scp-platform" }
 scp-testing = { path = "../scp-testing" }
-# DID-record frame tests build a DID document (scp-did) for the frame `value`.
 # The BEP44 signable payload / verify helpers (scp-dht) are now a NORMAL
-# dependency (validating-relay path, SCP-RELAYRES-003). Dev-only: scp-did.
-scp-did = { path = "../scp-did" }
+# dependency (validating-relay path, SCP-RELAYRES-003).
 # The push gate tests (PUSH-007) wire `TestPushVerifier`, which checks a real
 # P-256 signature against a key the test supplies and compiles only under
 # `scp-identity/testing`. Dev-only, so no shipped build contains it.

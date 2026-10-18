@@ -102,8 +102,7 @@ fn extract_capabilities(
     clock: &dyn Clock,
 ) -> Result<CapabilityEntry, DiscoveryError> {
     let capability_services: Vec<_> = document
-        .service
-        .iter()
+        .accepted_services()
         .filter(|s| s.service_type == SCP_CAPABILITIES_SERVICE_TYPE)
         .collect();
 
@@ -229,6 +228,7 @@ mod tests {
             id: format!("{}#scp-capabilities", document.id),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint: format!("scp:capabilities:{cap_str}"),
+            bridge_target: None,
         };
         document.service.push(service);
 
@@ -359,6 +359,7 @@ mod tests {
             service_endpoint:
                 "scp:capabilities:scp:capability:schema-validation/v1,scp:capability:rate-limit-compliance/v1"
                     .to_owned(),
+            bridge_target: None,
         });
         doc.service.push(scp_did::Service {
             id: format!("{did}#scp-capabilities-2"),
@@ -366,6 +367,7 @@ mod tests {
             service_endpoint:
                 "scp:capabilities:scp:capability:rate-limit-compliance/v1,scp:system:relay-operation"
                     .to_owned(),
+            bridge_target: None,
         });
 
         let entry = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap();
@@ -406,6 +408,7 @@ mod tests {
             service_endpoint:
                 "scp:capabilities:scp:capability:schema-validation/v1,scp:capability:rate-limit-compliance/v1"
                     .to_owned(),
+            bridge_target: None,
         });
 
         let entry = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap();
@@ -576,12 +579,14 @@ mod tests {
             service_endpoint:
                 "scp:capabilities:scp:system:relay-operation,scp:capability:schema-validation/v1"
                     .to_owned(),
+            bridge_target: None,
         });
         doc.service.push(scp_did::Service {
             id: format!("{did}#scp-capabilities-2"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint: "scp:capabilities:scp:system:relay-operation,scp:system:key-rotation"
                 .to_owned(),
+            bridge_target: None,
         });
 
         let entry = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap();

@@ -510,10 +510,12 @@ mod tests {
 
         // Create a document with relay service entries.
         let mut doc = make_document(did);
-        doc.add_relay_service("wss://relay1.example.com/scp/v1")
-            .unwrap();
-        doc.add_relay_service("wss://relay2.example.com/scp/v1")
-            .unwrap();
+        doc.add_relay_service(
+            scp_did::RelayService::new("wss://relay1.example.com/scp/v1", None).unwrap(),
+        );
+        doc.add_relay_service(
+            scp_did::RelayService::new("wss://relay2.example.com/scp/v1", None).unwrap(),
+        );
 
         cache.insert(did, doc, 1).await;
 
