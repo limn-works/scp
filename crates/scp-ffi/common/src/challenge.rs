@@ -322,6 +322,83 @@ pub enum EvaluatorOutcome {
     },
 }
 
+pub use stamp::{CaseCompletion, Stamped};
+
+/// The instant at which an evaluated case's outcome was reached.
+///
+/// The class of a late outcome must not depend on which future observes it
+/// first: the grading budget's timer or the case loop. So the task that
+/// reaches an outcome (the evaluator pipeline task, the schema check on the
+/// blocking pool) stamps it when it reaches it, and both observers classify
+/// it by that stamp against the deadline (spec 07 §7.3.4 step 3).
+mod stamp {
+    use std::sync::{Mutex, PoisonError};
+
+    use tokio::time::Instant;
+
+    /// An outcome and the instant it was reached. Only
+    /// [`CaseCompletion::finish`] makes one, so no observer can stamp an
+    /// outcome with the instant it happened to observe it.
+    #[derive(Debug, Clone)]
+    pub struct Stamped<T> {
+        completed_at: Instant,
+        value: T,
+    }
+
+    impl<T> Stamped<T> {
+        /// When the outcome was reached.
+        #[must_use]
+        pub const fn completed_at(&self) -> Instant {
+            self.completed_at
+        }
+
+        /// The outcome.
+        #[must_use]
+        pub fn into_value(self) -> T {
+            self.value
+        }
+    }
+
+    /// Where the task that reaches a case's outcome records it with its
+    /// instant, for the grader to read when the budget expires first.
+    #[derive(Debug)]
+    pub struct CaseCompletion<T> {
+        slot: Mutex<Option<Stamped<T>>>,
+    }
+
+    impl<T> Default for CaseCompletion<T> {
+        fn default() -> Self {
+            Self {
+                slot: Mutex::new(None),
+            }
+        }
+    }
+
+    impl<T: Clone> CaseCompletion<T> {
+        /// Stamps `value` with the current instant and records it, both
+        /// under the slot's lock: a [`read`](Self::read) that takes the lock
+        /// first sees no outcome, and any outcome recorded after that read
+        /// is stamped after it.
+        pub fn finish(&self, value: T) -> Stamped<T> {
+            let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+            let stamped = Stamped {
+                completed_at: Instant::now(),
+                value,
+            };
+            *slot = Some(stamped.clone());
+            stamped
+        }
+
+        /// The recorded outcome, if the task has reached one.
+        pub fn read(&self) -> Option<Stamped<T>> {
+            self.slot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+}
+
 /// The bridge side of a `CustomEval` evaluator: the lookup of the outlet
 /// registry and the host handlers the bridge keeps for an evaluator context.
 ///
@@ -388,8 +465,9 @@ impl<'a> SharedEvaluatorInvoker<'a> {
 
     /// Runs the evaluator on `call.input` within `call.remaining`, holding
     /// `call.permit` until the handler returns, and sets `call.started` when
-    /// the evaluator starts.
-    pub async fn invoke(&self, call: EvaluatorCall<'_>) -> EvaluatorOutcome {
+    /// the evaluator starts. The outcome carries the instant it was reached,
+    /// which `call.completion` also records.
+    pub async fn invoke(&self, call: EvaluatorCall<'_>) -> Stamped<EvaluatorOutcome> {
         let registry = self.host.registry(call.evaluator_context_id);
         let handler = self.host.handler(call.evaluator_context_id, call.outlet_id);
         invoke_evaluator_outlet(self.sup, registry.as_ref(), handler, call).await
@@ -400,8 +478,8 @@ impl<'a> SharedEvaluatorInvoker<'a> {
 ///
 /// It names the outlet in its evaluator context, the challenger invoking
 /// it, the case input, the time left in the grading budget, the grading
-/// permit the handler holds until it returns, and the flag that records
-/// whether the evaluator started.
+/// permit the handler holds until it returns, the flag that records
+/// whether the evaluator started, and the slot that records its outcome.
 pub struct EvaluatorCall<'a> {
     /// The context the evaluator outlet is registered in.
     pub evaluator_context_id: &'a str,
@@ -419,6 +497,10 @@ pub struct EvaluatorCall<'a> {
     /// owns it, so a budget that expires mid-call can tell a reserve that
     /// never finished (a fault) from an evaluator that ran (a failed case).
     pub started: Arc<AtomicBool>,
+    /// Records the outcome with the instant it was reached. The grader owns
+    /// it, so a budget that expires before the case loop observes the
+    /// outcome still classifies it by when it was reached.
+    pub completion: Arc<CaseCompletion<EvaluatorOutcome>>,
 }
 
 /// The body of [`SharedEvaluatorInvoker::check_registered`].
@@ -526,7 +608,7 @@ async fn invoke_evaluator_outlet(
     registry: Option<&OutletRegistry>,
     handler: Option<EvaluatorHandler>,
     call: EvaluatorCall<'_>,
-) -> EvaluatorOutcome {
+) -> Stamped<EvaluatorOutcome> {
     let EvaluatorCall {
         evaluator_context_id,
         outlet_id,
@@ -535,23 +617,21 @@ async fn invoke_evaluator_outlet(
         remaining,
         permit,
         started,
+        completion,
     } = call;
+    let unavailable = |reason: String| completion.finish(EvaluatorOutcome::Unavailable(reason));
     let Some(registry) = registry else {
-        return EvaluatorOutcome::Unavailable("the evaluator context is not open".to_owned());
+        return unavailable("the evaluator context is not open".to_owned());
     };
     let Some(registration) = registry.get(outlet_id) else {
-        return EvaluatorOutcome::Unavailable("the outlet is not registered".to_owned());
+        return unavailable("the outlet is not registered".to_owned());
     };
     let Some(handler) = handler else {
-        return EvaluatorOutcome::Unavailable("no host handler is registered".to_owned());
+        return unavailable("no host handler is registered".to_owned());
     };
-    let oversize =
-        serde_json::to_vec(&input).map_or(true, |bytes| bytes.len() > MAX_CHALLENGE_RESPONSE_BYTES);
-    if oversize
-        || validate_value_against_schema(&input, &registration.schema.input_schema).is_err()
-        || sha256_json(&input).is_err()
-    {
-        return EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned());
+    if !evaluator_input_admissible(&input, &registration.schema.input_schema) {
+        let failed = EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned());
+        return completion.finish(failed);
     }
     let output_schema = registration.schema.output_schema.clone();
     let captured: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
@@ -574,21 +654,21 @@ async fn invoke_evaluator_outlet(
             }
         }
     };
-    // Rounded up, so the pipeline's own timer never fires before the
-    // grading deadline: a call cut short by the budget must reach
-    // `eval_case` at or after the deadline, where it is expired.
-    let remaining_ms = remaining
-        .as_millis()
-        .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
-    let timeout_ms = u32::try_from(remaining_ms).unwrap_or(u32::MAX).max(1);
+    let timeout_ms = pipeline_timeout_ms(remaining);
+    // The pipeline task classifies and stamps its own result, so the
+    // instant a late outcome was reached does not depend on when the grader
+    // observes it.
     let spawned = {
         let pipeline_sup = Arc::clone(sup);
         let evaluator_context_id = evaluator_context_id.to_owned();
         let registry = registry.clone();
         let outlet_id = outlet_id.clone();
         let challenger = challenger.clone();
+        let (started, captured) = (Arc::clone(&started), Arc::clone(&captured));
+        let output_schema = output_schema.clone();
+        let completion = Arc::clone(&completion);
         sup.spawn_evaluator_pipeline(async move {
-            pipeline_sup
+            let result = pipeline_sup
                 .invoke_outlet_with_economy(
                     &evaluator_context_id,
                     &registry,
@@ -601,20 +681,52 @@ async fn invoke_evaluator_outlet(
                     executor,
                 )
                 .await
+                .map(|invocation| invocation.output);
+            completion.finish(classify_evaluator_result(
+                Ok(result),
+                &started,
+                &captured,
+                &output_schema,
+            ))
         })
     };
     let pipeline = match spawned {
         Ok(pipeline) => pipeline,
-        Err(e) => {
-            return EvaluatorOutcome::Unavailable(format!(
-                "the evaluator pipeline did not start: {e}"
-            ));
-        }
+        Err(e) => return unavailable(format!("the evaluator pipeline did not start: {e}")),
     };
-    let joined = pipeline
-        .await
-        .map(|result| result.map(|invocation| invocation.output));
-    classify_evaluator_result(joined, &started, &captured, &output_schema)
+    match pipeline.await {
+        Ok(stamped) => stamped,
+        // A panicked pipeline reached no outcome of its own: it is stamped
+        // when the join observes the panic.
+        Err(e) => completion.finish(classify_evaluator_result(
+            Err(e),
+            &started,
+            &captured,
+            &output_schema,
+        )),
+    }
+}
+
+/// Whether an evaluator input may be sent: within
+/// `MAX_CHALLENGE_RESPONSE_BYTES`, valid against the outlet's input schema,
+/// and hashable as canonical JSON.
+fn evaluator_input_admissible(input: &Value, input_schema: &Value) -> bool {
+    serde_json::to_vec(input).is_ok_and(|bytes| bytes.len() <= MAX_CHALLENGE_RESPONSE_BYTES)
+        && validate_value_against_schema(input, input_schema).is_ok()
+        && sha256_json(input).is_ok()
+}
+
+/// The evaluator pipeline's own timeout for the `remaining` budget, in
+/// whole milliseconds, at least one.
+///
+/// Rounded up, so the pipeline's own timer never fires before the grading
+/// deadline: a call cut short by the budget must reach `eval_case` at or
+/// after the deadline, where it is expired.
+fn pipeline_timeout_ms(remaining: Duration) -> u32 {
+    let remaining_ms = remaining.as_millis().saturating_add(u128::from(
+        !remaining.subsec_nanos().is_multiple_of(1_000_000),
+    ));
+    u32::try_from(remaining_ms).unwrap_or(u32::MAX).max(1)
 }
 
 /// Classifies an evaluator pipeline's result by the phase it failed in: see
@@ -1008,15 +1120,14 @@ where
             );
         }
     };
-    let mut evaluated = CaseVerdicts::default();
     let deadline = tokio::time::Instant::now() + budget;
+    let mut evaluated = CaseVerdicts::new(deadline);
     let run = async {
         let case_run = CaseRun {
             evaluator_context_id: lease.evaluator_context_id.as_deref(),
             challenger: verifier,
             invoker,
             permit: &permit,
-            deadline,
         };
         evaluate_cases(&auth, &lease.answer_key, &case_run, &mut evaluated).await;
     };
@@ -1025,11 +1136,11 @@ where
     // when its evaluator started. An evaluator that had not started was
     // still in its reserve: challenger state, so a fault.
     //
-    // The budget has one deadline. A case whose verdict returns at or
-    // after it stops the run and keeps its in-flight marker, so the expiry
-    // does not depend on whether this timer or the case's own timer is
-    // polled first. A fault or a capacity refusal is recorded whenever it
-    // returns, so neither is charged to the subject.
+    // The budget has one deadline, and each case's outcome carries the
+    // instant it was reached. An outcome reached before the deadline keeps
+    // its class whether the case loop or this timer observes it first; one
+    // reached at or after it stops the run with the case in flight, and
+    // the expiry rules decide it.
     if tokio::time::timeout_at(deadline, run).await.is_err() || evaluated.in_flight.is_some() {
         evaluated.expire_in_flight();
     }
@@ -1085,83 +1196,135 @@ async fn release_lease(
 }
 
 /// The verdicts gathered for one attempt, and what stopped it.
-#[derive(Default)]
 struct CaseVerdicts {
+    /// The grading budget's deadline. Every outcome is classified against
+    /// this one instant, the grading timer's, so no call site supplies its
+    /// own.
+    deadline: tokio::time::Instant,
     evals: BTreeMap<usize, CaseResult>,
     schemas: BTreeMap<usize, SchemaVerdict>,
     /// A challenger fault: `SchemaRejected` or `EvaluatorUnavailable`.
     fault: Option<TrustError>,
     /// A capacity refusal by an evaluator's reserve.
     capacity: Option<GradingCapacityCause>,
-    /// The evaluator call in progress, cleared when it returns before the
-    /// budget's deadline.
+    /// The case in progress, cleared when its outcome, reached before the
+    /// budget's deadline, is recorded.
     in_flight: Option<InFlight>,
 }
 
-/// The evaluator call in progress, and whether its evaluator started.
+/// The case in progress: its index and the check running it.
 struct InFlight {
-    context_id: String,
-    outlet_id: OutletId,
-    started: Arc<AtomicBool>,
+    index: usize,
+    check: InFlightCheck,
+}
+
+/// The check running an in-flight case, and the slot its task records the
+/// outcome in.
+enum InFlightCheck {
+    /// A `SchemaMatch` validation on the blocking pool.
+    Schema(Arc<CaseCompletion<Result<SchemaVerdict, TrustError>>>),
+    /// A `CustomEval` evaluator call, and whether its evaluator started.
+    Eval {
+        context_id: String,
+        outlet_id: OutletId,
+        started: Arc<AtomicBool>,
+        completion: Arc<CaseCompletion<EvaluatorOutcome>>,
+    },
 }
 
 impl CaseVerdicts {
-    /// Applies a budget expiry: an in-flight evaluator that had not started
-    /// becomes a fault (spec 07 §7.3.4 step 3); one that started leaves its
-    /// case without a verdict, which `grade` fails with `budget_exceeded`.
+    /// No verdicts yet, under a budget that ends at `deadline`.
+    const fn new(deadline: tokio::time::Instant) -> Self {
+        Self {
+            deadline,
+            evals: BTreeMap::new(),
+            schemas: BTreeMap::new(),
+            fault: None,
+            capacity: None,
+            in_flight: None,
+        }
+    }
+
+    /// Applies a budget expiry to the case in flight (spec 07 §7.3.4
+    /// step 3).
+    ///
+    /// An outcome its task reached before the deadline keeps its class, as
+    /// if the case loop had recorded it. Otherwise the expiry rules decide:
+    /// an evaluator that had not started is a fault; a started evaluator or
+    /// a schema check leaves its case without a verdict, which `grade` fails
+    /// with `budget_exceeded`.
     fn expire_in_flight(&mut self) {
-        let Some(in_flight) = self.in_flight.take() else {
+        let Some(InFlight { index, check }) = self.in_flight.take() else {
             return;
         };
-        if self.fault.is_none()
-            && self.capacity.is_none()
-            && !in_flight.started.load(Ordering::SeqCst)
-        {
-            self.fault = Some(TrustError::EvaluatorUnavailable {
-                context_id: in_flight.context_id,
-                outlet_id: in_flight.outlet_id,
-                reason: "the grading budget expired before the evaluator started".to_owned(),
-            });
+        let deadline = self.deadline;
+        match check {
+            InFlightCheck::Schema(completion) => {
+                if let Some(done) = completion.read().filter(|d| d.completed_at() < deadline) {
+                    let _ = apply_schema(index, done.into_value(), self);
+                }
+            }
+            InFlightCheck::Eval {
+                context_id,
+                outlet_id,
+                started,
+                completion,
+            } => {
+                if let Some(done) = completion.read().filter(|d| d.completed_at() < deadline) {
+                    let _ = apply_eval(index, done.into_value(), (&context_id, &outlet_id), self);
+                } else if self.fault.is_none()
+                    && self.capacity.is_none()
+                    && !started.load(Ordering::SeqCst)
+                {
+                    self.fault = Some(TrustError::EvaluatorUnavailable {
+                        context_id,
+                        outlet_id,
+                        reason: "the grading budget expired before the evaluator started"
+                            .to_owned(),
+                    });
+                }
+            }
         }
     }
 }
 
 /// How one attempt runs its evaluated cases: the evaluator context, the
-/// challenger, the bridge's invoker, the grading permit, and the budget's
-/// deadline.
+/// challenger, the bridge's invoker, and the grading permit.
 struct CaseRun<'a> {
     evaluator_context_id: Option<&'a str>,
     challenger: &'a DID,
     invoker: &'a SharedEvaluatorInvoker<'a>,
     permit: &'a Arc<OwnedSemaphorePermit>,
-    deadline: tokio::time::Instant,
 }
 
 /// Validates `output` against a `SchemaMatch` case's schema on the blocking
-/// pool, holding `permit`.
+/// pool, holding `permit`, and records the result in `completion` with the
+/// instant the validation reached it.
 ///
 /// A schema the gate refuses is a challenger fault; a validation that
-/// panicked did not accept the output.
+/// panicked did not accept the output, and is stamped when the join
+/// observes the panic.
 async fn schema_case(
     permit: Arc<OwnedSemaphorePermit>,
     test_id: &str,
     schema: &Value,
     output: &Value,
-) -> Result<SchemaVerdict, TrustError> {
+    completion: Arc<CaseCompletion<Result<SchemaVerdict, TrustError>>>,
+) -> Stamped<Result<SchemaVerdict, TrustError>> {
     let (id, schema, output) = (test_id.to_owned(), schema.clone(), output.clone());
+    let task_completion = Arc::clone(&completion);
     let verdict = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        SchemaGate::admit(&id, &schema).map(|validator| schema_verdict(&validator, &output))
+        let verdict = SchemaGate::admit(&id, &schema)
+            .map(|validator| schema_verdict(&validator, &output))
+            .map_err(|e| TrustError::SchemaRejected {
+                test_id: id,
+                reason: e.to_string(),
+            });
+        task_completion.finish(verdict)
     })
     .await;
-    match verdict {
-        Ok(Ok(verdict)) => Ok(verdict),
-        Ok(Err(e)) => Err(TrustError::SchemaRejected {
-            test_id: test_id.to_owned(),
-            reason: e.to_string(),
-        }),
-        Err(_) => Ok(SchemaVerdict::Fail),
-    }
+    verdict.unwrap_or_else(|_| completion.finish(Ok(SchemaVerdict::Fail)))
 }
 
 /// Runs every `SchemaMatch` and `CustomEval` case of the attempt, one at a
@@ -1181,17 +1344,31 @@ async fn evaluate_cases(
         .zip(outputs)
         .enumerate()
     {
+        let checked = matches!(
+            expected,
+            ExpectedOutput::SchemaMatch { .. } | ExpectedOutput::CustomEval { .. }
+        );
+        // A check never starts at or after the deadline: the budget expiry
+        // fails this case and every later one with `budget_exceeded`.
+        if checked && tokio::time::Instant::now() >= out.deadline {
+            return;
+        }
         match expected {
             ExpectedOutput::SchemaMatch { schema } => {
+                let completion = Arc::new(CaseCompletion::default());
+                out.in_flight = Some(InFlight {
+                    index: i,
+                    check: InFlightCheck::Schema(Arc::clone(&completion)),
+                });
                 let verdict = schema_case(
                     Arc::clone(run.permit),
                     &case.test_id,
                     schema,
                     &output.output,
+                    completion,
                 )
                 .await;
-                let past_deadline = tokio::time::Instant::now() >= run.deadline;
-                if record_schema(i, verdict, past_deadline, out).is_break() {
+                if record_schema(i, verdict, out).is_break() {
                     return;
                 }
             }
@@ -1228,7 +1405,6 @@ async fn eval_case(
         challenger,
         invoker,
         permit,
-        deadline,
     } = *run;
     let Some(context_id) = evaluator_context_id else {
         out.fault = Some(TrustError::EvaluatorUnavailable {
@@ -1247,12 +1423,19 @@ async fn eval_case(
         },
         "output": output,
     });
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let remaining = out
+        .deadline
+        .saturating_duration_since(tokio::time::Instant::now());
     let started = Arc::new(AtomicBool::new(false));
+    let completion = Arc::new(CaseCompletion::default());
     out.in_flight = Some(InFlight {
-        context_id: context_id.to_owned(),
-        outlet_id: evaluator_outlet_id.clone(),
-        started: Arc::clone(&started),
+        index: i,
+        check: InFlightCheck::Eval {
+            context_id: context_id.to_owned(),
+            outlet_id: evaluator_outlet_id.clone(),
+            started: Arc::clone(&started),
+            completion: Arc::clone(&completion),
+        },
     });
     let outcome = invoker
         .invoke(EvaluatorCall {
@@ -1263,30 +1446,37 @@ async fn eval_case(
             remaining,
             permit: Arc::clone(permit),
             started,
+            completion,
         })
         .await;
-    let past_deadline = tokio::time::Instant::now() >= deadline;
-    record_eval(
-        i,
-        outcome,
-        past_deadline,
-        (context_id, evaluator_outlet_id),
-        out,
-    )
+    record_eval(i, outcome, (context_id, evaluator_outlet_id), out)
 }
 
-/// Records one `SchemaMatch` verdict in `out`; breaks when the attempt
-/// stops at this case.
+/// Records one `SchemaMatch` result in `out` by the instant it was
+/// reached; breaks when the attempt stops at this case.
 ///
-/// A refused stored schema is the challenger's fault whenever it arrives, so
-/// it is recorded even at or after the deadline and never charged to the
-/// subject. A verdict at or after the deadline is over budget: it is
-/// dropped, and `grade` fails this case and every later one with
-/// `budget_exceeded`.
+/// A result reached at or after the deadline stops the run with the case in
+/// flight, and the grader expires it: the schema check had started, so the
+/// case and every later one fail with `budget_exceeded`. One reached before
+/// it keeps its class (see [`apply_schema`]).
 fn record_schema(
     i: usize,
+    verdict: Stamped<Result<SchemaVerdict, TrustError>>,
+    out: &mut CaseVerdicts,
+) -> ControlFlow<()> {
+    if verdict.completed_at() >= out.deadline {
+        return ControlFlow::Break(());
+    }
+    out.in_flight = None;
+    apply_schema(i, verdict.into_value(), out)
+}
+
+/// Records a `SchemaMatch` result reached before the deadline: a refused
+/// stored schema is the challenger's fault and stops the attempt; a verdict
+/// is the case's.
+fn apply_schema(
+    i: usize,
     verdict: Result<SchemaVerdict, TrustError>,
-    past_deadline: bool,
     out: &mut CaseVerdicts,
 ) -> ControlFlow<()> {
     match verdict {
@@ -1294,7 +1484,6 @@ fn record_schema(
             out.fault = Some(fault);
             ControlFlow::Break(())
         }
-        Ok(_) if past_deadline => ControlFlow::Break(()),
         Ok(verdict) => {
             out.schemas.insert(i, verdict);
             ControlFlow::Continue(())
@@ -1302,19 +1491,34 @@ fn record_schema(
     }
 }
 
-/// Records one `CustomEval` outcome in `out`; breaks when the attempt stops
-/// at this case. `evaluator` is the evaluator context and outlet.
+/// Records one `CustomEval` outcome in `out` by the instant it was
+/// reached; breaks when the attempt stops at this case. `evaluator` is the
+/// evaluator context and outlet.
 ///
-/// The outcome's class decides first, whatever the time: a capacity refusal
-/// is no fault and uses no attempt, and an unavailable evaluator is the
-/// challenger's fault, so neither is charged to the subject when it arrives
-/// at or after the deadline. A verdict or a failed case at or after the
-/// deadline is a budget expiry: the in-flight marker stays set, the run
-/// stops, and the grader expires the call.
+/// An outcome reached at or after the deadline is a budget expiry: the
+/// in-flight marker stays set, the run stops, and the grader expires the
+/// call by whether its evaluator started. One reached before it keeps its
+/// class (see [`apply_eval`]).
 fn record_eval(
     i: usize,
+    outcome: Stamped<EvaluatorOutcome>,
+    evaluator: (&str, &OutletId),
+    out: &mut CaseVerdicts,
+) -> ControlFlow<()> {
+    if outcome.completed_at() >= out.deadline {
+        return ControlFlow::Break(());
+    }
+    out.in_flight = None;
+    apply_eval(i, outcome.into_value(), evaluator, out)
+}
+
+/// Records a `CustomEval` outcome reached before the deadline by its class:
+/// a capacity refusal is no fault and uses no attempt, an unavailable
+/// evaluator is the challenger's fault, and a verdict or a failed case is
+/// the case's.
+fn apply_eval(
+    i: usize,
     outcome: EvaluatorOutcome,
-    past_deadline: bool,
     (context_id, evaluator_outlet_id): (&str, &OutletId),
     out: &mut CaseVerdicts,
 ) -> ControlFlow<()> {
@@ -1327,12 +1531,10 @@ fn record_eval(
                 reason,
                 "evaluator reserve refused the call for capacity"
             );
-            out.in_flight = None;
             out.capacity = Some(cause);
             ControlFlow::Break(())
         }
         EvaluatorOutcome::Unavailable(reason) => {
-            out.in_flight = None;
             out.fault = Some(TrustError::EvaluatorUnavailable {
                 context_id: context_id.to_owned(),
                 outlet_id: evaluator_outlet_id.clone(),
@@ -1340,11 +1542,7 @@ fn record_eval(
             });
             ControlFlow::Break(())
         }
-        EvaluatorOutcome::Verdict { .. } | EvaluatorOutcome::CaseFailed(_) if past_deadline => {
-            ControlFlow::Break(())
-        }
         EvaluatorOutcome::Verdict { passed, reason } => {
-            out.in_flight = None;
             out.evals.insert(
                 i,
                 CaseResult {
@@ -1355,7 +1553,6 @@ fn record_eval(
             ControlFlow::Continue(())
         }
         EvaluatorOutcome::CaseFailed(reason) => {
-            out.in_flight = None;
             out.evals.insert(
                 i,
                 CaseResult {

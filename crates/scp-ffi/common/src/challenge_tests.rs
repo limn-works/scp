@@ -1004,149 +1004,297 @@ async fn grading_deadline_decides_expiry_when_the_runtime_stalls() {
     );
 }
 
-/// A `CustomEval` case in flight whose evaluator `started` or not.
-fn in_flight(started: bool) -> CaseVerdicts {
-    CaseVerdicts {
-        in_flight: Some(InFlight {
-            context_id: EVAL_CTX.to_owned(),
-            outlet_id: OutletId::from(JUDGE),
-            started: Arc::new(AtomicBool::new(started)),
-        }),
-        ..CaseVerdicts::default()
+/// A deadline that an outcome stamped now is reached before (`late` false)
+/// or at or after (`late` true). Take it before stamping.
+fn deadline_for(late: bool) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    if late {
+        now
+    } else {
+        now + Duration::from_secs(3600)
     }
 }
 
-/// Records `outcome` for case 19 as `eval_case` does, then expires the call
-/// as the grader does when the run stopped with a case in flight.
-fn record_and_expire(
-    outcome: EvaluatorOutcome,
-    past_deadline: bool,
+/// Case 19 in flight on a `CustomEval` call whose evaluator `started` or
+/// not, and the slot its pipeline task records the outcome in.
+fn in_flight(
     started: bool,
+    deadline: tokio::time::Instant,
+) -> (CaseVerdicts, Arc<CaseCompletion<EvaluatorOutcome>>) {
+    let completion = Arc::new(CaseCompletion::default());
+    let out = CaseVerdicts {
+        in_flight: Some(InFlight {
+            index: 19,
+            check: InFlightCheck::Eval {
+                context_id: EVAL_CTX.to_owned(),
+                outlet_id: OutletId::from(JUDGE),
+                started: Arc::new(AtomicBool::new(started)),
+                completion: Arc::clone(&completion),
+            },
+        }),
+        ..CaseVerdicts::new(deadline)
+    };
+    (out, completion)
+}
+
+/// The two observers of case 19's `outcome`, reached `late` or not.
+#[derive(Debug, Clone, Copy)]
+enum Observer {
+    /// The case loop returns from the call and records the outcome; the
+    /// grader then expires whatever is still in flight.
+    CaseLoop,
+    /// The grading timer fires first: the run is dropped with the case in
+    /// flight, and the grader expires it from the slot.
+    Timer,
+}
+
+/// Has case 19's pipeline task reach `outcome`, `late` or not, then lets
+/// `observer` see it first, as `grade_response_within` does.
+fn observe(
+    outcome: EvaluatorOutcome,
+    late: bool,
+    started: bool,
+    observer: Observer,
 ) -> CaseVerdicts {
-    let mut out = in_flight(started);
-    let flow = record_eval(
-        19,
-        outcome,
-        past_deadline,
-        (EVAL_CTX, &OutletId::from(JUDGE)),
-        &mut out,
-    );
-    assert!(flow.is_break(), "the attempt stops at this case");
+    let (mut out, completion) = in_flight(started, deadline_for(late));
+    let stamped = completion.finish(outcome);
+    if matches!(observer, Observer::CaseLoop) {
+        let flow = record_eval(19, stamped, (EVAL_CTX, &OutletId::from(JUDGE)), &mut out);
+        if flow.is_continue() {
+            assert!(out.in_flight.is_none());
+            return out;
+        }
+    }
     if out.in_flight.is_some() {
         out.expire_in_flight();
     }
     out
 }
 
-/// A capacity refusal is a no-fault `GradingCapacityExhausted` whether it
-/// returns before or after the deadline: a late one is not expired into an
-/// `EvaluatorUnavailable` fault (spec 07 §7.3.4 step 3).
+const OBSERVERS: [Observer; 2] = [Observer::CaseLoop, Observer::Timer];
+
+/// A capacity refusal reached before the deadline is a no-fault
+/// `GradingCapacityExhausted` whichever observer sees it first; one reached
+/// at or after it follows the expiry rules: its evaluator never started, so
+/// it is a fault (spec 07 §7.3.4 step 3).
 #[test]
-fn a_capacity_refusal_is_no_fault_before_or_after_the_deadline() {
-    for past_deadline in [false, true] {
-        let out = record_and_expire(
-            EvaluatorOutcome::CapacityRefused {
-                cause: GradingCapacityCause::EvaluatorRateLimit,
-                reason: "rate limited".to_owned(),
-            },
-            past_deadline,
-            false,
-        );
+fn a_capacity_refusal_keeps_its_class_only_before_the_deadline() {
+    for observer in OBSERVERS {
+        let refusal = || EvaluatorOutcome::CapacityRefused {
+            cause: GradingCapacityCause::EvaluatorRateLimit,
+            reason: "rate limited".to_owned(),
+        };
+        let early = observe(refusal(), false, false, observer);
         assert_eq!(
-            out.capacity,
+            early.capacity,
             Some(GradingCapacityCause::EvaluatorRateLimit),
-            "past_deadline = {past_deadline}"
+            "{observer:?}"
         );
+        assert!(early.fault.is_none(), "{observer:?}: {:?}", early.fault);
+        let late = observe(refusal(), true, false, observer);
+        assert!(late.capacity.is_none(), "{observer:?}");
         assert!(
-            out.fault.is_none(),
-            "past_deadline = {past_deadline}: {:?}",
-            out.fault
+            matches!(
+                &late.fault,
+                Some(TrustError::EvaluatorUnavailable { reason, .. })
+                    if reason == "the grading budget expired before the evaluator started"
+            ),
+            "{observer:?}: {:?}",
+            late.fault
         );
     }
 }
 
-/// An unavailable evaluator, a settlement failure after a verdict included,
-/// is the challenger's fault whenever it returns: one at or after the
-/// deadline is recorded as the fault, not charged to the subject as
-/// `budget_exceeded`.
+/// An unavailable evaluator reached before the deadline, a settlement
+/// failure after a verdict included, is the challenger's fault whichever
+/// observer sees it first. One reached at or after the deadline after its
+/// evaluator started follows the expiry rules: no fault, and the case is
+/// left without a verdict for `grade` to fail with `budget_exceeded`.
 #[test]
-fn an_unavailable_evaluator_at_the_deadline_is_the_fault() {
-    for past_deadline in [false, true] {
-        let out = record_and_expire(
+fn an_unavailable_evaluator_keeps_its_class_only_before_the_deadline() {
+    for observer in OBSERVERS {
+        let early = observe(
             EvaluatorOutcome::Unavailable("settlement failed".to_owned()),
-            past_deadline,
+            false,
             true,
+            observer,
         );
         assert!(
             matches!(
-                &out.fault,
+                &early.fault,
                 Some(TrustError::EvaluatorUnavailable { reason, .. }) if reason == "settlement failed"
             ),
-            "past_deadline = {past_deadline}: {:?}",
-            out.fault
+            "{observer:?}: {:?}",
+            early.fault
         );
-        assert!(out.evals.is_empty());
+        assert!(early.evals.is_empty());
+        let late = observe(
+            EvaluatorOutcome::Unavailable("settlement failed".to_owned()),
+            true,
+            true,
+            observer,
+        );
+        assert!(
+            late.fault.is_none() && late.capacity.is_none() && late.evals.is_empty(),
+            "{observer:?}: {:?}",
+            late.fault
+        );
     }
 }
 
-/// A verdict at or after the deadline is over budget: it is dropped and the
-/// started call stays without a verdict, which `grade` fails with
-/// `budget_exceeded`; before the deadline it is recorded.
+/// A verdict reached at or after the deadline is over budget: it is dropped
+/// and the started call stays without a verdict, which `grade` fails with
+/// `budget_exceeded`. One reached before it is recorded whichever observer
+/// sees it first.
 #[test]
 fn a_verdict_at_the_deadline_is_over_budget() {
-    let late = record_and_expire(
-        EvaluatorOutcome::Verdict {
-            passed: true,
-            reason: "judged".to_owned(),
-        },
-        true,
-        true,
-    );
-    assert!(late.evals.is_empty() && late.fault.is_none() && late.capacity.is_none());
-    let mut out = in_flight(true);
-    let flow = record_eval(
-        19,
-        EvaluatorOutcome::Verdict {
-            passed: true,
-            reason: "judged".to_owned(),
-        },
-        false,
-        (EVAL_CTX, &OutletId::from(JUDGE)),
-        &mut out,
-    );
-    assert!(flow.is_continue());
-    assert!(out.in_flight.is_none());
-    assert!(out.evals[&19].passed);
+    let judged = || EvaluatorOutcome::Verdict {
+        passed: true,
+        reason: "judged".to_owned(),
+    };
+    for observer in OBSERVERS {
+        let late = observe(judged(), true, true, observer);
+        assert!(
+            late.evals.is_empty() && late.fault.is_none() && late.capacity.is_none(),
+            "{observer:?}"
+        );
+        let early = observe(judged(), false, true, observer);
+        assert!(early.in_flight.is_none(), "{observer:?}");
+        assert!(early.evals[&19].passed, "{observer:?}");
+    }
 }
 
-/// A `SchemaRejected` fault returned at or after the deadline is recorded
-/// as the fault, not charged to the subject as `budget_exceeded`; a schema
-/// verdict at or after the deadline is dropped as over budget.
+/// Case 19 in flight on a `SchemaMatch` check, with its result reached
+/// `late` or not, seen first by `observer`.
+fn observe_schema(
+    verdict: Result<SchemaVerdict, TrustError>,
+    late: bool,
+    observer: Observer,
+) -> (ControlFlow<()>, CaseVerdicts) {
+    let completion = Arc::new(CaseCompletion::default());
+    let mut out = CaseVerdicts {
+        in_flight: Some(InFlight {
+            index: 19,
+            check: InFlightCheck::Schema(Arc::clone(&completion)),
+        }),
+        ..CaseVerdicts::new(deadline_for(late))
+    };
+    let stamped = completion.finish(verdict);
+    let flow = match observer {
+        Observer::CaseLoop => record_schema(19, stamped, &mut out),
+        Observer::Timer => ControlFlow::Break(()),
+    };
+    if out.in_flight.is_some() {
+        out.expire_in_flight();
+    }
+    (flow, out)
+}
+
+/// A `SchemaRejected` fault reached before the deadline is the fault
+/// whichever observer sees it first; one reached at or after it, like a
+/// late schema verdict, is over budget: the check had started, so the case
+/// is left without a verdict for `grade` to fail with `budget_exceeded`.
 #[test]
-fn a_schema_fault_at_the_deadline_is_the_fault() {
-    for past_deadline in [false, true] {
-        let mut out = CaseVerdicts::default();
-        let flow = record_schema(
-            19,
-            Err(TrustError::SchemaRejected {
-                test_id: "t19".to_owned(),
-                reason: "schema gate".to_owned(),
-            }),
-            past_deadline,
-            &mut out,
-        );
+fn a_schema_fault_keeps_its_class_only_before_the_deadline() {
+    let rejected = || {
+        Err(TrustError::SchemaRejected {
+            test_id: "t19".to_owned(),
+            reason: "schema gate".to_owned(),
+        })
+    };
+    for observer in OBSERVERS {
+        let (flow, early) = observe_schema(rejected(), false, observer);
         assert!(flow.is_break());
         assert!(
-            matches!(out.fault, Some(TrustError::SchemaRejected { .. })),
-            "past_deadline = {past_deadline}: {:?}",
-            out.fault
+            matches!(early.fault, Some(TrustError::SchemaRejected { .. })),
+            "{observer:?}: {:?}",
+            early.fault
         );
+        for verdict in [rejected(), Ok(SchemaVerdict::Pass)] {
+            let (flow, late) = observe_schema(verdict, true, observer);
+            assert!(flow.is_break());
+            assert!(
+                late.schemas.is_empty() && late.fault.is_none(),
+                "{observer:?}: {:?}",
+                late.fault
+            );
+        }
+        let (_, early) = observe_schema(Ok(SchemaVerdict::Pass), false, observer);
+        assert_eq!(early.schemas[&19], SchemaVerdict::Pass, "{observer:?}");
     }
-    let mut out = CaseVerdicts::default();
-    assert!(record_schema(19, Ok(SchemaVerdict::Pass), true, &mut out).is_break());
-    assert!(out.schemas.is_empty() && out.fault.is_none());
-    assert!(record_schema(19, Ok(SchemaVerdict::Pass), false, &mut out).is_continue());
-    assert_eq!(out.schemas[&19], SchemaVerdict::Pass);
+    let (flow, _) = observe_schema(Ok(SchemaVerdict::Pass), false, Observer::CaseLoop);
+    assert!(flow.is_continue());
+}
+
+/// Polls `inner`, and on its first poll after `gate` is set blocks the
+/// polling thread for `stall` first: a grader that observes nothing while
+/// the work it waits on completes elsewhere.
+struct StallOnce<F> {
+    inner: std::pin::Pin<Box<F>>,
+    gate: Arc<AtomicBool>,
+    stall: Duration,
+    stalled: bool,
+}
+
+impl<F: std::future::Future> std::future::Future for StallOnce<F> {
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        if !self.stalled && self.gate.load(Ordering::SeqCst) {
+            self.stalled = true;
+            std::thread::sleep(self.stall);
+        }
+        self.inner.as_mut().poll(cx)
+    }
+}
+
+/// An evaluator outcome reached before the deadline keeps its class when
+/// the grader observes it only after the deadline: case 18's handler
+/// returns at once, its pipeline task stamps the verdict on a runtime
+/// worker, and the grader, polled on the test thread, stalls past the
+/// deadline before it sees the verdict. Case 18 passes on that verdict;
+/// case 19 never starts, so it fails with `budget_exceeded`.
+///
+/// The stall starts after case 18's handler returned and lasts the whole
+/// budget, and the deadline was set before the handler ran, so the grader
+/// resumes after the deadline. The pipeline task does not wait on the
+/// grader, so it stamps before the deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outcome_reached_before_the_deadline_keeps_its_class_when_seen_after_it() {
+    const BUDGET: Duration = Duration::from_secs(2);
+    let h = Harness::new(evaluator_params()).await;
+    let returned = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler: EvaluatorHandler = {
+        let (returned, calls) = (Arc::clone(&returned), Arc::clone(&calls));
+        Arc::new(move |_input| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            returned.store(true, Ordering::SeqCst);
+            Ok(verdict(true))
+        })
+    };
+    let invoker = h.invoker(Some(registry()), Some(handler));
+    let request = h.create(2, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    let graded = StallOnce {
+        inner: Box::pin(h.grade_within(&request, &response, &invoker, BUDGET)),
+        gate: returned,
+        stall: BUDGET + Duration::from_millis(50),
+        stalled: false,
+    }
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(graded.reasons[18].passed, "{:?}", graded.reasons[18]);
+    assert_eq!(
+        graded.reasons[19].reason.as_deref(),
+        Some("budget_exceeded"),
+        "{:?}",
+        graded.reasons[19]
+    );
 }
 
 /// TQ7: a slow evaluator that started uses the budget up, so its case and
@@ -1426,9 +1574,11 @@ async fn invoke(h: &Harness, handler: EvaluatorHandler) -> EvaluatorOutcome {
             remaining: Duration::from_secs(5),
             permit,
             started: Arc::new(AtomicBool::new(false)),
+            completion: Arc::new(CaseCompletion::default()),
         },
     )
     .await
+    .into_value()
 }
 
 /// 13i: an error before the handler runs (a payment refusal) or after it
@@ -1529,9 +1679,11 @@ async fn evaluator_input_refused_by_schema_fails_the_case() {
             remaining: Duration::from_secs(5),
             permit,
             started: Arc::new(AtomicBool::new(false)),
+            completion: Arc::new(CaseCompletion::default()),
         },
     )
-    .await;
+    .await
+    .into_value();
     assert_eq!(
         outcome,
         EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned())
@@ -1766,9 +1918,11 @@ async fn cut_off_evaluator_holds_one_permit_until_it_returns() {
             remaining: Duration::from_millis(1),
             permit,
             started: Arc::clone(&started),
+            completion: Arc::new(CaseCompletion::default()),
         },
     )
-    .await;
+    .await
+    .into_value();
     assert_eq!(
         outcome,
         EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned())
@@ -1823,9 +1977,11 @@ async fn oversize_evaluator_input_fails_the_case_without_a_call() {
             remaining: Duration::from_secs(30),
             permit,
             started: Arc::clone(&started),
+            completion: Arc::new(CaseCompletion::default()),
         },
     )
-    .await;
+    .await
+    .into_value();
     assert!(
         matches!(outcome, EvaluatorOutcome::CaseFailed(_)),
         "{outcome:?}"
