@@ -315,12 +315,14 @@ pub struct RelayDeletionRequest {
    - Multi-party contexts follow governance model.
    - Extension proposal is a context event in the Merkle log (ADR-011).
    - Extension resets the TTL timer.
+   - **Amendment (2026-10-18, ADR-066).** Every context, bilateral or multi-party, extends its TTL only by an `ExtendTtl` governance action whose executing Commit carries an approval from every current member and the `TtlExtended` leaf every receiver derives (`05-contexts.md` §5.10.1, `07-trust-validation-and-capabilities.md` §7.3.1.1). The bilateral consent path is retired, the extension is recorded by the `TtlExtended` and `GovernanceActionExecuted` leaves in that Commit, never by a context event outside it, and an extension that does not gather every approval never executes and records no `TtlExtensionRejected` leaf.
 
 4. **Promotion (ephemeral to persistent):**
    - Only `promotable` contexts can be promoted. `no_promotion` contexts reject promotion proposals.
    - Requires unanimous member consent (not just governance majority).
    - On promotion: TTL removed, memory scope transitions to `Full`, existing event log and key material preserved.
    - Promotion is a context event in the Merkle log.
+   - **Amendment (2026-10-18, ADR-066).** Promotion executes as a `PromoteContext` governance action whose Commit carries an approval from every current member, in every governance model, and its `GovernanceActionExecuted` leaf, never a separate `ContextPromoted` leaf. Every receiver of the Commit, not only the proposer, rejects a `PromoteContext` in a `no_promotion` context or a context with no TTL (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6).
 
 5. **Ephemeral close:**
    - Destroy MLS group state: tree secrets, all epoch key schedules, application key material via MLS wrapper (ADR-001 `destroy_group`).

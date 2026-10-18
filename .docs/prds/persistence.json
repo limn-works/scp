@@ -587,9 +587,9 @@
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
-      "description": "Define the `ContextSnapshot` struct (serializable) containing: context_id, state (ContextState), context_params (ContextParams), membership (MembershipState), role_state (ContextRoleState), executed_proposals (HashSet<ProposalId>), ttl_remaining_secs (Option<u64>). Define the `ContextPersistence` trait (dyn-compatible, Send + Sync) with methods: persist_context, load_context, persist_broadcast, load_broadcast, delete_context, list_persisted_contexts. This trait replaces `BroadcastPersistence` entirely — one trait, one provider. All methods return `Result<_, Box<dyn Error + Send + Sync>>` for best-effort semantics.",
+      "description": "Define the `ContextSnapshot` struct (serializable) containing: context_id, state (ContextState), context_params (ContextParams), membership (MembershipState), role_state (ContextRoleState), executed_proposals (HashSet<ProposalId>), ttl_deadline_secs (Option<u64>, the absolute TTL deadline in Unix seconds, a cache that restore re-derives and never trusts, per ADR-049 §9). Define the `ContextPersistence` trait (dyn-compatible, Send + Sync) with methods: persist_context, load_context, persist_broadcast, load_broadcast, delete_context, list_persisted_contexts. This trait replaces `BroadcastPersistence` entirely — one trait, one provider. All methods return `Result<_, Box<dyn Error + Send + Sync>>` for best-effort semantics.",
       "acceptanceCriteria": [
-        "`ContextSnapshot` struct with 7 fields: context_id, state, context_params, membership, role_state, executed_proposals, ttl_remaining_secs; derives Serialize, Deserialize, Debug, Clone",
+        "`ContextSnapshot` struct with 7 fields: context_id, state, context_params, membership, role_state, executed_proposals, ttl_deadline_secs (absolute Unix seconds, never a relative remaining value); derives Serialize, Deserialize, Debug, Clone",
         "`ContextPersistence` trait with 6 dyn-compatible methods: persist_context, load_context, persist_broadcast, load_broadcast, delete_context, list_persisted_contexts",
         "`persist_context(id, &ContextSnapshot)` and `load_context(id) -> Option<ContextSnapshot>`; `persist_broadcast(id, &BroadcastContextSnapshot)` and `load_broadcast(id) -> Option<BroadcastContextSnapshot>`",
         "`delete_context(id)` removes all persisted state; `list_persisted_contexts() -> Vec<String>`",
@@ -764,10 +764,10 @@
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
-      "description": "Implement `load_persisted_context_state(context_id)` and `restore_context(context_id, handle)` on ContextManager. `load_persisted_context_state` loads ContextSnapshot + BroadcastContextSnapshot from persistence, reconstructs `PerContextState` including MembershipState, ContextRoleState, executed_proposals HashSet, and re-spawns TTL timer if ttl_remaining_secs is Some. `restore_context` inserts the reconstructed state into the contexts map. This replaces the existing `restore_broadcast_context` method.",
+      "description": "Implement `load_persisted_context_state(context_id)` and `restore_context(context_id, handle)` on ContextManager. `load_persisted_context_state` loads ContextSnapshot + BroadcastContextSnapshot from persistence, reconstructs `PerContextState` including MembershipState, ContextRoleState, executed_proposals HashSet, and re-arms the TTL timer at the deadline `convergent_ttl_deadline` re-derives (ADR-049 §9), when that deadline is not none. `restore_context` inserts the reconstructed state into the contexts map. This replaces the existing `restore_broadcast_context` method.",
       "acceptanceCriteria": [
         "`load_persisted_context_state(context_id)` loads ContextSnapshot from persistence and reconstructs PerContextState with membership, role_state, and executed_proposals",
-        "Re-spawns TTL timer if `ttl_remaining_secs` is Some in the snapshot",
+        "Re-arms the TTL timer at the absolute deadline `convergent_ttl_deadline` re-derives (ADR-049 §9) when it is not none, never from a relative remaining value and never from the snapshot's cached `ttl_deadline_secs` alone",
         "`restore_context(context_id, handle: &ContextHandle)` uses the provided ContextHandle for re-registration and inserts restored state into the contexts map",
         "Restores broadcast context from persistence if BroadcastContextSnapshot exists for the context",
         "Existing `restore_broadcast_context` method removed (subsumed by new restore path)",
