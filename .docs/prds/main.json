@@ -10773,7 +10773,12 @@
         "crates/scp-testing/tests/integration/welcome_delivery.rs",
         "crates/scp-runtime/src/crypto/dh_counting_custody.rs",
         "crates/scp-testing/tests/integration/broadcast.rs",
-        "crates/scp-testing/tests/integration/content_access.rs"
+        "crates/scp-testing/tests/integration/content_access.rs",
+        "crates/scp-protocol/src/crypto/envelope_seal.rs",
+        "crates/scp-runtime/src/crypto/wrapping.rs",
+        ".docs/specs/05-contexts.md",
+        ".docs/adrs/ADR-057-in-browser-client-over-shared-mls.md",
+        ".docs/prds/keypackage-attestation.json"
       ],
       "description": "The first architecture slice of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, moves MLS to RFC 9420 ciphersuite 2 and HPKE to DHKEM(P-256), and adds the JOSE ES256 codec. SCP-315 wires that codec to UCAN. The key-event preimage types are SCP-308.",
       "acceptanceCriteria": [
@@ -10808,7 +10813,12 @@
         "A capability definition, a challenge policy and a `retry_cap` accept every `u32` for `max_retries` and `cooldown_secs`, no protocol constant bounds either, and every sum of a time and a cooldown saturates: a test at `u32::MAX` for each (`07-trust-validation-and-capabilities.md` §7.3.4.6)",
         "Create refuses a window shorter than the policy's `cooldown_secs` with `ChallengeWindowInvalid`, a consumer refuses a record whose window is shorter than its definition's `cooldown_secs` with `PolicyOutsideDefinition`, and admission refuses a record whose window is shorter than the requirement's `retry_cap.min_cooldown_secs` with `RetryCapExceeded`: a test per check (`07-trust-validation-and-capabilities.md` §7.3.4 steps 1 and 5(g), §7.3.4.4)",
         "A consumer rejects a record unless `challenge_created_at < timestamp < challenge_expires_at`, and the ledger grades an attempt only at a time strictly inside the window: a test at `created_at`, `created_at + 1`, `expires_at - 1` and `expires_at` for each check (`07-trust-validation-and-capabilities.md` §7.3.4 steps 3 and 5(c))",
-        "`MAX_OPEN_CHALLENGES_PER_CHALLENGER` counts only the challenges that are not closed: a test creates a challenge beside that many closed ones (`09-security-model.md` §9.18.C)"
+        "`MAX_OPEN_CHALLENGES_PER_CHALLENGER` counts only the challenges that are not closed: a test creates a challenge beside that many closed ones (`09-security-model.md` §9.18.C)",
+        "`Supervisor::invite_member` seals the `InvitationBundle` with HPKE DHKEM(P-256) to the `scp_wrapping_key` (`0xFF01`) of the invitee KeyPackage, and only after that KeyPackage's §9.7.1 attestation (`0xFF03`) verifies through `verify_add_attestation`; the sealed bundle carries a 65-byte uncompressed SEC1 `enc`. A KeyPackage whose credential names another identity, whose `0xFF01` or `0xFF03` is missing, or whose attestation was signed by a key that is not the invitee's resolved `#active` is rejected before any seal: a test per case (`05-contexts.md` §5.12.3.1, `09-security-model.md` §9.7.1)",
+        "Every native KeyPackage minter (the supervisor's KeyPackage store, its replenish, and the PyO3, napi and UniFFI self-join minters) attaches a `0xFF03` attestation signed through custody with a handle whose public key equals the owner's resolved `#active`; a handle that is not the resolved `#active`, or an owner that does not resolve, mints nothing and fails with a typed error, and replenish without a signer mints nothing: a test per case (`09-security-model.md` §9.7.1)",
+        "The joiner opens a sealed invitation with `KeyCustody::dh_agree` on the identity's custody wrapping handle, after checking that the reserved KeyPackage's `0xFF01`, the custody public key of that handle and the stored wrapping-key record are one key, and before it consumes the reservation; no wrapping private scalar exists in the runtime. A malformed `enc` fails before any custody call, and a custody that cannot agree fails the join with a typed error: a test per case (`09-security-model.md` §9.16.1, §9.16.2 Open step 2)",
+        "No Ed25519-to-X25519 conversion remains: `KeyCustody::ed25519_to_x25519_agree`, every custody and bridge implementation of it, and `ed25519_pubkey_to_x25519` are deleted, and `git grep ed25519_to_x25519` returns nothing (ADR-021 2026-10-18 amendment)",
+        "The X25519 HPKE suite lives in the crate-private `scp_protocol::crypto::hpke::legacy_x25519` module, and code outside `scp-protocol` reaches it through one function, `hpke::wrap_psk_for_device_x25519` (PSK recovery, `03-identity.md` §3.7.2), plus `open_psk_for_device_x25519` in `testing` builds only: a `compile_fail` doctest pins the module's privacy"
       ],
       "actionItems": [
         "Add P-256 verification, low-s, point validation, DER-to-raw conversion and SHA-256 to `scp-crypto`.",
