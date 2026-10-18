@@ -2518,6 +2518,80 @@ pub(crate) fn create_supervisor_context_for_test(
     create_supervisor_context_with_params_for_test(bi, context_id, creator_did, params);
 }
 
+/// Test-only: registers a host custody for `did` on `bi`, the custody a
+/// shipped host reaches through `identity_create_with_custody`, and loads
+/// `did`'s wrapping key into `bi`'s supervisor. Returns the host object, whose
+/// `calls` map counts each host method call, or `None` when `did` is already
+/// registered, in which case it does nothing.
+///
+/// A context's wrapping key lives in its owner's registered custody (spec 09
+/// §9.16.1), so a supervisor creates a context only for a DID with one. The
+/// custody is the production `Callback` variant over the fake Python host
+/// `P256Custody`, which mints the wrapping key as a P-256 key and agrees with
+/// it by ECDH. The registry entry carries the identity fields a created
+/// identity would; nothing here reads them but its custody. Each custody call
+/// runs with the GIL released, because the host takes the GIL on tokio's
+/// blocking pool; the wrapping key is loaded here for the same reason, so the
+/// create that follows makes no host call from a thread that may hold it.
+///
+/// # Panics
+///
+/// Panics when no supervisor is attached, or when the host call or the
+/// wrapping-key load fails, each a broken test fixture.
+#[cfg(test)]
+#[allow(clippy::expect_used)] // A broken test fixture panics; production paths keep the deny.
+pub(crate) fn register_host_custody_for_test(
+    bi: &PyBridgeInstance,
+    did: &str,
+) -> Option<pyo3::Py<pyo3::PyAny>> {
+    use scp_platform::KeyCustody as _;
+    if identity_registry(bi).contains_key(did) {
+        return None;
+    }
+    let (host_custody, host) = crate::custody::test_fakes::p256_py_custody_and_host();
+    let custody = Arc::new(crate::custody::FfiKeyCustody::Callback(host_custody));
+    let identity_key = Python::with_gil(|py| {
+        crate::actor_wait::block_on_released(py, custody.generate_identity_keypair())
+    })
+    .expect("the shared runtime drives the host call")
+    .expect("the host custody generates the identity key");
+    register_identity(
+        bi,
+        did,
+        IdentityEntry {
+            identity: ScpIdentity {
+                did: did.to_owned(),
+                identity_key,
+                active_signing_key: identity_key,
+                agent_signing_key: None,
+                pre_rotation_commitment: [0u8; 32],
+            },
+            custody,
+            document: DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: did.to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+            identity_link_attestations: Vec::new(),
+            pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            #[cfg(feature = "testing")]
+            pre_rotation_custody: Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new()),
+        },
+    );
+    let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));
+    let owner = scp_did::DID(did.to_owned());
+    Python::with_gil(|py| {
+        crate::actor_wait::block_on_released(py, sup.wrapping_public_key(&owner))
+    })
+    .expect("the shared runtime drives the wrapping-key load")
+    .expect("the host custody holds the wrapping key");
+    Some(host)
+}
+
 /// Test-only: [`create_supervisor_context_for_test`] with the caller's whole
 /// `params`, for a test whose context must carry a mode or other parameter the
 /// default leaves out.
@@ -2536,6 +2610,11 @@ pub(crate) fn create_supervisor_context_with_params_for_test(
 ) {
     #[cfg(feature = "testing")]
     serve_unregistered_wrapping_keys_from_test_custody(bi);
+    // The creator's custody serves only this create: the supervisor keeps the
+    // loaded wrapping key, and callers assert against a registry without the
+    // creator (an uncustodied creator refuses to sign), so a custody
+    // registered here is removed once the context exists.
+    let registered_here = register_host_custody_for_test(bi, creator_did).is_some();
     let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));
     let rt = super::runtime().expect("tokio runtime must be initialized");
     rt.block_on(sup.create_context(
@@ -2546,6 +2625,12 @@ pub(crate) fn create_supervisor_context_with_params_for_test(
         Vec::new(),
     ))
     .expect("test supervisor context creation must succeed");
+    if registered_here {
+        assert!(
+            identity_registry(bi).remove(creator_did).is_some(),
+            "the creator custody registered for this create must still be present"
+        );
+    }
 }
 
 /// Closes the receive channel for a context by dropping the sender (SCP-216).

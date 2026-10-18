@@ -1445,11 +1445,12 @@ pub(crate) fn init_supervisor_for_test_on(bi: &NapiBridgeInstance) {
 ///
 /// `NodeMlsFactory::validate_creator_identity` only accepts `did:test:` /
 /// `did:key:` under `scp-runtime`'s `testing` feature; a `did:dht:z*` identity
-/// is accepted in plain production builds. Tests that exercise behavior which
-/// MUST hold WITHOUT the in-memory-custody / `testing` features (e.g. the
-/// custody-signed context-export path) use this so they genuinely run in the
-/// no-`testing` configuration rather than silently relying on the test gate.
-#[cfg(test)]
+/// is accepted in plain production builds. The custody-signed context-export
+/// tests use it so the MLS identity has the shape a shipped build accepts.
+/// Gated on `testing` with them: their contexts take a wrapping-key custody
+/// from the `testing` seam, since a shipped build registers no identity
+/// (ADR-062 §Decision 6).
+#[cfg(all(test, feature = "testing"))]
 pub(crate) fn init_production_supervisor_for_test_on(bi: &NapiBridgeInstance) {
     init_supervisor_for_test_on_with_did(bi, "did:dht:z6MkNapiBridgeProductionTest");
 }

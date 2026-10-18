@@ -1228,6 +1228,13 @@ class WrongLengthCustody(P256Custody):
             .expect("fake provider module compiles")
     }
 
+    /// A `PyCallbackKeyCustody` over a fresh `P256Custody`, which mints
+    /// `hpke-p256` keys and agrees with them by real ECDH, also returning the
+    /// host object so a test can read its `calls` counts.
+    pub fn p256_py_custody_and_host() -> (PyCallbackKeyCustody, Py<PyAny>) {
+        fake_py_host_of(c"P256Custody", None)
+    }
+
     /// [`fake_py_custody_of`], also returning the host object.
     fn fake_py_host_of(
         class: &std::ffi::CStr,

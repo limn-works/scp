@@ -19389,6 +19389,7 @@ mod tests {
     fn scp_test() -> Arc<crate::scp::Scp> {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         // Fixtures create contexts for DIDs they never register.
+        #[cfg(feature = "testing")]
         crate::runtime::serve_unregistered_wrapping_keys_from_test_custody(&scp.inner);
         scp
     }
@@ -26579,6 +26580,7 @@ mod tests {
         let scp = scp_test();
         let bi = Arc::clone(&scp.inner);
         bi.init_context_manager_with_did(creator);
+        register_host_custody(&bi, creator).await;
         let supervisor = bi
             .context_manager_or_error()
             .expect("supervisor must be attached")
@@ -28005,6 +28007,7 @@ mod tests {
         let scp = scp_test();
         let bi = Arc::clone(&scp.inner);
         bi.init_context_manager_with_did("did:dht:z6MkDenialCreator");
+        register_host_custody(&bi, "did:dht:z6MkDenialCreator").await;
         bi.context_manager_or_error()
             .expect("supervisor must be attached")
             .clone()
@@ -28988,7 +28991,7 @@ mod tests {
     /// Supervisor role state, so a bare instance would serve nothing.
     async fn live_context(bi: &Arc<crate::runtime::UniffiBridgeInstance>, context_id: &str) {
         bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
-        crate::runtime::serve_unregistered_wrapping_keys_from_test_custody(bi);
+        register_host_custody(bi, "did:dht:z6MkSubscriber").await;
         let supervisor = bi
             .context_manager_or_error()
             .expect("supervisor must be attached")
@@ -29136,6 +29139,7 @@ mod tests {
         // role-state check, which the creator passes, then locks it again in
         // the UCAN step, which refuses the token.
         bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
+        register_host_custody(&bi, "did:dht:z6MkSubscriber").await;
         bi.context_manager_or_error()
             .expect("supervisor must be attached")
             .clone()
@@ -31435,6 +31439,37 @@ mod tests {
     /// test needs no particular one.
     const CALLBACK_SUPERVISOR_CEILING: &[&str] = &["messages:read", "messages:write"];
 
+    /// Registers a host custody for `did` on `bi`, the way a shipped host's
+    /// identity reaches the custody registry, unless `did` already has one.
+    /// Returns whether it registered one.
+    ///
+    /// A context's wrapping key lives in its owner's registered custody (spec
+    /// 09 §9.16.1), so a supervisor creates a context only for a DID with a
+    /// registered custody. The custody is the production `Callback` variant
+    /// over [`ProdLikeCustody`], which mints the wrapping key as a real P-256
+    /// key and agrees with it by ECDH, as a platform keystore does.
+    async fn register_host_custody(
+        bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+        did: &str,
+    ) -> bool {
+        if identity_custody_registry(bi).contains_key(did) {
+            return false;
+        }
+        let callback = Arc::new(CallbackKeyCustody::new(Box::new(ProdLikeCustody::new())));
+        let active_key = callback
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("the host custody generates an Ed25519 #active key");
+        register_identity_custody(
+            bi,
+            did,
+            &Arc::new(UniffiKeyCustody::Callback(callback)),
+            active_key,
+        )
+        .expect("registering the host custody must succeed");
+        true
+    }
+
     /// Registers `context_id` with `scp`'s supervisor under `creator_did` and
     /// `ceiling`, so the live reads every UCAN entry point makes answer for it.
     ///
@@ -31473,6 +31508,12 @@ mod tests {
         // here; the call is a no-op when the instance already carries one.
         scp.inner
             .init_context_manager_with_did("did:dht:z6MkUniffiTestBridge");
+        // The creator's custody holds the context's wrapping key. A creator
+        // the caller left unregistered is registered for the create and
+        // removed after it, through the shipped removal path, so a test of a
+        // registry that lacks the creator still sees that registry. The
+        // supervisor keeps the wrapping key it loaded at the create.
+        let registered_here = register_host_custody(&scp.inner, creator_did).await;
         scp.inner
             .context_manager_or_error()
             .expect("test supervisor must be attached")
@@ -31485,6 +31526,13 @@ mod tests {
             )
             .await
             .expect("test supervisor context creation must succeed");
+        if registered_here {
+            assert!(
+                scp.identity_remove_if_present(creator_did.to_owned())
+                    .expect("the creator DID is valid"),
+                "the creator's host custody was registered above"
+            );
+        }
     }
 
     /// Builds a `ContextHandle` carrying a real-Ed25519 [`ProdLikeCustody`]

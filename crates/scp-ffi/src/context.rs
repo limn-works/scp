@@ -2958,23 +2958,6 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let sup = sup.clone();
 
-            // Generate a real MLS key package for the joining member (#1324).
-            // The key package contains the joiner's SCP credential (DID) and is
-            // validated by NodeMlsFactory::validate_key_package before MLS
-            // group addition.
-            let wrapping_public = crate::actor_wait::block_on_released(
-                py,
-                sup.wrapping_public_key(&scp_did::DID(member_did.clone())),
-            )?
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let kp_bytes = generate_mls_key_package_bytes(identity_did, &wrapping_public)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let key_package = scp_core::context::membership::KeyPackage {
-                owner_did: scp_did::DID(member_did.clone()),
-                mls_key_package_bytes: Some(kp_bytes),
-            };
-
             // Look up the ContextHandle from a completed create_context call.
             // The ContextManager stores PerContextState keyed by context_id.
             // We need the handle to delegate. Since the handle is stored in
@@ -3002,6 +2985,25 @@ impl crate::scp::PyScp {
                 None
             } else {
                 Some(derive_member_pseudonym(py, bi, identity_did, &context_id)?)
+            };
+
+            // Generate a real MLS key package for the joining member (#1324).
+            // The key package contains the joiner's SCP credential (DID) and is
+            // validated by NodeMlsFactory::validate_key_package before MLS
+            // group addition. It runs after derivation, so a joiner with no
+            // key material fails with derivation's `SCP-IDENT-1054` first; a
+            // wrapping-key failure keeps its typed `ContextError` code.
+            let wrapping_public = crate::actor_wait::block_on_released(
+                py,
+                sup.wrapping_public_key(&scp_did::DID(member_did.clone())),
+            )?
+            .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
+            let kp_bytes = generate_mls_key_package_bytes(identity_did, &wrapping_public)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            let key_package = scp_core::context::membership::KeyPackage {
+                owner_did: scp_did::DID(member_did.clone()),
+                mls_key_package_bytes: Some(kp_bytes),
             };
             let temp_handle =
                 scp_core::context::ContextHandle::new(context_id.clone(), core_params);
@@ -6851,22 +6853,23 @@ mod tests {
     /// drives derivation policy — exercised through the REAL `context_create`
     /// entry point, not an inline copy of the branch.
     ///
-    /// Both sub-cases use an UNREGISTERED creator DID (no retained key material),
-    /// which makes the gate's effect directly observable:
-    /// - ENCRYPTED create routes through `derive_member_pseudonym(...)?`, so the
-    ///   registry miss HARD-FAILS with the canonical `SCP-IDENT-1054` — never a
-    ///   silent zero-pseudonym fallback that would leave the encrypted context
-    ///   unusable on the pseudonymous routing axis.
-    /// - BROADCAST create selects `None` (spec §5.14: no per-member pseudonym),
-    ///   never touches custody, and SUCCEEDS into an active handle.
+    /// The two sub-cases make the gate's effect directly observable:
+    /// - ENCRYPTED create by an UNREGISTERED creator DID routes through
+    ///   `derive_member_pseudonym(...)?`, so the registry miss HARD-FAILS with
+    ///   the canonical `SCP-IDENT-1054` — never a silent zero-pseudonym
+    ///   fallback that would leave the encrypted context unusable on the
+    ///   pseudonymous routing axis.
+    /// - BROADCAST create by a creator with a registered host custody selects
+    ///   `None` (spec §5.14: no per-member pseudonym), SUCCEEDS into an active
+    ///   handle, and the host records no derivation call.
     ///
     /// Not false-green: the previous version of this test copied the production
     /// `if create_is_broadcast { None } else { Some(derive...) }` branch inline
     /// and asserted against its own copy, so inverting the production gate would
     /// not have failed it. This version calls `context_create` itself. If the
     /// production gate at `:1799` were inverted (broadcast → derive, encrypted →
-    /// `None`), the broadcast create would hard-fail `SCP-IDENT-1054` and the
-    /// encrypted create would succeed — both assertions below would flip.
+    /// `None`), the host would record a broadcast derivation and the encrypted
+    /// create would succeed — both assertions below would flip.
     #[test]
     fn context_create_mode_gate_drives_pseudonym_derivation() {
         crate::init_runtime().ok();
@@ -6890,17 +6893,41 @@ mod tests {
             "expected encrypted-create missing-key-material code SCP-IDENT-1054, got: {encrypted_err}"
         );
 
-        // BROADCAST create with the SAME unregistered-creator condition SUCCEEDS
-        // — the gate selects `None` and never calls derivation.
+        // BROADCAST create SUCCEEDS and the gate selects `None`, so the
+        // creator's custody sees no derivation call. The creator registers a
+        // host custody first, because its wrapping key lives there (spec 09
+        // §9.16.1) and a create for a DID with no custody fails closed.
+        let bcast_creator = "did:dht:z6MkNoSuchCreateCreatorBcast";
+        let host = crate::runtime::register_host_custody_for_test(&bi_arc, bcast_creator)
+            .expect("the broadcast creator is not registered yet");
         let handle = Python::with_gil(|py| {
             let dict = PyDict::new(py);
             dict.set_item("mode", "broadcast").unwrap();
             // Broadcast contexts require MemoryScope::Full (spec §5.14).
             dict.set_item("memory_scope", "full").unwrap();
             dict.set_item("ceiling", vec!["messages:read"]).unwrap();
-            scp.context_create(py, "did:dht:z6MkNoSuchCreateCreatorBcast", &dict)
+            scp.context_create(py, bcast_creator, &dict)
                 .expect("broadcast create must succeed without pseudonym derivation")
         });
+        let derivations = Python::with_gil(|py| {
+            let calls = host
+                .bind(py)
+                .getattr("calls")
+                .expect("the host counts its calls");
+            ["derive_pseudonym", "derive_rotatable_pseudonym"]
+                .iter()
+                .map(|m| {
+                    calls
+                        .call_method1("get", (*m, 0))
+                        .and_then(|n| n.extract::<u64>())
+                        .expect("a call count is an int")
+                })
+                .sum::<u64>()
+        });
+        assert_eq!(
+            derivations, 0,
+            "broadcast create must not derive a pseudonym"
+        );
         assert_eq!(
             handle.state().unwrap(),
             "active",
@@ -7467,6 +7494,7 @@ mod tests {
         let bi = __bi();
         let ctx_id = format!("{ctx_prefix}-{}", uuid::Uuid::new_v4());
         crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+        let _host = crate::runtime::register_host_custody_for_test(&bi, creator);
         let sup = crate::runtime::supervisor(&bi).unwrap();
         let sup = Arc::clone(sup);
         let rt = crate::runtime().unwrap();
@@ -8375,6 +8403,7 @@ mod tests {
             let bi = scp.inner.clone();
 
             crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+            let _host = crate::runtime::register_host_custody_for_test(&bi, creator);
             let sup = crate::runtime::supervisor(&bi).unwrap();
             let rt = crate::runtime().unwrap();
             rt.block_on(sup.create_context(
@@ -9259,6 +9288,11 @@ mod tests {
         let bi = __bi();
         let context_id = format!("{prefix}{}", "0".repeat(64 - prefix.len()));
         crate::runtime::init_context_manager_for_test(&bi);
+        // A restore acts as the node identity and loads its wrapping key from
+        // its custody (spec 09 §9.16.1), so the node identity keeps a
+        // registered custody, as a host's own identity does.
+        let _host =
+            crate::runtime::register_host_custody_for_test(&bi, "did:test:pyo3-bridge-test");
         crate::runtime::create_supervisor_context_for_test(
             &bi,
             &context_id,

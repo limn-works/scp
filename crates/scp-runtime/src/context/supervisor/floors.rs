@@ -281,8 +281,8 @@ impl Supervisor {
     /// [`Self::check_and_advance_sender_epoch`] reads.
     ///
     /// The `KeyResponse` receive path checks the response's public epoch
-    /// against this floor with [`admit_sender_epoch`] before any custody call,
-    /// then advances the floor with [`Self::check_and_advance_sender_epoch`]
+    /// against this floor with [`admit_sender_epoch`](super::admit_sender_epoch)
+    /// before any custody call, then advances the floor with [`Self::check_and_advance_sender_epoch`]
     /// after the open. The read and the advance are separate, so a floor that
     /// moves between them is caught by the advance, which re-checks under the
     /// entry guard.
