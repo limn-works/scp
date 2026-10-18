@@ -26,10 +26,10 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import uniffi.scp.CeilingPolicy
-import uniffi.scp.ContextMode
 import uniffi.scp.ChallengePolicy
-import uniffi.scp.Identity
+import uniffi.scp.ContextMode
 import uniffi.scp.GovernanceModel
+import uniffi.scp.Identity
 import uniffi.scp.MemoryScope
 import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig

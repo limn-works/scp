@@ -16,7 +16,6 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Test
@@ -358,8 +357,7 @@ class ChallengeTrustInputTest {
     fun `challenge request decode refuses an unknown or missing field`() {
         val request = Json.parseToJsonElement(challengeWire).jsonObject
 
-        fun encode(fields: Map<String, JsonElement>): String =
-            Json.encodeToString(JsonObject.serializer(), JsonObject(fields))
+        fun encode(fields: Map<String, JsonElement>): String = JsonObject(fields).toString()
         assertFailsWith<IllegalArgumentException> {
             decodeChallengeRequestJson(encode(request + ("timeout_secs" to Json.parseToJsonElement("300"))))
         }

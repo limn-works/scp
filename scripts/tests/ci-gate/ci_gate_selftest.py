@@ -791,6 +791,7 @@ NOT_ON_PUSH_JOBS = (
     "protocol-sync",
     "saga-gating-granularity",
     "sdk-coverage",
+    "test-vectors",
     "toolchain-wiring",
 )
 

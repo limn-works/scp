@@ -460,6 +460,9 @@ jobs:
               # `crates/scp-testing/tests/integration/trust.rs` compiles in spec 07 to
               # check its protocol capability minimums against the compiled-in constants.
               - '.docs/specs/07-trust-validation-and-capabilities.md'
+              # `crates/scp-protocol/src/trust/challenge.rs` compiles in spec 09 in a
+              # unit test that checks the spec against the challenge code.
+              - '.docs/specs/09-security-model.md'
               - 'tests/conformance/**'
               - 'bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json'
               - 'scripts/pure-helpers-allowlist.txt'

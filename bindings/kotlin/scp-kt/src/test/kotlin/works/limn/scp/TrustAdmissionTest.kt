@@ -253,8 +253,7 @@ class TrustAdmissionTest {
     fun `challenge verification decode refuses a malformed record`() {
         val record = Json.parseToJsonElement(verificationWire).jsonObject
 
-        fun encode(fields: Map<String, JsonElement>): String =
-            Json.encodeToString(JsonObject.serializer(), JsonObject(fields))
+        fun encode(fields: Map<String, JsonElement>): String = JsonObject(fields).toString()
 
         fun with(
             key: String,
