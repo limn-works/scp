@@ -794,7 +794,8 @@ export function checkProposalResponse(raw: string): string {
  * {@link SCP.contextJoinFromWelcome} on the joiner side.
  *
  * Flat named-field object mirroring the runtime wire type and the PyO3/UniFFI
- * reference bridges. `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and
+ * reference bridges. `enc` is the RFC 9180 HPKE encapsulated key, a 65-byte
+ * uncompressed DHKEM(P-256) point (spec 05 §5.12.3.1), and
  * `ciphertext` is the HPKE ciphertext (`ct = ciphertext || tag`) of the
  * serialized, signed `InvitationBundle` carrying the authoritative genesis
  * params + MLS Welcome. Both are opaque bytes — the joiner does not interpret
@@ -809,7 +810,11 @@ export interface SealedInvitation {
   readonly contextId: string;
   /** Binding hint: the creator DID the bundle was sealed by. */
   readonly creatorDid: string;
-  /** RFC 9180 HPKE encapsulated key (`enc`) — exactly 32 bytes. */
+  /**
+   * RFC 9180 HPKE encapsulated key (`enc`): a 65-byte uncompressed
+   * DHKEM(P-256) point. The join rejects any other form before it makes a
+   * custody call or consumes the KeyPackage.
+   */
   readonly enc: Uint8Array;
   /** RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`). */
   readonly ciphertext: Uint8Array;

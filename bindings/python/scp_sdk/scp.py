@@ -397,8 +397,9 @@ class SealedInvitation:
     Attributes:
         context_id: Binding hint — the context id the bundle was sealed for.
         creator_did: Binding hint — the creator DID the bundle was sealed by.
-        enc: RFC 9180 HPKE encapsulated key. Exactly 32 bytes (validated at
-            the join boundary, fail-closed).
+        enc: RFC 9180 HPKE encapsulated key: a 65-byte uncompressed
+            DHKEM(P-256) point (spec 05 §5.12.3.1). The join rejects any other
+            form before it makes a custody call or consumes the KeyPackage.
         ciphertext: RFC 9180 HPKE ciphertext (``ct = ciphertext || tag``) of
             the serialized, signed ``InvitationBundle``. Opaque bytes.
     """
@@ -1593,7 +1594,8 @@ class SCP:
 
         Raises:
             Exception: If the joiner is not locally custodied, the sealed bundle
-                fails to open or authenticate, the ``enc`` is not 32 bytes, the
+                fails to open or authenticate, the ``enc`` is not a 65-byte
+                uncompressed P-256 point, the
                 reservation id is malformed, or the spawn fails (bad/duplicate
                 Welcome, single-use replay, first-writer-wins collision, or
                 fail-closed persist failure).

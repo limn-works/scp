@@ -7172,6 +7172,124 @@ mod tests {
         });
     }
 
+    /// Bob invites Alice from a second instance and Alice joins (spec 05
+    /// §5.12.3.1, spec 09 §9.16.2). Bob's invite verifies Alice's `KeyPackage`
+    /// attestation and seals to her 0xFF01 DHKEM(P-256) key, so `enc` is a
+    /// 65-byte uncompressed point. Alice's join opens it through `dh_agree` on
+    /// her custody wrapping handle and registers the context. With
+    /// `alice_host`, Alice's keys live in that Python host, and the host must
+    /// have agreed with exactly the sealed `enc`.
+    #[cfg(feature = "testing")]
+    fn invite_then_join_across_two_instances(alice_host: Option<Py<PyAny>>) {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let bob = crate::scp::PyScp::new_in_memory_for_test();
+            let bob_did = bob
+                .identity_create(py, "in_memory", None)
+                .expect("bob's identity")
+                .did()
+                .to_owned();
+            let alice = crate::scp::PyScp::new_in_memory_for_test();
+            // One DHT for both instances, so each resolves the other's DID.
+            crate::runtime::set_resolver_dht_client(
+                &alice.inner,
+                crate::runtime::resolver_dht_client(&bob.inner).expect("bob's DHT client"),
+            );
+            let alice_did = alice_host
+                .as_ref()
+                .map_or_else(
+                    || alice.identity_create(py, "in_memory", None),
+                    |host| alice.identity_create_with_custody(py, host.clone_ref(py)),
+                )
+                .expect("alice's identity")
+                .did()
+                .to_owned();
+
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            params
+                .set_item(
+                    "ceiling",
+                    vec![
+                        "messages:read",
+                        "messages:write",
+                        "role:assign",
+                        "member:invite",
+                        "governance:propose",
+                        "governance:vote",
+                    ],
+                )
+                .unwrap();
+            params.set_item("governance", "single_admin").unwrap();
+            let ctx_id = bob
+                .context_create(py, &bob_did, &params)
+                .expect("bob creates the context")
+                .context_id;
+
+            let (reservation, key_package) = alice
+                .reserve_key_package(py, &alice_did)
+                .expect("alice reserves a KeyPackage");
+            let invite = bob
+                .invite_member(
+                    py,
+                    ctx_id.clone(),
+                    bob_did.clone(),
+                    alice_did.clone(),
+                    key_package,
+                )
+                .expect("bob invites alice");
+            assert_eq!(invite.bundle.context_id, ctx_id);
+            assert_eq!(invite.bundle.creator_did, bob_did);
+            assert_eq!(
+                invite.bundle.enc.len(),
+                65,
+                "a DHKEM(P-256) enc is a 65-byte uncompressed point"
+            );
+            assert_eq!(invite.bundle.enc[0], 0x04, "uncompressed SEC1 tag");
+            let enc = invite.bundle.enc.clone();
+
+            let handle = alice
+                .context_join_from_welcome(py, alice_did, invite.bundle, reservation)
+                .expect("alice opens the sealed invitation and joins");
+            assert_eq!(handle.context_id, ctx_id);
+            assert!(
+                crate::runtime::with_ffi_state(&alice.inner, &ctx_id, |_| Ok(())).is_ok(),
+                "the joined context is registered on alice's instance"
+            );
+            if let Some(host) = &alice_host {
+                let peers: Vec<Vec<u8>> = host
+                    .bind(py)
+                    .getattr("dh_peers")
+                    .and_then(|p| p.extract())
+                    .expect("the host records each agreement's peer");
+                assert_eq!(
+                    peers,
+                    vec![enc],
+                    "the join agrees once, on the wrapping key, with the sealed enc"
+                );
+            }
+        });
+    }
+
+    /// [`invite_then_join_across_two_instances`] with Alice's keys in the
+    /// bridge's in-memory custody.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn invite_then_join_across_two_instances_opens_the_p256_sealed_invitation() {
+        invite_then_join_across_two_instances(None);
+    }
+
+    /// [`invite_then_join_across_two_instances`] with Alice's keys in a
+    /// `P256Custody` Python host, which agrees by real P-256 ECDH.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn invite_then_join_across_two_instances_opens_through_a_host_custody() {
+        pyo3::prepare_freethreaded_python();
+        let (_custody, host) = crate::custody::test_fakes::p256_py_custody_and_host();
+        invite_then_join_across_two_instances(Some(host));
+    }
+
     /// ADR-049 Phase 2J (orphaned-success fix): a pre-existing (`Occupied`)
     /// FFI-state entry fails `context_join_from_welcome` at its occupancy check
     /// — which runs BEFORE `spawn_actor_from_welcome` consumes the single-use
@@ -7240,16 +7358,9 @@ mod tests {
     /// lookup -> typed error mapping — and rejects the two reachable failure
     /// modes on the pre-add path.
     ///
-    /// NOTE ON SCOPE: the `"sealed"` happy-path (and the full creator-seal ->
-    /// joiner-open round-trip) is NOT asserted here because it terminates in the
-    /// MLS add-member step, which is not green on THIS branch — the same
-    /// pre-existing gap the untouched `plain_join_registers_known_context_for_joiner`
-    /// test hits ("the capabilities of the add proposal are insufficient for this
-    /// group"). That is the §5.13.3 `0xFF02` KeyPackage-capabilities work FFI-02
-    /// gates, not a defect in this bridge reshape. The sealed round-trip is
-    /// covered at the E2E layer once that add-member path lands. This test pins
-    /// what IS reachable on the pre-add path so the export is not merely
-    /// compiled-but-dead.
+    /// The `"sealed"` outcome and the creator-seal to joiner-open round trip
+    /// are asserted by `invite_then_join_across_two_instances`. This test pins
+    /// the two failures on the pre-add path.
     ///
     /// Not false-green: assertion (a) uses a REAL custodied inviter so
     /// signing-key resolution SUCCEEDS and the error is the live-context lookup
@@ -9345,34 +9456,13 @@ mod tests {
     #[cfg(feature = "testing")]
     const SLOW_AGREE_PY: &std::ffi::CStr = c"
 import threading
-from fake_custody import P256Custody, ed_expand
-
-def x25519(k, u):
-    # RFC 7748 Montgomery ladder; k is already clamped.
-    p, a24 = 2**255 - 19, 121665
-    x1 = int.from_bytes(bytes(u), 'little') & ((1 << 255) - 1)
-    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
-    for t in reversed(range(255)):
-        bit = (k >> t) & 1
-        if swap ^ bit:
-            x2, x3, z2, z3 = x3, x2, z3, z2
-        swap = bit
-        a, b, c, d = x2 + z2, x2 - z2, x3 + z3, x3 - z3
-        aa, bb, da, cb = a * a % p, b * b % p, d * a % p, c * b % p
-        e = aa - bb
-        x3, z3 = (da + cb) ** 2 % p, x1 * (da - cb) ** 2 % p
-        x2, z2 = aa * bb % p, e * (aa + a24 * e) % p
-    if swap:
-        x2, z2 = x3, z3
-    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, 'little')
+from fake_custody import P256Custody
 
 class SlowAgreeCustody(P256Custody):
     # Signals when an HPKE dh_agree starts, holds it until the test sets
     # release_agree, signals that the hold is over, then answers with the
     # P-256 ECDH of its key. release_agree starts set, so setup agrees
-    # without holding; the test clears it before the agree it watches. The
-    # #active Ed25519 key agrees by real X25519, so this identity can open a
-    # Welcome.
+    # without holding; the test clears it before the agree it watches.
 
     def __init__(self):
         super().__init__()
@@ -9387,8 +9477,6 @@ class SlowAgreeCustody(P256Custody):
             if not self.release_agree.wait(120.0):
                 raise RuntimeError('the test never released the agree')
             self.agree_done.set()
-        elif self._key_types.get(key_id) == 'ed25519':
-            return x25519(ed_expand(self._seed(key_id))[0], peer_public)
         return super().dh_agree(key_id, peer_public)
 ";
 

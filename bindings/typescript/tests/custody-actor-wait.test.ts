@@ -52,15 +52,12 @@ try {
 
 /** Ed25519 PKCS8 DER prefix; the 32-byte seed follows. */
 const ED25519_PKCS8 = Buffer.from("302e020100300506032b657004220420", "hex");
-/** X25519 PKCS8 DER prefix; the 32-byte scalar follows. */
-const X25519_PKCS8 = Buffer.from("302e020100300506032b656e04220420", "hex");
-/** X25519 SPKI DER prefix; the 32-byte point follows. */
-const X25519_SPKI = Buffer.from("302a300506032b656e032100", "hex");
 
 /**
- * Ed25519 identity seeds and real HPKE P-256 keys. An Ed25519 key agrees as
- * its RFC 7748 X25519 mapping, which opens a Welcome sealed to the identity
- * key. `onWrappingAgree`, when set, runs once inside the next `hpke-p256`
+ * Ed25519 identity seeds and real HPKE P-256 keys. Only an `hpke-p256` key
+ * agrees: the join opens the sealed invitation through the wrapping key
+ * (spec 09 §9.16.2), so an agreement on an Ed25519 key fails the test.
+ * `onWrappingAgree`, when set, runs once inside the next `hpke-p256`
  * agreement, before the host answers.
  */
 class WrappingAgreeKeychain implements KeyCustodyProvider {
@@ -133,20 +130,7 @@ class WrappingAgreeKeychain implements KeyCustodyProvider {
       hook?.();
       return this.#hpke.agree(keyId, peerPublic);
     }
-    // RFC 8032 §5.1.5: the X25519 scalar is the first half of SHA-512(seed);
-    // X25519 clamps it.
-    const scalar = crypto.createHash("sha512").update(this.#seed(keyId)).digest().subarray(0, 32);
-    const privateKey = crypto.createPrivateKey({
-      key: Buffer.concat([X25519_PKCS8, scalar]),
-      format: "der",
-      type: "pkcs8",
-    });
-    const publicKey = crypto.createPublicKey({
-      key: Buffer.concat([X25519_SPKI, Buffer.from(peerPublic)]),
-      format: "der",
-      type: "spki",
-    });
-    return new Uint8Array(crypto.diffieHellman({ privateKey, publicKey }));
+    throw new Error(`dhAgree on a non-wrapping key: ${keyId}`);
   }
 
   derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array {
