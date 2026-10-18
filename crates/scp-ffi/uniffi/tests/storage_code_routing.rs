@@ -3,7 +3,9 @@
 //! prefix (sdk-common.md §Registered SCP-STORAGE- codes). A call site that
 //! writes an `ScpError` variant literal with a storage code skips that
 //! routing and can name the wrong variant. This scan parses every source file
-//! under `src/` with `syn` and fails on any such literal outside `coded`.
+//! under `src/` with `syn` and fails on any such literal outside `coded` whose
+//! `code:` expression names a storage code directly. A code assigned through
+//! a local binding or returned from a function is not covered.
 //!
 //! What it matches: a struct expression whose path is `ScpError::<Variant>`,
 //! or `Self::<Variant>` inside `impl ScpError`, whose `code` field expression

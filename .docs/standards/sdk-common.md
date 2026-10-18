@@ -391,7 +391,7 @@ and are documented with their own features.
 | `InvalidConfig`, `Node(MissingField)`, `Node(InvalidConfig)` | `SCP-STORAGE-8007` | The node start configuration is invalid: a required field is missing, a field value is invalid, or `scp_node::validate_reach_and_tls` rejected the reach and TLS pair. The check runs before `node_start` creates any directory or file |
 | `Storage`, `Io` | `SCP-STORAGE-8008` | The blob storage backend failed to open (`Storage`), or `node_start` could not create the blob storage directory (`Io`) |
 | `Node(Storage)` | `SCP-STORAGE-8009` | The core node returned a storage error |
-| `OperatorIdentityUnavailable`, `Node(Identity(_))` | `SCP-IDENT-1063` | The operator identity is not available to the node: the identity is not registered on this `SCP` instance, or the core node's identity operation failed |
+| `OperatorIdentityUnavailable`, `Node(Identity(_))` | `SCP-IDENT-1063` | The operator identity is not available to the node: the identity is not registered on this `SCP` instance, the config's identity DID differs from the handle's, or the core node's identity operation failed |
 | `Node(Relay)` | `SCP-TRANS-5051` | The node's relay failed to start, such as a failed bind on `bind_addr` |
 | `Node(Tls)` | `SCP-TRANS-5052` | TLS provisioning failed |
 | `Node(Serve)`, `Node(Nat)` | `SCP-TRANS-5054` | The HTTP server failed to bind or hit a fatal I/O error (`Serve`), or NAT traversal failed (`Nat`) |
