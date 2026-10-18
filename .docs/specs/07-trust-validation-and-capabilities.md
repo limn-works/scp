@@ -211,9 +211,9 @@ Below, `N` is the receiver's commit-ordered leaf count before the Commit, and `E
 
 | Context | Limit |
 |---|---|
-| `Majority` | 191 eligible voters, because floor(191 / 2) + 1 = 96 |
-| `Unanimity` | 96 eligible voters |
-| A context with a TTL, under every model | 96 members, voters or not, because `ExtendTtl` and `PromoteContext` need every member |
+| `Majority` | At most 191 eligible voters, because floor(191 / 2) + 1 = 96 |
+| `Unanimity` | At most 96 eligible voters |
+| A context with a TTL, under every model | At most 96 members, voters or not, because `ExtendTtl` and `PromoteContext` need every member |
 | `SingleAdmin` and `Threshold`, without a TTL | None |
 
 A `Threshold` model's `threshold` is at most 64, its signer cap, and its approvals for every action but the two TTL actions come only from its signers, so a context that needs more voters than these limits allow uses `Threshold`. Context creation rejects a context with a TTL whose initial membership exceeds 96, and a receiver rejects a Commit that adds a member to a context with a TTL past 96 (step 2). Context creation and `ReconfigureGovernance` reject a configuration whose current `eligible` exceeds its limit, and a receiver rejects a Commit whose action would raise `eligible` past the limit, such as an add or a role change that grants `GovernanceVote`, and a `ReconfigureGovernance` Commit whose resulting configuration exceeds a limit of this table or of `05-contexts.md` §5.9 invariant 4 (step 2). Under the ADR-031 §10 deadlock fallback, which needs a majority of the remaining active voters, a `Threshold` context with more than 191 eligible voters would need more than 96 approvals, so the fallback cannot execute there; `00-open-questions.md` records this with the cap. An action whose required approvals exceed 96 is not executable, and the executor's SDK returns `GovernanceError::LimitExceeded` naming the limit.
