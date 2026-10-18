@@ -938,10 +938,11 @@ impl FfiBridgeProvider {
         //
         // Handler execution is bounded by `outlet_timeout_ms` to prevent a
         // misbehaving handler from blocking the tokio runtime indefinitely.
-        // Uses std::thread::spawn + mpsc::recv_timeout (sync timeout) because
-        // ContextProvider::invoke_outlet is a sync trait method. See issue #123.
+        // Uses std::thread::spawn plus a tokio timeout on a oneshot, driven by
+        // `bridge_block_on_off_thread`, because ContextProvider::invoke_outlet
+        // is a sync trait method. See issue #123.
         //
-        // KNOWN LIMITATION — thread leak on timeout: When `recv_timeout`
+        // KNOWN LIMITATION — thread leak on timeout: When the timeout
         // expires, the spawned `std::thread` continues running in the
         // background until the handler returns naturally. Rust threads
         // cannot be forcibly cancelled — there is no `pthread_cancel`
@@ -1093,23 +1094,29 @@ impl FfiBridgeProvider {
                 let _ = tx.send(result);
             });
 
-            // A timeout, or a handler thread that ended without sending (it
-            // panicked), is reported as the timeout, as before.
-            let handler_result =
-                block_on_provider_task(async move { tokio::time::timeout(timeout, rx).await })
-                    .map_err(|e| {
-                        refund(format!(
-                            "outlet handler for '{outlet_name}' wait failed: {e}"
-                        ))
-                    })?
-                    .ok()
-                    .and_then(Result::ok)
-                    .ok_or_else(|| {
-                        refund(format!(
-                            "outlet handler for '{outlet_name}' timed out after {}ms",
-                            timeout.as_millis()
-                        ))
-                    })?;
+            // The handler runs on its own thread, so the wait needs no worker
+            // of the ambient runtime: on a current-thread runtime it runs on
+            // a private runtime off this thread, as `UniFFI`'s `run_outlet`
+            // does, so the handler is waited on in every regime. A timeout,
+            // or a handler thread that ended without sending (it panicked),
+            // is reported as the timeout, as before.
+            let handler_result = scp_ffi_common::bridge_wait::bridge_block_on_off_thread(
+                || crate::runtime().map_err(|e| e.to_string()),
+                async move { tokio::time::timeout(timeout, rx).await },
+            )
+            .map_err(|e| {
+                refund(format!(
+                    "outlet handler for '{outlet_name}' wait failed: {e}"
+                ))
+            })?
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| {
+                refund(format!(
+                    "outlet handler for '{outlet_name}' timed out after {}ms",
+                    timeout.as_millis()
+                ))
+            })?;
 
             let output = handler_result
                 .map_err(|e| refund(format!("outlet handler for '{outlet_name}' failed: {e}")))?;
@@ -3340,6 +3347,46 @@ mod tests {
             final_count, 2,
             "event log should have 2 events after two invocations"
         );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// Called from a task on a current-thread runtime, `run_outlet` still
+    /// waits for the handler (on a private runtime off the blocked thread)
+    /// and returns its result, where a refusal of the current-thread wait
+    /// would report a failed call for an outlet that ran.
+    #[test]
+    fn run_outlet_waits_for_the_handler_on_a_current_thread_runtime() {
+        let creator = "did:dht:z6MkCreatorCurrentThreadOutlet";
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
+        register_sum_handler(&bi, &ctx_id);
+        let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: creator.to_owned(),
+            context_ids: vec![ctx_id.clone()],
+            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+        let host = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime builds");
+        let result = host.block_on(async {
+            invoke_granted(
+                &provider,
+                &ctx_id,
+                "calculator",
+                serde_json::json!({"a": 2, "b": 5}),
+            )
+        });
+        assert_eq!(
+            result,
+            Ok(serde_json::json!({"result": 7.0})),
+            "the handler result must arrive on a current-thread runtime"
+        );
+        assert_eq!(event_count(&bi, &ctx_id), 1, "the call must log its event");
 
         crate::runtime::remove_context(&bi, &ctx_id);
     }

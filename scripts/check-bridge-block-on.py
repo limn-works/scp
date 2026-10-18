@@ -161,6 +161,7 @@ CALLERS: dict[tuple[str, str], int] = {
     ("crates/scp-ffi/src/identity.rs", "identity_execute_custody_migration"): 1,
     ("crates/scp-ffi/src/lib.rs", "drain_runtime"): 1,
     ("crates/scp-ffi/src/mcp.rs", "block_on_provider_task"): 1,
+    ("crates/scp-ffi/src/mcp.rs", "run_outlet"): 1,
     ("crates/scp-ffi/src/runtime.rs", "run_storage_io"): 1,
     ("crates/scp-ffi/uniffi/src/bridge.rs", "add_relay"): 1,
     ("crates/scp-ffi/uniffi/src/bridge.rs", "address_resolve"): 1,
