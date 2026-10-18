@@ -1951,44 +1951,62 @@ The commitment is `SHA-256("SCP-PREROTATION-COMMITMENT-V1:" || pre_rotation_publ
 
 ### Vector 48: a service record signed by the designated operational key
 
-A service record is `(identifier, sequence, entries)`, and `03-identity.md` §3.10.13 states its preimage. The signer is the operational key Vector 41's key state designates for the service-record role, which is §25.2's secondary key. The record's sequence is its own and is unrelated to the key-event log's.
+A service record is `(identifier, sequence, entries)`, and `03-identity.md` §3.10.13 states its preimage. The signer is the operational key Vector 41's key state designates for the service-record role, which is §25.2's secondary key. The record's sequence is its own and is unrelated to the key-event log's. Entry 3 is a tier 3 bridge entry (`18-addressability-and-deployment.md` §18.2.1) whose `bridgeTarget` is the identity routing ID of `10-infrastructure-and-self-hosting.md` §10.12.4.1 over Vector 41's identifier; entries 0 and 1 are `SCPRelay` entries carrying no `bridgeTarget`, so each signs the absent value `SHA-256(0x00)`, and entry 2 is an `IdentityPrivateState` entry, which signs three strings and no trailing bytes.
 
 ```
 identifier:    2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
 sequence:      4
-entry_count:   3
+entry_count:   4
   entry 0:  id "#scp-relay-1", type "SCPRelay", serviceEndpoint "wss://relay.example.com/scp/v1"
+            bridgeTarget (absent, SHA-256(0x00)):
+              6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
   entry 1:  id "#scp-relay-2", type "SCPRelay", serviceEndpoint "wss://relay2.example.com/scp/v1"
+            bridgeTarget (absent, SHA-256(0x00)):
+              6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
   entry 2:  id "#private-state-1", type "IdentityPrivateState", serviceEndpoint "wss://relay.example.com/scp/v1"
+  entry 3:  id "#scp-relay-3", type "SCPRelay", serviceEndpoint "wss://bridge.example.com/scp/v1"
+            bridgeTarget (SHA-256("scp:did:" || identifier)):
+              e28f5c2c9807461518840283432a1af1701e1f2e8e83c3e8024fb6187e318ba9
 
-entries field (207 bytes) = BE32(3) || each entry's id, type, serviceEndpoint
-under §9.5.1's variable-length rule, in that order and with no discriminator:
-  000000030000000c237363702d72656c61792d310000000853435052656c6179
+entries field (366 bytes) = BE32(4) || each entry's id, type, serviceEndpoint
+under §9.5.1's variable-length rule, in that order and with no discriminator,
+then, for an SCPRelay entry only, its 32-byte bridgeTarget with no prefix:
+  000000040000000c237363702d72656c61792d310000000853435052656c6179
   0000001e7773733a2f2f72656c61792e6578616d706c652e636f6d2f7363702f
-  76310000000c237363702d72656c61792d320000000853435052656c61790000
+  76316e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617af
+  a01d0000000c237363702d72656c61792d320000000853435052656c61790000
   001f7773733a2f2f72656c6179322e6578616d706c652e636f6d2f7363702f76
-  310000001023707269766174652d73746174652d31000000144964656e746974
+  316e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa0
+  1d0000001023707269766174652d73746174652d31000000144964656e746974
   795072697661746553746174650000001e7773733a2f2f72656c61792e657861
-  6d706c652e636f6d2f7363702f7631
+  6d706c652e636f6d2f7363702f76310000000c237363702d72656c61792d3300
+  00000853435052656c61790000001f7773733a2f2f6272696467652e6578616d
+  706c652e636f6d2f7363702f7631e28f5c2c9807461518840283432a1af1701e
+  1f2e8e83c3e8024fb6187e318ba9
 
 Address, SHA-256("scp:svc:" || identifier):
   415152a878481430157966302b508188f6715a49e2bc7072bad1c4a54af24f17
 
-Preimage (269 bytes = 22-byte separator + 247 field bytes):
+Preimage (428 bytes = 22-byte separator + 406 field bytes):
   5343502d534552564943452d5245434f52442d56313a2c0f7f4478be94db0078
   311ef51ba3cc9934362b0f154dcbf9c597572e46cf3200000000000000040000
-  00030000000c237363702d72656c61792d310000000853435052656c61790000
+  00040000000c237363702d72656c61792d310000000853435052656c61790000
   001e7773733a2f2f72656c61792e6578616d706c652e636f6d2f7363702f7631
+  6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
   0000000c237363702d72656c61792d320000000853435052656c61790000001f
-  7773733a2f2f72656c6179322e6578616d706c652e636f6d2f7363702f763100
+  7773733a2f2f72656c6179322e6578616d706c652e636f6d2f7363702f76316e
+  340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d00
   00001023707269766174652d73746174652d31000000144964656e7469747950
   72697661746553746174650000001e7773733a2f2f72656c61792e6578616d70
-  6c652e636f6d2f7363702f7631
+  6c652e636f6d2f7363702f76310000000c237363702d72656c61792d33000000
+  0853435052656c61790000001f7773733a2f2f6272696467652e6578616d706c
+  652e636f6d2f7363702f7631e28f5c2c9807461518840283432a1af1701e1f2e
+  8e83c3e8024fb6187e318ba9
 Canonical hash:
-  fcff6eee58fb20d5fa2a262d87ab409bd6f58a8daf40bb64afe746a8084b6889
-Signature, secondary key (311 bytes on the wire):
-  5ba64b72652d546603a529bf03ab548699269a77ee215b31edf0597cf258b3c3
-  775b5d1cf03291277d994e85bd0bdc99497e002f426d2d00351d186d001a1cc4
+  9a5010feedaf272bfad571746c9b9029bf80863d7a549607f7095a19c593d08b
+Signature, secondary key (470 bytes on the wire):
+  f685cee3b5d36776ec6790328d3a89c84c70477821de29f8151eaa480bab5305
+  6c614efa573fcf4a62b940d032049f74aa9f63b6dcfc42389aa46aa99b8d4f1d
 ```
 
 ## 25.29 Reveal-Authorized Event, Ranking and Identifier Text-Form Vectors (§9.7.4.2 definitions, R3, R6, `03-identity.md` §3.1)

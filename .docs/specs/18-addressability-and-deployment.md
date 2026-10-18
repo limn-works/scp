@@ -39,6 +39,23 @@ An `SCPRelay` entry declares a transport-layer relay URL where the identity's SC
 ```
 
 - **URL format:** `wss://<host>/scp/v1`, the canonical SCP relay WebSocket endpoint (ADR-004), over TLS 1.3 (§9.13). A self-hosted relay with no domain MAY use `ws://` with an address literal where the URL came from a verified service record (§10.12.7); the SDK MUST reject a `ws://` URL from `.well-known/scp` or any other source.
+- **`serviceEndpoint` has a canonical form.** `serviceEndpoint` has a canonical form under the canonical relay URL rule of `09-security-model.md` §9.18.2, and that canonical form's path ends in `/scp/v1`. A reader rejects an entry whose URL has no canonical form (a query, a fragment, or user information among the causes) or whose canonical path does not end in `/scp/v1`, routes to no such entry, and keeps the record's other entries in their order. The rejection reaches the entry and not the record.
+- **`bridgeTarget`.** A tier 3 bridge entry (`10-infrastructure-and-self-hosting.md` §10.12.4) names the identity routing ID the bridge relay forwards to in a `bridgeTarget` property, and its `serviceEndpoint` is the bridge relay's own URL:
+
+  ```json
+  {
+    "id": "#scp-relay-2",
+    "type": "SCPRelay",
+    "serviceEndpoint": "wss://bridge.example.com/scp/v1",
+    "bridgeTarget": "<64 lowercase hex digits>"
+  }
+  ```
+
+  - `bridgeTarget` is optional, and a writer sets it only on a bridge entry. An entry that is not a bridge entry omits the key.
+  - Its value is a JSON string of exactly 64 characters, each in `[0-9a-f]`, which decodes to the 32-byte identity routing ID of `10-infrastructure-and-self-hosting.md` §10.12.4.1 that the self-hosted relay registered with `BRIDGE_REGISTER`. A reader rejects the entry when the string holds an uppercase letter, a non-hex character, or a length other than 64, so one target has one spelling and two records naming it sign the same bytes.
+  - A reader rejects the entry when the decoded 32 bytes equal `SHA-256(0x00)`, because §3.10.13 encodes an absent `bridgeTarget` as those 32 bytes and a present value equal to them would sign the same preimage as an absent one.
+  - Only an `SCPRelay` entry carries `bridgeTarget`. A reader rejects any other entry type that carries the key.
+  - A reader does not require `bridgeTarget` to equal the record subject's own identity routing ID; the value is an opaque `[u8; 32]` (`10-infrastructure-and-self-hosting.md` §10.12.4.1).
 - **Signed by the designated operational key.** Relay URLs ride in the service record, which the operational key the identity's key state designates for that role signs (`03-identity.md` §3.10.13, §9.6.3). Substituting a relay URL therefore takes that key, and substituting the designation takes a threshold of the identity's standing root.
 
 When a peer resolves an identity's service record, the `SCPRelay` entries tell it where to route encrypted envelopes for that identity. An out-of-band identifier exchange leads to a key-event log replay, which yields the designated key, which authenticates the record and its relay URLs.

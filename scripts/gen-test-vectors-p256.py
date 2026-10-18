@@ -2242,21 +2242,53 @@ def emit_community_relay_list() -> None:
 
 SERVICE_RECORD_SEPARATOR = "SCP-SERVICE-RECORD-V1:"
 SERVICE_RECORD_SEQUENCE = 4
-# Three entries in the order a record carries them. Each encodes as its three
-# strings under §9.5.1's variable-length rule, in the order id, type,
-# serviceEndpoint, and carries no type discriminator beside them.
+SERVICE_RECORD_RELAY_TYPE = "SCPRelay"
+# The absent `bridgeTarget` of an SCPRelay entry: §9.5.1's absent-optional
+# value for a fixed-length field, bare.
+SERVICE_RECORD_ABSENT_BRIDGE_TARGET = sha256(b"\x00")
+# The bridge entry's target is the identity routing ID of §10.12.4.1,
+# SHA-256("scp:did:" || identifier) over Vector 41's 32 raw identifier bytes.
+SERVICE_RECORD_BRIDGE_TARGET = sha256(b"scp:did:" + INCEPTION_IDENTIFIER)
+# Four entries in the order a record carries them, as (id, type,
+# serviceEndpoint, bridgeTarget). Each encodes its three strings under §9.5.1's
+# variable-length rule, in the order id, type, serviceEndpoint, and carries no
+# type discriminator beside them; an SCPRelay entry then encodes bridgeTarget
+# as 32 bare bytes, absent as SHA-256(0x00) (`03-identity.md` §3.10.13).
 SERVICE_RECORD_ENTRIES = [
-    ("#scp-relay-1", "SCPRelay", "wss://relay.example.com/scp/v1"),
-    ("#scp-relay-2", "SCPRelay", "wss://relay2.example.com/scp/v1"),
-    ("#private-state-1", "IdentityPrivateState", "wss://relay.example.com/scp/v1"),
+    ("#scp-relay-1", "SCPRelay", "wss://relay.example.com/scp/v1", None),
+    ("#scp-relay-2", "SCPRelay", "wss://relay2.example.com/scp/v1", None),
+    ("#private-state-1", "IdentityPrivateState", "wss://relay.example.com/scp/v1", None),
+    (
+        "#scp-relay-3",
+        "SCPRelay",
+        "wss://bridge.example.com/scp/v1",
+        SERVICE_RECORD_BRIDGE_TARGET,
+    ),
 ]
+assert SERVICE_RECORD_BRIDGE_TARGET != SERVICE_RECORD_ABSENT_BRIDGE_TARGET, (
+    "vector_48: a present bridgeTarget must differ from the absent sentinel"
+)
+
+
+def service_record_entry_bridge_target(entry_type: str, bridge_target: bytes | None) -> bytes:
+    """The 32 trailing bytes an SCPRelay entry signs; empty for any other type."""
+    if entry_type != SERVICE_RECORD_RELAY_TYPE:
+        assert bridge_target is None, "only an SCPRelay entry carries bridgeTarget"
+        return b""
+    if bridge_target is None:
+        return SERVICE_RECORD_ABSENT_BRIDGE_TARGET
+    assert len(bridge_target) == 32, len(bridge_target)
+    return bridge_target
 
 
 def service_record_entries_field() -> bytes:
-    """The `entries` field: a 4-byte count, then each entry's three strings."""
+    """The `entries` field: a 4-byte count, then each entry under its type's layout."""
     body = b"".join(
-        var_field(entry_id) + var_field(entry_type) + var_field(endpoint)
-        for entry_id, entry_type, endpoint in SERVICE_RECORD_ENTRIES
+        var_field(entry_id)
+        + var_field(entry_type)
+        + var_field(endpoint)
+        + service_record_entry_bridge_target(entry_type, bridge_target)
+        for entry_id, entry_type, endpoint, bridge_target in SERVICE_RECORD_ENTRIES
     )
     return u32(len(SERVICE_RECORD_ENTRIES)) + body
 
@@ -2288,10 +2320,15 @@ def emit_commitment_and_service_record() -> None:
     emit_hex("vector_48.identifier", identifier)
     emit("vector_48.sequence", SERVICE_RECORD_SEQUENCE)
     emit("vector_48.entry_count", len(SERVICE_RECORD_ENTRIES))
-    for index, (entry_id, entry_type, endpoint) in enumerate(SERVICE_RECORD_ENTRIES):
+    for index, (entry_id, entry_type, endpoint, bridge_target) in enumerate(
+        SERVICE_RECORD_ENTRIES
+    ):
         emit(f"vector_48.entry_{index}.id", entry_id)
         emit(f"vector_48.entry_{index}.type", entry_type)
         emit(f"vector_48.entry_{index}.serviceEndpoint", endpoint)
+        signed_target = service_record_entry_bridge_target(entry_type, bridge_target)
+        if signed_target:
+            emit_hex(f"vector_48.entry_{index}.bridgeTarget", signed_target)
     emit("vector_48.entries_len", len(entries))
     emit_hex("vector_48.entries", entries)
     emit("vector_48.field_bytes", len(fields))
