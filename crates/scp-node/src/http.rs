@@ -126,10 +126,11 @@ pub struct NodeState {
     /// The public TCP listener `Node::start` bound for a configured
     /// `http_bind_addr` with port 0, or `None`.
     ///
-    /// The node advertised this listener's port, so the first bind of
-    /// [`http_bind_addr`](Self::http_bind_addr) takes it through
-    /// [`NodeState::take_or_bind_public`] instead of binding a second,
-    /// unrelated port.
+    /// The node advertised this listener's port, so a bind of
+    /// [`http_bind_addr`](Self::http_bind_addr), or of port 0 on its IP, takes
+    /// it through [`NodeState::take_or_bind_public`] instead of binding a
+    /// second, unrelated port. A serve on any other address and
+    /// [`ApplicationNode::shutdown`](crate::ApplicationNode::shutdown) close it.
     pub(crate) prebound_public: std::sync::Mutex<Option<tokio::net::TcpListener>>,
     /// Shared cancellation token for graceful shutdown of both the public
     /// HTTPS listener and the dev API listener. Cancelled by
@@ -302,10 +303,19 @@ impl NodeState {
 
     /// A public TCP listener on `requested` and its bound address.
     ///
-    /// When `requested` is the address of the listener `Node::start` bound
-    /// for a port-0 `http_bind_addr` ([`prebound_public`](Self::prebound_public)),
-    /// this takes that listener, because the node already advertised its port.
-    /// Any other address binds a new listener.
+    /// When `Node::start` bound a listener for a port-0 `http_bind_addr`
+    /// ([`prebound_public`](Self::prebound_public)), the node already
+    /// advertised that listener's port, so the listener leaves the slot on
+    /// every successful call:
+    ///
+    /// - A request for the listener's address, or for port 0 on its IP (the
+    ///   address the caller configured), takes that listener.
+    /// - Any other request binds a new listener and closes the pre-bound one,
+    ///   because the node now serves elsewhere and the advertised port would
+    ///   otherwise accept connections nothing ever answers.
+    ///
+    /// A failed bind leaves the pre-bound listener in place, unless the node
+    /// has shut down.
     ///
     /// # Errors
     ///
@@ -315,21 +325,57 @@ impl NodeState {
         &self,
         requested: SocketAddr,
     ) -> Result<(tokio::net::TcpListener, SocketAddr), NodeError> {
-        let prebound = {
-            let mut slot = self
-                .prebound_public
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let matches = slot
-                .as_ref()
-                .is_some_and(|l| l.local_addr().is_ok_and(|bound| bound == requested));
-            if matches { slot.take() } else { None }
+        let prebound = self
+            .prebound_public
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(prebound) = prebound else {
+            return bind_public_tcp(requested).await;
         };
-        match prebound {
-            Some(listener) => Ok((listener, requested)),
-            None => bind_public_tcp(requested).await,
+        if let Ok(bound) = prebound.local_addr()
+            && serves_request(bound, requested)
+        {
+            return Ok((prebound, bound));
+        }
+        match bind_public_tcp(requested).await {
+            Ok(fresh) => Ok(fresh),
+            Err(e) => {
+                // The check runs under the slot lock, and `shutdown` cancels
+                // the token before it takes that lock, so a listener is never
+                // restored after `close_prebound_public` ran.
+                let mut slot = self
+                    .prebound_public
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !self.shutdown_token.is_cancelled() {
+                    *slot = Some(prebound);
+                }
+                drop(slot);
+                Err(e)
+            }
         }
     }
+
+    /// Closes the pre-bound public listener, if one is still unserved.
+    ///
+    /// Called by [`ApplicationNode::shutdown`](crate::ApplicationNode::shutdown)
+    /// after it cancels the shutdown token: a stopped node serves nothing, so its advertised port must refuse
+    /// connections rather than queue them in a backlog no task accepts.
+    pub(crate) fn close_prebound_public(&self) {
+        drop(
+            self.prebound_public
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
+
+/// Whether a listener bound to `bound` serves a request for `requested`: the
+/// same address, or port 0 on the same IP.
+fn serves_request(bound: SocketAddr, requested: SocketAddr) -> bool {
+    bound == requested || (requested.port() == 0 && requested.ip() == bound.ip())
 }
 
 // ---------------------------------------------------------------------------

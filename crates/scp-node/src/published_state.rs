@@ -307,6 +307,7 @@ pub async fn seed_from_startup_publish(
 /// `advertised`. No artifact yet defines a tier 3 node's push routing ID.
 pub fn reserve_push_routing_id(relay: &LiveRelayUrl, advertised: &RelayService) {
     if advertised.bridge_target().is_some() {
+        // Stub — see PUSH-032
         tracing::info!(
             bridge_url = %advertised.url(),
             reserved_url = %relay.current().canonical(),

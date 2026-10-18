@@ -653,7 +653,9 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// Signals the relay server, the public HTTPS listener, and the dev API
     /// listener (if running) to stop accepting new connections. In-flight
-    /// connection handlers drain naturally -- they are not cancelled.
+    /// connection handlers drain naturally -- they are not cancelled. A public
+    /// listener `Node::start` bound for a port-0 `http_bind_addr` and no serve
+    /// took is closed, so the advertised port refuses connections.
     ///
     /// The tier re-evaluation task is stopped. When the node was built on a
     /// multi-thread runtime and the caller is off any runtime or on a
@@ -678,6 +680,8 @@ impl<S: Storage> ApplicationNode<S> {
     pub fn shutdown(&self) {
         self.relay.shutdown_handle.shutdown();
         self.state.shutdown_token.cancel();
+        // After the cancel, so a serve whose bind fails cannot restore it.
+        self.state.close_prebound_public();
         if let Some(ref handle) = self.tier_reeval {
             handle.stop_and_wait();
         }
@@ -929,15 +933,17 @@ impl<S: Storage> ApplicationNode<S> {
         // and the bound address synchronously.
         // A node that advertised the port of a listener it bound at start
         // serves on that listener.
-        let (listener, _) = self
-            .state
-            .take_or_bind_public(addr)
-            .await
-            .inspect_err(|_| {
-                // Reset serving flag on bind failure.
-                self.serving.store(false, Ordering::SeqCst);
-            })?;
-        self.spawn_background_server(listener, surface, tls_config)
+        // Nothing after the take can fail, so a taken pre-bound listener is
+        // always served.
+        let (listener, local_addr) =
+            self.state
+                .take_or_bind_public(addr)
+                .await
+                .inspect_err(|_| {
+                    // Reset serving flag on bind failure.
+                    self.serving.store(false, Ordering::SeqCst);
+                })?;
+        self.spawn_background_server(listener, local_addr, surface, tls_config)
             .await
     }
 
@@ -959,7 +965,11 @@ impl<S: Storage> ApplicationNode<S> {
         tls_config: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<SocketAddr, NodeError> {
         self.claim_background_serve()?;
-        self.spawn_background_server(listener, surface, tls_config)
+        let local_addr = listener.local_addr().map_err(|e| {
+            self.serving.store(false, Ordering::SeqCst);
+            NodeError::Serve(format!("failed to get local address: {e}"))
+        })?;
+        self.spawn_background_server(listener, local_addr, surface, tls_config)
             .await
     }
 
@@ -988,11 +998,12 @@ impl<S: Storage> ApplicationNode<S> {
         Ok(())
     }
 
-    /// Spawns the background server on a bound listener. The caller holds the
-    /// single-serve flag; it is reset if the local address cannot be read.
+    /// Spawns the background server on a bound listener whose address the
+    /// caller read. The caller holds the single-serve flag.
     async fn spawn_background_server(
         &self,
         listener: tokio::net::TcpListener,
+        local_addr: SocketAddr,
         surface: PublicSurface,
         tls_config: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<SocketAddr, NodeError> {
@@ -1000,11 +1011,6 @@ impl<S: Storage> ApplicationNode<S> {
 
         // Build the merged router for the requested public surface.
         let merged = self.build_scp_router_with_surface(axum::Router::new(), surface);
-
-        let local_addr = listener.local_addr().map_err(|e| {
-            self.serving.store(false, Ordering::SeqCst);
-            NodeError::Serve(format!("failed to get local address: {e}"))
-        })?;
 
         // Store the bound address.
         {
@@ -5643,6 +5649,129 @@ mod tests {
             .await
             .expect("serves on the configured address");
         assert_eq!(served.port(), port, "the node serves the port it published");
+        node.shutdown();
+    }
+
+    /// Starts a node whose `http_bind_addr` is `127.0.0.1:0` and returns it
+    /// with the port its relay URL publishes.
+    async fn port_zero_node() -> (ApplicationNode<InMemoryStorage>, u16) {
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+        let node = Node::start_for_testing(NodeConfig {
+            reach: Reach::Local,
+            dht: DhtMode::Disabled,
+            http_bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            ..no_domain_config(tier)
+        })
+        .await
+        .expect("a port-0 http_bind_addr starts");
+        let url = node.relay_url();
+        let port: u16 = url
+            .strip_prefix("ws://127.0.0.1:")
+            .and_then(|rest| rest.strip_suffix("/scp/v1"))
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("loopback relay URL with a port: {url}"));
+        assert_ne!(port, 0);
+        (node, port)
+    }
+
+    /// Whether a TCP connect to `127.0.0.1:port` is refused.
+    async fn loopback_port_refuses(port: u16) -> bool {
+        tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+    }
+
+    /// The SDK `serve(bindAddr)` path passes the configured `127.0.0.1:0`; the
+    /// node serves the port it published, not a second port.
+    #[tokio::test]
+    async fn serve_background_on_the_configured_port_zero_serves_the_published_port() {
+        let (node, port) = port_zero_node().await;
+
+        let served = node
+            .serve_background(Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .await
+            .expect("serves on the configured address");
+
+        assert_eq!(served.port(), port, "the node serves the port it published");
+        node.shutdown();
+    }
+
+    /// `shutdown` closes a pre-bound listener no serve took.
+    #[tokio::test]
+    async fn shutdown_closes_the_unserved_prebound_listener() {
+        let (node, port) = port_zero_node().await;
+        assert!(
+            !loopback_port_refuses(port).await,
+            "the pre-bound listener accepts before shutdown"
+        );
+
+        node.shutdown();
+
+        assert!(
+            loopback_port_refuses(port).await,
+            "the published port refuses connections after shutdown"
+        );
+    }
+
+    /// Dropping a node that never served closes its pre-bound listener.
+    #[tokio::test]
+    async fn dropping_an_unserved_node_closes_the_prebound_listener() {
+        let (node, port) = port_zero_node().await;
+
+        drop(node);
+
+        assert!(
+            loopback_port_refuses(port).await,
+            "the published port refuses connections after the node drops"
+        );
+    }
+
+    /// A background serve on another address closes the pre-bound listener,
+    /// which no serve can take afterwards.
+    #[tokio::test]
+    async fn serving_elsewhere_closes_the_prebound_listener() {
+        let (node, port) = port_zero_node().await;
+        let elsewhere = free_loopback_addr();
+
+        let served = node
+            .serve_background(Some(elsewhere))
+            .await
+            .expect("serves on the requested address");
+
+        assert_eq!(served, elsewhere);
+        assert!(
+            loopback_port_refuses(port).await,
+            "the unserved published port refuses connections"
+        );
+        node.shutdown();
+    }
+
+    /// A background serve whose bind fails leaves the pre-bound listener open,
+    /// so no other socket can take the published port, and the next serve
+    /// takes it.
+    #[tokio::test]
+    async fn a_failed_serve_keeps_the_prebound_listener() {
+        let (node, port) = port_zero_node().await;
+        let occupied = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("bind a probe listener");
+        let occupied_addr = occupied.local_addr().expect("probe address");
+
+        node.serve_background(Some(occupied_addr))
+            .await
+            .expect_err("binding an occupied address fails");
+        assert!(
+            !loopback_port_refuses(port).await,
+            "the published port stays bound after the failed serve"
+        );
+        let served = node
+            .serve_background(None)
+            .await
+            .expect("serves on the configured address");
+
+        assert_eq!(served.port(), port, "the retry serves the published port");
+        drop(occupied);
         node.shutdown();
     }
 
