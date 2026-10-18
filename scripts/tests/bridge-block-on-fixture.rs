@@ -441,6 +441,78 @@ fn flag_glob_use_of_std_sync() {
     use std::sync::*;
 }
 
+// Each escape below builds a std receiver named `events`, which no receiver
+// name rule matches, so only the `mpsc` path can flag the loop over it.
+fn flag_use_list_nested_std_mpsc_path() {
+    use std::sync::{mpsc::channel, Arc};
+    let (_tx, events) = channel::<u8>();
+    for e in events {
+        drop(Arc::new(e));
+    }
+}
+
+fn flag_use_list_nested_std_mpsc_list() {
+    use std::sync::{mpsc::{channel}};
+    let (_tx, events) = channel::<u8>();
+    for e in events {
+        drop(e);
+    }
+}
+
+fn flag_use_list_std_mpsc_rename() {
+    use std::sync::{mpsc as chan};
+    let (_tx, events) = chan::channel::<u8>();
+    for e in events {
+        drop(e);
+    }
+}
+
+fn flag_use_std_root_list_std_mpsc() {
+    use std::{sync::{mpsc::{self as q}}};
+    let (_tx, events) = q::channel::<u8>();
+    for e in events {
+        drop(e);
+    }
+}
+
+fn flag_std_sync_alias_mpsc_path() {
+    use std::sync as std_sync_alias;
+    let (_tx, events) = std_sync_alias::mpsc::channel::<u8>();
+    for e in events {
+        drop(e);
+    }
+}
+
+fn flag_std_sync_self_alias_mpsc_path() {
+    use std::sync::{self as std_sync_self_alias};
+    let (_tx, events) = std_sync_self_alias::mpsc::channel::<u8>();
+    for e in events {
+        drop(e);
+    }
+}
+
+fn flag_std_alias_mpsc_path() {
+    use std as std_root_alias;
+    let (_tx, events) = std_root_alias::sync::mpsc::channel::<u8>();
+    for e in events {
+        drop(e);
+    }
+}
+
+fn flag_std_sync_alias_mpsc_in_a_macro() {
+    use std::sync as std_sync_macro_alias;
+    drop(vec![std_sync_macro_alias::mpsc::channel::<u8>()]);
+}
+
+fn pass_tokio_mpsc_nested_and_aliased() {
+    use tokio::sync::{mpsc::{channel}, Mutex};
+    use tokio::sync as tokio_sync_alias;
+    use futures::channel::{mpsc::unbounded};
+    let (_tx, _rx) = tokio_sync_alias::mpsc::channel::<u8>(1);
+    drop(vec![tokio_sync_alias::mpsc::unbounded_channel::<u8>()]);
+    let _ = (channel::<u8>(1), unbounded::<u8>(), Mutex::new(0_u8));
+}
+
 fn flag_crossbeam_channel() {
     let (_tx, _rx) = crossbeam_channel::unbounded::<u8>();
 }

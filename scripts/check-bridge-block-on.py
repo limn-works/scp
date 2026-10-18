@@ -44,9 +44,12 @@ thread-blocking call. Anywhere else these fail:
     `for m in self.rx`), an identifier or field named `rx`, `receiver`, or
     either with a `<word>_` prefix (`event_rx`); `try_iter` does not block
     and passes;
-  - any `std::sync::mpsc` (a `std::sync::mpsc` or bare `sync::mpsc` path, a
-    `use std::sync::{mpsc, ..}`, the same tokens in a macro, or a glob
-    `use std::sync::*` that would let a bare `mpsc` past) and any
+  - any `mpsc` path or use-tree segment whose full path, rebuilt through
+    the enclosing paths and use lists and expanded through the `use`
+    aliases in scope, starts with neither `tokio` nor `futures`
+    (`std::sync::mpsc`, a bare `sync::mpsc`, `use std::sync::{mpsc::channel}`,
+    `use std::sync as s; s::mpsc::channel()`, the same tokens in a macro),
+    a glob `use std::sync::*` that would let a bare `mpsc` past, and any
     `crossbeam_channel` identifier: a bridge channel is tokio's, so no
     production wait can hide in a sync channel's `recv`;
   - tokio `Runtime::shutdown_timeout`, which blocks until the runtime's
@@ -650,44 +653,172 @@ def _is_receiver_for_loop(node, source: bytes) -> bool:
     )
 
 
+def _path_segments(node, source: bytes) -> list[str]:
+    """The segments of a path node's text (`::std::sync` -> `std`, `sync`)."""
+    text = SCANNER.node_text(node, source)
+    return [seg.strip() for seg in text.split("::") if seg.strip()]
+
+
+def _use_leaves(
+    node, source: bytes, prefix: list[str], out: dict[str, list[list[str]]]
+) -> None:
+    """Record every name a use tree brings into scope, with the full path it
+    names: `use std::sync::{mpsc::channel, self as s}` records `channel` ->
+    `std::sync::mpsc::channel` and `s` -> `std::sync`."""
+    kind = node.type
+    if kind == "use_list":
+        for child in node.named_children:
+            _use_leaves(child, source, prefix, out)
+        return
+    if kind == "scoped_use_list":
+        path = node.child_by_field_name("path")
+        inner = prefix + (_path_segments(path, source) if path is not None else [])
+        listed = node.child_by_field_name("list")
+        if listed is not None:
+            _use_leaves(listed, source, inner, out)
+        return
+    if kind == "use_as_clause":
+        path = node.child_by_field_name("path")
+        alias = node.child_by_field_name("alias")
+        if path is None or alias is None:
+            return
+        full = prefix + _path_segments(path, source)
+        if full and full[-1] == "self":
+            full = full[:-1]
+        out.setdefault(SCANNER.node_text(alias, source), []).append(full)
+        return
+    if kind in ("identifier", "scoped_identifier", "self", "crate", "super"):
+        full = prefix + _path_segments(node, source)
+        if full and full[-1] == "self":
+            full = full[:-1]
+        if full:
+            out.setdefault(full[-1], []).append(full)
+
+
+def _scope_imports(node, source: bytes) -> list[dict[str, list[list[str]]]]:
+    """The names each enclosing scope's `use` declarations bring in, innermost
+    scope first: a `use` is visible in the block or module that holds it."""
+    scopes: list[dict[str, list[list[str]]]] = []
+    cur = node.parent
+    while cur is not None:
+        if cur.type in ("block", "declaration_list", "source_file"):
+            names: dict[str, list[list[str]]] = {}
+            for child in cur.named_children:
+                if child.type != "use_declaration":
+                    continue
+                arg = child.child_by_field_name("argument")
+                if arg is not None:
+                    _use_leaves(arg, source, [], names)
+            scopes.append(names)
+        cur = cur.parent
+    return scopes
+
+
+def _resolve_path(
+    segs: list[str], scopes: list[dict[str, list[list[str]]]], depth: int = 0
+) -> list[list[str]]:
+    """Every full path `segs` can name once its first segment is expanded
+    through the imports in scope (innermost scope first); a first segment no
+    `use` in scope binds stays as written."""
+    if not segs or depth > 8:
+        return [segs]
+    for names in scopes:
+        bound = names.get(segs[0])
+        if bound is None:
+            continue
+        out: list[list[str]] = []
+        for full in bound:
+            if full and full[0] == segs[0]:
+                out.append(full + segs[1:])
+            else:
+                out.extend(_resolve_path(full + segs[1:], scopes, depth + 1))
+        return out
+    return [segs]
+
+
+def _use_tree_prefix(container, source: bytes) -> list[str]:
+    """The segments the `scoped_use_list`s around `container` put before it
+    (`std::sync` for the `mpsc::channel` of `use std::sync::{mpsc::channel}`);
+    empty outside a use tree."""
+    segs: list[str] = []
+    cur = container
+    while cur.parent is not None:
+        parent = cur.parent
+        if parent.type == "scoped_use_list":
+            if parent.child_by_field_name("list") == cur:
+                path = parent.child_by_field_name("path")
+                if path is not None:
+                    segs = _path_segments(path, source) + segs
+        elif parent.type == "use_declaration":
+            return segs
+        elif parent.type not in ("use_list", "use_as_clause", "scoped_identifier"):
+            return []
+        cur = parent
+    return []
+
+
+# The roots a channel `mpsc` path may resolve to: tokio's and futures'.
+ASYNC_MPSC_ROOTS = frozenset({"tokio", "futures"})
+
+
+def _macro_path_before(node, source: bytes) -> list[str] | None:
+    """The `a::b::` segments before `node` in a macro's tokens."""
+    segs: list[str] = []
+    sep = _prev_token(node)
+    while sep is not None and SCANNER.node_text(sep, source) == "::":
+        word = _prev_token(sep)
+        if word is None or word.type not in ("identifier", "self", "crate", "super"):
+            break
+        segs.insert(0, SCANNER.node_text(word, source))
+        sep = _prev_token(word)
+    return segs
+
+
 def _is_std_mpsc(node, source: bytes) -> bool:
-    """True when `node` (an `mpsc`) names `std::sync::mpsc`: the last segment
-    of a `std::sync::mpsc` or bare `sync::mpsc` path, an item of a
-    `use std::sync::{mpsc, ..}`, or the same tokens in a macro. tokio's
-    `tokio::sync::mpsc` passes."""
+    """True when `node` (an `mpsc` path segment) can name a channel module
+    outside tokio and futures: its full path, rebuilt through the enclosing
+    `scoped_identifier`, `use_list`, `scoped_use_list` and `use_as_clause`
+    nodes (or a macro's `a::b::` tokens) and with its first segment expanded
+    through the `use` declarations in scope (`use std::sync as s;
+    s::mpsc::channel()`), starts with neither `tokio` nor `futures`. A bare
+    `mpsc` that no `use` in scope binds passes, because the `use` that brought
+    it in is itself checked."""
     if SCANNER.node_text(node, source) != "mpsc":
         return False
     parent = node.parent
     if parent is None:
         return False
-    if (
+    if parent.type == "token_tree":
+        segs = _macro_path_before(node, source)
+    elif (
         parent.type == "scoped_identifier"
         and parent.child_by_field_name("name") == node
     ):
         path = parent.child_by_field_name("path")
-        return path is not None and (
-            STD_SYNC_PATH_RE.match(SCANNER.node_text(path, source)) is not None
+        segs = _path_segments(path, source) if path is not None else []
+        segs = _use_tree_prefix(parent, source) + segs
+    elif (
+        parent.type
+        in (
+            "scoped_identifier",
+            "scoped_use_list",
+            "use_as_clause",
+            "scoped_type_identifier",
         )
-    if parent.type == "use_list":
-        scoped = parent.parent
-        if scoped is not None and scoped.type == "scoped_use_list":
-            path = scoped.child_by_field_name("path")
-            return path is not None and (
-                STD_SYNC_PATH_RE.match(SCANNER.node_text(path, source)) is not None
-            )
+        and parent.child_by_field_name("path") == node
+    ):
+        segs = (
+            _use_tree_prefix(parent, source)
+            if parent.type != "scoped_type_identifier"
+            else []
+        )
+    elif parent.type in ("use_list", "use_declaration"):
+        segs = _use_tree_prefix(node, source)
+    else:
         return False
-    if parent.type == "token_tree":
-        sep = _prev_token(node)
-        if sep is None or SCANNER.node_text(sep, source) != "::":
-            return False
-        sync = _prev_token(sep)
-        if sync is None or SCANNER.node_text(sync, source) != "sync":
-            return False
-        sep = _prev_token(sync)
-        if sep is None or SCANNER.node_text(sep, source) != "::":
+    for full in _resolve_path(segs + ["mpsc"], _scope_imports(node, source)):
+        if len(full) > 1 and full[0] not in ASYNC_MPSC_ROOTS:
             return True
-        root = _prev_token(sep)
-        return root is None or SCANNER.node_text(root, source) == "std"
     return False
 
 
@@ -1214,6 +1345,27 @@ def _real_scan_fixture_trees() -> list[str]:
                 + "mpsc.rs": "pub fn f() { let _ = std::sync::mpsc::channel::<u8>(); }\n"
             },
             1,
+        )
+        extra[f"a nested `use std::sync::{{mpsc::channel}}` in the {bridge} bridge"] = (
+            {
+                root + "nested.rs": "use std::sync::{mpsc::channel, Arc};\n"
+                + "pub fn f() { let (_t, events) = channel::<Arc<u8>>(); for e in events { drop(e); } }\n"
+            },
+            1,
+        )
+        extra[f"an aliased `std::sync` `mpsc` path in the {bridge} bridge"] = (
+            {
+                root + "alias.rs": "use std::sync as s;\n"
+                + "pub fn f() { let _ = s::mpsc::channel::<u8>(); }\n"
+            },
+            1,
+        )
+        extra[f"an aliased `tokio::sync` `mpsc` path in the {bridge} bridge"] = (
+            {
+                root + "talias.rs": "use tokio::sync as s;\n"
+                + "pub fn f() { let _ = s::mpsc::channel::<u8>(1); }\n"
+            },
+            0,
         )
         extra[f"a `crossbeam_channel` in the {bridge} bridge"] = (
             {
