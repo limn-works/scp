@@ -932,26 +932,69 @@ async fn grading_budget_is_total_per_attempt() {
     );
 }
 
+/// Signals the stall in [`grading_deadline_decides_expiry_when_the_runtime_stalls`]
+/// sends: case 18's handler returned, case 19's started, case 19's
+/// returned.
+#[derive(Debug, PartialEq, Eq)]
+enum StallSignal {
+    Case18Returned,
+    Case19Started,
+    Case19Returned,
+}
+
 /// The budget's deadline decides expiry, not timer poll order: the only
-/// runtime worker stalls from before the deadline until after the
-/// evaluator, the pipeline's timer and the grading timer have all
-/// finished, so every one of them is ready when the worker resumes. The
-/// second case still fails with `budget_exceeded`.
+/// runtime worker stalls from case 19's start until case 19's handler has
+/// returned, which is after the deadline, so the evaluator's result, the
+/// pipeline's timer and the grading timer are all ready when the worker
+/// resumes. The second case still fails with `budget_exceeded`.
+///
+/// Every step is ordered by a signal, not a wall-clock margin: case 18's
+/// handler returns at once and signals; the stall starts when case 19's
+/// handler signals its start (case 18's verdict is recorded by then, since
+/// the cases run one at a time) and blocks the worker until case 19's
+/// handler signals its return. Case 19's handler sleeps the whole budget
+/// after it starts, and the deadline was set before it started, so it
+/// returns after the deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn grading_deadline_decides_expiry_when_the_runtime_stalls() {
+    const BUDGET: Duration = Duration::from_secs(2);
     let h = Harness::new(evaluator_params()).await;
-    let invoker = h.invoker(Some(registry()), Some(sleeping_handler(500)));
+    let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel::<StallSignal>();
+    let (sync_tx, sync_rx) = std::sync::mpsc::channel::<StallSignal>();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler: EvaluatorHandler = {
+        let calls = Arc::clone(&calls);
+        let sync_tx = std::sync::Mutex::new(sync_tx);
+        Arc::new(move |_input| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                async_tx.send(StallSignal::Case18Returned).unwrap();
+            } else {
+                async_tx.send(StallSignal::Case19Started).unwrap();
+                std::thread::sleep(BUDGET);
+                sync_tx
+                    .lock()
+                    .unwrap()
+                    .send(StallSignal::Case19Returned)
+                    .unwrap();
+            }
+            Ok(verdict(true))
+        })
+    };
+    let invoker = h.invoker(Some(registry()), Some(handler));
     let request = h.create(2, &invoker).await;
     let response = h.respond(&request, 1).await;
-    let stall = tokio::spawn(async {
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        std::thread::sleep(Duration::from_millis(800));
+    let stall = tokio::spawn(async move {
+        assert_eq!(async_rx.recv().await, Some(StallSignal::Case18Returned));
+        assert_eq!(async_rx.recv().await, Some(StallSignal::Case19Started));
+        // Blocks the only worker until case 19's handler returns.
+        assert_eq!(sync_rx.recv(), Ok(StallSignal::Case19Returned));
     });
     let graded = h
-        .grade_within(&request, &response, &invoker, Duration::from_millis(750))
+        .grade_within(&request, &response, &invoker, BUDGET)
         .await
         .unwrap();
     stall.await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(graded.reasons[18].passed, "{:?}", graded.reasons[18]);
     assert_eq!(
         graded.reasons[19].reason.as_deref(),
