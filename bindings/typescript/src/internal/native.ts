@@ -122,6 +122,18 @@ function resolveNapiPackage(): string {
  */
 export type NativeAddon = Record<string, unknown>;
 
+/**
+ * The napi-rs `SCP.nodeStart` export (`crates/scp-ffi/napi/src/scp.rs`):
+ * `configJson` is the bridge's `NodeStartConfig` JSON and `identity` the raw
+ * operator handle whose DID it names. The bridge runs the ADR-048 handle
+ * check on `identity` before it reads `configJson`, and rejects with the
+ * codes of sdk-common.md §"Node start error codes".
+ */
+export type NativeNodeStart = (
+  configJson: string,
+  identity: BridgeIdentityHandle,
+) => Promise<unknown>;
+
 // why: one-time FFI addon load cache. Holds the raw napi-rs object whose
 // keys carry both the SCP class constructor (`addon.SCP`) and the
 // module-level free-function exports (templateGetParams, scpVersion,

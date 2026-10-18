@@ -4349,12 +4349,20 @@ impl Scp {
     /// `config_json` is a `NodeStartConfig` (construction.md §"Node start —
     /// `NodeStartConfig`"): its `identity` names an operator identity
     /// registered on this instance, and the node runs on this instance's own
-    /// storage. Each failure rejects with the code sdk-common.md §"Node start
-    /// error codes" gives it, such as `SCP-IDENT-1063` for an unregistered
-    /// operator DID.
+    /// storage. `identity` is the operator handle whose DID the config names.
+    /// Each failure rejects with the code sdk-common.md §"Node start error
+    /// codes" gives it: `SCP-PERM-3030` when another `SCP` minted `identity`
+    /// (ADR-048), checked before the config is read, and `SCP-IDENT-1063` for
+    /// an unregistered operator DID or a config that names a DID other than
+    /// `identity`'s.
     #[napi(js_name = "nodeStart")]
-    pub async fn node_start(&self, config_json: String) -> napi::Result<NapiNodeHandle> {
-        crate::server::node_start_on(&self.inner, config_json).await
+    pub async fn node_start(
+        &self,
+        config_json: String,
+        identity: &NapiIdentity,
+    ) -> napi::Result<NapiNodeHandle> {
+        crate::napi_check_handle!(&self.inner.core, identity);
+        crate::server::node_start_on(&self.inner, config_json, &identity.did()).await
     }
 }
 
