@@ -5881,63 +5881,86 @@ impl McpUniFfiBridgeProvider {
         // Phase 2: Execute handler OUTSIDE the locks so that concurrent
         // same-context operations are not blocked. Handler execution is
         // bounded by `outlet_timeout_ms` (matching PyO3 pattern, issue #123).
-        let (output, output_hash) = {
-            let (handler, output_schema) = dispatch;
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            std::thread::spawn(move || {
-                let result = handler(arguments);
-                let _ = tx.send(result);
-            });
+        let (output, output_hash, elapsed_ms) =
+            {
+                let (handler, output_schema) = dispatch;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                std::thread::spawn(move || {
+                    let result = handler(arguments);
+                    let _ = tx.send(result);
+                });
 
-            // The wait is an async timeout driven by the bridge wait, because
-            // no bridge code blocks outside `bridge_wait`. Inside a
-            // current-thread runtime it runs on a private runtime, so the
-            // handler is waited on in every regime, as before. A timeout, or a
-            // handler thread that ended without sending (it panicked), is
-            // reported as the timeout.
-            let handler_result = scp_ffi_common::bridge_wait::bridge_block_on_off_thread(
+                // One bridge wait drives the handler wait and the UCAN
+                // registration, because no bridge code blocks outside
+                // `bridge_wait`. Inside a current-thread runtime it runs on a
+                // private runtime, so the handler is waited on in every regime. A
+                // timeout, or a handler thread that ended without sending (it
+                // panicked), is reported as the timeout.
+                let bi_wait = &bi;
+                let finished = scp_ffi_common::bridge_wait::bridge_block_on_off_thread(
                 || Ok(crate::runtime()),
-                async move { tokio::time::timeout(timeout, rx).await },
+                async move {
+                    let handler_result = tokio::time::timeout(timeout, rx)
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .ok_or_else(|| {
+                            format!(
+                                "outlet handler for '{outlet_name}' timed out after {}ms",
+                                timeout.as_millis()
+                            )
+                        })?;
+                    let output = handler_result
+                        .map_err(|e| format!("outlet handler for '{outlet_name}' failed: {e}"))?;
+
+                    // Validate output against the outlet's output schema
+                    // (defense-in-depth).
+                    scp_core::context::outlets::schema::validate_value_against_schema(
+                        &output,
+                        &output_schema,
+                    )
+                    .map_err(|msg| {
+                        format!("output validation failed for outlet '{outlet_name}': {msg}")
+                    })?;
+                    // An output with no canonical form has no hash, so it
+                    // fails output validation before any event is appended.
+                    let output_hash = scp_core::context::outlets::sha256_json(&output).map_err(
+                        |e| format!("output validation failed for outlet '{outlet_name}': {e}"),
+                    )?;
+                    let elapsed = start.elapsed();
+
+                    // Ensure UCAN state is registered before the event is
+                    // appended, while the supervisor reports the context
+                    // `Active`. A failure leaves the append to the `None` arm
+                    // below, which logs it.
+                    if let Err(e) = bi_wait.ensure_ucan_registered_while_active(context_id).await {
+                        tracing::warn!(
+                            outlet = %outlet_name,
+                            context = %context_id,
+                            error = %e,
+                            "UCAN state could not be registered for the OutletInvokedEvent append"
+                        );
+                    }
+                    Ok::<_, String>((output, output_hash, elapsed))
+                },
             )
-            .map_err(|e| format!("outlet handler for '{outlet_name}' wait failed: {e}"))?
-            .ok()
-            .and_then(Result::ok)
-            .ok_or_else(|| {
-                format!(
-                    "outlet handler for '{outlet_name}' timed out after {}ms",
-                    timeout.as_millis()
-                )
-            })?;
+            .map_err(|e| format!("outlet handler for '{outlet_name}' wait failed: {e}"))?;
+                let (output, output_hash, elapsed) = finished?;
 
-            let output = handler_result
-                .map_err(|e| format!("outlet handler for '{outlet_name}' failed: {e}"))?;
-
-            // Validate output against the outlet's output schema (defense-in-depth).
-            scp_core::context::outlets::schema::validate_value_against_schema(
-                &output,
-                &output_schema,
-            )
-            .map_err(|msg| format!("output validation failed for outlet '{outlet_name}': {msg}"))?;
-            // An output with no canonical form has no hash, so it fails
-            // output validation before any event is appended.
-            let output_hash = scp_core::context::outlets::sha256_json(&output)
-                .map_err(|e| format!("output validation failed for outlet '{outlet_name}': {e}"))?;
-
-            (output, output_hash)
-        };
-
-        // Phase 3: Append OutletInvokedEvent to the event log (ADR-010
-        // criterion 3). Uses append_unsigned_event because ContextProvider
-        // is sync (same as PyO3 bridge).
-        #[allow(clippy::cast_possible_truncation)]
-        let elapsed_ms = {
-            let millis = start.elapsed().as_millis();
-            if millis > u128::from(u64::MAX) {
-                u64::MAX
-            } else {
-                millis as u64
-            }
-        };
+                // Phase 3: Append OutletInvokedEvent to the event log (ADR-010
+                // criterion 3). Uses append_unsigned_event because
+                // ContextProvider is sync (same as PyO3 bridge).
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed_ms = {
+                    let millis = elapsed.as_millis();
+                    if millis > u128::from(u64::MAX) {
+                        u64::MAX
+                    } else {
+                        millis as u64
+                    }
+                };
+                (output, output_hash, elapsed_ms)
+            };
 
         let outlet_event = scp_core::context::outlets::OutletInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -5961,21 +5984,6 @@ impl McpUniFfiBridgeProvider {
         let payload_data = serde_json::to_vec(&outlet_event).unwrap_or_default();
 
         let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
-
-        // Ensure UCAN state is registered before appending the event, while
-        // the supervisor reports the context `Active`. A failure leaves the
-        // append to the `None` arm below, which logs it.
-        if let Err(e) = crate::block_on_shared(bi.ensure_ucan_registered_while_active(context_id))
-            .map_err(|e| e.to_string())
-            .and_then(|registered| registered.map_err(|e| e.to_string()))
-        {
-            tracing::warn!(
-                outlet = %outlet_name,
-                context = %context_id,
-                error = %e,
-                "UCAN state could not be registered for the OutletInvokedEvent append"
-            );
-        }
 
         let append_result = bi.with_ucan_state(context_id, |ucan_state| {
             let sequence = scp_event_log::tree::event_count(&ucan_state.event_log);

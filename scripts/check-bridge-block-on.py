@@ -170,7 +170,7 @@ CALLERS: dict[tuple[str, str], int] = {
     ("crates/scp-ffi/uniffi/src/bridge.rs", "identity_execute_custody_migration"): 1,
     ("crates/scp-ffi/uniffi/src/bridge.rs", "outlet_grant"): 1,
     ("crates/scp-ffi/uniffi/src/bridge.rs", "role_state_of"): 1,
-    ("crates/scp-ffi/uniffi/src/bridge.rs", "run_outlet"): 2,
+    ("crates/scp-ffi/uniffi/src/bridge.rs", "run_outlet"): 1,
     ("crates/scp-ffi/uniffi/src/bridge.rs", "scpid_sign_impl"): 1,
     ("crates/scp-ffi/uniffi/src/bridge.rs", "scpid_verify_on"): 1,
     ("crates/scp-ffi/uniffi/src/lib.rs", "block_on_shared"): 1,
