@@ -147,11 +147,12 @@ public struct Node: Sendable {
     /// and throws `ScpError.Transport` with `SCP-TRANS-5055`. Production
     /// callers use `scp.nodeStart(config:)`.
     ///
-    /// On a `testing` build, when `identity` is provided, the node uses the
-    /// pre-existing identity instead of generating a fresh one, and it
-    /// auto-wires encrypted in-memory storage (ephemeral), self-signed TLS, a
-    /// relay on an OS-assigned port, in-memory key custody, and an in-memory
-    /// DHT client.
+    /// On a `testing` build the node auto-wires encrypted in-memory storage
+    /// (ephemeral), self-signed TLS, and a relay on an OS-assigned port. When
+    /// `identity` is provided, the node uses that pre-existing identity, its
+    /// DID method, and the production DHT mode. When `identity` is `nil`, the
+    /// node generates a fresh identity under in-memory key custody and an
+    /// in-memory DHT client.
     ///
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.

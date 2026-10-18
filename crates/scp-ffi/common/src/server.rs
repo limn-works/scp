@@ -404,8 +404,9 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// `OsRng` AES-256-GCM key.
 ///
 /// That wrap is what makes an ephemeral backend satisfy a sealed
-/// `EncryptedStorage` bound, so this shipped `server`-feature front door goes
-/// through a production [`Node::start`] constructor rather than
+/// `EncryptedStorage` bound, so `start_node_in_memory` (a `testing`-only front
+/// door since SCP-327) goes through a production [`Node::start`] constructor
+/// rather than
 /// `Node::start_for_testing`. Spec §17.5 names this pattern canonical, and
 /// it already appears in
 /// [`build_event_log_provider`](crate::bridge_runtime::build_event_log_provider).
@@ -498,8 +499,9 @@ pub async fn start_node_in_memory(
                     },
                     // `Explicit` carries no custody, so `K` is unconstrained by
                     // the variant; annotate it to a production custody type
-                    // (`FileKeyCustody`) so no test-only nullifier type appears
-                    // on this shipped `server`-feature path (ADR-062 §Decision 6).
+                    // (`FileKeyCustody`) so a caller-supplied identity runs on
+                    // no test-only nullifier type (ADR-062 §Decision 6). This
+                    // path compiles only under `test` or `testing` (SCP-327).
                     IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
                         ExplicitIdentity {
                             identity: id.identity,
@@ -737,8 +739,9 @@ where
                 },
                 // `Explicit` carries no custody, so `K` is unconstrained by the
                 // variant; annotate it to `FileKeyCustody` (matching the
-                // persisted arm below), so no test-only nullifier type appears on
-                // this shipped `server`-feature path (ADR-062 §Decision 6).
+                // persisted arm below), so a caller-supplied identity runs on no
+                // test-only nullifier type (ADR-062 §Decision 6). This path
+                // compiles only under `test` or `testing` (SCP-327).
                 IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
                     ExplicitIdentity {
                         identity: id.identity,

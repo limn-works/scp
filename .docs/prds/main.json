@@ -11825,6 +11825,7 @@
         "bindings/typescript/tests/server.test.ts",
         "bindings/swift/Sources/SCP/Server.swift",
         "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Server.kt",
         ".docs/standards/sdk-common.md",
         ".github/workflows/ci.yml"
       ],

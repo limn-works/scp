@@ -812,47 +812,31 @@ pub(crate) async fn node_start_on(
 // `scp-ffi-common/testing` on for every test build, so a split on the common
 // feature would start a node in a test of the shipped configuration. The
 // shipped variants are plain `fn`s returning a ready future, so the exported
-// `async` methods await either variant unchanged.
-
-/// The handle-affinity check every dev-pair variant runs first: an identity
-/// another `Scp` minted fails with `SCP-PERM-3030` (ADR-048).
-fn check_dev_identity(
-    bi: &crate::runtime::UniffiBridgeInstance,
-    identity: Option<&Arc<Identity>>,
-) -> Result<(), ScpError> {
-    identity.map_or(Ok(()), |id| {
-        bi.core
-            .check_handle(id.instance_id())
-            .map_err(ScpError::from)
-    })
-}
+// `async` methods await either variant unchanged. Neither variant checks the
+// identity handle: the `Scp` exports in `bridge.rs`, the FFI entry ADR-048
+// names, run that check before they call here, on both builds.
 
 /// The shipped `node_start_in_memory`: the dev pair is cut from builds
-/// without `testing` (SCP-327), so after the handle check it returns
-/// `SCP-TRANS-5055` and starts nothing.
+/// without `testing` (SCP-327), so it returns `SCP-TRANS-5055` and starts
+/// nothing.
 #[cfg(not(feature = "testing"))]
 pub(crate) fn node_start_in_memory_on(
-    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-    identity: Option<Arc<Identity>>,
+    _bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    _identity: Option<Arc<Identity>>,
 ) -> std::future::Ready<Result<Arc<NodeHandle>, ScpError>> {
-    std::future::ready(
-        check_dev_identity(bi, identity.as_ref()).and(Err(ServerError::DevStartUnavailable.into())),
-    )
+    std::future::ready(Err(ServerError::DevStartUnavailable.into()))
 }
 
 /// The shipped `node_start_local`: the dev pair is cut from builds without
-/// `testing` (SCP-327), so after the handle check it returns `SCP-TRANS-5055`
-/// and creates nothing.
+/// `testing` (SCP-327), so it returns `SCP-TRANS-5055` and creates nothing.
 #[cfg(not(feature = "testing"))]
 pub(crate) fn node_start_local_on(
-    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    _bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     _data_dir: String,
-    identity: Option<Arc<Identity>>,
+    _identity: Option<Arc<Identity>>,
     _passphrase: Option<String>,
 ) -> std::future::Ready<Result<Arc<NodeHandle>, ScpError>> {
-    std::future::ready(
-        check_dev_identity(bi, identity.as_ref()).and(Err(ServerError::DevStartUnavailable.into())),
-    )
+    std::future::ready(Err(ServerError::DevStartUnavailable.into()))
 }
 
 /// Per-instance helper used by [`crate::Scp::node_start_in_memory`] on a
@@ -862,7 +846,6 @@ pub(crate) async fn node_start_in_memory_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     identity: Option<Arc<Identity>>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
-    check_dev_identity(bi, identity.as_ref())?;
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
         None => None,
@@ -900,7 +883,6 @@ pub(crate) async fn node_start_local_on(
     identity: Option<Arc<Identity>>,
     passphrase: Option<String>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
-    check_dev_identity(bi, identity.as_ref())?;
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
         None => None,
@@ -1223,9 +1205,10 @@ mod tests {
 
     /// The dev pair is cut from a shipped build (SCP-327): the exported
     /// `node_start_in_memory` returns the transport-class `SCP-TRANS-5055`
-    /// and starts no node, with and without an identity, while an identity
-    /// another `Scp` minted still fails the ADR-048 check with
-    /// `SCP-PERM-3030` first.
+    /// and starts no node, with and without an identity. An identity another
+    /// `Scp` minted fails first with `SCP-PERM-3030`, from the ADR-048 check
+    /// the `Scp` export in `bridge.rs` runs before it calls the shipped
+    /// variant.
     #[test]
     #[cfg(not(feature = "testing"))]
     fn node_start_in_memory_on_a_shipped_build_returns_trans_5055() {
@@ -1267,7 +1250,9 @@ mod tests {
 
     /// The dev pair is cut from a shipped build (SCP-327): the exported
     /// `node_start_local` returns the transport-class `SCP-TRANS-5055` and
-    /// writes no key file or blob store under `data_dir`.
+    /// writes no key file or blob store under `data_dir`. An identity another
+    /// `Scp` minted fails first with `SCP-PERM-3030`, from the export's
+    /// ADR-048 check.
     #[test]
     #[cfg(not(feature = "testing"))]
     fn node_start_local_on_a_shipped_build_returns_trans_5055() {
@@ -1292,6 +1277,28 @@ mod tests {
         assert!(
             !tmp.exists(),
             "a shipped node_start_local must create nothing under data_dir"
+        );
+
+        let other = crate::scp::Scp::new_in_memory_for_test();
+        let foreign = rt()
+            .block_on(other.identity_load("did:dht:z6MkDevStartProbe".to_owned()))
+            .expect("identity_load builds an external handle on every build");
+        let err = start_error(
+            rt().block_on(scp.node_start_local(
+                tmp.to_string_lossy().into_owned(),
+                Some(foreign),
+                Some("test-passphrase".to_owned()),
+            )),
+            "foreign identity",
+        );
+        assert_eq!(
+            class_and_code(&err),
+            ("permission", codes::PERM_3030),
+            "{err:?}"
+        );
+        assert!(
+            !tmp.exists(),
+            "a refused node_start_local must create nothing under data_dir"
         );
     }
 
