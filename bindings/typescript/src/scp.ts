@@ -1856,6 +1856,19 @@ export class SCP {
   }
 
   /**
+   * Runs one native call and rethrows its rejection, or a synchronous throw
+   * from argument conversion, as the typed SDK error `mapBridgeError` derives
+   * from the `[SCP-…]` code in its message.
+   */
+  async #mapNativeErrors<T>(call: () => Promise<T>): Promise<T> {
+    try {
+      return await call();
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
    * Reserves a pooled MLS `KeyPackage` under the joiner's own identity for a
    * spawn-from-Welcome join (ADR-049 Phase 2J).
    *
@@ -1883,11 +1896,13 @@ export class SCP {
    * );
    */
   async reserveKeyPackage(owningDid: string): Promise<KeyPackageReservation> {
-    const raw = await (
-      this.#native.reserveKeyPackage as (
-        d: string,
-      ) => Promise<{ reservationId: string; keyPackagePublic: ArrayLike<number> }>
-    )(owningDid);
+    const raw = await this.#mapNativeErrors(() =>
+      (
+        this.#native.reserveKeyPackage as (
+          d: string,
+        ) => Promise<{ reservationId: string; keyPackagePublic: ArrayLike<number> }>
+      )(owningDid),
+    );
     return {
       reservationId: raw.reservationId,
       keyPackagePublic: new Uint8Array(raw.keyPackagePublic),
@@ -1942,18 +1957,20 @@ export class SCP {
       enc: Array.from(sealed.enc),
       ciphertext: Array.from(sealed.ciphertext),
     };
-    const raw = await (
-      this.#native.contextJoinFromWelcome as (
-        o: string,
-        s: {
-          contextId: string;
-          creatorDid: string;
-          enc: readonly number[];
-          ciphertext: readonly number[];
-        },
-        r: string,
-      ) => Promise<unknown>
-    )(owningDid, nativeSealed, reservationId);
+    const raw = await this.#mapNativeErrors(() =>
+      (
+        this.#native.contextJoinFromWelcome as (
+          o: string,
+          s: {
+            contextId: string;
+            creatorDid: string;
+            enc: readonly number[];
+            ciphertext: readonly number[];
+          },
+          r: string,
+        ) => Promise<unknown>
+      )(owningDid, nativeSealed, reservationId),
+    );
     return Context._fromHandle(this, raw as never, owningDid);
   }
 
@@ -2012,22 +2029,24 @@ export class SCP {
     const keyPackageArray = ArrayBuffer.isView(inviteeKeyPackage)
       ? Array.from(inviteeKeyPackage as Uint8Array)
       : (inviteeKeyPackage as readonly number[]);
-    const raw = await (
-      this.#native.inviteMember as (
-        ctx: string,
-        c: string,
-        i: string,
-        kp: readonly number[],
-      ) => Promise<{
-        bundle: {
-          contextId: string;
-          creatorDid: string;
-          enc: ArrayLike<number>;
-          ciphertext: ArrayLike<number>;
-        };
-        delivered: boolean;
-      }>
-    )(contextId, creatorDid, inviteeDid, keyPackageArray);
+    const raw = await this.#mapNativeErrors(() =>
+      (
+        this.#native.inviteMember as (
+          ctx: string,
+          c: string,
+          i: string,
+          kp: readonly number[],
+        ) => Promise<{
+          bundle: {
+            contextId: string;
+            creatorDid: string;
+            enc: ArrayLike<number>;
+            ciphertext: ArrayLike<number>;
+          };
+          delivered: boolean;
+        }>
+      )(contextId, creatorDid, inviteeDid, keyPackageArray),
+    );
 
     // Project the flat napi object into the SDK outcome. The `bundle` is a
     // SealedInvitation directly usable as the join input. A voting-governed

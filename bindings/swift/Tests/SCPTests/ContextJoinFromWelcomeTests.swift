@@ -305,7 +305,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
 
     /// A custodied joiner with a real reservation but an HPKE `enc` that is not
     /// a 65-byte uncompressed P-256 point is rejected by the runtime
-    /// (`ScpError.Context`) before any custody call or the reservation is
+    /// (`ScpError.Validation`, `SCP-VALID-7005`) before any custody call or the reservation is
     /// consumed (spec 09 §9.16.2 Open step 1). The retired 32-byte X25519
     /// width is rejected like any other length.
     func testJoinFromWelcomeRejectsAnEncThatIsNotAP256Point() async throws {
@@ -325,10 +325,10 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
                     reservationId: reservation.reservationId
                 )
                 XCTFail("expected a \(enc.count)-byte HPKE enc to be rejected")
-            } catch let ScpError.Context(msg, _) {
-                XCTAssertTrue(msg.contains("invitation enc"), "expected the enc rejection, got \(msg)")
+            } catch let ScpError.Validation(_, code) {
+                XCTAssertEqual(code, "SCP-VALID-7005")
             } catch {
-                XCTFail("expected ScpError.Context, got \(error)")
+                XCTFail("expected ScpError.Validation, got \(error)")
             }
         }
     }

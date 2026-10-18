@@ -319,9 +319,12 @@ if (!scpAvailable) {
         // Well-formed DID that passes format validation but is not a locally
         // custodied identity on this instance — the bridge custody gate fails
         // closed BEFORE any KeyPackage is consumed.
-        await expect(scp.reserveKeyPackage("did:dht:not-custodied-here")).rejects.toThrow(
-          /SCP-IDENT-1001/,
+        const err = await scp.reserveKeyPackage("did:dht:not-custodied-here").then(
+          () => undefined,
+          (e: unknown) => e,
         );
+        expect(err).toBeInstanceOf(IdentityError);
+        expect((err as IdentityError).code).toBe("SCP-IDENT-1001");
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }
@@ -413,14 +416,19 @@ if (!scpAvailable) {
         // Well-formed DID that is not custodied on this instance: the invite is
         // signed under the inviter's `#active` key, so the identity-registry
         // lookup fails closed before the runtime driver call.
-        await expect(
-          scp.inviteMember(
+        const err = await scp
+          .inviteMember(
             ctx.contextId,
             "did:dht:not-custodied-here",
             invitee.did,
             reservation.keyPackagePublic,
-          ),
-        ).rejects.toThrow();
+          )
+          .then(
+            () => undefined,
+            (e: unknown) => e,
+          );
+        expect(err).toBeInstanceOf(IdentityError);
+        expect((err as IdentityError).code).toBe("SCP-IDENT-1001");
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }
@@ -477,9 +485,13 @@ if (!scpAvailable) {
             enc,
             ciphertext: new Uint8Array([9]),
           };
-          await expect(
-            scp.contextJoinFromWelcome(joiner.did, sealed, reservation.reservationId),
-          ).rejects.toThrow(/invitation enc/);
+          const err = await scp
+            .contextJoinFromWelcome(joiner.did, sealed, reservation.reservationId)
+            .then(
+              () => undefined,
+              (e: unknown) => e,
+            );
+          expect((err as { code?: string } | undefined)?.code).toBe("SCP-VALID-7005");
         }
       } finally {
         await scp.shutdown(1000).catch(() => {});

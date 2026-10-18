@@ -157,12 +157,11 @@ enum class DestructionMethod {
  * - `SCP-CRYPTO-4006`: Key not found (a software or Keystore lookup, any key type, X25519
  *   included, or a Keystore identity's pseudonym secret)
  * - `SCP-CRYPTO-4003`: Wrong key type for operation, or a [KeyCustodyProvider.dhAgree] peer
- *   public key that is not 32 bytes long. [KeyCustodyProvider.dhAgree] raises it for a wrong
- *   key type only when the handle names a software Ed25519 key.
+ *   public key that is not 32 bytes long.
  * - `SCP-CRYPTO-4004`: Key destruction failed
- * - `SCP-CRYPTO-4005`: Key agreement refused, because the handle is a Keystore handle
- *   (thrown only by [KeyCustodyProvider.dhAgree], from [KeyHandle.custodyType] before any key
- *   lookup: Keystore never releases the Ed25519 seed the X25519 scalar comes from; retrying
+ * - `SCP-CRYPTO-4005`: Key agreement refused, because the handle names an Ed25519 key, a
+ *   Keystore one (from [KeyHandle.custodyType], before any key lookup) or a software one
+ *   (thrown only by [KeyCustodyProvider.dhAgree]: an Ed25519 key never agrees; retrying
  *   cannot succeed)
  * - `SCP-TRANS-5080`: Wake payload invalid: the push payload has no `scp` field, or its
  *   `scp` field is not `"1"`
@@ -473,14 +472,13 @@ interface KeyCustodyProvider {
      * key. See
      * [AndroidKeyCustody.dhAgree] for where the software implementation holds the key.
      *
-     * @param keyHandle Handle to an X25519 key, or to a software Ed25519 key, which agrees
-     *   through its X25519 scalar `SHA-512(seed)[0..32]`.
+     * @param keyHandle Handle to an X25519 key. An Ed25519 key never agrees.
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
      * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long,
      *   checked before any key lookup.
-     * @throws ScpException with code `SCP-CRYPTO-4005` for a Keystore Ed25519 handle
-     *   ([CustodyType.HARDWARE]): Keystore never releases the seed the scalar comes from.
+     * @throws ScpException with code `SCP-CRYPTO-4005` for an Ed25519 key, a Keystore handle
+     *   ([CustodyType.HARDWARE]) or a software one: an Ed25519 key never agrees.
      * @throws ScpException with code `SCP-CRYPTO-4006` if no software key sits under
      *   [keyHandle].
      * @throws IllegalStateException from Bouncy Castle ("X25519 agreement failed") if
