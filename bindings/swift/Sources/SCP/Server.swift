@@ -390,8 +390,9 @@ public struct Node: Sendable {
         ///   config), `SCP-STORAGE-8008` (blob storage open or directory
         ///   creation), `SCP-STORAGE-8009` (core node storage).
         ///   `.Validation`: `SCP-VALID-7004`. `.Identity`: `SCP-IDENT-1063`
-        ///   (operator identity unavailable, including one another ``SCP``
-        ///   minted), `SCP-IDENT-1001`. `.Transport`: `SCP-TRANS-5050`,
+        ///   (operator identity unavailable), `SCP-IDENT-1001`. `.Permission`:
+        ///   `SCP-PERM-3030` (another ``SCP`` minted `config.identity`,
+        ///   ADR-048). `.Transport`: `SCP-TRANS-5050`,
         ///   `SCP-TRANS-5051` (relay start), `SCP-TRANS-5052` (TLS),
         ///   `SCP-TRANS-5054` (serve or NAT), `SCP-TRANS-5055`,
         ///   `SCP-TRANS-5056` (the bridge could not bind the `Supervisor` to

@@ -3693,6 +3693,9 @@ class SCP:
                 ``SCP-STORAGE-8008`` when the blob storage cannot be opened or
                 its directory created, ``SCP-STORAGE-8009`` for a core node
                 storage error.
+            UcanPermissionError: ``SCP-PERM-3030`` when another ``SCP``
+                instance minted ``config.identity`` (ADR-048). The bridge runs
+                this check on the identity handle before it reads the config.
             IdentityError: ``SCP-IDENT-1063`` when the operator identity is not
                 registered on this instance or the node's identity operation
                 fails.
@@ -3704,9 +3707,13 @@ class SCP:
                 instance holds the binding; the bridge has shut the node down
                 before it raises ``SCP-TRANS-5056``.
         """
-        config_json = _require_type(config, NodeStartConfig, "SCP.node_start(): config")._to_json()
+        config = _require_type(config, NodeStartConfig, "SCP.node_start(): config")
+        # The bridge runs the ADR-048 affinity check on this handle, the check
+        # every operation taking an Identity runs, before it reads the config.
+        operator = _unwrap_handle(config.identity, Identity, "node_start", "config.identity")
+        config_json = config._to_json()
         try:
-            raw = await asyncio.to_thread(self._native.node_start, config_json)
+            raw = await asyncio.to_thread(self._native.node_start, config_json, operator)
         except Exception as exc:
             raise _coded_bridge_error(exc) from exc
         return Node(raw)

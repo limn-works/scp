@@ -780,19 +780,17 @@ fn lower_node_start_config(
 /// # Errors
 ///
 /// The code sdk-common.md §"Node start error codes" gives the failure. An
-/// identity another `Scp` minted is not registered on this instance, so it is
-/// `OperatorIdentityUnavailable` (`SCP-IDENT-1063`), as on the `PyO3` and
-/// napi-rs bridges.
+/// identity another `Scp` minted fails the ADR-048 handle check with
+/// `SCP-PERM-3030`, as on every bridge.
 pub(crate) async fn node_start_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     cfg: NodeStartConfig,
 ) -> Result<Arc<NodeHandle>, ScpError> {
-    // The handle check stays first, so a foreign handle reaches no other step;
-    // its failure goes through the shared table instead of the bridge-wide
-    // `SCP-PERM-3030`, which would give this one failure a UniFFI-only code.
+    // The ADR-048 handle check stays first, so a foreign handle reaches no
+    // other step.
     bi.core
         .check_handle(cfg.identity.instance_id())
-        .map_err(|_| ScpError::from(ServerError::OperatorIdentityUnavailable))?;
+        .map_err(ScpError::from)?;
     let (cfg, identity) = lower_node_start_config(cfg)?;
     let node_identity = build_node_identity_from_uniffi(&identity)?;
     let storage = bi.protocol_repository().instance_storage();
@@ -1463,13 +1461,12 @@ mod tests {
         drop(taken);
     }
 
-    /// An operator identity another `Scp` minted is not registered on this
-    /// instance, so `node_start` returns `SCP-IDENT-1063` through the shared
-    /// table, the code the `PyO3` and napi-rs bridges return, not the
-    /// bridge-wide handle-affinity code `SCP-PERM-3030`.
+    /// An operator identity another `Scp` minted fails the ADR-048 handle
+    /// check with `SCP-PERM-3030` before any other step, on `node_start` as on
+    /// the dev-pair start.
     #[test]
     #[cfg(feature = "testing")]
-    fn node_start_rejects_another_instances_identity_with_ident_1063() {
+    fn node_start_rejects_another_instances_identity_with_perm_3030() {
         let minting = crate::scp::Scp::new_in_memory_for_test();
         let identity = rt()
             .block_on(minting.identity_create("in_memory".to_owned(), None))
@@ -1481,11 +1478,10 @@ mod tests {
         );
         assert_eq!(
             class_and_code(&err),
-            ("identity", codes::IDENT_1063),
+            ("permission", codes::PERM_3030),
             "{err:?}"
         );
-        // Every other operation keeps the handle-affinity code: the dev-pair
-        // start still refuses the same foreign handle with `SCP-PERM-3030`.
+        // The dev-pair start refuses the same foreign handle the same way.
         let id = rt()
             .block_on(minting.identity_create("in_memory".to_owned(), None))
             .unwrap();

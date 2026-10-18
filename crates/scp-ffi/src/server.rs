@@ -525,10 +525,12 @@ fn instance_storage(bi: &crate::runtime::PyBridgeInstance) -> Result<InstanceSto
 /// Starts a production node on `bi`'s storage under the operator identity the
 /// config names (construction.md §"Node start — `NodeStartConfig`").
 ///
-/// Runs, in order: the config parse, the operator identity resolution, taking
-/// the instance storage, `server::node_start`, `server::register_node`,
-/// `auto_wire_context_manager` (which shuts the node down and unregisters it
-/// on failure), and wrapping the handle.
+/// Runs, in order: the config parse, the operator identity resolution (so a
+/// malformed DID stays `SCP-STORAGE-8007`), the check that the config names
+/// the operator handle the caller passed, taking the instance storage,
+/// `server::node_start`, `server::register_node`, `auto_wire_context_manager`
+/// (which shuts the node down and unregisters it on failure), and wrapping
+/// the handle.
 ///
 /// # Errors
 ///
@@ -538,10 +540,17 @@ fn node_start_on(
     py: Python<'_>,
     rt: &tokio::runtime::Runtime,
     config_json: &str,
+    operator_did: &str,
 ) -> Result<PyNodeHandle, ScpPyError> {
     let bi = &**bi_arc;
     let cfg = NodeStartConfig::from_json(config_json).map_err(server_error)?;
     let identity = resolve_operator_identity(bi, &cfg.identity)?;
+    // The config names its operator by DID; the caller also passed the
+    // operator handle the ADR-048 check ran on. A config naming any other
+    // identity would run the node under an operator that check never saw.
+    if cfg.identity != operator_did {
+        return Err(server_error(ServerError::OperatorIdentityUnavailable));
+    }
     let storage = instance_storage(bi)?;
     let node = py
         .allow_threads(|| rt.block_on(server::node_start(cfg, identity, storage)))
@@ -569,13 +578,22 @@ impl crate::scp::PyScp {
     /// ``config_json`` is a ``NodeStartConfig`` (construction.md §"Node start
     /// — ``NodeStartConfig``"): its ``identity`` names an operator identity
     /// registered on this instance, and the node runs on this instance's own
-    /// storage. Each failure raises with the code sdk-common.md §"Node start
-    /// error codes" gives it, such as ``SCP-IDENT-1063`` for an unregistered
-    /// operator DID.
+    /// storage. ``identity`` is the operator handle whose DID the config
+    /// names. Each failure raises with the code sdk-common.md §"Node start
+    /// error codes" gives it: ``SCP-PERM-3030`` when another ``SCP`` minted
+    /// ``identity`` (ADR-048), checked before the config is read, and
+    /// ``SCP-IDENT-1063`` for an unregistered operator DID or a config that
+    /// names a DID other than ``identity``'s.
     #[pyo3(name = "node_start")]
-    pub fn node_start(&self, py: Python<'_>, config_json: &str) -> PyResult<PyNodeHandle> {
+    pub fn node_start(
+        &self,
+        py: Python<'_>,
+        config_json: &str,
+        identity: &crate::identity::PyIdentity,
+    ) -> PyResult<PyNodeHandle> {
+        crate::pyscp_check_handle!(&self.inner.core, identity);
         let rt = crate::runtime()?;
-        node_start_on(&self.inner, py, rt, config_json).map_err(PyErr::from)
+        node_start_on(&self.inner, py, rt, config_json, identity.did()).map_err(PyErr::from)
     }
 
     /// Starts a relay with in-memory blob storage on an OS-assigned port.
@@ -1080,9 +1098,10 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let scp = crate::scp::PyScp::new_in_memory_for_test();
-            let json = start_json("did:dht:z6MkNodeStartOperatorProbe", |_| {});
+            let probe = "did:dht:z6MkNodeStartOperatorProbe";
+            let json = start_json(probe, |_| {});
             let err = start_error(
-                node_start_on(&scp.inner, py, rt(), &json),
+                node_start_on(&scp.inner, py, rt(), &json, probe),
                 "unregistered operator",
             );
             assert_eq!(
@@ -1091,7 +1110,15 @@ mod tests {
                 "{err:?}"
             );
 
-            let raised = match scp.node_start(py, &json) {
+            let handle = crate::identity::PyIdentity::new(
+                &scp.inner,
+                probe.to_owned(),
+                "in_memory".to_owned(),
+                false,
+                None,
+                None,
+            );
+            let raised = match scp.node_start(py, &json, &handle) {
                 Ok(node) => {
                     node.shutdown();
                     panic!("the pymethod must refuse an unregistered operator");
@@ -1099,6 +1126,63 @@ mod tests {
                 Err(e) => e.to_string(),
             };
             assert!(raised.contains(codes::IDENT_1063), "{raised}");
+        });
+    }
+
+    /// An operator handle another `SCP` minted fails the ADR-048 handle check
+    /// with `SCP-PERM-3030` before the config is read, so even a config that
+    /// cannot parse returns `SCP-PERM-3030`.
+    #[test]
+    fn node_start_refuses_another_instances_identity_with_perm_3030() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let minting = crate::scp::PyScp::new_in_memory_for_test();
+            let other = crate::scp::PyScp::new_in_memory_for_test();
+            let did = "did:dht:z6MkNodeStartForeignProbe";
+            let foreign = crate::identity::PyIdentity::new(
+                &minting.inner,
+                did.to_owned(),
+                "in_memory".to_owned(),
+                false,
+                None,
+                None,
+            );
+            for json in [start_json(did, |_| {}), "{not json".to_owned()] {
+                let raised = match other.node_start(py, &json, &foreign) {
+                    Ok(node) => {
+                        node.shutdown();
+                        panic!("node_start must refuse a foreign operator handle");
+                    }
+                    Err(e) => e.to_string(),
+                };
+                assert!(raised.contains(codes::PERM_3030), "{raised}");
+            }
+        });
+    }
+
+    /// A config naming a DID other than the operator handle's returns
+    /// `SCP-IDENT-1063`: the node never runs under an operator the handle
+    /// check did not see.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_refuses_a_config_naming_another_operator_with_ident_1063() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let named = scp.identity_create(py, "in_memory", None).unwrap();
+            let passed = scp.identity_create(py, "in_memory", None).unwrap();
+            let json = start_json(named.did(), |_| {});
+            let err = start_error(
+                node_start_on(&scp.inner, py, rt(), &json, passed.did()),
+                "config names another operator",
+            );
+            assert_eq!(
+                class_and_code(&err),
+                ("identity", codes::IDENT_1063),
+                "{err:?}"
+            );
         });
     }
 
@@ -1176,7 +1260,9 @@ mod tests {
             let scp = crate::scp::PyScp::new_in_memory_for_test();
             let identity = scp.identity_create(py, "in_memory", None).unwrap();
             let did = identity.did().to_owned();
-            let node = scp.node_start(py, &start_json(&did, |_| {})).unwrap();
+            let node = scp
+                .node_start(py, &start_json(&did, |_| {}), &identity)
+                .unwrap();
 
             assert_eq!(node.did(), did);
             assert!(node.relay_port() > 0);
@@ -1237,10 +1323,12 @@ mod tests {
                 "a fallback Supervisor was attached"
             );
 
-            let node = scp.node_start(py, &start_json(&did, |_| {})).unwrap();
+            let node = scp
+                .node_start(py, &start_json(&did, |_| {}), &identity)
+                .unwrap();
             assert!(server::supervisor_wired_to(&bi.core, &node.inner));
             let err = start_error(
-                node_start_on(&scp.inner, py, rt(), &start_json(&did, |_| {})),
+                node_start_on(&scp.inner, py, rt(), &start_json(&did, |_| {}), &did),
                 "second node start",
             );
             assert_eq!(
@@ -1250,7 +1338,7 @@ mod tests {
             );
             node.shutdown();
             let restarted = scp
-                .node_start(py, &start_json(&did, |_| {}))
+                .node_start(py, &start_json(&did, |_| {}), &identity)
                 .expect("a start after the bound node stops binds again");
             assert!(server::supervisor_wired_to(&bi.core, &restarted.inner));
             restarted.shutdown();
@@ -1342,7 +1430,7 @@ mod tests {
                 ),
             ];
             for (label, json, class, code) in cases {
-                let err = start_error(node_start_on(&scp.inner, py, rt(), &json), label);
+                let err = start_error(node_start_on(&scp.inner, py, rt(), &json, &did), label);
                 assert_eq!(class_and_code(&err), (class, code), "{label}: {err:?}");
             }
         });

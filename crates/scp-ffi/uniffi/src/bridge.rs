@@ -1385,6 +1385,10 @@ impl ScpError {
     /// durable store's open or lock failure. Routed through
     /// [`ScpError::coded`], so the prefix, not this name, picks the variant.
     pub(crate) fn storage(code: &'static str, msg: String) -> Self {
+        debug_assert!(
+            code.starts_with(STORAGE_CODE_PREFIX),
+            "ScpError::storage takes only a SCP-STORAGE- code, got {code}"
+        );
         Self::coded(ErrorClass::Validation, code, msg)
     }
 }
@@ -17046,9 +17050,9 @@ impl Scp {
     ///
     /// # Errors
     ///
-    /// The code sdk-common.md §"Node start error codes" gives the failure,
-    /// such as `SCP-IDENT-1063` for an identity another `Scp` minted or one
-    /// loaded with no custody.
+    /// The code sdk-common.md §"Node start error codes" gives the failure:
+    /// `SCP-PERM-3030` when another `Scp` minted `config.identity` (ADR-048),
+    /// `SCP-IDENT-1063` for an identity loaded with no custody.
     #[cfg(feature = "server")]
     pub async fn node_start(
         &self,

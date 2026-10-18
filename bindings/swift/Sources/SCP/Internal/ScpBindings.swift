@@ -3017,9 +3017,9 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * # Errors
      *
-     * The code sdk-common.md §"Node start error codes" gives the failure,
-     * such as `SCP-IDENT-1063` for an identity another `Scp` minted or one
-     * loaded with no custody.
+     * The code sdk-common.md §"Node start error codes" gives the failure:
+     * `SCP-PERM-3030` when another `Scp` minted `config.identity` (ADR-048),
+     * `SCP-IDENT-1063` for an identity loaded with no custody.
      */
     func nodeStart(config: NodeStartConfig) async throws  -> NodeHandle
     
@@ -6166,9 +6166,9 @@ open func migrationState(handle: ContextHandle)async throws  -> String?  {
      *
      * # Errors
      *
-     * The code sdk-common.md §"Node start error codes" gives the failure,
-     * such as `SCP-IDENT-1063` for an identity another `Scp` minted or one
-     * loaded with no custody.
+     * The code sdk-common.md §"Node start error codes" gives the failure:
+     * `SCP-PERM-3030` when another `Scp` minted `config.identity` (ADR-048),
+     * `SCP-IDENT-1063` for an identity loaded with no custody.
      */
 open func nodeStart(config: NodeStartConfig)async throws  -> NodeHandle  {
     return
@@ -18972,7 +18972,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_migration_state() != 34622) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start() != 14448) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start() != 24911) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_in_memory() != 58945) {

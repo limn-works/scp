@@ -257,6 +257,7 @@
         case "Context": .Context(msg: "node start failed", code: code)
         case "Transport": .Transport(msg: "node start failed", code: code)
         case "Storage": .Storage(msg: "node start failed", code: code)
+        case "Permission": .Permission(msg: "node start failed", code: code)
         default: .Validation(msg: "node start failed", code: code)
         }
     }
@@ -289,7 +290,8 @@
         ("SCP-VALID-7004", "Validation"),
         ("SCP-CTX-2053", "Context"),
         ("SCP-TRANS-5055", "Transport"),
-        ("SCP-TRANS-5056", "Transport")
+        ("SCP-TRANS-5056", "Transport"),
+        ("SCP-PERM-3030", "Permission")
     ]
 
     // MARK: - Config shape
@@ -516,8 +518,8 @@
 
             // An operator identity another instance minted.
             error = await startError { try await other.nodeStart(config: localConfig(identity)) }
-            #expect(error?.0 == "Identity")
-            #expect(error?.1 == "SCP-IDENT-1063")
+            #expect(error?.0 == "Permission")
+            #expect(error?.1 == "SCP-PERM-3030")
 
             node.shutdown()
             try await other.shutdown(timeoutMillis: 1000)

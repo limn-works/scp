@@ -11669,6 +11669,7 @@
       "acceptanceCriteria": [
         "The TypeScript options interface and its discriminated unions carry the same field names, enum arms and required and optional split as `NodeStartConfig`, and a test asserts the JSON each config produces matches the wire shape `NodeStartConfig::from_json` reads",
         "The options interface's `identity` is the TypeScript SDK's `Identity` object, which the wrapper lowers to its DID on the wire, and a test shows any other value is rejected with a typed SDK error before the napi-rs `node_start` export is called",
+        "The wrapper rejects an `Identity` that another `SCP` instance minted with `SCP-PERM-3030` (ADR-048) before it lowers the identity to its DID, and a test asserts the code",
         "The TypeScript SDK's node start entry calls the napi-rs `node_start` export and returns a `Node`",
         "A test shows each node start code of sdk-common.md §\"Node start error codes\" throws the typed SDK error of its category with the code preserved",
         "`bun run lint` and `bun test tests/server.test.ts` pass in `bindings/typescript`"
