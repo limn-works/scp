@@ -7,7 +7,9 @@
  * construct relays and nodes via the {@link SCP} class directly
  * (`scp.relayStartInMemory()`, `scp.relayStartLocal(dir)`,
  * `scp.nodeStartInMemory(identity?)`, `scp.nodeStartLocal(dir, identity?, passphrase?)`),
- * which internally calls `_fromHandle` to hydrate these wrappers.
+ * which internally calls `_fromHandle` to hydrate these wrappers. The last
+ * two are the development pair: a shipped addon refuses both with
+ * `SCP-TRANS-5055` (SCP-327).
  *
  * The handle-level methods remain: shutdown, serve, httpUrl,
  * enableSiteProjection, commitDeploy, rollbackDeploy,
@@ -466,9 +468,9 @@ export class Relay implements AsyncDisposable {
  * operator identity. Construct a production node with
  * `scp.nodeStart(config)` ({@link NodeStartConfig}), or a development node
  * with `scp.nodeStartInMemory(identity?)` or
- * `scp.nodeStartLocal(dir, identity?, passphrase?)`; those methods
- * dispatch through the {@link SCP} class and call `_fromHandle` to
- * hydrate an instance.
+ * `scp.nodeStartLocal(dir, identity?, passphrase?)`, which a shipped
+ * addon refuses with `SCP-TRANS-5055`; those methods dispatch through the
+ * {@link SCP} class and call `_fromHandle` to hydrate an instance.
  */
 export class Node implements AsyncDisposable {
   readonly #handle: NativeNodeHandle;

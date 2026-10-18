@@ -20,6 +20,9 @@ import Foundation
 //   scp.nodeStartInMemory(identity:)
 //   scp.nodeStartLocal(dataDir:identity:passphrase:)
 //
+// The last two are the development pair: a shipped library throws
+// `SCP-TRANS-5055` from both (SCP-327).
+//
 // The production node start, `scp.nodeStart(config:)`, is macOS-only and sits
 // at the end of this file.
 //
@@ -137,22 +140,26 @@ public struct Node: Sendable {
         handle.isShutdown()
     }
 
-    /// Starts a full application node with encrypted in-memory storage.
+    /// Starts a development node with encrypted in-memory storage.
     ///
-    /// When `identity` is provided, the node uses the pre-existing identity
-    /// instead of generating a fresh one. This enables identity portability --
-    /// the same DID persists across node restarts.
+    /// **Development only.** A library built with the UniFFI bridge's
+    /// `testing` feature starts the node; a shipped library starts nothing
+    /// and throws `ScpError.Transport` with `SCP-TRANS-5055`. Production
+    /// callers use `scp.nodeStart(config:)`.
     ///
-    /// Auto-wires encrypted in-memory storage (ephemeral), self-signed TLS,
-    /// and a relay on an OS-assigned port. A build carrying a test-harness
-    /// feature also auto-wires in-memory key custody and an in-memory DHT
-    /// client; a shipped build fails closed instead when `identity` is absent.
+    /// On a `testing` build the node auto-wires encrypted in-memory storage
+    /// (ephemeral), self-signed TLS, and a relay on an OS-assigned port. When
+    /// `identity` is provided, the node uses that pre-existing identity, its
+    /// DID method, and the production DHT mode. When `identity` is `nil`, the
+    /// node generates a fresh identity under in-memory key custody and an
+    /// in-memory DHT client.
     ///
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
     ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
-    /// - Throws: ``ScpError`` if startup fails.
+    /// - Throws: `ScpError.Transport` with `SCP-TRANS-5055` on a shipped
+    ///   library, or ``ScpError`` if startup fails.
     public static func startInMemory(
         scp: SCP,
         identity: Identity? = nil
@@ -161,9 +168,15 @@ public struct Node: Sendable {
         return Node(handle: handle)
     }
 
-    /// Starts a full application node on this instance's own storage backend.
+    /// Starts a development node on this instance's own storage backend.
     ///
-    /// When `identity` is provided, the node uses the pre-existing identity.
+    /// **Development only.** A library built with the UniFFI bridge's
+    /// `testing` feature starts the node; a shipped library creates nothing
+    /// and throws `ScpError.Transport` with `SCP-TRANS-5055`. Production
+    /// callers use `scp.nodeStart(config:)`.
+    ///
+    /// On a `testing` build, when `identity` is provided, the node uses the
+    /// pre-existing identity.
     /// When `nil`, the node creates or reloads a persistent identity via
     /// `FileKeyCustody`. The `passphrase` parameter is required in this mode.
     ///
@@ -182,7 +195,8 @@ public struct Node: Sendable {
     ///   - passphrase: Passphrase for Argon2id key derivation. Required when
     ///     `identity` is `nil`.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
-    /// - Throws: ``ScpError`` if startup fails.
+    /// - Throws: `ScpError.Transport` with `SCP-TRANS-5055` on a shipped
+    ///   library, or ``ScpError`` if startup fails.
     public static func startLocal(
         scp: SCP,
         dataDir: String,

@@ -4,7 +4,8 @@ Phase 4 PR 5 Agent B+C (#1549) collapsed :class:`Relay` and :class:`Node`
 into pure handle wrappers. Use :meth:`scp_sdk.SCP.relay_start_in_memory`,
 :meth:`scp_sdk.SCP.relay_start_local`, :meth:`scp_sdk.SCP.node_start`,
 :meth:`scp_sdk.SCP.node_start_in_memory`, and
-:meth:`scp_sdk.SCP.node_start_local` to construct them.
+:meth:`scp_sdk.SCP.node_start_local` to construct them. The last two are the
+development pair: a shipped extension refuses both with ``SCP-TRANS-5055``.
 
 Handle-level methods on the PyO3 objects — ``shutdown``, ``serve``,
 ``http_url``, the broadcast deployment lifecycle on Node
@@ -391,7 +392,8 @@ class Node:
     Construct a production node via :meth:`scp_sdk.SCP.node_start`, which runs
     it on the ``SCP`` instance's storage under an operator identity, or a
     development node via :meth:`scp_sdk.SCP.node_start_in_memory` or
-    :meth:`scp_sdk.SCP.node_start_local`.
+    :meth:`scp_sdk.SCP.node_start_local`, which a shipped extension refuses
+    with ``SCP-TRANS-5055``.
     """
 
     __slots__ = ("_raw_handle",)

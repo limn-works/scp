@@ -3,8 +3,9 @@
  * `SCP.nodeStart` and `NodeStartConfig` (SCP-324).
  *
  * The SCP-296 tests and the nodeStart config and error-table tests mock the
- * native addon. The last nodeStart block runs against the built napi addon
- * and skips itself when none is installed.
+ * native addon. The last nodeStart block, which also starts the dev pair
+ * (SCP-327), runs against the built napi addon and skips itself when none is
+ * installed.
  *
  * See spec section 18.11.8 and `.docs/prds/http-features.json` SCP-296.
  */
@@ -514,6 +515,27 @@ describe("SCP.nodeStart error codes (SCP-324)", () => {
       expect((err as ScpError).code).toBe(code);
     },
   );
+
+  // SCP-327: a shipped addon refuses the dev pair with SCP-TRANS-5055, in the
+  // form `ScpNapiError` renders it, and the SDK throws it as TransportError.
+  it("throws a shipped addon's dev-pair SCP-TRANS-5055 as TransportError", async () => {
+    const { scp, native } = mountMockScp();
+    const refusal = async () => {
+      throw new Error(
+        "[SCP-TRANS-5055] transport error: development node start is unavailable in this build; use node_start",
+      );
+    };
+    native.__stub("nodeStartInMemory", refusal);
+    native.__stub("nodeStartLocal", refusal);
+    for (const call of [
+      () => scp.nodeStartInMemory(),
+      () => scp.nodeStartLocal("/tmp/scp-dev-start", null, "passphrase"),
+    ]) {
+      const err = await thrown(call);
+      expect(Object.getPrototypeOf(err)).toBe(TransportError.prototype);
+      expect((err as ScpError).code).toBe("SCP-TRANS-5055");
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -625,9 +647,34 @@ if (realScp === null) {
     // - SCP-TRANS-5054 is a serve or NAT traversal failure. nodeStart does not
     //   bind the HTTP server (a taken httpBindAddr starts), and NAT traversal
     //   fails only when its STUN exchange over the network does.
-    // - SCP-TRANS-5050, SCP-TRANS-5055, SCP-IDENT-1001, SCP-VALID-7004 and
-    //   SCP-CTX-2053 come from core node wiring that an in-memory instance with
-    //   a registered operator completes.
+    // - SCP-TRANS-5050, SCP-IDENT-1001, SCP-VALID-7004 and SCP-CTX-2053 come
+    //   from core node wiring that an in-memory instance with a registered
+    //   operator completes.
+    // - SCP-TRANS-5055 comes only from the dev pair of a shipped addon. This
+    //   suite runs a `testing` addon, where the dev pair starts a node (the
+    //   test after this one), and the Rust shipped-build tests prove 5055.
+    // The suite's addon is built with `testing`, where the dev pair still
+    // starts a node (SCP-327 cuts it only from shipped builds).
+    it("starts a node through the dev pair on the testing addon", async () => {
+      const inMemory = await scp.nodeStartInMemory();
+      try {
+        expect(inMemory.did.startsWith("did:")).toBe(true);
+        expect(inMemory.relayPort).toBeGreaterThan(0);
+      } finally {
+        await inMemory.shutdown();
+      }
+      expect(inMemory.isShutdown).toBe(true);
+
+      const local = await scp.nodeStartLocal(join(workDir, "dev-local"), operator.did, null);
+      try {
+        expect(local.did).toBe(operator.did);
+        expect(local.relayPort).toBeGreaterThan(0);
+      } finally {
+        await local.shutdown();
+      }
+      expect(local.isShutdown).toBe(true);
+    });
+
     it("throws 8007, 8008, 1063, 3030, 5051 and 5056 from the addon as typed errors", async () => {
       const regularFile = join(workDir, "regular-file");
       writeFileSync(regularFile, "x");

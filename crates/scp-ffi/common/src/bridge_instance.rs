@@ -122,8 +122,9 @@ fn next_instance_id() -> u64 {
 /// # Why an instance tracks its borrowers
 ///
 /// A bridge instance owns exactly one storage backend, chosen at construction
-/// (`SCP.with_storage({...})`). `start_node_local` hands a node a clone of that
-/// backend's `Arc`, so an instance and a node write through one handle.
+/// (`SCP.with_storage({...})`). `node_start`, and on a `testing` build the dev
+/// `start_node_local`, hand a node a clone of that backend's `Arc`, so an
+/// instance and a node write through one handle.
 /// Each bridge's [`BridgeInstanceCore::durable_store_closer`] then reaches
 /// [`scp_platform::sqlite::SqliteStorage::close`], which drops an advisory
 /// `flock(2)` on `{dir}/scp.db.lock`. That lock is what stops a second process
@@ -3578,8 +3579,8 @@ pub trait BridgeInstanceCore: Send + Sync {
     ///
     /// [`CoreFields::stop_borrowers`] runs before anything else, and this
     /// ordering lives here rather than in each bridge so no bridge can drift
-    /// out of it. A node that `start_node_local` started writes through a
-    /// clone of this instance's storage `Arc`, while the
+    /// out of it. A node that `node_start` or the dev `start_node_local`
+    /// started writes through a clone of this instance's storage `Arc`, while the
     /// [`DurableStoreCloser`] closes that same `SQLCipher` handle and drops
     /// an advisory `flock(2)` on `{dir}/scp.db.lock`. Releasing that
     /// lock while a node still writes invites split-brain writes and WAL

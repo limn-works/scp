@@ -3024,19 +3024,25 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func nodeStart(config: NodeStartConfig) async throws  -> NodeHandle
     
     /**
-     * Per-instance equivalent of the free-function `node_start_in_memory`.
+     * Starts a development node on encrypted in-memory storage.
      *
-     * Starts an in-memory application node. If `identity` is supplied, it
-     * must have been minted by this `Scp` (cross-instance handles are
-     * rejected via the `CoreFields::check_handle` call).
+     * **Development only** (SCP-327): a library built with `testing` starts
+     * the node; a shipped library returns `SCP-TRANS-5055`
+     * (`DevStartUnavailable`) and starts nothing. Production callers use
+     * `node_start`. If `identity` is supplied, it must have been minted by
+     * this `Scp` (cross-instance handles are rejected via the
+     * `CoreFields::check_handle` call) on either build.
      */
     func nodeStartInMemory(identity: Identity?) async throws  -> NodeHandle
     
     /**
-     * Per-instance equivalent of the free-function `node_start_local`.
+     * Starts a development node on this instance's own storage.
      *
-     * Starts a file-backed application node at `data_dir`. If `identity`
-     * is supplied, it must have been minted by this `Scp`.
+     * **Development only** (SCP-327): a library built with `testing` starts
+     * the node, keeping its blobs and any generated key under `data_dir`; a
+     * shipped library returns `SCP-TRANS-5055` (`DevStartUnavailable`) and
+     * creates nothing. Production callers use `node_start`. If `identity` is
+     * supplied, it must have been minted by this `Scp`.
      */
     func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?) async throws  -> NodeHandle
     
@@ -6188,11 +6194,14 @@ open func nodeStart(config: NodeStartConfig)async throws  -> NodeHandle  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `node_start_in_memory`.
+     * Starts a development node on encrypted in-memory storage.
      *
-     * Starts an in-memory application node. If `identity` is supplied, it
-     * must have been minted by this `Scp` (cross-instance handles are
-     * rejected via the `CoreFields::check_handle` call).
+     * **Development only** (SCP-327): a library built with `testing` starts
+     * the node; a shipped library returns `SCP-TRANS-5055`
+     * (`DevStartUnavailable`) and starts nothing. Production callers use
+     * `node_start`. If `identity` is supplied, it must have been minted by
+     * this `Scp` (cross-instance handles are rejected via the
+     * `CoreFields::check_handle` call) on either build.
      */
 open func nodeStartInMemory(identity: Identity?)async throws  -> NodeHandle  {
     return
@@ -6212,10 +6221,13 @@ open func nodeStartInMemory(identity: Identity?)async throws  -> NodeHandle  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `node_start_local`.
+     * Starts a development node on this instance's own storage.
      *
-     * Starts a file-backed application node at `data_dir`. If `identity`
-     * is supplied, it must have been minted by this `Scp`.
+     * **Development only** (SCP-327): a library built with `testing` starts
+     * the node, keeping its blobs and any generated key under `data_dir`; a
+     * shipped library returns `SCP-TRANS-5055` (`DevStartUnavailable`) and
+     * creates nothing. Production callers use `node_start`. If `identity` is
+     * supplied, it must have been minted by this `Scp`.
      */
 open func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?)async throws  -> NodeHandle  {
     return
@@ -18975,10 +18987,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start() != 24911) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_in_memory() != 58945) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_in_memory() != 32190) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_local() != 59051) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_local() != 37328) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_accept() != 73) {
