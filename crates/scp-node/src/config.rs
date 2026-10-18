@@ -990,6 +990,8 @@ where
     #[cfg(feature = "quic")]
     let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start().await?;
+    // Every `?` from here until the node is built shuts the relay down.
+    let relay_guard = crate::RelayShutdownGuard::new(shutdown_handle);
     let dev_token = local_api.map(generate_dev_token);
 
     let tls_provider = resolve_tls(
@@ -1017,7 +1019,7 @@ where
                 // published unconditionally + fatally, ignoring `config.dht`.
                 dht,
                 protocol_repository,
-                shutdown_handle,
+                relay_guard,
                 bound_addr,
                 bridge_secret,
                 dev_token,
@@ -1055,7 +1057,7 @@ where
                 // keeps that publish fail-closed instead of silently dropped.
                 dht,
                 protocol_repository,
-                shutdown_handle,
+                relay_guard,
                 bound_addr,
                 strategy,
                 bridge_secret,
@@ -1148,6 +1150,8 @@ where
     #[cfg(feature = "quic")]
     let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start_with_listener(listener).await?;
+    // Every `?` from here until the node is built shuts the relay down.
+    let relay_guard = crate::RelayShutdownGuard::new(shutdown_handle);
 
     // 4. Generate dev API token if local_api was configured.
     let dev_token = local_api.map(generate_dev_token);
@@ -1161,7 +1165,7 @@ where
         did_method,
         dht,
         protocol_repository,
-        shutdown_handle,
+        relay_guard,
         bound_addr,
         strategy,
         bridge_secret,

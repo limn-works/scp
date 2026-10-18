@@ -269,6 +269,45 @@ impl RelayHandle {
     }
 }
 
+/// Holds a started relay's [`ShutdownHandle`] while `Node::start` finishes,
+/// and shuts the relay down if the build fails before an [`ApplicationNode`]
+/// takes the handle.
+///
+/// Dropping a bare `ShutdownHandle` leaves the relay serving, so every `?`
+/// between starting the relay and returning the node would leak a listener on
+/// `bind_addr`. The builder moves the guard through every fallible step and
+/// calls [`disarm`](Self::disarm) only when it builds the `ApplicationNode`.
+#[derive(Debug)]
+pub(crate) struct RelayShutdownGuard {
+    handle: ShutdownHandle,
+    armed: bool,
+}
+
+impl RelayShutdownGuard {
+    /// Guards the relay `handle` shuts down.
+    pub(crate) const fn new(handle: ShutdownHandle) -> Self {
+        Self {
+            handle,
+            armed: true,
+        }
+    }
+
+    /// Hands the relay to its owner: the guard no longer shuts it down.
+    pub(crate) fn disarm(mut self) -> ShutdownHandle {
+        self.armed = false;
+        self.handle.clone()
+    }
+}
+
+impl Drop for RelayShutdownGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::info!("node start failed after the relay started; shutting the relay down");
+            self.handle.shutdown();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IdentityHandle
 // ---------------------------------------------------------------------------
@@ -3335,7 +3374,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     did_method: Arc<D>,
     dht_mode: DhtMode,
     storage: Arc<ProtocolRepository<S>>,
-    shutdown_handle: ShutdownHandle,
+    relay_guard: RelayShutdownGuard,
     bound_addr: SocketAddr,
     bridge_secret: Zeroizing<[u8; 32]>,
     dev_token: Option<String>,
@@ -3472,7 +3511,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         domain: Some(domain),
         relay: RelayHandle {
             bound_addr,
-            shutdown_handle,
+            shutdown_handle: relay_guard.disarm(),
         },
         identity: IdentityHandle::new(identity, live_state),
         storage,
@@ -3630,7 +3669,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     did_method: Arc<D>,
     dht_mode: DhtMode,
     storage: Arc<ProtocolRepository<S>>,
-    shutdown_handle: ShutdownHandle,
+    relay_guard: RelayShutdownGuard,
     bound_addr: SocketAddr,
     nat_strategy: Arc<dyn NatStrategy>,
     bridge_secret: Zeroizing<[u8; 32]>,
@@ -3783,7 +3822,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         domain: None,
         relay: RelayHandle {
             bound_addr,
-            shutdown_handle,
+            shutdown_handle: relay_guard.disarm(),
         },
         identity: IdentityHandle::new(identity, live_state),
         storage,
@@ -5552,6 +5591,54 @@ mod tests {
             matches!(err, NodeError::Nat(_)),
             "error should be NodeError::Nat, got: {err:?}"
         );
+    }
+
+    /// A `Node::start` that fails after its relay started shuts the relay
+    /// down: nothing accepts connections on `bind_addr` afterwards. The NAT
+    /// probe fails after the relay is listening, so without the shutdown the
+    /// listener would outlive the failed start.
+    #[tokio::test]
+    async fn a_failed_nat_traversal_start_leaves_no_listener() {
+        let bind_addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .unwrap();
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+
+        let result = Node::start_for_testing(NodeConfig {
+            bind_addr: Some(bind_addr),
+            dht: DhtMode::Production,
+            nat: NatSlot::Custom(Arc::new(FailingNatStrategy)),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        })
+        .await;
+        assert!(
+            matches!(result, Err(NodeError::Nat(_))),
+            "{:?}",
+            result.err()
+        );
+
+        // Shutdown is signalled synchronously; the accept loop drops the
+        // listener when it next runs, so poll briefly for the refusal.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect(bind_addr).await {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                outcome => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the relay still listens on {bind_addr} after a failed start: {outcome:?}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
