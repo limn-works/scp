@@ -17,6 +17,8 @@
 //!
 //! See issue #323 and ADR-006.
 
+use std::sync::Arc;
+
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use scp_platform::error::PlatformError;
@@ -221,16 +223,24 @@ impl KeyCustody for FfiKeyCustody {
 /// Object-safe wrapper over a Python object implementing the
 /// `KeyCustodyProvider` protocol (see `scp_sdk.scp.KeyCustodyProvider`).
 ///
-/// Each method re-acquires the GIL via [`Python::with_gil`] and invokes the
-/// correspondingly-named Python method. Returned values are extracted into
-/// owned Rust types. An exception whose `code` is `SCP-CRYPTO-4006` maps to
+/// Each async method runs on tokio's blocking pool: it re-acquires the GIL
+/// there via [`Python::with_gil`], invokes the correspondingly-named Python
+/// method, and extracts the result into an owned Rust type. A host call that
+/// blocks (a keychain prompt, a slow token) therefore never blocks the
+/// thread polling the custody future, so an actor's custody budget can fire
+/// and other actors on that thread keep running. A caller that holds the
+/// GIL while it blocks on one of these futures deadlocks against the pool
+/// thread, so every bridge waits through `block_on_released`.
+///
+/// An exception whose `code` is `SCP-CRYPTO-4006` maps to
 /// [`PlatformError::KeyNotFound`]; any other exception maps to
 /// [`PlatformError::CustodyError`] carrying its code and text.
 pub struct PyKeyCustodyProvider {
     /// The Python object exposing the custody methods. Held as a GIL-
-    /// independent [`Py<PyAny>`] so it can be moved across the
-    /// `py.allow_threads` boundary and re-bound under a fresh GIL per call.
-    obj: Py<PyAny>,
+    /// independent [`Py<PyAny>`] behind an `Arc`, so each call moves a clone
+    /// onto the blocking pool without the GIL and re-binds it under a fresh
+    /// GIL there.
+    obj: Arc<Py<PyAny>>,
 }
 
 impl std::fmt::Debug for PyKeyCustodyProvider {
@@ -264,7 +274,7 @@ impl PyKeyCustodyProvider {
     /// missing or not callable.
     pub fn new(py: Python<'_>, obj: Py<PyAny>) -> Result<Self, PlatformError> {
         Self::validate(py, &obj)?;
-        Ok(Self { obj })
+        Ok(Self { obj: Arc::new(obj) })
     }
 
     /// Validates that `obj` exposes every method in [`Self::REQUIRED_METHODS`]
@@ -288,13 +298,16 @@ impl PyKeyCustodyProvider {
 
     /// Calls `method_name(key_id)` on the Python object under a fresh GIL and
     /// extracts the result as `T`.
-    fn call_str<T>(&self, method_name: &str, key_id: &str) -> Result<T, PlatformError>
+    fn call_str_blocking<T>(
+        obj: &Py<PyAny>,
+        method_name: &str,
+        key_id: &str,
+    ) -> Result<T, PlatformError>
     where
         T: for<'py> pyo3::FromPyObject<'py>,
     {
         Python::with_gil(|py| {
-            let result = self
-                .obj
+            let result = obj
                 .bind(py)
                 .call_method1(method_name, (key_id,))
                 .map_err(|e| Self::call_err(py, method_name, &e))?;
@@ -306,8 +319,8 @@ impl PyKeyCustodyProvider {
 
     /// Calls `method_name(first, second)` with two Python `str` arguments on the
     /// Python object under a fresh GIL and extracts the result as `T`.
-    fn call_str_str<T>(
-        &self,
+    fn call_str_str_blocking<T>(
+        obj: &Py<PyAny>,
         method_name: &str,
         first: &str,
         second: &str,
@@ -316,8 +329,7 @@ impl PyKeyCustodyProvider {
         T: for<'py> pyo3::FromPyObject<'py>,
     {
         Python::with_gil(|py| {
-            let result = self
-                .obj
+            let result = obj
                 .bind(py)
                 .call_method1(method_name, (first, second))
                 .map_err(|e| Self::call_err(py, method_name, &e))?;
@@ -329,8 +341,8 @@ impl PyKeyCustodyProvider {
 
     /// Calls `method_name(key_id, payload)` (payload as Python `bytes`) on the
     /// Python object under a fresh GIL and extracts the result as `T`.
-    fn call_str_bytes<T>(
-        &self,
+    fn call_str_bytes_blocking<T>(
+        obj: &Py<PyAny>,
         method_name: &str,
         key_id: &str,
         payload: &[u8],
@@ -340,8 +352,7 @@ impl PyKeyCustodyProvider {
     {
         Python::with_gil(|py| {
             let bytes = PyBytes::new(py, payload);
-            let result = self
-                .obj
+            let result = obj
                 .bind(py)
                 .call_method1(method_name, (key_id, bytes))
                 .map_err(|e| Self::call_err(py, method_name, &e))?;
@@ -356,8 +367,8 @@ impl PyKeyCustodyProvider {
     /// extracts the result as `T`. Used by the rotatable-pseudonym path, which
     /// must thread the epoch through to the provider so the provider performs
     /// the canonical v2 derivation itself (no bridge-side preimage synthesis).
-    fn call_str_bytes_u64<T>(
-        &self,
+    fn call_str_bytes_u64_blocking<T>(
+        obj: &Py<PyAny>,
         method_name: &str,
         key_id: &str,
         payload: &[u8],
@@ -368,8 +379,7 @@ impl PyKeyCustodyProvider {
     {
         Python::with_gil(|py| {
             let bytes = PyBytes::new(py, payload);
-            let result = self
-                .obj
+            let result = obj
                 .bind(py)
                 .call_method1(method_name, (key_id, bytes, epoch))
                 .map_err(|e| Self::call_err(py, method_name, &e))?;
@@ -381,14 +391,123 @@ impl PyKeyCustodyProvider {
 
     /// Calls `method_name(key_id)` for its side effect only, discarding the
     /// Python return value. Used for `destroy_key`, which returns `None`.
-    fn call_str_void(&self, method_name: &str, key_id: &str) -> Result<(), PlatformError> {
+    fn call_str_void_blocking(
+        obj: &Py<PyAny>,
+        method_name: &str,
+        key_id: &str,
+    ) -> Result<(), PlatformError> {
         Python::with_gil(|py| {
-            self.obj
-                .bind(py)
+            obj.bind(py)
                 .call_method1(method_name, (key_id,))
                 .map_err(|e| Self::call_err(py, method_name, &e))?;
             Ok(())
         })
+    }
+
+    /// Runs one host call on tokio's blocking pool and awaits it: the
+    /// chokepoint every async custody method goes through, so no host call
+    /// runs on the thread that polls the custody future. A caller that stops
+    /// waiting (a custody budget firing) leaves the host call to finish on
+    /// the pool.
+    ///
+    /// # Errors
+    ///
+    /// The host call's error, and [`PlatformError::CustodyError`] if the
+    /// blocking task panics or is cancelled.
+    async fn off_thread<T: Send + 'static>(
+        &self,
+        method_name: &'static str,
+        call: impl FnOnce(&Py<PyAny>) -> Result<T, PlatformError> + Send + 'static,
+    ) -> Result<T, PlatformError> {
+        let obj = Arc::clone(&self.obj);
+        tokio::task::spawn_blocking(move || call(&obj))
+            .await
+            .map_err(|e| {
+                PlatformError::CustodyError(format!(
+                    "KeyCustodyProvider.{method_name} {}",
+                    if e.is_panic() {
+                        "panicked"
+                    } else {
+                        "was cancelled"
+                    }
+                ))
+            })?
+    }
+
+    /// `method_name(key_id)`, off the polling thread.
+    async fn call_str<T>(
+        &self,
+        method_name: &'static str,
+        key_id: String,
+    ) -> Result<T, PlatformError>
+    where
+        T: for<'py> pyo3::FromPyObject<'py> + Send + 'static,
+    {
+        self.off_thread(method_name, move |obj| {
+            Self::call_str_blocking(obj, method_name, &key_id)
+        })
+        .await
+    }
+
+    /// `method_name(first, second)`, off the polling thread.
+    async fn call_str_str<T>(
+        &self,
+        method_name: &'static str,
+        first: &'static str,
+        second: &'static str,
+    ) -> Result<T, PlatformError>
+    where
+        T: for<'py> pyo3::FromPyObject<'py> + Send + 'static,
+    {
+        self.off_thread(method_name, move |obj| {
+            Self::call_str_str_blocking(obj, method_name, first, second)
+        })
+        .await
+    }
+
+    /// `method_name(key_id, payload)`, off the polling thread.
+    async fn call_str_bytes<T>(
+        &self,
+        method_name: &'static str,
+        key_id: String,
+        payload: Vec<u8>,
+    ) -> Result<T, PlatformError>
+    where
+        T: for<'py> pyo3::FromPyObject<'py> + Send + 'static,
+    {
+        self.off_thread(method_name, move |obj| {
+            Self::call_str_bytes_blocking(obj, method_name, &key_id, &payload)
+        })
+        .await
+    }
+
+    /// `method_name(key_id, payload, epoch)`, off the polling thread.
+    async fn call_str_bytes_u64<T>(
+        &self,
+        method_name: &'static str,
+        key_id: String,
+        payload: Vec<u8>,
+        epoch: u64,
+    ) -> Result<T, PlatformError>
+    where
+        T: for<'py> pyo3::FromPyObject<'py> + Send + 'static,
+    {
+        self.off_thread(method_name, move |obj| {
+            Self::call_str_bytes_u64_blocking(obj, method_name, &key_id, &payload, epoch)
+        })
+        .await
+    }
+
+    /// `method_name(key_id)` for its side effect, off the polling thread.
+    async fn call_str_void(
+        &self,
+        method_name: &'static str,
+        key_id: String,
+    ) -> Result<(), PlatformError> {
+        self.off_thread(method_name, move |obj| {
+            Self::call_str_void_blocking(obj, method_name, &key_id)
+        })
+        .await
     }
 
     /// Maps a provider exception through the shared host-failure mapping: a
@@ -514,31 +633,29 @@ struct PyHostPublicKey {
 impl PyKeyCustodyProvider {
     /// `get_public_key(key_id)` as the typed answer the shared flows take.
     /// A type or role name outside the host contract is a custody error.
-    fn host_public_key(
+    async fn host_public_key(
         &self,
-        key_id: &str,
-    ) -> std::future::Ready<Result<scp_ffi_common::callback_custody::HostPublicKey, PlatformError>>
-    {
-        std::future::ready(
-            self.call_str::<PyHostPublicKey>("get_public_key", key_id)
-                .and_then(|answer| {
-                    scp_ffi_common::callback_custody::HostPublicKey::from_names(
-                        "get_public_key",
-                        &answer.key_type,
-                        answer.public_key,
-                        &answer.role,
-                    )
-                }),
+        key_id: String,
+    ) -> Result<scp_ffi_common::callback_custody::HostPublicKey, PlatformError> {
+        let answer = self
+            .call_str::<PyHostPublicKey>("get_public_key", key_id)
+            .await?;
+        scp_ffi_common::callback_custody::HostPublicKey::from_names(
+            "get_public_key",
+            &answer.key_type,
+            answer.public_key,
+            &answer.role,
         )
     }
 
     /// `generate_keypair(key_type, role)`, passing the contract's names.
-    fn host_generate(
+    async fn host_generate(
         &self,
         key_type: KeyType,
         role: scp_platform::KeyRole,
-    ) -> std::future::Ready<Result<String, PlatformError>> {
-        std::future::ready(self.call_str_str("generate_keypair", key_type.as_str(), role.as_str()))
+    ) -> Result<String, PlatformError> {
+        self.call_str_str("generate_keypair", key_type.as_str(), role.as_str())
+            .await
     }
 }
 
@@ -562,7 +679,7 @@ impl PyCallbackKeyCustody {
 impl KeyCustody for PyCallbackKeyCustody {
     // The shared flows in `scp_ffi_common::callback_custody` hold every
     // key-type, length, role and signature rule; each closure is one
-    // synchronous provider call (the GIL is taken inside `call_*`). Every
+    // provider call on tokio's blocking pool (`PyKeyCustodyProvider::off_thread`). Every
     // entry point resolves a handle this adapter has not registered through
     // `get_public_key`.
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
@@ -571,8 +688,8 @@ impl KeyCustody for PyCallbackKeyCustody {
             &self.registry,
             key_type,
             |key_type, role| p.host_generate(key_type, role),
-            |key_id| p.host_public_key(&key_id),
-            |key_id| std::future::ready(p.call_str_void("destroy_key", &key_id)),
+            |key_id| p.host_public_key(key_id),
+            |key_id| p.call_str_void("destroy_key", key_id),
         )
         .await
     }
@@ -582,8 +699,8 @@ impl KeyCustody for PyCallbackKeyCustody {
         scp_ffi_common::callback_custody::generate_identity(
             &self.registry,
             |key_type, role| p.host_generate(key_type, role),
-            |key_id| p.host_public_key(&key_id),
-            |key_id| std::future::ready(p.call_str_void("destroy_key", &key_id)),
+            |key_id| p.host_public_key(key_id),
+            |key_id| p.call_str_void("destroy_key", key_id),
         )
         .await
     }
@@ -594,8 +711,8 @@ impl KeyCustody for PyCallbackKeyCustody {
             &self.registry,
             key,
             data,
-            |key_id, data| std::future::ready(p.call_str_bytes("sign", &key_id, &data)),
-            |key_id| p.host_public_key(&key_id),
+            |key_id, data| p.call_str_bytes("sign", key_id, data),
+            |key_id| p.host_public_key(key_id),
         )
         .await
     }
@@ -603,7 +720,7 @@ impl KeyCustody for PyCallbackKeyCustody {
     async fn public_key(&self, key: &KeyHandle) -> Result<PublicKey, PlatformError> {
         let p = &self.provider;
         scp_ffi_common::callback_custody::public_key(&self.registry, key, |key_id| {
-            p.host_public_key(&key_id)
+            p.host_public_key(key_id)
         })
         .await
     }
@@ -611,7 +728,7 @@ impl KeyCustody for PyCallbackKeyCustody {
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
         let p = &self.provider;
         scp_ffi_common::callback_custody::destroy_key(&self.registry, key, |key_id| {
-            std::future::ready(p.call_str_void("destroy_key", &key_id))
+            p.call_str_void("destroy_key", key_id)
         })
         .await
     }
@@ -626,8 +743,8 @@ impl KeyCustody for PyCallbackKeyCustody {
             &self.registry,
             key,
             peer_public,
-            |key_id, peer| std::future::ready(p.call_str_bytes("dh_agree", &key_id, &peer)),
-            |key_id| p.host_public_key(&key_id),
+            |key_id, peer| p.call_str_bytes("dh_agree", key_id, peer),
+            |key_id| p.host_public_key(key_id),
         )
         .await
     }
@@ -642,8 +759,8 @@ impl KeyCustody for PyCallbackKeyCustody {
             &self.registry,
             key,
             None,
-            |key_id| std::future::ready(p.call_str_bytes("derive_pseudonym", &key_id, context_id)),
-            |key_id| p.host_public_key(&key_id),
+            |key_id| p.call_str_bytes("derive_pseudonym", key_id, context_id.to_vec()),
+            |key_id| p.host_public_key(key_id),
         )
         .await
     }
@@ -671,14 +788,14 @@ impl KeyCustody for PyCallbackKeyCustody {
             key,
             Some(pseudonym_epoch),
             |key_id| {
-                std::future::ready(p.call_str_bytes_u64(
+                p.call_str_bytes_u64(
                     "derive_rotatable_pseudonym",
-                    &key_id,
-                    context_id,
+                    key_id,
+                    context_id.to_vec(),
                     pseudonym_epoch,
-                ))
+                )
             },
-            |key_id| p.host_public_key(&key_id),
+            |key_id| p.host_public_key(key_id),
         )
         .await
     }
@@ -693,8 +810,8 @@ impl KeyCustody for PyCallbackKeyCustody {
             &self.registry,
             ed25519_handle,
             peer_x25519_public,
-            |key_id, peer| std::future::ready(p.call_str_bytes("dh_agree", &key_id, &peer)),
-            |key_id| p.host_public_key(&key_id),
+            |key_id, peer| p.call_str_bytes("dh_agree", key_id, peer),
+            |key_id| p.host_public_key(key_id),
         )
         .await
     }
@@ -703,9 +820,13 @@ impl KeyCustody for PyCallbackKeyCustody {
         // Sync query; on any provider error fall back to the most conservative
         // classification (InMemory) rather than panicking across the FFI
         // boundary — matches the UniFFI adapter's lenient mapping.
-        let type_str: Result<String, _> = self
-            .provider
-            .call_str("custody_type", &key.id().to_string());
+        // A sync trait method cannot await the blocking pool, so this one
+        // host call takes the GIL on the calling thread.
+        let type_str: Result<String, _> = PyKeyCustodyProvider::call_str_blocking(
+            &self.provider.obj,
+            "custody_type",
+            &key.id().to_string(),
+        );
         match type_str.as_deref() {
             Ok("hardware") => CustodyType::Hardware,
             Ok("software" | "software_biometric") => CustodyType::Software,
@@ -984,18 +1105,23 @@ def der_int(v):
     return bytes([2, len(b)]) + b
 
 class P256Custody(FakeCustody):
-    '''Every P-256 key is d = 1 (public key G) and signs with nonce k = 1, so
-    r = Gx and s = z + r mod n. `sign` returns DER with the HIGH s, the form
-    a platform keystore may emit; the bridge must return raw low-s.'''
+    '''Every P-256 signing key is d = 1 (public key G) and signs with nonce
+    k = 1, so r = Gx and s = z + r mod n. `sign` returns DER with the HIGH s,
+    the form a platform keystore may emit; the bridge must return raw low-s.
+    The n-th hpke-p256 key is d = n, so two keys have different points and
+    `dh_agree` computes a real ECDH.'''
 
     def __init__(self, fault=None):
         super().__init__(fault)
         self._types = {}
+        self._hpke_d = {}
         self.dh_peers = []
 
     def generate_keypair(self, key_type, role):
         kid = super().generate_keypair(key_type, role)
         self._types[kid] = key_type
+        if key_type == 'hpke-p256':
+            self._hpke_d[kid] = len(self._hpke_d) + 1
         return kid
 
     def _public(self, key_id):
@@ -1003,7 +1129,8 @@ class P256Custody(FakeCustody):
         if t == 'p256':
             return ('p256', G_COMPRESSED)
         if t == 'hpke-p256':
-            return ('hpke-p256', bytes([4]) + GX.to_bytes(32, 'big') + GY.to_bytes(32, 'big'))
+            x, y = mul(self._hpke_d[key_id], G)
+            return ('hpke-p256', bytes([4]) + x.to_bytes(32, 'big') + y.to_bytes(32, 'big'))
         return super()._public(key_id)
 
     def sign(self, key_id, message):
@@ -1021,8 +1148,9 @@ class P256Custody(FakeCustody):
         self._count('dh_agree')
         peer = bytes(peer_public)
         self.dh_peers.append(peer)
-        # d = 1: the shared secret is the peer's x-coordinate.
-        return peer[1:33]
+        point = (int.from_bytes(peer[1:33], 'big'), int.from_bytes(peer[33:65], 'big'))
+        x, _ = mul(self._hpke_d[key_id], point)
+        return x.to_bytes(32, 'big')
 
 class BadP256Custody(P256Custody):
     '''Returns a 32-byte public key and an unverifiable signature for P-256.'''
@@ -1093,15 +1221,27 @@ class WrongLengthCustody(P256Custody):
         Python::with_gil(|py| PyKeyCustodyProvider::new(py, host).expect("valid provider"))
     }
 
+    /// Loads [`FAKE_PROVIDER_PY`] as the module `fake_custody`, so Python
+    /// code can subclass its hosts with `from fake_custody import ...`.
+    pub fn fake_custody_module(py: Python<'_>) -> Bound<'_, PyModule> {
+        PyModule::from_code(py, FAKE_PROVIDER_PY, c"fake_custody.py", c"fake_custody")
+            .expect("fake provider module compiles")
+    }
+
+    /// A `PyCallbackKeyCustody` over a fresh `P256Custody`, which mints
+    /// `hpke-p256` keys and agrees with them by real ECDH, also returning the
+    /// host object so a test can read its `calls` counts.
+    pub fn p256_py_custody_and_host() -> (PyCallbackKeyCustody, Py<PyAny>) {
+        fake_py_host_of(c"P256Custody", None)
+    }
+
     /// [`fake_py_custody_of`], also returning the host object.
     fn fake_py_host_of(
         class: &std::ffi::CStr,
         fault: Option<&str>,
     ) -> (PyCallbackKeyCustody, Py<PyAny>) {
         Python::with_gil(|py| {
-            let module =
-                PyModule::from_code(py, FAKE_PROVIDER_PY, c"fake_custody.py", c"fake_custody")
-                    .expect("fake provider module compiles");
+            let module = fake_custody_module(py);
             let cls = module
                 .getattr(class.to_str().expect("utf-8 class name"))
                 .expect("fake provider class");
@@ -1219,6 +1359,77 @@ mod tests {
         custody.destroy_key(&handle).await.expect("destroy");
     }
 
+    /// A host call runs on tokio's blocking pool, not on the thread polling
+    /// the custody future. On a single-thread runtime, while the host's
+    /// `dh_agree` sleeps for 2 s, a 200 ms budget around the call fires
+    /// within 1 s: the runtime bounds every wrapping-key custody call the
+    /// same way with its custody budget, whose timeout is `SCP-CRYPTO-4062`.
+    /// Another task on that thread runs meanwhile, and once the host is quick
+    /// again the same custody answers.
+    #[tokio::test]
+    async fn a_sleeping_host_call_leaves_the_polling_thread_free() {
+        const SLEEPY_AGREE_PY: &std::ffi::CStr = c"
+import time
+from fake_custody import P256Custody
+
+class SleepyAgreeCustody(P256Custody):
+    def __init__(self):
+        super().__init__()
+        self.sleep = 0.0
+
+    def dh_agree(self, key_id, peer_public):
+        time.sleep(self.sleep)
+        return super().dh_agree(key_id, peer_public)
+";
+        let (custody, host) = Python::with_gil(|py| {
+            super::test_fakes::fake_custody_module(py);
+            let host =
+                PyModule::from_code(py, SLEEPY_AGREE_PY, c"sleepy_agree.py", c"sleepy_agree")
+                    .and_then(|module| module.getattr("SleepyAgreeCustody"))
+                    .and_then(|cls| cls.call0())
+                    .expect("sleepy host")
+                    .unbind();
+            let provider =
+                PyKeyCustodyProvider::new(py, host.clone_ref(py)).expect("valid provider");
+            (PyCallbackKeyCustody::new(provider), host)
+        });
+        let handle = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("generate hpke-p256");
+        let peer = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&[9u8; 32])
+            .expect("scalar")
+            .public_key()
+            .to_uncompressed();
+        Python::with_gil(|py| host.bind(py).setattr("sleep", 2.0)).expect("slow the host");
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let other = tokio::spawn({
+            let ran = std::sync::Arc::clone(&ran);
+            async move { ran.store(true, std::sync::atomic::Ordering::SeqCst) }
+        });
+        let started = std::time::Instant::now();
+        let budget = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            custody.dh_agree(&handle, &peer),
+        )
+        .await;
+        let waited = started.elapsed();
+        assert!(budget.is_err(), "the budget fires while the host sleeps");
+        assert!(waited < std::time::Duration::from_secs(1), "{waited:?}");
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "another task on the polling thread ran during the host call"
+        );
+        other.await.expect("the other task");
+
+        Python::with_gil(|py| host.bind(py).setattr("sleep", 0.0)).expect("speed the host");
+        custody
+            .dh_agree(&handle, &peer)
+            .await
+            .expect("a quick host answers");
+    }
+
     #[tokio::test]
     async fn ffi_custody_callback_hpke_p256_dh_agree_validates_peer() {
         use scp_crypto::p256::{P256PublicKey, P256SecretKey, ecdh_p256};
@@ -1256,6 +1467,53 @@ mod tests {
                 actual: KeyType::HpkeP256
             })
         ));
+    }
+
+    /// Two HPKE P-256 keys on the embedded fake host have different points
+    /// and agree symmetrically, and an agreement with the pinned RFC 5903
+    /// initiator point equals both `ecdh_p256` from the pinned scalar and,
+    /// for the first key (private scalar 1), the pinned point's
+    /// x-coordinate.
+    #[tokio::test]
+    async fn ffi_custody_callback_hpke_p256_dh_agree_is_symmetric_and_matches_the_vector() {
+        use scp_crypto::p256::{P256PublicKey, P256SecretKey, ecdh_p256, testing};
+        let custody = fake_callback_custody_of(c"P256Custody");
+        let a = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("generate A");
+        let b = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("generate B");
+        let a_pub = custody.public_key(&a).await.expect("A public");
+        let b_pub = custody.public_key(&b).await.expect("B public");
+        assert_ne!(
+            a_pub.as_bytes(),
+            b_pub.as_bytes(),
+            "each key has its own point"
+        );
+        let ab = custody.dh_agree(&a, b_pub.as_bytes()).await.expect("A·B");
+        let ba = custody.dh_agree(&b, a_pub.as_bytes()).await.expect("B·A");
+        assert_eq!(ab.as_bytes(), ba.as_bytes());
+
+        let fixed = P256SecretKey::from_scalar_bytes(
+            &hex::decode(testing::ECDH_VECTOR_SCALAR_I)
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes"),
+        )
+        .expect("scalar");
+        let fixed_pub = fixed.public_key().to_uncompressed();
+        assert_eq!(hex::encode(fixed_pub), testing::ECDH_VECTOR_PUBLIC_I);
+        let shared = custody.dh_agree(&a, &fixed_pub).await.expect("A·I");
+        let a_point = P256PublicKey::from_uncompressed(a_pub.as_bytes()).expect("A point");
+        assert_eq!(shared.as_bytes(), ecdh_p256(&fixed, &a_point).as_slice());
+        assert_eq!(
+            hex::encode(shared.as_bytes()),
+            testing::ECDH_VECTOR_PUBLIC_I[2..66],
+            "scalar 1 agrees to the peer's x-coordinate"
+        );
     }
 
     #[tokio::test]

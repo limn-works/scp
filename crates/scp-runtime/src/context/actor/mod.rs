@@ -1551,7 +1551,7 @@ mod tests {
         // DID is supplied (resolves this identity's KeyPackageStoreActor).
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
-            .build_actor_deps(&DID("did:example:actor-with-state-test".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:actor-with-state-test".to_owned()))
             .await
             .expect("build_actor_deps")
     }
@@ -2248,7 +2248,7 @@ mod tests {
 
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
-            .build_actor_deps(&DID("did:example:sec1-ttl-test".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:sec1-ttl-test".to_owned()))
             .await
             .expect("build_actor_deps")
     }

@@ -7,7 +7,7 @@
 //! and publish idempotency against a real MLS backend + in-memory storage.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// Test-only `std::sync::Mutex` in the recording transport + faulty storage:
+// Test-only `std::sync::Mutex` in the recording transport:
 // these are sync helpers (no await held across the lock), so the async
 // deadlock hazard the disallow guards against does not apply. Per
 // `crates/scp-runtime/clippy.toml`, test-only `std::sync::Mutex` uses carry
@@ -29,6 +29,7 @@ use super::{
 use crate::context::builder::{
     ContextCreationError, ContextTransportProvider, NotConfiguredTransportProvider,
 };
+use crate::context::supervisor::faulty_storage::FaultyStorage;
 use crate::crypto::mls::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
@@ -40,7 +41,6 @@ use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::DecryptedContent;
 use scp_mls::error::MlsError;
 use scp_mls::group::ScpMlsGroup;
-use scp_platform::PlatformError;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::traits::Storage;
 
@@ -84,7 +84,7 @@ fn in_memory_storage_with_inner() -> (Arc<dyn OpenMlsStorageAdapter>, Arc<InMemo
     (adapter, inner)
 }
 
-fn deps_with(
+async fn deps_with(
     mls: Arc<dyn MlsBackend>,
     storage: Arc<dyn OpenMlsStorageAdapter>,
     transport: Arc<dyn ContextTransportProvider>,
@@ -94,10 +94,17 @@ fn deps_with(
         mls_storage: storage,
         transport,
         clock: Arc::new(SystemClock) as Arc<dyn Clock>,
-        wrapping_key: Arc::new(arc_swap::ArcSwap::from_pointee(
-            crate::crypto::wrapping::WrappingKeyPair::generate(),
-        )),
+        wrapping_key: test_wrapping_key_in_memory().await,
     }
+}
+
+/// A fresh identity wrapping key held in its own in-memory test custody.
+async fn test_wrapping_key_in_memory() -> Arc<crate::crypto::wrapping::IdentityWrappingKey> {
+    crate::crypto::wrapping::test_wrapping_key(&Arc::new(
+        scp_platform::testing::InMemoryKeyCustody::new(),
+    ))
+    .await
+    .expect("test wrapping key is created in custody")
 }
 
 /// Spawn an actor and wait for its startup replenish to fill the pool to
@@ -128,7 +135,7 @@ async fn spawn_filled(
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(mls, Arc::clone(&storage), no_transport()),
+        deps_with(mls, Arc::clone(&storage), no_transport()).await,
     );
     handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -205,7 +212,7 @@ async fn reserve_then_confirm_deletes_key_and_clears_reservation() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -308,7 +315,7 @@ async fn double_confirm_of_same_reservation_rejected() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -530,7 +537,7 @@ async fn reserve_when_empty_returns_typed_err_not_hang() {
     let failing: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(0));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(failing, Arc::clone(&storage), no_transport()),
+        deps_with(failing, Arc::clone(&storage), no_transport()).await,
     );
 
     let err = handle
@@ -554,7 +561,7 @@ async fn replenish_refills_to_min_and_reports_count() {
     let storage = in_memory_storage();
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
 
     let count = handle
@@ -612,7 +619,7 @@ async fn replenish_generate_failure_yields_typed_err_when_zero_generated() {
     let failing: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(0));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(failing, Arc::clone(&storage), no_transport()),
+        deps_with(failing, Arc::clone(&storage), no_transport()).await,
     );
 
     let err = handle
@@ -630,7 +637,7 @@ async fn replenish_partial_retain_returns_count_on_late_failure() {
     let failing: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(3));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&failing), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&failing), Arc::clone(&storage), no_transport()).await,
     );
 
     let _ = handle
@@ -662,7 +669,7 @@ async fn replenish_fails_closed_when_credential_absent() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         malformed.clone(),
-        deps_with(mls, Arc::clone(&storage), no_transport()),
+        deps_with(mls, Arc::clone(&storage), no_transport()).await,
     );
 
     let err = handle
@@ -706,7 +713,7 @@ async fn reserve_persist_failure_returns_kp_to_pool_and_errs() {
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -761,7 +768,7 @@ async fn reserve_id_set_persist_failure_returns_kp_and_cleans_record() {
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -826,7 +833,7 @@ async fn confirm_persist_failure_retains_reservation_and_errs() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -888,7 +895,7 @@ async fn confirm_tombstone_failure_then_healed_retry_completes_consume_but_errs_
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -990,7 +997,7 @@ async fn confirm_reservation_record_delete_failure_eventually_reclaimed_no_orpha
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1070,7 +1077,7 @@ async fn confirm_reservation_record_delete_failure_eventually_reclaimed_no_orpha
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1117,7 +1124,7 @@ async fn confirm_tombstone_delete_failure_eventually_reclaimed_no_orphan() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1188,7 +1195,7 @@ async fn confirm_tombstone_delete_failure_eventually_reclaimed_no_orphan() {
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1230,7 +1237,7 @@ async fn gc_reservation_record_delete_failure_eventually_reclaimed_no_orphan() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1368,7 +1375,7 @@ async fn gc_tombstone_delete_failure_eventually_reclaimed_no_orphan() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1498,7 +1505,7 @@ async fn respawn_restores_reservation_as_reserved_not_pooled() {
 
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1525,7 +1532,7 @@ async fn respawn_after_confirm_keeps_key_absent() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1553,7 +1560,7 @@ async fn respawn_after_confirm_keeps_key_absent() {
 
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1617,7 +1624,7 @@ async fn consumed_kp_with_surviving_record_not_repooled_on_respawn() {
     // Respawn: reconcile must EXCLUDE the consumed ref from the pool.
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1701,7 +1708,7 @@ async fn consumed_kp_with_surviving_record_and_lost_index_entry_reclaimed_on_dou
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1732,7 +1739,7 @@ async fn consumed_kp_with_surviving_record_and_lost_index_entry_reclaimed_on_dou
     let mls3 = backend_with_consumed_set(&storage);
     let (handle3, _join3) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls3), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls3), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle3
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1824,7 +1831,7 @@ async fn gc_reclaims_consumed_tombstone_and_reservation_record_after_respawn() {
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1863,7 +1870,7 @@ async fn malformed_consumed_tombstone_reconciles_fail_closed_and_a2_still_reject
     let mls = backend_with_consumed_set(&storage);
     let (handle, join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -1903,7 +1910,7 @@ async fn malformed_consumed_tombstone_reconciles_fail_closed_and_a2_still_reject
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
     let count = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2010,7 +2017,7 @@ async fn malformed_tombstone_recovers_consumed_ref_from_reservation_record() {
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
     handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2066,7 +2073,7 @@ async fn confirm_replay_with_surviving_kp_record_errs_not_false_ok() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2195,7 +2202,7 @@ async fn consumed_precedence_overlapping_reservation_and_tombstone_not_restored(
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
     handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2358,7 +2365,7 @@ async fn reserved_kp_with_lost_index_entry_restored_as_reserved_on_respawn() {
     let mls2 = backend_with_consumed_set(&storage);
     let (handle2, _join2) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle2
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2443,7 +2450,7 @@ async fn pooled_kp_lost_index_replenishes_to_min_without_record_leak() {
     faulty.fail_prefix("scp-kp-index/");
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), no_transport()),
+        deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2512,7 +2519,7 @@ async fn confirm_retry_with_different_welcome_completes_without_second_join() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2627,9 +2634,7 @@ async fn expired_reservation_is_swept_and_kp_burned() {
             mls_storage: Arc::clone(&storage),
             transport: no_transport(),
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
-            wrapping_key: Arc::new(arc_swap::ArcSwap::from_pointee(
-                crate::crypto::wrapping::WrappingKeyPair::generate(),
-            )),
+            wrapping_key: test_wrapping_key_in_memory().await,
         };
         KeyPackageStoreActor::spawn(alice(), deps)
     };
@@ -2746,7 +2751,7 @@ async fn publish_emits_one_call_per_pooled_kp() {
     let transport: Arc<dyn ContextTransportProvider> = Arc::clone(&recorder) as _;
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), transport),
+        deps_with(real_backend(), Arc::clone(&storage), transport).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2782,7 +2787,7 @@ async fn publish_empty_pool_is_noop() {
     let empty_backend: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(0));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(empty_backend, Arc::clone(&storage), transport),
+        deps_with(empty_backend, Arc::clone(&storage), transport).await,
     );
 
     handle
@@ -2801,7 +2806,7 @@ async fn publish_is_idempotent_and_errors_leave_ref_unmarked() {
     let transport: Arc<dyn ContextTransportProvider> = Arc::clone(&recorder) as _;
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(real_backend(), Arc::clone(&storage), transport),
+        deps_with(real_backend(), Arc::clone(&storage), transport).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2872,7 +2877,7 @@ async fn fused_welcome_confirm_flow_joins_real_reserved_kp() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -3032,7 +3037,7 @@ async fn fused_confirm_rejects_own_key_package_expired_under_joiner_clock_as_inv
     backend.set_consumed_init_key_store(Arc::clone(&storage));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(backend, Arc::clone(&storage), no_transport()),
+        deps_with(backend, Arc::clone(&storage), no_transport()).await,
     );
     handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -3101,7 +3106,7 @@ async fn confirm_retry_after_completed_join_finishes_consume_once_own_key_packag
     backend.set_consumed_init_key_store(Arc::clone(&storage));
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(backend, Arc::clone(&storage), no_transport()),
+        deps_with(backend, Arc::clone(&storage), no_transport()).await,
     );
     handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -3217,7 +3222,7 @@ async fn confirm_with_bad_welcome_keeps_reservation_for_retry() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -3433,115 +3438,6 @@ impl ContextTransportProvider for RecordingTransport {
     }
 }
 
-/// A `Storage` wrapper that fails writes/deletes whose key starts with a
-/// configured prefix, delegating everything else to an inner `InMemoryStorage`.
-/// Drives the H1 fail-closed branches deterministically.
-struct FaultyStorage {
-    inner: Arc<InMemoryStorage>,
-    /// Fails BOTH `store` and `delete` for keys under this prefix.
-    fail_prefix: std::sync::Mutex<Option<String>>,
-    /// Fails ONLY `delete` for keys under this prefix (`store`/`retrieve` pass).
-    /// Lets a test target the cleanup-tail / GC delete of a record while still
-    /// allowing it to have been written — the symmetric sibling of the
-    /// store-fault path, which would otherwise block the record's creation.
-    fail_delete_prefix: std::sync::Mutex<Option<String>>,
-}
-
-impl FaultyStorage {
-    fn new(inner: Arc<InMemoryStorage>) -> Self {
-        Self {
-            inner,
-            fail_prefix: std::sync::Mutex::new(None),
-            fail_delete_prefix: std::sync::Mutex::new(None),
-        }
-    }
-    fn fail_prefix(&self, prefix: &str) {
-        *self.fail_prefix.lock().unwrap() = Some(prefix.to_owned());
-    }
-    /// Arm the delete-only fault: subsequent `delete` calls for keys under
-    /// `prefix` return an injected error, while `store`/`retrieve` succeed.
-    fn fail_delete_prefix(&self, prefix: &str) {
-        *self.fail_delete_prefix.lock().unwrap() = Some(prefix.to_owned());
-    }
-    fn clear_fail(&self) {
-        *self.fail_prefix.lock().unwrap() = None;
-        *self.fail_delete_prefix.lock().unwrap() = None;
-    }
-    fn should_fail(&self, key: &str) -> bool {
-        self.fail_prefix
-            .lock()
-            .unwrap()
-            .as_deref()
-            .is_some_and(|p| key.starts_with(p))
-    }
-    /// True when a delete of `key` should be injected-failed: either the
-    /// store+delete `fail_prefix` matches, or the delete-only prefix matches.
-    fn should_fail_delete(&self, key: &str) -> bool {
-        self.should_fail(key)
-            || self
-                .fail_delete_prefix
-                .lock()
-                .unwrap()
-                .as_deref()
-                .is_some_and(|p| key.starts_with(p))
-    }
-}
-
-#[allow(clippy::manual_async_fn)]
-impl Storage for FaultyStorage {
-    fn store(
-        &self,
-        key: &str,
-        data: &[u8],
-    ) -> impl std::future::Future<Output = Result<(), PlatformError>> + Send {
-        async move {
-            if self.should_fail(key) {
-                return Err(PlatformError::StorageError(
-                    "injected store fault".to_owned(),
-                ));
-            }
-            self.inner.store(key, data).await
-        }
-    }
-    fn retrieve(
-        &self,
-        key: &str,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, PlatformError>> + Send {
-        async move { self.inner.retrieve(key).await }
-    }
-    fn delete(
-        &self,
-        key: &str,
-    ) -> impl std::future::Future<Output = Result<(), PlatformError>> + Send {
-        async move {
-            if self.should_fail_delete(key) {
-                return Err(PlatformError::StorageError(
-                    "injected delete fault".to_owned(),
-                ));
-            }
-            self.inner.delete(key).await
-        }
-    }
-    fn list_keys(
-        &self,
-        prefix: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, PlatformError>> + Send {
-        async move { self.inner.list_keys(prefix).await }
-    }
-    fn delete_prefix(
-        &self,
-        prefix: &str,
-    ) -> impl std::future::Future<Output = Result<u64, PlatformError>> + Send {
-        async move { self.inner.delete_prefix(prefix).await }
-    }
-    fn exists(
-        &self,
-        key: &str,
-    ) -> impl std::future::Future<Output = Result<bool, PlatformError>> + Send {
-        async move { self.inner.exists(key).await }
-    }
-}
-
 /// A clock whose `now_millis` is a base instant plus a settable offset, so a
 /// test can jump time forward past the reservation TTL deterministically.
 struct SteppingClock {
@@ -3648,7 +3544,7 @@ async fn reserve_any_replenishes_empty_pool_then_reserves() {
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
-        deps_with(mls, Arc::clone(&storage), no_transport()),
+        deps_with(mls, Arc::clone(&storage), no_transport()).await,
     );
 
     let (_rid, public_bytes) = handle
@@ -3750,4 +3646,53 @@ fn kp_record_encodes_like_plain_fields() {
         rmp_serde::to_vec_named(&record).unwrap(),
         rmp_serde::to_vec_named(&plain).unwrap()
     );
+}
+
+/// Spec 09 §9.16.1: every KeyPackage the store actor mints on replenish
+/// publishes, in its leaf's `0xFF01` extension, the public point of the owner's
+/// wrapping key as custody holds it.
+#[tokio::test]
+async fn replenished_key_packages_carry_the_custody_wrapping_public_key() {
+    use openmls::prelude::{OpenMlsProvider as _, ProtocolVersion};
+    use scp_platform::traits::KeyCustody as _;
+    let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+    let wrapping_key = crate::crypto::wrapping::test_wrapping_key(&custody)
+        .await
+        .expect("the wrapping key is created in custody");
+    let custody_public = custody
+        .public_key(wrapping_key.handle())
+        .await
+        .expect("custody holds the wrapping key");
+    let storage = in_memory_storage();
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        KeyPackageStoreDeps {
+            wrapping_key,
+            ..deps_with(real_backend(), Arc::clone(&storage), no_transport()).await
+        },
+    );
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("replenish succeeds");
+
+    let pooled = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds");
+    assert!(pooled.len() >= MIN_BUFFER, "the pool is filled");
+    let provider = scp_mls::InMemoryMlsProvider::default();
+    for (_ref, public_bytes) in &pooled {
+        let verified = scp_mls::wire::parse_key_package_in(public_bytes)
+            .unwrap()
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .unwrap();
+        let published =
+            scp_mls::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())
+                .unwrap()
+                .expect("every minted KeyPackage publishes 0xFF01");
+        assert_eq!(published.as_bytes().as_slice(), custody_public.as_bytes());
+    }
+
+    handle.send_shutdown().await.unwrap();
 }

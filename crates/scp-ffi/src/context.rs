@@ -2958,23 +2958,6 @@ impl crate::scp::PyScp {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let sup = sup.clone();
 
-            // Generate a real MLS key package for the joining member (#1324).
-            // The key package contains the joiner's SCP credential (DID) and is
-            // validated by NodeMlsFactory::validate_key_package before MLS
-            // group addition.
-            let wrapping_public = crate::actor_wait::block_on_released(
-                py,
-                sup.wrapping_public_key(&scp_did::DID(member_did.clone())),
-            )?
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let kp_bytes = generate_mls_key_package_bytes(identity_did, &wrapping_public)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let key_package = scp_core::context::membership::KeyPackage {
-                owner_did: scp_did::DID(member_did.clone()),
-                mls_key_package_bytes: Some(kp_bytes),
-            };
-
             // Look up the ContextHandle from a completed create_context call.
             // The ContextManager stores PerContextState keyed by context_id.
             // We need the handle to delegate. Since the handle is stored in
@@ -3002,6 +2985,25 @@ impl crate::scp::PyScp {
                 None
             } else {
                 Some(derive_member_pseudonym(py, bi, identity_did, &context_id)?)
+            };
+
+            // Generate a real MLS key package for the joining member (#1324).
+            // The key package contains the joiner's SCP credential (DID) and is
+            // validated by NodeMlsFactory::validate_key_package before MLS
+            // group addition. It runs after derivation, so a joiner with no
+            // key material fails with derivation's `SCP-IDENT-1054` first; a
+            // wrapping-key failure keeps its typed `ContextError` code.
+            let wrapping_public = crate::actor_wait::block_on_released(
+                py,
+                sup.wrapping_public_key(&scp_did::DID(member_did.clone())),
+            )?
+            .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
+            let kp_bytes = generate_mls_key_package_bytes(identity_did, &wrapping_public)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            let key_package = scp_core::context::membership::KeyPackage {
+                owner_did: scp_did::DID(member_did.clone()),
+                mls_key_package_bytes: Some(kp_bytes),
             };
             let temp_handle =
                 scp_core::context::ContextHandle::new(context_id.clone(), core_params);
@@ -6404,6 +6406,20 @@ mod tests {
         }
     }
 
+    /// Drives a custody call to completion with the GIL released, whether or
+    /// not the calling thread holds it. A callback custody's host call takes
+    /// the GIL on tokio's blocking pool, so a test thread that blocks on one
+    /// while holding the GIL deadlocks against it.
+    #[cfg(feature = "testing")]
+    fn custody_wait<F>(fut: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        Python::with_gil(|py| crate::actor_wait::block_on_released(py, fut))
+            .expect("the shared runtime drives the custody call")
+    }
+
     /// Registers `did` with callback custody over the fake Python provider,
     /// its identity key freshly generated there. Returns the identity key id.
     #[cfg(feature = "testing")]
@@ -6417,10 +6433,7 @@ mod tests {
         let custody = std::sync::Arc::new(crate::custody::FfiKeyCustody::Callback(
             crate::custody::test_fakes::fake_py_custody(fault),
         ));
-        let identity_key = crate::runtime()
-            .unwrap()
-            .block_on(custody.generate_identity_keypair())
-            .unwrap();
+        let identity_key = custody_wait(custody.generate_identity_keypair()).unwrap();
         crate::runtime::register_identity(
             bi,
             did,
@@ -6509,9 +6522,7 @@ mod tests {
         let custody =
             crate::runtime::with_identity(&bi_arc, did, |entry| Ok(entry.custody.clone()))
                 .expect("registered identity");
-        crate::runtime()
-            .expect("runtime")
-            .block_on(custody.destroy_key(&scp_platform::KeyHandle::new(key_id)))
+        custody_wait(custody.destroy_key(&scp_platform::KeyHandle::new(key_id)))
             .expect("host destroys the identity key");
         let scp = crate::scp::PyScp {
             inner: std::sync::Arc::clone(&bi_arc),
@@ -6842,22 +6853,23 @@ mod tests {
     /// drives derivation policy — exercised through the REAL `context_create`
     /// entry point, not an inline copy of the branch.
     ///
-    /// Both sub-cases use an UNREGISTERED creator DID (no retained key material),
-    /// which makes the gate's effect directly observable:
-    /// - ENCRYPTED create routes through `derive_member_pseudonym(...)?`, so the
-    ///   registry miss HARD-FAILS with the canonical `SCP-IDENT-1054` — never a
-    ///   silent zero-pseudonym fallback that would leave the encrypted context
-    ///   unusable on the pseudonymous routing axis.
-    /// - BROADCAST create selects `None` (spec §5.14: no per-member pseudonym),
-    ///   never touches custody, and SUCCEEDS into an active handle.
+    /// The two sub-cases make the gate's effect directly observable:
+    /// - ENCRYPTED create by an UNREGISTERED creator DID routes through
+    ///   `derive_member_pseudonym(...)?`, so the registry miss HARD-FAILS with
+    ///   the canonical `SCP-IDENT-1054` — never a silent zero-pseudonym
+    ///   fallback that would leave the encrypted context unusable on the
+    ///   pseudonymous routing axis.
+    /// - BROADCAST create by a creator with a registered host custody selects
+    ///   `None` (spec §5.14: no per-member pseudonym), SUCCEEDS into an active
+    ///   handle, and the host records no derivation call.
     ///
     /// Not false-green: the previous version of this test copied the production
     /// `if create_is_broadcast { None } else { Some(derive...) }` branch inline
     /// and asserted against its own copy, so inverting the production gate would
     /// not have failed it. This version calls `context_create` itself. If the
     /// production gate at `:1799` were inverted (broadcast → derive, encrypted →
-    /// `None`), the broadcast create would hard-fail `SCP-IDENT-1054` and the
-    /// encrypted create would succeed — both assertions below would flip.
+    /// `None`), the host would record a broadcast derivation and the encrypted
+    /// create would succeed — both assertions below would flip.
     #[test]
     fn context_create_mode_gate_drives_pseudonym_derivation() {
         crate::init_runtime().ok();
@@ -6881,17 +6893,41 @@ mod tests {
             "expected encrypted-create missing-key-material code SCP-IDENT-1054, got: {encrypted_err}"
         );
 
-        // BROADCAST create with the SAME unregistered-creator condition SUCCEEDS
-        // — the gate selects `None` and never calls derivation.
+        // BROADCAST create SUCCEEDS and the gate selects `None`, so the
+        // creator's custody sees no derivation call. The creator registers a
+        // host custody first, because its wrapping key lives there (spec 09
+        // §9.16.1) and a create for a DID with no custody fails closed.
+        let bcast_creator = "did:dht:z6MkNoSuchCreateCreatorBcast";
+        let host = crate::runtime::register_host_custody_for_test(&bi_arc, bcast_creator)
+            .expect("the broadcast creator is not registered yet");
         let handle = Python::with_gil(|py| {
             let dict = PyDict::new(py);
             dict.set_item("mode", "broadcast").unwrap();
             // Broadcast contexts require MemoryScope::Full (spec §5.14).
             dict.set_item("memory_scope", "full").unwrap();
             dict.set_item("ceiling", vec!["messages:read"]).unwrap();
-            scp.context_create(py, "did:dht:z6MkNoSuchCreateCreatorBcast", &dict)
+            scp.context_create(py, bcast_creator, &dict)
                 .expect("broadcast create must succeed without pseudonym derivation")
         });
+        let derivations = Python::with_gil(|py| {
+            let calls = host
+                .bind(py)
+                .getattr("calls")
+                .expect("the host counts its calls");
+            ["derive_pseudonym", "derive_rotatable_pseudonym"]
+                .iter()
+                .map(|m| {
+                    calls
+                        .call_method1("get", (*m, 0))
+                        .and_then(|n| n.extract::<u64>())
+                        .expect("a call count is an int")
+                })
+                .sum::<u64>()
+        });
+        assert_eq!(
+            derivations, 0,
+            "broadcast create must not derive a pseudonym"
+        );
         assert_eq!(
             handle.state().unwrap(),
             "active",
@@ -7458,6 +7494,7 @@ mod tests {
         let bi = __bi();
         let ctx_id = format!("{ctx_prefix}-{}", uuid::Uuid::new_v4());
         crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+        let _host = crate::runtime::register_host_custody_for_test(&bi, creator);
         let sup = crate::runtime::supervisor(&bi).unwrap();
         let sup = Arc::clone(sup);
         let rt = crate::runtime().unwrap();
@@ -8366,6 +8403,7 @@ mod tests {
             let bi = scp.inner.clone();
 
             crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+            let _host = crate::runtime::register_host_custody_for_test(&bi, creator);
             let sup = crate::runtime::supervisor(&bi).unwrap();
             let rt = crate::runtime().unwrap();
             rt.block_on(sup.create_context(
@@ -9250,6 +9288,11 @@ mod tests {
         let bi = __bi();
         let context_id = format!("{prefix}{}", "0".repeat(64 - prefix.len()));
         crate::runtime::init_context_manager_for_test(&bi);
+        // A restore acts as the node identity and loads its wrapping key from
+        // its custody (spec 09 §9.16.1), so the node identity keeps a
+        // registered custody, as a host's own identity does.
+        let _host =
+            crate::runtime::register_host_custody_for_test(&bi, "did:test:pyo3-bridge-test");
         crate::runtime::create_supervisor_context_for_test(
             &bi,
             &context_id,
@@ -9293,6 +9336,455 @@ mod tests {
                 .expect("restoring persisted contexts must succeed");
             assert!(restored.contains(&context_id), "{restored}");
             assert!(!crate::runtime::lock_release_marks(&bi).contains_key(&context_id));
+        });
+    }
+
+    #[cfg(feature = "testing")]
+    const SLOW_AGREE_PY: &std::ffi::CStr = c"
+import threading
+from fake_custody import P256Custody, ed_expand
+
+def x25519(k, u):
+    # RFC 7748 Montgomery ladder; k is already clamped.
+    p, a24 = 2**255 - 19, 121665
+    x1 = int.from_bytes(bytes(u), 'little') & ((1 << 255) - 1)
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in reversed(range(255)):
+        bit = (k >> t) & 1
+        if swap ^ bit:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = bit
+        a, b, c, d = x2 + z2, x2 - z2, x3 + z3, x3 - z3
+        aa, bb, da, cb = a * a % p, b * b % p, d * a % p, c * b % p
+        e = aa - bb
+        x3, z3 = (da + cb) ** 2 % p, x1 * (da - cb) ** 2 % p
+        x2, z2 = aa * bb % p, e * (aa + a24 * e) % p
+    if swap:
+        x2, z2 = x3, z3
+    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, 'little')
+
+class SlowAgreeCustody(P256Custody):
+    # Signals when an HPKE dh_agree starts, holds it until the test sets
+    # release_agree, signals that the hold is over, then answers with the
+    # P-256 ECDH of its key. release_agree starts set, so setup agrees
+    # without holding; the test clears it before the agree it watches. The
+    # #active Ed25519 key agrees by real X25519, so this identity can open a
+    # Welcome.
+
+    def __init__(self):
+        super().__init__()
+        self.agree_started = threading.Event()
+        self.release_agree = threading.Event()
+        self.release_agree.set()
+        self.agree_done = threading.Event()
+
+    def dh_agree(self, key_id, peer_public):
+        if self._types.get(key_id) == 'hpke-p256':
+            self.agree_started.set()
+            if not self.release_agree.wait(120.0):
+                raise RuntimeError('the test never released the agree')
+            self.agree_done.set()
+        elif self._key_types.get(key_id) == 'ed25519':
+            return x25519(ed_expand(self._seed(key_id))[0], peer_public)
+        return super().dh_agree(key_id, peer_public)
+";
+
+    /// Alice's side of the two-thread test: her instance, her Python host,
+    /// and her DID.
+    #[cfg(feature = "testing")]
+    struct SlowAgreeAlice {
+        scp: crate::scp::PyScp,
+        host: Py<PyAny>,
+        did: String,
+    }
+
+    /// Alice, with every key in a [`SLOW_AGREE_PY`] host.
+    #[cfg(feature = "testing")]
+    fn slow_agree_alice() -> SlowAgreeAlice {
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        Python::with_gil(|py| {
+            crate::custody::test_fakes::fake_custody_module(py);
+            let host = PyModule::from_code(py, SLOW_AGREE_PY, c"slow_agree.py", c"slow_agree")
+                .expect("slow-agree host compiles")
+                .getattr("SlowAgreeCustody")
+                .and_then(|cls| cls.call0())
+                .expect("slow-agree host")
+                .unbind();
+            let did = scp
+                .identity_create_with_custody(py, host.clone_ref(py))
+                .expect("alice's identity over the Python host")
+                .did()
+                .to_owned();
+            SlowAgreeAlice { scp, host, did }
+        })
+    }
+
+    /// Bob creates X and adds Alice, whose join opens the Welcome through her
+    /// host; then Bob sends `hello alice`. Returns X's id, Alice's handle, and
+    /// what Bob published after creating X: the add's Commit, his
+    /// `KeyResponse` sealed to Alice's wrapping key, and his message.
+    #[cfg(feature = "testing")]
+    fn bob_adds_alice_and_sends(
+        alice: &SlowAgreeAlice,
+    ) -> (String, PyContextHandle, Vec<Vec<u8>>, crate::scp::PyScp) {
+        let bob = crate::scp::PyScp::new_in_memory_for_test();
+        // One DHT for both instances, so each resolves the other's DID.
+        crate::runtime::set_resolver_dht_client(
+            &bob.inner,
+            crate::runtime::resolver_dht_client(&alice.scp.inner).expect("alice's DHT client"),
+        );
+        let bob_did = Python::with_gil(|py| {
+            bob.identity_create(py, "in_memory", None)
+                .expect("bob's identity")
+                .did()
+                .to_owned()
+        });
+        // Built after Bob's identity, so his supervisor resolves DIDs; it
+        // sends into a capture, so the test holds the exact bytes.
+        let sent = scp_core::context::supervisor::ContextSendCapture::default();
+        crate::runtime::init_context_manager_for_test_with_transport(
+            &bob.inner,
+            &bob_did,
+            sent.transport(),
+        );
+        let (ctx_id, alice_handle) = Python::with_gil(|py| {
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            let ceiling = [
+                "messages:read",
+                "messages:write",
+                "role:assign",
+                "member:invite",
+            ];
+            let ceiling = [&ceiling[..], &["governance:propose", "governance:vote"]].concat();
+            params.set_item("ceiling", ceiling).unwrap();
+            params.set_item("governance", "single_admin").unwrap();
+            let bob_handle = bob
+                .context_create(py, &bob_did, &params)
+                .expect("bob creates X");
+            // What Bob published before Alice's epoch never reaches her.
+            drop(sent.take());
+            let ctx_id = bob_handle.context_id.clone();
+            let (reservation, key_package) = alice
+                .scp
+                .reserve_key_package(py, &alice.did)
+                .expect("alice reserves a KeyPackage");
+            let invite = bob
+                .invite_member(
+                    py,
+                    ctx_id.clone(),
+                    bob_did.clone(),
+                    alice.did.clone(),
+                    key_package,
+                )
+                .expect("bob invites alice");
+            let alice_handle = alice
+                .scp
+                .context_join_from_welcome(py, alice.did.clone(), invite.bundle, reservation)
+                .expect("alice joins X from the Welcome");
+            // No relay carries Alice's routing announcement in this test.
+            bob.context_seed_peer_pseudonym(py, &bob_handle, &alice.did, &[0x41; 32])
+                .expect("bob learns alice's routing pseudonym");
+            let hello = pyo3::types::PyBytes::new(py, b"hello alice");
+            bob.context_send(py, &bob_handle, &bob_did, hello.as_any(), None)
+                .expect("bob sends");
+            (ctx_id, alice_handle)
+        });
+        let published = sent.take();
+        (ctx_id, alice_handle, published, bob)
+    }
+
+    /// Alice receives in X as a local member holding her access key, through
+    /// `Supervisor::test_admit_joined_member`, which says why no production
+    /// path does this yet.
+    #[cfg(feature = "testing")]
+    fn make_alice_a_receiving_member(
+        rt: &tokio::runtime::Runtime,
+        alice: &SlowAgreeAlice,
+        bob: &crate::scp::PyScp,
+        ctx_id: &str,
+    ) {
+        let alice_sup =
+            Arc::clone(crate::runtime::supervisor(&alice.scp.inner).expect("supervisor"));
+        let bob_sup = Arc::clone(crate::runtime::supervisor(&bob.inner).expect("supervisor"));
+        rt.block_on(alice_sup.test_admit_joined_member(&bob_sup, ctx_id, &alice.did))
+            .expect("alice receives as a member of X");
+    }
+
+    /// Delivers each payload to the actor for `ctx_id` from a runtime task
+    /// through `Supervisor::test_deliver_incoming`, as a relay subscription
+    /// would, so no host thread carries the delivery.
+    #[cfg(feature = "testing")]
+    fn deliver_from_a_runtime_task(
+        rt: &'static tokio::runtime::Runtime,
+        sup: Arc<scp_core::context::supervisor::Supervisor>,
+        ctx_id: String,
+        deliveries: Vec<Vec<u8>>,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<
+            Vec<
+                Result<
+                    scp_core::context::actor::commands::DeliverOutcome,
+                    scp_core::context::ContextError,
+                >,
+            >,
+        >,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let outcomes = rt.block_on(rt.spawn(async move {
+                let mut outcomes = Vec::new();
+                for envelope_bytes in deliveries {
+                    let outcome = sup
+                        .test_deliver_incoming(&ctx_id, envelope_bytes)
+                        .await
+                        .expect("alice's actor takes the delivery and replies");
+                    outcomes.push(outcome);
+                }
+                outcomes
+            }));
+            let _ = tx.send(outcomes.expect("delivery task"));
+        });
+        (thread, rx)
+    }
+
+    /// Waits for `who` until `deadline`; the caller holds no GIL meanwhile.
+    #[cfg(feature = "testing")]
+    fn recv_by<T>(rx: &std::sync::mpsc::Receiver<T>, deadline: std::time::Instant, who: &str) -> T {
+        use std::sync::mpsc::RecvTimeoutError;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(v) => v,
+            Err(RecvTimeoutError::Timeout) => panic!("{who} did not finish by the deadline"),
+            Err(RecvTimeoutError::Disconnected) => panic!("{who} panicked"),
+        }
+    }
+
+    /// Spec 09 §9.16.1 with a host custody: Alice's wrapping key lives in a
+    /// Python callback custody, so the actor turn that opens Bob's sender-key
+    /// `KeyResponse` waits on the Python `dh_agree`. While that callback is
+    /// held, a second host thread holding the GIL asks the same actor for its
+    /// member count. The test releases the callback only once that request
+    /// sits in the actor's mailbox behind the agree turn, so the two waits
+    /// overlap by construction, with no timed sleep. The count waits with the
+    /// GIL released, so the released callback takes the GIL, answers, and the
+    /// `KeyResponse` installs Bob's key: Bob's message opens for Alice and the
+    /// count answers after the turn. Were the count to wait holding the GIL,
+    /// neither the test's release nor the callback could take it, and the
+    /// `KeyResponse` would fail after the 30 s custody timeout.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn python_callback_custody_answers_a_key_response_while_another_thread_waits_on_the_actor() {
+        use scp_core::context::actor::commands::DeliverOutcome;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        let rt = crate::runtime().expect("runtime");
+        let alice = slow_agree_alice();
+        let (ctx_id, alice_handle, published, bob) = bob_adds_alice_and_sends(&alice);
+        let [commit, key_response, message]: [Vec<u8>; 3] =
+            published.try_into().unwrap_or_else(|p: Vec<Vec<u8>>| {
+                panic!(
+                    "bob publishes a Commit, a KeyResponse and a message: {}",
+                    p.len()
+                )
+            });
+        make_alice_a_receiving_member(rt, &alice, &bob, &ctx_id);
+        // The join may already have called the host; from here every HPKE
+        // agree is held until the test releases it.
+        let [agree_started, release_agree, agree_done] =
+            ["agree_started", "release_agree", "agree_done"].map(|name| {
+                Python::with_gil(|py| {
+                    let event = alice.host.bind(py).getattr(name).expect(name);
+                    event.call_method0("clear").expect("reset the event");
+                    event.unbind()
+                })
+            });
+
+        // Thread A delivers Bob's three payloads to Alice's actor. It sends
+        // each only after the previous one is answered, so while the agree
+        // turn runs, A queues nothing behind it.
+        let alice_sup =
+            Arc::clone(crate::runtime::supervisor(&alice.scp.inner).expect("supervisor"));
+        let deliveries = vec![commit, key_response, message];
+        let (thread_a, a_rx) =
+            deliver_from_a_runtime_task(rt, Arc::clone(&alice_sup), ctx_id.clone(), deliveries);
+
+        // Thread B: once the callback has started, ask the same actor for its
+        // member count while holding the GIL.
+        let (b_tx, b_rx) = std::sync::mpsc::channel();
+        let b_scp = crate::scp::PyScp {
+            inner: Arc::clone(&alice.scp.inner),
+        };
+        let b_agree_started = Python::with_gil(|py| agree_started.clone_ref(py));
+        let thread_b = std::thread::spawn(move || {
+            let count = Python::with_gil(|py| {
+                let started = b_agree_started
+                    .bind(py)
+                    .call_method1("wait", (60.0,))
+                    .and_then(|set| set.extract::<bool>())
+                    .expect("wait on agree_started");
+                assert!(started, "alice's actor calls the Python dh_agree");
+                let is_set = |event: &Py<PyAny>| {
+                    event
+                        .bind(py)
+                        .call_method0("is_set")
+                        .and_then(|set| set.extract::<bool>())
+                        .expect("agree_done.is_set")
+                };
+                assert!(
+                    !is_set(&agree_done),
+                    "thread B asks while the agree is held"
+                );
+                let count = b_scp.context_member_count(py, &alice_handle);
+                assert!(is_set(&agree_done), "the count waited for the agree turn");
+                count
+            });
+            let _ = b_tx.send(count.map_err(|e| e.to_string()));
+        });
+
+        // Release the agree only once B's request waits in the mailbox. The
+        // count is read only after the agree has started: before that, A's
+        // own deliveries can sit in the mailbox. From then on the agree turn
+        // runs and A queues nothing, so a waiting command is B's, and B waits
+        // on the held turn.
+        let started = Python::with_gil(|py| {
+            agree_started
+                .bind(py)
+                .call_method1("wait", (60.0,))
+                .and_then(|set| set.extract::<bool>())
+                .expect("wait on agree_started")
+        });
+        assert!(started, "alice's actor calls the Python dh_agree");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while alice_sup.test_queued_commands(&ctx_id).unwrap_or(0) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "thread B's member count never reached alice's mailbox"
+            );
+            std::thread::yield_now();
+        }
+        Python::with_gil(|py| {
+            release_agree
+                .bind(py)
+                .call_method0("set")
+                .expect("release the agree");
+        });
+
+        let count = recv_by(&b_rx, deadline, "thread B");
+        let outcomes = recv_by(&a_rx, deadline, "thread A");
+        thread_a.join().expect("thread A");
+        thread_b.join().expect("thread B");
+
+        assert_eq!(count.expect("member count"), Some(2));
+        let [commit, key_response, message]: [_; 3] =
+            outcomes.try_into().expect("three deliveries");
+        // Alice already holds the Commit's epoch through her Welcome.
+        assert!(commit.is_err(), "alice rejects the Commit she joined past");
+        assert!(
+            matches!(key_response, Ok(DeliverOutcome::Handled)),
+            "{key_response:?}"
+        );
+        // Bob's message opens only under his sender key, so it opening shows
+        // the KeyResponse installed that key. Alice never saw the message Bob
+        // sent when he created X (sequence 1), so this one (sequence 2) may be
+        // held in her reorder buffer rather than surfaced; a surfaced message
+        // is Bob's. Expect `Application` alone once the issue "A joiner holds
+        // the first post-join message from each existing sender as a false
+        // sequence gap" is fixed.
+        match &message {
+            Ok(DeliverOutcome::Handled) => {}
+            Ok(DeliverOutcome::Application((plaintext, _sender))) => {
+                assert_eq!(plaintext.as_slice(), b"hello alice");
+            }
+            other => panic!("bob's message opens under his installed sender key: {other:?}"),
+        }
+    }
+
+    /// Spec 09 §9.16.1, fail-closed restore order: after a restart, a context
+    /// whose owner's identity is not yet loaded does not restore, because the
+    /// owner's wrapping key lives in that identity's custody. `restore_context`
+    /// refuses with the `WrappingKeyCustodyUnavailable` text and
+    /// `restore_all_contexts` leaves the context out; once the identity is
+    /// registered again, `restore_all_contexts` restores it.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn restore_all_contexts_before_identity_load_fails_with_wrapping_custody_unavailable() {
+        use crate::runtime::{PyBridgeInstance, SqliteKeyMaterial, StorageConfig};
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        let rt = crate::runtime().expect("runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let open = || {
+            Arc::new(
+                PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+                    path: tmp.path().to_path_buf(),
+                    key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x6Bu8; 32])),
+                })
+                .expect("SQLCipher open must succeed"),
+            )
+        };
+
+        let first = crate::scp::PyScp { inner: open() };
+        let did = Python::with_gil(|py| {
+            first
+                .identity_create(py, "in_memory", None)
+                .expect("identity_create")
+                .did()
+                .to_owned()
+        });
+        let ctx_id = format!("restore-order-{}", uuid::Uuid::new_v4());
+        crate::runtime::init_context_manager(&first.inner, &did);
+        let sup = Arc::clone(crate::runtime::supervisor(&first.inner).expect("supervisor"));
+        rt.block_on(sup.create_context(
+            ctx_id.clone(),
+            scp_core::context::ContextParams {
+                ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                ..scp_core::context::ContextParams::default()
+            },
+            scp_did::DID(did.clone()),
+            None,
+            Vec::new(),
+        ))
+        .expect("create_context");
+        drop(sup);
+        // The identity's custody outlives the process, as a platform custody
+        // would; the next instance only learns of it when the app loads it.
+        let (_, entry) = first
+            .inner
+            .identity_registry
+            .remove(&did)
+            .expect("the creator is registered");
+        rt.block_on(first.inner.shutdown(std::time::Duration::from_secs(10)))
+            .expect("shutdown must release the store");
+        drop(first);
+
+        let reopened = crate::scp::PyScp { inner: open() };
+        crate::runtime::init_context_manager(&reopened.inner, &did);
+        let unavailable =
+            scp_core::context::ContextError::WrappingKeyCustodyUnavailable.to_string();
+        Python::with_gil(|py| {
+            let err = reopened
+                .restore_context(py, &ctx_id)
+                .expect_err("restore before the owner's identity is loaded fails closed");
+            assert!(err.to_string().contains(&unavailable), "{err}");
+            let restored = reopened
+                .restore_all_contexts(py)
+                .expect("restore_all_contexts returns the contexts it restored");
+            assert!(!restored.contains(&ctx_id), "{restored}");
+            let sup = Arc::clone(crate::runtime::supervisor(&reopened.inner).expect("supervisor"));
+            assert_eq!(
+                rt.block_on(sup.member_count(&ctx_id)),
+                None,
+                "no actor runs without the owner's wrapping key"
+            );
+
+            crate::runtime::register_identity(&reopened.inner, &did, entry);
+            let restored = reopened
+                .restore_all_contexts(py)
+                .expect("restore_all_contexts after the identity is loaded");
+            assert!(restored.contains(&ctx_id), "{restored}");
         });
     }
 
@@ -10565,23 +11057,11 @@ class SignOnlyCustody:
             // is forced through `KeyCustody::sign`.
             let creator_identity = scp.identity_create(py, "in_memory", None).unwrap();
             let creator = creator_identity.did().to_owned();
-
-            let (signer_pk, sign_only_custody) = install_sign_only_custody(py, &bi, &creator);
-
-            // Sanity: the swapped custody signs.
             let rt = crate::runtime().unwrap();
-            let active_handle_id = crate::runtime::with_identity(&bi, &creator, |entry| {
-                Ok(entry.identity.active_signing_key.id())
-            })
-            .unwrap();
-            let handle = scp_platform::KeyHandle::new(active_handle_id);
-            assert!(
-                rt.block_on(sign_only_custody.sign(&handle, b"probe"))
-                    .is_ok(),
-                "sign-only custody must still sign"
-            );
 
-            // Build the context as the creator.
+            // Build the context as the creator before the swap: creation loads
+            // the creator's wrapping key from the in-memory custody, which a
+            // sign-only custody cannot hold.
             let ctx_id = format!("export-sign-only-{}", uuid::Uuid::new_v4());
             crate::runtime::register_context(&bi, &ctx_id, &creator, &[]).unwrap();
             let sup = crate::runtime::supervisor(&bi).unwrap();
@@ -10597,6 +11077,19 @@ class SignOnlyCustody:
                 Vec::new(),
             ))
             .unwrap();
+
+            let (signer_pk, sign_only_custody) = install_sign_only_custody(py, &bi, &creator);
+
+            // Sanity: the swapped custody signs.
+            let active_handle_id = crate::runtime::with_identity(&bi, &creator, |entry| {
+                Ok(entry.identity.active_signing_key.id())
+            })
+            .unwrap();
+            let handle = scp_platform::KeyHandle::new(active_handle_id);
+            assert!(
+                custody_wait(sign_only_custody.sign(&handle, b"probe")).is_ok(),
+                "sign-only custody must still sign"
+            );
 
             // The export MUST succeed although the custody holds no private
             // key — the signature is produced via `KeyCustody::sign`.

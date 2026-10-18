@@ -128,6 +128,9 @@ scp-platform = { path = "../scp-platform", features = ["testing"] }
 # the `FfiDhtClient::InMemory` test seam. `features = ["testing"]` (no
 # slash-string in a feature list) is fine per the ADR-062 §Decision 1 invariant.
 scp-dht = { path = "../scp-dht", features = ["testing"] }
+# The HPKE P-256 fake-host test pins the RFC 5903 ECDH vector in
+# `scp_crypto::p256::testing`.
+scp-crypto = { path = "../scp-crypto", features = ["testing"] }
 tempfile = "3"
 
 [[test]]

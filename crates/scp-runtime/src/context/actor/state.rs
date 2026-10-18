@@ -2895,61 +2895,6 @@ impl PerContextState {
         Ok(std::mem::take(&mut crypto.pending_distributions))
     }
 
-    /// Processes an incoming sender-key distribution message, returning the
-    /// AUTHENTICATED `(sender_key, epoch)` — verbatim from
-    /// [`NodeMlsFactory::process_incoming_sender_key`]. The DHKEM(P-256) wrapping
-    /// secret enters as a parameter (the identity's, spec 09 §9.16.1); this method installs
-    /// nothing and reads no crypto state (the caller gates + installs via
-    /// [`Self::set_sender_key_unchecked`]).
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::CryptoFailed`] on deserialization, HPKE-open, or the
-    /// sender-DID authentication check.
-    ///
-    /// [`NodeMlsFactory::process_incoming_sender_key`]: crate::crypto::mls::provider::NodeMlsFactory::process_incoming_sender_key
-    // #2148 F9: crypto twin reached only from in-crate `#[cfg(test)]` fixtures;
-    // targeted (not block-wide) so a genuinely-unwired future method still trips.
-    #[allow(dead_code)]
-    pub(crate) fn process_incoming_sender_key(
-        &self,
-        wrapping_secret_key: &[u8; 32],
-        sender_did: &str,
-        message_bytes: &[u8],
-    ) -> Result<(SenderKey, u64), ContextError> {
-        let ctx_id_hex = hex::encode(self.context_id);
-
-        let msg = SenderKeyDistributionMessage::from_bytes(message_bytes)
-            .map_err(|e| ContextError::CryptoFailed(format!("deserialization failed: {e}")))?;
-
-        match msg {
-            SenderKeyDistributionMessage::KeyResponse(response) => {
-                let sender_key = crate::crypto::sender_keys::key_protocol::hpke_open_sender_key(
-                    &response.hpke_sealed_key,
-                    &response.ephemeral_pubkey,
-                    wrapping_secret_key,
-                    &ctx_id_hex,
-                    &response.sender_did,
-                    response.epoch,
-                )
-                .map_err(|e| ContextError::CryptoFailed(format!("HPKE open failed: {e}")))?;
-
-                // Verify the sender DID matches (HPKE tag + DID binding), NOT
-                // floor gating (the caller does that against the registry).
-                if response.sender_did != sender_did {
-                    return Err(ContextError::CryptoFailed(
-                        "sender DID mismatch in sender key distribution".into(),
-                    ));
-                }
-
-                Ok((sender_key, response.epoch))
-            }
-            _ => Err(ContextError::CryptoFailed(
-                "expected SenderKeyDistributionMessage::KeyResponse".to_string(),
-            )),
-        }
-    }
-
     /// Installs an AUTHENTICATED sender key WITHOUT epoch gating, verbatim from
     /// the former provider `set_sender_key_unchecked`. A no-op when this actor
     /// is not encrypted-mode.
@@ -4126,7 +4071,7 @@ mod tests {
 //     round-trip decrypts to the ORIGINAL `InnerEnvelope` byte-for-byte at the
 //     AAD-bound (`sender_did`, `ReceiveFloor`), at both the zero and a rotated
 //     non-zero sender-key epoch (the epoch is bound in the sender-layer AAD).
-//   * `distribute_sender_key` / `process_incoming_sender_key` — the RECOVERED
+//   * `distribute_sender_key` / `NodeMlsFactory::open_incoming_sender_key` — the RECOVERED
 //     sender key (deterministic — the existing key material) is byte-identical
 //     to Alice's actual local sender key, and installs so her seal opens.
 //   * `group_context_extension` / `local_sender_key_epoch` — DIRECT
@@ -4151,7 +4096,7 @@ mod crypto_ops_golden {
     use super::*;
     use crate::crypto::mls::provider::NodeMlsFactory;
     use crate::crypto::mls::two_party_test_support::{TwoPartyPair, stand_up_two_party};
-    use crate::crypto::wrapping::WrappingKeyPair;
+    use crate::crypto::wrapping::IdentityWrappingKey;
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
 
@@ -4165,11 +4110,11 @@ mod crypto_ops_golden {
     /// `take_crypto_state` round-trip). Returns
     /// `(alice_wrapping, alice_state, bob_wrapping, bob_state, ctx)`: each
     /// [`PerContextState`] already OWNS its per-context crypto, beside each
-    /// party's wrapping keypair.
+    /// party's identity wrapping key.
     fn setup() -> (
-        Arc<WrappingKeyPair>,
+        Arc<IdentityWrappingKey>,
         PerContextState,
-        Arc<WrappingKeyPair>,
+        Arc<IdentityWrappingKey>,
         PerContextState,
         [u8; 32],
     ) {
@@ -4591,11 +4536,10 @@ mod crypto_ops_golden {
     /// EACH impl and assert byte-identical decrypt at the non-zero epoch —
     /// proving the epoch is bound in the AAD identically across impls (the
     /// zero-epoch tests cannot see an epoch-binding divergence).
-    #[test]
-    fn golden_seal_open_after_rotate_nonzero_epoch() {
+    #[tokio::test]
+    async fn golden_seal_open_after_rotate_nonzero_epoch() {
         let (_alice_p, mut alice_a, bob_p, mut bob_recv_a, ctx) = setup();
         let rid = routing(&ctx);
-        let bob_secret: [u8; 32] = **bob_p.secret();
         let inner = build_inner(ALICE, 0);
 
         // --- Actor path: actor rotate + actor seal + actor open. ---
@@ -4608,8 +4552,14 @@ mod crypto_ops_golden {
         // Deliver the rotated key to Bob (the rotate queued a distribution).
         let msgs_a = alice_a.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs_a.len(), 1);
-        let (key_a, recv_epoch_a) = bob_recv_a
-            .process_incoming_sender_key(&bob_secret, ALICE, &msgs_a[0].1)
+        let (key_a, recv_epoch_a) =
+            crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                &bob_p,
+                &bob_recv_a.context_id,
+                ALICE,
+                &msgs_a[0].1,
+            )
+            .await
             .unwrap();
         assert_eq!(recv_epoch_a, epoch_a);
         bob_recv_a.set_sender_key_unchecked(ALICE, key_a);
@@ -4647,12 +4597,10 @@ mod crypto_ops_golden {
     /// delivering the rotated key to a DIFFERENT actor (Bob) before the open,
     /// where [`golden_seal_open_after_rotate_nonzero_epoch`] opens on the
     /// receiver that was seeded with the delivered key inline.
-    #[test]
-    fn golden_seal_open_cross_roundtrip_nonzero_epoch() {
+    #[tokio::test]
+    async fn golden_seal_open_cross_roundtrip_nonzero_epoch() {
         let (_alice_p, mut alice_a, bob_p, mut bob_a, ctx) = setup();
         let rid = routing(&ctx);
-        // Bob's node-resident wrapping secret (the actor path's HPKE-open key).
-        let bob_secret: [u8; 32] = **bob_p.secret();
 
         // Rotate ONCE on the actor so Alice holds a single rotated key at a
         // non-zero epoch.
@@ -4663,8 +4611,14 @@ mod crypto_ops_golden {
         // Deliver the rotated key to Bob (the rotate queued a distribution).
         let msgs = alice_a.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs.len(), 1);
-        let (rotated_key, recv_epoch) = bob_a
-            .process_incoming_sender_key(&bob_secret, ALICE, &msgs[0].1)
+        let (rotated_key, recv_epoch) =
+            crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                &bob_p,
+                &bob_a.context_id,
+                ALICE,
+                &msgs[0].1,
+            )
+            .await
             .unwrap();
         assert_eq!(recv_epoch, epoch);
         bob_a.set_sender_key_unchecked(ALICE, rotated_key);
@@ -4800,11 +4754,9 @@ mod crypto_ops_golden {
         );
     }
 
-    #[test]
-    fn golden_distribute_and_process_recover_identical_key() {
+    #[tokio::test]
+    async fn golden_distribute_and_process_recover_identical_key() {
         let (_alice_p, mut alice_a, bob_p, mut bob_a, ctx) = setup();
-        // Bob's wrapping secret (node-resident) — the actor path's HPKE-open key.
-        let bob_secret: [u8; 32] = **bob_p.secret();
 
         // Actor distributes Alice's CURRENT (unrotated) sender key.
         alice_a.distribute_sender_key(ALICE, BOB).unwrap();
@@ -4821,8 +4773,14 @@ mod crypto_ops_golden {
         // Recover the key via the actor receive half. The recovered key material
         // is deterministic (Alice's existing key), so it equals Alice's actual
         // local sender key byte-for-byte.
-        let (recovered_key, epoch) = bob_a
-            .process_incoming_sender_key(&bob_secret, ALICE, &actor_msgs[0].1)
+        let (recovered_key, epoch) =
+            crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                &bob_p,
+                &bob_a.context_id,
+                ALICE,
+                &actor_msgs[0].1,
+            )
+            .await
             .unwrap();
         assert_eq!(
             epoch, 1,
@@ -4845,10 +4803,9 @@ mod crypto_ops_golden {
         }
     }
 
-    #[test]
-    fn golden_rotate_sender_key_parity() {
+    #[tokio::test]
+    async fn golden_rotate_sender_key_parity() {
         let (_alice_p, mut alice_a, bob_p, bob_a, _ctx) = setup();
-        let bob_secret: [u8; 32] = **bob_p.secret();
 
         let epoch_before = alice_a.local_sender_key_epoch();
         assert_eq!(
@@ -4871,8 +4828,14 @@ mod crypto_ops_golden {
         // carries the new epoch.
         let msgs = alice_a.drain_pending_sender_key_messages().unwrap();
         assert_eq!(msgs.len(), 1, "one member (Bob) receives the rotated key");
-        let (_key, epoch) = bob_a
-            .process_incoming_sender_key(&bob_secret, ALICE, &msgs[0].1)
+        let (_key, epoch) =
+            crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                &bob_p,
+                &bob_a.context_id,
+                ALICE,
+                &msgs[0].1,
+            )
+            .await
             .unwrap();
         assert_eq!(epoch, epoch_before + 1);
     }
@@ -5081,8 +5044,8 @@ mod crypto_ops_golden {
     /// the ground-truth assert below does not. The sealed ciphertext is
     /// HPKE-randomised (fresh ephemeral per answer), so the deterministic golden
     /// is the RECOVERED key, not the ciphertext bytes.
-    #[test]
-    fn golden_handle_sender_key_request_actor_round_trip() {
+    #[tokio::test]
+    async fn golden_handle_sender_key_request_actor_round_trip() {
         use ed25519_dalek::Signer as _;
         use scp_clock::Clock as _;
 
@@ -5097,10 +5060,15 @@ mod crypto_ops_golden {
         let bob_verifying_key = bob_request_signing_key.verifying_key();
 
         // Build a signed SenderKeyRequest for Alice's key, sealing to a fresh
-        // ephemeral DHKEM(P-256) wrapping keypair.
+        // ephemeral DHKEM(P-256) wrapping key held in custody.
         let nonce = [2u8; 16];
-        let (wrapping_pub, wrapping_secret) =
-            scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+        let ephemeral = crate::crypto::wrapping::test_wrapping_key(&Arc::new(
+            scp_platform::testing::InMemoryKeyCustody::new(),
+        ))
+        .await
+        .unwrap();
+        let wrapping_pub =
+            scp_protocol::crypto::hpke::p256::P256Point::try_from(*ephemeral.public()).unwrap();
         let timestamp = SystemClock.now_secs();
         let hash = scp_protocol::crypto::sender_keys::key_protocol_verify::compute_request_hash(
             BOB,
@@ -5156,13 +5124,17 @@ mod crypto_ops_golden {
                 }
                 other => panic!("expected a KeyResponse envelope, got {other:?}"),
             };
-        let key_actor = scp_protocol::crypto::sender_keys::hpke_open_sender_key(
-            &resp.hpke_sealed_key,
-            &resp.ephemeral_pubkey,
-            &wrapping_secret,
+        let dh = ephemeral
+            .agree(&scp_protocol::crypto::hpke::p256::ValidatedEnc::from(
+                resp.ephemeral_pubkey,
+            ))
+            .await
+            .unwrap();
+        let key_actor = crate::crypto::sender_keys::key_protocol::open_sender_key_response_with_dh(
+            &dh,
+            ephemeral.public(),
             &ctx_hex,
-            &resp.sender_did,
-            resp.epoch,
+            &resp,
         )
         .unwrap();
 

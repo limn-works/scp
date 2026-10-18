@@ -1017,7 +1017,8 @@ impl NapiIdentity {
     /// # Returns
     ///
     /// A new `NapiIdentity` with the migrated DID. The original identity's
-    /// key material is dropped from the registry.
+    /// registry entry is removed; the supervisor's loaded wrapping key for the
+    /// old DID keeps its custody `Arc` until supervisor shutdown.
     ///
     /// # Errors
     ///

@@ -134,6 +134,15 @@ pub mod transport_slot;
 mod spawn_from_welcome_tests;
 
 #[cfg(test)]
+mod faulty_storage;
+
+#[cfg(any(test, feature = "testing"))]
+mod two_instance_seams;
+/// The capture behind the two-instance receive seams (`testing` only).
+#[cfg(any(test, feature = "testing"))]
+pub use two_instance_seams::ContextSendCapture;
+
+#[cfg(test)]
 impl supervisor::Supervisor {
     /// Registers `handle` under `context_id` with no actor task behind it, so a
     /// test holds the receiving half of the mailbox.
@@ -146,6 +155,12 @@ impl supervisor::Supervisor {
     }
 }
 
+/// The custody seam of the identity wrapping key (spec 09 §9.16.1): a bridge
+/// passes a [`WrappingCustodySource`] to the supervisor constructor.
+pub use crate::crypto::wrapping::{
+    ErasedCustody, WrappingCustody, WrappingCustodyFuture, WrappingCustodySource,
+    single_custody_source,
+};
 pub use challenger_ledger_actor::{
     BeginOutcome, ChallengeLedgerError, ChallengerLedgerCommand, ChallengerLedgerHandle,
     ChallengerLedgerShared, GradedAttempt, GradingLease, MAX_CONCURRENT_GRADINGS_PER_CHALLENGER,
@@ -176,3 +191,45 @@ pub use supervisor::{
     Supervisor, SupervisorConfig, WelcomeJoinRequest,
 };
 pub use transport_slot::TransportSlot;
+
+/// The sender-key epoch window: `epoch` is admitted against the recorded
+/// floor `current` when `current < epoch <= current + max_advance`.
+///
+/// The one rule both [`Supervisor::check_and_advance_sender_epoch`] (under the
+/// entry guard) and the `KeyResponse` receive path's read-only pre-check
+/// (`NodeMlsFactory::open_incoming_sender_key`, before any custody call)
+/// apply. It lives here rather than in the private `floors` module so that
+/// `pub(crate)` states its reach: in `floors` it would have to be `pub`, which
+/// `clippy::redundant_pub_crate` requires there.
+///
+/// # Errors
+///
+/// [`FloorAdvanceError::SenderEpochNotMonotonic`](floors::FloorAdvanceError::SenderEpochNotMonotonic)
+/// if `epoch <= current`;
+/// [`FloorAdvanceError::SenderEpochOvershoot`](floors::FloorAdvanceError::SenderEpochOvershoot)
+/// if `epoch` exceeds `current + max_advance`.
+pub(crate) fn admit_sender_epoch(
+    did: &str,
+    current: u64,
+    epoch: u64,
+    max_advance: u64,
+) -> Result<(), floors::FloorAdvanceError> {
+    // reject-if-<= (monotonicity, #1608).
+    if epoch <= current {
+        return Err(floors::FloorAdvanceError::SenderEpochNotMonotonic {
+            did: did.to_owned(),
+            current,
+            proposed: epoch,
+        });
+    }
+    // reject-if-overshoot (epoch-poisoning ceiling).
+    let ceiling = current.saturating_add(max_advance);
+    if epoch > ceiling {
+        return Err(floors::FloorAdvanceError::SenderEpochOvershoot {
+            did: did.to_owned(),
+            ceiling,
+            proposed: epoch,
+        });
+    }
+    Ok(())
+}

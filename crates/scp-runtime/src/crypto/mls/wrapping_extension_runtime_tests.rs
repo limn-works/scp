@@ -117,6 +117,7 @@ async fn sender_key_request_response_with_wrapping_key() {
         &custody,
         &request_result.wrapping_key_handle,
         "ctx-roundtrip",
+        "did:dht:alice",
         &response,
     )
     .await

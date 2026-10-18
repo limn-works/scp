@@ -1,13 +1,17 @@
 //! Test custody that loses a key at a chosen step, so each custody call in the
 //! sender-key and access-key wire protocols can be driven to key-not-found.
 //!
-//! A destroyed signing key or wrapping key reaches a `sign` or `dh_agree` call
-//! through plain [`InMemoryKeyCustody`]. Four calls cannot be reached that
-//! way, because the protocol obtains or uses the key inside one function:
-//! `generate_keypair` itself, `public_key` on the key `generate_keypair` just
-//! returned, `public_key` on the wrapping key after `dh_agree` used it, and
-//! `public_key` on the joiner's `#active` key after `ed25519_to_x25519_agree`
-//! used it to open an invitation. [`KeyLoss`] names each of those steps.
+//! A destroyed signing key reaches a `sign` call through plain
+//! [`InMemoryKeyCustody`]. A wrapping key is loaded at an entry point, which
+//! reads its public key from custody, so a key destroyed before an actor turn
+//! agrees with it fails the load instead; [`KeyLoss::OnDhAgree`] fails the
+//! agree itself, with the key still loaded. Four further calls cannot be
+//! reached by destroying a key from outside, because the protocol obtains or
+//! uses the key inside one function: `generate_keypair` itself, `public_key`
+//! on the key `generate_keypair` just returned, any call on the wrapping key
+//! after `dh_agree` used it, and `public_key` on the joiner's `#active` key
+//! after `ed25519_to_x25519_agree` used it to open an invitation. [`KeyLoss`]
+//! names each of those steps.
 
 use scp_platform::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
@@ -23,8 +27,11 @@ pub enum KeyLoss {
     /// `generate_keypair` destroys the key it created before returning its
     /// handle, so the next `public_key` on that handle is key-not-found.
     AfterGenerate,
-    /// `dh_agree` destroys its key after agreeing, so the next `public_key`
-    /// on that handle is key-not-found.
+    /// `dh_agree` reports [`PlatformError::KeyNotFound`] without agreeing.
+    OnDhAgree,
+    /// `dh_agree` destroys its key after agreeing, so every later call on
+    /// that handle (the next `dh_agree`, a reload's `public_key`) is
+    /// key-not-found.
     AfterDhAgree,
     /// `ed25519_to_x25519_agree` destroys its key after agreeing, so the next
     /// `public_key` on that handle is key-not-found.
@@ -56,7 +63,7 @@ impl KeyCustody for KeyLossCustody {
                 self.inner.destroy_key(&handle).await?;
                 Ok(handle)
             }
-            KeyLoss::AfterDhAgree | KeyLoss::AfterEd25519Agree => {
+            KeyLoss::OnDhAgree | KeyLoss::AfterDhAgree | KeyLoss::AfterEd25519Agree => {
                 self.inner.generate_keypair(key_type).await
             }
         }
@@ -83,6 +90,9 @@ impl KeyCustody for KeyLossCustody {
         key: &KeyHandle,
         peer_public: &[u8],
     ) -> Result<SharedSecret, PlatformError> {
+        if matches!(self.loss, KeyLoss::OnDhAgree) {
+            return Err(PlatformError::KeyNotFound);
+        }
         let shared = self.inner.dh_agree(key, peer_public).await?;
         if matches!(self.loss, KeyLoss::AfterDhAgree) {
             self.inner.destroy_key(key).await?;

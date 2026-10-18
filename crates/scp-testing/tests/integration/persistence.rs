@@ -875,6 +875,9 @@ fn restore_supervisor(
     // `executed_proposals` replay guard. `NodeMlsFactory` keeps a real
     // `SystemClock` so MLS key-package lifetimes validate against wall time.
     clock: Arc<dyn Clock>,
+    // The custody that holds the wrapping keys. A restart test passes the
+    // same custody to every supervisor, as a host's custody outlives a process.
+    wrapping_custody: &Arc<scp_platform::testing::InMemoryKeyCustody>,
 ) -> Arc<Supervisor> {
     Supervisor::with_providers_and_journal(
         Arc::new(NodeMlsFactory::new(
@@ -889,6 +892,7 @@ fn restore_supervisor(
         None,
         Some(clock),
         DurableProviders::for_test(journal, mls_storage),
+        scp_core::context::supervisor::single_custody_source(Arc::clone(wrapping_custody)),
     )
 }
 
@@ -913,6 +917,7 @@ fn restore_supervisor(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn executed_proposals_survive_restart_and_accumulate() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let creator_str = "did:dht:z6MkPersistRestoreCreator";
     let creator = DID::from(creator_str);
     let signing_key = deterministic_signing_key(&creator);
@@ -956,6 +961,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
             journal1,
             Arc::clone(&mls_storage),
             Arc::clone(&clock),
+            &wrapping_custody,
         );
         sup1.register_local_did(creator.clone()).await;
 
@@ -1021,6 +1027,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
         journal2,
         Arc::clone(&mls_storage),
         Arc::clone(&clock),
+        &wrapping_custody,
     );
     sup2.register_local_did(creator.clone()).await;
 
@@ -1167,6 +1174,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
 /// governance action execute against one, would FAIL this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_context_is_not_resurrected_and_refuses_operations() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let creator_str = "did:dht:z6MkExpiredRefuseCreator";
     let creator = DID::from(creator_str);
     let signing_key = deterministic_signing_key(&creator);
@@ -1188,6 +1196,7 @@ async fn expired_context_is_not_resurrected_and_refuses_operations() {
             journal1,
             Arc::clone(&mls_storage),
             Arc::clone(&clock),
+            &wrapping_custody,
         );
         sup1.register_local_did(creator.clone()).await;
         let params = ContextParams {
@@ -1227,6 +1236,7 @@ async fn expired_context_is_not_resurrected_and_refuses_operations() {
         journal2,
         Arc::clone(&mls_storage),
         Arc::clone(&clock),
+        &wrapping_custody,
     );
     sup2.register_local_did(creator.clone()).await;
 

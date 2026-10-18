@@ -1023,21 +1023,6 @@ pub(crate) async fn context_join_on(
     // suspended, so join is never the operation that attaches one.
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
 
-    // Generate a real MLS key package for the joining member (#1294).
-    // The key package contains the joiner's SCP credential (DID) and is
-    // validated by NodeMlsFactory::validate_key_package before MLS
-    // group addition.
-    let wrapping_public = crate::runtime::supervisor(bi)?
-        .wrapping_public_key(&DID(identity_did.clone()))
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-    let kp_bytes = generate_mls_key_package_bytes(&identity_did, &wrapping_public)?;
-
-    let key_package = scp_core::context::membership::KeyPackage {
-        owner_did: DID(identity_did.clone()),
-        mls_key_package_bytes: Some(kp_bytes),
-    };
-
     // §9.10.4: Derive pseudonym for the joining member so it can be stored
     // in PerContextState and announced to other members.
     //
@@ -1058,6 +1043,22 @@ pub(crate) async fn context_join_on(
         None
     } else {
         Some(derive_member_pseudonym_required(bi, &identity_did, &context_id).await?)
+    };
+
+    // Generate a real MLS key package for the joining member (#1294).
+    // The key package contains the joiner's SCP credential (DID) and is
+    // validated by NodeMlsFactory::validate_key_package before MLS
+    // group addition. It runs after derivation, so a joiner with no key
+    // material fails with derivation's `SCP-IDENT-1054` first.
+    let wrapping_public = crate::runtime::supervisor(bi)?
+        .wrapping_public_key(&DID(identity_did.clone()))
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    let kp_bytes = generate_mls_key_package_bytes(&identity_did, &wrapping_public)?;
+
+    let key_package = scp_core::context::membership::KeyPackage {
+        owner_did: DID(identity_did.clone()),
+        mls_key_package_bytes: Some(kp_bytes),
     };
 
     // Route through the ADR-049 lifecycle dispatch surface.
@@ -5584,17 +5585,22 @@ async fn dispatch_to_live_supervisor(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    // Consumed only by `testing`-gated helpers and tests.
+    #[cfg(feature = "testing")]
     use scp_core::context::ContextParams;
     // Consumed only by the `testing`-gated membership helper +
     // test; gate the import so the bare/production test target is warning-clean.
     #[cfg(feature = "testing")]
     use scp_core::context::membership::KeyPackage;
+    // Consumed only by `testing`-gated tests, like `DID` below.
+    #[cfg(feature = "testing")]
     use scp_core::context::params::Capability;
     // The feature-gated economy tests and the ungated
     // `parse_context_params_rejects_a_non_object_params_json` reference
     // `codes::` directly (no `use super::*`), so the alias stays ungated; the
     // ungated export tests reach `codes` through their in-fn `use super::*`
     // glob.
+    #[cfg(feature = "testing")]
     use scp_did::DID;
     use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
@@ -5636,7 +5642,10 @@ mod tests {
 
     /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
     /// supervisor. Mirrors the production rewire pattern but is callable
-    /// from tests with a pre-built `ContextParams`.
+    /// from tests with a pre-built `ContextParams`. Gated on `testing` with
+    /// its callers: a shipped build has no custody for the creator's
+    /// wrapping key.
+    #[cfg(feature = "testing")]
     async fn test_dispatch_create_context(
         bi: &crate::runtime::NapiBridgeInstance,
         ctx_id: &str,
@@ -7723,6 +7732,11 @@ mod tests {
     /// started leaves while this handle's cached string still reads "active".
     /// A gate weakened to an existence check admits all four here, because the
     /// actor answers the lifecycle read.
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lifecycle_gates_refuse_a_resident_actor_in_closing() {
         use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
@@ -9300,13 +9314,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Production callback-custody export sign chain (NO `testing`)
+    // Production callback-custody export sign chain
     //
-    // These tests compile and run in the BARE production build. They prove the
-    // un-gated §23.16.8 export sign/verify chain works for a non-in-memory,
-    // callback-shaped signer (the `identityCreateWithCustody` keychain/HSM
-    // case) and that the fail-closed boundary is the ABSENCE of retained
-    // custody (CTX_2040 from `resolve_napi_signer`), not a build flag.
+    // These tests prove the un-gated §23.16.8 export sign/verify chain works
+    // for a non-in-memory, callback-shaped signer (the
+    // `identityCreateWithCustody` keychain/HSM case) and that the fail-closed
+    // boundary is the ABSENCE of retained custody (CTX_2040 from
+    // `resolve_napi_signer`), not a build flag. Creating the exported context
+    // needs a wrapping-key custody, which only the `testing` seam supplies to
+    // an unregistered DID, so both run under `testing`.
     // -----------------------------------------------------------------------
 
     /// A minimal Rust signer that stands in for a production callback custody
@@ -9316,10 +9332,12 @@ mod tests {
     /// keychain/HSM shape. It is a plain Rust struct, not a `NapiKeyCustody`, so
     /// it needs no live JS `Env`/`ThreadsafeFunction` and exercises the exact
     /// signer shape `context_export_on` hands to `Supervisor::export_context`.
+    #[cfg(feature = "testing")]
     struct FakeExportCustody {
         signing_key: ed25519_dalek::SigningKey,
     }
 
+    #[cfg(feature = "testing")]
     impl FakeExportCustody {
         fn new() -> Self {
             // Deterministic seed for reproducibility; a real callback custody
@@ -9335,6 +9353,7 @@ mod tests {
     }
 
     /// Signs the §23.16.8 digest the way a callback custody's signer does.
+    #[cfg(feature = "testing")]
     impl scp_crypto::DynScpSigner for FakeExportCustody {
         fn algorithm(&self) -> scp_crypto::SigAlg {
             scp_crypto::SigAlg::Ed25519
@@ -9357,15 +9376,18 @@ mod tests {
     /// path that `context_export_on` / `context_import_on` delegate to. Proves a
     /// callback-shaped (non-exportable) signer produces a spec-valid §23.16.8
     /// signature that round-trips, and that a tampered snapshot is rejected.
-    /// Runs WITHOUT `testing`.
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn callback_custody_export_round_trips_and_rejects_tamper_without_feature() {
+    async fn callback_custody_export_round_trips_and_rejects_tamper() {
         use scp_core::context::export_import::{deserialize_export, serialize_export};
 
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        // Use a production-valid `did:dht:z*` MLS identity so context creation
-        // succeeds WITHOUT `scp-runtime/testing` — this test must genuinely
-        // exercise the no-in-memory-custody build, not the testing gate.
+        // A production-valid `did:dht:z*` MLS identity, the shape a shipped
+        // build's `NodeMlsFactory` accepts.
         crate::runtime::init_production_supervisor_for_test_on(&bi);
         let sup = crate::runtime::supervisor(&bi).expect("supervisor initialized above");
         let sup = Arc::clone(sup);
@@ -9444,14 +9466,17 @@ mod tests {
     /// `custody` is `None` (e.g. an externally loaded, DID-string-only
     /// creator) is rejected with `CTX_2040` by `resolve_napi_signer` —
     /// never with the old build-gate PERM-3001, and never an unsigned export.
-    /// Runs WITHOUT `testing`.
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_export_fails_closed_without_retained_custody() {
         use super::*;
         let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        // Production-valid `did:dht:z*` MLS identity so context creation
-        // succeeds WITHOUT `scp-runtime/testing` — this test must run in the
-        // no-in-memory-custody build it documents.
+        // A production-valid `did:dht:z*` MLS identity, the shape a shipped
+        // build's `NodeMlsFactory` accepts.
         crate::runtime::init_production_supervisor_for_test_on(&bi);
 
         let creator = DID("did:dht:z6MkNoCustodyExporter".to_owned());
@@ -10394,6 +10419,12 @@ mod tests {
         let ctx_id = handle.context_id.clone();
         drop(handle);
         drop(identity);
+        // The identity's custody outlives the instance, as a platform
+        // custody would: restore reopens the creator's wrapping key from it.
+        let (_, entry) = bi
+            .identity_registry
+            .remove(&did)
+            .expect("the creator is registered");
         bi.shutdown(std::time::Duration::from_secs(10))
             .await
             .expect("shutdown must release the store");
@@ -10401,6 +10432,7 @@ mod tests {
         drop(scp);
 
         let reopened = open();
+        crate::runtime::register_identity(&reopened, &did, entry);
         crate::runtime::init_supervisor(&reopened, &did);
         let restored_json = super::context_restore_all_on(&reopened)
             .await
@@ -10502,6 +10534,12 @@ mod tests {
 
         drop(handle);
         drop(identity);
+        // The identity's custody outlives the instance, as a platform
+        // custody would: restore reopens the creator's wrapping key from it.
+        let (_, entry) = bi
+            .identity_registry
+            .remove(&did)
+            .expect("the creator is registered");
         bi.shutdown(std::time::Duration::from_secs(10))
             .await
             .expect("shutdown must release the store");
@@ -10509,6 +10547,7 @@ mod tests {
         drop(scp);
 
         let reopened = Arc::new(open());
+        crate::runtime::register_identity(&reopened, &did, entry);
         crate::runtime::init_supervisor(&reopened, &did);
         // A restarted process resolves the issuer's DID document through the
         // resolver an identity call attaches; B makes no identity call.

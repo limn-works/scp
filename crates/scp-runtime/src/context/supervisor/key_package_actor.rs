@@ -112,8 +112,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
-
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
@@ -125,7 +123,7 @@ use zeroize::Zeroizing;
 use crate::context::builder::ContextTransportProvider;
 use crate::crypto::mls::backend::{MlsBackend, SignerState};
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
-use crate::crypto::wrapping::WrappingKeyPair;
+use crate::crypto::wrapping::IdentityWrappingKey;
 use scp_did::SigningKeyId;
 use scp_mls::credential::ScpCredential;
 use scp_mls::error::MlsError;
@@ -732,10 +730,10 @@ pub(in crate::context) struct KeyPackageStoreDeps {
     pub transport: Arc<dyn ContextTransportProvider>,
     /// Wall-clock source for reservation timestamps.
     pub clock: Arc<dyn Clock>,
-    /// The owning identity's wrapping-key slot (spec 09 §9.16.1), shared with
-    /// the supervisor. Read at each KeyPackage generation, so a KeyPackage
-    /// always publishes the identity's current key in `0xFF01`.
-    pub wrapping_key: Arc<ArcSwap<WrappingKeyPair>>,
+    /// The owning identity's wrapping key (spec 09 §9.16.1), shared with
+    /// the supervisor. Every KeyPackage publishes its public point in
+    /// `0xFF01`.
+    pub wrapping_key: Arc<IdentityWrappingKey>,
 }
 
 // ---------------------------------------------------------------------------
@@ -755,9 +753,9 @@ pub struct KeyPackageStoreActor {
     /// `None` only on a malformed-DID wiring bug, in which case replenish
     /// fail-closes rather than pooling inert KPs.
     credential: Option<ScpCredential>,
-    /// The owning identity's wrapping-key slot (§9.16.1), read at each
-    /// KeyPackage generation.
-    wrapping_key: Arc<ArcSwap<WrappingKeyPair>>,
+    /// The owning identity's wrapping key (§9.16.1), whose public point every
+    /// KeyPackage publishes.
+    wrapping_key: Arc<IdentityWrappingKey>,
     /// MLS primitives backend — the replenish source + fused-join executor.
     mls: Arc<dyn MlsBackend>,
     /// Durable KV for the Class-S reservation journal + KP records.
@@ -1809,9 +1807,11 @@ impl KeyPackageStoreActor {
         let mut generated = 0usize;
         let mut first_err: Option<ContextError> = None;
         for _ in 0..deficit {
-            // Read the identity's current key per KeyPackage (load → copy →
-            // drop), so a rotation is published by the next one generated.
-            let wrapping_public_key = *self.wrapping_key.load().public();
+            // The identity's wrapping public key, published as the `0xFF01`
+            // leaf extension. The supervisor's entry never changes once
+            // inserted, so every KeyPackage this store generates carries the
+            // same key.
+            let wrapping_public_key = *self.wrapping_key.public();
             match self
                 .mls
                 .generate_key_package(&credential, &wrapping_public_key)

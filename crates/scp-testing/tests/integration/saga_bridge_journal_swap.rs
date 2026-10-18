@@ -162,6 +162,9 @@ fn journal_supervisor(
     persistence: Arc<SharedPersistence>,
     journal: Arc<dyn SagaJournal>,
     mls_storage: Arc<dyn OpenMlsStorageAdapter>,
+    // The custody that holds the wrapping keys. A restart test passes the
+    // same custody to every supervisor, as a host's custody outlives a process.
+    wrapping_custody: &Arc<scp_platform::testing::InMemoryKeyCustody>,
 ) -> Arc<Supervisor> {
     let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
     Supervisor::with_providers_and_journal(
@@ -180,6 +183,7 @@ fn journal_supervisor(
         // ONE shared `InMemoryStorage` (see callers), then pairs them via the
         // test-only `for_test` constructor — production sites use `from_handle`.
         scp_core::context::supervisor::DurableProviders::for_test(journal, mls_storage),
+        scp_core::context::supervisor::single_custody_source(Arc::clone(wrapping_custody)),
     )
 }
 
@@ -220,6 +224,7 @@ async fn append_entry(
 /// reconciled per `load_unresolved`'s classification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let creator_did = "did:dht:z6MkJournalSwapCreator";
     let ctx_id = "ctx-journal-swap-both-legs";
 
@@ -245,6 +250,7 @@ async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
             Arc::clone(&persistence),
             journal1,
             Arc::clone(&mls_storage),
+            &wrapping_custody,
         );
         sup1.register_local_did(DID::from(creator_did)).await;
 
@@ -312,6 +318,7 @@ async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
         Arc::clone(&persistence),
         Arc::clone(&journal2),
         Arc::clone(&mls_storage),
+        &wrapping_custody,
     );
     sup2.register_local_did(DID::from(creator_did)).await;
 
@@ -365,6 +372,7 @@ async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
 /// reconciled terminal proves restore ran first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn journal_swap_restores_context_before_replaying_sagas() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let creator_did = "did:dht:z6MkJournalSwapOrdering";
     let ctx_id = "ctx-journal-swap-ordering";
 
@@ -382,6 +390,7 @@ async fn journal_swap_restores_context_before_replaying_sagas() {
             Arc::clone(&persistence),
             journal1,
             Arc::clone(&mls_storage),
+            &wrapping_custody,
         );
         sup1.register_local_did(DID::from(creator_did)).await;
         let params = ContextParams {
@@ -419,6 +428,7 @@ async fn journal_swap_restores_context_before_replaying_sagas() {
         Arc::clone(&persistence),
         Arc::clone(&journal2),
         Arc::clone(&mls_storage),
+        &wrapping_custody,
     );
     sup2.register_local_did(DID::from(creator_did)).await;
 
@@ -453,6 +463,7 @@ async fn journal_swap_restores_context_before_replaying_sagas() {
 /// the producer lands, yet is correctly wired.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn journal_swap_replay_on_empty_journal_is_a_noop() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let creator_did = "did:dht:z6MkJournalSwapEmpty";
     let persistence = Arc::new(SharedPersistence::default());
     let journal_storage = Arc::new(InMemoryStorage::new());
@@ -466,6 +477,7 @@ async fn journal_swap_replay_on_empty_journal_is_a_noop() {
         Arc::clone(&persistence),
         Arc::clone(&journal),
         mls_storage,
+        &wrapping_custody,
     );
     sup.register_local_did(DID::from(creator_did)).await;
 
@@ -505,6 +517,7 @@ async fn journal_swap_replay_on_empty_journal_is_a_noop() {
 /// supervisor — exactly the §17.16.4 ordering guarantee.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn journal_swap_second_restart_replay_is_idempotent() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let creator_did = "did:dht:z6MkJournalSwapIdempotent";
     let persistence = Arc::new(SharedPersistence::default());
     let journal_storage = Arc::new(InMemoryStorage::new());
@@ -529,6 +542,7 @@ async fn journal_swap_second_restart_replay_is_idempotent() {
         Arc::clone(&persistence),
         Arc::clone(&journal),
         mls_storage,
+        &wrapping_custody,
     );
     sup.register_local_did(DID::from(creator_did)).await;
 
@@ -577,6 +591,7 @@ async fn journal_swap_second_restart_replay_is_idempotent() {
 #[cfg(feature = "sqlite")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn journal_swap_sqlite_durable_crash_recovery_round_trips_on_disk() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     use scp_platform::sqlite::SqliteStorage;
 
     let creator_did = "did:dht:z6MkJournalSwapSqlite";
@@ -641,6 +656,7 @@ async fn journal_swap_sqlite_durable_crash_recovery_round_trips_on_disk() {
         Arc::new(SharedPersistence::default()),
         Arc::clone(&journal2),
         mls_storage,
+        &wrapping_custody,
     );
     sup2.register_local_did(DID::from(creator_did)).await;
 
@@ -678,6 +694,7 @@ async fn journal_swap_sqlite_durable_crash_recovery_round_trips_on_disk() {
 /// rebuilt for the carried-over `NeedsRepair` saga.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn journal_swap_needs_repair_carries_over_without_rebuilding_reservation() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let creator_did = "did:dht:z6MkJournalSwapNeedsRepair";
     let persistence = Arc::new(SharedPersistence::default());
     let journal_storage = Arc::new(InMemoryStorage::new());
@@ -707,6 +724,7 @@ async fn journal_swap_needs_repair_carries_over_without_rebuilding_reservation()
         Arc::clone(&persistence),
         Arc::clone(&journal),
         mls_storage,
+        &wrapping_custody,
     );
     sup.register_local_did(DID::from(creator_did)).await;
 

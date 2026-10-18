@@ -1145,7 +1145,31 @@
       "name": "dh_agree",
       "path": "crates/scp-ffi/napi/src/testing.rs",
       "kind": "test-fixture",
-      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Returns the shared secret the adapter read from the host's dhAgree, so a test shows the bridge reads the secret intact before the TypeScript adapter zeroes its copy; a peer key that is not 32 bytes is SCP-VALID-7005, a host failure SCP-CRYPTO-4006 or SCP-CRYPTO-4060. Not a protocol operation."
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Returns the shared secret the adapter read from the host's dhAgree, so a test shows the bridge reads the secret intact before the TypeScript adapter zeroes its copy; the peer key reaches the adapter unchanged, so the adapter's own peer check for the key's type (32 bytes for X25519, the 65-byte uncompressed point for hpke-p256) runs, and its refusal or a host failure is SCP-CRYPTO-4006 for key-not-found or SCP-CRYPTO-4060. Not a protocol operation."
+    },
+    {
+      "name": "take",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "Test hook; feature-gated (testing). Method of NapiContextSendCapture, the handle testingCaptureContextSends returns. Drains the context payloads the instance's capturing transport recorded, in send order, so a test can deliver one instance's exact bytes to another instance without a relay. Not a protocol operation."
+    },
+    {
+      "name": "testing_capture_context_sends",
+      "path": "crates/scp-ffi/napi/src/scp.rs",
+      "kind": "test-fixture",
+      "reason": "Test hook; feature-gated (testing). Initializes the instance's supervisor with a transport that records every context payload it sends instead of publishing it; SCP-CTX-2000 when a supervisor already exists. Not a protocol operation."
+    },
+    {
+      "name": "testing_admit_joined_member",
+      "path": "crates/scp-ffi/napi/src/testing.rs",
+      "kind": "test-fixture",
+      "reason": "Test hook; feature-gated (testing). Registers a Welcome joiner's DID as local and installs the inviter's context access key on the joiner, standing in for the out-of-band key delivery the join path does not perform, so a two-instance test can receive the inviter's sends. Not a protocol operation."
+    },
+    {
+      "name": "testing_deliver_incoming",
+      "path": "crates/scp-ffi/napi/src/scp.rs",
+      "kind": "test-fixture",
+      "reason": "Test hook; feature-gated (testing). Delivers payloads, in order, to a context actor through its relay receive path (MessagingCommand::DeliverIncoming) and returns each outcome or error, so a test drives the actor's receive turn with exact bytes. Not a protocol operation."
     }
   ],
   "pending_registration": {

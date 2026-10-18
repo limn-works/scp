@@ -1,141 +1,293 @@
-//! The DHKEM(P-256) wrapping keypair (spec 09 §9.16.1).
+//! The identity's DHKEM(P-256) wrapping key (spec 09 §9.16.1).
 //!
-//! One identity has one wrapping keypair, published as the `0xFF01` leaf
-//! extension in every context the identity joins and used to open the
-//! HPKE-sealed sender keys, access keys and invitations addressed to it. The
-//! scalar is the only persisted half: [`WrappingKeyPair::from_secret`] derives
-//! the public point once, so a stored public key can never disagree with the
-//! stored scalar.
+//! One identity has one wrapping key, published as the `0xFF01` leaf
+//! extension in every context the identity joins. Today the runtime uses it
+//! to open the HPKE-sealed sender keys addressed to the identity (§9.16.2).
+//! Spec 05 §5.12.3.1 also seals the invitation bundle to it; the Welcome join
+//! still opens that bundle with the `#active` key until the join moves to
+//! this key. The supervisor holds it as an [`IdentityWrappingKey`]: a
+//! custody, the custody's opaque handle, and the public point.
+//!
+//! `KeyCustody` uses return-position `impl Trait`, so it is not object safe.
+//! [`WrappingCustody`] is the object-safe slice of it the wrapping key needs.
+//! The trait is sealed, so [`ErasedCustody`] is its only implementation and
+//! any `KeyCustody` (test fakes included) reaches the supervisor through that
+//! adapter. A bridge hands the supervisor a [`WrappingCustodySource`] that
+//! finds an identity's custody by DID.
 
-use scp_crypto::p256::{P256Error, P256SecretKey};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use scp_crypto::CustodyFailure;
+use scp_did::DID;
+use scp_platform::PlatformError;
+use scp_platform::traits::{KeyCustody, KeyHandle, KeyType, PublicKey};
+use scp_protocol::context::ContextError;
+use scp_protocol::crypto::hpke::p256::ValidatedEnc;
 use zeroize::Zeroizing;
 
-/// A DHKEM(P-256) wrapping keypair: a scalar in `[1, n − 1]` and the
-/// uncompressed point `scalar · G` derived from it.
+use crate::context::actor::SIGN_TIMEOUT;
+use crate::context::actor::signer::custody_timed_out;
+
+/// A boxed custody future, the shape an object-safe async method returns.
+pub type WrappingCustodyFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+mod sealed {
+    /// Seals [`super::WrappingCustody`]: only this module implements it.
+    pub trait Sealed {}
+}
+
+/// The object-safe slice of `KeyCustody` the identity wrapping key uses.
 ///
-/// The fields are private, so a pair whose halves disagree cannot be built.
-/// The scalar is zeroized when the pair drops.
-pub struct WrappingKeyPair {
-    secret: Zeroizing<[u8; 32]>,
+/// Sealed: [`ErasedCustody`] is the only implementation, so every wrapping
+/// key the supervisor holds goes through that adapter over some `KeyCustody`.
+/// The seal says nothing about which `KeyCustody`: the adapter's field is
+/// public and accepts any implementation, test custodies included.
+pub trait WrappingCustody: sealed::Sealed + Send + Sync {
+    /// Generates a [`KeyType::HpkeP256`] key in the operational role.
+    fn generate_hpke_p256(&self) -> WrappingCustodyFuture<'_, Result<KeyHandle, PlatformError>>;
+
+    /// The public key of `handle`.
+    fn public_key<'a>(
+        &'a self,
+        handle: &'a KeyHandle,
+    ) -> WrappingCustodyFuture<'a, Result<PublicKey, PlatformError>>;
+
+    /// The P-256 ECDH x-coordinate of `handle`'s private key and `enc`.
+    fn dh_agree<'a>(
+        &'a self,
+        handle: &'a KeyHandle,
+        enc: &'a ValidatedEnc,
+    ) -> WrappingCustodyFuture<'a, Result<Zeroizing<[u8; 32]>, PlatformError>>;
+
+    /// Destroys `handle`'s key.
+    fn destroy_key<'a>(
+        &'a self,
+        handle: &'a KeyHandle,
+    ) -> WrappingCustodyFuture<'a, Result<(), PlatformError>>;
+}
+
+/// A `KeyCustody` seen through [`WrappingCustody`].
+pub struct ErasedCustody<C: KeyCustody + 'static>(pub Arc<C>);
+
+impl<C: KeyCustody + 'static> sealed::Sealed for ErasedCustody<C> {}
+
+impl<C: KeyCustody + 'static> WrappingCustody for ErasedCustody<C> {
+    fn generate_hpke_p256(&self) -> WrappingCustodyFuture<'_, Result<KeyHandle, PlatformError>> {
+        Box::pin(self.0.generate_keypair(KeyType::HpkeP256))
+    }
+
+    fn public_key<'a>(
+        &'a self,
+        handle: &'a KeyHandle,
+    ) -> WrappingCustodyFuture<'a, Result<PublicKey, PlatformError>> {
+        Box::pin(self.0.public_key(handle))
+    }
+
+    fn dh_agree<'a>(
+        &'a self,
+        handle: &'a KeyHandle,
+        enc: &'a ValidatedEnc,
+    ) -> WrappingCustodyFuture<'a, Result<Zeroizing<[u8; 32]>, PlatformError>> {
+        Box::pin(async move {
+            let shared = self.0.dh_agree(handle, enc.as_bytes()).await?;
+            Ok(Zeroizing::new(*shared.as_bytes()))
+        })
+    }
+
+    fn destroy_key<'a>(
+        &'a self,
+        handle: &'a KeyHandle,
+    ) -> WrappingCustodyFuture<'a, Result<(), PlatformError>> {
+        Box::pin(self.0.destroy_key(handle))
+    }
+}
+
+/// Finds the custody that holds an identity's wrapping key. `None` means no
+/// custody is registered for that identity, and the supervisor refuses to
+/// build its actors.
+pub type WrappingCustodySource =
+    Arc<dyn Fn(&DID) -> Option<Arc<dyn WrappingCustody>> + Send + Sync>;
+
+/// A source that answers every identity with `custody`.
+#[must_use]
+pub fn single_custody_source<C: KeyCustody + 'static>(custody: Arc<C>) -> WrappingCustodySource {
+    let erased: Arc<dyn WrappingCustody> = Arc::new(ErasedCustody(custody));
+    Arc::new(move |_owner: &DID| Some(Arc::clone(&erased)))
+}
+
+/// Awaits one custody call for at most [`SIGN_TIMEOUT`], the custody budget of
+/// ADR-049 Decision 7a.
+///
+/// A timeout drops `call`; the host may still finish it. Only `generate`
+/// creates anything, so only the wrapping-key create sequence (generate, read
+/// the public point, store the record, and on a failed store remove the
+/// record and destroy the key) can orphan a key: leave one in custody that no
+/// record names and no live code holds a handle to, so nothing destroys it.
+/// Each orphan is the cost of bounding a custody that does not answer or of a
+/// store that fails, and none leaves a record naming a missing key. The
+/// sequence orphans a key in exactly these cases:
+///
+/// - `generate` times out here and the host finishes it later.
+/// - Runtime shutdown cancels the spawned create task after `generate`
+///   returned a handle and before the record is stored, or before a failed
+///   store's cleanup destroys the key: the task is dropped at an `.await`
+///   and runs no cleanup.
+/// - The destroy of an unrecorded key fails or times out (after a public
+///   point that cannot be read, or after a failed store whose record was
+///   removed); the destroy is best effort and only logs.
+/// - The record write reports an error, its removal reports an error too,
+///   and no record ends up stored (the write did not commit, or the removal
+///   did): the key is kept, because the write may have committed and a
+///   committed record must name a live key.
+///
+/// # Errors
+///
+/// [`ContextError::Custody`] with the custody's own kind when custody refuses,
+/// and with kind [`scp_crypto::CustodyFailureKind::TimedOut`] (`SCP-CRYPTO-4062`) when it
+/// does not answer in time.
+pub(crate) async fn custody_bounded<T>(
+    call: WrappingCustodyFuture<'_, Result<T, PlatformError>>,
+    operation: &'static str,
+) -> Result<T, ContextError> {
+    match tokio::time::timeout(SIGN_TIMEOUT, call).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(ContextError::Custody(CustodyFailure::from(&e))),
+        Err(_) => Err(custody_timed_out(operation)),
+    }
+}
+
+/// Reads `handle`'s public point from `custody`, under the custody budget.
+///
+/// # Errors
+///
+/// [`ContextError::Custody`] if custody refuses or times out, and
+/// [`ContextError::CryptoFailed`] if the key is not a valid 65-byte
+/// uncompressed P-256 point (§9.5).
+async fn read_public_point(
+    custody: &dyn WrappingCustody,
+    handle: &KeyHandle,
+) -> Result<[u8; 65], ContextError> {
+    let public = custody_bounded(custody.public_key(handle), "public_key").await?;
+    let point = scp_protocol::crypto::hpke::p256::validate_enc(public.as_bytes())
+        .map_err(|e| ContextError::CryptoFailed(format!("custody wrapping public key: {e}")))?;
+    Ok(*point.as_bytes())
+}
+
+/// Destroys `handle`'s key in `custody`, best effort: the caller is already
+/// failing, so a failure here is logged and not returned.
+async fn destroy_handle(custody: &dyn WrappingCustody, handle: &KeyHandle) {
+    if let Err(e) = custody_bounded(custody.destroy_key(handle), "destroy_key").await {
+        tracing::warn!(error = %e, "destroying an unrecorded wrapping key failed");
+    }
+}
+
+/// An identity's wrapping key: its custody, the custody's handle, and the
+/// 65-byte uncompressed public point read from custody when the key was
+/// loaded.
+///
+/// `Debug` prints only the public point; the handle stays out of logs.
+pub(crate) struct IdentityWrappingKey {
+    custody: Arc<dyn WrappingCustody>,
+    handle: KeyHandle,
     public: [u8; 65],
 }
 
-impl WrappingKeyPair {
-    /// Draws a fresh keypair from the OS random source.
-    #[must_use]
-    pub fn generate() -> Self {
-        let (public, secret) = scp_protocol::crypto::sender_keys::generate_wrapping_keypair();
+impl IdentityWrappingKey {
+    /// A key whose public point `public` the caller has read from `custody`
+    /// for `handle`.
+    pub(crate) fn new(
+        custody: Arc<dyn WrappingCustody>,
+        handle: KeyHandle,
+        public: [u8; 65],
+    ) -> Self {
         Self {
-            secret,
-            public: *public.as_bytes(),
+            custody,
+            handle,
+            public,
         }
     }
 
-    /// Rebuilds the keypair from its 32-byte big-endian scalar, deriving the
-    /// public point.
+    /// Generates a fresh `HpkeP256` key in `custody` and reads its public
+    /// point, each under the custody budget.
     ///
     /// # Errors
     ///
-    /// [`P256Error::InvalidScalar`] if the scalar is zero or at least the
-    /// group order `n`.
-    pub fn from_secret(secret: Zeroizing<[u8; 32]>) -> Result<Self, P256Error> {
-        let public = P256SecretKey::from_scalar_bytes(&secret)?
-            .public_key()
-            .to_uncompressed();
-        Ok(Self { secret, public })
+    /// The errors of [`Self::read_public`], and [`ContextError::Custody`] if
+    /// the generation fails. A key whose public point cannot be read is
+    /// destroyed (best effort) before the error returns.
+    pub(crate) async fn generate(custody: Arc<dyn WrappingCustody>) -> Result<Self, ContextError> {
+        let handle = custody_bounded(custody.generate_hpke_p256(), "generate").await?;
+        match read_public_point(custody.as_ref(), &handle).await {
+            Ok(public) => Ok(Self::new(custody, handle, public)),
+            Err(e) => {
+                destroy_handle(custody.as_ref(), &handle).await;
+                Err(e)
+            }
+        }
     }
 
     /// The 65-byte uncompressed public point published in `0xFF01`.
-    #[must_use]
-    pub const fn public(&self) -> &[u8; 65] {
+    pub(crate) const fn public(&self) -> &[u8; 65] {
         &self.public
     }
 
-    /// The 32-byte scalar that opens HPKE ciphertexts sealed to [`Self::public`].
-    #[must_use]
-    pub const fn secret(&self) -> &Zeroizing<[u8; 32]> {
-        &self.secret
+    /// The custody handle of the private key.
+    pub(crate) const fn handle(&self) -> &KeyHandle {
+        &self.handle
+    }
+
+    /// Reads the public point from custody, under the custody budget.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::Custody`] if custody refuses or times out, and
+    /// [`ContextError::CryptoFailed`] if the key is not a valid 65-byte
+    /// uncompressed P-256 point (§9.5).
+    pub(crate) async fn read_public(&self) -> Result<[u8; 65], ContextError> {
+        read_public_point(self.custody.as_ref(), &self.handle).await
+    }
+
+    /// The ECDH x-coordinate of the private key and `enc`, computed inside
+    /// custody under the custody budget.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::Custody`] if custody refuses (key-not-found is
+    /// `SCP-CRYPTO-4006`) or times out (`SCP-CRYPTO-4062`).
+    pub(crate) async fn agree(
+        &self,
+        enc: &ValidatedEnc,
+    ) -> Result<Zeroizing<[u8; 32]>, ContextError> {
+        custody_bounded(self.custody.dh_agree(&self.handle, enc), "dh_agree").await
+    }
+
+    /// Destroys the key in custody, best effort: the caller is already
+    /// failing, so a failure here is logged and not returned.
+    pub(crate) async fn destroy(&self) {
+        destroy_handle(self.custody.as_ref(), &self.handle).await;
     }
 }
 
-impl std::fmt::Debug for WrappingKeyPair {
+impl std::fmt::Debug for IdentityWrappingKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WrappingKeyPair")
+        f.debug_struct("IdentityWrappingKey")
             .field("public", &hex::encode(self.public))
-            .field("secret", &"[REDACTED]")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
+/// A custody-backed wrapping key generated in `custody`, for tests.
+///
+/// # Errors
+///
+/// The errors of [`IdentityWrappingKey::generate`].
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    fn scalar(hex_str: &str) -> Zeroizing<[u8; 32]> {
-        Zeroizing::new(hex::decode(hex_str).unwrap().try_into().unwrap())
-    }
-
-    /// The P-256 group order `n`.
-    const N_HEX: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
-
-    /// `from_secret(X)` yields `X · G` for literal vectors: `1 · G` is the
-    /// base point of SEC 2 §2.4.2, `2 · G` its double.
-    #[test]
-    fn from_secret_derives_the_public_point_times_g() {
-        let one = format!("{:0>64}", "1");
-        let two = format!("{:0>64}", "2");
-        for (x, expected) in [
-            (
-                one.as_str(),
-                "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296\
-                 4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
-            ),
-            (
-                two.as_str(),
-                "047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978\
-                 07775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1",
-            ),
-        ] {
-            let pair = WrappingKeyPair::from_secret(scalar(x)).unwrap();
-            assert_eq!(hex::encode(pair.public()), expected, "scalar {x}");
-            assert_eq!(**pair.secret(), *scalar(x), "scalar {x}");
-        }
-    }
-
-    /// `from_secret` refuses 0 and `n`, the two ends just outside `[1, n − 1]`,
-    /// and accepts `n − 1`.
-    #[test]
-    fn from_secret_rejects_zero_and_the_group_order() {
-        for (case, x) in [("zero", "00".repeat(32)), ("n", N_HEX.to_owned())] {
-            assert!(
-                matches!(
-                    WrappingKeyPair::from_secret(scalar(&x)),
-                    Err(P256Error::InvalidScalar)
-                ),
-                "{case}"
-            );
-        }
-        let n_minus_1 = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550";
-        assert!(WrappingKeyPair::from_secret(scalar(n_minus_1)).is_ok());
-    }
-
-    /// A generated pair round-trips through its scalar to the same point.
-    #[test]
-    fn generated_pair_round_trips_through_its_secret() {
-        let pair = WrappingKeyPair::generate();
-        let again = WrappingKeyPair::from_secret(pair.secret().clone()).unwrap();
-        assert_eq!(again.public(), pair.public());
-    }
-
-    /// The secret accessor hands out the zeroizing wrapper, never a bare array.
-    #[test]
-    fn secret_accessor_is_zeroizing() {
-        fn zeroizing(k: &WrappingKeyPair) -> &Zeroizing<[u8; 32]> {
-            k.secret()
-        }
-        let pair = WrappingKeyPair::generate();
-        assert_eq!(zeroizing(&pair).len(), 32);
-        assert!(!format!("{pair:?}").contains(&hex::encode(**pair.secret())));
-    }
+pub(crate) async fn test_wrapping_key<C: KeyCustody + 'static>(
+    custody: &Arc<C>,
+) -> Result<Arc<IdentityWrappingKey>, ContextError> {
+    IdentityWrappingKey::generate(Arc::new(ErasedCustody(Arc::clone(custody))))
+        .await
+        .map(Arc::new)
 }

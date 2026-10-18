@@ -335,6 +335,15 @@ pub struct UniffiBridgeInstance {
             ),
         >,
     >,
+    /// Test seam: once set, the supervisor's wrapping custody source answers
+    /// an identity with no custody registered on this instance from this one
+    /// in-memory custody instead of failing closed. Set only by
+    /// `serve_unregistered_wrapping_keys_from_test_custody`, for fixtures that
+    /// create contexts for DIDs they never registered; a shipped build does
+    /// not compile it.
+    #[cfg(feature = "testing")]
+    pub(crate) unregistered_identity_wrapping_custody:
+        Arc<std::sync::OnceLock<Arc<scp_platform::testing::InMemoryKeyCustody>>>,
 
     /// Protocol repository used for trust aggregation + event log persistence.
     ///
@@ -489,6 +498,8 @@ impl UniffiBridgeInstance {
             released_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
             next_release_generation: std::sync::atomic::AtomicU64::new(0),
             identity_custody_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "testing")]
+            unregistered_identity_wrapping_custody: Arc::default(),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
             context_handle_registry: Arc::new(DashMap::new()),
@@ -634,6 +645,8 @@ impl UniffiBridgeInstance {
             released_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
             next_release_generation: std::sync::atomic::AtomicU64::new(0),
             identity_custody_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "testing")]
+            unregistered_identity_wrapping_custody: Arc::default(),
             protocol_repository,
             identity_link_attestation_registry: Arc::new(DashMap::new()),
             context_handle_registry: Arc::new(DashMap::new()),
@@ -914,6 +927,7 @@ impl UniffiBridgeInstance {
             persistence,
             durable,
             key_resolver_for_core(&self.core),
+            wrapping_custody_source(self),
         );
 
         self.core.set_supervisor(supervisor_arc);
@@ -969,6 +983,7 @@ impl UniffiBridgeInstance {
             persistence,
             durable,
             key_resolver_for_core(&self.core),
+            wrapping_custody_source(self),
         );
 
         self.core.set_supervisor(supervisor_arc);
@@ -1023,6 +1038,7 @@ impl UniffiBridgeInstance {
             persistence,
             durable,
             key_resolver_for_core(&self.core),
+            wrapping_custody_source(self),
         );
 
         self.core.set_supervisor(supervisor_arc);
@@ -2111,6 +2127,7 @@ fn build_supervisor(
     persistence: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
     durable: scp_core::context::supervisor::DurableProviders,
     key_resolver: scp_core::context::governance::KeyResolver,
+    wrapping_custody: scp_core::context::supervisor::WrappingCustodySource,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
     let persistence_box: Box<dyn scp_core::context::persistence::ContextPersistence> =
         Box::new(ArcContextPersistence::new(persistence));
@@ -2139,7 +2156,61 @@ fn build_supervisor(
         Some(event_tx),
         Some(clock),
         durable,
+        wrapping_custody,
     )
+}
+
+/// The supervisor's wrapping custody source for this bridge instance (spec 09
+/// §9.16.1): the custody registered for the identity, through
+/// [`registry_wrapping_custody_source`](scp_ffi_common::wrapping_custody::registry_wrapping_custody_source).
+/// An unregistered identity gets `None`, which fails the actor build closed
+/// with `WrappingKeyCustodyUnavailable`.
+#[cfg(not(feature = "testing"))]
+fn wrapping_custody_source(
+    bi: &UniffiBridgeInstance,
+) -> scp_core::context::supervisor::WrappingCustodySource {
+    scp_ffi_common::wrapping_custody::registry_wrapping_custody_source(
+        &bi.identity_custody_registry,
+        entry_custody,
+    )
+}
+
+/// As the shipped source, wrapped so that an instance on which
+/// `serve_unregistered_wrapping_keys_from_test_custody` ran answers an
+/// unregistered identity from its test custody.
+#[cfg(feature = "testing")]
+fn wrapping_custody_source(
+    bi: &UniffiBridgeInstance,
+) -> scp_core::context::supervisor::WrappingCustodySource {
+    scp_ffi_common::wrapping_custody::with_unregistered_test_custody(
+        scp_ffi_common::wrapping_custody::registry_wrapping_custody_source(
+            &bi.identity_custody_registry,
+            entry_custody,
+        ),
+        &bi.unregistered_identity_wrapping_custody,
+    )
+}
+
+/// The custody of one identity-registry entry.
+const fn entry_custody(
+    entry: &(
+        Arc<crate::bridge::UniffiKeyCustody>,
+        scp_platform::KeyHandle,
+    ),
+) -> &Arc<crate::bridge::UniffiKeyCustody> {
+    &entry.0
+}
+
+/// Test seam: serves unregistered identities' wrapping keys from one custody.
+///
+/// Every identity with no custody registered on `bi` gets its wrapping key
+/// from one in-memory custody, so a fixture can create a context for a DID it
+/// never registered. Idempotent; a registered identity still resolves to its
+/// own custody.
+#[cfg(feature = "testing")]
+pub fn serve_unregistered_wrapping_keys_from_test_custody(bi: &UniffiBridgeInstance) {
+    bi.unregistered_identity_wrapping_custody
+        .get_or_init(|| Arc::new(scp_platform::testing::InMemoryKeyCustody::new()));
 }
 
 /// Selects the governance key resolver for a bridge instance core.

@@ -455,6 +455,15 @@ pub struct PyBridgeInstance {
     /// `IdentityEntry` stores `Arc<FfiKeyCustody>` which is a `PyO3`-bridge
     /// crate concrete type that `scp-ffi-common` cannot know about.
     pub(crate) identity_registry: Arc<DashMap<String, IdentityEntry>>,
+    /// Test seam: once set, the supervisor's wrapping custody source answers
+    /// an identity with no custody registered on this instance from this one
+    /// in-memory custody instead of failing closed. Set only by
+    /// `serve_unregistered_wrapping_keys_from_test_custody`, for fixtures that
+    /// create contexts for DIDs they never registered; a shipped build does
+    /// not compile it.
+    #[cfg(feature = "testing")]
+    pub(crate) unregistered_identity_wrapping_custody:
+        Arc<std::sync::OnceLock<Arc<scp_platform::testing::InMemoryKeyCustody>>>,
 
     /// Encrypted storage provider — [`StorageProvider`] enum dispatching
     /// between `EncryptingAdapter<InMemoryStorage>` and `SqliteStorage`.
@@ -560,6 +569,8 @@ impl PyBridgeInstance {
         Self {
             core,
             identity_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "testing")]
+            unregistered_identity_wrapping_custody: Arc::default(),
             storage_provider: OnceLock::new(),
             ffi_bridge_state: Arc::new(DashMap::new()),
             released_contexts: std::sync::Mutex::new(HashMap::new()),
@@ -674,6 +685,8 @@ impl PyBridgeInstance {
                 let instance = Self {
                     core,
                     identity_registry: Arc::new(DashMap::new()),
+                    #[cfg(feature = "testing")]
+                    unregistered_identity_wrapping_custody: Arc::default(),
                     storage_provider: OnceLock::new(),
                     ffi_bridge_state: Arc::new(DashMap::new()),
                     released_contexts: std::sync::Mutex::new(HashMap::new()),
@@ -1037,6 +1050,23 @@ pub(crate) fn select_in_memory_storage_for_test(bi: &PyBridgeInstance) {
 /// Not behind `#[cfg(test)]` because integration tests (`tests/e2e_bridge.rs`)
 /// compile as separate crates and need access to this function.
 pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
+    init_context_manager_for_test_with_transport(
+        bi,
+        "did:test:pyo3-bridge-test",
+        Box::new(scp_core::context::LocalTransportProvider),
+    );
+}
+
+/// [`init_context_manager_for_test`] whose MLS credential identity is
+/// `local_did` and whose supervisor sends through `transport`.
+pub fn init_context_manager_for_test_with_transport(
+    bi: &PyBridgeInstance,
+    local_did: &str,
+    transport: Box<dyn ContextTransportProvider>,
+) {
+    // Test fixtures create contexts for DIDs they never register.
+    #[cfg(feature = "testing")]
+    serve_unregistered_wrapping_keys_from_test_custody(bi);
     if bi.core.has_supervisor() {
         return;
     }
@@ -1052,13 +1082,13 @@ pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
             .set(StorageProvider::new_in_memory_encrypted());
     }
     let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
-        "did:test:pyo3-bridge-test".to_owned(),
+        local_did.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
     let supervisor_arc = match build_supervisor(
         bi,
         crypto,
-        Box::new(scp_core::context::LocalTransportProvider),
+        transport,
         build_event_log_provider(bi),
         None,
     ) {
@@ -1309,8 +1339,57 @@ fn build_supervisor(
             Some(event_tx),
             Some(clock),
             durable,
+            wrapping_custody_source(bi),
         ),
     )
+}
+
+/// The supervisor's wrapping custody source for this bridge instance (spec 09
+/// §9.16.1): the custody registered for the identity, through
+/// [`registry_wrapping_custody_source`](scp_ffi_common::wrapping_custody::registry_wrapping_custody_source).
+/// An unregistered identity gets `None`, which fails the actor build closed
+/// with `WrappingKeyCustodyUnavailable`.
+#[cfg(not(feature = "testing"))]
+fn wrapping_custody_source(
+    bi: &PyBridgeInstance,
+) -> scp_core::context::supervisor::WrappingCustodySource {
+    scp_ffi_common::wrapping_custody::registry_wrapping_custody_source(
+        &bi.identity_registry,
+        entry_custody,
+    )
+}
+
+/// As the shipped source, wrapped so that an instance on which
+/// `serve_unregistered_wrapping_keys_from_test_custody` ran answers an
+/// unregistered identity from its test custody.
+#[cfg(feature = "testing")]
+fn wrapping_custody_source(
+    bi: &PyBridgeInstance,
+) -> scp_core::context::supervisor::WrappingCustodySource {
+    scp_ffi_common::wrapping_custody::with_unregistered_test_custody(
+        scp_ffi_common::wrapping_custody::registry_wrapping_custody_source(
+            &bi.identity_registry,
+            entry_custody,
+        ),
+        &bi.unregistered_identity_wrapping_custody,
+    )
+}
+
+/// The custody of one identity-registry entry.
+const fn entry_custody(entry: &IdentityEntry) -> &Arc<crate::custody::FfiKeyCustody> {
+    &entry.custody
+}
+
+/// Test seam: serves unregistered identities' wrapping keys from one custody.
+///
+/// Every identity with no custody registered on `bi` gets its wrapping key
+/// from one in-memory custody, so a fixture can create a context for a DID it
+/// never registered. Idempotent; a registered identity still resolves to its
+/// own custody.
+#[cfg(feature = "testing")]
+pub fn serve_unregistered_wrapping_keys_from_test_custody(bi: &PyBridgeInstance) {
+    bi.unregistered_identity_wrapping_custody
+        .get_or_init(|| Arc::new(scp_platform::testing::InMemoryKeyCustody::new()));
 }
 
 /// Builds the bridge's [`DurableProviders`](scp_core::context::supervisor::supervisor::DurableProviders) — the durable saga journal + the
@@ -2439,6 +2518,80 @@ pub(crate) fn create_supervisor_context_for_test(
     create_supervisor_context_with_params_for_test(bi, context_id, creator_did, params);
 }
 
+/// Test-only: registers a host custody for `did` on `bi`, the custody a
+/// shipped host reaches through `identity_create_with_custody`, and loads
+/// `did`'s wrapping key into `bi`'s supervisor. Returns the host object, whose
+/// `calls` map counts each host method call, or `None` when `did` is already
+/// registered, in which case it does nothing.
+///
+/// A context's wrapping key lives in its owner's registered custody (spec 09
+/// §9.16.1), so a supervisor creates a context only for a DID with one. The
+/// custody is the production `Callback` variant over the fake Python host
+/// `P256Custody`, which mints the wrapping key as a P-256 key and agrees with
+/// it by ECDH. The registry entry carries the identity fields a created
+/// identity would; nothing here reads them but its custody. Each custody call
+/// runs with the GIL released, because the host takes the GIL on tokio's
+/// blocking pool; the wrapping key is loaded here for the same reason, so the
+/// create that follows makes no host call from a thread that may hold it.
+///
+/// # Panics
+///
+/// Panics when no supervisor is attached, or when the host call or the
+/// wrapping-key load fails, each a broken test fixture.
+#[cfg(test)]
+#[allow(clippy::expect_used)] // A broken test fixture panics; production paths keep the deny.
+pub(crate) fn register_host_custody_for_test(
+    bi: &PyBridgeInstance,
+    did: &str,
+) -> Option<pyo3::Py<pyo3::PyAny>> {
+    use scp_platform::KeyCustody as _;
+    if identity_registry(bi).contains_key(did) {
+        return None;
+    }
+    let (host_custody, host) = crate::custody::test_fakes::p256_py_custody_and_host();
+    let custody = Arc::new(crate::custody::FfiKeyCustody::Callback(host_custody));
+    let identity_key = Python::with_gil(|py| {
+        crate::actor_wait::block_on_released(py, custody.generate_identity_keypair())
+    })
+    .expect("the shared runtime drives the host call")
+    .expect("the host custody generates the identity key");
+    register_identity(
+        bi,
+        did,
+        IdentityEntry {
+            identity: ScpIdentity {
+                did: did.to_owned(),
+                identity_key,
+                active_signing_key: identity_key,
+                agent_signing_key: None,
+                pre_rotation_commitment: [0u8; 32],
+            },
+            custody,
+            document: DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: did.to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+            identity_link_attestations: Vec::new(),
+            pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            #[cfg(feature = "testing")]
+            pre_rotation_custody: Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new()),
+        },
+    );
+    let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));
+    let owner = scp_did::DID(did.to_owned());
+    Python::with_gil(|py| {
+        crate::actor_wait::block_on_released(py, sup.wrapping_public_key(&owner))
+    })
+    .expect("the shared runtime drives the wrapping-key load")
+    .expect("the host custody holds the wrapping key");
+    Some(host)
+}
+
 /// Test-only: [`create_supervisor_context_for_test`] with the caller's whole
 /// `params`, for a test whose context must carry a mode or other parameter the
 /// default leaves out.
@@ -2455,6 +2608,13 @@ pub(crate) fn create_supervisor_context_with_params_for_test(
     creator_did: &str,
     params: scp_core::context::ContextParams,
 ) {
+    #[cfg(feature = "testing")]
+    serve_unregistered_wrapping_keys_from_test_custody(bi);
+    // The creator's custody serves only this create: the supervisor keeps the
+    // loaded wrapping key, and callers assert against a registry without the
+    // creator (an uncustodied creator refuses to sign), so a custody
+    // registered here is removed once the context exists.
+    let registered_here = register_host_custody_for_test(bi, creator_did).is_some();
     let sup = Arc::clone(supervisor(bi).expect("test supervisor must be attached"));
     let rt = super::runtime().expect("tokio runtime must be initialized");
     rt.block_on(sup.create_context(
@@ -2465,6 +2625,12 @@ pub(crate) fn create_supervisor_context_with_params_for_test(
         Vec::new(),
     ))
     .expect("test supervisor context creation must succeed");
+    if registered_here {
+        assert!(
+            identity_registry(bi).remove(creator_did).is_some(),
+            "the creator custody registered for this create must still be present"
+        );
+    }
 }
 
 /// Closes the receive channel for a context by dropping the sender (SCP-216).

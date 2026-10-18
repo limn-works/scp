@@ -245,7 +245,7 @@ pub async fn recovery_advance_epoch(
     //    counter is NOT incremented — disposition preserved.
     let wrapping_public_key = *deps
         .supervisor
-        .my_wrapping_keypair(&deps.owned_identity)?
+        .my_wrapping_key(&deps.owned_identity)?
         .public();
     let epoch_commit_bytes = cell
         .commit_class_s_keep(deps, context_id, |mut v| {

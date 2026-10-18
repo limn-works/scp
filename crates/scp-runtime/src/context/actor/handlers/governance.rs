@@ -1379,7 +1379,7 @@ mod consequence_fail_closed_tests {
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
-            .build_actor_deps(&DID(ADMIN.to_owned()))
+            .build_actor_deps_loaded(&DID(ADMIN.to_owned()))
             .await
             .expect("build_actor_deps")
     }

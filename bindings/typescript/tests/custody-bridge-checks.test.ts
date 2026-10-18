@@ -43,6 +43,7 @@ import type {
   KeyCustodyProvider,
 } from "../src/scp";
 import { p256SoftwarePseudonymPoint } from "../src/scp";
+import { ECDH_VECTOR_PUBLIC_I, ECDH_VECTOR_SCALAR_I, HpkeP256Keys } from "./hpke-p256-keys";
 
 interface TestingCustody {
   generateKeypair(): Promise<string>;
@@ -80,18 +81,28 @@ try {
 /** A host fault the keychain injects into signing or derivation. */
 type Fault = "signThrows" | "sign4001" | "legacy32";
 
-/** A host keychain of Ed25519 identity seeds; it stores no pseudonym. */
+/**
+ * A host keychain of Ed25519 identity seeds and real HPKE P-256 keys; it
+ * stores no pseudonym.
+ */
 class StoreKeychain implements KeyCustodyProvider {
   seeds = new Map<string, Uint8Array>();
+  hpke = new HpkeP256Keys();
   /** Key id -> the role `generateKeypair` minted it in. */
   roles = new Map<string, CustodyKeyRole>();
   next = 1;
+  /** How many times the bridge called `dhAgree`. */
+  dhAgreeCalls = 0;
 
   constructor(readonly fault?: Fault) {}
 
-  generateKeypair(_keyType: CustodyKeyType, role: CustodyKeyRole): string {
+  generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): string {
+    if (keyType !== "ed25519" && keyType !== "hpke-p256") {
+      throw new Error(`this keychain holds ed25519 and hpke-p256 keys, not ${keyType}`);
+    }
     const kid = String(this.next++);
-    this.seeds.set(kid, new Uint8Array(crypto.randomBytes(32)));
+    if (keyType === "hpke-p256") this.hpke.generate(kid);
+    else this.seeds.set(kid, new Uint8Array(crypto.randomBytes(32)));
     this.roles.set(kid, role);
     return kid;
   }
@@ -118,6 +129,13 @@ class StoreKeychain implements KeyCustodyProvider {
   }
 
   getPublicKey(keyId: string): CustodyPublicKey {
+    if (this.hpke.has(keyId)) {
+      return {
+        keyType: "hpke-p256",
+        publicKey: this.hpke.publicKey(keyId),
+        role: roleOf(this.roles, keyId),
+      };
+    }
     const spki = crypto
       .createPublicKey(this.#privateKey(keyId))
       .export({ format: "der", type: "spki" });
@@ -130,11 +148,16 @@ class StoreKeychain implements KeyCustodyProvider {
 
   destroyKey(keyId: string): void {
     this.seeds.delete(keyId);
+    this.hpke.delete(keyId);
     this.roles.delete(keyId);
   }
 
-  dhAgree(_keyId: string, _peerPublic: Uint8Array): Uint8Array {
-    throw new Error("unused");
+  dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array {
+    this.dhAgreeCalls++;
+    if (this.hpke.has(keyId)) return this.hpke.agree(keyId, peerPublic);
+    // An Ed25519 seed cannot agree; an unknown id is the contract's key-not-found.
+    this.#seed(keyId);
+    throw new Error(`key ${keyId} is ed25519; it cannot agree`);
   }
 
   derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array {
@@ -169,15 +192,23 @@ function roleOf(roles: Map<string, CustodyKeyRole>, keyId: string): CustodyKeyRo
  */
 class P256Keychain implements KeyCustodyProvider {
   keys = new Map<string, crypto.KeyObject>();
+  hpke = new HpkeP256Keys();
   roles = new Map<string, CustodyKeyRole>();
   /** Hex SHA-256 digest -> the message it hashes. */
   preimages = new Map<string, Buffer>();
   next = 1;
+  /** How many times the bridge called `dhAgree`. */
+  dhAgreeCalls = 0;
 
   generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): string {
-    if (keyType !== "p256") throw new Error(`this keychain holds only p256 keys, not ${keyType}`);
+    if (keyType !== "p256" && keyType !== "hpke-p256") {
+      throw new Error(`this keychain holds p256 and hpke-p256 keys, not ${keyType}`);
+    }
     const kid = String(this.next++);
-    this.keys.set(kid, crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey);
+    if (keyType === "hpke-p256") this.hpke.generate(kid);
+    else {
+      this.keys.set(kid, crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey);
+    }
     this.roles.set(kid, role);
     return kid;
   }
@@ -204,6 +235,13 @@ class P256Keychain implements KeyCustodyProvider {
   }
 
   getPublicKey(keyId: string): CustodyPublicKey {
+    if (this.hpke.has(keyId)) {
+      return {
+        keyType: "hpke-p256",
+        publicKey: this.hpke.publicKey(keyId),
+        role: roleOf(this.roles, keyId),
+      };
+    }
     const jwk = crypto.createPublicKey(this.#key(keyId)).export({ format: "jwk" }) as {
       x: string;
       y: string;
@@ -221,11 +259,15 @@ class P256Keychain implements KeyCustodyProvider {
 
   destroyKey(keyId: string): void {
     this.keys.delete(keyId);
+    this.hpke.delete(keyId);
     this.roles.delete(keyId);
   }
 
-  dhAgree(): Uint8Array {
-    throw new Error("unused");
+  dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array {
+    this.dhAgreeCalls++;
+    if (this.hpke.has(keyId)) return this.hpke.agree(keyId, peerPublic);
+    this.#key(keyId);
+    throw new Error(`key ${keyId} is a p256 signing key; it cannot agree`);
   }
 
   derivePseudonym(): Uint8Array {
@@ -320,6 +362,28 @@ describe.skipIf(skipReason !== "")("napi callback custody", () => {
     expect(
       crypto.verify("sha256", MESSAGE, { key: publicKey, dsaEncoding: "ieee-p1363" }, signature),
     ).toBe(true);
+  });
+
+  test("an hpke-p256 host key agrees through the bridge with the 65-byte point, matching the pinned vector's scalar", async () => {
+    for (const host of [new P256Keychain(), new StoreKeychain()]) {
+      const custody = adapter(host);
+      const key = await custody.generateOperationalKeypair("hpke-p256");
+      const own = host.getPublicKey(key).publicKey;
+      expect(own.length).toBe(65);
+      const peer = Buffer.from(ECDH_VECTOR_PUBLIC_I, "hex");
+      const shared = await custody.dhAgree(key, peer);
+      expect(host.dhAgreeCalls).toBe(1);
+      const vector = crypto.createECDH("prime256v1");
+      vector.setPrivateKey(Buffer.from(ECDH_VECTOR_SCALAR_I, "hex"));
+      expect(shared.toString("hex")).toBe(vector.computeSecret(Buffer.from(own)).toString("hex"));
+      // A compressed or 32-byte peer is refused before the host is asked.
+      const compressed = Buffer.from(vector.getPublicKey(null, "compressed"));
+      for (const bad of [compressed, peer.subarray(1, 33)]) {
+        const refused = await rejectionOf(() => custody.dhAgree(key, bad));
+        expect(refused).toBeInstanceOf(CryptoError);
+      }
+      expect(host.dhAgreeCalls).toBe(1);
+    }
   });
 
   test("a host that throws KeyNotFoundError for an unseen id rejects with SCP-CRYPTO-4006", async () => {

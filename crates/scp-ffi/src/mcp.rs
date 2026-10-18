@@ -6070,6 +6070,7 @@ mod tests {
         ceiling: &[&str],
     ) {
         crate::init_runtime().ok();
+        let _host = crate::runtime::register_host_custody_for_test(bi, creator);
         let supervisor = Arc::clone(crate::runtime::supervisor(bi).unwrap());
         let params = scp_core::context::ContextParams {
             ceiling: ceiling

@@ -844,6 +844,7 @@ impl FullStackNode {
                 &custody,
                 &request.wrapping_key_handle,
                 &ctx_id_hex,
+                &joiner_did,
                 &response,
             )
             .await

@@ -9,7 +9,7 @@
 
 use scp_ffi_common::error_codes as codes;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
@@ -604,23 +604,21 @@ impl TestingCallbackCustody {
     /// Runs the adapter's `dh_agree` for `key_id` against `peer_public` and
     /// returns the 32-byte shared secret the bridge read from the host.
     ///
+    /// `peer_public` reaches the adapter unchanged, so the adapter's own check
+    /// of its length and encoding for the key's type (32 bytes for X25519, the
+    /// 65-byte uncompressed point for `hpke-p256`) is the one that runs.
+    ///
     /// # Errors
     ///
-    /// `SCP-VALID-7005` when `peer_public` is not 32 bytes; otherwise the code
+    /// The code
     /// [`custody_failure_code`](scp_ffi_common::error_codes::custody_failure_code)
     /// assigns to the custody error, as production reports it.
     #[napi(js_name = "dhAgree")]
     pub async fn dh_agree(&self, key_id: String, peer_public: Buffer) -> napi::Result<Buffer> {
         use scp_platform::KeyCustody;
         let key = testing_handle(&key_id)?;
-        let peer: [u8; 32] = peer_public.as_ref().try_into().map_err(|_| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: format!("peer_public must be 32 bytes, got {}", peer_public.len()),
-                code: codes::VALID_7005.to_owned(),
-            })
-        })?;
         self.inner
-            .dh_agree(&key, &peer)
+            .dh_agree(&key, &peer_public)
             .await
             .map(|shared| Buffer::from(shared.as_bytes().to_vec()))
             .map_err(custody_err)
@@ -638,4 +636,163 @@ impl TestingCallbackCustody {
         let key = testing_handle(&key_id)?;
         self.inner.destroy_key(&key).await.map_err(custody_err)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Two-instance receive seams
+// ---------------------------------------------------------------------------
+//
+// A test that needs one SCP instance to receive exactly what another sent
+// captures the sender's context payloads and delivers them to the receiver's
+// actor itself, the way a relay subscription would, without a relay.
+
+/// The payloads an instance's supervisor has sent to its contexts, oldest
+/// first, from [`Scp::testing_capture_context_sends`](crate::scp::Scp::testing_capture_context_sends).
+#[napi]
+pub struct NapiContextSendCapture {
+    sent: scp_core::context::supervisor::ContextSendCapture,
+}
+
+#[napi]
+impl NapiContextSendCapture {
+    /// Returns every payload captured since the last call and clears them.
+    #[napi]
+    pub fn take(&self) -> Vec<Buffer> {
+        self.sent.take().into_iter().map(Buffer::from).collect()
+    }
+}
+
+/// Per-bridge-instance implementation of [`Scp::testing_capture_context_sends`](crate::scp::Scp::testing_capture_context_sends).
+///
+/// # Errors
+///
+/// `SCP-CTX-2000` when `bi` already has a supervisor, whose transport this
+/// cannot replace.
+pub(crate) fn capture_context_sends_on(
+    bi: &NapiBridgeInstance,
+    local_did: &str,
+) -> napi::Result<NapiContextSendCapture> {
+    if bi.core.has_supervisor() {
+        return Err(napi::Error::from(ScpNapiError::Context {
+            message: "a supervisor is already attached; capture its sends before the first \
+                      context operation"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        }));
+    }
+    let sent = scp_core::context::supervisor::ContextSendCapture::default();
+    crate::runtime::init_supervisor_with_transport_for_test(bi, local_did, sent.transport());
+    // A missing storage backend attaches nothing; report it here rather than
+    // at the first context call.
+    crate::runtime::supervisor(bi)?;
+    Ok(NapiContextSendCapture { sent })
+}
+
+/// Test seam: makes `memberDid`, which joined `contextId` on `joiner` from a
+/// Welcome, a receiving member there, with the access key `inviter` minted.
+///
+/// A free function rather than an `Scp` method because it takes two
+/// instances.
+///
+/// # Errors
+///
+/// A context error when either supervisor is missing, `inviter` holds no key
+/// for `memberDid`, or an actor refuses.
+#[napi(js_name = "testingAdmitJoinedMember")]
+pub async fn testing_admit_joined_member(
+    joiner: &crate::scp::Scp,
+    inviter: &crate::scp::Scp,
+    context_id: String,
+    member_did: String,
+) -> napi::Result<()> {
+    admit_joined_member_on(&joiner.inner, &inviter.inner, context_id, member_did).await
+}
+
+/// Implementation of [`testing_admit_joined_member`], through
+/// `Supervisor::test_admit_joined_member`, which says why no production path
+/// does this yet.
+///
+/// # Errors
+///
+/// A context error when either supervisor is missing, the inviter holds no
+/// access key for `member_did`, or an actor refuses.
+pub(crate) async fn admit_joined_member_on(
+    bi: &NapiBridgeInstance,
+    inviter: &NapiBridgeInstance,
+    context_id: String,
+    member_did: String,
+) -> napi::Result<()> {
+    let member_sup = Arc::clone(crate::runtime::supervisor(bi)?);
+    let inviter_sup = Arc::clone(crate::runtime::supervisor(inviter)?);
+    member_sup
+        .test_admit_joined_member(&inviter_sup, &context_id, &member_did)
+        .await
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: e.to_string(),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })
+}
+
+/// What one [`Scp::testing_deliver_incoming`](crate::scp::Scp::testing_deliver_incoming)
+/// payload did: exactly one of `outcome` and `error` is set.
+#[napi(object)]
+pub struct NapiDeliveryResult {
+    /// `"application"`, `"heartbeat"` or `"handled"`.
+    pub outcome: Option<String>,
+    /// The decrypted plaintext when `outcome` is `"application"`.
+    pub plaintext: Option<Buffer>,
+    /// The actor's refusal, rendered.
+    pub error: Option<String>,
+}
+
+/// Per-bridge-instance implementation of [`Scp::testing_deliver_incoming`](crate::scp::Scp::testing_deliver_incoming).
+///
+/// Hands each payload, in order, to `context_id`'s actor through
+/// `Supervisor::test_deliver_incoming` (the production
+/// `MessagingCommand::DeliverIncoming`, the path a relay subscription takes)
+/// and awaits each reply on the runtime.
+///
+/// # Errors
+///
+/// A context error when the supervisor is missing, the actor is gone, or it
+/// drops a reply. A payload the actor refuses is a result, not an error.
+pub(crate) async fn deliver_incoming_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    payloads: Vec<Buffer>,
+) -> napi::Result<Vec<NapiDeliveryResult>> {
+    use scp_core::context::actor::commands::DeliverOutcome;
+    let sup = Arc::clone(crate::runtime::supervisor(bi)?);
+    let mut results = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let reply = sup
+            .test_deliver_incoming(&context_id, payload.to_vec())
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        results.push(match reply {
+            Ok(DeliverOutcome::Application((plaintext, _sender))) => NapiDeliveryResult {
+                outcome: Some("application".to_owned()),
+                plaintext: Some(Buffer::from(plaintext)),
+                error: None,
+            },
+            Ok(DeliverOutcome::Heartbeat) => NapiDeliveryResult {
+                outcome: Some("heartbeat".to_owned()),
+                plaintext: None,
+                error: None,
+            },
+            Ok(DeliverOutcome::Handled) => NapiDeliveryResult {
+                outcome: Some("handled".to_owned()),
+                plaintext: None,
+                error: None,
+            },
+            Err(e) => NapiDeliveryResult {
+                outcome: None,
+                plaintext: None,
+                error: Some(e.to_string()),
+            },
+        });
+    }
+    Ok(results)
 }

@@ -318,6 +318,33 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
 // Open sender key response (requester side) — async custody variant
 // ---------------------------------------------------------------------------
 
+/// Checks that a [`SenderKeyResponse`] names `mls_sender`, the member the
+/// MLS layer authenticated as the message's sender.
+///
+/// The response's `sender_did` is bound into the HPKE `info` and `aad`, so an
+/// open under the wrong sender fails anyway; this check rejects it from the
+/// public field alone, before any custody call. Every receive path runs it
+/// first: [`open_sender_key_response`] and the runtime's
+/// `NodeMlsFactory::open_incoming_sender_key`.
+///
+/// # Errors
+///
+/// [`SenderKeyError::SenderMismatch`] if `response.sender_did` is not
+/// `mls_sender`.
+pub(crate) fn check_response_sender(
+    mls_sender: &str,
+    response: &SenderKeyResponse,
+) -> Result<(), SenderKeyError> {
+    if response.sender_did == mls_sender {
+        Ok(())
+    } else {
+        Err(SenderKeyError::SenderMismatch {
+            claimed: response.sender_did.clone(),
+            mls_sender: mls_sender.to_owned(),
+        })
+    }
+}
+
 /// Opens a [`SenderKeyResponse`] using the requester's wrapping key handle
 /// inside the [`KeyCustody`] boundary (RFC 9180 HPKE Base mode, §9.16.2).
 ///
@@ -337,13 +364,20 @@ pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
 /// decoded. Returns [`SenderKeyError::Custody`] if
 /// the DH agreement or public-key lookup fails in custody, and
 /// [`SenderKeyError::MalformedWrappingPublicKey`] if custody returns a
-/// wrapping public key that is not 65 bytes.
+/// wrapping public key that is not 65 bytes. Returns
+/// [`SenderKeyError::SenderMismatch`], before any custody call, if the
+/// response names a sender other than `mls_sender`.
 pub async fn open_sender_key_response(
     key_custody: &impl KeyCustody,
     wrapping_key_handle: &KeyHandle,
     context_id: &str,
+    mls_sender: &str,
     response: &SenderKeyResponse,
 ) -> Result<SenderKey, SenderKeyError> {
+    // The public sender check runs before any custody call, so a response
+    // that cannot be accepted never costs a host round trip.
+    check_response_sender(mls_sender, response)?;
+
     // Spec 09 §9.16.2 order: `enc` is validated (§9.5) before any key
     // agreement. Decoding the `P256Point` validated it.
     let enc = hpke_p256::ValidatedEnc::from(response.ephemeral_pubkey);
@@ -370,14 +404,39 @@ pub async fn open_sender_key_response(
             ))
         })?;
 
+    open_sender_key_response_with_dh(&dh_bytes, &pk_rm_bytes, context_id, response)
+}
+
+/// Opens a [`SenderKeyResponse`] with a KEM Diffie-Hellman output computed in custody.
+///
+/// `dh` is computed inside custody for the response's `enc`, and `pk_rm` is
+/// the recipient's wrapping public key (RFC 9180 HPKE Base mode, §9.16.2).
+/// The software half of [`open_sender_key_response`]: DHKEM Decap
+/// (`ExtractAndExpand(dh, enc || pkRm)`), `KeySchedule_base`, and the AEAD
+/// open. The caller computes `dh` with the custody handle whose public key is
+/// `pk_rm`, for exactly `ValidatedEnc::from(response.ephemeral_pubkey)`.
+///
+/// # Errors
+///
+/// [`SenderKeyError::HpkeDecryptionFailed`] if the HPKE open fails (wrong
+/// key, `info` or `aad`, tampered `enc` or `ct`) or the recovered plaintext
+/// is not exactly 32 bytes.
+pub(crate) fn open_sender_key_response_with_dh(
+    dh: &Zeroizing<[u8; 32]>,
+    pk_rm: &[u8; hpke_p256::PUBLIC_KEY_LEN],
+    context_id: &str,
+    response: &SenderKeyResponse,
+) -> Result<SenderKey, SenderKeyError> {
+    let enc = hpke_p256::ValidatedEnc::from(response.ephemeral_pubkey);
+
     // Build context-bound info and AAD (§9.16.2) using response fields.
     let info = build_hpke_info(context_id, &response.sender_did, response.epoch);
     let aad = build_hpke_aad(context_id, &response.sender_did, response.epoch);
 
     let plaintext = Zeroizing::new(
         hpke_p256::custody::open_with_external_dh(
-            &dh_bytes,
-            &pk_rm_bytes,
+            dh,
+            pk_rm,
             &enc,
             &info,
             &aad,
@@ -740,10 +799,55 @@ mod tests {
         let wrapping_key = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
         custody.destroy_key(&wrapping_key).await.unwrap();
         assert_key_not_found(
-            open_sender_key_response(&custody, &wrapping_key, "ctx-1", &response_with_valid_enc())
-                .await,
+            open_sender_key_response(
+                &custody,
+                &wrapping_key,
+                "ctx-1",
+                "did:dht:alice",
+                &response_with_valid_enc(),
+            )
+            .await,
             "DH agreement",
         );
+    }
+
+    /// A response naming a sender other than the MLS sender is refused from
+    /// its public field, with no custody call; the same response under its
+    /// real sender reaches custody (positive control).
+    #[tokio::test]
+    async fn open_sender_key_response_refuses_a_wrong_sender_before_custody() {
+        let custody = crate::crypto::dh_counting_custody::DhCountingCustody::new();
+        let wrapping_key = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
+        let response = response_with_valid_enc();
+
+        let refused = open_sender_key_response(
+            &custody,
+            &wrapping_key,
+            "ctx-1",
+            "did:dht:mallory",
+            &response,
+        )
+        .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(SenderKeyError::SenderMismatch { claimed, mls_sender })
+                    if claimed == "did:dht:alice" && mls_sender == "did:dht:mallory"
+            ),
+            "a wrong sender is SenderMismatch: {refused:?}"
+        );
+        assert_eq!(custody.dh_calls(), 0, "no dh_agree for a wrong sender");
+
+        // The sealed key is all zeros, so the open fails after the agree; the
+        // real sender passes the check and reaches custody.
+        let opened =
+            open_sender_key_response(&custody, &wrapping_key, "ctx-1", "did:dht:alice", &response)
+                .await;
+        assert!(
+            matches!(opened, Err(SenderKeyError::HpkeDecryptionFailed(_))),
+            "the real sender reaches the open: {opened:?}"
+        );
+        assert_eq!(custody.dh_calls(), 1, "the real sender reaches dh_agree");
     }
 
     #[tokio::test]
@@ -751,8 +855,14 @@ mod tests {
         let custody = KeyLossCustody::new(KeyLoss::AfterDhAgree);
         let wrapping_key = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
         assert_key_not_found(
-            open_sender_key_response(&custody, &wrapping_key, "ctx-1", &response_with_valid_enc())
-                .await,
+            open_sender_key_response(
+                &custody,
+                &wrapping_key,
+                "ctx-1",
+                "did:dht:alice",
+                &response_with_valid_enc(),
+            )
+            .await,
             "wrapping public key read after DH agreement",
         );
     }
@@ -1037,6 +1147,7 @@ mod tests {
             &bob_custody,
             &request_result.wrapping_key_handle,
             "ctx-1",
+            "did:dht:alice",
             &response,
         )
         .await

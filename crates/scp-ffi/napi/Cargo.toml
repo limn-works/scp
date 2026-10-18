@@ -120,6 +120,9 @@ tempfile = "3"
 # cdylib, they would shadow Node's real napi_* functions at static
 # link time and every #[napi] registration would silently no-op).
 scp-ffi-napi-test-stubs = { path = "../napi-test-stubs" }
+# The HPKE P-256 custody test pins the RFC 5903 ECDH vector in
+# `scp_crypto::p256::testing`.
+scp-crypto = { path = "../../scp-crypto", features = ["testing"] }
 
 [build-dependencies]
 napi-build = "2"
