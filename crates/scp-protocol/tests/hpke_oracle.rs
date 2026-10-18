@@ -6,8 +6,6 @@
 //! somehow miss would surface here as an interop failure against a separate
 //! codebase. `hpke-rs` is a dev-dependency only — it never ships in
 //! production or wasm32 builds — and this whole file is gated off wasm32.
-//! The crate-private X25519 suite runs the same oracle in its own test
-//! module (`hpke::legacy_x25519::hpke_rs_oracle`).
 #![cfg(not(target_arch = "wasm32"))]
 
 use hpke_rs::hpke_types::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm};
@@ -212,7 +210,7 @@ fn invitation_external_dh_open_equals_hpke_rs_open() -> TestResult {
         let ours = hpke_open_invitation_with_external_dh(
             &ref_ct,
             &dh,
-            &pk,
+            &hpke::p256::P256Point::try_from(&pk[..])?,
             &enc,
             INVITE_CONTEXT_ID,
             INVITE_CREATOR_DID,

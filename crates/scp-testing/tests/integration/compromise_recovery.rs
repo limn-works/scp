@@ -18,6 +18,13 @@ use scp_core::identity::recovery::{
     identity_key_rotation_outcome,
 };
 use scp_did::DID;
+use scp_protocol::crypto::hpke::p256::P256Point;
+
+/// A valid P-256 device key, distinct per `seed`.
+fn device_key(seed: u8) -> P256Point {
+    P256Point::try_from(scp_crypto::p256::testing::valid_uncompressed_point(seed))
+        .expect("valid point")
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -157,7 +164,7 @@ async fn compromise_tier_active_signing() {
     let contacts = HashSet::from([did("did:dht:bob")]);
     let psk_params = PskRotationParams {
         did: "did:dht:zRecoveryTestIdentity".to_owned(),
-        enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
+        enrolled_device_pubkeys: vec![device_key(1), device_key(2)],
         compromised_device_pubkey: None,
     };
     let backend = MockBackend::new();
@@ -200,7 +207,7 @@ async fn compromise_tier_identity_key() {
     let contacts = HashSet::from([did("did:dht:bob"), did("did:dht:carol")]);
     let psk_params = PskRotationParams {
         did: "did:dht:zRecoveryTestIdentity".to_owned(),
-        enrolled_device_pubkeys: vec![vec![1u8; 32]],
+        enrolled_device_pubkeys: vec![device_key(1)],
         compromised_device_pubkey: None,
     };
     let backend = MockBackend::new();
@@ -514,7 +521,7 @@ async fn psk_rotation_params() {
     // Without compromised device.
     let params_clean = PskRotationParams {
         did: "did:dht:zRecoveryTestIdentity".to_owned(),
-        enrolled_device_pubkeys: vec![vec![0xAA; 32], vec![0xBB; 32], vec![0xCC; 32]],
+        enrolled_device_pubkeys: vec![device_key(0xAA), device_key(0xBB), device_key(0xCC)],
         compromised_device_pubkey: None,
     };
     assert_eq!(params_clean.enrolled_device_pubkeys.len(), 3);
@@ -523,12 +530,12 @@ async fn psk_rotation_params() {
     // With compromised device excluded.
     let params_compromised = PskRotationParams {
         did: "did:dht:zRecoveryTestIdentity".to_owned(),
-        enrolled_device_pubkeys: vec![vec![0xAA; 32], vec![0xBB; 32], vec![0xCC; 32]],
-        compromised_device_pubkey: Some(vec![0xBB; 32]),
+        enrolled_device_pubkeys: vec![device_key(0xAA), device_key(0xBB), device_key(0xCC)],
+        compromised_device_pubkey: Some(device_key(0xBB)),
     };
     assert_eq!(
-        params_compromised.compromised_device_pubkey.as_deref(),
-        Some(vec![0xBB; 32].as_slice())
+        params_compromised.compromised_device_pubkey,
+        Some(device_key(0xBB))
     );
 
     // Serialization roundtrip (JSON).
@@ -674,8 +681,8 @@ async fn recovery_with_psk_rotation_failure() {
     let kr = active_key_rotation_outcome(&alice, 9000);
     let psk_params = PskRotationParams {
         did: "did:dht:zRecoveryTestIdentity".to_owned(),
-        enrolled_device_pubkeys: vec![vec![1u8; 32]],
-        compromised_device_pubkey: Some(vec![1u8; 32]),
+        enrolled_device_pubkeys: vec![device_key(1)],
+        compromised_device_pubkey: Some(device_key(1)),
     };
 
     let backend = MockBackend {

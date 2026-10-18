@@ -3,9 +3,10 @@
 //! round-trip test can prove the access-key open path performs exactly one key
 //! agreement, and a restart test can prove a wrapping key is generated once.
 //! It records every handle it generates and can be told to refuse
-//! `public_key` or to report a substitute public key.
+//! `public_key`, to report a substitute public key, or never to answer
+//! `public_key` or `dh_agree`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use tokio::sync::Notify;
@@ -27,6 +28,8 @@ pub struct DhCountingCustody {
     generate_gate: Option<GenerateGate>,
     generated: RwLock<Vec<KeyHandle>>,
     public_key_fault: RwLock<Option<PublicKeyFault>>,
+    dh_hang: AtomicBool,
+    hang_entered: Arc<Notify>,
 }
 
 /// What `public_key` answers instead of the key's public key.
@@ -36,6 +39,8 @@ pub enum PublicKeyFault {
     Refuse(String),
     /// Reports these bytes as the public key.
     Bytes(Vec<u8>),
+    /// Never answers, after signalling [`DhCountingCustody::hang_entered`].
+    Hang,
 }
 
 /// Holds `generate_keypair` open: the call signals `entered`, then waits for
@@ -56,6 +61,8 @@ impl DhCountingCustody {
             generate_gate: None,
             generated: RwLock::new(Vec::new()),
             public_key_fault: RwLock::new(None),
+            dh_hang: AtomicBool::new(false),
+            hang_entered: Arc::new(Notify::new()),
         }
     }
 
@@ -101,6 +108,17 @@ impl DhCountingCustody {
             .write()
             .unwrap_or_else(PoisonError::into_inner) = fault;
     }
+
+    /// Makes every later `dh_agree` call never answer (`true`), or answer
+    /// again (`false`).
+    pub fn set_dh_hang(&self, hang: bool) {
+        self.dh_hang.store(hang, Ordering::SeqCst);
+    }
+
+    /// Notified each time a hanging `public_key` or `dh_agree` call starts.
+    pub fn hang_entered(&self) -> Arc<Notify> {
+        Arc::clone(&self.hang_entered)
+    }
 }
 
 impl KeyCustody for DhCountingCustody {
@@ -140,6 +158,10 @@ impl KeyCustody for DhCountingCustody {
             None => self.inner.public_key(key).await,
             Some(PublicKeyFault::Refuse(detail)) => Err(PlatformError::CustodyError(detail)),
             Some(PublicKeyFault::Bytes(bytes)) => Ok(PublicKey::new(bytes)),
+            Some(PublicKeyFault::Hang) => {
+                self.hang_entered.notify_one();
+                std::future::pending().await
+            }
         }
     }
 
@@ -155,6 +177,10 @@ impl KeyCustody for DhCountingCustody {
     ) -> Result<SharedSecret, PlatformError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.dh_calls.fetch_add(1, Ordering::SeqCst);
+        if self.dh_hang.load(Ordering::SeqCst) {
+            self.hang_entered.notify_one();
+            return std::future::pending().await;
+        }
         self.inner.dh_agree(key, peer_public).await
     }
 

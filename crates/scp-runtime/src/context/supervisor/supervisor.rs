@@ -2393,6 +2393,21 @@ impl Supervisor {
         self.testing_wrapping_custody.get().cloned()
     }
 
+    /// The custody `KeyHandle` of `owner`'s wrapping key, loading the key
+    /// first. Tests use it to act on that one key in custody (destroy it,
+    /// read it) without scanning handles.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::load_wrapping_key`].
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn testing_wrapping_key_handle(
+        &self,
+        owner: &DID,
+    ) -> Result<scp_platform::KeyHandle, ContextError> {
+        Ok(*self.load_wrapping_key(owner).await?.handle())
+    }
+
     /// Internal constructor reachable from production builds. The public
     /// surface goes through [`Self::with_providers_and_journal`]; the test-only
     /// `Self::new` alias forwards here so the same body services both
@@ -3067,12 +3082,18 @@ impl Supervisor {
             .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))
     }
 
-    /// Cheap reference to the supervisor's
-    /// [`KeyResolver`].
-    /// Returns `None` if [`Self::with_providers_and_journal`] was not used.
-    #[must_use]
-    pub(crate) fn key_resolver_ref(&self) -> Option<&KeyResolver> {
-        self.key_resolver.get()
+    /// The supervisor's [`KeyResolver`], shared.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInitialized`] when
+    /// [`Self::with_providers_and_journal`] was not used.
+    pub(crate) fn key_resolver(&self) -> Result<KeyResolver, ContextError> {
+        use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
+        self.key_resolver
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))
     }
 
     /// Cheap reference to the supervisor's payment-adapter slot.
@@ -3417,45 +3438,48 @@ impl Supervisor {
     /// returns its TLS-serialized public bytes. The private leaf state is
     /// dropped.
     ///
-    /// The leaf carries `owner`'s wrapping public key as `0xFF01` (spec 09
-    /// §9.16.1) and a `0xFF03` attestation over its keys signed through
-    /// `active_signer` (§9.7.1). `active_signer` must hold the key `owner`'s
-    /// DID document names at `#active`; the key resolver checks it before the
-    /// sign, and the signature is verified against the resolved key after
-    /// it. A bridge calls this for a `KeyPackage` it hands to `join_context`.
-    /// Call it outside every supervisor lock.
+    /// The leaf carries `owning_did`'s wrapping public key as `0xFF01` (spec
+    /// 09 §9.16.1) and a `0xFF03` attestation over its keys signed through
+    /// `active_signer` (§9.7.1). `active_signer` must hold the key
+    /// `owning_did`'s DID document names at `#active`: the key is resolved and
+    /// compared before the sign, and the signature is verified under it before
+    /// the `KeyPackage` is built. A bridge calls this for a `KeyPackage` it
+    /// hands to `join_context`. Call it outside every supervisor lock.
     ///
     /// # Errors
     ///
     /// - The errors of [`Self::load_wrapping_key`].
     /// - [`ContextError::NotInitialized`] when the supervisor has no key
     ///   resolver or no crypto provider.
-    /// - [`ContextError::AttestationSignerActiveKeyUnresolved`] when `owner`'s
-    ///   `#active` key does not resolve, and
+    /// - [`ContextError::AttestationSignerActiveKeyUnresolved`] when
+    ///   `owning_did`'s `#active` key does not resolve, and
     ///   [`ContextError::AttestationSignerNotActiveKey`] when `active_signer`
-    ///   does not hold it.
+    ///   does not hold it or signs under another key.
     /// - [`ContextError::Custody`] when custody refuses or does not answer the
     ///   sign, and [`ContextError::CryptoFailed`] when the `KeyPackage` cannot
-    ///   be planned or built or the signature does not verify.
+    ///   be planned or built.
     pub async fn mint_attested_key_package(
         &self,
-        owner: &DID,
+        owning_did: &DID,
         active_signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<Vec<u8>, ContextError> {
         use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
-        let wrapping = *self.load_wrapping_key(owner).await?.public();
-        let not_init = || ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned());
-        let key_resolver = Arc::clone(self.key_resolver_ref().ok_or_else(not_init)?);
-        let mls = Arc::clone(self.crypto_ref().ok_or_else(not_init)?.mls_backend());
-        let signer = crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner::new(
-            owner.clone(),
-            active_signer.clone(),
-            key_resolver,
+        use crate::crypto::mls::attestation_signer::{
+            KeyPackageAttestationSigner, mint_attested_key_package,
+        };
+        let wrapping = *self.load_wrapping_key(owning_did).await?.public();
+        let mls = Arc::clone(
+            self.crypto_ref()
+                .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?
+                .mls_backend(),
         );
-        let generated = crate::crypto::mls::attestation_signer::mint_attested_key_package(
-            &*mls, &signer, &wrapping,
+        let signer = KeyPackageAttestationSigner::resolve(
+            owning_did.clone(),
+            active_signer.clone(),
+            self.key_resolver()?,
         )
         .await?;
+        let generated = mint_attested_key_package(&*mls, &signer, &wrapping).await?;
         Ok(generated.key_package_bytes)
     }
 
@@ -3609,11 +3633,10 @@ impl Supervisor {
                 mls_storage,
                 transport,
                 clock,
-                wrapping_key,
                 // The owner's attestation signer arrives with the first
                 // reserve (`KeyPackageCommand::ReserveAny`); until then the
                 // store mints nothing.
-                attestation_signer: None,
+                wrapping_key,
             },
         )
     }
@@ -3747,7 +3770,7 @@ impl Supervisor {
         let transport = self.transport_ref().ok_or_else(not_init)?;
         let event_log = Arc::clone(self.event_log_ref().ok_or_else(not_init)?);
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
-        let key_resolver = self.key_resolver_ref().ok_or_else(not_init)?.clone();
+        let key_resolver = self.key_resolver()?;
         let mls_storage = Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?);
         // The supervisor's own non-Option persistence field. Every shipped
         // constructor (`with_providers_and_journal`) fills it with the caller's
@@ -15266,17 +15289,13 @@ impl Supervisor {
         // Every KeyPackage publishes the owner's wrapping key; load it before
         // `key_package_store_for` takes `write_lock`.
         self.load_wrapping_key(&owning_did).await?;
-        let key_resolver = Arc::clone(self.key_resolver_ref().ok_or_else(|| {
-            ContextError::NotInitialized(
-                crate::context::manager_methods::PROVIDER_NOT_INITIALIZED.to_owned(),
-            )
-        })?);
         let signer = Arc::new(
-            crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner::new(
+            crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner::resolve(
                 owning_did.clone(),
                 active_signer.clone(),
-                key_resolver,
-            ),
+                self.key_resolver()?,
+            )
+            .await?,
         );
         let store = self.key_package_store_for(&owning_did).await?;
         store
@@ -15307,14 +15326,8 @@ impl Supervisor {
         key_package: &[u8],
     ) -> Result<scp_protocol::crypto::hpke::p256::P256Point, ContextError> {
         use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
-        use crate::crypto::mls::attestation_verification::{
-            AttestationAddGroundTruth, verify_add_attestation,
-        };
-        let resolver = self.key_resolver_ref().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "KeyPackage verification: key resolver not configured".to_owned(),
-            )
-        })?;
+        use crate::crypto::mls::attestation_verification::verify_add_attestation;
+        let resolver = self.key_resolver()?;
         let not_init = || ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned());
         let mls = Arc::clone(self.crypto_ref().ok_or_else(not_init)?.mls_backend());
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
@@ -15340,23 +15353,11 @@ impl Supervisor {
                 "KeyPackage leaf carries no attestation (0xFF03)".to_owned(),
             )
         })?;
-        verify_add_attestation(
-            resolver,
-            clock.as_ref(),
-            attestation,
-            &AttestationAddGroundTruth {
-                credential: &leaf.credential,
-                leaf_signature_key: &leaf.signature_key,
-                leaf_encryption_key: &leaf.encryption_key,
-                leaf_wrapping_key: &wrapping_key,
-                leaf_lifetime_not_before: leaf.not_before,
-                leaf_lifetime_not_after: leaf.not_after,
-                kp_init_key: &leaf.init_key,
-            },
-        )
-        .map_err(|e| {
-            ContextError::InvalidKeyPackage(format!("KeyPackage attestation rejected: {e}"))
-        })?;
+        verify_add_attestation(resolver, clock.as_ref(), leaf, &wrapping_key, attestation)
+            .await
+            .map_err(|e| {
+                ContextError::InvalidKeyPackage(format!("KeyPackage attestation rejected: {e}"))
+            })?;
         scp_protocol::crypto::hpke::p256::P256Point::try_from(wrapping_key).map_err(|e| {
             ContextError::InvalidKeyPackage(format!(
                 "KeyPackage scp_wrapping_key (0xFF01) is not a valid P-256 point: {e}"
@@ -15381,7 +15382,7 @@ impl Supervisor {
     ///    [`Self::verify_key_package_attestation`]: its `0xFF03` attestation
     ///    must verify against the invitee's resolved `#active` key. The
     ///    HPKE recipient key is the leaf's attested `0xFF01` DHKEM(P-256)
-    ///    wrapping key (§9.16.2).
+    ///    wrapping key (§9.16.1).
     /// 3. Only a `SingleAdmin` context is supported (a voting model returns
     ///    `Err(ContextError::InvalidState)` up front — no proposal, no add —
     ///    because governed-context invitations are not yet implemented). Routes
@@ -15521,7 +15522,7 @@ impl Supervisor {
         //     `#active` key. A supervisor without a key resolver refuses here,
         //     before any verification. `execute_add_member` validates the
         //     KeyPackage again in-actor; this pass is the attestation gate.
-        // 2. The verified leaf's `0xFF01` is the HPKE recipient (§9.16.2).
+        // 2. The verified leaf's `0xFF01` is the HPKE recipient (§9.16.1).
         let recipient = self
             .verify_key_package_attestation(&invitee_did, &invitee_key_package)
             .await?;
@@ -15863,10 +15864,9 @@ impl Supervisor {
     // its rollback-on-error path) reads clearer as one linear sequence than split
     // across helpers, hence the line-count allow.
     #[allow(clippy::too_many_lines)]
-    pub async fn spawn_actor_from_welcome<C: scp_platform::KeyCustody>(
+    pub async fn spawn_actor_from_welcome(
         self: &Arc<Self>,
         owning_did: DID,
-        custody: &C,
         req: WelcomeJoinRequest,
     ) -> Result<crate::context::ContextHandle, ContextError> {
         use crate::context::supervisor::key_package_actor::KeyPackageCommand;
@@ -15897,10 +15897,8 @@ impl Supervisor {
         // 1. The enc is validated before any custody call (§9.16.2 Open step
         //    1): a malformed point is rejected without touching the wrapping
         //    key or the reservation.
-        let enc =
-            scp_protocol::crypto::hpke::p256::validate_enc(&sealed_bundle_enc).map_err(|e| {
-                ContextError::CryptoFailed(format!("spawn-from-Welcome: invitation enc: {e}"))
-            })?;
+        let enc = scp_protocol::crypto::hpke::p256::validate_enc(&sealed_bundle_enc)
+            .map_err(|e| ContextError::InvitationEncMalformed(e.to_string()))?;
         // 2. The joiner's wrapping key, loaded from its custody handle record.
         let wrapping_key = self.load_wrapping_key(&owning_did).await?;
         // 3. The `0xFF01` the inviter sealed to: the reserved KeyPackage's own.
@@ -15913,30 +15911,17 @@ impl Supervisor {
             })
             .await?;
         // 4. The three keys must agree (§9.16.2 Open step 2): the reserved
-        //    `0xFF01`, the public key of the handle in the custody the caller
-        //    passed (`pkRm`), and the supervisor's recorded wrapping key. A
+        //    `0xFF01`, the public key custody reports for the wrapping handle
+        //    (`pkRm`), and the supervisor's recorded wrapping key. A
         //    disagreement means the reservation, the custody, or the record
-        //    names another key; nothing is opened or consumed.
-        let pk_rm: [u8; scp_protocol::crypto::hpke::p256::PUBLIC_KEY_LEN] =
-            match tokio::time::timeout(
-                crate::context::actor::SIGN_TIMEOUT,
-                custody.public_key(wrapping_key.handle()),
-            )
-            .await
-            {
-                Ok(Ok(public)) => public.as_bytes().try_into().map_err(|_| {
-                    ContextError::InvalidKeyPackage(
-                        "spawn-from-Welcome: the custody wrapping key is not a 65-byte P-256 point"
-                            .to_owned(),
-                    )
-                })?,
-                Ok(Err(e)) => return Err(ContextError::Custody(e.into())),
-                Err(_) => {
-                    return Err(crate::context::actor::signer::custody_timed_out(
-                        "public_key",
-                    ));
-                }
-            };
+        //    names another key; nothing is opened or consumed. A custody
+        //    public key that is not a valid 65-byte P-256 point disagrees too.
+        let pk_rm = wrapping_key.read_public().await.map_err(|e| match e {
+            ContextError::Custody(_) => e,
+            other => ContextError::InvalidKeyPackage(format!(
+                "spawn-from-Welcome: the custody wrapping key is not a P-256 point: {other}"
+            )),
+        })?;
         if reserved_wrapping_key.as_bytes() != &pk_rm || &pk_rm != wrapping_key.public() {
             return Err(ContextError::InvalidKeyPackage(
                 "spawn-from-Welcome: the reserved KeyPackage's scp_wrapping_key, the custody \
@@ -15945,17 +15930,8 @@ impl Supervisor {
             ));
         }
         // 5. The KEM Diffie-Hellman runs inside custody on the wrapping handle;
-        //    no wrapping scalar exists in the runtime (C-a).
-        let dh: Zeroizing<[u8; 32]> = match tokio::time::timeout(
-            crate::context::actor::SIGN_TIMEOUT,
-            custody.dh_agree(wrapping_key.handle(), enc.as_bytes()),
-        )
-        .await
-        {
-            Ok(Ok(shared)) => Zeroizing::new(*shared.as_bytes()),
-            Ok(Err(e)) => return Err(ContextError::Custody(e.into())),
-            Err(_) => return Err(crate::context::actor::signer::custody_timed_out("dh_agree")),
-        };
+        //    no wrapping scalar exists in the runtime.
+        let dh = wrapping_key.agree(&enc).await?;
         // 6. The rest of the RFC 9180 open (`ExtractAndExpand`, `KeySchedule`,
         //    AEAD) is software. `info`/`aad` are rebuilt from the UNTRUSTED
         //    `hint_context_id` / `hint_creator_did`; a successful AEAD open
@@ -15966,7 +15942,7 @@ impl Supervisor {
             scp_protocol::crypto::envelope_seal::hpke_open_invitation_with_external_dh(
                 &sealed_bundle_ct,
                 &dh,
-                &pk_rm,
+                &reserved_wrapping_key,
                 &enc,
                 &hint_context_id,
                 hint_creator_did.as_ref(),
@@ -16014,20 +15990,22 @@ impl Supervisor {
         // failure is treated as a permanent reject (fail-closed), matching the
         // import path: the `KeyResolver` returns `Option` with no transient
         // signal, so there is no retryable-vs-permanent distinction to model here.
-        let resolver = self.key_resolver_ref().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "spawn-from-Welcome: key resolver not configured — cannot verify the invitation \
-                 signature"
-                    .to_owned(),
-            )
+        let creator_vk = crate::crypto::mls::attestation_verification::resolve_active_key(
+            self.key_resolver()?,
+            bundle.creator_did.clone(),
+        )
+        .await
+        .map_err(|e| {
+            ContextError::CryptoFailed(format!(
+                "spawn-from-Welcome: creator #active key resolution task failed: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "spawn-from-Welcome: cannot resolve #active key for creator '{}'",
+                bundle.creator_did
+            ))
         })?;
-        let creator_vk =
-            resolver(&bundle.creator_did, scp_did::SigningKeyId::Active).ok_or_else(|| {
-                ContextError::CryptoFailed(format!(
-                    "spawn-from-Welcome: cannot resolve #active key for creator '{}'",
-                    bundle.creator_did
-                ))
-            })?;
         bundle.verify(&creator_vk).map_err(|e| {
             ContextError::CryptoFailed(format!(
                 "spawn-from-Welcome: invitation signature invalid: {e}"
@@ -19707,13 +19685,12 @@ mod tests {
             .map(|key| *key.as_bytes())
     }
 
-    /// A fixed `#active` key for the `KeyPackage`-attestation tests, and a
-    /// resolver that names it for `owner` only.
+    /// A fixed `#active` key for the `KeyPackage`-attestation tests, and the
+    /// shared test resolver over `owner` alone.
     fn kp_owner_key_and_resolver(owner: &DID) -> (ed25519_dalek::SigningKey, KeyResolver) {
         let key = ed25519_dalek::SigningKey::from_bytes(&[0x3C; 32]);
-        let vk = key.verifying_key();
         let owner = owner.clone();
-        let resolver: KeyResolver = Arc::new(move |did: &DID, _| (did == &owner).then_some(vk));
+        let resolver = crate::crypto::mls::test_support::role_resolver(&[(owner, key.clone())]);
         (key, resolver)
     }
 
@@ -19726,12 +19703,13 @@ mod tests {
 
     /// A `KeyPackage` the production store actor mints for a reserve publishes,
     /// in `0xFF01`, the wrapping public key of the identity that owns the
-    /// store, and carries a `0xFF03` attestation.
+    /// store, and carries a `0xFF03` attestation that verifies as an Add
+    /// against the owner's resolved `#active` key.
     #[tokio::test]
     async fn production_key_package_carries_the_owner_wrapping_key() {
         let did = DID("did:dht:z6MkKpWrapOwner".to_owned());
         let (key, resolver) = kp_owner_key_and_resolver(&did);
-        let sup = supervisor_with_resolver(resolver);
+        let sup = supervisor_with_resolver(Arc::clone(&resolver));
         let signer = crate::context::actor::CommandSigner::local_ed25519(key);
         let (_reservation, kp_bytes) = sup.reserve_key_package(did.clone(), &signer).await.unwrap();
         let owner = *sup.load_wrapping_key(&did).await.unwrap().public();
@@ -19743,20 +19721,52 @@ mod tests {
             .validate_key_package(&kp_bytes, &scp_clock::SystemClock)
             .await
             .unwrap();
-        assert!(
-            validated.leaf.attestation.is_some(),
-            "the KeyPackage carries 0xFF03"
-        );
+        let attestation = validated
+            .leaf
+            .attestation
+            .as_ref()
+            .expect("the KeyPackage carries 0xFF03");
+        crate::crypto::mls::attestation_verification::verify_add_attestation(
+            resolver,
+            &scp_clock::SystemClock,
+            &validated.leaf,
+            &owner,
+            attestation,
+        )
+        .await
+        .expect("the attestation verifies against the owner's #active key");
     }
 
-    /// N1: a reserve whose signer holds a key other than the owner's resolved
-    /// `#active` key is refused with `AttestationSignerNotActiveKey`, and the
-    /// owner's store mints nothing for it.
+    /// N1: with the owner's pool full, a reserve whose signer holds a key
+    /// other than the owner's resolved `#active` key is refused with
+    /// `AttestationSignerNotActiveKey`, and the store's pool is unchanged.
     #[tokio::test]
     async fn reserve_rejects_a_handle_that_is_not_the_identitys_active_key() {
+        use crate::context::supervisor::key_package_actor::KeyPackageCommand;
         let did = DID("did:dht:z6MkKpWrongHandleReserve".to_owned());
-        let (_key, resolver) = kp_owner_key_and_resolver(&did);
+        let (key, resolver) = kp_owner_key_and_resolver(&did);
         let sup = supervisor_with_resolver(resolver);
+        sup.reserve_key_package(
+            did.clone(),
+            &crate::context::actor::CommandSigner::local_ed25519(key),
+        )
+        .await
+        .expect("the #active signer reserves and fills the pool");
+        let store = sup.key_package_store_for_loaded(&did).await.unwrap();
+        store
+            .send(|reply| KeyPackageCommand::Replenish { reply })
+            .await
+            .expect("the refill ends");
+        let full = store
+            .send(|reply| KeyPackageCommand::ListPooled { reply })
+            .await
+            .unwrap();
+        assert_eq!(
+            full.len(),
+            crate::context::supervisor::key_package_actor::MIN_BUFFER - 1,
+            "the pool is full"
+        );
+
         let err = sup
             .reserve_key_package(did.clone(), &kp_other_signer())
             .await
@@ -19765,19 +19775,11 @@ mod tests {
             matches!(err, ContextError::AttestationSignerNotActiveKey),
             "got {err:?}"
         );
-        let store = sup.key_package_store_for_loaded(&did).await.unwrap();
         let pooled = store
-            .send(|reply| {
-                crate::context::supervisor::key_package_actor::KeyPackageCommand::ListPooled {
-                    reply,
-                }
-            })
+            .send(|reply| KeyPackageCommand::ListPooled { reply })
             .await
             .unwrap();
-        assert!(
-            pooled.is_empty(),
-            "no KeyPackage is minted for a refused signer"
-        );
+        assert_eq!(pooled, full, "the refused signer changed nothing");
     }
 
     /// N1: a self-join mint whose signer holds a key other than the owner's
@@ -28435,7 +28437,6 @@ mod tests {
             "spawn_actor_from_welcome",
             sup.spawn_actor_from_welcome(
                 identity.clone(),
-                custody.as_ref(),
                 WelcomeJoinRequest {
                     context_id: join_ctx,
                     creator_did: DID(creator.to_owned()),

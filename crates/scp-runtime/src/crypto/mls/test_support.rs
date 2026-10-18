@@ -17,7 +17,7 @@ use super::backend::{GeneratedKeyPackage, MlsBackend};
 /// Mints an attested `KeyPackage` through any [`MlsBackend`], for tests.
 #[async_trait]
 pub trait MintAttestedForTest {
-    /// Mints a `KeyPackage` for `credential` with `wrapping_pubkey` as its
+    /// Mints a `KeyPackage` for `credential`'s DID (at `#active`) with `wrapping_pubkey` as its
     /// `0xFF01`, its attestation signed by a fresh Ed25519 key.
     async fn mint_attested_for_test(
         &self,
@@ -25,7 +25,7 @@ pub trait MintAttestedForTest {
         wrapping_pubkey: &[u8; 65],
     ) -> Result<GeneratedKeyPackage, MlsError>;
 
-    /// Mints a `KeyPackage` for `credential` with `wrapping_pubkey` as its
+    /// Mints a `KeyPackage` for `credential`'s DID (at `#active`) with `wrapping_pubkey` as its
     /// `0xFF01`, its attestation signed by `identity_key`.
     async fn mint_attested_with_key_for_test(
         &self,
@@ -53,10 +53,55 @@ impl<B: MlsBackend + ?Sized> MintAttestedForTest for B {
         wrapping_pubkey: &[u8; 65],
         identity_key: &SigningKey,
     ) -> Result<GeneratedKeyPackage, MlsError> {
+        let owning_did = scp_did::DID(credential.did.clone());
         let draft = self
-            .prepare_key_package(credential, wrapping_pubkey)
+            .prepare_key_package(&owning_did, wrapping_pubkey)
             .await?;
         let signature = identity_key.sign(&draft.signing_hash()).to_bytes();
-        self.finish_key_package(draft, signature).await
+        self.finish_key_package(draft, signature, &identity_key.verifying_key())
+            .await
     }
+}
+
+/// The `#agent` key the test resolvers name for an identity whose `#active`
+/// key is `active`: a fixed key derived from it and distinct from it, so a
+/// test can sign with the `#agent` key of any fixture identity.
+pub fn test_agent_key(active: &SigningKey) -> SigningKey {
+    let mut seed = active.to_bytes();
+    for byte in &mut seed {
+        *byte ^= 0x5A;
+    }
+    SigningKey::from_bytes(&seed)
+}
+
+/// The resolver every in-crate test uses: each `(did, active)` pair resolves
+/// at `#active` to `active`'s key and at `#agent` to [`test_agent_key`]'s,
+/// and every other DID to nothing. Returning different keys per role is what
+/// lets a test catch a verifier or signer that asks for the wrong role.
+pub fn role_resolver(
+    identities: &[(scp_did::DID, SigningKey)],
+) -> scp_protocol::context::governance::KeyResolver {
+    let table: Vec<(
+        scp_did::DID,
+        ed25519_dalek::VerifyingKey,
+        ed25519_dalek::VerifyingKey,
+    )> = identities
+        .iter()
+        .map(|(did, active)| {
+            (
+                did.clone(),
+                active.verifying_key(),
+                test_agent_key(active).verifying_key(),
+            )
+        })
+        .collect();
+    std::sync::Arc::new(move |did: &scp_did::DID, kid: scp_did::SigningKeyId| {
+        table
+            .iter()
+            .find(|(d, _, _)| d == did)
+            .map(|(_, active, agent)| match kid {
+                scp_did::SigningKeyId::Active => *active,
+                scp_did::SigningKeyId::Agent => *agent,
+            })
+    })
 }

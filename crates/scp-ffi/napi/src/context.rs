@@ -421,19 +421,11 @@ async fn announce_pseudonym_best_effort(
     context_id: &str,
     params: scp_core::context::ContextParams,
 ) {
-    // Extract custody + key handle from the registry (sync), then export the
-    // signing key asynchronously — avoids block_on inside an async fn.
-    let Some((custody, key_handle)) = crate::runtime::with_identity(bi, did, |entry| {
-        Ok((entry.custody.clone(), entry.identity.active_signing_key))
-    })
-    .ok() else {
-        return;
-    };
     // Best effort by design (see the UniFFI bridge's
     // `announce_pseudonym_best_effort`): peers recover on the next explicit
     // announcement. A failure is logged, never discarded silently. The
     // announcement signs through custody (ADR-049 Decision 7a).
-    let signer = match scp_ffi_common::signer::identity_command_signer(custody, key_handle).await {
+    let signer = match crate::runtime::identity_active_signer(bi, did).await {
         Ok(signer) => signer,
         Err(e) => {
             tracing::warn!(
@@ -1253,27 +1245,6 @@ fn ensure_local_custody(bi: &NapiBridgeInstance, did: &str) -> napi::Result<()> 
     crate::runtime::with_identity(bi, did, |_| Ok(())).map_err(NapiError::from)
 }
 
-/// Builds the `#active` custody signer of the locally-custodied identity
-/// `did`, which signs its `KeyPackage` attestations (spec 09 §9.7.1). The
-/// private key stays in custody (ADR-049 Decision 7a).
-///
-/// # Errors
-///
-/// `SCP-IDENT-1001` when `did` is not a locally-custodied identity, and the
-/// custody's own code when the signer cannot be built.
-async fn identity_active_signer(
-    bi: &NapiBridgeInstance,
-    did: &str,
-) -> napi::Result<scp_core::context::actor::CommandSigner> {
-    let (custody, active_handle) = crate::runtime::with_identity(bi, did, |entry| {
-        Ok((entry.custody.clone(), entry.identity.active_signing_key))
-    })
-    .map_err(NapiError::from)?;
-    scp_ffi_common::signer::identity_command_signer(custody, active_handle)
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))
-}
-
 /// Mints the `KeyPackage` `identity_did` joins a context with: its leaf carries
 /// the identity's wrapping key (`0xFF01`) and a `0xFF03` attestation signed
 /// through the identity's `#active` custody key (spec 09 §9.7.1). A mint
@@ -1282,7 +1253,7 @@ async fn mint_self_join_key_package(
     bi: &NapiBridgeInstance,
     identity_did: &str,
 ) -> napi::Result<Vec<u8>> {
-    let active_signer = identity_active_signer(bi, identity_did).await?;
+    let active_signer = crate::runtime::identity_active_signer(bi, identity_did).await?;
     crate::runtime::supervisor(bi)?
         .mint_attested_key_package(&DID(identity_did.to_owned()), &active_signer)
         .await
@@ -1316,7 +1287,7 @@ pub(crate) async fn reserve_key_package_on(
 
     // Every pooled KeyPackage carries a `0xFF03` attestation signed through
     // the identity's `#active` custody key (spec 09 §9.7.1).
-    let active_signer = identity_active_signer(bi, &owning_did).await?;
+    let active_signer = crate::runtime::identity_active_signer(bi, &owning_did).await?;
     let sup = crate::runtime::supervisor(bi)?;
     let sup = Arc::clone(sup);
     let (reservation_id, kp_public) = sup
@@ -1433,11 +1404,11 @@ pub(crate) async fn context_join_from_welcome_on(
     let sup = Arc::clone(sup);
 
     // Resolve the joiner's OWN custody provider + `#active` KeyHandle (the same
-    // locally-custodied identity the pseudonym was derived from). The runtime
-    // opens the sealed bundle with `dh_agree` on the identity's wrapping key
-    // handle in this custody; no private key crosses the FFI (ADR-006, spec 09
-    // §9.16.2). Both are retained (custody `Arc` cloned, `KeyHandle` is `Copy`)
-    // so the returned handle can sign subsequent ops.
+    // locally-custodied identity the pseudonym was derived from), retained
+    // (custody `Arc` cloned, `KeyHandle` is `Copy`) so the returned handle can
+    // sign subsequent ops. The join itself opens the sealed bundle through the
+    // supervisor's own wrapping key for this identity (spec 09 §9.16.1); no
+    // private key crosses the FFI (ADR-006).
     let (custody, active_handle) = crate::runtime::with_identity(bi, &owning_did, |entry| {
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })
@@ -1474,7 +1445,7 @@ pub(crate) async fn context_join_from_welcome_on(
     // discovery entry) back so an errored join leaves no orphaned bridge state
     // beside a runtime that never committed.
     let core_handle = match sup
-        .spawn_actor_from_welcome(DID(owning_did.clone()), &*custody, req)
+        .spawn_actor_from_welcome(DID(owning_did.clone()), req)
         .await
     {
         Ok(handle) => handle,
@@ -1596,13 +1567,7 @@ pub(crate) async fn invite_member_on(
     // SCP-IDENT-1001, before any context lookup), then build the custody signer
     // the invite signs through (ADR-049 Decision 7a). The private key stays in
     // custody.
-    let (custody, active_handle) = crate::runtime::with_identity(bi, &creator_did, |entry| {
-        Ok((entry.custody.clone(), entry.identity.active_signing_key))
-    })
-    .map_err(NapiError::from)?;
-    let signer = scp_ffi_common::signer::identity_command_signer(custody, active_handle)
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    let signer = crate::runtime::identity_active_signer(bi, &creator_did).await?;
 
     let outcome = sup
         .invite_member(
@@ -3643,19 +3608,8 @@ pub(crate) async fn context_reconnect_on(
     // Resolve the local member's Ed25519 signing key from the identity
     // registry (used to sign the Phase-3 consistency checkpoint). Private
     // key never crosses FFI beyond this in-process driver call.
-    let (custody, key_handle) = crate::runtime::with_identity(bi, &identity_did, |entry| {
-        Ok((entry.custody.clone(), entry.identity.active_signing_key))
-    })
-    .map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("cannot resolve signing key for reconnect: {e}"),
-            code: codes::IDENT_1001.to_owned(),
-        })
-    })?;
     // The Phase-3 checkpoint signs through custody (ADR-049 Decision 7a).
-    let signer = scp_ffi_common::signer::identity_command_signer(custody, key_handle)
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    let signer = crate::runtime::identity_active_signer(bi, &identity_did).await?;
 
     let contacts: std::collections::HashMap<String, u64> = last_relay_contacts
         .unwrap_or_default()
@@ -5486,34 +5440,27 @@ fn parse_template_id_napi(
     }
 }
 
-/// Maps a failed supervisor call that otherwise reports every failure under
-/// one fixed `code` to the bridge error, keeping `ActorBusy` and
-/// `SupervisorShutDown` apart.
+/// Maps a failed supervisor call named `op` to the bridge error.
 ///
-/// `ActorBusy` reports `SCP-CTX-2130` (ADR-049 §10), whose producers and retry
-/// behaviour the `ContextError::ActorBusy` doc states. `SupervisorShutDown`
-/// reports `SCP-CTX-2138`. `Custody` keeps its custody code
-/// ([`ScpNapiError::custody_failure`]: a destroyed `#active` key is
-/// `SCP-CRYPTO-4006`). Every other failure reports `code`.
-/// The Welcome join, the key-package reservation and the invite map their
-/// errors through it.
+/// Every variant the shared `classify_context_error` gives a dedicated code
+/// keeps that code (through `From<ContextError>`): `ActorBusy` reports
+/// `SCP-CTX-2130`, `SupervisorShutDown` `SCP-CTX-2138`, `Custody` its custody
+/// code, a malformed invitation `enc` `SCP-VALID-7005`, and so on. A variant
+/// with no dedicated code reports `code`, the call's fixed fallback.
 fn typed_supervisor_failure(
     op: &str,
     code: &str,
     e: &scp_core::context::ContextError,
 ) -> ScpNapiError {
-    let code = match e {
-        scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
-        scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
-        scp_core::context::ContextError::Custody(failure) => {
-            return ScpNapiError::custody_failure(format!("{op} failed: {e}"), failure);
-        }
-        _ => code,
-    };
-    ScpNapiError::Context {
-        message: format!("{op} failed: {e}"),
-        code: code.to_owned(),
+    use scp_ffi_common::context_error_class::{ContextErrorClass, classify_context_error};
+    let message = format!("{op} failed: {e}");
+    if matches!(classify_context_error(e), ContextErrorClass::Generic) {
+        return ScpNapiError::Context {
+            message,
+            code: code.to_owned(),
+        };
     }
+    ScpNapiError::from_context_error(message, e)
 }
 
 /// Maps a refused `CreateContext` to its SDK error. The core's empty-ceiling
@@ -6072,8 +6019,8 @@ mod tests {
             };
             let msg = err.to_string();
             assert!(
-                msg.contains("invitation enc"),
-                "{name}: expected the runtime's enc rejection, got: {msg}"
+                msg.contains(codes::VALID_7005),
+                "{name}: expected the runtime's enc rejection as SCP-VALID-7005, got: {msg}"
             );
             assert!(
                 crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
@@ -6411,27 +6358,14 @@ mod tests {
             crate::runtime::with_identity(&bi, &joiner_did, |entry| Ok(entry.custody.clone()))
                 .expect("the joiner is registered");
         let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
-        let wrapping = sup
-            .wrapping_public_key(&DID(joiner_did.clone()))
+        let handle = sup
+            .testing_wrapping_key_handle(&DID(joiner_did.clone()))
             .await
             .expect("the reservation loaded the wrapping key");
-        let mut destroyed = false;
-        for id in 0..64 {
-            let handle = scp_platform::KeyHandle::new(id);
-            let held = custody.public_key(&handle).await;
-            if held.is_ok_and(|pk| pk.as_bytes() == &wrapping[..]) {
-                custody
-                    .destroy_key(&handle)
-                    .await
-                    .expect("destroy_key should succeed");
-                destroyed = true;
-                break;
-            }
-        }
-        assert!(
-            destroyed,
-            "the wrapping key is among the custody's first 64 handles"
-        );
+        custody
+            .destroy_key(&handle)
+            .await
+            .expect("destroy_key should succeed");
 
         let ctx_id = "b".repeat(64);
         let sealed = super::NapiSealedInvitation {

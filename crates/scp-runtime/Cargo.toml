@@ -87,7 +87,6 @@ serde_json = { workspace = true }
 z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
-x25519-dalek = { workspace = true }
 base64 = { workspace = true }
 bs58 = { workspace = true }
 uuid = { workspace = true }

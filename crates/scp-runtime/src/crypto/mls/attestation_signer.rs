@@ -5,33 +5,40 @@
 //! `Supervisor::mint_attested_key_package`) mints through
 //! [`mint_attested_key_package`], which signs the draft's attestation hash
 //! with a [`KeyPackageAttestationSigner`]. The signer holds the identity's
-//! custody-backed [`CommandSigner`], so no key leaves custody, and refuses to
-//! sign unless that signer's public key is the key the owner's DID document
-//! currently names at `#active`. A `KeyPackage` the owner's `#active` key did
-//! not attest is never minted.
+//! custody-backed [`CommandSigner`], so no key leaves custody. A signer exists
+//! only after [`KeyPackageAttestationSigner::resolve`] resolved the owner's
+//! `#active` key and found the custody signer holds it, and every mint hands
+//! that resolved key to [`MlsBackend::finish_key_package`], which verifies the
+//! signature under it before it builds anything. A `KeyPackage` the owner's
+//! `#active` key did not attest is never minted.
 
 use ed25519_dalek::VerifyingKey;
-use scp_did::{DID, SigningKeyId};
-use scp_mls::attested_key_package::KeyPackageDraft;
-use scp_mls::credential::ScpCredential;
+use scp_did::DID;
+use scp_mls::error::MlsError;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 
+use super::attestation_verification::resolve_active_key;
 use super::backend::{GeneratedKeyPackage, MlsBackend};
 use crate::context::actor::signer::CommandSigner;
 
 /// Signs `KeyPackage` attestations for one owner with the owner's `#active`
 /// key, through custody.
 ///
-/// Built only inside the crate, from the identity's [`CommandSigner`] and the
-/// supervisor's [`KeyResolver`]. Each sign re-resolves the owner's `#active`
-/// key, so a signer held by the `KeyPackage` store stops signing once the
-/// owner's DID document names another key (§9.12, rotation is revocation).
-/// `Debug` names the owner only.
+/// Built only by [`Self::resolve`], which resolves the owner's `#active` key
+/// and checks the custody signer holds it, so holding a value of this type is
+/// proof of that check at resolution time. The `KeyPackage` store compares
+/// [`Self::active_key`] across signers to retire the `KeyPackages` an older
+/// `#active` key attested (§9.12, rotation is revocation). `Debug` names the
+/// owner only.
+///
+/// The type is public only because the public `KeyPackageCommand::ReserveAny`
+/// carries it; its fields and constructor are crate-private, so no code
+/// outside this crate can build one.
 pub struct KeyPackageAttestationSigner {
     owner: DID,
     signer: CommandSigner,
-    key_resolver: KeyResolver,
+    active_key: VerifyingKey,
 }
 
 impl std::fmt::Debug for KeyPackageAttestationSigner {
@@ -43,13 +50,59 @@ impl std::fmt::Debug for KeyPackageAttestationSigner {
 }
 
 impl KeyPackageAttestationSigner {
-    /// A signer for `owner`'s attestations through `signer`, checked against
-    /// the `#active` key `key_resolver` returns for `owner`.
-    pub(crate) fn new(owner: DID, signer: CommandSigner, key_resolver: KeyResolver) -> Self {
+    /// Resolves `owner`'s `#active` key through `key_resolver` and returns a
+    /// signer over `signer` when `signer` holds that key.
+    ///
+    /// The resolver is synchronous and may block on a network resolution, so
+    /// it runs through [`resolve_active_key`] on the blocking pool, never on
+    /// an async worker.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::AttestationSignerNotActiveKey`] when `signer` is not
+    ///   an Ed25519 signer, or its key differs from the resolved key. The
+    ///   signer's key is read before the resolver runs.
+    /// - [`ContextError::AttestationSignerActiveKeyUnresolved`] when the
+    ///   owner's `#active` key does not resolve.
+    /// - [`ContextError::CryptoFailed`] when the resolver task panics or is
+    ///   cancelled.
+    pub(crate) async fn resolve(
+        owner: DID,
+        signer: CommandSigner,
+        key_resolver: KeyResolver,
+    ) -> Result<Self, ContextError> {
+        let held = signer
+            .verifying_key()
+            .map_err(|_| ContextError::AttestationSignerNotActiveKey)?;
+        let active_key = resolve_active_key(key_resolver, owner.clone())
+            .await
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!("#active key resolution task failed: {e}"))
+            })?
+            .ok_or(ContextError::AttestationSignerActiveKeyUnresolved)?;
+        if held != active_key {
+            return Err(ContextError::AttestationSignerNotActiveKey);
+        }
+        Ok(Self {
+            owner,
+            signer,
+            active_key,
+        })
+    }
+
+    /// A signer over `signer` for `owner`, taking `active_key` as the
+    /// owner's `#active` key without resolving it, for tests that drive the
+    /// `KeyPackage` store directly.
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        owner: DID,
+        signer: CommandSigner,
+        active_key: VerifyingKey,
+    ) -> Self {
         Self {
             owner,
             signer,
-            key_resolver,
+            active_key,
         }
     }
 
@@ -58,108 +111,135 @@ impl KeyPackageAttestationSigner {
         &self.owner
     }
 
-    /// The `#active` key the owner's DID document names now.
-    ///
-    /// # Errors
-    ///
-    /// [`ContextError::AttestationSignerActiveKeyUnresolved`] when the
-    /// resolver returns no key.
-    fn resolved_active(&self) -> Result<VerifyingKey, ContextError> {
-        (self.key_resolver)(&self.owner, SigningKeyId::Active)
-            .ok_or(ContextError::AttestationSignerActiveKeyUnresolved)
-    }
-
-    /// Checks that the held signer's key is the owner's resolved `#active`
-    /// key, and returns that key.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::AttestationSignerActiveKeyUnresolved`] when the
-    ///   owner's `#active` key does not resolve.
-    /// - [`ContextError::AttestationSignerNotActiveKey`] when the held signer
-    ///   is not an Ed25519 signer, or its key differs from the resolved key.
-    pub(crate) fn check_active(&self) -> Result<VerifyingKey, ContextError> {
-        let resolved = self.resolved_active()?;
-        let held = self
-            .signer
-            .verifying_key()
-            .map_err(|_| ContextError::AttestationSignerNotActiveKey)?;
-        if held == resolved {
-            Ok(resolved)
-        } else {
-            Err(ContextError::AttestationSignerNotActiveKey)
-        }
-    }
-
-    /// Signs `draft`'s attestation hash with the owner's `#active` key.
-    ///
-    /// The method takes only a [`KeyPackageDraft`], so it signs nothing but an
-    /// attestation hash. It re-runs [`Self::check_active`] before the sign and
-    /// verifies the signature against the resolved key after it.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::InvalidState`] when the draft's credential names
-    ///   another identity, or a `signing_key_id` other than `#active`.
-    /// - The errors of [`Self::check_active`].
-    /// - [`ContextError::Custody`] when custody refuses the sign or does not
-    ///   answer within the signing budget.
-    /// - [`ContextError::CryptoFailed`] when the signature does not verify
-    ///   against the resolved key.
-    pub(crate) async fn sign_attestation(
-        &self,
-        draft: &KeyPackageDraft,
-    ) -> Result<[u8; 64], ContextError> {
-        let credential = draft.credential();
-        if credential.did != self.owner.0 {
-            return Err(ContextError::InvalidState(
-                "attestation signer owner mismatch".to_owned(),
-            ));
-        }
-        if credential.signing_key_id != SigningKeyId::Active {
-            return Err(ContextError::InvalidState(format!(
-                "a KeyPackage attestation is signed by #active, not {:?}",
-                credential.signing_key_id
-            )));
-        }
-        let resolved = self.check_active()?;
-        let hash = draft.signing_hash();
-        let signature = self.signer.sign_bounded_ed25519(&hash).await?;
-        scp_crypto::verify_ed25519_signature(resolved.as_bytes(), &hash, &signature).map_err(
-            |e| {
-                ContextError::CryptoFailed(format!(
-                    "KeyPackage attestation signature does not verify against the resolved \
-                     #active key: {e}"
-                ))
-            },
-        )?;
-        Ok(signature)
+    /// The owner's `#active` key as resolved when this signer was built: the
+    /// key every attestation this signer makes verifies under.
+    pub(crate) const fn active_key(&self) -> &VerifyingKey {
+        &self.active_key
     }
 }
 
 /// Mints one attested `KeyPackage` for `signer`'s owner: plans it through
-/// `mls` with `wrapping_pubkey` as its `0xFF01`, signs its attestation with
-/// `signer`, and builds it.
+/// `mls` for the owner's DID with `wrapping_pubkey` as its `0xFF01`, signs its
+/// attestation hash through custody, and builds it under the resolved
+/// `#active` key.
 ///
 /// # Errors
 ///
-/// - [`ContextError::CryptoFailed`] when the owner's DID cannot form a
-///   credential, or `mls` fails to plan or build the `KeyPackage`.
-/// - The errors of [`KeyPackageAttestationSigner::sign_attestation`]; no
-///   `KeyPackage` is built.
+/// - [`ContextError::Custody`] when custody refuses or does not answer the
+///   sign, and [`ContextError::CryptoFailed`] when the signer is not Ed25519.
+/// - [`ContextError::AttestationSignerNotActiveKey`] when the signature does
+///   not verify under the resolved `#active` key: the custody signs with a key
+///   other than the one it reports. Nothing is built.
+/// - [`ContextError::CryptoFailed`] when `mls` fails to plan or build the
+///   `KeyPackage`.
 pub(crate) async fn mint_attested_key_package(
     mls: &dyn MlsBackend,
     signer: &KeyPackageAttestationSigner,
     wrapping_pubkey: &[u8; 65],
 ) -> Result<GeneratedKeyPackage, ContextError> {
-    let credential = ScpCredential::new(signer.owner().0.clone(), None, SigningKeyId::Active)
-        .map_err(|e| ContextError::CryptoFailed(format!("KeyPackage credential: {e}")))?;
     let draft = mls
-        .prepare_key_package(&credential, wrapping_pubkey)
+        .prepare_key_package(&signer.owner, wrapping_pubkey)
         .await
         .map_err(|e| ContextError::CryptoFailed(format!("planning key package: {e}")))?;
-    let signature = signer.sign_attestation(&draft).await?;
-    mls.finish_key_package(draft, signature)
+    let signature = signer
+        .signer
+        .sign_bounded_ed25519(&draft.signing_hash())
+        .await?;
+    mls.finish_key_package(draft, signature, &signer.active_key)
         .await
-        .map_err(|e| ContextError::CryptoFailed(format!("generating key package: {e}")))
+        .map_err(|e| match e {
+            MlsError::KeyPackageAttestationSignatureInvalid => {
+                ContextError::AttestationSignerNotActiveKey
+            }
+            other => ContextError::CryptoFailed(format!("generating key package: {other}")),
+        })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use scp_crypto::{ScpSigner, SigAlg};
+
+    use super::*;
+    use crate::crypto::mls::production_backend::ProductionMlsBackend;
+    use scp_did::SigningKeyId;
+
+    fn owner() -> DID {
+        DID("did:dht:z6MkAttestationSignerOwner".to_owned())
+    }
+
+    /// A signer that reports `reported` as its public key but signs with
+    /// `signing`.
+    struct LyingSigner {
+        reported: SigningKey,
+        signing: SigningKey,
+    }
+
+    impl ScpSigner for LyingSigner {
+        fn algorithm(&self) -> SigAlg {
+            SigAlg::Ed25519
+        }
+        fn public_key(&self) -> Vec<u8> {
+            self.reported.verifying_key().to_bytes().to_vec()
+        }
+        fn sign(
+            &self,
+            digest: &[u8; 32],
+        ) -> impl std::future::Future<Output = Result<[u8; 64], scp_crypto::SignError>> + Send
+        {
+            std::future::ready(Ok(self.signing.sign(digest).to_bytes()))
+        }
+    }
+
+    /// A custody that reports the owner's `#active` key but signs with another
+    /// key passes the resolve check, and the mint fails with a typed error
+    /// before any `KeyPackage` is built.
+    #[tokio::test]
+    async fn a_custody_signing_with_another_key_mints_nothing() {
+        let active = SigningKey::from_bytes(&[0x31; 32]);
+        let active_vk = active.verifying_key();
+        let resolver: KeyResolver = Arc::new(move |did: &DID, kid| {
+            (did == &owner() && kid == SigningKeyId::Active).then_some(active_vk)
+        });
+        let lying = CommandSigner::new(Arc::new(LyingSigner {
+            reported: active,
+            signing: SigningKey::from_bytes(&[0x32; 32]),
+        }));
+        let signer = KeyPackageAttestationSigner::resolve(owner(), lying, resolver)
+            .await
+            .expect("the reported key is the resolved #active key");
+        let mls = ProductionMlsBackend::new(Arc::new(scp_clock::SystemClock));
+        let wrapping = scp_crypto::p256::testing::uncompressed_point_for(&owner().0);
+
+        let err = mint_attested_key_package(&mls, &signer, &wrapping)
+            .await
+            .expect_err("a signature under another key is never built into a KeyPackage");
+        assert!(
+            matches!(err, ContextError::AttestationSignerNotActiveKey),
+            "got {err:?}"
+        );
+    }
+
+    /// The resolver is asked for `#active` and nothing else.
+    #[tokio::test]
+    async fn resolve_asks_for_the_active_role_only() {
+        let active = SigningKey::from_bytes(&[0x41; 32]);
+        let active_vk = active.verifying_key();
+        let agent_vk = SigningKey::from_bytes(&[0x42; 32]).verifying_key();
+        let resolver: KeyResolver = Arc::new(move |_did: &DID, kid| match kid {
+            SigningKeyId::Active => Some(active_vk),
+            SigningKeyId::Agent => Some(agent_vk),
+        });
+        let signer = KeyPackageAttestationSigner::resolve(
+            owner(),
+            CommandSigner::local_ed25519(active),
+            resolver,
+        )
+        .await
+        .expect("the #active signer resolves");
+        assert_eq!(signer.active_key(), &active_vk);
+    }
 }

@@ -160,7 +160,7 @@ pub fn hpke_seal_invitation(
 pub fn hpke_open_invitation_with_external_dh(
     sealed: &[u8],
     dh: &[u8; 32],
-    recipient_pk: &[u8; p256::PUBLIC_KEY_LEN],
+    recipient_pk: &p256::P256Point,
     enc: &ValidatedEnc,
     context_id: &str,
     creator_did: &str,
@@ -168,7 +168,7 @@ pub fn hpke_open_invitation_with_external_dh(
     let info = build_invitation_info(context_id, creator_did);
     let aad = build_invitation_aad(context_id, creator_did);
 
-    p256::custody::open_with_external_dh(dh, recipient_pk, enc, &info, &aad, sealed)
+    p256::custody::open_with_external_dh(dh, recipient_pk.as_bytes(), enc, &info, &aad, sealed)
         .map_err(|e| EnvelopeSealError::OpenFailed(e.to_string()))
 }
 
@@ -206,7 +206,8 @@ mod tests {
     ) -> Result<Zeroizing<Vec<u8>>, EnvelopeSealError> {
         let enc = p256::validate_enc(wire_enc).unwrap();
         let dh = ecdh_p256(sk, enc.point());
-        hpke_open_invitation_with_external_dh(sealed, &dh, pk, &enc, context_id, creator_did)
+        let pk = p256::P256Point::try_from(&pk[..]).unwrap();
+        hpke_open_invitation_with_external_dh(sealed, &dh, &pk, &enc, context_id, creator_did)
     }
 
     #[test]

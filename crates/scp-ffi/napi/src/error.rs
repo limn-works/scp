@@ -262,169 +262,60 @@ pub(crate) fn extract_scp_code(message: &str) -> Option<String> {
 }
 
 impl From<scp_core::context::ContextError> for ScpNapiError {
+    /// Maps through the shared [`classify_context_error`], so every
+    /// `ContextError` variant carries the same code in every binding.
+    ///
+    /// [`classify_context_error`]: scp_ffi_common::context_error_class::classify_context_error
     fn from(e: scp_core::context::ContextError) -> Self {
-        use scp_core::context::ContextError as CE;
-        match &e {
-            CE::Custody(failure) => Self::custody_failure(format!("{e}"), failure),
-            // Surface the canonical rate-limit code on the typed
-            // envelope so TypeScript callers can check `.code`
-            // instead of string-matching `SCP-ECON-12090` inside
-            // the message body.
-            CE::RateLimited { .. } => Self::Context {
-                message: format!("{e}"),
-                code: codes::ECON_12090.to_owned(),
+        Self::from_context_error(format!("{e}"), &e)
+    }
+}
+
+impl ScpNapiError {
+    /// The bridge error for `e`, reported with `message`, by the class and code
+    /// the shared `classify_context_error` names. A variant with no dedicated
+    /// code ([`ContextErrorClass::Generic`]) reports `SCP-CTX-2001` with a hint.
+    ///
+    /// [`ContextErrorClass::Generic`]: scp_ffi_common::context_error_class::ContextErrorClass::Generic
+    pub(crate) fn from_context_error(message: String, e: &scp_core::context::ContextError) -> Self {
+        use scp_ffi_common::context_error_class::{ContextErrorClass as K, classify_context_error};
+        match classify_context_error(e) {
+            K::Custody(failure) => Self::custody_failure(message, failure),
+            K::Context(code) => Self::Context {
+                message,
+                code: code.to_owned(),
             },
-            // §23.17 snapshot import regression.
-            CE::SnapshotFloorRegression { .. } => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2091.to_owned(),
+            K::Generic => Self::Context {
+                message: format!("{message} — verify context state, membership, and permissions"),
+                code: codes::CTX_2001.to_owned(),
             },
-            // C3: snapshot import structural/semantic rejection.
-            CE::ImportRejected { .. } => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2092.to_owned(),
+            K::Validation(code) => Self::Validation {
+                message,
+                code: code.to_owned(),
             },
-            // §23.16.8 / ADR-050: signed-context-export signature verification
-            // failure (forged/tampered snapshot, exporter_did != creator_did,
-            // or unresolvable creator key). Surface the dedicated SCP-CTX-2093
-            // contract instead of falling through to the catch-all CTX_2001 so
-            // TypeScript callers can distinguish a forged export from a generic
-            // context error. The version gate is reported separately (a distinct
-            // version error, not this arm), per §23.16.8 / §17.5.
-            CE::SnapshotSignatureInvalid { .. } => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2093.to_owned(),
+            K::Crypto(code) => Self::Crypto {
+                message,
+                code: code.to_owned(),
             },
-            // §23.16.8 / §17.5: signed-context-export format-version gate.
-            // The snapshot carries an export-format version this build does not
-            // support. This is a distinct contract from CTX_2093 (signature
-            // verification failure) so a caller can tell "old/unsupported
-            // export format" apart from "forged/tampered snapshot".
-            CE::ExportVersionUnsupported { .. } => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2094.to_owned(),
-            },
-            // §9.10.4: pseudonym registry empty on a multi-member encrypted send.
-            CE::PseudonymRegistryEmpty { .. } => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2095.to_owned(),
-            },
-            // §9.10.4 / §5.14: per-member pseudonym requested for a broadcast context.
-            CE::NotPseudonymousContext { .. } => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2096.to_owned(),
-            },
-            // construction.md M2: a create with no ceiling or a null one omits
-            // a required field; an empty one is an invalid field value.
-            CE::CeilingRequired(declared) => Self::Validation {
-                message: format!("{e}"),
-                code: match declared {
-                    scp_core::context::CeilingDeclaration::Absent
-                    | scp_core::context::CeilingDeclaration::Null => codes::VALID_7004,
-                    scp_core::context::CeilingDeclaration::Empty => codes::VALID_7005,
-                }
-                .to_owned(),
-            },
-            // ADR-049 §10: dedicated SCP-CTX-2130, not CTX_2001; the
-            // `ContextError::ActorBusy` doc states producers and retry behaviour.
-            CE::ActorBusy(_) => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2130.to_owned(),
-            },
-            // ADR-049 §10: actor poisoned (exceeded the respawn budget).
-            // Dedicated SCP-CTX-2134 instead of the CTX_2001 catch-all so a
-            // caller can detect "dormant, needs operator recovery".
-            CE::ContextPoisoned(_) => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2134.to_owned(),
-            },
-            // ADR-049 §10: actor crashed and could not be respawned (lost /
-            // corrupt snapshot). Dedicated SCP-CTX-2135 instead of CTX_2001.
-            CE::ActorCrashed(_) => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2135.to_owned(),
-            },
-            // ADR-049 §9: key package single-use replay rejected by the
-            // crypto-layer consumed-init-key backstop. Dedicated SCP-CTX-2136
-            // instead of CTX_2001 so a caller can detect a security-relevant
-            // single-use replay.
-            CE::KeyPackageReplay(_) => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2136.to_owned(),
-            },
-            // ADR-049 Decision 16: the Supervisor refused the operation
-            // because shutdown began. Dedicated SCP-CTX-2138 instead of
-            // CTX_2001. Mirrors the PyO3 bridge for cross-bridge parity.
-            CE::SupervisorShutDown(_) => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2138.to_owned(),
-            },
-            // §5.9: a `RestoreAccess` requested capabilities that were not
-            // actually suspended for the member (and the member is not
-            // read-excluded with read requested). Dedicated SCP-CTX-2137
-            // instead of the CTX_2001 catch-all so a caller can detect a no-op
-            // restore. Mirrors the PyO3 bridge for cross-bridge
-            // parity.
-            CE::NothingToRestore(_) => Self::Context {
-                message: format!("{e}"),
-                code: codes::CTX_2137.to_owned(),
-            },
-            // Recover embedded SCP-ECON-/SCP-OUTLET-/SCP-PERM- codes from
-            // the runtime's `PermissionDenied(String)` catch-all so the
-            // typed-envelope contract holds for outlet-economy failures.
-            CE::PermissionDenied(msg) => {
+            // Recover an embedded SCP-PERM-/SCP-OUTLET-/SCP-ECON- code from the
+            // runtime's `PermissionDenied(String)` so the typed-envelope
+            // contract holds for outlet-economy failures. The residual
+            // `SCP-OUTLET-` branch catches outlet diagnostics the runtime still
+            // emits as a raw `PermissionDenied` (the settle-path
+            // `SCP-OUTLET-6089` carrier).
+            K::PermissionDenied(msg) => {
                 let code = extract_scp_code(msg).unwrap_or_else(|| codes::PERM_3001.to_owned());
                 if code.starts_with("SCP-PERM-") {
-                    Self::Permission {
-                        message: format!("{e}"),
-                        code,
-                    }
+                    Self::Permission { message, code }
                 } else if code.starts_with("SCP-OUTLET-") {
-                    // SCP-OUT-031 PR-2a: outlet INVOCATION errors no longer flow
-                    // through this string path — they arrive as the typed
-                    // `CE::Outlet` / `CE::OutletContextNotActive` arms above.
-                    // This branch is now RESIDUAL: it still catches the handful
-                    // of outlet-coded diagnostics the runtime emits as a raw
-                    // `PermissionDenied` (e.g. the settle-path `SCP-OUTLET-6089`
-                    // "context vanished during settle" carrier in
-                    // `supervisor.rs`), so keep it as defense-in-depth.
-                    Self::Outlet {
-                        message: format!("{e}"),
-                        code,
-                    }
+                    Self::Outlet { message, code }
                 } else {
-                    Self::Context {
-                        message: format!("{e}"),
-                        code,
-                    }
+                    Self::Context { message, code }
                 }
             }
-            // SCP-OUT-031 PR-2a: outlet invocation errors now arrive as the
-            // typed `ContextError::Outlet(surface)` (was flattened to
-            // `PermissionDenied(String)`). Route to the dedicated `Outlet`
-            // variant preserving at least the concrete §5.4.4 code — parity
-            // with the pre-PR-2a `SCP-OUTLET-` prefix routing above. The
-            // `Display` renders `[code] class: slug`.
-            //
-            // PR-2b: render the structured surface (class/detail/retry/
-            // source_chain) into a richer typed TS error here.
-            CE::Outlet(surface) => Self::Outlet {
-                message: format!("{e}"),
-                code: surface.code.clone(),
-            },
-            // SCP-OUT-031 PR-2a: the outlet reserve-gate context-not-active
-            // carrier. `Display` is the structured, STATE-FREE
-            // `[SCP-OUTLET-6101] protocol: protocol.context-closed-mid-stream`
-            // — the raw lifecycle `current_state` is NEVER rendered here (this
-            // gate runs before authz, so an unauthorized caller must not learn
-            // the exact lifecycle state).
-            CE::OutletContextNotActive { .. } => Self::Outlet {
-                message: format!("{e}"),
-                code: scp_core::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
-            },
-            _ => Self::Context {
-                message: format!("{e} — verify context state, membership, and permissions"),
-                code: codes::CTX_2001.to_owned(),
+            K::Outlet(code) => Self::Outlet {
+                message,
+                code: code.to_owned(),
             },
         }
     }

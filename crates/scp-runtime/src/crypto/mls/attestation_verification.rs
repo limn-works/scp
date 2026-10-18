@@ -1,19 +1,21 @@
 //! The adder's `KeyPackage`-attestation verifier over the supervisor's
-//! [`KeyResolver`] — §9.7.1 verifier checks 1 and 3–13 for an **Add**
-//! (CRYPTO-22 S4, Layer B).
+//! [`KeyResolver`]: §9.7.1 verifier checks 1 and 3–13 for an **Add**.
 //!
-//! [`verify_add_attestation`] resolves the attestation signer's current key
-//! through the supervisor's [`KeyResolver`] — `document_vm_key_resolver` in
-//! production, which reads the DID document's verification method for the
-//! credential's `signing_key_id` — and hands that key to the pure, wasm-safe
-//! core [`verify_attestation`] for checks 3–13. Every identifier is resolved:
-//! there is no DID-prefix carve-out (§9.7.1 "Fail-closed scope").
+//! [`verify_add_attestation`] first requires both the attestation and the leaf
+//! credential to name `#active` (check 1's role rule), then resolves the
+//! signer DID's current `#active` key through the supervisor's
+//! [`KeyResolver`] (`document_vm_key_resolver` in production, which reads the
+//! DID document's verification method), and hands that key to the pure,
+//! wasm-safe core [`verify_attestation`] for checks 3–13. The role it resolves
+//! is the literal `#active` from the specification, never a role read from the
+//! record it checks. Every identifier is resolved: there is no DID-prefix
+//! carve-out (§9.7.1 "Fail-closed scope").
 //!
 //! # Where it runs
 //!
-//! Wired at `Supervisor::invite_member`, which verifies the invitee's
-//! `KeyPackage` before it adds the invitee or seals the invitation; check 2 is
-//! unmet until SCP-CRYPTO22-005 (open question (a)).
+//! Wired at `Supervisor::invite_member` through
+//! `Supervisor::verify_key_package_attestation`, which verifies the invitee's
+//! `KeyPackage` before it adds the invitee or seals the invitation.
 //!
 //! # Check 2 is not met here
 //!
@@ -22,137 +24,124 @@
 //! (300 s). The [`KeyResolver`] returns a key, not a document with its
 //! resolution time, and the production resolver reads through a DID cache
 //! that refreshes on a 24-hour cycle. The freshness seam is SCP-CRYPTO22-005
-//! and `.docs/prds/keypackage-attestation.json` open question (a). The pure
-//! Layer-A seam [`scp_mls::verify_attestation_with_resolution`], which does
-//! enforce check 2 over a resolved document, is unchanged.
+//! and `.docs/prds/keypackage-attestation.json` open question (a).
 //!
 //! See spec §9.7.1 (checks 1–13, resolution failure policy, fail-closed
 //! scope), §9.12 (rotation is revocation), and §9.14 (clock skew).
 
+use ed25519_dalek::VerifyingKey;
 use scp_clock::Clock;
-use scp_did::DID;
-use scp_mls::keypackage_attestation::{AttestationVerificationContext, verify_attestation};
-use scp_mls::{
-    AttestationResolutionVerifyError, AttestationTrigger, KeyPackageAttestation, ScpCredential,
+use scp_did::{DID, SigningKeyId};
+use scp_mls::keypackage_attestation::{
+    AttestationVerificationContext, AttestationVerifyError, KeyPackageLeafFacts,
+    require_active_signer, verify_attestation,
 };
+use scp_mls::{AttestationTrigger, KeyPackageAttestation};
 use scp_protocol::context::governance::KeyResolver;
-
-/// The Add-path leaf/credential ground-truth for [`verify_add_attestation`].
-///
-/// It carries the `KeyPackage`'s `init_key` (`kp_init_key`) directly and has
-/// **no** `trigger` field, so [`verify_add_attestation`] can verify only an
-/// Add: an [`AttestationTrigger::Update`] is unrepresentable here.
-///
-/// # Why Update is excluded
-///
-/// §9.7.1's "Resolution failure policy" gives an already-admitted member's
-/// **Update** a *last-known-good grace* on a transient resolution outage,
-/// whereas an **Add** is strictly fail-closed. This verifier implements only
-/// the fail-closed Add policy; routing an Update through it would let a
-/// resolver outage hard-reject a legitimate member's Update.
-#[derive(Debug, Clone, Copy)]
-pub struct AttestationAddGroundTruth<'a> {
-    /// The leaf's `ScpCredential`. Its `did` is the signer DID resolved here,
-    /// and its `did`/`signing_key_id` are the check-9/10 ground truth; its
-    /// `signing_key_id` names the current verification method for check 1.
-    pub credential: &'a ScpCredential,
-    /// The leaf's actual `signature_key`, a 65-byte uncompressed P-256 point
-    /// (check 4).
-    pub leaf_signature_key: &'a [u8; 65],
-    /// The leaf's actual ratchet-tree `encryption_key`, a 65-byte DHKEM(P-256)
-    /// public key (check 5).
-    pub leaf_encryption_key: &'a [u8; 65],
-    /// The value of the leaf's `scp_wrapping_key` (`0xFF01`) extension, a
-    /// 65-byte DHKEM(P-256) public key (check 6).
-    pub leaf_wrapping_key: &'a [u8; 65],
-    /// The leaf's `Lifetime.not_before` (check 11).
-    pub leaf_lifetime_not_before: u64,
-    /// The leaf's `Lifetime.not_after` (check 11).
-    pub leaf_lifetime_not_after: u64,
-    /// The `KeyPackage`'s `init_key` (checks 7–8) — the Add-specific payload
-    /// the [`AttestationTrigger::Add`] variant carries. `verify_add_attestation`
-    /// constructs that variant from this field internally.
-    pub kp_init_key: &'a [u8; 65],
-}
 
 /// A typed reason [`verify_add_attestation`] rejected a
 /// [`KeyPackageAttestation`] on an Add (§9.7.1 checks 1 and 3–13).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AttestationRuntimeVerifyError {
-    /// Check 1, fail-closed: the resolver returned no key for the
-    /// credential's DID at its `signing_key_id` — the DID does not resolve,
-    /// or its document names no such verification method. There is NO
-    /// fallback to a stale or pre-rotation key (§9.7.1 "Resolution failure
-    /// policy", Add).
-    #[error("attestation signer's current key does not resolve (fail-closed)")]
+    /// Check 1, fail-closed: the resolver returned no `#active` key for the
+    /// leaf credential's DID: the DID does not resolve, or its document names
+    /// no such verification method. There is NO fallback to a stale or
+    /// pre-rotation key (§9.7.1 "Resolution failure policy", Add).
+    #[error("attestation signer's current #active key does not resolve (fail-closed)")]
     ResolutionNotFound,
 
-    /// Checks 3–13: the pure core rejected, against the resolved key. The
-    /// error is [`AttestationResolutionVerifyError::Delegated`] wrapping the
-    /// pure core's error verbatim.
+    /// Check 1, fail-closed: the blocking resolver task panicked or was
+    /// cancelled, so no key was resolved.
+    #[error("attestation signer's #active key resolution task failed: {0}")]
+    ResolverTaskFailed(String),
+
+    /// Check 1's role rule, or checks 3–13 against the resolved key: the pure
+    /// core's error verbatim.
     #[error(transparent)]
-    Verify(#[from] AttestationResolutionVerifyError),
+    Verify(#[from] AttestationVerifyError),
 }
 
-/// Verifies an **Add**-path leaf's [`KeyPackageAttestation`] against the key
-/// the signer's DID document currently names — §9.7.1 checks 1 and 3–13.
+/// Resolves `did`'s current `#active` key through `key_resolver` on the
+/// blocking pool.
 ///
-/// Check 1 resolves `ground_truth.credential`'s DID at its `signing_key_id`
-/// through `key_resolver`; `None` is a fail-closed reject. Check 10 binds the
-/// attestation's `signing_key_id` to the credential's, so the key resolved
-/// is the key the attestation names. Checks 3–13 run in the pure core
-/// [`verify_attestation`] with the resolved key, `now` from `clock`, and the
-/// Add trigger built from `ground_truth.kp_init_key`. A rotated-away key
-/// fails check 3 (§9.12). Check 2 is not met here; see the module doc.
-///
-/// The resolver call is synchronous and may block on a network resolution.
+/// The resolver is synchronous and may block on a network resolution, so it
+/// never runs on an async worker. The role is the literal `#active`: §9.7.1
+/// admits no other attester, so no caller passes one.
 ///
 /// # Errors
 ///
-/// [`AttestationRuntimeVerifyError::ResolutionNotFound`] when the key does
-/// not resolve, and [`AttestationRuntimeVerifyError::Verify`] for the first
-/// failing check among 3–13.
-pub(crate) fn verify_add_attestation(
-    key_resolver: &KeyResolver,
+/// The [`tokio::task::JoinError`] when the resolver task panics or is
+/// cancelled; `Ok(None)` when the key does not resolve.
+pub(crate) async fn resolve_active_key(
+    key_resolver: KeyResolver,
+    did: DID,
+) -> Result<Option<VerifyingKey>, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || key_resolver(&did, SigningKeyId::Active)).await
+}
+
+/// Verifies an **Add**-path leaf's `0xFF03` `attestation` against the key the
+/// signer's DID document currently names at `#active`: §9.7.1 checks 1 and
+/// 3–13.
+///
+/// `leaf` is the `KeyPackage`'s parsed leaf, whose credential DID is the
+/// signer resolved; `wrapping_key` is its `0xFF01`. Check 1's role rule runs
+/// before any resolution: the attestation and the credential must both name
+/// `#active`, or the call fails without asking the resolver. Then the
+/// credential DID's `#active` key is resolved (`None` is a fail-closed
+/// reject), and checks 3–13 run in [`verify_attestation`] with that key, `now`
+/// from `clock`, and the Add trigger over `leaf.init_key`. A rotated-away key
+/// fails check 3 (§9.12). Check 2 is not met here; see the module doc.
+///
+/// # Errors
+///
+/// - [`AttestationRuntimeVerifyError::Verify`] with
+///   [`AttestationVerifyError::SignerNotActive`] when either record names a
+///   role other than `#active`; the resolver is not called.
+/// - [`AttestationRuntimeVerifyError::ResolutionNotFound`] when the key does
+///   not resolve, and [`AttestationRuntimeVerifyError::ResolverTaskFailed`]
+///   when the resolver task fails.
+/// - [`AttestationRuntimeVerifyError::Verify`] for the first failing check
+///   among 3–13.
+pub(crate) async fn verify_add_attestation(
+    key_resolver: KeyResolver,
     clock: &dyn Clock,
+    leaf: &KeyPackageLeafFacts,
+    wrapping_key: &[u8; 65],
     attestation: &KeyPackageAttestation,
-    ground_truth: &AttestationAddGroundTruth<'_>,
 ) -> Result<(), AttestationRuntimeVerifyError> {
-    let credential = ground_truth.credential;
-    let resolved = key_resolver(&DID(credential.did.clone()), credential.signing_key_id)
+    require_active_signer(attestation.signing_key_id, leaf.credential.signing_key_id)?;
+    let resolved = resolve_active_key(key_resolver, DID(leaf.credential.did.clone()))
+        .await
+        .map_err(|e| AttestationRuntimeVerifyError::ResolverTaskFailed(e.to_string()))?
         .ok_or(AttestationRuntimeVerifyError::ResolutionNotFound)?;
     let resolved_bytes = resolved.to_bytes();
-    let now = clock.now_secs();
     verify_attestation(
         attestation,
         &AttestationVerificationContext {
             resolved_current_vm_pubkey: &resolved_bytes,
-            leaf_signature_key: ground_truth.leaf_signature_key,
-            leaf_encryption_key: ground_truth.leaf_encryption_key,
-            leaf_wrapping_key: ground_truth.leaf_wrapping_key,
-            leaf_credential_did: &credential.did,
-            leaf_credential_signing_key_id: credential.signing_key_id,
-            leaf_lifetime_not_before: ground_truth.leaf_lifetime_not_before,
-            leaf_lifetime_not_after: ground_truth.leaf_lifetime_not_after,
-            now,
+            leaf_signature_key: &leaf.signature_key,
+            leaf_encryption_key: &leaf.encryption_key,
+            leaf_wrapping_key: wrapping_key,
+            leaf_credential_did: &leaf.credential.did,
+            leaf_credential_signing_key_id: leaf.credential.signing_key_id,
+            leaf_lifetime_not_before: leaf.not_before,
+            leaf_lifetime_not_after: leaf.not_after,
+            now: clock.now_secs(),
             trigger: AttestationTrigger::Add {
-                kp_init_key: ground_truth.kp_init_key,
+                kp_init_key: &leaf.init_key,
             },
         },
-    )
-    .map_err(|e| {
-        AttestationRuntimeVerifyError::Verify(AttestationResolutionVerifyError::Delegated(e))
-    })
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+    use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
-    use scp_did::SigningKeyId;
-    use scp_mls::keypackage_attestation::AttestationVerifyError;
+    use scp_mls::ScpCredential;
     use std::sync::Arc;
     use std::sync::mpsc;
 
@@ -172,16 +161,20 @@ mod tests {
         }
     }
 
-    /// A resolver that maps every `(did, signing_key_id)` to `key` (or to no
-    /// key) and sends each call to the returned receiver.
+    /// A resolver that answers `active` at `#active` and `agent` at `#agent`
+    /// for every DID, and sends each call to the returned receiver.
     fn recording_resolver(
-        key: Option<VerifyingKey>,
+        active: Option<VerifyingKey>,
+        agent: Option<VerifyingKey>,
     ) -> (KeyResolver, mpsc::Receiver<(String, SigningKeyId)>) {
         let (seen, calls) = mpsc::channel();
         let resolver: KeyResolver = Arc::new(move |did: &DID, kid: SigningKeyId| {
             // The receiver lives until the test's last assertion.
             let _ = seen.send((did.0.clone(), kid));
-            key
+            match kid {
+                SigningKeyId::Active => active,
+                SigningKeyId::Agent => agent,
+            }
         });
         (resolver, calls)
     }
@@ -191,114 +184,162 @@ mod tests {
         calls.try_iter().collect()
     }
 
-    fn fresh_pub() -> [u8; 32] {
-        SigningKey::generate(&mut OsRng).verifying_key().to_bytes()
-    }
-
     /// A fresh 65-byte uncompressed P-256 point for a leaf key position.
     fn fresh_leaf() -> [u8; 65] {
         scp_crypto::p256::P256SecretKey::from_seed(
             scp_crypto::p256::SeedLabel::TestVectorKey,
-            &fresh_pub(),
+            &SigningKey::generate(&mut OsRng).verifying_key().to_bytes(),
         )
         .public_key()
         .to_uncompressed()
     }
 
-    /// A signed attestation, its leaf ground truth, and the signer's key.
+    /// A signed attestation, its leaf, and the key that signed it.
     struct Fx {
         att: KeyPackageAttestation,
-        credential: ScpCredential,
-        leaf_sig: [u8; 65],
-        leaf_enc: [u8; 65],
-        leaf_wrap: [u8; 65],
-        kp_init: [u8; 65],
+        leaf: KeyPackageLeafFacts,
+        wrapping: [u8; 65],
         signer: VerifyingKey,
     }
 
-    impl Fx {
-        fn ground_truth(&self) -> AttestationAddGroundTruth<'_> {
-            AttestationAddGroundTruth {
-                credential: &self.credential,
-                leaf_signature_key: &self.leaf_sig,
-                leaf_encryption_key: &self.leaf_enc,
-                leaf_wrapping_key: &self.leaf_wrap,
-                leaf_lifetime_not_before: ISSUED,
-                leaf_lifetime_not_after: EXPIRES,
-                kp_init_key: &self.kp_init,
-            }
-        }
-    }
-
-    /// A signed Add fixture whose signer DID is `did`. The credential fields
-    /// are set directly, bypassing `ScpCredential::new`'s prefix validation.
-    fn add_fixture(did: &str) -> Fx {
-        let signer = SigningKey::generate(&mut OsRng);
-        let leaf_sig = fresh_leaf();
-        let leaf_enc = fresh_leaf();
-        let leaf_wrap = fresh_leaf();
-        let kp_init = fresh_leaf();
+    /// A leaf for `did` whose credential names `credential_role`, with an
+    /// attestation naming `attestation_role` signed by `key`. The credential
+    /// fields are set directly, bypassing `ScpCredential::new`'s prefix
+    /// validation.
+    fn fixture_with(
+        did: &str,
+        credential_role: SigningKeyId,
+        attestation_role: SigningKeyId,
+        key: &SigningKey,
+    ) -> Fx {
+        let (sig, enc, wrapping, init) = (fresh_leaf(), fresh_leaf(), fresh_leaf(), fresh_leaf());
         let mut att = KeyPackageAttestation {
             did: did.to_owned(),
-            leaf_signature_key: leaf_sig,
-            leaf_encryption_key: leaf_enc,
-            init_key: kp_init,
-            wrapping_key: leaf_wrap,
-            signing_key_id: SigningKeyId::Active,
+            leaf_signature_key: sig,
+            leaf_encryption_key: enc,
+            init_key: init,
+            wrapping_key: wrapping,
+            signing_key_id: attestation_role,
             issued_at: ISSUED,
             expires_at: EXPIRES,
             signature: [0u8; 64],
         };
-        att.signature = signer.sign(&att.signing_hash()).to_bytes();
-        let credential = ScpCredential {
-            did: did.to_owned(),
-            ucan_token: None,
-            signing_key_id: SigningKeyId::Active,
+        att.signature = key.sign(&att.signing_hash()).to_bytes();
+        let leaf = KeyPackageLeafFacts {
+            credential: ScpCredential {
+                did: did.to_owned(),
+                ucan_token: None,
+                signing_key_id: credential_role,
+            },
+            signature_key: sig,
+            encryption_key: enc,
+            init_key: init,
+            wrapping_key: Some(wrapping),
+            not_before: ISSUED,
+            not_after: EXPIRES,
+            attestation: Some(att.clone()),
         };
         Fx {
             att,
-            credential,
-            leaf_sig,
-            leaf_enc,
-            leaf_wrap,
-            kp_init,
-            signer: signer.verifying_key(),
+            leaf,
+            wrapping,
+            signer: key.verifying_key(),
         }
     }
 
-    // -- Check 1 resolves the credential's DID at its signing_key_id; the
-    //    resolved current key passes checks 3–13.
+    /// An `#active` leaf for `did` attested by a fresh key.
+    fn add_fixture(did: &str) -> Fx {
+        fixture_with(
+            did,
+            SigningKeyId::Active,
+            SigningKeyId::Active,
+            &SigningKey::generate(&mut OsRng),
+        )
+    }
 
-    #[test]
-    fn resolve_success_fresh_current_key_ok() {
+    async fn verify(fx: &Fx, resolver: KeyResolver) -> Result<(), AttestationRuntimeVerifyError> {
+        verify_add_attestation(resolver, &FixedClock(NOW), &fx.leaf, &fx.wrapping, &fx.att).await
+    }
+
+    // -- Check 1 resolves the credential's DID at #active; the resolved
+    //    current key passes checks 3–13.
+
+    #[tokio::test]
+    async fn resolve_success_fresh_current_key_ok() {
         let fx = add_fixture(TEST_DID);
-        let (resolver, calls) = recording_resolver(Some(fx.signer));
+        let (resolver, calls) = recording_resolver(Some(fx.signer), None);
 
-        let result =
-            verify_add_attestation(&resolver, &FixedClock(NOW), &fx.att, &fx.ground_truth());
-
-        assert_eq!(result, Ok(()));
+        assert_eq!(verify(&fx, resolver).await, Ok(()));
         assert_eq!(
             recorded(&calls),
             vec![(TEST_DID.to_owned(), SigningKeyId::Active)],
-            "the signer DID must be resolved exactly once, at the credential's signing_key_id"
+            "the signer DID must be resolved exactly once, at #active"
+        );
+    }
+
+    // -- Check 1's role rule: an #agent record is refused before any
+    //    resolution, whichever of the two records names it.
+
+    #[tokio::test]
+    async fn an_agent_role_is_refused_before_the_resolver_runs() {
+        let agent = SigningKey::generate(&mut OsRng);
+        for (credential_role, attestation_role) in [
+            (SigningKeyId::Agent, SigningKeyId::Agent),
+            (SigningKeyId::Active, SigningKeyId::Agent),
+            (SigningKeyId::Agent, SigningKeyId::Active),
+        ] {
+            let fx = fixture_with(TEST_DID, credential_role, attestation_role, &agent);
+            // The resolver would vouch for the agent key at #agent.
+            let (resolver, calls) = recording_resolver(None, Some(agent.verifying_key()));
+
+            assert_eq!(
+                verify(&fx, resolver).await,
+                Err(AttestationRuntimeVerifyError::Verify(
+                    AttestationVerifyError::SignerNotActive
+                )),
+                "credential {credential_role:?}, attestation {attestation_role:?}"
+            );
+            assert!(
+                recorded(&calls).is_empty(),
+                "no key is resolved for a refused role"
+            );
+        }
+    }
+
+    // -- The #agent key signing an attestation that names #active fails:
+    //    the verifier resolves #active itself, and the agent key is not it.
+
+    #[tokio::test]
+    async fn the_agent_key_cannot_attest_as_active() {
+        let active = SigningKey::generate(&mut OsRng);
+        let agent = SigningKey::generate(&mut OsRng);
+        let fx = fixture_with(TEST_DID, SigningKeyId::Active, SigningKeyId::Active, &agent);
+        let (resolver, calls) =
+            recording_resolver(Some(active.verifying_key()), Some(agent.verifying_key()));
+
+        assert_eq!(
+            verify(&fx, resolver).await,
+            Err(AttestationRuntimeVerifyError::Verify(
+                AttestationVerifyError::SignatureInvalid
+            ))
+        );
+        assert_eq!(
+            recorded(&calls),
+            vec![(TEST_DID.to_owned(), SigningKeyId::Active)]
         );
     }
 
     // -- Rotation is revocation: the RESOLVED key drives check 3.
 
-    #[test]
-    fn resolved_rotated_key_drives_check3_signature_invalid() {
+    #[tokio::test]
+    async fn resolved_rotated_key_drives_check3_signature_invalid() {
         let fx = add_fixture(TEST_DID);
         let rotated = SigningKey::generate(&mut OsRng).verifying_key();
-        let (resolver, _calls) = recording_resolver(Some(rotated));
-
-        let err = verify_add_attestation(&resolver, &FixedClock(NOW), &fx.att, &fx.ground_truth())
-            .unwrap_err();
+        let (resolver, _calls) = recording_resolver(Some(rotated), None);
 
         assert_eq!(
-            err,
-            AttestationRuntimeVerifyError::Verify(AttestationResolutionVerifyError::Delegated(
+            verify(&fx, resolver).await,
+            Err(AttestationRuntimeVerifyError::Verify(
                 AttestationVerifyError::SignatureInvalid
             )),
             "the resolved (rotated) key must drive check 3"
@@ -307,38 +348,34 @@ mod tests {
 
     // -- Add fails closed when the key does not resolve.
 
-    #[test]
-    fn add_resolution_not_found_is_fail_closed_reject() {
+    #[tokio::test]
+    async fn add_resolution_not_found_is_fail_closed_reject() {
         let fx = add_fixture(TEST_DID);
-        let (resolver, calls) = recording_resolver(None);
+        let (resolver, calls) = recording_resolver(None, Some(fx.signer));
 
-        let err = verify_add_attestation(&resolver, &FixedClock(NOW), &fx.att, &fx.ground_truth())
-            .unwrap_err();
-
-        assert_eq!(err, AttestationRuntimeVerifyError::ResolutionNotFound);
+        assert_eq!(
+            verify(&fx, resolver).await,
+            Err(AttestationRuntimeVerifyError::ResolutionNotFound)
+        );
         assert_eq!(recorded(&calls).len(), 1);
     }
 
     // -- No prefix carve-out: did:test:, did:key: and did:web: signers are
     //    resolved, and an unresolved one fails closed.
 
-    #[test]
-    fn did_test_and_did_key_are_resolved_like_any_other_identifier() {
+    #[tokio::test]
+    async fn did_test_and_did_key_are_resolved_like_any_other_identifier() {
         for did in [
             "did:test:carveout",
             "did:key:z6MkCarveout",
             "did:web:example.com",
         ] {
             let fx = add_fixture(did);
-            let (resolver, calls) = recording_resolver(None);
-
-            let err =
-                verify_add_attestation(&resolver, &FixedClock(NOW), &fx.att, &fx.ground_truth())
-                    .unwrap_err();
+            let (resolver, calls) = recording_resolver(None, None);
 
             assert_eq!(
-                err,
-                AttestationRuntimeVerifyError::ResolutionNotFound,
+                verify(&fx, resolver).await,
+                Err(AttestationRuntimeVerifyError::ResolutionNotFound),
                 "{did} must be resolved and fail closed when it does not resolve"
             );
             assert_eq!(

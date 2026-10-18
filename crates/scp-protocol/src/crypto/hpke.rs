@@ -9,12 +9,8 @@
 //! `0x0010`), `HKDF-SHA256` (KDF `0x0001`), `AES-128-GCM` (AEAD `0x0001`),
 //! with a 65-byte uncompressed SEC1 `enc` and public key.
 //!
-//! A crate-private X25519 suite (`DHKEM(X25519, HKDF-SHA256)`, KEM `0x0020`,
-//! 32-byte `enc`) remains only for PSK recovery while identity keys are still
-//! Ed25519, and for the invitation seal until it moves to the P-256 wrapping
-//! key. Code outside this crate reaches it only through
-//! [`wrap_psk_for_device_x25519`]. The move of identity keys to P-256 deletes
-//! it.
+//! It is the only suite: every caller, the invitation seal and the PSK
+//! recovery wrap included, seals to a P-256 key.
 //!
 //! Only the **single-shot Base mode** is implemented: each seal generates a
 //! fresh ephemeral keypair, the HPKE context performs exactly one `Seal`
@@ -31,8 +27,7 @@
 //! wire). Re-implementing it here — over the RustCrypto-family `hkdf`/`sha2`/`aes-gcm`
 //! primitives already in this crate — keeps the wasm32 artifact free of extra
 //! transitive crates and makes the construction fully auditable. Correctness
-//! is pinned by the RFC 9180 Appendix A.1 (X25519) and A.3 (P-256)
-//! known-answer tests, including intermediate values, and cross-validated
+//! is pinned by the RFC 9180 Appendix A.3 (P-256) known-answer tests, including intermediate values, and cross-validated
 //! against the `hpke-rs` reference implementation as a dev-dependency oracle.
 //!
 //! # Custody Decap
@@ -59,7 +54,6 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
-pub(crate) mod legacy_x25519;
 pub mod p256;
 
 // ---------------------------------------------------------------------------
@@ -81,8 +75,8 @@ const HPKE_AEAD_KEY_LEN: usize = 16;
 /// AEAD nonce length (`Nn` for AES-128-GCM), bytes.
 const HPKE_AEAD_NONCE_LEN: usize = 12;
 
-/// DHKEM shared-secret length (`Nsecret`), bytes. It is 32 for both
-/// DHKEM(P-256, HKDF-SHA256) and DHKEM(X25519, HKDF-SHA256).
+/// DHKEM shared-secret length (`Nsecret`), bytes: 32 for
+/// DHKEM(P-256, HKDF-SHA256).
 const HPKE_NSECRET: usize = 32;
 
 /// RFC 9180 §4 version label, prefixed to every labeled-KDF input.
@@ -205,8 +199,7 @@ fn labeled_expand(
 /// `shared_secret = LabeledExpand(eae_prk, "shared_secret", kem_context, Nsecret)`.
 ///
 /// `kem_suite_id` is the suite's **KEM** suite id. `Nsecret` is 32 bytes for
-/// both DHKEM(X25519, HKDF-SHA256) and DHKEM(P-256, HKDF-SHA256). `dh` is
-/// 32 bytes for both: the X25519 output, or the P-256 x-coordinate.
+/// DHKEM(P-256, HKDF-SHA256), and `dh` is the 32-byte P-256 x-coordinate.
 fn dhkem_extract_and_expand(
     kem_suite_id: [u8; 5],
     dh: &[u8; 32],
@@ -319,68 +312,4 @@ fn aead_open(ks: &KeyScheduleOutput, aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, H
             Payload { msg: ct, aad },
         )
         .map_err(|e| HpkeError::OpenFailed(e.to_string()))
-}
-
-// ---------------------------------------------------------------------------
-// The one export of the X25519 suite
-// ---------------------------------------------------------------------------
-
-/// Wraps a PSK to a device's X25519 public key for PSK recovery (§3.7.2).
-///
-/// This is single-shot Base-mode HPKE over `DHKEM(X25519, HKDF-SHA256)`,
-/// `HKDF-SHA256` and `AES-128-GCM`, with an empty `aad`. It is the only way
-/// code outside this crate reaches the X25519 suite, which §9.5 does not
-/// list and which goes away when identity keys move to P-256. Every other
-/// HPKE caller uses [`p256`].
-///
-/// Returns `(enc, ct)`: the 32-byte encapsulated key and `ciphertext || tag`
-/// (`psk.len() + 16` bytes).
-///
-/// ```
-/// use scp_protocol::crypto::hpke::wrap_psk_for_device_x25519;
-///
-/// // RFC 7748 §6.1 Bob public key.
-/// let pk: [u8; 32] = [
-///     0xde, 0x9e, 0xdb, 0x7d, 0x7b, 0x7d, 0xc1, 0xb4, 0xd3, 0x5b, 0x61, 0xc2, 0xec, 0xe4, 0x35,
-///     0x37, 0x3f, 0x83, 0x43, 0xc8, 0x5b, 0x78, 0x67, 0x4d, 0xad, 0xfc, 0x7e, 0x14, 0x6f, 0x88,
-///     0x2b, 0x4f,
-/// ];
-/// let (enc, ct) = wrap_psk_for_device_x25519(&pk, b"info", &[7u8; 32])?;
-/// assert_eq!((enc.len(), ct.len()), (32, 48));
-/// # Ok::<(), scp_protocol::crypto::hpke::HpkeError>(())
-/// ```
-///
-/// The X25519 suite itself is private to this crate:
-///
-/// ```compile_fail,E0603
-/// use scp_protocol::crypto::hpke::legacy_x25519::seal;
-/// ```
-///
-/// # Errors
-///
-/// [`HpkeError::SealFailed`] if KDF or AEAD encryption fails (operationally
-/// unreachable with valid inputs).
-pub fn wrap_psk_for_device_x25519(
-    device_pk: &[u8; 32],
-    info: &[u8],
-    psk: &[u8],
-) -> Result<([u8; 32], Vec<u8>), HpkeError> {
-    legacy_x25519::seal(device_pk, info, &[], psk)
-}
-
-/// Opens a PSK that [`wrap_psk_for_device_x25519`] wrapped, with the device's
-/// software-held X25519 secret key. Tests only.
-///
-/// # Errors
-///
-/// [`HpkeError::OpenFailed`] if KDF or AEAD verification fails (wrong key,
-/// wrong `info`, tampered `enc` or `ct`).
-#[cfg(any(test, feature = "testing"))]
-pub fn open_psk_for_device_x25519(
-    device_sk: &[u8; 32],
-    enc: &[u8; 32],
-    info: &[u8],
-    ct: &[u8],
-) -> Result<Vec<u8>, HpkeError> {
-    legacy_x25519::open(device_sk, enc, info, &[], ct)
 }

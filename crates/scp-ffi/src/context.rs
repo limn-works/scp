@@ -719,13 +719,10 @@ impl PyContextParams {
 
 /// The Python exception for a failed supervisor call named `op`.
 ///
-/// `ContextError::ActorBusy` raises `ContextError` with `SCP-CTX-2130` (its
-/// doc states producers and retry behaviour), and
-/// `ContextError::SupervisorShutDown` raises `ContextError` with
-/// `SCP-CTX-2138`, and `ContextError::Custody` keeps its custody code
-/// ([`crate::error::ScpPyError::custody_failure`]: a destroyed `#active` key is
-/// `SCP-CRYPTO-4006`); every other variant raises the `RuntimeError` this
-/// call site raised before.
+/// Every variant the shared `classify_context_error` gives a dedicated code
+/// raises its typed exception with that code ([`typed_supervisor_error`]);
+/// a variant with no dedicated code raises the `RuntimeError` this call site
+/// raised before.
 fn typed_supervisor_failure(op: &str, e: &scp_core::context::ContextError) -> PyErr {
     typed_supervisor_error(op, e).map_or_else(
         || PyRuntimeError::new_err(format!("{op} failed: {e}")),
@@ -733,29 +730,23 @@ fn typed_supervisor_failure(op: &str, e: &scp_core::context::ContextError) -> Py
     )
 }
 
-/// The typed error [`typed_supervisor_failure`] raises: `SCP-CTX-2130` for
-/// `ContextError::ActorBusy`, `SCP-CTX-2138` for
-/// `ContextError::SupervisorShutDown`, the custody code for
-/// `ContextError::Custody`, or `None` for every other variant.
+/// The typed error [`typed_supervisor_failure`] raises: the bridge error the
+/// shared classification names (`SCP-CTX-2130` for `ActorBusy`,
+/// `SCP-CTX-2138` for `SupervisorShutDown`, the custody code for `Custody`,
+/// `SCP-VALID-7005` for a malformed invitation `enc`, ...), or `None` for a
+/// variant with no dedicated code.
 fn typed_supervisor_error(
     op: &str,
     e: &scp_core::context::ContextError,
 ) -> Option<crate::error::ScpPyError> {
-    let code = match e {
-        scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
-        scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
-        scp_core::context::ContextError::Custody(failure) => {
-            return Some(crate::error::ScpPyError::custody_failure(
-                format!("{op} failed: {e}"),
-                failure,
-            ));
-        }
-        _ => return None,
-    };
-    Some(crate::error::ScpPyError::ContextError {
-        message: format!("{op} failed: {e}"),
-        code: code.to_owned(),
-    })
+    use scp_ffi_common::context_error_class::{ContextErrorClass, classify_context_error};
+    if matches!(classify_context_error(e), ContextErrorClass::Generic) {
+        return None;
+    }
+    Some(crate::error::ScpPyError::from_context_error(
+        format!("{op} failed: {e}"),
+        e,
+    ))
 }
 
 /// Extracts a `pseudonym_rotation` dict (spec 09 §9.10.4.1). The dict holds
@@ -3225,15 +3216,6 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
 
-        // Resolve the joiner's OWN custody provider (the same locally-custodied
-        // identity the pseudonym was derived from). The runtime opens the
-        // sealed bundle with `dh_agree` on the identity's wrapping key handle
-        // in this custody; no private key crosses the FFI (ADR-006, spec 09
-        // §9.16.2).
-        let custody =
-            crate::runtime::with_identity(bi, &owning_did, |entry| Ok(entry.custody.clone()))
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
         // A pre-existing FFI-state entry for this id fails the join here, before
         // `spawn_actor_from_welcome` consumes the single-use `KeyPackage`, and
         // the entry is left untouched.
@@ -3258,11 +3240,9 @@ impl crate::scp::PyScp {
         // A typed custody failure keeps its custody code (a wrapping key the
         // custody cannot agree with is `SCP-CRYPTO-4006`) through
         // `typed_supervisor_failure`.
-        let joined = crate::actor_wait::block_on_released(
-            py,
-            sup.spawn_actor_from_welcome(owning, &*custody, req),
-        )?
-        .map_err(|e| typed_supervisor_failure("context_join_from_welcome", &e))?;
+        let joined =
+            crate::actor_wait::block_on_released(py, sup.spawn_actor_from_welcome(owning, req))?
+                .map_err(|e| typed_supervisor_failure("context_join_from_welcome", &e))?;
 
         // Clearing the id's release mark and registering its FFI state run in
         // one critical section. When the entry is occupied, the mark stays and
@@ -7012,8 +6992,8 @@ mod tests {
                     .expect_err("a malformed HPKE enc must be rejected")
                     .to_string();
                 assert!(
-                    err.contains("invitation enc"),
-                    "{name}: expected the runtime's enc rejection, got: {err}"
+                    err.contains("SCP-VALID-7005"),
+                    "{name}: expected the runtime's enc rejection as SCP-VALID-7005, got: {err}"
                 );
                 assert!(
                     crate::runtime::with_ffi_state(&bi, &ctx_id, |_| Ok(())).is_err(),
@@ -7138,15 +7118,8 @@ mod tests {
             crate::runtime()
                 .unwrap()
                 .block_on(async {
-                    let wrapping = sup.wrapping_public_key(&owner).await.unwrap();
-                    for id in 0..64 {
-                        let handle = scp_platform::KeyHandle::new(id);
-                        let held = custody.public_key(&handle).await;
-                        if held.is_ok_and(|pk| pk.as_bytes() == &wrapping[..]) {
-                            return custody.destroy_key(&handle).await;
-                        }
-                    }
-                    panic!("the wrapping key is not among the custody's first 64 handles");
+                    let handle = sup.testing_wrapping_key_handle(&owner).await.unwrap();
+                    custody.destroy_key(&handle).await
                 })
                 .expect("destroy_key should succeed");
 

@@ -6765,3 +6765,80 @@ fn agents_md_enforcement_sections_present() {
         "AGENTS.md must contain the 'NEVER modify enforcement files' section"
     );
 }
+
+/// Spec 09 §9.7.1: the inviter verifies the invitee `KeyPackage`'s `0xFF03`
+/// attestation against the invitee's `#active` key before it seals anything
+/// to the `0xFF01` wrapping key that attestation binds.
+#[test]
+fn invite_member_verifies_the_key_package_attestation_before_sealing() {
+    let body = extract_fn_body(SUPERVISOR_SRC, "invite_member")
+        .expect("supervisor.rs must define invite_member");
+    let verify = body
+        .find(".verify_key_package_attestation(")
+        .expect("invite_member must call verify_key_package_attestation");
+    let seal = body
+        .find("envelope_seal::hpke_seal_invitation(")
+        .expect("invite_member must seal the invitation");
+    assert!(
+        verify < seal,
+        "invite_member must verify the attestation before it seals the invitation"
+    );
+}
+
+/// Spec 09 §9.7.1: every bridge's self-join (`context_join`) mints its
+/// `KeyPackage` through the supervisor's attested mint, so the leaf carries a
+/// `0xFF03` attestation signed by the joiner's `#active` key.
+#[test]
+fn every_bridge_self_join_mints_an_attested_key_package() {
+    for (bridge, src, entry, minter) in [
+        (
+            "PyO3",
+            PYO3_CONTEXT_SRC,
+            "context_join",
+            "mint_self_join_key_package",
+        ),
+        (
+            "NAPI",
+            NAPI_CONTEXT_SRC,
+            "context_join_on",
+            "mint_self_join_key_package",
+        ),
+        (
+            "UniFFI",
+            UNIFFI_BRIDGE_SRC,
+            "context_join",
+            "mint_self_join_key_package",
+        ),
+    ] {
+        assert!(
+            fn_body_contains(src, entry, &format!("{minter}(")),
+            "{bridge} {entry} must mint its KeyPackage through {minter}"
+        );
+        assert!(
+            fn_body_contains(src, minter, ".mint_attested_key_package("),
+            "{bridge} {minter} must call Supervisor::mint_attested_key_package"
+        );
+    }
+}
+
+/// Spec 09 §9.16.2 Open: the Welcome join loads the joiner's wrapping key,
+/// runs the KEM Diffie-Hellman through custody on its handle, and opens the
+/// invitation, all before it takes `bootstrap_spawn_lock`, so a slow custody
+/// never holds the node-wide bootstrap lock.
+#[test]
+fn spawn_actor_from_welcome_agrees_through_the_wrapping_key_before_the_bootstrap_lock() {
+    let body = extract_fn_body(SUPERVISOR_SRC, "spawn_actor_from_welcome")
+        .expect("supervisor.rs must define spawn_actor_from_welcome");
+    let mut from = 0;
+    for step in [
+        ".load_wrapping_key(",
+        ".agree(",
+        "hpke_open_invitation_with_external_dh(",
+        "bootstrap_spawn_lock.lock()",
+    ] {
+        let Some(at) = body[from..].find(step) else {
+            panic!("spawn_actor_from_welcome must run `{step}` after the steps before it");
+        };
+        from += at + step.len();
+    }
+}

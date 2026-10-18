@@ -536,17 +536,7 @@ impl FullStackNode {
         // add) and answers this joiner's pull requests below.
         let creator_did = sealed.creator_did.clone();
 
-        // 2. The open runs in the custody that holds this node's identity
-        //    wrapping key (§9.16.2): the supervisor's own. The creator sealed
-        //    to the `0xFF01` of the KeyPackage this node reserved, which that
-        //    custody minted.
-        let custody = self.manager.testing_wrapping_custody().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "the test supervisor has no in-memory wrapping custody".to_owned(),
-            )
-        })?;
-
-        // 3. Reconstruct the request. The spawn entrypoint rejects `None` /
+        // 2. Reconstruct the request. The spawn entrypoint rejects `None` /
         //    all-zero pseudonyms, so derive a distinct non-zero §9.10.4
         //    pseudonym from this joiner's DID + context.
         let req = WelcomeJoinRequest {
@@ -558,10 +548,10 @@ impl FullStackNode {
             local_pseudonym: Some(harness_pseudonym(&self.did, context_id_str)),
         };
 
-        // 4. Spawn the live per-context actor from the opened, verified bundle.
+        // 3. Spawn the live per-context actor from the opened, verified bundle.
         let handle = self
             .manager
-            .spawn_actor_from_welcome(self.did.clone(), custody.as_ref(), req)
+            .spawn_actor_from_welcome(self.did.clone(), req)
             .await?;
 
         // 5. Joiner-side pickup: pending epoch-advance Commits and the pushed

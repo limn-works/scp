@@ -329,21 +329,6 @@ fn challenge_op_error(e: scp_ffi_common::challenge::ChallengeOpError) -> napi::E
     })
 }
 
-/// Resolves `did` to the custody signer over its `#active` key. An
-/// identity this instance does not host fails with `SCP-IDENT-1001`.
-async fn identity_signer(
-    bi: &NapiBridgeInstance,
-    did: &str,
-) -> napi::Result<scp_core::context::actor::signer::CommandSigner> {
-    let (custody, active_handle) = crate::runtime::with_identity(bi, did, |entry| {
-        Ok((entry.custody.clone(), entry.identity.active_signing_key))
-    })
-    .map_err(napi::Error::from)?;
-    scp_ffi_common::signer::identity_command_signer(custody, active_handle)
-        .await
-        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))
-}
-
 /// The evaluator state of this bridge: the outlet registry and host
 /// handlers of an evaluator context's UCAN state. A lookup finds nothing when
 /// the context is not open on this bridge, the only failure of
@@ -405,7 +390,7 @@ pub(crate) async fn trust_create_challenge_on(
         scp_ffi_common::challenge::validate_challenge_context_id(id).map_err(challenge_op_error)?;
     }
     let sup = crate::runtime::supervisor(bi)?;
-    let signer = identity_signer(bi, &verifier).await?;
+    let signer = crate::runtime::identity_active_signer(bi, &verifier).await?;
     let host = NapiEvaluatorHost { bi };
     let invoker = scp_ffi_common::challenge::SharedEvaluatorInvoker::new(sup, &host);
     let request = scp_ffi_common::challenge::create_challenge(
@@ -459,7 +444,7 @@ pub(crate) async fn trust_respond_to_challenge_on(
         "trustRespondToChallenge",
     )
     .map_err(challenge_op_error)?;
-    let signer = identity_signer(bi, &subject).await?;
+    let signer = crate::runtime::identity_active_signer(bi, &subject).await?;
     let response = scp_ffi_common::challenge::respond_to_challenge(
         &signer,
         resolver,
@@ -496,7 +481,7 @@ pub(crate) async fn trust_grade_response_on(
     )
     .map_err(challenge_op_error)?;
     let sup = crate::runtime::supervisor(bi)?;
-    let signer = identity_signer(bi, &verifier).await?;
+    let signer = crate::runtime::identity_active_signer(bi, &verifier).await?;
     let verifier: scp_did::DID = verifier.into();
     let host = NapiEvaluatorHost { bi };
     let invoker = scp_ffi_common::challenge::SharedEvaluatorInvoker::new(sup, &host);

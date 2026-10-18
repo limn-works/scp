@@ -39,6 +39,7 @@ use super::backend::{
 };
 use super::storage_adapter::OpenMlsStorageAdapter;
 use scp_clock::Clock;
+use scp_did::DID;
 use scp_mls::InMemoryMlsProvider;
 use scp_mls::attested_key_package::{KeyPackageDraft, prepare_key_package};
 use scp_mls::credential::ScpCredential;
@@ -540,7 +541,7 @@ impl MlsBackend for ProductionMlsBackend {
 
     async fn prepare_key_package(
         &self,
-        credential: &ScpCredential,
+        owning_did: &DID,
         wrapping_pubkey: &[u8; 65],
     ) -> Result<KeyPackageDraft, MlsError> {
         // The draft's leaf declares `0xFF01`, `0xFF02` and `0xFF03`, so the
@@ -553,15 +554,16 @@ impl MlsBackend for ProductionMlsBackend {
         //
         // The injected `Clock` mints the KeyPackage `Lifetime` (ADR-057
         // Prereq-1, #2026) — never wall-clock `SystemTime::now()`.
-        prepare_key_package(credential, wrapping_pubkey, self.clock.as_ref())
+        prepare_key_package(owning_did, wrapping_pubkey, self.clock.as_ref())
     }
 
     async fn finish_key_package(
         &self,
         draft: KeyPackageDraft,
         signature: [u8; 64],
+        attesting_key: &ed25519_dalek::VerifyingKey,
     ) -> Result<GeneratedKeyPackage, MlsError> {
-        let (bundle, signer, provider) = draft.finish(signature)?;
+        let (bundle, signer, provider) = draft.finish(signature, attesting_key)?;
 
         let kp_bytes = bundle.key_package().tls_serialize_detached().map_err(|e| {
             MlsError::KeyPackageGenerationFailed(format!("serializing key package: {e}"))

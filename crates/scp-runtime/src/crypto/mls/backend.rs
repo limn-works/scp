@@ -46,6 +46,7 @@ use openmls::prelude::LeafNodeIndex;
 
 use super::storage_adapter::OpenMlsStorageAdapter;
 use scp_clock::Clock;
+use scp_did::DID;
 use scp_mls::attested_key_package::KeyPackageDraft;
 use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::DecryptedContent;
@@ -305,13 +306,13 @@ pub trait MlsBackend: Send + Sync {
         clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError>;
 
-    /// Plans a fresh `KeyPackage` for `credential` whose leaf will carry
-    /// `wrapping_pubkey` as its `0xFF01` extension and a `0xFF03` attestation
-    /// over its keys (§9.7.1), with a lifetime read from the backend's
-    /// injected clock. The identity key named by the credential signs the
-    /// draft's [`KeyPackageDraft::signing_hash`]; [`Self::finish_key_package`]
-    /// builds the `KeyPackage` with that signature. No unattested `KeyPackage`
-    /// can be minted through this trait.
+    /// Plans a fresh `KeyPackage` for `owning_did` whose credential and
+    /// `0xFF03` attestation (§9.7.1) both name the `#active` key, whose leaf
+    /// carries `wrapping_pubkey` as its `0xFF01` extension, and whose lifetime
+    /// is read from the backend's injected clock. The owner's `#active` key
+    /// signs the draft's [`KeyPackageDraft::signing_hash`], and
+    /// [`Self::finish_key_package`] builds the `KeyPackage` only when that
+    /// signature verifies under the attesting key the caller names.
     ///
     /// # Errors
     ///
@@ -319,24 +320,32 @@ pub trait MlsBackend: Send + Sync {
     /// Side-effect-free on external state.
     async fn prepare_key_package(
         &self,
-        credential: &ScpCredential,
+        owning_did: &DID,
         wrapping_pubkey: &[u8; 65],
     ) -> Result<KeyPackageDraft, MlsError>;
 
-    /// Builds the `KeyPackage` `draft` planned, with `signature` in its
-    /// `0xFF03` attestation, and returns the TLS-serialized bytes plus an
+    /// Verifies `signature` over `draft`'s attestation hash under
+    /// `attesting_key`, then builds the `KeyPackage` with that signature in its
+    /// `0xFF03` attestation and returns the TLS-serialized bytes plus an
     /// opaque signer-state handle the caller retains to later join a group
-    /// from a Welcome addressed to this KP. The caller verifies `signature`
-    /// against the identity key before it calls this.
+    /// from a Welcome addressed to this KP.
+    ///
+    /// The signature check makes the attestation verify under
+    /// `attesting_key`; whether `attesting_key` is the owner's resolved
+    /// `#active` key is the caller's to establish (the runtime's
+    /// `KeyPackageAttestationSigner` resolves it before every mint).
     ///
     /// # Errors
     ///
-    /// See [`KeyPackageDraft::finish`], and [`MlsError`] when the bundle does
-    /// not serialize. Side-effect-free on external state.
+    /// [`MlsError::KeyPackageAttestationSignatureInvalid`] when `signature`
+    /// does not verify under `attesting_key`, nothing built; otherwise see
+    /// [`KeyPackageDraft::finish`], and [`MlsError`] when the bundle does not
+    /// serialize. Side-effect-free on external state.
     async fn finish_key_package(
         &self,
         draft: KeyPackageDraft,
         signature: [u8; 64],
+        attesting_key: &ed25519_dalek::VerifyingKey,
     ) -> Result<GeneratedKeyPackage, MlsError>;
 
     /// Returns the `0xFF01` `scp_wrapping_key` (§9.16.1) of the `KeyPackage`

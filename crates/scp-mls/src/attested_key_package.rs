@@ -14,8 +14,8 @@
 //!    makes the leaf signer, and returns a [`KeyPackageDraft`] holding the
 //!    unsigned attestation. It builds nothing.
 //! 2. The caller signs [`KeyPackageDraft::signing_hash`] with the identity's
-//!    `#active` key, and [`KeyPackageDraft::finish`] builds the `KeyPackage`
-//!    once under a provider whose random source replays the two IKM values in
+//!    `#active` key, and [`KeyPackageDraft::finish`] verifies that signature
+//!    under the attesting key, then builds the `KeyPackage` once under a provider whose random source replays the two IKM values in
 //!    the order `openmls` draws them: init key first, then the leaf encryption
 //!    key. `finish` then checks that the built leaf holds exactly the keys the
 //!    attestation names and fails closed with
@@ -35,6 +35,7 @@ use openmls_traits::OpenMlsProvider;
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::random::OpenMlsRand;
 use scp_clock::Clock;
+use scp_did::{DID, SigningKeyId};
 use scp_protocol::crypto::hpke::p256::P256Point;
 use zeroize::Zeroizing;
 
@@ -60,7 +61,7 @@ const IKM_DRAWS: usize = 2;
 /// Why [`ReplayRand`] refused a draw. Each one means `openmls` asked for
 /// randomness the attested mint did not plan for, so the build fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ReplayRandError {
+pub(crate) enum ReplayRandError {
     /// A draw after the init-key and encryption-key draws.
     #[error("replay random source drawn more than twice")]
     Exhausted,
@@ -76,7 +77,7 @@ pub enum ReplayRandError {
 ///
 /// It returns the draft's two IKM values in order, init key first, and
 /// refuses every other draw with a [`ReplayRandError`].
-pub struct ReplayRand {
+pub(crate) struct ReplayRand {
     ikm: Zeroizing<[[u8; IKM_LEN]; IKM_DRAWS]>,
     // The next draw's index. An atomic counter serves the `&self` interface
     // of `OpenMlsRand` without a lock.
@@ -156,8 +157,8 @@ pub struct KeyPackageDraft {
 }
 
 impl KeyPackageDraft {
-    /// The credential the `KeyPackage` will carry. Its `signing_key_id` names
-    /// the identity key that must sign [`Self::signing_hash`].
+    /// The credential the `KeyPackage` will carry. Its `signing_key_id` is
+    /// always `#active`, the identity key that must sign [`Self::signing_hash`].
     #[must_use]
     pub const fn credential(&self) -> &ScpCredential {
         &self.credential
@@ -176,11 +177,15 @@ impl KeyPackageDraft {
     /// values, with the draft's lifetime and leaf signer. The leaf carries the
     /// `0xFF01` wrapping key and the `0xFF03` attestation and declares
     /// `0xFF01`, `0xFF02` and `0xFF03`, so the `KeyPackage` can join a context
-    /// group. `finish` does not check `signature`; the caller verifies it
-    /// against the identity key before it publishes the `KeyPackage`.
+    /// group. Before it builds anything, `finish` verifies `signature` over
+    /// [`Self::signing_hash`] under `attesting_key`, the owner's resolved
+    /// `#active` key, so no `KeyPackage` with an unverifiable attestation is
+    /// built.
     ///
     /// # Errors
     ///
+    /// - [`MlsError::KeyPackageAttestationSignatureInvalid`] if `signature`
+    ///   does not verify under `attesting_key`. Nothing is built.
     /// - [`MlsError::ExtensionError`] if the leaf extensions cannot be built.
     /// - [`MlsError::CredentialSerializationFailed`] if the credential does not
     ///   serialize.
@@ -192,7 +197,14 @@ impl KeyPackageDraft {
     pub fn finish(
         self,
         signature: [u8; 64],
+        attesting_key: &ed25519_dalek::VerifyingKey,
     ) -> Result<(KeyPackageBundle, SignatureKeyPair, InMemoryMlsProvider), MlsError> {
+        scp_crypto::verify_ed25519_signature(
+            attesting_key.as_bytes(),
+            &self.attestation.signing_hash(),
+            &signature,
+        )
+        .map_err(|_| MlsError::KeyPackageAttestationSignatureInvalid)?;
         let Self {
             credential,
             wrapping_pubkey,
@@ -242,9 +254,11 @@ impl KeyPackageDraft {
     }
 }
 
-/// Plans an attested `KeyPackage` for `credential` without building it.
+/// Plans an attested `KeyPackage` for `owning_did` without building it.
 ///
-/// It draws the init-key and encryption-key IKM from the operating system,
+/// The leaf credential names `owning_did` with `signing_key_id = #active`, and
+/// so does the attestation: §9.7.1 admits only the `#active` key as a
+/// `KeyPackage` attester, so no caller can choose another role. It draws the init-key and encryption-key IKM from the operating system,
 /// derives both DHKEM(P-256) public keys from them, makes a fresh ephemeral
 /// leaf signer, computes the lifetime once from `clock`, and fills the
 /// unsigned attestation with `issued_at = not_before` and
@@ -255,16 +269,19 @@ impl KeyPackageDraft {
 ///
 /// - [`MlsError::ExtensionError`] if `wrapping_pubkey` is not a valid
 ///   uncompressed P-256 point.
+/// - [`MlsError::CredentialSerializationFailed`] if `owning_did` is longer
+///   than a credential admits.
 /// - [`MlsError::KeyPackageGenerationFailed`] if the signer cannot be made,
 ///   the operating-system random source fails, or key derivation fails.
 /// - [`MlsError::InvalidSigner`] if the signer's public key is not 65 bytes.
 pub fn prepare_key_package(
-    credential: &ScpCredential,
+    owning_did: &DID,
     wrapping_pubkey: &[u8; 65],
     clock: &dyn Clock,
 ) -> Result<KeyPackageDraft, MlsError> {
     P256Point::try_from(*wrapping_pubkey)
         .map_err(|e| MlsError::ExtensionError(format!("wrapping key: {e}")))?;
+    let credential = ScpCredential::new(owning_did.0.clone(), None, SigningKeyId::Active)?;
 
     let lifetime = key_package_lifetime(clock);
     let signer = SignatureKeyPair::new(SCP_CIPHERSUITE.signature_algorithm())
@@ -293,14 +310,14 @@ pub fn prepare_key_package(
         leaf_encryption_key: encryption_key,
         init_key,
         wrapping_key: *wrapping_pubkey,
-        signing_key_id: credential.signing_key_id,
+        signing_key_id: SigningKeyId::Active,
         issued_at: lifetime.not_before(),
         expires_at: lifetime.not_after(),
         signature: [0; 64],
     };
 
     Ok(KeyPackageDraft {
-        credential: credential.clone(),
+        credential,
         wrapping_pubkey: *wrapping_pubkey,
         lifetime,
         signer,
@@ -331,18 +348,20 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn credential() -> Result<ScpCredential, MlsError> {
-        ScpCredential::new(
-            "did:dht:z6Mkalice".to_owned(),
-            None,
-            scp_did::SigningKeyId::Active,
-        )
+    fn draft() -> Result<KeyPackageDraft, Box<dyn std::error::Error>> {
+        let did = DID("did:dht:z6Mkalice".to_owned());
+        let wrapping = scp_crypto::p256::testing::uncompressed_point_for(&did.0);
+        Ok(prepare_key_package(&did, &wrapping, &SystemClock)?)
     }
 
-    fn draft() -> Result<KeyPackageDraft, Box<dyn std::error::Error>> {
-        let credential = credential()?;
-        let wrapping = scp_crypto::p256::testing::uncompressed_point_for(&credential.did);
-        Ok(prepare_key_package(&credential, &wrapping, &SystemClock)?)
+    /// Signs `draft` with a fresh identity key and returns the signature and
+    /// that key's verifying half.
+    fn sign(draft: &KeyPackageDraft) -> ([u8; 64], ed25519_dalek::VerifyingKey) {
+        let identity = SigningKey::generate(&mut OsRng);
+        (
+            identity.sign(&draft.signing_hash()).to_bytes(),
+            identity.verifying_key(),
+        )
     }
 
     /// A finished `KeyPackage`'s attestation, signed over the draft's hash,
@@ -353,7 +372,7 @@ mod tests {
         let identity = SigningKey::generate(&mut OsRng);
         let draft = draft()?;
         let signature = identity.sign(&draft.signing_hash()).to_bytes();
-        let (bundle, _signer, _provider) = draft.finish(signature)?;
+        let (bundle, _signer, _provider) = draft.finish(signature, &identity.verifying_key())?;
 
         let facts = leaf_facts(bundle.key_package())?;
         let attestation = facts.attestation.ok_or("leaf carries no attestation")?;
@@ -384,7 +403,8 @@ mod tests {
     fn prepare_keys_equal_finished_leaf_keys() -> TestResult {
         let draft = draft()?;
         let planned = draft.attestation.clone();
-        let (bundle, signer, _provider) = draft.finish([0; 64])?;
+        let (signature, attesting_key) = sign(&draft);
+        let (bundle, signer, _provider) = draft.finish(signature, &attesting_key)?;
 
         let facts = leaf_facts(bundle.key_package())?;
         assert_eq!(facts.signature_key, planned.leaf_signature_key);
@@ -421,10 +441,41 @@ mod tests {
     fn finish_rejects_a_draft_whose_ikm_order_was_swapped() -> TestResult {
         let mut draft = draft()?;
         draft.ikm.swap(0, 1);
+        let (signature, attesting_key) = sign(&draft);
         assert!(matches!(
-            draft.finish([0; 64]),
+            draft.finish(signature, &attesting_key),
             Err(MlsError::KeyPackageMintNonDeterministic)
         ));
+        Ok(())
+    }
+
+    /// A signature made by one key and offered with another key as the
+    /// attester is refused before anything is built.
+    #[test]
+    fn finish_rejects_a_signature_that_does_not_verify_under_the_attesting_key() -> TestResult {
+        let first = draft()?;
+        let (signature, _signing_key) = sign(&first);
+        let (_other_signature, other_key) = sign(&first);
+        assert!(matches!(
+            first.finish(signature, &other_key),
+            Err(MlsError::KeyPackageAttestationSignatureInvalid)
+        ));
+        let second = draft()?;
+        let (_signature, attesting_key) = sign(&second);
+        assert!(matches!(
+            second.finish([0; 64], &attesting_key),
+            Err(MlsError::KeyPackageAttestationSignatureInvalid)
+        ));
+        Ok(())
+    }
+
+    /// Every draft names `#active` in both the credential and the
+    /// attestation, whatever the caller holds.
+    #[test]
+    fn prepare_names_the_active_key_in_credential_and_attestation() -> TestResult {
+        let draft = draft()?;
+        assert_eq!(draft.credential().signing_key_id, SigningKeyId::Active);
+        assert_eq!(draft.attestation.signing_key_id, SigningKeyId::Active);
         Ok(())
     }
 

@@ -198,8 +198,8 @@ impl StreamSigner for BridgeCustodyStreamSigner {
 ///
 /// Clones the custody `Arc` + key handle OUT of the identity-registry shard
 /// guard (sync), then performs the (potentially slow) `public_key` export OFF
-/// the guard — the same clone-then-drop discipline as the saga export's
-/// `resolve_context_signer`.
+/// the guard — the same clone-then-drop discipline as
+/// `crate::runtime::identity_active_signer`.
 async fn resolve_stream_signer(
     bi: &NapiBridgeInstance,
     identity_did: &str,
@@ -1145,7 +1145,7 @@ pub(crate) fn outlet_stream_compute_caveats_binding_impl(
 // Cross-context streaming saga (§5.4.5, §6.2.4, SCP-OUT-047) — open / poll /
 // recover. The streaming ANALOG of the unary cross-context saga export in
 // `outlets.rs`, sharing its `enforce_caller_principal_binding`,
-// `resolve_context_signer`, `decode_asserted_nonce`, and `map_saga_error`
+// `crate::runtime::identity_active_signer`, `decode_asserted_nonce`, and `map_saga_error`
 // verbatim, and the SAME `NapiStreamExecutor` / `resolve_stream_signer` /
 // `NapiStreamRevocationChecker` this module already defines. Mirrors the
 // CANONICAL `PyO3` reference bridge's `outlet_stream.rs` cross-context section.
@@ -1498,8 +1498,8 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     // Each side signs as the creator its supervisor actor reported to that
     // side's gate at the top of this function.
     let target_signer =
-        crate::outlets::resolve_context_signer(bi, &target_role_state.creator_did).await?;
-    let caller_signer = crate::outlets::resolve_context_signer(bi, &caller_creator_did).await?;
+        crate::runtime::identity_active_signer(bi, &target_role_state.creator_did).await?;
+    let caller_signer = crate::runtime::identity_active_signer(bi, &caller_creator_did).await?;
 
     // ----- Chokepoint (ADR-056): id STRING → [u8; 32] -------------------------
     let caller_context_bytes = scp_core::context::state::context_id_to_bytes(&caller_context_id);
@@ -1695,7 +1695,7 @@ pub(crate) async fn outlet_streaming_saga_recover_truncated_close_on(
         .await
         .map_err(napi::Error::from)?
         .creator_did;
-    let target_signer = crate::outlets::resolve_context_signer(bi, &target_creator_did).await?;
+    let target_signer = crate::runtime::identity_active_signer(bi, &target_creator_did).await?;
     let supervisor = crate::runtime::supervisor(bi)?.clone();
     drive_recover_truncated_close(
         &supervisor,

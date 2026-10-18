@@ -43,6 +43,12 @@ pub enum MlsError {
     #[error("attested key package build did not reproduce the attested leaf keys")]
     KeyPackageMintNonDeterministic,
 
+    /// The signature handed to an attested `KeyPackage` build does not verify
+    /// under the attesting key over the attestation's signing hash (§9.7.1,
+    /// §9.5.1), so the build refuses it and mints nothing.
+    #[error("key package attestation signature does not verify under the attesting key")]
+    KeyPackageAttestationSignatureInvalid,
+
     /// Failed to process a Welcome message when joining a group.
     #[error("welcome processing failed: {0}")]
     WelcomeProcessingFailed(String),

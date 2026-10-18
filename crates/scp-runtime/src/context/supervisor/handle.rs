@@ -1366,7 +1366,6 @@ mod tests {
             wrapping_key: test_wrapping_key(&Arc::new(InMemoryKeyCustody::new()))
                 .await
                 .unwrap(),
-            attestation_signer: None,
         };
         let (kp_handle, _join) = KeyPackageStoreActor::spawn(did.clone(), deps);
         sup.key_package_stores.insert(did.clone(), kp_handle);

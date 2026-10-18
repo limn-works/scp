@@ -110,7 +110,7 @@ async fn drive_actor(
     let other_cred = test_credential(&format!("{name}-bob"));
     let draft = backend
         .prepare_key_package(
-            &other_cred,
+            &scp_did::DID(other_cred.did.clone()),
             &scp_crypto::p256::testing::uncompressed_point_for(&other_cred.did),
         )
         .await
@@ -120,7 +120,7 @@ async fn drive_actor(
     let identity_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let signature = ed25519_dalek::Signer::sign(&identity_key, &draft.signing_hash()).to_bytes();
     let kp = backend
-        .finish_key_package(draft, signature)
+        .finish_key_package(draft, signature, &identity_key.verifying_key())
         .await
         .expect("generate_kp");
     let _added = backend

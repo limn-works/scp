@@ -2213,6 +2213,29 @@ pub fn serve_unregistered_wrapping_keys_from_test_custody(bi: &UniffiBridgeInsta
         .get_or_init(|| Arc::new(scp_platform::testing::InMemoryKeyCustody::new()));
 }
 
+/// The DHT client backing `bi`'s DID resolver, once an identity call has
+/// initialized it.
+#[cfg(feature = "testing")]
+#[must_use]
+pub fn resolver_dht_client(
+    bi: &UniffiBridgeInstance,
+) -> Option<Arc<scp_ffi_common::dht::FfiDhtClient>> {
+    bi.core.dht_client().map(Arc::clone)
+}
+
+/// Makes `client` the DHT client `bi`'s DID resolver reads.
+///
+/// Two instances given one client resolve each other's DIDs, as two processes
+/// sharing the Mainline DHT do. Call it before `bi`'s first identity call: the
+/// resolver keeps the client set first, and a later call changes nothing.
+#[cfg(feature = "testing")]
+pub fn set_resolver_dht_client(
+    bi: &UniffiBridgeInstance,
+    client: Arc<scp_ffi_common::dht::FfiDhtClient>,
+) {
+    bi.core.set_dht_client(client);
+}
+
 /// Selects the governance key resolver for a bridge instance core.
 ///
 /// Wires the production VM-aware document resolver when a DID resolver is
