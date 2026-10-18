@@ -11824,6 +11824,7 @@
         "bindings/typescript/src/server.ts",
         "bindings/typescript/tests/server.test.ts",
         "bindings/swift/Sources/SCP/Server.swift",
+        "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
         ".docs/standards/sdk-common.md",
         ".github/workflows/ci.yml"
       ],
