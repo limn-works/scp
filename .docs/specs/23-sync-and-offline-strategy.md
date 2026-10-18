@@ -73,7 +73,7 @@ Tried in order:
 
 2. **Peer request.** If relays have expired some Commits (blob_ttl elapsed), the reconnecting member broadcasts a `CommitRangeRequest` as an MLS application message (using their current epoch keys -- they can still encrypt at their stale epoch). Online members who have persisted the Commit messages respond with the missing Commits. This is best-effort -- members are not required to retain raw Commit messages beyond the MLS grace window.
 
-3. **Welcome-based fast-forward.** If the epoch gap is too large (> 100 epochs or no member can provide the full Commit chain), the reconnecting member is treated as a new joiner. An online admin (or any member with `MemberInvite` capability) generates a fresh Welcome message for the reconnecting member's pre-published KeyPackage, effectively re-adding them to the group at the current epoch. The member's old leaf node is removed in the same Commit, which records the re-add as one `MemberReset` leaf and leaves the member's join point, role, and governance state unchanged (`07-trust-validation-and-capabilities.md` §7.3.1.1). The committer holds the re-add while another member has a governance transfer staged, as §7.3.1.1 'Adds wait for staged transfers' states. This preserves membership and context continuity, but the member loses access to messages encrypted in epochs between their stale epoch and the current epoch (forward secrecy is maintained).
+3. **Welcome-based fast-forward.** If the epoch gap is too large (> 100 epochs or no member can provide the full Commit chain), the reconnecting member is treated as a new joiner. The reconnecting member asks for the re-add with a signed `ResetRequest` (§23.5.2) whose reason is `CatchUpFailed`. An online member that holds both `MemberInvite` and `MemberRemove` (typically an admin) then generates a fresh Welcome message for the member's pre-published KeyPackage, whose `0xFF03` attestation is newer than the one on the member's old leaf, effectively re-adding them to the group at the current epoch. The member's old leaf node is removed in the same Commit, which records the re-add as one `MemberReset` leaf, carries the request in its governance block for every receiver to verify, and leaves the member's join point, role, and governance state unchanged (`07-trust-validation-and-capabilities.md` §7.3.1.1 steps 1.6, 1.7, and 2). This preserves membership and context continuity, but the member loses access to messages encrypted in epochs between their stale epoch and the current epoch (forward secrecy is maintained).
 
 ### 23.4.2 Epoch Catch-Up Limits
 
@@ -114,10 +114,10 @@ Any one of the following triggers a group state reset:
    - **(b) Timestamp freshness.** Reject requests where `|relay_clock - timestamp| > 30 seconds` (matching the freshness window used for SenderKeyRequest in section 9.16.2 and AccessKeyRequest in section 9.17).
    - **(c) Nonce uniqueness.** Maintain a deduplication cache of `(member_did, nonce)` pairs with a 60-second TTL. Reject any request whose nonce has been seen within the TTL window. The 60-second TTL is 2x the freshness window to prevent replay after nonce eviction at the window boundary. Cache capacity: bounded at 10,000 entries with oldest-first eviction.
 
-2. An online member with `MemberRemove` + `MemberInvite` capabilities (typically admin) processes the reset, holding it while another member has a governance transfer staged as `07-trust-validation-and-capabilities.md` §7.3.1.1 'Adds wait for staged transfers' states: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) immediately re-adds the member using a fresh KeyPackage via MLS `add_member()`, (c) distributes the new Welcome message via relay.
+2. An online member that holds both `MemberRemove` and `MemberInvite` (typically an admin) processes the reset in one Commit: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) re-adds the member using a fresh KeyPackage whose `0xFF03` attestation is newer than the stale leaf's, via MLS `add_member()`, (c) carries the member's `ResetRequest` in the Commit's governance block, where every receiver verifies its signature under the member's `#active` key and accepts it only when its `last_known_epoch` is above the member's reset floor and at most the Commit's sending epoch, so the request executes once (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.7), and (d) distributes the new Welcome message via relay. The relay checks in step 1 protect the relay path; the block check binds the reset to the member's own request for every member, and no member resets another without that request or an executed `ResetMember` governance action.
 3. The reconnecting member processes the Welcome, joining the group at the current epoch. They request sender keys for all current members via the pull-based protocol (ADR-007).
 4. The reconnecting member's outbound queue is drained using the new epoch's key schedule.
-5. A `MemberReset` event (distinct from `MemberLeft` + `MemberJoined`) is appended to the event log, recording the reset reason, old epoch, new epoch, and the admin who processed it.
+5. A `MemberReset` event (distinct from `MemberLeft` + `MemberJoined`) is appended to the event log, recording the reset reason, the old epoch (the request's `last_known_epoch`), the new epoch, and the member who processed it. It changes no role, join point, or conflict key (`07-trust-validation-and-capabilities.md` §7.3.1.1).
 
 ### 23.5.3 State Preservation
 
@@ -130,7 +130,7 @@ Any one of the following triggers a group state reset:
 **What the reset member retains:**
 
 - Their DID and identity.
-- Their role in the context (the admin re-assigns the same role during re-add).
+- Their role in the context. The reset Commit's `MemberReset` leaf leaves the role unchanged and assigns none, so the re-added member holds the role it held before.
 - Their event log history up to the last known epoch.
 - Context metadata (params, outlets, ceiling) -- this is public and queryable via the metadata routing ID (ADR-004).
 
