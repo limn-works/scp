@@ -3061,26 +3061,32 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * # Errors
      *
-     * `SCP-PERM-3030` when another `Scp` minted `config.identity`; otherwise
-     * the code sdk-common.md §"Node start error codes" gives the failure,
-     * such as `SCP-IDENT-1063` for an identity loaded with no custody.
+     * The code sdk-common.md §"Node start error codes" gives the failure:
+     * `SCP-PERM-3030` when another `Scp` minted `config.identity` (ADR-048),
+     * `SCP-IDENT-1063` for an identity loaded with no custody.
      */
     func nodeStart(config: NodeStartConfig) async throws  -> NodeHandle
     
     /**
-     * Per-instance equivalent of the free-function `node_start_in_memory`.
+     * Starts a development node on encrypted in-memory storage.
      *
-     * Starts an in-memory application node. If `identity` is supplied, it
-     * must have been minted by this `Scp` (cross-instance handles are
-     * rejected via the `CoreFields::check_handle` call).
+     * **Development only** (SCP-327): a library built with `testing` starts
+     * the node; a shipped library returns `SCP-TRANS-5055`
+     * (`DevStartUnavailable`) and starts nothing. Production callers use
+     * `node_start`. If `identity` is supplied, it must have been minted by
+     * this `Scp` (cross-instance handles are rejected via the
+     * `CoreFields::check_handle` call) on either build.
      */
     func nodeStartInMemory(identity: Identity?) async throws  -> NodeHandle
     
     /**
-     * Per-instance equivalent of the free-function `node_start_local`.
+     * Starts a development node on this instance's own storage.
      *
-     * Starts a file-backed application node at `data_dir`. If `identity`
-     * is supplied, it must have been minted by this `Scp`.
+     * **Development only** (SCP-327): a library built with `testing` starts
+     * the node, keeping its blobs and any generated key under `data_dir`; a
+     * shipped library returns `SCP-TRANS-5055` (`DevStartUnavailable`) and
+     * creates nothing. Production callers use `node_start`. If `identity` is
+     * supplied, it must have been minted by this `Scp`.
      */
     func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?) async throws  -> NodeHandle
     
@@ -3648,7 +3654,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
+     * Returns [`ScpError::Storage`] with `SCP-STORAGE-8005` when the
      * durable store still holds its advisory lock after the call.
      */
     func shutdown(timeoutMillis: UInt64) async throws 
@@ -3978,7 +3984,7 @@ open class Scp: ScpProtocol, @unchecked Sendable {
      * FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
      * opened — bad key/passphrase, permission denied, corrupt file, or a
      * salt-sidecar fail-closed condition — this returns
-     * `ScpError::Validation` with `SCP-STORAGE-8004`, or with
+     * `ScpError::Storage` with `SCP-STORAGE-8004`, or with
      * `SCP-STORAGE-8005` when another store holds the directory's advisory
      * lock, rather than silently degrading to in-memory storage. Surfaces to Swift
      * as `throws` and Kotlin as a thrown exception.
@@ -6345,9 +6351,9 @@ open func migrationState(handle: ContextHandle)async throws  -> String?  {
      *
      * # Errors
      *
-     * `SCP-PERM-3030` when another `Scp` minted `config.identity`; otherwise
-     * the code sdk-common.md §"Node start error codes" gives the failure,
-     * such as `SCP-IDENT-1063` for an identity loaded with no custody.
+     * The code sdk-common.md §"Node start error codes" gives the failure:
+     * `SCP-PERM-3030` when another `Scp` minted `config.identity` (ADR-048),
+     * `SCP-IDENT-1063` for an identity loaded with no custody.
      */
 open func nodeStart(config: NodeStartConfig)async throws  -> NodeHandle  {
     return
@@ -6367,11 +6373,14 @@ open func nodeStart(config: NodeStartConfig)async throws  -> NodeHandle  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `node_start_in_memory`.
+     * Starts a development node on encrypted in-memory storage.
      *
-     * Starts an in-memory application node. If `identity` is supplied, it
-     * must have been minted by this `Scp` (cross-instance handles are
-     * rejected via the `CoreFields::check_handle` call).
+     * **Development only** (SCP-327): a library built with `testing` starts
+     * the node; a shipped library returns `SCP-TRANS-5055`
+     * (`DevStartUnavailable`) and starts nothing. Production callers use
+     * `node_start`. If `identity` is supplied, it must have been minted by
+     * this `Scp` (cross-instance handles are rejected via the
+     * `CoreFields::check_handle` call) on either build.
      */
 open func nodeStartInMemory(identity: Identity?)async throws  -> NodeHandle  {
     return
@@ -6391,10 +6400,13 @@ open func nodeStartInMemory(identity: Identity?)async throws  -> NodeHandle  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `node_start_local`.
+     * Starts a development node on this instance's own storage.
      *
-     * Starts a file-backed application node at `data_dir`. If `identity`
-     * is supplied, it must have been minted by this `Scp`.
+     * **Development only** (SCP-327): a library built with `testing` starts
+     * the node, keeping its blobs and any generated key under `data_dir`; a
+     * shipped library returns `SCP-TRANS-5055` (`DevStartUnavailable`) and
+     * creates nothing. Production callers use `node_start`. If `identity` is
+     * supplied, it must have been minted by this `Scp`.
      */
 open func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?)async throws  -> NodeHandle  {
     return
@@ -7545,7 +7557,7 @@ open func setEconomicPolicy(handle: ContextHandle, policyJson: String)throws   {
      *
      * # Errors
      *
-     * Returns [`ScpError::Validation`] with `SCP-STORAGE-8005` when the
+     * Returns [`ScpError::Storage`] with `SCP-STORAGE-8005` when the
      * durable store still holds its advisory lock after the call.
      */
 open func shutdown(timeoutMillis: UInt64)async throws   {
@@ -11194,7 +11206,10 @@ public func FfiConverterTypeMessage_lower(_ value: Message) -> RustBuffer {
  *
  * construction.md §"Node start — `NodeStartConfig`", ADR-052. `identity` is
  * the operator's [`Identity`] handle, minted by the same `Scp`; the socket
- * addresses are `host:port` strings.
+ * addresses are `host:port` strings. Each optional field defaults to `None`
+ * in the generated Swift and Kotlin initializers, so a caller omits it as the
+ * Python and TypeScript SDKs do (construction.md, the same required and
+ * optional split in every language).
  */
 public struct NodeStartConfig {
     /**
@@ -11261,16 +11276,16 @@ public struct NodeStartConfig {
          */corsOrigins: FfiCorsOrigins, 
         /**
          * The relay's bind address (`host:port`); the core picks one when `None`.
-         */bindAddr: String?, 
+         */bindAddr: String? = nil, 
         /**
          * The HTTP server's bind address (`host:port`).
-         */httpBindAddr: String?, 
+         */httpBindAddr: String? = nil, 
         /**
          * The NAT traversal strategy.
-         */nat: FfiNat?, 
+         */nat: FfiNat? = nil, 
         /**
          * The projection rate limit, greater than 0.
-         */projectionRateLimit: UInt32?) {
+         */projectionRateLimit: UInt32? = nil) {
         self.reach = reach
         self.identity = identity
         self.blobStorage = blobStorage
@@ -15690,6 +15705,14 @@ public enum ScpError: Swift.Error {
     case Validation(msg: String, code: String
     )
     /**
+     * A storage operation failed: every `SCP-STORAGE-` code (sdk-common.md
+     * §Registered SCP-STORAGE- codes), as Python's `StorageError` and the
+     * TypeScript SDK's storage class receive it. [`ScpError::coded`] is the
+     * one place that picks this variant, from the code's prefix.
+     */
+    case Storage(msg: String, code: String
+    )
+    /**
      * A §6.2.4 cross-context outlet-invocation saga aborted.
      *
      * The code tells its causes apart.
@@ -15795,17 +15818,21 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf)
             )
-        case 8: return .SagaAborted(
+        case 8: return .Storage(
+            msg: try FfiConverterString.read(from: &buf), 
+            code: try FfiConverterString.read(from: &buf)
+            )
+        case 9: return .SagaAborted(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf), 
             retryAfterMs: try FfiConverterOptionUInt64.read(from: &buf)
             )
-        case 9: return .SagaNeedsRepair(
+        case 10: return .SagaNeedsRepair(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf), 
             sagaId: try FfiConverterString.read(from: &buf)
             )
-        case 10: return .SagaBusy(
+        case 11: return .SagaBusy(
             msg: try FfiConverterString.read(from: &buf), 
             code: try FfiConverterString.read(from: &buf), 
             contendedContext: try FfiConverterString.read(from: &buf)
@@ -15864,22 +15891,28 @@ public struct FfiConverterTypeScpError: FfiConverterRustBuffer {
             FfiConverterString.write(code, into: &buf)
             
         
-        case let .SagaAborted(msg,code,retryAfterMs):
+        case let .Storage(msg,code):
             writeInt(&buf, Int32(8))
+            FfiConverterString.write(msg, into: &buf)
+            FfiConverterString.write(code, into: &buf)
+            
+        
+        case let .SagaAborted(msg,code,retryAfterMs):
+            writeInt(&buf, Int32(9))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             FfiConverterOptionUInt64.write(retryAfterMs, into: &buf)
             
         
         case let .SagaNeedsRepair(msg,code,sagaId):
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(10))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             FfiConverterString.write(sagaId, into: &buf)
             
         
         case let .SagaBusy(msg,code,contendedContext):
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(11))
             FfiConverterString.write(msg, into: &buf)
             FfiConverterString.write(code, into: &buf)
             FfiConverterString.write(contendedContext, into: &buf)
@@ -19845,13 +19878,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_migration_state() != 34622) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start() != 21080) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start() != 24911) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_in_memory() != 58945) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_in_memory() != 32190) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_local() != 59051) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_local() != 37328) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_outlet_interface_accept() != 73) {
@@ -19995,7 +20028,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_set_economic_policy() != 12223) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 20138) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 41184) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 57088) {
@@ -20082,7 +20115,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_token_id() != 51675) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 22077) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 28869) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 18976) {

@@ -61,7 +61,12 @@ interface ServerBindings {
     fun relayStartLocal(dataDir: String): String
 
     /**
-     * Starts a full application node with encrypted in-memory storage.
+     * Starts a development node with encrypted in-memory storage.
+     *
+     * **Development only.** A library built with the UniFFI bridge's
+     * `testing` feature starts the node; a shipped library starts nothing and
+     * throws `ScpException.Transport` with `SCP-TRANS-5055`. Production
+     * callers use `nodeStart`.
      *
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
@@ -69,7 +74,12 @@ interface ServerBindings {
     fun nodeStartInMemory(identityDid: String? = null): String
 
     /**
-     * Starts a full application node on this instance's own storage backend.
+     * Starts a development node on this instance's own storage backend.
+     *
+     * **Development only.** A library built with the UniFFI bridge's
+     * `testing` feature starts the node; a shipped library creates nothing and
+     * throws `ScpException.Transport` with `SCP-TRANS-5055`. Production
+     * callers use `nodeStart`.
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
@@ -475,16 +485,19 @@ class Node internal constructor(
 
     companion object {
         /**
-         * Starts a full application node with encrypted in-memory storage.
+         * Starts a development node with encrypted in-memory storage.
          *
-         * When [identityDid] is provided, the node uses the pre-existing
-         * identity instead of generating a fresh one. This enables identity
-         * portability -- the same DID persists across node restarts.
+         * **Development only.** A library built with the UniFFI bridge's
+         * `testing` feature starts the node; a shipped library starts nothing
+         * and throws `ScpException.Transport` with `SCP-TRANS-5055`.
+         * Production callers use `nodeStart`.
          *
-         * Auto-wires encrypted in-memory storage (ephemeral), self-signed TLS,
-         * and a relay on an OS-assigned port. A build carrying a test-harness
-         * feature also auto-wires in-memory key custody and an in-memory DHT
-         * client; a shipped build fails closed instead when `identity` is absent.
+         * On a `testing` build the node auto-wires encrypted in-memory storage
+         * (ephemeral), self-signed TLS, and a relay on an OS-assigned port.
+         * When [identityDid] is provided, the node uses that pre-existing
+         * identity, its DID method, and the production DHT mode. When it is
+         * `null`, the node generates a fresh identity under in-memory key
+         * custody and an in-memory DHT client.
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
@@ -496,9 +509,14 @@ class Node internal constructor(
         ): Node = bridge.startNodeInMemory(identityDid)
 
         /**
-         * Starts a full application node on this instance's own storage backend.
+         * Starts a development node on this instance's own storage backend.
          *
-         * When [identityDid] is provided, the node uses the pre-existing
+         * **Development only.** A library built with the UniFFI bridge's
+         * `testing` feature starts the node; a shipped library creates nothing
+         * and throws `ScpException.Transport` with `SCP-TRANS-5055`.
+         * Production callers use `nodeStart`.
+         *
+         * On a `testing` build, when [identityDid] is provided, the node uses the pre-existing
          * identity. When `null`, the node creates or reloads a persistent
          * identity via `FileKeyCustody`. The [passphrase] parameter is
          * required in this mode.
@@ -581,10 +599,15 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Starts a full application node with encrypted in-memory storage.
+     * Starts a development node with encrypted in-memory storage.
      *
-     * When [identityDid] is provided, the node uses the pre-existing
-     * identity instead of generating a fresh one.
+     * **Development only.** A library built with the UniFFI bridge's
+     * `testing` feature starts the node; a shipped library starts nothing and
+     * throws `ScpException.Transport` with `SCP-TRANS-5055`. Production
+     * callers use `nodeStart`.
+     *
+     * On a `testing` build, when [identityDid] is provided, the node uses the
+     * pre-existing identity instead of generating a fresh one.
      *
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
@@ -603,7 +626,12 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Starts a full application node on this instance's own storage backend.
+     * Starts a development node on this instance's own storage backend.
+     *
+     * **Development only.** A library built with the UniFFI bridge's
+     * `testing` feature starts the node; a shipped library creates nothing and
+     * throws `ScpException.Transport` with `SCP-TRANS-5055`. Production
+     * callers use `nodeStart`.
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.

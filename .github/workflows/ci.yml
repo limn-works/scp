@@ -2347,9 +2347,12 @@ jobs:
           # "in_memory" with SCP-IDENT-1008, and refuses "encrypted_file" with
           # SCP-IDENT-1059 before the key file opens (spec 03 §3.2.2,
           # ADR-062 §Decision 6). A build that turned `scp-ffi-napi/testing`
-          # on selects zero tests and `--no-tests=fail` exits 4.
+          # on selects zero tests and `--no-tests=fail` exits 4. SCP-327: the
+          # same build returns SCP-TRANS-5055 from `nodeStartInMemory` and
+          # `nodeStartLocal`, the development node-start pair cut from shipped
+          # builds.
           cargo nextest run --no-tests=fail -p scp-ffi-napi --features server --lib \
-            -E 'test(in_memory_on_a_shipped_build_rejects_with_ident_1008) + test(encrypted_file_on_a_shipped_build_refuses_with_ident_1059_before_opening)'
+            -E 'test(in_memory_on_a_shipped_build_rejects_with_ident_1008) + test(encrypted_file_on_a_shipped_build_refuses_with_ident_1059_before_opening) + test(node_start_in_memory_on_a_shipped_build_returns_trans_5055) + test(node_start_local_on_a_shipped_build_returns_trans_5055)'
           # SCP-322: `Scp.nodeStart` refuses an operator DID no identity on the
           # instance holds with SCP-IDENT-1063 in the build a shipped bridge
           # links. The test carries no cfg gate, so it runs in its own command:
@@ -2442,9 +2445,12 @@ jobs:
           # nextest supplies process-per-test isolation, which a SAFETY
           # comment at crates/scp-ffi/src/scp.rs:560-565 rests two
           # `std::env::set_var` calls on, and `--no-tests=fail` exits 4 rather
-          # than 0 if a feature flip selects zero tests.
+          # than 0 if a feature flip selects zero tests. SCP-327: the same
+          # build raises SCP-TRANS-5055 from `node_start_in_memory` and
+          # `node_start_local`, the development node-start pair cut from
+          # shipped builds.
           cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
-            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed) + test(resolve_custody_rejects_in_memory_on_a_shipped_build_with_ident_1008)'
+            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed) + test(resolve_custody_rejects_in_memory_on_a_shipped_build_with_ident_1008) + test(node_start_in_memory_on_a_shipped_build_returns_trans_5055) + test(node_start_local_on_a_shipped_build_returns_trans_5055)'
           # SCP-322: `SCP.node_start` refuses an operator DID no identity on the
           # instance holds with SCP-IDENT-1063 in the build a shipped bridge
           # links. The test carries no cfg gate, so it runs in its own command
@@ -2622,8 +2628,10 @@ jobs:
           # deletes, which keeps a zero-test selection reachable; the second
           # runs the un-gated `ucan_*` tests under a `--no-tests=fail` of their
           # own, which fires if one of them is renamed out of the filter.
+          # SCP-327 adds the two tests proving `node_start_in_memory` and
+          # `node_start_local` return SCP-TRANS-5055 in a shipped build.
           cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
-            -E 'test(identity_create_in_memory_rejected_without_feature) + test(identity_create_entry_points_reject_in_memory_on_a_shipped_build) + test(identity_create_with_custody_fails_closed_without_pre_rotation_backend) + test(shipped_build_reaches_every_callback_custody_identity_op)'
+            -E 'test(identity_create_in_memory_rejected_without_feature) + test(identity_create_entry_points_reject_in_memory_on_a_shipped_build) + test(identity_create_with_custody_fails_closed_without_pre_rotation_backend) + test(shipped_build_reaches_every_callback_custody_identity_op) + test(node_start_in_memory_on_a_shipped_build_returns_trans_5055) + test(node_start_local_on_a_shipped_build_returns_trans_5055)'
           cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
             -E 'test(ucan_mint_works_over_callback_custody) + test(ucan_delegate_works_over_callback_custody) + test(ucan_delegate_signs_with_delegator_key_not_context_creator_key) + test(ucan_mint_without_retained_custody_returns_ident_1017)'
           # SCP-322: `Scp::node_start` refuses an operator identity that

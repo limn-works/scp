@@ -58,10 +58,12 @@ custody = ["dep:scp-platform", "scp-platform?/file", "dep:ed25519-dalek"]
 # `server` feature stays self-contained. This feature does NOT enable
 # scp-platform's `testing` feature: since ADR-062 Slice 6 (SCP-CAPINJECT-006)
 # server.rs's `Explicit`-identity phantoms are typed to a production
-# `FileKeyCustody` (not to an `InMemoryKeyCustody` nullifier), and a dev-relay
-# auto-generate path FAILS CLOSED (`ServerError::AutoGenerateUnavailable`) on a
-# shipped build instead of running a nullifier-backed node. No test-harness
-# platform edge is present, transitively or otherwise — G1 proves it.
+# `FileKeyCustody` (not to an `InMemoryKeyCustody` nullifier), and the dev-pair
+# bodies (`start_node_in_memory`, `start_node_local`) compile only under
+# `testing`; a bridge built without its own `testing` feature returns
+# `ServerError::DevStartUnavailable` (SCP-TRANS-5055) from its dev-pair exports
+# instead of running a nullifier-backed node. No test-harness platform edge is
+# present, transitively or otherwise — G1 proves it.
 # `resolvers` is listed because `server.rs` names `scp_core::context::supervisor::Supervisor`
 # and `crate::bridge_instance::CoreFields` (in `register_node`), and both live
 # behind `resolvers`. That edge held before

@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
-use zeroize::Zeroizing;
 
 use scp_ffi_common::error_codes as codes;
 use scp_ffi_common::node_start_config::NodeStartConfig;
@@ -490,8 +489,12 @@ fn resolve_operator_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result
 /// node on `bi`'s storage under the operator identity the config names
 /// (construction.md §"Node start — `NodeStartConfig`").
 ///
-/// Runs, in order: the config parse, the operator identity resolution, taking
-/// the instance storage, `server::node_start`, `server::register_node`,
+/// `operator_did` is the DID of the operator handle the caller passed, on
+/// which `Scp::node_start` already ran the ADR-048 handle check.
+///
+/// Runs, in order: the config parse, the operator identity resolution, the
+/// check that the config names `operator_did`, taking the instance storage,
+/// `server::node_start`, `server::register_node`,
 /// `auto_wire_context_manager`, and wrapping the handle.
 ///
 /// # Errors
@@ -500,9 +503,16 @@ fn resolve_operator_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result
 pub(crate) async fn node_start_on(
     bi: &Arc<NapiBridgeInstance>,
     config_json: String,
+    operator_did: &str,
 ) -> napi::Result<NapiNodeHandle> {
     let cfg = NodeStartConfig::from_json(&config_json).map_err(server_err)?;
     let identity = resolve_operator_identity(bi, &cfg.identity)?;
+    // The config names its operator by DID; the caller also passed the
+    // operator handle the ADR-048 check ran on. A config naming any other
+    // identity would run the node under an operator that check never saw.
+    if cfg.identity != operator_did {
+        return Err(server_err(ServerError::OperatorIdentityUnavailable));
+    }
     let storage = crate::runtime::protocol_repository(bi).instance_storage();
     let node = server::node_start(cfg, identity, storage)
         .await
@@ -555,7 +565,40 @@ pub(crate) async fn relay_start_local_on(
 // Free functions — node startup
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of `node_start_in_memory`.
+// The dev pair splits on this crate's own `testing` feature, never on
+// `scp-ffi-common`'s: this crate's dev-dependencies turn
+// `scp-ffi-common/testing` on for every test build, so a split on the common
+// feature would start a node in a test of the shipped configuration. The
+// shipped variants are plain `fn`s returning a ready future, so the exported
+// `async` methods await either variant unchanged.
+
+/// The shipped `node_start_in_memory`: the dev pair is cut from builds
+/// without `testing` (SCP-327), so it rejects with `SCP-TRANS-5055` and starts
+/// nothing.
+#[cfg(not(feature = "testing"))]
+pub(crate) fn node_start_in_memory_on(
+    _bi: &Arc<NapiBridgeInstance>,
+    _identity_did: Option<String>,
+) -> std::future::Ready<napi::Result<NapiNodeHandle>> {
+    std::future::ready(Err(server_err(ServerError::DevStartUnavailable)))
+}
+
+/// The shipped `node_start_local`: the dev pair is cut from builds without
+/// `testing` (SCP-327), so it rejects with `SCP-TRANS-5055` and creates
+/// nothing.
+#[cfg(not(feature = "testing"))]
+pub(crate) fn node_start_local_on(
+    _bi: &Arc<NapiBridgeInstance>,
+    _data_dir: String,
+    _identity_did: Option<String>,
+    _passphrase: Option<String>,
+) -> std::future::Ready<napi::Result<NapiNodeHandle>> {
+    std::future::ready(Err(server_err(ServerError::DevStartUnavailable)))
+}
+
+/// Per-bridge-instance implementation of `node_start_in_memory` on a
+/// `testing` build.
+#[cfg(feature = "testing")]
 pub(crate) async fn node_start_in_memory_on(
     bi: &Arc<NapiBridgeInstance>,
     identity_did: Option<String>,
@@ -586,11 +629,13 @@ pub(crate) async fn node_start_in_memory_on(
     })
 }
 
-/// Per-bridge-instance implementation of `node_start_local`.
+/// Per-bridge-instance implementation of `node_start_local` on a `testing`
+/// build.
 ///
 /// A node inherits whichever storage backend an instance was constructed with
 /// (`SCP.withStorage({...})`), so it opens no protocol store of its own. A
 /// caller wanting a node on a different backend constructs a second `SCP`.
+#[cfg(feature = "testing")]
 pub(crate) async fn node_start_local_on(
     bi: &Arc<NapiBridgeInstance>,
     data_dir: String,
@@ -604,7 +649,7 @@ pub(crate) async fn node_start_local_on(
         }
         None => None,
     };
-    let zeroized_passphrase = passphrase.map(Zeroizing::new);
+    let zeroized_passphrase = passphrase.map(zeroize::Zeroizing::new);
     let data_dir = std::path::Path::new(&data_dir);
     // `ProtocolRepository::storage()` yields this instance's own chosen
     // backend; cloning that `Arc` hands a node one store that an event log, a
@@ -695,6 +740,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "testing")]
     fn node_in_memory_starts_and_returns_did() {
         let node = rt()
             .block_on(crate::scp::Scp::new_in_memory_for_test().node_start_in_memory(None))
@@ -722,6 +768,7 @@ mod tests {
     /// `build_supervisor_arc` did not enable the channel on this bridge and the
     /// channel was `None`.
     #[test]
+    #[cfg(feature = "testing")]
     fn node_startup_enables_context_event_channel() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
@@ -737,6 +784,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "testing")]
     fn node_local_starts_and_returns_did() {
         let tmp = std::env::temp_dir().join(format!("scp-napi-node-test-{}", std::process::id()));
         let node = rt()
@@ -773,6 +821,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "testing")]
     fn node_shutdown_is_idempotent() {
         let node = rt()
             .block_on(crate::scp::Scp::new_in_memory_for_test().node_start_in_memory(None))
@@ -873,18 +922,132 @@ mod tests {
         );
     }
 
+    /// An operator handle for `did` minted by `scp` that holds no key
+    /// material and is not in `scp`'s identity registry, as an externally
+    /// loaded identity is; a shipped build can mint it, since it needs no
+    /// custody.
+    fn external_identity(scp: &crate::scp::Scp, did: &str) -> crate::identity::NapiIdentity {
+        // Balances the decrement in `NapiIdentity`'s `Drop`, as every handle
+        // constructor does.
+        crate::increment_handle_count();
+        crate::identity::NapiIdentity {
+            inner: Arc::new(crate::identity::NapiIdentityInner {
+                did: did.to_owned(),
+                custody_type: "external".to_owned(),
+                scp_identity: None,
+                custody: None,
+                document: None,
+                bi: Arc::clone(&scp.inner),
+                verifying_key_hex: None,
+                instance_id: scp.inner.instance_id(),
+                rotation_event_json: None,
+            }),
+        }
+    }
+
     /// A well-formed operator DID that no identity on this instance holds
     /// returns `SCP-IDENT-1063` on a shipped build as on a `testing` build.
     #[test]
     fn node_start_with_unregistered_operator_did_returns_ident_1063() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
-        let json = start_json("did:dht:z6MkNodeStartOperatorProbe", |_| {});
-        let reason = start_error(rt().block_on(scp.node_start(json)), "unregistered operator");
+        let probe = "did:dht:z6MkNodeStartOperatorProbe";
+        let handle = external_identity(&scp, probe);
+        let json = start_json(probe, |_| {});
+        let reason = start_error(
+            rt().block_on(scp.node_start(json, &handle)),
+            "unregistered operator",
+        );
         assert_coded(
             &reason,
             "identity",
             codes::IDENT_1063,
             "unregistered operator",
+        );
+    }
+
+    /// The dev pair is cut from a shipped build (SCP-327): the exported
+    /// `nodeStartInMemory` rejects with the transport-class `SCP-TRANS-5055`
+    /// and starts no node, with and without an identity.
+    #[test]
+    #[cfg(not(feature = "testing"))]
+    fn node_start_in_memory_on_a_shipped_build_returns_trans_5055() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        for identity in [None, Some("did:dht:z6MkDevStartProbe".to_owned())] {
+            let label = format!("node_start_in_memory({identity:?})");
+            let reason = start_error(rt().block_on(scp.node_start_in_memory(identity)), &label);
+            assert_coded(&reason, "transport", codes::TRANS_5055, &label);
+        }
+    }
+
+    /// The dev pair is cut from a shipped build (SCP-327): the exported
+    /// `nodeStartLocal` rejects with the transport-class `SCP-TRANS-5055` and
+    /// writes no key file or blob store under `data_dir`.
+    #[test]
+    #[cfg(not(feature = "testing"))]
+    fn node_start_local_on_a_shipped_build_returns_trans_5055() {
+        let tmp =
+            std::env::temp_dir().join(format!("scp-napi-shipped-dev-start-{}", std::process::id()));
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let reason = start_error(
+            rt().block_on(scp.node_start_local(
+                tmp.to_string_lossy().into_owned(),
+                None,
+                Some("test-passphrase".to_owned()),
+            )),
+            "node_start_local",
+        );
+        assert_coded(&reason, "transport", codes::TRANS_5055, "node_start_local");
+        assert!(
+            !tmp.exists(),
+            "a shipped node_start_local must create nothing under data_dir"
+        );
+    }
+
+    /// An operator handle another `SCP` minted fails the ADR-048 handle check
+    /// with `SCP-PERM-3030` before the config is read, so even a config that
+    /// cannot parse returns `SCP-PERM-3030`.
+    #[test]
+    fn node_start_refuses_another_instances_identity_with_perm_3030() {
+        let minting = crate::scp::Scp::new_in_memory_for_test();
+        let other = crate::scp::Scp::new_in_memory_for_test();
+        let did = "did:dht:z6MkNodeStartForeignProbe";
+        let foreign = external_identity(&minting, did);
+        for json in [start_json(did, |_| {}), "{not json".to_owned()] {
+            let reason = start_error(
+                rt().block_on(other.node_start(json, &foreign)),
+                "foreign operator handle",
+            );
+            assert_coded(
+                &reason,
+                "permission",
+                codes::PERM_3030,
+                "foreign operator handle",
+            );
+        }
+    }
+
+    /// A config naming a DID other than the operator handle's returns
+    /// `SCP-IDENT-1063`: the node never runs under an operator the handle
+    /// check did not see.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_refuses_a_config_naming_another_operator_with_ident_1063() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let named = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let passed = rt()
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let reason = start_error(
+            rt().block_on(scp.node_start(start_json(&named.did(), |_| {}), &passed)),
+            "config names another operator",
+        );
+        assert_coded(
+            &reason,
+            "identity",
+            codes::IDENT_1063,
+            "config names another operator",
         );
     }
 
@@ -963,7 +1126,7 @@ mod tests {
             .unwrap();
         let did = identity.did();
         let node = rt()
-            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .block_on(scp.node_start(start_json(&did, |_| {}), &identity))
             .unwrap();
 
         assert_eq!(node.did(), did);
@@ -1060,17 +1223,17 @@ mod tests {
         );
 
         let node = rt()
-            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .block_on(scp.node_start(start_json(&did, |_| {}), &identity))
             .unwrap();
         assert!(server::supervisor_wired_to(&scp.inner.core, &node.inner));
         let reason = start_error(
-            rt().block_on(scp.node_start(start_json(&did, |_| {}))),
+            rt().block_on(scp.node_start(start_json(&did, |_| {}), &identity)),
             "second node start",
         );
         assert_coded(&reason, "transport", codes::TRANS_5056, "second node start");
         node.shutdown();
         let restarted = rt()
-            .block_on(scp.node_start(start_json(&did, |_| {})))
+            .block_on(scp.node_start(start_json(&did, |_| {}), &identity))
             .expect("a start after the bound node stops binds again");
         assert!(server::supervisor_wired_to(
             &scp.inner.core,
@@ -1172,7 +1335,7 @@ mod tests {
             ),
         ];
         for (label, json, class, code) in cases {
-            let reason = start_error(rt().block_on(scp.node_start(json)), label);
+            let reason = start_error(rt().block_on(scp.node_start(json, &identity)), label);
             assert_coded(&reason, class, code, label);
         }
         drop(taken);

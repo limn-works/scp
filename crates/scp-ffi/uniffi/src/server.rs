@@ -17,8 +17,6 @@
 use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 
-use zeroize::Zeroizing;
-
 use scp_ffi_common::server::{self, BroadcastKeyError, RunningNode, ServerError};
 use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
@@ -35,13 +33,14 @@ use crate::{decrement_handle_count, increment_handle_count};
 /// the `PyO3`, napi-rs and `UniFFI` bridges share (sdk-common.md §"Node start
 /// error codes").
 fn coded(e: &ServerError, msg: String) -> ScpError {
-    let code = codes::server_error_code(e).to_owned();
-    match codes::server_error_class(e) {
-        codes::ServerErrorClass::Validation => ScpError::Validation { msg, code },
-        codes::ServerErrorClass::Identity => ScpError::Identity { msg, code },
-        codes::ServerErrorClass::Transport => ScpError::Transport { msg, code },
-        codes::ServerErrorClass::Context => ScpError::Context { msg, code },
-    }
+    use crate::bridge::ErrorClass;
+    let class = match codes::server_error_class(e) {
+        codes::ServerErrorClass::Validation => ErrorClass::Validation,
+        codes::ServerErrorClass::Identity => ErrorClass::Identity,
+        codes::ServerErrorClass::Transport => ErrorClass::Transport,
+        codes::ServerErrorClass::Context => ErrorClass::Context,
+    };
+    ScpError::coded(class, codes::server_error_code(e), msg)
 }
 
 impl From<ServerError> for ScpError {
@@ -688,7 +687,10 @@ pub enum FfiNat {
 ///
 /// construction.md §"Node start — `NodeStartConfig`", ADR-052. `identity` is
 /// the operator's [`Identity`] handle, minted by the same `Scp`; the socket
-/// addresses are `host:port` strings.
+/// addresses are `host:port` strings. Each optional field defaults to `None`
+/// in the generated Swift and Kotlin initializers, so a caller omits it as the
+/// Python and TypeScript SDKs do (construction.md, the same required and
+/// optional split in every language).
 #[derive(uniffi::Record)]
 pub struct NodeStartConfig {
     /// How the node is reached.
@@ -704,12 +706,16 @@ pub struct NodeStartConfig {
     /// The HTTP CORS origins the node allows.
     pub cors_origins: FfiCorsOrigins,
     /// The relay's bind address (`host:port`); the core picks one when `None`.
+    #[uniffi(default = None)]
     pub bind_addr: Option<String>,
     /// The HTTP server's bind address (`host:port`).
+    #[uniffi(default = None)]
     pub http_bind_addr: Option<String>,
     /// The NAT traversal strategy.
+    #[uniffi(default = None)]
     pub nat: Option<FfiNat>,
     /// The projection rate limit, greater than 0.
+    #[uniffi(default = None)]
     pub projection_rate_limit: Option<u32>,
 }
 
@@ -796,12 +802,15 @@ fn lower_node_start_config(
 ///
 /// # Errors
 ///
-/// `SCP-PERM-3030` when another `Scp` minted `cfg.identity`; otherwise the
-/// code sdk-common.md §"Node start error codes" gives the failure.
+/// The code sdk-common.md §"Node start error codes" gives the failure. An
+/// identity another `Scp` minted fails the ADR-048 handle check with
+/// `SCP-PERM-3030`, as on every bridge.
 pub(crate) async fn node_start_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     cfg: NodeStartConfig,
 ) -> Result<Arc<NodeHandle>, ScpError> {
+    // The ADR-048 handle check stays first, so a foreign handle reaches no
+    // other step.
     bi.core
         .check_handle(cfg.identity.instance_id())
         .map_err(ScpError::from)?;
@@ -823,21 +832,45 @@ pub(crate) async fn node_start_on(
     }))
 }
 
-/// Per-instance helper used by [`crate::Scp::node_start_in_memory`] on the
-/// caller-owned `Scp`. Replaces the deleted `node_start_in_memory` free
-/// function (Phase D, #1695).
+// The dev pair splits on this crate's own `testing` feature, never on
+// `scp-ffi-common`'s: this crate's dev-dependencies turn
+// `scp-ffi-common/testing` on for every test build, so a split on the common
+// feature would start a node in a test of the shipped configuration. The
+// shipped variants are plain `fn`s returning a ready future, so the exported
+// `async` methods await either variant unchanged. Neither variant checks the
+// identity handle: the `Scp` exports in `bridge.rs`, the FFI entry ADR-048
+// names, run that check before they call here, on both builds.
+
+/// The shipped `node_start_in_memory`: the dev pair is cut from builds
+/// without `testing` (SCP-327), so it returns `SCP-TRANS-5055` and starts
+/// nothing.
+#[cfg(not(feature = "testing"))]
+pub(crate) fn node_start_in_memory_on(
+    _bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    _identity: Option<Arc<Identity>>,
+) -> std::future::Ready<Result<Arc<NodeHandle>, ScpError>> {
+    std::future::ready(Err(ServerError::DevStartUnavailable.into()))
+}
+
+/// The shipped `node_start_local`: the dev pair is cut from builds without
+/// `testing` (SCP-327), so it returns `SCP-TRANS-5055` and creates nothing.
+#[cfg(not(feature = "testing"))]
+pub(crate) fn node_start_local_on(
+    _bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    _data_dir: String,
+    _identity: Option<Arc<Identity>>,
+    _passphrase: Option<String>,
+) -> std::future::Ready<Result<Arc<NodeHandle>, ScpError>> {
+    std::future::ready(Err(ServerError::DevStartUnavailable.into()))
+}
+
+/// Per-instance helper used by [`crate::Scp::node_start_in_memory`] on a
+/// `testing` build.
+#[cfg(feature = "testing")]
 pub(crate) async fn node_start_in_memory_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     identity: Option<Arc<Identity>>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
-    // Handle-affinity check moved from `uniffi_check_handle!` macro expansion
-    // (which read `DEFAULT_BRIDGE_INSTANCE`) to a direct `CoreFields::check_handle`
-    // against the caller's own `bi`. Mirrors `identity_attest_device` etc.
-    if let Some(ref id) = identity {
-        bi.core
-            .check_handle(id.instance_id())
-            .map_err(ScpError::from)?;
-    }
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
         None => None,
@@ -862,28 +895,24 @@ pub(crate) async fn node_start_in_memory_on(
     }))
 }
 
-/// Per-instance helper used by [`crate::Scp::node_start_local`] on the
-/// caller-owned `Scp`.
+/// Per-instance helper used by [`crate::Scp::node_start_local`] on a
+/// `testing` build.
 ///
 /// A node inherits whichever storage backend an instance was constructed with
 /// (`Scp::with_storage`), so it opens no protocol store of its own. A caller
 /// wanting a node on a different backend constructs a second `Scp`.
+#[cfg(feature = "testing")]
 pub(crate) async fn node_start_local_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     data_dir: String,
     identity: Option<Arc<Identity>>,
     passphrase: Option<String>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
-    if let Some(ref id) = identity {
-        bi.core
-            .check_handle(id.instance_id())
-            .map_err(ScpError::from)?;
-    }
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
         None => None,
     };
-    let zeroized_passphrase = passphrase.map(Zeroizing::new);
+    let zeroized_passphrase = passphrase.map(zeroize::Zeroizing::new);
     let data_dir = std::path::Path::new(&data_dir);
     // `ProtocolRepository::storage()` yields this instance's own chosen
     // backend; cloning that `Arc` hands a node one store that an event log, a
@@ -910,7 +939,7 @@ pub(crate) async fn node_start_local_on(
     let inner = server::register_node(&bi.core, inner);
 
     // Wire the Supervisor through the internal loopback URL — see the
-    // comment in node_start_in_memory.
+    // comment in the `testing` `node_start_in_memory_on`.
     auto_wire_context_manager(bi, &inner, &inner.internal_relay_url()).await?;
 
     let instance_id = bi.core.instance_id();
@@ -963,6 +992,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "testing")]
     fn node_in_memory_starts_and_returns_did() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
@@ -985,6 +1015,7 @@ mod tests {
     /// `build_supervisor` did not enable the channel on this bridge and it was
     /// `None`.
     #[test]
+    #[cfg(feature = "testing")]
     fn node_startup_enables_context_event_channel() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
@@ -1002,6 +1033,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "testing")]
     fn node_local_starts_and_returns_did() {
         let tmp = std::env::temp_dir().join(format!("scp-uniffi-node-test-{}", std::process::id()));
         let scp = crate::scp::Scp::new_in_memory_for_test();
@@ -1033,6 +1065,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "testing")]
     fn node_shutdown_is_idempotent() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
@@ -1189,9 +1222,109 @@ mod tests {
             ScpError::Permission { .. } => "permission",
             ScpError::Transport { .. } => "transport",
             ScpError::Validation { .. } => "validation",
+            ScpError::Storage { .. } => "storage",
             other => panic!("unexpected error class: {other:?}"),
         };
         (class, e.code())
+    }
+
+    /// The dev pair is cut from a shipped build (SCP-327): the exported
+    /// `node_start_in_memory` returns the transport-class `SCP-TRANS-5055`
+    /// and starts no node, with and without an identity. An identity another
+    /// `Scp` minted fails first with `SCP-PERM-3030`, from the ADR-048 check
+    /// the `Scp` export in `bridge.rs` runs before it calls the shipped
+    /// variant.
+    #[test]
+    #[cfg(not(feature = "testing"))]
+    fn node_start_in_memory_on_a_shipped_build_returns_trans_5055() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let err = start_error(rt().block_on(scp.node_start_in_memory(None)), "no identity");
+        assert_eq!(
+            class_and_code(&err),
+            ("transport", codes::TRANS_5055),
+            "{err:?}"
+        );
+
+        let own = rt()
+            .block_on(scp.identity_load("did:dht:z6MkDevStartProbe".to_owned()))
+            .expect("identity_load builds an external handle on every build");
+        let err = start_error(
+            rt().block_on(scp.node_start_in_memory(Some(own))),
+            "own identity",
+        );
+        assert_eq!(
+            class_and_code(&err),
+            ("transport", codes::TRANS_5055),
+            "{err:?}"
+        );
+
+        let other = crate::scp::Scp::new_in_memory_for_test();
+        let foreign = rt()
+            .block_on(other.identity_load("did:dht:z6MkDevStartProbe".to_owned()))
+            .expect("identity_load builds an external handle on every build");
+        let err = start_error(
+            rt().block_on(scp.node_start_in_memory(Some(foreign))),
+            "foreign identity",
+        );
+        assert_eq!(
+            class_and_code(&err),
+            ("permission", codes::PERM_3030),
+            "{err:?}"
+        );
+    }
+
+    /// The dev pair is cut from a shipped build (SCP-327): the exported
+    /// `node_start_local` returns the transport-class `SCP-TRANS-5055` and
+    /// writes no key file or blob store under `data_dir`. An identity another
+    /// `Scp` minted fails first with `SCP-PERM-3030`, from the export's
+    /// ADR-048 check.
+    #[test]
+    #[cfg(not(feature = "testing"))]
+    fn node_start_local_on_a_shipped_build_returns_trans_5055() {
+        let tmp = std::env::temp_dir().join(format!(
+            "scp-uniffi-shipped-dev-start-{}",
+            std::process::id()
+        ));
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let err = start_error(
+            rt().block_on(scp.node_start_local(
+                tmp.to_string_lossy().into_owned(),
+                None,
+                Some("test-passphrase".to_owned()),
+            )),
+            "node_start_local",
+        );
+        assert_eq!(
+            class_and_code(&err),
+            ("transport", codes::TRANS_5055),
+            "{err:?}"
+        );
+        assert!(
+            !tmp.exists(),
+            "a shipped node_start_local must create nothing under data_dir"
+        );
+
+        let other = crate::scp::Scp::new_in_memory_for_test();
+        let foreign = rt()
+            .block_on(other.identity_load("did:dht:z6MkDevStartProbe".to_owned()))
+            .expect("identity_load builds an external handle on every build");
+        let err = start_error(
+            rt().block_on(scp.node_start_local(
+                tmp.to_string_lossy().into_owned(),
+                Some(foreign),
+                Some("test-passphrase".to_owned()),
+            )),
+            "foreign identity",
+        );
+        assert_eq!(
+            class_and_code(&err),
+            ("permission", codes::PERM_3030),
+            "{err:?}"
+        );
+        assert!(
+            !tmp.exists(),
+            "a refused node_start_local must create nothing under data_dir"
+        );
     }
 
     /// An identity `identity_load` returns holds no key material, so the node
@@ -1222,17 +1355,17 @@ mod tests {
         let cases: Vec<(ServerError, &str, &str)> = vec![
             (
                 ServerError::InvalidConfig("x".into()),
-                "validation",
+                "storage",
                 codes::STORAGE_8007,
             ),
             (
                 ServerError::Io(std::io::Error::other("/secret/path")),
-                "validation",
+                "storage",
                 codes::STORAGE_8008,
             ),
             (
                 ServerError::Node(NodeError::Storage("x".into())),
-                "validation",
+                "storage",
                 codes::STORAGE_8009,
             ),
             (
@@ -1269,11 +1402,11 @@ mod tests {
 
         let err = ScpError::from(NodeError::InvalidConfig("/secret/path/data.db".into()));
         match err {
-            ScpError::Validation { msg, code } => {
+            ScpError::Storage { msg, code } => {
                 assert_eq!(msg, "node operation failed");
                 assert_eq!(code, codes::STORAGE_8007);
             }
-            other => panic!("expected Validation, got: {other:?}"),
+            other => panic!("expected Storage, got: {other:?}"),
         }
     }
 
@@ -1401,7 +1534,7 @@ mod tests {
                     };
                     c.tls = FfiTlsMode::SelfSigned;
                 }),
-                "validation",
+                "storage",
                 codes::STORAGE_8007,
             ),
             (
@@ -1411,13 +1544,13 @@ mod tests {
                         origins: vec!["*".to_owned()],
                     };
                 }),
-                "validation",
+                "storage",
                 codes::STORAGE_8007,
             ),
             (
                 "malformed bind_addr (InvalidConfig)",
                 Box::new(|c| c.bind_addr = Some("not-an-address".to_owned())),
-                "validation",
+                "storage",
                 codes::STORAGE_8007,
             ),
             (
@@ -1428,7 +1561,7 @@ mod tests {
                     };
                     c.tls = FfiTlsMode::Plaintext;
                 }),
-                "validation",
+                "storage",
                 codes::STORAGE_8007,
             ),
             (
@@ -1441,7 +1574,7 @@ mod tests {
                         };
                     }
                 }),
-                "validation",
+                "storage",
                 codes::STORAGE_8008,
             ),
             (
@@ -1450,7 +1583,7 @@ mod tests {
                     let path = dir.display().to_string();
                     move |c| c.blob_storage = FfiBlobBackend::Redb { path: path.clone() }
                 }),
-                "validation",
+                "storage",
                 codes::STORAGE_8008,
             ),
             (
@@ -1474,8 +1607,9 @@ mod tests {
         drop(taken);
     }
 
-    /// An operator identity another `Scp` minted fails the handle check with
-    /// `SCP-PERM-3030` before any other step.
+    /// An operator identity another `Scp` minted fails the ADR-048 handle
+    /// check with `SCP-PERM-3030` before any other step, on `node_start` as on
+    /// the dev-pair start.
     #[test]
     #[cfg(feature = "testing")]
     fn node_start_rejects_another_instances_identity_with_perm_3030() {
@@ -1492,6 +1626,19 @@ mod tests {
             class_and_code(&err),
             ("permission", codes::PERM_3030),
             "{err:?}"
+        );
+        // The dev-pair start refuses the same foreign handle the same way.
+        let id = rt()
+            .block_on(minting.identity_create("in_memory".to_owned(), None))
+            .unwrap();
+        let dev_err = start_error(
+            rt().block_on(other.node_start_in_memory(Some(id))),
+            "foreign identity, dev pair",
+        );
+        assert_eq!(
+            class_and_code(&dev_err),
+            ("permission", codes::PERM_3030),
+            "{dev_err:?}"
         );
     }
 

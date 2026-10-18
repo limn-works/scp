@@ -60,6 +60,7 @@ import {
   loadNativeAddon,
   NATIVE_ADDON_ABSENT_CODE,
   NATIVE_ADDON_LOAD_FAILED_CODE,
+  type NativeNodeStart,
   type NativeAddon as RawNativeAddon,
 } from "./internal/native";
 import { assertTestEnvironment } from "./internal/test-guard";
@@ -67,7 +68,7 @@ import { McpClient, McpServer } from "./mcp";
 import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
 import { StreamingSagaHandle } from "./outlets";
 import { decodeProvenanceRecord, type ProvenanceRecord } from "./provenance";
-import type { Node, Relay } from "./server";
+import type { Node, NodeStartConfig, Relay } from "./server";
 import { TransportManager } from "./transport";
 import type {
   AttestationType,
@@ -4651,6 +4652,51 @@ export class SCP {
     }
   }
 
+  /**
+   * Starts a production node under the operator in `config.identity`, on
+   * this instance's own storage (construction.md §"Node start —
+   * `NodeStartConfig`", ADR-052). Call {@link Node.shutdown} to stop it.
+   *
+   * The SDK checks `config` and lowers it to the bridge's JSON before the
+   * bridge runs; the bridge then checks the operator handle (ADR-048) before
+   * it reads the config.
+   *
+   * @throws {ValidationError} `SCP-VALID-7005` when `config` is not an object
+   *   or `config.identity` is not an {@link Identity} this SDK returned.
+   * @throws {StorageError} `SCP-STORAGE-8007` for a config the SDK or the
+   *   bridge cannot read, `SCP-STORAGE-8008` when the blob store cannot open,
+   *   `SCP-STORAGE-8009` when the instance storage cannot.
+   * @throws {UcanPermissionError} `SCP-PERM-3030` when `config.identity`
+   *   belongs to another `SCP` instance.
+   * @throws The typed error of every other code in sdk-common.md §"Node
+   *   start error codes", with the code preserved.
+   */
+  async nodeStart(config: NodeStartConfig): Promise<Node> {
+    const { Node: NodeCls, nodeStartConfigToWire } = await import("./server");
+    const wire = nodeStartConfigToWire(config);
+    const rawIdentity = identityHandle("nodeStart", "config.identity", config.identity);
+    try {
+      const raw = await (this.#native.nodeStart as NativeNodeStart)(
+        JSON.stringify(wire),
+        rawIdentity,
+      );
+      return NodeCls._fromHandle(raw, this);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Starts a development node on encrypted in-memory storage.
+   *
+   * Development only: an addon built with the bridge's `testing` feature
+   * starts the node; a shipped addon starts nothing. Production callers use
+   * {@link SCP.nodeStart}.
+   *
+   * @throws {TransportError} `SCP-TRANS-5055` on a shipped addon.
+   * @throws The typed error of any other code the bridge returns, with the
+   *   code preserved.
+   */
   async nodeStartInMemory(identityDid?: string | null): Promise<Node> {
     try {
       const raw = await (this.#native.nodeStartInMemory as (d: string | null) => Promise<unknown>)(
@@ -4663,6 +4709,18 @@ export class SCP {
     }
   }
 
+  /**
+   * Starts a development node on this instance's own storage.
+   *
+   * Development only: an addon built with the bridge's `testing` feature
+   * starts the node, keeping its blobs and any generated key under
+   * `dataDir`; a shipped addon creates nothing. Production callers use
+   * {@link SCP.nodeStart}.
+   *
+   * @throws {TransportError} `SCP-TRANS-5055` on a shipped addon.
+   * @throws The typed error of any other code the bridge returns, with the
+   *   code preserved.
+   */
   async nodeStartLocal(
     dataDir: string,
     identityDid?: string | null,

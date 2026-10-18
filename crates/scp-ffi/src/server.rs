@@ -11,8 +11,10 @@
 //!   startup.
 //! - `PyScp::node_start` -- production node start from this instance's
 //!   storage under an operator identity (SCP-322).
-//! - `PyScp::node_start_in_memory` / `PyScp::node_start_local` -- node
-//!   startup.
+//! - `PyScp::node_start_in_memory` / `PyScp::node_start_local` -- the
+//!   development node-start pair. A build with this crate's `testing`
+//!   feature starts a dev node; a shipped build raises `SCP-TRANS-5055`
+//!   (`DevStartUnavailable`) from both (SCP-327).
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice D (#1549).
@@ -22,7 +24,6 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use zeroize::Zeroizing;
 
 use scp_ffi_common::error_codes as codes;
 use scp_ffi_common::node_start_config::NodeStartConfig;
@@ -527,10 +528,12 @@ fn instance_storage(bi: &crate::runtime::PyBridgeInstance) -> Result<InstanceSto
 /// Starts a production node on `bi`'s storage under the operator identity the
 /// config names (construction.md §"Node start — `NodeStartConfig`").
 ///
-/// Runs, in order: the config parse, the operator identity resolution, taking
-/// the instance storage, `server::node_start`, `server::register_node`,
-/// `auto_wire_context_manager` (which shuts the node down and unregisters it
-/// on failure), and wrapping the handle.
+/// Runs, in order: the config parse, the operator identity resolution (so a
+/// malformed DID stays `SCP-STORAGE-8007`), the check that the config names
+/// the operator handle the caller passed, taking the instance storage,
+/// `server::node_start`, `server::register_node`, `auto_wire_context_manager`
+/// (which shuts the node down and unregisters it on failure), and wrapping
+/// the handle.
 ///
 /// # Errors
 ///
@@ -539,10 +542,17 @@ fn node_start_on(
     bi_arc: &Arc<crate::runtime::PyBridgeInstance>,
     py: Python<'_>,
     config_json: &str,
+    operator_did: &str,
 ) -> Result<PyNodeHandle, ScpPyError> {
     let bi = &**bi_arc;
     let cfg = NodeStartConfig::from_json(config_json).map_err(server_error)?;
     let identity = resolve_operator_identity(bi, &cfg.identity)?;
+    // The config names its operator by DID; the caller also passed the
+    // operator handle the ADR-048 check ran on. A config naming any other
+    // identity would run the node under an operator that check never saw.
+    if cfg.identity != operator_did {
+        return Err(server_error(ServerError::OperatorIdentityUnavailable));
+    }
     let storage = instance_storage(bi)?;
     let node =
         crate::actor_wait::block_on_released(py, server::node_start(cfg, identity, storage))?
@@ -570,12 +580,21 @@ impl crate::scp::PyScp {
     /// ``config_json`` is a ``NodeStartConfig`` (construction.md §"Node start
     /// — ``NodeStartConfig``"): its ``identity`` names an operator identity
     /// registered on this instance, and the node runs on this instance's own
-    /// storage. Each failure raises with the code sdk-common.md §"Node start
-    /// error codes" gives it, such as ``SCP-IDENT-1063`` for an unregistered
-    /// operator DID.
+    /// storage. ``identity`` is the operator handle whose DID the config
+    /// names. Each failure raises with the code sdk-common.md §"Node start
+    /// error codes" gives it: ``SCP-PERM-3030`` when another ``SCP`` minted
+    /// ``identity`` (ADR-048), checked before the config is read, and
+    /// ``SCP-IDENT-1063`` for an unregistered operator DID or a config that
+    /// names a DID other than ``identity``'s.
     #[pyo3(name = "node_start")]
-    pub fn node_start(&self, py: Python<'_>, config_json: &str) -> PyResult<PyNodeHandle> {
-        node_start_on(&self.inner, py, config_json).map_err(PyErr::from)
+    pub fn node_start(
+        &self,
+        py: Python<'_>,
+        config_json: &str,
+        identity: &crate::identity::PyIdentity,
+    ) -> PyResult<PyNodeHandle> {
+        crate::pyscp_check_handle!(&self.inner.core, identity);
+        node_start_on(&self.inner, py, config_json, identity.did()).map_err(PyErr::from)
     }
 
     /// Starts a relay with in-memory blob storage on an OS-assigned port.
@@ -613,78 +632,45 @@ impl crate::scp::PyScp {
         })?
     }
 
-    /// Starts a full application node with encrypted in-memory storage.
+    /// Starts a development node with encrypted in-memory storage.
     ///
-    /// Storage is an ephemeral ``InMemoryStorage`` under an ``EncryptingAdapter``
-    /// keyed by a fresh `OsRng` AES-256-GCM key, so a node is built through a
-    /// production ``Node::start`` constructor and its ``EncryptedStorage`` bound.
+    /// **Development only.** Alec ruled on 2026-08-10: "start local/start in
+    /// mem are for dev. all sdks still expose. we cut them from prod." A
+    /// bridge built with ``testing`` starts the node; a shipped build raises
+    /// ``TransportError`` with ``SCP-TRANS-5055`` (``DevStartUnavailable``,
+    /// sdk-common.md §"Node start error codes") and starts nothing.
+    /// Production callers use ``node_start``.
     ///
-    /// When ``identity_did`` is ``None`` (a default), a build carrying a
-    /// test-harness feature auto-wires in-memory key custody, an in-memory DHT
-    /// client, self-signed TLS, and a relay on an OS-assigned port with a fresh
-    /// DID; a shipped build fails closed instead.
-    ///
-    /// When ``identity_did`` is provided, the node uses the pre-existing identity
-    /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
-    /// This enables identity portability — the same DID persists across node
-    /// restarts.
+    /// On a ``testing`` build, storage is an ephemeral ``InMemoryStorage``
+    /// under an ``EncryptingAdapter`` keyed by a fresh `OsRng` AES-256-GCM
+    /// key. When ``identity_did`` is ``None`` (a default), the node
+    /// auto-wires in-memory key custody, an in-memory DHT client, self-signed
+    /// TLS, and a relay on an OS-assigned port with a fresh DID. When
+    /// ``identity_did`` is provided, the node uses the pre-existing identity
+    /// from the `PyO3` identity registry (populated by
+    /// ``PyScp::identity_create``).
     #[pyo3(name = "node_start_in_memory", signature = (identity_did=None))]
     pub fn node_start_in_memory(
         &self,
         py: Python<'_>,
         identity_did: Option<String>,
     ) -> PyResult<PyNodeHandle> {
-        let bi = &*self.inner;
-        let node_identity = match identity_did {
-            Some(ref did) => {
-                crate::validate::validate_did(did)?;
-                Some(build_node_identity(bi, did)?)
-            }
-            None => None,
-        };
-        let node = crate::actor_wait::block_on_released(py, async {
-            server::start_node_in_memory(node_identity)
-                .await
-                .map_err(server_err)
-        })??;
-
-        // Register this node as a borrower of this instance's resources, so
-        // `SCP.shutdown()` stops it before `bridge_specific_shutdown` releases
-        // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`), and
-        // so a failed wiring below can remove it again.
-        let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
-        // Wire the Supervisor through the internal loopback URL: `relay_url()`
-        // is the advertised URL, which requires TLS and lacks the bound port.
-        auto_wire_context_manager(bi, py, &inner, &inner.internal_relay_url())?;
-
-        let instance_id = bi.core.instance_id();
-        Ok(PyNodeHandle {
-            inner,
-            instance_id,
-            bi: Arc::clone(&self.inner),
-        })
+        node_start_in_memory_on(&self.inner, py, identity_did)
     }
 
-    /// Starts a full application node on this instance's own storage backend.
+    /// Starts a development node on this instance's own storage backend.
     ///
-    /// A node inherits whichever storage handle this ``SCP`` instance was
-    /// constructed with (``SCP.with_storage({...})``) — encrypted in-memory or
-    /// `SQLCipher` — so its context snapshots, Merkle event log, saga journal,
-    /// and `OpenMLS` store land in one backend this instance already owns. A
-    /// caller wanting a node on a different backend constructs a second ``SCP``
-    /// instance; no per-node storage argument exists.
+    /// **Development only**, like ``node_start_in_memory``: a shipped build
+    /// raises ``TransportError`` with ``SCP-TRANS-5055`` and creates nothing
+    /// under ``data_dir``. Production callers use ``node_start``.
     ///
-    /// ``data_dir`` holds a redb blob database at ``<data_dir>/blobs.redb`` and,
-    /// under auto-identity mode, a key file at ``<data_dir>/identity.key``.
-    /// No protocol store is created there.
-    ///
-    /// When ``identity_did`` is ``None`` (a default), a node creates or reloads
-    /// a persistent identity from ``<data_dir>/identity.key``, and a
-    /// ``passphrase`` argument is required in that mode.
-    ///
-    /// When ``identity_did`` is provided, a node uses that pre-existing identity
-    /// from a `PyO3` identity registry (populated by ``PyScp::identity_create``),
-    /// and no passphrase is required.
+    /// On a ``testing`` build, a node inherits whichever storage handle this
+    /// ``SCP`` instance was constructed with (``SCP.with_storage({...})``).
+    /// ``data_dir`` holds a redb blob database at ``<data_dir>/blobs.redb``
+    /// and, when ``identity_did`` is ``None``, a key file at
+    /// ``<data_dir>/identity.key``, for which ``passphrase`` is required. When
+    /// ``identity_did`` is provided, a node uses that pre-existing identity
+    /// from the `PyO3` identity registry, and no passphrase is required.
     #[pyo3(name = "node_start_local", signature = (data_dir, identity_did=None, passphrase=None))]
     pub fn node_start_local(
         &self,
@@ -693,54 +679,140 @@ impl crate::scp::PyScp {
         identity_did: Option<String>,
         passphrase: Option<String>,
     ) -> PyResult<PyNodeHandle> {
-        let bi = &*self.inner;
-        let node_identity = match identity_did {
-            Some(ref did) => {
-                crate::validate::validate_did(did)?;
-                Some(build_node_identity(bi, did)?)
-            }
-            None => None,
-        };
-        let zeroized_passphrase = passphrase.map(Zeroizing::new);
-        // Clone this instance's chosen backend out (a cheap `Arc` clone) before
-        // crossing into `allow_threads`. `get_storage` fails closed when an
-        // instance was built without a storage selection, rather than letting a
-        // node open a store of its own (SCP-CAPSEL-8000, spec §17.6).
-        let storage = crate::runtime::get_storage(bi)?.clone();
-        let inner = crate::actor_wait::block_on_released(py, async {
-            let data_dir = std::path::Path::new(&data_dir);
-            match storage {
-                crate::runtime::StorageProvider::InMemoryEncrypted(s) => {
-                    server::start_node_local(data_dir, s, node_identity, zeroized_passphrase)
-                        .await
-                        .map(RunningNode::InMemoryEncrypted)
-                }
-                crate::runtime::StorageProvider::Sqlite(s) => {
-                    server::start_node_local(data_dir, s, node_identity, zeroized_passphrase)
-                        .await
-                        .map(RunningNode::Sqlite)
-                }
-            }
-            .map_err(server_err)
-        })??;
-        // This node holds a clone of this instance's storage `Arc`, so register
-        // it before anything else: `SCP.shutdown()` must stop this node before
-        // the durable store closer closes that `SQLCipher` handle and drops
-        // an advisory `flock(2)`
-        // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
-        let inner = server::register_node(&bi.core, inner);
-
-        // Wire the Supervisor through the internal loopback URL — see the
-        // comment in `node_start_in_memory`.
-        auto_wire_context_manager(bi, py, &inner, &inner.internal_relay_url())?;
-
-        let instance_id = bi.core.instance_id();
-        Ok(PyNodeHandle {
-            inner,
-            instance_id,
-            bi: Arc::clone(&self.inner),
-        })
+        node_start_local_on(&self.inner, py, data_dir, identity_did, passphrase)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dev pair — split on this bridge's own `testing` feature (SCP-327)
+// ---------------------------------------------------------------------------
+//
+// The split reads `scp-ffi`'s `testing`, never `scp-ffi-common`'s: this
+// crate's dev-dependencies turn `scp-ffi-common/testing` on for every test
+// build, so a split on the common feature would start a node in a test of the
+// shipped configuration.
+
+/// The shipped `node_start_in_memory`: the dev pair is cut from builds
+/// without `testing`, so it raises `SCP-TRANS-5055` and starts nothing.
+#[cfg(not(feature = "testing"))]
+fn node_start_in_memory_on(
+    _bi: &Arc<crate::runtime::PyBridgeInstance>,
+    _py: Python<'_>,
+    _identity_did: Option<String>,
+) -> PyResult<PyNodeHandle> {
+    Err(server_err(ServerError::DevStartUnavailable))
+}
+
+/// The shipped `node_start_local`: the dev pair is cut from builds without
+/// `testing`, so it raises `SCP-TRANS-5055` and creates nothing.
+#[cfg(not(feature = "testing"))]
+fn node_start_local_on(
+    _bi: &Arc<crate::runtime::PyBridgeInstance>,
+    _py: Python<'_>,
+    _data_dir: String,
+    _identity_did: Option<String>,
+    _passphrase: Option<String>,
+) -> PyResult<PyNodeHandle> {
+    Err(server_err(ServerError::DevStartUnavailable))
+}
+
+/// The `testing` `node_start_in_memory`: starts a dev node through
+/// `server::start_node_in_memory`, registers it, and wires the `Supervisor`.
+#[cfg(feature = "testing")]
+fn node_start_in_memory_on(
+    bi_arc: &Arc<crate::runtime::PyBridgeInstance>,
+    py: Python<'_>,
+    identity_did: Option<String>,
+) -> PyResult<PyNodeHandle> {
+    let bi = &**bi_arc;
+    let node_identity = match identity_did {
+        Some(ref did) => {
+            crate::validate::validate_did(did)?;
+            Some(build_node_identity(bi, did)?)
+        }
+        None => None,
+    };
+    let node = crate::actor_wait::block_on_released(py, async {
+        server::start_node_in_memory(node_identity)
+            .await
+            .map_err(server_err)
+    })??;
+
+    // Register this node as a borrower of this instance's resources, so
+    // `SCP.shutdown()` stops it before `bridge_specific_shutdown` releases
+    // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`), and
+    // so a failed wiring below can remove it again.
+    let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
+    // Wire the Supervisor through the internal loopback URL: `relay_url()`
+    // is the advertised URL, which requires TLS and lacks the bound port.
+    auto_wire_context_manager(bi, py, &inner, &inner.internal_relay_url())?;
+
+    let instance_id = bi.core.instance_id();
+    Ok(PyNodeHandle {
+        inner,
+        instance_id,
+        bi: Arc::clone(bi_arc),
+    })
+}
+
+/// The `testing` `node_start_local`: starts a dev node on the instance's own
+/// storage through `server::start_node_local`, registers it, and wires the
+/// `Supervisor`.
+#[cfg(feature = "testing")]
+fn node_start_local_on(
+    bi_arc: &Arc<crate::runtime::PyBridgeInstance>,
+    py: Python<'_>,
+    data_dir: String,
+    identity_did: Option<String>,
+    passphrase: Option<String>,
+) -> PyResult<PyNodeHandle> {
+    let bi = &**bi_arc;
+    let node_identity = match identity_did {
+        Some(ref did) => {
+            crate::validate::validate_did(did)?;
+            Some(build_node_identity(bi, did)?)
+        }
+        None => None,
+    };
+    let zeroized_passphrase = passphrase.map(zeroize::Zeroizing::new);
+    // Clone this instance's chosen backend out (a cheap `Arc` clone) before
+    // crossing into `block_on_released`. `get_storage` fails closed when an
+    // instance was built without a storage selection, rather than letting a
+    // node open a store of its own (SCP-CAPSEL-8000, spec §17.6).
+    let storage = crate::runtime::get_storage(bi)?.clone();
+    let inner = crate::actor_wait::block_on_released(py, async {
+        let data_dir = std::path::Path::new(&data_dir);
+        match storage {
+            crate::runtime::StorageProvider::InMemoryEncrypted(s) => {
+                server::start_node_local(data_dir, s, node_identity, zeroized_passphrase)
+                    .await
+                    .map(RunningNode::InMemoryEncrypted)
+            }
+            crate::runtime::StorageProvider::Sqlite(s) => {
+                server::start_node_local(data_dir, s, node_identity, zeroized_passphrase)
+                    .await
+                    .map(RunningNode::Sqlite)
+            }
+        }
+        .map_err(server_err)
+    })??;
+    // This node holds a clone of this instance's storage `Arc`, so register
+    // it before anything else: `SCP.shutdown()` must stop this node before
+    // the durable store closer closes that `SQLCipher` handle and drops
+    // an advisory `flock(2)`
+    // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+    let inner = server::register_node(&bi.core, inner);
+
+    // Wire the Supervisor through the internal loopback URL — see the
+    // comment in the `testing` `node_start_in_memory_on`.
+    auto_wire_context_manager(bi, py, &inner, &inner.internal_relay_url())?;
+
+    let instance_id = bi.core.instance_id();
+    Ok(PyNodeHandle {
+        inner,
+        instance_id,
+        bi: Arc::clone(bi_arc),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -812,6 +884,7 @@ mod tests {
     /// tests. Before this assertion existed, `PyO3`'s "actually wired" guarantee
     /// rested solely on a `pipeline_wiring.rs` string-match.
     #[test]
+    #[cfg(feature = "testing")]
     fn node_startup_enables_context_event_channel() {
         // Initialize the process-global tokio runtime the same way `rt()` does;
         // `node_start_in_memory` fetches it via `crate::runtime()`.
@@ -847,6 +920,7 @@ mod tests {
     /// instance already holds, so this test selects in-memory storage through
     /// `PyScp::with_storage`, then asserts a node starts on that same handle.
     #[test]
+    #[cfg(feature = "testing")]
     fn node_local_starts_on_the_instance_storage_handle() {
         crate::init_runtime().ok();
         pyo3::prepare_freethreaded_python();
@@ -1069,9 +1143,10 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let scp = crate::scp::PyScp::new_in_memory_for_test();
-            let json = start_json("did:dht:z6MkNodeStartOperatorProbe", |_| {});
+            let probe = "did:dht:z6MkNodeStartOperatorProbe";
+            let json = start_json(probe, |_| {});
             let err = start_error(
-                node_start_on(&scp.inner, py, &json),
+                node_start_on(&scp.inner, py, &json, probe),
                 "unregistered operator",
             );
             assert_eq!(
@@ -1080,7 +1155,15 @@ mod tests {
                 "{err:?}"
             );
 
-            let raised = match scp.node_start(py, &json) {
+            let handle = crate::identity::PyIdentity::new(
+                &scp.inner,
+                probe.to_owned(),
+                "in_memory".to_owned(),
+                false,
+                None,
+                None,
+            );
+            let raised = match scp.node_start(py, &json, &handle) {
                 Ok(node) => {
                     node.shutdown();
                     panic!("the pymethod must refuse an unregistered operator");
@@ -1088,6 +1171,126 @@ mod tests {
                 Err(e) => e.to_string(),
             };
             assert!(raised.contains(codes::IDENT_1063), "{raised}");
+        });
+    }
+
+    /// The dev pair is cut from a shipped build (SCP-327): the exported
+    /// `node_start_in_memory` raises `TransportError` carrying
+    /// `SCP-TRANS-5055` and starts no node, with and without an identity.
+    #[test]
+    #[cfg(not(feature = "testing"))]
+    fn node_start_in_memory_on_a_shipped_build_returns_trans_5055() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            for identity in [None, Some("did:dht:z6MkDevStartProbe".to_owned())] {
+                let err = match scp.node_start_in_memory(py, identity.clone()) {
+                    Ok(node) => {
+                        node.shutdown();
+                        panic!("{identity:?}: a shipped node_start_in_memory must fail");
+                    }
+                    Err(e) => e,
+                };
+                assert!(
+                    err.is_instance_of::<crate::error::TransportError>(py),
+                    "{identity:?}: {err:?}"
+                );
+                assert!(err.to_string().contains(codes::TRANS_5055), "{err}");
+            }
+        });
+    }
+
+    /// The dev pair is cut from a shipped build (SCP-327): the exported
+    /// `node_start_local` raises `TransportError` carrying `SCP-TRANS-5055`,
+    /// and writes no key file or blob store under `data_dir`.
+    #[test]
+    #[cfg(not(feature = "testing"))]
+    fn node_start_local_on_a_shipped_build_returns_trans_5055() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        let tmp =
+            std::env::temp_dir().join(format!("scp-pyo3-shipped-dev-start-{}", std::process::id()));
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let err = match scp.node_start_local(
+                py,
+                tmp.display().to_string(),
+                None,
+                Some("test-passphrase".to_owned()),
+            ) {
+                Ok(node) => {
+                    node.shutdown();
+                    panic!("a shipped node_start_local must fail");
+                }
+                Err(e) => e,
+            };
+            assert!(
+                err.is_instance_of::<crate::error::TransportError>(py),
+                "{err:?}"
+            );
+            assert!(err.to_string().contains(codes::TRANS_5055), "{err}");
+        });
+        assert!(
+            !tmp.exists(),
+            "a shipped node_start_local must create nothing under data_dir"
+        );
+    }
+
+    /// An operator handle another `SCP` minted fails the ADR-048 handle check
+    /// with `SCP-PERM-3030` before the config is read, so even a config that
+    /// cannot parse returns `SCP-PERM-3030`.
+    #[test]
+    fn node_start_refuses_another_instances_identity_with_perm_3030() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let minting = crate::scp::PyScp::new_in_memory_for_test();
+            let other = crate::scp::PyScp::new_in_memory_for_test();
+            let did = "did:dht:z6MkNodeStartForeignProbe";
+            let foreign = crate::identity::PyIdentity::new(
+                &minting.inner,
+                did.to_owned(),
+                "in_memory".to_owned(),
+                false,
+                None,
+                None,
+            );
+            for json in [start_json(did, |_| {}), "{not json".to_owned()] {
+                let raised = match other.node_start(py, &json, &foreign) {
+                    Ok(node) => {
+                        node.shutdown();
+                        panic!("node_start must refuse a foreign operator handle");
+                    }
+                    Err(e) => e.to_string(),
+                };
+                assert!(raised.contains(codes::PERM_3030), "{raised}");
+            }
+        });
+    }
+
+    /// A config naming a DID other than the operator handle's returns
+    /// `SCP-IDENT-1063`: the node never runs under an operator the handle
+    /// check did not see.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn node_start_refuses_a_config_naming_another_operator_with_ident_1063() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let named = scp.identity_create(py, "in_memory", None).unwrap();
+            let passed = scp.identity_create(py, "in_memory", None).unwrap();
+            let json = start_json(named.did(), |_| {});
+            let err = start_error(
+                node_start_on(&scp.inner, py, &json, passed.did()),
+                "config names another operator",
+            );
+            assert_eq!(
+                class_and_code(&err),
+                ("identity", codes::IDENT_1063),
+                "{err:?}"
+            );
         });
     }
 
@@ -1165,7 +1368,9 @@ mod tests {
             let scp = crate::scp::PyScp::new_in_memory_for_test();
             let identity = scp.identity_create(py, "in_memory", None).unwrap();
             let did = identity.did().to_owned();
-            let node = scp.node_start(py, &start_json(&did, |_| {})).unwrap();
+            let node = scp
+                .node_start(py, &start_json(&did, |_| {}), &identity)
+                .unwrap();
 
             assert_eq!(node.did(), did);
             assert!(node.relay_port() > 0);
@@ -1226,10 +1431,12 @@ mod tests {
                 "a fallback Supervisor was attached"
             );
 
-            let node = scp.node_start(py, &start_json(&did, |_| {})).unwrap();
+            let node = scp
+                .node_start(py, &start_json(&did, |_| {}), &identity)
+                .unwrap();
             assert!(server::supervisor_wired_to(&bi.core, &node.inner));
             let err = start_error(
-                node_start_on(&scp.inner, py, &start_json(&did, |_| {})),
+                node_start_on(&scp.inner, py, &start_json(&did, |_| {}), &did),
                 "second node start",
             );
             assert_eq!(
@@ -1239,7 +1446,7 @@ mod tests {
             );
             node.shutdown();
             let restarted = scp
-                .node_start(py, &start_json(&did, |_| {}))
+                .node_start(py, &start_json(&did, |_| {}), &identity)
                 .expect("a start after the bound node stops binds again");
             assert!(server::supervisor_wired_to(&bi.core, &restarted.inner));
             restarted.shutdown();
@@ -1331,7 +1538,7 @@ mod tests {
                 ),
             ];
             for (label, json, class, code) in cases {
-                let err = start_error(node_start_on(&scp.inner, py, &json), label);
+                let err = start_error(node_start_on(&scp.inner, py, &json, &did), label);
                 assert_eq!(class_and_code(&err), (class, code), "{label}: {err:?}");
             }
         });

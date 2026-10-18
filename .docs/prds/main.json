@@ -11673,22 +11673,28 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/typescript/src/server.ts",
+        "bindings/typescript/src/scp.ts",
+        "bindings/typescript/src/index.ts",
         "bindings/typescript/src/internal/native.ts",
-        "bindings/typescript/tests/server.test.ts"
+        "bindings/typescript/tests/server.test.ts",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/napi/src/server.rs",
+        "crates/scp-ffi/common/tests/fixtures/node_start_config.json"
       ],
       "description": "The TypeScript SDK mirrors `NodeStartConfig` (construction.md §\"Node start — `NodeStartConfig`\") as an options interface with discriminated unions tagged `kind`, under the five-language equivalence table of construction.md, and calls the napi-rs `node_start` export from SCP-322. Each code of sdk-common.md §\"Node start error codes\" reaches the caller as the typed error of its category.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C7.",
       "acceptanceCriteria": [
         "The TypeScript options interface and its discriminated unions carry the same field names, enum arms and required and optional split as `NodeStartConfig`, and a test asserts the JSON each config produces matches the wire shape `NodeStartConfig::from_json` reads",
         "The options interface's `identity` is the TypeScript SDK's `Identity` object, which the wrapper lowers to its DID on the wire, and a test shows any other value is rejected with a typed SDK error before the napi-rs `node_start` export is called",
+        "The napi-rs `node_start` export takes the operator `Identity` handle alongside `config_json` and calls `napi_check_handle!` on it first, the same shape as the PyO3 `node_start`, so `check-handle-affinity.sh` enforces the check at the bridge; a handle another `SCP` instance minted returns `SCP-PERM-3030` (ADR-048), and a test asserts the code",
         "The TypeScript SDK's node start entry calls the napi-rs `node_start` export and returns a `Node`",
         "A test shows each node start code of sdk-common.md §\"Node start error codes\" throws the typed SDK error of its category with the code preserved",
         "`bun run lint` and `bun test tests/server.test.ts` pass in `bindings/typescript`"
       ],
       "actionItems": [
-        "Add the options interface and the node start entry to `bindings/typescript/src/server.ts`",
+        "Add the options interface to `bindings/typescript/src/server.ts` and the node start entry `SCP.nodeStart` to `bindings/typescript/src/scp.ts`",
         "Declare `node_start` in `src/internal/native.ts`",
         "Add wire-shape and error-mapping tests"
       ],
@@ -11723,15 +11729,18 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/swift/Sources/SCP/Server.swift",
-        "bindings/swift/Tests/SCPTests/NodeStartTests.swift"
+        "bindings/swift/Tests/SCPTests/NodeStartTests.swift",
+        "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
+        "crates/scp-ffi/uniffi/src/server.rs",
+        "crates/scp-ffi/common/tests/fixtures/node_start_config.json"
       ],
-      "description": "The Swift SDK mirrors `NodeStartConfig` (construction.md §\"Node start — `NodeStartConfig`\") as a struct with enums carrying associated values, under the five-language equivalence table of construction.md, and calls the UniFFI `node_start` export from SCP-322 with an `Identity` handle as the operator. The `#if os(macOS)` guard goes on the hand-written wrapper in `bindings/swift/Sources/SCP/Server.swift`, so the capability is absent on iOS. The UniFFI-generated layer needs no guard. Each code of sdk-common.md §\"Node start error codes\" reaches the caller as the typed error of its category.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C8.",
+      "description": "The Swift SDK mirrors `NodeStartConfig` (construction.md §\"Node start — `NodeStartConfig`\") as a struct with enums carrying associated values, under the five-language equivalence table of construction.md, and calls the UniFFI `node_start` export from SCP-322 with an `Identity` handle as the operator. The `#if os(macOS)` guard goes on the hand-written wrapper in `bindings/swift/Sources/SCP/Server.swift`, so an iOS build of the SDK exposes no `SCP.nodeStart`. This story guards the SDK wrapper only: the UniFFI-generated `Scp` node and relay start functions stay public on iOS, because the xcframework builds every slice with the `server` feature, and the issue named in `details.generatedLayer` covers that layer. Each code of sdk-common.md §\"Node start error codes\" reaches the caller as the typed error of its category.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C8.",
       "acceptanceCriteria": [
         "The Swift config struct and its enums carry the same field names, enum arms and required and optional split as `NodeStartConfig`, and a test asserts the record each config produces matches the UniFFI `node_start` argument",
-        "The Swift node start entry sits inside `#if os(macOS)` in `bindings/swift/Sources/SCP/Server.swift`, and an iOS build of the SDK has no node start symbol",
+        "The Swift node start entry sits inside `#if os(macOS)` in `bindings/swift/Sources/SCP/Server.swift`, and an iOS build of the SDK exposes no `SCP.nodeStart`",
         "The Swift node start entry calls the UniFFI `node_start` export with an `Identity` handle as the operator and returns a `Node`",
         "A test shows each node start code of sdk-common.md §\"Node start error codes\" throws the typed `ScpError` of its category with the code preserved"
       ],
@@ -11760,6 +11769,7 @@
         "plan": "Track C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C8.",
         "capabilityRow": "§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`.",
         "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
+        "generatedLayer": "GitHub issue 2945: on iOS the generated `Scp` node and relay start functions are public and run, because the iOS slices build with `server`; the fix builds the iOS slices without `server` and makes the generated bindings compile on iOS without those symbols. Not an acceptance criterion of this story.",
         "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
       }
     },
@@ -11810,14 +11820,27 @@
       "gate": "gate-addr",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/common/src/server.rs",
         "crates/scp-ffi/common/src/error_codes.rs",
+        "crates/scp-ffi/common/src/bridge_instance.rs",
+        "crates/scp-ffi/common/Cargo.toml",
         "crates/scp-ffi/src/server.rs",
         "crates/scp-ffi/napi/src/server.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
         "crates/scp-ffi/uniffi/src/server.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "bindings/python/scp_sdk/scp.py",
+        "bindings/python/scp_sdk/server.py",
+        "bindings/python/tests/test_server.py",
+        "bindings/typescript/src/scp.ts",
+        "bindings/typescript/src/server.ts",
         "bindings/typescript/tests/server.test.ts",
+        "bindings/swift/Sources/SCP/Server.swift",
+        "bindings/swift/Sources/SCP/Internal/ScpBindings.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Server.kt",
+        ".docs/standards/sdk-common.md",
         ".github/workflows/ci.yml"
       ],
       "description": "Alec ruled on 2026-08-10: \"start local/start in mem are for dev. all sdks still expose. we cut them from prod.\" This story gates the common dev-pair bodies with `#[cfg(any(test, feature = \"testing\"))]`, which removes the `start_node_local` no-identity arm that builds `FileKeyCustody` at `<data_dir>/identity.key`. Each bridge keeps its exported dev symbols, so every SDK still exposes them. The bridge's own `testing` feature splits each body: under `testing` it calls the common body, and otherwise it returns `ServerError::DevStartUnavailable` (`SCP-TRANS-5055`, sdk-common.md §\"Node start error codes\"), which replaces `AutoGenerateUnavailable`. The split reads the bridge's feature, because bridge dev-dependencies turn on `scp-ffi-common/testing`.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C10.",

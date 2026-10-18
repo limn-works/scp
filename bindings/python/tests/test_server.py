@@ -30,6 +30,7 @@ from scp_sdk.errors import (
     ScpError,
     StorageError,
     TransportError,
+    UcanPermissionError,
     ValidationError,
 )
 from scp_sdk.identity import Identity
@@ -390,6 +391,54 @@ async def test_start_local_with_passphrase() -> None:
     assert scp._native.local_calls == [("/tmp/test-dir", None, "my-secret")]
 
 
+#: The error a shipped extension's dev pair raises (SCP-327), in the form the
+#: PyO3 bridge renders it.
+_DEV_START_UNAVAILABLE = (
+    "[SCP-TRANS-5055] transport error: "
+    "development node start is unavailable in this build; use node_start"
+)
+
+
+class _ShippedDevPairNative:
+    """The dev pair of a shipped extension: both calls raise SCP-TRANS-5055."""
+
+    def __init__(self) -> None:
+        self.error = Exception(_DEV_START_UNAVAILABLE)
+
+    def node_start_in_memory(self, identity_did: str | None = None) -> _MockNodeHandle:
+        raise self.error
+
+    def node_start_local(
+        self,
+        data_dir: str,
+        identity_did: str | None = None,
+        passphrase: str | None = None,
+    ) -> _MockNodeHandle:
+        raise self.error
+
+
+@pytest.mark.asyncio
+async def test_dev_pair_on_a_shipped_extension_raises_transport_error_5055() -> None:
+    """A shipped extension refuses the dev pair with SCP-TRANS-5055, and the SDK
+    raises it as ``TransportError`` with the code preserved and the bridge
+    error as its cause."""
+    from scp_sdk.scp import SCP
+
+    scp = _MockSCP()
+    native = _ShippedDevPairNative()
+    scp._native = native  # type: ignore[assignment]
+    calls = [
+        SCP.node_start_in_memory(scp),  # type: ignore[arg-type]
+        SCP.node_start_local(scp, "/tmp/test-dir", None, "my-secret"),  # type: ignore[arg-type]
+    ]
+    for call in calls:
+        with pytest.raises(ScpError) as raised:
+            await call
+        assert type(raised.value) is TransportError
+        assert raised.value.code == "SCP-TRANS-5055"
+        assert raised.value.__cause__ is native.error
+
+
 # ---------------------------------------------------------------------------
 # enable_site_projection validation (#1405)
 # ---------------------------------------------------------------------------
@@ -662,11 +711,13 @@ class _NodeStartNative:
 
     def __init__(self, did: str, error: Exception | None = None) -> None:
         self.calls: list[str] = []
+        self.handles: list[Any] = []
         self.did = did
         self.error = error
 
-    def node_start(self, config_json: str) -> _MockNodeHandle:
+    def node_start(self, config_json: str, identity: Any) -> _MockNodeHandle:
         self.calls.append(config_json)
+        self.handles.append(identity)
         if self.error is not None:
             raise self.error
         return _MockNodeHandle(did=self.did)
@@ -690,6 +741,7 @@ async def test_node_start_sends_the_encoded_config_and_returns_a_node(operator: 
     assert node.did == operator.did
     assert len(native.calls) == 1
     assert json.loads(native.calls[0]) == config._to_wire()
+    assert native.handles == [operator._raw_handle]
 
 
 @pytest.mark.asyncio
@@ -737,6 +789,7 @@ _NODE_START_CODES: list[tuple[str, type[ScpError]]] = [
     ("SCP-CTX-2053", ContextError),
     ("SCP-TRANS-5055", TransportError),
     ("SCP-TRANS-5056", TransportError),
+    ("SCP-PERM-3030", UcanPermissionError),
 ]
 
 
@@ -804,26 +857,50 @@ async def test_node_start_starts_and_stops_a_node_on_the_extension(
 
 
 @pytest.mark.asyncio
+async def test_dev_pair_starts_a_node_on_the_testing_extension(
+    scp: Any, operator: Identity, tmp_path: Path
+) -> None:
+    """The SDK suite runs against an extension built with ``testing``, where the
+    dev pair still starts a node (SCP-327 cuts it only from shipped builds)."""
+    node = await scp.node_start_in_memory()
+    try:
+        assert node.did.startswith("did:")
+        assert node.relay_port > 0
+    finally:
+        await node.shutdown()
+    assert node.is_shutdown is True
+
+    node = await scp.node_start_local(str(tmp_path / "node"), operator.did)
+    try:
+        assert node.did == operator.did
+        assert node.relay_port > 0
+    finally:
+        await node.shutdown()
+    assert node.is_shutdown is True
+
+
 @pytest.mark.parametrize(
     ("field", "entry"),
     [(field, entry) for field, entries in _WIRE["arms"].items() for entry in entries],
     ids=lambda v: v if isinstance(v, str) else v["kind"],
 )
-async def test_node_start_extension_reads_every_arm(
-    scp: Any, stranger: Identity, field: str, entry: dict[str, Any]
+def test_node_start_extension_reads_every_arm(
+    scp: Any, operator: Identity, stranger: Identity, field: str, entry: dict[str, Any]
 ) -> None:
     """The extension parses a config carrying each arm and every optional field:
-    an operator not registered on the instance fails at identity resolution
-    (SCP-IDENT-1063), which runs only after the parse that rejects an unknown
-    key or ``kind`` with SCP-STORAGE-8007."""
+    a config naming an operator not registered on the instance fails at
+    identity resolution (SCP-IDENT-1063), which runs only after the parse that
+    rejects an unknown key or ``kind`` with SCP-STORAGE-8007. The handle passed
+    is the instance's own, so the ADR-048 check before the parse passes."""
     overrides: dict[str, Any] = {
         "http_bind_addr": "127.0.0.1:0",
         "nat": NatAuto(),
         "projection_rate_limit": 5,
         field: _arm_from_wire(field, entry),
     }
-    err = await _start_error(scp, _config(stranger, **overrides))
-    assert (type(err), err.code) == (IdentityError, "SCP-IDENT-1063"), err
+    wire = _config(stranger, **overrides)._to_wire()
+    with pytest.raises(Exception, match=r"^\[SCP-IDENT-1063\]"):
+        scp._native.node_start(json.dumps(wire), operator._raw_handle)
 
 
 def test_node_start_extension_rejects_a_key_outside_the_bridge_shape(
@@ -834,15 +911,17 @@ def test_node_start_extension_rejects_a_key_outside_the_bridge_shape(
     wire = _config(operator)._to_wire()
     wire["bind_address"] = wire.pop("bind_addr")
     with pytest.raises(Exception, match=r"^\[SCP-STORAGE-8007\]"):
-        scp._native.node_start(json.dumps(wire))
+        scp._native.node_start(json.dumps(wire), operator._raw_handle)
 
 
 @pytest.mark.asyncio
-async def test_node_start_extension_raises_8007_8008_1063_5051_and_5056(
+async def test_node_start_extension_raises_8007_8008_3030_5051_and_5056(
     scp: Any, operator: Identity, stranger: Identity, tmp_path: Path
 ) -> None:
-    """The extension raises SCP-STORAGE-8007, SCP-STORAGE-8008, SCP-IDENT-1063,
+    """The extension raises SCP-STORAGE-8007, SCP-STORAGE-8008, SCP-PERM-3030,
     SCP-TRANS-5051 and SCP-TRANS-5056 as the typed SDK error carrying each code.
+    An operator identity another ``SCP`` instance minted is SCP-PERM-3030
+    (ADR-048), as on every bridge.
 
     No config makes the extension raise the other node start codes from a test:
 
@@ -889,7 +968,12 @@ async def test_node_start_extension_raises_8007_8008_1063_5051_and_5056(
             StorageError,
             "SCP-STORAGE-8008",
         ),
-        ("unregistered operator", _config(stranger), IdentityError, "SCP-IDENT-1063"),
+        (
+            "operator from another SCP instance",
+            _config(stranger),
+            UcanPermissionError,
+            "SCP-PERM-3030",
+        ),
         (
             "relay bind on a taken port",
             _config(operator, bind_addr=taken_addr),

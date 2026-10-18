@@ -830,6 +830,10 @@ pub const TRANS_5051: &str = "SCP-TRANS-5051";
 pub const TRANS_5052: &str = "SCP-TRANS-5052";
 /// `UniFFI` transport node error.
 pub const TRANS_5054: &str = "SCP-TRANS-5054";
+/// Node start: a dev-pair constructor (`node_start_in_memory`,
+/// `node_start_local`) was called on a bridge built without its `testing`
+/// feature (sdk-common.md §"Node start error codes").
+pub const TRANS_5055: &str = "SCP-TRANS-5055";
 /// Node start: the bridge could not wire the `SCP` instance's `Supervisor`
 /// to the node it started (sdk-common.md §"Node start error codes").
 pub const TRANS_5056: &str = "SCP-TRANS-5056";
@@ -1814,9 +1818,7 @@ pub const fn admission_error_code(
 ///
 /// One mapping for the `PyO3`, napi-rs and `UniFFI` bridges, following
 /// [`custody_failure_code`]; sdk-common.md §"Node start error codes" lists
-/// every row. `AutoGenerateUnavailable` has no row there, because
-/// `DevStartUnavailable` replaces it; until then it keeps [`VALID_7004`], the
-/// code the bridges already return for it.
+/// every row.
 #[cfg(feature = "server")]
 #[must_use]
 pub const fn server_error_code(e: &crate::server::ServerError) -> &'static str {
@@ -1831,9 +1833,10 @@ pub const fn server_error_code(e: &crate::server::ServerError) -> &'static str {
         E::Node(N::Tls(_)) => TRANS_5052,
         E::Node(N::Serve(_) | N::Nat(_)) => TRANS_5054,
         E::Relay(_) => TRANS_5050,
+        E::DevStartUnavailable => TRANS_5055,
         E::SupervisorWiring(_) => TRANS_5056,
         E::DhtInit(_) => IDENT_1001,
-        E::MissingPassphrase | E::AutoGenerateUnavailable => VALID_7004,
+        E::MissingPassphrase => VALID_7004,
         E::Platform(_) => CTX_2053,
     }
 }
@@ -1851,7 +1854,8 @@ pub enum ServerErrorClass {
     /// client could not be built.
     Identity,
     /// A transport error: the relay, TLS, HTTP server or NAT traversal failed,
-    /// or the bridge could not wire its `Supervisor` to a started node.
+    /// the bridge could not wire its `Supervisor` to a started node, or a
+    /// dev-pair start reached a bridge built without `testing`.
     Transport,
     /// A context error: a dev-pair `PlatformError`.
     Context,
@@ -1869,13 +1873,13 @@ pub const fn server_error_class(e: &crate::server::ServerError) -> ServerErrorCl
         | E::Node(N::MissingField(_) | N::InvalidConfig(_) | N::Storage(_))
         | E::Storage(_)
         | E::Io(_)
-        | E::MissingPassphrase
-        | E::AutoGenerateUnavailable => ServerErrorClass::Validation,
+        | E::MissingPassphrase => ServerErrorClass::Validation,
         E::OperatorIdentityUnavailable | E::Node(N::Identity(_)) | E::DhtInit(_) => {
             ServerErrorClass::Identity
         }
         E::Node(N::Relay(_) | N::Tls(_) | N::Serve(_) | N::Nat(_))
         | E::Relay(_)
+        | E::DevStartUnavailable
         | E::SupervisorWiring(_) => ServerErrorClass::Transport,
         E::Platform(_) => ServerErrorClass::Context,
     }
@@ -1887,9 +1891,8 @@ mod server_error_tests {
     use crate::server::ServerError as E;
     use scp_node::NodeError as N;
 
-    /// One error per sdk-common.md §"Node start error codes" row that exists
-    /// after SCP-321, paired with its code and class. `DevStartUnavailable` is
-    /// absent until it exists.
+    /// One error per sdk-common.md §"Node start error codes" row, paired with
+    /// its code and class.
     fn rows() -> Vec<(E, &'static str, ServerErrorClass)> {
         use crate::server::SupervisorWiringError as W;
         use ServerErrorClass::{Context, Identity, Transport, Validation};
@@ -1940,6 +1943,7 @@ mod server_error_tests {
                 TRANS_5050,
                 Transport,
             ),
+            (E::DevStartUnavailable, TRANS_5055, Transport),
             (
                 E::SupervisorWiring(W::NodeAlreadyBound),
                 TRANS_5056,
@@ -1987,10 +1991,5 @@ mod server_error_tests {
             assert_eq!(server_error_code(&err), code, "{err:?}");
             assert_eq!(server_error_class(&err), class, "{err:?}");
         }
-    }
-
-    #[test]
-    fn auto_generate_unavailable_keeps_its_bridge_code() {
-        assert_eq!(server_error_code(&E::AutoGenerateUnavailable), VALID_7004);
     }
 }
