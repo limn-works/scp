@@ -112,7 +112,7 @@ pub enum AttestationRuntimeVerifyError {
 /// [`AttestationRuntimeVerifyError::ResolutionNotFound`] when the key does
 /// not resolve, and [`AttestationRuntimeVerifyError::Verify`] for the first
 /// failing check among 3–13.
-pub fn verify_add_attestation(
+pub(crate) fn verify_add_attestation(
     key_resolver: &KeyResolver,
     clock: &dyn Clock,
     attestation: &KeyPackageAttestation,

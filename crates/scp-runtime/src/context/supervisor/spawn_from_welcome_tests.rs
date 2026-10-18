@@ -4545,9 +4545,7 @@ async fn invite_bob_expecting_rejection(
             &CommandSigner::local_ed25519(alice_signing_key()),
         )
         .await;
-    let Err(err) = result else {
-        panic!("a substituted KeyPackage must not yield a sealed invitation");
-    };
+    let err = result.expect_err("a substituted KeyPackage must not yield a sealed invitation");
     assert_eq!(
         alice_sup.member_count(&ctx_id).await,
         Some(1),
@@ -4598,12 +4596,14 @@ async fn invite_member_rejects_a_substituted_key_package_before_any_seal() {
     for (seed, (case, key_package, reason)) in (0xf1..).zip(cases) {
         let (alice_sup, deliveries) = alice_supervisor_counting_bob_deliveries(pair_resolver());
         let err = invite_bob_expecting_rejection(&alice_sup, &deliveries, seed, key_package).await;
-        match err {
-            crate::context::ContextError::InvalidKeyPackage(msg) => {
-                assert!(msg.contains(reason), "{case}: {msg}");
-            }
-            other => panic!("{case}: expected InvalidKeyPackage, got {other:?}"),
-        }
+        assert!(
+            matches!(err, crate::context::ContextError::InvalidKeyPackage(_)),
+            "{case}: expected InvalidKeyPackage, got {err:?}"
+        );
+        let crate::context::ContextError::InvalidKeyPackage(msg) = err else {
+            return;
+        };
+        assert!(msg.contains(reason), "{case}: {msg}");
     }
 }
 
@@ -4635,12 +4635,14 @@ async fn invite_member_rejects_a_key_package_signed_by_a_rotated_away_key() {
         AttestationResolutionVerifyError::Delegated(AttestationVerifyError::SignatureInvalid),
     )
     .to_string();
-    match err {
-        crate::context::ContextError::InvalidKeyPackage(msg) => {
-            assert!(msg.ends_with(&expected), "{msg}");
-        }
-        other => panic!("expected InvalidKeyPackage, got {other:?}"),
-    }
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidKeyPackage(_)),
+        "expected InvalidKeyPackage, got {err:?}"
+    );
+    let crate::context::ContextError::InvalidKeyPackage(msg) = err else {
+        return;
+    };
+    assert!(msg.ends_with(&expected), "{msg}");
 }
 
 /// F1: a `KeyPackage` whose signer's `#active` key does not resolve is refused,
@@ -4659,12 +4661,14 @@ async fn invite_member_rejects_a_key_package_whose_key_does_not_resolve() {
     let (alice_sup, deliveries) = alice_supervisor_counting_bob_deliveries(resolver);
     let err = invite_bob_expecting_rejection(&alice_sup, &deliveries, 0xf5, bob_kp).await;
     let expected = AttestationRuntimeVerifyError::ResolutionNotFound.to_string();
-    match err {
-        crate::context::ContextError::InvalidKeyPackage(msg) => {
-            assert!(msg.ends_with(&expected), "{msg}");
-        }
-        other => panic!("expected InvalidKeyPackage, got {other:?}"),
-    }
+    assert!(
+        matches!(err, crate::context::ContextError::InvalidKeyPackage(_)),
+        "expected InvalidKeyPackage, got {err:?}"
+    );
+    let crate::context::ContextError::InvalidKeyPackage(msg) = err else {
+        return;
+    };
+    assert!(msg.ends_with(&expected), "{msg}");
 }
 
 // ---------------------------------------------------------------------------
@@ -4745,17 +4749,21 @@ async fn reservation_is_live(
             .await
             .expect("the owner's KeyPackage store"),
     };
-    match store
+    let lookup = store
         .send(|reply| KeyPackageCommand::ReservedWrappingKey {
             reservation_id: reservation_id.clone(),
             reply,
         })
-        .await
-    {
-        Ok(_) => true,
-        Err(crate::context::ContextError::InvalidState(_)) => false,
-        Err(e) => panic!("unexpected reservation lookup error: {e:?}"),
-    }
+        .await;
+    assert!(
+        matches!(
+            lookup,
+            Ok(_) | Err(crate::context::ContextError::InvalidState(_))
+        ),
+        "unexpected reservation lookup error: {:?}",
+        lookup.as_ref().err()
+    );
+    lookup.is_ok()
 }
 
 /// Asserts a failed join consumed nothing and stood nothing up: the

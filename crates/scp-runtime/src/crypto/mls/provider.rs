@@ -578,7 +578,7 @@ impl NodeMlsFactory {
     /// joiner (because the group carries `0xFF02`, `OpenMLS` (`valn0502`) rejects
     /// any Add whose leaf does not declare `0xFF02` support — pooled key packages
     /// MUST be generated via the context-params path, see
-    /// [`MlsBackend::generate_key_package`]) —
+    /// [`mint_attested_key_package`](super::attestation_signer::mint_attested_key_package)) —
     /// mints the local sender key via [`generate_sender_key`], and assembles the
     /// [`OwnedMlsCryptoState`] payload DIRECTLY. It touches NO shared provider
     /// map (there is none): `builder::create_context` hands the returned payload
