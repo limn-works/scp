@@ -910,19 +910,44 @@ fn sleeping_handler(millis: u64) -> EvaluatorHandler {
     })
 }
 
-/// 13b: the budget is total per attempt: two 500 ms evaluators under a
-/// 750 ms budget, so the first passes with 250 ms to spare and the second
-/// would end 250 ms past the budget.
+/// 13b: the budget is total per attempt, not per case: under a 5 s budget,
+/// case 18's evaluator takes 1.5 s and case 19's takes 4 s. Either fits
+/// the budget alone; together they exceed it.
+///
+/// Case 19's overrun is ordered, not timed: it starts after case 18's
+/// handler returned, so at least 1.5 s after the deadline was set, and a
+/// sleep never ends early, so it returns at least 5.5 s after the deadline
+/// was set, past the 5 s budget. The one wall-clock margin is case 18's
+/// 3.5 s of slack before the deadline. Under a budget that restarted for
+/// each case, case 19 would finish with 1 s to spare and pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grading_budget_is_total_per_attempt() {
+    const BUDGET: Duration = Duration::from_secs(5);
+    const CASE_18: Duration = Duration::from_millis(1500);
+    const CASE_19: Duration = Duration::from_secs(4);
+    const _: () = assert!(
+        CASE_18.as_millis() < BUDGET.as_millis()
+            && CASE_19.as_millis() < BUDGET.as_millis()
+            && CASE_18.as_millis() + CASE_19.as_millis() > BUDGET.as_millis()
+    );
     let h = Harness::new(evaluator_params()).await;
-    let invoker = h.invoker(Some(registry()), Some(sleeping_handler(500)));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler: EvaluatorHandler = {
+        let calls = Arc::clone(&calls);
+        Arc::new(move |_input| {
+            let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+            std::thread::sleep(if first { CASE_18 } else { CASE_19 });
+            Ok(verdict(true))
+        })
+    };
+    let invoker = h.invoker(Some(registry()), Some(handler));
     let request = h.create(2, &invoker).await;
     let response = h.respond(&request, 1).await;
     let graded = h
-        .grade_within(&request, &response, &invoker, Duration::from_millis(750))
+        .grade_within(&request, &response, &invoker, BUDGET)
         .await
         .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "case 19 never started");
     assert!(graded.reasons[18].passed, "{:?}", graded.reasons[18]);
     assert_eq!(
         graded.reasons[19].reason.as_deref(),
