@@ -1966,7 +1966,7 @@ entry_count:   4
   entry 2:  id "#private-state-1", type "IdentityPrivateState", serviceEndpoint "wss://relay.example.com/scp/v1"
   entry 3:  id "#scp-relay-3", type "SCPRelay", serviceEndpoint "wss://bridge.example.com/scp/v1"
             bridgeTarget (SHA-256("scp:did:" || identifier)):
-              e28f5c2c9807461518840283432a1af1701e1f2e8e83c3e8024fb6187e318ba9
+              f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb
 
 entries field (366 bytes) = BE32(4) || each entry's id, type, serviceEndpoint
 under §9.5.1's variable-length rule, in that order and with no discriminator,
@@ -1981,8 +1981,8 @@ then, for an SCPRelay entry only, its 32-byte bridgeTarget with no prefix:
   795072697661746553746174650000001e7773733a2f2f72656c61792e657861
   6d706c652e636f6d2f7363702f76310000000c237363702d72656c61792d3300
   00000853435052656c61790000001f7773733a2f2f6272696467652e6578616d
-  706c652e636f6d2f7363702f7631e28f5c2c9807461518840283432a1af1701e
-  1f2e8e83c3e8024fb6187e318ba9
+  706c652e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c16
+  f7329441b8fca65b32c78d86a4eb
 
 Address, SHA-256("scp:svc:" || identifier):
   415152a878481430157966302b508188f6715a49e2bc7072bad1c4a54af24f17
@@ -2000,13 +2000,13 @@ Preimage (428 bytes = 22-byte separator + 406 field bytes):
   72697661746553746174650000001e7773733a2f2f72656c61792e6578616d70
   6c652e636f6d2f7363702f76310000000c237363702d72656c61792d33000000
   0853435052656c61790000001f7773733a2f2f6272696467652e6578616d706c
-  652e636f6d2f7363702f7631e28f5c2c9807461518840283432a1af1701e1f2e
-  8e83c3e8024fb6187e318ba9
+  652e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c16f732
+  9441b8fca65b32c78d86a4eb
 Canonical hash:
-  9a5010feedaf272bfad571746c9b9029bf80863d7a549607f7095a19c593d08b
+  7d2418b56ff295d9ad807cee3072b7f6b4b38a09cef791650883ddbae839e1bc
 Signature, secondary key (470 bytes on the wire):
-  f685cee3b5d36776ec6790328d3a89c84c70477821de29f8151eaa480bab5305
-  6c614efa573fcf4a62b940d032049f74aa9f63b6dcfc42389aa46aa99b8d4f1d
+  2519ffbf63684afcc47014980bbd1857f5fde243ae14372b9ab9a85553152013
+  634453243ca98502746eb267912de43478724f09c4469ff66737c37bc445d5d8
 ```
 
 ## 25.29 Reveal-Authorized Event, Ranking and Identifier Text-Form Vectors (§9.7.4.2 definitions, R3, R6, `03-identity.md` §3.1)

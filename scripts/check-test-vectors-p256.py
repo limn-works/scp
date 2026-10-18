@@ -20,6 +20,15 @@ enforces two inclusions:
    tests (`RUST_VECTOR_TESTS`) appears in the generator's output, so a Rust test
    cannot assert a byte string the generator no longer produces.
 
+4. Vector 48's bridge entry signs the identity routing ID of
+   `10-infrastructure-and-self-hosting.md` §10.12.4.1 over Vector 41's
+   identifier: this check recomputes `SHA-256("scp:did:" || identifier)` from
+   the `vector_41.identifier` the generator emits and compares it with every
+   `vector_48.entry_N.bridgeTarget` that is not the absent value
+   `SHA-256(0x00)`. Inclusions 1 and 2 compare the generator with the spec and
+   so pass a value the generator itself computed wrongly, as it did when it
+   hashed the identifier before Vector 41 had set it.
+
 The check fails when either inclusion finds no candidate at all, so an empty
 generator run or a renamed test file cannot pass it.
 
@@ -31,6 +40,7 @@ Usage, from the repository root:
 
 from __future__ import annotations
 
+import hashlib
 import pathlib
 import re
 import subprocess
@@ -53,6 +63,9 @@ SPEC_HEADING_RE = re.compile(r"^#{2,} ")
 # Vector headings whose bytes spec 25 says no script generates.
 NOT_GENERATED = ("### Vector 58:",)
 WHITESPACE_RE = re.compile(r"\s")
+EMITTED_HEX_RE = re.compile(r"^(vector_(?:41|48)\.[\w.]+) = 0x([0-9a-fA-F]+)$", re.MULTILINE)
+BRIDGE_TARGET_RE = re.compile(r"^vector_48\.entry_\d+\.bridgeTarget$")
+ABSENT_BRIDGE_TARGET = hashlib.sha256(b"\x00").hexdigest()
 
 
 def run_generator() -> str:
@@ -147,6 +160,31 @@ def problems(generated: str, spec: str, rust_tests: dict[str, str]) -> list[str]
     return found
 
 
+def bridge_target_problems(generated: str) -> list[str]:
+    """Recomputes Vector 48's present bridgeTarget from Vector 41's identifier."""
+    emitted = {name: value.lower() for name, value in EMITTED_HEX_RE.findall(generated)}
+    identifier = emitted.get("vector_41.identifier")
+    if identifier is None or len(identifier) != 64:
+        return ["the generator emitted no 32-byte vector_41.identifier"]
+    found = []
+    if emitted.get("vector_48.identifier") != identifier:
+        found.append("vector_48.identifier differs from vector_41.identifier")
+    want = hashlib.sha256(b"scp:did:" + bytes.fromhex(identifier)).hexdigest()
+    present = [
+        (name, value)
+        for name, value in emitted.items()
+        if BRIDGE_TARGET_RE.match(name) and value != ABSENT_BRIDGE_TARGET
+    ]
+    if not present:
+        found.append("vector_48 emits no entry with a present bridgeTarget")
+    found.extend(
+        f"{name} = 0x{value}, but SHA-256(\"scp:did:\" || vector_41.identifier) = 0x{want}"
+        for name, value in present
+        if value != want
+    )
+    return found
+
+
 def load_rust_tests() -> dict[str, str]:
     return {
         str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
@@ -171,11 +209,25 @@ def plant_in_spec_line(spec: str, number: int, from_end: bool) -> str:
     return "\n".join(lines)
 
 
+def plant_import_time_bridge_target(generated: str) -> str:
+    """Replaces each present Vector 48 bridgeTarget with SHA-256("scp:did:"),
+    the value the generator emitted while it hashed INCEPTION_IDENTIFIER at
+    import, before Vector 41 set it."""
+    wrong = hashlib.sha256(b"scp:did:").hexdigest()
+    lines = []
+    for line in generated.splitlines():
+        name, sep, value = line.partition(" = 0x")
+        if sep and BRIDGE_TARGET_RE.match(name) and value.lower() != ABSENT_BRIDGE_TARGET:
+            line = f"{name} = 0x{wrong}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def self_test(generated: str) -> int:
     """Plants one changed digit per case and requires a report that names the plant."""
     spec = SPEC.read_text(encoding="utf-8")
     rust_tests = load_rust_tests()
-    if problems(generated, spec, rust_tests):
+    if problems(generated, spec, rust_tests) or bridge_target_problems(generated):
         print("self-test: the unmodified tree must pass first", file=sys.stderr)
         return 1
     runs = spec_hex_runs(spec)
@@ -207,6 +259,10 @@ def self_test(generated: str) -> int:
             problems("", spec, rust_tests),
             "no hex value under a §25 section",
         ),
+        "a Vector 48 bridgeTarget hashed over an empty identifier": (
+            bridge_target_problems(plant_import_time_bridge_target(generated)),
+            "vector_48.entry_",
+        ),
     }
     missed = [
         name
@@ -228,6 +284,7 @@ def main(argv: list[str]) -> int:
         print(__doc__, file=sys.stderr)
         return 2
     found = problems(generated, SPEC.read_text(encoding="utf-8"), load_rust_tests())
+    found += bridge_target_problems(generated)
     for line in found:
         print(line, file=sys.stderr)
     if found:
