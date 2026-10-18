@@ -41,22 +41,28 @@ pub fn approved_proposal(
 /// The `bridgeTarget` the fixture's accepted bridge entry carries.
 pub const FIXTURE_BRIDGE_TARGET: [u8; 32] = [0x42; 32];
 
-/// The `serviceEndpoint`s of the entries
-/// [`scp_did::DidDocument::accepted_services`] keeps from
-/// [`document_with_rejected_services`], in record order.
+/// The `serviceEndpoint`s of the entries [`document_with_rejected_services`]
+/// keeps, in record order.
 pub const FIXTURE_ACCEPTED_ENDPOINTS: [&str; 2] = [
     "wss://bridge.example.com/scp/v1",
     "wss://relay.example.com/scp/v1",
 ];
 
-/// A DID document mixing entries §18.2.1 accepts and rejects.
+/// A DID document deserialized from a record mixing entries §18.2.1 accepts
+/// and rejects.
 ///
-/// It accepts a tier 3 bridge `SCPRelay` entry carrying
-/// [`FIXTURE_BRIDGE_TARGET`] and a plain `SCPRelay` entry. It rejects an
-/// `SCPRelay` entry whose URL carries a query and a non-relay entry that
-/// carries `bridgeTarget` (`18-addressability-and-deployment.md` §18.2.1).
-/// Bridge projections must show only the two accepted entries.
+/// The record holds a tier 3 bridge `SCPRelay` entry carrying
+/// [`FIXTURE_BRIDGE_TARGET`], an `SCPRelay` entry whose URL carries a query,
+/// a non-relay entry that carries `bridgeTarget`, and a plain `SCPRelay`
+/// entry (`18-addressability-and-deployment.md` §18.2.1). Deserializing
+/// drops the two rejected entries, so bridge projections must show only the
+/// two accepted ones.
+///
+/// # Panics
+///
+/// Panics if the record does not serialize or deserialize.
 #[must_use]
+#[allow(clippy::expect_used)] // test fixture over a fixed record
 pub fn document_with_rejected_services() -> scp_did::DidDocument {
     let did = "did:dht:zFixtureRejectedServices";
     let entry = |n: &str, ty: &str, endpoint: &str, bridge_target| scp_did::Service {
@@ -65,7 +71,7 @@ pub fn document_with_rejected_services() -> scp_did::DidDocument {
         service_endpoint: endpoint.to_owned(),
         bridge_target,
     };
-    scp_did::DidDocument {
+    let record = scp_did::DidDocument {
         context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
         id: did.to_owned(),
         verification_method: Vec::new(),
@@ -98,5 +104,8 @@ pub fn document_with_rejected_services() -> scp_did::DidDocument {
                 None,
             ),
         ],
-    }
+    };
+    assert_eq!(record.service.len(), 4);
+    let json = record.to_json().expect("the record serializes");
+    scp_did::DidDocument::from_json(&json).expect("the record deserializes")
 }

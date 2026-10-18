@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use scp_did::{DID, RelayUrlError, canonical_relay_url};
+use scp_did::{DID, RelayEndpoint, RelayUrlError, canonical_relay_url};
 
 use crate::crypto::canonical::{CanonicalError, CanonicalField, canonical_hash_bytes};
 use crate::serde_util::{serde_bounded_bytes, serde_signature_64};
@@ -380,11 +380,23 @@ pub fn push_deregistration_signing_bytes(
 /// Returns [`PushMessageError::InvalidRelayUrl`] when `relay_url` has no
 /// canonical form.
 pub fn push_registration_routing_id(relay_url: &str) -> Result<[u8; 32], PushMessageError> {
-    let url = canonical_relay_url(relay_url)?;
+    Ok(routing_id_of_canonical(&canonical_relay_url(relay_url)?))
+}
+
+/// [`push_registration_routing_id`] for a [`RelayEndpoint`], which already
+/// holds the §9.18.2 canonical form, so the derivation cannot fail.
+#[must_use]
+pub fn relay_endpoint_push_routing_id(endpoint: &RelayEndpoint) -> [u8; 32] {
+    routing_id_of_canonical(endpoint.as_str())
+}
+
+/// `SHA-256("scp-push-registration" || canonical)` over a URL already in its
+/// §9.18.2 canonical form.
+fn routing_id_of_canonical(canonical: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(PUSH_ROUTING_PREFIX.as_bytes());
-    hasher.update(url.as_bytes());
-    Ok(hasher.finalize().into())
+    hasher.update(canonical.as_bytes());
+    hasher.finalize().into()
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +756,15 @@ mod tests {
             Err(PushMessageError::InvalidRelayUrl(
                 RelayUrlError::UnsupportedScheme
             ))
+        );
+    }
+
+    #[test]
+    fn relay_endpoint_push_routing_id_matches_the_string_derivation() {
+        let endpoint = RelayEndpoint::new("WSS://Relay.Example:443/scp/v1/").unwrap();
+        assert_eq!(
+            relay_endpoint_push_routing_id(&endpoint),
+            push_registration_routing_id("wss://relay.example/scp/v1").unwrap()
         );
     }
 

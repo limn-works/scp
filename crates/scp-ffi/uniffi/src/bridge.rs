@@ -2253,9 +2253,9 @@ pub struct DIDDocument {
 }
 
 impl From<&CoreDidDocument> for DIDDocument {
-    /// The one projection of a resolved document. `service_endpoints` lists
-    /// only the entries a reader accepts ([`CoreDidDocument::accepted_services`],
-    /// §18.2.1), so Swift and Kotlin never see an entry the resolver rejects.
+    /// The one projection of a resolved document. A deserialized document
+    /// holds no entry §18.2.1 rejects, so Swift and Kotlin never see one in
+    /// `service_endpoints`.
     fn from(document: &CoreDidDocument) -> Self {
         Self {
             id: document.id.clone(),
@@ -2263,7 +2263,8 @@ impl From<&CoreDidDocument> for DIDDocument {
             assertion_methods: document.assertion_method.clone(),
             also_known_as: document.also_known_as.clone(),
             service_endpoints: document
-                .accepted_services()
+                .service
+                .iter()
                 .map(|s| s.service_endpoint.clone())
                 .collect(),
         }

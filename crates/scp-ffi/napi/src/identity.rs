@@ -1341,9 +1341,9 @@ pub struct NapiDIDDocument {
 }
 
 impl From<&DidDocument> for NapiDIDDocument {
-    /// The one projection of a resolved document. `service_endpoints` lists
-    /// only the entries a reader accepts ([`DidDocument::accepted_services`],
-    /// §18.2.1), so JS never sees an entry the resolver rejects.
+    /// The one projection of a resolved document. A deserialized document
+    /// holds no entry §18.2.1 rejects, so JS never sees one in
+    /// `service_endpoints`.
     fn from(document: &DidDocument) -> Self {
         Self {
             id: document.id.clone(),
@@ -1361,7 +1361,8 @@ impl From<&DidDocument> for NapiDIDDocument {
             assertion_methods: document.assertion_method.clone(),
             also_known_as: document.also_known_as.clone(),
             service_endpoints: document
-                .accepted_services()
+                .service
+                .iter()
                 .map(|s| s.service_endpoint.clone())
                 .collect(),
             has_agent_key: document.has_agent_key(),

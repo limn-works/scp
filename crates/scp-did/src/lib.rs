@@ -18,13 +18,16 @@
 
 pub mod attestation;
 pub mod document;
-pub mod relay_url;
+mod relay_url;
 
 pub use document::{
-    ABSENT_BRIDGE_TARGET, DidDocument, DidError, DidRotationEvent, MigrationProof,
-    PreRotationProof, RelayService, Service, VerificationMethod, decode_multibase_key,
+    ABSENT_BRIDGE_TARGET, BridgeTarget, DidDocument, DidError, DidRotationEvent, MigrationProof,
+    PreRotationProof, RelayService, SCP_RELAY_SERVICE_TYPE, Service, VerificationMethod,
+    decode_multibase_key,
 };
-pub use relay_url::{RelayUrlError, canonical_relay_url};
+pub use relay_url::{
+    BridgeEndpoint, RelayEndpoint, RelayEntryUrlError, RelayUrlError, canonical_relay_url,
+};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

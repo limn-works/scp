@@ -91,6 +91,19 @@ impl RelayUrl {
     }
 }
 
+impl From<&scp_did::RelayService> for RelayUrl {
+    /// The relay URL of an `SCPRelay` entry, which holds its §9.18.2
+    /// canonical form by construction, so the conversion cannot fail.
+    fn from(relay: &scp_did::RelayService) -> Self {
+        Self {
+            canonical: relay.url().to_owned(),
+            push_routing_id: scp_protocol::discovery::push::relay_endpoint_push_routing_id(
+                relay.endpoint(),
+            ),
+        }
+    }
+}
+
 /// Whether a relay offers push (§10.7.1).
 ///
 /// The default is [`PushRole::Disabled`], the fail-safe value in the same way
@@ -529,6 +542,17 @@ pub(crate) fn test_relay_url() -> LiveRelayUrl {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_url_from_relay_service_matches_relay_url_new() {
+        let service = scp_did::RelayService::direct(
+            scp_did::RelayEndpoint::new("WSS://Relay.Example:443/scp/v1").unwrap(),
+        );
+        assert_eq!(
+            RelayUrl::from(&service),
+            RelayUrl::new("wss://relay.example/scp/v1").unwrap()
+        );
+    }
 
     #[test]
     fn relay_url_canonicalizes_and_derives_the_reserved_routing_id() {

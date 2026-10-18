@@ -1,10 +1,15 @@
-//! The canonical relay URL of `09-security-model.md` §9.18.2.
+//! The canonical relay URL of `09-security-model.md` §9.18.2, and the relay
+//! URLs an `SCPRelay` entry may carry.
 //!
 //! [`canonical_relay_url`] computes the eight steps of the **Canonical relay
 //! URL** paragraph. Push preimages (§9.5.2) and the reserved push routing ID
 //! (§10.7.1) end in this form, and `18-addressability-and-deployment.md`
 //! §18.2.1 requires every `SCPRelay` entry's `serviceEndpoint` to have it, so
 //! the function lives beside the DID document that carries those entries.
+//! [`RelayEndpoint`] and [`BridgeEndpoint`] hold a URL that passed §18.2.1's
+//! URL rules, so a relay entry built from one cannot fail them.
+
+use crate::document::DidError;
 
 /// Why a relay URL has no §9.18.2 canonical form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -34,6 +39,145 @@ pub enum RelayUrlError {
     /// so canonicalizing the result again would change it.
     #[error("relay URL path ends with an empty segment")]
     TrailingEmptySegment,
+}
+
+/// Why `18-addressability-and-deployment.md` §18.2.1 rejects a relay entry's
+/// URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RelayEntryUrlError {
+    /// The URL has no §9.18.2 canonical form.
+    #[error(transparent)]
+    Canonical(#[from] RelayUrlError),
+    /// The canonical path does not end in `/scp/v1` (§18.2.1, ADR-004).
+    #[error("relay URL canonical path does not end in {SCP_RELAY_PATH}")]
+    PathNotScpV1,
+    /// A tier 3 bridge relay URL uses `ws`, but a bridge relay is reached
+    /// over TLS (`10-infrastructure-and-self-hosting.md` §10.12.7).
+    #[error("bridge relay URL scheme must be wss")]
+    PlaintextBridge,
+}
+
+/// The path every `SCPRelay` URL's canonical form ends in (§18.2.1, ADR-004).
+pub const SCP_RELAY_PATH: &str = "/scp/v1";
+
+/// A relay URL an `SCPRelay` entry may carry: it has a §9.18.2 canonical form,
+/// and that form's path ends in `/scp/v1` (§18.2.1).
+///
+/// [`RelayEndpoint::new`] is the only constructor, and the value holds the
+/// canonical form, so every spelling of one relay yields one endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RelayEndpoint {
+    canonical: String,
+}
+
+impl RelayEndpoint {
+    /// Canonicalizes `url` and checks its path.
+    ///
+    /// # Errors
+    ///
+    /// [`DidError::InvalidRelayUrl`] with reason
+    /// [`RelayEntryUrlError::Canonical`] when `url` has no §9.18.2 canonical
+    /// form (a scheme other than `ws` or `wss`, a query, a fragment, or user
+    /// information among the causes), or [`RelayEntryUrlError::PathNotScpV1`]
+    /// when the canonical path does not end in `/scp/v1`.
+    pub fn new(url: &str) -> Result<Self, DidError> {
+        let canonical = canonical_relay_url(url).map_err(|e| invalid_relay_url(url, e.into()))?;
+        // The canonical form is `scheme://authority[path]`; the path starts at
+        // the first `/` after the authority, so a host spelled `scp` never
+        // passes as the path.
+        let after_scheme = canonical.split_once("://").map_or("", |(_, rest)| rest);
+        let path = after_scheme.find('/').map_or("", |i| &after_scheme[i..]);
+        if !path.ends_with(SCP_RELAY_PATH) {
+            return Err(invalid_relay_url(url, RelayEntryUrlError::PathNotScpV1));
+        }
+        Ok(Self { canonical })
+    }
+
+    /// The §9.18.2 canonical URL.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.canonical
+    }
+
+    /// Whether the scheme is `wss`. The canonical form lowercases the scheme.
+    fn is_tls(&self) -> bool {
+        self.canonical.starts_with("wss://")
+    }
+}
+
+/// A tier 3 bridge relay's URL: a [`RelayEndpoint`] whose scheme is `wss`
+/// (`10-infrastructure-and-self-hosting.md` §10.12.7).
+///
+/// [`BridgeEndpoint::new`] is the only public constructor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BridgeEndpoint(RelayEndpoint);
+
+impl BridgeEndpoint {
+    /// Validates `url` as a [`RelayEndpoint`] and requires `wss`.
+    ///
+    /// # Errors
+    ///
+    /// Every error of [`RelayEndpoint::new`], and
+    /// [`DidError::InvalidRelayUrl`] with reason
+    /// [`RelayEntryUrlError::PlaintextBridge`] when the scheme is `ws`.
+    pub fn new(url: &str) -> Result<Self, DidError> {
+        Self::from_endpoint(RelayEndpoint::new(url)?)
+    }
+
+    /// Requires `endpoint`'s scheme to be `wss`.
+    pub(crate) fn from_endpoint(endpoint: RelayEndpoint) -> Result<Self, DidError> {
+        if endpoint.is_tls() {
+            Ok(Self(endpoint))
+        } else {
+            Err(invalid_relay_url(
+                endpoint.as_str(),
+                RelayEntryUrlError::PlaintextBridge,
+            ))
+        }
+    }
+
+    /// The bridge relay's endpoint.
+    #[must_use]
+    pub const fn endpoint(&self) -> &RelayEndpoint {
+        &self.0
+    }
+
+    /// Consumes the value and returns the bridge relay's endpoint.
+    #[must_use]
+    pub fn into_endpoint(self) -> RelayEndpoint {
+        self.0
+    }
+
+    /// The §9.18.2 canonical URL.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// [`DidError::InvalidRelayUrl`] for `url`, with any user information removed
+/// so the error never repeats a credential.
+fn invalid_relay_url(url: &str, reason: RelayEntryUrlError) -> DidError {
+    DidError::InvalidRelayUrl {
+        url: without_userinfo(url),
+        reason,
+    }
+}
+
+/// `url` with any `user@` part of its authority removed.
+fn without_userinfo(url: &str) -> String {
+    let (scheme, rest) = url
+        .split_once("://")
+        .map_or((None, url), |(scheme, rest)| (Some(scheme), rest));
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    scheme.map_or_else(
+        || format!("{host}{tail}"),
+        |scheme| format!("{scheme}://{host}{tail}"),
+    )
 }
 
 /// Returns the canonical form of a relay's WebSocket URL, computed by the

@@ -58,7 +58,7 @@ fn relay_request(
 /// scenario -- avoids real NAT probing).
 async fn build_no_domain_node() -> scp_node::ApplicationNode<InMemoryStorage> {
     let tier = ReachabilityTier::Bridge {
-        bridge_url: "wss://bridge.test.scp/scp/v1".to_owned(),
+        bridge_url: scp_did::BridgeEndpoint::new("wss://bridge.test.scp/scp/v1").unwrap(),
     };
     Node::start_for_testing(helpers::test_no_domain_node_config(tier))
         .await

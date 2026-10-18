@@ -5553,7 +5553,7 @@ mod tests {
     /// Plain relay entries for `urls`, each without a `bridgeTarget`.
     fn relays(urls: &[&str]) -> Vec<RelayService> {
         urls.iter()
-            .map(|url| RelayService::new(url, None).unwrap())
+            .map(|url| RelayService::direct(scp_did::RelayEndpoint::new(url).unwrap()))
             .collect()
     }
 
@@ -5571,8 +5571,13 @@ mod tests {
             dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         let published = vec![
-            RelayService::new("wss://plain.example.com/scp/v1", None).unwrap(),
-            RelayService::new("wss://bridge.example.com/scp/v1", Some([0x42; 32])).unwrap(),
+            RelayService::direct(
+                scp_did::RelayEndpoint::new("wss://plain.example.com/scp/v1").unwrap(),
+            ),
+            RelayService::bridge(
+                scp_did::BridgeEndpoint::new("wss://bridge.example.com/scp/v1").unwrap(),
+                scp_did::BridgeTarget::new([0x42; 32]).unwrap(),
+            ),
         ];
         dht.publish_with_relay_services(&identity, &document, &published)
             .await
@@ -5596,8 +5601,10 @@ mod tests {
         let (identity, mut document, _pre_rotation_handle) =
             dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
-        let plain = RelayService::new("wss://plain.example.com/scp/v1", None).unwrap();
-        document.add_relay_service(plain.clone());
+        let plain = RelayService::direct(
+            scp_did::RelayEndpoint::new("wss://plain.example.com/scp/v1").unwrap(),
+        );
+        document.add_relay_service(&plain);
         document.service.push(scp_did::Service {
             id: format!("{}#scp-relay-2", identity.did),
             service_type: "SCPRelay".to_owned(),
@@ -5611,7 +5618,8 @@ mod tests {
 
         dht.cache().remove(&identity.did).await;
         let resolved = dht.resolve_did(&identity.did).await.unwrap();
-        assert_eq!(resolved.document.service.len(), document.service.len());
+        // The resolver drops the query-bearing entry and keeps the others.
+        assert_eq!(resolved.document.service.len(), document.service.len() - 1);
         assert_eq!(resolved.document.relay_services(), [plain]);
     }
 

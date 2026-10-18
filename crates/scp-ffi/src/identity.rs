@@ -722,16 +722,16 @@ impl PyDIDDocument {
         Ok(list)
     }
 
-    /// Returns the service entries a reader accepts as a list of Python dicts.
+    /// Returns the document's service entries as a list of Python dicts.
     ///
     /// Each dict contains `id`, `type`, `service_endpoint`, and
     /// `bridge_target`: the tier 3 routing ID as 64 lowercase hex characters,
-    /// or `None` (§18.2.1). An entry §18.2.1 rejects is left out, as the
-    /// resolver leaves it out ([`DidDocument::accepted_services`]).
+    /// or `None` (§18.2.1). A deserialized document holds no entry §18.2.1
+    /// rejects, so none appears here.
     #[getter]
     fn services<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for svc in self.inner.accepted_services() {
+        for svc in &self.inner.service {
             let dict = PyDict::new(py);
             dict.set_item("id", &svc.id)?;
             dict.set_item("type", &svc.service_type)?;
@@ -2366,7 +2366,8 @@ impl crate::scp::PyScp {
         // by `set_device_attestation_token`, so return it directly —
         // no double-encoding.
         let token_b64 = new_document
-            .accepted_services()
+            .service
+            .iter()
             .find(|s| s.service_type == "ScpDeviceAttestation")
             .map(|s| s.service_endpoint.clone())
             .ok_or_else(|| {

@@ -102,7 +102,8 @@ fn extract_capabilities(
     clock: &dyn Clock,
 ) -> Result<CapabilityEntry, DiscoveryError> {
     let capability_services: Vec<_> = document
-        .accepted_services()
+        .service
+        .iter()
         .filter(|s| s.service_type == SCP_CAPABILITIES_SERVICE_TYPE)
         .collect();
 
@@ -382,6 +383,65 @@ mod tests {
             ]
         );
         assert_eq!(entry.service_endpoints.len(), 2);
+    }
+
+    /// §18.2.1: an `SCPCapabilities` or `ScpParticipationStatements` entry
+    /// carrying `bridgeTarget` is rejected, and the resolved document drops
+    /// it, so neither reader sees it while the other entries remain.
+    #[test]
+    fn did_capabilities_and_participation_ignore_a_bridge_target_entry() {
+        use crate::trust::participation_service::{
+            add_participation_service, extract_participation_service_endpoint,
+        };
+        use scp_protocol::trust::participation::PARTICIPATION_STATEMENTS_SERVICE_TYPE;
+
+        let did = "did:dht:zTestDid";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        doc.service.push(scp_did::Service {
+            id: format!("{did}#scp-capabilities"),
+            service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
+            service_endpoint: "scp:capabilities:scp:capability:schema-validation/v1".to_owned(),
+            bridge_target: None,
+        });
+        add_participation_service(&mut doc, "https://relay.example.com/v1/scp/participation/x");
+
+        // Control: without bridgeTarget both readers see their entry.
+        let clean = DidDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        assert!(extract_capabilities(did, &clean, &scp_clock::SystemClock).is_ok());
+        assert!(extract_participation_service_endpoint(&clean).is_some());
+
+        for service_type in [
+            SCP_CAPABILITIES_SERVICE_TYPE,
+            PARTICIPATION_STATEMENTS_SERVICE_TYPE,
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&doc.to_json().unwrap()).unwrap();
+            for entry in value["service"].as_array_mut().unwrap() {
+                if entry["type"] == service_type {
+                    entry["bridgeTarget"] = serde_json::Value::String("ab".repeat(32));
+                }
+            }
+            let parsed = DidDocument::from_json(&value.to_string()).unwrap();
+            assert_eq!(
+                parsed.service.len(),
+                clean.service.len() - 1,
+                "{service_type}"
+            );
+            assert!(parsed.pre_rotation_service().is_some(), "{service_type}");
+
+            let caps = extract_capabilities(did, &parsed, &scp_clock::SystemClock);
+            let participation = extract_participation_service_endpoint(&parsed);
+            if service_type == SCP_CAPABILITIES_SERVICE_TYPE {
+                assert!(
+                    matches!(caps, Err(DiscoveryError::NoCapabilitiesService(_))),
+                    "{caps:?}"
+                );
+                assert!(participation.is_some());
+            } else {
+                assert!(caps.is_ok());
+                assert_eq!(participation, None);
+            }
+        }
     }
 
     // -----------------------------------------------------------------

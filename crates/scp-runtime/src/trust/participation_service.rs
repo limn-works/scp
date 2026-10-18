@@ -55,7 +55,8 @@ pub fn remove_participation_service(document: &mut DidDocument) {
 #[must_use]
 pub fn extract_participation_service_endpoint(document: &DidDocument) -> Option<&str> {
     document
-        .accepted_services()
+        .service
+        .iter()
         .find(|s| s.service_type == PARTICIPATION_STATEMENTS_SERVICE_TYPE)
         .map(|s| s.service_endpoint.as_str())
 }

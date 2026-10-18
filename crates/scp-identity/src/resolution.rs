@@ -409,8 +409,10 @@ mod tests {
         let did = format!("did:dht:z{}", zbase32::encode(&public_key));
 
         let mut doc = scp_did::DidDocument::new(&did, &public_key, &[2u8; 32], &[3u8; 32]);
-        let plain = scp_did::RelayService::new("wss://plain.example.com/scp/v1", None).unwrap();
-        doc.add_relay_service(plain.clone());
+        let plain = scp_did::RelayService::direct(
+            scp_did::RelayEndpoint::new("wss://plain.example.com/scp/v1").unwrap(),
+        );
+        doc.add_relay_service(&plain);
         doc.service.push(scp_did::Service {
             id: format!("{did}#scp-relay-2"),
             service_type: "SCPRelay".to_owned(),
@@ -430,7 +432,8 @@ mod tests {
         let resolved =
             super::verify_relay_record(&did, &public_key, &value, &signature.to_bytes(), seq)
                 .expect("the record resolves");
-        assert_eq!(resolved.service.len(), doc.service.len());
+        // The resolver drops the query-bearing entry and keeps the others.
+        assert_eq!(resolved.service.len(), doc.service.len() - 1);
         assert_eq!(resolved.relay_services(), [plain]);
     }
 

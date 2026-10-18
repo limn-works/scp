@@ -1125,10 +1125,7 @@ mod tests {
             .await
             .expect("test identity is created");
         let relay_url = "ws://198.51.100.7:32891/scp/v1".to_owned();
-        crate::push_relay_service(
-            &mut document,
-            &crate::published_state::test_relay(&relay_url),
-        );
+        document.insert_preferred_relay(&crate::published_state::test_relay(&relay_url));
         (did_method, identity, document, relay_url)
     }
 

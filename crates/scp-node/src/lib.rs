@@ -486,17 +486,6 @@ impl<S: Storage> ApplicationNode<S> {
         self.state.live_state.get().relay.url().to_owned()
     }
 
-    /// Returns the `SCPRelay` entry the node currently advertises.
-    ///
-    /// Its URL is [`relay_url`](Self::relay_url). On tier 3 it is the bridge
-    /// relay's URL, and the entry also carries the `bridgeTarget` the bridge
-    /// relay forwards to (§18.2.1, §10.12.7). Read from the live slot per call,
-    /// like `relay_url`.
-    #[must_use]
-    pub fn relay_service(&self) -> scp_did::RelayService {
-        self.state.live_state.get().relay
-    }
-
     /// Returns the TLS certificate resolver for ACME hot-reload.
     ///
     /// Returns `Some` in domain mode when TLS is active, `None` in
@@ -1836,7 +1825,7 @@ pub enum ReachabilityTier {
     /// the bridge forwards to (§10.12.7, §18.2.1).
     Bridge {
         /// The bridge relay's URL, published as the entry's `serviceEndpoint`.
-        bridge_url: String,
+        bridge_url: scp_did::BridgeEndpoint,
     },
 }
 
@@ -1892,8 +1881,8 @@ const DEFAULT_STUN_ENDPOINTS: &[(&str, &str)] = &[
 pub struct DefaultNatStrategy {
     /// STUN server URL override (if set via `.stun_server()`).
     stun_server: Option<String>,
-    /// Bridge relay URL override (if set via `.bridge_relay()`).
-    bridge_relay: Option<String>,
+    /// Bridge relay override (if set via `.bridge_relay()`).
+    bridge_relay: Option<scp_did::BridgeEndpoint>,
     /// Optional primary port mapper for Tier 1 (spec 10.12.2).
     /// Typically UPnP-IGD, tried first.
     port_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
@@ -1909,7 +1898,7 @@ pub struct DefaultNatStrategy {
 impl DefaultNatStrategy {
     /// Creates a new default NAT strategy with optional overrides.
     #[must_use]
-    pub fn new(stun_server: Option<String>, bridge_relay: Option<String>) -> Self {
+    pub fn new(stun_server: Option<String>, bridge_relay: Option<scp_did::BridgeEndpoint>) -> Self {
         Self {
             stun_server,
             bridge_relay,
@@ -2432,36 +2421,53 @@ impl Drop for TierReEvalHandle {
 /// `BRIDGE_REGISTER` at today, so a published target matches a registration a
 /// bridge relay accepts. The two values differ until the SCP-315 cut-over
 /// replaces `did:dht`.
-fn node_bridge_target(did: &str) -> [u8; 32] {
-    scp_identity::resolution::did_routing_id(did)
+///
+/// # Errors
+///
+/// [`NodeError::Identity`] when the routing ID equals SHA-256(0x00), the
+/// value §3.10.13 reserves for "no target" (a SHA-256 preimage collision).
+fn node_bridge_target(did: &str) -> Result<scp_did::BridgeTarget, NodeError> {
+    scp_did::BridgeTarget::new(scp_identity::resolution::did_routing_id(did))
+        .map_err(|e| NodeError::Identity(IdentityError::from(e)))
+}
+
+/// The `SCPRelay` entry for a node reachable at `addr`: `ws://<addr>/scp/v1`
+/// with no `bridgeTarget`.
+///
+/// # Errors
+///
+/// [`NodeError::Identity`] when `ws://<addr>/scp/v1` has no §9.18.2 canonical
+/// form, which a STUN or port-mapper answer can produce (port 0, or an IPv6
+/// address carrying a zone).
+fn address_relay_service(addr: SocketAddr) -> Result<scp_did::RelayService, NodeError> {
+    scp_did::RelayEndpoint::new(&format!("ws://{addr}/scp/v1"))
+        .map(scp_did::RelayService::direct)
+        .map_err(|e| NodeError::Identity(IdentityError::from(e)))
 }
 
 /// Converts a [`ReachabilityTier`] to the `SCPRelay` entry the node publishes.
 ///
 /// Tiers 1 and 2 publish the node's own `ws://` address with no
 /// `bridgeTarget`. Tier 3 publishes the bridge relay's URL with
-/// `bridge_target` (§10.12.7, §18.2.1).
+/// `bridge_target` (§10.12.7, §18.2.1); its [`scp_did::BridgeEndpoint`] and
+/// [`scp_did::BridgeTarget`] already passed §18.2.1, so that arm cannot fail.
 ///
 /// # Errors
 ///
-/// [`NodeError::Identity`] when the entry fails `RelayService::new`: a bridge
-/// URL with no §9.18.2 canonical form or a path other than `/scp/v1` (config
-/// lowering rejects such a `bridge_relay`, but a caller-supplied
-/// [`NatStrategy`] can still return one), or a `bridge_target` equal to the
-/// absent sentinel.
+/// As [`address_relay_service`], for tiers 1 and 2.
 fn tier_to_relay_service(
     tier: &ReachabilityTier,
-    bridge_target: [u8; 32],
+    bridge_target: scp_did::BridgeTarget,
 ) -> Result<scp_did::RelayService, NodeError> {
-    let entry = match tier {
+    match tier {
         ReachabilityTier::Upnp { external_addr } | ReachabilityTier::Stun { external_addr } => {
-            scp_did::RelayService::new(&format!("ws://{external_addr}/scp/v1"), None)
+            address_relay_service(*external_addr)
         }
-        ReachabilityTier::Bridge { bridge_url } => {
-            scp_did::RelayService::new(bridge_url, Some(bridge_target))
-        }
-    };
-    entry.map_err(|e| NodeError::Identity(IdentityError::from(e)))
+        ReachabilityTier::Bridge { bridge_url } => Ok(scp_did::RelayService::bridge(
+            bridge_url.clone(),
+            bridge_target,
+        )),
+    }
 }
 
 /// The relay URL a domain-mode node publishes in its DID document.
@@ -2488,13 +2494,10 @@ pub(crate) fn domain_relay_url(domain: &str) -> String {
 fn no_domain_relay_service(
     tier: Option<&ReachabilityTier>,
     http_port: u16,
-    bridge_target: [u8; 32],
+    bridge_target: scp_did::BridgeTarget,
 ) -> Result<scp_did::RelayService, NodeError> {
     tier.map_or_else(
-        || {
-            scp_did::RelayService::new(&format!("ws://127.0.0.1:{http_port}/scp/v1"), None)
-                .map_err(|e| NodeError::Identity(IdentityError::from(e)))
-        },
+        || address_relay_service(SocketAddr::from(([127, 0, 0, 1], http_port))),
         |tier| tier_to_relay_service(tier, bridge_target),
     )
 }
@@ -2682,6 +2685,7 @@ fn spawn_tier_reevaluation(
     nat_strategy: Arc<dyn NatStrategy>,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
     publisher: NodePublisher,
+    bridge_target: scp_did::BridgeTarget,
     identity: ScpIdentity,
     live_state: LiveSlot<NodePublishedState>,
     relay_url: LiveRelayUrl,
@@ -2690,7 +2694,6 @@ fn spawn_tier_reevaluation(
     reevaluation_interval: Duration,
 ) -> TierReEvalHandle {
     let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-    let bridge_target = node_bridge_target(&identity.did);
     // Teardown joins this task's `JoinHandle`, which completes only after the
     // runtime has dropped the future and the `publisher`/`DidMethod`/custody
     // clones it captured. See `TierReEvalHandle::task`.
@@ -2729,12 +2732,14 @@ fn spawn_tier_reevaluation(
                     continue;
                 }
             };
+            // Only a tier 1 or 2 address with no §9.18.2 canonical form fails
+            // here; a tier 3 entry is built from validated parts.
             let new_relay = match tier_to_relay_service(&new_tier, bridge_target) {
                 Ok(relay) => relay,
                 Err(e) => {
                     tracing::warn!(
                         error = %e, tier = ?new_tier,
-                        "re-evaluated tier has no valid relay entry, keeping current tier"
+                        "re-evaluated tier's address has no relay entry, keeping current tier"
                     );
                     continue;
                 }
@@ -3243,7 +3248,7 @@ pub(crate) async fn provision_with_challenge_listener(
 pub(crate) fn resolve_nat(
     strategy: Option<Arc<dyn NatStrategy>>,
     stun_server: Option<String>,
-    bridge_relay: Option<String>,
+    bridge_relay: Option<scp_did::BridgeEndpoint>,
     port_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
     reachability_probe: Option<Arc<dyn scp_transport::nat::ReachabilityProbe>>,
 ) -> Arc<dyn NatStrategy> {
@@ -3353,9 +3358,10 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // canonical form (config.rs builds the relay's `RelayUrl` from the same
     // string first), so this conversion succeeds on that path; it stays a
     // typed error, never an unwrap, for any other caller.
-    let relay = scp_did::RelayService::new(&domain_relay_url(&domain), None)
-        .map_err(IdentityError::from)?;
-    document.add_relay_service(relay.clone());
+    let relay = scp_did::RelayService::direct(
+        scp_did::RelayEndpoint::new(&domain_relay_url(&domain)).map_err(IdentityError::from)?,
+    );
+    document.add_relay_service(&relay);
     // Publish the domain→DID binding per the configured `DhtMode` (NOT
     // unconditionally). `DhtMode::Disabled` — the fail-safe default, and a
     // LEGITIMATE more-private `Domain + Disabled` config per construction.md M2
@@ -3486,61 +3492,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
 // Shared no-domain build logic (used by the non-domain reaches and the
 // Reach::Domain ACME-failure fallthrough in config.rs's build engine)
 // ---------------------------------------------------------------------------
-
-/// Installs the node's OWN `SCPRelay` service entry for `relay` at the
-/// preferred position — first among the document's `SCPRelay` entries (§18.2.3).
-///
-/// # Why it inserts rather than appends
-///
-/// [`repoint_relay_service`](crate::published_state) keys the tier-change rewrite
-/// on POSITION: the first `SCPRelay` entry is the subject's preferred relay and
-/// the only one this node's own reachability owns. Nothing used to *establish*
-/// that position — this function appended, and so does
-/// [`DidDocument::add_relay_service`](scp_did::DidDocument::add_relay_service).
-/// The node's entry therefore landed first only when the incoming document
-/// happened to carry no relay entry at all.
-///
-/// It does not always. `IdentitySource::Explicit` is public API and hands the
-/// caller's document through verbatim, so a caller supplying a document that
-/// already names a relay pushed the node's own entry to position 1. Then the
-/// first tier tick found `document_relay_service` (position 0 — the CALLER's relay)
-/// disagreeing with the address the node advertises, ran a tier change that had
-/// not happened, rewrote the caller's preferred relay to the node's address, and
-/// left the node's own entry at position 1 naming the pre-change URL forever —
-/// never the `find` target again. Inserting at the preferred position makes the
-/// premise the rewriter relies on true by construction instead of asserted.
-///
-/// Additional relay entries keep their relative order after it, and their ids are
-/// left alone (see the comment on the insert). The node's own entry is suffixed
-/// with the next free sequential index so multiple relays can coexist
-/// (`<did>#scp-relay-<n>`).
-fn push_relay_service(document: &mut DidDocument, relay: &scp_did::RelayService) {
-    let insert_at = document
-        .service
-        .iter()
-        .position(|s| s.service_type == "SCPRelay")
-        .unwrap_or(document.service.len());
-    // The id is derived from the count of relay entries ALREADY present, not by
-    // renumbering the whole set. A caller-supplied document reaches this function
-    // verbatim through `IdentitySource::Explicit`, and its service ids are
-    // resolvable URIs that third parties may already reference; silently
-    // rewriting `did:x#my-primary-relay` to `did:x#scp-relay-2` would dangle
-    // them. The node names only the entry it owns.
-    let existing_relays = document
-        .service
-        .iter()
-        .filter(|s| s.service_type == "SCPRelay")
-        .count();
-    document.service.insert(
-        insert_at,
-        scp_did::Service {
-            id: format!("{}#scp-relay-{}", document.id, existing_relays + 1),
-            service_type: "SCPRelay".to_owned(),
-            service_endpoint: relay.url().to_owned(),
-            bridge_target: relay.bridge_target(),
-        },
-    );
-}
 
 /// Publishes a node's DID document, discriminating on the configured
 /// [`DhtMode`] so the two semantically-opposite outcomes are never conflated.
@@ -3716,8 +3667,8 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
 
     // The binding is an `scp_did::RelayService`; it keeps the `relay_url`
     // name because `pipeline_wiring.rs` pins the reservation call's text.
-    let relay_url =
-        no_domain_relay_service(tier.as_ref(), http_port, node_bridge_target(&identity.did))?;
+    let bridge_target = node_bridge_target(&identity.did)?;
+    let relay_url = no_domain_relay_service(tier.as_ref(), http_port, bridge_target)?;
     // The relay reserves the push routing ID of the URL the node is about to
     // publish before the publish, so no client reads a URL whose routing ID the
     // relay does not yet intercept (§10.7.1 step 2). A tier 3 entry's URL is
@@ -3725,7 +3676,10 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     // still publishes the entry.
     published_state::reserve_push_routing_id(&relay_config.relay_url, &relay_url);
 
-    push_relay_service(&mut document, &relay_url);
+    // Inserted ahead of any relay a caller's `IdentitySource::Explicit`
+    // document names, so the first `SCPRelay` entry, which a tier change
+    // rewrites through `set_preferred_relay`, is the node's own.
+    document.insert_preferred_relay(&relay_url);
 
     // 4. Publish the DID document through the node's SINGLE publish seam AND seed
     //    the live slot in ONE step. `seed_from_startup_publish` performs the
@@ -3777,6 +3731,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
             nat_strategy,
             network_detector,
             publisher,
+            bridge_target,
             bg_identity,
             live_state.clone(),
             relay_config.relay_url.clone(),
@@ -4702,74 +4657,35 @@ mod tests {
     }
 
     /// Tier 3 publishes the bridge relay's own URL as `serviceEndpoint` and the
-    /// node's routing ID as `bridgeTarget` (§10.12.7, §18.2.1).
+    /// node's routing ID as `bridgeTarget` (§10.12.7, §18.2.1), and that target
+    /// is the routing ID a bridge relay admits this node's `BRIDGE_REGISTER`
+    /// at: `verify_bridge_registration` accepts a registration signed by the
+    /// node's identity key whose routing ID is the published target.
     ///
-    /// The expected target is pinned to `did_routing_id(did)`, the
-    /// `SHA-256("scp:did:" || did)` routing ID the bridge relay's
-    /// `verify_bridge_registration` admits a registration at today. §10.12.4.1
-    /// defines the value over the identifier's raw digest bytes instead; the
-    /// SCP-315 cut-over moves both sides, and this pin must move with it.
+    /// The target is `did_routing_id(did)` until SCP-315 moves both the
+    /// publisher and `verify_bridge_registration` to §10.12.4.1's value; the
+    /// check through the verifier keeps the two in step across that move.
     #[tokio::test]
     async fn no_domain_build_with_bridge_publishes_bridge_target() {
-        const BRIDGE_URL: &str = "wss://bridge.example.com/scp/v1";
-        let tier = ReachabilityTier::Bridge {
-            bridge_url: BRIDGE_URL.to_owned(),
+        use scp_platform::KeyCustody as _;
+        use scp_transport::relay::bridge::{
+            BridgeRegistration, bridge_register_signable, verify_bridge_registration,
         };
 
-        let node = Node::start_for_testing(no_domain_config(tier))
-            .await
-            .unwrap();
-
-        let target = scp_identity::resolution::did_routing_id(node.identity().did());
-        let expected = scp_did::RelayService::new(BRIDGE_URL, Some(target)).unwrap();
-        assert_eq!(
-            node.relay_url(),
-            BRIDGE_URL,
-            "no query on the published URL"
-        );
-        assert_eq!(node.relay_service(), expected);
-        assert_eq!(
-            node.identity().document().relay_services(),
-            vec![expected],
-            "the published document carries the bridge URL and the node's bridgeTarget"
-        );
-        let entry = node
-            .identity()
-            .document()
-            .service
-            .iter()
-            .find(|s| s.service_type == "SCPRelay")
-            .cloned()
-            .expect("the document carries an SCPRelay entry");
-        assert_eq!(entry.service_endpoint, BRIDGE_URL);
-        assert_eq!(entry.bridge_target, Some(target));
-    }
-
-    /// A `bridge_relay` that is not a URL a tier 3 entry may carry fails
-    /// `Node::start` with a typed `InvalidConfig` before any NAT probe. The
-    /// STUN server names an address nothing listens on, so a probe that ran
-    /// first would surface a NAT error instead.
-    #[tokio::test]
-    async fn node_start_rejects_a_bridge_relay_with_a_query() {
-        let bridge_relay = format!(
-            "wss://bridge.example.com/scp/v1?bridge_target={}",
-            "ab".repeat(32)
-        );
+        const BRIDGE_URL: &str = "wss://bridge.example.com/scp/v1";
+        let tier = ReachabilityTier::Bridge {
+            bridge_url: scp_did::BridgeEndpoint::new(BRIDGE_URL).unwrap(),
+        };
         let custody = Arc::new(InMemoryKeyCustody::new());
         let did_method = Arc::new(make_test_dht(&custody));
         let config: NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> = NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             dht: DhtMode::Production,
-            nat: NatSlot::Tuned {
-                stun_server: Some("127.0.0.1:9".to_owned()),
-                bridge_relay: Some(bridge_relay.clone()),
-                port_mapper: None,
-                reachability_probe: None,
-            },
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
             ..NodeConfig::defaults(
                 Reach::NatTraversal,
                 IdentitySource::Generate {
-                    custody,
+                    custody: Arc::clone(&custody),
                     did_method,
                 },
                 InMemoryStorage::new(),
@@ -4777,16 +4693,60 @@ mod tests {
             )
         };
 
-        let result = Node::start_for_testing(config).await;
+        let node = Node::start_for_testing(config).await.unwrap();
 
-        match result {
-            Err(NodeError::InvalidConfig(message)) => assert!(
-                message.contains("bridge_relay") && message.contains(&bridge_relay),
-                "the error names the rejected bridge_relay: {message}"
-            ),
-            Err(other) => panic!("expected InvalidConfig before any probe, got {other:?}"),
-            Ok(_) => panic!("a query-bearing bridge_relay must not start a node"),
-        }
+        assert_eq!(
+            node.relay_url(),
+            BRIDGE_URL,
+            "no query on the published URL"
+        );
+        let entry = node
+            .identity()
+            .document()
+            .service
+            .iter()
+            .find(|s| s.service_type == scp_did::SCP_RELAY_SERVICE_TYPE)
+            .cloned()
+            .expect("the document carries an SCPRelay entry");
+        assert_eq!(entry.service_endpoint, BRIDGE_URL);
+        let target = entry
+            .bridge_target
+            .expect("a tier 3 entry carries bridgeTarget");
+
+        // A BRIDGE_REGISTER at the published target, signed by the node's key.
+        let key = &node.identity().identity().identity_key;
+        let public_key: [u8; 32] = custody
+            .public_key(key)
+            .await
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .expect("an Ed25519 identity key");
+        let timestamp = 1_700_000_000;
+        let signature: [u8; 64] = custody
+            .sign(key, &bridge_register_signable(&target, timestamp))
+            .await
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .expect("an Ed25519 signature");
+        let registration = BridgeRegistration {
+            routing_id: target,
+            public_key,
+            signature,
+            timestamp,
+        };
+        verify_bridge_registration(&registration, timestamp)
+            .expect("the bridge relay admits the node at its published bridgeTarget");
+
+        // The re-read document reports the same entry.
+        assert_eq!(
+            node.identity().document().relay_services(),
+            [scp_did::RelayService::bridge(
+                scp_did::BridgeEndpoint::new(BRIDGE_URL).unwrap(),
+                scp_did::BridgeTarget::new(target).unwrap(),
+            )]
+        );
     }
 
     /// A domain with no §9.18.2 canonical relay URL fails `Node::start` with a
@@ -5933,7 +5893,7 @@ mod tests {
 
         let strategy = DefaultNatStrategy::new(
             Some(stun_addr.to_string()),
-            Some("wss://bridge.example.com/scp/v1".to_owned()),
+            Some(scp_did::BridgeEndpoint::new("wss://bridge.example.com/scp/v1").unwrap()),
         )
         .with_port_mapper(mapper)
         .with_reachability_probe(probe);
@@ -6004,7 +5964,7 @@ mod tests {
 
         let strategy = DefaultNatStrategy::new(
             Some(stun_addr.to_string()),
-            Some("wss://bridge.example.com/scp/v1".to_owned()),
+            Some(scp_did::BridgeEndpoint::new("wss://bridge.example.com/scp/v1").unwrap()),
         )
         .with_port_mapper(mapper)
         .with_reachability_probe(probe);
@@ -6067,7 +6027,7 @@ mod tests {
 
         let strategy = DefaultNatStrategy::new(
             Some(stun_addr.to_string()),
-            Some("wss://bridge.example.com/scp/v1".to_owned()),
+            Some(scp_did::BridgeEndpoint::new("wss://bridge.example.com/scp/v1").unwrap()),
         )
         .with_reachability_probe(probe);
 
@@ -6075,7 +6035,7 @@ mod tests {
 
         match tier {
             ReachabilityTier::Bridge { bridge_url } => {
-                assert_eq!(bridge_url, "wss://bridge.example.com/scp/v1");
+                assert_eq!(bridge_url.as_str(), "wss://bridge.example.com/scp/v1");
             }
             other => panic!("expected Tier 3 Bridge, got: {other:?}"),
         }
@@ -6431,6 +6391,7 @@ mod tests {
             Arc::clone(&strategy) as Arc<dyn NatStrategy>,
             None,
             NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
+            node_bridge_target(&identity.did).unwrap(),
             identity,
             LiveSlot::new(NodePublishedState {
                 document,
@@ -6524,6 +6485,7 @@ mod tests {
             Arc::clone(&strategy) as Arc<dyn NatStrategy>,
             Some(detector as Arc<dyn NetworkChangeDetector>),
             NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
+            node_bridge_target(&identity.did).unwrap(),
             identity,
             LiveSlot::new(NodePublishedState {
                 document,
@@ -6617,6 +6579,7 @@ mod tests {
             Arc::clone(&strategy) as Arc<dyn NatStrategy>,
             None,
             NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
+            node_bridge_target(&identity.did).unwrap(),
             identity,
             LiveSlot::new(NodePublishedState {
                 document,
@@ -6720,6 +6683,7 @@ mod tests {
             strategy as Arc<dyn NatStrategy>,
             None,
             NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
+            node_bridge_target(&identity.did).unwrap(),
             identity,
             LiveSlot::new(NodePublishedState {
                 document,
@@ -6846,6 +6810,7 @@ mod tests {
             strategy,
             None,
             NodePublisher::from_dyn(publisher as Arc<dyn DidPublisher>),
+            node_bridge_target("did:dht:slowdrop").unwrap(),
             ScpIdentity {
                 identity_key: scp_platform::KeyHandle::new(1),
                 active_signing_key: scp_platform::KeyHandle::new(2),
@@ -7678,10 +7643,10 @@ mod tests {
     }
 
     /// The node's own entry lands FIRST even when the caller's document already
-    /// names a relay — the position premise `repoint_relay_service` keys on.
+    /// names a relay — the position premise `set_preferred_relay` keys on.
     ///
     /// `IdentitySource::Explicit` hands a caller-supplied document through
-    /// verbatim. While `push_relay_service` appended, the node's own entry landed
+    /// verbatim. While the node's installer appended, the node's own entry landed
     /// at position 1 behind the caller's, so `document_relay_service` (position 0)
     /// reported the CALLER's relay while the slot reported the node's. The first
     /// tier tick then saw them disagree, ran a tier change that had not happened,
@@ -7692,10 +7657,7 @@ mod tests {
         const CALLER_RELAY: &str = "wss://caller.example.com/scp/v1";
         let mut document = slot_test_document(&[CALLER_RELAY]);
 
-        push_relay_service(
-            &mut document,
-            &crate::published_state::test_relay(TIER_CHANGE_NEW_URL),
-        );
+        document.insert_preferred_relay(&crate::published_state::test_relay(TIER_CHANGE_NEW_URL));
 
         assert_eq!(
             document.relay_service_urls(),
@@ -7810,11 +7772,10 @@ mod tests {
 
     /// The tier 3 entry the slot tests' identity publishes.
     fn slot_bridge_entry() -> scp_did::RelayService {
-        scp_did::RelayService::new(
-            SLOT_BRIDGE_URL,
-            Some(node_bridge_target(&slot_test_identity().did)),
+        scp_did::RelayService::bridge(
+            scp_did::BridgeEndpoint::new(SLOT_BRIDGE_URL).expect("a wss bridge URL"),
+            node_bridge_target(&slot_test_identity().did).expect("not the absent value"),
         )
-        .expect("a valid bridge entry")
     }
 
     /// A tier change to a bridge entry publishes its URL and `bridgeTarget`.
@@ -7861,7 +7822,7 @@ mod tests {
     #[tokio::test]
     async fn tier_change_from_bridge_to_stun_clears_bridge_target() {
         let mut document = slot_test_document(&[]);
-        push_relay_service(&mut document, &slot_bridge_entry());
+        document.insert_preferred_relay(&slot_bridge_entry());
         let live_state = LiveSlot::new(NodePublishedState {
             document,
             relay: slot_bridge_entry(),
@@ -7908,16 +7869,17 @@ mod tests {
     #[tokio::test]
     async fn tier_reevaluation_sees_no_change_for_an_identical_bridge_entry() {
         let strategy = Arc::new(SequenceNatStrategy::new(vec![ReachabilityTier::Bridge {
-            bridge_url: SLOT_BRIDGE_URL.to_owned(),
+            bridge_url: scp_did::BridgeEndpoint::new(SLOT_BRIDGE_URL).unwrap(),
         }]));
         let publisher = Arc::new(RecordingPublisher::new());
         let mut document = slot_test_document(&[]);
-        push_relay_service(&mut document, &slot_bridge_entry());
+        document.insert_preferred_relay(&slot_bridge_entry());
 
         let handle = spawn_tier_reevaluation(
             Arc::clone(&strategy) as Arc<dyn NatStrategy>,
             None,
             NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
+            node_bridge_target(&slot_test_identity().did).unwrap(),
             slot_test_identity(),
             LiveSlot::new(NodePublishedState {
                 document,
@@ -7957,7 +7919,7 @@ mod tests {
     #[test]
     fn persisted_identity_round_trips_a_bridge_entry() {
         let mut document = slot_test_document(&[TIER_CHANGE_OLD_URL]);
-        push_relay_service(&mut document, &slot_bridge_entry());
+        document.insert_preferred_relay(&slot_bridge_entry());
         let persisted = PersistedIdentity {
             identity: slot_test_identity(),
             document,

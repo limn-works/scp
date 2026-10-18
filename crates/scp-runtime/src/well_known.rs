@@ -947,9 +947,10 @@ mod tests {
         let bridge_url = "wss://bridge.example.com/scp/v1";
 
         let mut doc = did_document_with_relays(did, &["wss://relay.example.com/scp/v1"]);
-        doc.add_relay_service(
-            scp_did::RelayService::new(bridge_url, Some([0x42; 32])).expect("canonical bridge URL"),
-        );
+        doc.add_relay_service(&scp_did::RelayService::bridge(
+            scp_did::BridgeEndpoint::new(bridge_url).expect("canonical bridge URL"),
+            scp_did::BridgeTarget::new([0x42; 32]).expect("not the absent value"),
+        ));
         let mock = MockDidMethod::resolves_to(doc);
 
         let well_known = WellKnownScp {

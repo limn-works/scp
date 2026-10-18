@@ -26,7 +26,7 @@ base64 = { workspace = true }
 bs58 = { workspace = true }
 z-base-32 = { workspace = true }
 thiserror = { workspace = true }
-# relay_services() logs each SCPRelay entry it skips (§18.2.1).
+# DidDocument logs each service entry it drops while deserializing (§18.2.1).
 tracing = { workspace = true }
 
 [dev-dependencies]
