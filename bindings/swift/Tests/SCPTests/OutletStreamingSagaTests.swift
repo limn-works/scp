@@ -226,6 +226,7 @@ final class OutletStreamingSagaTests: XCTestCase {
             economicPolicy: nil,
             consequenceRulesJson: nil,
             consequenceConfigJson: nil,
+            capabilityRequirementsJson: nil,
             pseudonymRotation: nil
         )
         let context = try await Context.create(scp: scp, identity: identity, params: params)

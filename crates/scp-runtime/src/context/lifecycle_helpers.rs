@@ -22,8 +22,9 @@
 //!
 //! Per-context (actor-shape `(&mut PerContextState, &ActorDeps, ...)`):
 //!
-//! 1. [`export_context_blocks`] — read-only state borrow + persistence-side
-//!    snapshot construction; produces a signed [`ContextExport`](crate::context::export_import::ContextExport).
+//! 1. [`export_context_blocks`] — read-only state borrow; captures the
+//!    snapshot and event-log blocks the actor signs into a
+//!    [`ContextExport`](crate::context::export_import::ContextExport).
 //! 2. [`leave_context`] — capability check + MLS remove + sender-key
 //!    cleanup + membership removal + close-on-empty.
 //! 3. [`drain_and_deliver_sender_keys`] — drain pending sender-key
@@ -123,7 +124,7 @@ pub fn normalize_relay_urls(relay_urls: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::with_capacity(relay_urls.len());
     relay_urls
         .into_iter()
-        .map(|url| scp_protocol::discovery::push::canonical_relay_url(&url).unwrap_or(url))
+        .map(|url| scp_did::canonical_relay_url(&url).unwrap_or(url))
         .filter(|url| seen.insert(url.clone()))
         .collect()
 }
@@ -160,24 +161,23 @@ fn build_routing(is_broadcast: bool, local_pseudonym: Option<[u8; 32]>) -> Conte
 /// actor-owned state (§23.16.8, ADR-050).
 ///
 /// Returns the `ContextSnapshot` and the serialized Merkle event-log data.
-/// The actor holds no custody/signing key, so the signature is NOT applied
-/// here — the caller ([`crate::context::supervisor::Supervisor::export_context`])
-/// invokes [`crate::context::export_import::create_export`] with the
-/// FFI-supplied `sign` closure once the actor mailbox returns these blocks.
-/// Splitting the read-only capture (inside the actor) from the signing
-/// (at the bridge boundary) preserves the actor-per-context model while
-/// keeping the signature over the exact canonical bytes a verifier recomputes.
+/// The capture is synchronous so no `PerContextState` borrow (which is
+/// `!Sync`) spans the sign's await.
 ///
 /// The snapshot's `mls_crypto_state` is empty on this portable export path;
 /// live MLS crypto state is carried only on the persistence/restore path.
 /// Whether portable export should include MLS crypto state is an open design
 /// decision (security tradeoff).
 ///
-/// The event-log export is best-effort (`unwrap_or_default`), matching the
-/// pre-actor `export_context` body, so this capture is infallible. Any signing
-/// or Merkle-verification failure surfaces later in
-/// [`create_export`](crate::context::export_import::create_export) at the
-/// dispatch boundary.
+/// The actor lifecycle handler signs the returned blocks in the same turn
+/// through
+/// [`create_signed_export`](crate::context::export_import::create_signed_export).
+///
+/// # Errors
+///
+/// The event-log provider's error when the context's log cannot be exported:
+/// an export without its log would sign the empty-log Merkle root and
+/// silently drop the context's history.
 ///
 /// Crate-internal: this lives in the `pub(crate) mod lifecycle_helpers`
 /// module, so it is unreachable outside `scp-runtime` regardless of this
@@ -189,7 +189,7 @@ fn build_routing(is_broadcast: bool, local_pseudonym: Option<[u8; 32]>) -> Conte
 pub fn export_context_blocks(
     state: &PerContextState,
     deps: &ActorDeps,
-) -> (crate::context::state::ContextSnapshot, Vec<u8>) {
+) -> Result<(crate::context::state::ContextSnapshot, Vec<u8>), ContextError> {
     let context_id = state.handle.context_id();
     // ADR-056: resolve to the canonical digest (matches `state.context_id` and
     // the crypto keys the snapshot exports), not a re-hash of the hex id.
@@ -197,12 +197,9 @@ pub fn export_context_blocks(
 
     let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(state);
 
-    let event_log_data = deps
-        .event_log
-        .export_event_log_data(&ctx_id_bytes)
-        .unwrap_or_default();
+    let event_log_data = deps.event_log.export_event_log_data(&ctx_id_bytes)?;
 
-    (snapshot, event_log_data)
+    Ok((snapshot, event_log_data))
 }
 
 // ---------------------------------------------------------------------------
@@ -612,7 +609,44 @@ pub async fn close_context(
 // 5. close_context_with_key (per-context)
 // ---------------------------------------------------------------------------
 
-/// Closes a context with an optional signing key for final checkpoint
+/// Builds and signs the final checkpoint a close records (§9.9.3). A refused
+/// or timed-out sign is logged and yields `None`: the close transition has
+/// already committed and must persist.
+async fn final_close_checkpoint(
+    broadcast_context_is_none: bool,
+    mls_epoch: u64,
+    deps: &ActorDeps,
+    context_id: &str,
+    initiator_did: &DID,
+    signer: &crate::context::actor::signer::CommandSigner,
+) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+    // Takes the cell's two scalars, not `&ClassSCell`: the cell is not
+    // `Sync`, and a reference to it held across the sign's await would make
+    // the close future `!Send`.
+    match crate::context::queries_helpers::build_checkpoint(
+        context_id,
+        broadcast_context_is_none,
+        mls_epoch,
+        initiator_did,
+        signer,
+        deps.clock.now_secs(),
+        deps.event_log.as_ref(),
+    )
+    .await
+    {
+        Ok(cp) => Some(cp),
+        Err(e) => {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "final checkpoint not created on close: signing failed (§9.9.3)"
+            );
+            None
+        }
+    }
+}
+
+/// Closes a context with an optional signer for final checkpoint
 /// generation (§9.9.3).
 ///
 /// Multi-admin contexts (any governance model other than `SingleAdmin`)
@@ -631,7 +665,7 @@ pub async fn close_context_with_key(
     deps: &ActorDeps,
     handle: &ContextHandle,
     initiator_did: &DID,
-    signing_key: Option<&ed25519_dalek::SigningKey>,
+    signer: Option<&crate::context::actor::signer::CommandSigner>,
 ) -> Result<CloseResult, ContextError> {
     let context_id = handle.context_id().to_owned();
 
@@ -678,6 +712,32 @@ pub async fn close_context_with_key(
         deps.clock.now_secs(),
     )
     .await?;
+
+    // Final checkpoint before close (§9.9.3): capture the terminal event log
+    // state, including the `ContextClosing` leaf just appended, so equivocation
+    // detection covers the full context lifetime. It is built and signed HERE,
+    // before the synchronous Class-S combinator below, because signing awaits
+    // custody (ADR-049 Decision 7a). The epoch is read before the broadcast
+    // teardown, so a broadcast context's checkpoint carries no epoch
+    // (§23.16.1). Best-effort: the close transition above has already
+    // committed and must persist, so a refused or timed-out sign skips the
+    // checkpoint (logged) rather than aborting the close.
+    let final_checkpoint = match signer {
+        None => None,
+        Some(signer) => {
+            let broadcast_context_is_none = cell.broadcast_context.is_none();
+            let mls_epoch = cell.epoch.mls_epoch;
+            final_close_checkpoint(
+                broadcast_context_is_none,
+                mls_epoch,
+                deps,
+                &context_id,
+                initiator_did,
+                signer,
+            )
+            .await
+        }
+    };
 
     // ADR-049 §9 Class S: the lifecycle close transition is security-critical
     // (a closed context must not silently re-open on a crash) — STRUCTURAL
@@ -735,25 +795,14 @@ pub async fn close_context_with_key(
         // on context close (#1530).
         state.governance.decay_participation();
 
-        // Final checkpoint before close (§9.9.3): force-create a checkpoint
-        // to capture the terminal event log state. This ensures
-        // equivocation detection covers the full context lifetime.
-        // Best-effort: skip if no signing key is available.
-        if let Some(sk) = signing_key {
-            let now = deps.clock.now_secs();
-            let broadcast_context_is_none = state.broadcast_context.is_none();
-            let mls_epoch = state.epoch.mls_epoch;
+        // Record the final checkpoint signed above (§9.9.3).
+        if let Some(cp) = final_checkpoint {
             let cp = crate::context::queries_helpers::force_create_checkpoint_fields(
                 &context_id,
-                broadcast_context_is_none,
-                mls_epoch,
                 &mut state.checkpoint_events_since,
                 &mut state.checkpoint_last_time_secs,
                 &mut state.checkpoints,
-                initiator_did,
-                sk,
-                now,
-                deps.event_log.as_ref(),
+                cp,
             );
             tracing::debug!(
                 context_id = %context_id,
@@ -1709,7 +1758,7 @@ pub async fn create_context(
     // §9.16.1); with none loaded the creation fails closed before any group exists.
     let wrapping_public_key = *deps
         .supervisor
-        .my_wrapping_keypair(&deps.owned_identity)?
+        .my_wrapping_key(&deps.owned_identity)?
         .public();
     let (handle, created_owned_crypto) = crate::context::builder::create_context(
         context_id.clone(),
@@ -1876,7 +1925,6 @@ pub async fn create_context(
                     creation_timestamp_secs,
                 ),
         },
-        pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
@@ -2774,6 +2822,7 @@ pub async fn import_context(
                 },
                 threshold_signers: export.snapshot.threshold_signers,
                 threshold_value: export.snapshot.threshold_value,
+                capability_requirements: export.snapshot.capability_requirements,
                 // IMPORT path (not restore): start with a FRESH spending-
                 // nonce tracker.
                 spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
@@ -2872,7 +2921,6 @@ pub async fn import_context(
                     deps.clock.now_secs(),
                 ),
         },
-        pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
@@ -3444,6 +3492,7 @@ pub async fn restore_context(
                 },
                 threshold_signers: ctx_snapshot.threshold_signers,
                 threshold_value: ctx_snapshot.threshold_value,
+                capability_requirements: ctx_snapshot.capability_requirements,
                 spending_nonce_tracker:
                     scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
                         context_id.to_owned(),
@@ -3555,7 +3604,6 @@ pub async fn restore_context(
             // on the first actor turn.
             pseudonym_rotation: ctx_snapshot.pseudonym_rotation,
         },
-        pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,
         event_log: None,
@@ -3929,6 +3977,7 @@ async fn shutdown_sweep(supervisor: &crate::context::supervisor::Supervisor) -> 
     }
 
     supervisor.stop_key_package_actors().await;
+    supervisor.stop_challenger_ledger_actors().await;
 
     // Supervisor-level state clear. Acquired under the write_lock once
     // for the standing_contexts + local_dids stores so a concurrent
@@ -4553,7 +4602,7 @@ mod restore_reconcile_tests {
         let serving = ServingPersistence { snapshot };
         let supervisor = build_supervisor(Box::new(serving));
         let deps = supervisor
-            .build_actor_deps(&DID("did:dht:z6MkRestoreReconcile".to_owned()))
+            .build_actor_deps_loaded(&DID("did:dht:z6MkRestoreReconcile".to_owned()))
             .await
             .expect("build_actor_deps");
         let handle = ContextHandle::new(restore_ctx_id.to_owned(), ContextParams::default());
@@ -4580,7 +4629,7 @@ mod restore_reconcile_tests {
                 CapturingPersistence::default(),
             ))));
             let deps = supervisor
-                .build_actor_deps(&creator())
+                .build_actor_deps_loaded(&creator())
                 .await
                 .expect("build_actor_deps");
             if closed {
@@ -4616,7 +4665,7 @@ mod restore_reconcile_tests {
             snapshot: snapshot.clone(),
         }));
         let deps = serving
-            .build_actor_deps(&DID("did:dht:z6MkRestoreShutdown".to_owned()))
+            .build_actor_deps_loaded(&DID("did:dht:z6MkRestoreShutdown".to_owned()))
             .await
             .expect("build_actor_deps");
         let handle = ContextHandle::new(ctx_id.to_owned(), ContextParams::default());
@@ -4660,7 +4709,7 @@ mod restore_reconcile_tests {
             // The deps are built before shutdown, as an import already past
             // `build_actor_deps` holds them when shutdown begins.
             let deps = supervisor
-                .build_actor_deps(&creator)
+                .build_actor_deps_loaded(&creator)
                 .await
                 .expect("build_actor_deps");
             if closed {
@@ -4698,7 +4747,7 @@ mod restore_reconcile_tests {
         };
         let creator = || DID("did:dht:z6MkDuplicateCreate".to_owned());
         let deps = supervisor
-            .build_actor_deps(&creator())
+            .build_actor_deps_loaded(&creator())
             .await
             .expect("build_actor_deps");
         lifecycle_helpers::create_context(
@@ -5100,7 +5149,7 @@ mod restore_reconcile_tests {
 
         let admin = DID("did:dht:z6MkJoinMoneyAdmin".to_owned());
         let mut deps = sup
-            .build_actor_deps(&admin)
+            .build_actor_deps_loaded(&admin)
             .await
             .expect("build_actor_deps");
 
@@ -5302,7 +5351,7 @@ mod restore_reconcile_tests {
 
         let admin = DID("did:dht:z6MkFinalizeSendAdmin".to_owned());
         let deps = sup
-            .build_actor_deps(&admin)
+            .build_actor_deps_loaded(&admin)
             .await
             .expect("build_actor_deps");
 
@@ -5345,7 +5394,11 @@ mod restore_reconcile_tests {
             &sender,
             reserved,
             b"payload",
-            None,
+            crate::context::supervisor::MessageSigner::Active(
+                &crate::context::actor::signer::CommandSigner::local_ed25519(
+                    ed25519_dalek::SigningKey::from_bytes(&[0x5au8; 32]),
+                ),
+            ),
             None,  // no spending-nonce token (free send) — keeps best-effort persist
             false, // is_broadcast
         )
@@ -5473,7 +5526,7 @@ mod restore_reconcile_tests {
             mls_storage(),
         );
         let deps = sup
-            .build_actor_deps(&admin)
+            .build_actor_deps_loaded(&admin)
             .await
             .expect("build_actor_deps");
 
@@ -5682,7 +5735,7 @@ mod restore_reconcile_tests {
         let sup = build_supervisor(Box::new(FailingJoinPersistence));
         let admin = DID("did:dht:z6MkLeaveFailClosed".to_owned());
         let deps = sup
-            .build_actor_deps(&admin)
+            .build_actor_deps_loaded(&admin)
             .await
             .expect("build_actor_deps");
 
@@ -5748,7 +5801,7 @@ mod restore_reconcile_tests {
         let sup = build_supervisor(Box::new(FailingJoinPersistence));
         let admin = DID("did:dht:z6MkCloseFailClosed".to_owned());
         let deps = sup
-            .build_actor_deps(&admin)
+            .build_actor_deps_loaded(&admin)
             .await
             .expect("build_actor_deps");
 
@@ -5873,7 +5926,7 @@ mod restore_reconcile_tests {
                 ctx_id,
                 &outsider,
                 modify(Some(policy)),
-                &outsider_key,
+                &crate::context::actor::signer::CommandSigner::local_ed25519(outsider_key.clone()),
             )
             .await;
         assert!(
@@ -5892,7 +5945,7 @@ mod restore_reconcile_tests {
                     interval_secs: None,
                     on_membership_change: false,
                 })),
-                &admin_key,
+                &crate::context::actor::signer::CommandSigner::local_ed25519(admin_key.clone()),
             )
             .await;
         assert!(
@@ -5904,7 +5957,12 @@ mod restore_reconcile_tests {
 
         // Approved: the single admin's proposal auto-approves and executes.
         let outcome = supervisor
-            .propose_governance_action_checked(ctx_id, &admin, modify(Some(policy)), &admin_key)
+            .propose_governance_action_checked(
+                ctx_id,
+                &admin,
+                modify(Some(policy)),
+                &crate::context::actor::signer::CommandSigner::local_ed25519(admin_key.clone()),
+            )
             .await
             .expect("the admin's proposal executes");
         assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -6026,7 +6084,7 @@ mod restore_reconcile_tests {
                         did: bob.clone(),
                         role: "member".to_owned(),
                     },
-                    &admin_key,
+                    &crate::context::actor::signer::CommandSigner::local_ed25519(admin_key.clone()),
                 )
                 .await
                 .expect("the admin adds bob");
@@ -6048,7 +6106,7 @@ mod restore_reconcile_tests {
                             on_membership_change: true,
                         }),
                     },
-                    &admin_key,
+                    &crate::context::actor::signer::CommandSigner::local_ed25519(admin_key.clone()),
                 )
                 .await
                 .expect("the admin sets a rotation policy");
@@ -6073,7 +6131,9 @@ mod restore_reconcile_tests {
                             did: bob.clone(),
                             reason: None,
                         },
-                        &admin_key,
+                        &crate::context::actor::signer::CommandSigner::local_ed25519(
+                            admin_key.clone(),
+                        ),
                     )
                     .await
                     .expect("the admin removes bob");

@@ -657,6 +657,33 @@ pub mod testing {
             .to_uncompressed()
     }
 
+    /// The initiator scalar `i` of the pinned RFC 5903 §8.1 P-256 ECDH vector.
+    ///
+    /// Every `dh_agree` implementation compares against this vector (256-bit
+    /// random ECP group): the scalars `i` and `r` and the x-coordinate of
+    /// `i·r·G`, all big-endian hex.
+    ///
+    /// The key-custody tests of each bridge and host fake build the two keys
+    /// from these scalars (or their public points) and assert that both sides
+    /// of the agreement produce [`ECDH_VECTOR_SHARED_X`].
+    pub const ECDH_VECTOR_SCALAR_I: &str =
+        "c88f01f510d9ac3f70a292daa2316de544e9aab8afe84049c62a9c57862d1433";
+    /// The responder's scalar `r` of [`ECDH_VECTOR_SCALAR_I`]'s vector.
+    pub const ECDH_VECTOR_SCALAR_R: &str =
+        "c6ef9c5d78ae012a011164acb397ce2088685d8f06bf9be0b283ab46476bee53";
+    /// The 65-byte uncompressed point `i·G` of the vector.
+    pub const ECDH_VECTOR_PUBLIC_I: &str = "04\
+        dad0b65394221cf9b051e1feca5787d098dfe637fc90b9ef945d0c3772581180\
+        5271a0461cdb8252d61f1c456fa3e59ab1f45b33accf5f58389e0577b8990bb3";
+    /// The 65-byte uncompressed point `r·G` of the vector.
+    pub const ECDH_VECTOR_PUBLIC_R: &str = "04\
+        d12dfb5289c8d4f81208b70270398c342296970a0bccb74c736fc7554494bf63\
+        56fbf3ca366cc23e8157854c13c58d6aac23f046ada30f8353e74f33039872ab";
+    /// The 32-byte x-coordinate of `i·r·G`: the DHKEM(P-256) `DH` output both
+    /// sides of the vector compute.
+    pub const ECDH_VECTOR_SHARED_X: &str =
+        "d6840f6b42f6edafd13116e0e12565202fef8e9ece7dce03812464d04b9442de";
+
     /// The wire encodings §9.5 rejects where a 65-byte uncompressed point is
     /// required, one row per rejection class.
     ///
@@ -693,6 +720,29 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+
+    /// The pinned ECDH vector ([`testing::ECDH_VECTOR_SHARED_X`]) holds for
+    /// [`ecdh_p256`] from both sides, and each scalar's public point is the
+    /// vector's: the constant every other `dh_agree` test compares against is
+    /// the RFC 5903 §8.1 answer, not a value this crate computed.
+    #[test]
+    fn ecdh_p256_fixed_vector() {
+        let scalar = |h: &str| -> [u8; 32] { hex::decode(h).unwrap().try_into().unwrap() };
+        let i = P256SecretKey::from_scalar_bytes(&scalar(testing::ECDH_VECTOR_SCALAR_I)).unwrap();
+        let r = P256SecretKey::from_scalar_bytes(&scalar(testing::ECDH_VECTOR_SCALAR_R)).unwrap();
+        assert_eq!(
+            hex::encode(i.public_key().to_uncompressed()),
+            testing::ECDH_VECTOR_PUBLIC_I
+        );
+        assert_eq!(
+            hex::encode(r.public_key().to_uncompressed()),
+            testing::ECDH_VECTOR_PUBLIC_R
+        );
+        let ir = ecdh_p256(&i, &r.public_key());
+        let ri = ecdh_p256(&r, &i.public_key());
+        assert_eq!(hex::encode(*ir), testing::ECDH_VECTOR_SHARED_X);
+        assert_eq!(*ir, *ri);
+    }
 
     /// §9.5 point validation of the uncompressed wire form: one row per
     /// rejection class, with the valid point as the positive control. The

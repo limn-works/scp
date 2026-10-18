@@ -718,14 +718,14 @@ The protocol uses two distinct routing ID derivation schemes for different purpo
 1. The self-hosted relay behind symmetric NAT connects outbound to a bridge relay (outbound connections are not blocked by NAT).
 2. The self-hosted relay registers its routing ID with the bridge via `BRIDGE_REGISTER`, proving control of its identifier with a P-256 signature.
 3. The bridge relay accepts incoming connections from peers. Peers send `BRIDGE_DATA` to forward traffic to the registered self-hosted relay over the existing outbound connection.
-4. The self-hosted relay publishes the bridge relay's address in its service record, annotated as a bridge: `wss://bridge-relay.example.com/scp/v1?bridge_target=<hex-routing-hint>`.
+4. The self-hosted relay publishes an `SCPRelay` entry (`18-addressability-and-deployment.md` §18.2.1) whose `serviceEndpoint` is the bridge relay's own URL, `wss://bridge-relay.example.com/scp/v1`, and whose `bridgeTarget` is the identity routing ID (§10.12.4.1) it registered in step 2, as 64 lowercase hex digits.
 5. When the self-hosted relay disconnects, the bridge deregisters all its routing IDs. Subsequent `BRIDGE_DATA` for those IDs returns `BRIDGE_TARGET_NOT_FOUND`.
 
 **Bridge properties:**
 
 - **Transparent.** The bridge relay sees the same metadata as any relay (§9.9.1): routing IDs, blob sizes, timing. MLS prevents content access. The bridge CANNOT read, modify, or inject messages.
 - **Substitutable.** If a bridge relay goes down, the self-hosted relay discovers another bridge relay and re-registers. Peers re-resolve the service record and connect to the new bridge. No session state is lost — MLS sessions survive relay changes.
-- **Multiple bridges.** A self-hosted relay MAY register with multiple bridge relays simultaneously for availability. Each bridge is published as a separate `SCPRelay` entry in the service record.
+- **Multiple bridges.** A self-hosted relay MAY register with multiple bridge relays simultaneously for availability. Each bridge is published as a separate `SCPRelay` entry in the service record, each carrying that bridge's URL and the same `bridgeTarget`.
 - **Bridge relay MAY offer this service selectively.** The broker role is a relay configuration choice — a named selector with two states (brokering disabled or enabled), disabled by default (a relay brokers nothing until explicitly enabled). This broker-role selection is independent of any internal relay connection-admission secret. Bridge relays MAY charge for bridge service via the relay economic configuration (§19.8).
 
 **Honest constraint:** Tier 3 requires someone to operate a bridge relay that is itself publicly reachable. This is not Limn-specific — any SCP relay with a public address can serve as a bridge. But someone must operate one. This is the same pattern as bootstrap relays: the protocol requires no specific operator, but it requires that operators exist. The fallback relay list (§18.5.1) SHOULD include at least one relay that supports bridging.
@@ -778,8 +778,10 @@ Each reachability tier produces a different relay URL format for the service rec
 |------|-----------|---------|
 | 1 (UPnP) | `ws://` with IP literal | `ws://203.0.113.42:8443/scp/v1` |
 | 2 (STUN) | `ws://` with IP literal | `ws://198.51.100.7:32891/scp/v1` |
-| 3 (Bridge) | `wss://` with bridge domain | `wss://bridge.example.com/scp/v1?bridge_target=<hex-routing-hint>` |
+| 3 (Bridge) | `wss://` with bridge domain, plus `bridgeTarget` | `wss://bridge.example.com/scp/v1`, `bridgeTarget` `<64 hex>` |
 | 4 (Domain) | `wss://` with operator domain | `wss://relay.example.com/scp/v1` |
+
+Every tier's URL has a canonical form under the canonical relay URL rule of `09-security-model.md` §9.18.2; a tier 3 entry carries its routing target in `bridgeTarget` (`18-addressability-and-deployment.md` §18.2.1), never in the URL.
 
 Tiers 1 and 2 use `ws://` with raw IP addresses — these are the zero-config, no-domain tiers where TLS is not available (§10.12.6). Tier 3 uses `wss://` because the bridge relay itself has a domain and TLS. Tier 4 uses `wss://` with the operator's domain.
 

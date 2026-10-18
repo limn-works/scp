@@ -42,6 +42,7 @@ use crate::context::ContextHandle;
 use crate::context::actor::commands::{CloseContextReply, ExportContextReply, LifecycleCommand};
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
+use crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 use crate::context::actor::state::PerContextState;
 
 /// Per-call transport budget for lifecycle handlers. Plan §"Transport
@@ -145,8 +146,14 @@ async fn dispatch_actor_inner(
         LifecycleCommand::ExportContext {
             context_id,
             exporter_did,
+            signer,
             reply,
-        } => handle_export_context_actor(&*cell, deps, context_id, exporter_did, reply),
+        } => {
+            // Capture the blocks synchronously so no state borrow spans the
+            // sign's await.
+            let blocks = crate::context::lifecycle_helpers::export_context_blocks(&*cell, deps);
+            handle_export_context_actor(blocks, deps, context_id, exporter_did, signer, reply).await
+        }
         LifecycleCommand::ImportContext { export, reply, .. } => {
             // Bootstrap variant — see `CreateContext` arm comment.
             let err = ContextError::InvalidState(format!(
@@ -376,24 +383,41 @@ async fn handle_close_context_actor(
     outcome
 }
 
-fn handle_export_context_actor(
-    state: &PerContextState,
+/// Signs the captured export blocks with the exporter's signer in the same
+/// actor turn (ADR-049 Decision 7a) and replies with the signed export.
+/// Export is read-only, so the outcome never marks the state mutated.
+async fn handle_export_context_actor(
+    blocks: Result<(crate::context::state::ContextSnapshot, Vec<u8>), ContextError>,
     deps: &ActorDeps,
-    _context_id: String,
-    _exporter_did: scp_did::DID,
+    context_id: String,
+    exporter_did: scp_did::DID,
+    signer: crate::context::actor::signer::CommandSigner,
     reply: ExportContextReply,
 ) -> Outcome<()> {
-    // Export is sync and read-only — no timeout wrapping needed. The actor
-    // only captures the UNSIGNED export building blocks (snapshot + event-log
-    // data); the snapshot signature is applied at the dispatch boundary
-    // (`Supervisor::export_context`) where the FFI-supplied `sign` closure
-    // lives, since the runtime holds no custody key (§23.16.8, ADR-050). The
-    // capture is infallible (best-effort event-log export), but the reply
-    // channel carries `Result` for shape parity with the other lifecycle
-    // handlers.
-    let blocks = crate::context::lifecycle_helpers::export_context_blocks(state, deps);
-    let _ = reply.send(Ok(blocks));
-    Outcome::ok(())
+    let export_fut = async {
+        let (snapshot, event_log_data) = blocks?;
+        crate::context::export_import::create_signed_export(
+            snapshot,
+            event_log_data,
+            exporter_did,
+            crate::context::export_import::ExportScope::Full,
+            deps.clock.now_secs(),
+            &signer,
+        )
+        .await
+    };
+    let reply_result = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, export_fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ContextError::TransportTimeout(format!(
+            "export_context exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
+        ))),
+    };
+    let outcome = match &reply_result {
+        Ok(_) => Outcome::ok(()),
+        Err(e) => Outcome::err(outcome_error_sketch(e)),
+    };
+    let _ = reply.send(reply_result);
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -772,8 +796,8 @@ async fn handle_issue_mls_update_actor(
     // now lives in the Class-S closure. The Update keeps publishing the
     // identity's wrapping key (spec 09 §9.16.1); with none loaded it fails
     // closed before anything ratchets.
-    let wrapping_public_key = match deps.supervisor.my_wrapping_keypair(&deps.owned_identity) {
-        Ok(pair) => *pair.public(),
+    let wrapping_public_key = match deps.supervisor.my_wrapping_key(&deps.owned_identity) {
+        Ok(key) => *key.public(),
         Err(e) => {
             let _ = reply.send(Err(e));
             return Outcome::ok(());

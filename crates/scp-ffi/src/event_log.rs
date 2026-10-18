@@ -379,9 +379,8 @@ fn query_storage_fallback(
     let Ok(storage) = crate::runtime::get_storage(bi) else {
         return Ok(None);
     };
-    let rt = crate::runtime()?;
     let prefix = format!("context/{context_id}/event_data/");
-    let Ok(keys) = rt.block_on(storage.list_keys(&prefix)) else {
+    let Ok(keys) = crate::actor_wait::block_on_released(py, storage.list_keys(&prefix))? else {
         return Ok(None);
     };
 
@@ -401,7 +400,7 @@ fn query_storage_fallback(
         if seq_str < start_suffix.as_str() {
             continue;
         }
-        if let Ok(Some(data)) = rt.block_on(storage.retrieve(key))
+        if let Ok(Some(data)) = crate::actor_wait::block_on_released(py, storage.retrieve(key))?
             && let Ok(event) = rmp_serde::from_slice::<scp_event_log::Event>(&data)
         {
             // Apply additional filters.
@@ -724,6 +723,7 @@ fn event_log_verify_impl(
 /// this implementation — they are distinct public surface but identical in
 /// behavior.
 fn event_log_checkpoint_impl(
+    py: Python<'_>,
     bi: &PyBridgeInstance,
     context_id: &str,
     did: &str,
@@ -731,32 +731,33 @@ fn event_log_checkpoint_impl(
 ) -> PyResult<PyCheckpoint> {
     validate::validate_context_id(context_id)?;
     validate::validate_did(did)?;
-    let rt = crate::runtime()?;
 
     let context_id_owned = context_id.to_owned();
     let did_owned = did.to_owned();
 
     let sender_did = scp_did::DID(did_owned.clone());
 
-    let checkpoint = crate::runtime::with_identity(bi, &did_owned, |entry| {
-        crate::runtime::with_context(bi, &context_id_owned, |ctx_rt| {
-            let result = rt.block_on(async {
-                let signer = scp_core::event_log::KeyCustodySigner {
-                    custody: entry.custody.as_ref(),
-                    key: &entry.identity.active_signing_key,
-                };
-                scp_event_log::checkpoint::generate_checkpoint(
-                    &ctx_rt.event_log,
-                    &sender_did,
-                    epoch,
-                    &signer,
-                )
-                .await
-            });
-
-            result.map_err(|e| ScpPyError::checkpoint_error(&e))
-        })
+    // Read the custody handle and the log snapshot under their registry
+    // guards, then sign with every guard released: a GIL-released wait that
+    // held a registry shard lock would stall any Python thread that blocks
+    // on that shard while holding the GIL, including a custody callback's.
+    let (custody, key) = crate::runtime::with_identity(bi, &did_owned, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })?;
+    let snapshot = crate::runtime::with_context(bi, &context_id_owned, |ctx_rt| {
+        Ok(scp_event_log::checkpoint::CheckpointSnapshot::of(
+            &ctx_rt.event_log,
+        ))
+    })?;
+    // The `#active` signer signs through the bounded, key-type-checked call
+    // of ADR-049 Decision 7a, so a custody that never answers fails with
+    // `SCP-CRYPTO-4062` after `SIGN_TIMEOUT`.
+    let checkpoint = crate::actor_wait::block_on_released(py, async {
+        let signer = scp_ffi_common::signer::identity_command_signer(custody, key)
+            .await
+            .map_err(ScpPyError::from)?;
+        sign_checkpoint(snapshot, &sender_did, epoch, &signer).await
+    })??;
 
     Ok(PyCheckpoint {
         context_id: checkpoint.context_id,
@@ -772,6 +773,22 @@ fn event_log_checkpoint_impl(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Signs `snapshot` into a checkpoint through `signer`'s bounded sign, and
+/// maps a failure to its typed bridge error: a custody failure keeps its
+/// custody code (`SCP-CRYPTO-4062` past `SIGN_TIMEOUT`).
+async fn sign_checkpoint(
+    snapshot: scp_event_log::checkpoint::CheckpointSnapshot,
+    sender_did: &scp_did::DID,
+    epoch: u64,
+    signer: &scp_core::context::actor::CommandSigner,
+) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ScpPyError> {
+    scp_event_log::checkpoint::generate_checkpoint_from_snapshot(
+        snapshot, sender_did, epoch, signer,
+    )
+    .await
+    .map_err(|e| ScpPyError::checkpoint_error(&e))
+}
 
 /// Decodes a hex string into a 32-byte hash.
 fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
@@ -892,12 +909,13 @@ impl crate::scp::PyScp {
     #[pyo3(name = "event_log_checkpoint")]
     pub fn event_log_checkpoint(
         &self,
+        py: Python<'_>,
         context_id: &str,
         identity_did: &str,
         epoch: u64,
     ) -> PyResult<PyCheckpoint> {
         let bi = &*self.inner;
-        event_log_checkpoint_impl(bi, context_id, identity_did, epoch)
+        event_log_checkpoint_impl(py, bi, context_id, identity_did, epoch)
     }
 
     /// Generates a signed consistency checkpoint scoped to a member DID.
@@ -928,12 +946,13 @@ impl crate::scp::PyScp {
     #[pyo3(name = "event_log_checkpoint_by_did")]
     pub fn event_log_checkpoint_by_did(
         &self,
+        py: Python<'_>,
         context_id: &str,
         did: &str,
         epoch: u64,
     ) -> PyResult<PyCheckpoint> {
         let bi = &*self.inner;
-        event_log_checkpoint_impl(bi, context_id, did, epoch)
+        event_log_checkpoint_impl(py, bi, context_id, did, epoch)
     }
 }
 
@@ -957,4 +976,48 @@ pub fn register_event_log(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyProof>()?;
     m.add_class::<PyCheckpoint>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod checkpoint_sign_tests {
+    use super::sign_checkpoint;
+    use scp_core::context::actor::{CommandSigner, SIGN_TIMEOUT};
+    use scp_crypto::{DynScpSigner, SigAlg, SignFuture};
+    use std::sync::Arc;
+
+    /// A signer whose sign never completes, standing in for a custody that
+    /// never answers.
+    struct StalledSigner;
+
+    impl DynScpSigner for StalledSigner {
+        fn algorithm(&self) -> SigAlg {
+            SigAlg::Ed25519
+        }
+
+        fn public_key(&self) -> Vec<u8> {
+            vec![0; 32]
+        }
+
+        fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> SignFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// The `PyO3` checkpoint fails with `SCP-CRYPTO-4062` once `SIGN_TIMEOUT`
+    /// elapses when custody never answers, instead of waiting forever.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_custody_fails_the_checkpoint_with_4062() {
+        let log = scp_event_log::EventLog::new("ctx-pyo3-checkpoint-stall".to_owned());
+        let snapshot = scp_event_log::checkpoint::CheckpointSnapshot::of(&log);
+        let signer = CommandSigner::new(Arc::new(StalledSigner));
+        let started = tokio::time::Instant::now();
+        let result =
+            sign_checkpoint(snapshot, &scp_did::DID::from("did:dht:alice"), 0, &signer).await;
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains("SCP-CRYPTO-4062")),
+            "a stalled custody fails the checkpoint with SCP-CRYPTO-4062"
+        );
+        assert!(started.elapsed() >= SIGN_TIMEOUT);
+        assert!(started.elapsed() < SIGN_TIMEOUT + std::time::Duration::from_secs(1));
+    }
 }

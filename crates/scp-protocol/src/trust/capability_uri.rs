@@ -4,8 +4,11 @@
 //!
 //! 1. **Protocol-defined:** `scp:capability:{kebab-case}/v{N}` — reserved prefix
 //!    for protocol challenge capabilities.
-//! 2. **DID-scoped:** `did:{method}:{id}:capability:{kebab-case}/v{N}` — custom
-//!    capabilities defined under a DID's authority.
+//! 2. **Identifier-scoped:** `{identifier}:capability:{kebab-case}/v{N}` — custom
+//!    capabilities defined under an identifier's authority, where
+//!    `{identifier}` is the `03-identity.md` §3.1 text form
+//!    (`scp:` plus 52 lowercase base32 characters). A `did:` authority is
+//!    rejected with [`CapabilityUriError::NonCanonicalIdentifier`].
 //! 3. **System:** `scp:system:{kebab-case}` — protocol feature flags for node
 //!    roles, not challenge-testable.
 //!
@@ -18,8 +21,12 @@
 //! let uri: CapabilityUri = "scp:capability:prompt-injection-resistance/v1".parse().unwrap();
 //! assert_eq!(uri.to_string(), "scp:capability:prompt-injection-resistance/v1");
 //!
-//! // DID-scoped capability
-//! let uri: CapabilityUri = "did:dht:z6Mk123:capability:domain-expertise/v2".parse().unwrap();
+//! // Identifier-scoped capability
+//! let uri: CapabilityUri =
+//!     "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:domain-expertise/v2"
+//!         .parse()
+//!         .unwrap();
+//! assert!(uri.is_identifier_scoped());
 //!
 //! // System capability
 //! let uri: CapabilityUri = "scp:system:relay-operation".parse().unwrap();
@@ -29,6 +36,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+use crate::identity::text_form::is_canonical_identifier_text;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -53,6 +62,12 @@ pub enum CapabilityUriError {
     /// The URI prefix is not one of the three recognized authorities.
     #[error("unknown authority: {0}")]
     UnknownAuthority(String),
+
+    /// The authority before `:capability:` is not an identifier in the
+    /// canonical text form of `03-identity.md` §3.1 (for example a `did:`
+    /// string, an uppercase or padded encoding, or a wrong length).
+    #[error("capability URI authority is not a canonical identifier: {0}")]
+    NonCanonicalIdentifier(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -144,11 +159,13 @@ fn parse_version(s: &str) -> Result<u32, CapabilityUriError> {
 /// Three authorities are supported:
 ///
 /// - [`Protocol`](CapabilityUri::Protocol): `scp:capability:{name}/v{N}`
-/// - [`DidScoped`](CapabilityUri::DidScoped): `did:{method}:{id}:capability:{name}/v{N}`
+/// - [`IdentifierScoped`](CapabilityUri::IdentifierScoped): `{identifier}:capability:{name}/v{N}`
 /// - [`System`](CapabilityUri::System): `scp:system:{name}`
 ///
 /// Implements [`FromStr`] for parsing, `Display` for round-trip serialization,
-/// and serde `Serialize`/`Deserialize` via the string representation.
+/// and serde `Serialize`/`Deserialize` via the string representation. Parsing
+/// accepts only the string `Display` prints back, so each capability has one
+/// text form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CapabilityUri {
     /// A protocol-defined challenge capability.
@@ -161,12 +178,12 @@ pub enum CapabilityUri {
         version: u32,
     },
 
-    /// A DID-scoped custom capability.
+    /// An identifier-scoped custom capability.
     ///
-    /// Format: `did:{method}:{id}:capability:{name}/v{version}`
-    DidScoped {
-        /// The full DID string (e.g., `did:dht:z6Mk123`).
-        did: String,
+    /// Format: `{identifier}:capability:{name}/v{version}`
+    IdentifierScoped {
+        /// The definer's identifier in the `03-identity.md` §3.1 text form.
+        definer: String,
         /// Kebab-case capability name.
         name: String,
         /// Version number (>= 1).
@@ -186,37 +203,61 @@ impl FromStr for CapabilityUri {
     type Err = CapabilityUriError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.is_empty() {
-            return Err(CapabilityUriError::MalformedUri("empty string".into()));
-        }
-
-        // Protocol capability: scp:capability:{kebab-case}/v{N}
-        if let Some(rest) = s.strip_prefix("scp:capability:") {
-            return parse_protocol_capability(rest);
-        }
-
-        // System capability: scp:system:{kebab-case}
-        if let Some(rest) = s.strip_prefix("scp:system:") {
-            return parse_system_capability(rest);
-        }
-
-        // DID-scoped: did:{method}:{id}:capability:{kebab-case}/v{N}
-        if s.starts_with("did:") {
-            return parse_did_scoped_capability(s);
-        }
-
-        // scp: prefix but not capability: or system: — unknown authority
-        if let Some(after_scp) = s.strip_prefix("scp:") {
-            let authority = after_scp.split(':').next().unwrap_or(after_scp);
-            return Err(CapabilityUriError::UnknownAuthority(format!(
-                "scp:{authority}"
-            )));
-        }
-
-        Err(CapabilityUriError::MalformedUri(format!(
-            "URI must start with 'scp:' or 'did:', got '{s}'"
-        )))
+        parse_canonical(s)
     }
+}
+
+/// The separator between an identifier-scoped URI's authority and its name.
+const IDENTIFIER_CAPABILITY_MARKER: &str = ":capability:";
+
+/// Parses any spelling of a capability URI; [`parse_canonical`] then requires
+/// the canonical one.
+fn parse_any_form(s: &str) -> Result<CapabilityUri, CapabilityUriError> {
+    if s.is_empty() {
+        return Err(CapabilityUriError::MalformedUri("empty string".into()));
+    }
+
+    // Protocol capability: scp:capability:{kebab-case}/v{N}
+    if let Some(rest) = s.strip_prefix("scp:capability:") {
+        return parse_protocol_capability(rest);
+    }
+
+    // System capability: scp:system:{kebab-case}
+    if let Some(rest) = s.strip_prefix("scp:system:") {
+        return parse_system_capability(rest);
+    }
+
+    // Identifier-scoped: {identifier}:capability:{kebab-case}/v{N}. An
+    // identifier body holds no ':', so it never matches the two prefixes
+    // above.
+    if let Some(cap_pos) = s.find(IDENTIFIER_CAPABILITY_MARKER) {
+        return parse_identifier_scoped_capability(s, cap_pos);
+    }
+
+    // scp: prefix but not capability: or system: — unknown authority
+    if let Some(after_scp) = s.strip_prefix("scp:") {
+        let authority = after_scp.split(':').next().unwrap_or(after_scp);
+        return Err(CapabilityUriError::UnknownAuthority(format!(
+            "scp:{authority}"
+        )));
+    }
+
+    Err(CapabilityUriError::MalformedUri(format!(
+        "URI must start with 'scp:', got '{s}'"
+    )))
+}
+
+/// Parses `s` and accepts it only when it is the text the parsed value
+/// prints back, so a non-canonical spelling such as `/v01` or `/v+1` is
+/// rejected rather than accepted as a second form of `/v1`.
+fn parse_canonical(s: &str) -> Result<CapabilityUri, CapabilityUriError> {
+    let parsed = parse_any_form(s)?;
+    if parsed.to_string() != s {
+        return Err(CapabilityUriError::MalformedUri(format!(
+            "'{s}' is not in canonical form (expected '{parsed}')"
+        )));
+    }
+    Ok(parsed)
 }
 
 /// Parse the remainder after `scp:capability:`.
@@ -275,31 +316,22 @@ fn parse_system_capability(rest: &str) -> Result<CapabilityUri, CapabilityUriErr
     })
 }
 
-/// Parse a DID-scoped capability from the full URI string.
-fn parse_did_scoped_capability(s: &str) -> Result<CapabilityUri, CapabilityUriError> {
-    // Format: did:{method}:{id}:capability:{kebab-case}/v{N}
-    // We need to find ":capability:" in the string.
-    let cap_marker = ":capability:";
-    let cap_pos = s.find(cap_marker).ok_or_else(|| {
-        CapabilityUriError::MalformedUri(format!(
-            "DID-scoped URI must contain ':capability:', got '{s}'"
-        ))
-    })?;
+/// Parses an identifier-scoped capability whose `:capability:` marker
+/// starts at byte `cap_pos` of `s`.
+fn parse_identifier_scoped_capability(
+    s: &str,
+    cap_pos: usize,
+) -> Result<CapabilityUri, CapabilityUriError> {
+    // Format: {identifier}:capability:{kebab-case}/v{N}; the authority is the
+    // text before the first `:capability:`. The check is syntactic: the
+    // definer is not resolved.
+    let definer = &s[..cap_pos];
+    let after_cap = &s[cap_pos + IDENTIFIER_CAPABILITY_MARKER.len()..];
 
-    let did_part = &s[..cap_pos];
-    let after_cap = &s[cap_pos + cap_marker.len()..];
-
-    // Validate the DID portion has at least did:{method}:{id}
-    // DID format: did:{method}:{method-specific-id}
-    let did_segments: Vec<&str> = did_part.splitn(3, ':').collect();
-    if did_segments.len() < 3
-        || did_segments[0] != "did"
-        || did_segments[1].is_empty()
-        || did_segments[2].is_empty()
-    {
-        return Err(CapabilityUriError::MalformedUri(format!(
-            "invalid DID prefix: '{did_part}' (expected 'did:{{method}}:{{id}}')"
-        )));
+    if !is_canonical_identifier_text(definer) {
+        return Err(CapabilityUriError::NonCanonicalIdentifier(
+            definer.to_owned(),
+        ));
     }
 
     if after_cap.is_empty() {
@@ -311,7 +343,7 @@ fn parse_did_scoped_capability(s: &str) -> Result<CapabilityUri, CapabilityUriEr
     // Find the version separator
     let slash_pos = after_cap.find('/').ok_or_else(|| {
         CapabilityUriError::MalformedUri(format!(
-            "missing version suffix '/v{{N}}' in DID-scoped capability '{s}'"
+            "missing version suffix '/v{{N}}' in identifier-scoped capability '{s}'"
         ))
     })?;
 
@@ -328,8 +360,8 @@ fn parse_did_scoped_capability(s: &str) -> Result<CapabilityUri, CapabilityUriEr
     validate_kebab_case(name)?;
     let version = parse_version(version_part)?;
 
-    Ok(CapabilityUri::DidScoped {
-        did: did_part.to_owned(),
+    Ok(CapabilityUri::IdentifierScoped {
+        definer: definer.to_owned(),
         name: name.to_owned(),
         version,
     })
@@ -342,10 +374,10 @@ impl CapabilityUri {
         matches!(self, Self::Protocol { .. })
     }
 
-    /// Returns `true` if this is a [`DidScoped`](Self::DidScoped) capability.
+    /// Returns `true` if this is an [`IdentifierScoped`](Self::IdentifierScoped) capability.
     #[must_use]
-    pub const fn is_did_scoped(&self) -> bool {
-        matches!(self, Self::DidScoped { .. })
+    pub const fn is_identifier_scoped(&self) -> bool {
+        matches!(self, Self::IdentifierScoped { .. })
     }
 
     /// Returns `true` if this is a [`System`](Self::System) capability.
@@ -358,9 +390,9 @@ impl CapabilityUri {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Protocol { name, .. } | Self::DidScoped { name, .. } | Self::System { name } => {
-                name
-            }
+            Self::Protocol { name, .. }
+            | Self::IdentifierScoped { name, .. }
+            | Self::System { name } => name,
         }
     }
 }
@@ -371,8 +403,12 @@ impl fmt::Display for CapabilityUri {
             Self::Protocol { name, version } => {
                 write!(f, "scp:capability:{name}/v{version}")
             }
-            Self::DidScoped { did, name, version } => {
-                write!(f, "{did}:capability:{name}/v{version}")
+            Self::IdentifierScoped {
+                definer,
+                name,
+                version,
+            } => {
+                write!(f, "{definer}:capability:{name}/v{version}")
             }
             Self::System { name } => {
                 write!(f, "scp:system:{name}")
@@ -413,6 +449,15 @@ impl<'de> Deserialize<'de> for CapabilityUri {
 mod tests {
     use super::*;
 
+    /// Spec 25 Vector 57's identifier in the `03-identity.md` §3.1 text form.
+    const DEFINER: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
+    /// Spec 25 Vector 61's definer, whose last character is `q`.
+    const DEFINER_ENDING_Q: &str = "scp:tfgiiao36zlseo2tzfoi32knfx6topped3qloxcsube5gdvfrqgq";
+
+    fn scoped(definer: &str, tail: &str) -> String {
+        format!("{definer}:capability:{tail}")
+    }
+
     // -----------------------------------------------------------------------
     // AC 2: Protocol capability parsing
     // -----------------------------------------------------------------------
@@ -444,37 +489,142 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AC 3: DID-scoped capability parsing
+    // AC 3: identifier-scoped capability parsing
     // -----------------------------------------------------------------------
 
     #[test]
-    fn parse_did_scoped_capability() {
-        let uri: CapabilityUri = "did:dht:z6Mk123:capability:domain-expertise/v2"
-            .parse()
-            .unwrap();
+    fn parse_identifier_scoped_capability() {
+        let original = scoped(DEFINER, "domain-expertise/v2");
+        let uri: CapabilityUri = original.parse().unwrap();
         assert_eq!(
             uri,
-            CapabilityUri::DidScoped {
-                did: "did:dht:z6Mk123".into(),
+            CapabilityUri::IdentifierScoped {
+                definer: DEFINER.into(),
                 name: "domain-expertise".into(),
                 version: 2,
+            }
+        );
+        assert!(uri.is_identifier_scoped());
+        assert_eq!(uri.to_string(), original);
+    }
+
+    #[test]
+    fn accepts_definer_ending_q() {
+        let uri: CapabilityUri = scoped(DEFINER_ENDING_Q, "schema-validation/v1")
+            .parse()
+            .unwrap();
+        assert!(matches!(
+            uri,
+            CapabilityUri::IdentifierScoped { ref definer, .. } if definer == DEFINER_ENDING_Q
+        ));
+    }
+
+    #[test]
+    fn reject_did_authority_is_non_canonical_identifier() {
+        for (uri, authority) in [
+            (
+                "did:dht:z6Mk123:capability:domain-expertise/v2",
+                "did:dht:z6Mk123",
+            ),
+            (
+                "did:web:example.com:capability:custom-skill/v1",
+                "did:web:example.com",
+            ),
+        ] {
+            let err = uri.parse::<CapabilityUri>().unwrap_err();
+            assert_eq!(
+                err,
+                CapabilityUriError::NonCanonicalIdentifier(authority.into()),
+                "{uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_uppercase_identifier_authority() {
+        let authority = DEFINER.to_ascii_uppercase().replacen("SCP:", "scp:", 1);
+        let err = scoped(&authority, "x/v1")
+            .parse::<CapabilityUri>()
+            .unwrap_err();
+        assert_eq!(err, CapabilityUriError::NonCanonicalIdentifier(authority));
+    }
+
+    #[test]
+    fn reject_padded_identifier_authority() {
+        let authority = format!("{DEFINER}====");
+        let err = scoped(&authority, "x/v1")
+            .parse::<CapabilityUri>()
+            .unwrap_err();
+        assert_eq!(err, CapabilityUriError::NonCanonicalIdentifier(authority));
+    }
+
+    #[test]
+    fn reject_identifier_with_nonzero_trailing_bits() {
+        // `b` encodes 1, so this decodes to Vector 57's bytes a second way.
+        let authority = format!("{}b", &DEFINER[..DEFINER.len() - 1]);
+        let err = scoped(&authority, "x/v1")
+            .parse::<CapabilityUri>()
+            .unwrap_err();
+        assert_eq!(err, CapabilityUriError::NonCanonicalIdentifier(authority));
+    }
+
+    #[test]
+    fn reject_identifier_authority_of_51_and_53_chars() {
+        let short = format!("scp:{}", &DEFINER[5..]);
+        // Appended after the canonical text, so the 52nd body character is still
+        // `q` and only the length rule rejects it.
+        let long = format!("{DEFINER}a");
+        assert_eq!(short.len(), 4 + 51);
+        assert_eq!(long.len(), 4 + 53);
+        for authority in [short, long] {
+            let err = scoped(&authority, "x/v1")
+                .parse::<CapabilityUri>()
+                .unwrap_err();
+            assert_eq!(err, CapabilityUriError::NonCanonicalIdentifier(authority));
+        }
+    }
+
+    #[test]
+    fn identifier_beginning_with_capability_parses_as_identifier_scoped() {
+        // A canonical identifier whose base32 body starts with "capability".
+        let definer = format!("scp:capability{}", &DEFINER[14..]);
+        assert_eq!(definer.len(), 56);
+        let uri: CapabilityUri = scoped(&definer, "x/v1").parse().unwrap();
+        assert_eq!(
+            uri,
+            CapabilityUri::IdentifierScoped {
+                definer,
+                name: "x".into(),
+                version: 1,
             }
         );
     }
 
     #[test]
-    fn parse_did_web_scoped_capability() {
-        let uri: CapabilityUri = "did:web:example.com:capability:custom-skill/v1"
-            .parse()
-            .unwrap();
-        assert_eq!(
-            uri,
-            CapabilityUri::DidScoped {
-                did: "did:web:example.com".into(),
-                name: "custom-skill".into(),
-                version: 1,
+    fn reject_non_canonical_version_form() {
+        for tail in ["/v01", "/v+1"] {
+            for uri in [
+                format!("scp:capability:name{tail}"),
+                scoped(DEFINER, &format!("name{tail}")),
+            ] {
+                let err = uri.parse::<CapabilityUri>().unwrap_err();
+                assert!(
+                    matches!(err, CapabilityUriError::MalformedUri(_)),
+                    "{uri} must be MalformedUri, got {err:?}"
+                );
             }
-        );
+        }
+    }
+
+    #[test]
+    fn accepts_two_digit_version() {
+        for uri in [
+            "scp:capability:name/v10".to_owned(),
+            scoped(DEFINER, "name/v10"),
+        ] {
+            let parsed: CapabilityUri = uri.parse().unwrap();
+            assert_eq!(parsed.to_string(), uri);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -622,8 +772,8 @@ mod tests {
     }
 
     #[test]
-    fn reject_missing_version_did_scoped() {
-        let err = "did:dht:z6Mk123:capability:name"
+    fn reject_missing_version_identifier_scoped() {
+        let err = scoped(DEFINER, "name")
             .parse::<CapabilityUri>()
             .unwrap_err();
         assert!(matches!(err, CapabilityUriError::MalformedUri(_)));
@@ -664,8 +814,8 @@ mod tests {
     }
 
     #[test]
-    fn reject_deeper_nesting_did_scoped() {
-        let err = "did:dht:z6Mk123:capability:name/v1/extra"
+    fn reject_deeper_nesting_identifier_scoped() {
+        let err = scoped(DEFINER, "name/v1/extra")
             .parse::<CapabilityUri>()
             .unwrap_err();
         assert!(matches!(err, CapabilityUriError::MalformedUri(_)));
@@ -691,8 +841,8 @@ mod tests {
     }
 
     #[test]
-    fn display_roundtrip_did_scoped() {
-        let original = "did:dht:z6Mk123:capability:domain-expertise/v2";
+    fn display_roundtrip_identifier_scoped() {
+        let original = scoped(DEFINER, "domain-expertise/v2");
         let uri: CapabilityUri = original.parse().unwrap();
         assert_eq!(uri.to_string(), original);
     }
@@ -809,8 +959,8 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_did_scoped() {
-        let uri: CapabilityUri = "did:dht:z6Mk123:capability:skill/v3".parse().unwrap();
+    fn serde_roundtrip_identifier_scoped() {
+        let uri: CapabilityUri = scoped(DEFINER, "skill/v3").parse().unwrap();
         let json = serde_json::to_string(&uri).unwrap();
         let deserialized: CapabilityUri = serde_json::from_str(&json).unwrap();
         assert_eq!(uri, deserialized);
@@ -863,6 +1013,14 @@ mod tests {
             "scp:unknown:name".parse::<CapabilityUri>().unwrap_err(),
             CapabilityUriError::UnknownAuthority(_)
         ));
+
+        // NonCanonicalIdentifier
+        assert!(matches!(
+            "did:dht:z6Mk123:capability:name/v1"
+                .parse::<CapabilityUri>()
+                .unwrap_err(),
+            CapabilityUriError::NonCanonicalIdentifier(_)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -910,39 +1068,17 @@ mod tests {
     }
 
     #[test]
-    fn reject_did_with_empty_method() {
-        let err = "did::z6Mk123:capability:name/v1"
-            .parse::<CapabilityUri>()
-            .unwrap_err();
-        assert!(matches!(err, CapabilityUriError::MalformedUri(_)));
-    }
-
-    #[test]
-    fn reject_did_with_empty_id() {
-        let err = "did:dht::capability:name/v1"
-            .parse::<CapabilityUri>()
-            .unwrap_err();
-        // The `:capability:` will be found, but the DID part `did:dht:` has empty id
-        // Actually `did:dht:` splitn(3, ':') gives ["did", "dht", ""] — empty id
-        assert!(matches!(err, CapabilityUriError::MalformedUri(_)));
-    }
-
-    #[test]
-    fn parse_did_with_colons_in_id() {
-        // did:web:example.com:path:more has `:capability:` at the right place
-        // This tests that `:capability:` is correctly found even with complex DIDs
-        let uri: CapabilityUri = "did:web:example.com:path:capability:my-cap/v1"
-            .parse()
-            .unwrap();
-        // The DID is everything before `:capability:` = "did:web:example.com:path"
-        assert_eq!(
-            uri,
-            CapabilityUri::DidScoped {
-                did: "did:web:example.com:path".into(),
-                name: "my-cap".into(),
-                version: 1,
-            }
-        );
+    fn reject_did_authority_with_empty_method_or_id() {
+        for (uri, authority) in [
+            ("did::z6Mk123:capability:name/v1", "did::z6Mk123"),
+            ("did:dht::capability:name/v1", "did:dht:"),
+        ] {
+            let err = uri.parse::<CapabilityUri>().unwrap_err();
+            assert_eq!(
+                err,
+                CapabilityUriError::NonCanonicalIdentifier(authority.into())
+            );
+        }
     }
 
     #[test]

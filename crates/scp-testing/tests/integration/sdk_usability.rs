@@ -58,7 +58,7 @@ fn relay_request(
 /// scenario -- avoids real NAT probing).
 async fn build_no_domain_node() -> scp_node::ApplicationNode<InMemoryStorage> {
     let tier = ReachabilityTier::Bridge {
-        bridge_url: "wss://bridge.test.scp/scp/v1".to_owned(),
+        bridge_url: scp_did::BridgeEndpoint::new("wss://bridge.test.scp/scp/v1").unwrap(),
     };
     Node::start_for_testing(helpers::test_no_domain_node_config(tier))
         .await
@@ -308,7 +308,9 @@ async fn native_relay_adapter_roundtrip_through_relay() {
     let config = RelayConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         delivery_jitter_ms: 0,
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(scp_transport::relay::push_gate::LiveRelayUrl::new(
+            scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1").unwrap(),
+        ))
     };
     let (_shutdown, relay_addr) =
         RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()))
@@ -374,7 +376,9 @@ async fn sender_key_encrypt_relay_decrypt_roundtrip() {
     let config = RelayConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         delivery_jitter_ms: 0,
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(scp_transport::relay::push_gate::LiveRelayUrl::new(
+            scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1").unwrap(),
+        ))
     };
     let (_shutdown, relay_addr) =
         RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()))

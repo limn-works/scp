@@ -24,8 +24,7 @@
 //!   check first.
 //! - Every host signature is verified: an Ed25519 signature strictly over the
 //!   data under the cached verifying key, a P-256 signature through
-//!   [`p256_host_signature`]. An exported Ed25519 seed must produce the cached
-//!   verifying key ([`export_ed25519_signing_key`]).
+//!   [`p256_host_signature`].
 //! - Pseudonym derivation requires an Ed25519 [`KeyRole::Identity`] source
 //!   ([`scp_platform::require_derive_source`]). A pseudonym has no private key
 //!   (§9.10.4): the host returns only the 33-byte compressed point, which
@@ -842,49 +841,6 @@ where
     )?))
 }
 
-/// Exports the Ed25519 signing key of `key` through the host's
-/// `export_signing_key_bytes`.
-///
-/// The host's 32-byte seed must produce the verifying key cached (or
-/// resolved) for the handle; a seed for any other key is refused, so a host
-/// cannot hand the caller a key that signs under another identity. The
-/// host's buffer and the parsed seed are wiped on drop.
-///
-/// # Errors
-///
-/// [`PlatformError::WrongKeyType`] for a handle that is not Ed25519, with no
-/// export call; any host error; [`PlatformError::CustodyError`] for a seed
-/// that is not 32 bytes or whose public key is not the handle's; as in
-/// [`resolve`].
-pub async fn export_ed25519_signing_key<E, EF, P, PF>(
-    registry: &CallbackKeyRegistry,
-    key: &KeyHandle,
-    host_export: E,
-    host_get_public_key: P,
-) -> Result<ed25519_dalek::SigningKey, PlatformError>
-where
-    E: FnOnce(String) -> EF,
-    EF: Future<Output = Result<Vec<u8>, PlatformError>>,
-    P: Fn(String) -> PF + Sync,
-    PF: Future<Output = Result<HostPublicKey, PlatformError>>,
-{
-    let expected = require_ed25519(registry, key, &host_get_public_key).await?;
-    let bytes = zeroize::Zeroizing::new(host_export(key.id().to_string()).await?);
-    let seed = zeroize::Zeroizing::new(crate::custody_parse::expect_32(
-        "export_signing_key_bytes",
-        &bytes,
-    )?);
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    if signing_key.verifying_key() != expected {
-        return Err(PlatformError::CustodyError(
-            "KeyCustodyProvider.export_signing_key_bytes returned a seed whose public key is \
-             not the one registered for this key_id"
-                .into(),
-        ));
-    }
-    Ok(signing_key)
-}
-
 /// `KeyCustody::derive_pseudonym` (`epoch` `None`) and
 /// `derive_rotatable_pseudonym` over a host provider.
 ///
@@ -1036,6 +992,14 @@ pub mod fake_host {
         pub last_peer: Mutex<Option<Vec<u8>>>,
     }
 
+    /// The secret scalar the fake host mints for key id `id`: one byte
+    /// repeated, so a test recomputes a key's seed from its handle id instead
+    /// of asking the host to export it.
+    #[must_use]
+    pub fn scalar_for(id: u64) -> [u8; 32] {
+        [u8::try_from(id % 64).unwrap_or(0) + 0x40; 32]
+    }
+
     impl FakeHost {
         /// Whether the host still holds `key_id`.
         pub fn holds(&self, key_id: &str) -> bool {
@@ -1081,7 +1045,7 @@ pub mod fake_host {
         ) -> Result<String, PlatformError> {
             self.count("generate_keypair");
             let id = self.next_id();
-            let scalar = [u8::try_from(id % 64).unwrap_or(0) + 0x40; 32];
+            let scalar = scalar_for(id as u64);
             let p256 = || {
                 P256SecretKey::from_scalar_bytes(&scalar)
                     .map_err(|e| PlatformError::CustodyError(e.to_string()))
@@ -1217,21 +1181,6 @@ pub mod fake_host {
             Ok(derive_pseudonym(&seed, context_id, version)
                 .to_compressed()
                 .to_vec())
-        }
-
-        /// `export_signing_key_bytes`: an Ed25519 key's 32-byte seed.
-        ///
-        /// # Errors
-        ///
-        /// An unknown key id, or a key that is not Ed25519.
-        pub fn export_signing_key_bytes(&self, key_id: &str) -> Result<Vec<u8>, PlatformError> {
-            self.count("export_signing_key_bytes");
-            self.with_key(key_id, |key| match key {
-                HostKey::Ed25519(sk) => Ok(sk.to_bytes().to_vec()),
-                _ => Err(PlatformError::CustodyError(
-                    "only an Ed25519 key exports".into(),
-                )),
-            })
         }
 
         /// `destroy_key`.
@@ -1670,6 +1619,80 @@ mod tests {
                 .as_bytes(),
             key.public_key().to_compressed().as_slice()
         );
+    }
+
+    /// An HPKE P-256 agreement hands the host exactly the 65-byte
+    /// uncompressed peer point and returns the host's ECDH x-coordinate,
+    /// which equals `ecdh_p256` from the pinned vector's scalar. A peer of the
+    /// wrong length (32, 33, 64, 66 bytes), off the curve, or `0x00`-led is
+    /// rejected with no `dh_agree` call reaching the host.
+    #[tokio::test]
+    async fn hpke_p256_dh_agree_passes_exactly_the_65_byte_point_to_the_host() {
+        use scp_crypto::p256::{P256PublicKey, ecdh_p256, testing};
+
+        let host = super::fake_host::FakeHost::default();
+        let key_id = host
+            .generate_keypair(KeyType::HpkeP256, KeyRole::Operational)
+            .unwrap();
+        let handle = KeyHandle::new(key_id.parse().unwrap());
+        let registry = CallbackKeyRegistry::new();
+        let host_dh = |id: String, peer: Vec<u8>| {
+            let answer = host.dh_agree(&id, &peer);
+            async move { answer }
+        };
+        let host_lookup = |id: String| {
+            let answer = host.get_public_key(&id);
+            async move { answer }
+        };
+
+        let fixed = P256SecretKey::from_scalar_bytes(
+            &hex::decode(testing::ECDH_VECTOR_SCALAR_I)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let peer = fixed.public_key().to_uncompressed();
+        let shared = dh_agree(&registry, &handle, &peer, host_dh, &host_lookup)
+            .await
+            .unwrap();
+        assert_eq!(host.calls("dh_agree"), 1);
+        assert_eq!(
+            host.last_peer.lock().unwrap().as_deref(),
+            Some(peer.as_slice()),
+            "the host saw exactly the 65-byte point"
+        );
+        let own = P256PublicKey::from_uncompressed(
+            host.get_public_key(&key_id).unwrap().public_key.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(shared.as_bytes(), ecdh_p256(&fixed, &own).as_slice());
+
+        let mut off_curve = peer;
+        off_curve[64] ^= 1;
+        let infinity = [0u8; 65];
+        let rejected: [(&str, Vec<u8>); 6] = [
+            ("32 bytes", peer[1..33].to_vec()),
+            ("33 bytes", fixed.public_key().to_compressed().to_vec()),
+            ("64 bytes", peer[1..].to_vec()),
+            ("66 bytes", [&peer[..], &[0u8][..]].concat()),
+            ("off curve", off_curve.to_vec()),
+            ("0x00-led", infinity.to_vec()),
+        ];
+        for (case, bad) in rejected {
+            let host_dh = |id: String, peer: Vec<u8>| {
+                let answer = host.dh_agree(&id, &peer);
+                async move { answer }
+            };
+            assert!(
+                matches!(
+                    dh_agree(&registry, &handle, &bad, host_dh, &host_lookup).await,
+                    Err(PlatformError::CustodyError(_))
+                ),
+                "{case}"
+            );
+            assert_eq!(host.calls("dh_agree"), 1, "{case} reached the host");
+        }
     }
 
     /// Every entry point resolves an unregistered handle the same way,
@@ -2406,59 +2429,6 @@ mod tests {
         assert_eq!(registry.get(&h).unwrap(), None);
     }
 
-    /// An exported seed must produce the handle's verifying key. The host's
-    /// own seed is accepted; a seed for another key, or a buffer that is not
-    /// 32 bytes, is a custody error; a non-Ed25519 handle is `WrongKeyType`
-    /// with no export call.
-    #[tokio::test]
-    async fn export_refuses_a_seed_for_another_key() {
-        let registry = CallbackKeyRegistry::new();
-        let held = ed(0x51);
-        live(
-            &registry,
-            1,
-            RegisteredKey::Ed25519(held.verifying_key()),
-            KeyRole::Identity,
-        );
-        live(
-            &registry,
-            2,
-            RegisteredKey::P256Signing(p256(0x52).public_key()),
-            KeyRole::Operational,
-        );
-        let h = KeyHandle::new(1);
-        let exported =
-            export_ed25519_signing_key(&registry, &h, |_| async { Ok(vec![0x51; 32]) }, no_lookup)
-                .await
-                .unwrap();
-        assert_eq!(exported.verifying_key(), held.verifying_key());
-
-        for seed in [vec![0x53; 32], vec![0x51; 31], vec![0x51; 33]] {
-            let len = seed.len();
-            let refused =
-                export_ed25519_signing_key(&registry, &h, |_| async move { Ok(seed) }, no_lookup)
-                    .await;
-            assert!(
-                matches!(refused, Err(PlatformError::CustodyError(_))),
-                "{len}: {refused:?}"
-            );
-        }
-        let wrong = export_ed25519_signing_key(
-            &registry,
-            &KeyHandle::new(2),
-            |_| async { panic!("no export from a P-256 key") },
-            no_lookup,
-        )
-        .await;
-        assert!(matches!(
-            wrong,
-            Err(PlatformError::WrongKeyType {
-                expected: KeyType::Ed25519,
-                actual: KeyType::P256Signing
-            })
-        ));
-    }
-
     /// `generate_operational` asks the host for an operational key and
     /// `generate_identity` for an Ed25519 identity, and each caches the
     /// requested role.
@@ -2511,8 +2481,8 @@ mod tests {
     }
 
     /// The software host through the flows: an identity generates, signs,
-    /// derives a pseudonym that is the §9.10.4.A derivation of its exported
-    /// seed, and once destroyed is gone on both sides.
+    /// derives a pseudonym that is the §9.10.4.A derivation of its seed, and
+    /// once destroyed is gone on both sides.
     #[tokio::test]
     async fn fake_host_round_trip() {
         let host = fake_host::FakeHost::default();
@@ -2546,15 +2516,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let seed = export_ed25519_signing_key(
-            &registry,
-            &identity,
-            |id| async move { host.export_signing_key_bytes(&id) },
-            gpk,
-        )
-        .await
-        .unwrap()
-        .to_bytes();
+        // The seed is recomputed from the handle id and pinned to the key the
+        // host reports, so the derivation check below reads the host's key.
+        let seed = fake_host::scalar_for(identity.id());
+        assert_eq!(
+            public_key(&registry, &identity, gpk)
+                .await
+                .unwrap()
+                .as_bytes(),
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .as_bytes()
+        );
         assert_eq!(
             pseudonym.public_key(),
             &scp_crypto::pseudonym::derive_pseudonym(

@@ -581,20 +581,12 @@ fn held_role_state(
             .await
             .map_err(|e| format!("role state of context '{id}' could not be read: {e}"))
     };
-    match tokio::runtime::Handle::try_current() {
-        // Inside the MCP transport task: the actor runs on this runtime's
-        // other workers while this one blocks.
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| handle.block_on(query))
-        }
-        // A current-thread runtime would have to run the actor on the thread
-        // this call blocks.
-        Ok(_) => Err(format!(
-            "cannot read the role state of context '{context_id}' from a \
-             current-thread runtime"
-        )),
-        Err(_) => crate::runtime().block_on(query),
-    }
+    // Inside the MCP transport task the actor runs on the runtime's other
+    // workers while this one blocks; outside every runtime (direct calls from
+    // Rust tests) the shared runtime drives it. A current-thread runtime is
+    // refused, since it would have to run the actor on the blocked thread.
+    crate::block_on_shared(query)
+        .map_err(|e| format!("cannot read the role state of context '{context_id}': {e}"))?
 }
 
 /// Why the NAPI MCP server lists no tools and refuses every `tools/call`: this
@@ -2314,17 +2306,25 @@ mod tests {
     // together, and a wired bridge actually yields a receiver.
     // -----------------------------------------------------------------------
 
+    // Consumed only by the `testing`-gated subscription fixtures.
+    #[cfg(feature = "testing")]
     use scp_core::context::membership::ContextEvent;
+    use scp_mcp::protocol::{JSONRPC_VERSION, METHOD_INITIALIZE, RequestId};
+    // Consumed only by the `testing`-gated subscription tests: a shipped build
+    // has no custody for the wrapping key of the context they serve.
+    #[cfg(feature = "testing")]
     use scp_mcp::protocol::{
-        JSONRPC_VERSION, METHOD_INITIALIZE, METHOD_NOT_FOUND, METHOD_RESOURCES_SUBSCRIBE,
-        METHOD_RESOURCES_UPDATED, RequestId,
+        METHOD_NOT_FOUND, METHOD_RESOURCES_SUBSCRIBE, METHOD_RESOURCES_UPDATED,
     };
+    #[cfg(feature = "testing")]
     use tokio::sync::broadcast;
 
     /// The sender half of the supervisor's context-event channel.
+    #[cfg(feature = "testing")]
     type ContextEventSender = broadcast::Sender<(String, ContextEvent)>;
 
     const SUB_CTX: &str = "ctx-subscribe-napi";
+    #[cfg(feature = "testing")]
     const SUB_URI: &str = "scp://ctx-subscribe-napi/events";
     const AGENT_DID: &str = "did:test:napi-mcp-subscribe";
 
@@ -2334,6 +2334,7 @@ mod tests {
     ///
     /// Returning the `Arc` matters: the provider holds a `Weak`, so dropping
     /// the instance would make the provider's state reads fail.
+    #[cfg(feature = "testing")]
     fn napi_mcp_fixture() -> (
         Arc<NapiBridgeInstance>,
         scp_mcp::server::McpServer<McpNapiBridgeProvider>,
@@ -2363,6 +2364,7 @@ mod tests {
 
     /// Attaches a test supervisor to `bi` and creates `ctx_id` on it with
     /// `creator` as its creator and `default_ceiling()` as its ceiling.
+    #[cfg(feature = "testing")]
     fn register_supervised_context(bi: &NapiBridgeInstance, ctx_id: &str, creator: &str) {
         crate::runtime::init_supervisor_for_test_on(bi);
         let supervisor = Arc::clone(crate::runtime::supervisor(bi).unwrap());
@@ -2386,6 +2388,7 @@ mod tests {
 
     /// The same fixture with a live event source wired, as
     /// `mcp_server_create_on` does when the supervisor yields a receiver.
+    #[cfg(feature = "testing")]
     fn napi_mcp_fixture_wired() -> (
         Arc<NapiBridgeInstance>,
         scp_mcp::server::McpServer<McpNapiBridgeProvider>,
@@ -2442,6 +2445,11 @@ mod tests {
     /// AND reject `resources/subscribe`. The replaced bridge behaviour
     /// advertised the capability and then answered the call from the provider,
     /// so a client could hold a subscription that would never fire.
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[test]
     fn mcp_subscribe_rejected_when_no_event_source_wired_napi() {
         let (_bi, mut server) = napi_mcp_fixture();
@@ -2483,6 +2491,11 @@ mod tests {
     /// comes from a detached channel and the pump does not run; the
     /// `pipeline_wiring` event-source gate covers which receiver the NAPI
     /// serve path passes.
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[test]
     fn mcp_subscribe_produces_notifications_when_event_source_wired_napi() {
         let (_bi, mut server, _pump, _tx) = napi_mcp_fixture_wired();
@@ -2526,6 +2539,11 @@ mod tests {
     /// refused at the capability check. The context holds a registered
     /// outlet, so the empty list comes from the capability filter, not from
     /// an empty registry.
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[test]
     fn napi_mcp_lists_no_tool_it_cannot_invoke() {
         use scp_mcp::server::ContextProvider as _;
@@ -2618,6 +2636,11 @@ mod tests {
     /// live the moment resource authorization started admitting anyone.
     /// (`validate_capability` reports every tool unsupported on purpose; see
     /// `napi_mcp_lists_no_tool_it_cannot_invoke`.)
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[test]
     fn napi_provider_serves_real_context_state() {
         use scp_mcp::server::{ContextProvider as _, ResourceKind};
@@ -2803,6 +2826,7 @@ mod tests {
 
     /// Registers `ctx_id`'s UCAN state on the bridge, and creates the context
     /// on the actor with `actor_creator` as its creator and only member.
+    #[cfg(feature = "testing")]
     fn setup_actor_context(bi: &NapiBridgeInstance, ctx_id: &str, actor_creator: &str) {
         crate::runtime::register_ffi_state(bi, ctx_id, &[])
             .expect("registering context FFI state must succeed");
@@ -2832,6 +2856,11 @@ mod tests {
     /// actor holds the context without the agent. In `granted` the agent
     /// created the context. A gate that answered without the actor's role
     /// state fails one of the two halves.
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[test]
     fn provider_gates_read_the_actor_role_state_napi() {
         use scp_mcp::server::{ContextProvider as _, ResourceKind};
@@ -2938,6 +2967,11 @@ mod tests {
     /// `context_join_on` create none). Its outlet registry is empty, so
     /// `tools/list` answers `[]`; it is not an unreadable context. A context
     /// neither the supervisor nor the bridge holds stays an error.
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[test]
     fn served_context_without_ucan_state_lists_no_tools_napi() {
         use scp_mcp::server::ContextProvider as _;
@@ -2993,6 +3027,11 @@ mod tests {
     /// event log, whose events drive the `resources/updated` notices, at the
     /// top level, and reports the bridge's local tree under
     /// `bridge_event_log`, in the shape the `PyO3` and `UniFFI` bridges return.
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[test]
     fn events_resource_reports_the_actor_log_and_the_bridge_log_napi() {
         use scp_mcp::server::ContextProvider as _;
@@ -3206,6 +3245,11 @@ mod tests {
     /// instance's `Drop` runs) and `mcp_server_stop` is never called. The test
     /// holds the entry's shutdown sender, so only the cancel arm can end the
     /// server task.
+    // Gated on `testing`: a shipped build registers no identity (ADR-062
+    // §Decision 6), so no custody holds a wrapping key and creating the
+    // context this test needs fails closed with
+    // `WrappingKeyCustodyUnavailable` (spec 09 §9.16.1).
+    #[cfg(feature = "testing")]
     #[test]
     fn instance_cancel_stops_an_sse_mcp_server_napi() {
         let (bi, _fixture_server) = napi_mcp_fixture();

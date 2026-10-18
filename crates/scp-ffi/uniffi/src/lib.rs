@@ -277,6 +277,25 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Drives `fut` to completion on the calling thread through
+/// [`scp_ffi_common::bridge_wait::bridge_block_on`], with this bridge's shared
+/// runtime for a thread outside every runtime. Inside a current-thread
+/// runtime it refuses, because the awaited work may need the thread the wait
+/// would block.
+///
+/// # Errors
+///
+/// `SCP-CTX-2001` when the wait cannot drive `fut`.
+pub(crate) fn block_on_shared<F>(fut: F) -> Result<F::Output, bridge::ScpError>
+where
+    F: std::future::Future,
+{
+    Ok(scp_ffi_common::bridge_wait::bridge_block_on(
+        || Ok(runtime()),
+        fut,
+    )?)
+}
+
 // ---------------------------------------------------------------------------
 // Callback interfaces — proc-macro definitions
 //
@@ -570,44 +589,6 @@ pub trait KeyCustodyProvider: Send + Sync {
         let _ = (key_id, context_id, pseudonym_epoch);
         Err(ScpError::Context {
             msg: "derive_rotatable_pseudonym not implemented by this KeyCustodyProvider".to_owned(),
-            code: codes::CTX_2050.to_owned(),
-        })
-    }
-
-    /// Export the raw Ed25519 private key bytes (32 bytes) for `key_id`.
-    ///
-    /// The bridge's signing paths that sign with an `ed25519_dalek::SigningKey`,
-    /// governance vote signing among them, build that key from the returned
-    /// bytes. A key held in hardware or in Android Keystore does not export its
-    /// bytes, and ADR-063 requires every key-export accessor, this callback
-    /// included, to leave the custody adapters and all three bridges, because
-    /// hardware custody on the governance path is impossible until then.
-    ///
-    /// # Default
-    ///
-    /// Returns `ScpError::Context` (SCP-CTX-2050) indicating the method is not
-    /// implemented. A host that needs it overrides it. `AppleKeyCustody` and
-    /// `UniffiKeyCustody` override it for a software Ed25519 key, and fail
-    /// for a key Android Keystore holds. Third-party
-    /// `KeyCustodyProvider` implementations that do not need governance vote
-    /// signing may rely on the default until they add support.
-    ///
-    /// **Note:** `UniFFI` callback interfaces require foreign implementations to
-    /// define all methods. The generated Swift protocol / Kotlin interface will
-    /// include this method. The default here applies only to Rust-side callers.
-    ///
-    /// # Errors
-    ///
-    /// The host returns an `ScpError` with `SCP-CRYPTO-4006` when `key_id` was
-    /// destroyed or never existed, and the caller receives key-not-found
-    /// (`SCP-CRYPTO-4006`). Any other host error, including the Rust default's
-    /// `SCP-CTX-2050` and a key that is not exportable or not Ed25519, reaches
-    /// the caller as the custody error `SCP-CRYPTO-4060` carrying the host's
-    /// code and message.
-    async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, ScpError> {
-        let _ = key_id;
-        Err(ScpError::Context {
-            msg: "export_signing_key_bytes not implemented by this KeyCustodyProvider".to_owned(),
             code: codes::CTX_2050.to_owned(),
         })
     }
@@ -1208,6 +1189,7 @@ mod tests {
             economic_policy: None,
             consequence_rules_json: None,
             consequence_config_json: None,
+            capability_requirements_json: None,
             pseudonym_rotation: None,
         };
 
@@ -1272,6 +1254,7 @@ mod tests {
             economic_policy: None,
             consequence_rules_json: None,
             consequence_config_json: None,
+            capability_requirements_json: None,
             pseudonym_rotation: None,
         };
 

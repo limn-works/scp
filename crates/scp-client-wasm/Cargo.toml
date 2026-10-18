@@ -93,6 +93,9 @@ getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] 
 # The host-surface integration test drives did:key fixtures through the exposed
 # WasmScpClient, so it needs the testing DID formats enabled.
 scp-client = { path = "../scp-client", features = ["testing"] }
+# The stream KATs sign chunks with a raw test key through `sign_chunk`, which
+# `scp-protocol` compiles only under `testing` (ADR-049 Decision 7a).
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2", features = ["testing"] }
 scp-did = { path = "../scp-did", features = ["testing"] }
 
 # The cross-target determinism KAT also round-trips the relay wire types

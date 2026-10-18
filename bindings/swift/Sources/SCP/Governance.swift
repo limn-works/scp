@@ -1268,7 +1268,7 @@ public struct SiteConfig: Sendable, Equatable {
         guard (1 ... 8).contains(deployRetentionCount) else {
             throw ScpError.Validation(
                 msg: "deployRetentionCount must be between 1 and 8, got \(deployRetentionCount)",
-                code: "SCP-VALID-7140"
+                code: "SCP-VALID-7152"
             )
         }
         if let csp = cspOverride {

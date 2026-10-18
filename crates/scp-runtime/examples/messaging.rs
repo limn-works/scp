@@ -13,10 +13,11 @@
 use std::sync::Arc;
 
 use scp_did::DID;
+use scp_platform::testing::InMemoryKeyCustody;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::KeyPackage;
 use scp_protocol::context::{Capability, ContextMode, ContextParams};
-use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
+use scp_runtime::context::supervisor::{MessageSigner, Supervisor, single_custody_source};
 
 mod support;
 
@@ -35,13 +36,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         None,
         durable,
+        // Each identity's wrapping key lives in its key custody; a host passes
+        // its own custody here.
+        single_custody_source(Arc::new(InMemoryKeyCustody::new())),
     );
 
     // 2. Register two participants.
     let alice: DID = "did:dht:z6MkAlice".into();
     let bob: DID = "did:dht:z6MkBob".into();
-    manager.register_local_did(alice.clone()).await?;
-    manager.register_local_did(bob.clone()).await?;
+    manager.register_local_did(alice.clone()).await;
+    manager.register_local_did(bob.clone()).await;
 
     // 3. Alice creates a context with messaging capabilities.
     let params = ContextParams {
@@ -84,13 +88,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(members.len(), 2);
 
     // 5. Alice sends a message.
-    let alice_sk = support::signing_key_for(&alice);
+    let alice_signer = support::command_signer_for(&alice).await?;
     manager
         .send_message(
             &handle,
             &alice,
             b"Hello Bob!",
-            MessageSigner::Active(&alice_sk),
+            MessageSigner::Active(&alice_signer),
             None,
             None,
         )
@@ -98,13 +102,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nAlice: Hello Bob!");
 
     // 6. Bob sends a reply.
-    let bob_sk = support::signing_key_for(&bob);
+    let bob_signer = support::command_signer_for(&bob).await?;
     manager
         .send_message(
             &handle,
             &bob,
             b"Hi Alice!",
-            MessageSigner::Active(&bob_sk),
+            MessageSigner::Active(&bob_signer),
             None,
             None,
         )

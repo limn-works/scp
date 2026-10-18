@@ -16,8 +16,9 @@
 //! - `ArcSwap<HashMap<String, DID>>` for standing contexts (lock-free
 //!   read; atomic swap on write).
 //! - `ArcSwap<HashSet<DID>>` for local DIDs (same).
-//! - `DashMap<DID, ArcSwap<WrappingKeyPair>>` for per-identity wrapping
-//!   keys (rare rotation).
+//! - `DashMap<DID, Arc<IdentityWrappingKey>>` for per-identity wrapping
+//!   keys (custody handles), loaded under a per-identity
+//!   `tokio::sync::Mutex<()>` in `wrapping_key_loads`.
 //! - `tokio::sync::Mutex<()>` write-lock serializing ALL mutations of
 //!   the above. Reads are lock-free; the mutex prevents lost writes
 //!   when two callers race a `store` on the same `ArcSwap`.
@@ -57,7 +58,7 @@ use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
 };
-use crate::crypto::wrapping::WrappingKeyPair;
+use crate::crypto::wrapping::{IdentityWrappingKey, WrappingCustodySource};
 use crate::economy::adapter::PaymentAdapterDyn;
 use scp_protocol::context::outlets::cross_context_saga::CrossContextOutletReceipt;
 use serde::{Deserialize, Serialize};
@@ -649,15 +650,15 @@ enum CallerAbortReversal {
 
 /// The owned per-side plan [`Supervisor::divergence_marker_plan`] produces for
 /// a `NeedsRepair` divergence: `(committed_event_id, nonce, [(side-label,
-/// context_id, that side's Active Signing Key); 2])`. Each side signs + appends
-/// its OWN marker (spec §6.2.4 "Dual event-log recording").
+/// context_id, that side's Active Signing Key signer); 2])`. Each side signs +
+/// appends its OWN marker (spec §6.2.4 "Dual event-log recording").
 type DivergenceMarkerPlan = (
     String,
     [u8; 16],
     [(
         &'static str,
         [u8; 32],
-        crate::context::actor::commands::SigningKeyBytes,
+        crate::context::actor::signer::CommandSigner,
     ); 2],
     // CONVERGENT committer-assigned leaf-timestamp (seconds) for the
     // divergence-marker leaf: B's staged `recorded_timestamp_ms / 1000`, the
@@ -716,18 +717,18 @@ struct CrossContextSagaCtx<'a> {
     /// real role (spec §6.2.4 "Caller authentication"). `None` ⇒ no explicit
     /// role assignment.
     caller_source_role: Option<String>,
-    /// The target context's Active Signing Key — receipt + divergence-marker
-    /// signing (Commit-B / NeedsRepair). The actor holds no custody key
-    /// (ADR-049); the FSM rebuilds a `SigningKeyBytes` (zeroizes on drop) per
-    /// command from this caller-supplied key.
-    target_signing_key: ed25519_dalek::SigningKey,
-    /// The caller context's Active Signing Key — used ONLY to sign the
-    /// caller-side `CrossContextDivergenceMarker` on a `NeedsRepair` outcome
-    /// (spec §6.2.4 "Dual event-log recording"). The actor holds no custody
-    /// key (ADR-049); the FSM rebuilds a `SigningKeyBytes` per command from
-    /// this caller-supplied key. Distinct from `target_signing_key`: each side
-    /// signs its OWN marker into its OWN log under its OWN Active Signing Key.
-    caller_signing_key: ed25519_dalek::SigningKey,
+    /// The signer for the target context's Active Signing Key — receipt +
+    /// divergence-marker signing (Commit-B / NeedsRepair). The actor holds no
+    /// custody key (ADR-049); the FSM passes a clone of this caller-supplied
+    /// signer with each command, and the actor signs through it in the turn
+    /// (Decision 7a).
+    target_signer: crate::context::actor::signer::CommandSigner,
+    /// The signer for the caller context's Active Signing Key — used ONLY to
+    /// sign the caller-side `CrossContextDivergenceMarker` on a `NeedsRepair`
+    /// outcome (spec §6.2.4 "Dual event-log recording"). Distinct from
+    /// `target_signer`: each side signs its OWN marker into its OWN log under
+    /// its OWN Active Signing Key.
+    caller_signer: crate::context::actor::signer::CommandSigner,
     /// The supervisor-side outlet executor, taken once at Commit-B.
     executor: Option<SagaOutletExecutor<'a>>,
     /// The captured outlet output bytes, stashed the moment the executor runs
@@ -862,8 +863,9 @@ fn build_outlet_stream_pump_semaphore(requested: u32) -> Arc<tokio::sync::Semaph
 
 /// Supervisor configuration (per-node tunables). Saga phase timeouts and
 /// respawn-budget windows are still derived from code constants
-/// (`Supervisor::LIFECYCLE_TIMEOUT`, the function-local `PHASE_TIMEOUT`, and
-/// the module-level `CRASH_WINDOW_MS`) rather than this struct.
+/// (`Supervisor::LIFECYCLE_TIMEOUT`, the Prepare phase's function-local
+/// `PHASE_TIMEOUT`, and the module-level `COMMIT_PHASE_TIMEOUT` and
+/// `CRASH_WINDOW_MS`) rather than this struct.
 #[derive(Clone, Debug)]
 pub struct SupervisorConfig {
     /// Node-level ceiling on the number of outlet stream pumps that may run
@@ -890,6 +892,36 @@ impl Default for SupervisorConfig {
 /// Crashes older than this (relative to the newest crash) are evicted
 /// before the budget is evaluated.
 const CRASH_WINDOW_MS: u64 = 60_000;
+
+/// The budget of the supervisor-side outlet executor within one saga Commit
+/// attempt (§6.2.4). The executor runs off the actor mailbox (ADR-049 §3), so
+/// no actor turn bounds it.
+const COMMIT_EXECUTOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The budget of one saga Commit attempt, built from its parts: the executor
+/// ([`COMMIT_EXECUTOR_TIMEOUT`]), the Commit-B settle turn, which signs the
+/// receipt through `CommandSigner::sign_bounded_ed25519` and so takes
+/// [`SIGNING_HANDLER_TIMEOUT`](crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT),
+/// and 30 seconds for the Commit-B reserve and Commit-A turns.
+///
+/// A phase budget equal to the sign budget would expire with it, so a stalled
+/// custody would surface as the phase's `TransportTimeout`. With this budget
+/// the stalled sign fails first, as `SCP-CRYPTO-4062` (ADR-049 Decision 7a).
+const COMMIT_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
+    COMMIT_EXECUTOR_TIMEOUT.as_secs()
+        + crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT.as_secs()
+        + 30,
+);
+
+const _: () = assert!(
+    COMMIT_PHASE_TIMEOUT.as_secs()
+        > COMMIT_EXECUTOR_TIMEOUT.as_secs() + crate::context::actor::signer::SIGN_TIMEOUT.as_secs()
+);
+const _: () = assert!(
+    COMMIT_PHASE_TIMEOUT.as_secs()
+        > COMMIT_EXECUTOR_TIMEOUT.as_secs()
+            + crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT.as_secs()
+);
 
 /// Number of crashes within [`CRASH_WINDOW_MS`] that poisons a context
 /// (ADR-049 §10): "3 crashes in 60s poisons the context."
@@ -1490,7 +1522,7 @@ fn in_tracked_task(tracker: &tokio_util::task::TaskTracker) -> bool {
 /// named fields foreclose. Per the project's Agent-first API tenet: one flat
 /// config object, every field named, no builder, no ordering to track.
 ///
-/// The two Active Signing Keys (carried in the named-field [`SagaSigningKeys`])
+/// The two Active Signing Key signers (carried in the named-field [`SagaSigners`])
 /// and the supervisor-side outlet executor stay explicit parameters of the entry
 /// point — they are not envelope data (the keys are custody material the actor
 /// never holds; the executor is a non-`Send` closure), so folding them onto the
@@ -1600,31 +1632,32 @@ pub struct WelcomeJoinRequest {
     pub local_pseudonym: Option<[u8; 32]>,
 }
 
-/// The two Active Signing Keys a §6.2.4 cross-context saga signs under, named by
-/// role so the call site cannot transpose them.
+/// The signers for the two Active Signing Keys a §6.2.4 cross-context saga
+/// signs under, named by role so the call site cannot transpose them.
 ///
-/// `target` and `caller` are both `&SigningKey` of the SAME type; passed as two
-/// adjacent positional `&SigningKey` parameters a swap would compile and stay
-/// self-consistent (verification uses whichever key was supplied), silently
-/// signing each side's divergence marker under the wrong key — the same
-/// confused-deputy footgun the named-field [`CrossContextOutletInvocationRequest`]
-/// foreclosed one layer up for the `[u8; 32]` ids. Naming the role at the call
-/// site (`SagaSigningKeys { target: &…, caller: &… }`) makes a swap a visible
-/// field-name error, not a silent miscapture. Per the Agent-first API tenet:
-/// one flat named-field object, no ordering to track.
+/// `target` and `caller` are the SAME type; passed as two adjacent positional
+/// parameters a swap would compile and stay self-consistent (verification uses
+/// whichever key was supplied), silently signing each side's divergence marker
+/// under the wrong key — the same confused-deputy footgun the named-field
+/// [`CrossContextOutletInvocationRequest`] foreclosed one layer up for the
+/// `[u8; 32]` ids. Naming the role at the call site (`SagaSigners { target: …,
+/// caller: … }`) makes a swap a visible field-name error, not a silent
+/// miscapture. Per the Agent-first API tenet: one flat named-field object, no
+/// ordering to track.
 ///
-/// The keys are held by reference (the entry point clones each into the
-/// FSM-carried context); they are capabilities, NOT envelope data, so they stay
-/// off the wire [`CrossContextOutletInvocationRequest`].
-#[derive(Debug, Clone, Copy)]
-pub struct SagaSigningKeys<'a> {
-    /// The target context's Active Signing Key. Signs the
+/// Each signer reaches its key through custody (ADR-049 Decision 7a): the
+/// runtime never holds the key bytes. The signers are capabilities, NOT
+/// envelope data, so they stay off the wire
+/// [`CrossContextOutletInvocationRequest`].
+#[derive(Debug, Clone)]
+pub struct SagaSigners {
+    /// The target context's Active Signing Key signer. Signs the
     /// [`CrossContextOutletReceipt`]
     /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`.
-    pub target: &'a ed25519_dalek::SigningKey,
-    /// The caller context's Active Signing Key. Signs the CALLER-side divergence
-    /// marker on `NeedsRepair`.
-    pub caller: &'a ed25519_dalek::SigningKey,
+    pub target: crate::context::actor::signer::CommandSigner,
+    /// The caller context's Active Signing Key signer. Signs the CALLER-side
+    /// divergence marker on `NeedsRepair`.
+    pub caller: crate::context::actor::signer::CommandSigner,
 }
 
 /// The Phase-1 (pre-pump) outputs of an outlet-stream open, shared by
@@ -1704,34 +1737,37 @@ pub struct StreamingSagaHandle {
 // MessageSigner (ADR-039)
 // ---------------------------------------------------------------------------
 
-/// Pairs the signing key with its verification method so the persona stamped on
+/// Pairs the signer with its verification method so the persona stamped on
 /// the wire cannot disagree with the key that signed. Every send path requires a
-/// key, so this is non-optional.
+/// signer, so this is non-optional.
 ///
 /// ADR-039 — the inner envelope's `signing_key_id` (`#active` / `#agent`)
 /// selects which DID-document verification method the recipient resolves to
-/// check the signature. Carrying the key and its persona as two independent
+/// check the signature. Carrying the signer and its persona as two independent
 /// arguments let a caller stamp `#agent` while signing with the `#active` key
 /// (or vice versa), producing a message the recipient cannot verify. This enum
 /// binds the two together: [`Self::signing_key_id`] is derived from the same
-/// variant that carries the key, so the stamp and the key are one source of
+/// variant that carries the signer, so the stamp and the key are one source of
 /// truth. The single stamp+sign site
 /// (`build_encrypted_envelope_actor`)
-/// takes the `MessageSigner` directly.
+/// takes the `MessageSigner` directly. The signer is a [`CommandSigner`]
+/// (ADR-049 Decision 7a): the key stays in custody.
+///
+/// [`CommandSigner`]: crate::context::actor::signer::CommandSigner
 #[derive(Clone, Copy)]
 pub enum MessageSigner<'a> {
     /// Sign under the human `#active` verification method.
-    Active(&'a ed25519_dalek::SigningKey),
+    Active(&'a crate::context::actor::signer::CommandSigner),
     /// Sign under the autonomous `#agent` verification method (ADR-039).
-    Agent(&'a ed25519_dalek::SigningKey),
+    Agent(&'a crate::context::actor::signer::CommandSigner),
 }
 
 impl<'a> MessageSigner<'a> {
-    /// The Ed25519 signing key, regardless of persona.
+    /// The signer, regardless of persona.
     #[must_use]
-    pub const fn key(&self) -> &'a ed25519_dalek::SigningKey {
+    pub const fn signer(&self) -> &'a crate::context::actor::signer::CommandSigner {
         match self {
-            Self::Active(k) | Self::Agent(k) => k,
+            Self::Active(s) | Self::Agent(s) => s,
         }
     }
 
@@ -1779,13 +1815,31 @@ pub struct Supervisor {
     /// invisible to that actor's `local_dids` view — breaking the
     /// author-DID-controlled gate on broadcast key requests.
     pub(in crate::context::supervisor) local_dids: Arc<ArcSwap<HashSet<DID>>>,
-    /// Per-identity DHKEM(P-256) wrapping keypairs (spec 09 §9.16.1), the only
-    /// owner of each identity's pair. [`Self::ensure_wrapping_key`] fills an
-    /// entry from durable storage (or generates and stores one) before the
-    /// identity's first actor is built. The `Arc<ArcSwap<_>>` lets the
-    /// identity's `KeyPackageStoreActor` hold the same slot and read the
-    /// current pair at every KeyPackage it generates.
-    pub(in crate::context::supervisor) wrapping_keys: DashMap<DID, Arc<ArcSwap<WrappingKeyPair>>>,
+    /// Per-identity DHKEM(P-256) wrapping keys (spec 09 §9.16.1), the only
+    /// writer of each identity's key. [`Self::load_wrapping_key`] fills an
+    /// entry from durable storage (or generates and stores one) at every entry
+    /// point that builds an actor for the identity, before any lock is taken;
+    /// [`Self::wrapping_key`] reads it. An entry never changes once inserted,
+    /// so the identity's `KeyPackageStoreActor` holds the same `Arc`.
+    pub(in crate::context::supervisor) wrapping_keys: DashMap<DID, Arc<IdentityWrappingKey>>,
+    /// Per-identity load locks of [`Self::load_wrapping_key`]: two concurrent
+    /// first loads of one identity load or generate once. Lock order:
+    /// `wrapping_key_loads[owner]` → [`Self::write_lock`]. No shard lock of
+    /// this map is held across an await.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "ADR-049 §Decision 12 allow-list: per-identity guard held across the custody awaits of a first wrapping-key load. Cold path (once per identity per process), so the Mutex acquire cost the ban targets does not apply."
+    )]
+    pub(in crate::context::supervisor) wrapping_key_loads:
+        DashMap<DID, Arc<tokio::sync::Mutex<()>>>,
+    /// Finds the custody that holds each identity's wrapping key. Every
+    /// constructor takes it from its caller, except the test-only ones, which
+    /// install one shared in-memory custody ([`Self::testing_wrapping_custody`]).
+    pub(in crate::context::supervisor) wrapping_custody: WrappingCustodySource,
+    /// The in-memory custody a test-only constructor installed behind
+    /// [`Self::wrapping_custody`]; empty when the caller supplied the source.
+    #[cfg(any(test, feature = "testing"))]
+    testing_wrapping_custody: OnceLock<Arc<scp_platform::testing::InMemoryKeyCustody>>,
     /// Persistence backend. [`Self::build_actor_deps`] hands it to every actor
     /// as `ActorDeps::persistence`. Every shipped constructor fills it with the
     /// caller's required backend.
@@ -1821,6 +1875,12 @@ pub struct Supervisor {
     pub(in crate::context::supervisor) saga_journal: Arc<dyn SagaJournal>,
     /// Per-identity `KeyPackageStoreActor` handles.
     pub(in crate::context::supervisor) key_package_stores: DashMap<DID, KeyPackageStoreHandle>,
+    /// Per-challenger `ChallengerLedgerActor` handles, keyed by the
+    /// challenger's canonical identifier (spec 07 §7.3.4).
+    pub(in crate::context::supervisor) challenger_ledgers: DashMap<
+        String,
+        crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerHandle,
+    >,
     /// The one task tracker every supervisor-held task spawns through
     /// (ADR-049 Decision 16, supervisor task drain); Decision 16 item 1 states
     /// which tasks are members. Spawn only through [`Self::spawn_permit`],
@@ -1932,8 +1992,11 @@ pub struct Supervisor {
     // -----------------------------------------------------------------
     /// Shared crypto provider. Populated by [`Self::with_providers_and_journal`].
     crypto: OnceLock<Arc<crate::crypto::mls::provider::NodeMlsFactory>>,
-    /// Shared transport provider. Populated by [`Self::with_providers_and_journal`].
-    transport: OnceLock<Arc<dyn ContextTransportProvider>>,
+    /// Shared transport binding. Populated by [`Self::with_providers_and_journal`]
+    /// with a [`TransportSlot`](super::TransportSlot) around the caller's
+    /// provider. The `OnceLock` is set once; the provider inside the slot is
+    /// rebound through an `ArcSwap` (lock-free read per ADR-049 Decision 12).
+    transport: OnceLock<Arc<super::TransportSlot>>,
     /// Shared event-log provider. Populated by [`Self::with_providers_and_journal`].
     event_log: OnceLock<Arc<dyn ContextEventLogProvider>>,
     /// Helper-side persistence slot. [`Self::with_providers_and_journal`]
@@ -2259,6 +2322,11 @@ struct ProviderBootstrap {
     event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
     clock: Option<Arc<dyn Clock>>,
     durable: DurableProviders,
+    wrapping_custody: WrappingCustodySource,
+    /// The in-memory custody behind `wrapping_custody` when the test-only
+    /// `Supervisor::with_providers` built it.
+    #[cfg(any(test, feature = "testing"))]
+    testing_wrapping_custody: Option<Arc<scp_platform::testing::InMemoryKeyCustody>>,
 }
 
 impl Supervisor {
@@ -2288,7 +2356,38 @@ impl Supervisor {
         saga_journal: Arc<dyn SagaJournal>,
         health_config: SupervisorConfig,
     ) -> Self {
-        Self::new_inner(persistence, saga_journal, health_config)
+        Self::with_in_memory_wrapping_custody(persistence, saga_journal, health_config)
+    }
+
+    /// `new_inner` over one shared in-memory wrapping custody, which
+    /// [`Self::testing_wrapping_custody`] returns.
+    #[cfg(any(test, feature = "testing"))]
+    fn with_in_memory_wrapping_custody(
+        persistence: Arc<dyn ContextPersistence>,
+        saga_journal: Arc<dyn SagaJournal>,
+        health_config: SupervisorConfig,
+    ) -> Self {
+        let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+        let supervisor = Self::new_inner(
+            persistence,
+            saga_journal,
+            health_config,
+            crate::crypto::wrapping::single_custody_source(Arc::clone(&custody)),
+        );
+        let _ = supervisor.testing_wrapping_custody.set(custody);
+        supervisor
+    }
+
+    /// The in-memory custody behind this supervisor's wrapping keys when a
+    /// test-only constructor chose it; `None` when the caller supplied the
+    /// source. Tests generate keys in it so the supervisor and the test share
+    /// one custody.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn testing_wrapping_custody(
+        &self,
+    ) -> Option<Arc<scp_platform::testing::InMemoryKeyCustody>> {
+        self.testing_wrapping_custody.get().cloned()
     }
 
     /// Internal constructor reachable from production builds. The public
@@ -2300,6 +2399,7 @@ impl Supervisor {
         persistence: Arc<dyn ContextPersistence>,
         saga_journal: Arc<dyn SagaJournal>,
         health_config: SupervisorConfig,
+        wrapping_custody: WrappingCustodySource,
     ) -> Self {
         // Synchronous critical section only; the guard is provably never held
         // across an `.await` (check-disjoint + insert, or remove-on-drop, are
@@ -2336,12 +2436,17 @@ impl Supervisor {
             standing_contexts: ArcSwap::new(Arc::new(HashMap::new())),
             local_dids: Arc::new(ArcSwap::new(Arc::new(HashSet::new()))),
             wrapping_keys: DashMap::new(),
+            wrapping_key_loads: DashMap::new(),
+            wrapping_custody,
+            #[cfg(any(test, feature = "testing"))]
+            testing_wrapping_custody: OnceLock::new(),
             persistence,
             write_lock,
             bootstrap_spawn_lock,
             pending_discards: dashmap::DashSet::new(),
             saga_journal,
             key_package_stores: DashMap::new(),
+            challenger_ledgers: DashMap::new(),
             task_tracker: tokio_util::task::TaskTracker::new(),
             spawn_gate: std::sync::RwLock::new(false),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
@@ -2426,7 +2531,11 @@ impl Supervisor {
         let persistence: Arc<dyn ContextPersistence> =
             Arc::new(crate::context::persistence::NoOpContextPersistence);
         let saga_journal: Arc<dyn SagaJournal> = Arc::new(NoOpSagaJournal);
-        Self::new_inner(persistence, saga_journal, SupervisorConfig::default())
+        Self::with_in_memory_wrapping_custody(
+            persistence,
+            saga_journal,
+            SupervisorConfig::default(),
+        )
     }
 
     /// Test-only constructor: builds a supervisor over the given providers with
@@ -2447,7 +2556,9 @@ impl Supervisor {
     /// returns `PersistenceFailed`.
     ///
     /// The other arguments match [`Self::with_providers_and_journal`], except
-    /// that `mls_storage` arrives alone and is paired with the no-op journal.
+    /// that `mls_storage` arrives alone and is paired with the no-op journal,
+    /// and that the wrapping custody is one shared in-memory custody, which
+    /// [`Self::testing_wrapping_custody`] returns.
     #[must_use]
     #[cfg(any(test, feature = "testing"))]
     #[allow(clippy::too_many_arguments)] // mirrors the provider bootstrap of `with_providers_and_journal`
@@ -2461,6 +2572,73 @@ impl Supervisor {
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+    ) -> Arc<Self> {
+        let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+        let wrapping_custody = crate::crypto::wrapping::single_custody_source(Arc::clone(&custody));
+        Self::with_test_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            persistence,
+            payment_adapter,
+            event_tx,
+            clock,
+            mls_storage,
+            wrapping_custody,
+            Some(custody),
+        )
+    }
+
+    /// [`Self::with_providers`] over the caller's wrapping custody source,
+    /// for a test whose supervisor custody must be a wrapper (a counting or
+    /// key-losing custody) or must outlive one supervisor (a restart).
+    /// [`Self::testing_wrapping_custody`] returns `None`.
+    #[must_use]
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(clippy::too_many_arguments)] // mirrors the provider bootstrap of `with_providers_and_journal`
+    pub fn with_providers_and_wrapping_custody(
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+        transport: Box<dyn ContextTransportProvider>,
+        event_log: Box<dyn ContextEventLogProvider>,
+        key_resolver: KeyResolver,
+        persistence: Option<Box<dyn ContextPersistence>>,
+        payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+        clock: Option<Arc<dyn Clock>>,
+        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        wrapping_custody: WrappingCustodySource,
+    ) -> Arc<Self> {
+        Self::with_test_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            persistence,
+            payment_adapter,
+            event_tx,
+            clock,
+            mls_storage,
+            wrapping_custody,
+            None,
+        )
+    }
+
+    /// The body of the two test-only provider constructors.
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(clippy::too_many_arguments)] // mirrors the provider bootstrap of `with_providers_and_journal`
+    fn with_test_providers(
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+        transport: Box<dyn ContextTransportProvider>,
+        event_log: Box<dyn ContextEventLogProvider>,
+        key_resolver: KeyResolver,
+        persistence: Option<Box<dyn ContextPersistence>>,
+        payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+        clock: Option<Arc<dyn Clock>>,
+        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        wrapping_custody: WrappingCustodySource,
+        testing_wrapping_custody: Option<Arc<scp_platform::testing::InMemoryKeyCustody>>,
     ) -> Arc<Self> {
         let helper_persistence: Option<Arc<dyn ContextPersistence>> = persistence.map(Arc::from);
         let persistence: Arc<dyn ContextPersistence> = helper_persistence.as_ref().map_or_else(
@@ -2478,6 +2656,8 @@ impl Supervisor {
             event_tx,
             clock,
             durable: DurableProviders::with_noop_journal(mls_storage),
+            wrapping_custody,
+            testing_wrapping_custody,
         })
     }
 
@@ -2522,6 +2702,10 @@ impl Supervisor {
     ///   [`scp_clock::SystemClock`] when `None`.
     /// * `durable` — **required** saga journal + `mls_storage` pair over one
     ///   `Storage` backend. The runtime never defaults storage.
+    /// * `wrapping_custody` — **required** source of the custody that holds
+    ///   each identity's wrapping key (spec 09 §9.16.1). An actor whose owner
+    ///   it answers `None` for is not built
+    ///   ([`ContextError::WrappingKeyCustodyUnavailable`]).
     ///
     /// A `None` persistence does not compile:
     ///
@@ -2534,11 +2718,12 @@ impl Supervisor {
     /// #     event_log: Box<dyn scp_runtime::context::builder::ContextEventLogProvider>,
     /// #     key_resolver: scp_protocol::context::governance::KeyResolver,
     /// #     durable: DurableProviders,
+    /// #     wrapping_custody: scp_runtime::context::supervisor::WrappingCustodySource,
     /// # ) {
     /// let _ = Supervisor::with_providers_and_journal(
     ///     crypto, transport, event_log, key_resolver,
     ///     None, // E0308: expected `Box<dyn ContextPersistence>`
-    ///     None, None, None, durable,
+    ///     None, None, None, durable, wrapping_custody,
     /// );
     /// # }
     /// ```
@@ -2554,6 +2739,7 @@ impl Supervisor {
         event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
         clock: Option<Arc<dyn Clock>>,
         durable: DurableProviders,
+        wrapping_custody: WrappingCustodySource,
     ) -> Arc<Self> {
         let persistence: Arc<dyn ContextPersistence> = Arc::from(persistence);
         Self::bootstrap(ProviderBootstrap {
@@ -2567,6 +2753,9 @@ impl Supervisor {
             event_tx,
             clock,
             durable,
+            wrapping_custody,
+            #[cfg(any(test, feature = "testing"))]
+            testing_wrapping_custody: None,
         })
     }
 
@@ -2574,6 +2763,8 @@ impl Supervisor {
     /// behind [`Self::with_providers_and_journal`] and the test-only
     /// `Self::with_providers`.
     fn bootstrap(providers: ProviderBootstrap) -> Arc<Self> {
+        #[cfg(any(test, feature = "testing"))]
+        let testing_wrapping_custody = providers.testing_wrapping_custody.clone();
         let ProviderBootstrap {
             crypto,
             transport,
@@ -2585,6 +2776,8 @@ impl Supervisor {
             event_tx,
             clock,
             durable,
+            wrapping_custody,
+            ..
         } = providers;
         // `into_parts` is `pub(crate)`, so this is the single in-crate site that
         // decomposes the same-backend journal + `mls_storage` pair.
@@ -2593,13 +2786,20 @@ impl Supervisor {
             persistence,
             saga_journal,
             SupervisorConfig::default(),
+            wrapping_custody,
         ));
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(custody) = testing_wrapping_custody {
+            let _ = supervisor.testing_wrapping_custody.set(custody);
+        }
 
         // Populate provider OnceLocks. Each `set(...)` fails only when the slot
         // is already populated, which is impossible on this freshly-constructed
         // supervisor; `let _ =` discards the `Result` for clippy.
         let _ = supervisor.crypto.set(crypto);
-        let _ = supervisor.transport.set(Arc::from(transport));
+        let _ = supervisor
+            .transport
+            .set(Arc::new(super::TransportSlot::new(Arc::from(transport))));
         let _ = supervisor.event_log.set(Arc::from(event_log));
         if let Some(p) = helper_persistence {
             let _ = supervisor.helper_persistence.set(p);
@@ -2742,12 +2942,27 @@ impl Supervisor {
         self.crypto.get()
     }
 
-    /// Cheap reference to the supervisor's shared
-    /// [`ContextTransportProvider`]. Returns `None` if
+    /// The supervisor's shared [`ContextTransportProvider`]: its
+    /// [`TransportSlot`](super::TransportSlot), whose calls reach the
+    /// provider bound at call time. Returns `None` if
     /// [`Self::with_providers_and_journal`] was not used.
     #[must_use]
-    pub(crate) fn transport_ref(&self) -> Option<&Arc<dyn ContextTransportProvider>> {
-        self.transport.get()
+    pub(crate) fn transport_ref(&self) -> Option<Arc<dyn ContextTransportProvider>> {
+        self.transport
+            .get()
+            .map(|slot| Arc::clone(slot) as Arc<dyn ContextTransportProvider>)
+    }
+
+    /// This supervisor's [`TransportSlot`](super::TransportSlot), through which
+    /// a bridge binds the transport of the node it starts
+    /// (`construction.md` §"Node start — `NodeStartConfig`"). Every actor
+    /// this supervisor spawned holds the same slot, so a
+    /// [`TransportSlot::replace`](super::TransportSlot::replace) reaches
+    /// running contexts without a respawn. Returns `None` for a supervisor
+    /// built without providers.
+    #[must_use]
+    pub fn transport_slot(&self) -> Option<Arc<super::TransportSlot>> {
+        self.transport.get().map(Arc::clone)
     }
 
     /// Cheap reference to the supervisor's shared
@@ -2832,6 +3047,21 @@ impl Supervisor {
     #[must_use]
     pub(crate) fn clock_ref(&self) -> Option<&Arc<dyn Clock>> {
         self.clock.get()
+    }
+
+    /// The supervisor clock's current Unix seconds: the time a challenger
+    /// signs as `created_at`, from the same clock its ledger checks windows
+    /// against.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInitialized`] when the supervisor has no clock
+    /// ([`Self::with_providers_and_journal`] was not used).
+    pub fn now_secs(&self) -> Result<u64, ContextError> {
+        use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
+        self.clock_ref()
+            .map(scp_clock::Clock::now_secs)
+            .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))
     }
 
     /// Cheap reference to the supervisor's
@@ -2945,25 +3175,28 @@ impl Supervisor {
     }
 
     // -------------------------------------------------------------------
-    // Per-identity wrapping keypair (spec 09 §9.16.1; spec 10 §10.8.1(4)).
+    // Per-identity wrapping key (spec 09 §9.16.1; spec 10 §10.8.1(4)).
     //
-    // One pair per identity, shared by every context the identity joins. The
-    // supervisor's `wrapping_keys` map is its only owner; actors read it
-    // through `SupervisorHandle::my_wrapping_keypair`, and the identity's
-    // `KeyPackageStoreActor` holds the same slot. Context snapshots carry no
+    // One key per identity, shared by every context the identity joins. The
+    // supervisor's `wrapping_keys` map is its only writer; actors read it
+    // through `SupervisorHandle::my_wrapping_key`, and the identity's
+    // `KeyPackageStoreActor` holds the same `Arc`. Context snapshots carry no
     // wrapping key, so restoring a context never changes it.
+    //
+    // Load and lookup are split. `load_wrapping_key` runs at every entry point
+    // that builds an actor for an identity, before that entry point takes
+    // `bootstrap_spawn_lock` or `write_lock`, so no custody call runs under
+    // either. `wrapping_key` is the sync lookup the actor builders use.
     // -------------------------------------------------------------------
 
-    /// Clear every per-identity wrapping keypair. Used by the shutdown helper,
-    /// after it closes the spawn gate, so no wrapping secret stays resident
-    /// past shutdown. Wrapping-key secrets zeroize on drop via the
-    /// `Zeroizing<[u8;32]>` field on
-    /// [`WrappingKeyPair`].
+    /// Clear every per-identity wrapping key. Used by the shutdown helper,
+    /// after it closes the spawn gate, so no wrapping key stays resident past
+    /// shutdown.
     ///
     /// `_write` is the held [`Self::write_lock`] guard. The only insert,
     /// [`Self::insert_wrapping_key`], checks the gate under that same lock, so
     /// an insert either precedes this clear or sees the closed gate and is
-    /// refused: no load in flight at shutdown re-inserts a pair afterwards.
+    /// refused: no load in flight at shutdown re-inserts a key afterwards.
     pub(crate) fn clear_wrapping_keys(&self, _write: &tokio::sync::MutexGuard<'_, ()>) {
         self.wrapping_keys.clear();
     }
@@ -2971,86 +3204,210 @@ impl Supervisor {
     /// The only insert into `wrapping_keys`. Refuses with
     /// [`ContextError::SupervisorShutDown`] once the spawn gate is closed, so
     /// together with [`Self::clear_wrapping_keys`] (which takes the same
-    /// [`Self::write_lock`], held here as `_write`) no wrapping secret enters
-    /// the map after shutdown has begun. A refused `slot` drops, zeroizing its
-    /// secret.
+    /// [`Self::write_lock`], held here as `_write`) no wrapping key enters the
+    /// map after shutdown has begun.
     fn insert_wrapping_key(
         &self,
         _write: &tokio::sync::MutexGuard<'_, ()>,
         identity: &DID,
-        slot: &Arc<ArcSwap<WrappingKeyPair>>,
+        key: &Arc<IdentityWrappingKey>,
     ) -> Result<(), ContextError> {
-        self.refuse_if_shut_down("wrapping keypair load")?;
-        self.wrapping_keys
-            .insert(identity.clone(), Arc::clone(slot));
+        self.refuse_if_shut_down("wrapping key load")?;
+        self.wrapping_keys.insert(identity.clone(), Arc::clone(key));
         Ok(())
     }
 
-    /// Returns `identity`'s wrapping-key slot, loading it from durable storage
-    /// on first use and, when none is stored, generating a pair and storing it
-    /// once.
+    /// Returns `owner`'s wrapping key, loading it from durable storage on first
+    /// use and, when none is stored, creating one and storing it once.
     ///
-    /// Lock-free when the slot is already loaded. Otherwise it takes
-    /// [`Self::write_lock`] (the write path of `wrapping_keys`) and re-checks,
-    /// so concurrent first uses load or generate exactly once. The pair is
-    /// stored before it enters the map: a pair this node could lose on restart
-    /// is never published.
+    /// Lock-free when the key is already loaded. Otherwise it takes `owner`'s
+    /// load lock in `wrapping_key_loads` and re-checks, so concurrent first
+    /// loads of one identity load or create exactly once; loads of different
+    /// identities do not wait on each other. [`Self::write_lock`] is held only
+    /// for the final insert. The key is stored before it enters the map: a key
+    /// this node could lose on restart is never published.
+    ///
+    /// Call it before taking `bootstrap_spawn_lock` or `write_lock`.
     ///
     /// # Errors
     ///
+    /// - [`ContextError::WrappingKeyCustodyUnavailable`] if the custody source
+    ///   has no custody for `owner`.
     /// - [`ContextError::NotInitialized`] if the supervisor has no storage.
-    /// - [`ContextError::PersistenceFailed`] if the read or write fails.
-    /// - [`ContextError::CryptoFailed`] if the stored value is not a valid
-    ///   scalar; the stored value is left as it is and no pair is generated
+    /// - [`ContextError::PersistenceFailed`] if the read or write fails; a key
+    ///   generated for a record that could not be written is destroyed once
+    ///   its record is removed, and kept when the removal fails too.
+    /// - [`ContextError::CryptoFailed`] if the stored value is not a version-1
+    ///   handle record; the stored value is left as it is and no key is created
     ///   over it.
+    /// - [`ContextError::WrappingKeyHandleInvalid`] if custody does not hold
+    ///   the recorded handle or its public key differs from the record; nothing
+    ///   is regenerated over the record.
+    /// - [`ContextError::Custody`] if custody fails otherwise or does not
+    ///   answer within the custody budget (`SCP-CRYPTO-4062`).
     /// - [`ContextError::SupervisorShutDown`] once shutdown has begun, whether
     ///   the gate closes before the call or while it loads.
-    pub(crate) async fn ensure_wrapping_key(
+    pub(crate) async fn load_wrapping_key(
         &self,
-        identity: &DID,
-    ) -> Result<Arc<ArcSwap<WrappingKeyPair>>, ContextError> {
-        self.refuse_if_shut_down("wrapping keypair lookup")?;
-        if let Some(slot) = self.wrapping_keys.get(identity) {
-            return Ok(Arc::clone(slot.value()));
+        owner: &DID,
+    ) -> Result<Arc<IdentityWrappingKey>, ContextError> {
+        self.refuse_if_shut_down("wrapping key load")?;
+        if let Some(key) = self.wrapping_keys.get(owner) {
+            return Ok(Arc::clone(key.value()));
         }
+        // Clone the lock out of the entry so the entry (and its shard write
+        // lock) drops at the end of this statement, before any await.
+        let load_lock = Arc::clone(&*self.wrapping_key_loads.entry(owner.clone()).or_default());
+        // The guard comes back with the key and is held until the key is in
+        // the map, so a load waiting on the lock finds it there.
+        let (key, load_guard) = {
+            let held = load_lock.lock_owned().await;
+            if let Some(key) = self.wrapping_keys.get(owner) {
+                return Ok(Arc::clone(key.value()));
+            }
+            self.read_or_create_wrapping_key(owner, held).await?
+        };
+        let key = Arc::new(key);
         let guard = self.write_lock.lock().await;
-        if let Some(slot) = self.wrapping_keys.get(identity) {
-            return Ok(Arc::clone(slot.value()));
-        }
+        self.insert_wrapping_key(&guard, owner, &key)?;
+        drop(guard);
+        drop(load_guard);
+        Ok(key)
+    }
+
+    /// Reads `owner`'s stored wrapping key record and checks it against
+    /// `owner`'s custody or, when none is stored, generates a key in that
+    /// custody and stores its record. Runs under `owner`'s load lock only,
+    /// whose guard `load_guard` is, and returns that guard with the key.
+    ///
+    /// Generate, store, and the cleanup of a failed store run in a spawned
+    /// task that holds `load_guard`, so a caller dropped mid-sequence (a
+    /// UniFFI async cancellation drops the Rust future) cannot cut it, and no
+    /// other load of `owner` reads the record before the task finishes. When
+    /// the store reports an error, the task removes the record before it
+    /// destroys the key, because the write may have committed; a record it
+    /// cannot remove keeps its key. A stored record therefore never names a
+    /// key this task destroyed. The cases that can still orphan a key are
+    /// listed at [`custody_bounded`](crate::crypto::wrapping::custody_bounded).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load_wrapping_key`], and [`ContextError::InvalidState`] if
+    /// the creating task panics or is cancelled.
+    async fn read_or_create_wrapping_key(
+        &self,
+        owner: &DID,
+        load_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(IdentityWrappingKey, tokio::sync::OwnedMutexGuard<()>), ContextError> {
+        let custody =
+            (self.wrapping_custody)(owner).ok_or(ContextError::WrappingKeyCustodyUnavailable)?;
         let storage = self.mls_storage_ref().ok_or_else(|| {
             ContextError::NotInitialized(
                 crate::context::manager_methods::PROVIDER_NOT_INITIALIZED.to_owned(),
             )
         })?;
-        let stored =
-            crate::store::wrapping_key::load_wrapping_key(storage.as_ref(), identity).await?;
-        let pair = if let Some(pair) = stored {
-            pair
-        } else {
-            let pair = WrappingKeyPair::generate();
-            crate::store::wrapping_key::store_wrapping_key(storage.as_ref(), identity, &pair)
-                .await?;
-            pair
-        };
-        let slot = Arc::new(ArcSwap::from_pointee(pair));
-        self.insert_wrapping_key(&guard, identity, &slot)?;
-        drop(guard);
-        Ok(slot)
+        let record =
+            crate::store::wrapping_key::load_wrapping_key_handle(storage.as_ref(), owner).await?;
+        if let Some(record) = record {
+            let key = IdentityWrappingKey::new(custody, record.handle, record.public);
+            return match key.read_public().await {
+                Ok(public) if public == record.public => Ok((key, load_guard)),
+                // Custody answered, and the handle is not this key: lost,
+                // destroyed, or replaced. A custody that did not answer says
+                // nothing about the handle, so its failure passes through.
+                Ok(_) | Err(ContextError::CryptoFailed(_)) => {
+                    Err(ContextError::WrappingKeyHandleInvalid)
+                }
+                Err(ContextError::Custody(failure)) if failure.is_key_not_found() => {
+                    Err(ContextError::WrappingKeyHandleInvalid)
+                }
+                Err(e) => Err(e),
+            };
+        }
+        let storage = Arc::clone(storage);
+        let owner = owner.clone();
+        tokio::spawn(async move {
+            let key = IdentityWrappingKey::generate(custody).await?;
+            if let Err(e) = crate::store::wrapping_key::store_wrapping_key_handle(
+                storage.as_ref(),
+                &owner,
+                key.handle(),
+                key.public(),
+            )
+            .await
+            {
+                // A write that reports an error may still have committed, so
+                // the key is destroyed only once its record is gone: a stored
+                // record never names a destroyed key, which a later load
+                // would refuse forever as `WrappingKeyHandleInvalid`. When the
+                // record cannot be removed either, the key stays: a committed
+                // record then names a live key and the next load uses it, and
+                // an uncommitted one leaves an orphan the next load does not
+                // see.
+                match crate::store::wrapping_key::delete_wrapping_key_handle(
+                    storage.as_ref(),
+                    &owner,
+                )
+                .await
+                {
+                    Ok(()) => key.destroy().await,
+                    Err(delete_error) => tracing::warn!(
+                        error = %delete_error,
+                        "wrapping key record write failed and its removal failed; \
+                         keeping the key in custody"
+                    ),
+                }
+                return Err(e);
+            }
+            Ok((key, load_guard))
+        })
+        .await
+        .map_err(|e| {
+            ContextError::InvalidState(format!(
+                "wrapping key creation: {}",
+                JoinFailure::from_join_error(&e)
+            ))
+        })?
     }
 
-    /// Returns `identity`'s current 65-byte wrapping public key, the value it
-    /// publishes as the `0xFF01` leaf extension (spec 09 §9.16.1). Loads or
-    /// generates the pair exactly as `Self::ensure_wrapping_key` does.
-    ///
-    /// A bridge that mints a KeyPackage outside the KeyPackage store attaches
-    /// this key, so the leaf it adds advertises the key whose secret this
-    /// supervisor holds.
+    /// `owner`'s loaded wrapping key: a map read with no custody or storage
+    /// call. An entry point loads the key ([`Self::load_wrapping_key`]) before
+    /// any actor of `owner` is built, and only shutdown removes it, so a miss
+    /// here is a programming error and fails closed.
     ///
     /// # Errors
     ///
-    /// The errors of `Self::ensure_wrapping_key`.
+    /// [`ContextError::SupervisorShutDown`] if no key is loaded for `owner`
+    /// and shutdown has begun (shutdown clears the map), and
+    /// [`ContextError::InvalidState`] if no key is loaded otherwise. The map is
+    /// read before the gate, so a shutdown that clears the map between a gate
+    /// check and the read still reports `SupervisorShutDown`.
+    pub(crate) fn wrapping_key(
+        &self,
+        owner: &DID,
+    ) -> Result<Arc<IdentityWrappingKey>, ContextError> {
+        if let Some(key) = self.wrapping_keys.get(owner) {
+            return Ok(Arc::clone(key.value()));
+        }
+        self.refuse_if_shut_down("wrapping key lookup")?;
+        Err(ContextError::InvalidState(
+            "wrapping key not loaded for the actor owner".to_owned(),
+        ))
+    }
+
+    /// Returns `identity`'s 65-byte wrapping public key, the value it
+    /// publishes as the `0xFF01` leaf extension (spec 09 §9.16.1). Loads or
+    /// creates the key exactly as [`Self::load_wrapping_key`] does.
+    ///
+    /// A bridge that mints a KeyPackage outside the KeyPackage store attaches
+    /// this key, so the leaf it adds advertises the key this supervisor opens
+    /// with. Call it outside every supervisor lock.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::load_wrapping_key`].
     pub async fn wrapping_public_key(&self, identity: &DID) -> Result<[u8; 65], ContextError> {
-        Ok(*self.ensure_wrapping_key(identity).await?.load().public())
+        Ok(*self.load_wrapping_key(identity).await?.public())
     }
 
     /// Get-or-spawn this identity's
@@ -3081,11 +3438,11 @@ impl Supervisor {
             return Err(Self::kp_poison_err(identity));
         }
 
-        // Every actor of this identity is built after this call, so loading the
-        // identity's wrapping keypair here gives each of them one (spec 09
-        // §9.16.1). Runs before `write_lock` is taken below: it takes that lock
-        // itself when it has to load.
-        let wrapping_key = self.ensure_wrapping_key(identity).await?;
+        // The entry point that reached here loaded the identity's wrapping key
+        // before taking any lock (spec 09 §9.16.1); a respawn path's owner was
+        // loaded when its first actor was built. This is a map read, with no
+        // custody call.
+        let wrapping_key = self.wrapping_key(identity)?;
 
         if let Some(handle) = self.key_package_stores.get(identity) {
             return Ok(handle.value().clone());
@@ -3186,7 +3543,7 @@ impl Supervisor {
     /// is empty (i.e. [`Self::with_providers_and_journal`] was not used).
     fn build_kp_store_deps(
         &self,
-        wrapping_key: Arc<ArcSwap<WrappingKeyPair>>,
+        wrapping_key: Arc<IdentityWrappingKey>,
     ) -> Result<crate::context::supervisor::key_package_actor::KeyPackageStoreDeps, ContextError>
     {
         use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
@@ -3194,7 +3551,7 @@ impl Supervisor {
 
         let crypto = self.crypto_ref().ok_or_else(not_init)?;
         let mls = Arc::clone(crypto.mls_backend());
-        let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
+        let transport = self.transport_ref().ok_or_else(not_init)?;
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
         let mls_storage = Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?);
         Ok(
@@ -3230,6 +3587,38 @@ impl Supervisor {
             })
     }
 
+    /// [`Self::build_actor_deps`] after [`Self::load_wrapping_key`], for tests
+    /// that build deps without going through an entry point.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the two calls.
+    #[cfg(test)]
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) async fn build_actor_deps_loaded(
+        self: &Arc<Self>,
+        owning_did: &DID,
+    ) -> Result<crate::context::actor::deps::ActorDeps, ContextError> {
+        self.load_wrapping_key(owning_did).await?;
+        self.build_actor_deps(owning_did).await
+    }
+
+    /// [`Self::key_package_store_for`] after [`Self::load_wrapping_key`], for
+    /// tests that resolve the store without going through an entry point.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the two calls.
+    #[cfg(test)]
+    pub(in crate::context) async fn key_package_store_for_loaded(
+        self: &Arc<Self>,
+        owner: &DID,
+    ) -> Result<crate::context::supervisor::key_package_actor::KeyPackageStoreHandle, ContextError>
+    {
+        self.load_wrapping_key(owner).await?;
+        self.key_package_store_for(owner).await
+    }
+
     /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
     /// bundle entirely from the supervisor's own provider slots
     /// (ADR-049 §1 / ADR-049 §15), scoped to `owning_did`.
@@ -3261,8 +3650,12 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::NotInitialized`] if any required provider
-    /// slot is empty (i.e. [`Self::with_providers_and_journal`] was not used).
+    /// - [`ContextError::NotInitialized`] if any required provider slot is
+    ///   empty (i.e. [`Self::with_providers_and_journal`] was not used).
+    /// - [`ContextError::InvalidState`] if no entry point has loaded
+    ///   `owning_did`'s wrapping key ([`Self::load_wrapping_key`]).
+    /// - [`ContextError::SupervisorShutDown`] once shutdown has begun.
+    /// - The errors of [`Self::key_package_store_for`] otherwise.
     ///
     /// # Method receiver
     ///
@@ -3298,7 +3691,7 @@ impl Supervisor {
         // mls/hpke stay transitive — the NodeMlsFactory owns the only
         // backend pair (ADR §6); no Supervisor field mirrors them.
         let mls = Arc::clone(crypto.mls_backend());
-        let transport = Arc::clone(self.transport_ref().ok_or_else(not_init)?);
+        let transport = self.transport_ref().ok_or_else(not_init)?;
         let event_log = Arc::clone(self.event_log_ref().ok_or_else(not_init)?);
         let clock = Arc::clone(self.clock_ref().ok_or_else(not_init)?);
         let key_resolver = self.key_resolver_ref().ok_or_else(not_init)?.clone();
@@ -3575,6 +3968,19 @@ impl Supervisor {
             LifecycleCommand::CreateContext { payload, reply } => {
                 let p = *payload;
                 let context_id = p.context_id.clone();
+                // Load the creator's wrapping key before any lock: a custody
+                // call never runs under `bootstrap_spawn_lock` (spec 09
+                // §9.16.1). A failure returns here, before any lock, as the
+                // `ContextError` it is: a `Custody` failure keeps its custody
+                // code at the bridges, and the two wrapping-key variants keep
+                // their names.
+                if let Err(e) = self.load_wrapping_key(&p.creator_did).await {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(
+                        scp_protocol::context::builder::ContextCreationError::StateTransition(e),
+                    ));
+                    return Outcome::err_mutated(sketch);
+                }
                 // Serialize this bootstrap-spawn (crypto-init → spawn) against
                 // every other same-id bootstrap so a concurrent import/restore
                 // for the same id cannot interleave its crypto write between
@@ -3788,7 +4194,13 @@ impl Supervisor {
                 // `bootstrap_spawn_lock` → `write_lock`: `build_actor_deps`
                 // reaches `key_package_store_for`, which takes `write_lock`
                 // strictly inside this guard, never the reverse. See
-                // `bootstrap_spawn_lock`.
+                // `bootstrap_spawn_lock`. The wrapping key loads first, outside
+                // both locks, so no custody call runs under either.
+                if let Err(e) = self.load_wrapping_key(&owning_did).await {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(e));
+                    return Outcome::err_mutated(sketch);
+                }
                 let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
                 // Importing (re-establishing) this id is a fresh start: the
                 // imported actor begins with a clean budget, free of stale
@@ -3867,6 +4279,23 @@ impl Supervisor {
             LifecycleCommand::RestoreContext { payload, reply } => {
                 let p = *payload;
                 let context_id = p.context_id.clone();
+                // The restore payload carries no identity (it rehydrates a
+                // persisted snapshot rather than joining), so the context
+                // acts as this node's identity. Its wrapping key loads before
+                // any lock, so no custody call runs under one; a failure
+                // returns here.
+                let owner = match self.node_identity() {
+                    Ok(owner) => self.load_wrapping_key(&owner).await.map(|_| owner),
+                    Err(e) => Err(e),
+                };
+                let owner = match owner {
+                    Ok(owner) => owner,
+                    Err(e) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        let _ = reply.send(Err(e));
+                        return Outcome::err_mutated(sketch);
+                    }
+                };
                 // Serialize this bootstrap-spawn against every other same-id
                 // bootstrap (see `bootstrap_spawn_lock`).
                 let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
@@ -3878,15 +4307,7 @@ impl Supervisor {
                     let _ = reply.send(Err(e));
                     return Outcome::err(sketch);
                 }
-                // The restore payload carries no identity (it rehydrates a
-                // persisted snapshot rather than joining), so the context
-                // acts as this node's identity.
-                let deps = match async {
-                    let owning_did = self.node_identity()?;
-                    self.build_actor_deps(&owning_did).await
-                }
-                .await
-                {
+                let deps = match self.build_actor_deps(&owner).await {
                     Ok(deps) => deps,
                     Err(e) => {
                         let sketch = standing_outcome_error_sketch(&e);
@@ -4400,10 +4821,10 @@ impl Supervisor {
         recovering_did: &str,
         contact_did: &str,
         payload: &[u8],
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<(), ContextError> {
         use crate::context::actor::commands::{
-            RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
+            RecoverySendNotificationPayload, TrustRecoveryCommand,
         };
 
         // Lock-free actor-registry fan-out: the first context where BOTH
@@ -4426,7 +4847,7 @@ impl Supervisor {
                     sender_did: recovering_did.to_owned(),
                     payload: payload.to_vec(),
                     sequence: 4,
-                    signing_key: SigningKeyBytes::from_signing_key(signing_key),
+                    signer: signer.clone(),
                 };
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let cmd = TrustRecoveryCommand::RecoverySendNotification {
@@ -4456,10 +4877,11 @@ impl Supervisor {
     /// Mirrors the standing/queries/lifecycle direct precedents.
     /// `RecoveryNotifyContact` is intrinsically cross-context (it carries
     /// no `context_id`, so it always reaches this path): its arm wraps
-    /// the actor-native [`Self::recovery_notify_contact`] fan-out in a
-    /// 30s timeout matching the actor-handler shape (plan §"Transport
-    /// timeouts inside actor handlers") and relays the typed reply on the
-    /// variant's oneshot.
+    /// the actor-native [`Self::recovery_notify_contact`] fan-out in the
+    /// signing handler budget
+    /// ([`SIGNING_HANDLER_TIMEOUT`](crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT)),
+    /// because the dispatched notification signs in the shared context's turn,
+    /// and relays the typed reply on the variant's oneshot.
     ///
     /// The per-context variants reach this path only for a context with
     /// no registered actor. Post-Step-B every valid *registered* context
@@ -4484,17 +4906,17 @@ impl Supervisor {
         self: &Arc<Self>,
         cmd: TrustRecoveryCommand,
     ) -> Outcome<()> {
-        const TRUST_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const TRUST_RECOVERY_TIMEOUT: std::time::Duration =
+            crate::context::actor::signer::SIGNING_HANDLER_TIMEOUT;
 
         match cmd {
             TrustRecoveryCommand::RecoveryNotifyContact { payload, reply } => {
                 let recovering_did = payload.recovering_did.clone();
-                let signing_key = payload.signing_key.to_signing_key();
                 let notify_fut = self.recovery_notify_contact(
                     &payload.recovering_did,
                     &payload.contact_did,
                     &payload.payload,
-                    &signing_key,
+                    &payload.signer,
                 );
                 let (outcome, reply_result) = match tokio::time::timeout(
                     TRUST_RECOVERY_TIMEOUT,
@@ -4561,14 +4983,13 @@ impl Supervisor {
             // provider seal produced (best-effort no-op). See
             // `recovery_send_notification_direct` for the full contract.
             TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
-                let signing_key = payload.signing_key.to_signing_key();
                 let send_result = self
                     .recovery_send_notification_direct(
                         &payload.context_id,
                         &payload.sender_did,
                         &payload.payload,
                         payload.sequence,
-                        &signing_key,
+                        &payload.signer,
                     )
                     .await;
                 match send_result {
@@ -4654,17 +5075,17 @@ impl Supervisor {
         sender_did: &str,
         payload: &[u8],
         sequence: u64,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ContextError>> + Send + 'a>>
     {
         use crate::context::actor::commands::{
-            ContextCommand, RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
+            ContextCommand, RecoverySendNotificationPayload, TrustRecoveryCommand,
         };
 
         let context_id = context_id.to_owned();
         let sender_did = sender_did.to_owned();
         let payload = payload.to_vec();
-        let signing_key = signing_key.clone();
+        let signer = signer.clone();
 
         Box::pin(async move {
             // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) lazy-spawn seal: the per-context
@@ -4728,7 +5149,7 @@ impl Supervisor {
                 sender_did,
                 payload,
                 sequence,
-                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                signer,
             };
             let cmd =
                 ContextCommand::TrustRecovery(TrustRecoveryCommand::RecoverySendNotification {
@@ -4792,7 +5213,8 @@ impl Supervisor {
             // context surfaces the dedicated poison error (ADR-049 §10).
             QueriesCommand::LocalPseudonym { ref context_id, .. }
             | QueriesCommand::LocalRoutingIds { ref context_id, .. }
-            | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. } => {
+            | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. }
+            | QueriesCommand::GetCapabilityRequirements { ref context_id, .. } => {
                 let err = self
                     .lookup_miss_error(context_id, format!("context not registered: {context_id}"));
                 reply_with_error(cmd, err);
@@ -5852,6 +6274,26 @@ impl Supervisor {
             .insert(context_id.to_owned(), ContextActorHandle::from_sender(tx));
     }
 
+    /// Test fixture: registers an actor handle for `context_id` whose mailbox
+    /// accepts a command that no task ever handles, so a caller's command is
+    /// enqueued and its reply never arrives: the actor turn stalls until
+    /// [`REPLY_TIMEOUT`](crate::context::actor::handle::REPLY_TIMEOUT).
+    ///
+    /// Returns the mailbox's receiving half. Holding it keeps the stall;
+    /// dropping it drops every queued command and its reply sender, so a
+    /// waiting caller fails at once.
+    ///
+    /// `testing`-gated: no production build compiles it, no FFI bridge exports
+    /// it, and only an in-process `Arc<Supervisor>` holder can call it.
+    #[cfg(feature = "testing")]
+    #[must_use = "dropping the receiver ends the stall"]
+    pub fn test_stall_actor(&self, context_id: &str) -> Box<dyn std::any::Any + Send> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        self.actors
+            .insert(context_id.to_owned(), ContextActorHandle::from_sender(tx));
+        Box::new(rx)
+    }
+
     /// Map a per-context `lookup` miss to the right typed error (ADR-049
     /// §10). Three cases, in precedence order:
     ///
@@ -5907,12 +6349,17 @@ impl Supervisor {
     /// stale history, but also does not loop. While a
     /// [`Self::discard_joined_context`] of the id is in progress it returns
     /// [`ContextError::ContextNotRegistered`] and leaves the poison record
-    /// untouched.
+    /// untouched. The errors of [`Self::load_wrapping_key`] for `owning_did`
+    /// return before the poison record is touched.
     pub(in crate::context) async fn clear_poison(
         self: &Arc<Self>,
         ctx_id: &str,
         owning_did: &DID,
     ) -> Result<(), ContextError> {
+        // An operator entry point: load the owner's wrapping key before any
+        // lock, so no custody call runs under `bootstrap_spawn_lock` and the
+        // respawn's lookup finds the key.
+        self.load_wrapping_key(owning_did).await?;
         // Take `bootstrap_spawn_lock` BEFORE touching the window. While this
         // call waits for the lock the sticky poison flag still stands, so
         // `read_context_state_checked` reports the wait as `Poisoned`, never as
@@ -6476,7 +6923,7 @@ impl Supervisor {
     /// outlet-invocation saga (spec §6.2.4) is produced directly by
     /// [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga),
     /// not via the actor mailbox: that saga's
-    /// [`SagaSigningKeys`]
+    /// [`SagaSigners`]
     /// are borrowed (non-`'static`) `&ed25519_dalek::SigningKey`
     /// references that cannot move into a `'static` mailbox message,
     /// even though its executor is itself `Send + 'static`. Note that
@@ -6680,384 +7127,58 @@ impl Supervisor {
     }
 
     /// Reply to a [`BroadcastCommand`] whose target context has no
-    /// registered actor.
-    ///
-    /// Per-context variants (subscribe/unsubscribe/block/unblock/key
-    /// request/queries) get a typed [`ContextError::ContextNotRegistered`]
-    /// on their reply oneshot. The custody-bound publish variants and the
-    /// two-phase reserve/apply/release variants keep their own typed
-    /// replies (these never reach a per-context actor through this
-    /// no-custody router).
-    fn reply_broadcast_not_registered(cmd: BroadcastCommand) -> Outcome<()> {
+    /// registered actor, with the poison-aware lookup-miss error
+    /// ([`Self::lookup_miss_error`]): `ContextPoisoned` or `ActorCrashed`
+    /// when the context's crash window says so, `ContextNotRegistered`
+    /// otherwise.
+    fn reply_broadcast_lookup_miss(&self, cmd: BroadcastCommand) -> Outcome<()> {
+        let ctx_id = Self::broadcast_command_context_id(&cmd).to_owned();
+        let err = self.lookup_miss_error(&ctx_id, ctx_id.clone());
         match cmd {
-            BroadcastCommand::SubscribeBroadcast { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::SubscribeBroadcast { reply, .. } => reply_lookup_miss(reply, err),
+            BroadcastCommand::UnsubscribeBroadcast { reply, .. } => reply_lookup_miss(reply, err),
+            BroadcastCommand::PublishBroadcast { reply, .. }
+            | BroadcastCommand::PublishBroadcastContent { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::UnsubscribeBroadcast { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::BlockBroadcastSubscriber { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::BlockBroadcastSubscriber { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::UnblockBroadcastSubscriber { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::UnblockBroadcastSubscriber { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::HandleBroadcastKeyRequest { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::HandleBroadcastKeyRequest {
-                context_id, reply, ..
-            } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
+            BroadcastCommand::BroadcastSubscriberCount { reply, .. } => {
+                reply_lookup_miss(reply, err)
             }
-            BroadcastCommand::BroadcastSubscriberCount { context_id, reply } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            BroadcastCommand::IsBroadcastSubscriber {
-                context_id, reply, ..
-            } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            BroadcastCommand::BroadcastAdmission { context_id, reply } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            // Publish variants require a `KeyCustody` reference that cannot
-            // cross the actor mailbox — route through
-            // `dispatch_broadcast_command_with_custody`. Reaching here means
-            // a caller took the wrong path; surface a typed error.
-            BroadcastCommand::PublishBroadcast { reply, .. } => {
-                const MSG: &str = "BroadcastCommand::PublishBroadcast requires a KeyCustody \
-                     reference; route through \
-                     Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
-                let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
-                Outcome::err(ContextError::InvalidState(MSG.to_owned()))
-            }
-            BroadcastCommand::PublishBroadcastContent { reply, .. } => {
-                const MSG: &str = "BroadcastCommand::PublishBroadcastContent requires a KeyCustody \
-                     reference; route through \
-                     Supervisor::dispatch_broadcast_command_with_custody (generic over custody)";
-                let _ = reply.send(Err(ContextError::InvalidState(MSG.to_owned())));
-                Outcome::err(ContextError::InvalidState(MSG.to_owned()))
-            }
-            // Two-phase publish requires a per-context actor (the
-            // reservation lives in actor-owned state). No actor → typed
-            // not-registered.
-            BroadcastCommand::ReserveBroadcastPublish { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            BroadcastCommand::ApplyBroadcastPublish { payload, reply } => {
-                let err = ContextError::ContextNotRegistered(payload.context_id.clone());
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
-            // No actor → no reservation could have been issued. Idempotent
-            // release: reply Ok so an abort path never errors spuriously.
-            BroadcastCommand::ReleaseBroadcastReservation { reply, .. } => {
-                let _ = reply.send(Ok(()));
-                Outcome::ok(())
-            }
-            // Test-only seed seam — context must exist.
+            BroadcastCommand::IsBroadcastSubscriber { reply, .. } => reply_lookup_miss(reply, err),
+            BroadcastCommand::BroadcastAdmission { reply, .. } => reply_lookup_miss(reply, err),
             #[cfg(feature = "testing")]
-            BroadcastCommand::SeedBroadcastAuthor {
-                context_id, reply, ..
-            } => {
-                let err = ContextError::ContextNotRegistered(context_id);
-                let sketch = standing_outcome_error_sketch(&err);
-                let _ = reply.send(Err(err));
-                Outcome::err(sketch)
-            }
+            BroadcastCommand::SeedBroadcastAuthor { reply, .. } => reply_lookup_miss(reply, err),
         }
     }
 
-    /// Dispatch a [`BroadcastCommand`] for every non-publish variant.
+    /// Dispatch a [`BroadcastCommand`] through the target context's actor
+    /// mailbox.
     ///
-    /// Publish variants require a
-    /// [`KeyCustody`](scp_platform::KeyCustody) reference that cannot
-    /// cross the actor mailbox (RPITIT trait, not `dyn`-safe); use
-    /// [`Self::dispatch_broadcast_command_with_custody`] for publish.
+    /// The publish variants carry the author's `CommandSigner` and sign
+    /// inside the actor turn (ADR-049 Decision 7a).
     ///
     /// # Errors
     ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`] has
-    ///   been attached yet.
+    /// - [`ContextError::ActorBusy`] when the actor is registered but its
+    ///   mailbox is full, closed, or times out. An absent, poisoned or
+    ///   crashed actor is reported on the command's reply channel.
     pub async fn dispatch_broadcast_command(
         &self,
         cmd: BroadcastCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // Try the actor mailbox first. Post-Step-B every valid context
-        // has a registered actor, so the per-context broadcast handlers
-        // run on the actor. Reaching the fallback means no actor is
-        // registered for the target context — surface a typed
-        // `ContextNotRegistered` on the command's reply oneshot.
-        if let Some(ctx_id) = Self::broadcast_command_context_id(&cmd)
-            && let Some(actor) = self.lookup(ctx_id)
-        {
+        if let Some(actor) = self.lookup(Self::broadcast_command_context_id(&cmd)) {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd)).await;
         }
-        Ok(Self::reply_broadcast_not_registered(cmd))
-    }
-
-    /// Dispatch a [`BroadcastCommand`] with an explicit key custody
-    /// reference (ADR-049 §15 / plan row 11).
-    ///
-    /// # Why a custody-generic shim still exists
-    ///
-    /// [`KeyCustody`](scp_platform::KeyCustody) is an RPITIT trait whose
-    /// methods return `impl Future` — it is not `dyn`-safe, so a custody
-    /// reference cannot be erased and shipped across the actor mailbox.
-    /// The publish variants (`PublishBroadcast`, `PublishBroadcastContent`)
-    /// need the caller's custody to derive the sender key, and so they
-    /// remain on this generic shim path for the foreseeable future.
-    ///
-    /// # Routing
-    ///
-    /// - **Non-publish variants** (`Subscribe`, `Unsubscribe`, `Block`,
-    ///   `Unblock`, key request, queries) have a per-context owner and a
-    ///   `context_id` surfaced by
-    ///   `Self::broadcast_command_context_id`. They route through the
-    ///   per-context actor mailbox.
-    /// - **Publish variants** are intentionally returned as `None` from
-    ///   `broadcast_command_context_id`, fall through the mailbox check,
-    ///   and dispatch on the custody-generic shim below.
-    ///
-    /// This split is permanent: only the publish path needs custody; the
-    /// rest is identical to [`Self::dispatch_broadcast_command`].
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`] has
-    ///   been attached yet.
-    pub async fn dispatch_broadcast_command_with_custody<C: scp_platform::KeyCustody>(
-        &self,
-        cmd: BroadcastCommand,
-        custody: &C,
-    ) -> Result<Outcome<()>, ContextError> {
-        // Publish variants drive the two-phase reservation flow: the
-        // actor reserves the sequence (phase 1), the supervisor signs
-        // with the caller's custody OUTSIDE the actor, then the actor
-        // seals (phase 2). The custody never crosses the mailbox; both
-        // mailbox phases are custody-free. This removes the legacy
-        // DashMap read the single-phase shim used.
-        match cmd {
-            BroadcastCommand::PublishBroadcast { payload, reply } => {
-                let p = *payload;
-                self.publish_broadcast_two_phase(
-                    p.context_id,
-                    p.author_did,
-                    p.payload,
-                    &p.signing_key_handle,
-                    custody,
-                    reply,
-                )
-                .await
-            }
-            BroadcastCommand::PublishBroadcastContent { payload, reply } => {
-                let p = *payload;
-                let payload_bytes =
-                    match scp_protocol::context::broadcast_content::serialize_broadcast_content(
-                        &p.content,
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            let msg = format!("content serialization failed: {e}");
-                            let _ = reply.send(Err(ContextError::CryptoFailed(msg.clone())));
-                            return Ok(Outcome::err(ContextError::CryptoFailed(msg)));
-                        }
-                    };
-                self.publish_broadcast_two_phase(
-                    p.context_id,
-                    p.author_did,
-                    payload_bytes,
-                    &p.signing_key_handle,
-                    custody,
-                    reply,
-                )
-                .await
-            }
-            // Non-publish variants are custody-free and route straight
-            // through the per-context actor mailbox.
-            other => {
-                if let Some(ctx_id) = Self::broadcast_command_context_id(&other)
-                    && let Some(actor) = self.lookup(ctx_id)
-                {
-                    return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(other))
-                        .await;
-                }
-                // No registered actor — surface a typed not-registered
-                // error on the command's reply oneshot. (Publish variants
-                // are handled above and never reach here; non-publish
-                // variants need no custody.)
-                Ok(Self::reply_broadcast_not_registered(other))
-            }
-        }
-    }
-
-    /// Drive the two-phase broadcast publish across the actor mailbox.
-    ///
-    /// Phase 1 (`ReserveBroadcastPublish`) and phase 2
-    /// (`ApplyBroadcastPublish`) are custody-free mailbox commands; the
-    /// signing happens here, between them, with the caller's custody.
-    /// A reservation that cannot be applied (no actor, signing failure,
-    /// apply failure) is released via `ReleaseBroadcastReservation` so
-    /// the reserved sequence is not burned. The final
-    /// [`BroadcastEnvelope`](scp_protocol::crypto::sender_keys::BroadcastEnvelope)
-    /// (or error) is forwarded to the caller's `reply` channel.
-    async fn publish_broadcast_two_phase<C: scp_platform::KeyCustody>(
-        &self,
-        context_id: String,
-        author_did: DID,
-        payload: Vec<u8>,
-        signing_key_handle: &scp_platform::KeyHandle,
-        custody: &C,
-        reply: crate::context::actor::commands::PublishBroadcastReply,
-    ) -> Result<Outcome<()>, ContextError> {
-        use crate::context::actor::commands::{
-            ApplyBroadcastPublishPayload, ReserveBroadcastPublishPayload,
-        };
-
-        // Resolve the actor up front. Publish requires a registered
-        // per-context actor (the reservation lives in actor-owned state). On a
-        // miss, route through `lookup_miss_error` so a poisoned / silently-
-        // dead context surfaces the dedicated poison error rather than a
-        // misleading `ContextNotRegistered` (ADR-049 §10). The error is built
-        // twice (reply + outcome sketch) because `ContextError` is not
-        // `Clone`; both calls observe the same poison index.
-        let Some(actor) = self.lookup(&context_id) else {
-            let _ = reply.send(Err(self.lookup_miss_error(&context_id, context_id.clone())));
-            return Ok(Outcome::err(
-                self.lookup_miss_error(&context_id, context_id.clone()),
-            ));
-        };
-
-        // Phase 1 — reserve the sequence and get the signing payload.
-        let (reserve_tx, reserve_rx) = tokio::sync::oneshot::channel();
-        let reserve_cmd = BroadcastCommand::ReserveBroadcastPublish {
-            payload: Box::new(ReserveBroadcastPublishPayload {
-                context_id: context_id.clone(),
-                author_did: author_did.clone(),
-            }),
-            reply: reserve_tx,
-        };
-        Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(reserve_cmd)).await?;
-        let reservation = match bounded_reply_await(reserve_rx).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(e)) => {
-                // Operation-level error already typed by the handler;
-                // forward to the caller. The dispatch itself succeeded.
-                let _ = reply.send(Err(e));
-                return Ok(Outcome::ok_mutated(()));
-            }
-            Err(_) => {
-                let msg = "broadcast reserve reply channel closed".to_owned();
-                let _ = reply.send(Err(ContextError::InvalidState(msg.clone())));
-                return Ok(Outcome::err(ContextError::InvalidState(msg)));
-            }
-        };
-
-        // Sign OUTSIDE the actor with the caller's custody.
-        let signature = match custody
-            .sign(signing_key_handle, &reservation.signing_payload)
-            .await
-        {
-            Ok(sig) => sig.as_bytes().to_vec(),
-            Err(e) => {
-                // Signing failed — release the reservation so the
-                // sequence is reusable, then surface the error.
-                self.release_broadcast_reservation(&actor, context_id, reservation.reservation_id)
-                    .await;
-                let _ = reply.send(Err(ContextError::Custody((&e).into())));
-                return Ok(Outcome::ok_mutated(()));
-            }
-        };
-
-        // Phase 2 — apply the reservation with the signature.
-        let (apply_tx, apply_rx) = tokio::sync::oneshot::channel();
-        let apply_cmd = BroadcastCommand::ApplyBroadcastPublish {
-            payload: Box::new(ApplyBroadcastPublishPayload {
-                context_id: context_id.clone(),
-                reservation_id: reservation.reservation_id.clone(),
-                signature,
-                payload,
-            }),
-            reply: apply_tx,
-        };
-        Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(apply_cmd)).await?;
-        match bounded_reply_await(apply_rx).await {
-            Ok(Ok(envelope)) => {
-                let _ = reply.send(Ok(envelope));
-                Ok(Outcome::ok_mutated(()))
-            }
-            Ok(Err(e)) => {
-                // Apply itself released the reservation on its error
-                // paths; nothing more to do here.
-                let _ = reply.send(Err(e));
-                Ok(Outcome::ok_mutated(()))
-            }
-            Err(_) => {
-                // Apply reply channel closed without a result — release
-                // defensively in case the reservation is still live.
-                self.release_broadcast_reservation(&actor, context_id, reservation.reservation_id)
-                    .await;
-                let msg = "broadcast apply reply channel closed".to_owned();
-                let _ = reply.send(Err(ContextError::InvalidState(msg.clone())));
-                Ok(Outcome::err(ContextError::InvalidState(msg)))
-            }
-        }
-    }
-
-    /// Send a best-effort `ReleaseBroadcastReservation` to the actor so a
-    /// reservation that will never be applied does not burn its sequence.
-    /// Errors are swallowed — the snapshot floor is the crash-safe
-    /// backstop; this is the in-process fast path.
-    async fn release_broadcast_reservation(
-        &self,
-        actor: &ContextActorHandle,
-        context_id: String,
-        reservation_id: crate::context::actor::state::BroadcastReservationId,
-    ) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let cmd = BroadcastCommand::ReleaseBroadcastReservation {
-            payload: Box::new(
-                crate::context::actor::commands::ReleaseBroadcastReservationPayload {
-                    context_id,
-                    reservation_id,
-                },
-            ),
-            reply: tx,
-        };
-        if Self::dispatch_via_mailbox(actor, ContextCommand::Broadcast(cmd))
-            .await
-            .is_ok()
-        {
-            let _ = bounded_reply_await(rx).await;
-        }
+        Ok(self.reply_broadcast_lookup_miss(cmd))
     }
 
     /// Start a cross-context saga. See plan §"Cross-context saga
@@ -7142,13 +7263,13 @@ impl Supervisor {
     /// **exactly once** supervisor-side between the two Commit-B round-trips
     /// (the non-`Send` executor cannot cross the actor mailbox per ADR-049 §3).
     ///
-    /// `signing_keys` carries the two Active Signing Keys named by role
-    /// ([`SagaSigningKeys`]): `target` signs the
+    /// `signers` carries the two Active Signing Key signers named by role
+    /// ([`SagaSigners`]): `target` signs the
     /// [`CrossContextOutletReceipt`]
     /// and the TARGET-side divergence marker on a one-sided `NeedsRepair`;
     /// `caller` signs the CALLER-side divergence marker on `NeedsRepair`. Each
     /// side signs its own marker into its own log. The named fields make a
-    /// same-typed `&SigningKey` swap a compile-visible field-name error rather
+    /// same-typed signer swap a compile-visible field-name error rather
     /// than a silent miscapture. The actor holds no custody key (ADR-049), so
     /// the caller supplies both per-call exactly as [`Self::send_heartbeat`] /
     /// [`Self::build_local_checkpoint`] do.
@@ -7236,7 +7357,7 @@ impl Supervisor {
     pub async fn start_cross_context_outlet_invocation_saga<F, Fut>(
         &self,
         request: CrossContextOutletInvocationRequest,
-        signing_keys: SagaSigningKeys<'_>,
+        signers: SagaSigners,
         executor: F,
     ) -> Result<SagaOutput, SagaError>
     where
@@ -7332,8 +7453,8 @@ impl Supervisor {
             asserted_nonce,
             asserted_timestamp_ms,
             caller_source_role,
-            target_signing_key: signing_keys.target.clone(),
-            caller_signing_key: signing_keys.caller.clone(),
+            target_signer: signers.target,
+            caller_signer: signers.caller,
             executor: Some(boxed_executor),
             executor_output: None,
             prepared_a: None,
@@ -7408,7 +7529,7 @@ impl Supervisor {
     ///
     /// `caller_context_id` is the RECEIVING context A (the invoker's context);
     /// `target_context_id` is the OPERATING context B (which hosts the streaming
-    /// outlet registration). `signing_keys.target` signs the SCP-OUT-043
+    /// outlet registration). `signers.target` signs the SCP-OUT-043
     /// streaming receipt at seal-close.
     ///
     /// # Errors
@@ -7434,14 +7555,14 @@ impl Supervisor {
         timeout_ms: Option<u32>,
         executor: Arc<E>,
         caveat_binding: Option<crate::context::outlets_helpers::InvocationCaveatBinding>,
-        signing_keys: SagaSigningKeys<'_>,
+        signers: SagaSigners,
         params: crate::context::outlets::dispatch::OpenStreamParams,
     ) -> Result<StreamingSagaHandle, SagaError>
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
     {
         use crate::context::actor::commands::{
-            PrepareBOutcome, PrepareBStreamingFields, SagaPhaseMessage, SigningKeyBytes,
+            PrepareBOutcome, PrepareBStreamingFields, SagaPhaseMessage,
         };
 
         // Taken before any reserve, so a saga refused by shutdown has staged
@@ -7866,7 +7987,7 @@ impl Supervisor {
                 Arc::downgrade(self),
                 target_hex.clone(),
                 saga_id.clone(),
-                SigningKeyBytes::from_signing_key(signing_keys.target),
+                signers.target,
                 inner_rx,
                 outer_tx,
                 escrow_ticket,
@@ -7948,7 +8069,7 @@ impl Supervisor {
         self: &Arc<Self>,
         saga_id: SagaId,
         target_context_id: [u8; 32],
-        target_signing_key: crate::context::actor::commands::SigningKeyBytes,
+        target_signer: crate::context::actor::signer::CommandSigner,
     ) -> Result<(), SagaError> {
         use crate::context::actor::commands::SagaPhaseMessage;
         use scp_protocol::context::outlets::stream::StreamTerminalStatus;
@@ -7978,7 +8099,7 @@ impl Supervisor {
                             .to_owned(),
                     ),
                     cancel_ack_seq: None,
-                    target_signing_key,
+                    target_signer,
                     reply,
                 })
             })
@@ -9915,7 +10036,8 @@ impl Supervisor {
         }))
     }
 
-    /// Dispatch the Commit phase under the 30s per-attempt timeout.
+    /// Dispatch the Commit phase under the per-attempt
+    /// [`COMMIT_PHASE_TIMEOUT`].
     ///
     /// For a wired `CrossContextOutletInvocation` this drives the §6.2.4 Commit:
     /// Commit-B reserve → run the executor supervisor-side → Commit-B settle →
@@ -9926,8 +10048,6 @@ impl Supervisor {
         input: &SagaInput,
         xctx: Option<&mut CrossContextSagaCtx<'_>>,
     ) -> Result<(), ContextError> {
-        const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
         let dispatch_fut = async {
             match input {
                 SagaInput::CrossContextOutletInvocation { .. } => {
@@ -9960,11 +10080,11 @@ impl Supervisor {
             }
         };
 
-        match tokio::time::timeout(PHASE_TIMEOUT, dispatch_fut).await {
+        match tokio::time::timeout(COMMIT_PHASE_TIMEOUT, dispatch_fut).await {
             Ok(r) => r,
-            Err(_elapsed) => Err(ContextError::TransportTimeout(
-                "saga Commit exceeded 30s phase budget".to_owned(),
-            )),
+            Err(_elapsed) => Err(ContextError::TransportTimeout(format!(
+                "saga Commit exceeded {COMMIT_PHASE_TIMEOUT:?} phase budget"
+            ))),
         }
     }
 
@@ -9977,7 +10097,7 @@ impl Supervisor {
     /// 2. **Run the executor supervisor-side** — the non-`Send` outlet executor
     ///    runs off the actor mailbox (ADR-049 §3), producing the output.
     /// 3. **Commit-B settle** — hand the output to the target actor, which
-    ///    signs the receipt with `target_signing_key`, appends `OutletInvoked`,
+    ///    signs the receipt through `target_signer`, appends `OutletInvoked`,
     ///    and durably captures the output keyed by `SagaId`.
     /// 4. **Commit-A** — hand the receipt/output + the held Prepare-A
     ///    reservation to the caller actor, which settles escrow and records
@@ -9998,7 +10118,7 @@ impl Supervisor {
         // Verify-before-settle (spec §6.2.4 "Signer authorization"): before
         // Commit-A settles escrow + records the provenance edge, the FSM
         // re-verifies B's signature over the receipt against the SAME key it
-        // gave B to sign with (`ctx.target_signing_key`). This is an in-saga
+        // gave B to sign with (`ctx.target_signer`). This is an in-saga
         // integrity check — it proves the receipt was not corrupted/forged in
         // transit back from Commit-B — NOT the spec's independent
         // signer-authorization (governance-resolution) step. That step — confirm
@@ -10026,7 +10146,7 @@ impl Supervisor {
     /// authorization", normative MUST) and return the parsed receipt for the
     /// Commit-A binding.
     ///
-    /// The FSM holds the resolved target key (`ctx.target_signing_key` — the key
+    /// The FSM holds the resolved target signer (`ctx.target_signer` — the one
     /// it supplied to Commit-B for signing), so verifying the receipt's
     /// signature against `verifying_key()` is exactly "signed by the key
     /// authorized for `target_context_id`". On a parse or signature failure this
@@ -10045,7 +10165,7 @@ impl Supervisor {
                     saga_id.0
                 ))
             })?;
-        let authorized_target_key = ctx.target_signing_key.verifying_key();
+        let authorized_target_key = ctx.target_signer.verifying_key()?;
         receipt.verify(&authorized_target_key).map_err(|e| {
             ContextError::CryptoFailed(format!(
                 "SCP-SAGA-13064: cross-context saga Commit — target receipt signature for saga \
@@ -10140,12 +10260,23 @@ impl Supervisor {
                         .to_owned(),
                 )
             })?;
-            let output_value = executor(ctx.input.clone()).await.map_err(|e| {
-                ContextError::CryptoFailed(format!(
-                    "SCP-SAGA-13057: cross-context outlet executor failed for saga '{}': {e}",
-                    saga_id.0
-                ))
-            })?;
+            let output_value =
+                tokio::time::timeout(COMMIT_EXECUTOR_TIMEOUT, executor(ctx.input.clone()))
+                    .await
+                    .map_err(|_elapsed| {
+                        ContextError::TransportTimeout(format!(
+                            "saga Commit outlet executor exceeded {COMMIT_EXECUTOR_TIMEOUT:?} \
+                             budget for saga '{}'",
+                            saga_id.0
+                        ))
+                    })?
+                    .map_err(|e| {
+                        ContextError::CryptoFailed(format!(
+                            "SCP-SAGA-13057: cross-context outlet executor failed for saga '{}': \
+                             {e}",
+                            saga_id.0
+                        ))
+                    })?;
             let bytes = serde_json::to_vec(&output_value).map_err(|e| {
                 ContextError::CryptoFailed(format!(
                     "SCP-SAGA-13058: cross-context outlet output is not serializable for saga \
@@ -10169,9 +10300,7 @@ impl Supervisor {
             ))
         })?;
         let settle_saga_id = saga_id.clone();
-        let target_signing_key = crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-            &ctx.target_signing_key,
-        );
+        let target_signer = ctx.target_signer.clone();
         let CommitBSettleOutcome {
             receipt,
             output_bytes,
@@ -10181,7 +10310,7 @@ impl Supervisor {
                 ContextCommand::SagaPhase(SagaPhaseMessage::CommitBSettle {
                     saga_id: settle_saga_id,
                     output_bytes: exec_output_bytes,
-                    target_signing_key,
+                    target_signer,
                     reply,
                 })
             })
@@ -10435,7 +10564,7 @@ impl Supervisor {
         let (committed_event_id, nonce, sides, committed_timestamp_secs) = plan;
         let committed_side = CommittedSide::Target;
 
-        for (label, context_id, signing_key_bytes) in sides {
+        for (label, context_id, signer) in sides {
             let context_hex = hex::encode(context_id);
             if let Some(actor) = self.lookup(&context_hex) {
                 let marker_saga_id = saga_id.clone();
@@ -10448,7 +10577,7 @@ impl Supervisor {
                             committed_side,
                             committed_event_id: committed_event_id_for_send,
                             committed_timestamp_secs,
-                            signing_key: signing_key_bytes,
+                            signer,
                             reply,
                         })
                     })
@@ -10510,7 +10639,6 @@ impl Supervisor {
     /// (rather than across the caller's `.await`s) keeps the caller future
     /// `Send` despite the ctx's non-`Sync` boxed executor.
     fn divergence_marker_plan(ctx: &CrossContextSagaCtx<'_>) -> Option<DivergenceMarkerPlan> {
-        use crate::context::actor::commands::SigningKeyBytes;
         let committed_event_id = ctx.committed_b_outlet_invoked_event_id.clone()?;
         // B's VERIFIED staged provenance is the ONLY admissible source for the
         // convergent marker-leaf nonce + timestamp. In the current FSM a
@@ -10540,16 +10668,8 @@ impl Supervisor {
         // mirroring `commit_b_first_settle`'s witness-persist-before-append
         // ordering. A one-sided divergence is therefore always Target-committed.
         let sides = [
-            (
-                "target",
-                ctx.target_context_id,
-                SigningKeyBytes::from_signing_key(&ctx.target_signing_key),
-            ),
-            (
-                "caller",
-                ctx.caller_context_id,
-                SigningKeyBytes::from_signing_key(&ctx.caller_signing_key),
-            ),
+            ("target", ctx.target_context_id, ctx.target_signer.clone()),
+            ("caller", ctx.caller_context_id, ctx.caller_signer.clone()),
         ];
         // Source the STAGED `recorded_nonce` (B's captured copy of the wire
         // value) for symmetry with the signed receipt, which draws its `nonce`
@@ -11242,16 +11362,10 @@ impl Supervisor {
 
     /// Register a DID as locally controlled by this node / SDK.
     ///
-    /// Idempotent: registering the same DID twice is a no-op.
-    ///
-    /// # Errors
-    ///
-    /// Currently always returns `Ok(())` — the `Result` shape preserves
-    /// the legacy method's signature so callers can keep their
-    /// `?`-style propagation untouched.
-    pub async fn register_local_did(&self, did: DID) -> Result<(), ContextError> {
+    /// Idempotent: registering the same DID twice is a no-op. Infallible: the
+    /// registration is an insert into the supervisor-wide local-DID set.
+    pub async fn register_local_did(&self, did: DID) {
         crate::context::queries_helpers::register_local_did(self, did).await;
-        Ok(())
     }
 
     /// Returns `true` iff `did` is registered as locally controlled.
@@ -11402,67 +11516,42 @@ impl Supervisor {
     /// [`ContextExport`](crate::context::export_import::ContextExport)
     /// (§23.16.8, ADR-050).
     ///
-    /// The per-context actor captures the UNSIGNED export building blocks
-    /// (snapshot + Merkle event-log data) via the
-    /// [`LifecycleCommand::ExportContext`] mailbox turn; the snapshot is then
-    /// signed HERE, at the dispatch boundary, because the runtime holds no
-    /// custody key. The caller supplies a `sign` closure that produces an
-    /// Ed25519 signature over the canonical snapshot digest
+    /// The per-context actor captures the snapshot and Merkle event-log data
+    /// and signs the canonical snapshot digest
     /// (`SHA-256("SCP-CONTEXT-EXPORT-V1:" || scope-tag-byte || JCS(snapshot))`)
-    /// using the exporter's custody key.
+    /// through `signer` in the same turn (ADR-049 Decision 7a), so a custody
+    /// that never answers fails the export after `SIGN_TIMEOUT`.
     ///
     /// The exporter MUST be the snapshot `creator_did` (the importer enforces
-    /// `exporter_did == creator_did`). The FFI bridge resolves the signing
-    /// key via `resolve_signing_key`, mirroring the governance signing path.
-    /// The closure receives the canonical digest computed over the final
-    /// (post–public-stripping) snapshot.
+    /// `exporter_did == creator_did`), and `signer` holds that DID's key.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError`] if the context does not exist, the actor reply
     /// channel closes, event-log export or Merkle verification fails, canonical
-    /// hashing fails, or `sign` returns an error ([`ContextError::Custody`],
-    /// which keeps the custody failure's kind for the bridges).
-    pub async fn export_context<F, E>(
+    /// hashing fails, or the sign fails: [`ContextError::Custody`] keeps the
+    /// custody failure's kind (`TimedOut`, SCP-CRYPTO-4062, past
+    /// `SIGN_TIMEOUT`), and [`ContextError::CryptoFailed`] names a signer that
+    /// is not Ed25519.
+    pub async fn export_context(
         self: &Arc<Self>,
         context_id: &str,
         exporter_did: DID,
-        sign: F,
-    ) -> Result<crate::context::export_import::ContextExport, ContextError>
-    where
-        F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
-        E: Into<scp_crypto::CustodyFailure>,
-    {
+        signer: &crate::context::actor::CommandSigner,
+    ) -> Result<crate::context::export_import::ContextExport, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = LifecycleCommand::ExportContext {
             context_id: context_id.to_owned(),
-            exporter_did: exporter_did.clone(),
+            exporter_did,
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_lifecycle_command(cmd).await?;
-        let (snapshot, event_log_data) = bounded_reply_await(rx).await.map_err(|_| {
+        bounded_reply_await(rx).await.map_err(|_| {
             ContextError::TransportFailed(
                 "Supervisor::export_context — actor reply channel closed".to_owned(),
             )
-        })??;
-
-        // Sign at the dispatch boundary: the actor holds no custody key, so
-        // the FFI-supplied `sign` closure produces the Ed25519 signature over
-        // the canonical snapshot digest computed inside `create_export`
-        // (§23.16.8, ADR-050).
-        let clock = self.clock_ref().ok_or_else(|| {
-            ContextError::PersistenceFailed(
-                "Supervisor::export_context — clock provider not initialized".to_owned(),
-            )
-        })?;
-        crate::context::export_import::create_export(
-            snapshot,
-            event_log_data,
-            exporter_did,
-            crate::context::export_import::ExportScope::Full,
-            clock.as_ref(),
-            sign,
-        )
+        })?
     }
 
     /// Imports a previously exported context (§23.16.8, ADR-050).
@@ -11819,6 +11908,36 @@ impl Supervisor {
         self.shutdown_token.cancel();
     }
 
+    /// Stops every challenger-ledger actor and clears `challenger_ledgers`
+    /// (ADR-049 Decision 16, step 3), as [`Self::stop_key_package_actors`]
+    /// does for the key-package actors. The ledger is durable, so a stopped
+    /// actor loses only its in-memory grading leases.
+    pub(in crate::context) async fn stop_challenger_ledger_actors(&self) {
+        let handles: Vec<(
+            String,
+            crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerHandle,
+        )> = {
+            let _guard = self.write_lock.lock().await;
+            let drained = self
+                .challenger_ledgers
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect();
+            self.challenger_ledgers.clear();
+            drained
+        };
+        for (identity, handle) in handles {
+            if let Err(e) = handle.send_shutdown().await {
+                tracing::warn!(
+                    identity = %identity,
+                    error = %e,
+                    "shutdown: challenger-ledger actor did not accept Shutdown; its inbox \
+                     closes when the last handle drops"
+                );
+            }
+        }
+    }
+
     /// Stops every key-package actor and clears `key_package_stores`
     /// (ADR-049 Decision 16, step 3). The map is drained under the write lock
     /// so no resolver observes a half-cleared map; the shutdown commands are
@@ -12145,7 +12264,10 @@ impl Supervisor {
         // NOT hold this lock, and `create_context` below does not
         // re-acquire it. Lock order is always
         // `bootstrap_spawn_lock` → `write_lock` (see
-        // `track_standing_peer` / `spawn_actor_with_state`).
+        // `track_standing_peer` / `spawn_actor_with_state`). The local
+        // identity's wrapping key loads first, outside both locks, so no
+        // custody call runs under either.
+        self.load_wrapping_key(local_did).await?;
         let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
 
         // Step 1/2: existence + liveness probe. The decision to create turns
@@ -12492,26 +12614,26 @@ impl Supervisor {
     /// through the actor mailbox via [`Self::dispatch_command`].
     ///
     /// Used by the reconnection driver's Phase 3 (`event_log_sync`): the
-    /// caller supplies its locally-controlled `sender_did` + `signing_key`
+    /// caller supplies its locally-controlled `sender_did` + `signer`
     /// exactly as the application send path does.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the handler;
-    /// [`ContextError::TransportFailed`] if the reply channel is dropped.
+    /// Propagates [`ContextError`] from the handler, including
+    /// [`ContextError::Custody`] when the checkpoint sign is refused or times
+    /// out (`SCP-CRYPTO-4062`); [`ContextError::TransportFailed`] if the reply
+    /// channel is dropped.
     pub async fn build_local_checkpoint(
         &self,
         context_id: &str,
         sender_did: &DID,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::BuildLocalCheckpoint {
             context_id: context_id.to_owned(),
             sender_did: sender_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -12528,8 +12650,8 @@ impl Supervisor {
     ///
     /// Driven by the bridge/SDK subscribe-path periodic scheduler (the
     /// §9.9.2 "the SDK sends heartbeats" boundary): the caller supplies its
-    /// locally-controlled `sender_did` + `signing_key` exactly as the
-    /// application send path does — the signing key is not actor-owned state.
+    /// locally-controlled `sender_did` + `signer` exactly as the
+    /// application send path does — the actor holds no key material.
     /// The heartbeat carries an empty payload; its only purpose is to give
     /// peers a liveness beacon for suppression detection.
     ///
@@ -12543,15 +12665,13 @@ impl Supervisor {
         &self,
         context_id: &str,
         sender_did: &DID,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<(), ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::SendHeartbeat {
             context_id: context_id.to_owned(),
             sender_did: sender_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -12581,7 +12701,7 @@ impl Supervisor {
         &self,
         context_id: &str,
         sender_did: &DID,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
         new_epoch: u64,
         new_routing_id: [u8; 32],
     ) -> Result<(), ContextError> {
@@ -12591,9 +12711,7 @@ impl Supervisor {
             new_epoch,
             new_routing_id,
             sender_did: sender_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -13021,6 +13139,332 @@ impl Supervisor {
             Err(reply_error) => Err(ContextError::ActorBusy(format!(
                 "context '{context_id}' has a live actor that did not answer a role-state \
                  read: {reply_error:?}"
+            ))),
+        }
+    }
+
+    /// Get-or-spawn the attempt-ledger actor of `challenger` (spec 07
+    /// §7.3.4), keyed by its canonical identifier so two spellings of one key
+    /// can never hold two ledgers. A handle whose actor stopped is replaced;
+    /// the replacement keeps the old [`ChallengerLedgerShared`] state, so
+    /// permits held by unfinished gradings still count and no lease id is
+    /// issued twice.
+    ///
+    /// [`ChallengerLedgerShared`]: crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerShared
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::NonCanonicalIdentifier`](scp_protocol::trust::TrustError::NonCanonicalIdentifier)
+    /// for a non-canonical `challenger`; [`ContextError::NotInitialized`]
+    /// without storage or a clock; the spawn gate's error during shutdown.
+    async fn challenger_ledger_for(
+        &self,
+        challenger: &str,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerHandle,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::{
+            ChallengerLedgerActor, ChallengerLedgerShared,
+        };
+        let identity = scp_protocol::trust::CanonicalIdentifier::parse(challenger)?;
+        let key = identity.as_str().to_owned();
+        if let Some(handle) = self.challenger_ledgers.get(&key)
+            && !handle.is_closed()
+        {
+            return Ok(handle.value().clone());
+        }
+        let _guard = self.write_lock.lock().await;
+        let shared = match self.challenger_ledgers.get(&key) {
+            Some(handle) if !handle.is_closed() => return Ok(handle.value().clone()),
+            Some(handle) => handle.shared(),
+            None => ChallengerLedgerShared::new(),
+        };
+        let deps = self.build_challenger_ledger_deps()?;
+        let permit = self.spawn_permit("spawn challenger-ledger actor")?;
+        let (handle, _join) = ChallengerLedgerActor::spawn_through(&permit, identity, deps, shared);
+        self.challenger_ledgers.insert(key, handle.clone());
+        drop(permit);
+        Ok(handle)
+    }
+
+    /// Assembles the ledger actor's collaborators from the supervisor's
+    /// provider slots.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInitialized`] if storage or the clock is not wired.
+    fn build_challenger_ledger_deps(
+        &self,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerDeps,
+        ContextError,
+    > {
+        use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
+        let not_init = || ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned());
+        Ok(
+            crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerDeps {
+                mls_storage: Arc::clone(self.mls_storage_ref().ok_or_else(not_init)?),
+                clock: Arc::clone(self.clock_ref().ok_or_else(not_init)?),
+            },
+        )
+    }
+
+    /// Takes one of `challenger`'s `MAX_CONCURRENT_GRADINGS_PER_CHALLENGER`
+    /// grading permits without waiting (spec 09 §9.18.C). The grading holds
+    /// it until its future and every blocking closure it started finish.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::GradingCapacityExhausted`](scp_protocol::trust::TrustError::GradingCapacityExhausted)
+    /// when every permit is held; the errors of the ledger lookup.
+    pub async fn challenge_grading_permit(
+        &self,
+        challenger: &str,
+    ) -> Result<
+        tokio::sync::OwnedSemaphorePermit,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle.grading_semaphore().try_acquire_owned().map_err(|_| {
+            scp_protocol::trust::TrustError::GradingCapacityExhausted {
+                challenger: challenger.to_owned(),
+                cause: scp_protocol::trust::GradingCapacityCause::GradingPermits,
+            }
+            .into()
+        })
+    }
+
+    /// Persists a new challenge in `challenger`'s ledger and signs its
+    /// request in the same ledger turn (spec 07 §7.3.4 step 1).
+    ///
+    /// # Errors
+    ///
+    /// The ledger's refusal ([`TrustError::ChallengeWindowOpen`](scp_protocol::trust::TrustError::ChallengeWindowOpen),
+    /// [`TrustError::ChallengeNotOpen`](scp_protocol::trust::TrustError::ChallengeNotOpen),
+    /// a verifier mismatch), a persistence or custody failure, or
+    /// [`ContextError::ActorBusy`]. On any error no signed request exists.
+    pub async fn dispatch_challenge_create(
+        &self,
+        challenger: &str,
+        unsigned: scp_protocol::trust::UnsignedChallengeRequest,
+        answer_key: scp_protocol::trust::AnswerKey,
+        evaluator_context_id: Option<String>,
+        signer: crate::context::actor::signer::CommandSigner,
+    ) -> Result<
+        scp_protocol::trust::ChallengeRequest,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Create {
+                unsigned: Box::new(unsigned),
+                answer_key,
+                evaluator_context_id,
+                signer,
+                reply,
+            })
+            .await
+    }
+
+    /// Read-only: whether `challenger`'s ledger holds a live challenge with
+    /// this id, request digest and subject, and, once that challenge is
+    /// closed, an attempt graded from `response` (spec 07 §7.3.4 step 3,
+    /// before any resolution). Takes no lease and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::UnknownChallenge`](scp_protocol::trust::TrustError::UnknownChallenge)
+    /// when no such challenge exists;
+    /// [`TrustError::ChallengeClosed`](scp_protocol::trust::TrustError::ChallengeClosed)
+    /// when it is closed and `response` is not one it graded; a
+    /// non-canonical subject or an unencodable response; a load failure or
+    /// [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_lookup(
+        &self,
+        challenger: &str,
+        request: &scp_protocol::trust::ChallengeRequest,
+        response: &scp_protocol::trust::ChallengeResponse,
+    ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let request_digest = scp_protocol::trust::challenge_request_signing_digest(request)?;
+        let response_digest = scp_protocol::trust::challenge_response_signing_digest(response)?;
+        let subject = scp_protocol::trust::CanonicalIdentifier::parse(&request.subject)?;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Lookup {
+                challenge_id: request.challenge_id,
+                request_digest,
+                subject,
+                response_digest,
+                reply,
+            })
+            .await
+    }
+
+    /// Begins grading an authenticated response (spec 07 §7.3.4 step 3
+    /// Begin): a stored record for a resubmit, else the grading lease.
+    ///
+    /// # Errors
+    ///
+    /// The ledger's refusal (`UnknownChallenge`, the `check_attempt` errors,
+    /// `GradingInProgress`), a load failure, or [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_begin_grade(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::BeginOutcome,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::BeginGrade { auth, reply })
+            .await
+    }
+
+    /// Signs a graded attempt's record and records it (spec 07 §7.3.4 step
+    /// 4).
+    ///
+    /// # Errors
+    ///
+    /// `GradingLeaseLost` with nothing written, the `check_attempt` errors at
+    /// the commit time, a persistence or custody failure, or
+    /// [`ContextError::ActorBusy`]. Every error but the last leaves nothing
+    /// written and the attempt unused.
+    pub async fn dispatch_challenge_commit(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
+        lease_id: u64,
+        outcome: scp_protocol::trust::GradeOutcome,
+        signer: crate::context::actor::signer::CommandSigner,
+    ) -> Result<
+        crate::context::supervisor::challenger_ledger_actor::GradedAttempt,
+        crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError,
+    > {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Commit {
+                auth,
+                lease_id,
+                outcome,
+                signer,
+                reply,
+            })
+            .await
+    }
+
+    /// Records a challenger fault for the grading of `auth` (spec 07 §7.3.4
+    /// step 3). It uses no attempt and closes nothing; the cooldown restarts
+    /// from it.
+    ///
+    /// # Errors
+    ///
+    /// `GradingLeaseLost` with nothing written when the lease is not live
+    /// for this `(attempt, D_r)`, a persistence failure, or
+    /// [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_fault(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
+        lease_id: u64,
+        fault: scp_protocol::trust::TrustError,
+    ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::RecordFault {
+                auth,
+                lease_id,
+                fault,
+                reply,
+            })
+            .await
+    }
+
+    /// Releases the grading lease of `auth` and records nothing (spec 07
+    /// §7.3.4 step 3): the grading was refused for capacity, so it uses no
+    /// attempt, records no fault and starts no cooldown.
+    ///
+    /// # Errors
+    ///
+    /// `GradingLeaseLost` when the lease is not live for this
+    /// `(attempt, D_r)`, a load failure, or [`ContextError::ActorBusy`].
+    pub async fn dispatch_challenge_release(
+        &self,
+        challenger: &str,
+        auth: Arc<scp_protocol::trust::AuthenticatedResponse>,
+        lease_id: u64,
+    ) -> Result<(), crate::context::supervisor::challenger_ledger_actor::ChallengeLedgerError> {
+        use crate::context::supervisor::challenger_ledger_actor::ChallengerLedgerCommand;
+        let handle = self.challenger_ledger_for(challenger).await?;
+        handle
+            .send(|reply| ChallengerLedgerCommand::Release {
+                auth,
+                lease_id,
+                reply,
+            })
+            .await
+    }
+
+    /// Spawns a challenge evaluator's economy pipeline onto the Supervisor's
+    /// task tracker (ADR-049 Decision 16), so a shutdown waits for the
+    /// pipeline's settle and storage never closes under a reserve that has
+    /// not settled.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] once shutdown has begun; the
+    /// future is dropped without running.
+    pub fn spawn_evaluator_pipeline<F>(
+        &self,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, ContextError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_tracked("challenge evaluator pipeline", future)
+    }
+
+    /// Reads the context's live capability requirements (spec §8.10), the
+    /// list a member must satisfy, as set by `ModifyCapabilityRequirements`.
+    ///
+    /// Fails closed: an unknown, crashed, poisoned or busy context is an
+    /// error, never an empty list, because an empty list admits everyone.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] when the supervisor serves no
+    ///   context for `context_id`.
+    /// - [`ContextError::ContextPoisoned`] / [`ContextError::ActorCrashed`]
+    ///   for a poisoned or respawning context (ADR-049 §10).
+    /// - [`ContextError::ActorBusy`] when the actor's mailbox send or reply
+    ///   timed out.
+    pub async fn capability_requirements_checked(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_protocol::trust::CapabilityRequirements, ContextError> {
+        let Some(actor) = self.lookup(context_id) else {
+            return Err(
+                self.lookup_miss_error(context_id, format!("context not registered: {context_id}"))
+            );
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::Queries(QueriesCommand::GetCapabilityRequirements {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        });
+        Self::dispatch_via_mailbox(&actor, cmd).await?;
+        match bounded_reply_await(rx).await {
+            Ok(answer) => answer,
+            Err(reply_error) => Err(ContextError::ActorBusy(format!(
+                "context '{context_id}' has a live actor that did not answer a \
+                 capability-requirements read: {reply_error:?}"
             ))),
         }
     }
@@ -14752,6 +15196,9 @@ impl Supervisor {
     > {
         use crate::context::supervisor::key_package_actor::KeyPackageCommand;
 
+        // Every KeyPackage publishes the owner's wrapping key; load it before
+        // `key_package_store_for` takes `write_lock`.
+        self.load_wrapping_key(&owning_did).await?;
         let store = self.key_package_store_for(&owning_did).await?;
         store
             .send(|reply| KeyPackageCommand::ReserveAny { reply })
@@ -14852,7 +15299,7 @@ impl Supervisor {
         creator_did: DID,
         invitee_did: DID,
         invitee_key_package: Vec<u8>,
-        proposer_signing_key: &ed25519_dalek::SigningKey,
+        proposer_signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<InviteMemberOutcome, ContextError> {
         use rand::RngCore as _;
         use scp_protocol::context::governance::GovernanceAction;
@@ -14951,7 +15398,7 @@ impl Supervisor {
                     did: invitee_did.clone(),
                     role: "member".to_owned(),
                 },
-                proposer_signing_key,
+                proposer_signer,
                 Some(invitee_key_package),
             )
             .await?;
@@ -15016,9 +15463,9 @@ impl Supervisor {
                 sender_key_seed: None,
             };
 
-            // 5. Build + sign the bundle with the creator's #active key. The SAME
-            //    key just authorized (and signed) the governance `AddMember`
-            //    proposal, so signing the bundle here with it makes it
+            // 5. Build + sign the bundle through the creator's signer (ADR-049
+            //    Decision 7a). The SAME signer just authorized (and signed) the
+            //    governance `AddMember` proposal, so signing the bundle with it makes it
             //    STRUCTURALLY impossible for the authenticated `creator_did` on
             //    the bundle to diverge from the DID the governance gate authorized
             //    (a two-signing-input design could sign the proposal under admin A
@@ -15035,9 +15482,11 @@ impl Supervisor {
                 metadata_snapshot,
                 signature: Vec::new(),
             };
-            bundle.sign(proposer_signing_key).map_err(|e| {
-                ContextError::CryptoFailed(format!("invite_member: bundle sign failed: {e}"))
+            let bundle_hash = bundle.invitation_bundle_signing_hash().map_err(|e| {
+                ContextError::CryptoFailed(format!("invite_member: bundle hash failed: {e}"))
             })?;
+            // A custody refusal or timeout keeps its typed custody error.
+            bundle.set_signature(proposer_signer.sign_bounded_ed25519(&bundle_hash).await?);
 
             // 6. HPKE-seal the serialized bundle to the invitee. `wire` carries
             //    the plaintext `context_metadata_key` (§9.10.4.B) — hold it in
@@ -15129,7 +15578,7 @@ impl Supervisor {
                                 "invitation could not be sealed/delivered after the add".to_owned(),
                             ),
                         },
-                        proposer_signing_key,
+                        proposer_signer,
                         None,
                     )
                     .await;
@@ -15292,6 +15741,9 @@ impl Supervisor {
         // identical to create/import/standing/respawn); neither `build_actor_deps`,
         // the crypto ops, nor `spawn_actor_with_state` re-acquires
         // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free.
+        // The joiner's wrapping key loads first, outside both locks, so no
+        // custody call for it runs under either.
+        self.load_wrapping_key(&owning_did).await?;
         let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
 
         // ---- OPEN + VERIFY the signed §5.12.3 invitation bundle (FFI-02) ------
@@ -16108,7 +16560,6 @@ impl Supervisor {
                         deps.clock.now_secs(),
                     ),
             },
-            pending_broadcast_publishes: HashMap::new(),
             // Transient join-handshake state; the fused join already consumed
             // it, so a fresh joiner state carries none.
             welcome_scratchpad: None,
@@ -16248,15 +16699,15 @@ impl Supervisor {
     /// Encrypts and broadcasts a payload through the context's MLS
     /// group via the actor mailbox.
     ///
-    /// `signer` ([`MessageSigner`]) pairs the Ed25519 signing key with the
+    /// `signer` ([`MessageSigner`]) pairs the custody-backed signer with the
     /// verification method it is signed under (ADR-039):
     /// [`MessageSigner::Active`] for human-originated sends,
     /// [`MessageSigner::Agent`] for agent-autonomous sends. The persona is
     /// stamped into the inner envelope's `signing_key_id` from the same enum
-    /// variant that carries the key, so the recipient resolves the matching
+    /// variant that carries the signer, so the recipient resolves the matching
     /// public key (`#active` / `#agent`) from the sender's DID document and the
     /// stamp can never disagree with the key that signed. Every send path
-    /// requires a key, so the signer is non-optional.
+    /// requires a signer, so it is non-optional.
     ///
     /// Every per-context method on `Supervisor` builds a typed
     /// `ContextCommand` carrying an embedded reply oneshot, enqueues it
@@ -16286,7 +16737,7 @@ impl Supervisor {
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        // Single construction point: both `signing_key` and `signing_key_id`
+        // Single construction point: both `signer` and `signing_key_id`
         // are derived from the one `MessageSigner` so the persona stamped on the
         // wire cannot diverge from the key that signs (ADR-039). The owned
         // payload keeps two fields to cross the actor mailbox, but they are set
@@ -16297,9 +16748,7 @@ impl Supervisor {
             params: handle.params().clone(),
             sender_did: sender_did.clone(),
             payload: payload.to_vec(),
-            signing_key: Some(
-                crate::context::actor::commands::SigningKeyBytes::from_signing_key(signer.key()),
-            ),
+            signer: signer.signer().clone(),
             signing_key_id: signer.signing_key_id(),
             source_provenance: source_provenance.cloned(),
             spending_ucan: spending_ucan.cloned(),
@@ -16811,7 +17260,7 @@ impl Supervisor {
         context_id: &str,
         proposer_did: &DID,
         action: scp_protocol::context::governance::GovernanceAction,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<
         (
             scp_protocol::context::governance::GovernanceProposal,
@@ -16826,9 +17275,7 @@ impl Supervisor {
                 context_id: context_id.to_owned(),
                 proposer_did: proposer_did.clone(),
                 action,
-                signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                    signing_key,
-                ),
+                signer: signer.clone(),
                 // The unchecked propose path never carries an invitee KeyPackage
                 // (the invitation path uses the checked variant).
                 key_package: None,
@@ -16855,13 +17302,13 @@ impl Supervisor {
         context_id: &str,
         proposer_did: &DID,
         action: scp_protocol::context::governance::GovernanceAction,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
         self.propose_governance_action_checked_carrying_key_package(
             context_id,
             proposer_did,
             action,
-            signing_key,
+            signer,
             None,
         )
         .await
@@ -16886,7 +17333,7 @@ impl Supervisor {
         context_id: &str,
         proposer_did: &DID,
         action: scp_protocol::context::governance::GovernanceAction,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
         key_package: Option<Vec<u8>>,
     ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -16895,9 +17342,7 @@ impl Supervisor {
                 context_id: context_id.to_owned(),
                 proposer_did: proposer_did.clone(),
                 action,
-                signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                    signing_key,
-                ),
+                signer: signer.clone(),
                 key_package,
             },
         );
@@ -16928,7 +17373,7 @@ impl Supervisor {
         proposal_id: &scp_protocol::context::governance::ProposalId,
         voter_did: &DID,
         approve: bool,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: &crate::context::actor::signer::CommandSigner,
     ) -> Result<
         (
             scp_protocol::context::governance::ProposalStatus,
@@ -16941,9 +17386,7 @@ impl Supervisor {
             context_id: context_id.to_owned(),
             proposal_id: *proposal_id,
             voter_did: voter_did.clone(),
-            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
-            ),
+            signer: signer.clone(),
         });
         let cmd = GovernanceCommand::VoteOnProposal {
             payload,
@@ -17094,8 +17537,7 @@ impl Supervisor {
             for relay_url in routes.relay_urls {
                 // §9.18.2: a URL that a step rejects has no canonical URL, so
                 // the client derives no reserved push routing ID for it.
-                let Ok(canonical) = scp_protocol::discovery::push::canonical_relay_url(&relay_url)
-                else {
+                let Ok(canonical) = scp_did::canonical_relay_url(&relay_url) else {
                     continue;
                 };
                 by_relay
@@ -17302,43 +17744,26 @@ impl Supervisor {
         }
     }
 
-    /// Extract the target context_id from a [`BroadcastCommand`].
-    /// Publish variants are deliberately excluded because they require
-    /// the custody-generic shim path.
-    fn broadcast_command_context_id(cmd: &BroadcastCommand) -> Option<&str> {
+    /// Extract the target context_id from a [`BroadcastCommand`]. Every
+    /// variant names its context.
+    fn broadcast_command_context_id(cmd: &BroadcastCommand) -> &str {
         match cmd {
-            BroadcastCommand::SubscribeBroadcast { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            BroadcastCommand::UnsubscribeBroadcast { payload, .. } => {
-                Some(payload.context_id.as_str())
+            BroadcastCommand::SubscribeBroadcast { payload, .. } => payload.context_id.as_str(),
+            BroadcastCommand::UnsubscribeBroadcast { payload, .. } => payload.context_id.as_str(),
+            BroadcastCommand::PublishBroadcast { payload, .. } => payload.context_id.as_str(),
+            BroadcastCommand::PublishBroadcastContent { payload, .. } => {
+                payload.context_id.as_str()
             }
             BroadcastCommand::BlockBroadcastSubscriber { payload, .. }
             | BroadcastCommand::UnblockBroadcastSubscriber { payload, .. } => {
-                Some(payload.context_id.as_str())
+                payload.context_id.as_str()
             }
             BroadcastCommand::HandleBroadcastKeyRequest { context_id, .. }
             | BroadcastCommand::BroadcastSubscriberCount { context_id, .. }
             | BroadcastCommand::IsBroadcastSubscriber { context_id, .. }
-            | BroadcastCommand::BroadcastAdmission { context_id, .. } => Some(context_id.as_str()),
-            // Two-phase publish is custody-free — both phases route
-            // through the per-context actor mailbox.
-            BroadcastCommand::ReserveBroadcastPublish { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            BroadcastCommand::ApplyBroadcastPublish { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            BroadcastCommand::ReleaseBroadcastReservation { payload, .. } => {
-                Some(payload.context_id.as_str())
-            }
-            // Test-only seed seam — routed to the per-context actor.
+            | BroadcastCommand::BroadcastAdmission { context_id, .. } => context_id.as_str(),
             #[cfg(feature = "testing")]
-            BroadcastCommand::SeedBroadcastAuthor { context_id, .. } => Some(context_id.as_str()),
-            // PublishBroadcast / PublishBroadcastContent need
-            // KeyCustody on the shim, so they have no string target for
-            // this custody-free router.
-            _ => None,
+            BroadcastCommand::SeedBroadcastAuthor { context_id, .. } => context_id.as_str(),
         }
     }
 
@@ -17474,6 +17899,7 @@ impl Supervisor {
         match cmd {
             QueriesCommand::ReadContextState { context_id, .. }
             | QueriesCommand::LocalPseudonym { context_id, .. }
+            | QueriesCommand::GetCapabilityRequirements { context_id, .. }
             | QueriesCommand::LocalRoutingIds { context_id, .. }
             | QueriesCommand::GetBroadcastKeyForLocalAuthor { context_id, .. }
             | QueriesCommand::MemberCount { context_id, .. }
@@ -17505,6 +17931,17 @@ impl Supervisor {
 /// `outcome_error_sketch` pattern used in `handlers::*`. Kept in
 /// `supervisor.rs` to scope the helper to the standing-direct dispatch
 /// path; the actor handlers each carry their own equivalent sketch.
+/// Sends `err` on a broadcast command's reply channel and returns the
+/// matching error outcome.
+fn reply_lookup_miss<T>(
+    reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+    err: ContextError,
+) -> Outcome<()> {
+    let sketch = standing_outcome_error_sketch(&err);
+    let _ = reply.send(Err(err));
+    Outcome::err(sketch)
+}
+
 fn standing_outcome_error_sketch(err: &ContextError) -> ContextError {
     match err {
         ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
@@ -17829,6 +18266,14 @@ fn reply_with_soft_default(cmd: QueriesCommand) {
         | QueriesCommand::GetBroadcastKeyForLocalAuthor { .. } => {
             debug_assert!(false, "hard-error variant routed through soft-default path");
         }
+        // No soft default exists: an empty requirements list would admit
+        // every member, so a misrouted read fails closed.
+        QueriesCommand::GetCapabilityRequirements { reply, context_id } => {
+            debug_assert!(false, "hard-error variant routed through soft-default path");
+            let _ = reply.send(Err(ContextError::ContextNotRegistered(format!(
+                "context not registered: {context_id}"
+            ))));
+        }
         // Legacy `member_count` returns `None` on unknown context.
         QueriesCommand::MemberCount { reply, .. } => {
             let _ = reply.send(Ok(None));
@@ -17929,6 +18374,9 @@ fn reply_with_error(cmd: QueriesCommand, err: ContextError) {
         QueriesCommand::GetBroadcastKeyForLocalAuthor { reply, .. } => {
             let _ = reply.send(Err(err));
         }
+        QueriesCommand::GetCapabilityRequirements { reply, .. } => {
+            let _ = reply.send(Err(err));
+        }
         #[cfg(feature = "testing")]
         QueriesCommand::CheckpointEventsSince { reply, .. } => {
             let _ = reply.send(Err(err));
@@ -17975,8 +18423,16 @@ struct WelcomeBundleFacts<'a> {
 )]
 mod tests {
     use super::*;
+    use crate::context::actor::signer::CommandSigner;
     use crate::context::supervisor::saga_journal::ProtocolRepositorySagaJournal;
     use scp_platform::in_memory::InMemoryStorage;
+
+    /// A `Supervisor` built without providers holds no transport slot, so a
+    /// bridge cannot bind a node's relay transport to it.
+    #[test]
+    fn transport_slot_is_absent_without_providers() {
+        assert!(Supervisor::for_query_shim().transport_slot().is_none());
+    }
 
     /// The escrow-reversal join log names a panic as a panic without its
     /// payload, and names a cancelled task as cancelled, never as panicked.
@@ -18375,69 +18831,197 @@ mod tests {
         s.reap_stream_admission("never-existed");
     }
 
-    /// A supervisor whose `mls_storage` view is over `storage`, so two
-    /// supervisors built on one store model a node restart.
-    fn supervisor_over_storage(storage: Arc<InMemoryStorage>) -> Arc<Supervisor> {
+    /// A supervisor whose `mls_storage` view is over `storage` and whose
+    /// wrapping keys live in `custody`, so two supervisors built on one store
+    /// and one custody model a node restart.
+    fn supervisor_over_storage<
+        S: scp_platform::traits::Storage + 'static,
+        C: scp_platform::traits::KeyCustody + 'static,
+    >(
+        storage: Arc<S>,
+        custody: &Arc<C>,
+    ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestDoNotRely".to_owned(),
             Arc::new(scp_clock::SystemClock),
         ));
-        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
-            Arc::new(
-                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(storage),
-            );
-        Supervisor::with_providers(
-            crypto,
-            Box::new(crate::context::builder::NotConfiguredTransportProvider),
-            Box::new(TestEventLog),
-            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
-            None,
-            None,
-            None,
-            None,
-            mls_storage,
-        )
+        supervisor_with_crypto_storage_and_custody(crypto, storage, custody)
     }
 
-    /// The first use of an identity generates one pair and stores it; later
-    /// uses return the same slot; a supervisor restarted over the same store
-    /// loads that pair instead of generating another (spec 09 §9.16.1: one
-    /// wrapping keypair per identity). Another identity gets its own pair.
+    /// The raw bytes stored under `did`'s wrapping key record.
+    async fn stored_wrapping_record(sup: &Supervisor, did: &str) -> Option<Vec<u8>> {
+        sup.mls_storage_ref()
+            .unwrap()
+            .retrieve(&format!("wrapping_key/{did}"))
+            .await
+            .unwrap()
+    }
+
+    /// The public point custody reports for `handle`.
+    async fn custody_public(
+        custody: &crate::crypto::dh_counting_custody::DhCountingCustody,
+        handle: &scp_platform::KeyHandle,
+    ) -> [u8; 65] {
+        use scp_platform::traits::KeyCustody as _;
+        custody
+            .inner
+            .public_key(handle)
+            .await
+            .unwrap()
+            .as_bytes()
+            .try_into()
+            .unwrap()
+    }
+
+    /// The first load of an identity generates a P-256 key in custody and
+    /// stores only its handle and public point (spec 09 §9.16.1): the record
+    /// names the custody's handle, carries the public point custody reports
+    /// for it, and holds no field for key material. Later loads return the
+    /// same key, and another identity gets its own.
     #[tokio::test]
-    async fn ensure_wrapping_key_generates_once_and_reloads_after_restart() {
+    async fn load_wrapping_key_generates_a_custody_handle_and_stores_only_the_handle() {
         let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
         let alice = DID("did:example:wrap-alice".to_owned());
         let bob = DID("did:example:wrap-bob".to_owned());
 
-        let first = supervisor_over_storage(Arc::clone(&storage));
-        let slot = first.ensure_wrapping_key(&alice).await.unwrap();
-        let public = *slot.load().public();
-        let again = first.ensure_wrapping_key(&alice).await.unwrap();
-        assert!(Arc::ptr_eq(&slot, &again), "one slot per identity");
-        let stored = crate::store::wrapping_key::load_wrapping_key(
-            first.mls_storage_ref().unwrap().as_ref(),
+        let key = sup.load_wrapping_key(&alice).await.unwrap();
+        assert_eq!(custody.generate_calls(), 1, "one key is generated");
+        assert_eq!(*key.public(), custody_public(&custody, key.handle()).await);
+        let again = sup.load_wrapping_key(&alice).await.unwrap();
+        assert!(Arc::ptr_eq(&key, &again), "one key per identity");
+        assert_eq!(
+            custody.generate_calls(),
+            1,
+            "a second load generates nothing"
+        );
+
+        let bytes = stored_wrapping_record(&sup, &alice.0)
+            .await
+            .expect("the handle is stored before use");
+        let stored: crate::store::wrapping_key::StoredWrappingKeyHandle =
+            scp_platform::store_value::from_stored_value_bytes(&bytes).unwrap();
+        assert_eq!(stored.v, 1);
+        assert_eq!(&stored.handle, key.handle());
+        assert_eq!(stored.public.as_slice(), key.public().as_slice());
+        let record = crate::store::wrapping_key::load_wrapping_key_handle(
+            sup.mls_storage_ref().unwrap().as_ref(),
             &alice,
         )
         .await
         .unwrap()
-        .expect("the generated pair is stored before use");
-        assert_eq!(*stored.public(), public);
-        let bob_public = *first
-            .ensure_wrapping_key(&bob)
-            .await
-            .unwrap()
-            .load()
-            .public();
-        assert_ne!(bob_public, public, "each identity has its own pair");
+        .unwrap();
+        assert_eq!(&record.handle, key.handle());
+        assert_eq!(record.public, *key.public());
+
+        let bob_key = sup.load_wrapping_key(&bob).await.unwrap();
+        assert_ne!(
+            bob_key.handle(),
+            key.handle(),
+            "each identity has its own key"
+        );
+        assert_ne!(bob_key.public(), key.public());
+    }
+
+    /// A supervisor restarted over the same storage and the same custody
+    /// loads the stored handle: the handle and public point are unchanged and
+    /// custody generated one key across both supervisors.
+    #[tokio::test]
+    async fn load_wrapping_key_reloads_the_same_handle_after_restart() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let alice = DID("did:example:wrap-restart".to_owned());
+
+        let first = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let key = first.load_wrapping_key(&alice).await.unwrap();
+        let (handle, public) = (*key.handle(), *key.public());
+        drop(key);
+        first.shutdown_all_contexts().await;
         drop(first);
 
-        let restarted = supervisor_over_storage(storage);
-        let reloaded = restarted.ensure_wrapping_key(&alice).await.unwrap();
+        let restarted = supervisor_over_storage(storage, &custody);
+        let reloaded = restarted.load_wrapping_key(&alice).await.unwrap();
         assert_eq!(
-            *reloaded.load().public(),
-            public,
-            "a restart loads the stored pair, never a fresh one"
+            reloaded.handle(),
+            &handle,
+            "a restart loads the stored handle"
         );
+        assert_eq!(*reloaded.public(), public);
+        assert_eq!(
+            custody.generate_calls(),
+            1,
+            "a restart never generates a fresh key"
+        );
+    }
+
+    /// A stored record whose handle the custody does not hold fails closed
+    /// with `WrappingKeyHandleInvalid`: no key is generated over it, the record
+    /// stays as it was, and no key is loaded.
+    #[tokio::test]
+    async fn load_wrapping_key_refuses_a_record_whose_handle_the_custody_does_not_hold() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let did = DID("did:example:wrap-lost-custody".to_owned());
+        let original = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let first = supervisor_over_storage(Arc::clone(&storage), &original);
+        first.load_wrapping_key(&did).await.unwrap();
+        let before = stored_wrapping_record(&first, &did.0).await;
+        first.shutdown_all_contexts().await;
+        drop(first);
+
+        let other = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(storage, &other);
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyHandleInvalid),
+            "{err:?}"
+        );
+        assert_eq!(
+            other.generate_calls(),
+            0,
+            "no key is generated over the record"
+        );
+        assert_eq!(stored_wrapping_record(&sup, &did.0).await, before);
+        assert!(sup.wrapping_keys.get(&did).is_none());
+    }
+
+    /// A stored record whose public point differs from the point custody
+    /// reports for its handle fails closed with `WrappingKeyHandleInvalid`,
+    /// and no key is generated.
+    #[tokio::test]
+    async fn load_wrapping_key_refuses_a_record_whose_public_key_differs_from_the_record() {
+        use scp_platform::traits::KeyCustody as _;
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-swapped".to_owned());
+        let held = custody
+            .inner
+            .generate_keypair(scp_platform::traits::KeyType::HpkeP256)
+            .await
+            .unwrap();
+        let other = custody
+            .inner
+            .generate_keypair(scp_platform::traits::KeyType::HpkeP256)
+            .await
+            .unwrap();
+        let swapped = custody_public(&custody, &other).await;
+        crate::store::wrapping_key::store_wrapping_key_handle(
+            sup.mls_storage_ref().unwrap().as_ref(),
+            &did,
+            &held,
+            &swapped,
+        )
+        .await
+        .unwrap();
+
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyHandleInvalid),
+            "{err:?}"
+        );
+        assert_eq!(custody.generate_calls(), 0, "no key is generated");
+        assert!(sup.wrapping_keys.get(&did).is_none());
     }
 
     /// The `0xFF01` key the own leaf publishes in a context's persisted
@@ -18463,8 +19047,8 @@ mod tests {
 
     /// One identity publishes one wrapping key (spec 09 §9.16.1): two
     /// contexts it creates carry the same `0xFF01`, equal to the key the
-    /// supervisor holds for it; restoring one of them leaves that key and its
-    /// slot as they were and loads no key for any other DID.
+    /// supervisor holds for it; restoring one of them leaves that key as it
+    /// was and loads no key for any other DID.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn contexts_of_one_identity_share_its_wrapping_key_across_a_restore() {
@@ -18494,8 +19078,8 @@ mod tests {
                 .unwrap();
             handle_a.get_or_insert(handle);
         }
-        let slot = sup.ensure_wrapping_key(&identity).await.unwrap();
-        let owner = *slot.load().public();
+        let key = sup.load_wrapping_key(&identity).await.unwrap();
+        let owner = *key.public();
         assert_eq!(persisted_own_wrapping_key(&contexts, &ctx_a), Some(owner));
         assert_eq!(persisted_own_wrapping_key(&contexts, &ctx_b), Some(owner));
 
@@ -18503,16 +19087,12 @@ mod tests {
         sup.restore_context(&ctx_a, &handle_a.unwrap())
             .await
             .unwrap();
-        let after = sup.ensure_wrapping_key(&identity).await.unwrap();
+        let after = sup.load_wrapping_key(&identity).await.unwrap();
         assert!(
-            Arc::ptr_eq(&slot, &after),
-            "the restore keeps the owner's slot"
+            Arc::ptr_eq(&key, &after),
+            "the restore keeps the owner's loaded key"
         );
-        assert_eq!(
-            *after.load().public(),
-            owner,
-            "the restore keeps the owner's key"
-        );
+        assert_eq!(*after.public(), owner, "the restore keeps the owner's key");
         assert_eq!(
             sup.wrapping_keys.len(),
             1,
@@ -18959,70 +19539,27 @@ mod tests {
         let sup = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpWrapOwner".to_owned());
         let (_reservation, kp_bytes) = sup.reserve_key_package(did.clone()).await.unwrap();
-        let owner = *sup.ensure_wrapping_key(&did).await.unwrap().load().public();
+        let owner = *sup.load_wrapping_key(&did).await.unwrap().public();
         assert_eq!(key_package_wrapping_key(&kp_bytes), Some(owner));
     }
 
-    /// The store reads the owner's key when it mints each KeyPackage: after
-    /// the owner's slot is swapped, KeyPackages minted from then on carry the
-    /// new key. The pool held `MIN_BUFFER` KeyPackages minted before the swap;
-    /// each reservation is cancelled, which discards its KeyPackage, so
-    /// reserving twice that many reaches ones minted after the swap.
+    /// A record in the format that stored the scalar itself fails closed with
+    /// `CryptoFailed`: no key is generated over it, the stored bytes stay, and
+    /// the identity has no loaded key afterwards.
     #[tokio::test]
-    async fn key_packages_minted_after_a_rotation_carry_the_new_key() {
-        use crate::context::supervisor::key_package_actor::{KeyPackageCommand, MIN_BUFFER};
-        let sup = supervisor_with_providers();
-        let did = DID("did:dht:z6MkKpWrapRotate".to_owned());
-        let store = sup.key_package_store_for(&did).await.unwrap();
-        let slot = sup.ensure_wrapping_key(&did).await.unwrap();
-        let old = *slot.load().public();
-        let cancel = |reservation_id| {
-            let store = store.clone();
-            async move {
-                store
-                    .send(|reply| KeyPackageCommand::CancelReservation {
-                        reservation_id,
-                        reply,
-                    })
-                    .await
-                    .unwrap();
-            }
-        };
-        let (r, first) = sup.reserve_key_package(did.clone()).await.unwrap();
-        assert_eq!(key_package_wrapping_key(&first), Some(old));
-        cancel(r).await;
-
-        let rotated = WrappingKeyPair::generate();
-        let new = *rotated.public();
-        slot.store(Arc::new(rotated));
-        let mut seen_new = false;
-        for _ in 0..2 * MIN_BUFFER {
-            let (r, kp) = sup.reserve_key_package(did.clone()).await.unwrap();
-            let key = key_package_wrapping_key(&kp).expect("every KeyPackage carries 0xFF01");
-            assert!(
-                key == old || key == new,
-                "only the owner's keys are published"
-            );
-            seen_new |= key == new;
-            cancel(r).await;
+    async fn load_wrapping_key_fails_closed_on_an_old_format_record() {
+        /// The record shape that held the 32-byte secret scalar.
+        #[derive(serde::Serialize)]
+        struct OldScalarRecord {
+            key: Vec<u8>,
         }
-        assert!(
-            seen_new,
-            "a KeyPackage minted after the swap carries the new key"
-        );
-    }
-
-    /// A stored value that is not a valid scalar fails closed with
-    /// `CryptoFailed`: no pair is generated over it, the stored bytes stay, and
-    /// the identity has no loaded pair afterwards.
-    #[tokio::test]
-    async fn ensure_wrapping_key_fails_closed_on_a_corrupt_stored_key() {
         let storage = Arc::new(InMemoryStorage::new());
-        let sup = supervisor_over_storage(Arc::clone(&storage));
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
         let did = DID("did:example:wrap-corrupt".to_owned());
-        let bytes = scp_platform::store_value::to_stored_value_bytes(
-            &crate::store::wrapping_key::StoredWrappingSecretKey { key: vec![0u8; 32] },
-        )
+        let bytes = scp_platform::store_value::to_stored_value_bytes(&OldScalarRecord {
+            key: vec![7u8; 32],
+        })
         .unwrap();
         let adapter = sup.mls_storage_ref().unwrap();
         adapter
@@ -19030,17 +19567,333 @@ mod tests {
             .await
             .unwrap();
 
-        let err = sup.ensure_wrapping_key(&did).await.unwrap_err();
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
         assert!(matches!(err, ContextError::CryptoFailed(_)), "{err:?}");
+        assert_eq!(custody.generate_calls(), 0, "no key is generated over it");
         assert!(sup.wrapping_keys.get(&did).is_none());
         assert_eq!(
-            adapter
-                .retrieve("wrapping_key/did:example:wrap-corrupt")
-                .await
-                .unwrap()
-                .as_deref(),
+            stored_wrapping_record(&sup, &did.0).await.as_deref(),
             Some(bytes.as_slice()),
             "the stored value is not overwritten"
+        );
+    }
+
+    /// A load whose caller is dropped while custody generates still stores
+    /// the generated key's record, because generate and store run in their
+    /// own task: the next load waits for that task, returns the stored key,
+    /// and generates nothing.
+    #[tokio::test]
+    async fn load_wrapping_key_stores_the_generated_key_when_its_caller_is_dropped() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let (custody, gate) =
+            crate::crypto::dh_counting_custody::DhCountingCustody::with_generate_gate();
+        let custody = Arc::new(custody);
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-dropped".to_owned());
+        let loading = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            let did = did.clone();
+            async move { sup.load_wrapping_key(&did).await.map(|_| ()) }
+        });
+        gate.entered.notified().await;
+        loading.abort();
+        assert!(loading.await.unwrap_err().is_cancelled());
+        gate.release.notify_one();
+
+        let key = sup.load_wrapping_key(&did).await.unwrap();
+        assert_eq!(
+            custody.generate_calls(),
+            1,
+            "the dropped load's key is the one loaded"
+        );
+        let record = crate::store::wrapping_key::load_wrapping_key_handle(
+            sup.mls_storage_ref().unwrap().as_ref(),
+            &did,
+        )
+        .await
+        .unwrap()
+        .expect("the dropped load stored its record");
+        assert_eq!(record.handle, *key.handle());
+        assert_eq!(record.public, *key.public());
+    }
+
+    /// A custody that never answers `generate` fails the load with
+    /// `SCP-CRYPTO-4062` once the custody budget runs out, and no record is
+    /// stored for the identity.
+    #[tokio::test(start_paused = true)]
+    async fn load_wrapping_key_times_out_when_custody_never_answers_generate() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let (custody, _gate) =
+            crate::crypto::dh_counting_custody::DhCountingCustody::with_generate_gate();
+        let custody = Arc::new(custody);
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-generate-timeout".to_owned());
+
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ContextError::Custody(f)
+                    if f.kind == scp_crypto::CustodyFailureKind::TimedOut
+                        && f.detail == "custody did not answer generate within 30s"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(custody.generate_calls(), 1);
+        assert!(stored_wrapping_record(&sup, &did.0).await.is_none());
+        assert!(sup.wrapping_keys.get(&did).is_none());
+    }
+
+    /// A generated key whose record write is refused is destroyed in custody
+    /// once the record is removed, no record remains, and the load fails with
+    /// `PersistenceFailed`.
+    #[tokio::test]
+    async fn load_wrapping_key_destroys_the_generated_key_when_its_record_cannot_be_stored() {
+        let storage = Arc::new(
+            crate::context::supervisor::faulty_storage::FaultyStorage::new(Arc::new(
+                InMemoryStorage::new(),
+            )),
+        );
+        storage.fail_store_prefix("wrapping_key/");
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-store-fails".to_owned());
+
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
+        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+        let generated = custody.generated_handles();
+        assert_eq!(generated.len(), 1, "one key was generated");
+        let gone = {
+            use scp_platform::traits::KeyCustody as _;
+            custody.inner.public_key(&generated[0]).await
+        };
+        assert!(
+            matches!(gone, Err(scp_platform::PlatformError::KeyNotFound)),
+            "the unrecorded key is destroyed: {gone:?}"
+        );
+        assert!(stored_wrapping_record(&sup, &did.0).await.is_none());
+        assert!(sup.wrapping_keys.get(&did).is_none());
+    }
+
+    /// Whether custody still holds `handle`.
+    async fn custody_holds(
+        custody: &crate::crypto::dh_counting_custody::DhCountingCustody,
+        handle: &scp_platform::KeyHandle,
+    ) -> bool {
+        use scp_platform::traits::KeyCustody as _;
+        match custody.inner.public_key(handle).await {
+            Ok(_) => true,
+            Err(scp_platform::PlatformError::KeyNotFound) => false,
+            Err(e) => panic!("custody public_key: {e:?}"),
+        }
+    }
+
+    /// A record write that commits and then reports an error leaves no record
+    /// naming the destroyed key: the load removes the record, then destroys
+    /// the key, and fails with `PersistenceFailed`. The next load generates
+    /// and stores a key instead of refusing a record whose handle is gone.
+    #[tokio::test]
+    async fn a_record_write_that_commits_and_errors_is_removed_before_its_key_is_destroyed() {
+        let storage = Arc::new(
+            crate::context::supervisor::faulty_storage::FaultyStorage::new(Arc::new(
+                InMemoryStorage::new(),
+            )),
+        );
+        storage.fail_after_commit_prefix("wrapping_key/");
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-store-commits-then-fails".to_owned());
+
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
+        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+        let generated = custody.generated_handles();
+        assert_eq!(generated.len(), 1, "one key was generated");
+        assert!(
+            stored_wrapping_record(&sup, &did.0).await.is_none(),
+            "the committed record is removed"
+        );
+        assert!(
+            !custody_holds(&custody, &generated[0]).await,
+            "the unrecorded key is destroyed"
+        );
+
+        storage.clear_fail();
+        let key = sup.load_wrapping_key(&did).await.unwrap();
+        assert_eq!(custody.generate_calls(), 2, "the next load creates a key");
+        let record = crate::store::wrapping_key::load_wrapping_key_handle(
+            sup.mls_storage_ref().unwrap().as_ref(),
+            &did,
+        )
+        .await
+        .unwrap()
+        .expect("the next load stores its record");
+        assert_eq!(record.handle, *key.handle());
+        assert!(custody_holds(&custody, key.handle()).await);
+    }
+
+    /// When a record write commits and errors and the record cannot be
+    /// removed either, the key is kept: the committed record names a live
+    /// key, and the next load returns that key without generating one.
+    #[tokio::test]
+    async fn a_committed_record_that_cannot_be_removed_keeps_its_key() {
+        let storage = Arc::new(
+            crate::context::supervisor::faulty_storage::FaultyStorage::new(Arc::new(
+                InMemoryStorage::new(),
+            )),
+        );
+        storage.fail_after_commit_prefix("wrapping_key/");
+        storage.fail_delete_prefix("wrapping_key/");
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-store-commits-delete-fails".to_owned());
+
+        let err = sup.load_wrapping_key(&did).await.unwrap_err();
+        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+        let generated = custody.generated_handles();
+        assert_eq!(generated.len(), 1, "one key was generated");
+        assert!(
+            custody_holds(&custody, &generated[0]).await,
+            "the key a committed record may name is kept"
+        );
+
+        storage.clear_fail();
+        let key = sup.load_wrapping_key(&did).await.unwrap();
+        assert_eq!(*key.handle(), generated[0], "the recorded key loads");
+        assert_eq!(custody.generate_calls(), 1, "nothing is regenerated");
+    }
+
+    /// A custody refusal that is not key-not-found, met while checking a
+    /// stored record, passes through as `Custody`: it says nothing about the
+    /// handle, so it is not reported as `WrappingKeyHandleInvalid`.
+    #[tokio::test]
+    async fn load_wrapping_key_passes_a_custody_refusal_through_on_a_stored_record() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let did = DID("did:example:wrap-refused-record".to_owned());
+        let first = supervisor_over_storage(Arc::clone(&storage), &custody);
+        first.load_wrapping_key(&did).await.unwrap();
+        first.shutdown_all_contexts().await;
+        drop(first);
+
+        custody.set_public_key_fault(Some(
+            crate::crypto::dh_counting_custody::PublicKeyFault::Refuse(
+                "the device is locked".to_owned(),
+            ),
+        ));
+        let restarted = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let err = restarted.load_wrapping_key(&did).await.unwrap_err();
+        assert!(
+            matches!(&err, ContextError::Custody(f) if !f.is_key_not_found()),
+            "{err:?}"
+        );
+        assert!(
+            stored_wrapping_record(&restarted, &did.0).await.is_some(),
+            "the record is kept"
+        );
+    }
+
+    /// A custody that reports a public key that is not a 65-byte uncompressed
+    /// P-256 point fails a fresh load with `CryptoFailed` and the generated key
+    /// is destroyed; for a stored record the same answer is
+    /// `WrappingKeyHandleInvalid`.
+    #[tokio::test]
+    async fn load_wrapping_key_refuses_a_custody_public_key_that_is_not_a_p256_point() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let fresh = DID("did:example:wrap-bad-point-fresh".to_owned());
+        let stored = DID("did:example:wrap-bad-point-stored".to_owned());
+        let first = supervisor_over_storage(Arc::clone(&storage), &custody);
+        first.load_wrapping_key(&stored).await.unwrap();
+        first.shutdown_all_contexts().await;
+        drop(first);
+
+        custody.set_public_key_fault(Some(
+            crate::crypto::dh_counting_custody::PublicKeyFault::Bytes(vec![4; 64]),
+        ));
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let err = sup.load_wrapping_key(&fresh).await.unwrap_err();
+        assert!(matches!(err, ContextError::CryptoFailed(_)), "{err:?}");
+        let generated = custody.generated_handles();
+        assert_eq!(generated.len(), 2, "the stored key and the fresh one");
+        custody.set_public_key_fault(None);
+        let gone = {
+            use scp_platform::traits::KeyCustody as _;
+            custody.inner.public_key(&generated[1]).await
+        };
+        assert!(
+            matches!(gone, Err(scp_platform::PlatformError::KeyNotFound)),
+            "the fresh key is destroyed: {gone:?}"
+        );
+        assert!(stored_wrapping_record(&sup, &fresh.0).await.is_none());
+
+        custody.set_public_key_fault(Some(
+            crate::crypto::dh_counting_custody::PublicKeyFault::Bytes(vec![4; 64]),
+        ));
+        let err = sup.load_wrapping_key(&stored).await.unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyHandleInvalid),
+            "{err:?}"
+        );
+    }
+
+    /// Two concurrent first loads of one identity generate one key: the second
+    /// waits on the identity's load lock and returns the key the first stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_first_loads_of_one_identity_generate_one_key() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let (custody, gate) =
+            crate::crypto::dh_counting_custody::DhCountingCustody::with_generate_gate();
+        let custody = Arc::new(custody);
+        let sup = supervisor_over_storage(Arc::clone(&storage), &custody);
+        let did = DID("did:example:wrap-concurrent".to_owned());
+        let load = |sup: Arc<Supervisor>, did: DID| {
+            tokio::spawn(async move { sup.load_wrapping_key(&did).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let first = load(Arc::clone(&sup), did.clone());
+            gate.entered.notified().await;
+            let second = load(Arc::clone(&sup), did.clone());
+            // The second load holds a clone of the identity's load lock (the
+            // map, the first load's guard, and the second load's wait make
+            // three) once it waits on that lock.
+            while sup
+                .wrapping_key_loads
+                .get(&did)
+                .is_none_or(|lock| Arc::strong_count(lock.value()) < 3)
+            {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(custody.generate_calls(), 1, "the second load waits");
+            gate.release.notify_one();
+            let first = first.await.unwrap().unwrap();
+            let second = second.await.unwrap().unwrap();
+            assert!(Arc::ptr_eq(&first, &second), "both loads return one key");
+        })
+        .await
+        .expect("both loads finish");
+        assert_eq!(custody.generate_calls(), 1);
+    }
+
+    /// `wrapping_key` reads the map before the shutdown gate: a loaded key is
+    /// returned even once the gate is closed, so a shutdown that clears the
+    /// map between a gate check and the read cannot turn a miss into
+    /// `InvalidState`. A miss is `InvalidState` while the gate is open and
+    /// `SupervisorShutDown` once it is closed.
+    #[tokio::test]
+    async fn wrapping_key_reads_the_map_before_the_shutdown_gate() {
+        let sup = supervisor_with_providers();
+        let loaded = DID("did:example:wrap-gate-loaded".to_owned());
+        let missing = DID("did:example:wrap-gate-missing".to_owned());
+        let key = sup.load_wrapping_key(&loaded).await.unwrap();
+        let err = sup.wrapping_key(&missing).unwrap_err();
+        assert!(matches!(err, ContextError::InvalidState(_)), "{err:?}");
+
+        sup.close_spawn_gate();
+        assert!(Arc::ptr_eq(&sup.wrapping_key(&loaded).unwrap(), &key));
+        let err = sup.wrapping_key(&missing).unwrap_err();
+        assert!(
+            matches!(err, ContextError::SupervisorShutDown(_)),
+            "{err:?}"
         );
     }
 
@@ -19074,7 +19927,7 @@ mod tests {
         let did = DID("did:example:kp-after-shutdown".to_owned());
         sup.shutdown_all_contexts().await;
 
-        let res = sup.key_package_store_for(&did).await.map(|_| ());
+        let res = sup.key_package_store_for_loaded(&did).await.map(|_| ());
         assert!(
             matches!(res, Err(ContextError::SupervisorShutDown(_))),
             "{res:?}"
@@ -19085,21 +19938,21 @@ mod tests {
         );
     }
 
-    /// A load that passed the entry check before shutdown and waits on
-    /// `write_lock` while shutdown closes the gate and clears the map is
-    /// refused at its insert: it re-inserts no secret after the clear.
+    /// A load that passed the entry check before shutdown and reaches
+    /// `write_lock` while shutdown holds it, closes the gate and clears the
+    /// map is refused at its insert: it inserts no key after the clear.
     #[tokio::test]
-    async fn a_load_in_flight_at_shutdown_inserts_no_secret_after_the_clear() {
+    async fn load_racing_shutdown_inserts_nothing() {
         let sup = supervisor_with_providers();
         let did = DID("did:example:wrap-in-flight".to_owned());
         let guard = sup.write_lock.lock().await;
         let load = tokio::spawn({
             let sup = Arc::clone(&sup);
             let did = did.clone();
-            async move { sup.ensure_wrapping_key(&did).await.map(|_| ()) }
+            async move { sup.load_wrapping_key(&did).await.map(|_| ()) }
         });
-        // The current-thread runtime runs the load until it blocks on the
-        // held `write_lock`, past its entry gate check.
+        // The current-thread runtime runs the load past its entry gate check;
+        // it cannot finish while shutdown holds `write_lock`.
         tokio::task::yield_now().await;
         assert!(!load.is_finished(), "the load waits on write_lock");
         sup.close_spawn_gate();
@@ -19113,7 +19966,7 @@ mod tests {
         );
         assert!(
             sup.wrapping_keys.is_empty(),
-            "the in-flight load re-inserts no secret after the clear"
+            "the in-flight load inserts no key after the clear"
         );
     }
 
@@ -19161,7 +20014,7 @@ mod tests {
         supervisor: &Arc<Supervisor>,
     ) -> crate::context::actor::deps::ActorDeps {
         supervisor
-            .build_actor_deps(&DID("did:example:spawn-state-test".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:spawn-state-test".to_owned()))
             .await
             .expect("build_actor_deps requires providers populated")
     }
@@ -19407,7 +20260,9 @@ mod tests {
         let owned = crypto
             .create_mls_group_with_context(
                 ext,
-                crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+                scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
             )
             .expect("birth owned crypto material");
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
@@ -19994,6 +20849,9 @@ mod tests {
         );
         persistence.persist_context(&ctx_key, &snap).await.unwrap();
 
+        sup.load_wrapping_key(&admin)
+            .await
+            .expect("an entry point loads the owner's wrapping key");
         sup.respawn_from_snapshot(&ctx_key, &admin)
             .await
             .expect("respawn must restore the Active snapshot");
@@ -20106,6 +20964,9 @@ mod tests {
         );
         persistence.persist_context(&ctx_key, &snap).await.unwrap();
 
+        sup.load_wrapping_key(&admin)
+            .await
+            .expect("an entry point loads the owner's wrapping key");
         sup.respawn_from_snapshot(&ctx_key, &admin)
             .await
             .expect("respawn must restore the Active snapshot");
@@ -20202,6 +21063,9 @@ mod tests {
         let snap = crate::context::manager_methods::snapshot_context(&state);
         persistence.persist_context(&ctx_key, &snap).await.unwrap();
 
+        sup.load_wrapping_key(&admin)
+            .await
+            .expect("an entry point loads the owner's wrapping key");
         sup.respawn_from_snapshot(&ctx_key, &admin)
             .await
             .expect("respawn must restore the promoted Active snapshot");
@@ -20286,6 +21150,9 @@ mod tests {
         let snap = crate::context::manager_methods::snapshot_context(&state);
         persistence.persist_context(&ctx_key, &snap).await.unwrap();
 
+        sup.load_wrapping_key(&admin)
+            .await
+            .expect("an entry point loads the owner's wrapping key");
         sup.respawn_from_snapshot(&ctx_key, &admin)
             .await
             .expect("respawn must restore the Active snapshot");
@@ -20382,6 +21249,9 @@ mod tests {
         assert_eq!(snap.ttl_deadline_secs, Some(EXTENDED_DEADLINE));
         persistence.persist_context(&ctx_key, &snap).await.unwrap();
 
+        sup.load_wrapping_key(&admin)
+            .await
+            .expect("an entry point loads the owner's wrapping key");
         sup.respawn_from_snapshot(&ctx_key, &admin)
             .await
             .expect("respawn must restore the Active snapshot");
@@ -21984,7 +22854,7 @@ mod tests {
                 .expect("fresh context id registers");
         }
         supervisor_arc
-            .key_package_store_for(&DID("did:dht:z6MkProbeKp".to_owned()))
+            .key_package_store_for_loaded(&DID("did:dht:z6MkProbeKp".to_owned()))
             .await
             .expect("kp store resolves with providers");
         let probe = Arc::downgrade(&supervisor_arc);
@@ -22023,7 +22893,7 @@ mod tests {
                 .expect("fresh context id registers");
         }
         supervisor_arc
-            .key_package_store_for(&DID("did:dht:z6MkNoShutdownKp".to_owned()))
+            .key_package_store_for_loaded(&DID("did:dht:z6MkNoShutdownKp".to_owned()))
             .await
             .expect("kp store resolves with providers");
         let probe = Arc::downgrade(&supervisor_arc);
@@ -22188,7 +23058,7 @@ mod tests {
             "a spawn after shutdown must fail with SupervisorShutDown"
         );
         let kp = supervisor_arc
-            .key_package_store_for(&DID("did:dht:z6MkLateKp".to_owned()))
+            .key_package_store_for_loaded(&DID("did:dht:z6MkLateKp".to_owned()))
             .await;
         assert!(
             matches!(kp, Err(ContextError::SupervisorShutDown(_))),
@@ -22440,6 +23310,9 @@ mod tests {
             outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
+            capability_requirements: crate::context::state::Replicated::Live(
+                scp_protocol::trust::CapabilityRequirements::default(),
+            ),
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
@@ -23326,7 +24199,7 @@ mod tests {
         // store already in use by another context/import. The rejected
         // import below must NOT evict it.
         let preexisting = supervisor
-            .key_package_store_for(&owning_did)
+            .key_package_store_for_loaded(&owning_did)
             .await
             .expect("kp store resolves with providers");
         assert!(
@@ -23914,7 +24787,7 @@ mod tests {
     async fn build_actor_deps_reads_single_backend_pair() {
         let (supervisor, crypto, mls_storage) = build_deps_fixture();
         let deps = supervisor
-            .build_actor_deps(&DID("did:example:alice".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:alice".to_owned()))
             .await
             .expect("build_actor_deps succeeds when providers are populated");
 
@@ -23954,7 +24827,7 @@ mod tests {
     async fn build_actor_deps_propagates_supervisor_mls_storage() {
         let (supervisor, _crypto, mls_storage) = build_deps_fixture();
         let deps = supervisor
-            .build_actor_deps(&DID("did:example:storage".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:storage".to_owned()))
             .await
             .expect("build_actor_deps succeeds");
         assert!(
@@ -23973,7 +24846,7 @@ mod tests {
     async fn build_actor_deps_fails_when_no_providers() {
         let supervisor = Arc::new(Supervisor::for_query_shim());
         let result = supervisor
-            .build_actor_deps(&DID("did:example:none".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:none".to_owned()))
             .await;
         // `ActorDeps` (the Ok variant) is not Debug; assert via `matches!`,
         // which never formats the value.
@@ -23993,7 +24866,7 @@ mod tests {
         let (supervisor, _crypto, _mls_storage) = build_deps_fixture();
         let strong_before = Arc::strong_count(&supervisor);
         let deps = supervisor
-            .build_actor_deps(&DID("did:example:alice".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:alice".to_owned()))
             .await
             .expect("build_actor_deps succeeds");
         let weak_with_deps = Arc::weak_count(&supervisor);
@@ -24024,11 +24897,11 @@ mod tests {
         let supervisor = supervisor_with_providers();
         let did = DID("did:dht:z6MkKpIdem".to_owned());
         let first = supervisor
-            .key_package_store_for(&did)
+            .key_package_store_for_loaded(&did)
             .await
             .expect("kp store resolves with providers");
         let second = supervisor
-            .key_package_store_for(&did)
+            .key_package_store_for_loaded(&did)
             .await
             .expect("kp store resolves with providers");
         // The registry holds exactly one entry for this DID.
@@ -24039,7 +24912,7 @@ mod tests {
         );
         // A different DID spawns a distinct actor.
         let other = supervisor
-            .key_package_store_for(&DID("did:dht:z6MkKpOther".to_owned()))
+            .key_package_store_for_loaded(&DID("did:dht:z6MkKpOther".to_owned()))
             .await
             .expect("kp store resolves with providers");
         assert_eq!(supervisor.key_package_stores.len(), 2);
@@ -24069,7 +24942,7 @@ mod tests {
         let mut watchdog = supervisor.kp_watchdog_processed_tx.subscribe();
 
         let handle = supervisor
-            .key_package_store_for(&did)
+            .key_package_store_for_loaded(&did)
             .await
             .expect("kp store resolves");
 
@@ -24100,7 +24973,7 @@ mod tests {
 
         // The respawned actor resolves a live handle (the dead one was removed).
         let fresh = supervisor
-            .key_package_store_for(&did)
+            .key_package_store_for_loaded(&did)
             .await
             .expect("respawned kp store resolves");
         fresh
@@ -24134,7 +25007,7 @@ mod tests {
             // the final crash is recorded (below), so no resolution inside the
             // loop can observe it — a `ContextPoisoned` here would be a bug.
             let handle = supervisor
-                .key_package_store_for(&did)
+                .key_package_store_for_loaded(&did)
                 .await
                 .expect("live actor resolves before the budget is exhausted");
 
@@ -24157,7 +25030,7 @@ mod tests {
         );
 
         // The next resolution surfaces a typed poison error.
-        match supervisor.key_package_store_for(&did).await {
+        match supervisor.key_package_store_for_loaded(&did).await {
             Err(ContextError::ContextPoisoned(_)) => {}
             Ok(_) => panic!("poisoned identity must not resolve a live handle"),
             Err(e) => panic!("expected ContextPoisoned, got {e:?}"),
@@ -24190,7 +25063,7 @@ mod tests {
         // fully processed before inducing the next.
         for _ in 0..CRASH_POISON_THRESHOLD {
             let handle = supervisor
-                .key_package_store_for(&did)
+                .key_package_store_for_loaded(&did)
                 .await
                 .expect("live actor resolves before the budget is exhausted");
             let baseline = *watchdog.borrow_and_update();
@@ -24216,37 +25089,32 @@ mod tests {
             "clear_kp_poison clears the sticky poison flag"
         );
         supervisor
-            .key_package_store_for(&did)
+            .key_package_store_for_loaded(&did)
             .await
             .expect("a recovered identity resolves a live handle");
     }
 
-    /// Two concurrent broadcast publishes reserve DISTINCT sequences
-    /// through the actor mailbox.
-    ///
-    /// This is the end-to-end witness for the two-phase reservation
-    /// guarantee (ADR-049 §SequenceReservation): both `ReserveBroadcastPublish`
-    /// commands ride the per-context actor mailbox and are serialized by
-    /// the actor's command loop, so even when both are issued before
-    /// either applies, the reserved sequences never collide. The
-    /// single-phase shim could not close this hazard because a concurrent
-    /// publish could read the same `next_sequence` between snapshot and
-    /// seal.
+    /// Two publishes through `dispatch_broadcast_command` each sign inside
+    /// the actor turn with the payload's `CommandSigner`, take consecutive
+    /// sequences, and produce envelopes whose signatures verify against the
+    /// signer's key.
     #[tokio::test]
-    async fn concurrent_reserve_broadcast_publish_yields_distinct_sequences() {
-        use crate::context::actor::commands::ReserveBroadcastPublishPayload;
+    async fn publish_broadcast_dispatches_through_mailbox() {
+        use crate::context::actor::commands::PublishBroadcastPayload;
 
         let supervisor_arc = supervisor_with_providers();
-        let deps = test_actor_deps(&supervisor_arc).await;
+        let mut deps = test_actor_deps(&supervisor_arc).await;
+        // The test supervisor's transport refuses sends; publish delivers
+        // the sealed envelope, so this actor gets one that accepts them.
+        deps.transport = Arc::new(crate::context::builder::LocalTransportProvider);
 
         let ctx_id_bytes = [0xC0u8; 32];
         let ctx_key = hex::encode(ctx_id_bytes);
         let author = DID("did:example:author".to_owned());
 
-        // Build a broadcast-mode state with the author registered (so
-        // `can_write` passes) and present in membership (so the apply
-        // phase's per-sender sequence assignment can resolve). Transition
-        // the handle to Active so `require_active` passes.
+        // A broadcast-mode state with the author registered (so the
+        // reservation passes) and present in membership (so the seal's
+        // per-sender sequence resolves), in the Active state.
         let mut state = crate::context::actor::state::PerContextState::new_for_test_broadcast(
             ctx_id_bytes,
             1_700_000_000,
@@ -24272,48 +25140,72 @@ mod tests {
             .spawn_actor_with_state(state, deps, None)
             .await
             .expect("spawn_actor_with_state: fresh context id registers");
-        assert!(supervisor_arc.lookup(&ctx_key).is_some());
 
-        // Issue two reservations back-to-back via the mailbox.
-        let reserve = |author: DID| {
-            let ctx_key = ctx_key.clone();
-            let supervisor_arc = Arc::clone(&supervisor_arc);
-            async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = BroadcastCommand::ReserveBroadcastPublish {
-                    payload: Box::new(ReserveBroadcastPublishPayload {
-                        context_id: ctx_key,
-                        author_did: author,
-                    }),
-                    reply: tx,
-                };
-                if let Some(actor) = supervisor_arc.lookup(
-                    Supervisor::broadcast_command_context_id(&cmd)
-                        .expect("publish carries a context id"),
-                ) {
-                    Supervisor::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd))
-                        .await
-                        .expect("mailbox dispatch succeeds");
-                }
-                rx.await.expect("reserve reply").expect("reserve succeeds")
-            }
-        };
+        let signer =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]));
+        let verifying_key = signer.verifying_key().expect("Ed25519 signer");
 
-        let r1 = reserve(author.clone()).await;
-        let r2 = reserve(author.clone()).await;
+        let mut envelopes = Vec::new();
+        for body in [b"first".as_slice(), b"second".as_slice()] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcast {
+                payload: Box::new(PublishBroadcastPayload {
+                    context_id: ctx_key.clone(),
+                    author_did: author.clone(),
+                    payload: body.to_vec(),
+                    signer: signer.clone(),
+                }),
+                reply: tx,
+            };
+            supervisor_arc
+                .dispatch_broadcast_command(cmd)
+                .await
+                .expect("mailbox dispatch succeeds");
+            envelopes.push(rx.await.expect("publish reply").expect("publish succeeds"));
+        }
 
-        assert_ne!(
-            r1.reservation_id, r2.reservation_id,
-            "each reservation gets a unique id",
+        assert_eq!(
+            envelopes[1].sequence,
+            envelopes[0].sequence + 1,
+            "the mailbox serializes publishes onto consecutive sequences",
         );
+        for envelope in &envelopes {
+            crate::context::broadcast_helpers::check_envelope_signed_by(envelope, &verifying_key)
+                .expect("each envelope verifies under the custody key");
+        }
 
-        // Both reservations are live in actor-owned state; release them to
-        // confirm the actor accepts the release mailbox command. The core
-        // assertion is that the two reservations are distinct — proven by
-        // the distinct ids and by the protocol-layer
-        // `concurrent_reservations_get_distinct_sequences` test that pins
-        // the sequence values themselves.
         handle.send_shutdown().await.expect("handle is live");
+    }
+
+    /// A broadcast command for a context with no registered actor replies
+    /// `ContextNotRegistered` on its own channel, publish included.
+    #[tokio::test]
+    async fn publish_broadcast_without_actor_replies_not_registered() {
+        use crate::context::actor::commands::PublishBroadcastPayload;
+
+        let supervisor_arc = supervisor_with_providers();
+        let ctx_key = hex::encode([0xC1u8; 32]);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::PublishBroadcast {
+            payload: Box::new(PublishBroadcastPayload {
+                context_id: ctx_key.clone(),
+                author_did: DID("did:example:author".to_owned()),
+                payload: b"x".to_vec(),
+                signer: CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(
+                    &[0x42; 32],
+                )),
+            }),
+            reply: tx,
+        };
+        let outcome = supervisor_arc
+            .dispatch_broadcast_command(cmd)
+            .await
+            .expect("an absent actor is reported on the reply channel");
+        assert!(outcome.result.is_err(), "the outcome carries the miss");
+        match rx.await.expect("publish reply") {
+            Err(ContextError::ContextNotRegistered(id)) => assert_eq!(id, ctx_key),
+            other => panic!("expected ContextNotRegistered, got {other:?}"),
+        }
     }
 
     // =================================================================
@@ -26031,7 +26923,7 @@ mod tests {
             .build()
             .unwrap();
         let bob_deps = rt
-            .block_on(bob_sup.build_actor_deps(&DID::from(BOB)))
+            .block_on(bob_sup.build_actor_deps_loaded(&DID::from(BOB)))
             .expect("build bob's actor deps");
 
         let msg_a = alice_seals_content(
@@ -26055,13 +26947,13 @@ mod tests {
             panic!("expected encrypted mode")
         };
         let mut open = |msg: &[u8]| {
-            crate::context::messaging_helpers::decrypt_and_dispatch(
+            rt.block_on(crate::context::messaging_helpers::decrypt_and_dispatch(
                 &bob_deps,
                 Some(&mut *bob_cs),
                 ctx_str,
                 &ctx_bytes,
                 msg,
-            )
+            ))
         };
 
         // The gate `deliver_incoming` runs once the inner envelope verifies.
@@ -26163,7 +27055,7 @@ mod tests {
             .build()
             .unwrap();
         let mut bob_deps = rt
-            .block_on(bob_sup.build_actor_deps(&DID::from(bob)))
+            .block_on(bob_sup.build_actor_deps_loaded(&DID::from(bob)))
             .expect("build Bob's actor deps");
 
         // Carol's KeyPackage is minted under the wall clock, so the wall clock
@@ -26219,14 +27111,15 @@ mod tests {
             .expect("Bob's group")
             .epoch()
             .expect("Bob's epoch");
-        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps,
-            Some(&mut *bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &blob,
-        )
-        .expect("Bob merges the add-Carol Commit");
+        let opened = rt
+            .block_on(crate::context::messaging_helpers::decrypt_and_dispatch(
+                &bob_deps,
+                Some(&mut *bob_cs),
+                ctx_str,
+                &ctx_bytes,
+                &blob,
+            ))
+            .expect("Bob merges the add-Carol Commit");
         assert!(opened.is_none(), "a Commit surfaces no envelope");
         let group = bob_cs.mls_group.as_ref().expect("Bob's group");
         assert_eq!(
@@ -26297,24 +27190,28 @@ mod tests {
         // Alice rotates her sender key (epoch 1 → 2) on her owned actor state and
         // redistributes it to Bob, who installs it on HIS owned actor state via
         // the actor-native receive-side seams — exactly what the live flow does.
-        let bob_secret: [u8; 32] = **bob_wrapping.secret();
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds Bob's ActorDeps from a sync #[test]; not a production async bridge
+            .enable_all()
+            .build()
+            .unwrap();
         alice_actor.rotate_sender_key(ALICE).unwrap();
         alice_actor.distribute_sender_key(ALICE, ALICE).ok();
         for (_t, msg) in alice_actor.drain_pending_sender_key_messages().unwrap() {
-            if let Ok((key, _epoch)) =
-                bob_actor.process_incoming_sender_key(&bob_secret, ALICE, &msg)
-            {
+            if let Ok((key, _epoch)) = rt.block_on(
+                crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key_bytes(
+                    &bob_wrapping,
+                    &bob_actor.context_id,
+                    ALICE,
+                    &msg,
+                ),
+            ) {
                 bob_actor.set_sender_key_unchecked(ALICE, key);
             }
         }
 
         let bob_sup = supervisor_with_crypto(Arc::clone(&bob_crypto));
-        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, builds Bob's ActorDeps from a sync #[test]; not a production async bridge
-            .enable_all()
-            .build()
-            .unwrap();
         let bob_deps = rt
-            .block_on(bob_sup.build_actor_deps(&DID::from(BOB)))
+            .block_on(bob_sup.build_actor_deps_loaded(&DID::from(BOB)))
             .expect("build bob's actor deps");
 
         // The key-distribution seam advanced the registry epoch floor to 2.
@@ -26342,15 +27239,16 @@ mod tests {
                 panic!("expected encrypted mode")
             }
         };
-        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &bob_deps,
-            Some(bob_cs),
-            ctx_str,
-            &ctx_bytes,
-            &sealed,
-        )
-        .expect("a recv at the just-advanced epoch must open")
-        .expect("an Application envelope must surface");
+        let opened = rt
+            .block_on(crate::context::messaging_helpers::decrypt_and_dispatch(
+                &bob_deps,
+                Some(bob_cs),
+                ctx_str,
+                &ctx_bytes,
+                &sealed,
+            ))
+            .expect("a recv at the just-advanced epoch must open")
+            .expect("an Application envelope must surface");
         assert_eq!(
             opened.receive_floor.epoch, 2,
             "the surfaced recv floor must be at the rotated epoch 2"
@@ -26369,6 +27267,973 @@ mod tests {
                 .iter()
                 .any(|(d, f)| d == ALICE && f.epoch == 2),
             "the registry recv floor must track the epoch-2 receive"
+        );
+    }
+
+    /// Spec 09 §9.16.1: a KeyResponse on the production receive seam opens
+    /// through the owning identity's wrapping key in custody. Bob's loaded key
+    /// lives in a `DhCountingCustody`; Alice seals her rotated sender key to
+    /// it. Delivering the MLS-wrapped KeyResponse runs exactly one HpkeP256
+    /// `dh_agree`, and the opened key is installed: Alice's next application
+    /// message at the rotated epoch opens on Bob's state.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn key_response_opens_through_custody_dh_agree() {
+        const ALICE: &str = "did:dht:z6MkAliceDhAgreeAliceDhAgreeAliceDhAgr1";
+        const BOB: &str = "did:dht:z6MkBobDhAgreeBobDhAgreeBobDhAgreeBobD1";
+        let ctx_str = "e2e-key-response-opens-through-custody";
+
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let bob_key = crate::crypto::wrapping::test_wrapping_key(&custody)
+            .await
+            .expect("bob's wrapping key is created in custody");
+        let bob_sup = supervisor_with_crypto(Arc::clone(&bob_crypto));
+        bob_sup
+            .wrapping_keys
+            .insert(DID::from(BOB), Arc::clone(&bob_key));
+        let bob_deps = bob_sup
+            .build_actor_deps(&DID::from(BOB))
+            .await
+            .expect("build bob's actor deps over his loaded key");
+
+        // Alice records Bob's custody key as his wrapping key, rotates, and so
+        // seals her new sender key to it.
+        let alice_cs = alice_actor.mode.crypto_mut().expect("encrypted context");
+        alice_cs.member_wrapping_keys.insert(
+            BOB.to_owned(),
+            scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_key.public()).unwrap(),
+        );
+        alice_actor.rotate_sender_key(ALICE).unwrap();
+        let rotated_epoch = alice_actor.local_sender_key_epoch();
+        let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
+        assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        let sealed = alice_actor
+            .mode
+            .crypto_mut()
+            .expect("encrypted context")
+            .mls_encrypt_management(&msgs[0].1, &routing_id, 3600)
+            .expect("alice MLS-wraps the KeyResponse");
+
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &sealed,
+        )
+        .await
+        .expect("bob opens the KeyResponse through custody");
+        assert!(opened.is_none(), "a KeyResponse surfaces no envelope");
+        assert_eq!(
+            custody.dh_calls(),
+            1,
+            "exactly one dh_agree per KeyResponse"
+        );
+
+        let app = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            ALICE,
+            rotated_epoch,
+            b"after-key-response",
+        );
+        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &app,
+        )
+        .await
+        .expect("the installed sender key opens alice's message")
+        .expect("an Application envelope surfaces");
+        assert_eq!(opened.receive_floor.epoch, rotated_epoch);
+        assert_eq!(
+            custody.dh_calls(),
+            1,
+            "an application open runs no dh_agree"
+        );
+    }
+
+    /// The KeyResponse arm refuses a response from its public fields before
+    /// any custody call: one that names a sender other than its MLS sender,
+    /// and one whose epoch is at or below Bob's recorded floor for Alice. Each
+    /// delivery fails closed and Bob's custody records zero `dh_agree` calls.
+    /// `key_response_opens_through_custody_dh_agree` is the positive control:
+    /// the same delivery, unmodified and above the floor, runs one `dh_agree`.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn key_response_public_checks_run_before_custody() {
+        use scp_protocol::crypto::sender_keys::{MAX_EPOCH_ADVANCE, SenderKeyDistributionMessage};
+
+        const ALICE: &str = "did:dht:z6MkAlicePublicChkAlicePublicChkAlicePu1";
+        const BOB: &str = "did:dht:z6MkBobPublicChkBobPublicChkBobPublicChk1";
+        const MALLORY: &str = "did:dht:z6MkMalloryPublicChkMalloryPublicChkMa1";
+        let ctx_str = "e2e-key-response-public-checks";
+
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: mut bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        let custody = Arc::new(crate::crypto::dh_counting_custody::DhCountingCustody::new());
+        let bob_key = crate::crypto::wrapping::test_wrapping_key(&custody)
+            .await
+            .expect("bob's wrapping key is created in custody");
+        let bob_sup = supervisor_with_crypto(Arc::clone(&bob_crypto));
+        bob_sup
+            .wrapping_keys
+            .insert(DID::from(BOB), Arc::clone(&bob_key));
+        let bob_deps = bob_sup
+            .build_actor_deps(&DID::from(BOB))
+            .await
+            .expect("build bob's actor deps over his loaded key");
+
+        let alice_cs = alice_actor.mode.crypto_mut().expect("encrypted context");
+        alice_cs.member_wrapping_keys.insert(
+            BOB.to_owned(),
+            scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_key.public()).unwrap(),
+        );
+        alice_actor.rotate_sender_key(ALICE).unwrap();
+        let rotated_epoch = alice_actor.local_sender_key_epoch();
+        let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
+        assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
+        let SenderKeyDistributionMessage::KeyResponse(response) =
+            SenderKeyDistributionMessage::from_bytes(&msgs[0].1).unwrap()
+        else {
+            panic!("alice queued a KeyResponse");
+        };
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        let mut wrap = |payload: &[u8]| {
+            alice_actor
+                .mode
+                .crypto_mut()
+                .expect("encrypted context")
+                .mls_encrypt_management(payload, &routing_id, 3600)
+                .expect("alice MLS-wraps the KeyResponse")
+        };
+
+        // Alice is the MLS sender; the response names Mallory.
+        let mut forged = response.clone();
+        forged.sender_did = MALLORY.to_owned();
+        let forged_sealed = wrap(
+            &SenderKeyDistributionMessage::KeyResponse(forged)
+                .to_bytes()
+                .unwrap(),
+        );
+        // The genuine response, delivered after Bob's floor for Alice already
+        // reached its epoch.
+        let genuine_sealed = wrap(&msgs[0].1);
+
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        let wrong_sender = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &forged_sealed,
+        )
+        .await;
+        assert!(
+            matches!(&wrong_sender, Err(ContextError::CryptoFailed(m)) if m.contains("sender DID mismatch")),
+            "a response naming another sender fails closed: {wrong_sender:?}"
+        );
+        assert_eq!(custody.dh_calls(), 0, "no dh_agree for a wrong sender");
+
+        bob_sup
+            .check_and_advance_sender_epoch(&ctx_bytes, ALICE, rotated_epoch, MAX_EPOCH_ADVANCE)
+            .expect("bob's floor for alice reaches the rotated epoch");
+        let stale = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &genuine_sealed,
+        )
+        .await;
+        assert!(
+            matches!(&stale, Err(ContextError::CryptoFailed(_))),
+            "a response at the recorded floor fails closed: {stale:?}"
+        );
+        assert_eq!(
+            custody.dh_calls(),
+            0,
+            "no dh_agree for an epoch at the floor"
+        );
+    }
+
+    /// A supervisor over `crypto` whose `mls_storage` view is over `storage`
+    /// and whose wrapping keys live in `custody`.
+    fn supervisor_with_crypto_storage_and_custody<
+        S: scp_platform::traits::Storage + 'static,
+        C: scp_platform::traits::KeyCustody + 'static,
+    >(
+        crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+        storage: Arc<S>,
+        custody: &Arc<C>,
+    ) -> Arc<Supervisor> {
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(storage),
+            );
+        Supervisor::with_providers_and_wrapping_custody(
+            crypto,
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(TestEventLog),
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+            None,
+            None,
+            None,
+            None,
+            mls_storage,
+            crate::crypto::wrapping::single_custody_source(Arc::clone(custody)),
+        )
+    }
+
+    /// Alice and Bob in one two-party context, with Bob's wrapping key loaded
+    /// by `bob_sup` from `storage` and `custody`, and published to Alice.
+    struct KeyResponseToBob {
+        alice_actor: crate::context::actor::PerContextState,
+        bob_actor: crate::context::actor::PerContextState,
+        bob_crypto: Arc<crate::crypto::mls::provider::NodeMlsFactory>,
+        bob_sup: Arc<Supervisor>,
+        bob_deps: crate::context::actor::deps::ActorDeps,
+        ctx_bytes: [u8; 32],
+    }
+
+    const KR_ALICE: &str = "did:dht:z6MkAliceKeyLossAliceKeyLossAliceKeyLos1";
+    const KR_BOB: &str = "did:dht:z6MkBobKeyLossBobKeyLossBobKeyLossBobKe1";
+
+    async fn key_response_to_bob<C: scp_platform::traits::KeyCustody + 'static>(
+        ctx_str: &str,
+        storage: &Arc<InMemoryStorage>,
+        custody: &Arc<C>,
+    ) -> KeyResponseToBob {
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_state: mut alice_actor,
+            bob_provider: bob_crypto,
+            bob_state: bob_actor,
+            ctx_bytes,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(
+            ctx_str, KR_ALICE, KR_BOB,
+        );
+        let bob_sup = supervisor_with_crypto_storage_and_custody(
+            Arc::clone(&bob_crypto),
+            Arc::clone(storage),
+            custody,
+        );
+        let bob_key = bob_sup
+            .load_wrapping_key(&DID::from(KR_BOB))
+            .await
+            .expect("bob's wrapping key loads from custody");
+        let bob_deps = bob_sup
+            .build_actor_deps(&DID::from(KR_BOB))
+            .await
+            .expect("build bob's actor deps over his loaded key");
+        alice_actor
+            .mode
+            .crypto_mut()
+            .expect("encrypted context")
+            .member_wrapping_keys
+            .insert(
+                KR_BOB.to_owned(),
+                scp_protocol::crypto::hpke::p256::P256Point::try_from(*bob_key.public()).unwrap(),
+            );
+        KeyResponseToBob {
+            alice_actor,
+            bob_actor,
+            bob_crypto,
+            bob_sup,
+            bob_deps,
+            ctx_bytes,
+        }
+    }
+
+    /// Alice rotates and MLS-wraps the KeyResponse that seals her new sender
+    /// key to Bob; returns it with the rotated epoch.
+    fn alice_rotates_for_bob(
+        alice_actor: &mut crate::context::actor::PerContextState,
+        ctx_str: &str,
+    ) -> (Vec<u8>, u64) {
+        alice_actor.rotate_sender_key(KR_ALICE).unwrap();
+        let epoch = alice_actor.local_sender_key_epoch();
+        let msgs = alice_actor.drain_pending_sender_key_messages().unwrap();
+        assert_eq!(msgs.len(), 1, "one KeyResponse for Bob");
+        let routing_id = scp_protocol::context::context_routing_id(ctx_str);
+        let sealed = alice_actor
+            .mode
+            .crypto_mut()
+            .expect("encrypted context")
+            .mls_encrypt_management(&msgs[0].1, &routing_id, 3600)
+            .expect("alice MLS-wraps the KeyResponse");
+        (sealed, epoch)
+    }
+
+    /// Spec 09 §9.16.1: when custody cannot agree with Bob's wrapping key, the
+    /// KeyResponse fails closed with `ContextError::Custody`: no sender key is
+    /// installed (Alice's message at the rotated epoch does not open) and the
+    /// registry's sender-epoch floor is unchanged.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn key_response_fails_closed_when_custody_cannot_agree() {
+        let ctx_str = "e2e-key-response-custody-cannot-agree";
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::key_loss_custody::KeyLossCustody::new(
+            crate::crypto::key_loss_custody::KeyLoss::OnDhAgree,
+        ));
+        let KeyResponseToBob {
+            mut alice_actor,
+            mut bob_actor,
+            bob_sup,
+            bob_deps,
+            ctx_bytes,
+            ..
+        } = key_response_to_bob(ctx_str, &storage, &custody).await;
+        let floors_before = bob_sup.export_sender_key_epochs(&ctx_bytes);
+
+        let (sealed, rotated_epoch) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        let err = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &sealed,
+        )
+        .await
+        .expect_err("a KeyResponse custody cannot open fails closed");
+        assert!(
+            matches!(&err, ContextError::Custody(f) if f.is_key_not_found()),
+            "{err:?}"
+        );
+        assert_eq!(
+            bob_sup.export_sender_key_epochs(&ctx_bytes),
+            floors_before,
+            "the sender-epoch floor is unchanged"
+        );
+
+        let app = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            KR_ALICE,
+            rotated_epoch,
+            b"after-refused-key-response",
+        );
+        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &app,
+        )
+        .await;
+        assert!(
+            !matches!(opened, Ok(Some(_))),
+            "no rotated sender key was installed: {opened:?}"
+        );
+    }
+
+    /// Spec 09 §9.16.1: custody that loses Bob's wrapping key after agreeing
+    /// lets that KeyResponse open and install, because no custody call follows
+    /// the agree. The next KeyResponse fails closed with `Custody`, and a
+    /// supervisor rebuilt over the same storage and custody reports
+    /// `WrappingKeyHandleInvalid` from its first load.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn key_response_opens_then_a_reload_reports_the_wrapping_handle_invalid() {
+        let ctx_str = "e2e-key-response-then-handle-invalid";
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(crate::crypto::key_loss_custody::KeyLossCustody::new(
+            crate::crypto::key_loss_custody::KeyLoss::AfterDhAgree,
+        ));
+        let KeyResponseToBob {
+            mut alice_actor,
+            mut bob_actor,
+            bob_crypto,
+            bob_sup,
+            bob_deps,
+            ctx_bytes,
+        } = key_response_to_bob(ctx_str, &storage, &custody).await;
+
+        let (sealed, rotated_epoch) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
+        crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &sealed,
+        )
+        .await
+        .expect("the KeyResponse opens before the key is lost");
+        let app = alice_seals_content(
+            &mut alice_actor,
+            ctx_str,
+            KR_ALICE,
+            rotated_epoch,
+            b"after-key-response",
+        );
+        let opened = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &app,
+        )
+        .await
+        .expect("the installed sender key opens alice's message")
+        .expect("an Application envelope surfaces");
+        assert_eq!(opened.receive_floor.epoch, rotated_epoch);
+
+        let (second, _) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let err = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            Some(&mut *bob_cs),
+            ctx_str,
+            &ctx_bytes,
+            &second,
+        )
+        .await
+        .expect_err("the lost key cannot open the next KeyResponse");
+        assert!(
+            matches!(&err, ContextError::Custody(f) if f.is_key_not_found()),
+            "{err:?}"
+        );
+
+        drop(bob_deps);
+        bob_sup.shutdown_all_contexts().await;
+        drop(bob_sup);
+        let rebuilt =
+            supervisor_with_crypto_storage_and_custody(bob_crypto, Arc::clone(&storage), &custody);
+        let err = rebuilt
+            .load_wrapping_key(&DID::from(KR_BOB))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyHandleInvalid),
+            "{err:?}"
+        );
+    }
+
+    /// A supervisor with a clock and `persistence` whose wrapping keys come
+    /// from `wrapping_custody`. Its event log is a `MerkleEventLogProvider`,
+    /// because a context export fails closed on a provider that cannot export
+    /// its log, and an import needs a provider that takes the log.
+    fn supervisor_with_persistence_and_custody_source(
+        persistence: Box<dyn ContextPersistence>,
+        wrapping_custody: WrappingCustodySource,
+    ) -> Arc<Supervisor> {
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            "did:dht:z6MktestDoNotRely".to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        Supervisor::with_providers_and_wrapping_custody(
+            crypto,
+            Box::new(crate::context::builder::NotConfiguredTransportProvider),
+            Box::new(crate::context::providers::event_log::MerkleEventLogProvider::new()),
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
+            Some(persistence),
+            None,
+            None,
+            Some(Arc::new(TestClock::new(1_700_000_000))),
+            mls_storage,
+            wrapping_custody,
+        )
+    }
+
+    /// Spec 09 §9.16.1: with no custody registered for the owner's wrapping
+    /// key, CreateContext fails closed with `WrappingKeyCustodyUnavailable`
+    /// and registers no actor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_context_fails_closed_without_the_owners_wrapping_custody() {
+        let none: WrappingCustodySource = Arc::new(|_: &DID| None);
+        let sup = supervisor_with_persistence_and_custody_source(
+            Box::new(MapPersistence::default()),
+            none,
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([0xC5u8; 32]);
+        let err = sup
+            .create_context(
+                ctx.clone(),
+                scp_protocol::context::ContextParams {
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..Default::default()
+                },
+                identity,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::builder::ContextCreationError::StateTransition(
+                    ContextError::WrappingKeyCustodyUnavailable
+                )
+            ),
+            "{err:?}"
+        );
+        assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+        assert!(sup.wrapping_keys.is_empty(), "no key is loaded");
+    }
+
+    /// A wrapping-key load failure ends CreateContext, RestoreContext and
+    /// ImportContext before any of them takes `bootstrap_spawn_lock`: with
+    /// that lock held elsewhere, each returns the load error without waiting
+    /// on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_restore_and_import_return_a_wrapping_key_load_failure_before_any_lock() {
+        let none: WrappingCustodySource = Arc::new(|_: &DID| None);
+        let sup = supervisor_with_persistence_and_custody_source(
+            Box::new(MapPersistence::default()),
+            none,
+        );
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([0xC6u8; 32]);
+        let params = scp_protocol::context::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..Default::default()
+        };
+        // A valid export from a supervisor that has custody, so the import
+        // passes its export check and reaches the wrapping-key load.
+        let (exporter, _exporter_custody) = lock_checking_supervisor();
+        let exporter_identity = exporter.node_identity().unwrap();
+        let exported_ctx = hex::encode([0xC7u8; 32]);
+        exporter
+            .create_context(
+                exported_ctx.clone(),
+                params.clone(),
+                exporter_identity.clone(),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let export = exporter
+            .export_context(
+                &exported_ctx,
+                exporter_identity,
+                &CommandSigner::local_ed25519(signing_key.clone()),
+            )
+            .await
+            .unwrap();
+        let budget = std::time::Duration::from_secs(5);
+        let _held = sup.bootstrap_spawn_lock.lock().await;
+
+        let err = tokio::time::timeout(
+            budget,
+            sup.create_context(ctx.clone(), params.clone(), identity, None, Vec::new()),
+        )
+        .await
+        .expect("create returns without taking bootstrap_spawn_lock")
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::builder::ContextCreationError::StateTransition(
+                    ContextError::WrappingKeyCustodyUnavailable
+                )
+            ),
+            "{err:?}"
+        );
+
+        let handle = crate::context::ContextHandle::new(ctx.clone(), params);
+        let err = tokio::time::timeout(budget, sup.restore_context(&ctx, &handle))
+            .await
+            .expect("restore returns without taking bootstrap_spawn_lock")
+            .unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyCustodyUnavailable),
+            "{err:?}"
+        );
+        assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+
+        let err = tokio::time::timeout(
+            budget,
+            Box::pin(sup.import_context(export, &signing_key.verifying_key(), None)),
+        )
+        .await
+        .expect("import returns without taking bootstrap_spawn_lock")
+        .unwrap_err();
+        assert!(
+            matches!(err, ContextError::WrappingKeyCustodyUnavailable),
+            "{err:?}"
+        );
+        assert!(
+            sup.lookup(&exported_ctx).is_none(),
+            "no imported actor is registered"
+        );
+        assert!(sup.wrapping_keys.is_empty(), "no key is loaded");
+    }
+
+    /// Shutdown closes the spawn gate before it clears the wrapping-key map,
+    /// so a `wrapping_key` call that misses the map has already met the
+    /// closed gate and reports `SupervisorShutDown`, never `InvalidState`.
+    /// The map holds the only reference to the loaded key and through it to
+    /// its custody, so the clear drops that custody, which records whether
+    /// the gate was closed at that moment.
+    #[tokio::test]
+    async fn shutdown_closes_the_spawn_gate_before_it_clears_the_wrapping_keys() {
+        let custody = Arc::new(LockCheckingCustody::new());
+        let gate_closed_at_drop = Arc::clone(&custody.gate_closed_at_drop);
+        // The source hands the custody out once, so after the load the loaded
+        // key holds the only reference to it.
+        let slot = std::sync::RwLock::new(Some(Arc::clone(&custody)));
+        let source: WrappingCustodySource = Arc::new(move |_: &DID| {
+            slot.write().unwrap().take().map(
+                |c| -> Arc<dyn crate::crypto::wrapping::WrappingCustody> {
+                    Arc::new(crate::crypto::wrapping::ErasedCustody(c))
+                },
+            )
+        });
+        let sup = supervisor_with_persistence_and_custody_source(
+            Box::new(MapPersistence::default()),
+            source,
+        );
+        custody
+            .supervisor
+            .set(Arc::downgrade(&sup))
+            .unwrap_or_else(|_| unreachable!("set once"));
+        drop(custody);
+        let did = DID("did:example:wrap-shutdown-order".to_owned());
+        drop(sup.load_wrapping_key(&did).await.unwrap());
+        assert!(
+            gate_closed_at_drop.get().is_none(),
+            "the map keeps the loaded key's custody alive"
+        );
+
+        sup.shutdown_all_contexts().await;
+        assert!(sup.wrapping_keys.is_empty(), "shutdown clears the map");
+        assert_eq!(
+            gate_closed_at_drop.get(),
+            Some(&true),
+            "the gate is closed when the clear drops the key"
+        );
+    }
+
+    /// In-memory custody that, on every wrapping-key call, tries the
+    /// supervisor's `write_lock` and `bootstrap_spawn_lock` and records each
+    /// one it finds held: a host custody call may wait on a prompt, so no
+    /// such call may run while either lock is held.
+    struct LockCheckingCustody {
+        inner: scp_platform::testing::InMemoryKeyCustody,
+        supervisor: std::sync::OnceLock<std::sync::Weak<Supervisor>>,
+        calls: std::sync::atomic::AtomicUsize,
+        held: std::sync::Mutex<Vec<String>>,
+        /// Set when this custody drops, while its supervisor is alive, to
+        /// whether that supervisor's spawn gate was closed at the drop.
+        gate_closed_at_drop: Arc<std::sync::OnceLock<bool>>,
+    }
+
+    impl LockCheckingCustody {
+        fn new() -> Self {
+            Self {
+                inner: scp_platform::testing::InMemoryKeyCustody::new(),
+                supervisor: std::sync::OnceLock::new(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                held: std::sync::Mutex::new(Vec::new()),
+                gate_closed_at_drop: Arc::new(std::sync::OnceLock::new()),
+            }
+        }
+
+        fn check(&self, call: &str) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let Some(sup) = self.supervisor.get().and_then(std::sync::Weak::upgrade) else {
+                return;
+            };
+            let under_write = sup.write_lock.try_lock().is_err();
+            let under_spawn = sup.bootstrap_spawn_lock.try_lock().is_err();
+            let found = [
+                under_write.then(|| format!("{call} under write_lock")),
+                under_spawn.then(|| format!("{call} under bootstrap_spawn_lock")),
+            ];
+            self.held
+                .lock()
+                .unwrap()
+                .extend(found.into_iter().flatten());
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl scp_platform::traits::KeyCustody for LockCheckingCustody {
+        async fn generate_keypair(
+            &self,
+            key_type: scp_platform::traits::KeyType,
+        ) -> Result<scp_platform::KeyHandle, scp_platform::PlatformError> {
+            self.check("generate_keypair");
+            self.inner.generate_keypair(key_type).await
+        }
+
+        async fn generate_identity_keypair(
+            &self,
+        ) -> Result<scp_platform::KeyHandle, scp_platform::PlatformError> {
+            self.inner.generate_identity_keypair().await
+        }
+
+        async fn sign(
+            &self,
+            key: &scp_platform::KeyHandle,
+            data: &[u8],
+        ) -> Result<scp_platform::traits::Signature, scp_platform::PlatformError> {
+            self.inner.sign(key, data).await
+        }
+
+        async fn public_key(
+            &self,
+            key: &scp_platform::KeyHandle,
+        ) -> Result<scp_platform::traits::PublicKey, scp_platform::PlatformError> {
+            self.check("public_key");
+            self.inner.public_key(key).await
+        }
+
+        async fn destroy_key(
+            &self,
+            key: &scp_platform::KeyHandle,
+        ) -> Result<(), scp_platform::PlatformError> {
+            self.inner.destroy_key(key).await
+        }
+
+        async fn dh_agree(
+            &self,
+            key: &scp_platform::KeyHandle,
+            peer_public: &[u8],
+        ) -> Result<scp_platform::traits::SharedSecret, scp_platform::PlatformError> {
+            self.check("dh_agree");
+            self.inner.dh_agree(key, peer_public).await
+        }
+
+        async fn derive_pseudonym(
+            &self,
+            key: &scp_platform::KeyHandle,
+            context_id: &[u8],
+        ) -> Result<scp_platform::traits::Pseudonym, scp_platform::PlatformError> {
+            self.inner.derive_pseudonym(key, context_id).await
+        }
+
+        async fn derive_rotatable_pseudonym(
+            &self,
+            key: &scp_platform::KeyHandle,
+            context_id: &[u8],
+            pseudonym_epoch: u64,
+        ) -> Result<scp_platform::traits::Pseudonym, scp_platform::PlatformError> {
+            self.inner
+                .derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
+                .await
+        }
+
+        async fn ed25519_to_x25519_agree(
+            &self,
+            ed25519_handle: &scp_platform::KeyHandle,
+            peer_x25519_public: &[u8; 32],
+        ) -> Result<scp_platform::traits::SharedSecret, scp_platform::PlatformError> {
+            self.inner
+                .ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
+                .await
+        }
+
+        fn custody_type(&self, key: &scp_platform::KeyHandle) -> scp_platform::traits::CustodyType {
+            self.inner.custody_type(key)
+        }
+    }
+
+    impl Drop for LockCheckingCustody {
+        fn drop(&mut self) {
+            if let Some(sup) = self.supervisor.get().and_then(std::sync::Weak::upgrade) {
+                let _ = self
+                    .gate_closed_at_drop
+                    .set(sup.refuse_if_shut_down("custody drop probe").is_err());
+            }
+        }
+    }
+
+    /// A supervisor whose wrapping custody is a [`LockCheckingCustody`] bound
+    /// to it.
+    fn lock_checking_supervisor() -> (Arc<Supervisor>, Arc<LockCheckingCustody>) {
+        let custody = Arc::new(LockCheckingCustody::new());
+        let sup = supervisor_with_persistence_and_custody_source(
+            Box::new(MapPersistence::default()),
+            crate::crypto::wrapping::single_custody_source(Arc::clone(&custody)),
+        );
+        custody
+            .supervisor
+            .set(Arc::downgrade(&sup))
+            .unwrap_or_else(|_| unreachable!("set once"));
+        (sup, custody)
+    }
+
+    /// Runs `driver`, then asserts it made at least one wrapping custody call
+    /// and returns its result.
+    async fn assert_custody_called<T>(
+        custody: &LockCheckingCustody,
+        driver: &str,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        let before = custody.calls();
+        let out = fut.await;
+        assert!(
+            custody.calls() > before,
+            "{driver} must reach wrapping custody for this test to check it"
+        );
+        out
+    }
+
+    /// Spec 09 §9.16.1 and ADR-049: a host custody call may wait on a user
+    /// prompt, so no wrapping custody call runs under `write_lock` or
+    /// `bootstrap_spawn_lock`. Each driver below starts with no key loaded, so
+    /// it reaches custody: CreateContext, Restore, Import, `standing_context`,
+    /// `reserve_key_package` and `clear_poison`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_wrapping_custody_call_runs_under_write_lock_or_bootstrap_spawn_lock() {
+        let (sup, custody) = lock_checking_supervisor();
+        // Control: a call made while `write_lock` is held is recorded.
+        {
+            let _guard = sup.write_lock.lock().await;
+            custody.check("control");
+        }
+        assert_eq!(
+            std::mem::take(&mut *custody.held.lock().unwrap()),
+            vec!["control under write_lock".to_owned()],
+            "the custody detects a held lock"
+        );
+        let identity = sup.node_identity().unwrap();
+        let params = scp_protocol::context::ContextParams {
+            ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+            ..Default::default()
+        };
+
+        let ctx = hex::encode([0xD1u8; 32]);
+        let handle = assert_custody_called(
+            &custody,
+            "CreateContext",
+            sup.create_context(
+                ctx.clone(),
+                params.clone(),
+                identity.clone(),
+                None,
+                Vec::new(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(sup.despawn_actor(&ctx).await);
+        sup.wrapping_keys.clear();
+        assert_custody_called(&custody, "Restore", sup.restore_context(&ctx, &handle))
+            .await
+            .unwrap();
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let export = sup
+            .export_context(
+                &ctx,
+                identity.clone(),
+                &CommandSigner::local_ed25519(signing_key.clone()),
+            )
+            .await
+            .unwrap();
+        let (importer, importer_custody) = lock_checking_supervisor();
+        assert_custody_called(
+            &importer_custody,
+            "Import",
+            Box::pin(importer.import_context(export, &signing_key.verifying_key(), None)),
+        )
+        .await
+        .unwrap();
+
+        sup.wrapping_keys.clear();
+        let peer = DID("did:example:lock-discipline-peer".to_owned());
+        assert_custody_called(
+            &custody,
+            "standing_context",
+            sup.standing_context(&identity, &peer, Vec::new()),
+        )
+        .await
+        .unwrap();
+
+        let fresh = DID("did:dht:z6MkLockDisciplineKpOwner".to_owned());
+        assert_custody_called(
+            &custody,
+            "reserve_key_package",
+            sup.reserve_key_package(fresh),
+        )
+        .await
+        .unwrap();
+
+        // `clear_poison` loads the owner's wrapping key before it takes
+        // `bootstrap_spawn_lock`. The context carries no poison record, so
+        // what the respawn answers is not what this test checks and the
+        // result is ignored; the custody call before the lock is checked.
+        sup.wrapping_keys.clear();
+        let _ = assert_custody_called(
+            &custody,
+            "clear_poison",
+            Box::pin(sup.clear_poison(&ctx, &identity)),
+        )
+        .await;
+
+        let held: Vec<String> = custody
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(importer_custody.held.lock().unwrap().iter())
+            .cloned()
+            .collect();
+        assert!(held.is_empty(), "custody calls ran under a lock: {held:?}");
+    }
+
+    /// With no wrapping key loaded for an owner, building its actor deps and
+    /// resolving its KeyPackage store fail closed with `InvalidState` and
+    /// load nothing; once shutdown begins, the same lookup reports
+    /// `SupervisorShutDown`.
+    #[tokio::test]
+    async fn build_actor_deps_without_a_loaded_wrapping_key_is_invalid_state() {
+        let sup = supervisor_with_providers();
+        let did = DID("did:example:never-loaded".to_owned());
+
+        let deps = sup.build_actor_deps(&did).await.map(|_| ());
+        assert!(
+            matches!(&deps, Err(ContextError::InvalidState(m)) if m == "wrapping key not loaded for the actor owner"),
+            "{deps:?}"
+        );
+        let store = sup.key_package_store_for(&did).await.map(|_| ());
+        assert!(
+            matches!(&store, Err(ContextError::InvalidState(m)) if m == "wrapping key not loaded for the actor owner"),
+            "{store:?}"
+        );
+        assert!(sup.wrapping_keys.is_empty(), "a lookup loads nothing");
+
+        sup.shutdown_all_contexts().await;
+        let store = sup.key_package_store_for(&did).await.map(|_| ());
+        assert!(
+            matches!(&store, Err(ContextError::SupervisorShutDown(_))),
+            "{store:?}"
         );
     }
 
@@ -26411,10 +28276,9 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(bob_sup.register_local_did(DID::from(Self::BOB)))
-                .expect("register bob as a local DID");
+            rt.block_on(bob_sup.register_local_did(DID::from(Self::BOB)));
             let bob_deps = rt
-                .block_on(bob_sup.build_actor_deps(&DID::from(Self::BOB)))
+                .block_on(bob_sup.build_actor_deps_loaded(&DID::from(Self::BOB)))
                 .expect("build bob's actor deps");
 
             bob_state
@@ -26471,23 +28335,29 @@ mod tests {
                 Self::BOB.to_owned(),
                 self.bob_access_key.clone(),
             )]);
-            crate::context::messaging_helpers::build_encrypted_envelope_actor(
-                &clock,
-                self.alice_state
-                    .mode
-                    .crypto_mut()
-                    .expect("encrypted context"),
-                Self::ALICE,
-                ctx_str,
-                &DID::from(claimed_sender),
-                payload,
-                crate::context::supervisor::MessageSigner::Active(signing_key),
-                &recipients,
-                aad_sequence,
-                None,
-                scp_protocol::envelope::inner::MessageType::Content,
-            )
-            .expect("alice seals the application message")
+            let signer = CommandSigner::local_ed25519(signing_key.clone());
+            let crypto = self
+                .alice_state
+                .mode
+                .crypto_mut()
+                .expect("encrypted context");
+            self.rt
+                .block_on(
+                    crate::context::messaging_helpers::build_encrypted_envelope_actor(
+                        &clock,
+                        crypto,
+                        Self::ALICE,
+                        ctx_str,
+                        &DID::from(claimed_sender),
+                        payload,
+                        crate::context::supervisor::MessageSigner::Active(&signer),
+                        &recipients,
+                        aad_sequence,
+                        None,
+                        scp_protocol::envelope::inner::MessageType::Content,
+                    ),
+                )
+                .expect("alice seals the application message")
         }
 
         /// Alice's correctly signed inner envelope for `payload` at sender
@@ -26503,20 +28373,22 @@ mod tests {
                 Self::BOB.to_owned(),
                 self.bob_access_key.clone(),
             )]);
-            crate::context::messaging_helpers::build_inner_wire(
-                &clock,
-                ctx_str,
-                &DID::from(Self::ALICE),
-                payload,
-                crate::context::supervisor::MessageSigner::Active(
-                    &crate::crypto::mls::two_party_test_support::alice_signing_key(),
-                ),
-                &recipients,
-                aad_sequence,
-                None,
-                scp_protocol::envelope::inner::MessageType::Content,
-            )
-            .expect("alice builds the inner envelope")
+            let signer = CommandSigner::local_ed25519(
+                crate::crypto::mls::two_party_test_support::alice_signing_key(),
+            );
+            self.rt
+                .block_on(crate::context::messaging_helpers::build_inner_wire(
+                    &clock,
+                    ctx_str,
+                    &DID::from(Self::ALICE),
+                    payload,
+                    crate::context::supervisor::MessageSigner::Active(&signer),
+                    &recipients,
+                    aad_sequence,
+                    None,
+                    scp_protocol::envelope::inner::MessageType::Content,
+                ))
+                .expect("alice builds the inner envelope")
         }
 
         /// Seals `inner` through Alice's production sender-key and MLS seal at
@@ -26801,7 +28673,7 @@ mod tests {
             .build()
             .unwrap();
         let own_did_deps = rt
-            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .block_on(alice_sup.build_actor_deps_loaded(&DID::from(ALICE)))
             .expect("build deps whose local DID is alice");
 
         let inner = create_inner_envelope_raw(
@@ -26827,13 +28699,13 @@ mod tests {
             .expect("alice seals");
 
         let bob_cs = bob_actor.mode.crypto_mut().expect("encrypted context");
-        let result = crate::context::messaging_helpers::decrypt_and_dispatch(
+        let result = rt.block_on(crate::context::messaging_helpers::decrypt_and_dispatch(
             &own_did_deps,
             Some(bob_cs),
             ctx_str,
             &ctx_bytes,
             &sealed,
-        );
+        ));
         assert!(
             matches!(&result, Err(ContextError::CryptoFailed(m)) if m == "application message from own DID"),
             "an application message from the local DID must be rejected, got {result:?}"
@@ -26851,7 +28723,7 @@ mod tests {
     #[test]
     fn send_heartbeat_handler_reports_mutated() {
         use crate::context::actor::class_s::ClassSCell;
-        use crate::context::actor::commands::{MessagingCommand, SigningKeyBytes};
+        use crate::context::actor::commands::MessagingCommand;
         use scp_protocol::context::ContextState;
         use scp_protocol::context::roles::Capability;
 
@@ -26873,7 +28745,7 @@ mod tests {
             .build()
             .unwrap();
         let alice_deps = rt
-            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .block_on(alice_sup.build_actor_deps_loaded(&DID::from(ALICE)))
             .expect("build alice's actor deps");
 
         // Activate the context on Alice's owned actor state and seed Alice as a
@@ -26903,8 +28775,8 @@ mod tests {
             let heartbeat = MessagingCommand::SendHeartbeat {
                 context_id: ctx_str.to_owned(),
                 sender_did: DID::from(ALICE),
-                signing_key: SigningKeyBytes::from_signing_key(
-                    &crate::crypto::mls::two_party_test_support::alice_signing_key(),
+                signer: CommandSigner::local_ed25519(
+                    crate::crypto::mls::two_party_test_support::alice_signing_key(),
                 ),
                 reply: htx,
             };
@@ -26925,6 +28797,109 @@ mod tests {
                  generation — the handler MUST report mutated (ADR-049 §9 HIGH-1)"
             );
             hrx.await.expect("heartbeat reply").expect("heartbeat ok");
+        });
+    }
+
+    /// ADR-049 Decision 7a: a custody that never answers fails a signing
+    /// handler's turn with a custody failure of kind `TimedOut`
+    /// (`SCP-CRYPTO-4062`), not the handler's `TransportTimeout`. The handler
+    /// budget (`SIGNING_HANDLER_TIMEOUT`) outlasts the sign budget
+    /// (`SIGN_TIMEOUT`), so the sign budget always fires first.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn stalled_custody_fails_signing_handler_with_custody_timeout() {
+        use crate::context::actor::class_s::ClassSCell;
+        use crate::context::actor::commands::MessagingCommand;
+        use crate::context::actor::signer::SIGN_TIMEOUT;
+        use scp_crypto::{CustodyFailure, CustodyFailureKind, DynScpSigner, SigAlg, SignFuture};
+        use scp_protocol::context::ContextState;
+        use scp_protocol::context::roles::Capability;
+
+        /// A signer whose sign never completes, standing in for an
+        /// unanswered biometric prompt.
+        struct StalledSigner(Vec<u8>);
+
+        impl DynScpSigner for StalledSigner {
+            fn algorithm(&self) -> SigAlg {
+                SigAlg::Ed25519
+            }
+
+            fn public_key(&self) -> Vec<u8> {
+                self.0.clone()
+            }
+
+            fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> SignFuture<'a> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        const ALICE: &str = "did:dht:z6MkAliceStalledAliceStalledAliceStall1";
+        const BOB: &str = "did:dht:z6MkBobStalledBobStalledBobStalledBobSt1";
+        let ctx_str = "stalled-custody-handler-timeout";
+
+        let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+            alice_provider: alice_crypto,
+            mut alice_state,
+            ..
+        } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE, BOB);
+
+        let alice_sup = supervisor_with_crypto(Arc::clone(&alice_crypto));
+        let rt = tokio::runtime::Builder::new_current_thread() // ci-allow: block-on: test-only, drives async dispatch from a sync #[test]; not a production async bridge
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let alice_deps = rt
+            .block_on(alice_sup.build_actor_deps_loaded(&DID::from(ALICE)))
+            .expect("build alice's actor deps");
+
+        alice_state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("transition test handle to Active");
+        alice_state
+            .membership
+            .add_member(DID::from(ALICE), "member".to_owned(), Vec::new());
+        alice_state.members.insert(DID::from(ALICE));
+        alice_state.role_state.members.insert(ALICE.to_owned());
+        alice_state.role_state.member_capabilities.insert(
+            ALICE.to_owned(),
+            std::collections::HashSet::from([Capability::MessagesWrite]),
+        );
+        let mut cell = ClassSCell::new(alice_state);
+        let public_key = crate::crypto::mls::two_party_test_support::alice_signing_key()
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+
+        rt.block_on(async {
+            let (htx, hrx) = tokio::sync::oneshot::channel();
+            let heartbeat = MessagingCommand::SendHeartbeat {
+                context_id: ctx_str.to_owned(),
+                sender_did: DID::from(ALICE),
+                signer: CommandSigner::new(Arc::new(StalledSigner(public_key))),
+                reply: htx,
+            };
+            let started = tokio::time::Instant::now();
+            let outcome = crate::context::actor::handlers::messaging::dispatch(
+                &mut cell,
+                &alice_deps,
+                heartbeat,
+            )
+            .await;
+            assert!(outcome.result.is_err(), "a stalled sign must fail the turn");
+            assert!(started.elapsed() >= SIGN_TIMEOUT);
+            let result = hrx.await.expect("heartbeat reply");
+            assert!(
+                matches!(
+                    &result,
+                    Err(ContextError::Custody(CustodyFailure {
+                        kind: CustodyFailureKind::TimedOut,
+                        ..
+                    }))
+                ),
+                "a stalled custody must surface as TimedOut (SCP-CRYPTO-4062), got {result:?}"
+            );
         });
     }
 
@@ -26974,7 +28949,7 @@ mod tests {
             .build()
             .unwrap();
         let alice_deps = rt
-            .block_on(alice_sup.build_actor_deps(&DID::from(ALICE)))
+            .block_on(alice_sup.build_actor_deps_loaded(&DID::from(ALICE)))
             .expect("build alice's actor deps");
 
         // Build a Bob-signed KeyRequest (for Alice's key) sealing to a fresh
@@ -27037,13 +29012,13 @@ mod tests {
         };
 
         // BLACK-P7-1: the mismatch is rejected, and NO answer is enqueued.
-        let reject = crate::context::messaging_helpers::decrypt_and_dispatch(
+        let reject = rt.block_on(crate::context::messaging_helpers::decrypt_and_dispatch(
             &alice_deps,
             Some(&mut *alice_cs),
             ctx_str,
             &ctx_bytes,
             &mismatch_sealed,
-        );
+        ));
         assert!(
             matches!(
                 &reject,
@@ -27058,14 +29033,15 @@ mod tests {
         );
 
         // BLACK-P7-2: the well-formed request is answered.
-        let ok = crate::context::messaging_helpers::decrypt_and_dispatch(
-            &alice_deps,
-            Some(&mut *alice_cs),
-            ctx_str,
-            &ctx_bytes,
-            &ok_sealed,
-        )
-        .expect("a well-formed request is accepted on the receive path");
+        let ok = rt
+            .block_on(crate::context::messaging_helpers::decrypt_and_dispatch(
+                &alice_deps,
+                Some(&mut *alice_cs),
+                ctx_str,
+                &ctx_bytes,
+                &ok_sealed,
+            ))
+            .expect("a well-formed request is accepted on the receive path");
         assert!(
             ok.is_none(),
             "a KeyRequest is consumed on the receive side (no application envelope surfaces)"
@@ -27200,7 +29176,8 @@ mod tests {
             .expect("create the real 64-hex context under the digest");
         assert_eq!(created.context_id(), context_id);
 
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]));
         let result = sup
             .recovery_send_notification_direct(
                 &context_id,
@@ -27836,7 +29813,7 @@ mod tests {
 
         // A live key-package actor for `local`, so `build_actor_deps`
         // succeeds and the refusal comes from the actor spawn.
-        sup.key_package_store_for(&local)
+        sup.key_package_store_for_loaded(&local)
             .await
             .expect("a key-package actor spawns before shutdown");
         sup.close_spawn_gate();
@@ -28297,7 +30274,7 @@ mod tests {
         let owning_member = "did:key:aaa-replace-gap-owning-member";
         // Pre-load the node identity's store and wrapping keypair, so the
         // import's deps build does not wait on the `write_lock` held below.
-        sup.key_package_store_for(&sup.node_identity().unwrap())
+        sup.key_package_store_for_loaded(&sup.node_identity().unwrap())
             .await
             .expect("kp store resolves with providers");
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
@@ -28435,6 +30412,9 @@ mod tests {
         // Despawn the freshly-spawned actor so the respawn re-insert is clean
         // (respawn despawns internally too, but this keeps the test explicit).
         drop(handle);
+        sup.load_wrapping_key(&owning)
+            .await
+            .expect("an entry point loads the owner's wrapping key");
         sup.respawn_from_snapshot(&ctx_key, &owning)
             .await
             .expect("respawn from a valid Active snapshot must succeed");
@@ -28506,8 +30486,8 @@ mod tests {
         // smaller one; the respawn will derive that as `owning_did`.
         let did_a = DID("did:example:aaa-first".to_owned());
         let did_b = DID("did:example:zzz-second".to_owned());
-        sup.register_local_did(did_a.clone()).await.unwrap();
-        sup.register_local_did(did_b.clone()).await.unwrap();
+        sup.register_local_did(did_a.clone()).await;
+        sup.register_local_did(did_b.clone()).await;
 
         // Spawn an Active context (creator = did_b, the NON-min DID) and
         // persist its snapshot.
@@ -28528,7 +30508,7 @@ mod tests {
             .persist_context(&ctx_key, &snap)
             .await
             .unwrap();
-        let deps = sup.build_actor_deps(&did_b).await.unwrap();
+        let deps = sup.build_actor_deps_loaded(&did_b).await.unwrap();
         let handle = Box::pin(sup.spawn_actor_with_state(state, deps, None))
             .await
             .expect("spawn registers");
@@ -29272,7 +31252,8 @@ mod tests {
             .handle
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]));
 
         // `finalize_send` is actor-shape (ADR-049 §9): it takes the owning
         // `ClassSCell` so it can drive the Class-S fail-closed persist (via the
@@ -29289,7 +31270,7 @@ mod tests {
             &sender,
             0,
             b"paid",
-            Some(&signing_key),
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Paid send: a deferred spending-nonce token whose fail-closed
             // commit drives the persist (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -29312,7 +31293,7 @@ mod tests {
             &sender,
             1,
             b"free",
-            Some(&signing_key),
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Free send: no token (previously the `false` bool) — keeps the
             // best-effort persist, un-regressed.
             None,
@@ -29324,6 +31305,87 @@ mod tests {
             "a free (non-spending) send must keep best-effort persist and \
              not be regressed to fail-closed: got {free:?}"
         );
+    }
+
+    /// §9.9.3 + ADR-039: a checkpoint is stamped `#active`, so an agent-persona
+    /// send that makes one due builds none (no agent-key signature under the
+    /// `#active` stamp), and the next `#active` send builds one that verifies
+    /// against the `#active` key, as a peer checks it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_send_leaves_the_due_checkpoint_to_the_next_active_send() {
+        let sup = supervisor_with_providers();
+        let mut deps = test_actor_deps(&sup).await;
+        let ctx_id_bytes = [0xC7u8; 32];
+        // A real Merkle log: the checkpoint signs the log's count and root.
+        let event_log =
+            Arc::new(crate::context::providers::event_log::MerkleEventLogProvider::new());
+        event_log.init_event_log(&ctx_id_bytes).await.unwrap();
+        deps.event_log = event_log;
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let sender = DID("did:example:checkpoint-persona".to_owned());
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            sender.clone(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let active = CommandSigner::local_ed25519(active_key.clone());
+        let agent =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]));
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        // One more send reaches the 50-event threshold.
+        *cell.class_c_view().checkpoint_events_since_mut() = 49;
+
+        crate::context::messaging_helpers::finalize_send(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            &ctx_id_bytes,
+            &sender,
+            0,
+            b"agent",
+            MessageSigner::Agent(&agent),
+            None,
+            /* is_broadcast = */ false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cell.class_c_view().checkpoints_mut().is_empty(),
+            "an agent-persona send must not build a checkpoint"
+        );
+        assert_eq!(*cell.class_c_view().checkpoint_events_since_mut(), 50);
+
+        crate::context::messaging_helpers::finalize_send(
+            &mut cell,
+            &deps,
+            &ctx_key,
+            &ctx_id_bytes,
+            &sender,
+            1,
+            b"active",
+            MessageSigner::Active(&active),
+            None,
+            /* is_broadcast = */ false,
+        )
+        .await
+        .unwrap();
+        let checkpoints = cell.class_c_view().checkpoints_mut().clone();
+        assert_eq!(
+            checkpoints.len(),
+            1,
+            "the #active send builds the due checkpoint"
+        );
+        scp_event_log::checkpoint::verify_checkpoint_signature(
+            &checkpoints[0],
+            &active_key.verifying_key(),
+        )
+        .unwrap();
+        assert_eq!(*cell.class_c_view().checkpoint_events_since_mut(), 0);
     }
 
     /// Build an Active broadcast `PerContextState` with `author` registered as
@@ -29971,7 +32033,8 @@ mod tests {
                 seed_entries,
             );
         let deps = test_actor_deps(&sup).await;
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]);
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]));
         // `finalize_send` is actor-shape (ADR-049 §9): wrap the state in the
         // owning `ClassSCell` for the call, then reclaim it via `into_inner` to
         // hand off to `spawn_actor_with_state`.
@@ -29984,7 +32047,7 @@ mod tests {
             &sender,
             0,
             b"paid-send",
-            Some(&signing_key),
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Paid send: deferred token whose fail-closed commit persists the
             // consumed nonce (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -30424,7 +32487,8 @@ mod tests {
             .handle
             .transition_to(&crate::context::ContextState::Active)
             .unwrap();
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
+        let signing_key =
+            CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]));
 
         // Baseline: the sender's sequence counter before any reservation.
         let baseline = state
@@ -30457,7 +32521,7 @@ mod tests {
             &sender,
             reserved,
             b"paid",
-            Some(&signing_key),
+            crate::context::supervisor::MessageSigner::Active(&signing_key),
             // Paid send: deferred token whose fail-closed commit fails here,
             // driving the sequence-rollback path (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -30818,7 +32882,7 @@ mod tests {
         target_state: crate::context::actor::state::PerContextState,
     ) {
         let caller_deps = supervisor
-            .build_actor_deps(&DID("did:example:xctx-caller-owner".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:xctx-caller-owner".to_owned()))
             .await
             .expect("caller deps");
         supervisor
@@ -30826,7 +32890,7 @@ mod tests {
             .await
             .expect("spawn caller actor");
         let target_deps = supervisor
-            .build_actor_deps(&DID("did:example:xctx-target-owner".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:xctx-target-owner".to_owned()))
             .await
             .expect("target deps");
         supervisor
@@ -30939,6 +33003,7 @@ mod tests {
         journal: Arc<dyn SagaJournal>,
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
         persistence: Box<dyn ContextPersistence>,
+        wrapping_custody: WrappingCustodySource,
     ) -> Arc<Supervisor> {
         let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestXctxFaultJournal".to_owned(),
@@ -30966,6 +33031,7 @@ mod tests {
             None,
             None,
             crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
+            wrapping_custody,
         )
     }
 
@@ -31025,6 +33091,9 @@ mod tests {
             journal,
             mls_storage,
             Box::new(persistence),
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            )),
         );
         let caller_state = xctx_caller_state(caller_did, creator_did);
         let target_state = xctx_target_state(caller_did, creator_did);
@@ -31041,9 +33110,9 @@ mod tests {
         supervisor
             .start_cross_context_outlet_invocation_saga(
                 xctx_request(caller_did, now_ms, nonce),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31253,6 +33322,7 @@ mod tests {
         CapturingPersistence,
         Arc<std::sync::atomic::AtomicUsize>,
         Result<SagaOutput, SagaError>,
+        WrappingCustodySource,
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -31274,12 +33344,19 @@ mod tests {
                     &mls_inner,
                 )),
             );
+        // The wrapping keys' custody outlives supervisor #1, as the host's
+        // custody outlives a process restart.
+        let wrapping_custody: WrappingCustodySource =
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            ));
         let supervisor = xctx_supervisor_with_journal(
             creator_did.clone(),
             creator_key,
             journal,
             mls_storage,
             Box::new(persistence.clone()),
+            Arc::clone(&wrapping_custody),
         );
         let caller_did = "did:dht:z6MkXctxOkArmCaller";
         let caller_state = xctx_caller_state(caller_did, &creator_did);
@@ -31303,9 +33380,9 @@ mod tests {
         let result = supervisor
             .start_cross_context_outlet_invocation_saga(
                 xctx_request(caller_did, now_ms, [0x44u8; 16]),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31316,7 +33393,14 @@ mod tests {
         // snapshots) survives — exactly what a process restart leaves behind.
         drop(supervisor);
 
-        (journal_storage, mls_inner, persistence, calls, result)
+        (
+            journal_storage,
+            mls_inner,
+            persistence,
+            calls,
+            result,
+            wrapping_custody,
+        )
     }
 
     /// LIVE Ok-arm coverage (spec §6.2.4): after a FULLY successful dual-commit
@@ -31330,7 +33414,7 @@ mod tests {
     async fn xctx_saga_ok_arm_mark_resolved_fault_is_needs_repair_not_aborted() {
         use std::sync::atomic::Ordering;
 
-        let (journal_storage, _mls_inner, _persistence, calls, result) =
+        let (journal_storage, _mls_inner, _persistence, calls, result, _wrapping_custody) =
             Box::pin(drive_xctx_mark_resolved_committed_fault()).await;
 
         let err = result.expect_err(
@@ -31381,7 +33465,7 @@ mod tests {
     async fn xctx_saga_committing_self_heals_to_committed_on_reopen() {
         use std::sync::atomic::Ordering;
 
-        let (journal_storage, mls_inner, persistence, calls, result) =
+        let (journal_storage, mls_inner, persistence, calls, result, wrapping_custody) =
             Box::pin(drive_xctx_mark_resolved_committed_fault()).await;
         assert!(
             matches!(result, Err(SagaError::NeedsRepair { .. })),
@@ -31430,6 +33514,7 @@ mod tests {
             Arc::clone(&journal),
             mls_storage,
             Box::new(persistence.clone()),
+            wrapping_custody,
         );
 
         // Restore-then-replay: restores both actors (resident, carrying their
@@ -31523,9 +33608,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31665,9 +33750,9 @@ mod tests {
                     asserted_nonce: [0x43u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31783,9 +33868,9 @@ mod tests {
                     asserted_nonce: [0x43u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -31825,9 +33910,9 @@ mod tests {
                     asserted_nonce: [0x44u8; 16],
                     asserted_timestamp_ms: now_ms2,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
             )
@@ -31894,9 +33979,9 @@ mod tests {
                     asserted_nonce: [0x4Du8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({})) },
             )
@@ -31955,7 +34040,7 @@ mod tests {
             .spawn_actor_with_state(
                 caller_state,
                 supervisor
-                    .build_actor_deps(&DID("did:example:xctx-wedge-caller-owner".to_owned()))
+                    .build_actor_deps_loaded(&DID("did:example:xctx-wedge-caller-owner".to_owned()))
                     .await
                     .expect("caller deps"),
                 None,
@@ -31982,9 +34067,9 @@ mod tests {
                     asserted_nonce: [0x4Au8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
             )
@@ -32076,9 +34161,9 @@ mod tests {
                     asserted_nonce: [0x45u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 |_v: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) },
             )
@@ -32540,6 +34625,85 @@ mod tests {
         assert!(aborted.to_string().contains("SCP-SAGA-13013"));
     }
 
+    /// A target custody that never answers fails each Commit attempt with
+    /// `SCP-CRYPTO-4062` from `CommandSigner::sign_bounded_ed25519`, never with the phase's
+    /// `TransportTimeout`: the Commit budget is built from the executor budget
+    /// plus the signing turn's budget, so the sign budget always fires first.
+    #[tokio::test(start_paused = true)]
+    async fn xctx_saga_stalled_target_custody_fails_commit_with_custody_timeout() {
+        use crate::context::actor::signer::{SIGN_TIMEOUT, custody_timed_out};
+        use scp_crypto::{DynScpSigner, SigAlg, SignFuture};
+
+        /// A signer whose sign never completes, standing in for an
+        /// unanswered biometric prompt.
+        struct StalledSigner(Vec<u8>);
+
+        impl DynScpSigner for StalledSigner {
+            fn algorithm(&self) -> SigAlg {
+                SigAlg::Ed25519
+            }
+
+            fn public_key(&self) -> Vec<u8> {
+                self.0.clone()
+            }
+
+            fn sign_boxed<'a>(&'a self, _digest: &'a [u8; 32]) -> SignFuture<'a> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkXctxStallCreator".to_owned();
+        let creator_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let supervisor = xctx_supervisor(creator_did.clone(), creator_key);
+        let caller_did = "did:dht:z6MkXctxStallCaller";
+
+        let caller_state = xctx_caller_state(caller_did, &creator_did);
+        let target_state = xctx_target_state(caller_did, &creator_did);
+        Box::pin(spawn_xctx_pair(&supervisor, caller_state, target_state)).await;
+
+        let target_public = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes()
+            .to_vec();
+        let caller_signing = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let executor =
+            |_input: serde_json::Value| async move { Ok(serde_json::json!({ "result": 3 })) };
+
+        let now_ms = supervisor.clock_ref().expect("clock").now_millis();
+        let started = tokio::time::Instant::now();
+        let err = supervisor
+            .start_cross_context_outlet_invocation_saga(
+                CrossContextOutletInvocationRequest {
+                    caller_context_id: XCTX_CALLER,
+                    target_context_id: XCTX_TARGET,
+                    caller_did: DID(caller_did.to_owned()),
+                    outlet_registration_id: XCTX_OUTLET.to_owned(),
+                    ucan_proof_id: None,
+                    input: serde_json::json!({ "a": 1, "b": 2 }),
+                    asserted_chain_depth: 1,
+                    asserted_nonce: [0x47u8; 16],
+                    asserted_timestamp_ms: now_ms,
+                },
+                SagaSigners {
+                    target: CommandSigner::new(Arc::new(StalledSigner(target_public))),
+                    caller: CommandSigner::local_ed25519(caller_signing),
+                },
+                executor,
+            )
+            .await
+            .expect_err("a stalled target custody fails the saga");
+
+        let SagaError::NeedsRepair { message, .. } = err else {
+            panic!("a failed Commit lifts to NeedsRepair, got {err:?}");
+        };
+        // The public NeedsRepair carries the last Commit attempt's error as
+        // text; it is the typed `CommandSigner::sign_bounded_ed25519` timeout (`SCP-CRYPTO-4062` at
+        // the bridges), not the phase's `TransportTimeout`.
+        let expected = custody_timed_out("sign");
+        assert_eq!(message, expected.to_string());
+        assert!(started.elapsed() >= SIGN_TIMEOUT);
+    }
+
     /// Replay: after a saga commits, re-driving Commit-B for the SAME `SagaId`
     /// (the crash-recovery replay path) re-emits the STORED output + receipt
     /// WITHOUT re-invoking the outlet. We run a full saga, then directly send a
@@ -32588,9 +34752,9 @@ mod tests {
                     asserted_nonce: [0x46u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -32680,8 +34844,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: 1_700_000_000,
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({})) }) as _
             })),
@@ -33184,6 +35348,9 @@ mod tests {
                 Arc::clone(&journal),
                 mls_storage,
             ),
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            )),
         );
         (supervisor, journal)
     }
@@ -33461,9 +35628,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -33562,9 +35729,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -33669,9 +35836,9 @@ mod tests {
                     asserted_nonce: nonce,
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -33879,9 +36046,9 @@ mod tests {
                     asserted_nonce: [0x42u8; 16],
                     asserted_timestamp_ms: now_ms,
                 },
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 executor,
             )
@@ -33941,8 +36108,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34053,8 +36220,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34263,6 +36430,9 @@ mod tests {
             None,
             None,
             crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            )),
         );
         let caller_did = "did:dht:z6MkXctxWave8Caller";
         let caller_state = xctx_caller_state(caller_did, &creator_did);
@@ -34291,8 +36461,8 @@ mod tests {
             asserted_nonce: nonce,
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34503,6 +36673,9 @@ mod tests {
             None,
             None,
             crate::context::supervisor::DurableProviders::for_test(journal, mls_storage),
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            )),
         );
         (supervisor, persistence)
     }
@@ -34564,8 +36737,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34682,8 +36855,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -34821,8 +36994,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -35267,8 +37440,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -35413,8 +37586,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing,
-            caller_signing_key: caller_signing,
+            target_signer: CommandSigner::local_ed25519(target_signing),
+            caller_signer: CommandSigner::local_ed25519(caller_signing),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -35555,8 +37728,8 @@ mod tests {
             asserted_nonce: [0x42u8; 16],
             asserted_timestamp_ms: supervisor.clock_ref().expect("clock").now_millis(),
             caller_source_role: None,
-            target_signing_key: target_signing.clone(),
-            caller_signing_key: caller_signing.clone(),
+            target_signer: CommandSigner::local_ed25519(target_signing.clone()),
+            caller_signer: CommandSigner::local_ed25519(caller_signing.clone()),
             executor: Some(Box::new(|_v: serde_json::Value| {
                 Box::pin(async move { Ok(serde_json::json!({ "result": 3 })) }) as _
             })),
@@ -36281,7 +38454,7 @@ mod open_outlet_stream_tests {
             .grant(&invoker(), Amount::new(1_000_000));
         state.governance.economic_policy = Some(policy());
         let deps = supervisor
-            .build_actor_deps(&invoker())
+            .build_actor_deps_loaded(&invoker())
             .await
             .expect("build_actor_deps");
         supervisor
@@ -36554,7 +38727,7 @@ mod open_outlet_stream_tests {
             .grant(&invoker(), Amount::new(1_000_000));
         state.governance.economic_policy = Some(policy());
         let deps = supervisor
-            .build_actor_deps(&invoker())
+            .build_actor_deps_loaded(&invoker())
             .await
             .expect("build_actor_deps");
         supervisor
@@ -36819,7 +38992,7 @@ mod open_outlet_stream_tests {
             .grant(&invoker(), Amount::new(one_reservation));
         state.governance.economic_policy = Some(policy());
         let deps = supervisor
-            .build_actor_deps(&invoker())
+            .build_actor_deps_loaded(&invoker())
             .await
             .expect("build_actor_deps");
         supervisor
@@ -37008,7 +39181,7 @@ mod open_outlet_stream_tests {
             .grant(&invoker(), Amount::new(1_000_000));
         state.governance.economic_policy = Some(policy());
         let deps = supervisor
-            .build_actor_deps(&invoker())
+            .build_actor_deps_loaded(&invoker())
             .await
             .expect("build_actor_deps");
         supervisor
@@ -37368,7 +39541,7 @@ mod open_outlet_stream_tests {
             .grant(&invoker(), Amount::new(1_000_000));
         state.governance.economic_policy = Some(policy());
         let deps = supervisor
-            .build_actor_deps(&invoker())
+            .build_actor_deps_loaded(&invoker())
             .await
             .expect("build_actor_deps");
         supervisor
@@ -37494,7 +39667,7 @@ mod open_outlet_stream_tests {
             .grant(&invoker(), Amount::new(1_000_000));
         state.governance.economic_policy = Some(policy());
         let deps = supervisor
-            .build_actor_deps(&invoker())
+            .build_actor_deps_loaded(&invoker())
             .await
             .expect("build_actor_deps");
         supervisor
@@ -37606,6 +39779,7 @@ mod open_outlet_stream_tests {
     clippy::disallowed_types
 )]
 mod streaming_saga_tests {
+    use crate::context::actor::signer::CommandSigner;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -37626,9 +39800,9 @@ mod streaming_saga_tests {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
     use scp_protocol::trust::caveats::InvocationCaveats;
 
-    use super::{DurableProviders, SagaAbortReason, SagaError, SagaSigningKeys, Supervisor};
+    use super::{DurableProviders, SagaAbortReason, SagaError, SagaSigners, Supervisor};
     use crate::context::actor::ContextCommand;
-    use crate::context::actor::commands::{QueriesCommand, SagaPhaseMessage, SigningKeyBytes};
+    use crate::context::actor::commands::{QueriesCommand, SagaPhaseMessage};
     use crate::context::actor::state::PerContextState;
     use crate::context::builder::ContextEventLogProvider;
     use crate::context::outlets::dispatch::OpenStreamParams;
@@ -37863,6 +40037,9 @@ mod streaming_saga_tests {
             None,
             Some(clock),
             DurableProviders::for_test(journal, mls_storage),
+            crate::crypto::wrapping::single_custody_source(Arc::new(
+                scp_platform::testing::InMemoryKeyCustody::new(),
+            )),
         )
     }
 
@@ -38093,7 +40270,7 @@ mod streaming_saga_tests {
     /// Spawn one context actor with `state` under a per-context owner DID.
     async fn spawn_ss_actor(supervisor: &Arc<Supervisor>, owner: &str, state: PerContextState) {
         let deps = supervisor
-            .build_actor_deps(&DID(owner.to_owned()))
+            .build_actor_deps_loaded(&DID(owner.to_owned()))
             .await
             .expect("actor deps");
         supervisor
@@ -38222,9 +40399,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -38328,7 +40505,7 @@ mod streaming_saga_tests {
         // receipt bytes to verify.
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -38336,7 +40513,7 @@ mod streaming_saga_tests {
                         terminal_status:
                             scp_protocol::context::outlets::stream::StreamTerminalStatus::Ok,
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -38580,9 +40757,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -38747,9 +40924,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -38953,9 +41130,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -39068,7 +41245,7 @@ mod streaming_saga_tests {
             .recover_streaming_saga_truncated_close(
                 saga_id.clone(),
                 SS_TARGET,
-                SigningKeyBytes::from_signing_key(&target_signing),
+                CommandSigner::local_ed25519(target_signing.clone()),
             )
             .await
             .expect("AC7 (key-bearing): the truncated close seals the durable prefix");
@@ -39111,7 +41288,7 @@ mod streaming_saga_tests {
         // attests the manifest over the durable PREFIX (never the full stream).
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -39121,7 +41298,7 @@ mod streaming_saga_tests {
                                 "replay".to_owned(),
                             ),
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -39215,9 +41392,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -39259,7 +41436,7 @@ mod streaming_saga_tests {
         // DO NOT apply it (the seal task "died" before settle_outlet_stream_via_actor).
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -39269,7 +41446,7 @@ mod streaming_saga_tests {
                                 "crash-window seal".to_owned(),
                             ),
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -39463,9 +41640,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 executor,
                 Some(binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 params,
             )
@@ -39507,7 +41684,7 @@ mod streaming_saga_tests {
         // handoff point).
         let outcome = {
             let sid = saga_id.clone();
-            let target_key_bytes = SigningKeyBytes::from_signing_key(&target_signing);
+            let target_key_signer = CommandSigner::local_ed25519(target_signing.clone());
             actor
                 .send(move |reply| {
                     ContextCommand::SagaPhase(SagaPhaseMessage::CommitBStreamSettle {
@@ -39517,7 +41694,7 @@ mod streaming_saga_tests {
                                 "concurrent-settle seal".to_owned(),
                             ),
                         cancel_ack_seq: None,
-                        target_signing_key: target_key_bytes,
+                        target_signer: target_key_signer,
                         reply,
                     })
                 })
@@ -39727,9 +41904,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 s1_executor,
                 Some(s1_binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 s1_params,
             )
@@ -39776,9 +41953,9 @@ mod streaming_saga_tests {
                 Some(5_000),
                 s2_executor,
                 Some(s2_binding),
-                SagaSigningKeys {
-                    target: &target_signing,
-                    caller: &caller_signing,
+                SagaSigners {
+                    target: CommandSigner::local_ed25519(target_signing.clone()),
+                    caller: CommandSigner::local_ed25519(caller_signing.clone()),
                 },
                 s2_params,
             )

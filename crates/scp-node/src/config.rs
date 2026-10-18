@@ -29,9 +29,9 @@ use scp_identity::{DidMethod, ScpIdentity};
 use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::NetworkChangeDetector;
-use scp_transport::native::server::{RelayConfig, RelayServer};
+use scp_transport::native::server::{RelayConfig, RelayError, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::relay::push_gate::RelayUrl;
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 
 use crate::{
     ApplicationNode, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy, NoOpCustody, NoOpDidMethod,
@@ -268,8 +268,12 @@ pub enum NatSlot {
     Tuned {
         /// Override the STUN endpoint used for NAT type probing (§10.12.8).
         stun_server: Option<String>,
-        /// Override the bridge relay used for Tier 3 fallback (§10.12.8).
-        bridge_relay: Option<String>,
+        /// Override the bridge relay used for Tier 3 fallback (§10.12.8): the
+        /// bridge relay's own `wss` URL ending in `/scp/v1` (§10.12.7). The
+        /// node publishes it as its entry's `serviceEndpoint` and names
+        /// itself in `bridgeTarget` (§18.2.1). [`scp_did::BridgeEndpoint::new`]
+        /// rejects any other URL where the operator builds the value.
+        bridge_relay: Option<scp_did::BridgeEndpoint>,
         /// Optional UPnP/NAT-PMP port mapper for Tier 1 (spec 10.12.2).
         port_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
         /// Optional reachability probe for self-test (SCP-242).
@@ -679,7 +683,9 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
 /// - `Auto` constructs the default strategy (no overrides).
 /// - `Custom(strategy)` uses the caller-supplied strategy verbatim.
 /// - `Tuned { .. }` feeds the STUN / bridge / port-mapper / reachability-probe
-///   overrides into [`resolve_nat`], which builds a `DefaultNatStrategy`.
+///   overrides into [`resolve_nat`], which builds a `DefaultNatStrategy`. Its
+///   `bridge_relay` is a [`scp_did::BridgeEndpoint`], which already satisfies
+///   §18.2.1 and §10.12.7, so lowering it cannot fail.
 fn resolve_nat_slot(nat: NatSlot) -> Arc<dyn NatStrategy> {
     match nat {
         NatSlot::Auto => resolve_nat(None, None, None, None, None),
@@ -965,8 +971,7 @@ where
     let relay_config = RelayConfig {
         bind_addr,
         bridge_secret: Some(*bridge_secret),
-        relay_url: Some(relay_url),
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
     // The caller's explicit blob-backend selection, threaded verbatim — never
@@ -985,6 +990,8 @@ where
     #[cfg(feature = "quic")]
     let did_slot_registry = relay_server.did_slot_registry();
     let (shutdown_handle, bound_addr) = relay_server.start().await?;
+    // Every `?` from here until the node is built shuts the relay down.
+    let relay_guard = crate::RelayShutdownGuard::new(shutdown_handle);
     let dev_token = local_api.map(generate_dev_token);
 
     let tls_provider = resolve_tls(
@@ -1012,7 +1019,7 @@ where
                 // published unconditionally + fatally, ignoring `config.dht`.
                 dht,
                 protocol_repository,
-                shutdown_handle,
+                relay_guard,
                 bound_addr,
                 bridge_secret,
                 dev_token,
@@ -1050,7 +1057,7 @@ where
                 // keeps that publish fail-closed instead of silently dropped.
                 dht,
                 protocol_repository,
-                shutdown_handle,
+                relay_guard,
                 bound_addr,
                 strategy,
                 bridge_secret,
@@ -1107,10 +1114,25 @@ where
     // 3. Start relay server.
     let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
     let bridge_secret = generate_bridge_secret();
+    // The listener binds first so the relay starts on the URL of the address it
+    // actually serves, even for a port-0 bind. `build_no_domain_inner` then sets
+    // the advertised URL on this shared handle before the node publishes any
+    // URL, and the tier task moves it on each tier change to a URL with a
+    // §9.18.2 canonical form (§10.7.1 step 2).
+    let listener = tokio::net::TcpListener::bind(bind_addr)
+        .await
+        .map_err(|e| RelayError::BindFailed(e.to_string()))?;
+    let seed_url = crate::bound_relay_ws_url(
+        listener
+            .local_addr()
+            .map_err(|e| RelayError::BindFailed(e.to_string()))?,
+    );
+    let relay_url = RelayUrl::new(&seed_url)
+        .map_err(|e| NodeError::InvalidConfig(format!("relay URL {seed_url}: {e}")))?;
     let relay_config = RelayConfig {
         bind_addr,
         bridge_secret: Some(*bridge_secret),
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(LiveRelayUrl::new(relay_url))
     };
 
     // The caller's explicit blob-backend selection, threaded verbatim — never
@@ -1127,7 +1149,9 @@ where
     // unused in no-domain mode, kept for a uniform NodeState).
     #[cfg(feature = "quic")]
     let did_slot_registry = relay_server.did_slot_registry();
-    let (shutdown_handle, bound_addr) = relay_server.start().await?;
+    let (shutdown_handle, bound_addr) = relay_server.start_with_listener(listener).await?;
+    // Every `?` from here until the node is built shuts the relay down.
+    let relay_guard = crate::RelayShutdownGuard::new(shutdown_handle);
 
     // 4. Generate dev API token if local_api was configured.
     let dev_token = local_api.map(generate_dev_token);
@@ -1141,7 +1165,7 @@ where
         did_method,
         dht,
         protocol_repository,
-        shutdown_handle,
+        relay_guard,
         bound_addr,
         strategy,
         bridge_secret,
@@ -1480,9 +1504,9 @@ mod tests {
             node.state
                 .relay_config
                 .relay_url
-                .as_ref()
-                .map(RelayUrl::push_routing_id),
-            Some(RelayUrl::new(&node.relay_url()).unwrap().push_routing_id()),
+                .current()
+                .push_routing_id(),
+            RelayUrl::new(&node.relay_url()).unwrap().push_routing_id(),
             "the domain node's relay must reserve the push routing ID of its published URL"
         );
         node.shutdown();
@@ -1900,7 +1924,9 @@ mod tests {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             nat: NatSlot::Tuned {
                 stun_server: Some("127.0.0.1:3478".to_owned()),
-                bridge_relay: Some("wss://bridge.example.test/scp/v1".to_owned()),
+                bridge_relay: Some(
+                    scp_did::BridgeEndpoint::new("wss://bridge.example.test/scp/v1").unwrap(),
+                ),
                 port_mapper: None,
                 reachability_probe: None,
             },

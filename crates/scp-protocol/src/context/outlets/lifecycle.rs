@@ -352,16 +352,18 @@ const fn default_zero_manifest_hash() -> [u8; 32] {
 ///
 /// The value is serialized to a JCS-canonical JSON string, then hashed with
 /// SHA-256. Returns the hash as a lowercase hex string.
-#[must_use]
-pub fn sha256_json(value: &serde_json::Value) -> String {
+///
+/// # Errors
+///
+/// [`OutletError::CanonicalizationFailed`](super::OutletError::CanonicalizationFailed)
+/// when the value carries a number beyond 2^53, whose canonical bytes would
+/// also stand for another number ([`crate::jcs::require_i_json`]).
+pub fn sha256_json(value: &serde_json::Value) -> Result<String, super::OutletError> {
     use sha2::{Digest, Sha256};
 
-    // RFC 8785 JCS canonical serialization for cross-implementation
-    // deterministic hashing. Falls back to empty string on error (should
-    // not happen for valid JSON).
-    let bytes = crate::jcs::to_string(value).unwrap_or_default();
-    let hash = Sha256::digest(bytes.as_bytes());
-    hex::encode(hash)
+    let bytes = crate::jcs::to_vec(value)
+        .map_err(|reason| super::OutletError::CanonicalizationFailed { reason })?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +492,7 @@ mod tests {
     #[test]
     fn sha256_json_produces_64_char_hex() {
         let value = serde_json::json!({"hello": "world"});
-        let hash = sha256_json(&value);
+        let hash = sha256_json(&value).unwrap();
         assert_eq!(hash.len(), 64);
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -498,16 +500,27 @@ mod tests {
     #[test]
     fn sha256_json_deterministic() {
         let value = serde_json::json!({"a": 1, "b": 2});
-        let hash1 = sha256_json(&value);
-        let hash2 = sha256_json(&value);
+        let hash1 = sha256_json(&value).unwrap();
+        let hash2 = sha256_json(&value).unwrap();
         assert_eq!(hash1, hash2);
     }
 
     #[test]
     fn sha256_json_different_inputs_produce_different_hashes() {
-        let hash1 = sha256_json(&serde_json::json!({"a": 1}));
-        let hash2 = sha256_json(&serde_json::json!({"a": 2}));
+        let hash1 = sha256_json(&serde_json::json!({"a": 1})).unwrap();
+        let hash2 = sha256_json(&serde_json::json!({"a": 2})).unwrap();
         assert_ne!(hash1, hash2);
+    }
+
+    /// An outlet value carrying a number beyond 2^53 has no hash, rather than
+    /// the hash of an empty preimage.
+    #[test]
+    fn sha256_json_refuses_a_number_beyond_2_53() {
+        let err = sha256_json(&serde_json::json!({"id": 9_007_199_254_740_993_u64})).unwrap_err();
+        assert!(
+            matches!(&err, crate::context::outlets::OutletError::CanonicalizationFailed { reason } if reason.contains("/id")),
+            "{err:?}"
+        );
     }
 
     #[test]

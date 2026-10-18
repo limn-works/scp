@@ -27,10 +27,11 @@ use scp_did::DID;
 use scp_event_log::Event;
 
 use super::attestation::{
-    Attestation, AttestationRevocationChecker, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
+    ActiveKeyResolver, Attestation, AttestationRevocationChecker, AttestorInfo, FreshnessStatus,
     ThresholdCheckInput, ThresholdRequirement, check_attestation_freshness,
     check_threshold_attestation, verify_attestation,
 };
+use super::capability_definition::CapabilityDefinitionSource;
 use super::challenge::{ChallengeVerification, verify_challenge_verification};
 use super::consequence::ConsequenceRule;
 use super::participation::compute_participation_record;
@@ -179,8 +180,7 @@ pub trait TrustProtocolRepository: Send + Sync {
 /// deriving that id from its issuer, so two issuers can carry one id. A
 /// revocation list keyed on an id alone therefore lets an attacker suppress an
 /// honest issuer's attestation: the attacker mints a fresh DID at no cost
-/// (`IdentityDidPublicKeyResolver` reads a public key out of a DID string, so no
-/// publication gates it), signs an attestation that carries the honest issuer's
+/// (a fresh identity publishes its own document, so nothing gates it), signs an attestation that carries the honest issuer's
 /// id and revokes itself, and a consumer that ingests that record drops every
 /// later copy of the honest issuer's attestation. Keying on issuer DID plus id
 /// confines a revocation to the issuer who signed it.
@@ -444,7 +444,7 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         &self,
         context_id: &str,
         subject_did: &str,
-        resolver: &impl DidPublicKeyResolver,
+        resolver: &(impl ActiveKeyResolver + ?Sized),
         clock: &impl Clock,
     ) -> Result<Vec<Attestation>, TrustError> {
         let cached = self
@@ -462,28 +462,26 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         for entry in cached {
             if entry.is_expired(now) {
                 // Re-verify the attestation, consulting the context revocation
-                // list. `.is_ok()` keeps the entry only on success; a non-Ok
-                // result — a verification rejection (bad signature / expired /
-                // context-revoked) OR a resolver infra fault — drops this one
-                // entry. This is conservative (it can only drop, never inflate)
-                // and is sound here because the injected `resolver` is total and
-                // pure (`IdentityDidPublicKeyResolver`: a deterministic DID-string
-                // parse, no network), so no transient fault can spuriously drop a
-                // valid entry. A future networked/fallible resolver swap MUST
-                // revisit this to separate rejections from infra faults.
-                if verify_attestation(&entry.attestation, resolver, clock, &revocation_checker)
-                    .is_ok()
-                {
-                    // Update cache with new verified_at.
-                    let refreshed = CachedAttestation {
-                        attestation: entry.attestation.clone(),
-                        verified_at: now,
-                        ttl_secs: self.ttl_secs,
-                    };
-                    self.store.store_cached_attestation(context_id, refreshed)?;
-                    result.push(entry.attestation);
+                // list. A rejection of the attestation itself (bad signature,
+                // expired, context-revoked) drops this one entry. Any other
+                // failure, such as an unreachable `#active` resolution,
+                // propagates: the resolver reads the network, and dropping a
+                // valid entry on a transient fault would lower the subject's
+                // trust without signal.
+                match verify_attestation(&entry.attestation, resolver, clock, &revocation_checker) {
+                    Ok(()) => {
+                        // Update cache with new verified_at.
+                        let refreshed = CachedAttestation {
+                            attestation: entry.attestation.clone(),
+                            verified_at: now,
+                            ttl_secs: self.ttl_secs,
+                        };
+                        self.store.store_cached_attestation(context_id, refreshed)?;
+                        result.push(entry.attestation);
+                    }
+                    Err(e) if e.is_record_rejection() => {}
+                    Err(e) => return Err(e),
                 }
-                // On any non-Ok result the entry is dropped (see note above).
             } else if revocation_checker
                 .check_revocation(&entry.attestation.id, &entry.attestation.issuer)
                 .is_none()
@@ -517,7 +515,7 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         &self,
         context_id: &str,
         attestation: &Attestation,
-        resolver: &impl DidPublicKeyResolver,
+        resolver: &(impl ActiveKeyResolver + ?Sized),
         clock: &impl Clock,
         revocation_checker: &dyn AttestationRevocationChecker,
     ) -> Result<(), TrustError> {
@@ -548,7 +546,7 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
 ///
 /// Collects all the references needed by [`aggregate_trust_input`] into a
 /// single struct to avoid a large parameter list.
-pub struct AggregationContext<'a, S, R, C> {
+pub struct AggregationContext<'a, S, C> {
     /// The context ID to aggregate trust inputs for.
     pub context_id: &'a str,
 
@@ -575,8 +573,14 @@ pub struct AggregationContext<'a, S, R, C> {
     /// The attestation cache (with backing store).
     pub cache: &'a AttestationCache<S>,
 
-    /// DID public key resolver for attestation verification.
-    pub resolver: &'a R,
+    /// Resolves each issuer's and each challenge verifier's `#active` key,
+    /// for every attestation-class signature this aggregation re-verifies.
+    pub resolver: &'a dyn ActiveKeyResolver,
+
+    /// Supplies the capability definition each stored challenge record is
+    /// checked against (spec 07 §7.3.4.6). An unobtainable definition fails
+    /// the aggregation; it does not drop the record.
+    pub definitions: &'a dyn CapabilityDefinitionSource,
 
     /// Clock for timestamp operations.
     pub clock: &'a C,
@@ -603,12 +607,11 @@ pub struct AggregationContext<'a, S, R, C> {
 /// backing store is unavailable.
 ///
 /// See ADR-017 acceptance criterion 9.
-pub fn aggregate_trust_input<S, R, C>(
-    ctx: &AggregationContext<'_, S, R, C>,
+pub fn aggregate_trust_input<S, C>(
+    ctx: &AggregationContext<'_, S, C>,
 ) -> Result<TrustInput, TrustError>
 where
     S: TrustProtocolRepository,
-    R: DidPublicKeyResolver,
     C: Clock,
 {
     // 1. Collect and verify attestations from cache. Computed BEFORE the
@@ -644,35 +647,29 @@ where
     //    ([`AttestationCache::get_verified_attestations`]), which likewise re-
     //    validates persisted entries on every read.
     //
-    //    INVARIANT: `.is_ok()` drops the one entry on ANY non-Ok result — a
-    //    verification rejection (bad signature / wrong context / wrong subject /
-    //    expired) OR a resolver infra fault. This is sound (conservative: it can
-    //    only ever DROP an entry, never inflate trust) ONLY because the injected
-    //    `resolver` is total and pure — `IdentityDidPublicKeyResolver` is a
-    //    deterministic DID-string parse with no network I/O, so it cannot raise a
-    //    transient fault that would spuriously drop a valid record. If a
-    //    networked/fallible resolver is ever substituted here, this filter MUST be
-    //    revisited to distinguish verification rejections from infra faults (the
-    //    `is_verification_rejection` classifier on the ingest path does exactly
-    //    this) so a transient resolver outage does not silently zero a subject's
-    //    challenge signal. The store read above still propagates its faults via
-    //    `?`.
-    let challenge_results: Vec<ChallengeVerification> = ctx
+    //    Only a rejection of the record itself
+    //    ([`TrustError::is_record_rejection`]) drops it. Any other failure, such
+    //    as a resolver outage, propagates: dropping a valid record on a
+    //    transient fault would silently zero the subject's challenge signal.
+    let stored = ctx
         .cache
         .store()
-        .get_challenge_results(ctx.context_id, ctx.subject_did)?
-        .into_iter()
-        .filter(|cv| {
-            verify_challenge_verification(
-                cv,
-                ctx.resolver,
-                ctx.context_id,
-                ctx.subject_did,
-                ctx.clock,
-            )
-            .is_ok()
-        })
-        .collect();
+        .get_challenge_results(ctx.context_id, ctx.subject_did)?;
+    let mut challenge_results: Vec<ChallengeVerification> = Vec::with_capacity(stored.len());
+    for cv in stored {
+        match verify_challenge_verification(
+            &cv,
+            ctx.resolver,
+            ctx.definitions,
+            ctx.context_id,
+            ctx.subject_did,
+            ctx.clock,
+        ) {
+            Ok(()) => challenge_results.push(cv),
+            Err(e) if e.is_record_rejection() => {}
+            Err(e) => return Err(e),
+        }
+    }
 
     // 4. Consequence structure comes directly from context params.
     let consequence_structure: Vec<ConsequenceRule> = ctx.consequence_rules.to_vec();
@@ -683,7 +680,7 @@ where
     //    signed it must stop counting toward a threshold on the next read.
     let revoked = ctx.cache.store().get_revocation_state(ctx.context_id)?;
     let revocation_checker = RevocationMapChecker::new(&revoked);
-    let threshold_counts = compute_threshold_counts(ctx, &revocation_checker);
+    let threshold_counts = compute_threshold_counts(ctx, &revocation_checker)?;
 
     Ok(TrustInput {
         verified_attestations,
@@ -706,13 +703,17 @@ where
 /// applies its own admission rules — subject binding, issuer binding,
 /// signature verification, and DID deduplication — so `attestor_sets` reaches
 /// the count as raw candidates and never as a pre-approved tally.
-fn compute_threshold_counts<S, R, C>(
-    ctx: &AggregationContext<'_, S, R, C>,
+///
+/// # Errors
+///
+/// Returns the [`TrustError`] of an attestor verification that failed for a
+/// reason other than a rejection, such as an unreachable key resolution.
+fn compute_threshold_counts<S, C>(
+    ctx: &AggregationContext<'_, S, C>,
     revocation_checker: &dyn AttestationRevocationChecker,
-) -> HashMap<AttestationType, (u32, u32)>
+) -> Result<HashMap<AttestationType, (u32, u32)>, TrustError>
 where
     S: TrustProtocolRepository,
-    R: DidPublicKeyResolver,
     C: Clock,
 {
     let mut counts = HashMap::new();
@@ -732,14 +733,14 @@ where
             resolver: ctx.resolver,
             clock: ctx.clock,
             revocation_checker,
-        });
+        })?;
         counts.insert(
             att_type.clone(),
             (result.valid_count, result.required_count),
         );
     }
 
-    counts
+    Ok(counts)
 }
 
 // ---------------------------------------------------------------------------
@@ -787,6 +788,9 @@ mod tests {
 
     use super::*;
     use crate::trust::attestation::RevocationStatus;
+    use crate::trust::challenge_fixtures::{
+        FIXTURE_URI, Fixture, FixtureDefinitions, cases, fixture,
+    };
     use scp_clock::TestClock;
     use scp_event_log::{EventPayload, EventType};
 
@@ -935,7 +939,7 @@ mod tests {
                     sequence: 0,
                     reason: "lock poisoned".to_owned(),
                 })?;
-            let key = (context_id.to_owned(), result.subject_did.to_string());
+            let key = (context_id.to_owned(), result.subject.to_string());
             store.entry(key).or_default().push(result.clone());
             Ok(())
         }
@@ -957,8 +961,8 @@ mod tests {
         }
     }
 
-    impl DidPublicKeyResolver for TestResolver {
-        fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+    impl ActiveKeyResolver for TestResolver {
+        fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
             self.keys
                 .get(did)
                 .cloned()
@@ -1063,6 +1067,17 @@ mod tests {
         attestor_sets: &HashMap<AttestationType, Vec<AttestorInfo>>,
         revoked: &[(&str, &str)],
     ) -> HashMap<AttestationType, (u32, u32)> {
+        try_threshold_counts_via_aggregate(resolver, requirements, attestor_sets, revoked).unwrap()
+    }
+
+    /// [`threshold_counts_via_aggregate`] with any resolver, returning the
+    /// aggregation's error instead of panicking on it.
+    fn try_threshold_counts_via_aggregate(
+        resolver: &dyn ActiveKeyResolver,
+        requirements: &HashMap<AttestationType, ThresholdRequirement>,
+        attestor_sets: &HashMap<AttestationType, Vec<AttestorInfo>>,
+        revoked: &[(&str, &str)],
+    ) -> Result<HashMap<AttestationType, (u32, u32)>, TrustError> {
         let store = InMemoryTrustStore::new();
         let entries: Vec<RevocationEntry> = revoked
             .iter()
@@ -1093,69 +1108,28 @@ mod tests {
             attestor_sets,
             cache: &cache,
             resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
 
-        aggregate_trust_input(&ctx).unwrap().threshold_counts
+        aggregate_trust_input(&ctx).map(|input| input.threshold_counts)
     }
 
-    /// Deterministic verifier signing key used by `make_challenge_verification`,
-    /// so a test resolver can be seeded with the matching public key.
-    fn challenge_verifier_key() -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    /// A genuine record for the fixture subject in `"ctx-1"`, graded at
+    /// `at` through the production challenge steps, with its fixture.
+    fn make_challenge_verification(at: u64) -> (Fixture, ChallengeVerification) {
+        let fx = fixture();
+        fx.clock.set(at);
+        let cv = fx.genuine_record(FIXTURE_URI, cases(2)).unwrap();
+        (fx, cv)
     }
 
-    /// Builds a GENUINELY verifier-signed [`ChallengeVerification`] bound to
-    /// `context_id`. The `verifier_signature` is a real Ed25519 signature over
-    /// the canonical bytes, so it passes `verify_challenge_verification` when the
-    /// resolver is seeded via [`seed_challenge_verifier`].
-    fn make_challenge_verification(
-        challenge_id: &str,
-        responder: &str,
-        completed_at: u64,
-        context_id: Option<&str>,
-    ) -> ChallengeVerification {
-        use crate::trust::challenge::{
-            ChallengeType, VerificationMethod, canonical_challenge_verification_bytes,
-        };
-        use ed25519_dalek::Signer;
-
-        let verifier_key = challenge_verifier_key();
-        let verifier_pub = verifier_key.verifying_key().to_bytes();
-        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
-
-        let mut cv = ChallengeVerification {
-            verification_id: challenge_id.to_owned(),
-            verifier_did,
-            subject_did: responder.into(),
-            capability_uri: String::new(),
-            challenge_type: ChallengeType::schema_validation(),
-            verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::schema_validation(),
-            },
-            passed: true,
-            score: None,
-            test_count: 1,
-            pass_count: 1,
-            result: serde_json::json!({"passed": true}),
-            completed_at,
-            verified_at: completed_at + 1,
-            expires_at: completed_at + 86400,
-            context_id: context_id.map(ToOwned::to_owned),
-            verifier_signature: vec![],
-        };
-        let canonical = canonical_challenge_verification_bytes(&cv).unwrap();
-        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
-        cv
-    }
-
-    /// Seeds `resolver` with the public key for the verifier DID used by
-    /// [`make_challenge_verification`], so the genuine signature resolves and
-    /// verifies on the challenge read path.
-    fn seed_challenge_verifier(resolver: &mut TestResolver) {
-        let verifier_pub = challenge_verifier_key().verifying_key().to_bytes();
-        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub).to_string();
-        resolver.keys.insert(verifier_did, verifier_pub.to_vec());
+    /// Seeds `resolver` with the fixture verifier's key, so the record's
+    /// signature resolves and verifies on the challenge read path.
+    fn seed_challenge_verifier(resolver: &mut TestResolver, fx: &Fixture) {
+        resolver
+            .keys
+            .insert(fx.verifier.did.to_string(), fx.verifier.public().to_vec());
     }
 
     // -----------------------------------------------------------------------
@@ -1409,30 +1383,24 @@ mod tests {
     fn store_persists_and_retrieves_challenge_results() {
         let store = InMemoryTrustStore::new();
 
-        let cv = make_challenge_verification("ch-1", "did:key:alice", 1000, Some("ctx-1"));
+        let (_, cv) = make_challenge_verification(1000);
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
-        let results = store
-            .get_challenge_results("ctx-1", "did:key:alice")
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].verification_id, "ch-1");
-        assert_eq!(results[0].completed_at, 1000);
+        let results = store.get_challenge_results("ctx-1", &cv.subject).unwrap();
+        assert_eq!(results, vec![cv]);
     }
 
     #[test]
     fn store_accumulates_multiple_challenge_results() {
         let store = InMemoryTrustStore::new();
 
-        let cv1 = make_challenge_verification("ch-1", "did:key:alice", 1000, Some("ctx-1"));
-        let cv2 = make_challenge_verification("ch-2", "did:key:alice", 2000, Some("ctx-1"));
+        let (_, cv1) = make_challenge_verification(1000);
+        let (_, cv2) = make_challenge_verification(2000);
 
         store.store_challenge_result("ctx-1", &cv1).unwrap();
         store.store_challenge_result("ctx-1", &cv2).unwrap();
 
-        let results = store
-            .get_challenge_results("ctx-1", "did:key:alice")
-            .unwrap();
+        let results = store.get_challenge_results("ctx-1", &cv1.subject).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -1525,6 +1493,49 @@ mod tests {
     }
 
     #[test]
+    fn cache_propagates_key_resolution_outage_on_reverification() {
+        // An unreachable `#active` resolution is not a judgment on the
+        // attestation: the read fails instead of dropping the entry.
+        let mut resolver = TestResolver::new();
+        let store = InMemoryTrustStore::new();
+        let att = signed_attestor(
+            &mut resolver,
+            "did:key:issuer",
+            "did:key:alice",
+            AttestationType::Endorsement,
+            "att-1",
+        )
+        .attestation
+        .unwrap();
+        store
+            .store_cached_attestation(
+                "ctx-1",
+                CachedAttestation {
+                    attestation: att,
+                    verified_at: 500,
+                    ttl_secs: 300,
+                },
+            )
+            .unwrap();
+        let cache = AttestationCache::new(store);
+        let clock = TestClock::new(2000);
+
+        let outage =
+            cache.get_verified_attestations("ctx-1", "did:key:alice", &UnavailableResolver, &clock);
+        assert!(
+            matches!(&outage, Err(TrustError::KeyResolutionUnavailable { did, .. }) if did == "did:key:issuer"),
+            "got {outage:?}"
+        );
+
+        // Control: the same stale entry re-verifies and is kept once the
+        // issuer's key resolves.
+        let kept = cache
+            .get_verified_attestations("ctx-1", "did:key:alice", &resolver, &clock)
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
     fn cache_custom_ttl_is_respected() {
         let store = InMemoryTrustStore::new();
         let cache = AttestationCache::with_ttl(store, 60);
@@ -1540,13 +1551,16 @@ mod tests {
     fn aggregate_returns_complete_trust_input() {
         let store = InMemoryTrustStore::new();
         let clock = TestClock::new(2000);
-        // Seed the resolver with the verifier key so the genuinely-signed
-        // challenge result re-validates on the read path (Fix 1).
+        // A genuinely signed, in-context challenge result for the fixture
+        // subject, whose verifier key the resolver knows, so it re-validates
+        // on the read path.
+        let (fx, cv) = make_challenge_verification(1500);
+        let alice = fx.subject.did.to_string();
         let mut resolver = TestResolver::new();
-        seed_challenge_verifier(&mut resolver);
+        seed_challenge_verifier(&mut resolver, &fx);
 
         // Seed the store with cached attestations.
-        let att = make_attestation("att-1", "did:key:alice", AttestationType::Endorsement);
+        let att = make_attestation("att-1", &alice, AttestationType::Endorsement);
         let entry = CachedAttestation {
             attestation: att,
             verified_at: 1900,
@@ -1554,19 +1568,17 @@ mod tests {
         };
         store.store_cached_attestation("ctx-1", entry).unwrap();
 
-        // Seed the store with a genuinely-signed, in-context challenge result.
-        let cv = make_challenge_verification("ch-1", "did:key:alice", 1500, Some("ctx-1"));
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
         let cache = AttestationCache::new(store);
 
         // Create events for participation record computation.
         let events = vec![
-            make_event(EventType::MessageSent, "did:key:alice", 1000, 0, vec![]),
-            make_event(EventType::MessageSent, "did:key:alice", 1500, 1, vec![]),
+            make_event(EventType::MessageSent, &alice, 1000, 0, vec![]),
+            make_event(EventType::MessageSent, &alice, 1500, 1, vec![]),
             make_event(
                 EventType::OutletInvoked,
-                "did:key:alice",
+                &alice,
                 1600,
                 2,
                 b"my-outlet".to_vec(),
@@ -1590,7 +1602,7 @@ mod tests {
 
         let ctx = AggregationContext {
             context_id: "ctx-1",
-            subject_did: "did:key:alice",
+            subject_did: &alice,
             events: &events,
             merkle_root: [0u8; 32],
             consequence_rules: &consequence_rules,
@@ -1598,13 +1610,14 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
 
         let input = aggregate_trust_input(&ctx).unwrap();
 
         // Participation profile.
-        assert_eq!(input.participation_record.subject_did, "did:key:alice");
+        assert_eq!(input.participation_record.subject_did, alice);
         assert_eq!(input.participation_record.context_id, "ctx-1");
         assert_eq!(input.participation_record.participation_count, 3);
         assert_eq!(
@@ -1621,7 +1634,7 @@ mod tests {
 
         // Challenge results.
         assert_eq!(input.challenge_results.len(), 1);
-        assert_eq!(input.challenge_results[0].verification_id, "ch-1");
+        assert_eq!(input.challenge_results[0].capability_uri, FIXTURE_URI);
 
         // Consequence structure.
         assert_eq!(input.consequence_structure.len(), 1);
@@ -1637,20 +1650,13 @@ mod tests {
         // `expires_at`, re-running aggregation must EXCLUDE it (the persistent
         // store would otherwise serve it as a current trust signal forever).
         let store = InMemoryTrustStore::new();
+        let (fx, cv) = make_challenge_verification(1500);
+        let alice = fx.subject.did.to_string();
         let mut resolver = TestResolver::new();
-        seed_challenge_verifier(&mut resolver);
-
-        // completed_at = 1500 → expires_at = 1500 + 86400 = 87_900.
-        let cv = make_challenge_verification("ch-expiring", "did:key:alice", 1500, Some("ctx-1"));
+        seed_challenge_verifier(&mut resolver, &fx);
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
-        let events = vec![make_event(
-            EventType::MessageSent,
-            "did:key:alice",
-            1000,
-            0,
-            vec![],
-        )];
+        let events = vec![make_event(EventType::MessageSent, &alice, 1000, 0, vec![])];
         let consequence_rules = vec![];
         let threshold_requirements = HashMap::new();
         let attestor_sets = HashMap::new();
@@ -1660,7 +1666,7 @@ mod tests {
         let before_clock = TestClock::new(2000);
         let ctx_before = AggregationContext {
             context_id: "ctx-1",
-            subject_did: "did:key:alice",
+            subject_did: &alice,
             events: &events,
             merkle_root: [0u8; 32],
             consequence_rules: &consequence_rules,
@@ -1668,6 +1674,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &before_clock,
         };
         let input_before = aggregate_trust_input(&ctx_before).unwrap();
@@ -1678,10 +1685,10 @@ mod tests {
         );
 
         // After expiry the result is EXCLUDED on read.
-        let after_clock = TestClock::new(90_000);
+        let after_clock = TestClock::new(cv.expires_at);
         let ctx_after = AggregationContext {
             context_id: "ctx-1",
-            subject_did: "did:key:alice",
+            subject_did: &alice,
             events: &events,
             merkle_root: [0u8; 32],
             consequence_rules: &consequence_rules,
@@ -1689,12 +1696,85 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &after_clock,
         };
         let input_after = aggregate_trust_input(&ctx_after).unwrap();
         assert!(
             input_after.challenge_results.is_empty(),
             "an expired persisted challenge result must be excluded on the read path"
+        );
+    }
+
+    /// Runs `aggregate_trust_input` over one stored, genuinely signed,
+    /// in-context challenge result for `did:key:alice`.
+    fn aggregate_one_challenge(
+        fx: &Fixture,
+        cv: &ChallengeVerification,
+        resolver: &dyn ActiveKeyResolver,
+    ) -> Result<TrustInput, TrustError> {
+        let alice = fx.subject.did.to_string();
+        let store = InMemoryTrustStore::new();
+        store.store_challenge_result("ctx-1", cv).unwrap();
+        let events = vec![make_event(EventType::MessageSent, &alice, 1000, 0, vec![])];
+        let threshold_requirements = HashMap::new();
+        let attestor_sets = HashMap::new();
+        let cache = AttestationCache::new(store);
+        let clock = TestClock::new(2000);
+        let ctx = AggregationContext {
+            context_id: "ctx-1",
+            subject_did: &alice,
+            events: &events,
+            merkle_root: [0u8; 32],
+            consequence_rules: &[],
+            threshold_requirements: &threshold_requirements,
+            attestor_sets: &attestor_sets,
+            cache: &cache,
+            resolver,
+            definitions: &FixtureDefinitions::default(),
+            clock: &clock,
+        };
+        aggregate_trust_input(&ctx)
+    }
+
+    #[test]
+    fn aggregate_reverifies_challenges_with_the_active_key_resolver() {
+        // The resolver knows the verifier's `#active` key, so the stored
+        // challenge result is re-verified and kept.
+        let (fx, cv) = make_challenge_verification(1500);
+        let mut resolver = TestResolver::new();
+        seed_challenge_verifier(&mut resolver, &fx);
+        let input = aggregate_one_challenge(&fx, &cv, &resolver).unwrap();
+        assert_eq!(input.challenge_results.len(), 1);
+        assert_eq!(input.challenge_results[0].capability_uri, FIXTURE_URI);
+
+        // Control: a resolver that knows no key cannot authenticate the
+        // record's signature, so the record is dropped.
+        let input = aggregate_one_challenge(&fx, &cv, &TestResolver::new()).unwrap();
+        assert!(input.challenge_results.is_empty());
+    }
+
+    /// A resolver whose backend is down.
+    struct UnavailableResolver;
+
+    impl ActiveKeyResolver for UnavailableResolver {
+        fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+            Err(TrustError::KeyResolutionUnavailable {
+                did: did.to_owned(),
+                reason: "resolver offline".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn aggregate_propagates_key_resolution_outage_on_a_challenge() {
+        // A resolver outage is not a judgment on the record: aggregation fails
+        // instead of silently dropping a possibly valid challenge result.
+        let (fx, cv) = make_challenge_verification(1500);
+        let result = aggregate_one_challenge(&fx, &cv, &UnavailableResolver);
+        assert!(
+            matches!(&result, Err(TrustError::KeyResolutionUnavailable { did, .. }) if did.starts_with("did:dht:")),
+            "got {result:?}"
         );
     }
 
@@ -1743,6 +1823,44 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_propagates_key_resolution_outage_on_a_threshold_attestor() {
+        // An endorsement whose issuer key cannot be resolved is neither
+        // counted nor silently dropped: the aggregation fails.
+        let mut resolver = TestResolver::new();
+        let mut requirements = HashMap::new();
+        requirements.insert(
+            AttestationType::Endorsement,
+            ThresholdRequirement::new(1, 1, 0.0),
+        );
+        let mut attestor_sets = HashMap::new();
+        attestor_sets.insert(
+            AttestationType::Endorsement,
+            vec![signed_attestor(
+                &mut resolver,
+                "did:key:attestor1",
+                "did:key:alice",
+                AttestationType::Endorsement,
+                "att-a1",
+            )],
+        );
+
+        let outage = try_threshold_counts_via_aggregate(
+            &UnavailableResolver,
+            &requirements,
+            &attestor_sets,
+            &[],
+        );
+        assert!(
+            matches!(&outage, Err(TrustError::KeyResolutionUnavailable { did, .. }) if did == "did:key:attestor1"),
+            "got {outage:?}"
+        );
+
+        // Control: with the key resolvable the endorsement counts.
+        let counts = threshold_counts_via_aggregate(&resolver, &requirements, &attestor_sets, &[]);
+        assert_eq!(counts.get(&AttestationType::Endorsement), Some(&(1, 1)));
+    }
+
+    #[test]
     fn aggregate_returns_error_for_empty_event_log() {
         let store = InMemoryTrustStore::new();
         let clock = TestClock::new(2000);
@@ -1764,6 +1882,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
 
@@ -1805,6 +1924,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
 
@@ -1865,6 +1985,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &FixtureDefinitions::default(),
             clock: &clock,
         };
 

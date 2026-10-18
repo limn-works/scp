@@ -229,6 +229,7 @@ mod tests {
             id: format!("{}#scp-capabilities", document.id),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint: format!("scp:capabilities:{cap_str}"),
+            bridge_target: None,
         };
         document.service.push(service);
 
@@ -242,6 +243,12 @@ mod tests {
     fn cap(s: &str) -> CapabilityUri {
         s.parse().unwrap()
     }
+
+    /// Spec 25 Vector 57's identifier in the `03-identity.md` §3.1 text form.
+    const DEFINER: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za";
+    /// An identifier-scoped capability URI under [`DEFINER`].
+    const SCOPED: &str =
+        "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za:capability:custom/v1";
 
     // -----------------------------------------------------------------
     // AC 2: parse_capability_endpoint with Protocol URIs
@@ -259,17 +266,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // AC 3: parse_capability_endpoint with DID-scoped URI
+    // AC 3: parse_capability_endpoint with identifier-scoped URI
     // -----------------------------------------------------------------
 
     #[test]
-    fn parse_capability_endpoint_did_scoped_uri() {
-        let caps =
-            parse_capability_endpoint("scp:capabilities:did:dht:z6Mk123:capability:custom/v1")
-                .unwrap();
+    fn parse_capability_endpoint_identifier_scoped_uri() {
+        assert!(SCOPED.starts_with(DEFINER));
+        let caps = parse_capability_endpoint(&format!("scp:capabilities:{SCOPED}")).unwrap();
         assert_eq!(caps.len(), 1);
-        assert_eq!(caps[0], cap("did:dht:z6Mk123:capability:custom/v1"));
-        assert!(matches!(caps[0], CapabilityUri::DidScoped { .. }));
+        assert_eq!(caps[0], cap(SCOPED));
+        assert!(matches!(caps[0], CapabilityUri::IdentifierScoped { .. }));
+    }
+
+    #[test]
+    fn parse_capability_endpoint_rejects_did_scoped_uri() {
+        let err =
+            parse_capability_endpoint("scp:capabilities:did:dht:z6Mk123:capability:custom/v1")
+                .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DiscoveryError::InvalidCapabilities(msg) if msg.contains("not a canonical identifier")
+            ),
+            "got {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -340,6 +360,7 @@ mod tests {
             service_endpoint:
                 "scp:capabilities:scp:capability:schema-validation/v1,scp:capability:rate-limit-compliance/v1"
                     .to_owned(),
+            bridge_target: None,
         });
         doc.service.push(scp_did::Service {
             id: format!("{did}#scp-capabilities-2"),
@@ -347,6 +368,7 @@ mod tests {
             service_endpoint:
                 "scp:capabilities:scp:capability:rate-limit-compliance/v1,scp:system:relay-operation"
                     .to_owned(),
+            bridge_target: None,
         });
 
         let entry = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap();
@@ -361,6 +383,65 @@ mod tests {
             ]
         );
         assert_eq!(entry.service_endpoints.len(), 2);
+    }
+
+    /// §18.2.1: an `SCPCapabilities` or `ScpParticipationStatements` entry
+    /// carrying `bridgeTarget` is rejected, and the resolved document drops
+    /// it, so neither reader sees it while the other entries remain.
+    #[test]
+    fn did_capabilities_and_participation_ignore_a_bridge_target_entry() {
+        use crate::trust::participation_service::{
+            add_participation_service, extract_participation_service_endpoint,
+        };
+        use scp_protocol::trust::participation::PARTICIPATION_STATEMENTS_SERVICE_TYPE;
+
+        let did = "did:dht:zTestDid";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        doc.service.push(scp_did::Service {
+            id: format!("{did}#scp-capabilities"),
+            service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
+            service_endpoint: "scp:capabilities:scp:capability:schema-validation/v1".to_owned(),
+            bridge_target: None,
+        });
+        add_participation_service(&mut doc, "https://relay.example.com/v1/scp/participation/x");
+
+        // Control: without bridgeTarget both readers see their entry.
+        let clean = DidDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        assert!(extract_capabilities(did, &clean, &scp_clock::SystemClock).is_ok());
+        assert!(extract_participation_service_endpoint(&clean).is_some());
+
+        for service_type in [
+            SCP_CAPABILITIES_SERVICE_TYPE,
+            PARTICIPATION_STATEMENTS_SERVICE_TYPE,
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&doc.to_json().unwrap()).unwrap();
+            for entry in value["service"].as_array_mut().unwrap() {
+                if entry["type"] == service_type {
+                    entry["bridgeTarget"] = serde_json::Value::String("ab".repeat(32));
+                }
+            }
+            let parsed = DidDocument::from_json(&value.to_string()).unwrap();
+            assert_eq!(
+                parsed.service.len(),
+                clean.service.len() - 1,
+                "{service_type}"
+            );
+            assert!(parsed.pre_rotation_service().is_some(), "{service_type}");
+
+            let caps = extract_capabilities(did, &parsed, &scp_clock::SystemClock);
+            let participation = extract_participation_service_endpoint(&parsed);
+            if service_type == SCP_CAPABILITIES_SERVICE_TYPE {
+                assert!(
+                    matches!(caps, Err(DiscoveryError::NoCapabilitiesService(_))),
+                    "{caps:?}"
+                );
+                assert!(participation.is_some());
+            } else {
+                assert!(caps.is_ok());
+                assert_eq!(participation, None);
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -387,6 +468,7 @@ mod tests {
             service_endpoint:
                 "scp:capabilities:scp:capability:schema-validation/v1,scp:capability:rate-limit-compliance/v1"
                     .to_owned(),
+            bridge_target: None,
         });
 
         let entry = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap();
@@ -479,10 +561,7 @@ mod tests {
     fn capability_entry_serializes_uri_strings() {
         let entry = CapabilityEntry {
             did: "did:dht:zTestDid".into(),
-            capabilities: vec![
-                cap("scp:capability:schema-validation/v1"),
-                cap("did:dht:z6Mk123:capability:custom/v1"),
-            ],
+            capabilities: vec![cap("scp:capability:schema-validation/v1"), cap(SCOPED)],
             service_endpoints: vec!["scp:capabilities:scp:capability:schema-validation/v1".into()],
             resolved_at: 1_700_000_000,
         };
@@ -493,10 +572,7 @@ mod tests {
             caps[0].as_str().unwrap(),
             "scp:capability:schema-validation/v1"
         );
-        assert_eq!(
-            caps[1].as_str().unwrap(),
-            "did:dht:z6Mk123:capability:custom/v1"
-        );
+        assert_eq!(caps[1].as_str().unwrap(), SCOPED);
 
         // Round-trip deserialization.
         let deserialized: CapabilityEntry = serde_json::from_value(json).unwrap();
@@ -509,13 +585,13 @@ mod tests {
 
     #[test]
     fn parse_capability_endpoint_mixed_types() {
-        let caps = parse_capability_endpoint(
-            "scp:capabilities:scp:capability:schema-validation/v1,did:dht:z6Mk123:capability:custom/v1,scp:system:relay-operation",
-        )
+        let caps = parse_capability_endpoint(&format!(
+            "scp:capabilities:scp:capability:schema-validation/v1,{SCOPED},scp:system:relay-operation"
+        ))
         .unwrap();
         assert_eq!(caps.len(), 3);
         assert!(matches!(caps[0], CapabilityUri::Protocol { .. }));
-        assert!(matches!(caps[1], CapabilityUri::DidScoped { .. }));
+        assert!(matches!(caps[1], CapabilityUri::IdentifierScoped { .. }));
         assert!(matches!(caps[2], CapabilityUri::System { .. }));
     }
 
@@ -563,12 +639,14 @@ mod tests {
             service_endpoint:
                 "scp:capabilities:scp:system:relay-operation,scp:capability:schema-validation/v1"
                     .to_owned(),
+            bridge_target: None,
         });
         doc.service.push(scp_did::Service {
             id: format!("{did}#scp-capabilities-2"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint: "scp:capabilities:scp:system:relay-operation,scp:system:key-rotation"
                 .to_owned(),
+            bridge_target: None,
         });
 
         let entry = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap();
@@ -588,7 +666,7 @@ mod tests {
             did: "did:dht:zTestDid".into(),
             capabilities: vec![
                 cap("scp:capability:schema-validation/v1"),
-                cap("did:dht:z6Mk123:capability:custom/v1"),
+                cap(SCOPED),
                 cap("scp:system:relay-operation"),
             ],
             service_endpoints: vec!["scp:capabilities:test".into()],
@@ -596,7 +674,7 @@ mod tests {
         };
 
         assert!(entry.capabilities[0].is_protocol());
-        assert!(entry.capabilities[1].is_did_scoped());
+        assert!(entry.capabilities[1].is_identifier_scoped());
         assert!(entry.capabilities[2].is_system());
 
         // Round-trip serialization preserves all variants.

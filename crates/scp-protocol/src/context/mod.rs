@@ -39,9 +39,12 @@ pub use governance::{
     AccessScope, CheckpointAttestationStatus, ConflictResolution, CosignedCheckpoint,
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
     GovernanceModelConfig, GovernanceProposal, GovernanceReconfigAction, KeyResolver, ProposalId,
-    ProposalStatus, RejectionReason, SignedVote, VoteType, actions_conflict, compute_proposal_id,
-    sign_vote, verify_proposal_votes, verify_vote,
+    ProposalStatus, ProposeIntent, RejectionReason, SignedVote, VoteIntent, VoteType,
+    actions_conflict, compute_proposal_id, signed_vote, verify_proposal_votes, verify_vote,
+    vote_signing_digest,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use governance::{GovernanceEngineRawKey, sign_vote};
 pub use group_context_extension::{
     SCP_CONTEXT_EXTENSION_TYPE_ID, ScpContextBindingError, ScpContextExtension,
 };
@@ -373,6 +376,19 @@ pub enum ContextError {
     /// `scp_ffi_common::error_codes::custody_failure_code` assigns to the failure's kind.
     #[error(transparent)]
     Custody(#[from] scp_crypto::CustodyFailure),
+
+    /// No key custody is registered for the identity whose wrapping key
+    /// (`09-security-model.md` §9.16.1) an actor build needs, so the actor is
+    /// not built. The caller holds the identity, so the error names none.
+    #[error("no key custody is registered for the identity's wrapping key")]
+    WrappingKeyCustodyUnavailable,
+
+    /// The identity's stored wrapping key record names a custody handle that
+    /// the identity's custody does not hold, or whose public key differs from
+    /// the record (`09-security-model.md` §9.16.1). Nothing is regenerated over
+    /// the record. The caller holds the identity, so the error names none.
+    #[error("the stored wrapping key handle is not held by the identity's custody")]
+    WrappingKeyHandleInvalid,
 
     /// A transport operation failed during messaging.
     #[error("transport operation failed: {0}")]

@@ -101,7 +101,7 @@ final class PersistenceTests: XCTestCase {
         // Second open with a wrong key MUST throw — `SqliteStorage::new`
         // fails at the `PRAGMA key` / WAL-mode step because `SQLCipher`
         // rejects the key as "file is not a database". The `UniFFI`
-        // bridge propagates that through `ScpError::Validation`.
+        // bridge propagates that through `ScpError::Storage`.
         let wrongKey = Data(repeating: 0x11, count: 32)
         XCTAssertThrowsError(
             try SCP.withStorage(sqliteDir: dir, key: wrongKey),
@@ -115,10 +115,10 @@ final class PersistenceTests: XCTestCase {
             // All three bridges report SCP-STORAGE-8004 for it, so this
             // assertion also pins Swift to the Python and TypeScript answer.
             switch scpError {
-            case let .Validation(_, code):
+            case let .Storage(_, code):
                 XCTAssertEqual(code, "SCP-STORAGE-8004")
             default:
-                XCTFail("expected ScpError.Validation, got \(scpError)")
+                XCTFail("expected ScpError.Storage, got \(scpError)")
             }
         }
 

@@ -162,7 +162,7 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
             .create_context(ctx_id.clone(), params, creator.clone(), None, Vec::new())
             .await
             .unwrap();
-        supervisor.register_local_did(creator).await.unwrap();
+        supervisor.register_local_did(creator).await;
     });
 
     context_id
@@ -341,7 +341,9 @@ fn single_admin_owner_and_context(
     )
     .unwrap();
     params.set_item("ceiling", ceiling).unwrap();
-    let handle = scp.context_create(&owner, &params.as_borrowed()).unwrap();
+    let handle = scp
+        .context_create(py, &owner, &params.as_borrowed())
+        .unwrap();
     (scp, owner, handle)
 }
 
@@ -360,7 +362,7 @@ fn governance_propose_execution_result_is_a_wire_name() {
         })
         .to_string();
         let response = scp
-            .governance_propose(&handle, &owner, &action_json)
+            .governance_propose(py, &handle, &owner, &action_json)
             .expect("SuspendCapability must auto-execute under single_admin");
         let parsed: serde_json::Value =
             serde_json::from_str(&response).expect("governance_propose must return JSON");
@@ -377,6 +379,212 @@ fn governance_propose_execution_result_is_a_wire_name() {
     });
 }
 
+/// Python source for a sign-only custody provider. `sign` and `get_public_key`
+/// call the Rust functions it is constructed with. Like a keychain or HSM
+/// custody, it holds no private key it could release.
+const SIGN_ONLY_GOVERNANCE_PROVIDER_PY: &std::ffi::CStr = c"
+import types
+
+class SignOnlyCustody:
+    def __init__(self, key_id, sign_fn, public_key):
+        self._key_id = str(key_id)
+        self._sign_fn = sign_fn
+        self._public_key = bytes(public_key)
+        self.sign_calls = 0
+
+    def generate_keypair(self, key_type, role):
+        return self._key_id
+
+    def sign(self, key_id, message):
+        self.sign_calls += 1
+        return self._sign_fn(bytes(message))
+
+    def get_public_key(self, key_id):
+        return types.SimpleNamespace(
+            key_type='ed25519', public_key=self._public_key, role='identity')
+
+    def destroy_key(self, key_id):
+        return None
+
+    def dh_agree(self, key_id, peer_public):
+        raise RuntimeError('sign-only custody: dh_agree unsupported')
+
+    def derive_pseudonym(self, key_id, context_id):
+        raise RuntimeError('sign-only custody: derive_pseudonym unsupported')
+
+    def derive_rotatable_pseudonym(self, key_id, context_id, pseudonym_epoch):
+        raise RuntimeError('sign-only custody: derive_rotatable_pseudonym unsupported')
+
+    def custody_type(self, key_id):
+        return 'hardware'
+";
+
+/// Replaces `did`'s custody with a sign-only Python provider that signs
+/// through the identity's original custody, so its signatures verify under
+/// the DID's published key while the provider holds no private key. Returns
+/// the provider object, whose `sign_calls` the caller reads.
+fn install_sign_only_governance_custody(
+    py: Python<'_>,
+    bi: &PyBridgeInstance,
+    did: &str,
+) -> Py<PyAny> {
+    use scp_platform::KeyCustody as _;
+
+    let (original, key) = runtime::with_identity(bi, did, |entry: &IdentityEntry| {
+        Ok((
+            Arc::clone(&entry.custody),
+            entry.identity.active_signing_key,
+        ))
+    })
+    .unwrap();
+    let public_key = {
+        let original = Arc::clone(&original);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime")
+                .block_on(original.public_key(&key))
+        })
+        .join()
+        .expect("public key thread")
+        .expect("the original custody holds the #active key")
+        .into_bytes()
+    };
+    // The provider's `sign` runs under the GIL on whatever thread drives
+    // custody; the original in-memory custody signs on a separate thread with
+    // its own runtime so no runtime is entered twice.
+    let sign_fn = pyo3::types::PyCFunction::new_closure(py, None, None, move |args, _kwargs| {
+        let message: Vec<u8> = args.get_item(0)?.extract()?;
+        let original = Arc::clone(&original);
+        let signature = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("signing runtime")
+                .block_on(original.sign(&key, &message))
+        })
+        .join()
+        .expect("signing thread")
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok::<Vec<u8>, PyErr>(signature.into_bytes())
+    })
+    .unwrap();
+    let module = PyModule::from_code(
+        py,
+        SIGN_ONLY_GOVERNANCE_PROVIDER_PY,
+        c"sign_only_governance_custody.py",
+        c"sign_only_governance_custody",
+    )
+    .unwrap();
+    let obj = module
+        .getattr("SignOnlyCustody")
+        .unwrap()
+        .call1((key.id(), sign_fn, public_key))
+        .unwrap();
+    let host = obj.clone().unbind();
+    let provider = _scp_core::custody::PyKeyCustodyProvider::new(py, obj.unbind()).unwrap();
+    let custody = Arc::new(FfiKeyCustody::Callback(
+        _scp_core::custody::PyCallbackKeyCustody::new(provider),
+    ));
+    runtime::with_identity_mut(bi, did, |entry: &mut IdentityEntry| {
+        entry.custody = custody;
+        Ok(())
+    })
+    .unwrap();
+    host
+}
+
+/// ADR-049 Decision 7a: governance signs through custody, so a custody that
+/// refuses raw key export still proposes. The single-admin proposal
+/// auto-executes after the engine verifies the custody's signature, and the
+/// host is never asked for its key.
+#[test]
+fn governance_propose_signs_through_sign_only_custody() {
+    Python::with_gil(|py| {
+        let (scp, owner, handle) = single_admin_owner_and_context(py);
+        let host = install_sign_only_governance_custody(py, scp.bridge_instance(), &owner);
+        let action_json = serde_json::json!({
+            "SuspendCapability": { "did": owner, "capabilities": ["MessagesWrite"] }
+        })
+        .to_string();
+        let response = scp
+            .governance_propose(py, &handle, &owner, &action_json)
+            .expect("a sign-only custody proposes through CommandSigner");
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed["status"].as_str(),
+            Some("Approved"),
+            "got {response}"
+        );
+        let calls = |name: &str| {
+            host.bind(py)
+                .getattr(name)
+                .and_then(|n| n.extract::<usize>())
+                .unwrap()
+        };
+        assert!(
+            calls("sign_calls") >= 1,
+            "the proposal signed through the host"
+        );
+    });
+}
+
+/// ADR-049 Decision 7a: a send builds its `CommandSigner` from custody's
+/// public key, so a custody that only signs and reports public keys (no DH,
+/// no pseudonym derivation, no private key) still sends. A group-context send
+/// signs no envelope with the identity key; only a broadcast envelope does, so
+/// the provider's sign count is not asserted here.
+#[test]
+fn context_send_succeeds_with_sign_only_custody() {
+    Python::with_gil(|py| {
+        let (scp, owner, handle) = single_admin_owner_and_context(py);
+        let _host = install_sign_only_governance_custody(py, scp.bridge_instance(), &owner);
+        let payload = pyo3::types::PyBytes::new(py, b"sign-only send");
+        scp.context_send(py, &handle, &owner, payload.as_any(), None)
+            .expect("a sign-only custody sends through CommandSigner");
+    });
+}
+
+/// A proposer whose `#active` key custody no longer holds fails
+/// `governance_propose` with `SCP-CRYPTO-4006` when the signer is built.
+#[test]
+fn governance_propose_with_a_destroyed_signing_key_is_crypto_4006() {
+    use scp_platform::KeyCustody as _;
+    Python::with_gil(|py| {
+        let (scp, owner, handle) = single_admin_owner_and_context(py);
+        let (custody, key) =
+            runtime::with_identity(scp.bridge_instance(), &owner, |entry: &IdentityEntry| {
+                Ok((
+                    Arc::clone(&entry.custody),
+                    entry.identity.active_signing_key,
+                ))
+            })
+            .unwrap();
+        py.allow_threads(|| {
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("runtime")
+                    .block_on(custody.destroy_key(&key))
+            })
+            .join()
+            .expect("destroy thread")
+        })
+        .expect("destroy_key");
+        let action_json = serde_json::json!({
+            "SuspendCapability": { "did": owner, "capabilities": ["MessagesWrite"] }
+        })
+        .to_string();
+        let err = scp
+            .governance_propose(py, &handle, &owner, &action_json)
+            .expect_err("a destroyed signing key cannot propose")
+            .to_string();
+        assert!(
+            err.contains("SCP-CRYPTO-4006"),
+            "expected key-not-found SCP-CRYPTO-4006, got: {err}"
+        );
+    });
+}
+
 /// `context_member_role` returns `RoleAssignment.role_name`, which every
 /// SDK's `MemberRole` parser reads. A `Debug` dump of `RoleAssignment` also
 /// contains "admin", so only equality proves a bare name crossed.
@@ -384,7 +592,7 @@ fn governance_propose_execution_result_is_a_wire_name() {
 fn context_member_role_bridge_returns_role_name() {
     Python::with_gil(|py| {
         let (scp, owner, handle) = single_admin_owner_and_context(py);
-        let role = scp.context_member_role(&handle, &owner).unwrap();
+        let role = scp.context_member_role(py, &handle, &owner).unwrap();
         assert_eq!(role.as_deref(), Some("admin"));
     });
 }
@@ -526,10 +734,12 @@ fn outlet_register_and_verify() {
         let tv_list = PyList::new(py, &[tv]).unwrap();
         reg.set_item("test_vectors", tv_list).unwrap();
 
-        let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+        let outlet_id = scp
+            .outlet_register(py, &ctx_id, &reg.as_borrowed())
+            .unwrap();
         assert!(outlet_id.contains("test_outlet"));
 
-        let result = scp.outlet_verify(&ctx_id, &outlet_id).unwrap();
+        let result = scp.outlet_verify(py, &ctx_id, &outlet_id).unwrap();
         assert!(result.passed);
         assert!(result.failures.is_empty());
     });
@@ -549,7 +759,7 @@ fn outlet_register_rejects_invalid_context() {
         reg.set_item("schema", schema).unwrap();
 
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        let result = scp.outlet_register("nonexistent-ctx", &reg.as_borrowed());
+        let result = scp.outlet_register(py, "nonexistent-ctx", &reg.as_borrowed());
         assert!(result.is_err());
     });
 }
@@ -571,7 +781,7 @@ fn outlet_register_rejects_empty_name() {
         schema.set_item("output_schema", PyDict::new(py)).unwrap();
         reg.set_item("schema", schema).unwrap();
 
-        let result = scp.outlet_register(&ctx_id, &reg.as_borrowed());
+        let result = scp.outlet_register(py, &ctx_id, &reg.as_borrowed());
         assert!(result.is_err());
     });
 }
@@ -586,15 +796,18 @@ fn outlet_register_rejects_empty_name() {
 
 #[test]
 fn ucan_mint_rejects_empty_context() {
-    setup();
-    let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-    let result = scp.ucan_mint(
-        "",
-        "did:key:someone",
-        vec!["messages:write".to_owned()],
-        None,
-    );
-    assert!(result.is_err());
+    pyo3::Python::with_gil(|py| {
+        setup();
+        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+        let result = scp.ucan_mint(
+            py,
+            "",
+            "did:key:someone",
+            vec!["messages:write".to_owned()],
+            None,
+        );
+        assert!(result.is_err());
+    });
 }
 
 // ============================================================================
@@ -872,69 +1085,78 @@ fn event_log_query_invalid_context_fails() {
 
 #[test]
 fn event_log_checkpoint_by_did_generates_signed_checkpoint() {
-    Python::with_gil(|_py| {
-        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
-        let did = create_test_identity(scp.bridge_instance());
-        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+    pyo3::Python::with_gil(|py| {
+        Python::with_gil(|_py| {
+            let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+            runtime::init_context_manager_for_test(scp.bridge_instance());
+            let did = create_test_identity(scp.bridge_instance());
+            let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
-        // Append an unsigned event so the log is non-empty.
-        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
-            let event = scp_event_log::Event {
-                event_type: scp_event_log::EventType::ContextCreated,
-                actor_did: scp_did::DID(did.clone()),
-                timestamp: 1_700_000_000,
-                sequence: 0,
-                payload: scp_event_log::EventPayload { data: vec![] },
-                prev_hash: [0u8; 32],
-                signature: vec![],
-            };
-            scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event).unwrap();
-            Ok(())
-        })
-        .unwrap();
+            // Append an unsigned event so the log is non-empty.
+            runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+                let event = scp_event_log::Event {
+                    event_type: scp_event_log::EventType::ContextCreated,
+                    actor_did: scp_did::DID(did.clone()),
+                    timestamp: 1_700_000_000,
+                    sequence: 0,
+                    payload: scp_event_log::EventPayload { data: vec![] },
+                    prev_hash: [0u8; 32],
+                    signature: vec![],
+                };
+                scp_event_log::tree::append_unsigned_event(&mut rt.event_log, &event).unwrap();
+                Ok(())
+            })
+            .unwrap();
 
-        let checkpoint = scp.event_log_checkpoint_by_did(&ctx_id, &did, 7).unwrap();
-        assert_eq!(checkpoint.context_id, ctx_id);
-        assert_eq!(checkpoint.sender_did, did);
-        assert_eq!(checkpoint.event_count, 1);
-        assert_eq!(checkpoint.epoch, Some(7));
-        // Ed25519 signature is 64 bytes -> 128 hex chars.
-        assert_eq!(checkpoint.signature.len(), 128);
-        assert_eq!(checkpoint.merkle_root.len(), 64);
+            let checkpoint = scp
+                .event_log_checkpoint_by_did(py, &ctx_id, &did, 7)
+                .unwrap();
+            assert_eq!(checkpoint.context_id, ctx_id);
+            assert_eq!(checkpoint.sender_did, did);
+            assert_eq!(checkpoint.event_count, 1);
+            assert_eq!(checkpoint.epoch, Some(7));
+            // Ed25519 signature is 64 bytes -> 128 hex chars.
+            assert_eq!(checkpoint.signature.len(), 128);
+            assert_eq!(checkpoint.merkle_root.len(), 64);
+        });
     });
 }
 
 #[test]
 fn event_log_checkpoint_by_did_unregistered_did_errors() {
-    Python::with_gil(|_py| {
-        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
-        let did = create_test_identity(scp.bridge_instance());
-        let ctx_id = create_test_context(scp.bridge_instance(), &did);
+    pyo3::Python::with_gil(|py| {
+        Python::with_gil(|_py| {
+            let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+            runtime::init_context_manager_for_test(scp.bridge_instance());
+            let did = create_test_identity(scp.bridge_instance());
+            let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
-        // A syntactically valid DID that was never registered in this instance.
-        let result = scp.event_log_checkpoint_by_did(&ctx_id, "did:dht:zUnregisteredMember", 0);
-        assert!(
-            result.is_err(),
-            "checkpoint for an unregistered DID must error"
-        );
+            // A syntactically valid DID that was never registered in this instance.
+            let result =
+                scp.event_log_checkpoint_by_did(py, &ctx_id, "did:dht:zUnregisteredMember", 0);
+            assert!(
+                result.is_err(),
+                "checkpoint for an unregistered DID must error"
+            );
+        });
     });
 }
 
 #[test]
 fn event_log_checkpoint_by_did_invalid_context_errors() {
-    Python::with_gil(|_py| {
-        let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
-        runtime::init_context_manager_for_test(scp.bridge_instance());
-        let did = create_test_identity(scp.bridge_instance());
+    pyo3::Python::with_gil(|py| {
+        Python::with_gil(|_py| {
+            let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+            runtime::init_context_manager_for_test(scp.bridge_instance());
+            let did = create_test_identity(scp.bridge_instance());
 
-        // DID is registered, but the context does not exist.
-        let result = scp.event_log_checkpoint_by_did("nonexistent-context", &did, 0);
-        assert!(
-            result.is_err(),
-            "checkpoint for a nonexistent context must error"
-        );
+            // DID is registered, but the context does not exist.
+            let result = scp.event_log_checkpoint_by_did(py, "nonexistent-context", &did, 0);
+            assert!(
+                result.is_err(),
+                "checkpoint for a nonexistent context must error"
+            );
+        });
     });
 }
 
@@ -1246,22 +1468,6 @@ fn trust_query_score_validates_empty_did() {
 }
 
 #[test]
-fn trust_create_challenge_returns_dict() {
-    setup();
-    Python::with_gil(|py| {
-        let r = _scp_core::trust::py_trust_create_challenge(py, "did:key:target").unwrap();
-        let d = r.bind(py);
-        let cid: String = d
-            .get_item("challenge_id")
-            .unwrap()
-            .unwrap()
-            .extract()
-            .unwrap();
-        assert!(!cid.is_empty());
-    });
-}
-
-#[test]
 fn trust_verify_attestation_rejects_invalid_json() {
     setup();
     Python::with_gil(|py| {
@@ -1274,9 +1480,19 @@ fn trust_verify_attestation_rejects_invalid_json() {
 }
 
 #[test]
-fn trust_verify_response_rejects_invalid_json() {
+fn trust_grade_response_without_resolver_is_ident_1033() {
     setup();
-    assert!(_scp_core::trust::py_trust_verify_response("bad", "bad").is_err());
+    Python::with_gil(|py| {
+        let err = _scp_core::scp::PyScp::new_in_memory_for_test()
+            .trust_grade_response(
+                py,
+                "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+                "{}",
+                "{}",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("SCP-IDENT-1033"), "{err}");
+    });
 }
 
 #[test]
@@ -1304,11 +1520,13 @@ fn cross_domain_identity_context_outlet_eventlog_provenance() {
 
         // Register an outlet using the helper.
         let reg = build_outlet_reg(py, "cross_domain_outlet", &did_a);
-        let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+        let outlet_id = scp
+            .outlet_register(py, &ctx_id, &reg.as_borrowed())
+            .unwrap();
         assert!(!outlet_id.is_empty());
 
         // Verify outlet.
-        let vr = scp.outlet_verify(&ctx_id, &outlet_id).unwrap();
+        let vr = scp.outlet_verify(py, &ctx_id, &outlet_id).unwrap();
         assert!(vr.passed);
 
         // Append an event and query.
@@ -1334,7 +1552,7 @@ fn cross_domain_identity_context_outlet_eventlog_provenance() {
         let dummy = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
             eyJpc3MiOiJkaWQ6a2V5OnRlc3QiLCJhdWQiOiJkaWQ6a2V5OnRlc3QyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
             dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw";
-        scp.ucan_revoke(&ctx_id, dummy, &did_a).unwrap();
+        scp.ucan_revoke(py, &ctx_id, dummy, &did_a).unwrap();
 
         // Evaluate provenance (pure helper — module-level free fn per ADR-048 §1).
         let q = _scp_core::provenance::evaluate_provenance_quality(
@@ -1421,7 +1639,7 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
             .create_context(ctx_id.clone(), params, creator.clone(), None, Vec::new())
             .await
             .unwrap();
-        supervisor.register_local_did(creator).await.unwrap();
+        supervisor.register_local_did(creator).await;
     });
 }
 
@@ -1477,7 +1695,8 @@ fn register_saga_outlet(
     operator_did: &str,
 ) -> String {
     let reg = build_outlet_reg(py, "xctx_saga_outlet", operator_did);
-    scp.outlet_register(context_id, &reg.as_borrowed()).unwrap()
+    scp.outlet_register(py, context_id, &reg.as_borrowed())
+        .unwrap()
 }
 
 /// A valid 16-byte nonce as a 32-char hex string.
@@ -1512,6 +1731,7 @@ fn xctx_saga_unhosted_caller_rejected_before_saga() {
 
         let err = scp
             .outlet_invoke_cross_context_saga(
+                py,
                 &caller_ctx,
                 &target_ctx,
                 unhosted_caller,
@@ -1565,6 +1785,7 @@ fn xctx_saga_hosted_non_member_caller_rejected() {
 
         let err = scp
             .outlet_invoke_cross_context_saga(
+                py,
                 &caller_ctx,
                 &target_ctx,
                 &stranger, // hosted, but not a member of caller_ctx
@@ -1665,6 +1886,7 @@ fn xctx_saga_member_but_unhosted_caller_rejected_by_hosted_axis() {
 
         let err = scp
             .outlet_invoke_cross_context_saga(
+                py,
                 &caller_ctx,
                 &target_ctx,
                 &member_but_unhosted_caller, // member of caller_ctx, but NOT hosted
@@ -1730,6 +1952,7 @@ fn xctx_saga_authenticated_caller_reaches_target_axis_gate() {
 
         let err = scp
             .outlet_invoke_cross_context_saga(
+                py,
                 &caller_ctx,
                 &target_ctx,
                 &owner, // hosted AND a member of caller_ctx (its creator)
@@ -1799,6 +2022,7 @@ fn xctx_saga_malformed_nonce_rejected_fail_closed() {
         let short_nonce = "0011223344556677";
         let err = scp
             .outlet_invoke_cross_context_saga(
+                py,
                 &caller_ctx,
                 &target_ctx,
                 &owner,
@@ -1877,6 +2101,7 @@ fn xctx_streaming_saga_unhosted_caller_rejected_before_saga() {
 
         let err = scp
             .outlet_streaming_saga_open(
+                py,
                 &caller_ctx,
                 &target_ctx,
                 unhosted_caller,
@@ -1935,6 +2160,7 @@ fn xctx_streaming_saga_hosted_non_member_caller_rejected() {
 
         let err = scp
             .outlet_streaming_saga_open(
+                py,
                 &caller_ctx,
                 &target_ctx,
                 &stranger, // hosted, but not a member of caller_ctx
@@ -1984,7 +2210,7 @@ fn xctx_streaming_saga_recover_unhosted_caller_rejected() {
 
         let unhosted_caller = "did:dht:z6MkUnhostedStreamingRecover1";
         let err = scp
-            .outlet_streaming_saga_recover_truncated_close("any-saga-id", unhosted_caller)
+            .outlet_streaming_saga_recover_truncated_close(py, "any-saga-id", unhosted_caller)
             .expect_err("an unhosted caller_did must be rejected by streaming-saga recover");
 
         assert!(
@@ -2014,7 +2240,7 @@ fn xctx_streaming_saga_recover_unknown_saga_rejected() {
         // and reaches the registry lookup.
         let hosted = create_test_identity(bi);
         let err = scp
-            .outlet_streaming_saga_recover_truncated_close("unknown-saga-id-0001", &hosted)
+            .outlet_streaming_saga_recover_truncated_close(py, "unknown-saga-id-0001", &hosted)
             .expect_err("an unknown saga id must be rejected by streaming-saga recover");
 
         assert!(
@@ -2061,7 +2287,7 @@ fn xctx_streaming_saga_recover_hosted_non_invoker_rejected() {
         // A hosted-but-not-invoker caller clears the channel-auth gate, reaches
         // the invoker check, and is rejected there.
         let err = scp
-            .outlet_streaming_saga_recover_truncated_close(saga_id, &stranger)
+            .outlet_streaming_saga_recover_truncated_close(py, saga_id, &stranger)
             .expect_err("a hosted non-invoker caller must be rejected by streaming-saga recover");
 
         assert!(
@@ -2112,6 +2338,7 @@ fn xctx_streaming_saga_open_rejects_non_active_context() {
 
         let err = scp
             .outlet_streaming_saga_open(
+                py,
                 &caller_ctx,
                 &target_ctx,
                 &owner,
@@ -2151,6 +2378,7 @@ fn xctx_streaming_saga_open_rejects_non_active_context() {
 
         let err = scp
             .outlet_streaming_saga_open(
+                py,
                 &caller_ctx2,
                 &target_ctx2,
                 &owner,
@@ -2284,7 +2512,9 @@ fn establish_xctx_saga_commit_preconditions(
     )
     .unwrap();
     params_a.set_item("ceiling", ceiling_a).unwrap();
-    let handle_a = scp.context_create(&owner, &params_a.as_borrowed()).unwrap();
+    let handle_a = scp
+        .context_create(py, &owner, &params_a.as_borrowed())
+        .unwrap();
     let ctx_a = handle_context_id(py, &handle_a);
 
     // Context B (target). Its ceiling carries `governance:propose` and
@@ -2294,7 +2524,9 @@ fn establish_xctx_saga_commit_preconditions(
     let params_b = PyDict::new(py);
     let ceiling_b = PyList::new(py, ["governance:propose", "outlet:register"]).unwrap();
     params_b.set_item("ceiling", ceiling_b).unwrap();
-    let handle_b = scp.context_create(&owner, &params_b.as_borrowed()).unwrap();
+    let handle_b = scp
+        .context_create(py, &owner, &params_b.as_borrowed())
+        .unwrap();
     let ctx_b = handle_context_id(py, &handle_b);
 
     // The outlet id is the deterministic `generate_outlet_id(name)` form shared
@@ -2307,7 +2539,7 @@ fn establish_xctx_saga_commit_preconditions(
     // Register the saga outlet into B's ACTOR governance state so the saga's
     // Prepare-B finds it.
     let register_json = register_outlet_action_json(&outlet_id, outlet_name, &owner);
-    scp.governance_propose(&handle_b, &owner, &register_json)
+    scp.governance_propose(py, &handle_b, &owner, &register_json)
         .expect("RegisterOutlet must auto-execute under single_admin");
 
     // The executor snapshots the handler from the FFI-side `outlet_handlers`
@@ -2315,7 +2547,7 @@ fn establish_xctx_saga_commit_preconditions(
     // the FFI-side `outlet_registry`, so register it there too (same id), then
     // attach a deterministic handler returning the numeric `{sum, ok}`.
     let reg = build_outlet_reg(py, outlet_name, &owner);
-    let ffi_outlet_id = scp.outlet_register(&ctx_b, &reg.as_borrowed()).unwrap();
+    let ffi_outlet_id = scp.outlet_register(py, &ctx_b, &reg.as_borrowed()).unwrap();
     assert_eq!(
         ffi_outlet_id, outlet_id,
         "FFI and governance outlet ids must agree (deterministic generate_outlet_id)"
@@ -2327,7 +2559,7 @@ fn establish_xctx_saga_commit_preconditions(
     // Establish the bidirectionally-approved interface in A via governance.
     let action_json = establish_interface_action_json(&ctx_a, &ctx_b, &outlet_id);
     let propose_result = scp
-        .governance_propose(&handle_a, &owner, &action_json)
+        .governance_propose(py, &handle_a, &owner, &action_json)
         .expect("EstablishOutletInterface must auto-execute under single_admin");
     assert!(
         !propose_result.is_empty(),
@@ -2430,6 +2662,7 @@ fn xctx_saga_authenticated_caller_commits_via_governance_established_interface()
 
         let result = scp
             .outlet_invoke_cross_context_saga(
+                py,
                 &ctx_a,
                 &ctx_b,
                 &owner,
@@ -2548,7 +2781,9 @@ fn establish_xctx_streaming_saga_preconditions(
     )
     .unwrap();
     params_a.set_item("ceiling", ceiling_a).unwrap();
-    let handle_a = scp.context_create(&owner, &params_a.as_borrowed()).unwrap();
+    let handle_a = scp
+        .context_create(py, &owner, &params_a.as_borrowed())
+        .unwrap();
     let ctx_a = handle_context_id(py, &handle_a);
 
     // Context B (target). Its ceiling carries `governance:propose`,
@@ -2562,7 +2797,9 @@ fn establish_xctx_streaming_saga_preconditions(
     )
     .unwrap();
     params_b.set_item("ceiling", ceiling_b).unwrap();
-    let handle_b = scp.context_create(&owner, &params_b.as_borrowed()).unwrap();
+    let handle_b = scp
+        .context_create(py, &owner, &params_b.as_borrowed())
+        .unwrap();
     let ctx_b = handle_context_id(py, &handle_b);
 
     let outlet_name = "xctx_streaming_saga_outlet";
@@ -2571,10 +2808,10 @@ fn establish_xctx_streaming_saga_preconditions(
     // Register the saga outlet into B's ACTOR governance state (saga Prepare-B
     // reads it) AND the FFI-side registry (the executor snapshots the handler).
     let register_json = register_outlet_action_json(&outlet_id, outlet_name, &owner);
-    scp.governance_propose(&handle_b, &owner, &register_json)
+    scp.governance_propose(py, &handle_b, &owner, &register_json)
         .expect("RegisterOutlet must auto-execute under single_admin");
     let reg = build_outlet_reg(py, outlet_name, &owner);
-    let ffi_outlet_id = scp.outlet_register(&ctx_b, &reg.as_borrowed()).unwrap();
+    let ffi_outlet_id = scp.outlet_register(py, &ctx_b, &reg.as_borrowed()).unwrap();
     assert_eq!(
         ffi_outlet_id, outlet_id,
         "FFI and governance outlet ids must agree (deterministic generate_outlet_id)"
@@ -2629,14 +2866,14 @@ fn establish_xctx_streaming_saga_preconditions(
 
     // Establish the bidirectionally-approved interface in A via governance.
     let action_json = establish_interface_action_json(&ctx_a, &ctx_b, &outlet_id);
-    scp.governance_propose(&handle_a, &owner, &action_json)
+    scp.governance_propose(py, &handle_a, &owner, &action_json)
         .expect("EstablishOutletInterface must auto-execute under single_admin");
 
     // Mint the invocation UCAN in B (issued by B's creator `owner`, delegated to
     // the `invoker` audience), granting `outlet_call:*`. The streaming-saga open
     // validates it at the bridge against B (the "UCAN check locus").
     let ucan = scp
-        .ucan_mint(&ctx_b, &invoker, vec!["outlet_call:*".to_owned()], None)
+        .ucan_mint(py, &ctx_b, &invoker, vec!["outlet_call:*".to_owned()], None)
         .expect("mint the outlet_call invocation UCAN in B")
         .encoded;
 
@@ -2685,6 +2922,7 @@ fn xctx_streaming_saga_open_returns_before_committed_non_blocking() {
         // bound).
         let saga_id = scp
             .outlet_streaming_saga_open(
+                py,
                 &ctx_a,
                 &ctx_b,
                 &invoker,
@@ -2824,13 +3062,15 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
                 .map(|cap| cap.name().into_owned())
                 .collect();
             params.set_item("ceiling", ceiling).unwrap();
-            let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
+            let handle = scp
+                .context_create(py, &creator, &params.as_borrowed())
+                .unwrap();
             handle_context_id(py, &handle)
         };
 
         // Outlet operated by the creator (co-resident custody signs chunks).
         let reg = build_outlet_reg(py, "streaming_calc", &creator);
-        let outlet_id = scp.outlet_register(&ctx, &reg.as_borrowed()).unwrap();
+        let outlet_id = scp.outlet_register(py, &ctx, &reg.as_borrowed()).unwrap();
 
         // Schema-valid Data value ({sum, ok}).
         runtime::register_outlet_handler(
@@ -2848,7 +3088,7 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
         // Creator-issued outlet_call UCAN delegated to the invoker (root
         // issuer == context creator).
         let ucan = scp
-            .ucan_mint(&ctx, &invoker, vec!["outlet_call:*".to_owned()], None)
+            .ucan_mint(py, &ctx, &invoker, vec!["outlet_call:*".to_owned()], None)
             .unwrap();
 
         let input = PyDict::new(py);
@@ -2874,6 +3114,7 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
         // `pub(in crate::context)` `spawn_actor_with_state` fixture).
         let open_err = scp
             .outlet_stream_open(
+                py,
                 &ctx,
                 &outlet_id,
                 &input.as_borrowed(),
@@ -3009,14 +3250,16 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
                 .map(|cap| cap.name().into_owned())
                 .collect();
             params.set_item("ceiling", ceiling).unwrap();
-            let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
+            let handle = scp
+                .context_create(py, &creator, &params.as_borrowed())
+                .unwrap();
             handle_context_id(py, &handle)
         };
 
         // Zero-cost outlet operated by the creator (co-resident custody signs
         // chunks).
         let reg = build_outlet_reg(py, "streaming_live", &creator);
-        let outlet_id = scp.outlet_register(&ctx, &reg.as_borrowed()).unwrap();
+        let outlet_id = scp.outlet_register(py, &ctx, &reg.as_borrowed()).unwrap();
 
         // Register a REAL PYTHON handler through the bridge's
         // `mcp_register_outlet_handler` path — the closure that reacquires the
@@ -3052,7 +3295,7 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
 
         // Creator-issued outlet_call UCAN delegated to the member invoker.
         let ucan = scp
-            .ucan_mint(&ctx, &invoker, vec!["outlet_call:*".to_owned()], None)
+            .ucan_mint(py, &ctx, &invoker, vec!["outlet_call:*".to_owned()], None)
             .unwrap();
 
         let input = PyDict::new(py);
@@ -3064,6 +3307,7 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
         // terminal).
         let handle_id = scp
             .outlet_stream_open(
+                py,
                 &ctx,
                 &outlet_id,
                 &input.as_borrowed(),
@@ -3284,11 +3528,10 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
         }
         let creator = scp_did::DID(owner);
         let sup = supervisor;
-        rt.block_on(async move { sup.register_local_did(creator).await })
-            .unwrap();
+        rt.block_on(async move { sup.register_local_did(creator).await });
 
         let token = scp
-            .ucan_mint(&wide, &holder, vec!["messages:write".to_owned()], None)
+            .ucan_mint(py, &wide, &holder, vec!["messages:write".to_owned()], None)
             .expect("a mint inside the wide ceiling must succeed")
             .encoded;
 
@@ -3298,10 +3541,10 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
         let cap = format!("scp:ctx:{wide}/messages:write");
 
         let in_wide = scp
-            .ucan_evaluate(&wide, &token, Some(cap.as_str()), &holder, None)
+            .ucan_evaluate(py, &wide, &token, Some(cap.as_str()), &holder, None)
             .unwrap();
         let in_narrow = scp
-            .ucan_evaluate(&narrow, &token, Some(cap.as_str()), &holder, None)
+            .ucan_evaluate(py, &narrow, &token, Some(cap.as_str()), &holder, None)
             .unwrap();
         assert!(
             in_wide.within_ceiling,
@@ -3312,10 +3555,10 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
             "evaluate must report the narrow supervisor ceiling"
         );
 
-        scp.ucan_delegate(&wide, &holder, &delegatee, &token, vec![cap.clone()])
+        scp.ucan_delegate(py, &wide, &holder, &delegatee, &token, vec![cap.clone()])
             .expect("a delegation inside the wide ceiling must succeed");
         let delegate_err = scp
-            .ucan_delegate(&narrow, &holder, &delegatee, &token, vec![cap.clone()])
+            .ucan_delegate(py, &narrow, &holder, &delegatee, &token, vec![cap.clone()])
             .expect_err("the narrow supervisor ceiling must refuse the delegation")
             .to_string()
             .to_lowercase();
@@ -3325,7 +3568,7 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
         );
 
         let validate_err = scp
-            .ucan_validate(&narrow, &token, &cap, &holder, None)
+            .ucan_validate(py, &narrow, &token, &cap, &holder, None)
             .expect_err("the narrow supervisor ceiling must refuse the validation")
             .to_string()
             .to_lowercase();
@@ -3333,7 +3576,7 @@ fn ucan_validate_evaluate_and_delegate_compare_against_the_supervisor_ceiling() 
             validate_err.contains("ceiling"),
             "the validation refusal must be the ceiling check: {validate_err}"
         );
-        scp.ucan_validate(&wide, &token, &cap, &holder, None)
+        scp.ucan_validate(py, &wide, &token, &cap, &holder, None)
             .expect("a validation inside the wide ceiling must succeed");
     });
 }
@@ -3384,21 +3627,26 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator() {
         }
         let creator = scp_did::DID(owner.clone());
         let sup = supervisor;
-        rt.block_on(async move { sup.register_local_did(creator).await })
-            .unwrap();
+        rt.block_on(async move { sup.register_local_did(creator).await });
 
         // The mint issues as the supervisor's creator of `anchored`: `owner`.
         let token = scp
-            .ucan_mint(&anchored, &holder, vec!["messages:write".to_owned()], None)
+            .ucan_mint(
+                py,
+                &anchored,
+                &holder,
+                vec!["messages:write".to_owned()],
+                None,
+            )
             .expect("a mint by the supervisor's creator must succeed")
             .encoded;
         let cap = format!("scp:ctx:{anchored}/messages:write");
 
         let in_anchored = scp
-            .ucan_evaluate(&anchored, &token, Some(cap.as_str()), &holder, None)
+            .ucan_evaluate(py, &anchored, &token, Some(cap.as_str()), &holder, None)
             .unwrap();
         let in_crossed = scp
-            .ucan_evaluate(&crossed, &token, Some(cap.as_str()), &holder, None)
+            .ucan_evaluate(py, &crossed, &token, Some(cap.as_str()), &holder, None)
             .unwrap();
         assert!(
             in_anchored.signatures_valid,
@@ -3410,7 +3658,7 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator() {
         );
 
         let crossed_err = scp
-            .ucan_validate(&crossed, &token, &cap, &holder, None)
+            .ucan_validate(py, &crossed, &token, &cap, &holder, None)
             .expect_err(
                 "validate must refuse a root issuer the supervisor does not name as creator",
             )
@@ -3419,7 +3667,7 @@ fn ucan_validate_and_evaluate_anchor_on_the_supervisor_creator() {
             crossed_err.contains(&format!("invalid issuer: expected {other}, got {owner}")),
             "the validation refusal must be the root-issuer check: {crossed_err}"
         );
-        scp.ucan_validate(&anchored, &token, &cap, &holder, None)
+        scp.ucan_validate(py, &anchored, &token, &cap, &holder, None)
             .expect("the root issuer the supervisor names as creator must validate");
     });
 }
@@ -3483,11 +3731,13 @@ fn nb_fixture(py: Python<'_>) -> NbFixture {
             .map(|cap| cap.name().into_owned())
             .collect();
         params.set_item("ceiling", ceiling).unwrap();
-        let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
+        let handle = scp
+            .context_create(py, &creator, &params.as_borrowed())
+            .unwrap();
         handle_context_id(py, &handle)
     };
     let root = scp
-        .ucan_mint(&ctx, &holder, vec!["outlet_call:*".to_owned()], None)
+        .ucan_mint(py, &ctx, &holder, vec!["outlet_call:*".to_owned()], None)
         .unwrap();
     let cap = root.capabilities[0].clone();
     NbFixture {
@@ -3525,7 +3775,7 @@ fn ucan_validate_refuses_a_root_outlet_token_past_its_nb_time_box() {
         );
         let evaluation = f
             .scp
-            .ucan_evaluate(&f.ctx, &lapsed, Some(f.cap.as_str()), &f.holder, None)
+            .ucan_evaluate(py, &f.ctx, &lapsed, Some(f.cap.as_str()), &f.holder, None)
             .unwrap();
         assert!(
             evaluation.signatures_valid && !evaluation.time_bounds_valid,
@@ -3533,7 +3783,7 @@ fn ucan_validate_refuses_a_root_outlet_token_past_its_nb_time_box() {
         );
         let err = f
             .scp
-            .ucan_validate(&f.ctx, &lapsed, &f.cap, &f.holder, None)
+            .ucan_validate(py, &f.ctx, &lapsed, &f.cap, &f.holder, None)
             .expect_err("a root outlet token past nb.valid_until must not validate")
             .to_string();
         assert!(
@@ -3559,12 +3809,20 @@ fn ucan_validate_admits_a_delegated_outlet_token_inside_its_time_box() {
         );
         let child = f
             .scp
-            .ucan_delegate(&f.ctx, &f.holder, &delegatee, &live, vec![f.cap.clone()])
+            .ucan_delegate(
+                py,
+                &f.ctx,
+                &f.holder,
+                &delegatee,
+                &live,
+                vec![f.cap.clone()],
+            )
             .unwrap()
             .encoded;
         let evaluation = f
             .scp
             .ucan_evaluate(
+                py,
                 &f.ctx,
                 &child,
                 Some(f.cap.as_str()),
@@ -3577,7 +3835,7 @@ fn ucan_validate_admits_a_delegated_outlet_token_inside_its_time_box() {
             "evaluate must admit the delegated outlet token"
         );
         f.scp
-            .ucan_validate(&f.ctx, &child, &f.cap, &delegatee, Some(vec![live]))
+            .ucan_validate(py, &f.ctx, &child, &f.cap, &delegatee, Some(vec![live]))
             .expect("a delegated outlet token inside its time-box must validate");
     });
 }
@@ -3591,10 +3849,17 @@ fn ucan_validate_leaves_a_non_outlet_token_unaffected() {
         let f = nb_fixture(py);
         let plain = f
             .scp
-            .ucan_mint(&f.ctx, &f.holder, vec!["messages:write".to_owned()], None)
+            .ucan_mint(
+                py,
+                &f.ctx,
+                &f.holder,
+                vec!["messages:write".to_owned()],
+                None,
+            )
             .unwrap();
         f.scp
             .ucan_validate(
+                py,
                 &f.ctx,
                 &plain.encoded,
                 &plain.capabilities[0],
@@ -3646,11 +3911,17 @@ fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
                 .create_context(narrow_ctx, params, creator.clone(), None, Vec::new())
                 .await
                 .unwrap();
-            supervisor.register_local_did(creator).await.unwrap();
+            supervisor.register_local_did(creator).await;
         });
 
         let err = scp
-            .ucan_mint(&ctx_id, &audience, vec!["outlet_call:*".to_owned()], None)
+            .ucan_mint(
+                py,
+                &ctx_id,
+                &audience,
+                vec!["outlet_call:*".to_owned()],
+                None,
+            )
             .expect_err("the supervisor ceiling omits outlet_call, so the mint must refuse");
         let message = err.to_string().to_lowercase();
         assert!(
@@ -3660,8 +3931,14 @@ fn ucan_mint_enforces_the_supervisor_ceiling_not_the_registration_ceiling() {
 
         // The capability the supervisor's ceiling holds still mints, so the
         // refusal above is the ceiling check and not a broken fixture.
-        scp.ucan_mint(&ctx_id, &audience, vec!["messages:read".to_owned()], None)
-            .expect("a mint inside the supervisor's ceiling must succeed");
+        scp.ucan_mint(
+            py,
+            &ctx_id,
+            &audience,
+            vec!["messages:read".to_owned()],
+            None,
+        )
+        .expect("a mint inside the supervisor's ceiling must succeed");
     });
 }
 
@@ -3692,6 +3969,7 @@ fn xctx_unary_saga_rejects_non_active_context() {
 
         let err = scp
             .outlet_invoke_cross_context_saga(
+                py,
                 &caller_ctx,
                 &target_ctx,
                 &owner,
@@ -3721,6 +3999,7 @@ fn xctx_unary_saga_rejects_non_active_context() {
 
         let err = scp
             .outlet_invoke_cross_context_saga(
+                py,
                 &caller_ctx2,
                 &target_ctx2,
                 &owner,
@@ -3767,11 +4046,15 @@ fn supervisor_only_member_context(
     )
     .unwrap();
     params.set_item("ceiling", ceiling).unwrap();
-    let handle = scp.context_create(owner, &params.as_borrowed()).unwrap();
+    let handle = scp
+        .context_create(py, owner, &params.as_borrowed())
+        .unwrap();
     let ctx_id = handle_context_id(py, &handle);
 
     let reg = build_outlet_reg(py, "supervisor_member_outlet", owner);
-    let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+    let outlet_id = scp
+        .outlet_register(py, &ctx_id, &reg.as_borrowed())
+        .unwrap();
 
     let rt = test_runtime();
     let supervisor = runtime::supervisor(scp.bridge_instance()).unwrap().clone();
@@ -3794,7 +4077,7 @@ fn supervisor_only_member_context(
     }
 
     let ucan = scp
-        .ucan_mint(&ctx_id, invoker, vec!["outlet_call:*".to_owned()], None)
+        .ucan_mint(py, &ctx_id, invoker, vec!["outlet_call:*".to_owned()], None)
         .expect("mint the invocation UCAN")
         .encoded;
 
@@ -3818,7 +4101,7 @@ fn session_invoke_admits_a_supervisor_only_capability_holder() {
             supervisor_only_member_context(py, &scp, &owner, &invoker, true);
 
         let session_id = scp
-            .outlet_session_create(&ctx_id, &outlet_id, &ctx_id, None)
+            .outlet_session_create(py, &ctx_id, &outlet_id, &ctx_id, None)
             .expect("session creation");
 
         let input = PyDict::new(py);
@@ -3852,7 +4135,7 @@ fn session_invoke_refuses_a_member_the_supervisor_did_not_grant() {
             supervisor_only_member_context(py, &scp, &owner, &invoker, false);
 
         let session_id = scp
-            .outlet_session_create(&ctx_id, &outlet_id, &ctx_id, None)
+            .outlet_session_create(py, &ctx_id, &outlet_id, &ctx_id, None)
             .expect("session creation");
 
         let input = PyDict::new(py);
@@ -4017,7 +4300,7 @@ fn session_invoke_validates_the_ucan_against_the_supervisor_ceiling() {
                 .create_context(supervisor_ctx, params, creator.clone(), None, Vec::new())
                 .await
                 .unwrap();
-            supervisor.register_local_did(creator).await.unwrap();
+            supervisor.register_local_did(creator).await;
         });
         rt.block_on(seeding_supervisor.test_insert_member(
             &ctx_id,
@@ -4033,13 +4316,21 @@ fn session_invoke_validates_the_ucan_against_the_supervisor_ceiling() {
         .expect("grant OutletCallAll in the supervisor");
 
         let reg = build_outlet_reg(py, "supervisor_ceiling_outlet", &owner);
-        let outlet_id = scp.outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+        let outlet_id = scp
+            .outlet_register(py, &ctx_id, &reg.as_borrowed())
+            .unwrap();
         let ucan = scp
-            .ucan_mint(&ctx_id, &invoker, vec!["outlet_call:*".to_owned()], None)
+            .ucan_mint(
+                py,
+                &ctx_id,
+                &invoker,
+                vec!["outlet_call:*".to_owned()],
+                None,
+            )
             .expect("the supervisor ceiling carries outlet_call, so the mint succeeds")
             .encoded;
         let session_id = scp
-            .outlet_session_create(&ctx_id, &outlet_id, &ctx_id, None)
+            .outlet_session_create(py, &ctx_id, &outlet_id, &ctx_id, None)
             .expect("session creation");
 
         let input = PyDict::new(py);
@@ -4076,7 +4367,7 @@ fn session_invoke_anchors_the_ucan_on_the_supervisor_creator() {
             supervisor_only_member_context(py, &scp, &owner, &invoker, true);
 
         let session_id = scp
-            .outlet_session_create(&ctx_id, &outlet_id, &ctx_id, None)
+            .outlet_session_create(py, &ctx_id, &outlet_id, &ctx_id, None)
             .expect("session creation");
         let input = PyDict::new(py);
         input.set_item("a", "x").unwrap();
@@ -4117,6 +4408,7 @@ fn xctx_saga_signs_as_the_supervisor_creators() {
 
         let result = scp
             .outlet_invoke_cross_context_saga(
+                py,
                 &ctx_a,
                 &ctx_b,
                 &owner,
@@ -4159,6 +4451,7 @@ fn xctx_streaming_saga_open_signs_as_the_supervisor_creators() {
 
         let saga_id = scp
             .outlet_streaming_saga_open(
+                py,
                 &ctx_a,
                 &ctx_b,
                 &invoker,

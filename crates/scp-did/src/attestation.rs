@@ -294,6 +294,7 @@ impl ScpKeyCustodyAttestation {
             id: format!("{did}#custody-attestation"),
             service_type: CUSTODY_ATTESTATION_SERVICE_TYPE.to_owned(),
             service_endpoint: endpoint,
+            bridge_target: None,
         })
     }
 
@@ -535,6 +536,7 @@ impl IdentityLinkServiceEntry {
             id: format!("{did}#attestation-{platform}--{index}"),
             service_type: IDENTITY_LINK_ATTESTATION_SERVICE_TYPE.to_owned(),
             service_endpoint: attestation_id.to_owned(),
+            bridge_target: None,
         }
     }
 
@@ -808,6 +810,7 @@ mod tests {
             id: format!("{}#pre-rotation", test_did()),
             service_type: "PreRotationCommitment".to_owned(),
             service_endpoint: "sha256:abc123".to_owned(),
+            bridge_target: None,
         };
 
         let result = ScpKeyCustodyAttestation::from_service_entry(&service);
@@ -825,6 +828,7 @@ mod tests {
             id: format!("{}#custody-attestation", test_did()),
             service_type: CUSTODY_ATTESTATION_SERVICE_TYPE.to_owned(),
             service_endpoint: "not valid json".to_owned(),
+            bridge_target: None,
         };
 
         let result = ScpKeyCustodyAttestation::from_service_entry(&service);
@@ -1142,6 +1146,7 @@ mod tests {
             id: format!("{}#attestation-github.com--0", test_did()),
             service_type: "WrongType".to_owned(),
             service_endpoint: "abc123".to_owned(),
+            bridge_target: None,
         };
 
         let result = IdentityLinkServiceEntry::from_service_entry(&service);
@@ -1160,6 +1165,7 @@ mod tests {
             id: "no-fragment-here".to_owned(),
             service_type: "ScpIdentityLinkAttestation".to_owned(),
             service_endpoint: "abc123".to_owned(),
+            bridge_target: None,
         };
 
         let result = IdentityLinkServiceEntry::from_service_entry(&service);
@@ -1173,6 +1179,7 @@ mod tests {
             id: format!("{}#attestation-github.com-0", test_did()),
             service_type: "ScpIdentityLinkAttestation".to_owned(),
             service_endpoint: "abc123".to_owned(),
+            bridge_target: None,
         };
 
         let result = IdentityLinkServiceEntry::from_service_entry(&service);
@@ -1186,6 +1193,7 @@ mod tests {
             id: format!("{}#attestation-github.com--notanumber", test_did()),
             service_type: "ScpIdentityLinkAttestation".to_owned(),
             service_endpoint: "abc123".to_owned(),
+            bridge_target: None,
         };
 
         let result = IdentityLinkServiceEntry::from_service_entry(&service);

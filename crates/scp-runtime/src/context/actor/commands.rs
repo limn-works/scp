@@ -149,16 +149,15 @@ pub struct SendMessagePayload {
     pub sender_did: scp_did::DID,
     /// Plaintext payload to encrypt and send.
     pub payload: Vec<u8>,
-    /// Sender's Ed25519 signing key. `None` is rejected by the
-    /// encrypted path — the inner envelope cannot be signed without
-    /// it. Wrapped in [`SigningKeyBytes`] so the private key bytes
-    /// zeroize on drop.
-    pub signing_key: Option<SigningKeyBytes>,
+    /// The sender's signer (ADR-049 Decision 7a). The handler signs the
+    /// inner envelope (or the broadcast envelope) through it in the send
+    /// turn; the key stays in custody.
+    pub signer: crate::context::actor::signer::CommandSigner,
     /// Which verification method this message is signed under
     /// (`#active` or `#agent`, ADR-039). Stamped into the inner
     /// envelope's `signing_key_id` so the recipient resolves the
-    /// matching public key from the sender's DID document. Must agree
-    /// with the key material in `signing_key`.
+    /// matching public key from the sender's DID document. Set together
+    /// with `signer` from one [`MessageSigner`](crate::context::supervisor::MessageSigner).
     pub signing_key_id: scp_did::SigningKeyId,
     /// Optional cross-context provenance metadata — attaches a
     /// signed `DataProvenance` envelope to the inner message.
@@ -324,7 +323,7 @@ pub enum MessagingCommand {
     /// to it before dispatching; the handler delegates to
     /// `messaging_helpers::rotate_pseudonym`, which persists the rotation
     /// fail-closed, emits `ContextEvent::LocalPseudonymRotated`, and sends the
-    /// announcement. The signing key is per-call because the actor holds no
+    /// announcement. The signer is per-call because the actor holds no
     /// signing key.
     RotatePseudonym {
         /// Context identifier.
@@ -336,9 +335,9 @@ pub enum MessagingCommand {
         new_routing_id: [u8; 32],
         /// The local member's DID, which signs the announcement.
         sender_did: scp_did::DID,
-        /// The member's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
-        /// so the private key zeroes on drop.
-        signing_key: SigningKeyBytes,
+        /// The member's signer; the announcement is signed through it in the
+        /// handler's turn.
+        signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel: `Ok(())` once the rotation is persisted and
         /// announced, else the typed error of `rotate_pseudonym`.
         reply: oneshot::Sender<Result<(), ContextError>>,
@@ -622,18 +621,17 @@ pub enum MessagingCommand {
     /// Used by the reconnection driver's Phase 3 (`event_log_sync`) at the
     /// FFI/SDK layer: the driver builds its local checkpoint, sends it to
     /// peers via the send path, and compares peer checkpoints against local
-    /// state. The caller supplies `sender_did` + `signing_key` exactly as
-    /// the application send path does (the signing key is not actor-owned
-    /// state — it lives at the FFI boundary).
+    /// state. The caller supplies `sender_did` + `signer` exactly as the
+    /// application send path does (the actor holds no key material, ADR-049
+    /// Decision 7a).
     BuildLocalCheckpoint {
         /// Context identifier.
         context_id: String,
         /// Checkpoint author DID (a locally-controlled member).
         sender_did: scp_did::DID,
-        /// Author's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
-        /// so the private key zeroes on drop (mirrors the
-        /// [`SendMessagePayload`] pattern).
-        signing_key: SigningKeyBytes,
+        /// The author's signer; the checkpoint is signed through it in the
+        /// handler's turn.
+        signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel carrying the freshly-built signed
         /// checkpoint.
         reply: BuildLocalCheckpointReply,
@@ -674,10 +672,10 @@ pub enum MessagingCommand {
     /// which routes an EMPTY-payload [`MessageType::Heartbeat`](scp_protocol::envelope::inner::MessageType::Heartbeat)
     /// envelope through the regular encrypt-and-send path. Driven by the
     /// bridge/SDK subscribe-path scheduler (the §9.9.2 "the SDK sends
-    /// heartbeats" boundary): the caller supplies `sender_did` + `signing_key`
+    /// heartbeats" boundary): the caller supplies `sender_did` + `signer`
     /// per-call exactly like [`SendMessage`](Self::SendMessage) and
     /// [`BuildLocalCheckpoint`](Self::BuildLocalCheckpoint), because the
-    /// signing key is NOT actor-owned state — it lives at the FFI boundary.
+    /// actor holds no key material (ADR-049 Decision 7a).
     /// Routing the send through the actor serializes it with the context's
     /// other sends.
     ///
@@ -690,10 +688,9 @@ pub enum MessagingCommand {
         context_id: String,
         /// Heartbeat author DID (a locally-controlled member).
         sender_did: scp_did::DID,
-        /// Author's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
-        /// the private key zeroes on drop (mirrors the
-        /// [`SendMessagePayload`] pattern).
-        signing_key: SigningKeyBytes,
+        /// The author's signer; the heartbeat envelope is signed through it
+        /// in the handler's turn.
+        signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel. `Ok(())` on success; transport error if
         /// every fan-out send fails.
         reply: oneshot::Sender<Result<(), ContextError>>,
@@ -727,50 +724,9 @@ pub struct SendPseudonymAnnouncementPayload {
     pub params: scp_protocol::context::params::ContextParams,
     /// Sender DID (the announcing member).
     pub sender_did: scp_did::DID,
-    /// Sender's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
-    /// the private key zeroes on drop (mirrors the
-    /// [`SendMessagePayload`] pattern).
-    pub signing_key: SigningKeyBytes,
-}
-
-/// Owned Ed25519 signing key bytes used inside
-/// [`MessagingCommand::SendMessage`]. Wraps the 32-byte seed in
-/// [`Zeroizing`](zeroize::Zeroizing) so the private key zeroes on drop
-/// even if the command is dropped mid-mailbox without being dispatched
-/// (cancellation path). The handler reconstructs
-/// [`ed25519_dalek::SigningKey`] from the bytes on the receive side.
-pub struct SigningKeyBytes(pub zeroize::Zeroizing<[u8; 32]>);
-
-/// Redacting `Debug` (security def-in-depth): the seed bytes are NEVER formatted
-/// into a log line. `SigningKeyBytes` deliberately does not `derive(Debug)`, but
-/// providing a redacting impl means a FUTURE enclosing enum/struct that DOES
-/// `derive(Debug)` (a command variant carrying this key) prints `<redacted>`
-/// instead of failing to compile OR dumping the key bytes.
-impl std::fmt::Debug for SigningKeyBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SigningKeyBytes")
-            .field(&"<redacted>")
-            .finish()
-    }
-}
-
-impl SigningKeyBytes {
-    /// Construct from an [`ed25519_dalek::SigningKey`] borrowed from
-    /// the caller. Copies the 32-byte seed so the caller's key can be
-    /// dropped while the command is in flight.
-    #[must_use]
-    pub fn from_signing_key(sk: &ed25519_dalek::SigningKey) -> Self {
-        Self(zeroize::Zeroizing::new(sk.to_bytes()))
-    }
-
-    /// Rebuild the [`ed25519_dalek::SigningKey`] on the handler side.
-    /// The returned value is NOT wrapped in `Zeroizing`; callers take
-    /// responsibility for zeroizing it after use (the command's own
-    /// bytes zero on drop regardless).
-    #[must_use]
-    pub fn to_signing_key(&self) -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::from_bytes(&self.0)
-    }
+    /// The sender's signer; the announcement is signed through it in the
+    /// handler's turn.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
 /// Reply-channel type alias for [`LifecycleCommand::CreateContext`]. The
@@ -787,18 +743,14 @@ pub type CreateContextReply = oneshot::Sender<
 pub type CloseContextReply =
     oneshot::Sender<Result<crate::context::ttl::CloseResult, ContextError>>;
 
-/// Reply-channel type alias for [`LifecycleCommand::ExportContext`].
-///
-/// The reply carries the UNSIGNED export building blocks captured from the
-/// actor-owned state: the `ContextSnapshot` and the serialized Merkle
-/// event-log data. The actor holds no custody/signing key, so the snapshot
-/// signature is applied by the dispatcher
-/// ([`Supervisor::export_context`](crate::context::supervisor::Supervisor::export_context))
-/// via `create_export` once
-/// these blocks are returned — keeping the signature over the exact canonical
-/// bytes a verifier recomputes (§23.16.8, ADR-050).
+/// Reply-channel type alias for [`LifecycleCommand::ExportContext`]. The
+/// reply carries the signed
+/// [`ContextExport`](crate::context::export_import::ContextExport): the actor
+/// builds the snapshot and event-log blocks and signs the canonical snapshot
+/// digest with the command's signer in the same turn (§23.16.8, ADR-049
+/// Decision 7a).
 pub type ExportContextReply =
-    oneshot::Sender<Result<(crate::context::state::ContextSnapshot, Vec<u8>), ContextError>>;
+    oneshot::Sender<Result<crate::context::export_import::ContextExport, ContextError>>;
 
 /// Reply-channel type alias for [`LifecycleCommand::ImportContext`]. The
 /// reply carries the restored context's
@@ -968,16 +920,17 @@ pub enum LifecycleCommand {
     },
 
     /// Exports a snapshot of the context for cross-instance transfer.
-    /// The actor captures the unsigned snapshot + event-log blocks via the
-    /// `lifecycle_helpers::export_context_blocks` free function; the Ed25519
-    /// snapshot signature is produced at the dispatch boundary in
-    /// [`Supervisor::export_context`](crate::context::supervisor::Supervisor::export_context),
-    /// which holds the custody sign closure (the actor holds no key).
+    /// The actor captures the snapshot and event-log blocks via
+    /// `lifecycle_helpers::export_context_blocks` and signs the canonical
+    /// snapshot digest through `signer` in the same turn (ADR-049
+    /// Decision 7a).
     ExportContext {
         /// Context identifier string.
         context_id: String,
         /// Exporter DID — signs the export header.
         exporter_did: scp_did::DID,
+        /// The exporter's signer; its key must be the snapshot creator's.
+        signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel. See [`ExportContextReply`].
         reply: ExportContextReply,
     },
@@ -1254,10 +1207,10 @@ pub struct ProposeGovernanceActionPayload {
     pub proposer_did: scp_did::DID,
     /// Typed governance action — one of the 28 variants from ADR-031.
     pub action: scp_protocol::context::governance::GovernanceAction,
-    /// Proposer's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
-    /// so the private key zeroes on drop (mirrors the messaging path's
-    /// command-level zeroize contract).
-    pub signing_key: SigningKeyBytes,
+    /// The proposer's signer (ADR-049 Decision 7a). The handler signs the
+    /// proposer's approval digest through it once the prechecks pass; the
+    /// command carries no key material.
+    pub signer: crate::context::actor::signer::CommandSigner,
     /// The invitee's TLS-serialized MLS `KeyPackage` for an `AddMember`
     /// auto-execute. Carried here — on the in-process actor command envelope,
     /// NOT on the signed/logged
@@ -1273,10 +1226,9 @@ pub struct ProposeGovernanceActionPayload {
 /// Payload for [`GovernanceCommand::VoteOnProposal`],
 /// [`GovernanceCommand::ApproveGovernanceProposal`], and
 /// [`GovernanceCommand::RejectGovernanceProposal`]. Boxed so the outer
-/// enum's variant sizes stay uniform — the signing key embeds a
-/// [`Zeroizing<[u8; 32]>`](zeroize::Zeroizing) and the proposal-ID +
-/// DID + context-id fields combine to ~150 bytes; boxing keeps the
-/// variant payload size constant.
+/// enum's variant sizes stay uniform — the proposal-ID, DID, context-id and
+/// signer fields combine to ~150 bytes; boxing keeps the variant payload size
+/// constant.
 pub struct VoteOnProposalPayload {
     /// Context identifier string.
     pub context_id: String,
@@ -1284,9 +1236,9 @@ pub struct VoteOnProposalPayload {
     pub proposal_id: scp_protocol::context::governance::ProposalId,
     /// Voter DID.
     pub voter_did: scp_did::DID,
-    /// Voter's Ed25519 signing key (zeroized on drop via
-    /// [`SigningKeyBytes`]).
-    pub signing_key: SigningKeyBytes,
+    /// The voter's signer (ADR-049 Decision 7a). The handler signs the vote
+    /// digest through it only when the precheck asks for a signature.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
 /// Payload for [`GovernanceCommand::ExecuteGovernanceAction`].
@@ -1583,14 +1535,6 @@ pub type UnsubscribeBroadcastReply =
 pub type PublishBroadcastReply =
     oneshot::Sender<Result<scp_protocol::crypto::sender_keys::BroadcastEnvelope, ContextError>>;
 
-/// Reply-channel type alias for [`BroadcastCommand::ReserveBroadcastPublish`]
-/// (phase 1 of the two-phase publish path). Returns the reservation id plus
-/// the signing-payload digest the caller must sign. Factored out to satisfy
-/// `clippy::type_complexity`.
-pub type ReserveBroadcastPublishReply = oneshot::Sender<
-    Result<crate::context::broadcast_helpers::BroadcastPublishReservationOutcome, ContextError>,
->;
-
 /// Reply-channel type alias for
 /// [`BroadcastCommand::BlockBroadcastSubscriber`]. Factored out to satisfy
 /// `clippy::type_complexity`.
@@ -1644,27 +1588,10 @@ pub struct UnsubscribeBroadcastPayload {
 /// Payload for [`BroadcastCommand::PublishBroadcast`]. Boxed for
 /// variant-size uniformity — payload `Vec<u8>` may be large.
 ///
-/// # KeyCustody plumbing
-///
-/// Signing a broadcast envelope needs the caller's
-/// [`KeyCustody`](scp_platform::KeyCustody) backend; the trait uses
-/// RPITIT and is NOT `dyn`-safe, so it cannot cross the actor mailbox.
-/// Instead:
-///
-/// - The command carries only the
-///   [`KeyHandle`](scp_platform::KeyHandle) (an opaque reference that
-///   IS `Send + Sync + Clone`).
-/// - The custody-generic entry point
-///   [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody)
-///   drives the two-phase publish path: the actor reserves the
-///   sequence via
-///   `broadcast_helpers::reserve_broadcast_publish`
-///   and returns the signing-payload digest, the supervisor signs with
-///   the caller's custody OUTSIDE the actor, then the actor seals via
-///   `broadcast_helpers::apply_broadcast_publish`.
-/// - Dispatching this variant directly on the actor mailbox is
-///   rejected with a typed error pointing at the custody-generic
-///   entry point (see `handlers/broadcast.rs`).
+/// The payload carries the author's `CommandSigner` (ADR-049 Decision 7a).
+/// The handler reserves the author's broadcast sequence, signs the 32-byte
+/// broadcast signing payload through `CommandSigner::sign_bounded_ed25519`, and seals in one actor
+/// turn. A failed sign rolls the reservation back in the same turn.
 pub struct PublishBroadcastPayload {
     /// Context identifier string.
     pub context_id: String,
@@ -1672,14 +1599,12 @@ pub struct PublishBroadcastPayload {
     pub author_did: scp_did::DID,
     /// Plaintext payload bytes.
     pub payload: Vec<u8>,
-    /// Handle to the author's signing key inside the caller's custody
-    /// backend. The key bytes themselves never cross the mailbox — see
-    /// the struct-level docs for the custody plumbing contract.
-    pub signing_key_handle: scp_platform::KeyHandle,
+    /// The author's signer, an Ed25519 signer over the author's custody key.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
-/// Payload for [`BroadcastCommand::PublishBroadcastContent`]. See
-/// [`PublishBroadcastPayload`] for the custody plumbing rationale.
+/// Payload for [`BroadcastCommand::PublishBroadcastContent`]. Signs and
+/// seals in one actor turn, as [`PublishBroadcastPayload`] does.
 pub struct PublishBroadcastContentPayload {
     /// Context identifier string.
     pub context_id: String,
@@ -1687,47 +1612,8 @@ pub struct PublishBroadcastContentPayload {
     pub author_did: scp_did::DID,
     /// Structured broadcast content.
     pub content: scp_protocol::context::BroadcastContent,
-    /// Handle to the author's signing key inside the caller's custody
-    /// backend.
-    pub signing_key_handle: scp_platform::KeyHandle,
-}
-
-/// Payload for [`BroadcastCommand::ReserveBroadcastPublish`] — phase 1 of
-/// the two-phase publish path (ADR-049 §SequenceReservation). Custody-free:
-/// the actor reserves the broadcast sequence and returns the signing-payload
-/// digest; the caller signs it OUTSIDE the actor and applies the reservation
-/// via [`BroadcastCommand::ApplyBroadcastPublish`].
-pub struct ReserveBroadcastPublishPayload {
-    /// Context identifier string.
-    pub context_id: String,
-    /// Author DID (registered in the broadcast context).
-    pub author_did: scp_did::DID,
-}
-
-/// Payload for [`BroadcastCommand::ApplyBroadcastPublish`] — phase 2 of the
-/// two-phase publish path. Carries the caller-produced signature plus the
-/// reservation id and the plaintext payload. Custody-free: signing already
-/// happened outside the actor.
-pub struct ApplyBroadcastPublishPayload {
-    /// Context identifier string.
-    pub context_id: String,
-    /// Reservation id returned by phase 1.
-    pub reservation_id: crate::context::actor::state::BroadcastReservationId,
-    /// Ed25519 signature (64 bytes) over the phase-1 signing payload.
-    pub signature: Vec<u8>,
-    /// Plaintext payload bytes to seal.
-    pub payload: Vec<u8>,
-}
-
-/// Payload for [`BroadcastCommand::ReleaseBroadcastReservation`] — abort of
-/// a two-phase publish whose apply will never arrive (the caller's signing
-/// failed, or the caller is aborting). Releases the reserved sequence so it
-/// is not burned. Custody-free.
-pub struct ReleaseBroadcastReservationPayload {
-    /// Context identifier string.
-    pub context_id: String,
-    /// Reservation id returned by phase 1.
-    pub reservation_id: crate::context::actor::state::BroadcastReservationId,
+    /// The author's signer, an Ed25519 signer over the author's custody key.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
 /// Payload for
@@ -1746,19 +1632,13 @@ pub struct BroadcastBlockPayload {
 /// See [`ContextCommand::Broadcast`]. Real variants cover every public
 /// method on `crate::context::broadcast_helpers`.
 ///
-/// # Key-custody handoff
+/// # Publish signing
 ///
-/// `PublishBroadcast` / `PublishBroadcastContent` each require the
-/// caller's [`KeyCustody`](scp_platform::KeyCustody) backend to sign the
-/// broadcast envelope — the custody trait uses RPITIT and cannot cross
-/// an actor mailbox. The variants store only the
-/// [`KeyHandle`](scp_platform::KeyHandle) and are dispatched through
-/// the custody-generic
-/// [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody),
-/// which drives the custody-free two-phase
-/// `ReserveBroadcastPublish` / `ApplyBroadcastPublish` mailbox commands
-/// and signs with the caller's custody between the two phases, outside
-/// the actor.
+/// `PublishBroadcast` / `PublishBroadcastContent` carry the author's
+/// `CommandSigner` (ADR-049 Decision 7a) and ride the per-context actor
+/// mailbox like every other variant. The handler reserves the sequence,
+/// signs through `CommandSigner::sign_bounded_ed25519`, and seals in one actor turn, rolling the
+/// reservation back when the sign or the seal fails.
 pub enum BroadcastCommand {
     /// Subscribe a DID to a broadcast context. Mirrors
     /// `broadcast_helpers::subscribe_broadcast`.
@@ -1789,11 +1669,9 @@ pub enum BroadcastCommand {
         reply: UnsubscribeBroadcastReply,
     },
 
-    /// Publish raw bytes to a broadcast context. Dispatched via the
-    /// custody-generic supervisor path, which drives the two-phase
-    /// `broadcast_helpers::reserve_broadcast_publish`
-    /// / `broadcast_helpers::apply_broadcast_publish`
-    /// pair — see the enum-level key-custody handoff docs.
+    /// Publish raw bytes to a broadcast context. Reserves, signs through
+    /// the payload's `CommandSigner`, and seals in one actor turn via
+    /// `broadcast_helpers::publish_broadcast_in_turn`.
     PublishBroadcast {
         /// Boxed owned payload.
         payload: Box<PublishBroadcastPayload>,
@@ -1802,49 +1680,13 @@ pub enum BroadcastCommand {
     },
 
     /// Publish structured [`BroadcastContent`](scp_protocol::context::broadcast_content::BroadcastContent)
-    /// to a broadcast context. Serializes the content, then follows the
-    /// same custody-generic two-phase
-    /// `broadcast_helpers::reserve_broadcast_publish`
-    /// / `broadcast_helpers::apply_broadcast_publish`
-    /// path as [`Self::PublishBroadcast`].
+    /// to a broadcast context. Serializes the content, then publishes it in
+    /// one actor turn as [`Self::PublishBroadcast`] does.
     PublishBroadcastContent {
         /// Boxed owned payload.
         payload: Box<PublishBroadcastContentPayload>,
         /// Oneshot reply channel. See [`PublishBroadcastReply`].
         reply: PublishBroadcastReply,
-    },
-
-    /// Phase 1 of the two-phase publish path (ADR-049
-    /// §SequenceReservation). Reserve the broadcast sequence and return
-    /// the signing-payload digest. Custody-free — the caller signs
-    /// outside the actor. Routed through the per-context actor mailbox.
-    ReserveBroadcastPublish {
-        /// Boxed owned payload.
-        payload: Box<ReserveBroadcastPublishPayload>,
-        /// Oneshot reply channel. See [`ReserveBroadcastPublishReply`].
-        reply: ReserveBroadcastPublishReply,
-    },
-
-    /// Phase 2 of the two-phase publish path. Seal the reserved sequence
-    /// with the caller-produced signature, emit the event, send on the
-    /// transport, and append to the event log. Custody-free. Routed
-    /// through the per-context actor mailbox.
-    ApplyBroadcastPublish {
-        /// Boxed owned payload.
-        payload: Box<ApplyBroadcastPublishPayload>,
-        /// Oneshot reply channel. See [`PublishBroadcastReply`].
-        reply: PublishBroadcastReply,
-    },
-
-    /// Abort a two-phase publish whose apply will never arrive (signing
-    /// failed, or the caller is aborting). Releases the reserved sequence
-    /// so it is not burned. Custody-free. Routed through the per-context
-    /// actor mailbox.
-    ReleaseBroadcastReservation {
-        /// Boxed owned payload.
-        payload: Box<ReleaseBroadcastReservationPayload>,
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
     /// Block a subscriber from receiving future broadcasts from a
@@ -2015,7 +1857,7 @@ pub struct CreateGovernanceCheckpointPayload {
 
 /// Payload for [`TrustRecoveryCommand::RecoverySendNotification`].
 /// Boxed so the outer variant payload stays pointer-sized. Owns the
-/// payload bytes and the signing key so the command can cross the
+/// payload bytes and the signer so the command can cross the
 /// actor mailbox without lifetime juggling.
 pub struct RecoverySendNotificationPayload {
     /// Context identifier string.
@@ -2028,9 +1870,9 @@ pub struct RecoverySendNotificationPayload {
     /// revocation, 2 = key-package rotation, 3 = PSK rotation, 4 =
     /// contact notification — see spec §9.12).
     pub sequence: u64,
-    /// Sender's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
-    /// the private key zeroes on drop.
-    pub signing_key: SigningKeyBytes,
+    /// The sender's signer; the notification envelope is signed through it
+    /// in the handler's turn.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
 /// Payload for [`TrustRecoveryCommand::RecoveryNotifyContact`]. Boxed
@@ -2042,8 +1884,9 @@ pub struct RecoveryNotifyContactPayload {
     pub contact_did: String,
     /// Opaque recovery-notification payload bytes.
     pub payload: Vec<u8>,
-    /// Recovering DID's signing key (zeroized on drop).
-    pub signing_key: SigningKeyBytes,
+    /// The recovering DID's signer; the notification is signed through it
+    /// in the handler's turn.
+    pub signer: crate::context::actor::signer::CommandSigner,
 }
 
 /// See [`ContextCommand::TrustRecovery`]. Real variants land in commit
@@ -2363,8 +2206,7 @@ pub enum PushCommand {
 /// cross the actor mailbox. The cross-context saga itself is wired (§6.2.4,
 /// reached via
 /// [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga), whose
-/// borrowed (non-`'static`) [`SagaSigningKeys`](crate::context::supervisor::SagaSigningKeys)
-/// keep it off the `'static` mailbox); what remains
+/// generic executor closure keeps it off the `'static` mailbox); what remains
 /// deferred is its FFI export, pending per-participant-set saga gating
 /// (ADR-049 §3a).
 ///
@@ -2882,6 +2724,16 @@ pub enum QueriesCommand {
         reply: oneshot::Sender<
             Result<Option<scp_protocol::context::params::ContextParams>, ContextError>,
         >,
+    },
+    /// The context's live capability requirements (spec §8.10, the
+    /// Class-S governance field `ModifyCapabilityRequirements` sets).
+    /// Hard-error on an unknown context: an admission check that read an
+    /// empty list for a context it could not reach would admit everyone.
+    GetCapabilityRequirements {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<scp_protocol::trust::CapabilityRequirements, ContextError>>,
     },
     /// The context's stored relay set (§5.12.3.1 `relay_urls`,
     /// `PerContextState::relay_urls`).
@@ -3607,7 +3459,7 @@ pub enum SagaPhaseMessage {
     /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::CrossContextOutletReceipt)
     /// over the
     /// staged `recorded_nonce` / `recorded_chain_depth` / `recorded_timestamp_ms`
-    /// plus `output_hash` plus the event id using `target_signing_key`, Class-S
+    /// plus `output_hash` plus the event id through `target_signer`, Class-S
     /// sync-persists fail-closed, and replies the receipt + output bytes. A
     /// replayed `CommitBSettle` (output already captured) re-emits the stored
     /// bytes verbatim and does NOT re-append or re-sign.
@@ -3618,12 +3470,11 @@ pub enum SagaPhaseMessage {
         /// supervisor-side between reserve and settle). Hashed into the
         /// receipt's `output_hash` and carried as the receipt's JCS output.
         output_bytes: Vec<u8>,
-        /// The target context's Active Signing Key (§6.2.4 receipt signing).
-        /// The actor holds NO signing key (ADR-049): the FSM resolves the key
-        /// authorized for `target_context_id` and passes it per-call, exactly
-        /// like [`MessagingCommand::SendHeartbeat`] /
-        /// [`MessagingCommand::BuildLocalCheckpoint`]. Zeroizes on drop.
-        target_signing_key: SigningKeyBytes,
+        /// The signer for the target context's Active Signing Key (§6.2.4
+        /// receipt signing). The actor holds no key (ADR-049): the FSM passes
+        /// the signer authorized for `target_context_id` per call, and the
+        /// receipt is signed through it inside the turn (Decision 7a).
+        target_signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel. See [`CommitBSettleReply`].
         reply: CommitBSettleReply,
     },
@@ -3715,10 +3566,10 @@ pub enum SagaPhaseMessage {
         /// marker leaf is byte-identical across honest members (§9.9.3), never a
         /// per-member actor-local clock read.
         committed_timestamp_secs: u64,
-        /// The local (emitting) side's Active Signing Key. The actor holds no
-        /// key (ADR-049); the FSM passes the key authorized for this context
-        /// per-call. Zeroizes on drop.
-        signing_key: SigningKeyBytes,
+        /// The signer for the local (emitting) side's Active Signing Key. The
+        /// actor holds no key (ADR-049); the FSM passes the signer authorized
+        /// for this context per call (Decision 7a).
+        signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
@@ -3783,11 +3634,10 @@ pub enum SagaPhaseMessage {
         /// the cancel-ack billing boundary because the seal task never pushes an
         /// above-ceiling chunk (the pump drops them before emission).
         cancel_ack_seq: Option<u64>,
-        /// The target context's Active Signing Key (§6.2.5 receipt signing). The
-        /// actor holds NO signing key (ADR-049): the FSM resolves the key
-        /// authorized for `target_context_id` and passes it per-call. Zeroizes on
-        /// drop.
-        target_signing_key: SigningKeyBytes,
+        /// The signer for the target context's Active Signing Key (§6.2.5
+        /// receipt signing). The actor holds no key (ADR-049): the FSM passes
+        /// the signer authorized for `target_context_id` per call (Decision 7a).
+        target_signer: crate::context::actor::signer::CommandSigner,
         /// Oneshot reply channel. See [`CommitBStreamSettleReply`].
         reply: CommitBStreamSettleReply,
     },

@@ -214,6 +214,7 @@ private fun buildContextParams(
         economicPolicy = null,
         consequenceRulesJson = null,
         consequenceConfigJson = null,
+        capabilityRequirementsJson = null,
         pseudonymRotation = null
     )
 

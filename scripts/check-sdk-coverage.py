@@ -217,6 +217,11 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["governanceExecute"],
         "swift": ["executeGovernanceAction"],
     },
+    # The TypeScript wrapper keeps the napi export's `context` prefix; the
+    # domain-prefixed form matches the other three SDKs.
+    ("Governance", "modify_capability_requirements"): {
+        "typescript": ["contextGovernanceModifyCapabilityRequirements"],
+    },
     ("Governance", "propose_action"): {
         "python": ["propose_governance_action", "governance_propose"],
         "typescript": ["proposeGovernanceAction", "contextGovernancePropose"],
@@ -741,11 +746,17 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["trustVerifyAttestation"],
         "swift": ["trustVerifyAttestation"],
     },
-    ("Trust", "trust_verify_response"): {
-        "python": ["trust_verify_response"],
-        "typescript": ["trustVerifyResponse"],
-        "kotlin": ["trustVerifyResponse"],
-        "swift": ["trustVerifyResponse"],
+    ("Trust", "trust_respond_to_challenge"): {
+        "python": ["trust_respond_to_challenge"],
+        "typescript": ["trustRespondToChallenge"],
+        "kotlin": ["trustRespondToChallenge"],
+        "swift": ["trustRespondToChallenge"],
+    },
+    ("Trust", "trust_grade_response"): {
+        "python": ["trust_grade_response"],
+        "typescript": ["trustGradeResponse"],
+        "kotlin": ["trustGradeResponse"],
+        "swift": ["trustGradeResponse"],
     },
     # Discovery -- bare/different names across SDKs
     ("Discovery", "parse_address"): {

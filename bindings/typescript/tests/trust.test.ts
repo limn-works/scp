@@ -19,7 +19,10 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { UcanPermissionError } from "../src/errors";
+import type { Context } from "../src/context";
+import { IdentityError, UcanPermissionError, ValidationError } from "../src/errors";
+import { Identity } from "../src/identity";
+import type { SCP } from "../src/scp";
 import type {
   AttestorInfo,
   CachedAttestation,
@@ -30,11 +33,31 @@ import type {
   ChallengeResponse,
   ChallengeVerification,
   EventLogEntry,
+  ExpectedOutput,
   ParticipationProfile,
   RequireParticipation,
+  TestCase,
   ThresholdRequirement,
 } from "../src/types";
 import {
+  ADMISSION_REQUIREMENT_UNMET_CODE,
+  ATTEMPT_OUT_OF_ORDER_CODE,
+  CAPABILITY_DEFINITION_UNAVAILABLE_CODE,
+  CHALLENGE_CLOSED_CODE,
+  CHALLENGE_EXPIRED_CODE,
+  CHALLENGE_NOT_OPEN_CODE,
+  CHALLENGE_NOT_YET_GRADABLE_CODE,
+  CHALLENGE_SUITE_BELOW_MINIMUM_CODE,
+  CHALLENGE_WINDOW_OPEN_CODE,
+  COOLDOWN_ACTIVE_CODE,
+  DEFINITION_EQUIVOCATION_CODE,
+  DID_RESOLUTION_FAILED_CODE,
+  decodeCaseResults,
+  decodeChallengeRequest,
+  decodeChallengeResponse,
+  decodeChallengeVerification,
+  EMPTY_SUBJECT_DID_CODE,
+  EVALUATOR_UNAVAILABLE_CODE,
   encodeAttestation,
   encodeAttestorSets,
   encodeCapabilityRequirements,
@@ -45,7 +68,29 @@ import {
   encodeMerkleRoot,
   encodeParticipationProfile,
   encodeRequireParticipation,
+  encodeTestCases,
+  encodeTestOutputs,
   encodeThresholdRequirements,
+  GRADING_CAPACITY_EXHAUSTED_CODE,
+  GRADING_IN_PROGRESS_CODE,
+  GRADING_LEASE_LOST_CODE,
+  INVALID_REQUIREMENT_CODE,
+  isRetryable,
+  JSON_SCHEMA_VALIDATION_FAILED_CODE,
+  MALFORMED_AGENT_CAPABILITIES_CODE,
+  MALFORMED_CHALLENGE_VERIFICATIONS_CODE,
+  NON_CANONICAL_IDENTIFIER_CODE,
+  OUTPUTS_MISMATCH_CODE,
+  POLICY_OUTSIDE_DEFINITION_CODE,
+  RESPONSE_TOO_LARGE_CODE,
+  RETRIES_EXHAUSTED_CODE,
+  retryAfter,
+  SCHEMA_REJECTED_CODE,
+  SELF_CHALLENGE_CODE,
+  STANDARD_NOT_GRADABLE_CODE,
+  TOO_MANY_CAPABILITY_REQUIREMENTS_CODE,
+  UNKNOWN_CHALLENGE_CODE,
+  UNTRUSTED_VERIFIER_CODE,
 } from "../src/types";
 import { createMockNativeScp, mockContext, mountMockScp } from "./mock-bridge";
 
@@ -614,36 +659,26 @@ describe("scp.checkCapabilityRequirements — capability admission (§7.3.4.4)",
     cleanup = undefined;
   });
 
-  it("serializes typed inputs to the serde wire shape before crossing FFI", async () => {
+  it("passes no requirements: the bridge reads them from the context's governance", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
     native.__stub("checkCapabilityRequirements", () => undefined);
 
-    const requirements: readonly CapabilityRequirement[] = [
-      { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
-    ];
-    const capabilities: readonly string[] = ["scp:capability:schema-validation/v1"];
-
-    const result = scp.checkCapabilityRequirements(
+    const records = [makeRecord()];
+    const result = await scp.checkCapabilityRequirements(
       "ctx-1",
       "did:dht:subject",
-      requirements,
-      capabilities,
-      [],
+      ["scp:capability:schema-validation/v1"],
+      records,
     );
     expect(result).toBeUndefined();
 
-    // The native bridge receives snake_cased JSON strings, not the typed
-    // objects — the SDK serializes internally (ADR-058).
     const call = native.__lastCall("checkCapabilityRequirements");
     expect(call?.args).toEqual([
       "ctx-1",
       "did:dht:subject",
-      JSON.stringify([
-        { capability: "scp:capability:schema-validation/v1", verification_level: "SelfAttested" },
-      ]),
       JSON.stringify(["scp:capability:schema-validation/v1"]),
-      "[]",
+      encodeChallengeVerifications(records),
     ]);
   });
 
@@ -654,9 +689,9 @@ describe("scp.checkCapabilityRequirements — capability admission (§7.3.4.4)",
       throw new Error("missing required capability");
     });
 
-    expect(() => scp.checkCapabilityRequirements("ctx-1", "did:dht:subject", [], [], [])).toThrow(
-      "missing required capability",
-    );
+    await expect(
+      scp.checkCapabilityRequirements("ctx-1", "did:dht:subject", [], []),
+    ).rejects.toThrow("missing required capability");
   });
 });
 
@@ -742,13 +777,153 @@ function makeProfile(overrides: Partial<ParticipationProfile> = {}): Participati
   };
 }
 
+describe("typed capability requirements at the SCP boundary", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  const SCHEMA = "scp:capability:schema-validation/v1";
+  const typed: readonly CapabilityRequirement[] = [
+    { kind: "ChallengeVerified", capability: SCHEMA, trustedVerifiers: ["did:dht:zVerifier"] },
+  ];
+
+  it("contextCreate sends the typed requirements to the bridge in their wire form", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const creator = mockIdentity(scp, "did:dht:zCreator");
+    await scp
+      .contextCreate(
+        creator,
+        JSON.stringify({ ceiling: ["messages:read"], capabilityRequirements: typed }),
+      )
+      .catch(() => undefined);
+    const sent = JSON.parse(native.__lastCall("contextCreate")?.args[1] as string);
+    expect(sent.ceiling).toEqual(["messages:read"]);
+    expect(sent.capabilityRequirements).toBe(encodeCapabilityRequirements(typed));
+
+    // Params without requirements reach the bridge unchanged.
+    const plain = JSON.stringify({ ceiling: ["messages:read"] });
+    await scp.contextCreate(creator, plain).catch(() => undefined);
+    expect(native.__lastCall("contextCreate")?.args[1]).toBe(plain);
+  });
+
+  it("contextCreate replaces only the requirements and keeps every other params byte", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const creator = mockIdentity(scp, "did:dht:zCreator");
+    // 2^53 + 1 does not survive a JSON.parse round trip; a nested
+    // `capabilityRequirements` key is not the params field and stays as written.
+    const head =
+      '{ "ceiling": ["messages:read"], "limit": 9007199254740993,\n  "capabilityRequirements" : ';
+    const tail = ', "extra": { "capabilityRequirements": 1, "n": -12345678901234567890e0 } }';
+    await scp
+      .contextCreate(creator, `${head}${JSON.stringify(typed)}${tail}`)
+      .catch(() => undefined);
+    expect(native.__lastCall("contextCreate")?.args[1]).toBe(
+      `${head}${JSON.stringify(encodeCapabilityRequirements(typed))}${tail}`,
+    );
+
+    // A key spelled with an escape is the same field, as JSON.parse reads it.
+    const escaped =
+      '{"capabilityRequirement\\u0073":' + JSON.stringify(typed) + ',"big":18446744073709551615}';
+    await scp.contextCreate(creator, escaped).catch(() => undefined);
+    expect(native.__lastCall("contextCreate")?.args[1]).toBe(
+      `{"capabilityRequirement\\u0073":${JSON.stringify(encodeCapabilityRequirements(typed))},"big":18446744073709551615}`,
+    );
+  });
+
+  it("contextCreate refuses requirements that are not a typed list with no bridge call", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const creator = mockIdentity(scp, "did:dht:zCreator");
+    const cases: [unknown, string][] = [
+      [encodeCapabilityRequirements(typed), "SCP-VALID-7001"],
+      [JSON.parse(encodeCapabilityRequirements(typed)), "SCP-VALID-7001"],
+      [
+        [{ kind: "ChallengeVerified", capability: SCHEMA, trustedVerifiers: [] }],
+        INVALID_REQUIREMENT_CODE,
+      ],
+    ];
+    for (const [capabilityRequirements, code] of cases) {
+      const refused = await scp
+        .contextCreate(
+          creator,
+          JSON.stringify({ ceiling: ["messages:read"], capabilityRequirements }),
+        )
+        .catch((e: unknown) => e);
+      expect(refused).toBeInstanceOf(ValidationError);
+      expect((refused as ValidationError).code).toBe(code);
+    }
+    expect(native.__calls("contextCreate")).toHaveLength(0);
+  });
+
+  it("contextGovernanceModifyCapabilityRequirements sends the wire form and the proposer", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const ok = JSON.stringify({ status: "Approved", execution_result: "Executed" });
+    native.__stub("contextGovernanceModifyCapabilityRequirements", async () => ok);
+    const context = mockContext(scp);
+    expect(
+      await scp.contextGovernanceModifyCapabilityRequirements(context, typed, "did:dht:zA"),
+    ).toBe(ok);
+    const args = native.__lastCall("contextGovernanceModifyCapabilityRequirements")?.args;
+    expect(args?.slice(1)).toEqual([encodeCapabilityRequirements(typed), "did:dht:zA"]);
+
+    const refused = await scp
+      .contextGovernanceModifyCapabilityRequirements(
+        context,
+        [{ kind: "ChallengeVerified", capability: SCHEMA, trustedVerifiers: [] } as never],
+        "did:dht:zA",
+      )
+      .catch((e: unknown) => e);
+    expect((refused as ValidationError).code).toBe(INVALID_REQUIREMENT_CODE);
+    expect(native.__calls("contextGovernanceModifyCapabilityRequirements")).toHaveLength(1);
+  });
+});
+
 describe("encodeCapabilityRequirements", () => {
-  it("emits `capability` + `verification_level` bare-string fields", () => {
+  /** Runs `call` and returns the ValidationError it threw. */
+  function refusal(call: () => unknown): ValidationError {
+    try {
+      call();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ValidationError);
+      return err as ValidationError;
+    }
+    throw new Error("expected a ValidationError, got none");
+  }
+
+  it("emits a SelfAttested requirement with empty verifiers and no cap", () => {
+    const parsed = JSON.parse(
+      encodeCapabilityRequirements([
+        { kind: "SelfAttested", capability: "scp:capability:schema-validation/v1" },
+      ]),
+    );
+    expect(parsed).toEqual([
+      {
+        capability: "scp:capability:schema-validation/v1",
+        verification_level: "SelfAttested",
+        trusted_verifiers: [],
+        retry_cap: null,
+      },
+    ]);
+  });
+
+  it("emits a ChallengeVerified requirement's verifiers and retry cap", () => {
     const parsed = JSON.parse(
       encodeCapabilityRequirements([
         {
+          kind: "ChallengeVerified",
           capability: "scp:capability:schema-validation/v1",
-          verificationLevel: "ChallengeVerified",
+          trustedVerifiers: ["did:dht:zVerifier"],
+          retryCap: { maxRetries: 1, minCooldownSecs: 600 },
+        },
+        {
+          kind: "ChallengeVerified",
+          capability: "scp:capability:multilingual/v1",
+          trustedVerifiers: ["did:dht:zA", "did:dht:zB"],
         },
       ]),
     );
@@ -756,8 +931,73 @@ describe("encodeCapabilityRequirements", () => {
       {
         capability: "scp:capability:schema-validation/v1",
         verification_level: "ChallengeVerified",
+        trusted_verifiers: ["did:dht:zVerifier"],
+        retry_cap: { max_retries: 1, min_cooldown_secs: 600 },
+      },
+      {
+        capability: "scp:capability:multilingual/v1",
+        verification_level: "ChallengeVerified",
+        trusted_verifiers: ["did:dht:zA", "did:dht:zB"],
+        retry_cap: null,
       },
     ]);
+  });
+
+  it("a ChallengeVerified requirement with no trusted verifier fails with SCP-VALID-7150", () => {
+    const empty = {
+      kind: "ChallengeVerified",
+      capability: "scp:capability:schema-validation/v1",
+      // @ts-expect-error: trustedVerifiers is a non-empty tuple, so [] does not compile.
+      trustedVerifiers: [],
+    } satisfies CapabilityRequirement;
+    expect(INVALID_REQUIREMENT_CODE).toBe("SCP-VALID-7150");
+    expect(refusal(() => encodeCapabilityRequirements([empty])).code).toBe(
+      INVALID_REQUIREMENT_CODE,
+    );
+  });
+
+  it("a SelfAttested requirement that names verifiers or a retry cap fails with SCP-VALID-7150", () => {
+    for (const extra of [
+      { trustedVerifiers: ["did:dht:zVerifier"] },
+      { retryCap: { maxRetries: 0, minCooldownSecs: 0 } },
+    ]) {
+      const requirement = {
+        kind: "SelfAttested",
+        capability: "scp:capability:schema-validation/v1",
+        ...extra,
+      };
+      expect(refusal(() => encodeCapabilityRequirements([requirement])).code).toBe(
+        INVALID_REQUIREMENT_CODE,
+      );
+    }
+  });
+
+  it("refuses an untyped or malformed entry with SCP-VALID-7001 before any bridge call", () => {
+    for (const entry of [
+      // The snake_case wire form is not the typed requirement.
+      {
+        capability: "scp:capability:schema-validation/v1",
+        verification_level: "SelfAttested",
+        trusted_verifiers: [],
+        retry_cap: null,
+      },
+      { kind: "Other", capability: "scp:capability:schema-validation/v1" },
+      { kind: "SelfAttested", capability: 7 },
+      "scp:capability:schema-validation/v1",
+      {
+        kind: "ChallengeVerified",
+        capability: "scp:capability:schema-validation/v1",
+        trustedVerifiers: [7],
+      },
+      {
+        kind: "ChallengeVerified",
+        capability: "scp:capability:schema-validation/v1",
+        trustedVerifiers: ["did:dht:zVerifier"],
+        retryCap: { maxRetries: -1, minCooldownSecs: 600 },
+      },
+    ]) {
+      expect(refusal(() => encodeCapabilityRequirements([entry])).code).toBe("SCP-VALID-7001");
+    }
   });
 
   it("Layer 2 — non-context error propagates instead of swallowing to null", async () => {
@@ -836,75 +1076,104 @@ describe("encodeParticipationProfile", () => {
   });
 });
 
-describe("encodeChallengeVerifications", () => {
-  const base: ChallengeVerification = {
-    verificationId: "bridge-test-challenge",
-    verifierDid: "did:dht:zVerifier",
-    subjectDid: "did:dht:zResponder",
-    capabilityUri: "scp:capability:prompt-injection-resistance/v1",
-    challengeType: "scp:capability:prompt-injection-resistance/v1",
-    verificationMethod: {
-      kind: "ChallengeVerified",
-      challengeType: "scp:capability:prompt-injection-resistance/v1",
-    },
+/** The 22-field wire form of a graded record, as the bridge emits it. */
+const recordWire = {
+  verification_id: "ab".repeat(32),
+  verifier: "did:dht:zVerifier",
+  subject: "did:dht:zResponder",
+  capability_uri: "scp:capability:schema-validation/v1",
+  definition_digest: "c8".repeat(32),
+  suite_digest: "cd".repeat(32),
+  challenge_id: "01".repeat(32),
+  attempt: 2,
+  response_digest: "02".repeat(32),
+  max_retries: 2,
+  cooldown_secs: 300,
+  pass_threshold_bps: 9_000,
+  min_category_cases: 0,
+  passed: true,
+  score: 9_500,
+  test_count: 20,
+  pass_count: 19,
+  challenge_created_at: 1_699_999_000,
+  challenge_expires_at: 1_700_003_600,
+  timestamp: 1_700_000_000,
+  expires_at: 1_700_086_400,
+  context_id: "ctx-admission",
+  verifier_signature: Array.from({ length: 64 }, () => 9),
+};
+
+/** The typed form of `recordWire`, with `overrides` applied. */
+function makeRecord(overrides: Partial<ChallengeVerification> = {}): ChallengeVerification {
+  return {
+    verificationId: "ab".repeat(32),
+    verifier: "did:dht:zVerifier",
+    subject: "did:dht:zResponder",
+    capabilityUri: "scp:capability:schema-validation/v1",
+    definitionDigest: "c8".repeat(32),
+    suiteDigest: "cd".repeat(32),
+    challengeId: "01".repeat(32),
+    attempt: 2,
+    responseDigest: "02".repeat(32),
+    maxRetries: 2,
+    cooldownSecs: 300,
+    passThresholdBps: 9_000,
+    minCategoryCases: 0,
     passed: true,
-    testCount: 1,
-    passCount: 1,
-    result: true,
-    completedAt: 1_700_000_000,
-    verifiedAt: 1_700_000_000,
-    expiresAt: 4_000_000_000,
-    verifierSignature: Array.from({ length: 64 }, () => 9),
-    score: null,
+    score: 9_500,
+    testCount: 20,
+    passCount: 19,
+    challengeCreatedAt: 1_699_999_000,
+    challengeExpiresAt: 1_700_003_600,
+    timestamp: 1_700_000_000,
+    expiresAt: 1_700_086_400,
     contextId: "ctx-admission",
+    verifierSignature: Array.from({ length: 64 }, () => 9),
+    ...overrides,
   };
+}
 
-  it("emits the full 16-field snake_case record with a tagged verification_method", () => {
-    const parsed = JSON.parse(encodeChallengeVerifications([base]));
-    expect(parsed).toEqual([
-      {
-        verification_id: "bridge-test-challenge",
-        verifier_did: "did:dht:zVerifier",
-        subject_did: "did:dht:zResponder",
-        capability_uri: "scp:capability:prompt-injection-resistance/v1",
-        challenge_type: "scp:capability:prompt-injection-resistance/v1",
-        verification_method: {
-          ChallengeVerified: {
-            challenge_type: "scp:capability:prompt-injection-resistance/v1",
-          },
-        },
-        passed: true,
-        score: null,
-        test_count: 1,
-        pass_count: 1,
-        result: true,
-        completed_at: 1_700_000_000,
-        verified_at: 1_700_000_000,
-        expires_at: 4_000_000_000,
-        context_id: "ctx-admission",
-        verifier_signature: Array.from({ length: 64 }, () => 9),
-      },
-    ]);
+describe("encodeChallengeVerifications / decodeChallengeVerification", () => {
+  it("emits every field in snake_case and nothing else", () => {
+    expect(JSON.parse(encodeChallengeVerifications([makeRecord()]))).toEqual([recordWire]);
+    expect(Object.keys(recordWire)).toHaveLength(23);
   });
 
-  it("encodes a SelfAttested verification_method as the bare variant string", () => {
-    const parsed = JSON.parse(
-      encodeChallengeVerifications([{ ...base, verificationMethod: { kind: "SelfAttested" } }]),
-    );
-    expect(parsed[0].verification_method).toBe("SelfAttested");
+  it("decodes the bridge record back to the typed record", () => {
+    expect(decodeChallengeVerification(JSON.stringify(recordWire))).toEqual(makeRecord());
   });
 
-  it("defaults absent `score`/`contextId` to null", () => {
-    const { score: _s, contextId: _c, ...withoutOptionals } = base;
-    const parsed = JSON.parse(encodeChallengeVerifications([withoutOptionals]));
-    expect(parsed[0].score).toBeNull();
-    expect(parsed[0].context_id).toBeNull();
-  });
-
-  it("rejects a wrong-length verifierSignature before any bridge call", () => {
+  it("decode rejects a non-hex id, a score above 10000, a short signature and a missing field", () => {
     expect(() =>
-      encodeChallengeVerifications([{ ...base, verifierSignature: Array(63).fill(9) }]),
+      decodeChallengeVerification(
+        JSON.stringify({ ...recordWire, verification_id: "AB".repeat(32) }),
+      ),
+    ).toThrow("ChallengeVerification.verification_id must be 64 lowercase hex characters");
+    expect(() =>
+      decodeChallengeVerification(JSON.stringify({ ...recordWire, score: 10_001 })),
+    ).toThrow("ChallengeVerification.score must be an integer in [0, 10000]");
+    expect(
+      decodeChallengeVerification(JSON.stringify({ ...recordWire, score: 10_000 })).score,
+    ).toBe(10_000);
+    expect(() =>
+      decodeChallengeVerification(JSON.stringify({ ...recordWire, verifier_signature: [1, 2] })),
+    ).toThrow("ChallengeVerification.verifier_signature must be exactly 64 byte values");
+    const { attempt: _attempt, ...withoutAttempt } = recordWire;
+    expect(() => decodeChallengeVerification(JSON.stringify(withoutAttempt))).toThrow(
+      "ChallengeVerification.attempt must be an integer",
+    );
+  });
+
+  it("rejects a wrong-length signature or a non-hex digest before any bridge call", () => {
+    expect(() =>
+      encodeChallengeVerifications([makeRecord({ verifierSignature: Array(63).fill(9) })]),
     ).toThrow("ChallengeVerification.verifierSignature must be exactly 64 elements, got 63");
+    expect(() => encodeChallengeVerifications([makeRecord({ suiteDigest: "cd" })])).toThrow(
+      "ChallengeVerification.suiteDigest must be 64 lowercase hex characters",
+    );
+    expect(() => encodeChallengeVerifications([makeRecord({ responseDigest: "02" })])).toThrow(
+      "ChallengeVerification.responseDigest must be 64 lowercase hex characters",
+    );
   });
 });
 
@@ -1071,26 +1340,9 @@ describe("scp.aggregateTrustInput — typed trust-aggregation inputs (§7.3)", (
 
     const events = [makeEventLogEntry()];
     const merkleRoot = Array.from({ length: 32 }, () => 7);
-    const challengeResults: readonly ChallengeVerification[] = [
-      {
-        verificationId: "v-1",
-        verifierDid: "did:dht:zVerifier",
-        subjectDid: "did:dht:subject",
-        capabilityUri: "scp:capability:schema-validation/v1",
-        challengeType: "scp:capability:schema-validation/v1",
-        verificationMethod: { kind: "SelfAttested" },
-        passed: true,
-        testCount: 1,
-        passCount: 1,
-        result: true,
-        completedAt: 1_700_000_000,
-        verifiedAt: 1_700_000_000,
-        expiresAt: 4_000_000_000,
-        verifierSignature: Array.from({ length: 64 }, () => 9),
-      },
-    ];
+    const challengeResults: readonly ChallengeVerification[] = [makeRecord()];
 
-    const result = scp.aggregateTrustInput(
+    const result = await scp.aggregateTrustInput(
       "ctx-1",
       "did:dht:subject",
       events,
@@ -1135,7 +1387,7 @@ describe("scp.aggregateTrustInput — typed trust-aggregation inputs (§7.3)", (
     cleanup = () => scp.shutdown(0);
     native.__stub("aggregateTrustInput", () => "{}");
 
-    scp.aggregateTrustInput(
+    await scp.aggregateTrustInput(
       "ctx-1",
       "did:dht:subject",
       [],
@@ -1171,17 +1423,46 @@ const attestationEnvelope: CachedAttestationEnvelope = {
   signature: Array.from({ length: 64 }, () => 3),
 };
 
+const SCHEMA_URI = "scp:capability:schema-validation/v1";
+
+/** `n` exact-match cases whose weights sum to 10000. */
+function makeTestCases(n: number): TestCase[] {
+  const weight = Math.floor(10_000 / n);
+  return Array.from({ length: n }, (_, i) => ({
+    testId: `t${i}`,
+    input: { i },
+    expected: { kind: "ExactMatch", value: { ok: true } },
+    category: "basic",
+    weight: i === 0 ? 10_000 - weight * (n - 1) : weight,
+  }));
+}
+
+/** An SDK `Identity` over a mock bridge handle for `did`. */
+function mockIdentity(scp: SCP, did: string): Identity {
+  return Identity._fromHandle(scp, { did, custodyType: "in_memory" });
+}
+
 /** A structurally-valid ChallengeRequest with a real 64-byte signature. */
 function makeChallengeRequest(overrides: Partial<ChallengeRequest> = {}): ChallengeRequest {
   return {
-    challengeId: "chal-1",
-    challengeType: "scp:capability:schema-validation/v1",
-    challengerDid: "did:dht:challenger",
-    subjectDid: "did:dht:subject",
-    capabilityUri: "scp:capability:schema-validation/v1",
-    parameters: { schema: "object" },
-    timeout: { secs: 300, nanos: 0 },
-    signature: Array.from({ length: 64 }, () => 8),
+    challengeId: "ab".repeat(32),
+    capabilityUri: SCHEMA_URI,
+    definitionDigest: "c8".repeat(32),
+    testCases: makeTestCases(20).map((c) => ({
+      testId: c.testId,
+      input: c.input,
+      category: c.category,
+      weight: c.weight,
+    })),
+    createdAt: 1_700_000_000,
+    expiresAt: 1_700_003_600,
+    maxRetries: 2,
+    cooldownSecs: 300,
+    passThresholdBps: 9_000,
+    contextId: "ctx-1",
+    verifier: "did:dht:verifier",
+    subject: "did:dht:subject",
+    verifierSignature: Array.from({ length: 64 }, () => 8),
     ...overrides,
   };
 }
@@ -1189,11 +1470,12 @@ function makeChallengeRequest(overrides: Partial<ChallengeRequest> = {}): Challe
 /** A structurally-valid ChallengeResponse with a real 64-byte signature. */
 function makeChallengeResponse(overrides: Partial<ChallengeResponse> = {}): ChallengeResponse {
   return {
-    challengeId: "chal-1",
-    responderDid: "did:dht:subject",
-    result: { passed: true },
-    completedAt: 1_700_000_100,
-    signature: Array.from({ length: 64 }, () => 4),
+    challengeId: "ab".repeat(32),
+    requestDigest: "5e".repeat(32),
+    subject: "did:dht:subject",
+    attempt: 1,
+    outputs: [{ testId: "t0", output: { ok: true } }],
+    subjectSignature: Array.from({ length: 64 }, () => 4),
     ...overrides,
   };
 }
@@ -1213,46 +1495,125 @@ describe("encodeAttestation", () => {
   });
 });
 
-describe("encodeChallengeRequest", () => {
-  it("emits the full 8-field snake_case record with a Duration timeout", () => {
-    expect(JSON.parse(encodeChallengeRequest(makeChallengeRequest()))).toEqual({
-      challenge_id: "chal-1",
-      challenge_type: "scp:capability:schema-validation/v1",
-      challenger_did: "did:dht:challenger",
-      subject_did: "did:dht:subject",
-      capability_uri: "scp:capability:schema-validation/v1",
-      parameters: { schema: "object" },
-      timeout: { secs: 300, nanos: 0 },
-      signature: Array.from({ length: 64 }, () => 8),
+describe("encodeChallengeRequest / decodeChallengeRequest / encodeTestCases", () => {
+  it("emits the 13-field snake_case request whose cases carry no answers", () => {
+    const encoded = JSON.parse(encodeChallengeRequest(makeChallengeRequest()));
+    expect(Object.keys(encoded).sort()).toEqual([
+      "capability_uri",
+      "challenge_id",
+      "context_id",
+      "cooldown_secs",
+      "created_at",
+      "definition_digest",
+      "expires_at",
+      "max_retries",
+      "pass_threshold_bps",
+      "subject",
+      "test_cases",
+      "verifier",
+      "verifier_signature",
+    ]);
+    expect(encoded.test_cases[1]).toEqual({
+      test_id: "t1",
+      input: { i: 1 },
+      category: "basic",
+      weight: 500,
     });
   });
 
-  it("rejects a wrong-length signature before any bridge call", () => {
-    expect(() => encodeChallengeRequest(makeChallengeRequest({ signature: [1, 2, 3] }))).toThrow(
-      "ChallengeRequest.signature must be exactly 64 elements, got 3",
+  it("decodes the request back to the typed request", () => {
+    const request = makeChallengeRequest();
+    expect(decodeChallengeRequest(encodeChallengeRequest(request))).toEqual(request);
+  });
+
+  it("encodes every ExpectedOutput variant externally tagged", () => {
+    const variants: [ExpectedOutput, unknown][] = [
+      [{ kind: "ExactMatch", value: [1, "a"] }, { ExactMatch: { value: [1, "a"] } }],
+      [
+        { kind: "SchemaMatch", schema: { type: "object" } },
+        { SchemaMatch: { schema: { type: "object" } } },
+      ],
+      [{ kind: "ContainsAll", required: ["a", "b"] }, { ContainsAll: { required: ["a", "b"] } }],
+      [{ kind: "ContainsNone", forbidden: ["x"] }, { ContainsNone: { forbidden: ["x"] } }],
+      [
+        { kind: "CustomEval", evaluatorOutletId: "o-1", evaluatorContextId: "ctx-eval" },
+        { CustomEval: { evaluator_outlet_id: "o-1" } },
+      ],
+    ];
+    for (const [expected, wire] of variants) {
+      const testCases: TestCase[] = [
+        { testId: "t", input: null, expected, category: "c", weight: 10_000 },
+      ];
+      expect(JSON.parse(encodeTestCases(testCases))[0]).toEqual({
+        test_id: "t",
+        input: null,
+        expected: wire,
+        category: "c",
+        weight: 10_000,
+      });
+    }
+  });
+
+  it("rejects a wrong-length signature or a non-hex id before any bridge call", () => {
+    expect(() =>
+      encodeChallengeRequest(makeChallengeRequest({ verifierSignature: [1, 2, 3] })),
+    ).toThrow("ChallengeRequest.verifierSignature must be exactly 64 elements, got 3");
+    expect(() => encodeChallengeRequest(makeChallengeRequest({ challengeId: "chal-1" }))).toThrow(
+      "ChallengeRequest.challengeId must be 64 lowercase hex characters",
+    );
+  });
+
+  it("decode refuses a case with no weight", () => {
+    const wire = JSON.parse(encodeChallengeRequest(makeChallengeRequest()));
+    delete wire.test_cases[0].weight;
+    expect(() => decodeChallengeRequest(JSON.stringify(wire))).toThrow(
+      "ChallengeCase.weight must be an integer",
     );
   });
 });
 
-describe("encodeChallengeResponse", () => {
-  it("emits the full 5-field snake_case record", () => {
-    expect(JSON.parse(encodeChallengeResponse(makeChallengeResponse()))).toEqual({
-      challenge_id: "chal-1",
-      responder_did: "did:dht:subject",
-      result: { passed: true },
-      completed_at: 1_700_000_100,
-      signature: Array.from({ length: 64 }, () => 4),
+describe("encodeChallengeResponse / decodeChallengeResponse / decodeCaseResults", () => {
+  it("emits the 6-field snake_case response and decodes it back", () => {
+    const response = makeChallengeResponse();
+    expect(JSON.parse(encodeChallengeResponse(response))).toEqual({
+      challenge_id: "ab".repeat(32),
+      request_digest: "5e".repeat(32),
+      subject: "did:dht:subject",
+      attempt: 1,
+      outputs: [{ test_id: "t0", output: { ok: true } }],
+      subject_signature: Array.from({ length: 64 }, () => 4),
     });
+    expect(decodeChallengeResponse(encodeChallengeResponse(response))).toEqual(response);
   });
 
-  it("rejects a wrong-length signature before any bridge call", () => {
+  it("rejects a wrong-length signature or a negative attempt before any bridge call", () => {
     expect(() =>
-      encodeChallengeResponse(makeChallengeResponse({ signature: Array(63).fill(4) })),
-    ).toThrow("ChallengeResponse.signature must be exactly 64 elements, got 63");
+      encodeChallengeResponse(makeChallengeResponse({ subjectSignature: Array(63).fill(4) })),
+    ).toThrow("ChallengeResponse.subjectSignature must be exactly 64 elements, got 63");
+    expect(() => encodeChallengeResponse(makeChallengeResponse({ attempt: -1 }))).toThrow(
+      "ChallengeResponse.attempt must be an integer",
+    );
+  });
+
+  it("decodes case results, with an absent reason as null", () => {
+    expect(
+      decodeCaseResults(
+        JSON.stringify([
+          { passed: true, reason: null },
+          { passed: false, reason: "no" },
+        ]),
+      ),
+    ).toEqual([
+      { passed: true, reason: null },
+      { passed: false, reason: "no" },
+    ]);
+    expect(() => decodeCaseResults(JSON.stringify([{ reason: null }]))).toThrow(
+      "CaseResult.passed must be a boolean",
+    );
   });
 });
 
-describe("scp.trustVerifyAttestation / scp.trustVerifyResponse — typed challenge inputs", () => {
+describe("scp.trustCreateChallenge / trustRespondToChallenge / trustGradeResponse — typed inputs", () => {
   let cleanup: (() => Promise<void>) | undefined;
   afterEach(async () => {
     await cleanup?.();
@@ -1268,25 +1629,288 @@ describe("scp.trustVerifyAttestation / scp.trustVerifyResponse — typed challen
       errorMessage: "unresolvable issuer",
     }));
 
-    scp.trustVerifyAttestation("ctx-1", attestationEnvelope);
+    await scp.trustVerifyAttestation("ctx-1", attestationEnvelope);
     const call = native.__lastCall("trustVerifyAttestation");
     expect(call?.args).toEqual(["ctx-1", encodeAttestation(attestationEnvelope)]);
   });
 
-  it("serializes the typed challenge request and response before crossing FFI", async () => {
+  it("trustCreateChallenge passes the config's fields and decodes the request", async () => {
     const { scp, native } = mountMockScp();
     cleanup = () => scp.shutdown(0);
-    native.__stub("trustVerifyResponse", () => false);
+    const request = makeChallengeRequest();
+    native.__stub("trustCreateChallenge", async () => ({
+      challengeId: request.challengeId,
+      requestJson: encodeChallengeRequest(request),
+    }));
 
-    const challenge = makeChallengeRequest();
+    const verifier = mockIdentity(scp, "did:dht:v");
+    const testCases = makeTestCases(20);
+    const created = await scp.trustCreateChallenge({
+      verifier,
+      subject: "did:dht:s",
+      capabilityUri: SCHEMA_URI,
+      testCases,
+      contextId: "ctx-1",
+      windowSecs: 3_600,
+      policy: { maxRetries: 1, cooldownSecs: 600 },
+    });
+    expect(created).toEqual(request);
+    expect(native.__lastCall("trustCreateChallenge")?.args).toEqual([
+      "did:dht:v",
+      "did:dht:s",
+      SCHEMA_URI,
+      encodeTestCases(testCases),
+      "ctx-1",
+      3_600,
+      undefined,
+      { maxRetries: 1, cooldownSecs: 600 },
+    ]);
+
+    // A policy may name either field alone; an absent field takes the
+    // definition's value.
+    await scp.trustCreateChallenge({
+      verifier,
+      subject: "did:dht:s",
+      capabilityUri: SCHEMA_URI,
+      testCases,
+      contextId: "ctx-1",
+      windowSecs: 60,
+      policy: { cooldownSecs: 900 },
+    });
+    expect(native.__lastCall("trustCreateChallenge")?.args.slice(4)).toEqual([
+      "ctx-1",
+      60,
+      undefined,
+      { cooldownSecs: 900 },
+    ]);
+  });
+
+  it("trustCreateChallenge lifts the CustomEval cases' one evaluator context to the bridge", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const request = makeChallengeRequest();
+    native.__stub("trustCreateChallenge", async () => ({
+      challengeId: request.challengeId,
+      requestJson: encodeChallengeRequest(request),
+    }));
+    const custom = (testId: string, evaluatorContextId: string): TestCase => ({
+      testId,
+      input: null,
+      expected: { kind: "CustomEval", evaluatorOutletId: "o-1", evaluatorContextId },
+      category: "c",
+      weight: 5_000,
+    });
+    const config = {
+      verifier: mockIdentity(scp, "did:dht:v"),
+      subject: "did:dht:s",
+      capabilityUri: SCHEMA_URI,
+      contextId: "ctx-1",
+      windowSecs: 60,
+    };
+
+    await scp.trustCreateChallenge({
+      ...config,
+      testCases: [custom("a", "ctx-eval"), custom("b", "ctx-eval")],
+    });
+    expect(native.__lastCall("trustCreateChallenge")?.args[6]).toBe("ctx-eval");
+
+    const calls = native.__calls("trustCreateChallenge").length;
+    for (const testCases of [
+      [custom("a", "ctx-eval"), custom("b", "ctx-other")],
+      [custom("a", "")],
+    ]) {
+      const refused = await scp
+        .trustCreateChallenge({ ...config, testCases })
+        .catch((e: unknown) => e);
+      expect(refused).toBeInstanceOf(ValidationError);
+      expect((refused as ValidationError).code).toBe("SCP-VALID-7001");
+    }
+    expect(native.__calls("trustCreateChallenge")).toHaveLength(calls);
+  });
+
+  it("the signing operations refuse a signer that is not an SDK Identity with SCP-VALID-7005", async () => {
+    const { scp } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    const did = "did:dht:v" as unknown as Identity;
+    const refusals = [
+      scp.trustCreateChallenge({
+        verifier: did,
+        subject: "did:dht:s",
+        capabilityUri: SCHEMA_URI,
+        testCases: makeTestCases(20),
+        contextId: "ctx-1",
+        windowSecs: 60,
+      }),
+      scp.trustRespondToChallenge(did, makeChallengeRequest(), [], 1),
+      scp.trustGradeResponse(did, makeChallengeRequest(), makeChallengeResponse()),
+    ];
+    for (const refusal of refusals) {
+      await expect(refusal).rejects.toBeInstanceOf(ValidationError);
+      await expect(refusal).rejects.toMatchObject({ code: "SCP-VALID-7005" });
+    }
+  });
+
+  it("trustRespondToChallenge serializes the request and outputs and decodes the response", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
     const response = makeChallengeResponse();
-    const result = scp.trustVerifyResponse(challenge, response);
-    expect(result).toBe(false);
+    native.__stub("trustRespondToChallenge", async () => encodeChallengeResponse(response));
 
-    const call = native.__lastCall("trustVerifyResponse");
-    expect(call?.args).toEqual([
-      encodeChallengeRequest(challenge),
+    const request = makeChallengeRequest();
+    const outputs = [{ testId: "t0", output: { ok: true } }];
+    expect(
+      await scp.trustRespondToChallenge(mockIdentity(scp, "did:dht:subject"), request, outputs, 1),
+    ).toEqual(response);
+    expect(native.__lastCall("trustRespondToChallenge")?.args).toEqual([
+      "did:dht:subject",
+      encodeChallengeRequest(request),
+      encodeTestOutputs(outputs),
+      1,
+    ]);
+  });
+
+  it("trustGradeResponse serializes both records and decodes the record and case results", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    native.__stub("trustGradeResponse", async () => ({
+      recordJson: JSON.stringify(recordWire),
+      reasonsJson: JSON.stringify([{ passed: false, reason: "mismatch" }]),
+      trustStoreError: { code: "SCP-VALID-7003", message: "disk full" },
+    }));
+
+    const request = makeChallengeRequest();
+    const response = makeChallengeResponse();
+    const graded = await scp.trustGradeResponse(
+      mockIdentity(scp, "did:dht:verifier"),
+      request,
+      response,
+    );
+    expect(graded).toEqual({
+      record: makeRecord(),
+      caseResults: [{ passed: false, reason: "mismatch" }],
+      trustStoreError: { code: "SCP-VALID-7003", message: "disk full" },
+    });
+    expect(native.__lastCall("trustGradeResponse")?.args).toEqual([
+      "did:dht:verifier",
+      encodeChallengeRequest(request),
       encodeChallengeResponse(response),
     ]);
+  });
+
+  it("a bridge refusal keeps its code through each operation", async () => {
+    const { scp, native } = mountMockScp();
+    cleanup = () => scp.shutdown(0);
+    for (const code of CHALLENGE_CODES) {
+      native.__stub("trustGradeResponse", () => {
+        throw new Error(`[${code}] refused`);
+      });
+      const refusal = scp.trustGradeResponse(
+        mockIdentity(scp, "did:dht:v"),
+        makeChallengeRequest(),
+        makeChallengeResponse(),
+      );
+      // SCP-IDENT-1033 is an identity failure; every other code a validation one.
+      await expect(refusal).rejects.toBeInstanceOf(
+        code.startsWith("SCP-IDENT-") ? IdentityError : ValidationError,
+      );
+      await expect(refusal).rejects.toMatchObject({ code });
+    }
+  });
+});
+
+/** Every challenge and admission code constant, with its Rust variant's code. */
+const CHALLENGE_CODE_VALUES: readonly [string, string][] = [
+  [DID_RESOLUTION_FAILED_CODE, "SCP-IDENT-1033"],
+  [JSON_SCHEMA_VALIDATION_FAILED_CODE, "SCP-VALID-7003"],
+  [MALFORMED_AGENT_CAPABILITIES_CODE, "SCP-VALID-7074"],
+  [MALFORMED_CHALLENGE_VERIFICATIONS_CODE, "SCP-VALID-7075"],
+  [ADMISSION_REQUIREMENT_UNMET_CODE, "SCP-VALID-7076"],
+  [EMPTY_SUBJECT_DID_CODE, "SCP-VALID-7077"],
+  [UNTRUSTED_VERIFIER_CODE, "SCP-VALID-7121"],
+  [CHALLENGE_SUITE_BELOW_MINIMUM_CODE, "SCP-VALID-7039"],
+  [CHALLENGE_NOT_OPEN_CODE, "SCP-VALID-7099"],
+  [CHALLENGE_EXPIRED_CODE, "SCP-VALID-7102"],
+  [ATTEMPT_OUT_OF_ORDER_CODE, "SCP-VALID-7103"],
+  [RETRIES_EXHAUSTED_CODE, "SCP-VALID-7104"],
+  [COOLDOWN_ACTIVE_CODE, "SCP-VALID-7105"],
+  [CHALLENGE_CLOSED_CODE, "SCP-VALID-7106"],
+  [UNKNOWN_CHALLENGE_CODE, "SCP-VALID-7107"],
+  [OUTPUTS_MISMATCH_CODE, "SCP-VALID-7108"],
+  [EVALUATOR_UNAVAILABLE_CODE, "SCP-VALID-7109"],
+  [SELF_CHALLENGE_CODE, "SCP-VALID-7127"],
+  [STANDARD_NOT_GRADABLE_CODE, "SCP-VALID-7128"],
+  [CAPABILITY_DEFINITION_UNAVAILABLE_CODE, "SCP-VALID-7129"],
+  [POLICY_OUTSIDE_DEFINITION_CODE, "SCP-VALID-7137"],
+  [SCHEMA_REJECTED_CODE, "SCP-VALID-7138"],
+  [GRADING_IN_PROGRESS_CODE, "SCP-VALID-7139"],
+  [RESPONSE_TOO_LARGE_CODE, "SCP-VALID-7143"],
+  [DEFINITION_EQUIVOCATION_CODE, "SCP-VALID-7144"],
+  [GRADING_CAPACITY_EXHAUSTED_CODE, "SCP-VALID-7146"],
+  [NON_CANONICAL_IDENTIFIER_CODE, "SCP-VALID-7147"],
+  [TOO_MANY_CAPABILITY_REQUIREMENTS_CODE, "SCP-VALID-7148"],
+  [GRADING_LEASE_LOST_CODE, "SCP-VALID-7149"],
+  [INVALID_REQUIREMENT_CODE, "SCP-VALID-7150"],
+  [CHALLENGE_WINDOW_OPEN_CODE, "SCP-VALID-7151"],
+  [CHALLENGE_NOT_YET_GRADABLE_CODE, "SCP-VALID-7153"],
+];
+
+const CHALLENGE_CODES: readonly string[] = CHALLENGE_CODE_VALUES.map(([code]) => code);
+
+describe("challenge codes, isRetryable and retryAfter", () => {
+  it("each constant names its Rust variant's code", () => {
+    for (const [constant, value] of CHALLENGE_CODE_VALUES) {
+      expect(constant).toBe(value);
+    }
+    expect(new Set(CHALLENGE_CODES).size).toBe(32);
+  });
+
+  it("isRetryable is true for exactly the seven retry-later codes", () => {
+    const retryable = new Set([
+      "SCP-VALID-7099",
+      "SCP-VALID-7105",
+      "SCP-VALID-7139",
+      "SCP-VALID-7146",
+      "SCP-VALID-7149",
+      "SCP-VALID-7151",
+      "SCP-VALID-7153",
+    ]);
+    for (const code of CHALLENGE_CODES) {
+      expect([code, isRetryable(code)]).toEqual([code, retryable.has(code)]);
+    }
+    for (const code of ["SCP-VALID-7076", "SCP-VALID-7003", "SCP-VALID-7121", ""]) {
+      expect(isRetryable(code)).toBe(false);
+    }
+  });
+
+  it("retryAfter reads the (retry_after=N) suffix and is null without one", () => {
+    const cooldown = "challenge ab: cooldown active, retry at 1700000600 (retry_after=1700000600)";
+    expect(retryAfter(new ValidationError(cooldown, COOLDOWN_ACTIVE_CODE))).toBe(1_700_000_600);
+    expect(retryAfter(cooldown)).toBe(1_700_000_600);
+    expect(retryAfter(new Error("challenge ab: closed"))).toBeNull();
+    expect(retryAfter("challenge ab: closed")).toBeNull();
+    expect(retryAfter("retry_after=5 without parentheses")).toBeNull();
+    expect(retryAfter(42)).toBeNull();
+    expect(retryAfter(null)).toBeNull();
+  });
+
+  it("retryAfter reads the suffix of a bridge refusal mapped to a ValidationError", async () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("trustGradeResponse", () => {
+      throw new Error(
+        `[${COOLDOWN_ACTIVE_CODE}] trust evaluation failed: cooldown active (retry_after=1700000900)`,
+      );
+    });
+    const refused = await scp
+      .trustGradeResponse(
+        mockIdentity(scp, "did:dht:v"),
+        makeChallengeRequest(),
+        makeChallengeResponse(),
+      )
+      .catch((e: unknown) => e);
+    expect(refused).toBeInstanceOf(ValidationError);
+    expect((refused as ValidationError).code).toBe(COOLDOWN_ACTIVE_CODE);
+    expect(isRetryable((refused as ValidationError).code)).toBe(true);
+    expect(retryAfter(refused)).toBe(1_700_000_900);
+    await scp.shutdown(0);
   });
 });

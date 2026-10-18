@@ -1,12 +1,14 @@
 //! Shared relay and application node startup code for FFI bridges.
 //!
-//! Provides [`RunningRelay`] for standalone relay startup and
-//! [`start_node_in_memory`] / [`start_node_local`] for full application node
-//! startup. Both bind with sensible defaults and expose bound addresses for
-//! FFI consumers. All functions bind to `127.0.0.1:0` (OS-assigned port) so
-//! tests can run in parallel without port conflicts.
+//! Provides [`RunningRelay`] for standalone relay startup, [`node_start`] for
+//! production node startup from an `SCP` instance, and the development pair
+//! `start_node_in_memory` / `start_node_local`, which compile only under
+//! `test` or `feature = "testing"` (a bridge built without its own `testing`
+//! feature returns [`ServerError::DevStartUnavailable`] from its dev-pair
+//! exports). The relay and dev-pair starts bind `127.0.0.1:0` (OS-assigned
+//! port) so tests can run in parallel without port conflicts.
 //!
-//! [`start_node_local`] does not select or open a protocol-storage backend.
+//! `start_node_local` does not select or open a protocol-storage backend.
 //! A caller selected one when it constructed its bridge instance
 //! (`SCP.with_storage({...})` → `StorageConfig::InMemory` or
 //! `StorageConfig::Sqlite`), and passes that same handle here, so a node's
@@ -16,7 +18,7 @@
 //!
 //! Gated behind the `server` feature.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
@@ -26,7 +28,8 @@ use scp_did::DidDocument;
 use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
 use scp_node::{
-    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, NodeError, Reach, TlsMode,
+    DhtMode, ExplicitIdentity, IdentitySource, NatSlot, Node, NodeConfig, NodeError, Reach,
+    TlsMode, bound_relay_ws_url,
 };
 use scp_platform::EncryptedStorage;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
@@ -34,18 +37,14 @@ use scp_platform::file::FileKeyCustody;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::sqlite::SqliteStorage;
 
-use crate::bridge_instance::{CoreFields, InstanceBorrower};
+use crate::bridge_instance::{CoreFields, InstanceBorrower, NodeBinding};
 use crate::dht::{DhtInitError, FfiDhtClient};
 use crate::node_start_config::{
     FfiBlobBackend, FfiCorsOrigins, FfiDhtMode, FfiNat, FfiReach, FfiTlsMode, NodeStartConfig,
 };
-// `ClientDhtConfig` is only referenced by the production (non-test) fail-closed
-// node DHT client in `start_node_local`; the test-harness build uses the
-// in-memory double instead, so the import would otherwise be unused.
-#[cfg(not(any(test, feature = "testing")))]
-use crate::dht::ClientDhtConfig;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorageBackend, StorageError};
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -65,8 +64,8 @@ pub type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>;
 /// the identity, its DID document, and a configured DID method instance
 /// with signing capability.
 ///
-/// When `Some(NodeIdentity)` is passed to [`start_node_in_memory`] or
-/// [`start_node_local`], the node uses this identity instead of generating
+/// When `Some(NodeIdentity)` is passed to `start_node_in_memory` or
+/// `start_node_local`, the node uses this identity instead of generating
 /// a fresh one. This enables identity portability — the same DID persists
 /// across node restarts and can be shared across FFI bridge instances.
 pub struct NodeIdentity {
@@ -119,10 +118,13 @@ pub enum ServerError {
     #[error("DHT init error: {0}")]
     DhtInit(#[from] DhtInitError),
 
-    /// A node identity auto-generation was requested on a shipped build, where
-    /// the in-memory test-harness node is not compiled (fail-closed; ADR-062).
-    #[error("auto-generated in-memory node identity is unavailable in this build")]
-    AutoGenerateUnavailable,
+    /// A dev-pair constructor (`node_start_in_memory`, `node_start_local`) was
+    /// called on a bridge built without its `testing` feature. The dev pair is
+    /// for development only, so a shipped bridge keeps the exported symbols and
+    /// returns this error from each (sdk-common.md §"Node start error codes",
+    /// `SCP-TRANS-5055`); `node_start` is the production entry.
+    #[error("development node start is unavailable in this build; use node_start")]
+    DevStartUnavailable,
 
     /// A [`NodeStartConfig`](crate::node_start_config::NodeStartConfig) failed
     /// to parse or failed a field check in [`node_start`]. The message names the
@@ -134,6 +136,34 @@ pub enum ServerError {
     /// the bridge resolved from this `SCP` instance.
     #[error("operator identity is not available to the node")]
     OperatorIdentityUnavailable,
+
+    /// The node started, but the bridge could not wire the `SCP` instance's
+    /// `Supervisor` to it. [`wire_supervisor_to_node`] shut the node down and
+    /// removed it from the instance's node registry before returning this
+    /// error (sdk-common.md §"Node start error codes", `SCP-TRANS-5056`).
+    #[error("supervisor wiring failed: {0}")]
+    SupervisorWiring(#[from] SupervisorWiringError),
+}
+
+/// The step at which [`wire_supervisor_to_node`] failed to wire an `SCP`
+/// instance's `Supervisor` to a node it started.
+#[derive(Debug, thiserror::Error)]
+pub enum SupervisorWiringError {
+    /// Another node of this instance is running and holds the `Supervisor`'s
+    /// transport binding. One node at a time binds an instance's transport.
+    #[error("another running node holds this instance's Supervisor transport")]
+    NodeAlreadyBound,
+    /// The connection to the node's relay failed.
+    #[error("connecting to the node's relay failed: {0}")]
+    RelayConnect(#[from] scp_transport::TransportError),
+    /// After the bridge's attach step, the instance holds no `Supervisor`
+    /// built with providers: the bridge's `Supervisor` build failed.
+    #[error("the bridge could not attach a Supervisor to the instance")]
+    SupervisorUnavailable,
+    /// The instance refused the transport manager for the node's relay,
+    /// because the instance is suspended or its transport lock is poisoned.
+    #[error("installing the node's relay transport failed: {0}")]
+    TransportInstall(#[from] crate::bridge_instance::TransportLockError),
 }
 
 impl ServerError {
@@ -154,14 +184,40 @@ impl ServerError {
                 "passphrase required for persistent node identity".to_owned()
             }
             Self::DhtInit(_) => "DHT client initialization failed".to_owned(),
-            Self::AutoGenerateUnavailable => {
-                "auto-generated in-memory node identity is unavailable in this build".to_owned()
+            Self::DevStartUnavailable => {
+                "development node start is unavailable in this build; use node_start".to_owned()
             }
             // The message names a field and a rule, never a path or an OS error.
             Self::InvalidConfig(msg) => format!("invalid node start config: {msg}"),
             Self::OperatorIdentityUnavailable => {
                 "operator identity is not available to the node".to_owned()
             }
+            Self::SupervisorWiring(step) => {
+                format!(
+                    "wiring the Supervisor to the node failed: {}",
+                    step.user_message()
+                )
+            }
+        }
+    }
+}
+
+impl SupervisorWiringError {
+    /// Returns a sanitized message that names the failed wiring step, so a
+    /// caller can tell `NodeAlreadyBound` from `RelayConnect` under the one
+    /// `SCP-TRANS-5056` code. The message carries no inner transport or lock
+    /// error, because a transport error can name a relay address.
+    #[must_use]
+    pub const fn user_message(&self) -> &'static str {
+        match self {
+            Self::NodeAlreadyBound => {
+                "another running node holds this instance's Supervisor transport"
+            }
+            Self::RelayConnect(_) => "connecting to the node's relay failed",
+            Self::SupervisorUnavailable => {
+                "the bridge could not attach a Supervisor to the instance"
+            }
+            Self::TransportInstall(_) => "installing the node's relay transport failed",
         }
     }
 }
@@ -266,41 +322,30 @@ impl RunningRelay {
     }
 }
 
-/// Builds a [`RelayConfig`] bound to `127.0.0.1:0` with zero delivery jitter
-/// (suitable for testing — deterministic timing).
-fn test_relay_config() -> RelayConfig {
-    RelayConfig {
-        bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-        delivery_jitter_ms: 0,
-        ..RelayConfig::default()
-    }
-}
-
-/// Builds the in-process WebSocket URL of a relay bound at `addr`.
+/// Starts a test relay on an OS-assigned loopback port, with zero delivery
+/// jitter (deterministic timing), and returns a [`RunningRelay`].
 ///
-/// The URL carries the bound address itself, so a relay bound to `::1` or to a
-/// LAN address is reached where it listens. An unspecified bind (`0.0.0.0` or
-/// `::`) listens on every interface but is not a connectable destination, so it
-/// maps to the loopback address of the same family. `SocketAddr`'s `Display`
-/// brackets an IPv6 host.
-fn bound_relay_ws_url(mut addr: SocketAddr) -> String {
-    if addr.ip().is_unspecified() {
-        addr.set_ip(match addr.ip() {
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        });
-    }
-    format!("ws://{addr}/scp/v1")
-}
-
-/// Starts a relay and returns a [`RunningRelay`] from the given config and storage.
-async fn start_relay_with(
-    config: RelayConfig,
-    storage: BlobStorageBackend,
-) -> Result<RunningRelay, ServerError> {
+/// The listener is bound first so the relay's URL names the real port from the
+/// relay's first connection: the relay reserves the push routing ID of exactly
+/// the URL [`RunningRelay::relay_url`] returns (§10.7.1 step 2), and answers a
+/// PUBLISH there with `4063` instead of storing it.
+async fn start_relay_with(storage: BlobStorageBackend) -> Result<RunningRelay, ServerError> {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .map_err(|e| RelayError::BindFailed(e.to_string()))?;
+    let relay_url = bound_relay_ws_url(
+        listener
+            .local_addr()
+            .map_err(|e| RelayError::BindFailed(e.to_string()))?,
+    );
+    let config = RelayConfig {
+        delivery_jitter_ms: 0,
+        ..RelayConfig::defaults(LiveRelayUrl::new(
+            RelayUrl::new(&relay_url).map_err(RelayError::from)?,
+        ))
+    };
     let server = RelayServer::new(config, Arc::new(storage));
-    let (handle, addr) = server.start().await?;
-    let relay_url = bound_relay_ws_url(addr);
+    let (handle, addr) = server.start_with_listener(listener).await?;
     Ok(RunningRelay {
         relay_url,
         bound_addr: addr,
@@ -318,7 +363,7 @@ async fn start_relay_with(
 ///
 /// Returns [`ServerError::Relay`] if the relay cannot bind.
 pub async fn start_relay_in_memory() -> Result<RunningRelay, ServerError> {
-    start_relay_with(test_relay_config(), BlobStorageBackend::in_memory()).await
+    start_relay_with(BlobStorageBackend::in_memory()).await
 }
 
 /// Starts a relay with redb-backed blob storage on an OS-assigned port.
@@ -347,26 +392,27 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
     }
     let db_path = data_dir.join("blobs.redb");
     let storage = BlobStorageBackend::redb(&db_path)?;
-    start_relay_with(test_relay_config(), storage).await
+    start_relay_with(storage).await
 }
 
 // ---------------------------------------------------------------------------
 // ApplicationNode startup
 // ---------------------------------------------------------------------------
 
-/// Ephemeral storage backend for [`start_node_in_memory`]: a durability-only
+/// Ephemeral storage backend for `start_node_in_memory`: a durability-only
 /// [`InMemoryStorage`] wrapped in an [`EncryptingAdapter`] under a per-node
 /// `OsRng` AES-256-GCM key.
 ///
 /// That wrap is what makes an ephemeral backend satisfy a sealed
-/// `EncryptedStorage` bound, so this shipped `server`-feature front door goes
-/// through a production [`Node::start`] constructor rather than
+/// `EncryptedStorage` bound, so `start_node_in_memory` (a `testing`-only front
+/// door since SCP-327) goes through a production [`Node::start`] constructor
+/// rather than
 /// `Node::start_for_testing`. Spec §17.5 names this pattern canonical, and
 /// it already appears in
 /// [`build_event_log_provider`](crate::bridge_runtime::build_event_log_provider).
 /// A bridge instance that selected in-memory storage holds
 /// `Arc<EncryptedInMemoryStorage>`, so a node built here and a node built by
-/// [`start_node_local`] on such an instance carry one `ApplicationNode` type and
+/// `start_node_local` on such an instance carry one `ApplicationNode` type and
 /// land in one [`RunningNode`] variant.
 ///
 /// **Do not copy this key lifetime onto a durable backend.** A per-node `OsRng`
@@ -385,15 +431,19 @@ pub type EncryptedInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
 /// `EncryptedStorage` bound. Nothing on this path reaches
 /// `Node::start_for_testing`.
 ///
-/// When `identity` is `None` (auto-generate): available ONLY in a `testing`
-/// build via a test-harness `ApplicationNode::dev` (in-memory key custody and
-/// an [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
-/// network; its storage is that same encrypted in-memory backend). A shipped
-/// (no-`testing`) build FAILS CLOSED with
-/// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
-/// node (ADR-062 §Decision 1/6); production callers pass an explicit
-/// `Some(NodeIdentity)`. Self-signed TLS (localhost); relay bound to
-/// `127.0.0.1:0` (OS-assigned port).
+/// **Development only.** Alec ruled on 2026-08-10: "start local/start in mem
+/// are for dev. all sdks still expose. we cut them from prod." This body
+/// compiles only under `test` or `feature = "testing"`. Each bridge keeps its
+/// exported `node_start_in_memory` symbol and, built without its own `testing`
+/// feature, returns [`ServerError::DevStartUnavailable`] (`SCP-TRANS-5055`)
+/// without calling here. Production callers use [`node_start`].
+///
+/// When `identity` is `None` (auto-generate), the node is a test-harness
+/// `ApplicationNode::dev` (in-memory key custody and an
+/// [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
+/// network; its storage is that same encrypted in-memory backend).
+/// Self-signed TLS (localhost); relay bound to `127.0.0.1:0` (OS-assigned
+/// port).
 ///
 /// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
 /// identity instead of generating a fresh one. This enables identity
@@ -405,7 +455,7 @@ pub type EncryptedInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
 /// cache, credentials — that its database never receives and that process exit
 /// discards, while that instance's supervisor, event log, and saga journal keep
 /// writing to `SQLCipher`. A caller wanting one backend for both calls
-/// [`start_node_local`] instead; this front door exists for callers who want an
+/// `start_node_local` instead; this front door exists for callers who want an
 /// ephemeral node whatever their instance holds.
 ///
 /// The relay is started during construction. The HTTP server is **not** started;
@@ -415,18 +465,14 @@ pub type EncryptedInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
 ///
 /// Returns [`ServerError::Node`] if relay binding, identity generation, or TLS
 /// provisioning fails.
+#[cfg(any(test, feature = "testing"))]
 pub async fn start_node_in_memory(
     identity: Option<NodeIdentity>,
 ) -> Result<scp_node::ApplicationNode<Arc<EncryptedInMemoryStorage>>, ServerError> {
     let node = match identity {
         // Auto-generate uses the test-harness `ApplicationNode::dev` (in-memory
         // DHT nullifier), compiled only under `testing` (ADR-062 §Decision 1).
-        // A shipped build fails closed rather than running a nullifier-backed
-        // node; callers pass an explicit `Some(NodeIdentity)` in production.
-        #[cfg(any(test, feature = "testing"))]
         None => scp_node::ApplicationNode::dev(0).await?,
-        #[cfg(not(any(test, feature = "testing")))]
-        None => return Err(ServerError::AutoGenerateUnavailable),
         Some(id) => {
             // Migrated to the ADR-052 flat-config front door (Phase B-P2).
             // The dropped explicit `SelfSignedTlsProvider::new("localhost")` is
@@ -453,8 +499,9 @@ pub async fn start_node_in_memory(
                     },
                     // `Explicit` carries no custody, so `K` is unconstrained by
                     // the variant; annotate it to a production custody type
-                    // (`FileKeyCustody`) so no test-only nullifier type appears
-                    // on this shipped `server`-feature path (ADR-062 §Decision 6).
+                    // (`FileKeyCustody`) so a caller-supplied identity runs on
+                    // no test-only nullifier type (ADR-062 §Decision 6). This
+                    // path compiles only under `test` or `testing` (SCP-327).
                     IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
                         ExplicitIdentity {
                             identity: id.identity,
@@ -484,7 +531,7 @@ pub async fn start_node_in_memory(
 
 /// Logs a warning when `data_dir` holds a `storage/` subdirectory.
 ///
-/// Earlier revisions of [`start_node_local`] opened a plaintext
+/// Earlier revisions of `start_node_local` opened a plaintext
 /// `FilesystemStorage` there. This revision reads no such directory, so one left
 /// behind by an earlier run is plaintext protocol state that no code path opens
 /// and no upgrade converts. Silence would make an operator believe their
@@ -493,6 +540,7 @@ pub async fn start_node_in_memory(
 ///
 /// A warning rather than an error: `storage/` is an ordinary directory name, and
 /// refusing to start would break a caller who put something unrelated there.
+#[cfg(any(test, feature = "testing"))]
 fn warn_on_stale_plaintext_store(data_dir: &Path) {
     let stale = data_dir.join("storage");
     if stale.is_dir() {
@@ -508,7 +556,7 @@ fn warn_on_stale_plaintext_store(data_dir: &Path) {
 
 /// Logs a warning when `data_dir` grants group or other any access on Unix.
 ///
-/// [`start_node_local`] creates `data_dir` at mode `0o700`, and that mode
+/// `start_node_local` creates `data_dir` at mode `0o700`, and that mode
 /// applies only to a directory this call creates. When `data_dir` already
 /// exists, its existing mode stands, so `blobs.redb` — which carries blob
 /// identifiers, sizes, timestamps, and TTLs in plaintext — can land in a
@@ -517,7 +565,7 @@ fn warn_on_stale_plaintext_store(data_dir: &Path) {
 ///
 /// A warning rather than a `chmod`: tightening a directory a caller created
 /// could break an operator who deliberately shares it with a backup account.
-#[cfg(unix)]
+#[cfg(all(unix, any(test, feature = "testing")))]
 fn warn_on_permissive_data_dir(data_dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -540,10 +588,18 @@ fn warn_on_permissive_data_dir(data_dir: &Path) {
 ///
 /// Windows expresses directory access through ACLs rather than through a mode
 /// word, so a mode check has nothing to read there.
-#[cfg(not(unix))]
+#[cfg(all(not(unix), any(test, feature = "testing")))]
 const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
 
 /// Starts a full application node on a caller's own protocol-storage handle.
+///
+/// **Development only**, like `start_node_in_memory`: this body, and with it
+/// the [`FileKeyCustody`] at `<data_dir>/identity.key` that the no-identity
+/// arm builds, compiles only under `test` or `feature = "testing"`. A bridge
+/// built without its own `testing` feature returns
+/// [`ServerError::DevStartUnavailable`] (`SCP-TRANS-5055`) from its exported
+/// `node_start_local` without calling here. Production callers use
+/// [`node_start`].
 ///
 /// A caller chose its storage backend when it constructed its bridge instance
 /// (`SCP.with_storage({...})` — encrypted in-memory or `SQLCipher`), and passes
@@ -607,7 +663,7 @@ const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
 /// fresh DID per process, because that backend keeps nothing across process
 /// exit; a caller whose instance selected `SQLCipher` keeps its DID.
 ///
-/// For fully ephemeral setups use [`start_node_in_memory`].
+/// For fully ephemeral setups use `start_node_in_memory`.
 ///
 /// # Errors
 ///
@@ -619,6 +675,7 @@ const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
 ///   ([`ServerError::MissingPassphrase`]); this check runs before the data
 ///   directory or any file in it is created
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
+#[cfg(any(test, feature = "testing"))]
 pub async fn start_node_local<S>(
     data_dir: &Path,
     storage: S,
@@ -682,8 +739,9 @@ where
                 },
                 // `Explicit` carries no custody, so `K` is unconstrained by the
                 // variant; annotate it to `FileKeyCustody` (matching the
-                // persisted arm below), so no test-only nullifier type appears on
-                // this shipped `server`-feature path (ADR-062 §Decision 6).
+                // persisted arm below), so a caller-supplied identity runs on no
+                // test-only nullifier type (ADR-062 §Decision 6). This path
+                // compiles only under `test` or `testing` (SCP-327).
                 IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
                     ExplicitIdentity {
                         identity: id.identity,
@@ -716,19 +774,12 @@ where
             .map_err(std::io::Error::from)??,
         );
 
-        // Build the node's DHT client for its DID method. A shipped build uses
-        // the real Mainline Pkarr client, fail-closed (never an in-memory
-        // substitution; ADR-062 §Decision 1) — the node's dht gateways would
-        // thread in here; the local path uses direct Mainline DHT (no gateways).
-        // A test-harness build (`testing`) uses the in-memory §17.17.3 double so
+        // Build the node's DHT client for its DID method: the in-memory
+        // §17.17.3 double, because this body compiles only under `testing`, so
         // the startup publish stays offline instead of timing out against live
         // Mainline. `Node::start` publishes, and fails on a failed publish,
-        // because this call selects `DhtMode::Production` below; it skips the
-        // publish under `DhtMode::Disabled`. The client backs both this node's DID
-        // publication and its `did:dht` resolution.
-        #[cfg(not(any(test, feature = "testing")))]
-        let dht_client = Arc::new(ClientDhtConfig::default().into_client()?);
-        #[cfg(any(test, feature = "testing"))]
+        // because this call selects `DhtMode::Production` below. The client
+        // backs both this node's DID publication and its `did:dht` resolution.
         let dht_client = Arc::new(FfiDhtClient::InMemory(scp_dht::InMemoryDhtClient::new()));
         let cache = Arc::new(DidCache::new());
         let sign_fn = ConcreteDidMethod::make_sign_fn(Arc::clone(&key_custody));
@@ -870,7 +921,7 @@ fn lower_tls(tls: FfiTlsMode) -> Result<TlsMode, ServerError> {
 fn lower_cors(cors: FfiCorsOrigins) -> Result<Option<Vec<String>>, ServerError> {
     match cors {
         FfiCorsOrigins::AnyOrigin {} => Ok(None),
-        FfiCorsOrigins::List { origins } => {
+        FfiCorsOrigins::Allowlist { origins } => {
             for origin in &origins {
                 if origin == "*" {
                     return Err(invalid(
@@ -1098,18 +1149,18 @@ pub async fn node_start(
 /// can hold: an encrypted in-memory handle and a `SQLCipher` handle. Each
 /// mirrors one arm of a bridge's `StorageConfig` selector, so no third arm can
 /// appear here without a matching selector arm a caller can choose.
-/// [`start_node_in_memory`] builds its own encrypted in-memory handle and lands
+/// `start_node_in_memory` builds its own encrypted in-memory handle and lands
 /// in that first variant, because both handles carry one type.
 ///
 /// [`RunningRelay`] established this pattern — shared in `scp-ffi-common` so
 /// each FFI bridge wraps one enum rather than duplicating it and its dispatch
 /// methods.
 pub enum RunningNode {
-    /// An encrypted in-memory handle: either one [`start_node_in_memory`]
-    /// builds for itself, or one [`start_node_local`] receives from a
+    /// An encrypted in-memory handle: either one `start_node_in_memory`
+    /// builds for itself, or one `start_node_local` receives from a
     /// `StorageConfig::InMemory` bridge instance. Both are ephemeral.
     InMemoryEncrypted(scp_node::ApplicationNode<Arc<EncryptedInMemoryStorage>>),
-    /// A caller's `SQLCipher` handle, produced by [`start_node_local`] on a
+    /// A caller's `SQLCipher` handle, produced by `start_node_local` on a
     /// `StorageConfig::Sqlite` bridge instance.
     Sqlite(scp_node::ApplicationNode<Arc<SqliteStorage>>),
 }
@@ -1306,7 +1357,7 @@ impl InstanceBorrower for RunningNode {
 /// Wraps a started node in an [`Arc`] and registers it with `core` as a
 /// borrower of that instance's storage.
 ///
-/// Every bridge node-start path (`node_start_in_memory_*`,
+/// Every bridge node-start path (`node_start_on`, `node_start_in_memory_*`,
 /// `node_start_local_*`, across `PyO3`, NAPI, and `UniFFI`) routes its node
 /// through this one call, so registration is not a step a bridge author can
 /// forget while still obtaining an `Arc<RunningNode>` for its handle type.
@@ -1322,6 +1373,186 @@ pub fn register_node(core: &CoreFields, node: RunningNode) -> Arc<RunningNode> {
     let node = Arc::new(node);
     core.register_borrower(&node);
     node
+}
+
+/// Wires `core`'s `Supervisor` to a started, registered `node`, or stops and
+/// unregisters `node`.
+///
+/// On failure this shuts `node` down, removes it from `core`'s node registry,
+/// and returns [`ServerError::SupervisorWiring`] (construction.md §"Node
+/// start — `NodeStartConfig`").
+///
+/// Every bridge node-start path (`node_start_on`, `node_start_in_memory_*`,
+/// `node_start_local_*` on `PyO3`, napi-rs and `UniFFI`) runs this one wiring
+/// step. Each bridge passes `node.internal_relay_url()` as `relay_url`, and
+/// passes `ensure_supervisor`, the bridge's set-once `Supervisor` init, which
+/// attaches a `Supervisor` with an unconfigured transport when the instance
+/// holds none and does nothing when it holds one.
+///
+/// Steps, in order: refuse when another running node holds the binding;
+/// connect twice to the relay with the node's bearer token, one adapter for
+/// the `Supervisor`'s transport and one for the instance's transport manager,
+/// because an adapter is not `Clone`; call `ensure_supervisor` with the
+/// operator DID; then, holding [`CoreFields::node_binding`], check the binding
+/// again, install the transport manager, bind the `Supervisor`'s
+/// [`TransportSlot`](scp_core::context::supervisor::TransportSlot) to the
+/// node's relay, and record the [`NodeBinding`]; last, register the operator
+/// DID as a local DID. The binding works whichever call attached the
+/// `Supervisor`, and that `Supervisor` keeps the DID its attaching call gave
+/// its MLS factory. No step falls back to a `Supervisor` without relay
+/// transport, and the function returns `Ok` only after its own bind.
+///
+/// # Errors
+///
+/// [`ServerError::SupervisorWiring`] naming the failed step.
+pub async fn wire_supervisor_to_node<E>(
+    core: &CoreFields,
+    node: &Arc<RunningNode>,
+    relay_url: &str,
+    ensure_supervisor: E,
+) -> Result<(), ServerError>
+where
+    E: FnOnce(&str),
+{
+    let Err(e) = wire_steps(core, node, relay_url, ensure_supervisor).await else {
+        return Ok(());
+    };
+    tracing::warn!(error = %e, "node start: Supervisor wiring failed; shutting the node down");
+    node.shutdown();
+    core.unregister_borrower(node);
+    Err(ServerError::SupervisorWiring(e))
+}
+
+/// Stops `node`, and unbinds `core`'s `Supervisor` transport from it when
+/// `node` holds the binding.
+///
+/// Every bridge node handle's `shutdown` and `Drop` call this. The unbind puts
+/// back the transport provider and the transport manager the binding
+/// displaced, so a later node start binds again. When another node holds the
+/// binding, or none does, only the stop happens.
+pub fn stop_node(core: &CoreFields, node: &Arc<RunningNode>) {
+    node.shutdown();
+    let mut binding = core.node_binding();
+    if !binding.as_ref().is_some_and(|b| b.is_for(node)) {
+        return;
+    }
+    if let Some(b) = binding.take() {
+        b.slot.replace(b.displaced_provider);
+        core.restore_transport(&b.manager, b.displaced_manager);
+    }
+}
+
+/// Returns whether `core` is wired to `node` as [`wire_supervisor_to_node`]
+/// leaves it.
+///
+/// Wired means `core`'s binding record names `node`, `core`'s `Supervisor`
+/// holds the recorded transport slot and that slot holds the recorded
+/// relay provider, and `core`'s transport manager holds exactly `node`'s
+/// internal relay URL.
+#[must_use]
+pub fn supervisor_wired_to(core: &CoreFields, node: &Arc<RunningNode>) -> bool {
+    let bound = core.node_binding().as_ref().is_some_and(|b| {
+        b.is_for(node)
+            && b.slot.holds(&b.provider)
+            && core
+                .try_supervisor()
+                .and_then(|s| s.transport_slot())
+                .is_some_and(|slot| Arc::ptr_eq(&slot, &b.slot))
+    });
+    bound
+        && core
+            .with_transport(scp_transport::TransportManager::relay_urls)
+            .is_ok_and(|urls| urls == [node.internal_relay_url()])
+}
+
+/// Returns [`SupervisorWiringError::NodeAlreadyBound`] when `binding` names a
+/// live node.
+fn refuse_live_binding(binding: Option<&NodeBinding>) -> Result<(), SupervisorWiringError> {
+    if binding.is_some_and(NodeBinding::is_live) {
+        return Err(SupervisorWiringError::NodeAlreadyBound);
+    }
+    Ok(())
+}
+
+/// The fallible steps of [`wire_supervisor_to_node`].
+async fn wire_steps<E>(
+    core: &CoreFields,
+    node: &Arc<RunningNode>,
+    relay_url: &str,
+    ensure_supervisor: E,
+) -> Result<(), SupervisorWiringError>
+where
+    E: FnOnce(&str),
+{
+    use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+    refuse_live_binding(core.node_binding().as_ref())?;
+    let sourced = SourcedRelayUrl {
+        url: relay_url.to_owned(),
+        source: RelayUrlSource::Explicit,
+    };
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    // Bearer-authenticated relays are WebSocket-only (spec §10.14.3 item 4);
+    // the selector keeps this connect on the shared selection surface (ADR-037).
+    let selector = core.transport_selector();
+    let supervisor_adapter = selector
+        .select_and_connect_with_bearer(&sourced, Some(node.bridge_token_hex()), Some(&profile))
+        .await?;
+    let manager_adapter = selector
+        .select_and_connect_with_bearer(&sourced, Some(node.bridge_token_hex()), Some(&profile))
+        .await?;
+    ensure_supervisor(node.did());
+    let supervisor = Arc::clone(
+        core.try_supervisor()
+            .ok_or(SupervisorWiringError::SupervisorUnavailable)?,
+    );
+    let slot = supervisor
+        .transport_slot()
+        .ok_or(SupervisorWiringError::SupervisorUnavailable)?;
+    let provider: Arc<dyn scp_core::context::builder::ContextTransportProvider> = Arc::new(
+        scp_transport::RelayTransportProvider::new(supervisor_adapter),
+    );
+    let manager = Arc::new(scp_transport::TransportManager::new(
+        relay_url.to_owned(),
+        manager_adapter,
+    ));
+    {
+        // No `.await` in this block: the record, the manager slot and the
+        // transport slot change together under the binding lock.
+        let mut binding = core.node_binding();
+        refuse_live_binding(binding.as_ref())?;
+        let replaced_manager = core.swap_transport(Arc::clone(&manager))?;
+        let replaced_provider = slot.replace(Arc::clone(&provider));
+        // A stale binding's node stopped without unbinding; the transport it
+        // displaced is the one a stop of this node puts back. A manager over
+        // the stale node's relay URLs is that node's transport, even when a
+        // resume rebuilt it as a new `Arc`.
+        let (displaced_provider, displaced_manager) = match binding.take() {
+            Some(stale) => {
+                let manager_before = match replaced_manager {
+                    Some(m) if !crate::bridge_instance::same_node_transport(&m, &stale.manager) => {
+                        Some(m)
+                    }
+                    _ => stale.displaced_manager,
+                };
+                (stale.displaced_provider, manager_before)
+            }
+            None => (replaced_provider, replaced_manager),
+        };
+        let node_weak: std::sync::Weak<dyn crate::bridge_instance::InstanceBorrower> =
+            Arc::downgrade(node) as _;
+        *binding = Some(NodeBinding {
+            node: node_weak,
+            slot,
+            provider,
+            manager,
+            displaced_provider,
+            displaced_manager,
+        });
+    }
+    supervisor
+        .register_local_did(node.did().to_owned().into())
+        .await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,6 +1738,53 @@ mod tests {
             relay.relay_url()
         );
         assert_ne!(relay.bound_addr().port(), 0, "port should be assigned");
+        relay.shutdown();
+    }
+
+    /// The test relay reserves the push routing ID of the URL it hands to
+    /// clients (§10.7.1 step 2), so a PUBLISH there is answered `4063` and never
+    /// stored as a blob.
+    #[tokio::test]
+    async fn test_relay_reserves_the_push_routing_id_of_its_url() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let relay = start_relay_in_memory().await.unwrap();
+        let routing_id = scp_transport::relay::push_gate::RelayUrl::new(relay.relay_url())
+            .unwrap()
+            .push_routing_id();
+        let (mut ws, _) = tokio_tungstenite::connect_async(relay.relay_url())
+            .await
+            .unwrap();
+        let publish = scp_relay_client::ClientMessage::Publish {
+            ref_id: None,
+            routing_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: vec![1],
+        };
+        ws.send(Message::Binary(publish.to_bytes().unwrap()))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Binary(bytes) = frame else {
+            panic!("expected a binary relay frame, got {frame:?}");
+        };
+        let reply = scp_relay_client::RelayMessage::from_bytes(&bytes).unwrap();
+        assert!(
+            matches!(
+                reply,
+                scp_relay_client::RelayMessage::Err {
+                    code: scp_relay_client::code::PUSH_NOT_SUPPORTED,
+                    ..
+                }
+            ),
+            "expected ERR 4063 PUSH_NOT_SUPPORTED, got {reply:?}"
+        );
         relay.shutdown();
     }
 
@@ -2342,7 +2620,7 @@ mod tests {
             },
             tls: FfiTlsMode::Plaintext {},
             dht: FfiDhtMode::Disabled {},
-            cors_origins: FfiCorsOrigins::List {
+            cors_origins: FfiCorsOrigins::Allowlist {
                 origins: vec!["https://app.example.org".to_owned()],
             },
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -2399,7 +2677,7 @@ mod tests {
             (
                 "wildcard cors entry",
                 |c| {
-                    c.cors_origins = FfiCorsOrigins::List {
+                    c.cors_origins = FfiCorsOrigins::Allowlist {
                         origins: vec!["*".to_owned()],
                     };
                 },
@@ -2517,5 +2795,277 @@ mod tests {
             let addr: SocketAddr = addr.parse().expect("fixture address");
             assert_eq!(bound_relay_ws_url(addr), url);
         }
+    }
+
+    /// Starts an in-memory node and registers it on `core`, as every bridge
+    /// node-start path does before it wires the `Supervisor`.
+    async fn registered_node(core: &CoreFields) -> Arc<RunningNode> {
+        let node = start_node_in_memory(None).await.unwrap();
+        register_node(core, RunningNode::InMemoryEncrypted(node))
+    }
+
+    /// The provider the binding displaced, read from `core`'s record.
+    fn displaced_provider(
+        core: &CoreFields,
+    ) -> Arc<dyn scp_core::context::builder::ContextTransportProvider> {
+        Arc::clone(
+            &core
+                .node_binding()
+                .as_ref()
+                .expect("a wired node leaves a binding record")
+                .displaced_provider,
+        )
+    }
+
+    fn slot_of(core: &CoreFields) -> Arc<scp_core::context::supervisor::TransportSlot> {
+        core.try_supervisor()
+            .and_then(|s| s.transport_slot())
+            .expect("a Supervisor built with providers holds a transport slot")
+    }
+
+    #[tokio::test]
+    async fn wire_binds_a_supervisor_attached_before_the_node_start() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let node = registered_node(&core).await;
+
+        wire_supervisor_to_node(&core, &node, &node.internal_relay_url(), |_| {})
+            .await
+            .expect("a node start binds a Supervisor that an earlier call attached");
+
+        assert!(supervisor_wired_to(&core, &node));
+        assert!(
+            !slot_of(&core).holds(&displaced_provider(&core)),
+            "the Supervisor's transport now reaches the node's relay"
+        );
+        stop_node(&core, &node);
+    }
+
+    /// A `configure_local_transport` that attaches a `Supervisor` after the
+    /// node start's connects and before its attach step wins the set-once
+    /// slot; the start still binds that `Supervisor` to the node's relay
+    /// before it returns `Ok`.
+    #[tokio::test]
+    async fn wire_binds_a_supervisor_attached_by_a_racing_local_transport() {
+        let core = CoreFields::new();
+        let node = registered_node(&core).await;
+
+        wire_supervisor_to_node(&core, &node, &node.internal_relay_url(), |_| {
+            core.set_supervisor(crate::bridge_instance::tests::test_supervisor());
+        })
+        .await
+        .expect("a racing attach leaves a Supervisor the start binds");
+
+        assert!(
+            supervisor_wired_to(&core, &node),
+            "Ok means this start bound the Supervisor's transport to the node's relay"
+        );
+        assert!(!slot_of(&core).holds(&displaced_provider(&core)));
+        stop_node(&core, &node);
+    }
+
+    #[tokio::test]
+    async fn stop_node_restores_displaced_provider_and_manager_and_restart_binds_again() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let first = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &first, &first.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        let displaced = displaced_provider(&core);
+
+        stop_node(&core, &first);
+
+        assert!(first.is_shutdown());
+        assert!(core.node_binding().is_none(), "a stop clears the binding");
+        assert!(
+            slot_of(&core).holds(&displaced),
+            "a stop puts back the provider the start displaced"
+        );
+        assert_eq!(
+            core.with_transport(|_| ()),
+            Err(crate::bridge_instance::TransportLockError::NotInitialized),
+            "a stop puts back the instance's empty transport manager"
+        );
+        assert!(!supervisor_wired_to(&core, &first));
+
+        let second = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &second, &second.internal_relay_url(), |_| {})
+            .await
+            .expect("a start after a stop binds again");
+        assert!(supervisor_wired_to(&core, &second));
+        stop_node(&core, &second);
+        assert!(slot_of(&core).holds(&displaced));
+    }
+
+    #[tokio::test]
+    async fn wire_fails_closed_while_a_running_node_holds_the_binding() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let first = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &first, &first.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        let second = registered_node(&core).await;
+
+        let err = wire_supervisor_to_node(&core, &second, &second.internal_relay_url(), |_| {})
+            .await
+            .expect_err("one node at a time binds an instance's transport");
+
+        assert!(
+            matches!(
+                err,
+                ServerError::SupervisorWiring(SupervisorWiringError::NodeAlreadyBound)
+            ),
+            "{err:?}"
+        );
+        assert!(second.is_shutdown(), "a refused start stops its node");
+        assert!(
+            !core.has_borrower(&second),
+            "a refused start unregisters its node"
+        );
+        assert!(
+            supervisor_wired_to(&core, &first),
+            "a refused start leaves the first node's binding in place"
+        );
+        stop_node(&core, &first);
+    }
+
+    #[tokio::test]
+    async fn stale_binding_of_a_shut_down_node_is_reclaimed() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let first = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &first, &first.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        let original = displaced_provider(&core);
+        // Stopped without `stop_node`, so the record still names it.
+        first.shutdown();
+
+        let second = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &second, &second.internal_relay_url(), |_| {})
+            .await
+            .expect("a binding whose node stopped is stale and a start reclaims it");
+        assert!(supervisor_wired_to(&core, &second));
+
+        stop_node(&core, &second);
+        assert!(
+            slot_of(&core).holds(&original),
+            "the provider before the stale binding is the one a stop puts back"
+        );
+        assert_eq!(
+            core.with_transport(|_| ()),
+            Err(crate::bridge_instance::TransportLockError::NotInitialized)
+        );
+    }
+
+    /// A resume rebuilds the instance's transport manager over the same
+    /// relay URLs as a new `Arc`. A start that reclaims the stale binding
+    /// reads the rebuilt manager as the stale node's transport, so a stop of
+    /// the new node puts back the manager from before the stale binding and
+    /// not the rebuilt manager of the stopped node.
+    #[tokio::test]
+    async fn stale_binding_reclaim_recognises_a_manager_a_resume_rebuilt() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let first = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &first, &first.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        // Stopped without `stop_node`, so the record still names it.
+        first.shutdown();
+        let recorded = Arc::clone(
+            &core
+                .node_binding()
+                .as_ref()
+                .expect("the stale binding stays recorded")
+                .manager,
+        );
+        let rebuilt = Arc::new(crate::bridge_instance::tests::manager_on(
+            &first.internal_relay_url(),
+        ));
+        assert!(!Arc::ptr_eq(&rebuilt, &recorded));
+        core.install_transport(rebuilt)
+            .expect("a resume installs the rebuilt manager");
+
+        let second = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &second, &second.internal_relay_url(), |_| {})
+            .await
+            .expect("a start reclaims the stale binding");
+        assert!(
+            core.node_binding()
+                .as_ref()
+                .is_some_and(|b| b.displaced_manager.is_none()),
+            "the reclaim keeps the stale binding's displaced manager, not the rebuilt one"
+        );
+
+        stop_node(&core, &second);
+        assert_eq!(
+            core.with_transport(|_| ()),
+            Err(crate::bridge_instance::TransportLockError::NotInitialized),
+            "a stop puts back the empty manager from before the stale binding"
+        );
+    }
+
+    /// Each `SupervisorWiringError` step gives the caller a distinct
+    /// message, so a bridge test can tell `NodeAlreadyBound` from
+    /// `RelayConnect` under the shared `SCP-TRANS-5056` code.
+    #[test]
+    fn supervisor_wiring_user_messages_name_distinct_steps() {
+        let steps = [
+            SupervisorWiringError::NodeAlreadyBound,
+            SupervisorWiringError::RelayConnect(scp_transport::TransportError::ConnectionFailed(
+                "ws://10.0.0.7:4000/scp/v1".to_owned(),
+            )),
+            SupervisorWiringError::SupervisorUnavailable,
+            SupervisorWiringError::TransportInstall(
+                crate::bridge_instance::TransportLockError::Poisoned,
+            ),
+        ];
+        let messages: std::collections::HashSet<String> = steps
+            .into_iter()
+            .map(|step| ServerError::SupervisorWiring(step).user_message())
+            .collect();
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert!(
+            messages.iter().all(|m| !m.contains("10.0.0.7")),
+            "a step message carries no inner transport error: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_fails_closed_when_no_supervisor_attaches() {
+        let core = CoreFields::new();
+        let node = registered_node(&core).await;
+
+        let err = wire_supervisor_to_node(&core, &node, &node.internal_relay_url(), |_| {})
+            .await
+            .expect_err("a start whose attach step attached nothing fails closed");
+
+        assert!(
+            matches!(
+                err,
+                ServerError::SupervisorWiring(SupervisorWiringError::SupervisorUnavailable)
+            ),
+            "{err:?}"
+        );
+        assert!(node.is_shutdown());
+        assert!(!core.has_borrower(&node));
+        assert!(core.node_binding().is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_node_of_an_unbound_node_leaves_the_binding() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let bound = registered_node(&core).await;
+        wire_supervisor_to_node(&core, &bound, &bound.internal_relay_url(), |_| {})
+            .await
+            .unwrap();
+        let other = registered_node(&core).await;
+
+        stop_node(&core, &other);
+
+        assert!(other.is_shutdown());
+        assert!(
+            supervisor_wired_to(&core, &bound),
+            "stopping a node that holds no binding unbinds nothing"
+        );
+        stop_node(&core, &bound);
     }
 }

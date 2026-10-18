@@ -875,8 +875,8 @@ pub fn format_unbind_event(event: &AppUnbindEvent) -> String {
 
 /// Produces RFC 8785 (JCS) canonical JSON bytes from a `serde_json::Value`.
 ///
-/// Delegates to [`scp_protocol::jcs::to_vec`] which uses `serde_json_canonicalizer`
-/// for true RFC 8785 compliance (key sorting, number formatting, escaping).
+/// Delegates to [`scp_protocol::jcs::to_vec`], which refuses a value carrying a
+/// number outside I-JSON (RFC 7493) and otherwise produces RFC 8785 bytes.
 fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, SandboxError> {
     scp_protocol::jcs::to_vec(value).map_err(SandboxError::SerializationFailed)
 }

@@ -614,7 +614,7 @@ mod tests {
         Arc::new(NodeState {
             did: "did:dht:test123".to_owned(),
             live_state: crate::LiveSlot::new(crate::NodePublishedState {
-                relay_url: "wss://localhost/scp/v1".to_owned(),
+                relay: crate::published_state::test_relay("wss://localhost/scp/v1"),
                 record: None,
                 document: scp_did::DidDocument {
                     context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
@@ -633,9 +633,15 @@ mod tests {
             dev_bind_addr: Some("127.0.0.1:9100".parse::<SocketAddr>().unwrap()),
             projected_contexts: RwLock::new(HashMap::new()),
             blob_storage: Arc::new(BlobStorageBackend::in_memory()),
-            relay_config: scp_transport::native::server::RelayConfig::default(),
+            relay_config: scp_transport::native::server::RelayConfig::defaults(
+                scp_transport::relay::push_gate::LiveRelayUrl::new(
+                    scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1")
+                        .unwrap(),
+                ),
+            ),
             start_time: Instant::now(),
             http_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8443))),
+            prebound_public: std::sync::Mutex::new(None),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             cors_origins: None,
             projection_rate_limiter: scp_transport::relay::rate_limit::PublishRateLimiter::new(

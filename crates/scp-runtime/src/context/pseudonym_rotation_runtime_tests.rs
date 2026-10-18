@@ -36,6 +36,7 @@ use tokio::sync::broadcast;
 
 use crate::context::ContextHandle;
 use crate::context::actor::pseudonym_rotation::LocalRoutingIds;
+use crate::context::actor::signer::CommandSigner;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::persistence::ContextPersistence;
 use crate::context::state::ContextSnapshot;
@@ -322,14 +323,25 @@ impl Node {
         routing_id: [u8; 32],
     ) -> Result<(), ContextError> {
         self.supervisor
-            .rotate_pseudonym(ctx_id, &local(), &local_key(), epoch, routing_id)
+            .rotate_pseudonym(
+                ctx_id,
+                &local(),
+                &CommandSigner::local_ed25519(local_key()),
+                epoch,
+                routing_id,
+            )
             .await
     }
 
     async fn govern(&self, ctx_id: &str, action: GovernanceAction) {
         let outcome = self
             .supervisor
-            .propose_governance_action_checked(ctx_id, &local(), action, &local_key())
+            .propose_governance_action_checked(
+                ctx_id,
+                &local(),
+                action,
+                &CommandSigner::local_ed25519(local_key()),
+            )
             .await
             .expect("the sole admin's proposal executes");
         assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -503,7 +515,7 @@ async fn push_routing_ids_follow_a_rotation() {
         )
         .await
         .expect("create_context");
-    let relay = scp_protocol::discovery::push::canonical_relay_url(RELAY).expect("canonical");
+    let relay = scp_did::canonical_relay_url(RELAY).expect("canonical");
     let routes = |ids: [u8; 32]| {
         std::collections::BTreeMap::from([(
             relay.clone(),
@@ -593,7 +605,13 @@ async fn rejected_rotations_change_nothing_and_send_nothing() {
 
     let foreign = n
         .supervisor
-        .rotate_pseudonym(ctx, &bob(), &bob_key(), 1, RID_1)
+        .rotate_pseudonym(
+            ctx,
+            &bob(),
+            &CommandSigner::local_ed25519(bob_key()),
+            1,
+            RID_1,
+        )
         .await;
     assert!(
         matches!(foreign, Err(ContextError::PermissionDenied(_))),
@@ -803,16 +821,14 @@ async fn a_failed_announcement_stays_pending_and_the_republish_clears_it() {
 
 /// Dispatches `SendPseudonymAnnouncement`, the bridge's re-publish path.
 async fn republish(supervisor: &Supervisor, handle: &ContextHandle) -> Result<(), ContextError> {
-    use crate::context::actor::commands::{
-        MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
-    };
+    use crate::context::actor::commands::{MessagingCommand, SendPseudonymAnnouncementPayload};
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cmd = MessagingCommand::SendPseudonymAnnouncement {
         payload: Box::new(SendPseudonymAnnouncementPayload {
             context_id: handle.context_id().to_owned(),
             params: handle.params().clone(),
             sender_did: local(),
-            signing_key: SigningKeyBytes::from_signing_key(&local_key()),
+            signer: crate::context::actor::signer::CommandSigner::local_ed25519(local_key()),
         }),
         reply: tx,
     };

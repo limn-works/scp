@@ -168,6 +168,17 @@ pub enum SenderKeyError {
     #[error("verification failed: {0}")]
     VerificationFailed(String),
 
+    /// A sender-key response names a sender other than the member the MLS
+    /// layer authenticated as its sender. The receiver checks this public
+    /// field before any custody call, ahead of the spec 09 §9.16.2 Open steps.
+    #[error("sender DID mismatch: the response names {claimed}, the MLS sender is {mls_sender}")]
+    SenderMismatch {
+        /// The `sender_did` the response carries.
+        claimed: String,
+        /// The sender the MLS layer authenticated.
+        mls_sender: String,
+    },
+
     /// JSON serialization failed.
     #[error("serialization failed: {0}")]
     SerializationFailed(String),

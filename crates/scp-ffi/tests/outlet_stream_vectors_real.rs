@@ -438,12 +438,14 @@ mod live {
                 .map(|cap| cap.name().into_owned())
                 .collect();
             params.set_item("ceiling", ceiling).unwrap();
-            let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
+            let handle = scp
+                .context_create(py, &creator, &params.as_borrowed())
+                .unwrap();
             handle_context_id(py, &handle)
         };
 
         let reg = build_outlet_reg(py, outlet_name, &creator);
-        let outlet_id = scp.outlet_register(&ctx, &reg.as_borrowed()).unwrap();
+        let outlet_id = scp.outlet_register(py, &ctx, &reg.as_borrowed()).unwrap();
 
         let handler: PyObject = py.eval(handler_src, None, None).unwrap().unbind();
         scp.py_register_outlet_handler(py, &ctx, &outlet_id, handler)
@@ -467,7 +469,7 @@ mod live {
         }
 
         let ucan = scp
-            .ucan_mint(&ctx, &invoker, vec!["outlet_call:*".to_owned()], None)
+            .ucan_mint(py, &ctx, &invoker, vec!["outlet_call:*".to_owned()], None)
             .unwrap();
 
         let input = PyDict::new(py);
@@ -476,6 +478,7 @@ mod live {
 
         let handle_id = scp
             .outlet_stream_open(
+                py,
                 &ctx,
                 &outlet_id,
                 &input.as_borrowed(),

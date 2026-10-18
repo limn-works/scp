@@ -276,6 +276,7 @@ async fn end_to_end_network_demo() {
         &bob_custody,
         &req_result.wrapping_key_handle,
         ctx_id,
+        alice_did_str,
         &sk_response,
     )
     .await

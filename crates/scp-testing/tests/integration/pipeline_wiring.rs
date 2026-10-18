@@ -146,6 +146,11 @@ const NODE_BUILDER_SRC: &str = include_str!("../../../../crates/scp-node/src/lib
 // BEP44 record would give its monotonic sequence two independent writers.
 const NODE_SELF_HOST_SRC: &str = include_str!("../../../../crates/scp-node/src/self_host.rs");
 
+// Node published-state source — owns `apply_tier_change`, the NAT-tier task's
+// one writer, which moves the relay's live URL handle (PUSH-007, §10.7.1).
+const NODE_PUBLISHED_STATE_SRC: &str =
+    include_str!("../../../../crates/scp-node/src/published_state.rs");
+
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
@@ -232,6 +237,25 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // every bridge's `trust_verify_attestation` reaches, lives here.
 const FFI_TRUST_STORE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/trust_store.rs");
+// The shared challenge operations (spec 07 §7.3.4) every bridge's
+// `trust_create_challenge`, `trust_respond_to_challenge`,
+// `trust_grade_response` and `check_capability_requirements` reach, the
+// challenger ledger actor the supervisor dispatches them to, the common context
+// params builder, and the NAPI class whose exported methods delegate to the
+// `_on` bodies.
+const FFI_CHALLENGE_SRC: &str = include_str!("../../../../crates/scp-ffi/common/src/challenge.rs");
+const LEDGER_SRC: &str = include_str!(
+    "../../../../crates/scp-runtime/src/context/supervisor/challenger_ledger_actor.rs"
+);
+const FFI_CONTEXT_PARAMS_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/common/src/context_params.rs");
+const NAPI_SCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs");
+// Each bridge's `node_start` (construction.md §"Node start — `NodeStartConfig`"):
+// PyO3's and napi-rs's bodies live in `node_start_on` in their `server.rs`,
+// UniFFI's in `node_start_on` in `uniffi/src/server.rs`.
+const PYO3_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/src/server.rs");
+const NAPI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/server.rs");
+const UNIFFI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/server.rs");
 
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
@@ -266,18 +290,33 @@ const FFI_TRUST_STORE_SRC: &str =
 // Raised 52 -> 55 (merge with origin/main) when the capability-admission op
 // `check_capability_requirements` (§7.3.4.4, SCP-ACR-008) was wired through all
 // three native bridges: one per-bridge assertion pins each export body to the
-// core `scp_core::trust::check_capability_requirements` call and the production
-// `IdentityDidPublicKeyResolver`. The 2J joiner (+4) and capability-admission
+// core `scp_core::trust::check_capability_requirements` call and the instance
+// DID resolver. The 2J joiner (+4) and capability-admission
 // (+3) additions are disjoint, so the merged floor is 48 + 4 + 3 = 55.
 // Raised 55 -> 59 when attestation verification began reading the context's
 // revocation list (§7.4.4 step 5): one assertion pins the shared
 // `verify_attestation_in_context` to the list read and its checker, and one per
 // native bridge pins each `trust_verify_attestation` export to that helper over
 // the instance's own repository.
-// Raised 59 -> 60 when the local member's pseudonym rotation (spec 09
+// Raised 59 -> 67 when the challenge operations (spec 07 §7.3.4) gained their
+// routing assertions: two pin the shared `create_challenge` and
+// `verify_response_and_sign` to their checks and to `CommandSigner::sign_bounded_ed25519`, and one per
+// native bridge pins each of `trust_create_challenge` and
+// `trust_verify_response` to the shared operation.
+// Raised 67 -> 88 when challenge grading moved to the challenger ledger
+// (spec 07 §7.3.4): the verify assertions became grade assertions, and 21 new
+// ones pin the shared respond, grade, evaluator, and check bodies, each
+// supervisor challenge dispatch to the ledger mailbox, the ledger's attempt
+// checks and its ban on the synchronous trust store, each bridge's respond
+// export, grade repository, and evaluator invoker, the context params reading
+// `capability_requirements`, and the governance leaf's direction choice.
+// Raised 88 -> 89 when each bridge gained its modify-requirements proposal
+// export: one assertion pins all three to the shared decode and to the
+// bridge's governance propose path.
+// Raised 89 -> 90 when the local member's pseudonym rotation (spec 09
 // §9.10.4.1) was wired: one assertion pins the rotate command, the routing-ID
 // query, and the actor's rotation and grace arms to their helpers.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 60;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 90;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -1058,6 +1097,55 @@ fn relay_set_writes_store_canonical_relay_urls() {
     );
 }
 
+// PUSH-007 (§10.7.1 step 2): the NAT-tier task writes the relay's live URL
+// handle, so every relay listener reserves the push routing ID of the URL the
+// node advertises after a tier change. `build_no_domain_inner` hands the task a
+// clone of the relay config's handle, the task calls `apply_tier_change` with
+// it, and `apply_tier_change` sets the handle before it publishes the document.
+#[test]
+fn nat_tier_task_writes_the_relay_push_url_handle() {
+    assert!(
+        fn_body_contains(
+            NODE_BUILDER_SRC,
+            "build_no_domain_inner",
+            "relay_config.relay_url.clone()"
+        ),
+        "build_no_domain_inner must give the tier task the relay config's live URL handle"
+    );
+    assert!(
+        fn_body_contains(
+            NODE_BUILDER_SRC,
+            "build_no_domain_inner",
+            "reserve_push_routing_id(&relay_config.relay_url, &relay_url)"
+        ),
+        "build_no_domain_inner must set the probed tier's URL on the relay handle"
+    );
+    assert!(
+        fn_body_contains(NODE_BUILDER_SRC, "spawn_tier_reevaluation", "&relay_url,"),
+        "the tier task must pass the relay handle to apply_tier_change"
+    );
+    let body = extract_fn_body(NODE_PUBLISHED_STATE_SRC, "apply_tier_change")
+        .expect("apply_tier_change body");
+    let set = body
+        .find("reserve_push_routing_id(relay, new_relay_url)")
+        .expect("apply_tier_change must set the relay's live URL handle");
+    assert!(
+        fn_body_contains(
+            NODE_PUBLISHED_STATE_SRC,
+            "reserve_push_routing_id",
+            "relay.set(url)"
+        ),
+        "reserve_push_routing_id must set the relay's live URL handle"
+    );
+    let publish = body
+        .find(".publish(")
+        .expect("apply_tier_change must publish the document");
+    assert!(
+        set < publish,
+        "apply_tier_change must move the relay handle before it publishes the new URL"
+    );
+}
+
 // PUSH-013 (§10.7.1): the push routing-ID query runs
 // `Supervisor::push_routing_ids` → `dispatch_push_command` → actor mailbox →
 // `handlers::push::dispatch` → `push_helpers::push_routes`.
@@ -1828,9 +1916,13 @@ fn encrypt_path_calls_create_outer_envelope_or_seal() {
 #[test]
 fn encrypt_path_calls_create_inner_envelope() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope_raw")
-            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "create_inner_envelope_raw"),
-        "send path must call create_inner_envelope_raw"
+        fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope_signed")
+            || fn_body_contains(
+                MANAGER_SRC,
+                "build_inner_wire",
+                "create_inner_envelope_signed"
+            ),
+        "send path must call create_inner_envelope_signed"
     );
 }
 
@@ -2573,12 +2665,12 @@ fn out047_pyo3_streaming_saga_recover_reaches_truncated_close() {
          channel-authenticated principal (§6.2.4)."
     );
     assert!(
-        body.contains("resolve_context_signing_key"),
-        "PyO3 streaming-saga recover must SURFACE the target context's Active \
-         Signing Key per-call from custody (resolve_context_signing_key) before \
-         sealing — the recovery receipt is signed with a custody-resolved key, \
-         NEVER an envelope-asserted one (§6.2.4). Structurally pins the \
-         FFI-layer key-surfacing, not just the runtime seal."
+        body.contains("resolve_context_signer"),
+        "PyO3 streaming-saga recover must build the target context's Active \
+         Signing Key custody signer per-call (resolve_context_signer) before \
+         sealing — the recovery receipt is signed through a custody-resolved \
+         signer, NEVER an envelope-asserted key (§6.2.4). Structurally pins the \
+         FFI-layer signer resolution, not just the runtime seal."
     );
 }
 
@@ -5201,6 +5293,10 @@ fn pyo3_participation_record_routes_to_supervisor() {
         fn_body_contains(
             PYO3_TRUST_SRC,
             "participation_record_impl",
+            "participation_record_on_pool("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "participation_record_on_pool",
             ".participation_record("
         ),
         "PyO3 participation_record_impl must call Supervisor::participation_record, \
@@ -5249,68 +5345,184 @@ fn uniffi_participation_record_routes_to_supervisor() {
 // Capability-admission op `check_capability_requirements` (§7.3.4.4, SCP-ACR-008)
 // ===========================================================================
 //
-// Each native bridge's capability-admission export MUST delegate to the shared
-// core `scp_protocol::trust::check_capability_requirements` (re-exported as
-// `scp_core::trust::check_capability_requirements`) rather than re-implementing
-// the admission decision locally, AND MUST wire the production
-// `IdentityDidPublicKeyResolver` so each `ChallengeVerification` is
-// signature/subject/context/expiry verified. Pinning the fully-qualified
-// `scp_core::trust::check_capability_requirements(` call (not the bare leaf,
-// which the bridge fn shares its name with) plus the resolver makes a
-// self-satisfying substring impossible.
+// The shared `scp_ffi_common::challenge::check_capability_requirements` reads
+// the requirements from the context's governance at call time
+// (`Supervisor::capability_requirements_checked`), then runs the core
+// `scp_protocol::trust::check_capability_requirements` on the blocking pool
+// with the instance's DID resolver (`instance_active_key_resolver`), which
+// reads each verifier's `#active` key. Each native bridge's export reaches that
+// shared body with its own instance's resolver, so no bridge takes the
+// requirements from its caller or decides admission itself.
 
-/// The PyO3 `check_capability_requirements` bridge op must route to core.
+#[test]
+fn shared_check_capability_requirements_reads_governance_then_resolves() {
+    let body = extract_fn_body(FFI_CHALLENGE_SRC, "check_capability_requirements")
+        .expect("scp_ffi_common::challenge::check_capability_requirements must exist");
+    let read = body.find("sup.capability_requirements_checked(&context_id)");
+    let pool = body.find("run_blocking_resolution(");
+    assert!(
+        read.is_some()
+            && pool.is_some()
+            && read < pool
+            && body.contains("scp_protocol::trust::check_capability_requirements(")
+            && body.contains("instance_active_key_resolver(scope, resolver.as_ref())"),
+        "check_capability_requirements must read the context's governed requirements \
+         before it runs core check_capability_requirements on the blocking pool with \
+         the instance DID resolver"
+    );
+}
+
+/// The PyO3 `SCP.check_capability_requirements` method reaches the shared
+/// operation with the instance's supervisor and DID resolver, without the GIL.
 #[test]
 fn pyo3_check_capability_requirements_routes_to_core() {
+    let reaches =
+        |callee| fn_body_contains(PYO3_TRUST_SRC, "check_capability_requirements", callee);
     assert!(
-        fn_body_contains(
-            PYO3_TRUST_SRC,
-            "py_check_capability_requirements",
-            "scp_core::trust::check_capability_requirements("
-        ) && fn_body_contains(
-            PYO3_TRUST_SRC,
-            "py_check_capability_requirements",
-            "IdentityDidPublicKeyResolver"
-        ),
-        "PyO3 py_check_capability_requirements must call core \
-         check_capability_requirements with the production DID resolver"
+        reaches("scp_ffi_common::challenge::check_capability_requirements(")
+            && reaches("crate::runtime::supervisor(bi)")
+            && reaches("crate::runtime::did_resolver(bi).cloned()")
+            && reaches("crate::actor_wait::block_on_released("),
+        "PyO3 check_capability_requirements must reach the shared operation with the \
+         instance supervisor and DID resolver, with the GIL released"
     );
 }
 
 /// The NAPI `check_capability_requirements` bridge op (body in
-/// `check_capability_requirements_on`) must route to core.
+/// `check_capability_requirements_on`) reaches the shared operation.
 #[test]
 fn napi_check_capability_requirements_routes_to_core() {
     assert!(
         fn_body_contains(
-            NAPI_TRUST_SRC,
-            "check_capability_requirements_on",
-            "scp_core::trust::check_capability_requirements("
+            NAPI_SCP_SRC,
+            "check_capability_requirements",
+            "check_capability_requirements_on("
         ) && fn_body_contains(
             NAPI_TRUST_SRC,
             "check_capability_requirements_on",
-            "IdentityDidPublicKeyResolver"
+            "scp_ffi_common::challenge::check_capability_requirements("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "check_capability_requirements_on",
+            "crate::runtime::supervisor(bi)"
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "check_capability_requirements_on",
+            "crate::runtime::did_resolver(bi).cloned()"
         ),
-        "NAPI check_capability_requirements_on must call core \
-         check_capability_requirements with the production DID resolver"
+        "NAPI check_capability_requirements_on must reach the shared operation with \
+         the instance supervisor and DID resolver"
     );
 }
 
-/// The UniFFI `check_capability_requirements` bridge op must route to core.
+/// The UniFFI `Scp::check_capability_requirements` method reaches the shared
+/// operation.
 #[test]
 fn uniffi_check_capability_requirements_routes_to_core() {
+    let reaches =
+        |callee| fn_body_contains(UNIFFI_BRIDGE_SRC, "check_capability_requirements", callee);
+    assert!(
+        reaches("scp_ffi_common::challenge::check_capability_requirements(")
+            && reaches("self.inner.context_manager_expect()")
+            && reaches("self.inner.did_resolver()"),
+        "UniFFI check_capability_requirements must reach the shared operation with the \
+         instance supervisor and DID resolver"
+    );
+}
+
+/// Every bridge passes its `capability_requirements` parameter into the
+/// common context params, and the common builder parses it through the
+/// validating type, so a context created through any bridge holds the
+/// requirements its creator set.
+#[test]
+fn ffi_context_create_reads_capability_requirements() {
     assert!(
         fn_body_contains(
-            UNIFFI_BRIDGE_SRC,
-            "check_capability_requirements",
-            "scp_core::trust::check_capability_requirements("
+            FFI_CONTEXT_PARAMS_SRC,
+            "build_context_params",
+            "parse_capability_requirements(params.capability_requirements_json.as_ref())"
+        ) && fn_body_contains(
+            PYO3_CONTEXT_SRC,
+            "build_core_context_params",
+            "capability_requirements_json: py_params.capability_requirements.clone()"
+        ) && fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "parse_context_params",
+            "capability_requirements_json,"
         ) && fn_body_contains(
             UNIFFI_BRIDGE_SRC,
-            "check_capability_requirements",
-            "IdentityDidPublicKeyResolver"
+            "bridge_params_to_core",
+            "capability_requirements_json: params.capability_requirements_json.clone()"
         ),
-        "UniFFI check_capability_requirements must call core \
-         check_capability_requirements with the production DID resolver"
+        "each bridge must pass its capability requirements to the common builder, \
+         which must parse them"
+    );
+}
+
+/// `ModifyCapabilityRequirements` keeps a tightening in force on a persist
+/// failure and restores the old list for any other change, so a loosening
+/// never takes effect without being durable.
+#[test]
+fn governance_modify_capability_requirements_chooses_direction_by_delta() {
+    let body = extract_fn_body(MANAGER_SRC, "execute_modify_capability_requirements")
+        .expect("execute_modify_capability_requirements must exist");
+    let tightening = body.find(".is_tightening_of(");
+    let keep = body.find(".commit_class_s_keep(");
+    let restore = body.find(".commit_class_s_restore(");
+    assert!(
+        tightening.is_some() && keep.is_some() && restore.is_some() && tightening < keep,
+        "execute_modify_capability_requirements must choose commit_class_s_keep for a \
+         tightening and commit_class_s_restore otherwise"
+    );
+}
+
+/// Every bridge exports a `ModifyCapabilityRequirements` proposal entry point
+/// that decodes the list through the shared validating builder and proposes
+/// the action through the bridge's checked governance path, so governance can
+/// change a context's requirements from every SDK.
+#[test]
+fn every_bridge_exports_modify_capability_requirements() {
+    const DECODE: &str = "scp_ffi_common::context_params::modify_capability_requirements_action(";
+    let pyo3 = |callee| {
+        fn_body_contains(
+            PYO3_CONTEXT_SRC,
+            "governance_modify_capability_requirements",
+            callee,
+        )
+    };
+    let napi = |callee| {
+        fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "context_governance_modify_capability_requirements_on",
+            callee,
+        )
+    };
+    let uniffi = |callee| {
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "governance_modify_capability_requirements",
+            callee,
+        )
+    };
+    assert!(
+        pyo3(DECODE) && pyo3("propose_governance_action("),
+        "PyO3 SCP.governance_modify_capability_requirements must decode the list with \
+         modify_capability_requirements_action and propose it"
+    );
+    assert!(
+        fn_body_contains(
+            NAPI_SCP_SRC,
+            "context_governance_modify_capability_requirements",
+            "context_governance_modify_capability_requirements_on("
+        ) && napi(DECODE)
+            && napi("propose_governance_action_on("),
+        "NAPI Scp.contextGovernanceModifyCapabilityRequirements must reach its _on body, \
+         which decodes the list with modify_capability_requirements_action and proposes it"
+    );
+    assert!(
+        uniffi(DECODE) && uniffi(".propose_governance_action("),
+        "UniFFI Scp::governance_modify_capability_requirements must decode the list with \
+         modify_capability_requirements_action and propose it"
     );
 }
 
@@ -5404,7 +5616,15 @@ fn uniffi_trust_verify_attestation_reads_the_instance_revocation_list() {
         fn_body_contains(
             UNIFFI_BRIDGE_SRC,
             "trust_verify_attestation",
-            "self.inner.protocol_repository()"
+            "let inner = Arc::clone(&self.inner);"
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_verify_attestation",
+            "on_resolution_pool("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_verify_attestation",
+            "inner.protocol_repository()"
         ) && fn_body_contains(
             UNIFFI_BRIDGE_SRC,
             "trust_verify_attestation",
@@ -5416,6 +5636,497 @@ fn uniffi_trust_verify_attestation_reads_the_instance_revocation_list() {
         ),
         "UniFFI trust_verify_attestation must verify through \
          verify_attestation_in_context over the instance's repository"
+    );
+}
+
+// ===========================================================================
+// Challenge operations (spec 07 §7.3.4) — shared bodies, ledger, and bridge routing
+// ===========================================================================
+//
+// The shared `create_challenge` builds the request, checks every `CustomEval`
+// evaluator, and records the challenge in the challenger's ledger, which signs
+// it. `respond_to_challenge` signs the subject's response through custody.
+// `grade_response` looks the challenge up in the ledger before any DID
+// resolution, authenticates the response on the blocking pool, takes the ledger
+// lease and then a grading permit, grades, commits, and writes the record to the
+// bridge's repository. Each supervisor dispatch reaches the challenger ledger's
+// mailbox, whose Begin and Commit handlers check the attempt. Each bridge's
+// export reaches the shared body, and each bridge grades through the one
+// `SharedEvaluatorInvoker` over its own `EvaluatorHost`.
+
+#[test]
+fn shared_create_challenge_checks_the_definition_and_signs_in_the_ledger() {
+    let reaches = |callee| fn_body_contains(FFI_CHALLENGE_SRC, "create_challenge", callee);
+    assert!(
+        reaches("challenge_request_unsigned(")
+            && reaches(".check_registered(")
+            && reaches(".dispatch_challenge_create(")
+            && fn_body_contains(LEDGER_SRC, "handle_create", "sign_bounded_ed25519("),
+        "create_challenge must build the request, check each evaluator, and record it \
+         in the ledger, whose Create handler signs it through sign_bounded_ed25519"
+    );
+}
+
+#[test]
+fn shared_respond_to_challenge_signs_through_custody() {
+    let reaches = |callee| fn_body_contains(FFI_CHALLENGE_SRC, "respond_to_challenge", callee);
+    assert!(
+        reaches("challenge_response_unsigned(")
+            && reaches("run_blocking_resolution(")
+            && reaches(".sign_bounded_ed25519(&unsigned.signing_digest())"),
+        "respond_to_challenge must build the response on the blocking pool and sign \
+         its digest through sign_bounded_ed25519"
+    );
+}
+
+#[test]
+fn shared_grade_response_authenticates_then_grades_and_commits() {
+    assert!(
+        fn_body_contains(
+            FFI_CHALLENGE_SRC,
+            "grade_response",
+            "grade_response_within("
+        ),
+        "grade_response must run grade_response_within"
+    );
+    let body = extract_fn_body(FFI_CHALLENGE_SRC, "grade_response_within")
+        .expect("grade_response_within must exist");
+    let at = |needle: &str| body.find(needle);
+    let lookup = at(".dispatch_challenge_lookup(");
+    let resolve = at("run_blocking_resolution(");
+    let permit = at(".challenge_grading_permit(");
+    let begin = at(".dispatch_challenge_begin_grade(");
+    let commit = at(".dispatch_challenge_commit(");
+    assert!(
+        lookup.is_some()
+            && resolve.is_some()
+            && permit.is_some()
+            && begin.is_some()
+            && commit.is_some()
+            && lookup < resolve
+            && resolve < begin
+            && begin < permit
+            && permit < commit,
+        "grade_response_within must look the challenge up, then resolve, then Begin, \
+         then take a permit, then Commit, in that order: a stored resubmit takes no permit"
+    );
+    assert!(
+        fn_body_contains(
+            FFI_CHALLENGE_SRC,
+            "release_lease",
+            ".dispatch_challenge_release("
+        ) && body.contains("release_lease(")
+            && fn_body_contains(LEDGER_SRC, "handle_release", "self.require_lease(")
+            && fn_body_contains(LEDGER_SRC, "handle_release", "self.leases.remove("),
+        "a capacity refusal in grade_response_within must release the lease through \
+         release_lease, whose ledger handler checks and drops the lease"
+    );
+    assert!(
+        body.contains("authenticate_challenge_response(")
+            && body.contains(" grade(")
+            && body.contains("store_graded(repo, committed)")
+            && fn_body_contains(
+                FFI_CHALLENGE_SRC,
+                "store_graded",
+                ".store_trust_challenge_result("
+            )
+            && body.contains("evaluate_cases(")
+            && fn_body_contains(FFI_CHALLENGE_SRC, "evaluate_cases", "schema_case(")
+            && fn_body_contains(FFI_CHALLENGE_SRC, "evaluate_cases", "eval_case(")
+            && fn_body_contains(FFI_CHALLENGE_SRC, "eval_case", ".invoke(EvaluatorCall {")
+            && fn_body_contains(FFI_CHALLENGE_SRC, "schema_case", "SchemaGate::admit("),
+        "grade_response_within must authenticate, run each evaluated case (schemas \
+         through SchemaGate, evaluators through the invoker), grade, and store the record"
+    );
+}
+
+/// Begin and Commit both check the attempt in the ledger turn, and Commit signs
+/// the record before it persists it.
+#[test]
+fn ledger_begin_and_commit_check_the_attempt() {
+    let commit = extract_fn_body(LEDGER_SRC, "handle_commit").expect("handle_commit");
+    let sign = commit.find(".sign_bounded_ed25519(");
+    let persist = commit.find("self.persist_entry(");
+    assert!(
+        fn_body_contains(LEDGER_SRC, "handle_begin", "check_attempt(")
+            && commit.contains("check_attempt(")
+            && sign.is_some()
+            && persist.is_some()
+            && sign < persist,
+        "the ledger's Begin and Commit handlers must check the attempt, and Commit must \
+         sign the record through sign_bounded_ed25519 before it persists the attempt"
+    );
+}
+
+/// The ledger actor never reaches the synchronous trust store or blocks its
+/// turn on a runtime; the graded record is written by the async caller.
+#[test]
+fn ledger_handler_never_calls_the_sync_trust_store() {
+    let code = strip_non_code(LEDGER_SRC);
+    for banned in [
+        "TrustStore",
+        "trust_store",
+        "block_on(",
+        "store_trust_challenge_result(",
+    ] {
+        assert!(
+            !code.contains(banned),
+            "challenger_ledger_actor.rs must not reach `{banned}`"
+        );
+    }
+}
+
+/// Asserts that `Supervisor::{dispatch}` resolves the challenger's ledger and
+/// sends `ChallengerLedgerCommand::{command}` to its mailbox.
+fn assert_dispatch_reaches_ledger(dispatch: &str, command: &str) {
+    let body = extract_fn_body(SUPERVISOR_SRC, dispatch)
+        .unwrap_or_else(|| panic!("Supervisor::{dispatch} must exist"));
+    assert!(
+        body.contains("self.challenger_ledger_for(challenger)")
+            && body.contains(".send(|reply| ChallengerLedgerCommand::")
+            && body.contains(&format!("ChallengerLedgerCommand::{command} {{")),
+        "Supervisor::{dispatch} must send ChallengerLedgerCommand::{command} to the \
+         challenger's ledger mailbox"
+    );
+    let arm = format!("ChallengerLedgerCommand::{command} {{");
+    let dispatch_body = extract_fn_body(LEDGER_SRC, "dispatch").expect("ledger dispatch");
+    assert!(
+        dispatch_body.contains(&arm),
+        "the ledger actor's dispatch must handle ChallengerLedgerCommand::{command}"
+    );
+}
+
+#[test]
+fn supervisor_challenge_create_reaches_the_ledger_mailbox() {
+    assert_dispatch_reaches_ledger("dispatch_challenge_create", "Create");
+}
+
+#[test]
+fn supervisor_challenge_lookup_reaches_the_ledger_mailbox() {
+    assert_dispatch_reaches_ledger("dispatch_challenge_lookup", "Lookup");
+}
+
+#[test]
+fn supervisor_challenge_begin_grade_reaches_the_ledger_mailbox() {
+    assert_dispatch_reaches_ledger("dispatch_challenge_begin_grade", "BeginGrade");
+}
+
+#[test]
+fn supervisor_challenge_commit_reaches_the_ledger_mailbox() {
+    assert_dispatch_reaches_ledger("dispatch_challenge_commit", "Commit");
+}
+
+#[test]
+fn supervisor_challenge_fault_reaches_the_ledger_mailbox() {
+    assert_dispatch_reaches_ledger("dispatch_challenge_fault", "RecordFault");
+}
+
+#[test]
+fn pyo3_trust_create_challenge_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_create_challenge",
+            "trust_create_challenge_impl("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_create_challenge_impl",
+            "scp_ffi_common::challenge::create_challenge("
+        ),
+        "PyO3 trust_create_challenge must reach scp_ffi_common::challenge::create_challenge"
+    );
+}
+
+#[test]
+fn napi_trust_create_challenge_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            NAPI_SCP_SRC,
+            "trust_create_challenge",
+            "trust_create_challenge_on("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_create_challenge_on",
+            "scp_ffi_common::challenge::create_challenge("
+        ),
+        "NAPI trustCreateChallenge must reach scp_ffi_common::challenge::create_challenge"
+    );
+}
+
+#[test]
+fn uniffi_trust_create_challenge_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_create_challenge",
+            "trust_create_challenge_impl("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_create_challenge_impl",
+            "scp_ffi_common::challenge::create_challenge("
+        ),
+        "UniFFI trust_create_challenge must reach scp_ffi_common::challenge::create_challenge"
+    );
+}
+
+#[test]
+fn pyo3_trust_respond_to_challenge_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_respond_to_challenge",
+            "trust_respond_to_challenge_impl("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_respond_to_challenge_impl",
+            "scp_ffi_common::challenge::respond_to_challenge("
+        ),
+        "PyO3 trust_respond_to_challenge must reach \
+         scp_ffi_common::challenge::respond_to_challenge"
+    );
+}
+
+#[test]
+fn napi_trust_respond_to_challenge_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            NAPI_SCP_SRC,
+            "trust_respond_to_challenge",
+            "trust_respond_to_challenge_on("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_respond_to_challenge_on",
+            "scp_ffi_common::challenge::respond_to_challenge("
+        ),
+        "NAPI trustRespondToChallenge must reach \
+         scp_ffi_common::challenge::respond_to_challenge"
+    );
+}
+
+#[test]
+fn uniffi_trust_respond_to_challenge_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_respond_to_challenge",
+            "trust_respond_to_challenge_impl("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_respond_to_challenge_impl",
+            "scp_ffi_common::challenge::respond_to_challenge("
+        ),
+        "UniFFI trust_respond_to_challenge must reach \
+         scp_ffi_common::challenge::respond_to_challenge"
+    );
+}
+
+#[test]
+fn pyo3_trust_grade_response_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_grade_response",
+            "trust_grade_response_impl("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_grade_response_impl",
+            "grade_with_storage("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "grade_with_storage",
+            "scp_ffi_common::challenge::grade_response("
+        ),
+        "PyO3 trust_grade_response must reach scp_ffi_common::challenge::grade_response"
+    );
+}
+
+#[test]
+fn napi_trust_grade_response_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            NAPI_SCP_SRC,
+            "trust_grade_response",
+            "trust_grade_response_on("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_grade_response_on",
+            "scp_ffi_common::challenge::grade_response("
+        ),
+        "NAPI trustGradeResponse must reach scp_ffi_common::challenge::grade_response"
+    );
+}
+
+#[test]
+fn uniffi_trust_grade_response_reaches_the_shared_operation() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_grade_response",
+            "trust_grade_response_impl("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_grade_response_impl",
+            "scp_ffi_common::challenge::grade_response("
+        ),
+        "UniFFI trust_grade_response must reach scp_ffi_common::challenge::grade_response"
+    );
+}
+
+/// The PyO3 grade writes the record through a `ProtocolRepository` over the
+/// instance's own storage provider.
+#[test]
+fn pyo3_grade_response_uses_the_bridge_repository() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_grade_response_impl",
+            "crate::runtime::get_storage(bi)"
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "grade_with_storage",
+            "ProtocolRepository::new(storage)"
+        ),
+        "PyO3 trust_grade_response must store through a ProtocolRepository over the \
+         instance storage"
+    );
+}
+
+/// The NAPI grade writes the record through the instance's repository.
+#[test]
+fn napi_grade_response_uses_the_bridge_repository() {
+    assert!(
+        fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_grade_response_on",
+            "crate::runtime::protocol_repository(bi)"
+        ),
+        "NAPI trustGradeResponse must store through the instance's protocol repository"
+    );
+}
+
+/// The UniFFI grade writes the record through the instance's repository.
+#[test]
+fn uniffi_grade_response_uses_the_bridge_repository() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_grade_response_impl",
+            "bi.protocol_repository()"
+        ),
+        "UniFFI trust_grade_response must store through the instance's protocol repository"
+    );
+}
+
+/// The shared evaluator call runs the host handler on the blocking pool under
+/// the grading permit, inside the outlet economy pipeline, on its own task.
+#[test]
+fn shared_evaluator_outlet_spawns_blocking_inside_the_economy_pipeline() {
+    let reaches = |callee| fn_body_contains(FFI_CHALLENGE_SRC, "invoke_evaluator_outlet", callee);
+    assert!(
+        reaches("tokio::task::spawn_blocking(")
+            && reaches("let _permit = permit;")
+            && reaches(".spawn_evaluator_pipeline(")
+            && !reaches("tokio::spawn(")
+            && fn_body_contains(
+                SUPERVISOR_SRC,
+                "spawn_evaluator_pipeline",
+                "self.spawn_tracked("
+            )
+            && reaches(".invoke_outlet_with_economy(")
+            && reaches("let Some(handler) = handler else")
+            && reaches("EvaluatorOutcome::Unavailable("),
+        "invoke_evaluator_outlet must refuse without a handler and run it on the \
+         blocking pool under the permit inside invoke_outlet_with_economy"
+    );
+}
+
+/// Returns the source text from `header` to the end of `src`, so a body lookup
+/// finds the first `fn` after that impl header rather than an earlier sibling.
+fn from_impl<'a>(src: &'a str, header: &str) -> &'a str {
+    let at = src
+        .find(header)
+        .unwrap_or_else(|| panic!("`{header}` must exist"));
+    &src[at..]
+}
+
+/// Asserts that a bridge grades through the one shared invoker over its own
+/// evaluator host. `create_fn` and `grade_fn` must each bind `let host = {host}
+/// { bi };` and build `SharedEvaluatorInvoker::new(sup, &host)`, and the host
+/// must implement `EvaluatorHost` by reading the bridge's state: `registry`
+/// reaches `registry_lookup` and `handler` reaches `handler_lookup`.
+/// `SharedEvaluatorInvoker` is a struct, so a bridge cannot supply a check or
+/// an invocation of its own; what a bridge can still get wrong is the host it
+/// passes, and this pins it.
+fn assert_bridge_uses_shared_invoker(
+    src: &str,
+    host: &str,
+    create_fn: &str,
+    grade_fn: &str,
+    registry_lookup: &str,
+    handler_lookup: &str,
+) {
+    let bind = format!("let host = {host} {{ bi }};");
+    let build = "scp_ffi_common::challenge::SharedEvaluatorInvoker::new(sup, &host)";
+    for op in [create_fn, grade_fn] {
+        assert!(
+            fn_body_contains(src, op, &bind) && fn_body_contains(src, op, build),
+            "{op} must build SharedEvaluatorInvoker over `{host} {{ bi }}`"
+        );
+    }
+    let host_impl = from_impl(
+        src,
+        &format!("impl scp_ffi_common::challenge::EvaluatorHost for {host}<'_>"),
+    );
+    assert!(
+        fn_body_contains(host_impl, "registry", registry_lookup)
+            && fn_body_contains(host_impl, "handler", handler_lookup),
+        "{host} must read the outlet registry through `{registry_lookup}` and the \
+         handler through `{handler_lookup}`"
+    );
+}
+
+#[test]
+fn pyo3_grades_through_the_shared_evaluator_invoker() {
+    assert_bridge_uses_shared_invoker(
+        PYO3_TRUST_SRC,
+        "PyEvaluatorHost",
+        "trust_create_challenge_impl",
+        "trust_grade_response_impl",
+        "rt.outlet_registry.clone()",
+        "rt.outlet_handlers.get(outlet_id.as_str())",
+    );
+}
+
+#[test]
+fn napi_grades_through_the_shared_evaluator_invoker() {
+    assert_bridge_uses_shared_invoker(
+        NAPI_TRUST_SRC,
+        "NapiEvaluatorHost",
+        "trust_create_challenge_on",
+        "trust_grade_response_on",
+        "rt.outlet_registry.clone()",
+        "rt.outlet_handlers.get(outlet_id.as_str())",
+    );
+}
+
+#[test]
+fn uniffi_grades_through_the_shared_evaluator_invoker() {
+    assert_bridge_uses_shared_invoker(
+        UNIFFI_BRIDGE_SRC,
+        "UniffiEvaluatorHost",
+        "trust_create_challenge_impl",
+        "trust_grade_response_impl",
+        ".outlet_registry",
+        ".outlet_handlers",
+    );
+    assert!(
+        fn_body_contains(
+            from_impl(UNIFFI_BRIDGE_SRC, "impl UniffiEvaluatorHost<'_>"),
+            "handle",
+            "context_handle_registry(self.bi)"
+        ),
+        "UniffiEvaluatorHost must find the evaluator context's handle in this \
+         instance's context handle registry"
     );
 }
 
@@ -5880,6 +6591,163 @@ fn every_node_start_path_starts_the_self_did_republish_cycle() {
          shutdown would keep asserting this node's address on the DHT for the \
          life of the process (§10.12.1)"
     );
+}
+
+/// Asserts that `steps` occur in `body` in the given order, each after the one
+/// before it.
+fn assert_steps_in_order(bridge: &str, body: &str, steps: &[&str]) {
+    let mut from = 0;
+    for step in steps {
+        let Some(at) = body[from..].find(step) else {
+            panic!("{bridge} node_start_on must run `{step}` after the steps before it");
+        };
+        from += at + step.len();
+    }
+}
+
+/// Each bridge's `node_start` delegates to `server::node_start(` and runs its
+/// steps in the order construction.md §"Node start — `NodeStartConfig`" and
+/// SCP-322 give: the handle check (UniFFI), the config parse or conversion,
+/// operator identity resolution, the instance storage, `server::node_start`,
+/// `server::register_node`, `auto_wire_context_manager`, and the handle. An
+/// unregistered operator identity is `OperatorIdentityUnavailable`.
+#[test]
+fn every_bridge_node_start_delegates_to_server_node_start_in_order() {
+    let pyo3 = extract_fn_body(PYO3_SERVER_SRC, "node_start_on")
+        .expect("PyO3 server.rs must define node_start_on");
+    assert_steps_in_order(
+        "PyO3",
+        &pyo3,
+        &[
+            "NodeStartConfig::from_json(",
+            "resolve_operator_identity(",
+            "instance_storage(",
+            "server::node_start(",
+            "server::register_node(",
+            "auto_wire_context_manager(",
+            "PyNodeHandle {",
+        ],
+    );
+    let napi = extract_fn_body(NAPI_SERVER_SRC, "node_start_on")
+        .expect("napi server.rs must define node_start_on");
+    assert_steps_in_order(
+        "napi-rs",
+        &napi,
+        &[
+            "NodeStartConfig::from_json(",
+            "resolve_operator_identity(",
+            ".instance_storage()",
+            "server::node_start(",
+            "server::register_node(",
+            "auto_wire_context_manager(",
+            "NapiNodeHandle {",
+        ],
+    );
+    let uniffi = extract_fn_body(UNIFFI_SERVER_SRC, "node_start_on")
+        .expect("UniFFI server.rs must define node_start_on");
+    assert_steps_in_order(
+        "UniFFI",
+        &uniffi,
+        &[
+            ".check_handle(",
+            "lower_node_start_config(",
+            "build_node_identity_from_uniffi(",
+            ".instance_storage()",
+            "server::node_start(",
+            "server::register_node(",
+            "auto_wire_context_manager(",
+            "NodeHandle {",
+        ],
+    );
+
+    // The exported entry points reach `node_start_on`.
+    assert!(
+        fn_body_contains(PYO3_SERVER_SRC, "node_start", "node_start_on("),
+        "PyO3 SCP.node_start must delegate to node_start_on"
+    );
+    assert!(
+        fn_body_contains(NAPI_SCP_SRC, "node_start", "crate::server::node_start_on("),
+        "napi-rs Scp.nodeStart must delegate to node_start_on"
+    );
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "node_start",
+            "crate::server::node_start_on("
+        ),
+        "UniFFI Scp.node_start must delegate to node_start_on"
+    );
+
+    // Identity resolution: PyO3 and napi-rs look the DID up in the instance
+    // registry, and a miss is `OperatorIdentityUnavailable` (SCP-IDENT-1063).
+    for (bridge, src) in [("PyO3", PYO3_SERVER_SRC), ("napi-rs", NAPI_SERVER_SRC)] {
+        assert!(
+            fn_body_contains(src, "resolve_operator_identity", "build_node_identity("),
+            "{bridge} resolve_operator_identity must call build_node_identity"
+        );
+        assert!(
+            fn_body_contains(
+                src,
+                "build_node_identity",
+                "ServerError::OperatorIdentityUnavailable"
+            ),
+            "{bridge} build_node_identity must map a registry miss to \
+             OperatorIdentityUnavailable"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            UNIFFI_SERVER_SRC,
+            "build_node_identity_from_uniffi",
+            "ServerError::OperatorIdentityUnavailable"
+        ),
+        "UniFFI build_node_identity_from_uniffi must map a handle without key \
+         material to OperatorIdentityUnavailable"
+    );
+}
+
+/// Each bridge's node handle `shutdown` and `Drop` stop the node through
+/// `server::stop_node(`, which unbinds the instance's `Supervisor` transport
+/// from that node (construction.md §"Node start — `NodeStartConfig`"). A path
+/// that called only `RunningNode::shutdown` would leave the binding in place,
+/// so the instance's sends would go on targeting a stopped relay.
+#[test]
+fn every_bridge_node_handle_stop_path_calls_server_stop_node() {
+    for (bridge, src, handle_impl, drop_impl) in [
+        (
+            "PyO3",
+            PYO3_SERVER_SRC,
+            "impl PyNodeHandle {",
+            "impl Drop for PyNodeHandle {",
+        ),
+        (
+            "napi-rs",
+            NAPI_SERVER_SRC,
+            "impl NapiNodeHandle {",
+            "impl Drop for NapiNodeHandle {",
+        ),
+        (
+            "UniFFI",
+            UNIFFI_SERVER_SRC,
+            "impl NodeHandle {",
+            "impl Drop for NodeHandle {",
+        ),
+    ] {
+        for (label, header, method) in [
+            ("shutdown", handle_impl, "shutdown"),
+            ("Drop", drop_impl, "drop"),
+        ] {
+            let at = src
+                .find(header)
+                .unwrap_or_else(|| panic!("{bridge} server.rs must contain `{header}`"));
+            let body = extract_fn_body(&src[at..], method)
+                .unwrap_or_else(|| panic!("{bridge} `{header}` must define fn {method}"));
+            assert!(
+                body.contains("server::stop_node("),
+                "{bridge} node handle {label} must call server::stop_node"
+            );
+        }
+    }
 }
 
 /// Verifies that the root AGENTS.md contains the required enforcement sections.

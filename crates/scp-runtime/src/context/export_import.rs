@@ -15,7 +15,6 @@
 //!
 //! See GitHub issue #363.
 
-use scp_clock::Clock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -741,6 +740,9 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         outlet_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
         threshold_value: 0,
+        // Admission requirements are public context parameters (legibility
+        // before opt-in), so the public scope carries the live list.
+        capability_requirements: snapshot.capability_requirements.clone(),
         pruning_policy: None,
         governance_model_config: None,
         economic_policy: snapshot.economic_policy.clone(),
@@ -848,42 +850,31 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
     })
 }
 
-/// Creates a signed [`ContextExport`] from a snapshot and event log data.
+/// Builds an unsigned [`ContextExport`] from a snapshot and event log data and
+/// returns it with the digest its exporter signs.
 ///
 /// For [`ExportScope::Full`], includes all data. For [`ExportScope::Public`],
 /// strips sensitive data from the snapshot and omits event log entries.
 ///
-/// The export's [`ContextExport::canonical_snapshot_hash`] =
-/// `SHA-256(domain || scope-tag-byte || JCS(snapshot))` is computed over the
-/// **final** snapshot
-/// (after public stripping) and passed to `sign`, which must return an Ed25519
-/// signature produced by the exporter's custody key (spec §23.16.8). The
-/// exporter MUST be the snapshot `creator_did` (the verifier enforces
-/// `exporter_did == creator_did`). Signing happens at the FFI boundary because
-/// the runtime holds no custody key — see the module-level architecture note.
+/// The digest is [`ContextExport::canonical_snapshot_hash`] =
+/// `SHA-256(domain || scope-tag-byte || JCS(snapshot))`, computed over the
+/// **final** snapshot (after public stripping). The returned export carries
+/// an all-zero `snapshot_signature` until the caller writes the exporter's
+/// Ed25519 signature over that digest (spec §23.16.8). The exporter MUST be
+/// the snapshot `creator_did` (the verifier enforces
+/// `exporter_did == creator_did`).
 ///
 /// # Errors
 ///
-/// Returns [`ContextError`] if Merkle root computation fails, if canonical hash
-/// construction fails, or if `sign` returns an error.
-///
-/// Crate-internal: the only producer is `Supervisor::export_context` (the
-/// authoritative path FFI bridges reach through `Supervisor`). It is not part
-/// of the FFI surface, so it carries no cross-layer export obligation.
-pub(crate) fn create_export<F, E>(
+/// Returns [`ContextError`] if Merkle root computation fails or canonical hash
+/// construction fails.
+pub(crate) fn prepare_export(
     snapshot: ContextSnapshot,
     event_log_data: Vec<u8>,
     exporter_did: DID,
     scope: ExportScope,
-    clock: &dyn Clock,
-    sign: F,
-) -> Result<ContextExport, ContextError>
-where
-    F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
-    E: Into<scp_crypto::CustodyFailure>,
-{
-    let exported_at = clock.now_secs();
-
+    exported_at: u64,
+) -> Result<(ContextExport, [u8; 32]), ContextError> {
     let (mut final_snapshot, event_log_data, merkle_root) = match scope {
         ExportScope::Full => {
             let merkle_root = recompute_event_log_root(&event_log_data)?;
@@ -909,7 +900,7 @@ where
     // Build the export with a placeholder signature so the canonical hash can
     // be computed over the exact bytes a verifier will recompute. The signature
     // field itself is NOT part of the hash (see `canonical_snapshot_hash`).
-    let mut export = ContextExport {
+    let export = ContextExport {
         snapshot: final_snapshot,
         event_log_data,
         version: CURRENT_EXPORT_VERSION,
@@ -924,8 +915,56 @@ where
     // on the envelope, not the snapshot).
     let hash = export.canonical_snapshot_hash()?;
 
-    export.snapshot_signature = sign(&hash).map_err(|e| ContextError::Custody(e.into()))?;
+    Ok((export, hash))
+}
 
+/// Creates a signed [`ContextExport`]: [`prepare_export`], then one
+/// [`CommandSigner::sign_bounded_ed25519`](crate::context::actor::CommandSigner::sign_bounded_ed25519)
+/// over the canonical snapshot digest inside the exporting actor's turn
+/// (ADR-049 Decision 7a).
+///
+/// # Errors
+///
+/// [`prepare_export`]'s errors, and the signer's: [`ContextError::Custody`]
+/// with the custody's kind (`TimedOut`, SCP-CRYPTO-4062, past `SIGN_TIMEOUT`),
+/// or [`ContextError::CryptoFailed`] for a signer that is not Ed25519.
+pub(crate) async fn create_signed_export(
+    snapshot: ContextSnapshot,
+    event_log_data: Vec<u8>,
+    exporter_did: DID,
+    scope: ExportScope,
+    exported_at: u64,
+    signer: &crate::context::actor::CommandSigner,
+) -> Result<ContextExport, ContextError> {
+    let (mut export, hash) =
+        prepare_export(snapshot, event_log_data, exporter_did, scope, exported_at)?;
+    export.snapshot_signature = signer.sign_bounded_ed25519(&hash).await?;
+    Ok(export)
+}
+
+/// Test helper: [`prepare_export`] signed by a synchronous closure, so unit
+/// tests can build exports with fixed keys or forged signatures.
+#[cfg(test)]
+pub(crate) fn create_export<F, E>(
+    snapshot: ContextSnapshot,
+    event_log_data: Vec<u8>,
+    exporter_did: DID,
+    scope: ExportScope,
+    clock: &dyn scp_clock::Clock,
+    sign: F,
+) -> Result<ContextExport, ContextError>
+where
+    F: FnOnce(&[u8; 32]) -> Result<[u8; 64], E>,
+    E: Into<scp_crypto::CustodyFailure>,
+{
+    let (mut export, hash) = prepare_export(
+        snapshot,
+        event_log_data,
+        exporter_did,
+        scope,
+        clock.now_secs(),
+    )?;
+    export.snapshot_signature = sign(&hash).map_err(|e| ContextError::Custody(e.into()))?;
     Ok(export)
 }
 
@@ -1058,6 +1097,9 @@ mod tests {
             outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
+            capability_requirements: crate::context::state::Replicated::Live(
+                scp_protocol::trust::CapabilityRequirements::default(),
+            ),
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
@@ -1706,7 +1748,7 @@ mod tests {
             },
             status: ProposalStatus::Approved,
             created_at: 0,
-            voting_deadline: u64::MAX,
+            voting_deadline: 1_700_086_400,
             approvals: vec![],
             rejections: vec![],
             created_at_epoch: Some(0),

@@ -490,6 +490,7 @@ async fn sender_key_request_response() {
         &requester_custody,
         &request_result.wrapping_key_handle,
         "ctx-request-test",
+        sender_did,
         &response,
     )
     .await

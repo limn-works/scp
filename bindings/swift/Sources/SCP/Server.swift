@@ -4,8 +4,7 @@ import Foundation
 //   - RelayHandle: relayUrl() -> String, relayPort() -> UInt16, isShutdown() -> Bool, shutdown()
 //   - NodeHandle: relayUrl() -> String, relayPort() -> UInt16, did() -> String,
 //                 isShutdown() -> Bool, shutdown(),
-//                 enableSiteProjection(contextId:broadcastKeyHex:authorDid:admission:hostname:
-//                     indexPath:maxAssetsPerDeploy:maxDeploySizeBytes:deployRetentionCount:cspOverride:)
+//                 enableSiteProjection(contextId:admission:broadcastKeyHex:authorDid:site:)
 //                 commitDeploy(contextId:deployId:) -> UInt32
 //                 rollbackDeploy(contextId:deployId:)
 //                 disableSiteProjection(contextId:)
@@ -19,6 +18,12 @@ import Foundation
 //   scp.relayStartLocal(dataDir:)
 //   scp.nodeStartInMemory(identity:)
 //   scp.nodeStartLocal(dataDir:identity:passphrase:)
+//
+// The last two are the development pair: a shipped library throws
+// `SCP-TRANS-5055` from both (SCP-327).
+//
+// The production node start, `scp.nodeStart(config:)`, is macOS-only and sits
+// at the end of this file.
 //
 // Factories therefore accept an `SCP` parameter so handles are stamped with
 // the caller's bridge instance, and the `ServerBridge` injectable-closure
@@ -134,22 +139,26 @@ public struct Node: Sendable {
         handle.isShutdown()
     }
 
-    /// Starts a full application node with encrypted in-memory storage.
+    /// Starts a development node with encrypted in-memory storage.
     ///
-    /// When `identity` is provided, the node uses the pre-existing identity
-    /// instead of generating a fresh one. This enables identity portability --
-    /// the same DID persists across node restarts.
+    /// **Development only.** A library built with the UniFFI bridge's
+    /// `testing` feature starts the node; a shipped library starts nothing
+    /// and throws `ScpError.Transport` with `SCP-TRANS-5055`. Production
+    /// callers use `scp.nodeStart(config:)`.
     ///
-    /// Auto-wires encrypted in-memory storage (ephemeral), self-signed TLS,
-    /// and a relay on an OS-assigned port. A build carrying a test-harness
-    /// feature also auto-wires in-memory key custody and an in-memory DHT
-    /// client; a shipped build fails closed instead when `identity` is absent.
+    /// On a `testing` build the node auto-wires encrypted in-memory storage
+    /// (ephemeral), self-signed TLS, and a relay on an OS-assigned port. When
+    /// `identity` is provided, the node uses that pre-existing identity, its
+    /// DID method, and the production DHT mode. When `identity` is `nil`, the
+    /// node generates a fresh identity under in-memory key custody and an
+    /// in-memory DHT client.
     ///
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
     ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
-    /// - Throws: ``ScpError`` if startup fails.
+    /// - Throws: `ScpError.Transport` with `SCP-TRANS-5055` on a shipped
+    ///   library, or ``ScpError`` if startup fails.
     public static func startInMemory(
         scp: SCP,
         identity: Identity? = nil
@@ -158,9 +167,15 @@ public struct Node: Sendable {
         return Node(handle: handle)
     }
 
-    /// Starts a full application node on this instance's own storage backend.
+    /// Starts a development node on this instance's own storage backend.
     ///
-    /// When `identity` is provided, the node uses the pre-existing identity.
+    /// **Development only.** A library built with the UniFFI bridge's
+    /// `testing` feature starts the node; a shipped library creates nothing
+    /// and throws `ScpError.Transport` with `SCP-TRANS-5055`. Production
+    /// callers use `scp.nodeStart(config:)`.
+    ///
+    /// On a `testing` build, when `identity` is provided, the node uses the
+    /// pre-existing identity.
     /// When `nil`, the node creates or reloads a persistent identity via
     /// `FileKeyCustody`. The `passphrase` parameter is required in this mode.
     ///
@@ -179,7 +194,8 @@ public struct Node: Sendable {
     ///   - passphrase: Passphrase for Argon2id key derivation. Required when
     ///     `identity` is `nil`.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
-    /// - Throws: ``ScpError`` if startup fails.
+    /// - Throws: `ScpError.Transport` with `SCP-TRANS-5055` on a shipped
+    ///   library, or ``ScpError`` if startup fails.
     public static func startLocal(
         scp: SCP,
         dataDir: String,
@@ -268,14 +284,16 @@ public struct Node: Sendable {
         try await handle.enableSiteProjection(
             contextId: contextId,
             admission: admission,
-            hostname: config.hostname,
             broadcastKeyHex: broadcastKeyHex,
             authorDid: authorDid,
-            indexPath: config.indexPath == "/index.html" ? nil : config.indexPath,
-            maxAssetsPerDeploy: config.maxAssetsPerDeploy == 10000 ? nil : UInt32(config.maxAssetsPerDeploy),
-            maxDeploySizeBytes: config.maxDeploySizeBytes == 536_870_912 ? nil : UInt64(config.maxDeploySizeBytes),
-            deployRetentionCount: config.deployRetentionCount == 2 ? nil : UInt32(config.deployRetentionCount),
-            cspOverride: config.cspOverride
+            site: SiteProjectionSettings(
+                hostname: config.hostname,
+                indexPath: config.indexPath == "/index.html" ? nil : config.indexPath,
+                maxAssetsPerDeploy: config.maxAssetsPerDeploy == 10000 ? nil : UInt32(config.maxAssetsPerDeploy),
+                maxDeploySizeBytes: config.maxDeploySizeBytes == 536_870_912 ? nil : UInt64(config.maxDeploySizeBytes),
+                deployRetentionCount: config.deployRetentionCount == 2 ? nil : UInt32(config.deployRetentionCount),
+                cspOverride: config.cspOverride
+            )
         )
     }
 
@@ -325,3 +343,77 @@ public struct Node: Sendable {
         try await handle.disableSiteProjection(contextId: contextId)
     }
 }
+
+// MARK: - Production node start (macOS only)
+
+#if os(macOS)
+    // `NodeStartConfig` and its enums (`FfiReach`, `FfiBlobBackend`,
+    // `FfiTlsMode`, `FfiDhtMode`, `FfiCorsOrigins`, `FfiNat`) are the UniFFI
+    // record and enums in ScpBindings.swift, as `StorageConfig` is for
+    // `SCP.init(storage:)`. They carry the field names, arms and required and
+    // optional split of the bridge's `NodeStartConfig` (construction.md
+    // §"Node start — `NodeStartConfig`", ADR-052): a flat config with no
+    // builder, required fields with no default, and optional fields that
+    // default to `nil`. The UniFFI layer is platform-agnostic; the node start
+    // entry below is macOS-only, so an iOS build of the SDK has no node start.
+
+    extension Node {
+        /// Starts a node through `bridge`, the UniFFI `node_start` export,
+        /// passing `config` unchanged and wrapping the returned handle.
+        ///
+        /// ``SCP/nodeStart(config:)`` passes `inner.nodeStart(config:)`; the
+        /// tests pass a double that records the record it receives and throws
+        /// each node start error. Every `ScpError` the bridge throws reaches
+        /// the caller unchanged.
+        static func start(
+            config: NodeStartConfig,
+            bridge: (NodeStartConfig) async throws -> NodeHandle
+        ) async throws -> Node {
+            try await Node(handle: bridge(config))
+        }
+    }
+
+    public extension SCP {
+        /// Starts a production node from this instance under an operator
+        /// identity (construction.md §"Node start — `NodeStartConfig`").
+        ///
+        /// Delegates to the UniFFI `node_start` export. The node runs on this
+        /// instance's own storage, under the operator ``Identity`` in
+        /// `config.identity`, which this instance must have minted. Before the
+        /// call returns, the bridge binds this instance's `Supervisor` to the
+        /// node's relay; one running node at a time holds that binding. `dht`
+        /// takes `.disabled` only: the node runs its relay and publishes
+        /// nothing to a DHT.
+        ///
+        /// ```swift
+        /// let node = try await scp.nodeStart(config: NodeStartConfig(
+        ///     reach: .local,
+        ///     identity: operatorIdentity,
+        ///     blobStorage: .sqlite(path: "/var/lib/scp/blobs.sqlite"),
+        ///     tls: .plaintext,
+        ///     dht: .disabled,
+        ///     corsOrigins: .allowlist(origins: ["https://app.example.org"])
+        /// ))
+        /// ```
+        ///
+        /// - Parameter config: The node's flat configuration.
+        /// - Returns: The running ``Node``; its ``Node/did`` is the operator DID.
+        /// - Throws: ``ScpError`` with the code sdk-common.md §"Node start error
+        ///   codes" gives the failure. Every `SCP-STORAGE-` code is
+        ///   `.Storage`; the bridge's `server_error_class` selects the case of
+        ///   every other code. `.Storage`: `SCP-STORAGE-8007` (invalid
+        ///   config), `SCP-STORAGE-8008` (blob storage open or directory
+        ///   creation), `SCP-STORAGE-8009` (core node storage).
+        ///   `.Validation`: `SCP-VALID-7004`. `.Identity`: `SCP-IDENT-1063`
+        ///   (operator identity unavailable), `SCP-IDENT-1001`. `.Permission`:
+        ///   `SCP-PERM-3030` (another ``SCP`` minted `config.identity`,
+        ///   ADR-048). `.Transport`: `SCP-TRANS-5050`,
+        ///   `SCP-TRANS-5051` (relay start), `SCP-TRANS-5052` (TLS),
+        ///   `SCP-TRANS-5054` (serve or NAT), `SCP-TRANS-5055`,
+        ///   `SCP-TRANS-5056` (the bridge could not bind the `Supervisor` to
+        ///   the node and has shut the node down). `.Context`: `SCP-CTX-2053`.
+        func nodeStart(config: NodeStartConfig) async throws -> Node {
+            try await Node.start(config: config, bridge: inner.nodeStart(config:))
+        }
+    }
+#endif

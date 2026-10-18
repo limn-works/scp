@@ -630,72 +630,68 @@ pub struct AttestorInfo {
 }
 
 // ---------------------------------------------------------------------------
-// DID resolver trait
+// Active-key resolver trait
 // ---------------------------------------------------------------------------
 
-/// Resolves a DID to its Ed25519 public key bytes.
+/// Resolves a DID to the public key of its current `#active` verification
+/// method.
 ///
-/// Used by [`verify_attestation`] to obtain the issuer's public key for
-/// signature verification. Implementations may resolve via DHT, cache, or
-/// test fixtures.
+/// Every attestation-class signature verifies against this key and no other:
+/// `09-security-model.md` §9.7.1's classification table states that an
+/// attestation "verifies against the identity's current key for that role",
+/// and names the role `#active` for each challenge separator. ADR-063 keeps
+/// `#0` as the root, which signs establishment events only, so a key read out
+/// of the DID string (the root) is never the answer, and a key the identity
+/// has rotated away from is never the answer either. [`verify_attestation`],
+/// the challenge verifications, admission and trust aggregation all take this
+/// trait, so one key-selection rule serves every attestation-class site.
 ///
-/// # Totality invariant (REQUIRED)
+/// The shipped implementations live in `scp-ffi-common`: the bridge
+/// instance's identity-backed resolver, which reads the `#active` method of
+/// the DID's resolved document, and the resolver of an instance with no DID
+/// resolver, which fails every lookup with
+/// [`TrustError::KeyResolutionUnavailable`]. Test resolvers implement it
+/// under `testing`.
 ///
-/// An `Err` from [`Self::resolve_public_key`] MUST mean a **terminal** outcome:
-/// the key genuinely cannot exist for that DID, or the DID is malformed —
-/// i.e., verification against it can never succeed and never will. An `Err`
-/// MUST NOT signal a **transient** condition (network timeout, cache miss,
-/// resolver temporarily unavailable). Callers on the trust read path (e.g.
-/// `trust::aggregate`) treat `Err` as "verification genuinely failed" and
-/// **discard** the attestation; a transient error surfaced as `Err` would
-/// silently erase a live attestation from the trust computation — a fail-open
-/// availability bug for trust evidence.
+/// # Error contract (REQUIRED)
 ///
-/// A resolver that cannot honor this invariant (a networked/fallible DHT or
-/// cache-backed resolver) MUST NOT be wired into the aggregate read path
-/// without first splitting terminal from transient errors there. The
-/// production [`IdentityDidPublicKeyResolver`] satisfies the invariant by
-/// construction: it is a pure, deterministic DID-string parse with no I/O.
-pub trait DidPublicKeyResolver {
-    /// Resolves a DID string to its Ed25519 public key bytes (32 bytes).
+/// - [`TrustError::KeyResolutionUnavailable`] means every resolution layer
+///   was unreachable. It is an infrastructure fault: a read-path or
+///   verify-on-ingest loop propagates it and drops no record
+///   ([`TrustError::is_record_rejection`] is `false`).
+/// - Any other `Err` is terminal for that DID (malformed, or it has no
+///   `#active` key), and verification against it never succeeds.
+pub trait ActiveKeyResolver {
+    /// Resolves `did` to the 32-byte Ed25519 public key of its current
+    /// `#active` verification method.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustError`] if the DID cannot be resolved. Per the trait's
-    /// totality invariant, an `Err` MUST be terminal (key cannot exist /
-    /// malformed DID), never a retryable transient failure.
-    fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError>;
+    /// Returns [`TrustError::KeyResolutionUnavailable`] when no resolution
+    /// layer can be reached, and another [`TrustError`] when the DID has no
+    /// `#active` key; see the trait's error contract.
+    fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError>;
 }
 
 // ---------------------------------------------------------------------------
-// IdentityDidPublicKeyResolver — production implementation
+// IdentityDidPublicKeyResolver — test fixture
 // ---------------------------------------------------------------------------
 
-/// Production [`DidPublicKeyResolver`] that resolves public keys from DID
-/// strings using `scp-identity`.
+/// Test-fixture [`ActiveKeyResolver`] that reads the key a DID string embeds.
 ///
-/// For `did:dht:z...` DIDs, extracts the Ed25519 public key embedded in the
-/// DID string itself (the identity key, verification method `#0`).
-///
-/// For `did:key:` DIDs (only accepted when `scp-core/testing` feature is
-/// enabled), decodes the hex-encoded key.
-///
-/// This resolver does NOT perform full DID document resolution (DHT lookup,
-/// relay query, cache check). It extracts the identity key directly from the
-/// DID string, which is sufficient for attestation signature verification
-/// because the identity key (`#0`) is the canonical signing key for
-/// attestations per ADR-017.
-///
-/// For use cases that require resolving the active signing key (`#active`) or
-/// agent key (`#agent`), callers should use the full DID resolution pipeline
-/// in `scp-identity` directly.
+/// For `did:dht:z...` DIDs it returns the Ed25519 key the identifier encodes,
+/// and for `did:key:` DIDs (accepted only under `testing`) the hex-encoded
+/// key. It performs no resolution, so it answers with the `#active` key only
+/// for a fixture identity whose `#active` key is the key its DID string
+/// carries and that never rotated. A shipped identity's `#active` key comes
+/// from its resolved document, so the `#[cfg(any(test, feature = "testing"))]`
+/// gate keeps this type out of every shipped artifact.
+#[cfg(any(test, feature = "testing"))]
 pub struct IdentityDidPublicKeyResolver;
 
-impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
-    fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
-        // Delegates to the canonical implementation in scp-did which
-        // supports did:dht:z (production) and did:key:{hex} (testing only,
-        // gated behind #[cfg(test)] / feature = "testing"). See issue #128.
+#[cfg(any(test, feature = "testing"))]
+impl ActiveKeyResolver for IdentityDidPublicKeyResolver {
+    fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
         let key = scp_did::extract_public_key_from_did(did).map_err(|e| {
             TrustError::AttestationSignatureInvalid {
                 attestation_id: String::new(),
@@ -918,7 +914,7 @@ impl Default for AttestationVerificationCache {
 /// # Verification steps
 ///
 /// 1. **Signature:** Verifies the Ed25519 signature against the issuer's public
-///    key, resolved via the provided [`DidPublicKeyResolver`].
+///    key, resolved via the provided [`ActiveKeyResolver`].
 /// 2. **Evidence:** Validates that evidence is present when required by the
 ///    attestation type.
 /// 3. **Expiry:** Rejects if `expires_at < now`.
@@ -953,12 +949,12 @@ impl Default for AttestationVerificationCache {
 /// See ADR-017 acceptance criteria 3-7.
 pub fn verify_attestation(
     attestation: &Attestation,
-    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    resolver: &(impl ActiveKeyResolver + ?Sized),
     clock: &(impl Clock + ?Sized),
     revocation_checker: &dyn AttestationRevocationChecker,
 ) -> Result<(), TrustError> {
     // 1. Verify Ed25519 signature against issuer's public key.
-    let public_key_bytes = resolver.resolve_public_key(&attestation.issuer)?;
+    let public_key_bytes = resolver.resolve_active_key(&attestation.issuer)?;
     let canonical = canonical_attestation_bytes(attestation)?;
     verify_ed25519_signature(&public_key_bytes, &canonical, &attestation.signature).map_err(
         |reason| TrustError::AttestationSignatureInvalid {
@@ -1083,9 +1079,9 @@ pub struct ThresholdCheckInput<'a> {
     /// The N-of-M requirement and its independence penalties.
     pub requirement: &'a ThresholdRequirement,
 
-    /// Resolves each issuer DID to the Ed25519 public key that must have
-    /// signed that issuer's attestation.
-    pub resolver: &'a dyn DidPublicKeyResolver,
+    /// Resolves each issuer DID to its `#active` key, which must have signed
+    /// that issuer's attestation.
+    pub resolver: &'a dyn ActiveKeyResolver,
 
     /// Supplies the current time, which decides attestation expiry.
     pub clock: &'a dyn Clock,
@@ -1112,9 +1108,11 @@ pub struct ThresholdCheckInput<'a> {
 ///    stops an attacker from claiming an attestation that someone else issued.
 /// 4. [`verify_attestation`] accepts that attestation, so a
 ///    forged signature, an expired attestation, and a revoked attestation each
-///    fall out of the count. Per the [`DidPublicKeyResolver`] totality
-///    invariant an `Err` is terminal, so this function discards the attestation
-///    instead of retrying.
+///    fall out of the count. Only a rejection of the attestation itself
+///    ([`TrustError::is_record_rejection`]) drops it; a resolver outage
+///    ([`TrustError::KeyResolutionUnavailable`]) returns `Err`, because
+///    dropping a valid endorsement on a transient fault would lower the count
+///    without signal.
 /// 5. No earlier-admitted attestor carries the same DID. Spec §7.3.5 rule 1
 ///    (distinct DIDs) states that multiple attestations from one DID count as
 ///    one attestation regardless of quantity, so N copies of one attestor yield
@@ -1135,8 +1133,15 @@ pub struct ThresholdCheckInput<'a> {
 /// is the average pairwise independence across all admitted attestor pairs.
 ///
 /// See ADR-017 acceptance criterion 7 and spec §7.3.5.
-#[must_use]
-pub fn check_threshold_attestation(input: &ThresholdCheckInput<'_>) -> ThresholdResult {
+///
+/// # Errors
+///
+/// Returns the [`TrustError`] of a verification that failed for a reason other
+/// than a rejection of the attestation, such as
+/// [`TrustError::KeyResolutionUnavailable`].
+pub fn check_threshold_attestation(
+    input: &ThresholdCheckInput<'_>,
+) -> Result<ThresholdResult, TrustError> {
     let requirement = input.requirement;
 
     // Defense-in-depth: validate requirement even though constructors enforce it.
@@ -1166,15 +1171,15 @@ pub fn check_threshold_attestation(input: &ThresholdCheckInput<'_>) -> Threshold
             continue;
         }
         // Rule 4: signature, evidence, expiry, and revocation.
-        if verify_attestation(
+        match verify_attestation(
             attestation,
             input.resolver,
             input.clock,
             input.revocation_checker,
-        )
-        .is_err()
-        {
-            continue;
+        ) {
+            Ok(()) => {}
+            Err(e) if e.is_record_rejection() => continue,
+            Err(e) => return Err(e),
         }
         // Rule 5: spec §7.3.5 rule 1 — one DID contributes one attestation.
         if !seen_dids.insert(&attestor.did) {
@@ -1196,13 +1201,13 @@ pub fn check_threshold_attestation(input: &ThresholdCheckInput<'_>) -> Threshold
     let count_met = valid_count >= requirement.required_count();
     let independence_met = independence_score >= requirement.independence_threshold();
 
-    ThresholdResult {
+    Ok(ThresholdResult {
         met: count_met && independence_met,
         valid_count,
         required_count: requirement.required_count(),
         independence_score,
         independence_threshold: requirement.independence_threshold(),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,7 +1259,7 @@ pub fn check_threshold_attestation(input: &ThresholdCheckInput<'_>) -> Threshold
 ///   implementations. This matches how the same §9.5.2 "compact JSON" phrase
 ///   is implemented for `GovernanceProposal` `action_bytes`
 ///   (`compute_proposal_id`) and `SignedVote` `vote_type`
-///   (`compute_vote_hash`).
+///   (`vote_signing_digest`).
 /// - `evidence` and `revocation_status` — `rmp_serde::to_vec_named`
 ///   (`MessagePack`, named keys), as the §9.5.2 note explicitly sanctions for
 ///   these two fields.
@@ -1271,16 +1276,17 @@ pub fn check_threshold_attestation(input: &ThresholdCheckInput<'_>) -> Threshold
 /// same f64 rounding class (e.g. `9007199254740993` and `9007199254740992`)
 /// canonicalize to identical bytes, producing identical preimages — a
 /// signature over one validly covers the other, and the substitution is
-/// undetectable. Callers MUST keep claim numeric values within |n| ≤ 2^53 and
-/// string-encode larger identifiers (snowflake IDs, u64 counters). This
-/// function does not reject out-of-range integers — the coercion is inherent
-/// to RFC 8785 and is pinned by test.
+/// undetectable. This function therefore rejects a claim that carries, at any
+/// depth, an integer of magnitude above 2^53 or a non-finite number
+/// ([`crate::jcs::require_i_json`]); string-encode larger identifiers
+/// (snowflake IDs, u64 counters). Signing and verification both build this
+/// preimage, so such a claim can be neither signed nor verified.
 ///
 /// # Errors
 ///
-/// Returns [`TrustError::CanonicalizationFailed`] if evidence, claim, or
-/// revocation-status serialization fails, or if the canonical hash cannot be
-/// constructed.
+/// Returns [`TrustError::CanonicalizationFailed`] if the claim breaks the
+/// I-JSON numeric constraint, if evidence, claim, or revocation-status
+/// serialization fails, or if the canonical hash cannot be constructed.
 pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
@@ -1311,7 +1317,12 @@ pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>,
     // `json.dumps(separators=(',', ':'))`). RFC 8785 JCS produces exactly
     // that compact form with deterministic (sorted) key ordering — the same
     // implementation of the same spec phrase as `compute_proposal_id`
-    // (`action_bytes`) and `compute_vote_hash` (`vote_type`).
+    // (`action_bytes`) and `vote_signing_digest` (`vote_type`).
+    crate::jcs::require_i_json(&attestation.claim).map_err(|v| {
+        TrustError::CanonicalizationFailed {
+            reason: format!("claim: {v}"),
+        }
+    })?;
     let claim_bytes = crate::jcs::to_vec(&attestation.claim).map_err(|err| {
         TrustError::CanonicalizationFailed {
             reason: format!("claim serialization failed: {err}"),
@@ -1489,8 +1500,8 @@ mod tests {
         }
     }
 
-    impl DidPublicKeyResolver for TestResolver {
-        fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+    impl ActiveKeyResolver for TestResolver {
+        fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
             self.keys
                 .get(did)
                 .cloned()
@@ -2167,6 +2178,58 @@ mod tests {
         }
     }
 
+    /// A key-resolution outage on any attestor is an infrastructure fault:
+    /// the threshold check returns it instead of skipping that attestor, so
+    /// an outage never reads as "threshold not met". A rejection on another
+    /// attestor (an unknown DID) is still skipped.
+    #[test]
+    fn threshold_propagates_key_resolution_outage() {
+        /// Reports an outage for one DID and defers to `TestResolver` for the rest.
+        struct OutageFor<'a>(&'static str, &'a TestResolver);
+        impl ActiveKeyResolver for OutageFor<'_> {
+            fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+                if did == self.0 {
+                    return Err(TrustError::KeyResolutionUnavailable {
+                        did: did.to_owned(),
+                        reason: "all resolution layers down".to_owned(),
+                    });
+                }
+                self.1.resolve_active_key(did)
+            }
+        }
+
+        let att_type = AttestationType::Endorsement;
+        let mut fx = ThresholdFixture::new();
+        let a = fx.signed_attestation(att_type.clone(), "did:key:a");
+        let b = fx.signed_attestation(att_type.clone(), "did:key:b");
+        let attestors = vec![
+            make_attestor("did:key:a", &["ctx-1"], &[], Some(a)),
+            make_attestor("did:key:b", &["ctx-2"], &[], Some(b)),
+        ];
+        let requirement = ThresholdRequirement::new(1, 2, 0.0);
+
+        let outage = OutageFor("did:key:b", &fx.resolver);
+        let mut input = fx.input(&att_type, &attestors, &requirement);
+        input.resolver = &outage;
+        let result = check_threshold_attestation(&input);
+        assert!(
+            matches!(result, Err(TrustError::KeyResolutionUnavailable { ref did, .. }) if did == "did:key:b"),
+            "{result:?}"
+        );
+
+        // Control: when `did:key:b` resolves to nothing, that is a rejection;
+        // the attestor is skipped and `did:key:a` alone meets the threshold.
+        let mut only_a = TestResolver::new();
+        only_a.add_key(
+            "did:key:a",
+            fx.resolver.resolve_active_key("did:key:a").unwrap(),
+        );
+        input.resolver = &only_a;
+        let result = check_threshold_attestation(&input).unwrap();
+        assert!(result.met, "{result:?}");
+        assert_eq!(result.valid_count, 1);
+    }
+
     #[test]
     fn threshold_met_with_sufficient_independent_attestors() {
         let att_type = AttestationType::Endorsement;
@@ -2194,7 +2257,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(2, 3, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert!(result.met, "threshold should be met: {result:?}");
         assert_eq!(result.valid_count, 3);
         assert!(
@@ -2217,7 +2281,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(3, 5, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert!(!result.met, "threshold should NOT be met: {result:?}");
         assert_eq!(result.valid_count, 1);
     }
@@ -2244,7 +2309,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(2, 2, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert!(
             !result.met,
             "threshold should NOT be met due to low independence: {result:?}"
@@ -2278,7 +2344,8 @@ mod tests {
         let requirement = ThresholdRequirement::new(1, 2, 0.5);
 
         let result =
-            check_threshold_attestation(&fx.input(&required_type, &attestors, &requirement));
+            check_threshold_attestation(&fx.input(&required_type, &attestors, &requirement))
+                .unwrap();
         assert!(
             !result.met,
             "threshold should NOT be met (wrong type): {result:?}"
@@ -2299,7 +2366,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(1, 1, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert!(
             result.met,
             "single attestor should meet threshold: {result:?}"
@@ -2332,7 +2400,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(2, 2, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert!(result.met, "0.7 independence >= 0.5 threshold: {result:?}");
         // 3 shared contexts => 0.3 penalty. Independence = 0.7.
         assert!(
@@ -2364,7 +2433,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(2, 2, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         // Mutual endorsements: A->B = -0.2, B->A = -0.2 => independence = 0.6.
         assert!(result.met, "0.6 >= 0.5: {result:?}");
         assert!(
@@ -2388,7 +2458,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(3, 5, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert_eq!(
             result.valid_count, 1,
             "five copies of one DID count once: {result:?}"
@@ -2415,7 +2486,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(1, 1, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert_eq!(
             result.valid_count, 0,
             "an endorsement of another subject must not count: {result:?}"
@@ -2438,7 +2510,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(1, 1, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert_eq!(
             result.valid_count, 0,
             "an attestation issued by another DID must not count: {result:?}"
@@ -2458,7 +2531,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(1, 1, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert_eq!(
             result.valid_count, 0,
             "a forged signature must not count: {result:?}"
@@ -2482,7 +2556,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(1, 1, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert_eq!(
             result.valid_count, 0,
             "an expired attestation must not count: {result:?}"
@@ -2506,7 +2581,8 @@ mod tests {
 
         let requirement = ThresholdRequirement::new(1, 2, 0.5);
 
-        let result = check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement));
+        let result =
+            check_threshold_attestation(&fx.input(&att_type, &attestors, &requirement)).unwrap();
         assert_eq!(
             result.valid_count, 1,
             "the valid copy must still count: {result:?}"
@@ -2645,21 +2721,8 @@ mod tests {
         );
     }
 
-    /// Pins the documented RFC 8785 f64 rounding class for claim integers
-    /// beyond 2^53 (§9.5.2 I-JSON constraint, RFC 7493).
-    ///
-    /// RFC 8785 serializes JSON numbers as ES6 IEEE-754 doubles, so distinct
-    /// claim integers in the same f64 rounding class canonicalize to
-    /// IDENTICAL bytes — a signature over one validly covers the other. This
-    /// is inherent to RFC 8785 (not a defect in this implementation, and not
-    /// something to "fix" here): it is why §9.5.2 requires claim numeric
-    /// values to stay within |n| ≤ 2^53 and large identifiers (snowflake IDs,
-    /// u64 counters) to be string-encoded. The test makes the hazard visible
-    /// and pins the current behavior; the string-encoded forms of the same
-    /// values remain distinct.
-    #[test]
-    fn canonical_attestation_claim_integers_beyond_2_53_collide_per_rfc8785() {
-        let make = |claim: serde_json::Value| Attestation {
+    fn numeric_claim_attestation(claim: serde_json::Value) -> Attestation {
+        Attestation {
             id: "att-claim-numeric".to_owned(),
             attestation_type: AttestationType::Endorsement,
             issuer: "did:key:issuer".into(),
@@ -2672,35 +2735,44 @@ mod tests {
             renewed_at: None,
             revocation_status: RevocationStatus::Active,
             signature: vec![],
-        };
+        }
+    }
 
-        // 2^53 = 9007199254740992 is exactly representable as an f64;
-        // 2^53 + 1 = 9007199254740993 is NOT, and rounds to 2^53 under
-        // RFC 8785 / ES6 number serialization.
-        let att_exact = make(serde_json::json!({"id": 9_007_199_254_740_992_u64}));
-        let att_plus_one = make(serde_json::json!({"id": 9_007_199_254_740_993_u64}));
+    /// RFC 8785 serializes numbers as IEEE-754 doubles, so 2^53 + 1 and 2^53
+    /// would canonicalize to the same bytes and one signature would cover
+    /// both (§9.5.2 I-JSON constraint). The preimage refuses such a claim.
+    #[test]
+    fn canonical_attestation_rejects_claim_integer_beyond_2_53() {
+        for claim in [
+            serde_json::json!({"id": 9_007_199_254_740_993_u64}),
+            serde_json::json!({"nested": [{"id": -9_007_199_254_740_993_i64}]}),
+        ] {
+            let err =
+                canonical_attestation_bytes(&numeric_claim_attestation(claim.clone())).unwrap_err();
+            assert!(
+                matches!(&err, TrustError::CanonicalizationFailed { reason } if reason.contains("I-JSON")),
+                "{claim}: {err:?}"
+            );
+        }
+    }
 
-        let canonical_exact = canonical_attestation_bytes(&att_exact).unwrap();
-        let canonical_plus_one = canonical_attestation_bytes(&att_plus_one).unwrap();
-
-        // Documented rounding-class collision: distinct claims differing only
-        // beyond f64 precision produce IDENTICAL canonical bytes, so one
-        // signature covers both. This is why §9.5.2 mandates string-encoding
-        // for identifiers beyond 2^53.
-        assert_eq!(
-            canonical_exact, canonical_plus_one,
-            "claim integers in the same f64 rounding class must canonicalize \
-             identically per RFC 8785 (documented §9.5.2 hazard)"
-        );
-
-        // The mandated mitigation preserves injectivity: string-encoded forms
-        // of the same two values yield distinct canonical bytes.
-        let att_exact_str = make(serde_json::json!({"id": "9007199254740992"}));
-        let att_plus_one_str = make(serde_json::json!({"id": "9007199254740993"}));
+    /// Control: 2^53 is exactly representable, and the string-encoded forms
+    /// of 2^53 and 2^53 + 1 stay distinct in the preimage.
+    #[test]
+    fn canonical_attestation_accepts_claim_integer_at_2_53() {
+        canonical_attestation_bytes(&numeric_claim_attestation(
+            serde_json::json!({"id": 9_007_199_254_740_992_u64, "neg": -9_007_199_254_740_992_i64}),
+        ))
+        .unwrap();
         assert_ne!(
-            canonical_attestation_bytes(&att_exact_str).unwrap(),
-            canonical_attestation_bytes(&att_plus_one_str).unwrap(),
-            "string-encoded identifiers must remain distinct in the preimage"
+            canonical_attestation_bytes(&numeric_claim_attestation(
+                serde_json::json!({"id": "9007199254740992"})
+            ))
+            .unwrap(),
+            canonical_attestation_bytes(&numeric_claim_attestation(
+                serde_json::json!({"id": "9007199254740993"})
+            ))
+            .unwrap(),
         );
     }
 
@@ -2713,7 +2785,7 @@ mod tests {
         let resolver = IdentityDidPublicKeyResolver;
         let key_hex = "a".repeat(64); // 32 bytes
         let did = format!("did:key:{key_hex}");
-        let result = resolver.resolve_public_key(&did);
+        let result = resolver.resolve_active_key(&did);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 32);
     }
@@ -2721,7 +2793,7 @@ mod tests {
     #[test]
     fn resolver_did_key_invalid_hex() {
         let resolver = IdentityDidPublicKeyResolver;
-        let result = resolver.resolve_public_key("did:key:not-valid-hex!");
+        let result = resolver.resolve_active_key("did:key:not-valid-hex!");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -2733,7 +2805,7 @@ mod tests {
     #[test]
     fn resolver_unsupported_method() {
         let resolver = IdentityDidPublicKeyResolver;
-        let result = resolver.resolve_public_key("did:web:example.com");
+        let result = resolver.resolve_active_key("did:web:example.com");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -2745,7 +2817,7 @@ mod tests {
     #[test]
     fn resolver_empty_string() {
         let resolver = IdentityDidPublicKeyResolver;
-        let result = resolver.resolve_public_key("");
+        let result = resolver.resolve_active_key("");
         assert!(result.is_err());
     }
 
@@ -2753,7 +2825,7 @@ mod tests {
     fn resolver_did_dht_malformed() {
         let resolver = IdentityDidPublicKeyResolver;
         // Valid prefix but garbage z-base-32
-        let result = resolver.resolve_public_key("did:dht:z!@#$%^&*");
+        let result = resolver.resolve_active_key("did:dht:z!@#$%^&*");
         assert!(result.is_err());
     }
 
@@ -2871,13 +2943,13 @@ mod tests {
         // (a) Accepted forms → Ok, round-tripping to the embedded key.
         let did_dht = did_dht_from_public_key(&key);
         assert_eq!(
-            resolver.resolve_public_key(did_dht.as_ref()).unwrap(),
+            resolver.resolve_active_key(did_dht.as_ref()).unwrap(),
             key.to_vec(),
             "valid did:dht:z must resolve to its embedded key",
         );
         let did_key = format!("did:key:{}", hex::encode(key));
         assert_eq!(
-            resolver.resolve_public_key(&did_key).unwrap(),
+            resolver.resolve_active_key(&did_key).unwrap(),
             key.to_vec(),
             "valid did:key:{{hex}} (testing form) must resolve",
         );
@@ -2897,8 +2969,8 @@ mod tests {
             "did:key:00",          // hex but wrong length
         ];
         for input in terminal_cases {
-            let first = resolver.resolve_public_key(input);
-            let second = resolver.resolve_public_key(input);
+            let first = resolver.resolve_active_key(input);
+            let second = resolver.resolve_active_key(input);
             assert!(first.is_err(), "expected terminal Err for {input:?}");
             assert_eq!(
                 first.is_ok(),

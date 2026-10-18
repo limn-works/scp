@@ -73,7 +73,7 @@ impl SupervisorHandle {
     // AXIS: actor-internal (ADR-049 §5 placement invariant). Every
     // PER-IDENTITY method on this handle takes `&OwnedIdentityDid`, never a
     // bare `&DID` — an actor reaches only the identity that owns it, even for
-    // PUBLIC reads (`my_wrapping_keypair` exposes public data too, yet is
+    // PUBLIC reads (`my_wrapping_key` exposes public data too, yet is
     // token-gated, because the discriminator is caller-isolation, not
     // data-sensitivity). A per-identity op callable by the FFI/bridge
     // orchestrator does NOT belong here: add a bare-`DID` `pub fn` on
@@ -177,6 +177,20 @@ impl SupervisorHandle {
         self.upgrade()?
             .check_and_advance_sender_epoch(ctx, did, epoch, max_advance)
             .map_err(ContextError::from)
+    }
+
+    /// Read a per-sender epoch floor from the authoritative registry without
+    /// advancing it (absent reads as `0`). See [`Supervisor::sender_epoch_floor`].
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub(in crate::context) fn sender_epoch_floor(
+        &self,
+        ctx: &[u8; 32],
+        did: &str,
+    ) -> Result<u64, ContextError> {
+        Ok(self.upgrade()?.sender_epoch_floor(ctx, did))
     }
 
     /// Advance a per-sender receive-sequence floor in the authoritative registry,
@@ -565,14 +579,13 @@ impl SupervisorHandle {
         self.upgrade()?.reconnect_all_standing().await
     }
 
-    /// This identity's DHKEM(P-256) wrapping keypair (spec 09 §9.16.1): the
+    /// This identity's DHKEM(P-256) wrapping key (spec 09 §9.16.1): the
     /// public point every context of the identity publishes in `0xFF01`, and
-    /// the scalar that opens what is sealed to it.
+    /// the custody handle that opens what is sealed to it.
     ///
-    /// The supervisor loads or creates the pair when it builds the identity's
-    /// first actor (`Supervisor::key_package_store_for`), so every actor's
-    /// owner has one. The returned `Arc` is a snapshot of the current pair;
-    /// drop it within the operation that needed it.
+    /// The supervisor loads the key at every entry point that builds an actor
+    /// for the identity, before the actor exists, so every actor's owner has
+    /// one. The returned `Arc` is shared with the supervisor.
     ///
     /// Takes `&OwnedIdentityDid` — not `&DID` — so the caller must hold the
     /// capability proof that it is an actor of this identity. The token is
@@ -580,36 +593,32 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// [`ContextError::SupervisorShutDown`] if no pair is loaded because
-    /// shutdown has begun and cleared every pair, and
-    /// [`ContextError::InvalidState`] if no pair is loaded otherwise. Either
+    /// [`ContextError::SupervisorShutDown`] if no key is loaded because
+    /// shutdown has begun and cleared every key, and
+    /// [`ContextError::InvalidState`] if no key is loaded otherwise. Either
     /// fails the operation closed rather than publishing or opening with
     /// another key.
-    pub(in crate::context) fn my_wrapping_keypair(
+    pub(in crate::context) fn my_wrapping_key(
         &self,
         identity: &OwnedIdentityDid,
-    ) -> Result<Arc<crate::crypto::wrapping::WrappingKeyPair>, ContextError> {
-        let did = identity.as_did();
+    ) -> Result<Arc<crate::crypto::wrapping::IdentityWrappingKey>, ContextError> {
         let supervisor = self.upgrade()?;
-        let pair = supervisor
+        let key = supervisor
             .wrapping_keys
-            .get(did)
-            .map(|entry| entry.value().load_full());
-        if pair.is_none() {
-            supervisor.refuse_if_shut_down("wrapping keypair lookup")?;
+            .get(identity.as_did())
+            .map(|entry| Arc::clone(entry.value()));
+        if key.is_none() {
+            supervisor.refuse_if_shut_down("wrapping key lookup")?;
         }
-        pair.ok_or_else(|| {
-            ContextError::InvalidState(format!(
-                "no wrapping keypair is loaded for identity {}",
-                did.0
-            ))
+        key.ok_or_else(|| {
+            ContextError::InvalidState("wrapping key not loaded for the actor owner".to_owned())
         })
     }
 
     /// Look up this identity's `KeyPackageStoreActor` handle. Returns
     /// `None` if no KeyPackage actor has been spawned for the identity.
     ///
-    /// Same capability discipline as [`Self::my_wrapping_keypair`]:
+    /// Same capability discipline as [`Self::my_wrapping_key`]:
     /// `&OwnedIdentityDid` proves ownership, the token cannot be minted
     /// outside `supervisor/`, and the method shares the type's
     /// `pub(in crate::context)` visibility — so no `private_interfaces`
@@ -1133,9 +1142,9 @@ mod tests {
     use crate::context::supervisor::key_package_actor::KeyPackageStoreActor;
     use crate::context::supervisor::saga_journal::{ProtocolRepositorySagaJournal, SagaJournal};
     use crate::context::supervisor::supervisor::SupervisorConfig;
-    use crate::crypto::wrapping::WrappingKeyPair;
-    use arc_swap::ArcSwap;
+    use crate::crypto::wrapping::test_wrapping_key;
     use scp_platform::in_memory::InMemoryStorage;
+    use scp_platform::testing::InMemoryKeyCustody;
 
     struct TestPersistence;
     #[async_trait::async_trait]
@@ -1271,64 +1280,55 @@ mod tests {
         assert!(handle.standing_peer(&unknown).unwrap().is_none());
     }
 
-    /// An identity with no loaded pair gets a typed error, never a default key.
+    /// An identity with no loaded key gets a typed error, never a default key.
     #[tokio::test]
-    async fn my_wrapping_keypair_fails_closed_when_unset() {
+    async fn my_wrapping_key_fails_closed_when_unset() {
         let (_sup, handle) = test_handle();
         let did = DID("did:example:alice".to_owned());
         let token = OwnedIdentityDid::issue_for_actor(did);
         assert!(matches!(
-            handle.my_wrapping_keypair(&token),
+            handle.my_wrapping_key(&token),
             Err(ContextError::InvalidState(_))
         ));
     }
 
-    /// Once shutdown has begun, a missing pair reports `SupervisorShutDown`,
-    /// because shutdown clears every pair; a loaded pair is still returned.
+    /// Once shutdown has begun, a missing key reports `SupervisorShutDown`,
+    /// because shutdown clears every key; a loaded key is still returned.
     #[tokio::test]
-    async fn my_wrapping_keypair_reports_shutdown_after_the_gate_closes() {
+    async fn my_wrapping_key_reports_shutdown_after_the_gate_closes() {
         let (sup, handle) = test_handle();
+        let custody = Arc::new(InMemoryKeyCustody::new());
         let alice = DID("did:example:alice".to_owned());
-        sup.wrapping_keys.insert(
-            alice.clone(),
-            Arc::new(ArcSwap::from_pointee(WrappingKeyPair::generate())),
-        );
+        sup.wrapping_keys
+            .insert(alice.clone(), test_wrapping_key(&custody).await.unwrap());
         sup.close_spawn_gate();
         let missing = OwnedIdentityDid::issue_for_actor(DID("did:example:bob".to_owned()));
         assert!(matches!(
-            handle.my_wrapping_keypair(&missing),
+            handle.my_wrapping_key(&missing),
             Err(ContextError::SupervisorShutDown(_))
         ));
         let loaded = OwnedIdentityDid::issue_for_actor(alice);
-        assert!(handle.my_wrapping_keypair(&loaded).is_ok());
+        assert!(handle.my_wrapping_key(&loaded).is_ok());
     }
 
-    /// The reader returns the identity's own pair, and after the owner's slot
-    /// is swapped it returns the new pair.
+    /// The reader returns the identity's own key, never another identity's:
+    /// the same public point and the same custody handle as the installed key.
     #[tokio::test]
-    async fn my_wrapping_keypair_reads_the_owner_slot() {
+    async fn my_wrapping_key_reads_the_owner_slot() {
         let (sup, handle) = test_handle();
+        let custody = Arc::new(InMemoryKeyCustody::new());
         let did = DID("did:example:alice".to_owned());
-        let kp = WrappingKeyPair::generate();
-        let public = *kp.public();
-        let slot = Arc::new(ArcSwap::new(Arc::new(kp)));
-        sup.wrapping_keys.insert(did.clone(), Arc::clone(&slot));
-        sup.wrapping_keys.insert(
-            DID("did:example:bob".to_owned()),
-            Arc::new(ArcSwap::from_pointee(WrappingKeyPair::generate())),
-        );
+        let installed = test_wrapping_key(&custody).await.unwrap();
+        let other = test_wrapping_key(&custody).await.unwrap();
+        sup.wrapping_keys
+            .insert(did.clone(), Arc::clone(&installed));
+        sup.wrapping_keys
+            .insert(DID("did:example:bob".to_owned()), Arc::clone(&other));
         let token = OwnedIdentityDid::issue_for_actor(did);
-        assert_eq!(
-            *handle.my_wrapping_keypair(&token).unwrap().public(),
-            public
-        );
-        let rotated = WrappingKeyPair::generate();
-        let rotated_public = *rotated.public();
-        slot.store(Arc::new(rotated));
-        assert_eq!(
-            *handle.my_wrapping_keypair(&token).unwrap().public(),
-            rotated_public
-        );
+        let got = handle.my_wrapping_key(&token).unwrap();
+        assert_eq!(got.public(), installed.public());
+        assert_eq!(got.handle(), installed.handle());
+        assert_ne!(got.handle(), other.handle());
     }
 
     #[tokio::test]
@@ -1363,9 +1363,9 @@ mod tests {
             mls_storage,
             transport,
             clock,
-            wrapping_key: Arc::new(arc_swap::ArcSwap::from_pointee(
-                crate::crypto::wrapping::WrappingKeyPair::generate(),
-            )),
+            wrapping_key: test_wrapping_key(&Arc::new(InMemoryKeyCustody::new()))
+                .await
+                .unwrap(),
         };
         let (kp_handle, _join) = KeyPackageStoreActor::spawn(did.clone(), deps);
         sup.key_package_stores.insert(did.clone(), kp_handle);

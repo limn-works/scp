@@ -46,8 +46,14 @@ pub use scp_protocol::context::builder::{
 /// `#[async_trait]`, not `?Send`.
 #[async_trait::async_trait]
 pub trait ContextTransportProvider: Send + Sync {
-    /// Returns `true` if the transport layer is connected and at least one
-    /// relay is reachable.
+    /// Returns the provider's connection flag.
+    ///
+    /// Each implementor states what sets its flag. `RelayTransportProvider` in
+    /// `scp-transport` sets it at construction and changes it only through its
+    /// `mark_*` methods, which no adapter path calls, so a `true` result does
+    /// not mean a relay is reachable now. No production caller reads this
+    /// method to decide whether a send can succeed; a send reports its own
+    /// failure.
     fn is_connected(&self) -> bool;
 
     /// Publishes the context announcement to connected relays.
@@ -1432,7 +1438,9 @@ mod tests {
             &TestEventLog,
             ContextCreator {
                 did: TEST_DID,
-                wrapping_public_key: crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
             },
             1_700_000_000,
         )
@@ -1488,7 +1496,9 @@ mod tests {
             &provider,
             ContextCreator {
                 did: TEST_DID,
-                wrapping_public_key: crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
             },
             CREATION_TS,
         )
@@ -1619,7 +1629,9 @@ mod tests {
             &provider,
             ContextCreator {
                 did: TEST_DID,
-                wrapping_public_key: crate::crypto::wrapping::WrappingKeyPair::generate().public(),
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
             },
             CREATION_TS,
         )

@@ -321,7 +321,7 @@ impl FullStackNode {
         // the harness never registered its own DID; in production the FFI bridge
         // registers each identity via `identity_add`. Mirror that here (idempotent,
         // supervisor-wide) so this node can identify itself as the local member.
-        let _ = self.manager.register_local_did(self.did.clone()).await;
+        self.manager.register_local_did(self.did.clone()).await;
         self.manager
             // The in-process harness has no relay (module docs), so no relay
             // hosts the context.
@@ -399,7 +399,7 @@ impl FullStackNode {
                 self.did.clone(),
                 DID::from(member_did),
                 kp_bytes,
-                &self.signing_key,
+                &scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone()),
             )
             .await?;
         let InviteMemberOutcome::Sealed { bundle, .. } = outcome;
@@ -514,7 +514,7 @@ impl FullStackNode {
         // production the FFI bridge registers each identity via `identity_add`;
         // mirror that here (idempotent) so this joiner can identify itself as the
         // local member when it opens incumbent traffic.
-        let _ = self.manager.register_local_did(self.did.clone()).await;
+        self.manager.register_local_did(self.did.clone()).await;
 
         // 1. Take the sealed invitation (bundle + reservation id) the creator
         //    deposited.
@@ -844,6 +844,7 @@ impl FullStackNode {
                 &custody,
                 &request.wrapping_key_handle,
                 &ctx_id_hex,
+                &joiner_did,
                 &response,
             )
             .await
@@ -874,12 +875,14 @@ impl FullStackNode {
         handle: &ContextHandle,
         payload: &[u8],
     ) -> Result<(), ContextError> {
+        let signer =
+            scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone());
         self.manager
             .send_message(
                 handle,
                 &self.did,
                 payload,
-                MessageSigner::Active(&self.signing_key),
+                MessageSigner::Active(&signer),
                 None,
                 None,
             )
@@ -896,7 +899,11 @@ impl FullStackNode {
     /// Propagates [`ContextError`] from the supervisor.
     pub async fn send_heartbeat(&self, context_id: &str) -> Result<(), ContextError> {
         self.manager
-            .send_heartbeat(context_id, &self.did, &self.signing_key)
+            .send_heartbeat(
+                context_id,
+                &self.did,
+                &scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone()),
+            )
             .await
     }
 
@@ -924,7 +931,12 @@ impl FullStackNode {
     ) -> Result<scp_core::context::governance::GovernanceProposal, ContextError> {
         let (proposal, _events, _execution) = self
             .manager
-            .propose_governance_action(context_id, &self.did, action, &self.signing_key)
+            .propose_governance_action(
+                context_id,
+                &self.did,
+                action,
+                &scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone()),
+            )
             .await?;
         Ok(proposal)
     }
@@ -943,7 +955,13 @@ impl FullStackNode {
     ) -> Result<scp_core::context::governance::ProposalStatus, ContextError> {
         let (status, _events) = self
             .manager
-            .vote_on_proposal(context_id, proposal_id, &self.did, true, &self.signing_key)
+            .vote_on_proposal(
+                context_id,
+                proposal_id,
+                &self.did,
+                true,
+                &scp_core::context::actor::CommandSigner::local_ed25519(self.signing_key.clone()),
+            )
             .await?;
         Ok(status)
     }

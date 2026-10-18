@@ -261,6 +261,22 @@ pub enum ProtocolRepoVariant {
 }
 
 impl ProtocolRepoVariant {
+    /// The instance's own storage handle, which `server::node_start` gives to
+    /// the node (spec §17.6): the `Arc` this repository's event log, saga
+    /// journal and `OpenMLS` view already share, never a second store.
+    #[cfg(feature = "server")]
+    #[must_use]
+    pub fn instance_storage(&self) -> crate::server::InstanceStorage {
+        match self {
+            Self::InMemory(repo) => {
+                crate::server::InstanceStorage::InMemoryEncrypted(Arc::clone(repo.storage()))
+            }
+            Self::Sqlite(repo) => {
+                crate::server::InstanceStorage::Sqlite(Arc::clone(repo.storage()))
+            }
+        }
+    }
+
     /// Constructs a [`ContextEventLogProvider`] backed by this repository.
     ///
     /// The bridge is retained by `Arc` inside

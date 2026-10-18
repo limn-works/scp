@@ -199,7 +199,7 @@ impl StreamSigner for BridgeCustodyStreamSigner {
 /// Clones the custody `Arc` + key handle OUT of the identity-registry shard
 /// guard (sync), then performs the (potentially slow) `public_key` export OFF
 /// the guard — the same clone-then-drop discipline as the saga export's
-/// `resolve_context_signing_key`.
+/// `resolve_context_signer`.
 async fn resolve_stream_signer(
     bi: &NapiBridgeInstance,
     identity_did: &str,
@@ -1145,7 +1145,7 @@ pub(crate) fn outlet_stream_compute_caveats_binding_impl(
 // Cross-context streaming saga (§5.4.5, §6.2.4, SCP-OUT-047) — open / poll /
 // recover. The streaming ANALOG of the unary cross-context saga export in
 // `outlets.rs`, sharing its `enforce_caller_principal_binding`,
-// `resolve_context_signing_key`, `decode_asserted_nonce`, and `map_saga_error`
+// `resolve_context_signer`, `decode_asserted_nonce`, and `map_saga_error`
 // verbatim, and the SAME `NapiStreamExecutor` / `resolve_stream_signer` /
 // `NapiStreamRevocationChecker` this module already defines. Mirrors the
 // CANONICAL `PyO3` reference bridge's `outlet_stream.rs` cross-context section.
@@ -1188,8 +1188,9 @@ fn no_active_saga_err(saga_id: &str) -> ScpNapiError {
 ///   (c) `validate_ucan_for_outlet` against the TARGET context B, then resolve
 ///       the effective §7.3.8 caveats + `ucan_cid` and compute the §5.4.5
 ///       `caveats_binding` from a FRESH `request_id`;
-///   (d) resolve `SagaSigningKeys { target, caller }` from each context's Active
-///       Signing Key (via custody — the key never enters the runtime, ADR-006);
+///   (d) resolve `SagaSigners { target, caller }`, each context's Active
+///       Signing Key custody signer (the key stays in custody, ADR-049
+///       Decision 7a);
 ///   (e) build the executor over the TARGET handler;
 ///   (f) drive the saga to the Commit-transition;
 ///   (g) register the receiver and return the `saga_id`.
@@ -1496,15 +1497,9 @@ pub(crate) async fn outlet_streaming_saga_open_on(
     //
     // Each side signs as the creator its supervisor actor reported to that
     // side's gate at the top of this function.
-    let target_signing_key = crate::outlets::resolve_context_signing_key(
-        bi,
-        &target_role_state.creator_did,
-        &target_context_id,
-    )
-    .await?;
-    let caller_signing_key =
-        crate::outlets::resolve_context_signing_key(bi, &caller_creator_did, &caller_context_id)
-            .await?;
+    let target_signer =
+        crate::outlets::resolve_context_signer(bi, &target_role_state.creator_did).await?;
+    let caller_signer = crate::outlets::resolve_context_signer(bi, &caller_creator_did).await?;
 
     // ----- Chokepoint (ADR-056): id STRING → [u8; 32] -------------------------
     let caller_context_bytes = scp_core::context::state::context_id_to_bytes(&caller_context_id);
@@ -1535,9 +1530,9 @@ pub(crate) async fn outlet_streaming_saga_open_on(
             timeout_ms,
             executor,
             value_caveat_binding,
-            scp_core::context::supervisor::SagaSigningKeys {
-                target: &target_signing_key,
-                caller: &caller_signing_key,
+            scp_core::context::supervisor::SagaSigners {
+                target: target_signer,
+                caller: caller_signer,
             },
             params,
         ),
@@ -1700,15 +1695,16 @@ pub(crate) async fn outlet_streaming_saga_recover_truncated_close_on(
         .await
         .map_err(napi::Error::from)?
         .creator_did;
-    let target_key =
-        crate::outlets::resolve_context_signing_key(bi, &target_creator_did, &target_context_id)
-            .await?;
-    let signing_key =
-        scp_core::context::actor::commands::SigningKeyBytes::from_signing_key(&target_key);
+    let target_signer = crate::outlets::resolve_context_signer(bi, &target_creator_did).await?;
     let supervisor = crate::runtime::supervisor(bi)?.clone();
-    drive_recover_truncated_close(&supervisor, saga_id_typed, &target_context_id, signing_key)
-        .await
-        .map_err(|e| napi::Error::from(crate::outlets::map_saga_error(e)))?;
+    drive_recover_truncated_close(
+        &supervisor,
+        saga_id_typed,
+        &target_context_id,
+        target_signer,
+    )
+    .await
+    .map_err(|e| napi::Error::from(crate::outlets::map_saga_error(e)))?;
 
     // Evict on SUCCESS: the saga is now `Committed` and its prefix sealed. A
     // stale second recover then surfaces "no active saga" instead of re-driving

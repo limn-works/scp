@@ -18,12 +18,16 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Context } from "../src/context";
-import { ContextError } from "../src/errors";
+import { ContextError, ScpError } from "../src/errors";
 import type { BridgeContextHandle } from "../src/internal/bridge";
 import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { BehavioralRecord, CapabilityRequirement, ParticipationProfile } from "../src/types";
-import { allValid } from "../src/types";
+import {
+  allValid,
+  encodeCapabilityRequirements,
+  NON_CANONICAL_IDENTIFIER_CODE,
+} from "../src/types";
 import { HARNESS_IN_MEMORY_CUSTODY } from "./harness-custody";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
@@ -2938,37 +2942,94 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   // surface as a parse error here, not just in the mock unit tests.
   // ---------------------------------------------------------------------------
   describe("Typed trust-input admission (real NAPI, ADR-058)", () => {
-    test("checkCapabilityRequirements: SelfAttested requirement met by a declared capability", () => {
-      const requirements: readonly CapabilityRequirement[] = [
-        { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
-      ];
-      // A SelfAttested requirement is satisfied by the declared capability with
-      // no challenge verification — the typed inputs round-trip through the
-      // bridge deserializers and admission succeeds (returns void, no throw).
-      expect(() =>
+    /** A context whose governance requires `requirements`. */
+    async function requiringContext(
+      requirements: readonly CapabilityRequirement[],
+    ): Promise<string> {
+      const creator = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      const ctx = await napi.contextCreate(
+        creator,
+        JSON.stringify({
+          ceiling: ["messages:read", "messages:write"],
+          capabilityRequirements: encodeCapabilityRequirements(requirements),
+        }),
+      );
+      return ctx.contextId;
+    }
+
+    const selfAttested: readonly CapabilityRequirement[] = [
+      { kind: "SelfAttested", capability: "scp:capability:schema-validation/v1" },
+    ];
+
+    /** A canonical subject DID: a fresh identity's. */
+    async function subjectDid(): Promise<string> {
+      return (await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY)).did;
+    }
+
+    test("checkCapabilityRequirements: SelfAttested requirement met by a declared capability", async () => {
+      // The context's governance holds the requirement; the declared
+      // capability meets it with no challenge record.
+      const contextId = await requiringContext(selfAttested);
+      await expect(
         scpInstance.checkCapabilityRequirements(
-          "ctx-admission",
-          "did:dht:zSubject",
-          requirements,
+          contextId,
+          await subjectDid(),
           ["scp:capability:schema-validation/v1"],
           [],
         ),
-      ).not.toThrow();
+      ).resolves.toBeUndefined();
     });
 
-    test("checkCapabilityRequirements: missing SelfAttested capability is rejected", () => {
-      const requirements: readonly CapabilityRequirement[] = [
-        { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
-      ];
-      expect(() =>
+    test("checkCapabilityRequirements: missing SelfAttested capability is rejected", async () => {
+      const contextId = await requiringContext(selfAttested);
+      await expect(
+        scpInstance.checkCapabilityRequirements(contextId, await subjectDid(), [], []),
+      ).rejects.toMatchObject({ code: "SCP-VALID-7076" });
+    });
+
+    test("checkCapabilityRequirements: a non-canonical subject DID is refused with SCP-VALID-7147", async () => {
+      const contextId = await requiringContext(selfAttested);
+      await expect(
         scpInstance.checkCapabilityRequirements(
-          "ctx-admission",
+          contextId,
           "did:dht:zSubject",
-          requirements,
-          [],
+          ["scp:capability:schema-validation/v1"],
           [],
         ),
-      ).toThrow();
+      ).rejects.toMatchObject({ code: NON_CANONICAL_IDENTIFIER_CODE });
+    });
+
+    test("checkCapabilityRequirements: an unknown context fails closed", async () => {
+      await expect(
+        scpInstance.checkCapabilityRequirements(
+          "ctx-not-created",
+          await subjectDid(),
+          ["scp:capability:schema-validation/v1"],
+          [],
+        ),
+      ).rejects.toBeInstanceOf(ScpError);
+    });
+
+    test("the bridge refuses a wire ChallengeVerified requirement with no verifier with SCP-VALID-7150", async () => {
+      // The raw bridge call skips the SDK encoder, so the Rust check alone
+      // refuses the empty verifier list.
+      const creator = await napi.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
+      await expect(
+        napi.contextCreate(
+          creator,
+          JSON.stringify({
+            ceiling: ["messages:read", "messages:write"],
+            capabilityRequirements: JSON.stringify([
+              {
+                capability: "scp:capability:schema-validation/v1",
+                verification_level: "ChallengeVerified",
+                trusted_verifiers: [],
+                retry_cap: null,
+              },
+            ]),
+          }),
+        ),
+      ).rejects.toThrow("SCP-VALID-7150");
     });
 
     test("verifyParticipationRequirements: valid profile + empty requirements round-trips", () => {

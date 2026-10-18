@@ -165,11 +165,6 @@ pub struct NapiKeyCustodyProvider {
         ts_type = "(args: [string, number[], bigint]) => { ok: boolean; value?: number[]; code?: string; message?: string }"
     )]
     pub derive_rotatable_pseudonym: Function<'static, (String, Vec<u8>, u64), HostBytesResult>,
-    /// `(keyId: string) => Uint8Array` — 32 raw private-seed bytes.
-    #[napi(
-        ts_type = "(keyId: string) => { ok: boolean; value?: number[]; code?: string; message?: string }"
-    )]
-    pub export_signing_key_bytes: Function<'static, String, HostBytesResult>,
     /// `(keyId: string) => string` — `"hardware"` / `"software"` / `"in_memory"`.
     #[napi(
         ts_type = "(keyId: string) => { ok: boolean; value?: string; code?: string; message?: string }"
@@ -272,7 +267,7 @@ pub struct HostStringResult {
 }
 
 /// A host callback outcome carrying bytes (`sign`, `getPublicKey`, `dhAgree`,
-/// `derivePseudonym`, `deriveRotatablePseudonym`, `exportSigningKeyBytes`).
+/// `derivePseudonym`, `deriveRotatablePseudonym`).
 #[napi(object, object_to_js = false)]
 pub struct HostBytesResult {
     /// `true` when the host call succeeded and `value` holds its result.
@@ -504,8 +499,6 @@ pub(crate) struct CallbackTsfns {
         napi::Status,
         false,
     >,
-    export_signing_key_bytes:
-        ThreadsafeFunction<String, HostBytesResult, String, napi::Status, false>,
     custody_type: ThreadsafeFunction<String, HostStringResult, String, napi::Status, false>,
 }
 
@@ -545,10 +538,6 @@ pub(crate) trait JsCustodyHost: Send + Sync {
         key_id: String,
         context_id: Vec<u8>,
         epoch: u64,
-    ) -> impl Future<Output = Result<Vec<u8>, PlatformError>> + Send;
-    fn export_signing_key_bytes(
-        &self,
-        key_id: String,
     ) -> impl Future<Output = Result<Vec<u8>, PlatformError>> + Send;
     /// Fire-and-forget: the answer is advisory and has no synchronous path.
     fn notify_custody_type(&self, key_id: String);
@@ -612,15 +601,6 @@ impl JsCustodyHost for CallbackTsfns {
             "derive_rotatable_pseudonym",
             &self.derive_rotatable_pseudonym,
             (key_id, context_id, epoch),
-        )
-        .await
-    }
-
-    async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, PlatformError> {
-        call_host(
-            "export_signing_key_bytes",
-            &self.export_signing_key_bytes,
-            key_id,
         )
         .await
     }
@@ -712,44 +692,12 @@ impl NapiCallbackKeyCustody {
                 .build_threadsafe_function()
                 .weak::<false>()
                 .build()?,
-            export_signing_key_bytes: provider
-                .export_signing_key_bytes
-                .build_threadsafe_function()
-                .weak::<false>()
-                .build()?,
             custody_type: provider
                 .custody_type
                 .build_threadsafe_function()
                 .weak::<false>()
                 .build()?,
         }))
-    }
-}
-
-impl<H: JsCustodyHost> CallbackAdapter<H> {
-    /// Exports the raw Ed25519 signing key via the provider's
-    /// `exportSigningKeyBytes` callback through
-    /// [`flow::export_ed25519_signing_key`], which requires the seed to
-    /// produce the handle's verifying key.
-    ///
-    /// # Errors
-    ///
-    /// [`PlatformError::WrongKeyType`] for a handle of another type, before
-    /// any export call; [`PlatformError::KeyNotFound`] for a handle the host
-    /// does not hold; [`PlatformError::CustodyError`] if the callback raises,
-    /// returns a non-32-byte value, or returns a seed for another key.
-    pub async fn export_ed25519_signing_key(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
-        let h = &self.host;
-        flow::export_ed25519_signing_key(
-            &self.registry,
-            handle,
-            |key_id| h.export_signing_key_bytes(key_id),
-            |key_id| h.get_public_key(key_id),
-        )
-        .await
     }
 }
 
@@ -979,28 +927,6 @@ impl NapiKeyCustody {
     /// The request string [`Self::request`] names, for handle reporting.
     pub(crate) const fn custody_type_label(&self) -> &'static str {
         self.request().as_str()
-    }
-
-    /// Exports the raw Ed25519 signing key for the given handle, dispatching
-    /// through the active variant. Mirrors the inherent helper on the `PyO3`
-    /// `FfiKeyCustody` enum (required by SCPID signing, event-log
-    /// checkpointing, and pseudonym announcements).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError`] if the handle is invalid or (for callback
-    /// custody) the JS `exportSigningKeyBytes` callback fails.
-    pub async fn export_ed25519_signing_key(
-        &self,
-        handle: &KeyHandle,
-    ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
-        match self {
-            #[cfg(feature = "testing")]
-            Self::InMemory(kc) => kc.0.export_ed25519_signing_key(handle).await,
-            Self::Callback(kc) => kc.export_ed25519_signing_key(handle).await,
-            #[cfg(feature = "testing")]
-            Self::File(kc) => kc.export_ed25519_signing_key(handle).await,
-        }
     }
 }
 
@@ -1303,8 +1229,7 @@ mod tests {
     /// `Callback` variant requires a Node.js runtime (threadsafe functions) and
     /// is exercised end-to-end by the TypeScript SDK test; here we verify the
     /// `InMemory` arm so the migration's dispatch wiring (`generate_keypair` →
-    /// `sign` → `public_key` → `custody_type`, plus the inherent export helper)
-    /// is covered in plain `cargo test`.
+    /// `sign` → `public_key` → `custody_type`) is covered in plain `cargo test`.
     #[tokio::test]
     async fn napi_key_custody_in_memory_dispatch() {
         let custody = NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
@@ -1322,12 +1247,6 @@ mod tests {
         let sig = custody.sign(&handle, b"data").await.expect("sign via enum");
         assert_eq!(sig.as_bytes().len(), 64);
         assert_eq!(custody.custody_type(&handle), CustodyType::InMemory);
-        // Inherent export helper dispatches through the enum.
-        let sk = custody
-            .export_ed25519_signing_key(&handle)
-            .await
-            .expect("export via enum");
-        assert_eq!(sk.to_bytes().len(), 32);
     }
 
     /// The locally-minted ephemeral pre-rotation seed path works through the
@@ -1343,6 +1262,101 @@ mod tests {
             .await
             .expect("ephemeral seed via enum");
         assert_eq!(seed.len(), 32);
+    }
+
+    /// HPKE P-256 `dh_agree` through the enum's `InMemory` arm, the custody a
+    /// testing identity's wrapping key lives in:
+    /// (a) two handles agree symmetrically, and each agreement equals
+    ///     `ecdh_p256` from the pinned vector's scalar against the handle's
+    ///     public point;
+    /// (b) peers of 32, 33, 64 and 66 bytes are rejected;
+    /// (c) an off-curve 65-byte point and a `0x00`-led one are rejected;
+    /// (d) an Ed25519 or X25519 handle with a 65-byte peer is rejected, and so
+    ///     is the HPKE handle with a 32-byte peer.
+    #[tokio::test]
+    async fn napi_key_custody_in_memory_hpke_p256_dh_agree() {
+        use scp_crypto::p256::{P256PublicKey, P256SecretKey, ecdh_p256, testing};
+
+        let custody = NapiKeyCustody::InMemory(Box::new(OpaqueInMemoryKeyCustody(
+            InMemoryKeyCustody::new(),
+        )));
+        let a = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("generate A");
+        let b = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("generate B");
+        let a_pub = custody.public_key(&a).await.expect("A public");
+        let b_pub = custody.public_key(&b).await.expect("B public");
+        assert_eq!(a_pub.as_bytes().len(), 65);
+        assert_eq!(b_pub.as_bytes().len(), 65);
+
+        // (a) symmetry, and agreement with the pinned vector's scalar.
+        let ab = custody.dh_agree(&a, b_pub.as_bytes()).await.expect("A·B");
+        let ba = custody.dh_agree(&b, a_pub.as_bytes()).await.expect("B·A");
+        assert_eq!(ab.as_bytes(), ba.as_bytes());
+        let fixed = P256SecretKey::from_scalar_bytes(
+            &hex::decode(testing::ECDH_VECTOR_SCALAR_I)
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes"),
+        )
+        .expect("scalar");
+        let fixed_pub = fixed.public_key().to_uncompressed();
+        assert_eq!(hex::encode(fixed_pub), testing::ECDH_VECTOR_PUBLIC_I);
+        let a_fixed = custody.dh_agree(&a, &fixed_pub).await.expect("A·I");
+        let a_point = P256PublicKey::from_uncompressed(a_pub.as_bytes()).expect("A point");
+        assert_eq!(a_fixed.as_bytes(), ecdh_p256(&fixed, &a_point).as_slice());
+
+        // (b) wrong peer lengths.
+        let compressed = fixed.public_key().to_compressed();
+        let wrong_lengths: [(&str, Vec<u8>); 4] = [
+            ("32", fixed_pub[1..33].to_vec()),
+            ("33", compressed.to_vec()),
+            ("64", fixed_pub[1..].to_vec()),
+            ("66", [&fixed_pub[..], &[0u8][..]].concat()),
+        ];
+        for (len, peer) in wrong_lengths {
+            assert!(
+                matches!(
+                    custody.dh_agree(&a, &peer).await,
+                    Err(PlatformError::CustodyError(_))
+                ),
+                "{len}-byte peer"
+            );
+        }
+
+        // (c) off-curve and 0x00-led points.
+        let mut off_curve = fixed_pub;
+        off_curve[64] ^= 1;
+        let infinity = [0u8; 65];
+        for (case, peer) in [("off curve", off_curve), ("0x00-led", infinity)] {
+            assert!(
+                matches!(
+                    custody.dh_agree(&a, &peer).await,
+                    Err(PlatformError::CustodyError(_))
+                ),
+                "{case}"
+            );
+        }
+
+        // (d) key type and peer length must match.
+        let ed = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("Ed25519");
+        let x = custody
+            .generate_keypair(KeyType::X25519)
+            .await
+            .expect("X25519");
+        assert!(custody.dh_agree(&ed, &fixed_pub).await.is_err(), "Ed25519");
+        assert!(custody.dh_agree(&x, &fixed_pub).await.is_err(), "X25519");
+        assert!(
+            custody.dh_agree(&a, &[7u8; 32]).await.is_err(),
+            "HPKE handle, 32-byte peer"
+        );
     }
 }
 
@@ -1410,10 +1424,6 @@ mod adapter_tests {
         ) -> Result<Vec<u8>, PlatformError> {
             self.host
                 .derive_pseudonym(&key_id, &context_id, Some(epoch))
-        }
-
-        async fn export_signing_key_bytes(&self, key_id: String) -> Result<Vec<u8>, PlatformError> {
-            self.host.export_signing_key_bytes(&key_id)
         }
 
         fn notify_custody_type(&self, _key_id: String) {}
@@ -1518,13 +1528,17 @@ mod adapter_tests {
             .generate_identity_keypair()
             .await
             .expect("identity generation");
-        let seed = zeroize::Zeroizing::new(
-            <[u8; 32]>::try_from(
-                host.export_signing_key_bytes(&identity.id().to_string())
-                    .expect("seed")
-                    .as_slice(),
-            )
-            .expect("32 bytes"),
+        let seed = scp_ffi_common::callback_custody::fake_host::scalar_for(identity.id());
+        assert_eq!(
+            custody
+                .public_key(&identity)
+                .await
+                .expect("public key")
+                .as_bytes(),
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .as_bytes(),
+            "the recomputed seed is the host's key"
         );
         let expected = |version| scp_crypto::pseudonym::derive_pseudonym(&seed, b"ctx", version);
 
@@ -1637,9 +1651,9 @@ mod adapter_tests {
         assert_eq!(host.calls("sign"), 2);
     }
 
-    /// `export_ed25519_signing_key` and `ed25519_to_x25519_agree` refuse a
-    /// P-256 handle, minted or resolved, with `WrongKeyType` before any host
-    /// export or agreement call.
+    /// `ed25519_to_x25519_agree` refuses a P-256 handle, minted or resolved,
+    /// with `WrongKeyType` before any host agreement call; an Ed25519 handle
+    /// passes the type check and reaches the host.
     #[tokio::test]
     async fn napi_adapter_ed25519_only_paths_refuse_p256() {
         let host = Arc::new(FakeHost::default());
@@ -1656,25 +1670,22 @@ mod adapter_tests {
         );
         for handle in [minted, resolved] {
             assert!(matches!(
-                custody.export_ed25519_signing_key(&handle).await,
-                Err(PlatformError::WrongKeyType { .. })
-            ));
-            assert!(matches!(
                 custody.ed25519_to_x25519_agree(&handle, &[9u8; 32]).await,
                 Err(PlatformError::WrongKeyType { .. })
             ));
         }
-        assert_eq!(host.calls("export_signing_key_bytes"), 0);
         assert_eq!(host.calls("dh_agree"), 0);
 
+        // The fake host agrees with HPKE keys only, so its refusal is a
+        // custody error: the call passed the adapter's type check.
         let ed = custody
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("ed25519 generation");
-        custody
-            .export_ed25519_signing_key(&ed)
-            .await
-            .expect("an Ed25519 key exports");
-        assert_eq!(host.calls("export_signing_key_bytes"), 1);
+        assert!(matches!(
+            custody.ed25519_to_x25519_agree(&ed, &[9u8; 32]).await,
+            Err(PlatformError::CustodyError(_))
+        ));
+        assert_eq!(host.calls("dh_agree"), 1);
     }
 }

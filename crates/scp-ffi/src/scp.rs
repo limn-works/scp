@@ -269,17 +269,14 @@ impl PyScp {
     /// Raises `ContextError` (code `SCP-CTX-2000`) if the instance has
     /// been permanently shut down.
     pub fn resume(&self, py: Python<'_>) -> PyResult<()> {
-        let rt = crate::runtime()?;
         let inner = Arc::clone(&self.inner);
         // Release the GIL while we drive the tokio runtime. The
         // `BridgeInstanceCore::resume` default body performs async work
         // (transport reconnect, context restore) that must not block the
         // Python interpreter.
-        py.allow_threads(|| {
-            rt.block_on(async move {
-                scp_ffi_common::bridge_instance::BridgeInstanceCore::resume(&*inner).await
-            })
-        })
+        crate::actor_wait::block_on_released(py, async move {
+            scp_ffi_common::bridge_instance::BridgeInstanceCore::resume(&*inner).await
+        })?
         .map_err(|e| ScpPyError::ContextError {
             message: format!("resume failed: {e}"),
             code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
@@ -304,14 +301,13 @@ impl PyScp {
     /// still holds its advisory lock after the call.
     pub fn shutdown(&self, py: Python<'_>, timeout_millis: u64) -> PyResult<()> {
         let timeout = Duration::from_millis(timeout_millis);
-        let rt = crate::runtime()?;
         let inner = Arc::clone(&self.inner);
         // Release the GIL while we drive the tokio runtime — shutdown may
         // drain tasks for up to `timeout_millis`, and we must not block the
         // Python interpreter meanwhile.
-        py.allow_threads(|| {
-            rt.block_on(async move { sdk_shutdown(inner.shutdown(timeout).await) })
-        })?;
+        crate::actor_wait::block_on_released(py, async {
+            async move { sdk_shutdown(inner.shutdown(timeout).await) }.await
+        })??;
         Ok(())
     }
 

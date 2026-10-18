@@ -70,10 +70,11 @@ use crate::context::actor::commands::{
     CommitBReserveOutcome, CommitBReserveReply, CommitBSettleOutcome, CommitBSettleReply,
     CommitBStreamSettleOutcome, CommitBStreamSettleReply, PrepareAOutcome, PrepareBOutcome,
     PrepareBStreamingFields, PreparedAFields, PreparedBFields, SagaPhaseMessage, SagaReject,
-    SigningKeyBytes, saga_reject,
+    saga_reject,
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::{Outcome, outcome_error_sketch};
+use crate::context::actor::signer::CommandSigner;
 use crate::context::actor::state::PerContextState;
 use crate::context::economy_logic::{ContextRevocationChecker, KeyResolverDidResolver};
 use crate::context::messaging_helpers::{
@@ -296,7 +297,7 @@ async fn dispatch_stream_phase(
             saga_id,
             terminal_status,
             cancel_ack_seq,
-            target_signing_key,
+            target_signer,
             reply,
         } => {
             commit_b_stream_settle(
@@ -305,7 +306,7 @@ async fn dispatch_stream_phase(
                 &saga_id,
                 &terminal_status,
                 cancel_ack_seq,
-                &target_signing_key,
+                &target_signer,
                 reply,
             )
             .await
@@ -433,19 +434,9 @@ async fn dispatch_commit_phase(
         SagaPhaseMessage::CommitBSettle {
             saga_id,
             output_bytes,
-            target_signing_key,
+            target_signer,
             reply,
-        } => {
-            commit_b_settle(
-                cell,
-                deps,
-                &saga_id,
-                output_bytes,
-                &target_signing_key,
-                reply,
-            )
-            .await
-        }
+        } => commit_b_settle(cell, deps, &saga_id, output_bytes, &target_signer, reply).await,
         SagaPhaseMessage::CommitA {
             saga_id,
             reservation,
@@ -483,7 +474,7 @@ async fn dispatch_commit_phase(
             committed_side,
             committed_event_id,
             committed_timestamp_secs,
-            signing_key,
+            signer,
             reply,
         } => {
             // Build the owned snapshot HERE (holding `&mut ClassSCell`) and hand
@@ -501,7 +492,7 @@ async fn dispatch_commit_phase(
                 committed_side,
                 &committed_event_id,
                 committed_timestamp_secs,
-                &signing_key,
+                &signer,
                 reply,
             )
             .await
@@ -1714,7 +1705,7 @@ async fn commit_b_settle(
     deps: &ActorDeps,
     saga_id: &SagaId,
     output_bytes: Vec<u8>,
-    target_signing_key: &SigningKeyBytes,
+    target_signer: &CommandSigner,
     reply: CommitBSettleReply,
 ) -> Outcome<()> {
     // Replay: re-emit the stored capture byte-for-byte; never re-invoke / re-sign.
@@ -1722,7 +1713,7 @@ async fn commit_b_settle(
         return reemit_committed_settle(committed, reply);
     }
 
-    match commit_b_first_settle(cell, deps, saga_id, &output_bytes, target_signing_key).await {
+    match commit_b_first_settle(cell, deps, saga_id, &output_bytes, target_signer).await {
         Ok(outcome) => {
             let _ = reply.send(Ok(outcome));
             Outcome::ok_mutated(())
@@ -1815,7 +1806,7 @@ async fn commit_b_first_settle(
     deps: &ActorDeps,
     saga_id: &SagaId,
     output_bytes: &[u8],
-    target_signing_key: &SigningKeyBytes,
+    target_signer: &CommandSigner,
 ) -> Result<CommitBSettleOutcome, (bool, ContextError)> {
     // Peek the staged slot to derive the persist `context_id` (target hex) BEFORE
     // the capture combinator (which needs `context_id` up front) and to reject the
@@ -1836,16 +1827,26 @@ async fn commit_b_first_settle(
     };
     let target_hex = hex_context_id(&peek.target_context_id);
 
+    // Sign BEFORE the capture combinator (ADR-049 Decision 7a): custody signing
+    // is async and the combinator's `f` is synchronous. The receipt is a pure
+    // function of the staged slot and the captured output, and this actor turn
+    // owns the cell, so the slot `f` moves out below is the slot signed here. A
+    // signing failure (13032-13034, or the custody error) changes no state:
+    // `(false, err)`, no persist.
+    let event_id = outlet_invoked_event_id(saga_id);
+    let receipt = build_signed_receipt(peek, output_bytes, &event_id, target_signer)
+        .await
+        .map_err(|e| (false, e))?;
+
     // (1) CAPTURE + fail-closed persist with RESTORE-on-persist-failure.
     //
     // `f` MOVES the staged slot out (owning the original `SagaPreparedState` for a
-    // lossless rollback), signs the receipt, and inserts the durable output
-    // capture. On a signing failure `f` re-inserts the owned original and returns
-    // the error (no persist). `commit_class_s_restore` snapshots Class-S BEFORE
-    // `f`, so its persist-failure RESTORE rolls the capture back and re-stages the
-    // slot verbatim (matching the prior inline rollback). Both the `f`-error
-    // (13031 already handled above, or signing 13032-13034) and the persist
-    // failure surface as `(false, err)` — `mutated = false` (no event-log touch).
+    // lossless rollback) and inserts the durable output capture with the receipt
+    // signed above. `commit_class_s_restore` snapshots Class-S BEFORE `f`, so its
+    // persist-failure RESTORE rolls the capture back and re-stages the slot
+    // verbatim (matching the prior inline rollback). Both the `f`-error (13031)
+    // and the persist failure surface as `(false, err)` — `mutated = false` (no
+    // event-log touch).
     //
     // `f` returns the data the post-persist append + reply need, plus the OWNED
     // `prepared` so the append-failure compensation in (2) can re-insert the slot.
@@ -1866,20 +1867,6 @@ async fn commit_b_first_settle(
             )));
         };
 
-        // Build the signed receipt from STAGED provenance + the captured output.
-        // A signing failure leaves state as found (re-insert the owned original).
-        let event_id = outlet_invoked_event_id(saga_id);
-        let receipt =
-            match build_signed_receipt(&prepared, output_bytes, &event_id, target_signing_key) {
-                Ok(r) => r,
-                Err(e) => {
-                    view.class_s_mut().saga_pending.insert(
-                        saga_id.clone(),
-                        SagaPreparedState::CrossContextOutletInvocation(prepared),
-                    );
-                    return Err(e);
-                }
-            };
         // The receipt's JCS output bytes are the canonical preimage A re-hashes.
         let canonical_output = receipt.output_jcs.clone();
 
@@ -2064,14 +2051,15 @@ struct CommitBCaptured {
 
 /// Sign the [`CrossContextOutletReceipt`] over the staged B-recorded provenance +
 /// `SHA-256(jcs(output))` + the `SagaId`-stable event id, using the target's
-/// Active Signing Key (spec §6.2.4 "Receipt / response return path"). The
-/// output is canonicalized to JCS so the receipt is self-verifying (the
-/// verifier re-hashes the carried bytes with no re-canonicalization step).
-fn build_signed_receipt(
+/// Active Signing Key through its custody signer (spec §6.2.4 "Receipt /
+/// response return path"; ADR-049 Decision 7a). The output is canonicalized to
+/// JCS so the receipt is self-verifying (the verifier re-hashes the carried
+/// bytes with no re-canonicalization step).
+async fn build_signed_receipt(
     prepared: &CrossContextOutletInvocationPrepared,
     output_bytes: &[u8],
     event_id: &str,
-    target_signing_key: &SigningKeyBytes,
+    target_signer: &CommandSigner,
 ) -> Result<CrossContextOutletReceipt, ContextError> {
     // Canonicalize the executor output to JCS — the exact bytes the preimage
     // hashes and the receipt carries (Output canonicalization obligation).
@@ -2087,26 +2075,24 @@ fn build_signed_receipt(
         ))
     })?;
 
-    let signing_key = target_signing_key.to_signing_key();
-    CrossContextOutletReceipt::sign(
-        &signing_key,
-        CrossContextOutletReceiptFields {
-            caller_context_id: prepared.caller_context_id,
-            target_context_id: prepared.target_context_id,
-            caller_did: prepared.caller_did.0.clone(),
-            nonce: prepared.recorded_nonce,
-            outlet_registration_id: prepared.outlet_registration_id.clone(),
-            output_jcs,
-            outlet_invoked_event_id: event_id.to_owned(),
-            chain_depth: prepared.recorded_chain_depth,
-            timestamp_ms: prepared.recorded_timestamp_ms,
-        },
-    )
-    .map_err(|e| {
+    let unsigned = CrossContextOutletReceipt::unsigned(CrossContextOutletReceiptFields {
+        caller_context_id: prepared.caller_context_id,
+        target_context_id: prepared.target_context_id,
+        caller_did: prepared.caller_did.0.clone(),
+        nonce: prepared.recorded_nonce,
+        outlet_registration_id: prepared.outlet_registration_id.clone(),
+        output_jcs,
+        outlet_invoked_event_id: event_id.to_owned(),
+        chain_depth: prepared.recorded_chain_depth,
+        timestamp_ms: prepared.recorded_timestamp_ms,
+    });
+    let preimage = unsigned.signing_preimage().map_err(|e| {
         ContextError::CryptoFailed(format!(
             "SCP-SAGA-13034: Commit-B receipt signing failed: {e}"
         ))
-    })
+    })?;
+    let signature = target_signer.sign_bounded_ed25519(&preimage).await?;
+    Ok(unsigned.with_signature(signature))
 }
 
 /// JCS-encode a [`CrossContextOutletReceipt`] to the wire bytes the FSM forwards.
@@ -2461,7 +2447,7 @@ async fn commit_b_stream_settle(
     saga_id: &SagaId,
     terminal_status: &StreamTerminalStatus,
     cancel_ack_seq: Option<u64>,
-    target_signing_key: &SigningKeyBytes,
+    target_signer: &CommandSigner,
     reply: CommitBStreamSettleReply,
 ) -> Outcome<()> {
     // B's CURRENT spawn-generation (Class-C, read via Deref) — carried on the
@@ -2483,7 +2469,7 @@ async fn commit_b_stream_settle(
         saga_id,
         terminal_status,
         cancel_ack_seq,
-        target_signing_key,
+        target_signer,
         generation,
     )
     .await
@@ -2594,7 +2580,7 @@ async fn commit_b_stream_first_settle(
     saga_id: &SagaId,
     terminal_status: &StreamTerminalStatus,
     cancel_ack_seq: Option<u64>,
-    target_signing_key: &SigningKeyBytes,
+    target_signer: &CommandSigner,
     generation: u64,
 ) -> Result<CommitBStreamSettleOutcome, (bool, ContextError)> {
     // Peek to derive the persist `context_id` and reject the no-slot case as
@@ -2613,6 +2599,20 @@ async fn commit_b_stream_first_settle(
     };
     let target_hex = hex_context_id(&peek.target_context_id);
 
+    // Seal the manifest root from the durable frontier prefix (the RFC-6962
+    // `frontier.root()`) and sign the streaming receipt over the STAGED provenance
+    // + that root BEFORE the capture combinator (ADR-049 Decision 7a): custody
+    // signing is async and `f` is synchronous. This actor turn owns the cell, so
+    // the slot `f` moves out below is the slot signed here. An EMPTY / zero-chunk
+    // sealed prefix legitimately yields `[0u8; 32]` — an honest zero-billed
+    // empty-stream attestation, not a placeholder. A signing failure changes no
+    // state: `(false, err)`, no persist.
+    let stream_manifest_hash = peek.frontier.root();
+    let event_id = outlet_invoked_event_id(saga_id);
+    let receipt = build_signed_stream_receipt(peek, stream_manifest_hash, &event_id, target_signer)
+        .await
+        .map_err(|e| (false, e))?;
+
     // (1) SEAL + CAPTURE + fail-closed persist with RESTORE-on-persist-failure.
     let captured = cell.commit_class_s_restore(deps, &target_hex, |mut view| {
         let saga_pending = &mut view.class_s_mut().saga_pending;
@@ -2629,14 +2629,9 @@ async fn commit_b_stream_first_settle(
             )));
         };
 
-        // Seal the manifest root from the durable frontier prefix (the RFC-6962
-        // `frontier.root()`) + finalize the §5.4.5 counts. An EMPTY / zero-chunk
-        // sealed prefix legitimately yields `[0u8; 32]` — an honest zero-billed
-        // empty-stream attestation, not a placeholder.
-        let stream_manifest_hash = prepared.frontier.root();
+        // Finalize the §5.4.5 counts from the same durable frontier prefix.
         let billed_count = u32::try_from(prepared.frontier.billed_count()).unwrap_or(u32::MAX);
         let stream_chunk_count = prepared.frontier.leaf_count();
-        let event_id = outlet_invoked_event_id(saga_id);
 
         // Settle escrow from the DURABLE ledger (ADR-061 seal step 3; ADR-049
         // §3a(b) decoupled release): reconstruct the pinned escrow from
@@ -2672,24 +2667,6 @@ async fn commit_b_stream_first_settle(
                  over-accrued past the credit ceiling (should be impossible)"
             );
         }
-
-        // Sign the streaming receipt over the STAGED provenance + the sealed root.
-        // A signing failure leaves state as found (re-insert the owned original).
-        let receipt = match build_signed_stream_receipt(
-            &prepared,
-            stream_manifest_hash,
-            &event_id,
-            target_signing_key,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                view.class_s_mut().saga_pending.insert(
-                    saga_id.clone(),
-                    SagaPreparedState::CrossContextStreamingOutletInvocation(prepared),
-                );
-                return Err(e);
-            }
-        };
 
         let caller_did_str = prepared.caller_did.0.clone();
         let target_context_id = prepared.target_context_id;
@@ -2918,20 +2895,18 @@ async fn commit_b_stream_settle_finalize(
 
 /// Sign the [`CrossContextOutletStreamReceipt`] over the staged B-recorded
 /// provenance + the sealed `stream_manifest_hash` + the `SagaId`-stable event id,
-/// using the target's Active Signing Key (ADR-061 "Receipt (streaming)";
-/// §6.2.5). The root is carried directly — the streaming receipt attests the
-/// Merkle root, reproduced on replay from the durable capture, never from output
-/// bytes.
-fn build_signed_stream_receipt(
+/// using the target's Active Signing Key through its custody signer (ADR-061
+/// "Receipt (streaming)"; §6.2.5; ADR-049 Decision 7a). The root is carried
+/// directly — the streaming receipt attests the Merkle root, reproduced on
+/// replay from the durable capture, never from output bytes.
+async fn build_signed_stream_receipt(
     prepared: &CrossContextStreamingOutletInvocationPrepared,
     stream_manifest_hash: [u8; 32],
     event_id: &str,
-    target_signing_key: &SigningKeyBytes,
+    target_signer: &CommandSigner,
 ) -> Result<CrossContextOutletStreamReceipt, ContextError> {
-    let signing_key = target_signing_key.to_signing_key();
-    CrossContextOutletStreamReceipt::sign(
-        &signing_key,
-        CrossContextOutletStreamReceiptFields {
+    let unsigned =
+        CrossContextOutletStreamReceipt::unsigned(CrossContextOutletStreamReceiptFields {
             caller_context_id: prepared.caller_context_id,
             target_context_id: prepared.target_context_id,
             caller_did: prepared.caller_did.0.clone(),
@@ -2941,13 +2916,14 @@ fn build_signed_stream_receipt(
             outlet_invoked_event_id: event_id.to_owned(),
             chain_depth: prepared.recorded_chain_depth,
             timestamp_ms: prepared.recorded_timestamp_ms,
-        },
-    )
-    .map_err(|e| {
+        });
+    let preimage = unsigned.signing_preimage().map_err(|e| {
         ContextError::CryptoFailed(format!(
             "SCP-SAGA-13044: streaming Commit-B receipt signing failed: {e}"
         ))
-    })
+    })?;
+    let signature = target_signer.sign_bounded_ed25519(&preimage).await?;
+    Ok(unsigned.with_signature(signature))
 }
 
 /// JCS-encode a [`CrossContextOutletStreamReceipt`] to the wire bytes the FSM
@@ -3545,6 +3521,24 @@ async fn abort(
 // behaviour-preserving. A snapshot the caller could not build (no floor export:
 // the Supervisor has dropped, ADR-049 Decision 16) persists nothing and replies
 // with that typed error.
+/// Sign a [`CrossContextDivergenceMarker`] through the emitting side's custody
+/// signer (ADR-049 Decision 7a). A preimage failure is `SCP-SAGA-13036`; a
+/// custody refusal or timeout keeps its typed [`ContextError::Custody`].
+async fn sign_divergence_marker(
+    signer: &CommandSigner,
+    fields: CrossContextDivergenceMarkerFields,
+) -> Result<CrossContextDivergenceMarker, ContextError> {
+    let saga_id = fields.saga_id.clone();
+    let unsigned = CrossContextDivergenceMarker::unsigned(fields);
+    let preimage = unsigned.signing_preimage().map_err(|e| {
+        ContextError::CryptoFailed(format!(
+            "SCP-SAGA-13036: divergence-marker signing failed for saga '{saga_id}': {e}"
+        ))
+    })?;
+    let signature = signer.sign_bounded_ed25519(&preimage).await?;
+    Ok(unsigned.with_signature(signature))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn emit_divergence_marker(
     context_id: [u8; 32],
@@ -3555,7 +3549,7 @@ async fn emit_divergence_marker(
     committed_side: CommittedSide,
     committed_event_id: &str,
     committed_timestamp_secs: u64,
-    signing_key: &SigningKeyBytes,
+    signer: &CommandSigner,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // Bound by reference: a moved-out copy would give this future a second
@@ -3570,22 +3564,15 @@ async fn emit_divergence_marker(
     };
     let context_hex = hex_context_id(&context_id);
 
-    let key = signing_key.to_signing_key();
-    let marker = match CrossContextDivergenceMarker::sign(
-        &key,
-        CrossContextDivergenceMarkerFields {
-            saga_id: saga_id.0.clone(),
-            nonce,
-            committed_side,
-            committed_event_id: committed_event_id.to_owned(),
-        },
-    ) {
+    let fields = CrossContextDivergenceMarkerFields {
+        saga_id: saga_id.0.clone(),
+        nonce,
+        committed_side,
+        committed_event_id: committed_event_id.to_owned(),
+    };
+    let marker = match sign_divergence_marker(signer, fields).await {
         Ok(m) => m,
-        Err(e) => {
-            let err = ContextError::CryptoFailed(format!(
-                "SCP-SAGA-13036: divergence-marker signing failed for saga '{}': {e}",
-                saga_id.0
-            ));
+        Err(err) => {
             let sketch = outcome_error_sketch(&err);
             let _ = reply.send(Err(err));
             return Outcome::err(sketch);
@@ -4158,7 +4145,7 @@ mod tests {
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
-            .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:saga-test-owner".to_owned()))
             .await
             .expect("build_actor_deps")
     }
@@ -4204,7 +4191,7 @@ mod tests {
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
-            .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:saga-test-owner".to_owned()))
             .await
             .expect("build_actor_deps")
     }
@@ -5327,9 +5314,9 @@ mod tests {
 
     // --- Commit-B / Commit-A / Abort tests --------------------------------
 
-    /// A target signing key wrapped for the per-call receipt-signing argument.
-    fn signing_key_bytes(seed: u8) -> SigningKeyBytes {
-        SigningKeyBytes::from_signing_key(&ed25519_dalek::SigningKey::from_bytes(&[seed; 32]))
+    /// A local Ed25519 signer for the per-call receipt-signing argument.
+    fn test_signer(seed: u8) -> CommandSigner {
+        CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]))
     }
 
     /// Build a valid JCS-serialized `CrossContextOutletReceipt` for Commit-A
@@ -5400,7 +5387,7 @@ mod tests {
         ));
 
         // Settle: capture output, append OutletInvoked, sign a verifiable receipt.
-        let target_key = signing_key_bytes(0x55);
+        let target_key = test_signer(0x55);
         let output = br#"{"result":42}"#.to_vec();
         let (tx, rx) = oneshot::channel();
         let out =
@@ -5412,7 +5399,7 @@ mod tests {
         let receipt: CrossContextOutletReceipt =
             serde_json::from_slice(&settled.receipt).expect("receipt json");
         receipt
-            .verify(&target_key.to_signing_key().verifying_key())
+            .verify(&target_key.verifying_key().expect("signer key"))
             .expect("receipt verifies against target signing key");
         // The receipt is signed over B's STAGED provenance: re-derived depth 3
         // (incoming 2 + 1) and the staged wire nonce.
@@ -5442,7 +5429,7 @@ mod tests {
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         stage_prepared_b(&mut st_cell, &deps, 0xC2, &saga.0, now_ms).await;
 
-        let target_key = signing_key_bytes(0x66);
+        let target_key = test_signer(0x66);
         let output = br#"{"result":7}"#.to_vec();
 
         let (tx, rx) = oneshot::channel();
@@ -5466,7 +5453,7 @@ mod tests {
             &deps,
             &saga,
             br#"{"result":999}"#.to_vec(),
-            &signing_key_bytes(0x77),
+            &test_signer(0x77),
             tx,
         )
         .await;
@@ -5506,7 +5493,7 @@ mod tests {
         let mut st_cell = crate::context::actor::class_s::ClassSCell::new(st);
         stage_prepared_b(&mut st_cell, &deps, 0xC3, &saga.0, now_ms).await;
 
-        let target_key = signing_key_bytes(0x88);
+        let target_key = test_signer(0x88);
         // Non-canonical (pretty-printed, reordered keys) output — the handler
         // re-canonicalizes so the receipt's output_jcs is the hashed preimage.
         let output = br#"{ "b": 2, "a": 1 }"#.to_vec();
@@ -5517,7 +5504,7 @@ mod tests {
             serde_json::from_slice(&settled.receipt).expect("receipt json");
         // Self-verifying: output_hash recomputes from the carried JCS bytes.
         receipt
-            .verify(&target_key.to_signing_key().verifying_key())
+            .verify(&target_key.verifying_key().expect("signer key"))
             .expect("self-verifying receipt");
         assert_eq!(receipt.output_jcs, br#"{"a":1,"b":2}"#.to_vec());
     }
@@ -6119,7 +6106,7 @@ mod tests {
         )
         .await;
 
-        let signing = signing_key_bytes(0x99);
+        let signing = test_signer(0x99);
         let saga = SagaId("saga-divergence".to_owned());
         let (tx, rx) = oneshot::channel();
         let ctx_hex = hex_context_id(&st.context_id);
@@ -6145,7 +6132,7 @@ mod tests {
 
         // The marker the handler signed verifies against the emitting key.
         let marker = CrossContextDivergenceMarker::sign(
-            &signing.to_signing_key(),
+            &ed25519_dalek::SigningKey::from_bytes(&[0x99; 32]),
             CrossContextDivergenceMarkerFields {
                 saga_id: saga.0.clone(),
                 nonce: [0xAB; 16],
@@ -6155,7 +6142,7 @@ mod tests {
         )
         .expect("marker");
         marker
-            .verify(&signing.to_signing_key().verifying_key())
+            .verify(&signing.verifying_key().expect("signer key"))
             .expect("marker verifies");
     }
 
@@ -6177,7 +6164,7 @@ mod tests {
             CommittedSide::Target,
             "evt-committed-10",
             1_700_000_000,
-            &signing_key_bytes(0x99),
+            &test_signer(0x99),
             tx,
         )
         .await;
@@ -6244,7 +6231,7 @@ mod tests {
             &fail_deps,
             &saga,
             br#"{"result":1}"#.to_vec(),
-            &signing_key_bytes(0xAA),
+            &test_signer(0xAA),
             tx,
         )
         .await;
@@ -6294,7 +6281,7 @@ mod tests {
         )
         .await;
         let output = br#"{"result":7}"#.to_vec();
-        let signing = signing_key_bytes(0xAA);
+        let signing = test_signer(0xAA);
 
         // FIRST settle: the persist fails BEFORE the append — capture rolled back,
         // staged slot restored, and (FIX 3) NO `OutletInvoked` appended.
@@ -6339,6 +6326,53 @@ mod tests {
         );
         assert!(st_cell.class_s.xctx_committed_outputs.contains_key(&saga));
         assert!(!st_cell.class_s.saga_pending.contains_key(&saga));
+    }
+
+    /// The Commit-B receipt signed through a custody-backed signer (ADR-049
+    /// Decision 7a) verifies under the target context's key and fails under any
+    /// other key: the signature comes from custody, not from a key the actor
+    /// holds.
+    #[tokio::test]
+    async fn receipt_signed_via_signer_verifies_against_target_key() {
+        use crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared;
+        use scp_platform::testing::InMemoryKeyCustody;
+
+        let custody = InMemoryKeyCustody::new();
+        let key = custody.import_ed25519_key(&[0xB7; 32]).await;
+        let signer = CommandSigner::from_custody(
+            scp_platform::CustodySigner::new(
+                std::sync::Arc::new(custody),
+                key,
+                scp_crypto::SigAlg::Ed25519,
+            )
+            .await
+            .expect("custody signer over the imported key"),
+        );
+        let prepared = CrossContextOutletInvocationPrepared {
+            caller_context_id: [0xCC; 32],
+            target_context_id: [0xCB; 32],
+            caller_did: DID(CALLER.to_owned()),
+            outlet_registration_id: OUTLET.to_owned(),
+            ucan_proof_id: String::new(),
+            recorded_timestamp_ms: 1_700_000_000_000,
+            recorded_nonce: [0x42; 16],
+            recorded_chain_depth: 1,
+        };
+
+        let receipt = build_signed_receipt(&prepared, br#"{"result":5}"#, "evt-receipt", &signer)
+            .await
+            .expect("the receipt signs through custody");
+
+        let target_key = ed25519_dalek::SigningKey::from_bytes(&[0xB7; 32]).verifying_key();
+        assert_eq!(signer.verifying_key().expect("signer key"), target_key);
+        receipt
+            .verify(&target_key)
+            .expect("the receipt verifies under the target context's key");
+        let other = ed25519_dalek::SigningKey::from_bytes(&[0xB8; 32]).verifying_key();
+        assert!(
+            receipt.verify(&other).is_err(),
+            "the receipt must not verify under a different key"
+        );
     }
 
     /// FIX 6 (simplifier): a Commit-B settle persist-failure rollback RE-INSERTS
@@ -6390,7 +6424,7 @@ mod tests {
             &fail_deps,
             &saga,
             br#"{"result":5}"#.to_vec(),
-            &signing_key_bytes(0xBB),
+            &test_signer(0xBB),
             tx,
         )
         .await;
@@ -6463,7 +6497,7 @@ mod tests {
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
-            .build_actor_deps(&DID("did:example:saga-test-owner".to_owned()))
+            .build_actor_deps_loaded(&DID("did:example:saga-test-owner".to_owned()))
             .await
             .expect("build_actor_deps")
     }

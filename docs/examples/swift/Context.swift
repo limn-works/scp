@@ -63,6 +63,7 @@ enum ContextExample {
             economicPolicy: nil,
             consequenceRulesJson: nil,
             consequenceConfigJson: nil,
+            capabilityRequirementsJson: nil,
             pseudonymRotation: nil
         )
 

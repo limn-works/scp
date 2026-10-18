@@ -168,9 +168,14 @@ pub(crate) fn ensure_did_resolver_initialized_on(
         return Ok(());
     }
 
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return Ok(()); // No runtime available; skip initialization.
-    };
+    // Fails closed off a runtime: skipping here left the instance with no
+    // resolver, so the supervisor later snapshotted the not-configured key
+    // resolver and every governance vote by this instance's identities failed
+    // as an unknown voter, far from the cause.
+    let handle = tokio::runtime::Handle::try_current().map_err(|e| ScpNapiError::Identity {
+        message: format!("DID resolver initialization requires a tokio runtime: {e}"),
+        code: codes::IDENT_1058.to_owned(),
+    })?;
 
     // Reuse the process-wide `SHARED_DHT_CLIENT` when already set so Alice
     // (on `SCP` A) publishes to the same DHT Bob (on `SCP` B) reads from.
@@ -1012,7 +1017,8 @@ impl NapiIdentity {
     /// # Returns
     ///
     /// A new `NapiIdentity` with the migrated DID. The original identity's
-    /// key material is dropped from the registry.
+    /// registry entry is removed; the supervisor's loaded wrapping key for the
+    /// old DID keeps its custody `Arc` until supervisor shutdown.
     ///
     /// # Errors
     ///
@@ -1333,6 +1339,39 @@ pub struct NapiDIDDocument {
     ///
     /// See ADR-039 acceptance criterion 19 and SCP-AB-016.
     pub agent_public_key: Option<String>,
+}
+
+impl From<&DidDocument> for NapiDIDDocument {
+    /// The one projection of a resolved document. A deserialized document
+    /// holds no entry §18.2.1 rejects, so JS never sees one in
+    /// `service_endpoints`.
+    fn from(document: &DidDocument) -> Self {
+        Self {
+            id: document.id.clone(),
+            verification_methods: document
+                .verification_method
+                .iter()
+                .map(|vm| NapiVerificationMethod {
+                    id: vm.id.clone(),
+                    method_type: vm.method_type.clone(),
+                    controller: vm.controller.clone(),
+                    public_key_multibase: vm.public_key_multibase.clone(),
+                })
+                .collect(),
+            authentication: document.authentication.clone(),
+            assertion_methods: document.assertion_method.clone(),
+            also_known_as: document.also_known_as.clone(),
+            service_endpoints: document
+                .service
+                .iter()
+                .map(|s| s.service_endpoint.clone())
+                .collect(),
+            has_agent_key: document.has_agent_key(),
+            agent_public_key: document
+                .agent_verification_method()
+                .map(|vm| vm.public_key_multibase.clone()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1751,6 +1790,16 @@ mod tests {
         );
     }
 
+    /// `service_endpoints` lists only the entries §18.2.1 accepts.
+    #[test]
+    fn napi_did_document_skips_rejected_service_entries() {
+        let document = scp_ffi_common::test_helpers::document_with_rejected_services();
+        assert_eq!(
+            NapiDIDDocument::from(&document).service_endpoints,
+            scp_ffi_common::test_helpers::FIXTURE_ACCEPTED_ENDPOINTS,
+        );
+    }
+
     #[test]
     fn napi_did_document_contains_full_verification_methods() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -1762,37 +1811,7 @@ mod tests {
             .as_ref()
             .expect("identity must have a document");
 
-        // Build NapiDIDDocument the same way identity_resolve does.
-        let has_agent_key = document.has_agent_key();
-        let agent_public_key = document
-            .agent_verification_method()
-            .map(|vm| vm.public_key_multibase.clone());
-
-        let verification_methods: Vec<NapiVerificationMethod> = document
-            .verification_method
-            .iter()
-            .map(|vm| NapiVerificationMethod {
-                id: vm.id.clone(),
-                method_type: vm.method_type.clone(),
-                controller: vm.controller.clone(),
-                public_key_multibase: vm.public_key_multibase.clone(),
-            })
-            .collect();
-
-        let napi_doc = NapiDIDDocument {
-            id: document.id.clone(),
-            verification_methods,
-            authentication: document.authentication.clone(),
-            assertion_methods: document.assertion_method.clone(),
-            also_known_as: document.also_known_as.clone(),
-            service_endpoints: document
-                .service
-                .iter()
-                .map(|s| s.service_endpoint.clone())
-                .collect(),
-            has_agent_key,
-            agent_public_key,
-        };
+        let napi_doc = NapiDIDDocument::from(document);
 
         // Verification methods must be non-empty.
         assert!(
@@ -2256,6 +2275,25 @@ mod tests {
                 "an attestation whose handle changed after signing must not verify"
             );
         });
+    }
+
+    /// Off a tokio runtime the resolver cannot be built, and initialization
+    /// fails with `SCP-IDENT-1058` instead of returning `Ok` with no resolver
+    /// attached, which left the supervisor's governance key resolver
+    /// unconfigured.
+    #[test]
+    fn did_resolver_initialization_off_a_runtime_is_ident_1058() {
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
+        let err = ensure_did_resolver_initialized_on(&bi)
+            .expect_err("no runtime is current on this thread");
+        assert!(
+            format!("{err}").contains(codes::IDENT_1058),
+            "expected SCP-IDENT-1058, got: {err}"
+        );
+        assert!(
+            crate::runtime::did_resolver(&bi).is_none(),
+            "a failed initialization attaches no resolver"
+        );
     }
 }
 

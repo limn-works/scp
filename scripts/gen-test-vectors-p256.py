@@ -475,6 +475,8 @@ ID_HPKE_SENDER = fixture_identifier("hpke sender")
 ID_HPKE_MEMBER = fixture_identifier("hpke member")
 ID_ISSUER = fixture_identifier("issuer")
 ID_SUBJECT = fixture_identifier("subject")
+ID_VERIFIER = fixture_identifier("verifier")
+ID_DEFINER = fixture_identifier("definer")
 ID_PSEUDONYMIZED_MEMBER = fixture_identifier("pseudonymized member")
 ID_ANNOUNCING_MEMBER = fixture_identifier("announcing member")
 ID_OTHER_MEMBER = fixture_identifier("other member")
@@ -2240,23 +2242,72 @@ def emit_community_relay_list() -> None:
 
 SERVICE_RECORD_SEPARATOR = "SCP-SERVICE-RECORD-V1:"
 SERVICE_RECORD_SEQUENCE = 4
-# Three entries in the order a record carries them. Each encodes as its three
-# strings under §9.5.1's variable-length rule, in the order id, type,
-# serviceEndpoint, and carries no type discriminator beside them.
-SERVICE_RECORD_ENTRIES = [
-    ("#scp-relay-1", "SCPRelay", "wss://relay.example.com/scp/v1"),
-    ("#scp-relay-2", "SCPRelay", "wss://relay2.example.com/scp/v1"),
-    ("#private-state-1", "IdentityPrivateState", "wss://relay.example.com/scp/v1"),
-]
+SERVICE_RECORD_RELAY_TYPE = "SCPRelay"
+# The absent `bridgeTarget` of an SCPRelay entry: §9.5.1's absent-optional
+# value for a fixed-length field, bare.
+SERVICE_RECORD_ABSENT_BRIDGE_TARGET = sha256(b"\x00")
 
 
-def service_record_entries_field() -> bytes:
-    """The `entries` field: a 4-byte count, then each entry's three strings."""
-    body = b"".join(
-        var_field(entry_id) + var_field(entry_type) + var_field(endpoint)
-        for entry_id, entry_type, endpoint in SERVICE_RECORD_ENTRIES
+def service_record_bridge_target(identifier: bytes) -> bytes:
+    """The bridge entry's target: the identity routing ID of §10.12.4.1,
+    SHA-256("scp:did:" || identifier) over Vector 41's 32 raw identifier bytes.
+
+    It reads the identifier as an argument, never at import, because
+    INCEPTION_IDENTIFIER is empty until Vector 41's emitter runs."""
+    assert len(identifier) == 32, (
+        f"vector_48: the bridgeTarget hashes Vector 41's 32-byte identifier, got {len(identifier)} bytes"
     )
-    return u32(len(SERVICE_RECORD_ENTRIES)) + body
+    target = sha256(b"scp:did:" + identifier)
+    assert target != SERVICE_RECORD_ABSENT_BRIDGE_TARGET, (
+        "vector_48: a present bridgeTarget must differ from the absent sentinel"
+    )
+    return target
+
+
+def service_record_entries(identifier: bytes) -> list[tuple[str, str, str, bytes | None]]:
+    """Four entries in the order a record carries them, as (id, type,
+    serviceEndpoint, bridgeTarget).
+
+    Each encodes its three strings under §9.5.1's variable-length rule, in the
+    order id, type, serviceEndpoint, and carries no type discriminator beside
+    them; an SCPRelay entry then encodes bridgeTarget as 32 bare bytes, and
+    SHA-256(0x00) there means "no target" (`03-identity.md` §3.10.13)."""
+    return [
+        ("#scp-relay-1", "SCPRelay", "wss://relay.example.com/scp/v1", None),
+        ("#scp-relay-2", "SCPRelay", "wss://relay2.example.com/scp/v1", None),
+        ("#private-state-1", "IdentityPrivateState", "wss://relay.example.com/scp/v1", None),
+        (
+            "#scp-relay-3",
+            "SCPRelay",
+            "wss://bridge.example.com/scp/v1",
+            service_record_bridge_target(identifier),
+        ),
+    ]
+
+
+def service_record_entry_bridge_target(entry_type: str, bridge_target: bytes | None) -> bytes:
+    """The 32 trailing bytes an SCPRelay entry signs; empty for any other type."""
+    if entry_type != SERVICE_RECORD_RELAY_TYPE:
+        assert bridge_target is None, "only an SCPRelay entry carries bridgeTarget"
+        return b""
+    if bridge_target is None:
+        return SERVICE_RECORD_ABSENT_BRIDGE_TARGET
+    assert len(bridge_target) == 32, len(bridge_target)
+    return bridge_target
+
+
+def service_record_entries_field(
+    entries: list[tuple[str, str, str, bytes | None]],
+) -> bytes:
+    """The `entries` field: a 4-byte count, then each entry under its type's layout."""
+    body = b"".join(
+        var_field(entry_id)
+        + var_field(entry_type)
+        + var_field(endpoint)
+        + service_record_entry_bridge_target(entry_type, bridge_target)
+        for entry_id, entry_type, endpoint, bridge_target in entries
+    )
+    return u32(len(entries)) + body
 
 
 def emit_commitment_and_service_record() -> None:
@@ -2281,15 +2332,20 @@ def emit_commitment_and_service_record() -> None:
     # The vector identity of §25.26 designates #active for the service-record
     # role, and §25.2's secondary key is that key.
     identifier = INCEPTION_IDENTIFIER
-    entries = service_record_entries_field()
+    assert len(identifier) == 32, "vector_48 runs after Vector 41 fixes the identifier"
+    record_entries = service_record_entries(identifier)
+    entries = service_record_entries_field(record_entries)
     fields = fixed_field(identifier) + u64(SERVICE_RECORD_SEQUENCE) + entries
     emit_hex("vector_48.identifier", identifier)
     emit("vector_48.sequence", SERVICE_RECORD_SEQUENCE)
-    emit("vector_48.entry_count", len(SERVICE_RECORD_ENTRIES))
-    for index, (entry_id, entry_type, endpoint) in enumerate(SERVICE_RECORD_ENTRIES):
+    emit("vector_48.entry_count", len(record_entries))
+    for index, (entry_id, entry_type, endpoint, bridge_target) in enumerate(record_entries):
         emit(f"vector_48.entry_{index}.id", entry_id)
         emit(f"vector_48.entry_{index}.type", entry_type)
         emit(f"vector_48.entry_{index}.serviceEndpoint", endpoint)
+        signed_target = service_record_entry_bridge_target(entry_type, bridge_target)
+        if signed_target:
+            emit_hex(f"vector_48.entry_{index}.bridgeTarget", signed_target)
     emit("vector_48.entries_len", len(entries))
     emit_hex("vector_48.entries", entries)
     emit("vector_48.field_bytes", len(fields))
@@ -2884,6 +2940,306 @@ def emit_webpush() -> None:
     emit("vector_60.authorization", f"vapid t={jwt}, k={k}")
 
 
+def challenge_verification_id(
+    verifier: str,
+    subject: str,
+    capability_uri: str,
+    challenge_id: bytes,
+    attempt: int,
+    timestamp: int,
+) -> tuple[bytes, bytes]:
+    """`07-trust-validation-and-capabilities.md` §7.3.4: the preimage and the
+    value of `verification_id`."""
+    pre = (
+        var_field(verifier)
+        + var_field(subject)
+        + var_field(capability_uri)
+        + fixed_field(challenge_id)
+        + u32(attempt)
+        + u64(timestamp)
+    )
+    return pre, sha256(pre)
+
+
+def challenge_verification_preimage(
+    verification_id: bytes,
+    verifier: str,
+    subject: str,
+    capability_uri: str,
+    definition_digest: bytes,
+    suite_digest: bytes,
+    challenge_id: bytes,
+    attempt: int,
+    response_digest: bytes,
+    max_retries: int,
+    cooldown_secs: int,
+    pass_threshold_bps: int,
+    min_category_cases: int,
+    passed: bool,
+    score: int,
+    test_count: int,
+    pass_count: int,
+    challenge_created_at: int,
+    challenge_expires_at: int,
+    timestamp: int,
+    expires_at: int,
+    context_id: str,
+) -> bytes:
+    """§7.3.4's `R_v`: 22 signed fields, none optional."""
+    return canonical_preimage(
+        "SCP-CHALLENGE-VERIFY-V1:",
+        fixed_field(verification_id),
+        var_field(verifier),
+        var_field(subject),
+        var_field(capability_uri),
+        fixed_field(definition_digest),
+        fixed_field(suite_digest),
+        fixed_field(challenge_id),
+        u32(attempt),
+        fixed_field(response_digest),
+        u32(max_retries),
+        u32(cooldown_secs),
+        u32(pass_threshold_bps),
+        u32(min_category_cases),
+        u8(1 if passed else 0),
+        u32(score),
+        u32(test_count),
+        u32(pass_count),
+        u64(challenge_created_at),
+        u64(challenge_expires_at),
+        u64(timestamp),
+        u64(expires_at),
+        var_field(context_id),
+    )
+
+
+def capability_definition_preimage(
+    capability_uri: str,
+    min_cases_tag: int,
+    min_cases: int,
+    pass_threshold_bps: int,
+    max_retries: int,
+    cooldown_secs: int,
+    description: str,
+) -> bytes:
+    """§7.3.4.6's `Def`. The tag is 0 for `Total` and 1 for `PerCategory`."""
+    return canonical_preimage(
+        "SCP-CAPABILITY-DEFINITION-V1:",
+        var_field(capability_uri),
+        u8(min_cases_tag),
+        u32(min_cases),
+        u32(pass_threshold_bps),
+        u32(max_retries),
+        u32(cooldown_secs),
+        var_field(description),
+    )
+
+
+def emit_challenge_vectors() -> None:
+    section("§25.31 Trust challenge request, response, record and definition (§7.3.4)")
+    # An identifier-scoped URI: a protocol URI with one case is a request a
+    # conforming SDK refuses, because `schema-validation/v1` sets a minimum of
+    # 20 cases (§7.3.4.3).
+    capability_uri = ID_DEFINER + ":capability:schema-validation/v1"
+    context_id = "test-context-01"
+    created_at, expires_at = 1700000000, 1700086400
+    max_retries, cooldown_secs, threshold = 2, 3600, 8000
+
+    # --- Vector 65: the capability definition the fixture URI follows. ---
+    pre65 = capability_definition_preimage(
+        capability_uri,
+        0,
+        1,
+        threshold,
+        max_retries,
+        cooldown_secs,
+        "Fixture definition for spec 25 vectors 59-62.",
+    )
+    definition_digest = sha256(pre65)
+    emit("vector_65.preimage_len", len(pre65))
+    emit_hex("vector_65.preimage", pre65)
+    emit_hex("vector_65.definition_digest", definition_digest)
+
+    # --- Vector 61: the challenge request. ---
+    challenge_id = bytes(range(1, 33))
+    test_input = {"name": "widget", "count": 3}
+    expected = {
+        "SchemaMatch": {"schema": {"type": "object", "required": ["name", "count"]}}
+    }
+    input_jcs = jcs(test_input)
+    expected_jcs = jcs(expected)
+    test_case = (
+        var_field("schema-validation-001")
+        + var_field(input_jcs)
+        + var_field("schema")
+        + u32(10000)
+    )
+    test_cases_field = u32(1) + test_case
+    suite_digest = sha256(test_cases_field)
+    pre61 = canonical_preimage(
+        "SCP-CHALLENGE-REQ-V1:",
+        fixed_field(challenge_id),
+        var_field(capability_uri),
+        fixed_field(definition_digest),
+        test_cases_field,
+        u64(created_at),
+        u64(expires_at),
+        u32(max_retries),
+        u32(cooldown_secs),
+        u32(threshold),
+        var_field(context_id),
+        var_field(ID_VERIFIER),
+        var_field(ID_SUBJECT),
+    )
+    request_digest = sha256(pre61)
+    emit_hex("vector_61.challenge_id", challenge_id)
+    emit("vector_61.verifier", ID_VERIFIER)
+    emit("vector_61.definer", ID_DEFINER)
+    emit("vector_61.capability_uri", capability_uri)
+    emit("vector_61.subject", ID_SUBJECT)
+    emit("vector_61.input_jcs", input_jcs.decode())
+    emit("vector_61.expected_jcs", expected_jcs.decode())
+    emit("vector_61.test_case_field_len", len(test_cases_field))
+    emit_hex("vector_61.test_case_field", test_cases_field)
+    emit_hex("vector_61.suite_digest", suite_digest)
+    emit("vector_61.preimage_len", len(pre61))
+    emit_hex("vector_61.preimage", pre61)
+    emit_hex("vector_61.digest", request_digest)
+    # No byte of the request derives from the expected output (§7.3.4).
+    assert expected_jcs not in pre61
+
+    # --- Responses: attempt 1 (fails the schema) and Vector 64 (attempt 2). ---
+    response_digests = {}
+    for label, attempt, output in (
+        ("vector_62.response", 1, {"name": "widget"}),
+        ("vector_64", 2, {"count": 3, "name": "widget"}),
+    ):
+        pre = canonical_preimage(
+            "SCP-CHALLENGE-RESP-V1:",
+            fixed_field(challenge_id),
+            fixed_field(request_digest),
+            var_field(ID_SUBJECT),
+            u32(attempt),
+            u32(1),
+            var_field("schema-validation-001"),
+            var_field(jcs(output)),
+        )
+        response_digests[attempt] = sha256(pre)
+        emit("%s.output_jcs" % label, jcs(output).decode())
+        emit("%s.preimage_len" % label, len(pre))
+        emit_hex("%s.preimage" % label, pre)
+        emit_hex("%s.digest" % label, response_digests[attempt])
+
+    # --- Vectors 62 and 63: the verification records of attempts 1 and 2. ---
+    # Vector 63 is graded exactly `cooldown_secs` after Vector 62, the
+    # cooldown boundary (§7.3.4 step 3).
+    for label, attempt, ts, passed, score, pass_count in (
+        ("vector_62", 1, 1700000600, False, 0, 0),
+        ("vector_63", 2, 1700000600 + cooldown_secs, True, 10000, 1),
+    ):
+        record_expires_at = ts + 7776000
+        vid_pre, vid = challenge_verification_id(
+            ID_VERIFIER, ID_SUBJECT, capability_uri, challenge_id, attempt, ts
+        )
+        pre = challenge_verification_preimage(
+            vid,
+            ID_VERIFIER,
+            ID_SUBJECT,
+            capability_uri,
+            definition_digest,
+            suite_digest,
+            challenge_id,
+            attempt,
+            response_digests[attempt],
+            max_retries,
+            cooldown_secs,
+            threshold,
+            1,
+            passed,
+            score,
+            1,
+            pass_count,
+            created_at,
+            expires_at,
+            ts,
+            record_expires_at,
+            context_id,
+        )
+        emit("%s.attempt" % label, attempt)
+        emit("%s.timestamp" % label, ts)
+        emit("%s.expires_at" % label, record_expires_at)
+        emit("%s.verification_id_preimage_len" % label, len(vid_pre))
+        emit_hex("%s.verification_id_preimage" % label, vid_pre)
+        emit_hex("%s.verification_id" % label, vid)
+        emit("%s.preimage_len" % label, len(pre))
+        emit_hex("%s.preimage" % label, pre)
+        emit_hex("%s.digest" % label, sha256(pre))
+        assert ABSENT_SENTINEL not in pre, label
+
+
+# ---------------------------------------------------------------------------
+# Spec 09 §9.5.2 push signing bytes. These goldens are not §25 vectors: the
+# section heading carries no `§25`, so spec 25 does not print them, and
+# `crates/scp-runtime/tests/test_vectors.rs` asserts them.
+# ---------------------------------------------------------------------------
+
+PUSH_TOKEN = bytes.fromhex("0123456789abcdef")
+PUSH_TIMESTAMP = 1_700_000_000
+PUSH_DEREGISTER_TIMESTAMP = 1_700_000_300
+PUSH_RELAYS = ("wss://relay.example", "wss://relay.example/scp/v1")
+PUSH_PLATFORM_APNS = 0x01
+PUSH_PLATFORM_FCM = 0x02
+
+
+def push_register_bytes(relay_url: str) -> bytes:
+    """§9.5.2 `PushRegistration`: registrant, platform, token, routing ids,
+    timestamp, relay URL."""
+    assert len(ID_SENDER) == 56
+    routing_ids = [
+        sha256(b"SCP test vector push routing id 1"),
+        sha256(b"SCP test vector push routing id 2"),
+    ]
+    return canonical_preimage(
+        "SCP-PUSH-REGISTER-V1:",
+        var_field(ID_SENDER),
+        u8(PUSH_PLATFORM_APNS),
+        var_field(PUSH_TOKEN),
+        u32(len(routing_ids)),
+        *routing_ids,
+        u64(PUSH_TIMESTAMP),
+        var_field(relay_url),
+    )
+
+
+def push_deregister_bytes(relay_url: str) -> bytes:
+    """§9.5.2 `PushDeregistration`: registrant, platform, token, timestamp,
+    relay URL."""
+    return canonical_preimage(
+        "SCP-PUSH-DEREGISTER-V1:",
+        var_field(ID_SENDER),
+        u8(PUSH_PLATFORM_FCM),
+        var_field(PUSH_TOKEN),
+        u64(PUSH_DEREGISTER_TIMESTAMP),
+        var_field(relay_url),
+    )
+
+
+def emit_push_signing_bytes() -> None:
+    section("spec 09 §9.5.2 push signing bytes and §9.18.2 routing ids")
+    for tag, relay in zip(("a", "b"), PUSH_RELAYS, strict=True):
+        register = push_register_bytes(relay)
+        deregister = push_deregister_bytes(relay)
+        emit("push.relay_" + tag, relay)
+        emit_hex("push.register_" + tag, register)
+        emit_hex("push.deregister_" + tag, deregister)
+        emit_hex(
+            "push.routing_id_" + tag,
+            sha256(b"scp-push-registration" + relay.encode()),
+        )
+    assert len(push_register_bytes(PUSH_RELAYS[0])) == 193
+    assert len(push_deregister_bytes(PUSH_RELAYS[0])) == 127
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -2915,6 +3271,8 @@ def main() -> int:
     emit_commitment_and_service_record()
     emit_reveal_ranking_and_text_form()
     emit_webpush()
+    emit_challenge_vectors()
+    emit_push_signing_bytes()
     print("\n".join(_LINES))
     return 0
 

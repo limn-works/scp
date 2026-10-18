@@ -52,7 +52,9 @@ async fn start_relay() -> (ShutdownHandle, SocketAddr) {
     let config = RelayConfig {
         bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         delivery_jitter_ms: 0,
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(scp_transport::relay::push_gate::LiveRelayUrl::new(
+            scp_transport::relay::push_gate::RelayUrl::new("ws://127.0.0.1:9000/scp/v1").unwrap(),
+        ))
     };
     let storage = Arc::new(BlobStorageBackend::in_memory());
     let server = RelayServer::new(config, storage);

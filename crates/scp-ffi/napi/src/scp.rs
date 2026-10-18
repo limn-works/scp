@@ -53,7 +53,7 @@ use crate::sync::NapiSyncPolicy;
 #[cfg(feature = "testing")]
 use crate::testing::NapiFullStackNode;
 use crate::transport::{NapiReliabilityScore, NapiTransportManager, NapiTransportStatus};
-use crate::trust::{NapiAttestationVerificationResult, NapiChallengeResult, NapiTrustScoreResult};
+use crate::trust::{NapiAttestationVerificationResult, NapiChallengeRequest, NapiTrustScoreResult};
 use crate::ucan::NapiUcanToken;
 
 /// The SCP instance — a caller-owned handle that wraps a
@@ -475,18 +475,12 @@ impl Scp {
     ///
     /// `provider` is a JS object implementing the `KeyCustodyProvider` record
     /// (`generateKeypair`, `sign`, `getPublicKey`, `destroyKey`, `dhAgree`,
-    /// `derivePseudonym`, `exportSigningKeyBytes`, `custodyType`). Sign,
-    /// Diffie-Hellman, and pseudonym-derivation operations keep the private key
-    /// inside the caller's custody — those keys are never imported into the Rust
-    /// core (ADR-006); each such op is marshalled back to the Node.js event loop
-    /// via threadsafe functions and awaited. The `exportSigningKeyBytes` callback
-    /// is the exception: the `SigningKeyBytes`-based signing paths (UCAN mint,
-    /// SCPID, event-log checkpoint, and the join-time pseudonym announcement)
-    /// currently pull the raw 32-byte Ed25519 seed into Rust ownership, where it
-    /// is held in `Zeroizing` for the duration of the operation and wiped on
-    /// drop. That raw-export surface is tracked for migration to
-    /// `KeyCustody::sign`; context export already signs via `KeyCustody::sign`
-    /// (§23.16.8) and never exports the raw seed. This is the Node/Bun equivalent
+    /// `derivePseudonym`, `deriveRotatablePseudonym`, `custodyType`). Every
+    /// operation keeps the private key inside the caller's custody — no key is
+    /// imported into or exported to the Rust core (ADR-006); each operation is
+    /// marshalled back to the Node.js event loop via threadsafe functions and
+    /// awaited, and every signing path signs through `KeyCustody::sign`
+    /// (ADR-049 Decision 7a). This is the Node/Bun equivalent
     /// of the `UniFFI` bridge's `identity_create_with_custody`, used to back a DID
     /// with an OS keychain, hardware token, or HSM wrapper.
     ///
@@ -521,17 +515,13 @@ impl Scp {
         // capability injection and prove-absent dev backends, §Decision 6). A
         // shipped build of this entry point therefore fails closed with
         // `codes::IDENT_1059` inside the spawned future (`create_identity`)
-        // rather than minting a pre-rotation key at all. Sign / Diffie-Hellman /
-        // pseudonym-derivation operations keep the caller's private keys in
-        // custody (never imported into Rust) per ADR-006; the
-        // `SigningKeyBytes`-based paths (UCAN mint, SCPID, event-log checkpoint,
-        // join-time pseudonym announcement) are the exception — they export the
-        // raw seed into Rust (held in `Zeroizing`, wiped on drop), a surface
-        // tracked for migration to `KeyCustody::sign`.
+        // rather than minting a pre-rotation key at all. Every custody operation
+        // keeps the caller's private keys in custody (never imported into Rust)
+        // per ADR-006, and every signing path signs through `KeyCustody::sign`
+        // (ADR-049 Decision 7a).
         use crate::identity::ensure_did_resolver_initialized_on;
 
         let bi_arc = Arc::clone(&self.inner);
-        ensure_did_resolver_initialized_on(&bi_arc).map_err(NapiError::from)?;
 
         // Promote the JS callbacks to threadsafe functions on the JS
         // thread (consuming the non-Send `Function`s). A malformed
@@ -547,7 +537,12 @@ impl Scp {
         )
         .map_err(NapiError::from)?;
 
-        env.spawn_future(create_identity(bi_arc, selection, false))
+        env.spawn_future(async move {
+            // On the tokio runtime, unlike this function's JS-thread body, so
+            // the resolver the identity publishes into exists.
+            ensure_did_resolver_initialized_on(&bi_arc).map_err(NapiError::from)?;
+            create_identity(bi_arc, selection, false).await
+        })
     }
 
     /// Per-instance equivalent of `identity_load`.
@@ -629,8 +624,6 @@ impl Scp {
         &self,
         did: String,
     ) -> napi::Result<crate::identity::NapiDIDDocument> {
-        use crate::identity::NapiVerificationMethod;
-
         if !did.starts_with("did:dht:") {
             return Err(ScpNapiError::Identity {
                 message: format!("unsupported DID method: {did} — only did:dht is supported"),
@@ -653,36 +646,7 @@ impl Scp {
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?
         };
 
-        let has_agent_key = document.has_agent_key();
-        let agent_public_key = document
-            .agent_verification_method()
-            .map(|vm| vm.public_key_multibase.clone());
-
-        let verification_methods = document
-            .verification_method
-            .iter()
-            .map(|vm| NapiVerificationMethod {
-                id: vm.id.clone(),
-                method_type: vm.method_type.clone(),
-                controller: vm.controller.clone(),
-                public_key_multibase: vm.public_key_multibase.clone(),
-            })
-            .collect();
-
-        Ok(crate::identity::NapiDIDDocument {
-            id: document.id.clone(),
-            verification_methods,
-            authentication: document.authentication.clone(),
-            assertion_methods: document.assertion_method.clone(),
-            also_known_as: document.also_known_as.clone(),
-            service_endpoints: document
-                .service
-                .iter()
-                .map(|s| s.service_endpoint.clone())
-                .collect(),
-            has_agent_key,
-            agent_public_key,
-        })
+        Ok(crate::identity::NapiDIDDocument::from(&document))
     }
 
     /// Per-instance equivalent of `identity_create_link_attestation`.
@@ -736,22 +700,15 @@ impl Scp {
 
         let mut attestation = built.attestation;
 
-        let rt = tokio::runtime::Handle::try_current().map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("no tokio runtime: {e}"),
-                code: codes::IDENT_1041.to_owned(),
-            })
-        })?;
-
-        let sig = tokio::task::block_in_place(|| {
-            rt.block_on(custody.sign(&key_handle, &built.canonical_bytes))
-        })
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::custody_failure(
-                format!("link attestation signing failed: {e}"),
-                &scp_crypto::CustodyFailure::from(&e),
-            ))
-        })?;
+        let sig = custody
+            .sign(&key_handle, &built.canonical_bytes)
+            .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::custody_failure(
+                    format!("link attestation signing failed: {e}"),
+                    &scp_crypto::CustodyFailure::from(&e),
+                ))
+            })?;
         attestation.signature = sig.as_bytes().to_vec();
 
         crate::runtime::with_identity_mut(bi, &did, |entry| {
@@ -1191,16 +1148,16 @@ impl Scp {
 
         // Drive the async orchestrator on the module-local tokio runtime
         // (crate::runtime()). Same rationale as identity_execute_recovery:
-        // the napi-rs worker thread has no tokio context (round-2
-        // bug-catcher finding).
-        let result = crate::runtime()
-            .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: format!("custody migration failed: {e}"),
-                    code: codes::IDENT_1025.to_owned(),
-                })
-            })?;
+        // the napi-rs worker thread has no tokio context.
+        // Waits on no context actor and no host callback.
+        let result =
+            crate::block_on_shared(orchestrator.execute(&backend, &scp_clock::SystemClock))?
+                .map_err(|e| {
+                    NapiError::from(ScpNapiError::Identity {
+                        message: format!("custody migration failed: {e}"),
+                        code: codes::IDENT_1025.to_owned(),
+                    })
+                })?;
 
         serde_json::to_string(&result).map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
@@ -2348,6 +2305,27 @@ impl Scp {
             &self.inner,
             handle,
             action_json,
+            proposer_did,
+        )
+        .await
+    }
+
+    /// Proposes `ModifyCapabilityRequirements` (spec 07 §7.3.4.4):
+    /// `requirements_json` is the complete new list as a JSON array, and `[]`
+    /// clears it. A malformed list throws `SCP-VALID-7000`, a requirement
+    /// that breaks a §7.3.4.4 rule throws its own code (7147, 7148, 7150).
+    #[napi(js_name = "contextGovernanceModifyCapabilityRequirements")]
+    pub async fn context_governance_modify_capability_requirements(
+        &self,
+        handle: &NapiContextHandle,
+        requirements_json: String,
+        proposer_did: String,
+    ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
+        crate::context::context_governance_modify_capability_requirements_on(
+            &self.inner,
+            handle,
+            requirements_json,
             proposer_did,
         )
         .await
@@ -3644,11 +3622,14 @@ impl Scp {
     ///
     /// Verifies a JSON array of payment receipts against the supervisor and
     /// returns a JSON `{"results":[...]}` document with one entry per receipt.
-    /// Synchronous: the supervisor dispatch is driven on the shared runtime
-    /// inside the helper, since libuv worker threads carry no tokio context.
+    /// Async: the supervisor reply is awaited, never waited on from the JS
+    /// thread.
     #[napi(js_name = "economyVerifyPaymentReceipts")]
-    pub fn economy_verify_payment_receipts(&self, receipts_json: String) -> napi::Result<String> {
-        crate::economy::economy_verify_payment_receipts_on(&self.inner, receipts_json)
+    pub async fn economy_verify_payment_receipts(
+        &self,
+        receipts_json: String,
+    ) -> napi::Result<String> {
+        crate::economy::economy_verify_payment_receipts_on(&self.inner, receipts_json).await
     }
 
     // -------------------------------------------------------------------
@@ -3668,28 +3649,86 @@ impl Scp {
     /// Verifies an attestation, including this instance's revocation list for
     /// `context_id`.
     #[napi(js_name = "trustVerifyAttestation")]
-    pub fn trust_verify_attestation(
+    pub async fn trust_verify_attestation(
         &self,
         context_id: String,
         attestation_json: String,
     ) -> napi::Result<NapiAttestationVerificationResult> {
-        crate::trust::trust_verify_attestation_on(&self.inner, context_id, attestation_json)
+        let bi = Arc::clone(&self.inner);
+        crate::trust::on_resolution_pool(move |scope| {
+            crate::trust::trust_verify_attestation_on(scope, &bi, context_id, attestation_json)
+        })
+        .await
     }
 
-    /// Per-instance equivalent of the free-function `trust_create_challenge`.
+    /// Creates a challenge for `subject` from the challenger-written test cases
+    /// (`testCasesJson`, a JSON array of `TestCase` with their answers),
+    /// records it in `verifier`'s ledger, and returns the request signed with
+    /// `verifier`'s `#active` key (spec 07 §7.3.4 step 1). `policy` picks
+    /// fewer retries or a longer cooldown than the capability definition's;
+    /// `evaluatorContextId` names the context of the `CustomEval` evaluator
+    /// outlets.
     #[napi(js_name = "trustCreateChallenge")]
-    pub fn trust_create_challenge(&self, target_did: String) -> napi::Result<NapiChallengeResult> {
-        crate::trust::trust_create_challenge_on(&self.inner, target_did)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn trust_create_challenge(
+        &self,
+        verifier: String,
+        subject: String,
+        capability_uri: String,
+        test_cases_json: String,
+        context_id: String,
+        window_secs: u32,
+        evaluator_context_id: Option<String>,
+        policy: Option<crate::trust::NapiPolicyPick>,
+    ) -> napi::Result<NapiChallengeRequest> {
+        crate::trust::trust_create_challenge_on(
+            &self.inner,
+            verifier,
+            subject,
+            capability_uri,
+            test_cases_json,
+            context_id,
+            window_secs,
+            evaluator_context_id,
+            policy,
+        )
+        .await
     }
 
-    /// Per-instance equivalent of the free-function `trust_verify_response`.
-    #[napi(js_name = "trustVerifyResponse")]
-    pub fn trust_verify_response(
+    /// Answers a challenge: checks the challenger's signature on
+    /// `requestJson`, and returns the `ChallengeResponse` JSON of
+    /// `outputsJson` for `attempt`, signed with `subject`'s `#active` key
+    /// (spec 07 §7.3.4 step 2).
+    #[napi(js_name = "trustRespondToChallenge")]
+    pub async fn trust_respond_to_challenge(
         &self,
-        challenge_json: String,
+        subject: String,
+        request_json: String,
+        outputs_json: String,
+        attempt: u32,
+    ) -> napi::Result<String> {
+        crate::trust::trust_respond_to_challenge_on(
+            &self.inner,
+            subject,
+            request_json,
+            outputs_json,
+            attempt,
+        )
+        .await
+    }
+
+    /// Grades a subject's response in `verifier`'s ledger and returns the
+    /// record signed with `verifier`'s `#active` key, with the per-case
+    /// results (spec 07 §7.3.4 steps 3 and 4).
+    #[napi(js_name = "trustGradeResponse")]
+    pub async fn trust_grade_response(
+        &self,
+        verifier: String,
+        request_json: String,
         response_json: String,
-    ) -> napi::Result<bool> {
-        crate::trust::trust_verify_response_on(&self.inner, challenge_json, response_json)
+    ) -> napi::Result<crate::trust::NapiGradeResult> {
+        crate::trust::trust_grade_response_on(&self.inner, verifier, request_json, response_json)
+            .await
     }
 
     /// Per-instance equivalent of the free-function `verify_participation_requirements`.
@@ -3708,19 +3747,18 @@ impl Scp {
         )
     }
 
-    /// Per-instance equivalent of the free-function `check_capability_requirements`.
-    ///
-    /// Verifies that an agent meets a context's capability requirements for
-    /// admission (spec §7.3.4.4). `subjectDid`/`contextId` bind challenge
-    /// verifications to the agent and context being admitted. Returns normally
+    /// Verifies that an agent meets the capability requirements in the
+    /// context's governance state (spec §7.3.4.4). `subjectDid`/`contextId`
+    /// bind challenge verifications to the agent and context being admitted,
+    /// and each record's signature is checked against the verifier's
+    /// `#active` key through this instance's DID resolver. Returns normally
     /// when all requirements are satisfied; throws on any unmet requirement or
     /// malformed JSON.
     #[napi(js_name = "checkCapabilityRequirements")]
-    pub fn check_capability_requirements(
+    pub async fn check_capability_requirements(
         &self,
         context_id: String,
         subject_did: String,
-        requirements_json: String,
         agent_capabilities_json: String,
         challenge_verifications_json: String,
     ) -> napi::Result<()> {
@@ -3728,16 +3766,16 @@ impl Scp {
             &self.inner,
             context_id,
             subject_did,
-            requirements_json,
             agent_capabilities_json,
             challenge_verifications_json,
         )
+        .await
     }
 
     /// Per-instance equivalent of the free-function `aggregate_trust_input`.
     #[napi(js_name = "aggregateTrustInput")]
     #[allow(clippy::too_many_arguments)]
-    pub fn aggregate_trust_input(
+    pub async fn aggregate_trust_input(
         &self,
         context_id: String,
         subject_did: String,
@@ -3749,18 +3787,23 @@ impl Scp {
         cached_attestations_json: String,
         challenge_results_json: String,
     ) -> napi::Result<String> {
-        crate::trust::aggregate_trust_input_on(
-            &self.inner,
-            context_id,
-            subject_did,
-            events_json,
-            merkle_root_json,
-            consequence_rules_json,
-            threshold_requirements_json,
-            attestor_sets_json,
-            cached_attestations_json,
-            challenge_results_json,
-        )
+        let bi = Arc::clone(&self.inner);
+        crate::trust::on_resolution_pool(move |scope| {
+            crate::trust::aggregate_trust_input_on(
+                scope,
+                &bi,
+                context_id,
+                subject_did,
+                events_json,
+                merkle_root_json,
+                consequence_rules_json,
+                threshold_requirements_json,
+                attestor_sets_json,
+                cached_attestations_json,
+                challenge_results_json,
+            )
+        })
+        .await
     }
 
     /// Computes the structured participation record (§7.3.2) for `subjectDid`
@@ -3773,18 +3816,23 @@ impl Scp {
     /// a typed `NapiParticipationRecord` — the SDK receives the flattened facts
     /// and never re-aggregates event-log collections. See ADR-017, spec §7.3.2.
     #[napi(js_name = "participationRecord")]
-    pub fn participation_record(
+    pub async fn participation_record(
         &self,
         context_id: String,
         subject_did: String,
         cached_attestations_json: String,
     ) -> napi::Result<crate::trust::NapiParticipationRecord> {
-        crate::trust::participation_record_on(
-            &self.inner,
-            context_id,
-            subject_did,
-            cached_attestations_json,
-        )
+        let bi = Arc::clone(&self.inner);
+        crate::trust::on_resolution_pool(move |scope| {
+            crate::trust::participation_record_on(
+                scope,
+                &bi,
+                context_id,
+                subject_did,
+                cached_attestations_json,
+            )
+        })
+        .await
     }
 
     // ====================================================================
@@ -4324,7 +4372,12 @@ impl Scp {
         crate::server::relay_start_local_on(&self.inner, data_dir).await
     }
 
-    /// Per-instance equivalent of the free-function `node_start_in_memory`.
+    /// Starts a development node on encrypted in-memory storage.
+    ///
+    /// **Development only** (SCP-327): an addon built with `testing` starts
+    /// the node; a shipped addon rejects with `SCP-TRANS-5055`
+    /// (`DevStartUnavailable`) and starts nothing. Production callers use
+    /// `nodeStart`.
     #[napi(js_name = "nodeStartInMemory")]
     pub async fn node_start_in_memory(
         &self,
@@ -4333,7 +4386,12 @@ impl Scp {
         crate::server::node_start_in_memory_on(&self.inner, identity_did).await
     }
 
-    /// Per-instance equivalent of the free-function `node_start_local`.
+    /// Starts a development node on this instance's own storage.
+    ///
+    /// **Development only** (SCP-327): an addon built with `testing` starts
+    /// the node; a shipped addon rejects with `SCP-TRANS-5055`
+    /// (`DevStartUnavailable`) and creates nothing under `data_dir`.
+    /// Production callers use `nodeStart`.
     #[napi(js_name = "nodeStartLocal")]
     pub async fn node_start_local(
         &self,
@@ -4342,6 +4400,27 @@ impl Scp {
         passphrase: Option<String>,
     ) -> napi::Result<NapiNodeHandle> {
         crate::server::node_start_local_on(&self.inner, data_dir, identity_did, passphrase).await
+    }
+
+    /// Starts a production node from this `SCP` instance.
+    ///
+    /// `config_json` is a `NodeStartConfig` (construction.md §"Node start —
+    /// `NodeStartConfig`"): its `identity` names an operator identity
+    /// registered on this instance, and the node runs on this instance's own
+    /// storage. `identity` is the operator handle whose DID the config names.
+    /// Each failure rejects with the code sdk-common.md §"Node start error
+    /// codes" gives it: `SCP-PERM-3030` when another `SCP` minted `identity`
+    /// (ADR-048), checked before the config is read, and `SCP-IDENT-1063` for
+    /// an unregistered operator DID or a config that names a DID other than
+    /// `identity`'s.
+    #[napi(js_name = "nodeStart")]
+    pub async fn node_start(
+        &self,
+        config_json: String,
+        identity: &NapiIdentity,
+    ) -> napi::Result<NapiNodeHandle> {
+        crate::napi_check_handle!(&self.inner.core, identity);
+        crate::server::node_start_on(&self.inner, config_json, &identity.did()).await
     }
 }
 
@@ -4507,6 +4586,38 @@ impl Scp {
     #[must_use]
     pub fn fullstack_create_node(&self, did: String) -> NapiFullStackNode {
         crate::testing::fullstack_create_node_on(&self.inner, did)
+    }
+
+    /// Test seam: attaches this instance's supervisor with `localDid` as its
+    /// MLS identity and captures every payload it sends to a context.
+    ///
+    /// Call it before the first context operation, which would otherwise
+    /// attach a supervisor with no transport.
+    ///
+    /// # Errors
+    ///
+    /// `SCP-CTX-2000` when a supervisor is already attached or none can be.
+    #[napi(js_name = "testingCaptureContextSends")]
+    pub fn testing_capture_context_sends(
+        &self,
+        local_did: String,
+    ) -> napi::Result<crate::testing::NapiContextSendCapture> {
+        crate::testing::capture_context_sends_on(&self.inner, &local_did)
+    }
+
+    /// Test seam: delivers `payloads`, in order, to `contextId`'s actor as a
+    /// relay subscription would, and resolves with each payload's result.
+    ///
+    /// # Errors
+    ///
+    /// A context error when the supervisor or actor is gone.
+    #[napi(js_name = "testingDeliverIncoming")]
+    pub async fn testing_deliver_incoming(
+        &self,
+        context_id: String,
+        payloads: Vec<Buffer>,
+    ) -> napi::Result<Vec<crate::testing::NapiDeliveryResult>> {
+        crate::testing::deliver_incoming_on(&self.inner, context_id, payloads).await
     }
 
     /// Per-instance equivalent of the free-function `fullstack_reset_network`.

@@ -15,7 +15,7 @@
 //! | `send_message`        | `Supervisor::send_message` (encrypt + fan-out)            | mixed                    |
 //! | `deliver_incoming`    | `Supervisor::deliver_commit_blob` (actor decrypt + merge) | mixed (read fast path)   |
 //! | `governance_propose`  | `Supervisor::propose_governance_action`                   | mixed (write slow path)  |
-//! | `broadcast_publish`   | `Supervisor::dispatch_broadcast_command_with_custody`     | overhead-dominated (mailbox) |
+//! | `broadcast_publish`   | `Supervisor::dispatch_broadcast_command` (signs in turn)  | overhead-dominated (mailbox) |
 //! | `broadcast_subscribe` | `Supervisor::dispatch_broadcast_command`                  | overhead-dominated (mailbox) |
 //!
 //! # Why the `scp-testing` `FullStackNetwork` harness
@@ -84,7 +84,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use scp_did::DID;
-use scp_platform::KeyHandle;
+use scp_platform::CustodySigner;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_protocol::context::context_id_bytes;
 use scp_protocol::context::governance::GovernanceAction;
@@ -92,6 +92,7 @@ use scp_protocol::context::params::{
     Capability, ContextMode, ContextParams, GovernanceModel, MemoryScope,
 };
 use scp_runtime::context::ContextHandle;
+use scp_runtime::context::actor::CommandSigner;
 use scp_runtime::context::actor::commands::{
     BroadcastCommand, PublishBroadcastPayload, SubscribeBroadcastPayload,
 };
@@ -340,10 +341,7 @@ async fn build_pair(
     // intersecting context membership with the supervisor's registered local
     // DIDs. The full-stack harness never registers one (its own receive tests
     // decrypt at the crypto layer), so register Bob here for the actor path.
-    bob.manager
-        .register_local_did(bob.did.clone())
-        .await
-        .expect("register bob as local did");
+    bob.manager.register_local_did(bob.did.clone()).await;
     (network, alice, bob, handle, ctx_id)
 }
 
@@ -553,8 +551,9 @@ struct PublishInst {
     sup: Arc<Supervisor>,
     ctx_id: String,
     author: DID,
-    custody: InMemoryKeyCustody,
-    key: KeyHandle,
+    /// The author's signer over custody; each publish signs through it inside
+    /// the actor turn (ADR-049 Decision 7a).
+    signer: CommandSigner,
 }
 
 async fn setup_publish(n: usize) -> Vec<Arc<PublishInst>> {
@@ -565,13 +564,17 @@ async fn setup_publish(n: usize) -> Vec<Arc<PublishInst>> {
         // signature verifies.
         let custody = InMemoryKeyCustody::new();
         let key = custody.import_ed25519_key(&did_to_seed(&creator.did)).await;
+        let signer = CommandSigner::from_custody(
+            CustodySigner::new(Arc::new(custody), key, scp_crypto::SigAlg::Ed25519)
+                .await
+                .expect("custody signer over the imported key"),
+        );
         instances.push(Arc::new(PublishInst {
             author: creator.did.clone(),
             sup: Arc::clone(&creator.manager),
             _network: network,
             ctx_id,
-            custody,
-            key,
+            signer,
         }));
     }
     instances
@@ -584,13 +587,13 @@ async fn op_publish(inst: Arc<PublishInst>, _round: usize) -> Duration {
             context_id: inst.ctx_id.clone(),
             author_did: inst.author.clone(),
             payload: PAYLOAD.to_vec(),
-            signing_key_handle: inst.key,
+            signer: inst.signer.clone(),
         }),
         reply: tx,
     };
     let start = Instant::now();
     inst.sup
-        .dispatch_broadcast_command_with_custody(cmd, &inst.custody)
+        .dispatch_broadcast_command(cmd)
         .await
         .expect("dispatch publish");
     rx.await

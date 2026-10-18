@@ -18,10 +18,15 @@
 
 pub mod attestation;
 pub mod document;
+mod relay_url;
 
 pub use document::{
-    DidDocument, DidError, DidRotationEvent, MigrationProof, PreRotationProof, Service,
-    VerificationMethod, decode_multibase_key,
+    ABSENT_BRIDGE_TARGET, BridgeTarget, DidDocument, DidError, DidRotationEvent, MigrationProof,
+    PreRotationProof, RelayService, SCP_RELAY_SERVICE_TYPE, Service, VerificationMethod,
+    decode_multibase_key,
+};
+pub use relay_url::{
+    BridgeEndpoint, RelayEndpoint, RelayEntryUrlError, RelayUrlError, canonical_relay_url,
 };
 
 use serde::{Deserialize, Serialize};

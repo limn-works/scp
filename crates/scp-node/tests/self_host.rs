@@ -12,7 +12,7 @@
 //!   the historically fragile `ws://` path — tagged
 //!   [`RelayUrlSource::DhtResolved`] and bridge-bearer-authenticated — built
 //!   inside [`scp_node::deploy_site`];
-//! * the real two-phase broadcast publish for every embedded asset, followed by
+//! * the actor's one-turn broadcast publish for every embedded asset, followed by
 //!   [`ApplicationNode::commit_deploy`];
 //! * an HTTP `GET /scp/broadcast/<routing_id_hex>/site/index.html` against the
 //!   node's real broadcast projection router via [`tower::ServiceExt::oneshot`].
@@ -38,6 +38,7 @@ use tower::ServiceExt;
 use zeroize::Zeroizing;
 
 use scp_clock::SystemClock;
+use scp_core::context::supervisor::single_custody_source;
 use scp_dht::InMemoryDhtClient;
 use scp_identity::DidCache;
 use scp_identity::dht::DidDht;
@@ -288,7 +289,7 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
 
     // -- Deploy through the shared production core: this builds the in-process
     //    supervisor on the node's own loopback relay over the ws:// DhtResolved +
-    //    bearer path, publishes every asset via the real two-phase broadcast
+    //    bearer path, publishes every asset via the actor's one-turn broadcast
     //    publish, enables projection, and commits the deploy.
     let deploy_params = DeploySiteParams {
         node_did: node_did.clone(),
@@ -297,9 +298,10 @@ async fn self_host_deploys_embedded_site_and_serves_index_over_http() {
         hostname: "selfhost.scp.local".to_owned(),
         signing_key_handle,
         key_resolver,
-        custody: custody.as_ref(),
+        custody: &custody,
         durable,
         persistence: persistence_over(&mls_inner),
+        wrapping_custody: single_custody_source(Arc::clone(&custody)),
         assets: &assets,
     };
 
@@ -399,6 +401,7 @@ async fn build_deployer(built: &BuiltNode, context_id: &str) -> scp_node::SelfHo
         built.key_resolver(),
         durable,
         persistence_over(&mls_inner),
+        single_custody_source(Arc::clone(&built.custody)),
     )
     .await
     .expect("deployer setup should succeed")
@@ -416,7 +419,7 @@ async fn deploy_through(
     let assets = scp_node::embedded_assets(Some(&node_did));
     let expected = assets.len();
     let committed = deployer
-        .deploy(&built.node, deploy_id, built.custody.as_ref(), &assets)
+        .deploy(&built.node, deploy_id, &built.custody, &assets)
         .await
         .expect("self-host deploy should succeed end to end");
     assert_eq!(
@@ -958,7 +961,7 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
     //    deploy/serve — exactly one advisory-lock holder for the whole test. --
     deploy_embedded_and_assert_serves(
         &node,
-        custody.as_ref(),
+        &custody,
         &storage_dir,
         &storage_key,
         "selfhost-shared-storage-deploy",
@@ -979,7 +982,7 @@ async fn self_host_shares_single_root_storage_handle_and_serves() {
 /// subdirectory — its own advisory lock, never conflicting with the root DB.
 async fn deploy_embedded_and_assert_serves<S>(
     node: &scp_node::ApplicationNode<S>,
-    custody: &SqliteKeyCustody,
+    custody: &Arc<SqliteKeyCustody>,
     storage_dir: &std::path::Path,
     storage_key: &Zeroizing<[u8; 32]>,
     deploy_id: &str,
@@ -1013,6 +1016,7 @@ async fn deploy_embedded_and_assert_serves<S>(
             custody,
             durable,
             persistence,
+            wrapping_custody: single_custody_source(Arc::clone(custody)),
             assets: &assets,
         },
     )
@@ -1616,6 +1620,7 @@ async fn self_host_deployer_shutdown_drains_before_store_close() {
         built.key_resolver(),
         durable,
         persistence_over(&mls_inner),
+        single_custody_source(Arc::clone(&built.custody)),
     )
     .await
     .expect("deployer setup should succeed");
@@ -1628,12 +1633,7 @@ async fn self_host_deployer_shutdown_drains_before_store_close() {
     let assets = scp_node::embedded_assets(Some(&node_did));
     assert!(
         deployer
-            .deploy(
-                &built.node,
-                "selfhost-drain-run-2",
-                built.custody.as_ref(),
-                &assets
-            )
+            .deploy(&built.node, "selfhost-drain-run-2", &built.custody, &assets)
             .await
             .is_err(),
         "a deploy after shutdown must fail"

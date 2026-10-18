@@ -12,9 +12,10 @@
 use std::sync::Arc;
 
 use scp_did::DID;
+use scp_platform::testing::InMemoryKeyCustody;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::{Capability, ContextMode, ContextParams, ContextState};
-use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
+use scp_runtime::context::supervisor::{MessageSigner, Supervisor, single_custody_source};
 
 mod support;
 
@@ -35,11 +36,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         None,
         durable,
+        // Each identity's wrapping key lives in its key custody; a host passes
+        // its own custody here.
+        single_custody_source(Arc::new(InMemoryKeyCustody::new())),
     );
 
     // 2. Register our DID so the manager recognizes us as a local participant.
     let alice: DID = "did:dht:z6MkAlice".into();
-    manager.register_local_did(alice.clone()).await?;
+    manager.register_local_did(alice.clone()).await;
 
     // 3. Define context parameters.
     let params = ContextParams {
@@ -82,13 +86,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(handle.state(), ContextState::Active);
 
     // 5. Send a message (mock transport captures it).
-    let alice_sk = support::signing_key_for(&alice);
+    let alice_signer = support::command_signer_for(&alice).await?;
     manager
         .send_message(
             &handle,
             &alice,
             b"Hello, context!",
-            MessageSigner::Active(&alice_sk),
+            MessageSigner::Active(&alice_signer),
             None,
             None,
         )

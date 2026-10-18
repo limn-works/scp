@@ -59,7 +59,6 @@ use crate::context::providers::event_log::MerkleEventLogProvider;
 use crate::context::state::context_id_to_bytes;
 use crate::crypto::mls::provider::NodeMlsFactory;
 use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
-use crate::crypto::wrapping::WrappingKeyPair;
 
 const ALICE_DID: &str = "did:dht:z6MkAliceSpawnFromWelcomeCreator";
 const BOB_DID: &str = "did:dht:z6MkBobSpawnFromWelcomeJoiner";
@@ -439,7 +438,7 @@ async fn reserve_bob_kp(
     bob: &DID,
 ) -> (super::key_package_actor::ReservationId, Vec<u8>) {
     let store = sup
-        .key_package_store_for(bob)
+        .key_package_store_for_loaded(bob)
         .await
         .expect("bob's key-package store spawns");
     store
@@ -562,14 +561,20 @@ async fn run_join_with_active_key(
     let alice_owned = committed.as_ref().map_or_else(
         || {
             alice_crypto
-                .create_bare_group_owned(WrappingKeyPair::generate().public())
+                .create_bare_group_owned(
+                    scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                        .0
+                        .as_bytes(),
+                )
                 .expect("alice creates a wrapping-only group (no 0xFF02)")
         },
         |committed_params| {
             alice_crypto
                 .create_mls_group_with_context(
                     &honest_ext(&group_ctx_id, committed_params),
-                    WrappingKeyPair::generate().public(),
+                    scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                        .0
+                        .as_bytes(),
                 )
                 .expect("alice creates the SCP context group (0xFF02)")
         },
@@ -891,6 +896,67 @@ async fn welcome_joiner_does_not_install_the_genesis_outlet_declaration() {
                 .iter()
                 .all(|e| e.event_type != scp_event_log::EventType::OutletRegistered)),
         "joiner emits no local OutletRegistered leaf; genesis leaves converge via replication"
+    );
+}
+
+/// T21. A Welcome joiner holds no live capability-requirements list: the
+/// genesis list in `ContextParams` records no `ModifyCapabilityRequirements`
+/// governance made since (the creator may already have tightened it), so the
+/// joiner's admission read fails closed instead of answering from the
+/// declaration (spec 07 §7.3.4.4).
+#[tokio::test]
+async fn welcome_joiner_capability_requirements_await_replication() {
+    let genesis: scp_protocol::trust::CapabilityRequirements = vec![
+        scp_protocol::trust::RawCapabilityRequirement {
+            capability: "scp:capability:schema-validation/v1"
+                .parse()
+                .expect("capability URI"),
+            verification_level: scp_protocol::trust::VerificationLevel::SelfAttested,
+            trusted_verifiers: Vec::new(),
+            retry_cap: None,
+        }
+        .try_into()
+        .expect("valid requirement"),
+    ]
+    .try_into()
+    .expect("valid list");
+    let params = ContextParams {
+        capability_requirements: genesis,
+        ..joiner_params()
+    };
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with(
+        0x30,
+        Some(Box::new(rec.clone())),
+        Some(params.clone()),
+        params.clone(),
+        None,
+    )
+    .await;
+    result.expect("welcome join succeeds");
+
+    let snapshot = rec
+        .store
+        .get(&j.ctx_id)
+        .map(|e| e.value().clone())
+        .expect("the joiner persisted a snapshot before spawning");
+    assert_eq!(
+        snapshot.capability_requirements,
+        crate::context::state::Replicated::AwaitingReplication,
+        "the joiner seeds no live list from the genesis declaration"
+    );
+    assert!(
+        !snapshot.context_params.capability_requirements.is_empty(),
+        "non-vacuity: the genesis list reached the joiner's params"
+    );
+    let err = j
+        .sup
+        .capability_requirements_checked(&j.ctx_id)
+        .await
+        .expect_err("the joiner's admission read fails closed");
+    assert!(
+        matches!(err, scp_protocol::context::ContextError::InvalidState(_)),
+        "{err:?}"
     );
 }
 
@@ -1244,7 +1310,9 @@ async fn second_spawn_reusing_a_consumed_reservation_is_rejected() {
     let alice_owned = alice_crypto
         .create_mls_group_with_context(
             &honest_ext(&ctx_id, &joiner_params()),
-            WrappingKeyPair::generate().public(),
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                .0
+                .as_bytes(),
         )
         .unwrap();
     let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
@@ -1331,7 +1399,9 @@ fn alice_welcome_for(context_id: &str, kp_public_bytes: &[u8]) -> (Arc<NodeMlsFa
     let alice_owned = alice_crypto
         .create_mls_group_with_context(
             &honest_ext(context_id, &joiner_params()),
-            WrappingKeyPair::generate().public(),
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                .0
+                .as_bytes(),
         )
         .expect("alice creates the SCP context group (0xFF02)");
     let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, kp_public_bytes);
@@ -2683,7 +2753,7 @@ async fn invite_member_round_trip_stands_up_a_bidirectional_joiner() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect("alice seals an invitation for bob");
@@ -2781,7 +2851,7 @@ async fn invite_member_seals_the_creators_stored_relay_set() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect("alice seals an invitation for bob");
@@ -2925,7 +2995,7 @@ async fn invite_member_broadcasts_the_add_commit_to_existing_members() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect("alice invites bob");
@@ -2988,7 +3058,7 @@ async fn invite_member_into_voting_context_is_rejected() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await
         .expect_err("a voting context refuses a unilateral invite with an error");
@@ -3057,7 +3127,7 @@ async fn invite_member_by_non_admin_is_rejected() {
             bob.clone(),
             bob.clone(),
             kp_public_bytes,
-            &bob_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(bob_signing_key().clone()),
         )
         .await;
 
@@ -3163,7 +3233,7 @@ async fn invite_member_rolls_back_the_add_on_delivery_failure() {
             alice.clone(),
             bob.clone(),
             kp_public_bytes,
-            &alice_signing_key(),
+            &crate::context::actor::CommandSigner::local_ed25519(alice_signing_key().clone()),
         )
         .await;
 
@@ -3231,7 +3301,9 @@ async fn spawn_from_welcome_rejects_creator_substitution_before_admin_install() 
     let alice_owned = alice_crypto
         .create_mls_group_with_context(
             &honest_ext(&ctx_id, &params),
-            WrappingKeyPair::generate().public(),
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                .0
+                .as_bytes(),
         )
         .expect("alice creates the honest SCP context group committing creator=Alice");
     let add_output = alice_welcome_for_bob(&ctx_bytes, alice_owned, &kp_public_bytes);
@@ -4035,7 +4107,9 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
     let alice_owned = alice_crypto
         .create_mls_group_with_context(
             &honest_ext(&group_ctx_id, &joiner_params()),
-            WrappingKeyPair::generate().public(),
+            scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                .0
+                .as_bytes(),
         )
         .expect("alice creates the SCP context group (0xFF02)");
     let add_output = alice_welcome_for_bob(&group_ctx_bytes, alice_owned, &kp_public_bytes);
@@ -4079,7 +4153,9 @@ async fn spawn_from_welcome_joiner_is_active_and_send_capable() {
             &handle,
             &bob,
             b"joiner send after welcome (\xc2\xa79b)",
-            MessageSigner::Active(&bob_signing_key()),
+            MessageSigner::Active(&crate::context::actor::CommandSigner::local_ed25519(
+                bob_signing_key(),
+            )),
             None,
             None,
         )

@@ -32,6 +32,9 @@ shadowing Python's built-in ``PermissionError``.
 from __future__ import annotations
 
 import re
+from typing import TypeVar
+
+_T = TypeVar("_T")
 
 
 class ScpError(Exception):
@@ -186,6 +189,22 @@ class ValidationError(ScpError):
     """Input validation failure (schema, parameters)."""
 
     _default_code: str = "SCP-VALID-7000"
+
+
+def _require_type(value: object, expected: type[_T], where: str) -> _T:
+    """Return ``value`` when it is an ``expected``, else raise ``SCP-VALID-7005``.
+
+    The one place an SDK entry point rejects a value of the wrong type, so every
+    such rejection carries the same code and message shape. ``where`` names the
+    parameter, such as ``"SCP.node_start(): config"``.
+    """
+    if isinstance(value, expected):
+        return value
+    raise ValidationError(
+        f"{where} must be a scp_sdk.{expected.__name__}, got "
+        f"{type(value).__module__}.{type(value).__qualname__}",
+        "SCP-VALID-7005",
+    )
 
 
 class StorageError(ScpError):

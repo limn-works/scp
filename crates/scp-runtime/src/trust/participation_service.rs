@@ -33,6 +33,7 @@ pub fn add_participation_service(document: &mut DidDocument, service_endpoint: &
         id: format!("{}#{PARTICIPATION_STATEMENTS_FRAGMENT}", document.id),
         service_type: PARTICIPATION_STATEMENTS_SERVICE_TYPE.to_owned(),
         service_endpoint: service_endpoint.to_owned(),
+        bridge_target: None,
     };
     document.service.push(service);
 }

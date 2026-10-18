@@ -1303,6 +1303,9 @@ mod tests {
             outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
+            capability_requirements: crate::context::state::Replicated::Live(
+                scp_protocol::trust::CapabilityRequirements::default(),
+            ),
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
@@ -1373,6 +1376,48 @@ mod tests {
         assert!(loaded.membership.contains("did:dht:z6MkCreator"));
         // The relay set survives the stored encoding in order (PUSH-025).
         assert_eq!(loaded.relay_urls, snapshot.relay_urls);
+    }
+
+    /// T22. A stored snapshot missing `capability_requirements`,
+    /// `threshold_signers` or `threshold_value` fails to load, so restore
+    /// fails closed instead of reading an empty list, no signers or quorum 0.
+    #[tokio::test]
+    async fn full_snapshot_missing_a_governance_field_fails_to_load() {
+        let store = make_store();
+        let full = serde_json::to_value(make_context_snapshot()).unwrap();
+
+        // Positive control: the same encoding with every field loads.
+        let bytes = scp_platform::store_value::to_stored_value_bytes(&full).unwrap();
+        store
+            .storage
+            .store("context/ctx-whole/full_snapshot", &bytes)
+            .await
+            .unwrap();
+        store
+            .load_full_snapshot("ctx-whole")
+            .await
+            .unwrap()
+            .unwrap();
+
+        for field in [
+            "capability_requirements",
+            "threshold_signers",
+            "threshold_value",
+        ] {
+            let mut partial = full.clone();
+            assert!(
+                partial.as_object_mut().unwrap().remove(field).is_some(),
+                "{field} is a snapshot field"
+            );
+            let bytes = scp_platform::store_value::to_stored_value_bytes(&partial).unwrap();
+            let key = format!("context/ctx-{field}/full_snapshot");
+            store.storage.store(&key, &bytes).await.unwrap();
+            let err = store
+                .load_full_snapshot(&format!("ctx-{field}"))
+                .await
+                .expect_err(field);
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
     }
 
     #[tokio::test]

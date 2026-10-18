@@ -11,15 +11,15 @@ Minimal standalone SCP relay server using `scp-transport`'s `RelayServer`. Accep
 
 ```bash
 cd scaffolds/relay
-cargo run
+SCP_RELAY_URL=ws://127.0.0.1:9000/scp/v1 cargo run
 ```
 
-The relay binds to `0.0.0.0:9000` by default. Override the address in `src/main.rs` or adapt it to read from environment variables.
+`SCP_RELAY_URL` is required: it is the relay's public URL, from which the relay derives its reserved push routing ID (spec §10.7.1). Without it the relay exits 1. The relay binds to `0.0.0.0:9000` by default. Override the address in `src/main.rs` or adapt it to read from environment variables.
 
 Set log level via `RUST_LOG`:
 
 ```bash
-RUST_LOG=debug cargo run
+RUST_LOG=debug SCP_RELAY_URL=ws://127.0.0.1:9000/scp/v1 cargo run
 ```
 
 ## What This Does

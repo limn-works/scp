@@ -168,15 +168,15 @@ class PersistenceTest {
             // fails at the `PRAGMA key` / WAL-mode step because `SQLCipher`
             // rejects the key as "file is not a database". The UniFFI bridge
             // converts that `StorageInitError::SqliteOpen` to
-            // `ScpError::Validation` with code `SCP-STORAGE-8004`
+            // `ScpError::Storage` with code `SCP-STORAGE-8004`
             // (`crates/scp-ffi/uniffi/src/runtime.rs`, the
             // `From<StorageInitError> for ScpError` impl), which the generated
-            // Kotlin surfaces as `ScpException.Validation`. Main's 9fa80e13c
+            // Kotlin surfaces as `ScpException.Storage`. Main's 9fa80e13c
             // replaced the former silent fallback to in-memory (split-brain
             // where writes silently vanished) with hard-error propagation.
             val wrongKey = ByteArray(32) { 0x11 }
             val rejected =
-                assertFailsWith<ScpException.Validation> {
+                assertFailsWith<ScpException.Storage> {
                     SCP.withSqlite(dir.toFile(), wrongKey)
                 }
             assertEquals(
@@ -243,7 +243,7 @@ class PersistenceTest {
             // Reopen with the WRONG passphrase must fail closed — never
             // silently open a fresh DB (spec §17.6).
             val rejected =
-                assertFailsWith<ScpException.Validation> {
+                assertFailsWith<ScpException.Storage> {
                     SCP.withSqlite(dir.toFile(), passphrase = "the-WRONG-one")
                 }
             assertEquals(

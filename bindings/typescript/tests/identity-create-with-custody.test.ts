@@ -27,6 +27,13 @@ import type {
   KeyCustodyProvider,
 } from "../src/scp";
 import { p256SoftwarePseudonymPoint, SCP } from "../src/scp";
+import {
+  ECDH_VECTOR_PUBLIC_I,
+  ECDH_VECTOR_PUBLIC_R,
+  ECDH_VECTOR_SCALAR_I,
+  ECDH_VECTOR_SHARED_X,
+  HpkeP256Keys,
+} from "./hpke-p256-keys";
 import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
@@ -44,14 +51,17 @@ try {
 }
 
 // ---------------------------------------------------------------------------
-// Real-Ed25519 custody provider backed by node:crypto
+// Real-Ed25519 and real-P-256 custody provider backed by node:crypto
 // ---------------------------------------------------------------------------
 
 /** A host fault the fixture can inject into its pseudonym results. */
 type PseudonymFault = "legacy32" | "deriveKeyNotFound";
 
 class CryptoKeychain implements KeyCustodyProvider {
+  /** Ed25519 identity seeds. */
   #seeds = new Map<string, Uint8Array>();
+  /** HPKE P-256 keys (the identity wrapping key). */
+  #hpke = new HpkeP256Keys();
   // Key id -> the role generateKeypair minted it in.
   #roles = new Map<string, CustodyKeyRole>();
   #next = 1;
@@ -61,11 +71,18 @@ class CryptoKeychain implements KeyCustodyProvider {
     this.#fault = fault;
   }
 
-  generateKeypair(_keyType: CustodyKeyType, role: CustodyKeyRole): string {
-    const { privateKey } = crypto.generateKeyPairSync("ed25519");
-    const jwk = privateKey.export({ format: "jwk" }) as { d: string };
+  generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): string {
+    if (keyType !== "ed25519" && keyType !== "hpke-p256") {
+      throw new Error(`this keychain holds ed25519 and hpke-p256 keys, not ${keyType}`);
+    }
     const kid = String(this.#next++);
     this.#roles.set(kid, role);
+    if (keyType === "hpke-p256") {
+      this.#hpke.generate(kid);
+      return kid;
+    }
+    const { privateKey } = crypto.generateKeyPairSync("ed25519");
+    const jwk = privateKey.export({ format: "jwk" }) as { d: string };
     this.#seeds.set(kid, new Uint8Array(Buffer.from(jwk.d, "base64url")));
     return kid;
   }
@@ -93,6 +110,13 @@ class CryptoKeychain implements KeyCustodyProvider {
   }
 
   getPublicKey(keyId: string): CustodyPublicKey {
+    if (this.#hpke.has(keyId)) {
+      return {
+        keyType: "hpke-p256",
+        publicKey: this.#hpke.publicKey(keyId),
+        role: this.#role(keyId),
+      };
+    }
     const pub = crypto.createPublicKey(this.#keyObject(keyId));
     const jwk = pub.export({ format: "jwk" }) as { x: string };
     return {
@@ -110,17 +134,16 @@ class CryptoKeychain implements KeyCustodyProvider {
 
   destroyKey(keyId: string): void {
     this.#seeds.delete(keyId);
+    this.#hpke.delete(keyId);
     this.#roles.delete(keyId);
   }
 
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array {
-    // Not exercised by identity creation; a deterministic stand-in keeps the
-    // protocol surface complete.
-    const seed = this.#seeds.get(keyId) ?? new Uint8Array(32);
-    const h = crypto.createHash("sha256");
-    h.update(Buffer.from(seed));
-    h.update(Buffer.from(peerPublic));
-    return new Uint8Array(h.digest());
+    if (!this.#hpke.has(keyId)) {
+      if (this.#seeds.has(keyId)) throw new Error(`key ${keyId} is ed25519; it cannot agree`);
+      throw new KeyNotFoundError(`unknown key id: ${keyId}`);
+    }
+    return this.#hpke.agree(keyId, peerPublic);
   }
 
   #identitySeed(keyId: string): Uint8Array {
@@ -154,30 +177,64 @@ class CryptoKeychain implements KeyCustodyProvider {
     return this.#pseudonymPoint(keyId, contextId, pseudonymEpoch);
   }
 
-  exportSigningKeyBytes(keyId: string): Uint8Array {
-    const seed = this.#seeds.get(keyId);
-    if (seed === undefined) throw new Error(`unknown key id: ${keyId}`);
-    return seed;
-  }
-
   custodyType(_keyId: string): string {
     return "software";
-  }
-}
-
-// A keychain that signs but REFUSES to export raw key bytes — the shape of a
-// real OS keychain / HSM / secure-enclave custody. `exportSigningKeyBytes`
-// throws, so any operation that depends on extracting the raw private key would
-// fail; only operations routed through the `sign` callback can succeed.
-class SignOnlyKeychain extends CryptoKeychain {
-  override exportSigningKeyBytes(_keyId: string): Uint8Array {
-    throw new Error("sign-only custody: raw key export is not permitted");
   }
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// The keychain's hpke-p256 keys are real P-256: agreement is symmetric, and
+// the ECDH it runs reproduces the RFC 5903 §8.1 vector `scp_crypto` pins.
+describe("CryptoKeychain hpke-p256", () => {
+  test("agrees symmetrically and matches the pinned ECDH vector", () => {
+    const keychain = new CryptoKeychain();
+    const a = keychain.generateKeypair("hpke-p256", "operational");
+    const b = keychain.generateKeypair("hpke-p256", "operational");
+    const aPub = keychain.getPublicKey(a);
+    const bPub = keychain.getPublicKey(b);
+    expect(aPub.keyType).toBe("hpke-p256");
+    expect(aPub.publicKey.length).toBe(65);
+    expect(Buffer.from(keychain.dhAgree(a, bPub.publicKey)).toString("hex")).toBe(
+      Buffer.from(keychain.dhAgree(b, aPub.publicKey)).toString("hex"),
+    );
+
+    const ecdh = crypto.createECDH("prime256v1");
+    ecdh.setPrivateKey(Buffer.from(ECDH_VECTOR_SCALAR_I, "hex"));
+    expect(ecdh.getPublicKey("hex")).toBe(ECDH_VECTOR_PUBLIC_I);
+    expect(ecdh.computeSecret(Buffer.from(ECDH_VECTOR_PUBLIC_R, "hex")).toString("hex")).toBe(
+      ECDH_VECTOR_SHARED_X,
+    );
+    // The keychain's agreement with the vector's point is the one the
+    // vector's scalar computes against the keychain's point.
+    expect(
+      Buffer.from(keychain.dhAgree(a, Buffer.from(ECDH_VECTOR_PUBLIC_I, "hex"))).toString("hex"),
+    ).toBe(ecdh.computeSecret(Buffer.from(aPub.publicKey)).toString("hex"));
+  });
+
+  test("refuses a peer that is not a 65-byte curve point, and an ed25519 key", () => {
+    const keychain = new CryptoKeychain();
+    const a = keychain.generateKeypair("hpke-p256", "operational");
+    const point = Buffer.from(ECDH_VECTOR_PUBLIC_I, "hex");
+    const offCurve = Buffer.from(point);
+    offCurve[64] = (offCurve[64] ?? 0) ^ 1;
+    const bad = [
+      point.subarray(1, 33),
+      point.subarray(1),
+      Buffer.concat([point, Buffer.alloc(1)]),
+      offCurve,
+      Buffer.alloc(65),
+    ];
+    for (const peer of bad) {
+      expect(() => keychain.dhAgree(a, peer)).toThrow();
+    }
+    const ed = keychain.generateKeypair("ed25519", "identity");
+    expect(() => keychain.dhAgree(ed, point)).toThrow();
+    expect(() => keychain.generateKeypair("x25519", "operational")).toThrow();
+  });
+});
 
 if (!scpAvailable) {
   describe("identityCreateWithCustody (SKIPPED)", () => {
@@ -289,33 +346,49 @@ if (!scpAvailable) {
       }
     });
 
-    // The decisive regression guard: with a custody that signs but REFUSES to
-    // export raw key bytes (the keychain/HSM shape), export still succeeds
-    // because signing is routed through `KeyCustody::sign`. Under the previous
-    // raw-key-extraction path this export would have failed with an
-    // exportSigningKeyBytes error.
-    test("sign-only (no raw-key-export) custody can still produce a signed export", async () => {
+    // ADR-049 Decision 7a: governance signs through `KeyCustody::sign`, so a
+    // callback custody, which only signs, proposes, and the single-admin
+    // proposal auto-executes after the engine verifies the custody signature.
+    test("callback custody proposes governance through sign", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
-        const identity = await scp.identityCreateWithCustody(new SignOnlyKeychain());
+        const identity = await scp.identityCreateWithCustody(new CryptoKeychain());
         const ctx = await scp.contextCreate(
           identity,
           JSON.stringify({
-            ceiling: ["messages:read", "context:close"],
+            ceiling: ["messages:read", "messages:write", "governance:propose", "member:ban"],
             memoryScope: "ephemeral",
+            governance: "single_admin",
           }),
         );
+        const response = await scp.contextGovernancePropose(
+          ctx,
+          JSON.stringify({
+            SuspendCapability: { did: identity.did, capabilities: ["MessagesWrite"] },
+          }),
+          identity.did,
+        );
+        expect(JSON.parse(response).status).toBe("Approved");
+      } finally {
+        await scp.shutdown(1000).catch(() => {});
+      }
+    });
 
-        // Must NOT throw: signing the §23.16.8 digest goes through the `sign`
-        // callback, never through the throwing `exportSigningKeyBytes`.
-        const data = await scp.contextExport(ctx);
-        expect(data.length).toBeGreaterThan(0);
-
-        await scp.contextClose(ctx, identity.did);
-
-        const importedContextId = await scp.contextImport(data, identity.did);
-        expect(typeof importedContextId).toBe("string");
-        expect(importedContextId.length).toBeGreaterThan(0);
+    // ADR-049 Decision 7a: a send signs its inner envelope through
+    // `KeyCustody::sign`, so a callback custody, which only signs, sends.
+    test("callback custody sends through sign", async () => {
+      const scp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const identity = await scp.identityCreateWithCustody(new CryptoKeychain());
+        const ctx = await scp.contextCreate(
+          identity,
+          JSON.stringify({
+            ceiling: ["messages:read", "messages:write"],
+            memoryScope: "ephemeral",
+            governance: "single_admin",
+          }),
+        );
+        await scp.contextSend(ctx, identity.did, new TextEncoder().encode("sign-only send"));
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }

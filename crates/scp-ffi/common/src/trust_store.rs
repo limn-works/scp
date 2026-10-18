@@ -21,7 +21,8 @@ use scp_core::trust::aggregate::{
     CachedAttestation, RevocationEntry, RevocationMapChecker, TrustProtocolRepository,
     revocation_list_key,
 };
-use scp_core::trust::attestation::{Attestation, DidPublicKeyResolver, RevocationStatus};
+use scp_core::trust::attestation::{ActiveKeyResolver, Attestation, RevocationStatus};
+use scp_core::trust::capability_definition::CapabilityDefinitionSource;
 use scp_core::trust::{
     ChallengeVerification, TrustError, verify_attestation, verify_challenge_verification,
 };
@@ -66,7 +67,7 @@ impl Default for InMemoryFfiTrustStore {
 fn lock_error() -> TrustError {
     // A poisoned lock is an INFRA fault, not a credential rejection. It must map
     // to a variant OUTSIDE the verify-on-ingest rejection allowlist
-    // (`is_verification_rejection`) so it propagates rather than being silently
+    // (`TrustError::is_record_rejection`) so it propagates rather than being silently
     // swallowed as a dropped entry. `StoreError` is that variant; the dedicated
     // `CanonicalizationFailed` variant is the only canonicalization-rejection
     // signal, so an infra fault can never collide with a rejection here.
@@ -161,7 +162,7 @@ impl TrustProtocolRepository for InMemoryFfiTrustStore {
         result: &ChallengeVerification,
     ) -> Result<(), TrustError> {
         let mut store = self.challenges.lock().map_err(|_| lock_error())?;
-        let key = (context_id.to_owned(), result.subject_did.to_string());
+        let key = (context_id.to_owned(), result.subject.to_string());
         store.entry(key).or_default().push(result.clone());
         Ok(())
     }
@@ -170,42 +171,6 @@ impl TrustProtocolRepository for InMemoryFfiTrustStore {
 // ---------------------------------------------------------------------------
 // Verify-on-ingest support
 // ---------------------------------------------------------------------------
-
-/// Classifies a verify-on-ingest error.
-///
-/// Returns `true` for a verification REJECTION — the caller-supplied credential
-/// is itself invalid (bad signature, expired, revoked, malformed
-/// evidence/revocation, context-mismatched, subject-mismatched, or
-/// non-canonicalizable), so dropping that one entry and continuing is correct.
-/// Returns `false` for an INFRA fault
-/// (store read/write failure, poisoned lock), which MUST propagate: silently
-/// dropping every credential on a transient backend error would zero a subject's
-/// trust without signal. Closed allowlist of rejection variants (white-hat P2-d).
-///
-/// `CanonicalizationFailed` is the dedicated canonicalization-failure variant
-/// raised by `canonical_attestation_bytes` / `canonical_challenge_verification_bytes`:
-/// a credential whose own bytes cannot be canonicalized cannot be authenticated,
-/// so it is a REJECTION of that one entry (drop it), not an infra fault. It is
-/// purpose-built so the allowlist is closed by construction — no infrastructure
-/// path produces it, and it is NOT overloaded onto a general-purpose variant.
-/// `InvalidEventData` / `ChallengeSigningFailed` are deliberately EXCLUDED: they
-/// are no longer used by the ingest canonicalization paths, so treating them as
-/// rejections would risk silently swallowing an unrelated fault.
-const fn is_verification_rejection(err: &TrustError) -> bool {
-    matches!(
-        err,
-        TrustError::AttestationSignatureInvalid { .. }
-            | TrustError::AttestationExpired { .. }
-            | TrustError::AttestationRevoked { .. }
-            | TrustError::AttestationRevocationInvalid { .. }
-            | TrustError::AttestationEvidenceInvalid { .. }
-            | TrustError::ChallengeVerificationSignatureInvalid { .. }
-            | TrustError::ChallengeVerificationExpired { .. }
-            | TrustError::ChallengeContextMismatch { .. }
-            | TrustError::ChallengeSubjectMismatch { .. }
-            | TrustError::CanonicalizationFailed { .. }
-    )
-}
 
 /// Reports whether a verify-on-ingest rejection proves that `attestation`
 /// carries an issuer-signed revocation of itself.
@@ -322,8 +287,8 @@ const fn is_issuer_signed_revocation(err: &TrustError, attestation: &Attestation
 /// (`revoked_by == issuer`) can revoke an attestation") while §7.4.1 binds
 /// `Attestation.id` to no issuer. Keying on an id alone would break that grant:
 /// an attacker who derives a DID from a fresh keypair — which costs nothing,
-/// because `IdentityDidPublicKeyResolver` reads a public key out of a DID string
-/// and no publication gates it — signs an attestation carrying an honest
+/// because publishing a DID document needs no one's permission — signs an
+/// attestation carrying an honest
 /// issuer's id and revoking itself, both conditions of
 /// [`is_issuer_signed_revocation`] hold, and every later read of the honest
 /// issuer's attestation then finds that id listed. [`revocation_list_key`]
@@ -332,7 +297,7 @@ const fn is_issuer_signed_revocation(err: &TrustError, attestation: &Attestation
 fn verify_and_cache_attestations<S: TrustProtocolRepository>(
     cache: &scp_core::trust::aggregate::AttestationCache<S>,
     context_id: &str,
-    resolver: &impl DidPublicKeyResolver,
+    resolver: &dyn ActiveKeyResolver,
     clock: &impl Clock,
     entries: Vec<CachedAttestation>,
 ) -> Result<(), TrustError> {
@@ -350,7 +315,7 @@ fn verify_and_cache_attestations<S: TrustProtocolRepository>(
         for ca in entries {
             match verify_attestation(&ca.attestation, resolver, clock, &revocation_checker) {
                 Ok(()) => accepted.push(ca),
-                Err(reason) if is_verification_rejection(&reason) => {
+                Err(reason) if reason.is_record_rejection() => {
                     let key = revocation_list_key(&ca.attestation.issuer, &ca.attestation.id);
                     if is_issuer_signed_revocation(&reason, &ca.attestation)
                         && !revoked.get(&key).copied().unwrap_or(false)
@@ -394,7 +359,7 @@ fn verify_and_cache_attestations<S: TrustProtocolRepository>(
             &revocation_checker,
         ) {
             Ok(()) => {}
-            Err(reason) if is_verification_rejection(&reason) => {
+            Err(reason) if reason.is_record_rejection() => {
                 tracing::debug!(
                     attestation_id = %ca.attestation.id,
                     issuer = %ca.attestation.issuer,
@@ -448,7 +413,7 @@ pub fn verify_attestation_in_context<S, R, C>(
 ) -> Result<AttestationVerdict, TrustError>
 where
     S: TrustProtocolRepository + ?Sized,
-    R: DidPublicKeyResolver + ?Sized,
+    R: ActiveKeyResolver + ?Sized,
     C: Clock + ?Sized,
 {
     let revoked = store.get_revocation_state(context_id)?;
@@ -459,9 +424,7 @@ where
         &RevocationMapChecker::new(&revoked),
     ) {
         Ok(()) => Ok(AttestationVerdict::Valid),
-        Err(reason) if is_verification_rejection(&reason) => {
-            Ok(AttestationVerdict::Rejected(reason))
-        }
+        Err(reason) if reason.is_record_rejection() => Ok(AttestationVerdict::Rejected(reason)),
         Err(infra) => Err(infra),
     }
 }
@@ -480,10 +443,23 @@ where
 /// # Errors
 ///
 /// Returns [`TrustError`] if store population, aggregation, or serialization
-/// fails.
+/// fails, or if `resolver` cannot reach its backend
+/// ([`TrustError::KeyResolutionUnavailable`]).
+///
+/// `definitions` supplies the capability definition each challenge record
+/// cites (spec 07 §7.3.4.6); a record whose definition cannot be obtained is
+/// an error, never a silent drop.
+///
+/// `resolver` resolves the `#active` key of each attestation issuer, threshold
+/// attestor and challenge verifier (spec 09 §9.7.1), for verify-on-ingest and
+/// for the aggregation read path. The bridges pass their
+/// instance's resolver through
+/// [`instance_active_key_resolver`](crate::resolvers::instance_active_key_resolver).
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     store: S,
+    resolver: &dyn ActiveKeyResolver,
+    definitions: &dyn CapabilityDefinitionSource,
     context_id: &str,
     subject_did: &str,
     cached_attestations: Vec<CachedAttestation>,
@@ -498,12 +474,11 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     attestor_sets: &HashMap<scp_core::trust::AttestationType, Vec<scp_core::trust::AttestorInfo>>,
 ) -> Result<String, TrustError> {
     let cache = scp_core::trust::aggregate::AttestationCache::new(store);
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_clock::SystemClock;
 
     // Verify-on-ingest for caller-supplied attestations (see helper for the
     // SECURITY rationale).
-    verify_and_cache_attestations(&cache, context_id, &resolver, &clock, cached_attestations)?;
+    verify_and_cache_attestations(&cache, context_id, resolver, &clock, cached_attestations)?;
 
     // SECURITY (verify-on-ingest). Caller-supplied challenge verifications carry
     // a caller-controlled `passed`/`score` trust signal that is only meaningful
@@ -519,11 +494,18 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
     // that fail verification, and propagate infra faults so a backend error does
     // not silently discard a legitimate verifier's signal.
     for cr in challenge_results {
-        match verify_challenge_verification(cr, &resolver, context_id, subject_did, &clock) {
+        match verify_challenge_verification(
+            cr,
+            resolver,
+            definitions,
+            context_id,
+            subject_did,
+            &clock,
+        ) {
             Ok(()) => cache.store().store_challenge_result(context_id, cr)?,
-            Err(reason) if is_verification_rejection(&reason) => {
+            Err(reason) if reason.is_record_rejection() => {
                 tracing::debug!(
-                    verification_id = %cr.verification_id,
+                    verification_id = %hex::encode(cr.verification_id),
                     %reason,
                     "dropping caller-supplied challenge result that failed verify-on-ingest",
                 );
@@ -541,7 +523,8 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
         threshold_requirements,
         attestor_sets,
         cache: &cache,
-        resolver: &resolver,
+        resolver,
+        definitions,
         clock: &clock,
     };
 
@@ -558,8 +541,7 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
 /// This is the attestation-sourcing half of [`populate_and_aggregate`], factored
 /// out so the participation-record bridge path can obtain the credential-layer
 /// `attestation_count` input (§7.4) WITHOUT running the full trust aggregation.
-/// It uses the SAME `AttestationCache` /
-/// [`IdentityDidPublicKeyResolver`](scp_core::trust::IdentityDidPublicKeyResolver) /
+/// It uses the SAME `AttestationCache` / `#active` key `resolver` /
 /// [`SystemClock`](scp_clock::SystemClock) wiring as
 /// `aggregate_trust_input`, so the participation `attestation_count` and the
 /// aggregation's `verified_attestations` agree by construction.
@@ -573,24 +555,26 @@ pub fn populate_and_aggregate<S: TrustProtocolRepository>(
 ///
 /// # Errors
 ///
-/// Returns [`TrustError`] if store population or attestation verification fails.
+/// Returns [`TrustError`] if store population or attestation verification
+/// fails, or if `resolver` cannot reach its backend
+/// ([`TrustError::KeyResolutionUnavailable`]).
 pub fn verified_attestations<S: TrustProtocolRepository>(
     store: S,
+    resolver: &dyn ActiveKeyResolver,
     context_id: &str,
     subject_did: &str,
     cached_attestations: Vec<CachedAttestation>,
 ) -> Result<Vec<scp_core::trust::attestation::Attestation>, TrustError> {
     let cache = scp_core::trust::aggregate::AttestationCache::new(store);
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_clock::SystemClock;
 
     // Verify-on-ingest for caller-supplied attestations (see helper for the
     // SECURITY rationale). A REJECTION drops the entry so a caller can never
     // inflate `attestation_count` with an unverified, freshly-marked, or
     // context-revoked entry.
-    verify_and_cache_attestations(&cache, context_id, &resolver, &clock, cached_attestations)?;
+    verify_and_cache_attestations(&cache, context_id, resolver, &clock, cached_attestations)?;
 
-    cache.get_verified_attestations(context_id, subject_did, &resolver, &clock)
+    cache.get_verified_attestations(context_id, subject_did, resolver, &clock)
 }
 
 #[cfg(test)]
@@ -598,7 +582,9 @@ pub fn verified_attestations<S: TrustProtocolRepository>(
 mod tests {
     use super::*;
     use scp_core::trust::AttestationType;
-    use scp_core::trust::challenge::{ChallengeType, VerificationMethod};
+    use scp_core::trust::MinCases;
+    use scp_core::trust::capability_definition::{CapabilityDefinition, ProtocolOnlyDefinitions};
+    use scp_core::trust::challenge::TOTAL_WEIGHT_BPS;
     use scp_event_log::{Event, EventPayload, EventType};
 
     /// A revocation entry that never expires.
@@ -732,96 +718,128 @@ mod tests {
         }
     }
 
-    /// A `ChallengeVerification` that is FORGED only in its signature: its
-    /// `verifier_did` is a RESOLVABLE `did:key:{hex}` (so verify-on-ingest gets
-    /// past DID resolution and actually reaches the signature branch — the
-    /// previous `did:key:verifier` was non-hex and failed resolution first,
-    /// masking the signature check), its `context_id` matches the ingest context,
-    /// and its `expires_at` is far in the future. Everything is otherwise valid
-    /// EXCEPT the all-zero `verifier_signature`, so a correct gate drops it solely
-    /// because the signature does not verify (which is what the mutation check on
-    /// the signature branch exercises).
-    ///
-    /// The verifier DID is a `did:dht:z` (resolvable in production without the
-    /// testing-only `did:key:{hex}` path), so resolution genuinely succeeds and
-    /// the all-zero signature is what fails — not a masked resolution error.
-    fn make_challenge_result(id: &str, subject: &str, context_id: &str) -> ChallengeVerification {
-        // A resolvable verifier DID whose key the all-zero signature does NOT
-        // authenticate.
-        let verifier_pub = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
-            .verifying_key()
-            .to_bytes();
-        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
+    /// The capability every challenge-result test record names.
+    const CHALLENGE_URI: &str = "scp:capability:schema-validation/v1";
+
+    /// An `expires_at` 30 days past the real clock, within the 90-day
+    /// validity bound, for records that must stay live at ingest (which reads
+    /// the system clock).
+    fn live_expiry() -> u64 {
+        scp_clock::SystemClock.now_secs() + 30 * 86_400
+    }
+
+    /// Builds a challenge record with a derived `verification_id`, its
+    /// `timestamp` 30 days before `expires_at`, and an empty signature. A
+    /// record expiring 30 days after the verifying clock's now is therefore
+    /// stamped at that now, never in its future, which a verifier rejects.
+    /// Its policy fields copy the [`CHALLENGE_URI`] protocol row, so
+    /// [`ProtocolOnlyDefinitions`] admits it: the full-credit pass of a
+    /// suite holding exactly the row's minimum case count. Its challenge
+    /// window opens 60 seconds before `timestamp` and closes a cooldown after
+    /// it, so `timestamp` is strictly inside a window no shorter than the
+    /// cooldown (spec 07 §7.3.4.4 step 4(c) and (g)).
+    fn unsigned_challenge(
+        verifier_key: &ed25519_dalek::SigningKey,
+        subject: &str,
+        record_context: &str,
+        expires_at: u64,
+    ) -> ChallengeVerification {
+        let verifier = scp_did::did_dht_from_public_key(&verifier_key.verifying_key().to_bytes());
+        let subject = scp_did::DID::from(subject);
+        let timestamp = expires_at.saturating_sub(30 * 86_400);
+        let (definition, _) = CapabilityDefinition::protocol_row(CHALLENGE_URI).unwrap();
+        let (test_count, min_category_cases) = match definition.min_cases {
+            MinCases::Total(k) => (k, 0),
+            MinCases::PerCategory(k) => (k, k),
+        };
+        let challenge_id = [0x3c; 32];
+        let attempt = 1;
         ChallengeVerification {
-            verification_id: id.to_owned(),
-            verifier_did,
-            subject_did: subject.into(),
-            capability_uri: "scp:capability:schema-validation/v1".to_owned(),
-            challenge_type: ChallengeType::schema_validation(),
-            verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::schema_validation(),
-            },
+            verification_id: scp_core::trust::challenge_verification_id(
+                &verifier,
+                &subject,
+                CHALLENGE_URI,
+                &challenge_id,
+                attempt,
+                timestamp,
+            )
+            .unwrap(),
+            verifier,
+            subject,
+            capability_uri: CHALLENGE_URI.to_owned(),
+            definition_digest: definition.digest().unwrap(),
+            suite_digest: [0x5d; 32],
+            challenge_id,
+            attempt,
+            response_digest: [0x7e; 32],
+            max_retries: definition.max_retries,
+            cooldown_secs: definition.cooldown_secs,
+            pass_threshold_bps: definition.pass_threshold_bps,
+            min_category_cases,
             passed: true,
-            score: Some(95),
-            test_count: 10,
-            pass_count: 9,
-            result: serde_json::json!({"passed": true}),
-            completed_at: 1800,
-            verified_at: 1801,
-            expires_at: u64::MAX,
-            context_id: Some(context_id.to_owned()),
-            verifier_signature: vec![0u8; 64],
+            score: TOTAL_WEIGHT_BPS,
+            test_count,
+            pass_count: test_count,
+            challenge_created_at: timestamp.saturating_sub(60),
+            challenge_expires_at: timestamp.saturating_add(u64::from(definition.cooldown_secs)),
+            timestamp,
+            expires_at,
+            context_id: record_context.to_owned(),
+            verifier_signature: Vec::new(),
         }
+    }
+
+    /// Signs `cv` over its `D_v` with the [`make_genuinely_signed_challenge_with`]
+    /// verifier key.
+    fn sign_challenge(mut cv: ChallengeVerification) -> ChallengeVerification {
+        use ed25519_dalek::Signer;
+        let digest = scp_core::trust::challenge_verification_signing_digest(&cv).unwrap();
+        cv.verifier_signature = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32])
+            .sign(&digest)
+            .to_bytes()
+            .to_vec();
+        cv
+    }
+
+    /// A `ChallengeVerification` that is FORGED only in its signature: its
+    /// verifier DID resolves, its id is derived, its `context_id` matches the
+    /// ingest context and it is live, but the `verifier_signature` is all
+    /// zeros, so a correct gate drops it solely because the signature does not
+    /// verify.
+    fn make_challenge_result(subject: &str, context_id: &str) -> ChallengeVerification {
+        let mut cv = unsigned_challenge(
+            &ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]),
+            subject,
+            context_id,
+            live_expiry(),
+        );
+        cv.verifier_signature = vec![0u8; 64];
+        cv
     }
 
     /// Produces a GENUINELY verifier-signed [`ChallengeVerification`] with the
     /// record's signed `context_id` set to `record_context` and the signed
-    /// `expires_at` set to `expires_at`. The verifier DID is a `did:dht:z` that
-    /// resolves in production (no testing-only `did:key` path), and the
-    /// `verifier_signature` is a real Ed25519 signature over the public
-    /// [`canonical_challenge_verification_bytes`], mirroring the attestation
-    /// path's `make_genuinely_signed`. By varying `record_context`/`expires_at`
-    /// the caller exercises the context-binding and expiry gates with an
-    /// otherwise-valid (genuinely-signed) record.
+    /// `expires_at` set to `expires_at`. The verifier DID is a `did:dht:z`
+    /// whose identity key is the signing key, so
+    /// `IdentityDidPublicKeyResolver` resolves it. By varying
+    /// `record_context`/`expires_at` the caller exercises the context-binding
+    /// and expiry gates with an otherwise-valid record.
     fn make_genuinely_signed_challenge_with(
         subject: &str,
-        record_context: Option<&str>,
+        record_context: &str,
         expires_at: u64,
     ) -> ChallengeVerification {
-        use ed25519_dalek::Signer;
-
-        let verifier_key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
-        let verifier_pub: [u8; 32] = verifier_key.verifying_key().to_bytes();
-        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
-
-        let mut cv = ChallengeVerification {
-            verification_id: "genuine-cv-1".to_owned(),
-            verifier_did,
-            subject_did: subject.into(),
-            capability_uri: "scp:capability:schema-validation/v1".to_owned(),
-            challenge_type: ChallengeType::schema_validation(),
-            verification_method: VerificationMethod::ChallengeVerified {
-                challenge_type: ChallengeType::schema_validation(),
-            },
-            passed: true,
-            score: Some(95),
-            test_count: 1,
-            pass_count: 1,
-            result: serde_json::json!({"passed": true}),
-            completed_at: 1000,
-            verified_at: 1001,
+        sign_challenge(unsigned_challenge(
+            &ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+            subject,
+            record_context,
             expires_at,
-            context_id: record_context.map(ToOwned::to_owned),
-            verifier_signature: Vec::new(),
-        };
-        let canonical = scp_core::trust::canonical_challenge_verification_bytes(&cv).unwrap();
-        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
-        cv
+        ))
     }
 
-    /// Convenience: a genuinely-signed, in-context, non-expiring challenge.
+    /// Convenience: a genuinely-signed, in-context, live challenge.
     fn make_genuinely_signed_challenge(subject: &str, context_id: &str) -> ChallengeVerification {
-        make_genuinely_signed_challenge_with(subject, Some(context_id), u64::MAX)
+        make_genuinely_signed_challenge_with(subject, context_id, live_expiry())
     }
 
     fn make_event(event_type: EventType, actor: &str, ts: u64, seq: u64, data: Vec<u8>) -> Event {
@@ -839,8 +857,8 @@ mod tests {
     /// Resolver that returns a dummy key — attestation cache holds already-verified
     /// (non-expired) entries, so the resolver is not called for fresh entries.
     struct NoOpResolver;
-    impl scp_core::trust::attestation::DidPublicKeyResolver for NoOpResolver {
-        fn resolve_public_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
+    impl scp_core::trust::attestation::ActiveKeyResolver for NoOpResolver {
+        fn resolve_active_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
             Ok(vec![0u8; 32])
         }
     }
@@ -851,8 +869,8 @@ mod tests {
     /// path (Fix 1). Fresh cached attestations are not re-verified, so the
     /// resolver is only consulted for the challenge result here.
     struct GenuineVerifierResolver;
-    impl scp_core::trust::attestation::DidPublicKeyResolver for GenuineVerifierResolver {
-        fn resolve_public_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
+    impl scp_core::trust::attestation::ActiveKeyResolver for GenuineVerifierResolver {
+        fn resolve_active_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
             Ok(ed25519_dalek::SigningKey::from_bytes(&[3u8; 32])
                 .verifying_key()
                 .to_bytes()
@@ -878,7 +896,8 @@ mod tests {
         };
 
         let context_id = "ctx-integration";
-        let subject_did = "did:key:alice";
+        // A canonical subject: the read path rejects a non-canonical one.
+        let subject_did = POPULATE_SUBJECT;
         let clock = TestClock::new(2000);
         // Resolves the genuine challenge verifier key so the read-path
         // re-validation (Fix 1) keeps the genuinely-signed challenge result.
@@ -898,7 +917,8 @@ mod tests {
 
         // A genuinely verifier-signed, in-context challenge result so it survives
         // the aggregation read-path re-validation.
-        let cr = make_genuinely_signed_challenge(subject_did, context_id);
+        // Stamped at the test clock's now, 2000, and live for 30 days.
+        let cr = make_genuinely_signed_challenge_with(subject_did, context_id, 2000 + 30 * 86_400);
         store.store_challenge_result(context_id, &cr).unwrap();
 
         // --- Build events ---
@@ -939,6 +959,7 @@ mod tests {
             attestor_sets: &attestor_sets,
             cache: &cache,
             resolver: &resolver,
+            definitions: &ProtocolOnlyDefinitions,
             clock: &clock,
         };
 
@@ -964,9 +985,13 @@ mod tests {
         );
 
         assert_eq!(input.challenge_results.len(), 1);
-        assert_eq!(input.challenge_results[0].verification_id, "genuine-cv-1");
+        assert_eq!(
+            input.challenge_results[0].verification_id,
+            cr.verification_id
+        );
+        assert_eq!(input.challenge_results[0].capability_uri, CHALLENGE_URI);
         assert!(input.challenge_results[0].passed);
-        assert_eq!(input.challenge_results[0].score, Some(95));
+        assert_eq!(input.challenge_results[0].score, TOTAL_WEIGHT_BPS);
 
         assert_eq!(input.consequence_structure.len(), 1);
         assert!(input.threshold_counts.is_empty());
@@ -974,7 +999,7 @@ mod tests {
         // Verify JSON serialization (as the FFI bridges do).
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("att-integration-1"));
-        assert!(json.contains("genuine-cv-1"));
+        assert!(json.contains(&hex::encode(cr.verification_id)));
     }
 
     /// Builds a caller-supplied attestation that an attacker has marked "fresh"
@@ -1022,6 +1047,7 @@ mod tests {
         let store = InMemoryFfiTrustStore::new();
         let verified = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![make_forged_fresh_cached(subject_did)],
@@ -1058,6 +1084,8 @@ mod tests {
         let store = InMemoryFfiTrustStore::new();
         let json = populate_and_aggregate(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![make_forged_fresh_cached(subject_did)],
@@ -1125,6 +1153,7 @@ mod tests {
         let store = InMemoryFfiTrustStore::new();
         let verified = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![CachedAttestation {
@@ -1164,6 +1193,8 @@ mod tests {
         let store = InMemoryFfiTrustStore::new();
         let json = populate_and_aggregate(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![CachedAttestation {
@@ -1204,7 +1235,7 @@ mod tests {
 
         // `passed = true`, but the verifier signature is forged (zeros) and the
         // verifier DID is attacker-chosen — the signature cannot authenticate.
-        let forged = make_challenge_result("forged-cv-1", subject_did, context_id);
+        let forged = make_challenge_result(subject_did, context_id);
 
         let events = vec![make_event(
             EventType::MessageSent,
@@ -1217,6 +1248,8 @@ mod tests {
         let store = InMemoryFfiTrustStore::new();
         let json = populate_and_aggregate(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![],
@@ -1262,10 +1295,12 @@ mod tests {
         let store = InMemoryFfiTrustStore::new();
         let json = populate_and_aggregate(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![],
-            &[genuine],
+            std::slice::from_ref(&genuine),
             &events,
             [0u8; 32],
             &[],
@@ -1281,7 +1316,11 @@ mod tests {
             1,
             "genuinely-signed, in-context, unexpired challenge must survive ingest"
         );
-        assert_eq!(challenge_results[0]["verification_id"], "genuine-cv-1");
+        assert_eq!(
+            challenge_results[0]["verification_id"],
+            hex::encode(genuine.verification_id)
+        );
+        assert_eq!(challenge_results[0]["capability_uri"], CHALLENGE_URI);
     }
 
     /// SECURITY (verify-on-ingest, expiry binding). A genuinely verifier-signed
@@ -1296,7 +1335,7 @@ mod tests {
             "did:key:77777777777777777777777777777777777777777777777777777777777777ff";
 
         // expires_at = 1000 is far below the real system clock used at ingest.
-        let expired = make_genuinely_signed_challenge_with(subject_did, Some(context_id), 1000);
+        let expired = make_genuinely_signed_challenge_with(subject_did, context_id, 1000);
 
         let events = vec![make_event(
             EventType::MessageSent,
@@ -1309,6 +1348,8 @@ mod tests {
         let store = InMemoryFfiTrustStore::new();
         let json = populate_and_aggregate(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![],
@@ -1343,7 +1384,7 @@ mod tests {
 
         // Genuinely signed, unexpired — but bound to `other_context`.
         let foreign =
-            make_genuinely_signed_challenge_with(subject_did, Some(other_context), u64::MAX);
+            make_genuinely_signed_challenge_with(subject_did, other_context, live_expiry());
 
         let events = vec![make_event(
             EventType::MessageSent,
@@ -1356,6 +1397,8 @@ mod tests {
         let store = InMemoryFfiTrustStore::new();
         let json = populate_and_aggregate(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             ingest_context,
             subject_did,
             vec![],
@@ -1554,6 +1597,7 @@ mod tests {
         let inner = SharedFfiStore::new();
         let verified = verified_attestations(
             inner.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],
@@ -1578,7 +1622,7 @@ mod tests {
 
     /// Test-only store whose revocation write, `add_revocations`, fails with
     /// an INFRA fault (`StoreError`, a variant
-    /// outside `is_verification_rejection`). Every other method delegates to a
+    /// outside `TrustError::is_record_rejection`). Every other method delegates to a
     /// working [`SharedFfiStore`], so a test that feeds it an issuer-signed
     /// revoked attestation isolates a revocation-list write failure.
     struct RevocationWriteFailsStore(SharedFfiStore);
@@ -1669,6 +1713,7 @@ mod tests {
 
         let first = verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],
@@ -1682,6 +1727,7 @@ mod tests {
 
         let second = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(active_copy)],
@@ -1727,6 +1773,7 @@ mod tests {
 
         let attacker_pass = verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(attacker_revoked)],
@@ -1740,6 +1787,7 @@ mod tests {
 
         let honest_pass = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(honest_active)],
@@ -1845,6 +1893,7 @@ mod tests {
 
         let before = verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(active_copy)],
@@ -1858,6 +1907,7 @@ mod tests {
 
         let during = verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],
@@ -1870,7 +1920,14 @@ mod tests {
 
         // A later call that supplies nothing reads the cache alone, so the
         // revocation this ingest recorded is what excludes the cached copy.
-        let after = verified_attestations(store, context_id, subject_did, vec![]).unwrap();
+        let after = verified_attestations(
+            store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            context_id,
+            subject_did,
+            vec![],
+        )
+        .unwrap();
         assert!(
             after.is_empty(),
             "an issuer's own revocation must keep suppressing that issuer's cached copy, got {after:?}"
@@ -1893,6 +1950,7 @@ mod tests {
         let store = SharedFfiStore::new();
         verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],
@@ -1928,6 +1986,7 @@ mod tests {
         let store = SharedFfiStore::new();
         let verified = verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(forged)],
@@ -1957,6 +2016,7 @@ mod tests {
         let store = RevocationWriteFailsStore(SharedFfiStore::new());
         let err = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],
@@ -1992,6 +2052,7 @@ mod tests {
         let store = RevocationWriteFailsStore(inner.clone());
         let err = verified_attestations(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy), fresh_entry(cacheable)],
@@ -2014,34 +2075,195 @@ mod tests {
 
     /// Fix C (classifier). The dedicated `CanonicalizationFailed` variant is
     /// classified as a verify-on-ingest REJECTION (drop the one entry), while
-    /// infra store faults are NOT (they propagate). The previously-overloaded
-    /// `InvalidEventData` / `ChallengeSigningFailed` variants are EXCLUDED so the
-    /// rejection set is closed by construction. Pins the closed allowlist's
-    /// membership.
+    /// infra faults are NOT (they propagate). `InvalidEventData`,
+    /// `ChallengeSigningFailed` and `KeyResolutionUnavailable` are not
+    /// rejections. Pins the classifier the ingest loops call.
     #[test]
     fn canonicalization_failures_are_rejections_infra_is_not() {
-        assert!(is_verification_rejection(
-            &TrustError::CanonicalizationFailed {
+        assert!(
+            TrustError::CanonicalizationFailed {
                 reason: "claim serialization failed".to_owned(),
             }
-        ));
-        // Infra store fault (e.g. poisoned lock) must remain non-rejection so it
-        // propagates rather than silently dropping an entry.
-        assert!(!is_verification_rejection(&TrustError::StoreError {
-            reason: "lock poisoned".to_owned(),
-        }));
-        // The previously-overloaded variants are no longer rejections: they are
-        // not produced by the ingest canonicalization paths, so they must
-        // propagate rather than silently drop an entry.
-        assert!(!is_verification_rejection(&TrustError::InvalidEventData {
-            sequence: 0,
-            reason: "unrelated".to_owned(),
-        }));
-        assert!(!is_verification_rejection(
-            &TrustError::ChallengeSigningFailed {
+            .is_record_rejection()
+        );
+        for infra in [
+            TrustError::StoreError {
+                reason: "lock poisoned".to_owned(),
+            },
+            TrustError::InvalidEventData {
+                sequence: 0,
                 reason: "unrelated".to_owned(),
-            }
-        ));
+            },
+            TrustError::ChallengeSigningFailed {
+                reason: "unrelated".to_owned(),
+            },
+            TrustError::KeyResolutionUnavailable {
+                did: "did:dht:zX".to_owned(),
+                reason: "offline".to_owned(),
+            },
+        ] {
+            assert!(!infra.is_record_rejection(), "{infra:?}");
+        }
+    }
+
+    /// Runs `populate_and_aggregate` over one caller-supplied challenge record
+    /// and returns how many challenge results reached the output.
+    fn populate_challenge_count(record: ChallengeVerification, context_id: &str) -> usize {
+        let subject_did = record.subject.to_string();
+        let events = vec![make_event(
+            EventType::MessageSent,
+            &subject_did,
+            1000,
+            0,
+            vec![],
+        )];
+        let json = populate_and_aggregate(
+            InMemoryFfiTrustStore::new(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
+            context_id,
+            &subject_did,
+            vec![],
+            &[record],
+            &events,
+            [0u8; 32],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        parsed["challenge_results"].as_array().unwrap().len()
+    }
+
+    const POPULATE_SUBJECT: &str =
+        "did:key:99999999999999999999999999999999999999999999999999999999999999ff";
+
+    #[test]
+    fn populate_drops_record_with_underived_verification_id() {
+        // A genuinely signed record whose id is not derived from its fields is
+        // dropped, not an aggregation failure.
+        let ctx = "ctx-underived-id";
+        let mut cv = unsigned_challenge(
+            &ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+            POPULATE_SUBJECT,
+            ctx,
+            live_expiry(),
+        );
+        cv.verification_id = [0x11; 32];
+        assert_eq!(populate_challenge_count(sign_challenge(cv), ctx), 0);
+        // Control: the same record with its derived id survives.
+        assert_eq!(
+            populate_challenge_count(
+                make_genuinely_signed_challenge_with(POPULATE_SUBJECT, ctx, live_expiry()),
+                ctx
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn populate_drops_record_with_validity_over_90_days() {
+        let ctx = "ctx-validity";
+        let mut cv = unsigned_challenge(
+            &ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+            POPULATE_SUBJECT,
+            ctx,
+            live_expiry(),
+        );
+        cv.expires_at = cv.timestamp + 90 * 86_400 + 1;
+        assert_eq!(populate_challenge_count(sign_challenge(cv), ctx), 0);
+        // Control: exactly 90 days is accepted.
+        let mut cv = unsigned_challenge(
+            &ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]),
+            POPULATE_SUBJECT,
+            ctx,
+            live_expiry(),
+        );
+        cv.expires_at = cv.timestamp + 90 * 86_400;
+        assert_eq!(populate_challenge_count(sign_challenge(cv), ctx), 1);
+    }
+
+    /// A challenge resolver whose backend is down.
+    struct UnavailableResolver;
+    impl ActiveKeyResolver for UnavailableResolver {
+        fn resolve_active_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
+            Err(TrustError::KeyResolutionUnavailable {
+                did: did.to_owned(),
+                reason: "offline".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn populate_propagates_challenge_resolver_outage() {
+        // A resolver outage must not silently drop a record: it fails the call.
+        let ctx = "ctx-outage";
+        let record = make_genuinely_signed_challenge(POPULATE_SUBJECT, ctx);
+        let err = populate_and_aggregate(
+            InMemoryFfiTrustStore::new(),
+            &UnavailableResolver,
+            &ProtocolOnlyDefinitions,
+            ctx,
+            POPULATE_SUBJECT,
+            vec![],
+            &[record],
+            &[],
+            [0u8; 32],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrustError::KeyResolutionUnavailable { .. }),
+            "{err:?}"
+        );
+    }
+
+    fn populate_without_resolver(
+        records: &[ChallengeVerification],
+        ctx: &str,
+    ) -> Result<String, TrustError> {
+        populate_and_aggregate(
+            InMemoryFfiTrustStore::new(),
+            crate::resolvers::instance_active_key_resolver(
+                &crate::resolvers::BlockingResolutionScope::for_tests(),
+                None,
+            ),
+            &ProtocolOnlyDefinitions,
+            ctx,
+            POPULATE_SUBJECT,
+            vec![],
+            records,
+            // One event, so the control below reaches aggregation instead of
+            // stopping at EmptyEventLog.
+            &[make_event(
+                EventType::MessageSent,
+                POPULATE_SUBJECT,
+                1000,
+                0,
+                vec![],
+            )],
+            [0u8; 32],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn populate_without_resolver_fails_closed_on_challenge_record() {
+        // An instance with no DID resolver can neither admit nor drop a record.
+        let ctx = "ctx-no-resolver";
+        let record = make_genuinely_signed_challenge(POPULATE_SUBJECT, ctx);
+        let err = populate_without_resolver(&[record], ctx).unwrap_err();
+        assert!(
+            matches!(err, TrustError::KeyResolutionUnavailable { .. }),
+            "{err:?}"
+        );
+        // Control: with no record to verify, the call needs no resolver.
+        populate_without_resolver(&[], ctx).unwrap();
     }
 
     /// Fix C (behavioral). An invalid caller credential drops ONLY itself and
@@ -2069,6 +2291,8 @@ mod tests {
         // loop before the genuine entry is verified and cached.
         let json = populate_and_aggregate(
             store,
+            &scp_core::trust::IdentityDidPublicKeyResolver,
+            &ProtocolOnlyDefinitions,
             context_id,
             subject_did,
             vec![
@@ -2131,6 +2355,7 @@ mod tests {
 
         verified_attestations(
             store.clone(),
+            &scp_core::trust::IdentityDidPublicKeyResolver,
             context_id,
             subject_did,
             vec![fresh_entry(revoked_copy)],

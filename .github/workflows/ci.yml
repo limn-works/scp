@@ -457,6 +457,12 @@ jobs:
               - '.docs/standards/sdk-capability-matrix.json'
               - '.docs/adrs/**'
               - '.docs/prds/**'
+              # `crates/scp-testing/tests/integration/trust.rs` compiles in spec 07 to
+              # check its protocol capability minimums against the compiled-in constants.
+              - '.docs/specs/07-trust-validation-and-capabilities.md'
+              # `crates/scp-protocol/src/trust/challenge.rs` compiles in spec 09 in a
+              # unit test that checks the spec against the challenge code.
+              - '.docs/specs/09-security-model.md'
               - 'tests/conformance/**'
               - 'bindings/typescript-wasm/tests/fixtures/outlet-stream-invoker-kat.json'
               - 'scripts/pure-helpers-allowlist.txt'
@@ -1303,6 +1309,12 @@ jobs:
         run: python3.12 scripts/check-block-in-place.py --self-test
       - name: Real scan
         run: python3.12 scripts/check-block-in-place.py
+      # ADR-049 Decision 7a: `bridge_block_on` is the only bridge wait, and
+      # only listed callers reach it. Self-test first, as above.
+      - name: Bridge block_on self-test
+        run: python3.12 scripts/check-bridge-block-on.py --self-test
+      - name: Bridge block_on whitelist + caller list
+        run: python3.12 scripts/check-bridge-block-on.py
 
   # Every `§N.M` citation in the artifacts that tell an agent how to write and how to
   # work names a heading its spec file carries. It runs on every pull request, without a
@@ -1325,6 +1337,36 @@ jobs:
         run: python3.12 scripts/check-doc-citations.py --self-test
       - name: Real scan
         run: python3.12 scripts/check-doc-citations.py
+
+  # `.docs/specs/25-test-vectors.md` §25 says `scripts/gen-test-vectors-p256.py`
+  # produces every keyed byte it prints. This job regenerates the vectors and fails when
+  # spec 25 or a Rust vector test (`crates/scp-runtime/tests/test_vectors.rs`,
+  # `crates/scp-event-log/tests/test_vectors.rs`) holds a value the generator no longer
+  # emits, or when spec 25 lacks a value the generator emits. It runs on every pull
+  # request, without a paths filter, because the `ci` aggregator counts a skipped job as
+  # a pass.
+  test-vectors:
+    needs: check-draft
+    if: github.event_name != 'push'
+    name: Docs / spec 25 test vectors match the generator
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The generator cross-checks every key and signature through `cryptography` when it
+      # imports, so CI installs it to run the stronger check.
+      - name: Install generator dependencies
+        run: python3.12 -m pip install 'cryptography>=44,<51'
+      # Self-test MUST run first: it plants a changed digit in spec 25 and in a Rust
+      # vector test and asserts the check names each one, so a green real scan means the
+      # check compared the files rather than that it can no longer fail.
+      - name: Self-test vector check
+        run: python3.12 scripts/check-test-vectors-p256.py --self-test
+      - name: Real check
+        run: python3.12 scripts/check-test-vectors-p256.py
 
   # A `[mirror]` site of the identity-substrate plan carries an include directive and
   # the Owner's bytes, and this job re-runs the resolver into a temporary tree and
@@ -1379,6 +1421,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-deleted-primitives.sh
+      - name: Run deleted-primitives fixture tests
+        run: bash scripts/tests/deleted-primitives/run-tests.sh
 
   handler-no-panic:
     needs: check-draft
@@ -2117,7 +2161,7 @@ jobs:
   # (src/profile.rs, and the macOS assertion in src/config.rs), and its `udp`
   # listener sets SO_REUSEPORT, whose kernel behaviour differs between Darwin
   # and Linux. scp-platform links SQLCipher against CommonCrypto on Apple
-  # targets, and its SQLite storage takes an `fs2` advisory file lock, whose
+  # targets, and its SQLite storage takes an advisory file lock (`File::try_lock`), whose
   # semantics differ between the two kernels. Every other crate's tests run on
   # Linux only.
   #
@@ -2303,9 +2347,19 @@ jobs:
           # "in_memory" with SCP-IDENT-1008, and refuses "encrypted_file" with
           # SCP-IDENT-1059 before the key file opens (spec 03 §3.2.2,
           # ADR-062 §Decision 6). A build that turned `scp-ffi-napi/testing`
-          # on selects zero tests and `--no-tests=fail` exits 4.
+          # on selects zero tests and `--no-tests=fail` exits 4. SCP-327: the
+          # same build returns SCP-TRANS-5055 from `nodeStartInMemory` and
+          # `nodeStartLocal`, the development node-start pair cut from shipped
+          # builds.
           cargo nextest run --no-tests=fail -p scp-ffi-napi --features server --lib \
-            -E 'test(in_memory_on_a_shipped_build_rejects_with_ident_1008) + test(encrypted_file_on_a_shipped_build_refuses_with_ident_1059_before_opening)'
+            -E 'test(in_memory_on_a_shipped_build_rejects_with_ident_1008) + test(encrypted_file_on_a_shipped_build_refuses_with_ident_1059_before_opening) + test(node_start_in_memory_on_a_shipped_build_returns_trans_5055) + test(node_start_local_on_a_shipped_build_returns_trans_5055)'
+          # SCP-322: `Scp.nodeStart` refuses an operator DID no identity on the
+          # instance holds with SCP-IDENT-1063 in the build a shipped bridge
+          # links. The test carries no cfg gate, so it runs in its own command:
+          # in the union above it would keep that command's selection non-empty
+          # and `--no-tests=fail` could never fire.
+          cargo nextest run --no-tests=fail -p scp-ffi-napi --features server --lib \
+            -E 'test(node_start_with_unregistered_operator_did_returns_ident_1063)'
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
   # features (`server` on) but WITHOUT `testing`. `build-matrix.yml` builds the
@@ -2391,9 +2445,18 @@ jobs:
           # nextest supplies process-per-test isolation, which a SAFETY
           # comment at crates/scp-ffi/src/scp.rs:560-565 rests two
           # `std::env::set_var` calls on, and `--no-tests=fail` exits 4 rather
-          # than 0 if a feature flip selects zero tests.
+          # than 0 if a feature flip selects zero tests. SCP-327: the same
+          # build raises SCP-TRANS-5055 from `node_start_in_memory` and
+          # `node_start_local`, the development node-start pair cut from
+          # shipped builds.
           cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
-            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed) + test(resolve_custody_rejects_in_memory_on_a_shipped_build_with_ident_1008)'
+            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed) + test(resolve_custody_rejects_in_memory_on_a_shipped_build_with_ident_1008) + test(node_start_in_memory_on_a_shipped_build_returns_trans_5055) + test(node_start_local_on_a_shipped_build_returns_trans_5055)'
+          # SCP-322: `SCP.node_start` refuses an operator DID no identity on the
+          # instance holds with SCP-IDENT-1063 in the build a shipped bridge
+          # links. The test carries no cfg gate, so it runs in its own command
+          # for the reason the scp-ffi-napi step gives.
+          cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
+            -E 'test(node_start_with_unregistered_operator_did_returns_ident_1063)'
       - name: Check the PyPI wheel's features vendor OpenSSL on non-Apple targets only
         run: |
           # `crates/scp-platform/Cargo.toml` declares the libsqlite3-sys edge that
@@ -2565,10 +2628,18 @@ jobs:
           # deletes, which keeps a zero-test selection reachable; the second
           # runs the un-gated `ucan_*` tests under a `--no-tests=fail` of their
           # own, which fires if one of them is renamed out of the filter.
+          # SCP-327 adds the two tests proving `node_start_in_memory` and
+          # `node_start_local` return SCP-TRANS-5055 in a shipped build.
           cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
-            -E 'test(identity_create_in_memory_rejected_without_feature) + test(identity_create_entry_points_reject_in_memory_on_a_shipped_build) + test(identity_create_with_custody_fails_closed_without_pre_rotation_backend) + test(shipped_build_reaches_every_callback_custody_identity_op)'
+            -E 'test(identity_create_in_memory_rejected_without_feature) + test(identity_create_entry_points_reject_in_memory_on_a_shipped_build) + test(identity_create_with_custody_fails_closed_without_pre_rotation_backend) + test(shipped_build_reaches_every_callback_custody_identity_op) + test(node_start_in_memory_on_a_shipped_build_returns_trans_5055) + test(node_start_local_on_a_shipped_build_returns_trans_5055)'
           cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
             -E 'test(ucan_mint_works_over_callback_custody) + test(ucan_delegate_works_over_callback_custody) + test(ucan_delegate_signs_with_delegator_key_not_context_creator_key) + test(ucan_mint_without_retained_custody_returns_ident_1017)'
+          # SCP-322: `Scp::node_start` refuses an operator identity that
+          # `identity_load` returned, which holds no key material, with
+          # SCP-IDENT-1063 in the build a shipped bridge links. Un-gated, so it
+          # runs under its own `--no-tests=fail`, as the `ucan_*` tests do.
+          cargo nextest run --no-tests=fail -p scp-ffi-uniffi --features server --lib \
+            -E 'test(node_start_with_externally_loaded_identity_returns_ident_1063)'
 
   # ── Why the doc tests and rustdoc run in two jobs ───────────────────────────
   #
@@ -3510,7 +3581,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install pytest pytest-asyncio mypy==1.20.2
+          pip install pytest pytest-asyncio mypy==1.20.2 'cryptography>=42'
       # THE DEFECT THIS CLOSES: every real-FFI test module under bindings/python/tests
       # skips itself when the extension is absent, and so does the `scp` fixture in
       # bindings/python/tests/conftest.py, which skips a test only when `SCP(...)`
@@ -5074,6 +5145,7 @@ jobs:
       - noop-spelling
       - saga-gating-granularity
       - doc-citations
+      - test-vectors
       - doc-includes
       - agent-verdict-criterion
       - deleted-primitives

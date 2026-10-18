@@ -76,7 +76,7 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | Code | Layer | Condition |
 |------|-------|-----------|
 | `SCP-SAGA-13000` | protocol | Canonical preimage construction exceeded the length-prefix ceiling |
-| `SCP-SAGA-13001` | protocol | P-256 saga signature failed verification |
+| `SCP-SAGA-13001` | protocol | Saga signature failed verification |
 | `SCP-SAGA-13002` | protocol | Malformed P-256 verifying key |
 | `SCP-SAGA-13010` | handler | Caller lacks `outlet:interface` capability (outbound) |
 | `SCP-SAGA-13011` | handler | Caller not in outbound `allowed_callers` |
@@ -267,8 +267,9 @@ constant).
 | `SCP-CRYPTO-4030` | `scp-client-wasm` (browser participant) | Event-log append / proof failure (`ClientError::EventLog`) |
 | `SCP-CRYPTO-4040` | `scp-client-wasm` (browser participant) | Convergent committer-timestamp AAD failure — missing or malformed (ADR-057) (`ClientError::Mls(ConvergentTimestampMissing \| ConvergentTimestampMalformed)`) |
 | `SCP-CRYPTO-4041` | `scp-client-wasm` (browser participant) | Generic MLS group operation failure — create/add/join/encrypt/decrypt/commit catch-all (`ClientError::Mls(_)`) |
-| `SCP-CRYPTO-4060` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Key custody error: a key custody provider or a host custody callback failed for a reason other than key-not-found or a rejected host pseudonym. Covers every `PlatformError` variant except `KeyNotFound` (`SCP-CRYPTO-4006`), `PseudonymRejected` (`SCP-IDENT-1055`), `StorageLockHeld` (`SCP-STORAGE-8005`), `StorageClosed` (`SCP-STORAGE-8006`), `AttestationError` (`SCP-ATTEST-9001`), `Unsupported` (`SCP-CRYPTO-4061`) and `PushError` (`SCP-TRANS-5080` to `SCP-TRANS-5084`), whether it reaches the bridge as a `PlatformError` or as a `CustodyFailure` (ADR-006 2026-09-29 and 2026-10-12 amendments) |
+| `SCP-CRYPTO-4060` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Key custody error: a key custody provider or a host custody callback failed for a reason that has no more specific code. Covers every custody failure except `KeyNotFound` (`SCP-CRYPTO-4006`), `PseudonymRejected` (`SCP-IDENT-1055`), `StorageLockHeld` (`SCP-STORAGE-8005`), `StorageClosed` (`SCP-STORAGE-8006`), `AttestationError` (`SCP-ATTEST-9001`), `Unsupported` (`SCP-CRYPTO-4061`), a custody sign past the ADR-049 Decision 7a budget (`CustodyFailureKind::TimedOut`, `SCP-CRYPTO-4062`) and `PushError` (`SCP-TRANS-5080` to `SCP-TRANS-5084`), whether it reaches the bridge as a `PlatformError` or as a `CustodyFailure` (ADR-006 2026-09-29 and 2026-10-12 amendments) |
 | `SCP-CRYPTO-4061` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Unsupported platform operation: the backend does not support an optional operation, such as an HSM-backed custody asked for an extractable Ed25519 seed or a signature it cannot make (`PlatformError::Unsupported`, bare or wrapped in a `CustodyFailure`; ADR-006 2026-10-12 amendment) |
+| `SCP-CRYPTO-4062` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Key custody timeout: a custody sign did not answer within the ADR-049 Decision 7a budget (`CustodyFailureKind::TimedOut`) (ADR-006 2026-10-11 amendment) |
 | `SCP-TRANS-5005` | `scp-client-wasm` (browser participant) | Injected outbound `Socket`/`RelaySink` failed to enqueue a relay frame — WebSocket closed / JS exception (`ClientError::Transport`) |
 | `SCP-TRANS-5080` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Push wake payload invalid: a received push payload is not the platform's wake signal (`PlatformError::PushError` with `PushFailureKind::WakePayloadInvalid`; ADR-006 2026-10-12 amendment) |
 | `SCP-TRANS-5081` | native FFI-common registry (`PyO3`, napi-rs, `UniFFI`) | Push registration rejected: the relay found the registration's signature, key state or encoding invalid (`PushFailureKind::RegistrationRejected`; ADR-006 2026-10-12 amendment) |
@@ -283,6 +284,19 @@ constant).
 | `SCP-VALID-7025` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | wasm module not initialized — `initScp()` (or `ScpBrowserClient.connect`) must be awaited before constructing/using a client |
 | `SCP-VALID-7026` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | `WebSocketRelaySocket` (the managed transport) passed to `create()` instead of `ScpBrowserClient.connect()` — it would be left unattached |
 | `SCP-VALID-7081` | SDK-wrapper native-loader guard (**one meaning in every SDK that loads a native bridge**; never minted by a bridge). ts-native SDK: `src/internal/native.ts`. Python SDK: `scp_sdk/_extension.py` | No native bridge is installed for the platform; in the ts-native SDK, no napi addon package resolves; in the Python SDK, no `scp_sdk._scp_core` extension file is present. The only native-load failure a test skip guard may treat as absence |
+| `SCP-VALID-7140` | native FFI-common registry | Recovery or custody-migration concurrency cap reached; back off and retry |
+| `SCP-VALID-7141` | Swift SDK (`Governance.swift`) | Site hostname is empty |
+| `SCP-VALID-7142` | Swift SDK (`Governance.swift`) | Site hostname exceeds 253 characters |
+| `SCP-VALID-7143` | native FFI-common registry | A challenge request or response exceeds its size bound (`TrustError::ResponseTooLarge`) |
+| `SCP-VALID-7144` | native FFI-common registry | Two capability definitions with one URI disagree (`TrustError::DefinitionEquivocation`) |
+| `SCP-VALID-7146` | native FFI-common registry | The challenger cannot grade now and the attempt is not used: every grading permit is held, or an evaluator's reserve refused the call for its rate limit or budget; resubmit the attempt (`TrustError::GradingCapacityExhausted`) |
+| `SCP-VALID-7147` | native FFI-common registry | An identifier is not the canonical spelling of its key (`TrustError::NonCanonicalIdentifier`, `AdmissionError::NonCanonicalIdentifier`) |
+| `SCP-VALID-7148` | native FFI-common registry | A context names more than `MAX_CAPABILITY_REQUIREMENTS_PER_CONTEXT` capability requirements (`AdmissionError::TooManyCapabilityRequirements`) |
+| `SCP-VALID-7149` | native FFI-common registry | A grading's lease expired or was replaced before its commit; nothing was written (`TrustError::GradingLeaseLost`) |
+| `SCP-VALID-7150` | native FFI-common registry | A capability requirement breaks a shape rule of spec 07 §7.3.4.4 (`AdmissionError::InvalidRequirement`) |
+| `SCP-VALID-7151` | native FFI-common registry | The challenger's last challenge to this subject for this capability is inside its window; retry at that challenge's `expires_at` (`TrustError::ChallengeWindowOpen`, spec 07 §7.3.4 step 1) |
+| `SCP-VALID-7152` | Swift SDK (`Governance.swift`) | Site `deployRetentionCount` is outside 1 to 8 |
+| `SCP-VALID-7153` | native FFI-common registry | An attempt was graded at or before its challenge's `created_at`; resubmit it at `created_at + 1` (`TrustError::ChallengeNotYetGradable`, spec 07 §7.3.4 step 3) |
 | `SCP-VALID-7082` | SDK-wrapper native-loader guard (**one meaning in every SDK that loads a native bridge**; never minted by a bridge). ts-native SDK: `src/internal/native.ts`, `src/scp.ts`. Python SDK: `scp_sdk/__init__.py`, `scp_sdk/_extension.py`, `scp_sdk/scp.py` | A native bridge is installed and failed to load (`dlopen` error, ABI or architecture mismatch, missing shared library), or it loaded without an export the SDK calls. A test skip guard fails on it |
 
 The browser participant reuses **only** `SCP-CTX-2095` from the shared band —
@@ -391,7 +405,7 @@ and are documented with their own features.
 | `InvalidConfig`, `Node(MissingField)`, `Node(InvalidConfig)` | `SCP-STORAGE-8007` | The node start configuration is invalid: a required field is missing, a field value is invalid, or `scp_node::validate_reach_and_tls` rejected the reach and TLS pair. The check runs before `node_start` creates any directory or file |
 | `Storage`, `Io` | `SCP-STORAGE-8008` | The blob storage backend failed to open (`Storage`), or `node_start` could not create the blob storage directory (`Io`) |
 | `Node(Storage)` | `SCP-STORAGE-8009` | The core node returned a storage error |
-| `OperatorIdentityUnavailable`, `Node(Identity(_))` | `SCP-IDENT-1063` | The operator identity is not available to the node: the identity is not registered on this `SCP` instance, or the core node's identity operation failed |
+| `OperatorIdentityUnavailable`, `Node(Identity(_))` | `SCP-IDENT-1063` | The operator identity is not available to the node: the identity is not registered on this `SCP` instance, the config's identity DID differs from the handle's, or the core node's identity operation failed |
 | `Node(Relay)` | `SCP-TRANS-5051` | The node's relay failed to start, such as a failed bind on `bind_addr` |
 | `Node(Tls)` | `SCP-TRANS-5052` | TLS provisioning failed |
 | `Node(Serve)`, `Node(Nat)` | `SCP-TRANS-5054` | The HTTP server failed to bind or hit a fatal I/O error (`Serve`), or NAT traversal failed (`Nat`) |
@@ -399,8 +413,9 @@ and are documented with their own features.
 | `DhtInit` | `SCP-IDENT-1001` | The production DHT client could not be built |
 | `MissingPassphrase` (dev pair) | `SCP-VALID-7004` | A dev-pair start that persists a node identity received no passphrase, or an empty one |
 | `Platform` (dev pair) | `SCP-CTX-2053` | A dev-pair start received a `PlatformError`, such as from a key custody file it could not open |
-| `DevStartUnavailable` | `SCP-TRANS-5055` | A dev-pair constructor (`start_node_in_memory`, `start_node_local`) was called on a bridge built without its `testing` feature |
-| `SupervisorWiring` | `SCP-TRANS-5056` | The node started, but the bridge could not wire the `SCP` instance's `Supervisor` to it: the connection to the node's relay failed, or registering the operator DID as a local DID on the `Supervisor` failed. The bridge has shut the node down and removed it from the instance's node registry before it returns this error (`construction.md` §"Node start — `NodeStartConfig`") |
+| `DevStartUnavailable` | `SCP-TRANS-5055` | A dev-pair constructor (`node_start_in_memory` or `node_start_local`) was called on a bridge built without that bridge's own `testing` feature. Such a build starts no node and creates nothing under `data_dir`. The PyO3, napi-rs and UniFFI bridges map this variant through `server_error_code` and `server_error_class` to the transport class, so each SDK raises its typed transport error with the code preserved: `TransportError` in Python and TypeScript, `ScpError.Transport` in Swift, and `ScpException.Transport` in Kotlin |
+| `SupervisorWiring` | `SCP-TRANS-5056` | The node started, but the bridge could not bind the `SCP` instance's `Supervisor` to it, for one of four causes: another running node of the instance holds the binding (`NodeAlreadyBound`); the connection to the node's relay failed (`RelayConnect`); no `Supervisor` was attached after the bridge's attach step (`SupervisorUnavailable`); or the instance's transport manager could not be installed, because the instance is suspended or its transport lock is poisoned (`TransportInstall`). The bridge has shut the node down and removed it from the instance's node registry before it returns this error (`construction.md` §"Node start — `NodeStartConfig`") |
+| None: the ADR-048 handle check, before any `ServerError` | `SCP-PERM-3030` | Operator identity minted by another `SCP` instance. Every bridge returns this code (ADR-048), at the handle check that runs before node start lowers the identity |
 
 `SCP-IDENT-1063` is the next free number in the `SCP-IDENT-1000` to `SCP-IDENT-1099` bridge sub-block. The `SCP-IDENT-1100` to `SCP-IDENT-1199` sub-block stays with the key-event-log identity model of `03-identity.md` §3.10.10. `SCP-STORAGE-8007` to `SCP-STORAGE-8009` sit between the selection layer's `8004` to `8006` and the browser participant's `8010` to `8013`. `SCP-TRANS-5055` follows the node codes `SCP-TRANS-5050` to `SCP-TRANS-5054`. `SCP-TRANS-5056` follows `SCP-TRANS-5055`, and `server_error_class` maps `SupervisorWiring` to the transport class, with the other relay failures. `DevStartUnavailable` replaces `AutoGenerateUnavailable`. `SCP-TRANS-5053`, the former UniFFI node-storage code, is retired, and a node storage failure now returns `SCP-STORAGE-8009`.
 
@@ -545,6 +560,10 @@ All public handle types (`Identity`, `ContextHandle`/`Context`, `TransportManage
 | Java | Thread-safe | Interior locking in Rust core via JNA |
 
 **Invariant:** No SDK user should ever need an external lock to use SCP types safely. If a data race is possible without user-side synchronization, the SDK has a bug.
+
+### Signing operations take the `Identity` handle
+
+An SDK operation that signs as a participant takes that participant's `Identity` handle, in every SDK: the challenger of `trustCreateChallenge` and `trustGradeResponse`, and the subject of `trustRespondToChallenge`. A DID string names a party the call does not sign as, such as a challenge's subject at creation. Every SDK in this table has an `Identity` handle, so no language forces a string in its place, and an SDK that takes a DID string for a signer diverges from this rule.
 
 ## Context Creation
 

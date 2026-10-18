@@ -1987,14 +1987,14 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(typeof scp.economyCheckPolicyLock(locked)).toBe("boolean");
     });
 
-    it("scp.economyVerifyPaymentReceipts returns an empty results set for empty input", () => {
+    it("scp.economyVerifyPaymentReceipts returns an empty results set for empty input", async () => {
       // An empty receipt batch is the clean supervisor-backed happy path —
       // it needs no payment adapter, so it exercises the cross-bridge
       // forwarder without a configured paid context. The bridge returns
       // `{"all_valid":true,"results":[]}` — `allValid` is vacuously true for
       // an empty batch, and `ok` (adapter-responded) is distinct from
       // `valid`/`allValid` (payment validity).
-      const result = scp.economyVerifyPaymentReceipts([]);
+      const result = await scp.economyVerifyPaymentReceipts([]);
       expect(result.allValid).toBe(true);
       expect(result.results).toEqual([]);
     });
@@ -2044,6 +2044,27 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         let threw = false;
         try {
           await other.contextSend(ourCtx, ours.did, new TextEncoder().encode("cross-instance"));
+        } catch (err) {
+          threw = true;
+          expect(String(err)).toMatch(/SCP-PERM-3030/);
+        }
+        expect(threw).toBe(true);
+      } finally {
+        await other.shutdown(1);
+      }
+    });
+
+    it("contextGovernanceModifyCapabilityRequirements with a handle minted by another SCP is rejected", async () => {
+      const other = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const ours = await createInMemoryIdentity(scp);
+        const ourCtx = await scp.contextCreate(
+          ours,
+          JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
+        );
+        let threw = false;
+        try {
+          await other.contextGovernanceModifyCapabilityRequirements(ourCtx, [], ours.did);
         } catch (err) {
           threw = true;
           expect(String(err)).toMatch(/SCP-PERM-3030/);

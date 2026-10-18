@@ -45,7 +45,9 @@
 
 use std::fmt;
 
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
+#[cfg(any(test, feature = "testing"))]
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -232,17 +234,26 @@ impl InvitationBundle {
         .map_err(|e| InvitationBundleError::Canonicalization(e.to_string()))
     }
 
-    /// Signs the bundle in place: computes
-    /// [`Self::invitation_bundle_signing_hash`] and stores the creator's
-    /// Ed25519 signature over it in [`Self::signature`].
+    /// Stores the creator's Ed25519 signature over
+    /// [`Self::invitation_bundle_signing_hash`] in [`Self::signature`].
     ///
-    /// The caller supplies the already-resolved creator `#active` signing key;
-    /// DID → key resolution is the runtime layer's responsibility.
+    /// Production signs the hash through the creator's custody signer (ADR-049
+    /// Decision 7a), outside this crate, and passes the 64 signature bytes in.
+    /// [`Self::verify`] is the check that the bytes cover this bundle.
+    pub fn set_signature(&mut self, signature: [u8; 64]) {
+        self.signature = signature.to_vec();
+    }
+
+    /// Signs the bundle in place with a raw key: computes
+    /// [`Self::invitation_bundle_signing_hash`] and stores the creator's
+    /// Ed25519 signature over it in [`Self::signature`]. Test-only; production
+    /// signs through custody and calls [`Self::set_signature`].
     ///
     /// # Errors
     ///
     /// Returns [`InvitationBundleError::Canonicalization`] if the signing hash
     /// cannot be computed.
+    #[cfg(any(test, feature = "testing"))]
     pub fn sign(&mut self, signing_key: &SigningKey) -> Result<(), InvitationBundleError> {
         let hash = self.invitation_bundle_signing_hash()?;
         self.signature = signing_key.sign(&hash).to_bytes().to_vec();
@@ -434,12 +445,25 @@ impl JoinResponse {
         .map_err(|e| InvitationBundleError::Canonicalization(e.to_string()))
     }
 
-    /// Signs the response in place over [`Self::join_response_signing_hash`].
+    /// Stores the joiner's Ed25519 signature over
+    /// [`Self::join_response_signing_hash`] in [`Self::signature`].
+    ///
+    /// Production signs the hash through the joiner's custody signer (ADR-049
+    /// Decision 7a) and passes the 64 signature bytes in. [`Self::verify`] is
+    /// the check that the bytes cover this response.
+    pub fn set_signature(&mut self, signature: [u8; 64]) {
+        self.signature = signature.to_vec();
+    }
+
+    /// Signs the response in place with a raw key over
+    /// [`Self::join_response_signing_hash`]. Test-only; production signs
+    /// through custody and calls [`Self::set_signature`].
     ///
     /// # Errors
     ///
     /// Returns [`InvitationBundleError::Canonicalization`] if the signing hash
     /// cannot be computed.
+    #[cfg(any(test, feature = "testing"))]
     pub fn sign(&mut self, signing_key: &SigningKey) -> Result<(), InvitationBundleError> {
         let hash = self.join_response_signing_hash()?;
         self.signature = signing_key.sign(&hash).to_bytes().to_vec();
@@ -872,5 +896,36 @@ mod tests {
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("66")); // 0x42 would render as `66` in a byte array
         assert!(!rendered.contains('1'), "raw seed bytes must not appear");
+    }
+
+    /// The signature-in path (hash, sign elsewhere, `set_signature`) stores the
+    /// same bytes as the raw-key `sign`, and the result verifies.
+    #[test]
+    fn with_signature_matches_sign() {
+        use ed25519_dalek::Signer as _;
+
+        let sk = signing_key(7);
+
+        let mut signed = fixture_bundle();
+        signed.sign(&sk).unwrap();
+        let mut set = fixture_bundle();
+        let hash = set.invitation_bundle_signing_hash().unwrap();
+        set.set_signature(sk.sign(&hash).to_bytes());
+        assert_eq!(set.signature, signed.signature);
+        set.verify(&sk.verifying_key()).unwrap();
+        // A signature over another bundle's hash does not verify here.
+        let mut other = fixture_bundle();
+        other.context_id = "another-context".to_owned();
+        let other_hash = other.invitation_bundle_signing_hash().unwrap();
+        set.set_signature(sk.sign(&other_hash).to_bytes());
+        assert!(set.verify(&sk.verifying_key()).is_err());
+
+        let mut signed = fixture_join();
+        signed.sign(&sk).unwrap();
+        let mut set = fixture_join();
+        let hash = set.join_response_signing_hash().unwrap();
+        set.set_signature(sk.sign(&hash).to_bytes());
+        assert_eq!(set.signature, signed.signature);
+        set.verify(&sk.verifying_key()).unwrap();
     }
 }

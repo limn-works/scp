@@ -32,7 +32,10 @@
 //! monolithic context methods did not carry their own deadline — this is
 //! the new behaviour introduced by ADR-049 §7. 30 seconds matches the
 //! plan's "every transport and storage call inside a handler wraps
-//! `tokio::time::timeout(30s, ...)`" contract.
+//! `tokio::time::timeout(30s, ...)`" contract. A handler that signs in its
+//! turn uses [`SIGNING_HANDLER_TIMEOUT`] instead, so a stalled custody fails
+//! as `SCP-CRYPTO-4062` before the handler budget expires (ADR-049
+//! Decision 7a).
 
 use std::time::Duration;
 
@@ -45,6 +48,7 @@ use crate::context::actor::commands::MessagingCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::sequence::SequenceReservation;
+use crate::context::actor::signer::{CommandSigner, SIGNING_HANDLER_TIMEOUT};
 
 /// Per-call transport budget for mutation handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -86,7 +90,7 @@ pub(crate) async fn dispatch(
                 p.params,
                 &p.sender_did,
                 &p.payload,
-                p.signing_key.as_ref(),
+                &p.signer,
                 p.signing_key_id,
                 p.source_provenance.as_ref(),
                 p.spending_ucan.as_ref(),
@@ -113,7 +117,7 @@ pub(crate) async fn dispatch(
                 p.context_id,
                 p.params,
                 &p.sender_did,
-                &p.signing_key,
+                &p.signer,
                 reply,
             )
             .await
@@ -172,10 +176,10 @@ pub(crate) async fn dispatch(
         MessagingCommand::BuildLocalCheckpoint {
             context_id,
             sender_did,
-            signing_key,
+            signer,
             reply,
         } => {
-            handle_build_local_checkpoint(cell, deps, &context_id, &sender_did, &signing_key, reply)
+            handle_build_local_checkpoint(cell, deps, &context_id, &sender_did, &signer, reply)
                 .await
         }
         MessagingCommand::CompareRemoteCheckpoint {
@@ -186,15 +190,15 @@ pub(crate) async fn dispatch(
         MessagingCommand::SendHeartbeat {
             context_id,
             sender_did,
-            signing_key,
+            signer,
             reply,
-        } => handle_send_heartbeat(cell, deps, &context_id, &sender_did, &signing_key, reply).await,
+        } => handle_send_heartbeat(cell, deps, &context_id, &sender_did, &signer, reply).await,
         MessagingCommand::RotatePseudonym {
             context_id,
             new_epoch,
             new_routing_id,
             sender_did,
-            signing_key,
+            signer,
             reply,
         } => {
             handle_rotate_pseudonym(
@@ -205,7 +209,7 @@ pub(crate) async fn dispatch(
                     new_epoch,
                     new_routing_id,
                     sender_did: &sender_did,
-                    signing_key: &signing_key,
+                    signer: &signer,
                 },
                 reply,
             )
@@ -699,7 +703,7 @@ fn handle_test_install_access_key(
 /// sequence number via RAII on the actor-owned `send_tracker`,
 /// delegate to
 /// [`messaging_helpers::send_message`](crate::context::messaging_helpers::send_message)
-/// under a 30s timeout, commit the reservation on success or let it
+/// under [`SIGNING_HANDLER_TIMEOUT`], commit the reservation on success or let it
 /// drop (RAII rollback) on any failure path.
 ///
 /// The reservation is taken first against `state.send_tracker`, then
@@ -715,7 +719,7 @@ async fn handle_send_message(
     params: scp_protocol::context::params::ContextParams,
     sender_did: &scp_did::DID,
     payload: &[u8],
-    signing_key: Option<&crate::context::actor::commands::SigningKeyBytes>,
+    signer: &CommandSigner,
     signing_key_id: scp_did::SigningKeyId,
     source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
@@ -758,10 +762,8 @@ async fn handle_send_message(
         return Outcome::err(sketch);
     }
 
-    // Step 3: delegate to the actor-shape helper, wrapped in the
-    // per-call transport-timeout budget.
-    let sk = signing_key.map(crate::context::actor::commands::SigningKeyBytes::to_signing_key);
-    let sk_ref = sk.as_ref();
+    // Step 3: delegate to the actor-shape helper, wrapped in the signing
+    // handler budget (the send signs its inner envelope in this turn).
     // `send_message` is the spending-nonce-bearing path and takes the cell; the
     // `state` borrow above has ended (NLL) so `cell` is free here. The failure
     // arms re-derive the bare state for the send-tracker rollback.
@@ -771,13 +773,15 @@ async fn handle_send_message(
         &handle,
         sender_did,
         payload,
-        sk_ref,
+        signer,
         signing_key_id,
         source_provenance,
         spending_ucan,
     );
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
+    let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, send_fut)
+        .await
+    {
         Ok(Ok(())) => {
             // Send succeeded — keep the committed high-water mark.
             (Outcome::ok_mutated(()), Ok(()))
@@ -793,7 +797,7 @@ async fn handle_send_message(
             *cell.class_c_view().send_tracker_mut() =
                 SendSequenceTracker::from_persisted(high_water_before);
             let err = ContextError::TransportTimeout(format!(
-                "send_message exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "send_message exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
@@ -848,7 +852,10 @@ async fn handle_deliver_incoming(
             .await
         };
 
-        match tokio::time::timeout(HANDLER_TIMEOUT, deliver_fut).await {
+        // A KeyResponse opens through the identity wrapping key's custody
+        // `dh_agree`, bounded by `SIGN_TIMEOUT`; the signing budget lets a
+        // stalled custody fail first as `SCP-CRYPTO-4062`.
+        match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, deliver_fut).await {
             Ok(Ok(opt)) => (Outcome::ok_mutated(()), Ok(opt)),
             Ok(Err(e)) => {
                 let sketch = outcome_error_sketch(&e);
@@ -856,7 +863,7 @@ async fn handle_deliver_incoming(
             }
             Err(_elapsed) => {
                 let err = ContextError::TransportTimeout(format!(
-                    "deliver_incoming exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                    "deliver_incoming exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
                 ));
                 let sketch = outcome_error_sketch(&err);
                 (Outcome::err_mutated(sketch), Err(err))
@@ -984,7 +991,7 @@ async fn handle_send_pseudonym_announcement(
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     sender_did: &scp_did::DID,
-    signing_key: &crate::context::actor::commands::SigningKeyBytes,
+    signer: &CommandSigner,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let handle = ContextHandle::new(context_id.clone(), params);
@@ -994,14 +1001,15 @@ async fn handle_send_pseudonym_announcement(
         return Outcome::err(sketch);
     }
 
-    let sk = signing_key.to_signing_key();
     let send_fut = crate::context::messaging_helpers::send_pseudonym_announcement(
-        cell, deps, &handle, sender_did, &sk,
+        cell, deps, &handle, sender_did, signer,
     );
 
     // The announcement seals an MLS message (send-ratchet advance) and may
     // clear `announce_pending`, so every arm reports `mutated`.
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
+    let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, send_fut)
+        .await
+    {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
         Ok(Err(err)) => {
             let sketch = outcome_error_sketch(&err);
@@ -1009,7 +1017,7 @@ async fn handle_send_pseudonym_announcement(
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "send_pseudonym_announcement exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "send_pseudonym_announcement exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
@@ -1026,14 +1034,15 @@ struct RotateRequest<'a> {
     new_epoch: u64,
     new_routing_id: [u8; 32],
     sender_did: &'a scp_did::DID,
-    signing_key: &'a crate::context::actor::commands::SigningKeyBytes,
+    signer: &'a crate::context::actor::signer::CommandSigner,
 }
 
 /// Handle [`MessagingCommand::RotatePseudonym`] (actor-shape).
 ///
 /// Delegates to
 /// [`rotate_pseudonym`](crate::context::messaging_helpers::rotate_pseudonym)
-/// under [`HANDLER_TIMEOUT`] and replies with its result. An error reports
+/// under [`SIGNING_HANDLER_TIMEOUT`], because the announcement signs through
+/// the custody signer, and replies with its result. An error reports
 /// `mutated` when the rotation state or the local routing ID changed (the
 /// rotation committed before an announcement error) and on a timeout, which
 /// can stop the helper part-way; a rejection or a restored persist failure
@@ -1045,7 +1054,6 @@ async fn handle_rotate_pseudonym(
     request: RotateRequest<'_>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let sk = request.signing_key.to_signing_key();
     let before = (
         cell.class_s.pseudonym_rotation,
         cell.routing.local_pseudonym(),
@@ -1054,11 +1062,13 @@ async fn handle_rotate_pseudonym(
         cell,
         deps,
         request.sender_did,
-        &sk,
+        request.signer,
         request.new_epoch,
         request.new_routing_id,
     );
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, rotate_fut).await {
+    let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, rotate_fut)
+        .await
+    {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
         Ok(Err(err)) => {
             let sketch = outcome_error_sketch(&err);
@@ -1074,7 +1084,7 @@ async fn handle_rotate_pseudonym(
         }
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
-                "rotate_pseudonym exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                "rotate_pseudonym exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
@@ -1135,67 +1145,89 @@ fn handle_report_degraded_mode(
 /// mailbox round-trip — build + broadcast — and the reply carries the
 /// built checkpoint so the driver can record it.
 ///
-/// Synchronous (the send body has no awaits); no
-/// `tokio::time::timeout` wrapper required. Always replies
-/// `Ok(checkpoint)`; reports [`Outcome::ok_mutated`] because the
-/// checkpoint ring and counters changed.
+/// The checkpoint is signed through `signer` in this turn (ADR-049
+/// Decision 7a); build and broadcast run under [`SIGNING_HANDLER_TIMEOUT`].
+/// Replies `Ok(checkpoint)` when the build succeeds (the broadcast is
+/// best-effort), the signing error when custody refuses or stalls (the
+/// checkpoint fields are then unchanged), and `TransportTimeout` when the
+/// turn outlasts its budget. Reports [`Outcome::ok_mutated`] on success
+/// because the checkpoint ring and counters changed, and on the timeout arm
+/// because the broadcast seal may already have advanced the MLS generation.
 async fn handle_build_local_checkpoint(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &scp_did::DID,
-    signing_key: &crate::context::actor::commands::SigningKeyBytes,
+    signer: &CommandSigner,
     reply: crate::context::actor::commands::BuildLocalCheckpointReply,
 ) -> Outcome<()> {
-    let sk = signing_key.to_signing_key();
-    let now = deps.clock.now_secs();
-    // Build + retain the checkpoint through the non-persisting Class-C view
-    // (coalesced — the run loop persists on `mutated`). The `&mut view` borrow
-    // ends before the shared-`&` `send_checkpoint` read below (NLL).
-    let checkpoint = {
-        let mut view = cell.class_c_view();
-        let broadcast_context_is_none = view.broadcast_class_c_mut().is_none();
-        let mls_epoch = view.epoch_mut().mls_epoch;
-        crate::context::queries_helpers::force_create_checkpoint_view(
-            &mut view,
+    // Build, sign and retain the checkpoint, then broadcast it best-effort.
+    let turn = async {
+        let now = deps.clock.now_secs();
+        // Build + retain the checkpoint through the non-persisting Class-C view
+        // (coalesced — the run loop persists on `mutated`). The `&mut view` borrow
+        // ends before the shared-`&` `send_checkpoint` read below (NLL).
+        let checkpoint = {
+            let mut view = cell.class_c_view();
+            let broadcast_context_is_none = view.broadcast_class_c_mut().is_none();
+            let mls_epoch = view.epoch_mut().mls_epoch;
+            crate::context::queries_helpers::force_create_checkpoint_view(
+                &mut view,
+                context_id,
+                broadcast_context_is_none,
+                mls_epoch,
+                sender_did,
+                signer,
+                now,
+                &*deps.event_log,
+            )
+            .await?
+        };
+
+        // Broadcast the freshly-built checkpoint to peers over the regular
+        // encrypted inner-envelope pipeline (§9.9.3). Best-effort: a transport
+        // failure is logged but never fails the build (the reconnection driver
+        // still receives + records the local checkpoint). Mirrors the
+        // periodic `create_and_broadcast_checkpoint_if_due` contract.
+        // ADR-049 PR-7: `send_checkpoint` takes `&mut ClassSCell` (Send) and seals on
+        // the actor crypto view; `cell` is free here (the checkpoint-build view borrow
+        // above ended) and `checkpoint` is owned.
+        if let Err(e) = crate::context::messaging_helpers::send_checkpoint(
+            deps,
+            cell,
             context_id,
-            broadcast_context_is_none,
-            mls_epoch,
             sender_did,
-            &sk,
-            now,
-            &*deps.event_log,
+            signer,
+            &checkpoint,
         )
+        .await
+        {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "failed to broadcast forced consistency checkpoint to peers \
+                 (best-effort; build not rolled back) (§9.9.3)"
+            );
+        }
+
+        Ok::<_, ContextError>(checkpoint)
     };
-
-    // Broadcast the freshly-built checkpoint to peers over the regular
-    // encrypted inner-envelope pipeline (§9.9.3). Best-effort: a transport
-    // failure is logged but never fails the build (the reconnection driver
-    // still receives + records the local checkpoint). Mirrors the
-    // periodic `create_and_broadcast_checkpoint_if_due` contract.
-    // ADR-049 PR-7: `send_checkpoint` takes `&mut ClassSCell` (Send) and seals on
-    // the actor crypto view; `cell` is free here (the checkpoint-build view borrow
-    // above ended) and `checkpoint` is owned.
-    if let Err(e) = crate::context::messaging_helpers::send_checkpoint(
-        deps,
-        cell,
-        context_id,
-        sender_did,
-        &sk,
-        &checkpoint,
-    )
-    .await
-    {
-        tracing::warn!(
-            context_id,
-            error = %e,
-            "failed to broadcast forced consistency checkpoint to peers \
-             (best-effort; build not rolled back) (§9.9.3)"
-        );
-    }
-
-    let _ = reply.send(Ok(checkpoint));
-    Outcome::ok_mutated(())
+    let (outcome, reply_result) = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, turn).await {
+        Ok(Ok(checkpoint)) => (Outcome::ok_mutated(()), Ok(checkpoint)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "build_local_checkpoint exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
+    outcome
 }
 
 /// Handle [`MessagingCommand::CompareRemoteCheckpoint`] (actor-shape).
@@ -1241,8 +1273,8 @@ fn handle_compare_remote_checkpoint(
 /// [`send_heartbeat`](crate::context::messaging_helpers::send_heartbeat),
 /// which routes an EMPTY-payload [`MessageType::Heartbeat`](scp_protocol::envelope::inner::MessageType::Heartbeat)
 /// envelope through the regular encrypt-and-send path. The caller (the
-/// bridge/SDK subscribe-path scheduler) supplies `sender_did` + `signing_key`
-/// per-call — the signing key is not actor-owned state. Routing the send
+/// bridge/SDK subscribe-path scheduler) supplies `sender_did` + `signer`
+/// per-call — the actor holds no key material. Routing the send
 /// through the actor serializes it with the context's other sends.
 ///
 /// Forwards the `send_heartbeat` result verbatim: `Ok(())` on success, or the
@@ -1270,7 +1302,7 @@ async fn handle_send_heartbeat(
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &scp_did::DID,
-    signing_key: &crate::context::actor::commands::SigningKeyBytes,
+    signer: &CommandSigner,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // Take `&mut ClassSCell` (Send) rather than `&PerContextState` (`!Sync`, so
@@ -1278,10 +1310,15 @@ async fn handle_send_heartbeat(
     // the `send_heartbeat` await, so the borrow must be `Send` for the spawned
     // actor future. `send_heartbeat` reads the shared `&*cell` in its sync
     // prelude (ADR-049 Decision 7).
-    let sk = signing_key.to_signing_key();
-    let result =
-        crate::context::messaging_helpers::send_heartbeat(deps, cell, context_id, sender_did, &sk)
-            .await;
+    let heartbeat = crate::context::messaging_helpers::send_heartbeat(
+        deps, cell, context_id, sender_did, signer,
+    );
+    let result = match tokio::time::timeout(SIGNING_HANDLER_TIMEOUT, heartbeat).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ContextError::TransportTimeout(format!(
+            "send_heartbeat exceeded {SIGNING_HANDLER_TIMEOUT:?} budget for context {context_id}"
+        ))),
+    };
     match result {
         Ok(()) => {
             let _ = reply.send(Ok(()));

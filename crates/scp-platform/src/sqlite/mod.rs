@@ -18,17 +18,17 @@ pub mod key_custody;
 #[cfg(feature = "software_platform")]
 pub use key_custody::SqliteKeyCustody;
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Mutex;
 
-use fs2::FileExt;
 use rand::RngCore;
 use rusqlite::Connection;
 
 use zeroize::Zeroize;
 
 use crate::error::PlatformError;
+use crate::file_lock::ExclusiveFileLock;
 use crate::kdf;
 use crate::traits::Storage;
 
@@ -77,15 +77,17 @@ pub struct SqliteStorage {
     // corruption that can occur when two `rusqlite` handles share the same
     // database file without coordinating access. See red-hat RED-1002.
     //
-    // Held in `Mutex<Option<File>>` so [`close`](Self::close) can take the
-    // `File` out and drop it explicitly, after the connection, while outer
+    // Held in `Mutex<Option<ExclusiveFileLock>>` so [`close`](Self::close)
+    // can take the lock out and release it, after the connection, while outer
     // `Arc<SqliteStorage>` references persist (FFI bridge instances hold the
     // storage through several `Arc` chains: `StorageProvider`,
     // `CoreFields::persistence`, the Supervisor's persistence, the event-log
     // repository). The owner calls `close` only after every writer has
     // exited (spec §17.6, ADR-048 §5 amendment); dropping the struct also
-    // releases both, connection first.
-    lock_file: Mutex<Option<File>>,
+    // releases both, connection first. Both paths unlock before the lock file
+    // closes, because a descriptor copy a child process inherited would
+    // otherwise keep the lock held (see `crate::file_lock`).
+    lock_file: Mutex<Option<ExclusiveFileLock>>,
 }
 
 impl SqliteStorage {
@@ -123,12 +125,12 @@ impl SqliteStorage {
             .map_err(|e| PlatformError::StorageError(format!("failed to create directory: {e}")))?;
 
         // Take the advisory exclusive lock BEFORE opening the database. We
-        // use `try_lock_exclusive` (non-blocking) so a second caller gets an
+        // use `File::try_lock` (non-blocking) so a second caller gets an
         // actionable error immediately rather than silently blocking — the
         // caller is expected to use a single `SqliteStorage` per database
         // directory. The lock file is persistent (created with OpenOptions
-        // so it survives across process restarts) but the lock itself is
-        // advisory and released automatically when the File is dropped.
+        // so it survives across process restarts); the lock itself is
+        // advisory, and `ExclusiveFileLock` unlocks it on close and on drop.
         let lock_path = dir.join("scp.db.lock");
         let lock_file = OpenOptions::new()
             .create(true)
@@ -142,7 +144,8 @@ impl SqliteStorage {
                     lock_path.display()
                 ))
             })?;
-        FileExt::try_lock_exclusive(&lock_file).map_err(|e| lock_error(&e, dir, &lock_path))?;
+        let lock_file = ExclusiveFileLock::try_acquire(lock_file, &lock_path)
+            .map_err(|(_, e)| lock_error(e, dir, &lock_path))?;
 
         let db_path = dir.join("scp.db");
         // `scp_sqlite_pools::open` refuses, before it opens the file, unless
@@ -306,6 +309,11 @@ impl SqliteStorage {
     /// the connection. The store then keeps both its connection and its
     /// lock, because releasing the lock while the connection may still be
     /// open would admit a second writer.
+    ///
+    /// Also returns [`PlatformError::StorageError`] if the connection closed
+    /// but the unlock of `{dir}/scp.db.lock` failed. The lock file is closed
+    /// either way, so the lock stays held only while a descriptor copy that
+    /// another process inherited stays open; a later `close` returns `Ok`.
     pub fn close(&self) -> Result<(), PlatformError> {
         let mut conn_guard = self
             .conn
@@ -327,11 +335,16 @@ impl SqliteStorage {
             .lock_file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Dropping the taken `File` releases the flock(2) / LockFileEx lock.
-        drop(lock_guard.take());
+        // Unlock before the lock file closes: closing alone leaves the
+        // flock(2) held while any inherited copy of the descriptor survives.
+        let released = lock_guard.take().map_or(Ok(()), ExclusiveFileLock::release);
         drop(lock_guard);
         drop(conn_guard);
-        Ok(())
+        released.map_err(|e| {
+            PlatformError::StorageError(format!(
+                "closed the database connection but failed to unlock its advisory lock: {e}"
+            ))
+        })
     }
 }
 
@@ -557,21 +570,19 @@ fn prefix_successor(prefix: &str) -> Option<String> {
     None
 }
 
-/// Classifies a failed `try_lock_exclusive` on `lock_path`. Contention is the
+/// Classifies a failed `File::try_lock` on `lock_path`. Contention
+/// ([`TryLockError::WouldBlock`](std::fs::TryLockError::WouldBlock)) is the
 /// typed lock-still-held condition (spec §17.6); any other lock failure is an
-/// I/O fault on the lock file and stays a generic storage error. The OS error
-/// code is compared, not the `ErrorKind`: std maps the Windows contention code
-/// to no specific kind, so a kind comparison also matches unrelated
-/// uncategorized failures.
-fn lock_error(e: &std::io::Error, dir: &Path, lock_path: &Path) -> PlatformError {
-    let contended = fs2::lock_contended_error().raw_os_error();
-    if contended.is_some() && e.raw_os_error() == contended {
-        PlatformError::StorageLockHeld {
+/// I/O fault on the lock file and stays a generic storage error.
+fn lock_error(e: std::fs::TryLockError, dir: &Path, lock_path: &Path) -> PlatformError {
+    match e {
+        std::fs::TryLockError::WouldBlock => PlatformError::StorageLockHeld {
             dir: dir.display().to_string(),
             lock_path: lock_path.display().to_string(),
+        },
+        std::fs::TryLockError::Error(e) => {
+            PlatformError::StorageError(format!("failed to lock {}: {e}", lock_path.display()))
         }
-    } else {
-        PlatformError::StorageError(format!("failed to lock {}: {e}", lock_path.display()))
     }
 }
 
@@ -1104,6 +1115,65 @@ mod tests {
         drop(first);
     }
 
+    /// A copy of the lock file's descriptor, kept alive by the caller, stands
+    /// in for the copy a concurrently spawned or forked child inherits; both
+    /// share the `flock(2)`.
+    fn inherit_lock_descriptor(
+        storage: &SqliteStorage,
+    ) -> Result<std::fs::File, Box<dyn std::error::Error>> {
+        let copy = storage
+            .lock_file
+            .lock()
+            .map_err(|e| format!("lock mutex poisoned: {e}"))?
+            .as_ref()
+            .and_then(ExclusiveFileLock::file)
+            .map(std::fs::File::try_clone)
+            .ok_or("an open store must hold its lock file")??;
+        Ok(copy)
+    }
+
+    /// `close()` returns `Ok` only once a reopen of the directory can
+    /// succeed, even while an inherited copy of the lock descriptor
+    /// survives (spec §17.6 "One Opener per Durable Directory").
+    #[test]
+    fn close_releases_the_lock_while_an_inherited_descriptor_survives()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let key = [3u8; 32];
+        let storage = SqliteStorage::new(tmp.path(), &key)?;
+        let inherited = inherit_lock_descriptor(&storage)?;
+
+        storage.close()?;
+        let reopened = SqliteStorage::new(tmp.path(), &key);
+        assert!(
+            reopened.is_ok(),
+            "close must unlock, not only close: {:?}",
+            reopened.err()
+        );
+        drop(inherited);
+        Ok(())
+    }
+
+    /// Dropping the store unlocks as `close()` does.
+    #[test]
+    fn drop_releases_the_lock_while_an_inherited_descriptor_survives()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let key = [4u8; 32];
+        let storage = SqliteStorage::new(tmp.path(), &key)?;
+        let inherited = inherit_lock_descriptor(&storage)?;
+
+        drop(storage);
+        let reopened = SqliteStorage::new(tmp.path(), &key);
+        assert!(
+            reopened.is_ok(),
+            "drop must unlock, not only close: {:?}",
+            reopened.err()
+        );
+        drop(inherited);
+        Ok(())
+    }
+
     /// Spec §17.6 "One Opener per Durable Directory": `close()` releases the
     /// database connection as well as the lock, and every later operation on
     /// the handle fails with the typed closed-store error rather than
@@ -1173,28 +1243,26 @@ mod tests {
         ));
     }
 
-    /// Only the OS contention code is the typed lock-held condition. An error
-    /// with the same `ErrorKind` but no OS code, or a different OS code, is a
-    /// generic storage error.
+    /// Only contention is the typed lock-held condition. Any other lock
+    /// failure, including one whose `ErrorKind` is `WouldBlock`, is a generic
+    /// storage error.
     #[test]
-    fn lock_error_matches_the_contention_os_code_only() {
+    fn lock_error_matches_contention_only() {
         let dir = Path::new("/d");
         let lock_path = Path::new("/d/scp.db.lock");
-        let contended = fs2::lock_contended_error();
 
         assert!(matches!(
-            lock_error(&contended, dir, lock_path),
+            lock_error(std::fs::TryLockError::WouldBlock, dir, lock_path),
             PlatformError::StorageLockHeld { .. }
         ));
-        let same_kind = std::io::Error::new(contended.kind(), "same kind, no OS code");
+        let same_kind = std::io::Error::new(std::io::ErrorKind::WouldBlock, "an I/O fault");
         assert!(matches!(
-            lock_error(&same_kind, dir, lock_path),
+            lock_error(std::fs::TryLockError::Error(same_kind), dir, lock_path),
             PlatformError::StorageError(_)
         ));
         let other_code = std::io::Error::from_raw_os_error(9);
-        assert_ne!(other_code.raw_os_error(), contended.raw_os_error());
         assert!(matches!(
-            lock_error(&other_code, dir, lock_path),
+            lock_error(std::fs::TryLockError::Error(other_code), dir, lock_path),
             PlatformError::StorageError(_)
         ));
     }

@@ -132,10 +132,9 @@ impl crate::scp::PyScp {
     ///
     /// See ADR-013 section 5: `transport_connect(relay_url) -> None`.
     #[pyo3(name = "transport_connect", signature = (relay_url, source = "explicit"))]
-    pub fn transport_connect(&self, relay_url: &str, source: &str) -> PyResult<()> {
+    pub fn transport_connect(&self, py: Python<'_>, relay_url: &str, source: &str) -> PyResult<()> {
         let bi = &*self.inner;
         validate::validate_relay_url(relay_url)?;
-        let rt = crate::runtime()?;
         let url = relay_url.to_owned();
 
         let relay_source = match source {
@@ -166,11 +165,11 @@ impl crate::scp::PyScp {
         // instance so its per-relay QUIC-suppression and well-known caches
         // survive across connects.
         let selector = bi.core.transport_selector();
-        let result = rt.block_on(async {
+        let result = crate::actor_wait::block_on_released(py, async {
             selector
                 .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
                 .await
-        });
+        })?;
 
         match result {
             Ok((adapter, suppression_rx)) => {
@@ -309,12 +308,15 @@ impl crate::scp::PyScp {
     ///
     /// Raises `TransportError` if the URL fails validation or the connection fails.
     #[pyo3(name = "configure_relay_transport")]
-    pub fn configure_relay_transport(&self, relay_url: &str, local_did: &str) -> PyResult<()> {
+    pub fn configure_relay_transport(
+        &self,
+        py: Python<'_>,
+        relay_url: &str,
+        local_did: &str,
+    ) -> PyResult<()> {
         let bi = &*self.inner;
         validate::validate_relay_url(relay_url)?;
         validate::validate_did(local_did)?;
-
-        let rt = crate::runtime()?;
 
         let sourced = SourcedRelayUrl {
             url: relay_url.to_owned(),
@@ -327,15 +329,14 @@ impl crate::scp::PyScp {
         // `.well-known/scp` (spec §10.5.1) at connect time to enable QUIC,
         // failing open to WebSocket when discovery is unavailable.
         let selector = bi.core.transport_selector();
-        let adapter = rt
-            .block_on(async {
-                selector
-                    .select_and_connect_discovering(&sourced, Some(&profile))
-                    .await
-            })
-            .map_err(|e| {
-                ScpPyError::transport(format!("failed to connect to relay '{relay_url}': {e}"))
-            })?;
+        let adapter = crate::actor_wait::block_on_released(py, async {
+            selector
+                .select_and_connect_discovering(&sourced, Some(&profile))
+                .await
+        })?
+        .map_err(|e| {
+            ScpPyError::transport(format!("failed to connect to relay '{relay_url}': {e}"))
+        })?;
 
         let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             local_did.to_owned(),
@@ -413,10 +414,14 @@ impl crate::scp::PyScp {
     /// Raises `TransportError` if no transport manager exists, the URL is
     /// invalid, or the connection fails.
     #[pyo3(name = "transport_add_relay", signature = (relay_url, source = "explicit"))]
-    pub fn transport_add_relay(&self, relay_url: &str, source: &str) -> PyResult<usize> {
+    pub fn transport_add_relay(
+        &self,
+        py: Python<'_>,
+        relay_url: &str,
+        source: &str,
+    ) -> PyResult<usize> {
         let bi = &*self.inner;
         validate::validate_relay_url(relay_url)?;
-        let rt = crate::runtime()?;
 
         let relay_source = match source {
             "dht_resolved" => RelayUrlSource::DhtResolved,
@@ -447,13 +452,12 @@ impl crate::scp::PyScp {
         // based on the profile's tier (#1532 AC6). The selector surfaces the
         // suppression receiver (drained into reliability scoring, #1533 AC5).
         let selector = bi.core.transport_selector();
-        let (adapter, suppression_rx) = rt
-            .block_on(async {
-                selector
-                    .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
-                    .await
-            })
-            .map_err(ScpPyError::from)?;
+        let (adapter, suppression_rx) = crate::actor_wait::block_on_released(py, async {
+            selector
+                .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
+                .await
+        })?
+        .map_err(ScpPyError::from)?;
         let scoring_url = relay_url.to_owned();
 
         // The manager records the relay with its adapter; a budget eviction
@@ -711,30 +715,41 @@ mod tests {
 
     #[test]
     fn transport_connect_fails_for_unreachable_localhost() {
-        // Connecting to an unreachable URL should fail with TransportError.
-        // We need the tokio runtime to be initialized first.
-        crate::init_runtime().ok();
-        // ws:// to loopback passes scheme validation (loopback exemption),
-        // but the connection fails because nothing is listening on port 1.
-        let result = default_scp().transport_connect("ws://127.0.0.1:1/nonexistent", "explicit");
-        assert!(result.is_err());
+        pyo3::Python::with_gil(|py| {
+            // Connecting to an unreachable URL should fail with TransportError.
+            // We need the tokio runtime to be initialized first.
+            crate::init_runtime().ok();
+            // ws:// to loopback passes scheme validation (loopback exemption),
+            // but the connection fails because nothing is listening on port 1.
+            let result =
+                default_scp().transport_connect(py, "ws://127.0.0.1:1/nonexistent", "explicit");
+            assert!(result.is_err());
+        });
     }
 
     #[test]
     fn transport_connect_rejects_ws_to_remote_host() {
-        crate::init_runtime().ok();
-        // ws:// to a non-loopback address from "explicit" source is
-        // rejected by the transport layer per §10.12.6.
-        let result = default_scp().transport_connect("ws://203.0.113.42:9000/scp/v1", "explicit");
-        assert!(result.is_err());
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            // ws:// to a non-loopback address from "explicit" source is
+            // rejected by the transport layer per §10.12.6.
+            let result =
+                default_scp().transport_connect(py, "ws://203.0.113.42:9000/scp/v1", "explicit");
+            assert!(result.is_err());
+        });
     }
 
     #[test]
     fn transport_connect_rejects_invalid_source() {
-        crate::init_runtime().ok();
-        let result =
-            default_scp().transport_connect("wss://relay.example.com/scp/v1", "invalid_source");
-        assert!(result.is_err());
+        pyo3::Python::with_gil(|py| {
+            crate::init_runtime().ok();
+            let result = default_scp().transport_connect(
+                py,
+                "wss://relay.example.com/scp/v1",
+                "invalid_source",
+            );
+            assert!(result.is_err());
+        });
     }
 
     #[test]

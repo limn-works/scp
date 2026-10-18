@@ -240,9 +240,21 @@ pub enum IdentityError {
     #[error("key rotation failed: {0}")]
     KeyRotationFailed(String),
 
-    /// An invalid relay URL was provided (must use wss:// scheme and /scp/v1 path).
-    #[error("invalid relay URL: {0}")]
-    InvalidRelayUrl(String),
+    /// A relay URL fails `18-addressability-and-deployment.md` §18.2.1: it
+    /// has no `09-security-model.md` §9.18.2 canonical form, its canonical
+    /// path does not end in `/scp/v1`, or it names a bridge relay over `ws`.
+    #[error("invalid relay URL {url:?}: {reason}")]
+    InvalidRelayUrl {
+        /// The rejected URL with any user information removed.
+        url: String,
+        /// Which rule the URL fails.
+        reason: scp_did::RelayEntryUrlError,
+    },
+
+    /// A relay entry's `bridgeTarget` equals `SHA-256(0x00)`, which §18.2.1
+    /// forbids as a present value.
+    #[error("bridgeTarget equals SHA-256(0x00), the absent-value encoding")]
+    AbsentSentinelBridgeTarget,
 
     /// Publishing a DID document to an SCP relay failed.
     #[error("relay publish failed: {0}")]
@@ -433,11 +445,11 @@ impl IdentityError {
 ///
 /// The mapping is variant-for-variant onto the pre-existing `IdentityError`
 /// variants, so `?`-propagation from a `scp-did` method yields the *identical*
-/// observable error (`IdentityError::InvalidRelayUrl(..)`, etc.) it did before
+/// observable error (`IdentityError::InvalidRelayUrl { .. }`, etc.) it did before
 /// the move — the split is behavior-preserving for every existing consumer,
 /// not just compile-preserving. `scp-identity`'s own code constructs these
-/// same variants directly for its DHT/config paths, so no new variant is
-/// introduced.
+/// same variants directly for its DHT/config paths. Each `DidError` variant
+/// has exactly one `IdentityError` counterpart of the same name.
 impl From<scp_did::DidError> for IdentityError {
     fn from(err: scp_did::DidError) -> Self {
         match err {
@@ -448,7 +460,10 @@ impl From<scp_did::DidError> for IdentityError {
             scp_did::DidError::DocumentDeserializationError(msg) => {
                 Self::DocumentDeserializationError(msg)
             }
-            scp_did::DidError::InvalidRelayUrl(msg) => Self::InvalidRelayUrl(msg),
+            scp_did::DidError::InvalidRelayUrl { url, reason } => {
+                Self::InvalidRelayUrl { url, reason }
+            }
+            scp_did::DidError::AbsentSentinelBridgeTarget => Self::AbsentSentinelBridgeTarget,
             scp_did::DidError::AgentKeyAlreadyExists => Self::AgentKeyAlreadyExists,
             scp_did::DidError::AgentKeyNotFound => Self::AgentKeyNotFound,
             scp_did::DidError::MultipleAgentKeys { count } => Self::MultipleAgentKeys { count },

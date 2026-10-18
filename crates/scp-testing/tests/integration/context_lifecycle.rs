@@ -176,7 +176,7 @@ async fn context_params_all_fields() {
         session_cap: None,
         counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
         participation_requirements: Vec::new(),
-        capability_requirements: Vec::new(),
+        capability_requirements: scp_core::trust::CapabilityRequirements::default(),
         incomplete_verification_policy:
             scp_core::context::params::IncompleteVerificationPolicy::default(),
         min_protocol_version: None,

@@ -875,6 +875,9 @@ fn restore_supervisor(
     // `executed_proposals` replay guard. `NodeMlsFactory` keeps a real
     // `SystemClock` so MLS key-package lifetimes validate against wall time.
     clock: Arc<dyn Clock>,
+    // The custody that holds the wrapping keys. A restart test passes the
+    // same custody to every supervisor, as a host's custody outlives a process.
+    wrapping_custody: &Arc<scp_platform::testing::InMemoryKeyCustody>,
 ) -> Arc<Supervisor> {
     Supervisor::with_providers_and_journal(
         Arc::new(NodeMlsFactory::new(
@@ -889,6 +892,7 @@ fn restore_supervisor(
         None,
         Some(clock),
         DurableProviders::for_test(journal, mls_storage),
+        scp_core::context::supervisor::single_custody_source(Arc::clone(wrapping_custody)),
     )
 }
 
@@ -913,6 +917,7 @@ fn restore_supervisor(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn executed_proposals_survive_restart_and_accumulate() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let creator_str = "did:dht:z6MkPersistRestoreCreator";
     let creator = DID::from(creator_str);
     let signing_key = deterministic_signing_key(&creator);
@@ -956,8 +961,9 @@ async fn executed_proposals_survive_restart_and_accumulate() {
             journal1,
             Arc::clone(&mls_storage),
             Arc::clone(&clock),
+            &wrapping_custody,
         );
-        sup1.register_local_did(creator.clone()).await.unwrap();
+        sup1.register_local_did(creator.clone()).await;
 
         // `Encrypted` (MLS-backed) is the standard restore path: the group state
         // lives in the shared OpenMLS storage and the restore leg reinstates it.
@@ -974,7 +980,12 @@ async fn executed_proposals_survive_restart_and_accumulate() {
         // proposal auto-approves and EXECUTES — marking `executed_proposals` and
         // persisting the Class-S snapshot fail-closed.
         let (proposal, _events, execution) = sup1
-            .propose_governance_action(ctx_id, &creator, first_action.clone(), &signing_key)
+            .propose_governance_action(
+                ctx_id,
+                &creator,
+                first_action.clone(),
+                &scp_core::context::actor::CommandSigner::local_ed25519(signing_key.clone()),
+            )
             .await
             .expect("propose_governance_action (pre-restart)");
         assert!(
@@ -1016,8 +1027,9 @@ async fn executed_proposals_survive_restart_and_accumulate() {
         journal2,
         Arc::clone(&mls_storage),
         Arc::clone(&clock),
+        &wrapping_custody,
     );
-    sup2.register_local_did(creator.clone()).await.unwrap();
+    sup2.register_local_did(creator.clone()).await;
 
     // Pre-condition: the context is NOT yet resident (process 2 hasn't restored).
     assert!(
@@ -1049,7 +1061,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
                 amount: Amount::new(2_000),
                 purpose: "restore-replay durability probe (post-restart)".to_owned(),
             },
-            &signing_key,
+            &scp_core::context::actor::CommandSigner::local_ed25519(signing_key.clone()),
         )
         .await
         .expect("propose_governance_action (post-restart)");
@@ -1109,7 +1121,12 @@ async fn executed_proposals_survive_restart_and_accumulate() {
     // marker (or stopped consulting it) would let this auto-execute a SECOND
     // time and return `Ok`, failing the assertion below.
     let replay = sup2
-        .propose_governance_action(ctx_id, &creator, first_action.clone(), &signing_key)
+        .propose_governance_action(
+            ctx_id,
+            &creator,
+            first_action.clone(),
+            &scp_core::context::actor::CommandSigner::local_ed25519(signing_key.clone()),
+        )
         .await;
     let err = replay.expect_err(
         "replaying the pre-restart proposal after restore must be REJECTED — the rehydrated \
@@ -1157,6 +1174,7 @@ async fn executed_proposals_survive_restart_and_accumulate() {
 /// governance action execute against one, would FAIL this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_context_is_not_resurrected_and_refuses_operations() {
+    let wrapping_custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let creator_str = "did:dht:z6MkExpiredRefuseCreator";
     let creator = DID::from(creator_str);
     let signing_key = deterministic_signing_key(&creator);
@@ -1178,8 +1196,9 @@ async fn expired_context_is_not_resurrected_and_refuses_operations() {
             journal1,
             Arc::clone(&mls_storage),
             Arc::clone(&clock),
+            &wrapping_custody,
         );
-        sup1.register_local_did(creator.clone()).await.unwrap();
+        sup1.register_local_did(creator.clone()).await;
         let params = ContextParams {
             mode: ContextMode::Encrypted,
             ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
@@ -1217,8 +1236,9 @@ async fn expired_context_is_not_resurrected_and_refuses_operations() {
         journal2,
         Arc::clone(&mls_storage),
         Arc::clone(&clock),
+        &wrapping_custody,
     );
-    sup2.register_local_did(creator.clone()).await.unwrap();
+    sup2.register_local_did(creator.clone()).await;
 
     let restored = sup2.restore_on_startup().await.expect("restore_on_startup");
     assert!(
@@ -1242,7 +1262,7 @@ async fn expired_context_is_not_resurrected_and_refuses_operations() {
                 amount: Amount::new(1),
                 purpose: "operation against an expired context (must be refused)".to_owned(),
             },
-            &signing_key,
+            &scp_core::context::actor::CommandSigner::local_ed25519(signing_key.clone()),
         )
         .await;
     let err = refused

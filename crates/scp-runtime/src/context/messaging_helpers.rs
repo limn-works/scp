@@ -123,7 +123,7 @@ pub const DEFAULT_BLOB_TTL_SECS: u32 =
 /// inner-envelope construction and the sealed wire stays byte-identical across
 /// the flip (the 16 golden byte-identity tests continue to hold).
 #[allow(clippy::too_many_arguments)]
-pub(in crate::context) fn build_inner_wire(
+pub(in crate::context) async fn build_inner_wire(
     clock: &Arc<dyn Clock>,
     context_id: &str,
     sender_did: &DID,
@@ -194,8 +194,11 @@ pub(in crate::context) fn build_inner_wire(
         signing_key_id: signer.signing_key_id(),
     };
 
-    let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signer.key())
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+    // ADR-049 Decision 7a: the canonical hash is signed through custody
+    // within the signing budget; the actor holds no key material.
+    let inner =
+        crate::envelope::inner::sign::create_inner_envelope_signed(&params, signer.signer())
+            .await?;
 
     Ok((inner, context_id_bytes))
 }
@@ -223,7 +226,7 @@ pub(in crate::context) fn build_inner_wire(
 // false positive here for the same reason as `Supervisor::build_actor_deps`: the
 // enclosing module is `pub(crate)`, but the item is genuinely reached crate-wide.
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) fn build_encrypted_envelope_actor(
+pub(crate) async fn build_encrypted_envelope_actor(
     clock: &Arc<dyn Clock>,
     crypto_state: &mut crate::context::actor::state::ContextCryptoState,
     local_did: &str,
@@ -246,7 +249,8 @@ pub(crate) fn build_encrypted_envelope_actor(
         aad_sequence,
         source_provenance,
         message_type,
-    )?;
+    )
+    .await?;
     // §9.10.4 privacy: app-data outer `routing_id` is the 32-byte zero sentinel
     // — one sealed blob fans out to N per-member pseudonym transport addresses,
     // so no single per-recipient value belongs here, and embedding the
@@ -397,13 +401,24 @@ pub fn commit_send_nonce_token_on_abort<'d, 'c>(
 // 3. build_broadcast_envelope
 // ---------------------------------------------------------------------------
 
-/// Builds a broadcast envelope for the send path. Pure helper.
-pub fn build_broadcast_envelope(
+/// Builds a broadcast envelope for the send path.
+///
+/// The §5.14 signing payload is signed through `signer` within the custody
+/// budget (ADR-049 Decision 7a) before `publish` mutates any state, so a
+/// refused or timed-out sign leaves the broadcast state untouched.
+///
+/// # Errors
+///
+/// - [`ContextError::Custody`] when custody refuses the sign or does not
+///   answer within the budget (`TimedOut`, `SCP-CRYPTO-4062`).
+/// - [`ContextError::CryptoFailed`] when the signing payload cannot be built.
+/// - Any error `publish_metadata` or `publish` returns.
+pub async fn build_broadcast_envelope(
     clock: &dyn Clock,
     bc: &mut BroadcastContextClassCMut<'_>,
     sender_did: &DID,
     payload: &[u8],
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &crate::context::actor::signer::CommandSigner,
 ) -> Result<BroadcastEnvelope, ContextError> {
     let timestamp = clock.now_millis();
     let meta = bc.publish_metadata(sender_did)?;
@@ -423,7 +438,8 @@ pub fn build_broadcast_envelope(
         },
     )
     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-    let signature = ed25519_dalek::Signer::sign(signing_key, &signing_payload);
+    let signature =
+        ed25519_dalek::Signature::from_bytes(&signer.sign_bounded_ed25519(&signing_payload).await?);
     bc.publish(sender_did, payload, timestamp, signature, &nonce, None)
 }
 
@@ -947,7 +963,7 @@ pub async fn send_message(
     handle: &ContextHandle,
     sender_did: &DID,
     payload: &[u8],
-    signing_key: Option<&ed25519_dalek::SigningKey>,
+    signer: &crate::context::actor::signer::CommandSigner,
     signing_key_id: SigningKeyId,
     source_provenance: Option<&SourceContextInfo>,
     spending_ucan: Option<&UcanToken>,
@@ -969,24 +985,15 @@ pub async fn send_message(
         governance_helpers::check_commit_fault_marker(view.commit_fault_mut().as_ref())?;
     }
 
-    // ADR-039: pair the signing key with its persona into a single
+    // ADR-039: pair the signer with its persona into a single
     // `MessageSigner` up front — both the broadcast envelope build and the
-    // encrypted stamp+sign site below read the key and the stamped
-    // verification method from this one value, so they cannot disagree. Every
-    // send path requires a key; a missing one is rejected here, fail-closed,
-    // BEFORE any rate-limit / velocity / economy state is mutated (so no
-    // rollback is needed). Both encrypted and broadcast sends previously
-    // re-checked `None` downstream; this single check subsumes them.
-    let signer = match signing_key {
-        Some(sk) => match signing_key_id {
-            SigningKeyId::Active => MessageSigner::Active(sk),
-            SigningKeyId::Agent => MessageSigner::Agent(sk),
-        },
-        None => {
-            return Err(ContextError::CryptoFailed(
-                "signing key required for send".into(),
-            ));
-        }
+    // encrypted stamp+sign site below read the signer and the stamped
+    // verification method from this one value, so they cannot disagree. The
+    // signer is a required parameter (ADR-049 Decision 7a), so no send path
+    // reaches here without one.
+    let signer = match signing_key_id {
+        SigningKeyId::Active => MessageSigner::Active(signer),
+        SigningKeyId::Agent => MessageSigner::Agent(signer),
     };
 
     // ADR-049 §9 Class-S cell seam: the pre-economy gate runs through the
@@ -1102,11 +1109,11 @@ pub async fn send_message(
     > = {
         let mut view = cell.class_c_view();
         if let Some(mut bc) = view.broadcast_class_c_mut() {
-            // `signer` was validated non-`None` at the top of the function; the
-            // broadcast envelope is signed with the same key the encrypted path
-            // would stamp, sourced from the one `MessageSigner`.
-            build_broadcast_envelope(&*deps.clock, &mut bc, sender_did, payload, signer.key()).map(
-                |env| {
+            // The broadcast envelope is signed through the same signer the
+            // encrypted path would stamp, sourced from the one `MessageSigner`.
+            build_broadcast_envelope(&*deps.clock, &mut bc, sender_did, payload, signer.signer())
+                .await
+                .map(|env| {
                     // Broadcast: SHA-256(context_id) per spec §5.14.
                     let broadcast_rid = scp_protocol::context::broadcast_routing_id(&context_id);
                     (
@@ -1116,8 +1123,7 @@ pub async fn send_message(
                         true,
                         vec![broadcast_rid],
                     )
-                },
-            )
+                })
         } else {
             // Encrypted: assign sequence under actor-owned tracker.
             let Some(seq) = view
@@ -1412,10 +1418,9 @@ pub async fn send_message(
         sender_did,
         sequence,
         payload,
-        // Periodic checkpoints broadcast from `finalize_send` are always
-        // human/device-originated `#active` signals; they need only the raw
-        // key, which we hand over from the one `MessageSigner`.
-        Some(signer.key()),
+        // The persona travels with the key: `finalize_send` builds a due
+        // periodic checkpoint only under `MessageSigner::Active`.
+        signer,
         spending_nonce_token.take(),
         is_broadcast,
     )
@@ -1532,7 +1537,7 @@ pub async fn deliver_incoming(
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's field-granular
     // Class-C `&mut ContextCryptoState` (`mode_mut().crypto_mut()`). Broadcast
     // contexts carry no crypto sub-state (`None`), matching the retained provider
-    // fallback; the `&mut` view is released as soon as the sync call returns, so
+    // fallback; the `&mut` view is released when the awaited call returns, so
     // `view` is free for the dispatch cascade below.
     let Some(opened_envelope) = decrypt_and_dispatch(
         deps,
@@ -1540,7 +1545,8 @@ pub async fn deliver_incoming(
         context_id,
         &context_id_bytes,
         encrypted_blob,
-    )?
+    )
+    .await?
     else {
         // MLS Commit / Proposal — processed internally by the crypto layer,
         // no inner envelope to classify.
@@ -1745,7 +1751,7 @@ pub async fn encrypt_and_send(
 ) -> Result<(), ContextError> {
     let encrypted = if let Some(envelope) = broadcast_envelope {
         // Broadcast: the envelope was already built and signed by
-        // `build_broadcast_envelope` (which used `signer.key()`); the persona is
+        // `build_broadcast_envelope` (through `signer.signer()`); the persona is
         // not part of the broadcast wire shape, so the signer is unused here.
         rmp_serde::to_vec_named(&envelope)
             .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?
@@ -1780,7 +1786,8 @@ pub async fn encrypt_and_send(
             sequence,
             source_provenance,
             message_type,
-        )?;
+        )
+        .await?;
         crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
         result
     };
@@ -1865,7 +1872,7 @@ pub(crate) async fn send_checkpoint(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &crate::context::actor::signer::CommandSigner,
     checkpoint: &scp_event_log::checkpoint::ConsistencyCheckpoint,
 ) -> Result<(), ContextError> {
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): this is now a plain `async fn` taking
@@ -1921,7 +1928,7 @@ pub(crate) async fn send_checkpoint(
         None,
         // Consistency checkpoints are device/human-originated signals, not
         // agent-autonomous messages — sign under `#active` (ADR-039).
-        MessageSigner::Active(signing_key),
+        MessageSigner::Active(signer),
         context_id,
         sender_did,
         &payload,
@@ -1983,7 +1990,7 @@ pub(crate) async fn send_heartbeat(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &crate::context::actor::signer::CommandSigner,
 ) -> Result<(), ContextError> {
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): plain `async fn` taking `&mut ClassSCell`
     // (Send), so the seal runs on the actor's crypto view held across the fan-out
@@ -2049,7 +2056,7 @@ pub(crate) async fn send_heartbeat(
         None,
         // Heartbeats are device/human-originated liveness beacons, not
         // agent-autonomous messages — sign under `#active` (ADR-039).
-        MessageSigner::Active(signing_key),
+        MessageSigner::Active(signer),
         context_id,
         sender_did,
         // Heartbeats carry NO user content — the empty payload is the whole point:
@@ -2281,7 +2288,7 @@ pub async fn finalize_send(
     sender_did: &DID,
     sequence: u64,
     payload: &[u8],
-    signing_key: Option<&ed25519_dalek::SigningKey>,
+    signer: MessageSigner<'_>,
     token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     is_broadcast: bool,
 ) -> Result<(), ContextError> {
@@ -2405,8 +2412,7 @@ pub async fn finalize_send(
         // Checkpoint tracking (§9.9.3).
         *view.checkpoint_events_since_mut() += 1;
     }
-    create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signing_key, now)
-        .await;
+    create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signer, now).await;
 
     // Reconcile the GROW-armed `downward_auth_sink` with the send's nonce `token`
     // so EXACTLY ONE fail-closed persist is owed on every branch (ADR-049 §9,
@@ -2450,17 +2456,24 @@ pub async fn finalize_send(
 /// transport failure is logged but never rolls back the just-completed
 /// application send, because the checkpoint is an independent
 /// consistency-monitoring artifact, not part of the message's delivery
-/// guarantee. A missing signing key (e.g. a context with no local custody)
-/// skips checkpoint creation entirely.
+/// guarantee. An agent-persona send builds no checkpoint, because a
+/// checkpoint is stamped `#active` and only the `#active` key may sign it.
+/// A refused or timed-out checkpoint sign is logged the same way
+/// and leaves the §9.9.3 thresholds armed, so the next send retries it; the
+/// checkpoint fields change only after the signature exists.
 async fn create_and_broadcast_checkpoint_if_due(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &DID,
-    signing_key: Option<&ed25519_dalek::SigningKey>,
+    signer: MessageSigner<'_>,
     now: u64,
 ) {
-    let Some(sk) = signing_key else {
+    // A checkpoint is stamped `#active` (ADR-039), so only the `#active` key may
+    // sign it: the key comes out of the same variant as the stamp. After an
+    // agent-persona send the §9.9.3 thresholds stay armed, and the next
+    // `#active` operation builds the due checkpoint.
+    let MessageSigner::Active(signer) = signer else {
         return;
     };
     // Build + retain the checkpoint through the non-persisting Class-C view
@@ -2476,16 +2489,30 @@ async fn create_and_broadcast_checkpoint_if_due(
             broadcast_context_is_none,
             mls_epoch,
             sender_did,
-            sk,
+            signer,
             now,
             &*deps.event_log,
         )
+        .await
+    };
+    let due_checkpoint = match due_checkpoint {
+        Ok(cp) => cp,
+        Err(e) => {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "consistency checkpoint not created: signing failed (best-effort; \
+                 send not rolled back; retried on the next send) (§9.9.3)"
+            );
+            return;
+        }
     };
     // ADR-049 PR-7: `send_checkpoint` now takes `&mut ClassSCell` (Send) and seals
     // on the actor crypto view; `cell` is free here (the `due_checkpoint` view
     // borrow above ended) and this is its last use.
     if let Some(checkpoint) = due_checkpoint
-        && let Err(e) = send_checkpoint(deps, cell, context_id, sender_did, sk, &checkpoint).await
+        && let Err(e) =
+            send_checkpoint(deps, cell, context_id, sender_did, signer, &checkpoint).await
     {
         tracing::warn!(
             context_id,
@@ -2831,13 +2858,15 @@ pub fn build_snapshot_from_state(
         // Class-S governance subset (ADR-049 §9): exhaustively destructured so a
         // NEW Class-S governance field forces a conscious persist decision here
         // too. `executed_proposals` / `threshold_signers` / `threshold_value` /
-        // `spending_nonce_tracker` are all persisted into the snapshot below.
+        // `spending_nonce_tracker` / `capability_requirements` are all persisted
+        // into the snapshot below.
         class_s:
             crate::context::state::GovernanceClassS {
                 executed_proposals: _executed_proposals,
                 threshold_signers: _threshold_signers,
                 threshold_value: _threshold_value,
                 spending_nonce_tracker: _spending_nonce_tracker,
+                capability_requirements: _capability_requirements,
             },
         // --- Transient: deliberately NOT persisted (rebuilt at restore). ---
         // `deadlock`: per-context deadlock-detection scratch state, recomputed
@@ -2879,6 +2908,7 @@ pub fn build_snapshot_from_state(
         outlet_interfaces: state.governance.outlet_interfaces.clone(),
         threshold_signers: state.governance.class_s.threshold_signers.clone(),
         threshold_value: state.governance.class_s.threshold_value,
+        capability_requirements: state.governance.class_s.capability_requirements.clone(),
         pruning_policy: state.governance.pruning_policy.clone(),
         governance_model_config: Some(state.governance.engine.model_config()),
         economic_policy: state.governance.economic_policy.clone(),
@@ -3122,7 +3152,7 @@ pub(in crate::context) fn stream_reservations_snapshot(
 ///
 /// It does not advance the anti-replay floor. The only caller,
 /// [`deliver_incoming`], advances it after the inner envelope verifies.
-pub(super) fn decrypt_and_dispatch(
+pub(super) async fn decrypt_and_dispatch(
     deps: &ActorDeps,
     crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     context_id: &str,
@@ -3133,9 +3163,10 @@ pub(super) fn decrypt_and_dispatch(
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's OWNED
     // field-granular Class-C `&mut ContextCryptoState` (driven from
     // `deliver_incoming`'s `ClassCMut` view) — byte-identical to the deleted
-    // provider `open` twin (the 16 golden tests hold). `process_incoming_sender_key`
-    // below stays on the provider (it HPKE-opens with the owning identity's
-    // wrapping secret — receive-side, NOT in the delete set); the sender-key INSTALL,
+    // provider `open` twin (the 16 golden tests hold). A KeyResponse opens
+    // through `NodeMlsFactory::open_incoming_sender_key` (public sender and
+    // epoch checks, then the owning identity's wrapping key in custody); the
+    // sender-key INSTALL,
     // however, now writes to the ACTOR-owned `cs.sender_key_store.set_unchecked`
     // (the provider store is empty on a taken context — see the KeyResponse arm
     // below), and `local_did` is likewise retained. A `None` crypto
@@ -3248,25 +3279,38 @@ pub(super) fn decrypt_and_dispatch(
                     }
                     Ok(None)
                 }
-                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(_) => {
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(
+                    response,
+                ) => {
                     // ADR-049 PR-6 GATE-BEFORE-INSTALL + PR-7 install-onto-ACTOR
-                    // fix. `process_incoming_sender_key` HPKE-opens with the
-                    // owning identity's wrapping secret (spec 09 §9.16.1; with
-                    // none loaded it fails closed) and returns the authenticated
-                    // `(key, epoch)`; the
-                    // authoritative Class-M registry gates epoch monotonicity + the
-                    // poisoning ceiling FAIL-CLOSED BEFORE install; the install then
-                    // writes to the ACTOR's OWNED `cs.sender_key_store`. The provider
-                    // store is EMPTY on a taken (actor-owned) context, so the former
-                    // `deps.crypto.set_sender_key_unchecked` was a silent no-op — the
-                    // latent bug this fixes (D1 close, fail-safe ordering preserved).
-                    let wrapping = deps.supervisor.my_wrapping_keypair(&deps.owned_identity)?;
-                    let (sender_key, epoch) = deps.crypto.process_incoming_sender_key(
-                        context_id_bytes,
-                        &sender_did,
-                        &payload,
-                        wrapping.secret(),
-                    )?;
+                    // fix. `open_incoming_sender_key` checks the response's
+                    // public sender and epoch (against the floor read here)
+                    // before any custody call, then the owning identity's
+                    // wrapping key agrees in custody (spec 09 §9.16.1; with no
+                    // key loaded it fails closed, and a custody failure or
+                    // timeout surfaces as `ContextError::Custody`) and HPKE opens
+                    // the authenticated `(key, epoch)`. The authoritative Class-M
+                    // registry then advances the floor FAIL-CLOSED (re-checking
+                    // monotonicity + the poisoning ceiling under its entry
+                    // guard) BEFORE install; the install writes to the ACTOR's
+                    // OWNED `cs.sender_key_store`. The provider store is EMPTY on
+                    // a taken (actor-owned) context, so the former
+                    // `deps.crypto.set_sender_key_unchecked` was a silent no-op —
+                    // the latent bug this fixes (D1 close, fail-safe ordering
+                    // preserved).
+                    let floor = deps
+                        .supervisor
+                        .sender_epoch_floor(context_id_bytes, &sender_did)?;
+                    let wrapping = deps.supervisor.my_wrapping_key(&deps.owned_identity)?;
+                    let (sender_key, epoch) =
+                        crate::crypto::mls::provider::NodeMlsFactory::open_incoming_sender_key(
+                            &wrapping,
+                            context_id_bytes,
+                            &sender_did,
+                            &response,
+                            floor,
+                        )
+                        .await?;
                     drop(wrapping);
                     deps.supervisor.check_and_advance_sender_epoch(
                         context_id_bytes,
@@ -3856,7 +3900,7 @@ pub async fn send_pseudonym_announcement(
     deps: &ActorDeps,
     handle: &ContextHandle,
     sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &crate::context::actor::signer::CommandSigner,
 ) -> Result<(), ContextError> {
     let context_id = handle.context_id().to_owned();
     // Read the routing pseudonym and rotation state via Deref; the borrow ends
@@ -3872,7 +3916,7 @@ pub async fn send_pseudonym_announcement(
         handle,
         sender_did,
         &payload,
-        Some(signing_key),
+        signer,
         // Pseudonym announcements are protocol-level membership signals from
         // the local member, signed under `#active` (ADR-039).
         SigningKeyId::Active,
@@ -3980,7 +4024,7 @@ pub(super) async fn rotate_pseudonym(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: &crate::context::actor::signer::CommandSigner,
     new_epoch: u64,
     new_routing_id: [u8; 32],
 ) -> Result<(), ContextError> {
@@ -4065,7 +4109,7 @@ pub(super) async fn rotate_pseudonym(
     );
 
     // §9.10.4.1 steps 4 and 5: announce, then clear `announce_pending`.
-    send_pseudonym_announcement(cell, deps, &handle, sender_did, signing_key).await
+    send_pseudonym_announcement(cell, deps, &handle, sender_did, signer).await
 }
 
 #[cfg(test)]
@@ -4957,7 +5001,7 @@ mod pseudonym_routing_tests {
         );
         crate::context::supervisor::supervisor::leak_for_test(&supervisor);
         supervisor
-            .build_actor_deps(&DID(ALICE.to_owned()))
+            .build_actor_deps_loaded(&DID(ALICE.to_owned()))
             .await
             .expect("build_actor_deps")
     }
@@ -5477,7 +5521,7 @@ pub mod dropped_supervisor_tests {
                 mls_storage,
             );
             let deps = supervisor
-                .build_actor_deps(&DID(OWNER.to_owned()))
+                .build_actor_deps_loaded(&DID(OWNER.to_owned()))
                 .await
                 .expect("build_actor_deps");
             Self {

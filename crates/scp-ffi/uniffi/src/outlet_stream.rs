@@ -94,8 +94,7 @@ use scp_ffi_common::validate::{
 use crate::ScpError;
 use crate::bridge::{
     ContextHandle, UniffiKeyCustody, decode_asserted_nonce, enforce_caller_principal_binding,
-    identity_custody_registry, map_saga_error, resolve_uniffi_signing_key,
-    validate_outlet_ucan_uniffi,
+    identity_custody_registry, map_saga_error, resolve_uniffi_signer, validate_outlet_ucan_uniffi,
 };
 use crate::runtime::UniffiBridgeInstance;
 use crate::scp::Scp;
@@ -1105,7 +1104,7 @@ pub(crate) fn outlet_stream_compute_caveats_binding_impl(
 // Cross-context streaming saga (§5.4.5, §6.2.4, SCP-OUT-047) — open / poll /
 // recover. The streaming ANALOG of the unary cross-context saga export in
 // `bridge.rs`, sharing its `enforce_caller_principal_binding`,
-// `resolve_uniffi_signing_key`, `validate_outlet_ucan_uniffi`, `map_saga_error`,
+// `resolve_uniffi_signer`, `validate_outlet_ucan_uniffi`, `map_saga_error`,
 // and `decode_asserted_nonce` verbatim, and the SAME `UniffiStreamExecutor` /
 // `resolve_stream_signer` this module already defines.
 //
@@ -1129,13 +1128,13 @@ fn no_active_saga_err(saga_id: &str) -> ScpError {
     }
 }
 
-/// Resolves the TARGET context's raw Ed25519 Active Signing Key from a
-/// context-id STRING (the streaming-saga RECOVER path has no `ContextHandle`,
-/// only the `target_context_id` pinned in the registry entry). Reads the
-/// context creator DID off the supervisor actor, then exports that identity's
-/// Active Signing Key from this instance's identity custody registry
-/// (co-resident single-tenant). The key never enters the runtime autonomously
-/// (ADR-006) — it is resolved per-call here and passed to the seal.
+/// Builds the TARGET context's custody signer from a context-id STRING (the
+/// streaming-saga RECOVER path has no `ContextHandle`, only the
+/// `target_context_id` pinned in the registry entry). Reads the context
+/// creator DID off the supervisor actor, then builds that identity's Active
+/// Signing Key signer from this instance's identity custody registry
+/// (co-resident single-tenant). The private key stays in custody (ADR-049
+/// Decision 7a); the signer is resolved per call here and passed to the seal.
 ///
 /// The creator DID comes from the actor rather than from the handle's
 /// `creator_did`, because this call chooses the authority a streaming saga
@@ -1148,11 +1147,12 @@ fn no_active_saga_err(saga_id: &str) -> ScpError {
 /// Returns the error
 /// [`UniffiBridgeInstance::live_role_state`](crate::runtime::UniffiBridgeInstance::live_role_state)
 /// returns, `SCP-CTX-2001` when this bridge instance hosts no custody for the
-/// creator, and `SCP-CTX-2040` when the custody export fails.
-async fn resolve_context_active_signing_key_by_id(
+/// creator, and the custody's own code through `ScpError::from(PlatformError)`
+/// when the signer cannot be built; a destroyed key is `SCP-CRYPTO-4006`.
+async fn resolve_context_signer_by_id(
     bi: &Arc<UniffiBridgeInstance>,
     context_id: &str,
-) -> Result<ed25519_dalek::SigningKey, ScpError> {
+) -> Result<scp_core::context::actor::CommandSigner, ScpError> {
     let creator_did = bi.live_role_state(context_id).await?.creator_did;
     let (custody, key_handle) = {
         let registry = identity_custody_registry(bi);
@@ -1169,17 +1169,12 @@ async fn resolve_context_active_signing_key_by_id(
         let (custody, key_handle) = entry.value();
         (Arc::clone(custody), *key_handle)
     };
-    custody
-        .export_ed25519_signing_key(&key_handle)
+    // Distinct from the CTX_2001 "not hosted here" error above: the identity
+    // IS hosted, and a failure here is the custody's own fault, reported
+    // under its own code.
+    scp_ffi_common::signer::identity_command_signer(custody, key_handle)
         .await
-        .map_err(|e| ScpError::Context {
-            msg: format!("failed to export Active Signing Key for context '{context_id}': {e}"),
-            // INTENTIONALLY DISTINCT from the CTX_2001 "not hosted here" error
-            // above: the identity IS hosted, but the custody export operation
-            // itself failed (a crypto/custody operational fault, not a hosting /
-            // channel-auth class) — kept as CTX_2040.
-            code: codes::CTX_2040.to_owned(),
-        })
+        .map_err(ScpError::from)
 }
 
 /// §5.4.5 / §6.2.4 cross-context streaming-saga open (SCP-OUT-047). The
@@ -1199,8 +1194,9 @@ async fn resolve_context_active_signing_key_by_id(
 ///   (c) `validate_outlet_ucan_uniffi` against the TARGET context B, then resolve
 ///       the effective §7.3.8 caveats + `ucan_cid` and compute the §5.4.5
 ///       `caveats_binding` from a FRESH `request_id`;
-///   (d) resolve `SagaSigningKeys { target, caller }` from each handle's Active
-///       Signing Key (via custody — the key never enters the runtime, ADR-006);
+///   (d) resolve `SagaSigners { target, caller }`, each handle's Active
+///       Signing Key custody signer (the key stays in custody, ADR-049
+///       Decision 7a);
 ///   (e) build the executor over the TARGET handler;
 ///   (f) drive the saga to the Commit-transition;
 ///   (g) register the receiver and return the `saga_id`.
@@ -1461,8 +1457,8 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
     // Resolved DIRECTLY from the owned, instance-affine handles (mirrors the
     // unary saga export). Each context signs its own side under its registered
     // Active Signing Key.
-    let target_signing_key = resolve_uniffi_signing_key(target_handle).await?;
-    let caller_signing_key = resolve_uniffi_signing_key(source_handle).await?;
+    let target_signer = resolve_uniffi_signer(target_handle).await?;
+    let caller_signer = resolve_uniffi_signer(source_handle).await?;
 
     // ----- Chokepoint (ADR-056): id STRING → [u8; 32] -------------------------
     let caller_context_bytes = scp_core::context::state::context_id_to_bytes(&caller_context_id);
@@ -1492,9 +1488,9 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
             timeout_ms,
             executor,
             value_caveat_binding,
-            scp_core::context::supervisor::SagaSigningKeys {
-                target: &target_signing_key,
-                caller: &caller_signing_key,
+            scp_core::context::supervisor::SagaSigners {
+                target: target_signer,
+                caller: caller_signer,
             },
             params,
         ),
@@ -1644,13 +1640,16 @@ pub(crate) async fn outlet_streaming_saga_recover_truncated_close_impl(
 
     // Resolve the TARGET context's Active Signing Key per-call from custody
     // (never envelope-asserted) and seal via the shared recovery driver.
-    let target_key = resolve_context_active_signing_key_by_id(bi, &target_context_id).await?;
-    let signing_key =
-        scp_core::context::actor::commands::SigningKeyBytes::from_signing_key(&target_key);
+    let target_signer = resolve_context_signer_by_id(bi, &target_context_id).await?;
     let supervisor = Arc::clone(bi.context_manager_or_error()?);
-    drive_recover_truncated_close(&supervisor, saga_id_typed, &target_context_id, signing_key)
-        .await
-        .map_err(map_saga_error)?;
+    drive_recover_truncated_close(
+        &supervisor,
+        saga_id_typed,
+        &target_context_id,
+        target_signer,
+    )
+    .await
+    .map_err(map_saga_error)?;
 
     // Evict on SUCCESS: the saga is now `Committed` and its prefix sealed.
     bi.outlet_streaming_saga_registry.remove(saga_id);
@@ -1668,6 +1667,24 @@ fn join_err(e: tokio::task::JoinError) -> ScpError {
         msg: format!("tokio task join error during outlet stream op: {e}"),
         code: codes::OUTLET_6006.to_owned(),
     }
+}
+
+/// The invocation authority of one [`Scp::outlet_streaming_saga_open`] call
+/// (§6.2.4).
+///
+/// It travels as one record so that the export takes seven buffer arguments:
+/// JNA on darwin-aarch64 corrupts a by-value `RustBuffer` argument of some
+/// calls that pass nine or more of them, and the `ffi_buffer_arg_bound` test
+/// holds every export to eight.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OutletStreamAuthority {
+    /// The invocation UCAN, validated once at open against the target context.
+    pub ucan_token: String,
+    /// The delegation-chain proof tokens, if the UCAN is delegated.
+    pub proof_tokens: Option<Vec<String>>,
+    /// The id of the spending proof, resolved on the target side at
+    /// Prepare-B, if the invocation spends.
+    pub ucan_proof_id: Option<String>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -1886,7 +1903,8 @@ impl Scp {
     /// `caller_did` is bound to this bridge instance's channel-authenticated
     /// principal (§6.2.4) and must be a member of `source_handle`'s context — a
     /// mismatch returns `ScpError::SagaAborted` (SCP-SAGA-13050) BEFORE the saga
-    /// runs, so the receiver is never handed out.
+    /// runs, so the receiver is never handed out. `authority` carries the UCAN,
+    /// its proof chain, and the spending proof id.
     ///
     /// # Errors
     ///
@@ -1906,9 +1924,7 @@ impl Scp {
         asserted_nonce_hex: String,
         timestamp_ms: u64,
         chain_depth: u8,
-        ucan_token: String,
-        proof_tokens: Option<Vec<String>>,
-        ucan_proof_id: Option<String>,
+        authority: OutletStreamAuthority,
         timeout_ms: Option<u32>,
         estimated_chunk_count: Option<u32>,
     ) -> Result<String, ScpError> {
@@ -1922,6 +1938,11 @@ impl Scp {
             .core
             .check_handle(target_handle.instance_id())
             .map_err(ScpError::from)?;
+        let OutletStreamAuthority {
+            ucan_token,
+            proof_tokens,
+            ucan_proof_id,
+        } = authority;
         let bi = Arc::clone(&self.inner);
         crate::runtime()
             .spawn(async move {

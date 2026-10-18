@@ -60,8 +60,9 @@ class DIDDocument:
     #: ``controller``, ``public_key_multibase``).
     verification_methods: list[dict[str, Any]] = field(default_factory=list)
 
-    #: Service entries (list of dicts with ``id``, ``type``,
-    #: ``service_endpoint``).
+    #: Service entries a reader accepts (list of dicts with ``id``, ``type``,
+    #: ``service_endpoint``, ``bridge_target``). ``bridge_target`` is the tier 3
+    #: routing ID as 64 lowercase hex characters, or ``None`` (spec 18 §18.2.1).
     services: list[dict[str, Any]] = field(default_factory=list)
 
     #: Alternative identifiers for the DID subject.

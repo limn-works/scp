@@ -200,6 +200,10 @@ mod tests {
             codes::CRYPTO_4006
         );
         assert_eq!(
+            ucan_error_code(&failure(scp_crypto::CustodyFailureKind::TimedOut)),
+            codes::CRYPTO_4062
+        );
+        assert_eq!(
             ucan_error_code(&failure(scp_crypto::CustodyFailureKind::Failed)),
             codes::CRYPTO_4060
         );

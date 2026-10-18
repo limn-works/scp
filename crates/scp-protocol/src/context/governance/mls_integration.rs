@@ -119,6 +119,7 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::ProposeContextMigration { .. }
         | GovernanceAction::CancelContextMigration
         | GovernanceAction::ModifyHardRateLimit { .. }
+        | GovernanceAction::ModifyCapabilityRequirements { .. }
         | GovernanceAction::ModifyPseudonymRotationPolicy { .. } => MlsImpact::NoMlsChange,
     }
 }

@@ -23,8 +23,11 @@ use hex;
 
 /// Sentinel value for absent optional fields: `SHA-256(0x00)`.
 ///
-/// Pre-computed to avoid re-hashing on every call.
-const ABSENT_SENTINEL: [u8; 32] = [
+/// Pre-computed to avoid re-hashing on every call. Public so a preimage whose
+/// spec writes an absent optional as a length-prefixed sentinel (spec 07
+/// §7.3.4 `R_v` fields 7 and 12: `00 00 00 20 ‖ SHA-256(0x00)`) can encode it
+/// as `CanonicalField::VarBytes(&ABSENT_SENTINEL)`.
+pub const ABSENT_SENTINEL: [u8; 32] = [
     0x6e, 0x34, 0x0b, 0x9c, 0xff, 0xb3, 0x7a, 0x98, 0x9c, 0xa5, 0x44, 0xe6, 0xbb, 0x78, 0x0a, 0x2c,
     0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76, 0x85, 0x11, 0xa3, 0x06, 0x17, 0xaf, 0xa0, 0x1d,
 ];
@@ -43,7 +46,7 @@ pub const MAX_VAR_BYTES_LEN: usize = u32::MAX as usize;
 /// length-prefix ceiling (`u32::MAX` bytes). Protocol messages are bounded
 /// to 256 KB by the envelope layer (§9.10.3), so this error should never
 /// occur in production; it is present to eliminate the panic path (I1).
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum CanonicalError {
     /// A [`CanonicalField::VarBytes`] field exceeded `u32::MAX` bytes and
     /// cannot be length-prefixed in the canonical encoding.

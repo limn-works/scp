@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 use crate::native::server::{RelayConfig, RelayError};
 use crate::native::storage::{BlobStorageBackend, StorageError};
 use crate::relay::push::PushSender;
-use crate::relay::push_gate::{PushRole, PushServiceConfig, RelayUrl};
+use crate::relay::push_gate::{LiveRelayUrl, PushRole, PushServiceConfig, RelayUrl};
 use crate::relay::push_store::{PushRegistrationStore, PushStoreError};
 
 /// The variable that names the relay's blob storage backend.
@@ -215,8 +215,8 @@ fn is_blank(raw: &std::ffi::OsStr) -> bool {
 /// - [`StartupError::InvalidValue`] when one of these variables is set to a
 ///   value that does not parse.
 pub fn relay_config_from_env() -> Result<RelayConfig, StartupError> {
+    let relay_url = LiveRelayUrl::new(parse_relay_url(RELAY_URL_VAR, env::var_os(RELAY_URL_VAR))?);
     Ok(RelayConfig {
-        relay_url: Some(parse_relay_url(RELAY_URL_VAR, env::var_os(RELAY_URL_VAR))?),
         bind_addr: env_or(
             "SCP_RELAY_BIND_ADDR",
             SocketAddr::from(([0, 0, 0, 0], 9000)),
@@ -226,7 +226,7 @@ pub fn relay_config_from_env() -> Result<RelayConfig, StartupError> {
         max_total_connections: env_or("SCP_RELAY_MAX_CONNECTIONS", 1_000)?,
         max_connections_per_ip: env_or("SCP_RELAY_MAX_CONNECTIONS_PER_IP", 10)?,
         rate_limit_publishes_per_second: env_or("SCP_RELAY_RATE_LIMIT", 100)?,
-        ..RelayConfig::default()
+        ..RelayConfig::defaults(relay_url)
     })
 }
 
@@ -2409,7 +2409,7 @@ mod push_tests {
 
         use crate::native::server::{RelayConfig, RelayServer};
         use crate::native::storage::BlobStorageBackend;
-        use crate::relay::push_gate::RelayUrl;
+        use crate::relay::push_gate::{LiveRelayUrl, RelayUrl};
         use crate::relay::push_store::{
             PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore,
         };
@@ -2442,9 +2442,8 @@ mod push_tests {
         let relay_url = RelayUrl::new("wss://relay.example/scp/v1").unwrap();
         let config = RelayConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            relay_url: Some(relay_url.clone()),
             push: role,
-            ..RelayConfig::default()
+            ..RelayConfig::defaults(LiveRelayUrl::new(relay_url.clone()))
         };
         let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
         let (handle, addr) = server.start().await.unwrap();

@@ -23,11 +23,12 @@
 
 use std::sync::Arc;
 
-use scp_did::DidDocument;
+use scp_did::{DidDocument, RelayService};
 use scp_identity::DidMethod;
 use scp_identity::ScpIdentity;
 use scp_identity::republish::RepublishEntry;
 use scp_transport::nat::NatTierChange;
+use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
 
 use crate::DhtMode;
 use crate::NodeError;
@@ -62,7 +63,7 @@ use crate::NodeError;
 ///
 /// # The address and the document are gated differently, on purpose
 ///
-/// [`relay_url`](Self::relay_url) is the node's own live answer to "where am I",
+/// [`relay`](Self::relay) is the node's own live answer to "where am I",
 /// not published state: a detected tier change means the external address has
 /// ALREADY moved, so it advances whether or not the re-publish lands — otherwise
 /// `.well-known/scp` keeps handing peers a dead endpoint for as long as
@@ -79,8 +80,10 @@ pub struct NodePublishedState {
     /// document" must not be read as "this document is retrievable from the
     /// network": only [`record`](Self::record) being `Some` says that.
     pub document: DidDocument,
-    /// The relay URL the node is currently reachable at.
-    pub relay_url: String,
+    /// The `SCPRelay` entry the node currently advertises: the relay URL it is
+    /// reachable at and, on tier 3, the `bridgeTarget` the bridge relay forwards
+    /// to (§18.2.1).
+    pub relay: RelayService,
     /// The signed BEP44 record the node most recently published, or `None` when
     /// it has published nothing: the honest absent state of a
     /// [`DhtMode::Disabled`](crate::DhtMode) node, never a synthesized record.
@@ -120,41 +123,22 @@ impl<T: Clone> LiveSlot<T> {
     }
 }
 
-/// Points the document's preferred `SCPRelay` endpoint at `new_url`, appending
-/// an entry when the document carries none.
+/// The entry `document` advertises for the node, or `None` if it carries no
+/// `SCPRelay` entry a reader accepts. The counterpart of
+/// [`DidDocument::set_preferred_relay`]'s key: the node's own entry is always
+/// first ([`DidDocument::insert_preferred_relay`] puts it there at startup)
+/// and always valid (it is written from a [`RelayService`]), so the first
+/// accepted entry is the first entry.
 ///
-/// The **first** `SCPRelay` entry is the subject's preferred relay (§18.2.3) and
-/// the only one this node's own reachability owns; any further entries are
-/// additional relays a tier change does not move.
-///
-/// [`push_relay_service`](crate::push_relay_service) is what ESTABLISHES that
-/// position — it inserts the node's entry ahead of any the incoming document
-/// already carried. `scp_did::DidDocument::add_relay_service` APPENDS and is
-/// therefore not an establisher; it is used only by the domain builder, which
-/// spawns no tier re-evaluation, so no document built that way ever reaches this
-/// function. Do not wire a tier loop to that path without giving it the
-/// positional installer too. Keying on position rather than on the address the
-/// node currently advertises is what makes this idempotent and retry-stable: the
-/// two are allowed to differ while a publish is failing, so an
-/// address-keyed rewrite would match nothing on the retry and append a duplicate.
-/// The predecessor was address-keyed and simply left the document untouched when
-/// nothing matched, while the advertised address advanced regardless — so the
-/// two could diverge permanently.
-fn repoint_relay_service(document: &mut DidDocument, new_url: &str) {
-    match document
-        .service
-        .iter_mut()
-        .find(|svc| svc.service_type == "SCPRelay")
-    {
-        Some(svc) => new_url.clone_into(&mut svc.service_endpoint),
-        None => crate::push_relay_service(document, new_url),
-    }
-}
-
-/// The endpoint `document` advertises for the node, or `None` if it carries no
-/// `SCPRelay` entry. The counterpart of [`repoint_relay_service`]'s key.
-pub fn document_relay_url(document: &DidDocument) -> Option<String> {
-    document.relay_service_urls().into_iter().next()
+/// A tier change rewrites that first entry in place rather than an entry
+/// matching the address the node advertises: the two differ while a publish
+/// is failing, so an address-keyed rewrite would match nothing on the retry
+/// and append a duplicate. The domain builder appends through
+/// [`DidDocument::add_relay_service`], which does not establish the position,
+/// and spawns no tier task, so no document built that way reaches a tier
+/// change.
+pub fn document_relay_service(document: &DidDocument) -> Option<RelayService> {
+    document.relay_services().into_iter().next()
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +282,7 @@ pub async fn seed_from_startup_publish(
     publisher: &NodePublisher,
     identity: &ScpIdentity,
     document: DidDocument,
-    relay_url: &str,
+    relay: &RelayService,
 ) -> Result<LiveSlot<NodePublishedState>, NodeError> {
     let record = publisher
         .0
@@ -306,9 +290,34 @@ pub async fn seed_from_startup_publish(
         .await?;
     Ok(LiveSlot::new(NodePublishedState {
         document,
-        relay_url: relay_url.to_owned(),
+        relay: relay.clone(),
         record,
     }))
+}
+
+/// Moves the relay's live URL handle to `advertised`'s URL, the URL the node
+/// is about to publish, so every relay listener reserves its push routing ID
+/// before any client reads it (§10.7.1 step 2).
+///
+/// A tier 3 entry is the exception. Its URL is the **bridge relay's** own URL
+/// (§18.2.1), so its push routing ID is one the bridge relay reserves, not
+/// one this node's relay may intercept. While `advertised` carries a
+/// `bridgeTarget`, the handle stays on its current URL, whose routing ID this
+/// node's relay keeps intercepting, and the caller still publishes
+/// `advertised`. No artifact yet defines a tier 3 node's push routing ID.
+pub fn reserve_push_routing_id(relay: &LiveRelayUrl, advertised: &RelayService) {
+    if advertised.bridge_target().is_some() {
+        // Stub — see PUSH-032
+        tracing::info!(
+            bridge_url = %advertised.url(),
+            reserved_url = %relay.current().canonical(),
+            "advertised relay entry is a tier 3 bridge entry whose URL is the bridge \
+             relay's; this node's relay keeps reserving its current URL's push routing ID"
+        );
+        return;
+    }
+    let url = RelayUrl::from(advertised);
+    relay.set(url);
 }
 
 /// Handles a detected tier change: re-points the node's relay endpoint,
@@ -326,16 +335,26 @@ pub async fn seed_from_startup_publish(
 /// honest `None`.
 pub async fn apply_tier_change(
     live_state: &LiveSlot<NodePublishedState>,
-    new_relay_url: &str,
+    relay: &LiveRelayUrl,
+    new_relay_url: &RelayService,
     trigger_reason: &str,
     publisher: &NodePublisher,
     identity: &ScpIdentity,
     event_tx: Option<&tokio::sync::mpsc::Sender<NatTierChange>>,
 ) {
+    // The relay moves first: every listener reserves the new URL's push
+    // routing ID before any client can read that URL from the document or the
+    // slot, so a registration signed for it is intercepted, never stored as a
+    // blob (§10.7.1 step 2). A bridge entry's URL is the bridge relay's, so the
+    // relay keeps its reservation and the entry is still published; see
+    // `reserve_push_routing_id`. `new_relay_url` is the new `RelayService`
+    // entry; the name stays because `pipeline_wiring.rs` pins this call text.
+    reserve_push_routing_id(relay, new_relay_url);
+    let new_url = new_relay_url.url();
     let current = live_state.get();
-    let previous_relay_url = current.relay_url;
+    let previous_relay_url = current.relay.url().to_owned();
     let mut next_document = current.document;
-    repoint_relay_service(&mut next_document, new_relay_url);
+    next_document.set_preferred_relay(new_relay_url);
 
     match publisher
         .0
@@ -345,7 +364,7 @@ pub async fn apply_tier_change(
         Ok(signed) => {
             let sequence = signed.as_ref().map(|entry| entry.sequence);
             live_state.modify(|state| {
-                new_relay_url.clone_into(&mut state.relay_url);
+                state.relay = new_relay_url.clone();
                 state.document = next_document;
                 if let Some(entry) = signed {
                     state.record = Some(entry);
@@ -353,21 +372,21 @@ pub async fn apply_tier_change(
             });
             if let Some(sequence) = sequence {
                 tracing::info!(
-                    new_url = %new_relay_url, did = %identity.did, sequence,
+                    new_url = %new_url, did = %identity.did, sequence,
                     "DID document republished with new relay URL"
                 );
             } else {
                 tracing::info!(
-                    new_url = %new_relay_url, did = %identity.did,
+                    new_url = %new_url, did = %identity.did,
                     "reachability tier changed; DID document NOT published \
                      (DhtMode::Disabled — not discoverable by design)"
                 );
             }
         }
         Err(e) => {
-            live_state.modify(|state| new_relay_url.clone_into(&mut state.relay_url));
+            live_state.modify(|state| state.relay = new_relay_url.clone());
             tracing::warn!(
-                error = %e, new_url = %new_relay_url,
+                error = %e, new_url = %new_url,
                 "DID document republish failed after tier change; the node reports \
                  the address it has actually moved to, but its DID document still \
                  carries the published one — the next re-evaluation retries"
@@ -391,12 +410,12 @@ pub async fn apply_tier_change(
     // this module exists to close. This stream is
     // OBSERVABILITY; reachability must never be a hostage to whether anyone is
     // draining it.
-    if previous_relay_url != new_relay_url
+    if previous_relay_url != new_url
         && let Some(tx) = event_tx
     {
         let event = NatTierChange::TierChanged {
             previous_relay_url,
-            new_relay_url: new_relay_url.to_owned(),
+            new_relay_url: new_url.to_owned(),
             reason: trigger_reason.to_owned(),
         };
         match tx.try_send(event) {
@@ -415,7 +434,7 @@ pub async fn apply_tier_change(
                 // authoritative surfaces (`.well-known/scp`, the DID document,
                 // `relay_url()`) never depended on this stream in the first place.
                 tracing::warn!(
-                    new_url = %new_relay_url,
+                    new_url = %new_url,
                     "tier-change queue full: a consumer has stopped draining, so \
                      this event is dropped. The node's address still advanced — \
                      only the notification was lost."
@@ -425,10 +444,20 @@ pub async fn apply_tier_change(
                 // The consumer is gone for good. Not a fault: the receiver is
                 // optional and the authoritative surfaces already advanced.
                 tracing::debug!(
-                    new_url = %new_relay_url,
+                    new_url = %new_url,
                     "tier-change event dropped: the TierChanged receiver is closed"
                 );
             }
         }
     }
+}
+
+/// Test-only: the plain (no `bridgeTarget`) relay entry for `url`, which every
+/// test fixture names by a canonical relay URL.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub fn test_relay(url: &str) -> RelayService {
+    RelayService::direct(
+        scp_did::RelayEndpoint::new(url).expect("every test fixture names a canonical relay URL"),
+    )
 }

@@ -621,7 +621,7 @@ export interface Bridge {
     floor: bigint | null,
     cap: bigint | null,
   ): bigint;
-  economyVerifyPaymentReceipts(receiptsJson: string): string;
+  economyVerifyPaymentReceipts(receiptsJson: string): Promise<string>;
 
   // Media (ADR-024)
   mediaCheckCapability(ceiling: string[], capability: string): boolean;
@@ -664,10 +664,9 @@ export interface Bridge {
   checkCapabilityRequirements(
     contextId: string,
     subjectDid: string,
-    requirementsJson: string,
     agentCapabilitiesJson: string,
     challengeVerificationsJson: string,
-  ): void;
+  ): Promise<void>;
 
   // Lifecycle
   version(): string;

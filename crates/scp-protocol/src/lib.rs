@@ -49,9 +49,11 @@ pub use context::outlets::stream::{
     SCP_OUTLET_CAVEAT_BIND_V1, SCP_OUTLET_CHUNK_SIG_V1, SCP_OUTLET_CHUNK_V1, SCP_OUTLET_CREDIT_V1,
     SessionState, StreamRejection, StreamTerminalStatus, compute_caveats_binding,
     compute_chunk_sig_preimage, compute_credit_sig_preimage, evaluate_open_pinning,
-    evaluate_revocation_recheck, evaluate_session_open, sign_chunk, sign_credit_grant,
-    verify_chunk_signature, verify_credit_signature,
+    evaluate_revocation_recheck, evaluate_session_open, verify_chunk_signature,
+    verify_credit_signature,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use context::outlets::stream::{sign_chunk, sign_credit_grant};
 pub use context::outlets::{
     OutletCancel, OutletError, OutletInvokedEvent, OutletKind, OutletRegisteredEvent,
     OutletRemovedEvent, OutletRequest, OutletStatus, OutletUpdatedEvent, OutletVerifiedEvent,

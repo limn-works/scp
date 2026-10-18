@@ -1845,16 +1845,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2706,7 +2696,6 @@ dependencies = [
  "percent-encoding",
  "referencing",
  "regex-syntax",
- "reqwest",
  "serde",
  "serde_json",
  "uuid-simd",
@@ -4483,7 +4472,6 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -4897,7 +4885,9 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
+ "tracing",
  "z-base-32",
 ]
 
@@ -4970,6 +4960,7 @@ dependencies = [
  "async-trait",
  "dashmap",
  "ed25519-dalek 2.2.0",
+ "futures",
  "hex",
  "rand 0.8.8",
  "rand_core 0.6.4",
@@ -4984,12 +4975,14 @@ dependencies = [
  "scp-node",
  "scp-platform",
  "scp-protocol",
+ "scp-relay-client",
  "scp-transport",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tokio-util",
  "tracing",
  "z-base-32",
@@ -5247,7 +5240,6 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "ed25519-dalek 2.2.0",
- "fs2",
  "hex",
  "hmac 0.12.1",
  "libsqlite3-sys",
@@ -5290,6 +5282,7 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "rand 0.8.8",
+ "regex-syntax",
  "rmp-serde",
  "rmpv",
  "scp-clock",
@@ -5359,7 +5352,6 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures",
  "hex",
- "jsonschema",
  "lru 0.18.2",
  "metrics",
  "metrics-util",
@@ -5386,7 +5378,6 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
- "serde_json_canonicalizer",
  "sha2 0.10.9",
  "static_assertions",
  "subtle",
