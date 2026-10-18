@@ -1309,7 +1309,7 @@ mod tests {
         Arc::new(NodeState {
             did: "did:dht:cors_test".to_owned(),
             live_state: crate::LiveSlot::new(crate::NodePublishedState {
-                relay_url: "wss://localhost/scp/v1".to_owned(),
+                relay: crate::published_state::test_relay("wss://localhost/scp/v1"),
                 record: None,
                 document: scp_did::DidDocument {
                     context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
@@ -1511,7 +1511,7 @@ mod vhost_tests {
         Arc::new(NodeState {
             did: "did:dht:vhost_test".to_owned(),
             live_state: crate::LiveSlot::new(crate::NodePublishedState {
-                relay_url: "wss://localhost/scp/v1".to_owned(),
+                relay: crate::published_state::test_relay("wss://localhost/scp/v1"),
                 record: None,
                 document: scp_did::DidDocument {
                     context: vec!["https://www.w3.org/ns/did/v1".to_owned()],

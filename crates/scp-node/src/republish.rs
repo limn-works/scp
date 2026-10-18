@@ -748,7 +748,7 @@ mod tests {
                 &[2u8; 32],
                 &[3u8; 32],
             ),
-            relay_url: "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            relay: crate::published_state::test_relay("ws://198.51.100.7:32891/scp/v1"),
             record: entry,
         });
         let rx = tx.subscribe();
@@ -1125,7 +1125,10 @@ mod tests {
             .await
             .expect("test identity is created");
         let relay_url = "ws://198.51.100.7:32891/scp/v1".to_owned();
-        crate::push_relay_service(&mut document, &relay_url);
+        crate::push_relay_service(
+            &mut document,
+            &crate::published_state::test_relay(&relay_url),
+        );
         (did_method, identity, document, relay_url)
     }
 
@@ -1146,9 +1149,14 @@ mod tests {
         document: DidDocument,
         relay_url: String,
     ) -> LiveSlot<NodePublishedState> {
-        seed_from_startup_publish(publisher, identity, document, &relay_url)
-            .await
-            .expect("startup publish succeeds")
+        seed_from_startup_publish(
+            publisher,
+            identity,
+            document,
+            &crate::published_state::test_relay(&relay_url),
+        )
+        .await
+        .expect("startup publish succeeds")
     }
 
     /// Drives ONE real tier change through the real writer, alternating the
@@ -1167,7 +1175,7 @@ mod tests {
                 scp_transport::relay::push_gate::RelayUrl::new("ws://203.0.113.42:9000/scp/v1")
                     .expect("canonical test URL"),
             ),
-            &next_url,
+            &crate::published_state::test_relay(&next_url),
             "test tier change",
             publisher,
             identity,
@@ -1268,7 +1276,7 @@ mod tests {
                 scp_transport::relay::push_gate::RelayUrl::new("ws://203.0.113.42:9000/scp/v1")
                     .expect("canonical test URL"),
             ),
-            new_relay_url,
+            &crate::published_state::test_relay(new_relay_url),
             "test tier change",
             &publisher,
             &identity,
@@ -1280,7 +1288,7 @@ mod tests {
         // the re-publish succeeded (it is written on the success arm only), which
         // the record assertions below then corroborate.
         let state = live_state.get();
-        assert_eq!(state.relay_url, new_relay_url);
+        assert_eq!(state.relay.url(), new_relay_url);
         assert_eq!(
             state.document.relay_service_urls(),
             vec![new_relay_url.to_owned()],

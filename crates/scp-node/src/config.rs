@@ -268,7 +268,11 @@ pub enum NatSlot {
     Tuned {
         /// Override the STUN endpoint used for NAT type probing (§10.12.8).
         stun_server: Option<String>,
-        /// Override the bridge relay used for Tier 3 fallback (§10.12.8).
+        /// Override the bridge relay used for Tier 3 fallback (§10.12.8): the
+        /// bridge relay's own `ws`/`wss` URL ending in `/scp/v1`, with no
+        /// query. The node publishes it as its entry's `serviceEndpoint` and
+        /// names itself in `bridgeTarget` (§18.2.1). `Node::start` rejects
+        /// any other value with [`NodeError::InvalidConfig`].
         bridge_relay: Option<String>,
         /// Optional UPnP/NAT-PMP port mapper for Tier 1 (spec 10.12.2).
         port_mapper: Option<Arc<dyn scp_transport::nat::PortMapper>>,
@@ -680,8 +684,16 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
 /// - `Custom(strategy)` uses the caller-supplied strategy verbatim.
 /// - `Tuned { .. }` feeds the STUN / bridge / port-mapper / reachability-probe
 ///   overrides into [`resolve_nat`], which builds a `DefaultNatStrategy`.
-fn resolve_nat_slot(nat: NatSlot) -> Arc<dyn NatStrategy> {
-    match nat {
+///
+/// # Errors
+///
+/// [`NodeError::InvalidConfig`] when a `Tuned` `bridge_relay` is not a URL a
+/// tier 3 `SCPRelay` entry may carry (§18.2.1): no §9.18.2 canonical form (a
+/// query such as the retired `?bridge_target=` among the causes) or a path
+/// other than `/scp/v1`. Raised here, before any NAT probe runs, so a node
+/// never probes its way to a tier it cannot publish.
+fn resolve_nat_slot(nat: NatSlot) -> Result<Arc<dyn NatStrategy>, NodeError> {
+    Ok(match nat {
         NatSlot::Auto => resolve_nat(None, None, None, None, None),
         NatSlot::Custom(strategy) => resolve_nat(Some(strategy), None, None, None, None),
         NatSlot::Tuned {
@@ -689,14 +701,20 @@ fn resolve_nat_slot(nat: NatSlot) -> Arc<dyn NatStrategy> {
             bridge_relay,
             port_mapper,
             reachability_probe,
-        } => resolve_nat(
-            None,
-            stun_server,
-            bridge_relay,
-            port_mapper,
-            reachability_probe,
-        ),
-    }
+        } => {
+            if let Some(url) = &bridge_relay {
+                scp_did::RelayService::new(url, None)
+                    .map_err(|e| NodeError::InvalidConfig(format!("bridge_relay {url}: {e}")))?;
+            }
+            resolve_nat(
+                None,
+                stun_server,
+                bridge_relay,
+                port_mapper,
+                reachability_probe,
+            )
+        }
+    })
 }
 
 /// Resolves a [`TlsMode`] into the optional `Arc<dyn TlsProvider>` override the
@@ -1039,7 +1057,7 @@ where
                 domain = %domain, error = %tls_err,
                 "TLS provisioning failed, falling through to NAT-traversed mode (§10.12.8)"
             );
-            let strategy = resolve_nat_slot(nat);
+            let strategy = resolve_nat_slot(nat)?;
             build_no_domain_inner(
                 identity,
                 document,
@@ -1147,7 +1165,7 @@ where
     let dev_token = local_api.map(generate_dev_token);
 
     // 5-8. Delegate to shared no-domain logic.
-    let strategy = resolve_nat_slot(nat);
+    let strategy = resolve_nat_slot(nat)?;
 
     build_no_domain_inner(
         identity,
