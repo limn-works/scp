@@ -803,8 +803,8 @@ pub enum EventType {
     MediaSessionStarted,    // ADR-024: media session start
     MediaSessionEnded,      // ADR-024: media session end
     PaymentReceived,        // §19.6.1: payment captured
-    EconomicPolicyChanged,  // §19.3: economic policy change proposed (24h notice start)
-    EconomicPolicyApplied,  // §19.3: pending economic policy change applied
+    EconomicPolicyChanged,  // §19.3; ADR-066 decision 19 removed the 24h notice, so no Commit carries it
+    EconomicPolicyApplied,  // §19.3; ADR-066 decision 19 removed the pending change, so no Commit carries it
     SpendingUcanGranted,    // §19.6.1: spending UCAN granted
     SpendingUcanRevoked,    // §19.6.1: spending UCAN revoked
     // Governance event types (ADR-031 §8)
