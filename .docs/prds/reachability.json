@@ -781,27 +781,46 @@
       "gate": "gate-reachability-3",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
+        "bindings/python/scp_sdk/identity.py",
         "crates/scp-did/Cargo.toml",
+        "crates/scp-did/src/attestation.rs",
         "crates/scp-did/src/document.rs",
         "crates/scp-did/src/lib.rs",
         "crates/scp-did/src/relay_url.rs",
+        "crates/scp-ffi/common/src/attestation.rs",
+        "crates/scp-ffi/common/src/test_helpers.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-identity/src/cache.rs",
+        "crates/scp-identity/src/dht.rs",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-identity/src/resolution.rs",
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/src/dev_api.rs",
+        "crates/scp-node/src/http.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/projection.rs",
+        "crates/scp-node/src/published_state.rs",
+        "crates/scp-node/src/republish.rs",
+        "crates/scp-node/src/well_known.rs",
         "crates/scp-protocol/src/discovery/push.rs",
+        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
+        "crates/scp-runtime/src/context/pseudonym_rotation_runtime_tests.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/discovery/did_capabilities.rs",
+        "crates/scp-runtime/src/trust/participation_service.rs",
+        "crates/scp-runtime/src/well_known.rs",
+        "crates/scp-testing/tests/integration/discovery.rs",
         "crates/scp-transport/Cargo.toml",
         "crates/scp-transport/src/relay/bridge.rs",
         "crates/scp-transport/src/relay/connection.rs",
         "crates/scp-transport/src/relay/push_gate.rs",
-        "crates/scp-identity/src/dht.rs",
-        "crates/scp-identity/src/resolution.rs",
-        "crates/scp-node/src/lib.rs",
-        "crates/scp-node/src/published_state.rs",
-        "crates/scp-node/src/republish.rs",
-        "crates/scp-runtime/src/discovery/well_known.rs",
-        "crates/scp-ffi/src/identity.rs",
-        "crates/scp-ffi/napi/src/identity.rs",
-        "crates/scp-ffi/uniffi/src/bridge.rs",
-        "bindings/python/scp_sdk/identity.py"
+        "docs/guides/relay-operations.md",
+        "scripts/gen-test-vectors-p256.py"
       ],
       "description": "A tier 3 bridge entry carried its routing target as a `?bridge_target=` query on the bridge relay's URL. §18.2.1 now gives the `SCPRelay` entry a `bridgeTarget` property: 64 lowercase hex digits naming the identity routing ID of §10.12.4.1, and the entry's `serviceEndpoint` is the bridge relay's own URL (§10.12.4 step 4, §10.12.7). §3.10.13 signs `bridgeTarget` as 32 bare bytes after an `SCPRelay` entry's three strings, absent as SHA-256(0x00). Every `SCPRelay` URL has a §9.18.2 canonical form whose path ends in /scp/v1, and a reader rejects an entry that fails §18.2.1 and keeps the record, except that a misspelled `bridgeTarget` rejects the record. This story adds `RelayService { url, bridge_target }` to scp-did as the one validating constructor for publishers and readers, moves the §9.18.2 canonicalizer into scp-did so that constructor can call it, makes the scp-node tier 3 publisher write the bridge relay's URL with `bridge_target`, deletes the query-string bridge parser from scp-transport, and makes every FFI projection of service entries skip an `SCPRelay` entry the reader rejects. The node publishes the routing ID that `verify_bridge_registration` checks today; the identifier-bytes value §10.12.4.1 defines arrives with SCP-315, the key-event-log identity cut-over. Sending `BRIDGE_REGISTER` from the node is not this story.",
       "acceptanceCriteria": [
@@ -857,7 +876,8 @@
           "section": "## ADR-032: Addressability and Deployment"
         }
       ],
-      "details": {}
+      "details": {},
+      "result": "Service gains bridge_target (bridgeTarget, 64 lowercase hex), and scp_did::RelayService is the one validating SCPRelay constructor: a §9.18.2 canonical URL ending in /scp/v1 with no query, and no SHA-256(0x00) bridgeTarget. DidDocument::accepted_services() drops each entry §18.2.1 rejects and keeps the record; the §9.18.2 canonicalizer moved into scp-did with no re-export. scp-node holds the advertised RelayService in its live slot, publishes the bridge relay URL with bridgeTarget = did_routing_id(did) on tier 3 (Stub — see SCP-315 for the §10.12.4.1 identifier-bytes value), clears it on a move off tier 3, and keeps its relay's reserved push routing ID for a bridge entry. Node::start rejects a query-bearing bridge_relay and a non-ASCII domain with NodeError::InvalidConfig. scp-transport's query-string bridge parser is deleted. PyO3 services carry bridge_target, and the PyO3, NAPI and UniFFI projections read accepted_services(). Each acceptance-criterion test named above exists, and each was seen failing with its behavior removed."
     }
   ]
 }
