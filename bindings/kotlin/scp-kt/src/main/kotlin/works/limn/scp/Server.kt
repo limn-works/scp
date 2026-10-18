@@ -65,8 +65,11 @@ interface ServerBindings {
      *
      * **Development only.** A library built with the UniFFI bridge's
      * `testing` feature starts the node; a shipped library starts nothing and
-     * throws `ScpException.Transport` with `SCP-TRANS-5055`. Production
-     * callers use `nodeStart`.
+     * throws `ScpException.Transport` with `SCP-TRANS-5055`.
+     * The Kotlin SDK has no production node start yet. The `node_start` row
+     * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
+     * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
+     * not forever. we can add impls later".
      *
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
@@ -78,8 +81,11 @@ interface ServerBindings {
      *
      * **Development only.** A library built with the UniFFI bridge's
      * `testing` feature starts the node; a shipped library creates nothing and
-     * throws `ScpException.Transport` with `SCP-TRANS-5055`. Production
-     * callers use `nodeStart`.
+     * throws `ScpException.Transport` with `SCP-TRANS-5055`.
+     * The Kotlin SDK has no production node start yet. The `node_start` row
+     * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
+     * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
+     * not forever. we can add impls later".
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
@@ -490,7 +496,10 @@ class Node internal constructor(
          * **Development only.** A library built with the UniFFI bridge's
          * `testing` feature starts the node; a shipped library starts nothing
          * and throws `ScpException.Transport` with `SCP-TRANS-5055`.
-         * Production callers use `nodeStart`.
+         * The Kotlin SDK has no production node start yet. The `node_start` row
+         * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
+         * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
+         * not forever. we can add impls later".
          *
          * On a `testing` build the node auto-wires encrypted in-memory storage
          * (ephemeral), self-signed TLS, and a relay on an OS-assigned port.
@@ -514,7 +523,10 @@ class Node internal constructor(
          * **Development only.** A library built with the UniFFI bridge's
          * `testing` feature starts the node; a shipped library creates nothing
          * and throws `ScpException.Transport` with `SCP-TRANS-5055`.
-         * Production callers use `nodeStart`.
+         * The Kotlin SDK has no production node start yet. The `node_start` row
+         * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
+         * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
+         * not forever. we can add impls later".
          *
          * On a `testing` build, when [identityDid] is provided, the node uses the pre-existing
          * identity. When `null`, the node creates or reloads a persistent
@@ -603,8 +615,11 @@ class ServerBridge internal constructor(
      *
      * **Development only.** A library built with the UniFFI bridge's
      * `testing` feature starts the node; a shipped library starts nothing and
-     * throws `ScpException.Transport` with `SCP-TRANS-5055`. Production
-     * callers use `nodeStart`.
+     * throws `ScpException.Transport` with `SCP-TRANS-5055`.
+     * The Kotlin SDK has no production node start yet. The `node_start` row
+     * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
+     * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
+     * not forever. we can add impls later".
      *
      * On a `testing` build, when [identityDid] is provided, the node uses the
      * pre-existing identity instead of generating a fresh one.
@@ -630,8 +645,11 @@ class ServerBridge internal constructor(
      *
      * **Development only.** A library built with the UniFFI bridge's
      * `testing` feature starts the node; a shipped library creates nothing and
-     * throws `ScpException.Transport` with `SCP-TRANS-5055`. Production
-     * callers use `nodeStart`.
+     * throws `ScpException.Transport` with `SCP-TRANS-5055`.
+     * The Kotlin SDK has no production node start yet. The `node_start` row
+     * of `.docs/standards/sdk-capability-matrix.json` records Kotlin as
+     * false under Alec's ruling of 2026-08-17: "let's keep kotlin false but
+     * not forever. we can add impls later".
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.

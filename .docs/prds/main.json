@@ -11767,7 +11767,8 @@
       "severity": "minor",
       "status": "done",
       "files": [
-        ".docs/standards/sdk-capability-matrix.json"
+        ".docs/standards/sdk-capability-matrix.json",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Server.kt"
       ],
       "description": "After the Python (SCP-323), TypeScript (SCP-324) and Swift (SCP-325) wrappers land, `sdk-capability-matrix.json` gains a `node_start` row. Python, TypeScript and Swift are true. Kotlin is false, with an exemption that quotes Alec's 2026-08-17 ruling verbatim: \"let's keep kotlin false but not forever. we can add impls later\". The row's `notes` record that the Swift wrapper exists on macOS only.\n\n§17.17 of the persistence spec, which requires every provider capability to be selected and classified, needs no new capability row for node start: the node inherits the storage of its `SCP` instance, the blob storage arms already carry a classification, the identity lowers to `IdentitySource::Explicit`, and `dht` is `Disabled`. Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation. Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\".\n\nTrack C of the nullifier-seal and crate-split plan (`~/.claude/plans/nullifier-seal-and-crate-split-plan.md`, section \"Track C execution plan (revised 2026-10-13, after plan review)\") defines this story as PR C9.",
       "acceptanceCriteria": [
