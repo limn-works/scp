@@ -37,7 +37,7 @@ pub mod attestation_signer;
 
 // Test-only minting of attested KeyPackages with a local Ed25519 key.
 #[cfg(test)]
-pub(crate) mod test_support;
+pub mod test_support;
 
 // Async MLS backend and provider — stay in scp-runtime (tokio-coupled, node-only).
 pub mod backend;

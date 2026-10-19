@@ -188,9 +188,10 @@ pub const RESERVATION_TTL_MS: u64 = 10 * 60 * 1000;
 /// rest. Generously above the realistic concurrent-Welcome count.
 pub const MAX_OUTSTANDING_RESERVATIONS: usize = 128;
 
-/// Ceiling on the replies parked while the pool refills: `ReserveAny`
-/// commands that found the pool empty, plus `Replenish` commands waiting for
-/// the refill to end. Each queue holds at most this many; a command past it is
+/// Ceiling on the replies a store holds: `ReserveAny` commands waiting for
+/// their signer check, `ReserveAny` commands that found the pool empty, and
+/// `Replenish` commands waiting for the refill to end. Each queue holds at
+/// most this many; a command past it is
 /// refused with [`ContextError::ActorBusy`]. Equal to the mailbox capacity, so
 /// parking never holds more callers than the mailbox already admits.
 pub const MAX_PARKED_REPLIES: usize = KP_MAILBOX_CAPACITY;
@@ -430,18 +431,33 @@ struct MintOutcome {
     result: Result<GeneratedKeyPackage, ContextError>,
 }
 
+/// A subtask's handle that aborts the subtask when dropped, so a stopped
+/// actor leaves none of its subtasks running.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The one mint in flight, a task of its own. The actor polls its handle
 /// alongside its mailbox, so a slow custody sign never holds a command turn.
 /// Dropping it (the actor stopped) aborts the mint.
 struct MintTask {
     attested_by: [u8; 32],
-    task: tokio::task::JoinHandle<Result<GeneratedKeyPackage, ContextError>>,
+    task: AbortOnDrop<Result<GeneratedKeyPackage, ContextError>>,
 }
 
-impl Drop for MintTask {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+/// The one signer check in flight: a `ReserveAny`'s signer whose key is not
+/// the installed signer's, and the task re-resolving the owner's `#active`
+/// key for it ([`KeyPackageAttestationSigner::confirm_still_active`]). The
+/// actor polls it alongside its mailbox, so a slow resolver never holds a
+/// command turn.
+struct SignerCheck {
+    signer: Arc<KeyPackageAttestationSigner>,
+    reply: ReserveReply,
+    task: AbortOnDrop<Result<(), ContextError>>,
 }
 
 /// A refill in progress: how many `KeyPackages` it has pooled, and the
@@ -459,7 +475,7 @@ async fn next_mint(minting: &mut Option<MintTask>) -> MintOutcome {
     let Some(mint) = minting else {
         return std::future::pending().await;
     };
-    let result = match (&mut mint.task).await {
+    let result = match (&mut mint.task.0).await {
         Ok(result) => result,
         Err(e) => Err(ContextError::CryptoFailed(format!(
             "key package mint task failed: {e}"
@@ -468,6 +484,19 @@ async fn next_mint(minting: &mut Option<MintTask>) -> MintOutcome {
     MintOutcome {
         attested_by: mint.attested_by,
         result,
+    }
+}
+
+/// Polls the signer check in flight, or never resolves when there is none.
+async fn next_signer_check(checking: &mut Option<SignerCheck>) -> Result<(), ContextError> {
+    let Some(check) = checking else {
+        return std::future::pending().await;
+    };
+    match (&mut check.task.0).await {
+        Ok(result) => result,
+        Err(e) => Err(ContextError::CryptoFailed(format!(
+            "attestation signer check task failed: {e}"
+        ))),
     }
 }
 
@@ -526,11 +555,19 @@ pub enum KeyPackageCommand {
     /// The command carries the owner's attestation signer (§9.7.1), which
     /// the supervisor built only after resolving the owner's `#active` key and
     /// finding the signer holds it. It is the only way a signer reaches the
-    /// store. The handler installs it first: every pooled `KeyPackage` another
-    /// key attested is burned (record deleted, unpublished, index rewritten,
-    /// §9.12), and every `KeyPackage` minted from then on carries an
-    /// attestation the signer made. A signer for another identity is refused
-    /// with [`ContextError::InvalidState`] and nothing changes.
+    /// store. A signer for another identity is refused with
+    /// [`ContextError::InvalidState`] and nothing changes. A signer over the
+    /// installed signer's key replaces it and the reserve proceeds. A signer
+    /// over any other key waits its turn in a queue of signer checks, run one
+    /// at a time off the command turn: the store resolves the owner's
+    /// `#active` key again, and a signer whose key is no longer it (resolved
+    /// before a rotation, delivered after a newer signer) is refused with
+    /// [`ContextError::AttestationSignerNotActiveKey`], leaving the installed
+    /// signer and the pool as they were. A signer that passes is installed:
+    /// every pooled `KeyPackage` another key attested is burned (record
+    /// deleted, unpublished, index rewritten, §9.12), and every `KeyPackage`
+    /// minted from then on carries an attestation the signer made. More than
+    /// [`MAX_PARKED_REPLIES`] queued checks is [`ContextError::ActorBusy`].
     ///
     /// On an empty pool the reply is parked until the refill pools a
     /// `KeyPackage`, which happens off the command turn; the store's pool fills
@@ -877,6 +914,13 @@ pub struct KeyPackageStoreActor {
     attestation_signer: Option<Arc<KeyPackageAttestationSigner>>,
     /// The mint in flight, polled alongside the mailbox.
     minting: Option<MintTask>,
+    /// The signer check in flight, polled alongside the mailbox.
+    checking: Option<SignerCheck>,
+    /// `ReserveAny` commands waiting for their signer check.
+    signer_checks: VecDeque<(Arc<KeyPackageAttestationSigner>, ReserveReply)>,
+    /// Spawns the mint and signer-check subtasks onto the Supervisor's task
+    /// tracker (ADR-049 Decision 16).
+    subtasks: super::supervisor::SubtaskSpawner,
     /// The refill in progress, if any.
     refill: Option<Refill>,
     /// `ReserveAny` replies waiting for the refill to pool a `KeyPackage`.
@@ -911,16 +955,18 @@ pub struct KeyPackageStoreActor {
 }
 
 impl KeyPackageStoreActor {
-    /// Spawns a new actor task on the ambient runtime and returns its handle
-    /// and `JoinHandle`. Test-only: production spawns through
-    /// [`Self::new`] and the Supervisor's task tracker (ADR-049 Decision 16).
+    /// Spawns a new actor task onto a task tracker of its own and returns
+    /// its handle and `JoinHandle`. Test-only: production spawns through
+    /// [`Self::spawn_through`] and the Supervisor's task tracker (ADR-049
+    /// Decision 16).
     #[cfg(test)]
     pub(in crate::context) fn spawn(
         identity: DID,
         deps: KeyPackageStoreDeps,
     ) -> (KeyPackageStoreHandle, tokio::task::JoinHandle<()>) {
-        let (handle, actor) = Self::new(identity, deps);
-        (handle, tokio::spawn(actor.run()))
+        let subtasks = super::supervisor::SubtaskSpawner::standalone();
+        let (handle, actor) = Self::new(identity, deps, subtasks.clone());
+        (handle, subtasks.spawn(actor.run()))
     }
 
     /// Like [`Self::spawn`], with `signer` installed through
@@ -933,10 +979,11 @@ impl KeyPackageStoreActor {
         deps: KeyPackageStoreDeps,
         signer: Arc<KeyPackageAttestationSigner>,
     ) -> (KeyPackageStoreHandle, tokio::task::JoinHandle<()>) {
-        let (handle, mut actor) = Self::new(identity, deps);
+        let subtasks = super::supervisor::SubtaskSpawner::standalone();
+        let (handle, mut actor) = Self::new(identity, deps, subtasks.clone());
         (
             handle,
-            tokio::spawn(async move {
+            subtasks.spawn(async move {
                 if let Err(e) = actor.reconcile_from_storage().await {
                     tracing::error!(error = %e, "test spawn: reconcile failed");
                 }
@@ -965,19 +1012,27 @@ impl KeyPackageStoreActor {
         identity: DID,
         deps: KeyPackageStoreDeps,
     ) -> (KeyPackageStoreHandle, tokio::task::JoinHandle<()>) {
-        let (handle, actor) = Self::new(identity, deps);
+        let (handle, actor) = Self::new(identity, deps, permit.subtask_spawner());
         (handle, permit.spawn(actor.run()))
     }
 
     /// Builds a new actor and its handle without spawning it. Private, with
     /// [`Self::run`], so no caller can spawn the actor off the tracker.
-    fn new(identity: DID, deps: KeyPackageStoreDeps) -> (KeyPackageStoreHandle, Self) {
+    /// `subtasks` spawns the actor's mints and signer checks.
+    fn new(
+        identity: DID,
+        deps: KeyPackageStoreDeps,
+        subtasks: super::supervisor::SubtaskSpawner,
+    ) -> (KeyPackageStoreHandle, Self) {
         let (tx, rx) = mpsc::channel::<KeyPackageCommand>(KP_MAILBOX_CAPACITY);
 
         let actor = Self {
             identity,
             attestation_signer: None,
             minting: None,
+            checking: None,
+            signer_checks: VecDeque::new(),
+            subtasks,
             refill: None,
             parked_reserves: VecDeque::new(),
             stale_refs: HashSet::new(),
@@ -1248,10 +1303,11 @@ impl KeyPackageStoreActor {
         self.serve().await;
     }
 
-    /// Serves the mailbox and the mint in flight together. A mint (resolver
-    /// and custody sign) runs as a future this loop polls, never inside a
-    /// command turn, so a `ConfirmConsume` is handled while a custody sign is
-    /// still pending.
+    /// Serves the mailbox, the mint in flight and the signer check in flight
+    /// together. A mint (resolver and custody sign) and a signer check
+    /// (resolver) each run as a subtask this loop polls, never inside a
+    /// command turn, so a `ConfirmConsume` is handled while a custody sign or
+    /// a resolution is still pending.
     async fn serve(mut self) {
         loop {
             tokio::select! {
@@ -1267,6 +1323,9 @@ impl KeyPackageStoreActor {
                     Some(other) => self.dispatch(other).await,
                 },
                 outcome = next_mint(&mut self.minting) => self.handle_minted(outcome).await,
+                checked = next_signer_check(&mut self.checking) => {
+                    self.handle_signer_checked(checked).await;
+                }
             }
         }
     }
@@ -1282,12 +1341,7 @@ impl KeyPackageStoreActor {
                 self.maybe_replenish().await;
             }
             KeyPackageCommand::ReserveAny { signer, reply } => {
-                if let Err(e) = self.install_attestation_signer(signer).await {
-                    let _ = reply.send(Err(e));
-                    return;
-                }
-                self.handle_reserve_any(reply).await;
-                self.maybe_replenish().await;
+                self.admit_reserve_any(signer, reply).await;
             }
             KeyPackageCommand::ConfirmConsume {
                 reservation_id,
@@ -1467,11 +1521,114 @@ impl KeyPackageStoreActor {
         self.pool.len() + self.reserved.len()
     }
 
+    /// The installed attestation signer's key, if one is installed.
+    fn installed_key(&self) -> Option<[u8; 32]> {
+        self.attestation_signer
+            .as_ref()
+            .map(|s| s.active_key().to_bytes())
+    }
+
+    /// Admits a `ReserveAny`. A signer for another identity is refused. A
+    /// signer over the installed signer's key, with no check queued ahead of
+    /// it, replaces the installed signer (nothing is burned, the key is the
+    /// same) and the reserve is served. Any other signer joins the queue of
+    /// signer checks.
+    async fn admit_reserve_any(
+        &mut self,
+        signer: Arc<KeyPackageAttestationSigner>,
+        reply: ReserveReply,
+    ) {
+        if signer.owner() != &self.identity {
+            let _ = reply.send(Err(ContextError::InvalidState(
+                "attestation signer owner mismatch".to_owned(),
+            )));
+            return;
+        }
+        if self.checking.is_none()
+            && self.signer_checks.is_empty()
+            && self.installed_key() == Some(signer.active_key().to_bytes())
+        {
+            self.attestation_signer = Some(signer);
+            self.serve_reserve_any(reply).await;
+            return;
+        }
+        if self.signer_checks.len() >= MAX_PARKED_REPLIES {
+            let _ = reply.send(Err(ContextError::ActorBusy(format!(
+                "key package store has {MAX_PARKED_REPLIES} reserves waiting for a signer check"
+            ))));
+            return;
+        }
+        self.signer_checks.push_back((signer, reply));
+        self.start_next_signer_check().await;
+    }
+
+    /// Starts the next queued signer check when none runs. A queued signer
+    /// over the installed signer's key needs no check and is served at once;
+    /// a queued reply whose caller has gone is dropped.
+    async fn start_next_signer_check(&mut self) {
+        while self.checking.is_none() {
+            let Some((signer, reply)) = self.signer_checks.pop_front() else {
+                return;
+            };
+            if reply.is_closed() {
+                continue;
+            }
+            if self.installed_key() == Some(signer.active_key().to_bytes()) {
+                self.attestation_signer = Some(signer);
+                self.serve_reserve_any(reply).await;
+                continue;
+            }
+            let checked = Arc::clone(&signer);
+            let task = self
+                .subtasks
+                .spawn(async move { checked.confirm_still_active().await });
+            self.checking = Some(SignerCheck {
+                signer,
+                reply,
+                task: AbortOnDrop(task),
+            });
+        }
+    }
+
+    /// Takes the finished signer check. A signer whose key is still the
+    /// owner's `#active` key is installed and its reserve served; any other
+    /// outcome refuses the reserve and leaves the installed signer and the
+    /// pool as they were. Then the next queued check starts.
+    async fn handle_signer_checked(&mut self, checked: Result<(), ContextError>) {
+        let Some(SignerCheck { signer, reply, .. }) = self.checking.take() else {
+            return;
+        };
+        match checked {
+            Ok(()) => match self.install_attestation_signer(signer).await {
+                Ok(()) => self.serve_reserve_any(reply).await,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    actor_kind = "key_package_store",
+                    identity = %self.identity.0,
+                    error = %e,
+                    "reserve refused: its attestation signer's key is not the owner's \
+                     #active key; the installed signer and the pool are unchanged"
+                );
+                let _ = reply.send(Err(e));
+            }
+        }
+        self.start_next_signer_check().await;
+    }
+
+    /// Serves a `ReserveAny` whose signer is installed, then replenishes.
+    async fn serve_reserve_any(&mut self, reply: ReserveReply) {
+        self.handle_reserve_any(reply).await;
+        self.maybe_replenish().await;
+    }
+
     /// Installs `signer` as the owner's attestation signer, then burns every
     /// pooled `KeyPackage` another key attested (§9.12, rotation is
-    /// revocation). The supervisor builds `signer` only after resolving the
-    /// owner's `#active` key and finding the signer holds it, so the store
-    /// does not resolve again.
+    /// revocation). A `ReserveAny` reaches this only after its signer check
+    /// found the signer's key is still the owner's `#active` key.
     ///
     /// # Errors
     ///
@@ -1558,11 +1715,12 @@ impl KeyPackageStoreActor {
         }
         self.parked_reserves.push_back(reply);
         if !self.ensure_refill() {
-            // Pooled plus reserved already reach MIN_BUFFER, so no refill
-            // runs: every KeyPackage is reserved.
+            // The signer is installed, so no refill runs only because pooled
+            // plus reserved reach the reservation ceiling.
             self.fail_parked_reserves(&ContextError::CreationFailed(format!(
-                "the KeyPackage pool is empty and {} reservations are outstanding; no \
-                 refill runs until one is confirmed or cancelled",
+                "the KeyPackage pool is empty and {} reservations are outstanding, the \
+                 ceiling of {MAX_OUTSTANDING_RESERVATIONS}; no refill runs until one is \
+                 confirmed or cancelled",
                 self.reserved.len()
             )));
         }
@@ -2101,19 +2259,32 @@ impl KeyPackageStoreActor {
         }
     }
 
-    /// Starts a refill when none runs, a signer is installed, and pooled plus
-    /// reserved is below [`MIN_BUFFER`]. Returns whether a refill is running.
+    /// Whether the refill mints another `KeyPackage`: a signer is installed,
+    /// and either pooled plus reserved is below [`MIN_BUFFER`], or parked
+    /// reserves outnumber the pool while pooled plus reserved is below
+    /// [`MAX_OUTSTANDING_RESERVATIONS`], the most reservations the store
+    /// holds.
+    fn wants_mint(&self) -> bool {
+        self.attestation_signer.is_some()
+            && (self.stock() < MIN_BUFFER
+                || (self.parked_reserves.len() > self.pool.len()
+                    && self.stock() < MAX_OUTSTANDING_RESERVATIONS))
+    }
+
+    /// Starts a refill when none runs and [`Self::wants_mint`]. Returns
+    /// whether a refill is running.
     ///
     /// A refill mints one `KeyPackage` at a time as the actor's in-flight mint
-    /// future (see [`Self::serve`]) until pooled plus reserved reaches
-    /// [`MIN_BUFFER`] or a mint fails. Every `KeyPackage` carries a `0xFF03`
-    /// attestation the installed signer made with the owner's `#active` key
-    /// (§9.7.1).
+    /// subtask (see [`Self::serve`]) while [`Self::wants_mint`]: it serves
+    /// every parked reserve, then tops pooled plus reserved back up to
+    /// [`MIN_BUFFER`], or ends when a mint fails. Every `KeyPackage` carries a
+    /// `0xFF03` attestation the installed signer made with the owner's
+    /// `#active` key (§9.7.1).
     fn ensure_refill(&mut self) -> bool {
         if self.refill.is_some() {
             return true;
         }
-        if self.attestation_signer.is_none() || self.stock() >= MIN_BUFFER {
+        if !self.wants_mint() {
             return false;
         }
         self.refill = Some(Refill::default());
@@ -2121,9 +2292,9 @@ impl KeyPackageStoreActor {
         true
     }
 
-    /// Starts one mint with the installed signer as its own task. The task
-    /// owns clones of the backend and signer, so it borrows nothing from the
-    /// actor.
+    /// Starts one mint with the installed signer as a subtask on the
+    /// Supervisor's task tracker. The task owns clones of the backend and
+    /// signer, so it borrows nothing from the actor.
     fn start_mint(&mut self) {
         let Some(signer) = self.attestation_signer.clone() else {
             return;
@@ -2136,9 +2307,9 @@ impl KeyPackageStoreActor {
         let attested_by = signer.active_key().to_bytes();
         self.minting = Some(MintTask {
             attested_by,
-            task: tokio::spawn(async move {
+            task: AbortOnDrop(self.subtasks.spawn(async move {
                 mint_attested_key_package(&*mls, &signer, &wrapping_public_key).await
-            }),
+            })),
         });
     }
 
@@ -2177,7 +2348,7 @@ impl KeyPackageStoreActor {
                 return;
             }
         }
-        if self.stock() < MIN_BUFFER && self.attestation_signer.is_some() {
+        if self.wants_mint() {
             self.start_mint();
         } else {
             self.end_refill(None);
@@ -2202,9 +2373,10 @@ impl KeyPackageStoreActor {
         }
         if !self.parked_reserves.is_empty() {
             let e = error.unwrap_or_else(|| {
-                ContextError::CreationFailed(
-                    "the KeyPackage refill ended with every KeyPackage reserved".to_owned(),
-                )
+                ContextError::CreationFailed(format!(
+                    "the KeyPackage refill ended with {MAX_OUTSTANDING_RESERVATIONS} \
+                     KeyPackages reserved, the reservation ceiling"
+                ))
             });
             self.fail_parked_reserves(&e);
         }

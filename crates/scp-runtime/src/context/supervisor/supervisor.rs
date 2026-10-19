@@ -1352,6 +1352,46 @@ impl SpawnPermit<'_> {
     {
         spawn_marked(self.tracker, future)
     }
+
+    /// A [`SubtaskSpawner`] for the actor this permit spawns, onto the same
+    /// tracker.
+    pub(in crate::context) fn subtask_spawner(&self) -> SubtaskSpawner {
+        SubtaskSpawner {
+            tracker: self.tracker.clone(),
+        }
+    }
+}
+
+/// Spawns a tracked actor's own subtasks, such as a `KeyPackage` store's mint,
+/// onto the Supervisor's task tracker (ADR-049 Decision 16). Issued by
+/// [`SpawnPermit::subtask_spawner`] to the actor the permit spawns. It holds
+/// no tracker token: the actor that spawns through it is itself a tracked
+/// task, so the tracker is not empty while a subtask can start, and the drain
+/// waits for every subtask as it waits for the actor.
+#[derive(Clone)]
+pub(in crate::context) struct SubtaskSpawner {
+    tracker: tokio_util::task::TaskTracker,
+}
+
+impl SubtaskSpawner {
+    /// Spawns `future` onto the tracker, marked as a tracked task (see
+    /// [`tracked_task_marker`]).
+    pub(in crate::context) fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        spawn_marked(&self.tracker, future)
+    }
+
+    /// A spawner over a tracker of its own, for tests that run an actor with
+    /// no Supervisor.
+    #[cfg(test)]
+    pub(in crate::context) fn standalone() -> Self {
+        Self {
+            tracker: tokio_util::task::TaskTracker::new(),
+        }
+    }
 }
 
 /// Spawns onto the Supervisor's task tracker for one operation that began

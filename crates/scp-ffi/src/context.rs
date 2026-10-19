@@ -7325,6 +7325,52 @@ mod tests {
         });
     }
 
+    /// A `KeyPackage` the inviter rejects (§9.7.1) raises `CryptoError` with
+    /// `SCP-CRYPTO-4067`, the code every bridge reports for
+    /// `ContextError::InvalidKeyPackage`, never a bare `RuntimeError`. The
+    /// context is live and single-admin, so the `KeyPackage` check is the
+    /// first step that fails.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn invite_member_rejects_an_invalid_key_package_with_its_code() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let creator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = creator.did().to_owned();
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            params
+                .set_item("ceiling", vec!["messages:read", "member:invite"])
+                .unwrap();
+            params.set_item("governance", "single_admin").unwrap();
+            let handle = scp
+                .context_create(py, &creator_did, &params)
+                .expect("encrypted single-admin context_create succeeds");
+
+            let err = scp
+                .invite_member(
+                    py,
+                    handle.context_id,
+                    creator_did,
+                    "did:dht:z6MkInviteeBadKeyPackage".to_owned(),
+                    b"bogus-key-package".to_vec(),
+                )
+                .expect_err("an invalid KeyPackage must be rejected");
+            assert!(
+                err.is_instance_of::<crate::error::CryptoError>(py),
+                "expected CryptoError, got: {err}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(codes::CRYPTO_4067),
+                "expected {}, got: {msg}",
+                codes::CRYPTO_4067
+            );
+        });
+    }
+
     /// ADR-049 Phase 2J / FFI-02 Option A (invite export wiring): the new
     /// `invite_member` bridge export is wired end-to-end — DID validation ->
     /// supervisor resolution -> inviter signing-key resolution -> live-context

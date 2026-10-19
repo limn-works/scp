@@ -65,6 +65,9 @@ pub fn classify_context_error(e: &ContextError) -> ContextErrorClass<'_> {
         ContextError::WrappingKeyHandleInvalid => K::Crypto(codes::CRYPTO_4064),
         ContextError::AttestationSignerActiveKeyUnresolved => K::Crypto(codes::CRYPTO_4065),
         ContextError::AttestationSignerNotActiveKey => K::Crypto(codes::CRYPTO_4066),
+        // §9.7.1: a KeyPackage that fails validation or attestation, whatever
+        // the reason, is one code in every binding.
+        ContextError::InvalidKeyPackage(_) => K::Crypto(codes::CRYPTO_4067),
         ContextError::ActorBusy(_) => K::Context(codes::CTX_2130),
         ContextError::ContextPoisoned(_) => K::Context(codes::CTX_2134),
         ContextError::ActorCrashed(_) => K::Context(codes::CTX_2135),
@@ -91,7 +94,6 @@ pub fn classify_context_error(e: &ContextError) -> ContextErrorClass<'_> {
         | ContextError::EventLogFailed(_)
         | ContextError::MemberNotFound(_)
         | ContextError::InvalidState(_)
-        | ContextError::InvalidKeyPackage(_)
         | ContextError::LimitExceeded(_)
         | ContextError::InvalidMemoryScopeForBroadcast
         | ContextError::IntegrationFailed(_)
@@ -149,9 +151,17 @@ mod tests {
     }
 
     #[test]
-    fn a_variant_without_a_dedicated_code_is_generic() {
+    fn a_rejected_key_package_carries_its_own_crypto_code() {
         assert_eq!(
             classify_context_error(&ContextError::InvalidKeyPackage("x".into())),
+            ContextErrorClass::Crypto(codes::CRYPTO_4067)
+        );
+    }
+
+    #[test]
+    fn a_variant_without_a_dedicated_code_is_generic() {
+        assert_eq!(
+            classify_context_error(&ContextError::MemberNotFound("x".into())),
             ContextErrorClass::Generic
         );
     }

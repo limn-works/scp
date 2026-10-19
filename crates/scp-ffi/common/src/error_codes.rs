@@ -786,6 +786,16 @@ pub const CRYPTO_4065: &str = "SCP-CRYPTO-4065";
 ///
 /// Maps from `ContextError::AttestationSignerNotActiveKey`.
 pub const CRYPTO_4066: &str = "SCP-CRYPTO-4066";
+/// A `KeyPackage` the inviter checks (spec 09 §9.7.1) is rejected.
+///
+/// It does not validate, its credential names another identity, it carries no
+/// `0xFF01` or no `0xFF03`, its `0xFF01` is not a P-256 point, or its
+/// attestation does not verify against the owner's resolved `#active` key
+/// (including an attestation naming another role). A joiner's own reserved
+/// `KeyPackage` that fails at join reports this code too.
+///
+/// Maps from `ContextError::InvalidKeyPackage`.
+pub const CRYPTO_4067: &str = "SCP-CRYPTO-4067";
 
 // -------------------------------------------------------------------------
 // Transport (SCP-TRANS- 5000--5999)

@@ -22586,6 +22586,37 @@ mod tests {
         );
     }
 
+    /// A `KeyPackage` the inviter rejects (§9.7.1) reports `ScpError::Crypto`
+    /// with `SCP-CRYPTO-4067`, the code every bridge reports for
+    /// `ContextError::InvalidKeyPackage`. The context is live and
+    /// single-admin, so the `KeyPackage` check is the first step that fails.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn invite_member_rejects_an_invalid_key_package_with_its_code() {
+        let rt = runtime();
+        let scp = scp_test();
+        let creator = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        let handle = rt
+            .block_on(scp.context_create(Arc::clone(&creator), encrypted_join_test_params()))
+            .expect("encrypted single-admin context_create succeeds");
+
+        let err = rt
+            .block_on(scp.invite_member(
+                Arc::clone(&creator),
+                handle.context_id(),
+                "did:dht:z6MkInviteeBadKeyPackage".to_owned(),
+                b"bogus-key-package".to_vec(),
+            ))
+            .expect_err("an invalid KeyPackage must be rejected");
+        assert!(
+            matches!(&err, ScpError::Crypto { code, .. } if code == codes::CRYPTO_4067),
+            "expected ScpError::Crypto with {}, got: {err:?}",
+            codes::CRYPTO_4067
+        );
+    }
+
     /// FFI-02 Option A (invite export wiring): the new `invite_member` bridge
     /// export is wired end-to-end — DID validation -> supervisor resolution ->
     /// inviter signing-key resolution -> live-context lookup -> typed error

@@ -39,6 +39,10 @@ pub struct KeyPackageAttestationSigner {
     owner: DID,
     signer: CommandSigner,
     active_key: VerifyingKey,
+    /// The resolver `active_key` came from, kept so the `KeyPackage` store
+    /// can re-resolve before it installs this signer
+    /// ([`Self::confirm_still_active`]).
+    key_resolver: KeyResolver,
 }
 
 impl std::fmt::Debug for KeyPackageAttestationSigner {
@@ -74,12 +78,7 @@ impl KeyPackageAttestationSigner {
         let held = signer
             .verifying_key()
             .map_err(|_| ContextError::AttestationSignerNotActiveKey)?;
-        let active_key = resolve_active_key(key_resolver, owner.clone())
-            .await
-            .map_err(|e| {
-                ContextError::CryptoFailed(format!("#active key resolution task failed: {e}"))
-            })?
-            .ok_or(ContextError::AttestationSignerActiveKeyUnresolved)?;
+        let active_key = resolve_current_active(&key_resolver, &owner).await?;
         if held != active_key {
             return Err(ContextError::AttestationSignerNotActiveKey);
         }
@@ -87,22 +86,51 @@ impl KeyPackageAttestationSigner {
             owner,
             signer,
             active_key,
+            key_resolver,
         })
+    }
+
+    /// Resolves the owner's `#active` key again and checks it is still
+    /// [`Self::active_key`]. The `KeyPackage` store runs this, off its command
+    /// turn, before it installs a signer, so a signer resolved before a
+    /// rotation and delivered after a newer one never replaces the newer one
+    /// or burns its pool (§9.12).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::AttestationSignerNotActiveKey`] when the owner's
+    ///   `#active` key is now another key.
+    /// - [`ContextError::AttestationSignerActiveKeyUnresolved`] when it no
+    ///   longer resolves.
+    /// - [`ContextError::CryptoFailed`] when the resolver task panics or is
+    ///   cancelled.
+    pub(crate) async fn confirm_still_active(&self) -> Result<(), ContextError> {
+        let current = resolve_current_active(&self.key_resolver, &self.owner).await?;
+        if current == self.active_key {
+            Ok(())
+        } else {
+            Err(ContextError::AttestationSignerNotActiveKey)
+        }
     }
 
     /// A signer over `signer` for `owner`, taking `active_key` as the
     /// owner's `#active` key without resolving it, for tests that drive the
-    /// `KeyPackage` store directly.
+    /// `KeyPackage` store directly. Its re-resolution
+    /// ([`Self::confirm_still_active`]) names `active_key` for `owner` and
+    /// nothing else.
     #[cfg(test)]
-    pub(crate) const fn for_test(
-        owner: DID,
-        signer: CommandSigner,
-        active_key: VerifyingKey,
-    ) -> Self {
+    pub(crate) fn for_test(owner: DID, signer: CommandSigner, active_key: VerifyingKey) -> Self {
+        let resolved_owner = owner.clone();
+        let key_resolver: KeyResolver =
+            std::sync::Arc::new(move |did: &DID, kid: scp_did::SigningKeyId| {
+                (did == &resolved_owner && kid == scp_did::SigningKeyId::Active)
+                    .then_some(active_key)
+            });
         Self {
             owner,
             signer,
             active_key,
+            key_resolver,
         }
     }
 
@@ -116,6 +144,25 @@ impl KeyPackageAttestationSigner {
     pub(crate) const fn active_key(&self) -> &VerifyingKey {
         &self.active_key
     }
+}
+
+/// `owner`'s `#active` key through `key_resolver`, on the blocking pool.
+///
+/// # Errors
+///
+/// [`ContextError::AttestationSignerActiveKeyUnresolved`] when the key does
+/// not resolve; [`ContextError::CryptoFailed`] when the resolver task panics
+/// or is cancelled.
+async fn resolve_current_active(
+    key_resolver: &KeyResolver,
+    owner: &DID,
+) -> Result<VerifyingKey, ContextError> {
+    resolve_active_key(std::sync::Arc::clone(key_resolver), owner.clone())
+        .await
+        .map_err(|e| {
+            ContextError::CryptoFailed(format!("#active key resolution task failed: {e}"))
+        })?
+        .ok_or(ContextError::AttestationSignerActiveKeyUnresolved)
 }
 
 /// Mints one attested `KeyPackage` for `signer`'s owner: plans it through

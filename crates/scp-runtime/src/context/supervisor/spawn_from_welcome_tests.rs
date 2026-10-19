@@ -4836,6 +4836,16 @@ async fn alice_invites_bob(
     ctx_id: &str,
     bob_sup: &Arc<Supervisor>,
 ) -> (ReservationId, Vec<u8>, WelcomeJoinRequest) {
+    alice_invites_bob_reserving_with(ctx_id, bob_sup, &bob_signer()).await
+}
+
+/// [`alice_invites_bob`], with Bob's KeyPackage reserved through
+/// `bob_active_signer`, his `#active` signer.
+async fn alice_invites_bob_reserving_with(
+    ctx_id: &str,
+    bob_sup: &Arc<Supervisor>,
+    bob_active_signer: &CommandSigner,
+) -> (ReservationId, Vec<u8>, WelcomeJoinRequest) {
     let alice = DID::from(ALICE_DID);
     let bob = DID::from(BOB_DID);
     let (alice_sup, _alice_crypto) = alice_supervisor();
@@ -4849,7 +4859,10 @@ async fn alice_invites_bob(
         )
         .await
         .expect("alice creates the encrypted context");
-    let (reservation_id, kp_public_bytes) = reserve_bob_kp(bob_sup, &bob).await;
+    let (reservation_id, kp_public_bytes) = bob_sup
+        .reserve_key_package(bob.clone(), bob_active_signer)
+        .await
+        .expect("reserve a pooled KP for join");
     let InviteMemberOutcome::Sealed { bundle, .. } = alice_sup
         .invite_member(
             ctx_id.to_owned(),
@@ -5524,4 +5537,60 @@ async fn join_rejects_a_malformed_enc_before_keypackage_consumption() {
         .spawn_actor_from_welcome(bob, req)
         .await
         .expect("the well-formed enc joins");
+}
+
+/// The join sends its `ConfirmConsume` while it holds `bootstrap_spawn_lock`.
+/// Bob's `KeyPackage` store mints as a subtask it polls beside its mailbox, so
+/// with the refill's second mint blocked in the custody sign, the confirm is
+/// served and the join completes; the lock is free again afterwards.
+#[tokio::test]
+async fn a_join_confirms_under_the_bootstrap_lock_while_a_mint_waits_on_custody() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let bob = DID::from(BOB_DID);
+    let (bob_sup, _bob_crypto) = bob_supervisor(None);
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let signs = Arc::new(AtomicUsize::new(0));
+    let gated = CommandSigner::new(Arc::new(crate::crypto::mls::test_support::GatedSigner {
+        key: bob_signing_key(),
+        permits: Arc::clone(&permits),
+        signs: Arc::clone(&signs),
+    }));
+    let (_reservation_id, _kp, req) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        alice_invites_bob_reserving_with(&ctx_hex(0xc3), &bob_sup, &gated),
+    )
+    .await
+    .expect("the first mint serves the reserve and alice invites bob");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while signs.load(Ordering::Acquire) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the refill's second mint is waiting on the custody sign");
+    assert_eq!(
+        permits.available_permits(),
+        0,
+        "the custody sign is held shut"
+    );
+
+    // Well inside `SIGN_TIMEOUT`, so a confirm queued behind the blocked mint
+    // cannot be freed by the custody sign timing out.
+    tokio::time::timeout(
+        crate::context::actor::SIGN_TIMEOUT / 3,
+        bob_sup.spawn_actor_from_welcome(bob, req),
+    )
+    .await
+    .expect("the confirm under the bootstrap lock does not wait on the blocked mint")
+    .expect("bob joins");
+    assert_eq!(
+        signs.load(Ordering::Acquire),
+        2,
+        "the second mint is still waiting on custody"
+    );
+    assert!(
+        bob_sup.bootstrap_spawn_lock.try_lock().is_ok(),
+        "the join released the bootstrap lock"
+    );
 }

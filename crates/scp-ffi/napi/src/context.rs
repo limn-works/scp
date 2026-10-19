@@ -6482,6 +6482,49 @@ mod tests {
         );
     }
 
+    /// A `KeyPackage` the inviter rejects (§9.7.1) reports `SCP-CRYPTO-4067`,
+    /// the code every bridge reports for `ContextError::InvalidKeyPackage`,
+    /// not the call's `SCP-CTX-2013` fallback. The context is live and
+    /// single-admin, so the `KeyPackage` check is the first step that fails.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invite_member_rejects_an_invalid_key_package_with_its_code() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let creator = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params_json = serde_json::json!({
+            "mode": "encrypted",
+            "ceiling": ["messages:read", "member:invite"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &creator, params_json)
+            .await
+            .expect("context_create should succeed");
+
+        let Err(err) = super::invite_member_on(
+            &bi,
+            handle.context_id.clone(),
+            creator.inner.did.clone(),
+            "did:dht:z6MkNapiInviteeBadKeyPackage".to_owned(),
+            b"bogus-key-package".to_vec(),
+        )
+        .await
+        else {
+            panic!("an invalid KeyPackage must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::CRYPTO_4067) && !msg.contains(codes::CTX_2013),
+            "expected {}, got: {msg}",
+            codes::CRYPTO_4067
+        );
+    }
+
     /// ADR-049 Phase 2J / FFI-02 Option A (invite export wiring): the new
     /// `invite_member` bridge export is wired end-to-end — DID validation ->
     /// supervisor resolution -> inviter signing-key resolution/export -> live-

@@ -4050,44 +4050,6 @@ async fn a_respawned_store_burns_entries_a_superseded_key_attested() {
     handle.send_shutdown().await.unwrap();
 }
 
-/// A local Ed25519 signer whose sign waits for a permit, standing in for a
-/// custody that does not answer: each sign takes one permit, and a sign with
-/// none left waits until the test adds one.
-struct GatedSigner {
-    key: SigningKey,
-    permits: Arc<tokio::sync::Semaphore>,
-    signs: Arc<AtomicUsize>,
-}
-
-impl scp_crypto::ScpSigner for GatedSigner {
-    fn algorithm(&self) -> scp_crypto::SigAlg {
-        scp_crypto::SigAlg::Ed25519
-    }
-
-    fn public_key(&self) -> Vec<u8> {
-        self.key.verifying_key().to_bytes().to_vec()
-    }
-
-    fn sign(
-        &self,
-        digest: &[u8; 32],
-    ) -> impl std::future::Future<Output = Result<[u8; 64], scp_crypto::SignError>> + Send {
-        use ed25519_dalek::Signer as _;
-        let permits = Arc::clone(&self.permits);
-        let signs = Arc::clone(&self.signs);
-        let signature = self.key.sign(digest).to_bytes();
-        async move {
-            signs.fetch_add(1, Ordering::AcqRel);
-            permits
-                .acquire()
-                .await
-                .map_err(|e| scp_crypto::SignError::Backend(e.to_string()))?
-                .forget();
-            Ok(signature)
-        }
-    }
-}
-
 /// A mint runs off the store's command turn: with the custody sign of the
 /// refill's second mint held shut, a `ConfirmConsume` for the reservation the
 /// first mint served still joins.
@@ -4103,7 +4065,7 @@ async fn confirm_consume_completes_while_a_mint_waits_on_custody() {
     let signs = Arc::new(AtomicUsize::new(0));
     let gated = Arc::new(KeyPackageAttestationSigner::for_test(
         alice(),
-        CommandSigner::new(Arc::new(GatedSigner {
+        CommandSigner::new(Arc::new(crate::crypto::mls::test_support::GatedSigner {
             key: alice_identity_key(),
             permits: Arc::clone(&permits),
             signs: Arc::clone(&signs),
@@ -4151,6 +4113,120 @@ async fn confirm_consume_completes_while_a_mint_waits_on_custody() {
         signs.load(Ordering::Acquire),
         2,
         "the second mint is still waiting"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// Spec 09 §9.12 under a reserve that races a rotation: a signer resolved
+/// before Alice rotated, delivered after a signer for her new `#active` key,
+/// is refused with [`ContextError::AttestationSignerNotActiveKey`] once the
+/// store re-resolves her `#active` key. The new key's signer stays installed
+/// and its pool, records and index are untouched.
+#[tokio::test]
+async fn a_signer_resolved_before_a_rotation_neither_replaces_the_new_signer_nor_burns_its_pool() {
+    let storage = in_memory_storage();
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
+    );
+    let current = Arc::new(std::sync::Mutex::new(alice_identity_key().verifying_key()));
+    let resolver: KeyResolver = {
+        let current = Arc::clone(&current);
+        Arc::new(move |did: &DID, kid: scp_did::SigningKeyId| {
+            (did == &alice() && kid == scp_did::SigningKeyId::Active)
+                .then(|| *current.lock().unwrap())
+        })
+    };
+    let stale = attestation_signer(alice(), alice_identity_key(), Arc::clone(&resolver)).await;
+    *current.lock().unwrap() = alice_rotated_key().verifying_key();
+    let fresh = attestation_signer(alice(), alice_rotated_key(), resolver).await;
+
+    let (_rid, public_bytes) = handle
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: fresh,
+            reply,
+        })
+        .await
+        .expect("the new key's signer reserves");
+    assert!(attested_by(&public_bytes, &alice_rotated_key()).await);
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("the refill ends");
+    let before: Vec<KpRef> = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds")
+        .into_iter()
+        .map(|(kp_ref, _)| kp_ref)
+        .collect();
+    assert_eq!(before.len(), MIN_BUFFER - 1);
+    let index_before = live_index(&storage, &alice()).await;
+
+    let err = handle
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: stale,
+            reply,
+        })
+        .await
+        .expect_err("the stale signer is refused");
+    assert!(
+        matches!(err, ContextError::AttestationSignerNotActiveKey),
+        "got {err:?}"
+    );
+
+    let after: Vec<KpRef> = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("the new key's signer is still installed")
+        .into_iter()
+        .map(|(kp_ref, _)| kp_ref)
+        .collect();
+    assert_eq!(after, before, "the new key's pool is untouched");
+    for kp_ref in &before {
+        assert!(kp_record_present(&storage, &alice(), kp_ref).await);
+    }
+    assert_eq!(live_index(&storage, &alice()).await, index_before);
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// Every `ReserveAny` parked on an empty pool receives a `KeyPackage`, even
+/// when more park than [`MIN_BUFFER`]: the refill keeps minting while parked
+/// reserves outnumber the pool.
+#[tokio::test]
+async fn every_reserve_parked_on_an_empty_pool_receives_a_key_package() {
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(real_backend(), in_memory_storage(), no_transport()).await,
+    );
+    let signer = alice_attestation_signer();
+    let reserves: Vec<_> = (0..MIN_BUFFER + 2)
+        .map(|_| {
+            let handle = handle.clone();
+            let signer = Arc::clone(&signer);
+            tokio::spawn(async move {
+                handle
+                    .send(|reply| KeyPackageCommand::ReserveAny { signer, reply })
+                    .await
+            })
+        })
+        .collect();
+    let mut reservations = std::collections::HashSet::new();
+    for reserve in reserves {
+        let (reservation_id, _public) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), reserve)
+                .await
+                .expect("the parked reserve is answered")
+                .expect("the reserve task completes")
+                .expect("every parked reserve receives a KeyPackage");
+        reservations.insert(reservation_id);
+    }
+    assert_eq!(
+        reservations.len(),
+        MIN_BUFFER + 2,
+        "each reservation is distinct"
     );
 
     handle.send_shutdown().await.unwrap();
