@@ -681,7 +681,8 @@ pub enum TrustError {
     },
 
     /// The challenger's ledger holds no live challenge with this id, request
-    /// digest and subject (spec 07 §7.3.4 step 3).
+    /// digest and subject, or holds a closed one with no graded attempt for
+    /// the response's `D_r` (spec 07 §7.3.4 step 3.2).
     #[error("challenge {challenge_id}: unknown to this challenger")]
     UnknownChallenge {
         /// The challenge id (lowercase hex).

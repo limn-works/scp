@@ -1192,7 +1192,10 @@ pub const VALID_7105: &str = "SCP-VALID-7105";
 /// The challenge is closed: passed or out of attempts
 /// ([`TrustError::ChallengeClosed`](scp_protocol::trust::TrustError::ChallengeClosed)).
 pub const VALID_7106: &str = "SCP-VALID-7106";
-/// The challenger holds no open challenge with this id, digest and subject
+/// No challenge the challenger holds answers this lookup.
+///
+/// No live challenge has this id, digest and subject, or a closed one graded
+/// no response with this `D_r`
 /// ([`TrustError::UnknownChallenge`](scp_protocol::trust::TrustError::UnknownChallenge)).
 pub const VALID_7107: &str = "SCP-VALID-7107";
 /// A response does not answer its request: another challenge or digest, or

@@ -1466,7 +1466,8 @@ async fn evaluator_error_and_budget_overrun_fail_the_case() {
 }
 
 /// T13 (U-1): a fresh response to a passed challenge is refused by the
-/// ledger lookup before any DID resolution.
+/// ledger lookup before any DID resolution, with `UnknownChallenge`: no
+/// stored attempt has its `D_r` (spec 07 §7.3.4 step 3.2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_response_to_a_closed_challenge_resolves_nothing() {
     let h = Harness::new(evaluator_params()).await;
@@ -1486,7 +1487,7 @@ async fn fresh_response_to_a_closed_challenge_resolves_nothing() {
     assert!(
         matches!(
             err,
-            ChallengeOpError::Trust(TrustError::ChallengeClosed { .. })
+            ChallengeOpError::Trust(TrustError::UnknownChallenge { .. })
         ),
         "{err:?}"
     );

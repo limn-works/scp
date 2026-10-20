@@ -13392,10 +13392,9 @@ impl Supervisor {
     /// # Errors
     ///
     /// [`TrustError::UnknownChallenge`](scp_protocol::trust::TrustError::UnknownChallenge)
-    /// when no such challenge exists;
-    /// [`TrustError::ChallengeClosed`](scp_protocol::trust::TrustError::ChallengeClosed)
-    /// when it is closed and `response` is not one it graded; a
-    /// non-canonical subject or an unencodable response; a load failure or
+    /// when no such challenge exists, or when it is closed and `response`
+    /// is not one it graded (spec 07 §7.3.4 step 3.2); a non-canonical
+    /// subject or an unencodable response; a load failure or
     /// [`ContextError::ActorBusy`].
     pub async fn dispatch_challenge_lookup(
         &self,
