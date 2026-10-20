@@ -158,6 +158,8 @@ Slices 1–3 shipped with the interim Prerequisite-3 factoring. Corrective slice
 
   **Residuals, out of this slice's scope (named, not hidden).** (1) **Offline-during-push.** Rotation and add distributions are unsigned **pushes** over the management channel; a peer offline during the push does not receive the new key until a future push. Re-driving it needs the demand-driven **pull** path (`SenderKeyRequest`/`SenderKeyResponse`, §9.16.2) — gated on #1980 — which this slice does not implement (it uses the `SenderKeyDistributionMessage` PUSH variant, with a zeroed `request_nonce`). (2) **Block protocol excluded.** The signed `SenderKeyEpochAdvance` / block-notification auto-rotation (§9.16.3) is node-side and out of the participant fence. (3) **Self-certifying directory.** The wrapping-key directory is transported adder→joiner and trusted like the replayed event-log stream; independently re-deriving each member's wrapping key from a per-leaf-signed source is the leaf-signing / custody slice (§23.13), the same residual T3 names for the convergent timestamp.
 
+  **Superseded by §9.16.2 (2026-10-12).** Sender-key distribution is pull: a member sends a `SenderKeyRequest` carrying a fresh ephemeral `wrapping_pubkey`, and the key holder seals the `SenderKeyResponse` to that key (`09-security-model.md` §9.16.2). T4's push of a sender key sealed to a peer's stable `scp_wrapping_key` diverges from §9.16.2, and the stable key's payloads are the invitation bundle and the `participation_signing_seed` (§9.16.1).
+
 ## Evidence
 
 - wasm32 compile spike: `cargo check --target wasm32-unknown-unknown` → exit 0 on the lifted MLS machine.
