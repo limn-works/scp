@@ -12,7 +12,9 @@
 package works.limn.scp.android.platform
 
 import android.content.SharedPreferences
+import java.io.IOException
 import java.math.BigInteger
+import java.security.GeneralSecurityException
 import java.security.SecureRandom
 import java.util.Base64
 import kotlinx.coroutines.test.runTest
@@ -25,6 +27,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
@@ -487,9 +490,12 @@ class AndroidKeyCustodyP256Test {
             val custody = custody(agreementInKeystore = false)
             val handles = (1..16).map { custody.generateKeypair(KeyType.HPKE_P256) }
             val publics = handles.map { custody.publicKey(it) }
-            for (handle in handles) {
+            handles.forEachIndexed { index, handle ->
                 val stored = Base64.getDecoder().decode(prefs.getString("scp.p256.${handle.id}", null))
                 assertEquals(32, stored.size)
+                // The process-wide pair cache would serve a wrong scalar's key pair, so the
+                // committed scalar itself must produce the minted public key.
+                assertArrayEquals(publics[index], pointOf(stored))
             }
 
             val restored = custody(agreementInKeystore = true)
@@ -743,6 +749,33 @@ class AndroidKeyCustodyP256Test {
         }
 
         @Test
+        fun `a preferences file that cannot be opened or read is SCP-CRYPTO-4060, never a raw exception`() {
+            for (failure in listOf(GeneralSecurityException("master key unavailable"), IOException("unreadable"))) {
+                val error = assertThrows<ScpException> {
+                    AndroidKeyCustody.openPreferences(MAIN_PROCESS, MAIN_PROCESS) { throw failure }
+                }
+                assertEquals("SCP-CRYPTO-4060", error.code)
+                assertSame(failure, error.cause)
+            }
+
+            var opened = false
+            val refused = assertThrows<ScpException> {
+                AndroidKeyCustody.openPreferences("other.app", MAIN_PROCESS) {
+                    opened = true
+                    prefs
+                }
+            }
+            assertEquals("SCP-CRYPTO-4060", refused.code)
+            assertFalse(opened, "the preferences were opened outside the main process")
+            assertSame(prefs, AndroidKeyCustody.openPreferences(MAIN_PROCESS, MAIN_PROCESS) { prefs })
+
+            // A file that opens but whose role index cannot be read fails construction typed too.
+            val unreadable = assertThrows<ScpException> { custody(store = UnreadableKeyPrefs(prefs, "scp.role.ids")) }
+            assertEquals("SCP-CRYPTO-4060", unreadable.code)
+            assertTrue(unreadable.cause is ClassCastException, "cause: ${unreadable.cause}")
+        }
+
+        @Test
         fun `a new instance sweeps the pending mints an earlier process left under its own tag`() {
             // One process runs the adapter at a time, so a pending record under another tag was
             // left by an earlier process that died mid-mint.
@@ -860,14 +893,17 @@ class AndroidKeyCustodyP256Test {
             val first = custody(agreementInKeystore = false)
             val identity = first.generateKeypair(KeyType.ED25519, KeyRole.IDENTITY)
             val signing = first.generateKeypair(KeyType.P256)
-            val agreement = first.generateKeypair(KeyType.HPKE_P256)
+            // Stored beside the adapter, so no instance has cached its pair and the restored
+            // instance loads it through NoGetAllPrefs.
+            val scalar = randomScalar()
+            val agreement = storedSoftwareKey(scalar)
             KeyRecords(prefs).reserve("91", KeyType.HPKE_P256, Backing.SOFTWARE, KeyRole.OPERATIONAL, FOREIGN_TAG)
 
             val restored = custody(agreementInKeystore = false, store = NoGetAllPrefs(prefs))
 
             assertEquals(64, restored.sign(identity, byteArrayOf(9)).size)
             assertNotNull(restored.sign(signing, digest()))
-            assertEquals(65, restored.publicKey(agreement).size)
+            assertArrayEquals(pointOf(scalar), restored.publicKey(agreement))
             assertFalse(KeyRecords(prefs).contains("91"))
             restored.destroyKey(agreement)
             restored.generateKeypair(KeyType.HPKE_P256)

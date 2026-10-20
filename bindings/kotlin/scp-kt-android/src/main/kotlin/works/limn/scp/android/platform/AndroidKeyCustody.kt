@@ -150,7 +150,8 @@ class AndroidKeyCustody private constructor(
      * @param context Android application context. Must be an application context
      *   (not an activity context) to avoid memory leaks from long-lived references.
      * @throws ScpException with code `SCP-CRYPTO-4060` outside the app's main process, before
-     *   the preferences file is opened.
+     *   the preferences file is opened, and when the master key or the preferences file cannot
+     *   be opened or read. The constructor throws no other exception.
      */
     constructor(context: Context) : this(
         openPreferences(context),
@@ -182,7 +183,7 @@ class AndroidKeyCustody private constructor(
      * role lives in its record instead (see [roleOf]).
      */
     @get:JvmSynthetic
-    internal val keyRoles = KeyRoles(encryptedPrefs)
+    internal val keyRoles = custodyGuarded { KeyRoles(encryptedPrefs) }
 
     /** The record of each P-256 and HPKE P-256 key, its role included. */
     @get:JvmSynthetic
@@ -563,15 +564,34 @@ class AndroidKeyCustody private constructor(
          * The production preferences, opened only after [requireMainProcess] has checked that
          * this is the app's main process.
          */
-        private fun openPreferences(context: Context): SharedPreferences {
-            requireMainProcess(currentProcessName(context), context.applicationInfo.processName)
-            return EncryptedSharedPreferences.create(
-                PREFS_FILENAME,
-                MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC),
-                context.applicationContext,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-            )
+        private fun openPreferences(context: Context): SharedPreferences =
+            openPreferences(currentProcessName(context), context.applicationInfo.processName) {
+                EncryptedSharedPreferences.create(
+                    PREFS_FILENAME,
+                    MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC),
+                    context.applicationContext,
+                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+                )
+            }
+
+        /**
+         * Runs [requireMainProcess] on [processName] and [mainProcessName], then [open]. A
+         * failure of [open] (`MasterKeys.getOrCreate` and `EncryptedSharedPreferences.create`
+         * throw `GeneralSecurityException` and `IOException`) becomes `SCP-CRYPTO-4060`, so the
+         * production constructor throws only [ScpException].
+         *
+         * @throws ScpException with code `SCP-CRYPTO-4060` outside the main process, or when
+         *   [open] fails.
+         */
+        @JvmSynthetic
+        internal fun openPreferences(
+            processName: String?,
+            mainProcessName: String,
+            open: () -> SharedPreferences,
+        ): SharedPreferences {
+            requireMainProcess(processName, mainProcessName)
+            return custodyGuarded(open)
         }
 
         /**
