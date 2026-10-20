@@ -723,7 +723,7 @@ impl PyContextParams {
 /// raises its typed exception with that code ([`typed_supervisor_error`]);
 /// a variant with no dedicated code raises the `RuntimeError` this call site
 /// raised before.
-fn typed_supervisor_failure(op: &str, e: &scp_core::context::ContextError) -> PyErr {
+pub(crate) fn typed_supervisor_failure(op: &str, e: &scp_core::context::ContextError) -> PyErr {
     typed_supervisor_error(op, e).map_or_else(
         || PyRuntimeError::new_err(format!("{op} failed: {e}")),
         PyErr::from,
@@ -739,14 +739,8 @@ pub(crate) fn typed_supervisor_error(
     op: &str,
     e: &scp_core::context::ContextError,
 ) -> Option<crate::error::ScpPyError> {
-    use scp_ffi_common::context_error_class::{ContextErrorClass, classify_context_error};
-    if matches!(classify_context_error(e), ContextErrorClass::Generic) {
-        return None;
-    }
-    Some(crate::error::ScpPyError::from_context_error(
-        format!("{op} failed: {e}"),
-        e,
-    ))
+    scp_ffi_common::context_error_class::has_dedicated_code(e)
+        .then(|| crate::error::ScpPyError::from_context_error(format!("{op} failed: {e}"), e))
 }
 
 /// Extracts a `pseudonym_rotation` dict (spec 09 §9.10.4.1). The dict holds
@@ -2684,10 +2678,12 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Returns `TypeError` if params contains invalid types, `ValueError` if
-    /// parameter values are out of range, the typed SDK error for a failure
-    /// `keeps_create_failure_code` keeps (`ContextError` with `SCP-CTX-2138`
-    /// when the Supervisor refused the create because shutdown began), or
-    /// `RuntimeError` if context creation fails otherwise.
+    /// parameter values are out of range, the typed SDK error with its code
+    /// for a failure that has a dedicated code
+    /// (`scp_ffi_common::context_error_class::has_dedicated_code`: a custody
+    /// failure's custody code, `SCP-CTX-2138` when the Supervisor refused the
+    /// create because shutdown began, ...), or `RuntimeError` if context
+    /// creation fails otherwise.
     #[pyo3(signature = (identity_did, params))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, registers FFI state, delegates to ContextManager, returns handle
     pub fn context_create(
@@ -2783,11 +2779,7 @@ impl crate::scp::PyScp {
             .map_err(|e| {
                 // Clean up FFI state on ContextManager failure.
                 crate::runtime::remove_context(bi, &context_id);
-                if keeps_create_failure_code(&e) {
-                    PyErr::from(crate::error::ScpPyError::from(e))
-                } else {
-                    PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
-                }
+                typed_supervisor_failure("ContextManager create_context", &e)
             })?;
         }
 
@@ -2975,13 +2967,7 @@ impl crate::scp::PyScp {
                 )
                 .await
             })?
-            .map_err(|e| {
-                if keeps_join_failure_code(&e) {
-                    PyErr::from(crate::error::ScpPyError::from(e))
-                } else {
-                    PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}"))
-                }
-            })?;
+            .map_err(|e| typed_supervisor_failure("ContextManager join_context", &e))?;
 
             // §9.10.4: Send pseudonym announcement to inform existing members.
             if local_pseudonym.is_some()
@@ -6205,48 +6191,28 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Whether a refused create keeps its typed SDK code: the core's empty-ceiling
-/// rejection keeps its validation code (construction.md M2), and a create
-/// refused because Supervisor shutdown began keeps SCP-CTX-2138.
-const fn keeps_create_failure_code(e: &scp_core::context::ContextError) -> bool {
-    matches!(
-        e,
-        scp_core::context::ContextError::CeilingRequired(_)
-            | scp_core::context::ContextError::SupervisorShutDown(_)
+/// The Python exception for a refused `RestoreContext` at `stage`: an error
+/// with a dedicated code raises its typed exception with that code
+/// ([`typed_supervisor_error`]: `SCP-CTX-2138` when Supervisor shutdown began,
+/// a custody failure's custody code, ...); every other failure raises the
+/// `RuntimeError` naming SCP-CTX-2064.
+pub(crate) fn restore_context_failure(stage: &str, e: scp_core::context::ContextError) -> PyErr {
+    typed_supervisor_error(stage, &e).map_or_else(
+        || PyRuntimeError::new_err(format!("SCP-CTX-2064: {stage} failed: {e}")),
+        PyErr::from,
     )
 }
 
-/// Whether a refused join keeps its typed SDK code: a join refused because
-/// Supervisor shutdown began keeps SCP-CTX-2138.
-const fn keeps_join_failure_code(e: &scp_core::context::ContextError) -> bool {
-    matches!(e, scp_core::context::ContextError::SupervisorShutDown(_))
-}
-
-/// The Python exception for a refused `RestoreContext` at `stage`: a restore
-/// refused because Supervisor shutdown began raises `ContextError` with
-/// SCP-CTX-2138; every other failure raises the `RuntimeError` naming
-/// SCP-CTX-2064.
-fn restore_context_failure(stage: &str, e: scp_core::context::ContextError) -> PyErr {
-    if matches!(e, scp_core::context::ContextError::SupervisorShutDown(_)) {
-        PyErr::from(crate::error::ScpPyError::from(e))
-    } else {
-        PyRuntimeError::new_err(format!("SCP-CTX-2064: {stage} failed: {e}"))
-    }
-}
-
-/// Flattens a refused create to a [`scp_core::context::ContextError`], keeping
-/// the variants [`keeps_create_failure_code`] names typed.
-fn create_context_failure(
+/// Flattens a refused create to a [`scp_core::context::ContextError`]: a
+/// wrapped error with a dedicated code stays itself
+/// (`scp_ffi_common::context_error_class::coded_creation_failure`), and every
+/// other failure becomes `CreationFailed`, which `context_create` raises as
+/// its `RuntimeError`.
+pub(crate) fn create_context_failure(
     e: scp_core::context::builder::ContextCreationError,
 ) -> scp_core::context::ContextError {
-    match e {
-        scp_core::context::builder::ContextCreationError::StateTransition(inner)
-            if keeps_create_failure_code(&inner) =>
-        {
-            inner
-        }
-        other => scp_core::context::ContextError::CreationFailed(other.to_string()),
-    }
+    scp_ffi_common::context_error_class::coded_creation_failure(e)
+        .unwrap_or_else(|other| scp_core::context::ContextError::CreationFailed(other.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -6260,18 +6226,6 @@ mod tests {
     use crate::runtime::RECEIVE_BUFFER_CAPACITY;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A join refused because Supervisor shutdown began keeps its typed code;
-    /// any other join failure does not.
-    #[test]
-    fn join_failure_keeps_only_supervisor_shut_down_typed() {
-        assert!(keeps_join_failure_code(
-            &scp_core::context::ContextError::SupervisorShutDown("join".to_owned())
-        ));
-        assert!(!keeps_join_failure_code(
-            &scp_core::context::ContextError::TransportFailed("join".to_owned())
-        ));
-    }
-
     /// A create refused because Supervisor shutdown began stays typed and maps
     /// to SCP-CTX-2138; an unrelated create failure is flattened.
     #[test]
@@ -6280,7 +6234,6 @@ mod tests {
         let shut_down = create_context_failure(ContextCreationError::StateTransition(
             scp_core::context::ContextError::SupervisorShutDown("create".to_owned()),
         ));
-        assert!(keeps_create_failure_code(&shut_down));
         match crate::error::ScpPyError::from(shut_down) {
             crate::error::ScpPyError::ContextError { code, .. } => {
                 assert_eq!(code, scp_ffi_common::error_codes::CTX_2138);
@@ -6288,7 +6241,6 @@ mod tests {
             other => panic!("expected a context error, got {other:?}"),
         }
         let flattened = create_context_failure(ContextCreationError::TransportNotConnected);
-        assert!(!keeps_create_failure_code(&flattened));
         assert!(matches!(
             flattened,
             scp_core::context::ContextError::CreationFailed(_)

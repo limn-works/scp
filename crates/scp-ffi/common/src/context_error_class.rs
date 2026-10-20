@@ -8,8 +8,15 @@
 //! turns a class into its own error type; only the routing of a
 //! [`ContextErrorClass::PermissionDenied`] message by its embedded code prefix
 //! is bridge-specific, because the bridges' exception hierarchies differ.
+//!
+//! [`has_dedicated_code`] and [`coded_creation_failure`] are the one rule for
+//! a `ContextError` a bridge would otherwise flatten to its call's fallback
+//! code (a create, restore or join): an error with a dedicated code keeps it,
+//! so a custody failure keeps its custody code however the call wraps it
+//! (ADR-006 2026-09-29 amendment).
 
 use scp_crypto::CustodyFailure;
+use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::{CeilingDeclaration, ContextError};
 
 use crate::error_codes as codes;
@@ -110,11 +117,78 @@ pub fn classify_context_error(e: &ContextError) -> ContextErrorClass<'_> {
     }
 }
 
+/// Whether `e` carries a code of its own: every class except
+/// [`ContextErrorClass::Generic`]. A bridge reports such an error with that
+/// code, and reports any other error with its call's fallback code.
+#[must_use]
+pub fn has_dedicated_code(e: &ContextError) -> bool {
+    !matches!(classify_context_error(e), ContextErrorClass::Generic)
+}
+
+/// The coded `ContextError` a refused create reports, if it has one.
+///
+/// `Ok` holds the error a `StateTransition` wraps when it has a dedicated code
+/// ([`has_dedicated_code`]); `Err` returns `e` unchanged, which the bridge
+/// reports with its create fallback code. Only `StateTransition` wraps a
+/// `ContextError`; the match names every variant so a new wrapping variant
+/// needs a decision here.
+///
+/// # Errors
+///
+/// `Err(e)` when `e` wraps no `ContextError` with a dedicated code.
+pub fn coded_creation_failure(
+    e: ContextCreationError,
+) -> Result<ContextError, ContextCreationError> {
+    match e {
+        ContextCreationError::StateTransition(inner) if has_dedicated_code(&inner) => Ok(inner),
+        ContextCreationError::StateTransition(_)
+        | ContextCreationError::TransportNotConnected
+        | ContextCreationError::IdentityValidationFailed(_)
+        | ContextCreationError::CryptoFailed(_)
+        | ContextCreationError::TransportFailed(_)
+        | ContextCreationError::EventLogFailed(_)
+        | ContextCreationError::TemplateValidationFailed(_)
+        | ContextCreationError::BilateralPeerNotSupported
+        | ContextCreationError::InvalidCeilingCategory(_)
+        | ContextCreationError::InvalidPseudonymRotationPolicy(_)
+        | ContextCreationError::CreationFailed(_) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ContextErrorClass, classify_context_error};
+    use super::{ContextErrorClass, classify_context_error, coded_creation_failure};
     use crate::error_codes as codes;
     use scp_protocol::context::ContextError;
+    use scp_protocol::context::builder::ContextCreationError;
+
+    /// A create refused with a coded `ContextError` (a custody failure, a
+    /// shutdown, a ceiling rejection) yields that error; a generic wrapped
+    /// error and every other creation failure keep the create's fallback.
+    #[test]
+    fn a_refused_create_keeps_exactly_the_coded_context_errors() {
+        let custody = ContextError::Custody(scp_crypto::CustodyFailure {
+            kind: scp_crypto::CustodyFailureKind::TimedOut,
+            detail: "sign".to_owned(),
+        });
+        for kept in [
+            custody,
+            ContextError::SupervisorShutDown("create".to_owned()),
+            ContextError::WrappingKeyCustodyUnavailable,
+        ] {
+            let expected = format!("{kept:?}");
+            let inner = coded_creation_failure(ContextCreationError::StateTransition(kept))
+                .ok()
+                .map(|inner| format!("{inner:?}"));
+            assert_eq!(inner, Some(expected));
+        }
+        for flattened in [
+            ContextCreationError::StateTransition(ContextError::MemberNotFound("x".to_owned())),
+            ContextCreationError::TransportNotConnected,
+        ] {
+            assert!(coded_creation_failure(flattened).is_err());
+        }
+    }
 
     #[test]
     fn the_wrapping_key_and_attestation_signer_failures_carry_their_own_crypto_codes() {

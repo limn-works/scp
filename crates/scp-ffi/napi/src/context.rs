@@ -5452,9 +5452,8 @@ pub(crate) fn typed_supervisor_failure(
     code: &str,
     e: &scp_core::context::ContextError,
 ) -> ScpNapiError {
-    use scp_ffi_common::context_error_class::{ContextErrorClass, classify_context_error};
     let message = format!("{op} failed: {e}");
-    if matches!(classify_context_error(e), ContextErrorClass::Generic) {
+    if !scp_ffi_common::context_error_class::has_dedicated_code(e) {
         return ScpNapiError::Context {
             message,
             code: code.to_owned(),
@@ -5463,21 +5462,22 @@ pub(crate) fn typed_supervisor_failure(
     ScpNapiError::from_context_error(message, e)
 }
 
-/// Maps a refused `CreateContext` to its SDK error. The core's empty-ceiling
-/// rejection keeps its typed validation code (construction.md M2), and a
-/// create refused because Supervisor shutdown began keeps SCP-CTX-2138; every
-/// other failure carries SCP-CTX-2000.
-fn create_context_failure(e: scp_core::context::builder::ContextCreationError) -> ScpNapiError {
-    match e {
-        scp_core::context::builder::ContextCreationError::StateTransition(
-            scp_core::context::ContextError::CeilingRequired(_)
-            | scp_core::context::ContextError::SupervisorShutDown(_),
-        ) => ScpNapiError::from(e),
-        other => ScpNapiError::Context {
+/// Maps a refused `CreateContext` to its SDK error. A wrapped error with a
+/// dedicated code keeps it (`scp_ffi_common::context_error_class::
+/// coded_creation_failure`): the core's empty-ceiling rejection its validation
+/// code (construction.md M2), a create refused because Supervisor shutdown
+/// began SCP-CTX-2138, a custody failure its custody code. Every other failure
+/// carries SCP-CTX-2000.
+pub(crate) fn create_context_failure(
+    e: scp_core::context::builder::ContextCreationError,
+) -> ScpNapiError {
+    scp_ffi_common::context_error_class::coded_creation_failure(e).map_or_else(
+        |other| ScpNapiError::Context {
             message: format!("create_context failed: {other}"),
             code: codes::CTX_2000.to_owned(),
         },
-    }
+        ScpNapiError::from,
+    )
 }
 
 /// Dispatches `cmd` to `context_id` through the Supervisor `supervisor` still

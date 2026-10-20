@@ -1549,17 +1549,16 @@ impl ScpError {
 
 impl From<scp_core::context::builder::ContextCreationError> for ScpError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
-        // construction.md M2: the runtime's empty-ceiling rejection keeps its
-        // own validation code, and a create refused because Supervisor
-        // shutdown began keeps SCP-CTX-2138 (ADR-049 Decision 16); every other
-        // creation failure is SCP-CTX-2002.
-        if let scp_core::context::builder::ContextCreationError::StateTransition(
-            inner @ (scp_core::context::ContextError::CeilingRequired(_)
-            | scp_core::context::ContextError::SupervisorShutDown(_)),
-        ) = e
-        {
-            return inner.into();
-        }
+        // A wrapped error with a dedicated code keeps it, the one rule every
+        // bridge applies (`coded_creation_failure`): the core's empty-ceiling
+        // rejection keeps its validation code (construction.md M2), a create
+        // refused because Supervisor shutdown began keeps SCP-CTX-2138
+        // (ADR-049 Decision 16), and a custody failure keeps its custody code
+        // (ADR-006 2026-09-29 amendment).
+        let e = match scp_ffi_common::context_error_class::coded_creation_failure(e) {
+            Ok(inner) => return inner.into(),
+            Err(e) => e,
+        };
         Self::Context {
             msg: format!("context creation failed: {e} — check context parameters and identity"),
             code: codes::CTX_2002.to_owned(),
@@ -19256,9 +19255,11 @@ mod tests {
     /// 2026-10-12 amendments; `sdk-common.md` error codes): for every custody
     /// failure kind, every carrier this bridge maps reports the row's class
     /// and code. The carriers are a `CustodyFailure` inside `EnvelopeError`,
-    /// `ContextError`, `SenderKeyError`, `UcanError` and `EventLogError`
-    /// (through `From` and through the checkpoint path), and each bare
-    /// `PlatformError` of that kind. A closed or still-locked store reports
+    /// `ContextError` (through `From`, which a join and a restore take),
+    /// `ContextCreationError` (through `From`, which `context_create` takes),
+    /// `SenderKeyError`, `UcanError` and `EventLogError` (through `From` and
+    /// through the checkpoint path), and each bare `PlatformError` of that
+    /// kind. A closed or still-locked store reports
     /// its `SCP-STORAGE-` code in the `Storage` variant, the one this bridge
     /// gives every storage code.
     #[test]
@@ -19284,12 +19285,19 @@ mod tests {
             };
             let expected = (class, row.code.to_owned());
             let failure = || custody_failure(row.kind);
-            let carriers: [(&str, ScpError); 6] = [
+            let carriers: [(&str, ScpError); 7] = [
                 (
                     "EnvelopeError",
                     scp_core::envelope::EnvelopeError::Custody(failure()).into(),
                 ),
                 ("ContextError", ContextError::Custody(failure()).into()),
+                (
+                    "ContextCreationError",
+                    scp_core::context::builder::ContextCreationError::StateTransition(
+                        ContextError::Custody(failure()),
+                    )
+                    .into(),
+                ),
                 (
                     "SenderKeyError",
                     scp_core::crypto::sender_keys::SenderKeyError::Custody(failure()).into(),

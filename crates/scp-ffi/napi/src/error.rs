@@ -323,17 +323,16 @@ impl ScpNapiError {
 
 impl From<scp_core::context::builder::ContextCreationError> for ScpNapiError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
-        // The core's empty-ceiling rejection keeps its own validation code
-        // (construction.md M2), the one the parser's rejection carries, and a
-        // create refused because Supervisor shutdown began keeps SCP-CTX-2138
-        // (ADR-049 Decision 16).
-        if let scp_core::context::builder::ContextCreationError::StateTransition(
-            inner @ (scp_core::context::ContextError::CeilingRequired(_)
-            | scp_core::context::ContextError::SupervisorShutDown(_)),
-        ) = e
-        {
-            return inner.into();
-        }
+        // A wrapped error with a dedicated code keeps it, the one rule every
+        // bridge applies (`coded_creation_failure`): the core's empty-ceiling
+        // rejection keeps its validation code (construction.md M2), a create
+        // refused because Supervisor shutdown began keeps SCP-CTX-2138
+        // (ADR-049 Decision 16), and a custody failure keeps its custody code
+        // (ADR-006 2026-09-29 amendment).
+        let e = match scp_ffi_common::context_error_class::coded_creation_failure(e) {
+            Ok(inner) => return inner.into(),
+            Err(e) => e,
+        };
         Self::Context {
             message: format!(
                 "context creation failed: {e} — check context parameters and identity"
@@ -694,13 +693,16 @@ mod tests {
     /// 2026-10-12 amendments; `sdk-common.md` error codes): for every custody
     /// failure kind, every carrier this bridge maps reports the row's class
     /// and code. The carriers are a `CustodyFailure` inside `EnvelopeError`,
-    /// `ContextError` (through `From` and through the supervisor-failure path
-    /// a Welcome join, a reserve and an invite take), `SenderKeyError`,
-    /// `UcanError` and `EventLogError` (through `From` and through the
-    /// checkpoint path), and each bare `PlatformError` of that kind.
+    /// `ContextError` (through `From`, which a join takes, and through the
+    /// supervisor-failure path a Welcome join, a restore, a reserve and an
+    /// invite take), `ContextCreationError` (through `From` and through the
+    /// flattening `context_create` applies), `SenderKeyError`, `UcanError` and
+    /// `EventLogError` (through `From` and through the checkpoint path), and
+    /// each bare `PlatformError` of that kind.
     #[test]
     fn custody_failures_carry_the_custody_codes_in_every_carrier() {
         use scp_core::context::ContextError;
+        use scp_core::context::builder::ContextCreationError;
         use scp_ffi_common::error_codes::CustodyFailureClass as Class;
         use scp_ffi_common::test_helpers::{custody_code_rows, custody_failure};
         fn class_and_code(e: &ScpNapiError) -> (&'static str, String) {
@@ -721,7 +723,9 @@ mod tests {
             };
             let expected = (class, row.code.to_owned());
             let failure = || custody_failure(row.kind);
-            let carriers: [(&str, ScpNapiError); 7] = [
+            let wrapped =
+                || ContextCreationError::StateTransition(ContextError::Custody(failure()));
+            let carriers: [(&str, ScpNapiError); 10] = [
                 (
                     "EnvelopeError",
                     scp_core::envelope::EnvelopeError::Custody(failure()).into(),
@@ -734,6 +738,19 @@ mod tests {
                         codes::CTX_2013,
                         &ContextError::Custody(failure()),
                     ),
+                ),
+                (
+                    "ContextError via typed_supervisor_failure (restore)",
+                    crate::context::typed_supervisor_failure(
+                        "restore_context",
+                        codes::CTX_2064,
+                        &ContextError::Custody(failure()),
+                    ),
+                ),
+                ("ContextCreationError", wrapped().into()),
+                (
+                    "ContextCreationError via create_context_failure",
+                    crate::context::create_context_failure(wrapped()),
                 ),
                 (
                     "SenderKeyError",
