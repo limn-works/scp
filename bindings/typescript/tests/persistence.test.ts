@@ -65,7 +65,7 @@ const suite = await napiSuite(() => {
   probe.shutdown(1).catch(() => {});
 });
 
-suite.describe("SCP with SQLite storage (#1549 PR 3)", () => {
+suite.describe("SCP with SQLite storage", () => {
   it("creates the SQLCipher database file at {path}/scp.db", async () => {
     await withTempDir(async (dir) => {
       const dbPath = join(dir, "scp.db");

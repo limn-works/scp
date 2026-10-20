@@ -247,12 +247,20 @@ describe("napiSuite", () => {
   });
 });
 
-// `describe` runs each suite body when the file is collected, so both counts
-// are settled before any test runs. The absent suite registers one skipped
-// test, which `bun test` reports as a skip.
+// `describe` runs each suite body when the file is collected, so both body
+// counts are settled before any test runs. bun runs a `describe.skip` body at
+// collection too, so a body count cannot tell a running suite from a skipped
+// one; the test the present suite registers can, because it runs only when
+// the suite is not skipped. Tests run in registration order, so that test runs
+// before the assertions below. The absent suite registers one skipped test,
+// which `bun test` reports as a skip.
 const presentBodies: number[] = [];
+let presentTestRan = false;
 (await napiSuite(() => 7, absent)).describe("napiSuite control: addon present", (value) => {
   presentBodies.push(value);
+  test("runs", () => {
+    presentTestRan = true;
+  });
 });
 let absentBodyCalls = 0;
 (
@@ -266,6 +274,10 @@ let absentBodyCalls = 0;
 describe("napiSuite registration", () => {
   test("a present addon runs the body once with the probe's value", () => {
     expect(presentBodies).toEqual([7]);
+  });
+
+  test("a present addon's suite runs its tests rather than skipping them", () => {
+    expect(presentTestRan).toBe(true);
   });
 
   test("an absent addon never runs the body", () => {

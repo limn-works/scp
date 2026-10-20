@@ -99,6 +99,12 @@ const suite = await napiSuite(() => {
   if (typeof addon.SCP !== "function") {
     throw new Error("SCP class not exported from native addon — rebuild with the Phase 4 changes");
   }
+  // The handle-affinity test below mints an identity on one instance and
+  // creates a context with it on another, so both methods must exist.
+  const probe = new addon.SCP(JSON.stringify({ type: "in_memory" }));
+  if (typeof probe.identityCreate !== "function" || typeof probe.contextCreate !== "function") {
+    throw new Error("SCP instances have no identityCreate or contextCreate");
+  }
   return addon;
 });
 
@@ -172,9 +178,6 @@ suite.describe("SCP class (Phase 4)", (addon) => {
     // in the Rust integration tests.
     const scpA = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     const scpB = new addon.SCP(JSON.stringify({ type: "in_memory" }));
-    if (typeof scpA.identityCreate !== "function" || typeof scpB.contextCreate !== "function") {
-      return; // addon predates per-instance identity/context — covered in Rust
-    }
     expect(scpA.instanceId).not.toBe(scpB.instanceId);
     const identity = await scpA.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
     // contextCreate takes a NapiIdentity handle. Crossing it over to
