@@ -20,6 +20,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+# Verifies the spec 25 indexed signatures with the §9.5.1 strict verifier.
+scp-crypto = { path = "../scp-crypto" }
 # Round-trips encode and decode over generated preimages of all four kinds.
 proptest = "1"
 
