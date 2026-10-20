@@ -376,9 +376,17 @@ describe.skipIf(skipReason !== "")("napi callback custody", () => {
       const vector = crypto.createECDH("prime256v1");
       vector.setPrivateKey(Buffer.from(ECDH_VECTOR_SCALAR_I, "hex"));
       expect(shared.toString("hex")).toBe(vector.computeSecret(Buffer.from(own)).toString("hex"));
-      // A compressed or 32-byte peer is refused before the host is asked.
+      // A compressed peer, a 32-byte peer, and a 65-byte uncompressed point
+      // that is off the curve are each refused before the host is asked.
       const compressed = Buffer.from(vector.getPublicKey(null, "compressed"));
-      for (const bad of [compressed, peer.subarray(1, 33)]) {
+      const offCurve = Buffer.from(peer);
+      offCurve[64] = (offCurve[64] as number) ^ 1;
+      // The flipped y no longer satisfies the curve equation for x, so only
+      // the bridge's on-curve check, not its length check, can refuse it.
+      expect(offCurve.length).toBe(65);
+      expect(offCurve[0]).toBe(0x04);
+      expect(() => vector.computeSecret(offCurve)).toThrow();
+      for (const bad of [compressed, peer.subarray(1, 33), offCurve]) {
         const refused = await rejectionOf(() => custody.dhAgree(key, bad));
         expect(refused).toBeInstanceOf(CryptoError);
       }
