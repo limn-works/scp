@@ -649,6 +649,7 @@
         "ScpIdentity declares exactly four public fields: identity_key (KeyHandle), active_signing_key (KeyHandle), pre_rotation_commitment ([u8; 32]), identifier (Identifier)",
         "Every identity-creation entry point — Identity::create, the scp-node identity resolvers, and the identity_create paths of the PyO3, napi-rs, and UniFFI bridges — returns IdentityError::NoIndependentSubstrate where no substrate satisfying §9.7.4.1 item 3a is available, and the three bridges surface it as error code SCP-IDENT-1100; a test drives each entry point with no such substrate and asserts that code (`03-identity.md` §3.10.10)",
         "An identity publishes no W3C DID Core document: key material and each key's condition live in the key-event log, and every transport and service field is a service-record entry",
+        "The identity API maps `IdentifierError::NonCanonicalIdentifier` to `IdentityError::NonCanonicalIdentifier`, SCP-IDENT-1106 (`03-identity.md` §3.1, §3.10.10)",
         "All public items have /// doc comments",
         "Unit tests for create, verify_did, and key-state construction",
         "No unwrap() or expect() in library code"
@@ -728,6 +729,7 @@
         "resolve recomputes the identifier from the inception event and discards a differing response (§9.7.4.2 R2)",
         "resolve verifies every later event under the standing root and discards a defective chain (§9.7.4.2 R3)",
         "resolve derives the key state from the latest state-carrying event at or before the adopted head (§9.7.4.2 R8)",
+        "Content signed under a key the resolved log's replay marks `Superseded` or `Retired` is judged by the class the classification table of `09-security-model.md` §9.7.1 assigns its separator: an attestation-class signature fails, a content-class signature verifies only for content that reached the party under an epoch before that context's boundary for the key, and a log-anchored signature verifies only where the key was `Current` at the position its `key_state_head` names: a test per class, each signed under the `Superseded` key of a chain whose `KeyState` installs a new `#active` key (`09-security-model.md` §9.7.1, §9.7.4.2 R8)",
         "resolve caches results: 24-hour refresh for active contacts, 7-day for inactive (§9.10.7)",
         "`ResolutionOutcome` carries no staleness field (`03-identity.md` §3.10.10): where every relay fails and a cached key state under seven days old exists, resolve returns `Confirmed` carrying the cached head, with an empty `relays_reached`, an empty `proven`, and the `head_provenance` an earlier resolution recorded; a test asserts all four (`03-identity.md` §3.10.4)",
         "Stale results trigger an SDK warning log",
@@ -751,7 +753,9 @@
         "Write tests for the cadence lifecycle (start on load, stop on unload, one loop), for each `EntryReach`, and for each relation the acceptance criteria name"
       ],
       "blockedBy": [
-        "SCP-006"
+        "SCP-006",
+        "SCP-309",
+        "SCP-310"
       ],
       "sources": [
         {
@@ -769,6 +773,10 @@
         {
           "file": ".docs/specs/03-identity.md",
           "section": "### 3.10.4 Resolution Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.1 MLS-to-SCP Concept Mapping"
         }
       ],
       "details": {
@@ -10915,7 +10923,7 @@
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-did/src/lib.rs",
         "crates/scp-kel/src/preimage.rs",
@@ -10932,7 +10940,7 @@
         "`decode_preimage`, the inverse of `encode_preimage`, rejects a preimage whose declared lengths run past its buffer and sizes no allocation from a count before reading that many elements: a test per bound (`09-security-model.md` §9.7.4.2 definitions). SCP-309's `decode_event` wraps `decode_preimage`",
         "A native-versus-wasm32 known-answer test asserts that every vector above encodes to identical bytes on both targets (ADR-063, implementation constraints)",
         "`cargo tree -p scp-kel` lists no tokio and no async runtime crate",
-        "The identifier's text form encodes Vector 57 of `25-test-vectors.md` §25.29 to `scp:` and 52 lowercase unpadded base32 characters, and the `scp-did` parser returns `IdentifierError::NonCanonicalIdentifier` for the uppercase and padded strings Vector 57 lists and for a `did:` string: a test per case. The identity API maps `IdentifierError::NonCanonicalIdentifier` to `IdentityError::NonCanonicalIdentifier`, SCP-IDENT-1106 (`03-identity.md` §3.1, §3.10.10)",
+        "The identifier's text form encodes Vector 57 of `25-test-vectors.md` §25.29 to `scp:` and 52 lowercase unpadded base32 characters, and the `scp-did` parser returns `IdentifierError::NonCanonicalIdentifier` for the uppercase and padded strings Vector 57 lists and for a `did:` string: a test per case.",
         "`compute_key_continuity_fingerprint` takes two `(Identifier, KeyState)` pairs and computes the `09-security-model.md` §9.11 construction, reading each party's `Current` `RootMember` entries in the key state's list order and its `Current` `Active` entry: the production function reproduces Vector 20 of `25-test-vectors.md` §25.9, and reproduces Vector 38 with the two parties supplied in reverse order",
         "No unwrap() or expect() in library code"
       ],
@@ -10984,20 +10992,37 @@
       "severity": "critical",
       "status": "pending",
       "files": [
+        "crates/scp-kel/src/lib.rs",
+        "crates/scp-kel/src/event_codec.rs",
+        "crates/scp-kel/src/client_data.rs",
         "crates/scp-kel/src/signature.rs",
         "crates/scp-kel/src/validate.rs",
         "crates/scp-kel/src/replay.rs",
-        "fuzz/fuzz_targets/kel_decode_event.rs",
-        "fuzz/fuzz_targets/kel_client_data.rs"
+        "crates/scp-kel/tests/kel/main.rs",
+        "fuzz/Cargo.toml",
+        "fuzz/fuzz_targets/fuzz_kel_decode_event.rs",
+        "fuzz/fuzz_targets/fuzz_kel_client_data.rs"
       ],
-      "description": "Architecture slice S2. `verify_indexed` verifies a root signature group in either signature form, raw or WebAuthn assertion, and the WebAuthn form needs a client-data JSON parser that rejects a duplicate key, because `serde_json` keeps the last duplicate. `validate_chain` applies R1 through R4 and returns `Valid`, `AuthorDefect` or `CopyDefect`, and `replay` derives the key state under R8. `09-security-model.md` §9.7.4.2 states each rule. Ranking is SCP-310.",
+      "description": "Architecture slice S2. `decode_event` in `event_codec.rs` reads one event's signed preimage and signature field out of a §9.10.12 frame. `verify_indexed` verifies an indexed signature group in either signature form, raw or WebAuthn assertion, and the WebAuthn form needs the client-data JSON parser in `client_data.rs`, which applies the clientDataJSON acceptance set of `09-security-model.md` §9.7.4.2, because `serde_json` keeps the last duplicate. `validate_chain` applies R1 through R4 and returns `Valid`, `AuthorDefect` or `CopyDefect`, and `replay` derives the key state under R8. `09-security-model.md` §9.7.4.2 states each rule. Ranking is SCP-310.",
       "acceptanceCriteria": [
         "`verify_indexed` verifies Vectors 41 and 42 of `25-test-vectors.md` §25.26 and checks, for the assertion form, the challenge, the UP and UV flags and low-s: one negative test per check (`09-security-model.md` §9.7.4.2 definitions)",
         "The client-data JSON parser rejects a document carrying a duplicate key: a test feeds `{\"challenge\":\"a\",\"challenge\":\"b\"}` and asserts rejection",
         "`validate_chain` returns `AuthorDefect` or `CopyDefect` for every defect R3 lists, with one negative fixture per defect, and returns `Valid` for Vectors 41, 42, 50 and 51 (`09-security-model.md` §9.7.4.2 R3)",
         "`replay` derives the key state from the latest state-carrying event at or before the head, and a `RootRecovery` replaces the whole key state: a test per case (`09-security-model.md` §9.7.4.2 R8)",
-        "Two fuzz targets, one over `decode_event`, which wraps SCP-308's `decode_preimage`, and one over the client-data parser, build with `cd fuzz && cargo fuzz build` and each runs 60 seconds without a crash",
+        "Two fuzz targets, `fuzz_kel_decode_event` over `decode_event`, which wraps SCP-308's `decode_preimage`, and `fuzz_kel_client_data` over the client-data parser, build with `cd fuzz && cargo fuzz build` and each runs 60 seconds without a crash",
         "`validate_chain` returns `Valid` for Vector 41 extended by each of Vectors 53, 54 and 55 of `25-test-vectors.md` §25.29, and returns a defect where a `RootRecovery{CoSigns}` lacks its standing-root group: a test per case (`09-security-model.md` §9.7.4.2 R3)",
+        "`validate_chain` returns `AuthorDefect` for an `Inception` and for a `RootRecovery` whose installed root set (field 9) differs from the `Current` `RootMember` entries and `root_threshold` of its snapshot, in members, in member order, and in threshold: a test per kind and difference (`09-security-model.md` §9.7.4.2 R3)",
+        "An event whose encoded length, its signed preimage with the separator plus 64 bytes per `Raw` index and 840 per `WebAuthnAssertion` index its signer groups name, exceeds `MAX_EVENT_BYTES` is rejected, and one at exactly `MAX_EVENT_BYTES` is accepted; one function computes that length and both `encode_preimage` and `decode_event` call it: a test per side (`09-security-model.md` §9.7.4.2 R3, §9.18.17)",
+        "`decode_event` returns a copy-level defect for an event whose prefixed bytes do not begin with `SCP-KEL-EVENT-V1:`: a test flips one separator byte (`09-security-model.md` §9.7.4.2 R3)",
+        "`verify_indexed` verifies the inception signature of Vector 51 of `25-test-vectors.md` §25.26 under root member 0, and `validate_chain` returns `Valid` for Vector 51's inception followed by Vector 51's `KeyState`",
+        "`validate_chain` returns `Valid` for Vector 41 extended by Vector 68 and by Vector 69 of `25-test-vectors.md` §25.29; `replay` of the first records the abandonment and rejects any event after Vector 68, and `replay` of the second yields Vector 41's `#active` key as `Compromised` with `compromised_from` 1: a test per case (`09-security-model.md` §9.7.4.2 R4, R8)",
+        "The client-data parser applies the clientDataJSON acceptance set of `09-security-model.md` §9.7.4.2: one rejection test each for a byte-order mark, an overlong UTF-8 form, an encoded surrogate, a code point above U+10FFFF, trailing non-whitespace after the top-level object, a top-level array, an unescaped control character, an unpaired surrogate escape, a duplicate member name in a nested object, a duplicate that differs only by escapes, and a `type` or `challenge` that is absent or not a string; and one acceptance test each for `1e400`, nesting 200 levels deep inside 512 bytes, and an unknown member",
+        "The challenge comparison reads the decoded JSON string: a `challenge` whose expected base64url text is written with `\\u` escapes is accepted, and a `challenge` carrying `=` padding, a character outside the base64url alphabet, or nonzero trailing bits is rejected: a test per case (`09-security-model.md` §9.7.4.2 definitions)",
+        "`validate_chain` returns a defect for each field a kind carries as a sentinel holding any other value: one fixture per pair, `Inception` fields 5, 8 and 11, `KeyState` fields 5, 8, 9 and 12, `CommitmentRollover` fields 5, 9, 10 and 11, and `RootRecovery` field 11 (`09-security-model.md` §9.7.4.2 R3)",
+        "`validate_chain` returns `AuthorDefect` for a commitment whose preimage is a key that same event installs, and for one whose preimage is a key installed as a root member at an earlier event of the chain: a test per case (`09-security-model.md` §9.7.4.2 R3, commitment freshness)",
+        "`validate_chain` returns `AuthorDefect` for a state-carrying event that silently drops a key `Current` at its predecessor, a dropped entry `Superseded` where no installed key takes its role, a dropped entry `Retired` where one does, a key listed in a role other than the one it was installed in, and a key list out of the snapshot order: a test per case (`09-security-model.md` §9.7.4.2 definitions, R3, R8)",
+        "`validate_chain` verifies each signer group against the key set the R10 table of `09-security-model.md` §9.7.4.2 names for it, and returns a defect where a K′ group verifies under the standing root but not under the event's field 9, where a `RootRecovery{CoSigns}` standing-root group verifies under K′ but not under the standing root, and where a reveal group meets the threshold the event fixes but not the standing next threshold: a test per case",
+        "A chain-level test in `crates/scp-kel/tests/kel/` replays Vector 41 extended by a `KeyState` re-signed by Vector 41's root that installs a new `#active` key, and asserts the old `#active` key is `Superseded` and the key-continuity fingerprint changes (`09-security-model.md` §9.7.4.2 R8, §9.11)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -11020,6 +11045,14 @@
         {
           "file": ".docs/specs/25-test-vectors.md",
           "section": "## 25.29 Reveal-Authorized Event, Ranking and Identifier Text-Form Vectors (§9.7.4.2 definitions, R3, R6, `03-identity.md` §3.1)"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay Key-Event Record Frame"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.17 Key-Event Log"
         }
       ],
       "details": {}
