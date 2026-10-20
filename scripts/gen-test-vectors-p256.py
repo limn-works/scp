@@ -1937,6 +1937,17 @@ def emit_custody_registry_key_state() -> None:
     emit_hex("vector_51.inception_preimage_digest", inception_digest)
     emit_hex("vector_51.identifier", identifier)
     emit_hex("vector_51.routing_id", sha256(b"scp:did:" + identifier))
+    # The inception's root group names member 0 in the raw form, so its
+    # signature field is one 64-byte r || s over the inception digest.
+    inception_sig = ecdsa_sign(CUSTODY_ROOT_KEYS[0].d, inception_digest)
+    assert ecdsa_verify(CUSTODY_ROOT_KEYS[0].point, inception_digest, inception_sig)
+    if _HAVE_CRYPTOGRAPHY:
+        _verify_with_cryptography(
+            CUSTODY_ROOT_KEYS[0], inception_digest, inception_sig, "vector_51.inception"
+        )
+    assert int.from_bytes(inception_sig[32:], "big") * 2 <= N, "vector_51.inception: high-s"
+    emit("vector_51.inception_indexed_signature_len", len(inception_sig))
+    emit_hex("vector_51.inception_indexed_signature", inception_sig)
     emit(
         "vector_51.key_state_bytes", len(custody_key_state(CUSTODY_INTERVAL_KEY_STATE))
     )
@@ -2448,6 +2459,70 @@ def rollover_preimage(identifier: bytes, predecessor: bytes) -> bytes:
     )
 
 
+CONTINUATION_ABANDONS = 0x00
+CONDITION_COMPROMISED = 0x04
+# Vector 69's `Compromised{from: N}` position: the event's own sequence, the
+# largest N R8 admits on an event at sequence 1.
+COMPROMISED_FROM = 1
+COMPROMISE_ACTIVE_KEY = keypair_from_seed(
+    sha256(b"scp-25-compromise-active"), TEST_VECTOR_KEY_LABEL, "post-compromise #active"
+)
+
+
+def abandoning_rollover_preimage(identifier: bytes, predecessor: bytes) -> bytes:
+    """Vector 68: Vector 53's `CommitmentRollover` with field 12 declaring
+    abandonment, the one-byte `0x00` and nothing after it."""
+    pre = rollover_preimage(identifier, predecessor)
+    fixed = commitment_continuation(ROLLOVER_NEXT_KEY)
+    assert pre.endswith(fixed)
+    return pre[: -len(fixed)] + u8(CONTINUATION_ABANDONS)
+
+
+def compromised_key_state() -> bytes:
+    """Vector 69's snapshot: the kept root first, then the `#active` key the event
+    installs, then the dropped `#active` key as `Compromised{from: 1}`."""
+    compromised = (
+        fixed_field(REF_KEY_2.compressed)
+        + u8(ROLE_ACTIVE)
+        + u8(CONDITION_COMPROMISED)
+        + u64(COMPROMISED_FROM)
+        + u8(CUSTODY_PASSKEY)
+        + u8(KEY_ALGORITHM_ECDSA_P256_SHA256)
+    )
+    assert len(compromised) == 45
+    return (
+        u32(1)  # root threshold
+        + u32(3)  # key count
+        + key_state_entry(REF_KEY_1.compressed, ROLE_ROOT, CONDITION_CURRENT)
+        + key_state_entry(COMPROMISE_ACTIVE_KEY.compressed, ROLE_ACTIVE, CONDITION_CURRENT)
+        + compromised
+        + u32(1)
+        + fixed_field(VECTOR_WITNESS_OPERATOR)
+        + u32(VECTOR_WITNESSING_INTERVAL)
+        + u8(ROLE_ACTIVE)
+        + fixed_field(ZERO32)
+    )
+
+
+def compromised_key_state_preimage(identifier: bytes, predecessor: bytes) -> bytes:
+    """Vector 69: a `KeyState` at sequence 1 over Vector 41, root-signed, no seals."""
+    return (
+        KEL_EVENT_SEPARATOR
+        + u8(KIND_KEY_STATE)  # 1
+        + fixed_field(identifier)  # 2
+        + u64(1)  # 3
+        + fixed_field(predecessor)  # 4
+        + u8(0)  # 5. standing_root: sentinel
+        + one_member_group()  # 6. the root group's index list
+        + one_raw_form()  # 7. the root group's form list
+        + u32(0)  # 8. revealed keys: sentinel
+        + u32(0)  # 9. installed root set: composite sentinel
+        + compromised_key_state()  # 10
+        + u32(0)  # 11. key-event seals: an empty list
+        + u32(0)  # 12. continuation: composite sentinel
+    )
+
+
 def recovery_key_state(root: KeyPair, active: KeyPair) -> bytes:
     """The post-recovery snapshot: the current entries first, then one entry
     per key the event drops, each `Superseded` because a successor takes its role."""
@@ -2634,6 +2709,34 @@ def emit_reveal_ranking_and_text_form() -> None:
     emit("vector_57.text_form_len", len(text))
     emit("vector_57.rejected_uppercase", "scp:" + text[4:].upper())
     emit("vector_57.rejected_padded", text + "====")
+
+    # --- Vector 68: a root-co-signed `CommitmentRollover` that abandons. ---
+    pre68 = abandoning_rollover_preimage(identifier, predecessor)
+    d68 = sha256(pre68)
+    reveal68 = sign_group(REF_KEY_3, d68, "vector_68.reveal")
+    root68 = sign_group(REF_KEY_1, d68, "vector_68.standing_root")
+    emit_hex("vector_68.consumed_commitment", standing)
+    emit("vector_68.continuation", f"0x{CONTINUATION_ABANDONS:02x}")
+    emit("vector_68.preimage_len", len(pre68))
+    emit_hex("vector_68.preimage", pre68)
+    emit_hex("vector_68.preimage_digest", d68)
+    emit_hex("vector_68.reveal_signature", reveal68)
+    emit_hex("vector_68.standing_root_signature", root68)
+    emit("vector_68.signature_field_len", len(reveal68 + root68))
+    emit_hex("vector_68.signature_field", reveal68 + root68)
+
+    # --- Vector 69: a `KeyState` carrying `Compromised{from: 1}`. ---
+    pre69 = compromised_key_state_preimage(identifier, predecessor)
+    d69 = sha256(pre69)
+    root69 = sign_group(REF_KEY_1, d69, "vector_69.root")
+    emit_hex("vector_69.installed_active_key", COMPROMISE_ACTIVE_KEY.compressed)
+    emit_hex("vector_69.compromised_key", REF_KEY_2.compressed)
+    emit("vector_69.compromised_from", COMPROMISED_FROM)
+    emit("vector_69.key_state_bytes", len(compromised_key_state()))
+    emit("vector_69.preimage_len", len(pre69))
+    emit_hex("vector_69.preimage", pre69)
+    emit_hex("vector_69.preimage_digest", d69)
+    emit_hex("vector_69.root_signature", root69)
 
 
 # ---------------------------------------------------------------------------
