@@ -658,7 +658,7 @@ async fn invoke_evaluator_outlet(
     // The pipeline task classifies and stamps its own result, so the
     // instant a late outcome was reached does not depend on when the grader
     // observes it.
-    let spawned = {
+    let spawned = sup.spawn_evaluator_pipeline({
         let pipeline_sup = Arc::clone(sup);
         let evaluator_context_id = evaluator_context_id.to_owned();
         let registry = registry.clone();
@@ -689,44 +689,27 @@ async fn invoke_evaluator_outlet(
                 &output_schema,
             ))
         }
+    });
+    let pipeline = match spawned {
+        Ok(pipeline) => pipeline,
+        Err(e) => return unavailable(format!("the evaluator pipeline did not start: {e}")),
     };
-    join_evaluator_pipeline(
-        sup,
-        spawned,
-        &started,
-        &captured,
-        &output_schema,
-        &completion,
-    )
-    .await
+    join_evaluator_pipeline(pipeline, &started, &captured, &output_schema, &completion).await
 }
 
-/// Runs `pipeline` on its own task on the supervisor's task tracker and
-/// returns the outcome it stamped.
+/// Awaits the evaluator pipeline task `pipeline` and returns the outcome it
+/// stamped.
 ///
-/// A refused spawn is [`EvaluatorOutcome::Unavailable`]. A pipeline that
-/// panicked reached no outcome of its own, so the join classifies the panic
-/// by `started` (see [`classify_evaluator_result`]) and stamps it when it
-/// observes the panic.
-async fn join_evaluator_pipeline<F>(
-    sup: &Supervisor,
-    pipeline: F,
+/// A pipeline that panicked reached no outcome of its own, so the join
+/// classifies the panic by `started` (see [`classify_evaluator_result`]) and
+/// stamps it when it observes the panic.
+async fn join_evaluator_pipeline(
+    pipeline: tokio::task::JoinHandle<Stamped<EvaluatorOutcome>>,
     started: &AtomicBool,
     captured: &Mutex<Option<Value>>,
     output_schema: &Value,
     completion: &CaseCompletion<EvaluatorOutcome>,
-) -> Stamped<EvaluatorOutcome>
-where
-    F: Future<Output = Stamped<EvaluatorOutcome>> + Send + 'static,
-{
-    let pipeline = match sup.spawn_evaluator_pipeline(pipeline) {
-        Ok(pipeline) => pipeline,
-        Err(e) => {
-            return completion.finish(EvaluatorOutcome::Unavailable(format!(
-                "the evaluator pipeline did not start: {e}"
-            )));
-        }
-    };
+) -> Stamped<EvaluatorOutcome> {
     match pipeline.await {
         Ok(stamped) => stamped,
         Err(e) => completion.finish(classify_evaluator_result(

@@ -1825,14 +1825,18 @@ async fn panicking_pipeline(started: Option<Arc<AtomicBool>>) -> Stamped<Evaluat
     panic!("evaluator pipeline panicked")
 }
 
-/// Joins `pipeline` as the evaluator call does, with no captured output.
+/// Spawns `pipeline` on the supervisor's evaluator task and joins it as the
+/// evaluator call does, with no captured output.
 async fn join_panicking(
     h: &Harness,
     started: &AtomicBool,
     pipeline: impl Future<Output = Stamped<EvaluatorOutcome>> + Send + 'static,
 ) -> EvaluatorOutcome {
+    let pipeline = h
+        .sup
+        .spawn_evaluator_pipeline(pipeline)
+        .expect("the supervisor spawns the evaluator pipeline");
     join_evaluator_pipeline(
-        &h.sup,
         pipeline,
         started,
         &Mutex::new(None),
