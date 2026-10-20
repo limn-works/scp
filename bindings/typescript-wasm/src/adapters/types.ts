@@ -55,16 +55,32 @@ export interface JsKeyCustody {
 
   /**
    * Signs `data` with the key identified by `keyId`, returning the signature
-   * bytes. The private key never leaves the custody backend. SEAM (#1980): no
-   * driver call site in this slice.
+   * bytes. The private key never leaves the custody backend.
+   *
+   * An `"ed25519"` key signs `data` itself and returns the 64-byte signature.
+   * A `"p256"` key receives the 32-byte digest as `data` (no second hash) and
+   * returns either the 64-byte raw `r || s` or DER, with either `s`. The
+   * native bridges pass that result through the shared
+   * `scp_ffi_common::callback_custody` flow, which normalises it to low-`s`
+   * and verifies it strictly under the key's public key. This browser seam
+   * has no Rust caller yet and checks nothing: a result is not converted from
+   * DER, normalised or verified until the slice that wires a caller routes it
+   * through that flow. An `"x25519"` or `"hpke-p256"` key does not sign.
+   * SEAM (#1980): no driver call site in this slice.
    */
   sign(keyId: string, data: Uint8Array): Uint8Array;
 
-  /** Raw public key bytes for `keyId`. Throws if absent. SEAM (#1980). */
+  /**
+   * Raw public key bytes for `keyId`: 32 bytes for `"ed25519"` and
+   * `"x25519"`, the 33-byte compressed SEC1 point for `"p256"`, and the
+   * 65-byte uncompressed SEC1 point for `"hpke-p256"`. Throws if absent.
+   * SEAM (#1980).
+   */
   getPublicKey(keyId: string): Uint8Array;
 
   /**
-   * Generates a keypair of type `keyType` (`"ed25519"` / `"x25519"`) and
+   * Generates a keypair of type `keyType` (`"ed25519"`, `"x25519"`, `"p256"`
+   * for ECDSA P-256 signing, or `"hpke-p256"` for P-256 ECDH under HPKE) and
    * returns its opaque `keyId`. SEAM (#1980).
    */
   generateKeypair(keyType: string): string;
@@ -73,8 +89,15 @@ export interface JsKeyCustody {
   destroyKey(keyId: string): void;
 
   /**
-   * X25519 DH agreement against `peerPublic`, returning the 32-byte shared
-   * secret. SEAM (#1980).
+   * DH agreement against `peerPublic`, returning the 32-byte shared secret:
+   * X25519 for an `"x25519"` key (32-byte peer key), P-256 ECDH for an
+   * `"hpke-p256"` key (65-byte uncompressed SEC1 peer point; the secret is
+   * the x-coordinate). An `"ed25519"` or `"p256"` key does not agree. Before
+   * calling the host, the native bridges reject an X25519 peer that is not 32
+   * bytes and a P-256 peer that is not a 65-byte uncompressed point on the
+   * curve; after the call they reject a result that is not 32 bytes. This browser seam
+   * has no Rust caller yet and validates neither the peer nor the result.
+   * SEAM (#1980).
    */
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array;
 }
