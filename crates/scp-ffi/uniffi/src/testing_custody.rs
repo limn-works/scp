@@ -265,7 +265,7 @@ fn share_refused(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::bridge::tests::FakeHostProvider;
+    use crate::fake_host_provider::FakeHostProvider;
     use scp_ffi_common::callback_custody::fake_host::{FakeHost, scalar_for};
 
     fn custody_over(

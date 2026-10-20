@@ -741,6 +741,9 @@ pub trait DeviceAttestationProvider: Send + Sync {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod fake_host_provider;
+
 /// Runs a test case in a child process with its own environment, so no test
 /// mutates the environment of a process whose other threads may read it.
 #[cfg(test)]
