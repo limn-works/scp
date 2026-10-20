@@ -2897,6 +2897,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | `"scp-broadcast-key-v1"` | Broadcast key HPKE encapsulation | `"scp-broadcast-key-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(author_did)) \|\| author_did \|\| epoch_bytes` | §5.14.2 |
 | `"scp-invitation-v1"` | Invitation/join HPKE encapsulation | `"scp-invitation-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(creator_did)) \|\| creator_did` | §5.12.3.1 |
 | `"scp-private-state-v1"` | PSK distribution HPKE encapsulation | `"scp-private-state-v1" \|\| BE32(len(did)) \|\| did \|\| purpose` where `purpose` ∈ {`"device-enroll"`, `"psk-rotate"`} | §3.7.2 |
+| `"scp-participation-seed-wrap:"` | Participation signing seed wrap to the holding admin's `scp_wrapping_key` (`0xFF01`) leaf key; the AAD is empty | `"scp-participation-seed-wrap:" \|\| context_id` (UTF-8, no length prefix) | §7.3.2.1 |
 
 `"scp-invitation-aad-v1"` is an AEAD-AAD domain string (not an HPKE `info` prefix): `aad = "scp-invitation-aad-v1" \|\| BE32(len(context_id)) \|\| context_id \|\| BE32(len(creator_did)) \|\| creator_did` (§5.12.3.1). The broadcast-key and access-key `aad` strings reuse the `info` field encoding without the domain-separator prefix (§5.14.2, §9.17.1).
 
@@ -2906,7 +2907,8 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 |-------|------|----------|----------------|
 | `"scp-private-state-salt-v1"` | HKDF salt domain | Private state routing ID derivation — actual salt is `SHA-256("scp-private-state-salt-v1")` | §3.7 |
 | `"scp-private-state-v1"` | HKDF info prefix | Private state routing ID derivation — full info is `"scp-private-state-v1" \|\| did_string` | §3.7 |
-| `"scp-participation-statement-v1"` | HKDF info | Context-specific participation signing key derivation | §7.3 |
+| `"SCP-PARTICIPATION-SIGNER-V1"` | HKDF salt domain | Participation signing key derivation — actual salt is `SHA-256("SCP-PARTICIPATION-SIGNER-V1")`; `prk = HKDF-Extract(salt, participation_signing_seed)` | §7.3.2.1 |
+| `"scp-participation-signer:"` | HKDF info prefix | Participation signing key derivation — full info is `"scp-participation-signer:" \|\| context_id` (UTF-8, no length prefix); `okm = HKDF-Expand(prk, info, 48)`, then `d = (int(okm) mod (n - 1)) + 1` | §7.3.2.1 |
 | `"scp-pseudonym-secret-v1"` | HKDF salt (the label bytes themselves, not their hash) | `pseudonym_secret` derivation — `HKDF-SHA256(ikm = p256_private_scalar, salt = "scp-pseudonym-secret-v1", info = "", len = 32)`; native software custody passes the Ed25519 identity seed as `ikm` until the identity key moves to P-256 (§9.10.4.A interim) | §9.10.4.A |
 | `"SCP-PSEUDONYM-P256-V1"` | HKDF-Expand info | Pseudonym seed-to-scalar step (FIPS 186-5 A.2.1), for v1 and v2 alike — `scalar_input = HKDF-Expand-SHA256(context_seed, "SCP-PSEUDONYM-P256-V1", 48)`, then `d = (int(scalar_input) mod (n - 1)) + 1` | §9.10.4 (v1), §9.10.4.1 (v2) |
 

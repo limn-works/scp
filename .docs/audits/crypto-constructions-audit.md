@@ -15,6 +15,9 @@
 >
 > **Annotation, 2026-10-04.** This annotation adds the `**Resolution (later)**` line on
 > CRYPTO-33 and, like the one above, edits no finding text, severity tally, or summary line.
+>
+> **Annotation, 2026-10-20.** This annotation adds the `**Resolution (later)**` line on
+> CRYPTO-14 and, like the two above, edits no finding text, severity tally, or summary line.
 
 # SCP Cryptographic Specification Audit
 
@@ -129,6 +132,7 @@ The most serious category of findings involves underspecified constructions wher
 - **What's missing**: The spec says `signer_public_key` is "context-specific -- derived from the context's identity with domain separation, not reused across contexts." It does not specify: (1) what "the context's identity" is (does the context have a key? Is it the creator's key? A group key?); (2) the derivation function (HMAC? HKDF? SHA-256?); (3) the domain separation string; (4) the input material; (5) how the derived Ed25519 keypair is generated from the derived material (same `Ed25519_keygen` ambiguity as CRYPTO-06). This is a complete specification gap -- there is no way to implement this construction from the spec alone.
 - **Security impact**: Without the derivation specification, the privacy guarantee (contexts cannot be correlated via signer keys) is aspirational but unimplementable. Each implementation will invent its own derivation, and they will not interoperate.
 - **Severity**: CRITICAL
+- **Resolution (later)**: Accepted and fixed at the spec layer. `07-trust-validation-and-capabilities.md` §7.3.2.1 derives the participation signing keypair from a random 32-byte `participation_signing_seed` the context creates once, with `salt = SHA-256("SCP-PARTICIPATION-SIGNER-V1")`, `info = "scp-participation-signer:" || context_id`, a 48-byte HKDF expansion, and the FIPS 186-5 A.2.1 reduction to a P-256 scalar; `09-security-model.md` §9.18.3 registers both labels, and `25-test-vectors.md` §25.32 Vector 66 pins the derivation. Recommendation 7's derivation was not adopted. The shipped code still derives under a different salt and info (`27-attestations.md` §27.3.8, contradiction C16).
 
 ### [CRYPTO-15] Pre-Rotation Commitment Is Bare SHA-256 Without Domain Separation
 - **Construction**: Pre-rotation commitment scheme

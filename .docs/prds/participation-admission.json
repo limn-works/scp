@@ -19,7 +19,8 @@
       "status": "in-progress",
       "stories": [
         "SCP-BA-005",
-        "SCP-BA-006"
+        "SCP-BA-006",
+        "SCP-BA-007"
       ]
     },
     {
@@ -334,6 +335,63 @@
         {
           "file": ".docs/specs/07-trust-validation-and-capabilities.md",
           "section": "#### 7.3.2.1 Participation Admission Requirements"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-BA-007",
+      "title": "participation signing seed: derivation, custody-held wrap and open, and the derive-and-compare check",
+      "gate": "gate-participation-admission-production",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-crypto/src/p256.rs",
+        "crates/scp-protocol/src/trust/participation_seed.rs",
+        "crates/scp-protocol/src/trust/mod.rs",
+        "crates/scp-protocol/src/crypto/hpke/p256.rs"
+      ],
+      "description": "Implements the two §7.3.2.1 constructions over a context's participation_signing_seed, and the check §7.3.2.1 requires of every party that opens the seed. (1) Derivation: salt = SHA-256(\"SCP-PARTICIPATION-SIGNER-V1\"), info = \"scp-participation-signer:\" || context_id as UTF-8 with no length prefix, prk = HKDF-Extract(salt, seed), okm = HKDF-Expand(prk, info, 48), d = (int(okm) mod (n - 1)) + 1 under FIPS 186-5 A.2.1, which §9.18.3 of the security-model spec registers. (2) Seed wrap: HPKE base mode, DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-128-GCM, info \"scp-participation-seed-wrap:\" || context_id with no length prefix, empty AAD, sealed to the holding admin's scp_wrapping_key (0xFF01) MLS leaf key; the opener reaches the wrapping key's private half only through KeyCustody::dh_agree. (3) Derive-and-compare: HPKE base mode authenticates no sender, so anyone holding the recipient's public 0xFF01 key can seal a seed of their choosing; after every open, the opener derives the participation public key from the opened seed, compares it with the context's current signer_public_key, and refuses the seed on a mismatch, before it signs with the seed or re-wraps it. Spec 25 §25.32 Vector 66 pins the derivation and Vector 67 pins the wrap. Implementation recipe (labelled, not contract): constants PARTICIPATION_SIGNER_SALT_LABEL and PARTICIPATION_SIGNER_INFO_PREFIX and P256SecretKey::from_participation_seed in scp-crypto, sharing one private 48-byte reduction with the pseudonym seed-to-scalar path; PARTICIPATION_SEED_WRAP_INFO_PREFIX, WrappedParticipationSeed, seal_participation_seed and open_participation_seed in a new scp-protocol trust/participation_seed.rs, with open_participation_seed taking the expected signer_public_key so the compare runs inside the one open function every caller uses. Scope: this story is the crypto and protocol layer only. Governance state for the seed, the AdminRotation re-wrap, RotateParticipationKey, the producer path, the ParticipationProfile preimage, the holder model, the for-cause definition, re-wrap delivery, key linking and min_contexts dedup, and opt-in are outside this story; SCP-BA-005 carries profile production and still names the superseded derivation, which this story replaces at the key-derivation layer.",
+      "acceptanceCriteria": [
+        "scp-crypto test participation_signer_matches_spec25_vector derives from the spec 25 §25.32 Vector 66 seed and context_id \"context-alpha\" and asserts okm, the scalar d, and the 33-byte compressed signer_public_key 02ae8181b600262629a7d73b40f05cb6785e5ae6e34f816db22d260ec50d1ea887 byte for byte",
+        "participation_signer_matches_spec25_vector fails under each of four mutants: the salt dropped, a 32-byte expand, info without context_id, and reduction modulo n in place of n - 1",
+        "The pseudonym seed-to-scalar path and the participation derivation share one 48-byte reduction function, and the existing pseudonym known-answer tests and the §25.2 reference and secondary key tests pass unchanged",
+        "Removing the + 1 from the shared 48-byte reduction fails at least one existing pseudonym or §25.2 known-answer test",
+        "Test seed_wrap_round_trips: seal_participation_seed then open_participation_seed with the matching recipient, context_id and expected signer_public_key returns the original 32-byte seed",
+        "Test seed_wrap_rejects_other_context: opening a wrap under a different context_id returns a typed error, and the test fails when info omits context_id",
+        "Test seed_wrap_rejects_other_recipient: opening with a different recipient key returns a typed error",
+        "Test seed_wrap_rejects_tampered_ct: flipping one ciphertext byte makes the open return a typed error",
+        "Test seed_wrap_rejects_non_32_plaintext: a wrap whose plaintext is not exactly 32 bytes is refused with a typed error",
+        "Test seed_wrap_matches_spec25_vector: opening the §25.32 Vector 67 enc and ciphertext with the §25.2 reference private scalar under info \"scp-participation-seed-wrap:context-alpha\" and the empty AAD returns the Vector 66 seed, and sealing the Vector 66 seed with the Vector 67 fixed ephemeral key reproduces enc and ciphertext byte for byte",
+        "Test open_seed_rejects_seed_not_matching_signer_public_key: a fresh random seed sealed to the holder's wrapping key opens under HPKE but open_participation_seed returns a typed mismatch error, and the test fails when the derive-and-compare step is removed",
+        "The plaintext seed and the derived participation private key are held in Zeroizing values, and no Debug or Display output of WrappedParticipationSeed or of the error types contains seed or private-key bytes"
+      ],
+      "actionItems": [
+        "Add PARTICIPATION_SIGNER_SALT_LABEL and PARTICIPATION_SIGNER_INFO_PREFIX to crates/scp-crypto/src/p256.rs, and add P256SecretKey::from_participation_seed(seed, context_id)",
+        "Refactor seed_to_scalar so the pseudonym path and from_participation_seed share one private 48-byte reduction",
+        "Create crates/scp-protocol/src/trust/participation_seed.rs with PARTICIPATION_SEED_WRAP_INFO_PREFIX, WrappedParticipationSeed, seal_participation_seed, and open_participation_seed over the custody open_with_external_dh path, with the derive-and-compare check inside open_participation_seed",
+        "Re-export the new items from crates/scp-protocol/src/trust/mod.rs",
+        "Expose a crate-internal fixed-ephemeral seal in crates/scp-protocol/src/crypto/hpke/p256.rs to the Vector 67 seal-side test, without making it reachable from a production path",
+        "Add the Vector 66 and Vector 67 known-answer tests, the seal and open tests, and the derive-and-compare test, and run each named mutant once to confirm its test fails"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.2.1 Participation Admission Requirements"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.3 Key Derivation and HPKE Labels"
+        },
+        {
+          "file": ".docs/specs/25-test-vectors.md",
+          "section": "## 25.32 Participation Signer Derivation and Seed-Wrap Vectors (`07-trust-validation-and-capabilities.md` §7.3.2.1)"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-actor-per-context.md",
+          "section": "### 7a. Signing goes through an erased signer carried in commands (ADR-063, the curve slice's build constraint)"
         }
       ],
       "details": {}
