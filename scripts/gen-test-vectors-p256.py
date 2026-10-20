@@ -8,7 +8,8 @@ P-256 field and point arithmetic, RFC 6979 deterministic ECDSA with SHA-256,
 low-`s` normalization, SEC1 point encoding, HKDF-SHA256, HMAC-SHA256, the
 §9.5.1 canonical hash construction, the RFC 6962 Merkle construction, the
 MessagePack subset the SCP structures serializes into, and AES-128-GCM with
-the RFC 8291 WebPush message encryption built on it.
+the RFC 8291 WebPush message encryption and the RFC 9180 HPKE base-mode seal
+built on it.
 
 The script depends on nothing outside the Python standard library. Every
 public key it derives is computed twice, by two independent scalar
@@ -3240,6 +3241,91 @@ def emit_push_signing_bytes() -> None:
     assert len(push_deregister_bytes(PUSH_RELAYS[0])) == 127
 
 
+# ---------------------------------------------------------------------------
+# §25.32 participation signer vectors 66-67
+# (`07-trust-validation-and-capabilities.md` §7.3.2.1)
+#
+# Vector 66 derives the participation signing keypair from a seed and a
+# context id. Vector 67 seals that seed with RFC 9180 HPKE base mode,
+# DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and AES-128-GCM, to the reference
+# key, with the secondary scalar fixed as the ephemeral key so the bytes
+# reproduce. The AAD is empty, which is what `aes128_gcm_encrypt` computes.
+# ---------------------------------------------------------------------------
+
+PARTICIPATION_SEED = bytes(range(32))
+PARTICIPATION_CONTEXT_ID = b"context-alpha"
+PARTICIPATION_SIGNER_SALT_LABEL = b"SCP-PARTICIPATION-SIGNER-V1"
+PARTICIPATION_SIGNER_INFO_PREFIX = b"scp-participation-signer:"
+PARTICIPATION_SEED_WRAP_INFO_PREFIX = b"scp-participation-seed-wrap:"
+HPKE_SUITE_KEM = b"KEM" + u16(0x0010)
+HPKE_SUITE = b"HPKE" + u16(0x0010) + u16(0x0001) + u16(0x0001)
+
+
+def hpke_labeled_extract(suite: bytes, salt: bytes, label: bytes, ikm: bytes) -> bytes:
+    return hkdf_extract(salt, b"HPKE-v1" + suite + label + ikm)
+
+
+def hpke_labeled_expand(
+    suite: bytes, prk: bytes, label: bytes, info: bytes, length: int
+) -> bytes:
+    return hkdf_expand(prk, u16(length) + b"HPKE-v1" + suite + label + info, length)
+
+
+def participation_signer(
+    seed: bytes, context_id: bytes
+) -> tuple[bytes, bytes, KeyPair]:
+    salt = sha256(PARTICIPATION_SIGNER_SALT_LABEL)
+    prk = hkdf_extract(salt, seed)
+    okm = hkdf_expand(prk, PARTICIPATION_SIGNER_INFO_PREFIX + context_id, 48)
+    scalar = (int.from_bytes(okm, "big") % (N - 1)) + 1
+    return prk, okm, KeyPair(scalar, "participation signer")
+
+
+def emit_participation_seed() -> None:
+    section("§25.32 Participation signer derivation and seed wrap")
+    salt = sha256(PARTICIPATION_SIGNER_SALT_LABEL)
+    info = PARTICIPATION_SIGNER_INFO_PREFIX + PARTICIPATION_CONTEXT_ID
+    prk, okm, signer = participation_signer(
+        PARTICIPATION_SEED, PARTICIPATION_CONTEXT_ID
+    )
+    assert len(info) == 38
+    emit_hex("vector_66.seed", PARTICIPATION_SEED)
+    emit_hex("vector_66.salt", salt)
+    emit_hex("vector_66.info", info)
+    emit_hex("vector_66.prk", prk)
+    emit_hex("vector_66.okm", okm)
+    emit_hex("vector_66.scalar", signer.private_bytes)
+    emit_hex("vector_66.signer_public_key_compressed", signer.compressed)
+    emit_hex("vector_66.signer_public_key_uncompressed", signer.uncompressed)
+
+    wrap_info = PARTICIPATION_SEED_WRAP_INFO_PREFIX + PARTICIPATION_CONTEXT_ID
+    assert len(wrap_info) == 41
+    enc = REF_KEY_2.uncompressed
+    dh = ecdh_p256(REF_KEY_2.d, REF_KEY_1.point)
+    assert dh == ecdh_p256(REF_KEY_1.d, REF_KEY_2.point)
+    eae_prk = hpke_labeled_extract(HPKE_SUITE_KEM, b"", b"eae_prk", dh)
+    shared_secret = hpke_labeled_expand(
+        HPKE_SUITE_KEM, eae_prk, b"shared_secret", enc + REF_KEY_1.uncompressed, 32
+    )
+    psk_id_hash = hpke_labeled_extract(HPKE_SUITE, b"", b"psk_id_hash", b"")
+    info_hash = hpke_labeled_extract(HPKE_SUITE, b"", b"info_hash", wrap_info)
+    context = b"\x00" + psk_id_hash + info_hash
+    secret = hpke_labeled_extract(HPKE_SUITE, shared_secret, b"secret", b"")
+    key = hpke_labeled_expand(HPKE_SUITE, secret, b"key", context, 16)
+    base_nonce = hpke_labeled_expand(HPKE_SUITE, secret, b"base_nonce", context, 12)
+    ciphertext = aes128_gcm_encrypt(key, base_nonce, PARTICIPATION_SEED)
+    assert len(ciphertext) == 48
+    emit_hex("vector_67.recipient_public_key", REF_KEY_1.uncompressed)
+    emit_hex("vector_67.ephemeral_scalar", REF_KEY_2.private_bytes)
+    emit_hex("vector_67.info", wrap_info)
+    emit_hex("vector_67.dh", dh)
+    emit_hex("vector_67.enc", enc)
+    emit_hex("vector_67.shared_secret", shared_secret)
+    emit_hex("vector_67.key", key)
+    emit_hex("vector_67.base_nonce", base_nonce)
+    emit_hex("vector_67.ciphertext", ciphertext)
+
+
 def main() -> int:
     self_test()
     _LINES.append("SCP §25 test vectors — ECDSA on NIST P-256, RFC 6979, SHA-256")
@@ -3272,6 +3358,7 @@ def main() -> int:
     emit_reveal_ranking_and_text_form()
     emit_webpush()
     emit_challenge_vectors()
+    emit_participation_seed()
     emit_push_signing_bytes()
     print("\n".join(_LINES))
     return 0

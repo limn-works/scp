@@ -2509,3 +2509,74 @@ verification_id:               5cec3cdef9ef548b71a346c713eead24381a8cac1e0d422e1
 ```
 D_v = SHA-256(R_v):            765bf9ca092df576175ae942aae2a0cc501fba5f899a96dbd065157f5e6c0fa3
 ```
+
+## 25.32 Participation Signer Derivation and Seed-Wrap Vectors (`07-trust-validation-and-capabilities.md` §7.3.2.1)
+
+`07-trust-validation-and-capabilities.md` §7.3.2.1 fixes two constructions over a context's `participation_signing_seed`: the derivation of the participation signing keypair, and the HPKE wrap of the seed to the holding admin's `scp_wrapping_key` (`0xFF01`) leaf key. `09-security-model.md` §9.18.3 registers their labels. `scripts/gen-test-vectors-p256.py` emits these bytes like every other keyed byte here. **A second computation that shares no code with the generator produced the same bytes:** a script that reads no repository file computed them with Python's standard-library HMAC and the `cryptography` package, computed every public key twice (by `cryptography` and by a standard-library scalar multiplication), and opened the Vector 67 seal with the `cryptography` package's own RFC 9180 implementation. The Rust known-answer tests of story SCP-BA-007 check them.
+
+Both vectors share these inputs:
+
+- `participation_signing_seed`: the 32 bytes `00` through `1f`;
+- `context_id`: `context-alpha`, whose 13 UTF-8 bytes are `636f6e746578742d616c706861`.
+
+### Vector 66: the participation signing keypair
+
+`salt` is the SHA-256 of the 27 ASCII bytes `SCP-PARTICIPATION-SIGNER-V1`. `info` is the 25 ASCII bytes `scp-participation-signer:` followed by the `context_id` bytes, with no length prefix. The expansion is 48 bytes, and `d = (int(okm) mod (n - 1)) + 1` under FIPS 186-5 Appendix A.2.1.
+
+```
+participation_signing_seed:
+  000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+salt = SHA-256("SCP-PARTICIPATION-SIGNER-V1"):
+  c23bba4622e901f27bfd4b0faf56328911bdae514b6eb4774cc4f9b35d8a1957
+info (38 bytes):
+  7363702d70617274696369706174696f6e2d7369676e65723a636f6e74657874
+  2d616c706861
+prk = HKDF-Extract(salt, participation_signing_seed):
+  0b6cc9ae75973e9ccf9ab536d092e92483c516293a35b80128237ea90f86ac48
+okm = HKDF-Expand(prk, info, 48):
+  94b394743b1d0d7f09077136f9f6480fbc6a48595db3784e02090535632139f6
+  1d6f076e62c92fb2317b066580852534
+d:
+  0d8976f15845c51e5793b0c8c3ac322299bde6cf0bc448a80008f6b35cd14995
+signer_public_key, compressed (33 bytes):
+  02ae8181b600262629a7d73b40f05cb6785e5ae6e34f816db22d260ec50d1ea8
+  87
+signer public key, uncompressed:
+  04ae8181b600262629a7d73b40f05cb6785e5ae6e34f816db22d260ec50d1ea8
+  87a7c9466511badd299368f6880a37710a027e995503b62bd67deeba34655102
+  da
+```
+
+An implementation that drops the salt, expands 32 bytes, omits `context_id` from `info`, or reduces modulo `n` in place of `n - 1` derives a different `d` from these inputs.
+
+### Vector 67: the seed wrap
+
+The suite is HPKE base mode with DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and AES-128-GCM (RFC 9180, `kem_id` `0x0010`, `kdf_id` `0x0001`, `aead_id` `0x0001`). The recipient is the §25.2 reference key. A real sender draws a fresh ephemeral keypair for every wrap; this fixture fixes the ephemeral private key to the §25.2 secondary scalar so the bytes reproduce, so `enc` is the secondary key's uncompressed point. `info` is the 28 ASCII bytes `scp-participation-seed-wrap:` followed by the `context_id` bytes, with no length prefix. The AAD is empty, the sequence number is 0, and the plaintext is the Vector 66 seed.
+
+```
+pkR (reference key, uncompressed):
+  043b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30
+  27471695574e78728df503a0c21dd1da9f7b77252d8398527a1b2177c78224f0
+  51
+skE (secondary private scalar):
+  0fed5549df222a5cf0b537e423fbd60875c6fb2b334b381a0c0a6c89eae9ac6a
+info (41 bytes):
+  7363702d70617274696369706174696f6e2d736565642d777261703a636f6e74
+  6578742d616c706861
+aad:            (empty)
+dh:
+  39cc00defd06eb2704dc5604630f54f7196fa7f402f8236214fb5fbac9e6f4ad
+enc:
+  0423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20a
+  ead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6d
+  a6
+shared_secret:
+  aa46dbd7cce4d39f686c1fc7587835e53b97f2b4e705f08faeace6a1dda7c53f
+key:            4297d239d2542a50018bdca010bf81b2
+base_nonce:     3cdd73d67487775d2ef21b62
+ciphertext (48 bytes, the 32-byte sealed seed and the 16-byte tag):
+  56c81f506f32f056c2a8e7242e8afc476e846ba65b54e1b496bc2345837d4bd1
+  3807770941f5a06f0a4d1916612b4b02
+```
+
+Opening `enc` and `ciphertext` with the reference private scalar under the same `info` and the empty AAD yields the Vector 66 seed, and deriving under Vector 66 from that seed yields Vector 66's `signer_public_key`, which is the comparison §7.3.2.1 requires of every opener. Opening under the `info` of any other `context_id` fails the AEAD tag check.

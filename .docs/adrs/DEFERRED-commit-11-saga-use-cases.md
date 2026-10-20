@@ -362,8 +362,8 @@ downstream PR):
   — a saga coordinates atomicity across 2+ context-actors, but custody
   handover is a 1-context/2-identity operation, which SCP correctly
   models as single-context governance (§7.3.2.1's "Seed custody and
-  admin rotation" paragraph re-wraps the participation signing seed to the incoming admin's `#0` via
-  HPKE; §5.15.5 "governance never requires cross-context
+  admin rotation" paragraph re-wraps the participation signing seed to the incoming admin's
+  `scp_wrapping_key` (`0xFF01`) MLS leaf key via HPKE; §5.15.5 "governance never requires cross-context
   coordination"). The `SagaInput::ContextMigration` /
   `ContextMigrationPrepared` types are **removed** — the type no longer
   exists anywhere in `crates/`, so the §9.4.3 secret-bearing journal
