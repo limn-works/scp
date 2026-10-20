@@ -295,8 +295,6 @@ def test_fake_keychain_hpke_p256_refuses_bad_peers_and_ed25519_keys() -> None:
     ed = keychain.generate_keypair("ed25519", "identity")
     with pytest.raises(ValueError):
         keychain.dh_agree(ed, point)
-    with pytest.raises(ValueError):
-        keychain.generate_keypair("x25519", "operational")
 
 
 @pytest.mark.asyncio
@@ -405,6 +403,29 @@ async def test_coroutine_derive_fails_with_custody_error(scp) -> None:
     with pytest.raises(_scp_core.ScpError, match="coroutine") as excinfo:
         await scp.context_create(identity.did, _ENCRYPTED_PARAMS)
     assert str(excinfo.value).startswith("[SCP-CRYPTO-4060]"), excinfo.value
+
+
+@pytest.mark.asyncio
+async def test_host_reporting_the_retired_x25519_key_type_fails_with_4060(scp) -> None:
+    """A host whose ``get_public_key`` reports the retired ``"x25519"`` key
+    type fails the operation with the custody error ``SCP-CRYPTO-4060``: the
+    bridge parses the type name and refuses one outside the host contract."""
+    from scp_sdk import _scp_core
+
+    class _ReportsX25519(_FakeKeychain):
+        def get_public_key(self, key_id: str) -> CustodyPublicKey:
+            real = super().get_public_key(key_id)
+            return CustodyPublicKey(
+                key_type="x25519",  # type: ignore[arg-type]
+                public_key=real.public_key,
+                role=real.role,
+            )
+
+    with pytest.raises(_scp_core.ScpError) as excinfo:
+        await scp.identity_create_with_custody(_ReportsX25519())
+    message = str(excinfo.value)
+    assert message.startswith("[SCP-CRYPTO-4060]"), message
+    assert 'unknown key type "x25519"' in message, message
 
 
 @pytest.mark.asyncio

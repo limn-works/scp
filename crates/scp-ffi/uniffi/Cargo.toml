@@ -72,7 +72,7 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 rmp-serde = { workspace = true }
 # Only `software_platform` and `encrypting` are enabled by default —
-# `software_platform` provides crypto primitives (Ed25519, X25519);
+# `software_platform` provides crypto primitives (Ed25519, P-256);
 # `encrypting` provides `EncryptingAdapter` for event log persistence (#484).
 # The `testing` feature is NOT enabled unconditionally because it exposes
 # the `InMemoryKeyCustody` nullifier in production mobile builds. Instead, the

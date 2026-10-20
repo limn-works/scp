@@ -46,7 +46,7 @@
             )
         }
 
-        /// An adapter for Ed25519 and X25519 tests: no enclave, and a P-256
+        /// An adapter for software-custody tests: no enclave, and a P-256
         /// store that holds keys in process.
         func custody(policy: BiometricPolicy = .none) -> AppleKeyCustody {
             let store = SoftwareP256KeyStore()

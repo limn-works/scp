@@ -227,7 +227,6 @@ describe("CryptoKeychain hpke-p256", () => {
     }
     const ed = keychain.generateKeypair("ed25519", "identity");
     expect(() => keychain.dhAgree(ed, point)).toThrow();
-    expect(() => keychain.generateKeypair("x25519", "operational")).toThrow();
   });
 });
 

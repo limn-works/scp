@@ -2,9 +2,9 @@
 //
 // The UniFFI KeyCustodyProvider contract (crates/scp-ffi/uniffi/src/lib.rs) requires a host to
 // record the role generate_keypair names and report it from get_public_key for the key's
-// lifetime, across sessions. A key that survives process death (a Keystore Ed25519 key, a
-// software Ed25519 key whose seed AndroidKeyCustody persists, or a P-256 or HPKE P-256 key) has
-// its role persisted beside it; an X25519 key lives in process memory only, and so does its role.
+// lifetime, across sessions. Every key AndroidKeyCustody holds survives process death (a Keystore
+// Ed25519 key, a software Ed25519 key whose seed it persists, or a P-256 or HPKE P-256 key), so
+// each has its role persisted beside it.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer).
 

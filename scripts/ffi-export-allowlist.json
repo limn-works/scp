@@ -1205,7 +1205,7 @@
       "name": "dh_agree",
       "path": "crates/scp-ffi/napi/src/testing.rs",
       "kind": "test-fixture",
-      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Returns the shared secret the adapter read from the host's dhAgree, so a test shows the bridge reads the secret intact before the TypeScript adapter zeroes its copy; the peer key reaches the adapter unchanged, so the adapter's own peer check for the key's type (32 bytes for X25519, the 65-byte uncompressed point for hpke-p256) runs, and its refusal or a host failure is SCP-CRYPTO-4006 for key-not-found or SCP-CRYPTO-4060. Not a protocol operation."
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Returns the shared secret the adapter read from the host's dhAgree, so a test shows the bridge reads the secret intact before the TypeScript adapter zeroes its copy; the peer key reaches the adapter unchanged, so the adapter's own peer check for the key's type (the 65-byte uncompressed point for hpke-p256) runs, and its refusal or a host failure is SCP-CRYPTO-4006 for key-not-found or SCP-CRYPTO-4060. Not a protocol operation."
     },
     {
       "name": "take",

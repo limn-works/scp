@@ -752,7 +752,7 @@ file_hmac:    [u8; 32]   (32 bytes, HMAC-SHA-256)
 entry_count:  u32 LE     (4 bytes)
 entry[i]:     key_type u8 | role u8 | entry_id [u8; 16] | nonce [u8; 12] | ciphertext+tag [u8; 48]
 
-key_type:     0x01 = Ed25519, 0x02 = X25519, 0x03 = P-256 signing, 0x04 = P-256 HPKE
+key_type:     0x01 = Ed25519, 0x03 = P-256 signing, 0x04 = P-256 HPKE (0x02 is retired and MUST be refused)
 role:         0x00 = operational, 0x01 = identity
 ```
 

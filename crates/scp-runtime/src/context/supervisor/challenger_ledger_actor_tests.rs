@@ -812,6 +812,43 @@ async fn ledger_refuses_after_pass() {
     ));
 }
 
+/// Commit runs the attempt check again at its own `t` (spec 07 §7.3.4 step
+/// 4): an attempt that began at the last second inside the window and
+/// commits at `expires_at` is refused with `ChallengeExpired` while its lease
+/// is still live, and writes no record. The attempt stays unused, so a
+/// resubmit is refused by Begin for the same reason, not served as stored.
+#[tokio::test]
+async fn commit_reruns_the_attempt_check_and_writes_nothing_when_it_fails() {
+    let h = harness();
+    let issued = h.create().await.unwrap();
+    h.clock.set(issued.request.expires_at - 1);
+    let auth = h.respond(&issued.request, 1, "ok");
+    let lease = h.lease(&auth).await;
+    h.clock.advance(1);
+    let writes = h.storage.writes();
+    let refusal = trust_err(h.commit(&auth, lease.lease_id, &issued.key).await);
+    assert!(
+        matches!(refusal, TrustError::ChallengeExpired { .. }),
+        "commit at expires_at must re-run the attempt check, got {refusal:?}"
+    );
+    assert_eq!(
+        h.storage.writes(),
+        writes,
+        "a refused commit writes nothing"
+    );
+    assert!(
+        h.storage
+            .entry_versions()
+            .iter()
+            .all(|v| v.attempts.is_empty()),
+        "no stored entry holds an attempt"
+    );
+    assert!(matches!(
+        trust_err(h.begin(&auth).await),
+        TrustError::ChallengeExpired { .. }
+    ));
+}
+
 /// Attempt 1 again with a different `D_r` is out of order.
 #[tokio::test]
 async fn ledger_refuses_replayed_attempt_with_new_digest() {
@@ -1300,7 +1337,9 @@ async fn lookup_refuses_other_digest_or_subject_and_writes_nothing() {
 }
 
 /// T13 (U-1): Lookup on a closed challenge admits only a resubmit of a
-/// response it graded, so a fresh response costs no resolution.
+/// response it graded, so a fresh response costs no resolution. A closed
+/// challenge with no stored attempt for the response's `D_r` is a lookup
+/// miss, refused with `UnknownChallenge` (spec 07 §7.3.4 step 3.2).
 #[tokio::test]
 async fn lookup_on_a_closed_challenge_admits_only_a_resubmit() {
     let h = harness();
@@ -1313,7 +1352,7 @@ async fn lookup_on_a_closed_challenge_admits_only_a_resubmit() {
     let fresh = h.respond_response(&issued.request, 2, "ok");
     assert!(matches!(
         trust_err(h.lookup(&issued.request, &h.subject, &fresh).await),
-        TrustError::ChallengeClosed { .. }
+        TrustError::UnknownChallenge { .. }
     ));
 }
 

@@ -460,8 +460,8 @@ mod tests {
         );
         assert_eq!(
             StreamSignerCustodyCategory::from(&PlatformError::WrongKeyType {
-                expected: KeyType::Ed25519,
-                actual: KeyType::X25519,
+                expected: KeyType::P256Signing,
+                actual: KeyType::HpkeP256,
             }),
             StreamSignerCustodyCategory::WrongKeyType
         );

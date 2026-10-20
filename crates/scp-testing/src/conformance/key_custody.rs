@@ -382,12 +382,7 @@ macro_rules! key_custody_conformance {
             #[tokio::test]
             async fn derive_from_operational_key_is_not_identity_key() {
                 let custody = $factory;
-                for key_type in [
-                    KeyType::Ed25519,
-                    KeyType::X25519,
-                    KeyType::P256Signing,
-                    KeyType::HpkeP256,
-                ] {
+                for key_type in [KeyType::Ed25519, KeyType::P256Signing, KeyType::HpkeP256] {
                     let operational = custody
                         .generate_keypair(key_type)
                         .await

@@ -545,7 +545,7 @@ impl PyKeyCustodyProvider {
 ///   canonical decimal form of a `u64`, as `str(n)` writes it (no sign, no
 ///   leading zero, no whitespace), which
 ///   [`parse_handle`](scp_ffi_common::custody_parse::parse_handle) enforces
-///   (`SCP-CRYPTO-4060` otherwise). `key_type` is `"ed25519"`, `"x25519"`,
+///   (`SCP-CRYPTO-4060` otherwise). `key_type` is `"ed25519"`,
 ///   `"p256"` or `"hpke-p256"` (`scp_sdk.CustodyKeyType`), and `role` is
 ///   `"identity"` (the only pseudonym-derivation source) or `"operational"`
 ///   (`scp_sdk.CustodyKeyRole`). The host records `role` and reports it from
@@ -561,8 +561,8 @@ impl PyKeyCustodyProvider {
 ///   Enclave, `StrongBox`/TEE) may use a random nonce.
 /// - `get_public_key(key_id: str) -> scp_sdk.CustodyPublicKey` — an object
 ///   whose `key_type` attribute is the key's type (as above), whose
-///   `public_key` attribute is its public key, exactly 32 bytes (Ed25519 /
-///   X25519), 33 (compressed SEC1, `"p256"`) or 65 (uncompressed SEC1,
+///   `public_key` attribute is its public key, exactly 32 bytes (Ed25519),
+///   33 (compressed SEC1, `"p256"`) or 65 (uncompressed SEC1,
 ///   `"hpke-p256"`), and whose `role` attribute is the role
 ///   `generate_keypair` minted it in. The bridge types the key from
 ///   `key_type`, never from the length, and refuses any other length, and
@@ -1011,8 +1011,6 @@ class FakeCustody:
     def _public(self, key_id):
         self._count('get_public_key')
         seed = self._seed(key_id)
-        if self._key_types[key_id] == 'x25519':
-            return ('x25519', hashlib.sha256(seed).digest())
         return ('ed25519', ed_public(seed))
 
     def destroy_key(self, key_id):
@@ -1132,7 +1130,7 @@ TWO_G_COMPRESSED = bytes.fromhex('037cf27b188d034f7e8a52380304b51ac3c08969e277f2
 
 class WrongLengthCustody(P256Custody):
     '''Returns a wrong length from every host call the bridge checks: a
-    33-byte X25519 shared secret, a 72-byte Ed25519 signature, a 31-byte
+    33-byte HPKE P-256 shared secret, a 72-byte Ed25519 signature, a 31-byte
     Ed25519 public key, and, after a P-256 key is generated (public key G),
     a different valid point (2G) for it.'''
 
@@ -1516,12 +1514,16 @@ class SleepyAgreeCustody(P256Custody):
         );
 
         let custody = fake_callback_custody_of(c"WrongLengthCustody");
-        let x = custody
-            .generate_keypair(KeyType::X25519)
+        let hpke = custody
+            .generate_keypair(KeyType::HpkeP256)
             .await
-            .expect("x25519 key");
+            .expect("HPKE P-256 key");
+        let peer = P256SecretKey::from_scalar_bytes(&two)
+            .expect("2 is a valid scalar")
+            .public_key()
+            .to_uncompressed();
         assert!(matches!(
-            custody.dh_agree(&x, &[9u8; 32]).await,
+            custody.dh_agree(&hpke, &peer).await,
             Err(PlatformError::CustodyError(_))
         ));
 
@@ -2107,19 +2109,18 @@ class SleepyAgreeCustody(P256Custody):
         let custody = FfiKeyCustody::File(file_kc);
 
         let handle_a = custody
-            .generate_keypair(KeyType::X25519)
+            .generate_keypair(KeyType::HpkeP256)
             .await
-            .expect("generate X25519 keypair A");
+            .expect("generate HPKE P-256 keypair A");
         let handle_b = custody
-            .generate_keypair(KeyType::X25519)
+            .generate_keypair(KeyType::HpkeP256)
             .await
-            .expect("generate X25519 keypair B");
+            .expect("generate HPKE P-256 keypair B");
 
         let pub_b = custody.public_key(&handle_b).await.expect("public key B");
-        let pub_b_bytes: [u8; 32] = pub_b.as_bytes().try_into().expect("32 bytes");
 
         let shared = custody
-            .dh_agree(&handle_a, &pub_b_bytes)
+            .dh_agree(&handle_a, pub_b.as_bytes())
             .await
             .expect("dh_agree");
         assert_eq!(shared.as_bytes().len(), 32, "shared secret is 32 bytes");

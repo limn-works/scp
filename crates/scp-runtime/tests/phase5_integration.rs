@@ -339,17 +339,17 @@ async fn platform_key_custody_sign_and_verify() {
         "signature must verify correctly"
     );
 
-    // -- Generate X25519 keypair --
+    // -- Generate HPKE P-256 keypair --
     let x_handle = custody
-        .generate_keypair(KeyType::X25519)
+        .generate_keypair(KeyType::HpkeP256)
         .await
-        .expect("generate x25519 key");
+        .expect("generate HPKE P-256 key");
 
     let x_pubkey = custody
         .public_key(&x_handle)
         .await
-        .expect("get x25519 public key");
-    assert_eq!(x_pubkey.as_bytes().len(), 32);
+        .expect("get HPKE P-256 public key");
+    assert_eq!(x_pubkey.as_bytes().len(), 65);
 
     // -- Verify custody type --
     let custody_type = custody.custody_type(&ed_handle);

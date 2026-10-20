@@ -32,9 +32,8 @@ impl<C: KeyCustody> CustodySigner<C> {
     /// [`KeyCustody`] has no key-type query, so the caller names `alg`, and
     /// this constructor checks it against the length of the public key the
     /// custody reports: 32 bytes for [`SigAlg::Ed25519`], 33 for
-    /// [`SigAlg::EcdsaP256Sha256`]. A 32-byte X25519 key passes the Ed25519
-    /// check, and the custody then refuses its first sign with
-    /// [`PlatformError::WrongKeyType`].
+    /// [`SigAlg::EcdsaP256Sha256`]. A 65-byte HPKE P-256 key fails both
+    /// checks.
     ///
     /// # Errors
     ///
@@ -92,15 +91,14 @@ const fn signing_key_type(alg: SigAlg) -> Result<KeyType, PlatformError> {
 /// `key_type`.
 const fn public_key_len(key_type: KeyType) -> usize {
     match key_type {
-        KeyType::Ed25519 | KeyType::X25519 => 32,
+        KeyType::Ed25519 => 32,
         KeyType::P256Signing => 33,
         KeyType::HpkeP256 => 65,
     }
 }
 
-/// The key type a public key of `len` bytes belongs to. A 32-byte key is
-/// reported as [`KeyType::Ed25519`], although an X25519 key has the same
-/// length.
+/// The key type a public key of `len` bytes belongs to; the lengths are
+/// distinct across [`KeyType`].
 const fn key_type_of_len(len: usize) -> Option<KeyType> {
     match len {
         32 => Some(KeyType::Ed25519),

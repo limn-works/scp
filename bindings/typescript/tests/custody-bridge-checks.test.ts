@@ -533,6 +533,22 @@ suite.describe("napi callback custody", () => {
     expect((await rejectionOf(() => thenable.generateKeypair())).code).toBe("SCP-CRYPTO-4060");
   });
 
+  test("a host that reports the retired x25519 key type is a custody error", async () => {
+    const custody = adapterWith({
+      getPublicKey: () => ({
+        keyType: "x25519",
+        publicKey: new Uint8Array(32),
+        role: "operational",
+      }),
+    });
+    const mapped = await rejectionOf(() => custody.sign("9", MESSAGE));
+    expect(mapped).toBeInstanceOf(CryptoError);
+    expect(mapped.code).toBe("SCP-CRYPTO-4060");
+    expect(mapped.message).toContain(
+      "a { keyType: CustodyKeyType, publicKey: Uint8Array, role: CustodyKeyRole } result",
+    );
+  });
+
   test("a thrown value with no readable message is a custody error", async () => {
     const { proxy, revoke } = Proxy.revocable({}, {});
     revoke();
@@ -552,18 +568,19 @@ suite.describe("napi callback custody", () => {
   test("the bridge reads the host's shared secret intact, then the adapter's copy is zeroed", async () => {
     // A secret no wipe or truncation produces: 32 distinct non-zero bytes.
     const secret = Uint8Array.from({ length: 32 }, (_, i) => 0xa0 + i);
-    const peer = Buffer.alloc(32, 0x5c);
+    // A valid uncompressed P-256 peer point, which the bridge checks first.
+    const peerEcdh = crypto.createECDH("prime256v1");
+    const peer = peerEcdh.generateKeys();
     const seen: unknown[][] = [];
-    // An X25519 key the host holds: the adapter resolves it through
+    // An HPKE P-256 key the host holds: the adapter resolves it through
     // `getPublicKey`, since `dhAgree` refuses a signing key.
-    const spki = crypto
-      .generateKeyPairSync("x25519")
-      .publicKey.export({ format: "der", type: "spki" });
+    const hostEcdh = crypto.createECDH("prime256v1");
+    const hostPublic = hostEcdh.generateKeys();
     const keyId = "9";
     const custody = adapterWith({
       getPublicKey: () => ({
-        keyType: "x25519",
-        publicKey: new Uint8Array(spki.subarray(spki.length - 32)),
+        keyType: "hpke-p256",
+        publicKey: new Uint8Array(hostPublic),
         role: "operational",
       }),
       dhAgree: (...args: unknown[]) => {

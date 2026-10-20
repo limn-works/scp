@@ -30,7 +30,7 @@
 //! signature over that 32-byte hash — and over **nothing else**. §9.5.2 and
 //! Vector 37 specify a P-256 signature; this module still verifies an Ed25519
 //! signature from the attester's `#active` key until identity signing
-//! moves to P-256 (SCP-307 criterion 15 / SCP-315), and treats the 64 signature bytes as
+//! moves to P-256 (SCP-315), and treats the 64 signature bytes as
 //! opaque when it serializes them. It MUST NOT sign the raw `signing_preimage()` bytes, and it MUST NOT
 //! sign the [`to_extension_body`] output. `signing_preimage()` is
 //! module-private: it exists only to build the hash and to
@@ -106,8 +106,7 @@ pub const MAX_ATTESTATION_KEY_RESOLUTION_STALENESS: u64 = 300;
 const LEAF_PUBLIC_KEY_SIZE: usize = 65;
 
 /// Size of the attester's resolved Ed25519 `#active` key, which
-/// verifies the signature until identity signing moves to P-256 (SCP-307
-/// criterion 15 / SCP-315).
+/// verifies the signature until identity signing moves to P-256 (SCP-315).
 const ED25519_PUBLIC_KEY_SIZE: usize = 32;
 
 /// Size of a raw Ed25519 signature in bytes.
@@ -196,8 +195,7 @@ pub struct KeyPackageAttestation {
     /// The raw 64-byte signature over [`signing_hash`](Self::signing_hash).
     ///
     /// Serialized and parsed as opaque bytes; [`verify_attestation`] checks it as
-    /// Ed25519 until identity signing moves to P-256 (SCP-307 criterion 15 /
-    /// SCP-315).
+    /// Ed25519 until identity signing moves to P-256 (SCP-315).
     pub signature: [u8; SIGNATURE_SIZE],
 }
 
@@ -501,7 +499,7 @@ pub enum AttestationVerifyError {
 pub struct AttestationVerificationContext<'a> {
     /// The **current** `#active` public key the caller resolved from
     /// the signer's DID document (raw 32-byte Ed25519, until identity signing
-    /// moves to P-256 per SCP-307 criterion 15 / SCP-315). The signature (check 3) is verified
+    /// moves to P-256 per SCP-315). The signature (check 3) is verified
     /// against this key.
     ///
     /// **Caller contract (§9.7.1 checks 1–2 — NOT re-checked here).** The caller
@@ -958,8 +956,7 @@ mod tests {
     /// parsing the spec body returns the same struct. The spec's P-256 signature
     /// verifies over the hash under the §25.2 reference key, which proves the
     /// hash this module computes is the one the spec signed. Production
-    /// attestation signing stays Ed25519 under SCP-307 criterion 15; SCP-315
-    /// moves it to P-256.
+    /// attestation signing stays Ed25519 until SCP-315 moves it to P-256.
     #[test]
     fn spec_vector37_matches() {
         let att = v37_attestation();

@@ -39,7 +39,7 @@ import uniffi.scp.ScpException as BridgeException
  * exception (carried as the cause), the bridge reports as the custody error `SCP-CRYPTO-4060`.
  * Coroutine cancellation propagates unchanged.
  *
- * The adapter holds all four key types. A P-256 signature is Keystore's DER over the bridge's
+ * The adapter holds Ed25519, P-256 signing and HPKE P-256 keys. A P-256 signature is Keystore's DER over the bridge's
  * 32-byte digest; the bridge converts it to raw low-s and verifies it.
  *
  * @param inner The custody whose keys this adapter exposes.
@@ -59,7 +59,6 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
         val publicKey = inner.publicKey(handle)
         val keyType = when (keyTypeOf(keyId, handle)) {
             KeyType.ED25519 -> CustodyKeyType.ED25519
-            KeyType.X25519 -> CustodyKeyType.X25519
             KeyType.P256 -> CustodyKeyType.P256
             KeyType.HPKE_P256 -> CustodyKeyType.HPKE_P256
         }
@@ -83,7 +82,6 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
     override suspend fun generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): String = bridged {
         val androidType = when (keyType) {
             CustodyKeyType.ED25519 -> KeyType.ED25519
-            CustodyKeyType.X25519 -> KeyType.X25519
             CustodyKeyType.P256 -> KeyType.P256
             CustodyKeyType.HPKE_P256 -> KeyType.HPKE_P256
         }

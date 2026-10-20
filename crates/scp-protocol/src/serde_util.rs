@@ -9,7 +9,7 @@
 //! - [`serde_signature_64`] — Ed25519 signatures (exactly 64 bytes)
 //! - [`serde_hash_32`] — SHA-256 hashes (exactly 32 bytes)
 //! - [`serde_id_16`] — 128-bit opaque identifiers (exactly 16 bytes)
-//! - [`serde_pubkey_32`] — X25519 / Ed25519 public keys (exactly 32 bytes)
+//! - [`serde_pubkey_32`] — Ed25519 public keys (exactly 32 bytes)
 //! - [`serde_hpke_sealed_48`] — HPKE-sealed sender key (exactly 48 bytes)
 //!
 //! # Bounded variable-size
@@ -94,7 +94,7 @@ pub mod serde_signature_64 {
     }
 }
 
-/// Serde module for `[u8; 32]` fields (SHA-256 hashes, X25519 public keys).
+/// Serde module for `[u8; 32]` fields (SHA-256 hashes, Ed25519 public keys).
 ///
 /// Same pattern as [`serde_signature_64`] but for 32-byte values.
 #[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
@@ -148,7 +148,7 @@ pub mod serde_id_16 {
     }
 }
 
-/// Serde module for `[u8; 32]` fields (X25519 / Ed25519 public keys).
+/// Serde module for `[u8; 32]` fields (Ed25519 public keys).
 ///
 /// Same pattern as [`serde_hash_32`] but with a domain-specific error message.
 #[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
