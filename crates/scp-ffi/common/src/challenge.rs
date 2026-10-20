@@ -667,7 +667,7 @@ async fn invoke_evaluator_outlet(
         let (started, captured) = (Arc::clone(&started), Arc::clone(&captured));
         let output_schema = output_schema.clone();
         let completion = Arc::clone(&completion);
-        sup.spawn_evaluator_pipeline(async move {
+        async move {
             let result = pipeline_sup
                 .invoke_outlet_with_economy(
                     &evaluator_context_id,
@@ -688,21 +688,52 @@ async fn invoke_evaluator_outlet(
                 &captured,
                 &output_schema,
             ))
-        })
+        }
     };
-    let pipeline = match spawned {
+    join_evaluator_pipeline(
+        sup,
+        spawned,
+        &started,
+        &captured,
+        &output_schema,
+        &completion,
+    )
+    .await
+}
+
+/// Runs `pipeline` on its own task on the supervisor's task tracker and
+/// returns the outcome it stamped.
+///
+/// A refused spawn is [`EvaluatorOutcome::Unavailable`]. A pipeline that
+/// panicked reached no outcome of its own, so the join classifies the panic
+/// by `started` (see [`classify_evaluator_result`]) and stamps it when it
+/// observes the panic.
+async fn join_evaluator_pipeline<F>(
+    sup: &Supervisor,
+    pipeline: F,
+    started: &AtomicBool,
+    captured: &Mutex<Option<Value>>,
+    output_schema: &Value,
+    completion: &CaseCompletion<EvaluatorOutcome>,
+) -> Stamped<EvaluatorOutcome>
+where
+    F: Future<Output = Stamped<EvaluatorOutcome>> + Send + 'static,
+{
+    let pipeline = match sup.spawn_evaluator_pipeline(pipeline) {
         Ok(pipeline) => pipeline,
-        Err(e) => return unavailable(format!("the evaluator pipeline did not start: {e}")),
+        Err(e) => {
+            return completion.finish(EvaluatorOutcome::Unavailable(format!(
+                "the evaluator pipeline did not start: {e}"
+            )));
+        }
     };
     match pipeline.await {
         Ok(stamped) => stamped,
-        // A panicked pipeline reached no outcome of its own: it is stamped
-        // when the join observes the panic.
         Err(e) => completion.finish(classify_evaluator_result(
             Err(e),
-            &started,
-            &captured,
-            &output_schema,
+            started,
+            captured,
+            output_schema,
         )),
     }
 }

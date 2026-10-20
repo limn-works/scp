@@ -25,7 +25,10 @@ use crate::error::PlatformError;
 /// The type of cryptographic key managed by a [`KeyHandle`].
 ///
 /// See ADR-006 for usage. The P-256 types are the SCP key suite (ADR-063);
-/// Ed25519 remains until the identity key moves to P-256 (SCP-315).
+/// Ed25519 remains until the identity key moves to P-256 (SCP-315). The set is
+/// these three types: the X25519 custody type and its `dh_agree` path were
+/// removed under SCP-307 criterion 37 (ADR-006, ADR-021 and ADR-025, each
+/// amended 2026-10-20).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum KeyType {
     /// Ed25519 signing key (identity keys, active signing keys). Pseudonym keys

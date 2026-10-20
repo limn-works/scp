@@ -1625,10 +1625,12 @@ RETRIES_EXHAUSTED_CODE = "SCP-VALID-7104"
 #: The cooldown since the last graded attempt has not passed; the message
 #: names the second the next attempt is accepted (:func:`retry_after`).
 COOLDOWN_ACTIVE_CODE = "SCP-VALID-7105"
-#: The challenge closed after a pass or after its last allowed attempt.
+#: The challenge is closed: passed or out of attempts. The attempt check
+#: returns this code at begin and at commit (spec 07 §7.3.4).
 CHALLENGE_CLOSED_CODE = "SCP-VALID-7106"
-#: The challenger's ledger holds no live challenge with this id, request
-#: digest and subject.
+#: No challenge the challenger holds answers this lookup: no live challenge
+#: has this id, digest and subject, or a closed one graded no response with
+#: this ``D_r`` (spec 07 §7.3.4).
 UNKNOWN_CHALLENGE_CODE = "SCP-VALID-7107"
 #: The response answers another challenge, or its outputs do not match the
 #: request's cases one for one and in order.

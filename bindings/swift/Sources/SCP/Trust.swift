@@ -1988,10 +1988,13 @@ public let retriesExhaustedCode = "SCP-VALID-7104"
 /// The error code the bridges raise when the cooldown between attempts has not passed; ``retryAfter(_:)`` reads the first second a retry may succeed.
 public let cooldownActiveCode = "SCP-VALID-7105"
 
-/// The error code the bridges raise when the challenge is closed after a pass or its last allowed attempt.
+/// The challenge is closed: passed or out of attempts. The attempt check returns
+/// this code at begin and at commit (spec 07 §7.3.4).
 public let challengeClosedCode = "SCP-VALID-7106"
 
-/// The error code the bridges raise when the challenger's ledger holds no live challenge with the response's id, request digest and subject.
+/// No challenge the challenger holds answers this lookup: no live challenge has
+/// this id, digest and subject, or a closed one graded no response with this
+/// `D_r` (spec 07 §7.3.4).
 public let unknownChallengeCode = "SCP-VALID-7107"
 
 /// The error code the bridges raise when the outputs do not answer the request's cases one for one.

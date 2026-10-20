@@ -73,6 +73,13 @@
         }
     }
 
+    private func expectWrongKeyType(_ error: PlatformError?) {
+        guard case .wrongKeyType = error else {
+            Issue.record("expected wrongKeyType, got \(String(describing: error))")
+            return
+        }
+    }
+
     // MARK: - AppleKeyCustody Tests
 
     final class AppleKeyCustodyTests: Sendable {
@@ -119,9 +126,9 @@
         @Test("sign with an HPKE P-256 key throws wrongKeyType")
         func signHpkeP256Fails() async throws {
             let handle = try await custody.generateKeypair(keyType: "hpke-p256")
-            await #expect(throws: PlatformError.self) {
+            expectWrongKeyType(await #expect(throws: PlatformError.self) {
                 _ = try await custody.sign(handle, data: Data("test".utf8))
-            }
+            })
             // Cleanup
             try await custody.destroyKey(handle)
         }
@@ -301,9 +308,9 @@
         @Test("derivePseudonym with an HPKE P-256 key throws wrongKeyType")
         func derivePseudonymHpkeP256Fails() async throws {
             let handle = try await custody.generateKeypair(keyType: "hpke-p256")
-            await #expect(throws: PlatformError.self) {
+            expectWrongKeyType(await #expect(throws: PlatformError.self) {
                 _ = try await custody.derivePseudonym(handle, contextId: Data("ctx".utf8))
-            }
+            })
             // Cleanup
             try await custody.destroyKey(handle)
         }
@@ -498,11 +505,11 @@
         @Test("deriveRotatablePseudonym with an HPKE P-256 key throws wrongKeyType")
         func deriveRotatablePseudonymHpkeP256Fails() async throws {
             let handle = try await custody.generateKeypair(keyType: "hpke-p256")
-            await #expect(throws: PlatformError.self) {
+            expectWrongKeyType(await #expect(throws: PlatformError.self) {
                 _ = try await custody.deriveRotatablePseudonym(
                     handle, contextId: Data("ctx".utf8), pseudonymEpoch: 1
                 )
-            }
+            })
             // Cleanup
             try await custody.destroyKey(handle)
         }

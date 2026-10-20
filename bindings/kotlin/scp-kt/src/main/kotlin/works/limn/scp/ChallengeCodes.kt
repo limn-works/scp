@@ -73,10 +73,17 @@ const val RETRIES_EXHAUSTED_CODE: String = "SCP-VALID-7104"
 /** The cooldown since the last attempt has not passed; [retryAfter] names when it ends. */
 const val COOLDOWN_ACTIVE_CODE: String = "SCP-VALID-7105"
 
-/** The challenge closed after a pass or its last allowed attempt. */
+/**
+ * The challenge is closed: passed or out of attempts. The attempt check returns
+ * this code at begin and at commit (spec 07 §7.3.4).
+ */
 const val CHALLENGE_CLOSED_CODE: String = "SCP-VALID-7106"
 
-/** The challenger's ledger holds no live challenge with this id, request digest and subject. */
+/**
+ * No challenge the challenger holds answers this lookup: no live challenge has
+ * this id, digest and subject, or a closed one graded no response with this
+ * `D_r` (spec 07 §7.3.4).
+ */
 const val UNKNOWN_CHALLENGE_CODE: String = "SCP-VALID-7107"
 
 /** The response does not answer the request, or its outputs do not match the cases one for one, in order. */

@@ -10017,8 +10017,8 @@ public struct CustodyPublicKey {
      */
     public var keyType: CustodyKeyType
     /**
-     * The public key in that type's one encoding: 32 bytes (Ed25519,
-     * X25519), the 33-byte compressed SEC1 point (P-256 signing), or the
+     * The public key in that type's one encoding: 32 bytes (Ed25519), the
+     * 33-byte compressed SEC1 point (P-256 signing), or the
      * 65-byte uncompressed SEC1 point (HPKE P-256).
      */
     public var publicKey: Data
@@ -10034,8 +10034,8 @@ public struct CustodyPublicKey {
          * The key's type.
          */keyType: CustodyKeyType, 
         /**
-         * The public key in that type's one encoding: 32 bytes (Ed25519,
-         * X25519), the 33-byte compressed SEC1 point (P-256 signing), or the
+         * The public key in that type's one encoding: 32 bytes (Ed25519), the
+         * 33-byte compressed SEC1 point (P-256 signing), or the
          * 65-byte uncompressed SEC1 point (HPKE P-256).
          */publicKey: Data, 
         /**
@@ -14468,10 +14468,6 @@ public enum CustodyKeyType {
      */
     case ed25519
     /**
-     * An X25519 key-agreement key.
-     */
-    case x25519
-    /**
      * A P-256 (ECDSA) signing key.
      */
     case p256
@@ -14498,11 +14494,9 @@ public struct FfiConverterTypeCustodyKeyType: FfiConverterRustBuffer {
         
         case 1: return .ed25519
         
-        case 2: return .x25519
+        case 2: return .p256
         
-        case 3: return .p256
-        
-        case 4: return .hpkeP256
+        case 3: return .hpkeP256
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -14516,16 +14510,12 @@ public struct FfiConverterTypeCustodyKeyType: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case .x25519:
+        case .p256:
             writeInt(&buf, Int32(2))
         
         
-        case .p256:
-            writeInt(&buf, Int32(3))
-        
-        
         case .hpkeP256:
-            writeInt(&buf, Int32(4))
+            writeInt(&buf, Int32(3))
         
         }
     }
@@ -16573,7 +16563,7 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
      * Return the type and public key of `key_id` as a [`CustodyPublicKey`].
      *
      * The bridge types the key by `key_type` alone and requires exactly that
-     * type's length: 32 bytes (`"ed25519"`, `"x25519"`), the 33-byte
+     * type's length: 32 bytes (`"ed25519"`), the 33-byte
      * compressed SEC1 point (P-256 signing), or the 65-byte uncompressed
      * SEC1 point (HPKE P-256). A length that does not match the stated type,
      * or an invalid point, is an error, and the bridge binds nothing. The bridge asks this for every key id it has not yet
@@ -16614,9 +16604,8 @@ public protocol KeyCustodyProvider: AnyObject, Sendable {
     /**
      * Perform Diffie-Hellman key agreement.
      *
-     * `key_id` — the X25519 or HPKE P-256 key handle.
-     * `peer_public` — the 32-byte peer X25519 public key, or for
-     * HPKE P-256 the 65-byte uncompressed SEC1 peer point (validated
+     * `key_id` — the HPKE P-256 key handle.
+     * `peer_public` — the 65-byte uncompressed SEC1 peer point (validated
      * on-curve by the bridge before this call).
      *
      * Returns the 32-byte shared secret. The private key never leaves the
@@ -20131,7 +20120,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_sign() != 25409) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 8353) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_get_public_key() != 19655) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_destroy_key() != 48628) {
@@ -20140,7 +20129,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_generate_keypair() != 28522) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 1106) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_dh_agree() != 28036) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_keycustodyprovider_derive_pseudonym() != 1572) {

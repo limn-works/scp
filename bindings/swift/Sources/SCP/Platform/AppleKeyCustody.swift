@@ -1488,9 +1488,11 @@ public extension AppleKeyCustody {
     /// HPKE P-256 key is a key item in the store its companion records plus
     /// that companion; the key item is deleted first, so a failure part-way
     /// leaves the record of a key that is gone, never a key without a record.
-    /// When the companion is missing or does not decode, the store of
-    /// ``mintBacking`` is still asked for a key under the id's tag, and an
-    /// orphaned key is deleted. After each delete this method re-fetches, and
+    /// When the companion is missing, does not decode, or records a key type
+    /// this adapter does not know (a retired one such as `"x25519"`), the
+    /// store of ``mintBacking`` is still asked for a key under the id's tag,
+    /// an orphaned key is deleted, and the companion item is deleted: the
+    /// custody contract destroys whatever the id names, whatever its type. After each delete this method re-fetches, and
     /// if the re-fetch finds the item it throws
     /// ``PlatformError/destructionFailed(_:)``.
     ///
@@ -1514,9 +1516,11 @@ public extension AppleKeyCustody {
     @concurrent
     @discardableResult
     func destroyKey(_ keyHandle: String) async throws -> DestructionAttestation {
-        // A missing or undecodable companion records no type or backing, so
-        // the store this instance mints into is asked for an orphaned key; a
-        // store failure propagates and nothing is reported destroyed.
+        // A missing or undecodable companion, or one recording a type this
+        // adapter does not know, gives no usable type or backing, so the store
+        // this instance mints into is asked for an orphaned key and the
+        // companion is deleted below; a store failure propagates and nothing
+        // is reported destroyed.
         let metadata: KeyMetadata?
         do {
             metadata = try fetchRecord(for: keyHandle).metadata
@@ -1526,8 +1530,8 @@ public extension AppleKeyCustody {
 
         let tag = applicationTag(for: keyHandle)
         var removedKey = false
-        if let metadata {
-            switch try Self.keyType(of: metadata, handle: keyHandle) {
+        if let metadata, let keyType = KeyType(rawValue: metadata.keyType) {
+            switch keyType {
             case .p256, .hpkeP256:
                 removedKey = try await deleteConfirmed(
                     keyHandle, tag: tag, from: p256Store(for: metadata, handle: keyHandle)

@@ -289,8 +289,8 @@ interface PushProvider {
  * Platform trait for cryptographic key custody.
  *
  * Abstracts key generation, signing, key agreement, and pseudonym derivation
- * behind a uniform interface. The Android implementation ([AndroidKeyCustody]) holds four key
- * types (ADR-027):
+ * behind a uniform interface. The Android implementation ([AndroidKeyCustody]) holds Ed25519,
+ * P-256 signing and HPKE P-256 keys (ADR-027):
  *
  * - P-256 signing keys in Android Keystore at every supported API level, signing the bridge's
  *   32-byte digest with `NONEwithECDSA` under a `DIGEST_NONE` key.
@@ -316,7 +316,8 @@ interface PushProvider {
  * - Parameters: its methods name a key by a [KeyHandle], a data class of a `String` id and a
  *   [CustodyType]. The Rust trait's `KeyHandle` is a different type, an opaque `u64`, and the
  *   UniFFI callback's methods take a `String` key ID. [generateKeypair] takes a [KeyType] enum,
- *   as the Rust trait's takes a `KeyType` enum of the same four key types, while the UniFFI
+ *   as the Rust trait's takes a `KeyType` enum of the same key types (Ed25519, P-256 signing and
+ *   HPKE P-256), while the UniFFI
  *   callback's takes a `String` key type. [deriveRotatablePseudonym] takes `pseudonymEpoch` as
  *   a signed `Long`, while both Rust declarations take a `u64`, which UniFFI generates in Kotlin
  *   as `ULong`.

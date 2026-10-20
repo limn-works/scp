@@ -2392,15 +2392,16 @@ export const RETRIES_EXHAUSTED_CODE = "SCP-VALID-7104";
 export const COOLDOWN_ACTIVE_CODE = "SCP-VALID-7105";
 
 /**
- * Code the bridge raises when the challenge closed after a pass or after its
- * last allowed attempt. Maps from `TrustError::ChallengeClosed`.
+ * The challenge is closed: passed or out of attempts. The attempt check returns
+ * this code at begin and at commit (spec 07 §7.3.4). Maps from
+ * `TrustError::ChallengeClosed`.
  */
 export const CHALLENGE_CLOSED_CODE = "SCP-VALID-7106";
 
 /**
- * Code the bridge raises when the challenger's ledger holds no live challenge
- * with the request's id, request digest and subject. Maps from
- * `TrustError::UnknownChallenge`.
+ * No challenge the challenger holds answers this lookup: no live challenge has
+ * this id, digest and subject, or a closed one graded no response with this
+ * `D_r` (spec 07 §7.3.4). Maps from `TrustError::UnknownChallenge`.
  */
 export const UNKNOWN_CHALLENGE_CODE = "SCP-VALID-7107";
 

@@ -701,6 +701,30 @@
             #expect(!KeyIdRecorder.companionExists(keyId))
         }
 
+        /// An item whose record decodes but names a key type this adapter
+        /// does not know, such as the retired `"x25519"`, is still destroyed:
+        /// the custody contract destroys whatever the id names.
+        @Test("destroyKey deletes an item whose recorded key type is unknown")
+        func destroyDeletesAnItemWithAnUnknownRecordedType() async throws {
+            let store = SoftwareP256KeyStore()
+            let custody = keyIds.p256Adapter(store)
+            let keyId = keyIds.next()
+            let label = #"{"keyType":"x25519","role":"operational","custodyType":"software"}"#
+            let status = SecItemAdd([
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: AppleKeyCustody.itemService,
+                kSecAttrAccount as String: "scp.key.\(keyId)",
+                kSecAttrLabel as String: label,
+                kSecValueData as String: Data(repeating: 7, count: 32)
+            ] as CFDictionary, nil)
+            #expect(status == errSecSuccess)
+            #expect(KeyIdRecorder.companionExists(keyId))
+
+            let attestation = try await custody.destroyKey(keyId)
+            #expect(attestation.confirmed)
+            #expect(!KeyIdRecorder.companionExists(keyId))
+        }
+
         /// A new adapter over the same store (an app restart) finds the key.
         /// This covers only the companion item, which keeps the type, role,
         /// backing and public key across instances: the test store holds its

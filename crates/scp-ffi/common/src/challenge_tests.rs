@@ -1815,11 +1815,38 @@ fn case_failed() -> EvaluatorOutcome {
     EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned())
 }
 
+/// An evaluator pipeline task that marks the evaluator started when
+/// `started` is given, yields once as a running pipeline does, then panics.
+async fn panicking_pipeline(started: Option<Arc<AtomicBool>>) -> Stamped<EvaluatorOutcome> {
+    if let Some(started) = started {
+        started.store(true, Ordering::SeqCst);
+    }
+    tokio::task::yield_now().await;
+    panic!("evaluator pipeline panicked")
+}
+
+/// Joins `pipeline` as the evaluator call does, with no captured output.
+async fn join_panicking(
+    h: &Harness,
+    started: &AtomicBool,
+    pipeline: impl Future<Output = Stamped<EvaluatorOutcome>> + Send + 'static,
+) -> EvaluatorOutcome {
+    join_evaluator_pipeline(
+        &h.sup,
+        pipeline,
+        started,
+        &Mutex::new(None),
+        &json!({"type": "object"}),
+        &CaseCompletion::default(),
+    )
+    .await
+    .into_value()
+}
+
 /// A panic after the evaluator started fails the case (spec 07 §7.3.4 step
 /// 3, "a panic"): outcome `CaseFailed`, never a fault. A handler that
 /// panics is caught on its blocking thread; a pipeline task that panics
-/// after the start is caught at its join. A pipeline that panics before the
-/// start ran no evaluator, so that one alone is a fault.
+/// after the start is caught at its join.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evaluator_panic_after_start_fails_the_case() {
     let h = Harness::new(evaluator_params()).await;
@@ -1835,27 +1862,20 @@ async fn evaluator_panic_after_start_fails_the_case() {
     assert_eq!(entered.load(Ordering::SeqCst), 1, "the handler started");
     assert_eq!(outcome, case_failed(), "a handler panic is CaseFailed");
 
-    let panicked = tokio::spawn(async { panic!("evaluator pipeline panicked") })
-        .await
-        .unwrap_err();
-    assert!(panicked.is_panic());
-    let outcome = classify_evaluator_result(
-        Err(panicked),
-        &AtomicBool::new(true),
-        &Mutex::new(None),
-        &json!({"type": "object"}),
-    );
+    let started = Arc::new(AtomicBool::new(false));
+    let pipeline = panicking_pipeline(Some(Arc::clone(&started)));
+    let outcome = join_panicking(&h, &started, pipeline).await;
+    assert!(started.load(Ordering::SeqCst), "the pipeline started");
     assert_eq!(outcome, case_failed(), "a pipeline panic is CaseFailed");
+}
 
-    let before = tokio::spawn(async { panic!("evaluator pipeline panicked") })
-        .await
-        .unwrap_err();
-    let outcome = classify_evaluator_result(
-        Err(before),
-        &AtomicBool::new(false),
-        &Mutex::new(None),
-        &json!({"type": "object"}),
-    );
+/// A pipeline task that panics before the evaluator started ran no
+/// evaluator, so the panic is a fault: outcome `Unavailable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_pipeline_panic_before_start_is_unavailable() {
+    let h = Harness::new(evaluator_params()).await;
+    let started = AtomicBool::new(false);
+    let outcome = join_panicking(&h, &started, panicking_pipeline(None)).await;
     assert!(
         matches!(outcome, EvaluatorOutcome::Unavailable(_)),
         "{outcome:?}"

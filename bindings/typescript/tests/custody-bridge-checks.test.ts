@@ -533,6 +533,22 @@ suite.describe("napi callback custody", () => {
     expect((await rejectionOf(() => thenable.generateKeypair())).code).toBe("SCP-CRYPTO-4060");
   });
 
+  test("a host that reports the retired x25519 key type is a custody error", async () => {
+    const custody = adapterWith({
+      getPublicKey: () => ({
+        keyType: "x25519",
+        publicKey: new Uint8Array(32),
+        role: "operational",
+      }),
+    });
+    const mapped = await rejectionOf(() => custody.sign("9", MESSAGE));
+    expect(mapped).toBeInstanceOf(CryptoError);
+    expect(mapped.code).toBe("SCP-CRYPTO-4060");
+    expect(mapped.message).toContain(
+      "a { keyType: CustodyKeyType, publicKey: Uint8Array, role: CustodyKeyRole } result",
+    );
+  });
+
   test("a thrown value with no readable message is a custody error", async () => {
     const { proxy, revoke } = Proxy.revocable({}, {});
     revoke();
