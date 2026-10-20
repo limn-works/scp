@@ -296,8 +296,18 @@ impl P256SecretKey {
     /// d    = (int(okm) mod (n − 1)) + 1                   // FIPS 186-5 A.2.1
     /// ```
     ///
-    /// The reduction is the one [`from_seed`](Self::from_seed) uses. The key
-    /// zeroizes its scalar on drop, and every intermediate here is wiped.
+    /// The reduction is the one [`from_seed`](Self::from_seed) uses.
+    ///
+    /// Wiped: the key's scalar on drop, the 48-byte `okm` (`Zeroizing`), and
+    /// the `U384` and `U256` reduction intermediates. Not wiped: the 32-byte
+    /// `prk`, which hkdf 0.12's `Hkdf::new` returns from Extract and drops;
+    /// the HMAC-SHA256 state keyed by `prk` inside the `Hkdf` value (hmac 0.12
+    /// and sha2 0.10 do not zeroize), whose inner and outer midstates
+    /// recompute `okm` and so `d`; the HMAC block buffer that held the seed
+    /// during Extract; the `T(1)` and `T(2)` Expand blocks inside hkdf; and the
+    /// stack copies of the `NonZeroScalar` moved by value into the signing
+    /// key. The tracking issue "Secret HKDF derivations leave unwiped PRK and
+    /// HMAC state" owns the fix for this and every other secret HKDF path.
     #[must_use]
     pub fn from_participation_seed(seed: &[u8; 32], context_id: &str) -> Self {
         Self::from_nonzero_scalar(wide48_to_scalar(&participation_signer_okm(
@@ -333,6 +343,15 @@ impl P256SecretKey {
 /// The 48-byte input carries 128 bits more than `n`, so the bias from uniform
 /// is below 2^-128. There is no reject-and-retry and no direct reduction of the
 /// 32-byte seed, both of which §9.10.4 forbids.
+///
+/// Wiped: the 48-byte `scalar_input` (`Zeroizing`) and the `U384` and `U256`
+/// reduction intermediates. Not wiped: the HMAC-SHA256 state keyed by the seed
+/// itself inside the hkdf 0.12 `Hkdf` value (`from_prk(seed)`; hmac 0.12 and
+/// sha2 0.10 do not zeroize), whose midstates recompute `scalar_input` and so
+/// `d`; the `T(1)` and `T(2)` Expand blocks inside hkdf; and the copies of the
+/// returned `NonZeroScalar` left on the stack when it moves by value. The
+/// tracking issue "Secret HKDF derivations leave unwiped PRK and HMAC state"
+/// owns the fix.
 #[must_use]
 pub(crate) fn seed_to_scalar(label: SeedLabel, seed: &[u8; 32]) -> NonZeroScalar {
     // A 32-byte PRK is `HashLen`, and 48 ≤ 255 · HashLen, so neither call fails.
@@ -366,7 +385,9 @@ fn participation_signer_okm(seed: &[u8; 32], context_id: &str) -> Zeroizing<[u8;
 }
 
 /// The FIPS 186-5 A.2.1 reduction both seed-to-scalar derivations share:
-/// `d = (int(okm) mod (n − 1)) + 1`, wiping every intermediate.
+/// `d = (int(okm) mod (n − 1)) + 1`. It wipes its `U384` and `U256`
+/// intermediates; the `NonZeroScalar` it returns by value leaves stack copies
+/// that nothing wipes.
 fn wide48_to_scalar(okm: &Zeroizing<[u8; 48]>) -> NonZeroScalar {
     let mut wide = U384::from_be_slice(okm.as_ref());
     let mut reduced = wide.rem(&N_MINUS_ONE);

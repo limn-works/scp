@@ -84,7 +84,7 @@ pub use participation::{
     UnsignedParticipationProfile, compute_participation_record, participation_profile_unsigned,
 };
 pub use participation_seed::{
-    OpenedParticipationSeed, PARTICIPATION_SEED_LEN, PARTICIPATION_SEED_WRAP_INFO_PREFIX,
+    PARTICIPATION_SEED_LEN, PARTICIPATION_SEED_WRAP_INFO_PREFIX, ParticipationSeed,
     ParticipationSeedError, WrappedParticipationSeed, open_participation_seed,
     seal_participation_seed,
 };
