@@ -25,6 +25,8 @@ hex = { workspace = true }
 base64 = { workspace = true }
 bs58 = { workspace = true }
 z-base-32 = { workspace = true }
+# The RFC 4648 base32 of the identifier text form (03-identity.md §3.1).
+data-encoding = { workspace = true }
 thiserror = { workspace = true }
 # DidDocument logs each service entry it drops while deserializing (§18.2.1).
 tracing = { workspace = true }

@@ -164,6 +164,7 @@ argon2 = "0.5"
 percent-encoding = "2"
 base64 = "0.22"
 bs58 = "0.5"
+data-encoding = "2.10"
 jsonschema = { version = "0.28", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 tracing = "0.1"
