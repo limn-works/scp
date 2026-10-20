@@ -1468,7 +1468,7 @@ The regenerator is `#[ignore]` by default so the default `cargo test` run does n
 
 ## 25.26 Key-Event Preimage and Indexed-Signature Vectors (§9.7.4.2 definitions, §9.5)
 
-**What these vectors pin.** §9.7.4.2's definitions fix the key-event preimage's field order, so these vectors pin an inception event's own bytes, the digest of those bytes, the identifier that digest derives, and the routing id that identifier derives, then the indexed signature each of the two forms produces over the same event.
+**What these vectors pin.** §9.7.4.2's definitions fix the key-event preimage's field order, so these vectors pin an inception event's own bytes, the digest of those bytes, the identifier that digest derives, and the four routing ids that identifier derives under `09-security-model.md` §9.7.4.2 R13, then the indexed signature each of the two forms produces over the same event.
 
 **The vector identity.** A one-member root set holding §25.2's reference key, one `#active` key which is §25.2's secondary key, a one-member next set whose pre-rotation key is §25.2's tertiary key, one designated witness, and a witnessing interval of 3600 seconds. Every key carries `KeyAlgorithm` `0x01` and `CustodyType` `Passkey` (`0x01`). The key-state snapshot is 171 bytes and the preimage is 364 bytes.
 
@@ -1507,6 +1507,12 @@ Identifier, SHA-256("SCP-KEL-ID-V1:" || preimage):
   2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
 Routing id, SHA-256("scp:did:" || identifier):
   f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb
+Cosigned-head routing id, SHA-256("scp:wit:" || identifier):
+  e278b66a7481f608d58a5f11b5fa7c4221f23071172ffd0d7ec1fd94494970fe
+Conflict-statement routing id, SHA-256("scp:wcf:" || identifier):
+  31f18999c7207845a6ac3b85ce774a6f9eff1a8da300b37d2b54ff8688e07744
+Service-record routing id, SHA-256("scp:svc:" || identifier) (Vector 48's address):
+  415152a878481430157966302b508188f6715a49e2bc7072bad1c4a54af24f17
 
 Root-set member 0, 33-byte SEC1 compressed point:
   033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30
@@ -1588,7 +1594,7 @@ Indexed signature, BE32(len(authenticatorData)) || authenticatorData || BE32(len
   049ebcbf9716c424
 ```
 
-**Conformance procedure.** Rebuild the preimage from the field order §9.7.4.2's definitions state and compare it byte for byte, recompute the digest, the identifier and the routing id, then run against Vector 42's indexed signature every assertion-signature check those same definitions state.
+**Conformance procedure.** Rebuild the preimage from the field order §9.7.4.2's definitions state and compare it byte for byte, recompute the digest, the identifier and the four routing ids, then run against Vector 42's indexed signature every assertion-signature check those same definitions state.
 
 
 ### Vector 50: a `KeyState` that pins both composite absent-field sentinels
@@ -2186,7 +2192,7 @@ winner:
 
 ### Vector 57: the identifier's text form
 
-`03-identity.md` §3.1 fixes the text form as `scp:` followed by the RFC 4648 base32 encoding of the identifier's 32 bytes, lowercase and without padding. A parser rejects the two variants below with `IdentityError::NonCanonicalIdentifier`.
+`03-identity.md` §3.1 fixes the text form as `scp:` followed by the RFC 4648 base32 encoding of the identifier's 32 bytes, lowercase and without padding. A parser rejects the two variants below with `IdentityError::NonCanonicalIdentifier`, or with a `NonCanonicalIdentifier` error of its own that the identity API maps to that variant (`03-identity.md` §3.1).
 
 ```
 identifier (Vector 41):

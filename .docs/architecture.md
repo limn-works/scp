@@ -289,6 +289,9 @@ scp/
 │   │   ├── document.rs        # Retired document types; the key state replaces them
 │   │   └── attestation.rs     # Key-custody / identity-link attestation types
 │   │
+│   ├── scp-kel/               # Key-event log codec (SCP-308, slice S1) and verifier (SCP-309, from slice S2) — wasm-safe leaf;
+│   │                          #   no async, no I/O; depends on scp-did, and on scp-crypto from S2 (09-security-model.md §9.7.4.2, ADR-063)
+│   │
 │   ├── scp-mls/               # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
 │   │
 │   ├── scp-client/            # Single-threaded in-browser participant driver over scp-mls (ADR-057)
