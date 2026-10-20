@@ -516,6 +516,10 @@ jobs:
               - 'crates/scp-protocol/**'
               - 'crates/scp-event-log/**'
               - 'crates/scp-relay-client/**'
+              # A dev-dependency, not in the closure above: the wasm32 key-event
+              # KAT (crates/scp-client-wasm/tests/kel_cross_target_kat.rs)
+              # checks scp-kel and includes scp-kel's test fixtures.
+              - 'crates/scp-kel/**'
               # scp-client-wasm is member 15 of the root workspace, so
               # `wasm-pack build` resolves every `dep = { workspace = true }`
               # entry in the crates above against the root manifest's
@@ -1526,7 +1530,7 @@ jobs:
           shared-key: wasm32
           save-if: false
       - uses: ./.github/actions/cargo-fetch
-      - run: cargo check -p scp-alloc -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
+      - run: cargo check -p scp-alloc -p scp-clock -p scp-crypto -p scp-did -p scp-kel -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
 
   wasm-test:
     needs: changes
@@ -1910,7 +1914,7 @@ jobs:
       - name: Run every other member's tests
         if: matrix.leg == 'all' || matrix.leg == 'rest'
         run: |
-          cargo nextest run --no-tests=fail -p scp-alloc -p scp-sqlite-pools -p scp-clock -p scp-crypto -p scp-did -p scp-dht -p scp-identity -p scp-event-log -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-client-wasm -p scp-relay-mock -p scp-transport -p scp-mcp -p scp-media -p scp-node -p scp-relay --features serde_json/unbounded_depth,rustix/net,scp-crypto/testing,scp-identity/testing,scp-testing/testing,scp-core/outlet-capability-test-grant,scp-mcp/testing,scp-node/allow_unencrypted_storage,scp-node/testing
+          cargo nextest run --no-tests=fail -p scp-alloc -p scp-sqlite-pools -p scp-clock -p scp-crypto -p scp-did -p scp-kel -p scp-dht -p scp-identity -p scp-event-log -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-client-wasm -p scp-relay-mock -p scp-transport -p scp-mcp -p scp-media -p scp-node -p scp-relay --features serde_json/unbounded_depth,rustix/net,scp-crypto/testing,scp-identity/testing,scp-testing/testing,scp-core/outlet-capability-test-grant,scp-mcp/testing,scp-node/allow_unencrypted_storage,scp-node/testing
 
   # ── Optional-feature test lanes ─────────────────────────────────────────────
   #

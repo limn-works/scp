@@ -4804,6 +4804,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
+ "hex",
  "js-sys",
  "openmls",
  "rmp-serde",
@@ -4813,6 +4814,7 @@ dependencies = [
  "scp-crypto",
  "scp-did",
  "scp-event-log",
+ "scp-kel",
  "scp-mls",
  "scp-protocol",
  "scp-relay-client",
@@ -5110,6 +5112,17 @@ dependencies = [
  "tracing-subscriber",
  "z-base-32",
  "zeroize",
+]
+
+[[package]]
+name = "scp-kel"
+version = "0.1.0-beta.2"
+dependencies = [
+ "hex",
+ "proptest",
+ "scp-did",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
