@@ -2210,7 +2210,8 @@ async fn evaluator_permission_denied_at_grading_is_a_fault() {
 ///
 /// The fault names the spending check's refusal by the code production
 /// gives it today. The runtime reports a missing spending UCAN as an
-/// execution handler panic (`SCP-OUTLET-6130`, `execution.handler-panic`),
+/// execution handler panic (`CODE_EXECUTION_FAULT`, slug
+/// `SLUG_EXECUTION_HANDLER_PANIC`),
 /// not as a payment or authorization refusal. No other fault this harness
 /// can reach before the evaluator starts carries that code: an unregistered
 /// outlet or a denied permission surfaces as `authorization.denied`, and a
@@ -2219,6 +2220,9 @@ async fn evaluator_permission_denied_at_grading_is_a_fault() {
 /// code of its own, this assertion moves to that code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evaluator_payment_refusal_at_grading_is_a_fault() {
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_EXECUTION_FAULT, SLUG_EXECUTION_HANDLER_PANIC,
+    };
     let h = Harness::new(priced_params()).await;
     let calls = Arc::new(AtomicUsize::new(0));
     let invoker = h.invoker(Some(registry()), Some(passing_handler(&calls)));
@@ -2235,7 +2239,7 @@ async fn evaluator_payment_refusal_at_grading_is_a_fault() {
     };
     assert_eq!((context_id.as_str(), outlet_id.as_str()), (EVAL_CTX, JUDGE));
     assert!(
-        reason.contains("SCP-OUTLET-6130") && reason.contains("execution.handler-panic"),
+        reason.contains(CODE_EXECUTION_FAULT) && reason.contains(SLUG_EXECUTION_HANDLER_PANIC),
         "the spending check's refusal, got {reason}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler never ran");
