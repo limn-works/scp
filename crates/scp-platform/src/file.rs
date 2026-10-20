@@ -11,7 +11,7 @@
 //! summary and §17.8 differ, §17.8 governs.
 //!
 //! The key file stores zero or more encrypted key entries, each containing
-//! one Ed25519, X25519 or P-256 private key. The file begins with a global
+//! one Ed25519 or P-256 private key. The file begins with a global
 //! header and is followed by a sequence of key entries:
 //!
 //! ```text
@@ -25,7 +25,7 @@
 //! ├────────────────────────────────────────────────┤
 //! │ Entry 0:                                       │
 //! │   key_type: u8       (0x01 = Ed25519,          │
-//! │                       0x02 = X25519,           │
+//! │                       0x02 = retired,          │
 //! │                       0x03 = P-256 signing,    │
 //! │                       0x04 = P-256 HPKE)       │
 //! │   role: u8           (0x00 = operational,      │
@@ -84,8 +84,8 @@
 //! second custody object rewrites the file under the same passphrase, so the
 //! first object's map outlives the entry it names while the file it now reads
 //! still carries a valid HMAC. [`SigningKey::from_bytes`] accepts any 32 bytes,
-//! so without the stored-byte comparison a stale Ed25519 handle turns an X25519
-//! static secret into an Ed25519 signing key and returns a signature. Without
+//! so without the stored-byte comparison a stale Ed25519 handle turns a P-256
+//! scalar into an Ed25519 signing key and returns a signature. Without
 //! the associated data, a writer who moves one entry's ciphertext behind
 //! another entry's identifier hands that ciphertext an identity it never
 //! committed to.
@@ -137,7 +137,7 @@
 //!    A matching commitment with a mismatched HMAC proves something modified
 //!    this file after custody wrote it — a header transplanted from another
 //!    file, a rewritten entry count that hides keys, a reordered entry that
-//!    redirects a handle, a flipped `key_type` byte that reads an X25519 secret
+//!    redirects a handle, a flipped `key_type` byte that reads a P-256 scalar
 //!    as an Ed25519 signing key, or a flipped ciphertext bit. An operator
 //!    answers a modified file by restoring a backup, so this condition carries
 //!    its own message instead of reading as a wrong passphrase.
@@ -169,7 +169,6 @@ use rand::RngCore;
 use std::sync::Mutex as StdMutex;
 use subtle::ConstantTimeEq as _;
 use tokio::sync::Mutex;
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::error::PlatformError;
@@ -198,8 +197,8 @@ const SALT_LEN: usize = 16;
 /// AES-256-GCM nonce length in bytes.
 const NONCE_LEN: usize = 12;
 
-/// Private key length in bytes (an Ed25519 seed, an X25519 secret, or a
-/// big-endian P-256 scalar).
+/// Private key length in bytes (an Ed25519 seed or a big-endian P-256
+/// scalar).
 const KEY_LEN: usize = 32;
 
 /// AES-256-GCM authentication tag length in bytes.
@@ -273,8 +272,8 @@ const HEADER_SIZE: usize = ENTRY_COUNT_OFFSET + ENTRY_COUNT_LEN;
 /// Key type byte for Ed25519.
 const KEY_TYPE_ED25519: u8 = 0x01;
 
-/// Key type byte for X25519.
-const KEY_TYPE_X25519: u8 = 0x02;
+// Key type byte 0x02 named the retired X25519 key type. No key type takes
+// it, so `StoredKeyType::from_byte` refuses an entry that carries it.
 
 /// Key type byte for a P-256 signing key ([`KeyType::P256Signing`]).
 const KEY_TYPE_P256_SIGNING: u8 = 0x03;
@@ -290,7 +289,6 @@ const KEY_TYPE_P256_HPKE: u8 = 0x04;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredKeyType {
     Ed25519,
-    X25519,
     P256Signing,
     HpkeP256,
 }
@@ -299,7 +297,6 @@ impl StoredKeyType {
     const fn to_byte(self) -> u8 {
         match self {
             Self::Ed25519 => KEY_TYPE_ED25519,
-            Self::X25519 => KEY_TYPE_X25519,
             Self::P256Signing => KEY_TYPE_P256_SIGNING,
             Self::HpkeP256 => KEY_TYPE_P256_HPKE,
         }
@@ -308,7 +305,6 @@ impl StoredKeyType {
     const fn from_key_type(key_type: KeyType) -> Self {
         match key_type {
             KeyType::Ed25519 => Self::Ed25519,
-            KeyType::X25519 => Self::X25519,
             KeyType::P256Signing => Self::P256Signing,
             KeyType::HpkeP256 => Self::HpkeP256,
         }
@@ -319,7 +315,6 @@ impl StoredKeyType {
     const fn to_key_type(self) -> KeyType {
         match self {
             Self::Ed25519 => KeyType::Ed25519,
-            Self::X25519 => KeyType::X25519,
             Self::P256Signing => KeyType::P256Signing,
             Self::HpkeP256 => KeyType::HpkeP256,
         }
@@ -328,7 +323,6 @@ impl StoredKeyType {
     fn from_byte(b: u8) -> Result<Self, PlatformError> {
         match b {
             KEY_TYPE_ED25519 => Ok(Self::Ed25519),
-            KEY_TYPE_X25519 => Ok(Self::X25519),
             KEY_TYPE_P256_SIGNING => Ok(Self::P256Signing),
             KEY_TYPE_P256_HPKE => Ok(Self::HpkeP256),
             _ => Err(PlatformError::CustodyError(format!(
@@ -926,7 +920,7 @@ fn sync_parent_dir(dir: &Path) {
 
 /// Encrypted file-backed implementation of [`KeyCustody`].
 ///
-/// Stores Ed25519, X25519, P-256 signing and P-256 HPKE private keys
+/// Stores Ed25519, P-256 signing and P-256 HPKE private keys
 /// encrypted at rest using
 /// AES-256-GCM with a key derived from a user-provided passphrase via
 /// Argon2id. This is the universal fallback custody for non-HSM platforms.
@@ -1225,7 +1219,7 @@ impl FileKeyCustody {
     /// `expected_key_type` is what a caller's handle map recorded, and
     /// `data[offset]` is what the file says now. Comparing those two before
     /// decrypting is what stops [`SigningKey::from_bytes`] from turning an
-    /// X25519 static secret into an Ed25519 signing key, which it does without
+    /// P-256 scalar into an Ed25519 signing key, which it does without
     /// complaint for any 32 bytes. The associated data this function rebuilds —
     /// `key_type | role | entry_id`, per §17.8 of
     /// `.docs/specs/17-persistence-and-storage.md` — then makes AES-256-GCM
@@ -1474,7 +1468,7 @@ impl FileKeyCustody {
         crate::traits::require_derive_source(role, loaded.key_type())?;
         match loaded {
             LoadedKey::Ed25519(seed) => Ok(seed),
-            other => Err(wrong_type(other.key_type(), KeyType::Ed25519)),
+            other @ LoadedKey::P256(..) => Err(wrong_type(other.key_type(), KeyType::Ed25519)),
         }
     }
 
@@ -1507,7 +1501,6 @@ impl FileKeyCustody {
         let key_bytes = self.decrypt_entry(&data, &entry_id, key_type, role)?;
         Ok(match key_type {
             StoredKeyType::Ed25519 => LoadedKey::Ed25519(key_bytes),
-            StoredKeyType::X25519 => LoadedKey::X25519(key_bytes),
             StoredKeyType::P256Signing => LoadedKey::P256(
                 KeyType::P256Signing,
                 crate::traits::p256_key_from_stored(&key_bytes)?,
@@ -1522,7 +1515,7 @@ impl FileKeyCustody {
     /// Mints and persists a key of `key_type` in `role`.
     async fn generate(&self, key_type: KeyType, role: KeyRole) -> Result<KeyHandle, PlatformError> {
         let key_bytes = match key_type {
-            KeyType::Ed25519 | KeyType::X25519 => {
+            KeyType::Ed25519 => {
                 let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
                 rand::rngs::OsRng.fill_bytes(key_bytes.as_mut());
                 key_bytes
@@ -1562,7 +1555,6 @@ use scp_crypto::pseudonym::{PseudonymVersion, derive_pseudonym};
 /// drop, and `P256SecretKey` zeroizes its scalar on drop.
 enum LoadedKey {
     Ed25519(Zeroizing<[u8; KEY_LEN]>),
-    X25519(Zeroizing<[u8; KEY_LEN]>),
     /// A P-256 key and its public type (`P256Signing` or `HpkeP256`).
     P256(KeyType, P256SecretKey),
 }
@@ -1571,7 +1563,6 @@ impl LoadedKey {
     const fn key_type(&self) -> KeyType {
         match self {
             Self::Ed25519(_) => KeyType::Ed25519,
-            Self::X25519(_) => KeyType::X25519,
             Self::P256(key_type, _) => *key_type,
         }
     }
@@ -1615,7 +1606,6 @@ impl KeyCustody for FileKeyCustody {
                 LoadedKey::P256(KeyType::P256Signing, key) => {
                     crate::traits::sign_p256_digest(&key, data)
                 }
-                LoadedKey::X25519(_) => Err(wrong_type(KeyType::X25519, KeyType::Ed25519)),
                 LoadedKey::P256(actual, _) => Err(wrong_type(actual, KeyType::P256Signing)),
             }
         }
@@ -1632,11 +1622,6 @@ impl KeyCustody for FileKeyCustody {
                     let signing_key = SigningKey::from_bytes(&key_bytes);
                     let vk: VerifyingKey = signing_key.verifying_key();
                     PublicKey::new(vk.to_bytes().to_vec())
-                }
-                LoadedKey::X25519(key_bytes) => {
-                    let secret = StaticSecret::from(*key_bytes);
-                    let public = X25519PublicKey::from(&secret);
-                    PublicKey::new(public.to_bytes().to_vec())
                 }
                 LoadedKey::P256(KeyType::HpkeP256, key) => {
                     PublicKey::new(key.public_key().to_uncompressed().to_vec())
@@ -1797,18 +1782,10 @@ impl KeyCustody for FileKeyCustody {
         let peer_public = peer_public.to_vec();
         async move {
             match self.load_key(key_id).await? {
-                LoadedKey::X25519(key_bytes) => {
-                    let peer = crate::traits::x25519_peer(&peer_public)?;
-                    let secret = StaticSecret::from(*key_bytes);
-                    let peer_key = X25519PublicKey::from(peer);
-                    let shared = secret.diffie_hellman(&peer_key);
-                    let shared_bytes = Zeroizing::new(shared.to_bytes());
-                    Ok(SharedSecret::new(*shared_bytes))
-                }
                 LoadedKey::P256(KeyType::HpkeP256, key) => {
                     crate::traits::p256_dh_agree(&key, &peer_public)
                 }
-                LoadedKey::Ed25519(_) => Err(wrong_type(KeyType::Ed25519, KeyType::X25519)),
+                LoadedKey::Ed25519(_) => Err(wrong_type(KeyType::Ed25519, KeyType::HpkeP256)),
                 LoadedKey::P256(actual, _) => Err(wrong_type(actual, KeyType::HpkeP256)),
             }
         }
@@ -2064,21 +2041,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_x25519_and_dh_agree() {
+    async fn generate_hpke_p256_and_dh_agree() {
         let dir = TempDir::new().unwrap();
         let custody = make_custody(&dir, "pw");
 
-        let alice = custody.generate_keypair(KeyType::X25519).await.unwrap();
-        let bob = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        let alice = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
+        let bob = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
 
         let alice_pub = custody.public_key(&alice).await.unwrap();
         let bob_pub = custody.public_key(&bob).await.unwrap();
 
-        let a_bytes: [u8; 32] = alice_pub.as_bytes().try_into().unwrap();
-        let b_bytes: [u8; 32] = bob_pub.as_bytes().try_into().unwrap();
-
-        let secret_ab = custody.dh_agree(&alice, &b_bytes).await.unwrap();
-        let secret_ba = custody.dh_agree(&bob, &a_bytes).await.unwrap();
+        let secret_ab = custody.dh_agree(&alice, bob_pub.as_bytes()).await.unwrap();
+        let secret_ba = custody.dh_agree(&bob, alice_pub.as_bytes()).await.unwrap();
 
         assert_eq!(secret_ab.as_bytes(), secret_ba.as_bytes());
     }
@@ -2689,17 +2663,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sign_with_x25519_key_fails() {
+    async fn sign_with_hpke_p256_key_fails() {
         let dir = TempDir::new().unwrap();
         let custody = make_custody(&dir, "pw");
-        let handle = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        let handle = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
 
         let result = custody.sign(&handle, b"data").await;
         assert!(result.is_err());
         match result.unwrap_err() {
             PlatformError::WrongKeyType { expected, actual } => {
-                assert_eq!(expected, KeyType::Ed25519);
-                assert_eq!(actual, KeyType::X25519);
+                assert_eq!(expected, KeyType::P256Signing);
+                assert_eq!(actual, KeyType::HpkeP256);
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -2715,7 +2689,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             PlatformError::WrongKeyType { expected, actual } => {
-                assert_eq!(expected, KeyType::X25519);
+                assert_eq!(expected, KeyType::HpkeP256);
                 assert_eq!(actual, KeyType::Ed25519);
             }
             other => panic!("unexpected error: {other:?}"),
@@ -2846,7 +2820,7 @@ mod tests {
         let custody = FileKeyCustody::new(&path, passphrase).unwrap();
 
         let h1 = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let h2 = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        let h2 = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
         let h3 = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         let pk1 = custody.public_key(&h1).await.unwrap();
@@ -3622,14 +3596,14 @@ mod tests {
     /// A handle whose entry a second custody object destroyed reports an error
     /// instead of signing with whichever key moved into that entry's position.
     ///
-    /// Object `a` records (Ed25519, entry 0) and (X25519, entry 1). Object `b`
-    /// destroys entry 0, which moves the X25519 secret to position 0 and
+    /// Object `a` records (Ed25519, entry 0) and (P-256 HPKE, entry 1). Object
+    /// `b` destroys entry 0, which moves the P-256 scalar to position 0 and
     /// re-seals a valid file HMAC under the same passphrase. Object `a`'s
     /// handle names the identifier of the entry `b` removed, so both calls
     /// below report that the file holds no such entry. A handle bound to a
-    /// position instead reads the X25519 secret sitting at position 0, and
+    /// position instead reads the P-256 scalar sitting at position 0, and
     /// `SigningKey::from_bytes` accepts any 32 bytes, so it returns an Ed25519
-    /// signature computed from an X25519 static secret.
+    /// signature computed from a P-256 scalar.
     #[tokio::test]
     async fn a_handle_over_a_destroyed_entry_fails_instead_of_signing() {
         let dir = TempDir::new().unwrap();
@@ -3637,7 +3611,7 @@ mod tests {
 
         let a = FileKeyCustody::new(&path, "pw").unwrap();
         let ed = a.generate_keypair(KeyType::Ed25519).await.unwrap();
-        a.generate_keypair(KeyType::X25519).await.unwrap();
+        a.generate_keypair(KeyType::HpkeP256).await.unwrap();
 
         // `b` loads the same two entries, and derives the same handle ids from
         // their identifiers, so `ed` names entry 0 in `b` too.
@@ -3682,7 +3656,7 @@ mod tests {
         let ed = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         let mut data = custody.read_file().unwrap();
-        data[HEADER_SIZE] = KEY_TYPE_X25519;
+        data[HEADER_SIZE] = KEY_TYPE_P256_HPKE;
         seal_file_mac(&custody.mac_key, &mut data).unwrap();
         atomic_write(&path, &data).unwrap();
 
@@ -3696,24 +3670,24 @@ mod tests {
             .expect_err("an entry whose type byte changed must not sign");
         match error {
             PlatformError::CustodyError(msg) => assert!(
-                msg.contains("X25519") && msg.contains("Ed25519"),
+                msg.contains("HpkeP256") && msg.contains("Ed25519"),
                 "the error must name both the stored type and the expected type: {msg}"
             ),
             other => panic!("expected CustodyError, got {other:?}"),
         }
     }
 
-    /// A writer who flips an Ed25519 entry's `key_type` byte to X25519 and
-    /// re-seals the file HMAC cannot use that seed as an X25519 secret through
-    /// a custody object that reopens the file.
+    /// A writer who flips an Ed25519 entry's `key_type` byte to P-256 HPKE and
+    /// re-seals the file HMAC cannot use that seed as a P-256 scalar through a
+    /// custody object that reopens the file.
     ///
     /// A reopened custody builds its handle map from the stored type byte, so
-    /// the handle's expected type and the stored type both read X25519 and the
+    /// the handle's expected type and the stored type both read P-256 HPKE and the
     /// comparison in `decrypt_entry` passes. The associated data `encrypt_key`
     /// bound is the only check left: the entry was sealed under the Ed25519
     /// type, so the AEAD rejects it. Passing a type-independent value to
     /// `entry_aad` at both call sites makes `dh_agree` and `public_key` here
-    /// succeed with the Ed25519 seed used as an X25519 static secret.
+    /// succeed with the Ed25519 seed used as a P-256 scalar.
     #[tokio::test]
     async fn a_flipped_key_type_byte_fails_the_aead_check_after_a_reopen() {
         let dir = TempDir::new().unwrap();
@@ -3723,7 +3697,7 @@ mod tests {
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
         let mut data = custody.read_file().unwrap();
-        data[HEADER_SIZE] = KEY_TYPE_X25519;
+        data[HEADER_SIZE] = KEY_TYPE_P256_HPKE;
         seal_file_mac(&custody.mac_key, &mut data).unwrap();
         atomic_write(&path, &data).unwrap();
         drop(custody);
@@ -3731,18 +3705,20 @@ mod tests {
         let reopened = FileKeyCustody::new(&path, "pw")
             .expect("a re-sealed file passes its HMAC check, so the reopen succeeds");
 
-        // The X25519 base point, so an unmutated build could not fail on a
-        // low-order peer instead of on the AEAD.
-        let mut peer = [0u8; 32];
-        peer[0] = 9;
+        // A valid P-256 peer point, so an unmutated build could not fail on
+        // the peer instead of on the AEAD.
+        let peer = P256SecretKey::from_scalar_bytes(&[6u8; 32])
+            .unwrap()
+            .public_key()
+            .to_uncompressed();
         let dh_error = reopened
             .dh_agree(&handle, &peer)
             .await
-            .expect_err("an Ed25519 seed relabelled X25519 must not reach a DH agreement");
+            .expect_err("an Ed25519 seed relabelled P-256 HPKE must not reach a DH agreement");
         let public_key_error = reopened
             .public_key(&handle)
             .await
-            .expect_err("an Ed25519 seed relabelled X25519 must not yield an X25519 public key");
+            .expect_err("an Ed25519 seed relabelled P-256 HPKE must not yield a P-256 public key");
         for error in [dh_error, public_key_error] {
             match error {
                 PlatformError::CustodyError(msg) => assert!(
@@ -3871,7 +3847,7 @@ mod tests {
         let first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let victim = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let third = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let fourth = custody.generate_keypair(KeyType::X25519).await.unwrap();
+        let fourth = custody.generate_keypair(KeyType::HpkeP256).await.unwrap();
 
         let first_public = custody.public_key(&first).await.unwrap();
         let third_public = custody.public_key(&third).await.unwrap();
@@ -3893,17 +3869,16 @@ mod tests {
         assert_eq!(
             custody.public_key(&fourth).await.unwrap().as_bytes(),
             fourth_public.as_bytes(),
-            "a moved X25519 entry must still decrypt to the same key"
+            "a moved P-256 HPKE entry must still decrypt to the same key"
         );
         custody
             .sign(&third, b"payload")
             .await
             .expect("a moved Ed25519 entry must still sign");
-        let peer = [7u8; 32];
         custody
-            .dh_agree(&fourth, &peer)
+            .dh_agree(&fourth, fourth_public.as_bytes())
             .await
-            .expect("a moved X25519 entry must still agree");
+            .expect("a moved P-256 HPKE entry must still agree");
 
         // Every surviving entry carries the bytes it carried before, at
         // whatever position it now sits.
@@ -4079,6 +4054,18 @@ mod tests {
         );
     }
 
+    /// Type byte 0x02 named the retired X25519 key type. No key type takes it,
+    /// so an entry carrying it is refused before any decryption.
+    #[test]
+    fn the_retired_type_byte_is_refused() {
+        match StoredKeyType::from_byte(0x02) {
+            Err(PlatformError::CustodyError(msg)) => {
+                assert!(msg.contains("unknown key type byte: 0x02"), "{msg}");
+            }
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+    }
+
     /// `entry_aad` gives every (`key_type`, `role`, `entry_id`) triple its own
     /// 18-byte encoding, so no two entries share associated data.
     #[test]
@@ -4086,7 +4073,6 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for key_type in [
             StoredKeyType::Ed25519,
-            StoredKeyType::X25519,
             StoredKeyType::P256Signing,
             StoredKeyType::HpkeP256,
         ] {
@@ -4100,7 +4086,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen.len(), 512);
+        assert_eq!(seen.len(), 3 * 2 * 64);
     }
 
     /// `generate_unique_entry_id` never returns an identifier the file already

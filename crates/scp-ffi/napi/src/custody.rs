@@ -91,7 +91,7 @@ pub struct NapiKeyCustodyProvider {
     /// The host never reuses a key id: an id it returns here names no other
     /// key for the host's lifetime, even after that key is destroyed.
     #[napi(
-        ts_type = "(args: [\"ed25519\" | \"x25519\" | \"p256\" | \"hpke-p256\", \"identity\" | \"operational\"]) => { ok: boolean; value?: string; code?: string; message?: string }"
+        ts_type = "(args: [\"ed25519\" | \"p256\" | \"hpke-p256\", \"identity\" | \"operational\"]) => { ok: boolean; value?: string; code?: string; message?: string }"
     )]
     pub generate_keypair:
         Function<'static, (NapiCustodyKeyType, NapiCustodyKeyRole), HostStringResult>,
@@ -106,8 +106,8 @@ pub struct NapiKeyCustodyProvider {
     )]
     pub sign: Function<'static, (String, Vec<u8>), HostBytesResult>,
     /// `(keyId: string) => { keyType, publicKey, role }` — the key's type
-    /// (`"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`) and its public
-    /// key: exactly 32 bytes (Ed25519 / X25519), the 33-byte compressed SEC1
+    /// (`"ed25519"`, `"p256"` or `"hpke-p256"`) and its public
+    /// key: exactly 32 bytes (Ed25519), the 33-byte compressed SEC1
     /// point (`"p256"`) or the 65-byte uncompressed SEC1 point
     /// (`"hpke-p256"`). The bridge types the key from `keyType`, never from
     /// the length, and refuses any other length. A key id the host does not
@@ -119,7 +119,7 @@ pub struct NapiKeyCustodyProvider {
     /// reports `"identity"` for a key it minted as `"operational"` lets that
     /// key derive pseudonyms, which is outside Rust's control.
     #[napi(
-        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: \"ed25519\" | \"x25519\" | \"p256\" | \"hpke-p256\"; publicKey: number[]; role: \"identity\" | \"operational\" }; code?: string; message?: string }"
+        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: \"ed25519\" | \"p256\" | \"hpke-p256\"; publicKey: number[]; role: \"identity\" | \"operational\" }; code?: string; message?: string }"
     )]
     pub get_public_key: Function<'static, String, HostPublicKeyResult>,
     /// `(keyId: string) => void` — destroy key material.
@@ -179,9 +179,6 @@ pub enum NapiCustodyKeyType {
     /// An Ed25519 signing key.
     #[napi(value = "ed25519")]
     Ed25519,
-    /// An X25519 key-agreement key.
-    #[napi(value = "x25519")]
-    X25519,
     /// A P-256 signing key.
     #[napi(value = "p256")]
     P256,
@@ -194,7 +191,6 @@ impl From<KeyType> for NapiCustodyKeyType {
     fn from(key_type: KeyType) -> Self {
         match key_type {
             KeyType::Ed25519 => Self::Ed25519,
-            KeyType::X25519 => Self::X25519,
             KeyType::P256Signing => Self::P256,
             KeyType::HpkeP256 => Self::HpkeP256,
         }
@@ -205,7 +201,6 @@ impl From<NapiCustodyKeyType> for KeyType {
     fn from(key_type: NapiCustodyKeyType) -> Self {
         match key_type {
             NapiCustodyKeyType::Ed25519 => Self::Ed25519,
-            NapiCustodyKeyType::X25519 => Self::X25519,
             NapiCustodyKeyType::P256 => Self::P256Signing,
             NapiCustodyKeyType::HpkeP256 => Self::HpkeP256,
         }
@@ -1232,7 +1227,7 @@ mod tests {
     ///     public point;
     /// (b) peers of 32, 33, 64 and 66 bytes are rejected;
     /// (c) an off-curve 65-byte point and a `0x00`-led one are rejected;
-    /// (d) an Ed25519 or X25519 handle with a 65-byte peer is rejected, and so
+    /// (d) an Ed25519 or P-256 signing handle with a 65-byte peer is rejected, and so
     ///     is the HPKE handle with a 32-byte peer.
     #[tokio::test]
     async fn napi_key_custody_in_memory_hpke_p256_dh_agree() {
@@ -1308,12 +1303,15 @@ mod tests {
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("Ed25519");
-        let x = custody
-            .generate_keypair(KeyType::X25519)
+        let signing = custody
+            .generate_keypair(KeyType::P256Signing)
             .await
-            .expect("X25519");
+            .expect("P-256 signing");
         assert!(custody.dh_agree(&ed, &fixed_pub).await.is_err(), "Ed25519");
-        assert!(custody.dh_agree(&x, &fixed_pub).await.is_err(), "X25519");
+        assert!(
+            custody.dh_agree(&signing, &fixed_pub).await.is_err(),
+            "P-256 signing"
+        );
         assert!(
             custody.dh_agree(&a, &[7u8; 32]).await.is_err(),
             "HPKE handle, 32-byte peer"

@@ -227,7 +227,9 @@ describe("CryptoKeychain hpke-p256", () => {
     }
     const ed = keychain.generateKeypair("ed25519", "identity");
     expect(() => keychain.dhAgree(ed, point)).toThrow();
-    expect(() => keychain.generateKeypair("x25519", "operational")).toThrow();
+    // The retired X25519 type is outside CustodyKeyType; the host still refuses it.
+    const retired = "x25519" as unknown as CustodyKeyType;
+    expect(() => keychain.generateKeypair(retired, "operational")).toThrow();
   });
 });
 

@@ -1,6 +1,6 @@
 // AndroidKeyCustodyTest.kt — Unit tests for AndroidKeyCustody (SCP-110)
 //
-// These tests exercise the Ed25519 and X25519 software path (Bouncy Castle), with
+// These tests exercise the Ed25519 software path (Bouncy Castle), with
 // JcaFakeKeystoreKeys standing in for Android Keystore, which JVM unit tests cannot reach.
 // AndroidKeyCustodyPseudonymLifecycleTest runs the Keystore Ed25519 path and
 // AndroidKeyCustodyP256Test the P-256 keys; the emulator lane runs the real Keystore. dhAgree
@@ -102,9 +102,7 @@ internal class InMemorySharedPreferences : SharedPreferences {
  *
  * Android Keystore is not available in JVM unit tests. These tests verify:
  * - Software Ed25519 key generation, signing, and public key extraction
- * - Software X25519 key generation and DH agreement, and `SCP-CRYPTO-4060` from dhAgree for a
- *   peer key that is not 32 bytes and for a [CustodyType.HARDWARE] Ed25519 handle
- * - dhAgree's `SCP-CRYPTO-4060` refusal of a software Ed25519 key
+ * - dhAgree's `SCP-CRYPTO-4060` refusal of a software or [CustodyType.HARDWARE] Ed25519 key
  * - Pseudonym derivation determinism
  * - Key destruction, and the error codes a destroyed handle yields
  * - Error handling (key not found, wrong key type)
@@ -149,26 +147,6 @@ class AndroidKeyCustodyTest {
         @Test
         fun `generateKeypair ED25519 stores key in softwareKeys map`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
-            assertTrue(custody.softwareKeys.containsKey(handle.id))
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // X25519 software key generation
-    // -------------------------------------------------------------------
-
-    @Nested
-    inner class GenerateKeypairX25519 {
-
-        @Test
-        fun `generateKeypair X25519 returns SOFTWARE custody`() {
-            val handle = custody.generateKeypair(KeyType.X25519)
-            assertEquals(CustodyType.SOFTWARE, handle.custodyType)
-        }
-
-        @Test
-        fun `generateKeypair X25519 stores key in softwareKeys map`() {
-            val handle = custody.generateKeypair(KeyType.X25519)
             assertTrue(custody.softwareKeys.containsKey(handle.id))
         }
     }
@@ -237,15 +215,6 @@ class AndroidKeyCustodyTest {
             }
             assertEquals("SCP-CRYPTO-4006", exception.code)
         }
-
-        @Test
-        fun `sign throws SCP-CRYPTO-4060 for X25519 key`() {
-            val handle = custody.generateKeypair(KeyType.X25519)
-            val exception = assertThrows<ScpException> {
-                custody.sign(handle, "data".toByteArray())
-            }
-            assertEquals("SCP-CRYPTO-4060", exception.code)
-        }
     }
 
     // -------------------------------------------------------------------
@@ -258,13 +227,6 @@ class AndroidKeyCustodyTest {
         @Test
         fun `publicKey returns 32 bytes for Ed25519`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
-            val pubKey = custody.publicKey(handle)
-            assertEquals(32, pubKey.size)
-        }
-
-        @Test
-        fun `publicKey returns 32 bytes for X25519`() {
-            val handle = custody.generateKeypair(KeyType.X25519)
             val pubKey = custody.publicKey(handle)
             assertEquals(32, pubKey.size)
         }
@@ -338,15 +300,6 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `destroyKey removes X25519 key from softwareKeys`() {
-            val handle = custody.generateKeypair(KeyType.X25519)
-            val attestation = custody.destroyKey(handle)
-            assertEquals(DestructionMethod.SOFTWARE_ONLY, attestation.method)
-            assertTrue(attestation.confirmed)
-            assertTrue(!custody.softwareKeys.containsKey(handle.id))
-        }
-
-        @Test
         fun `destroyKey makes subsequent sign fail with SCP-CRYPTO-4006`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             custody.destroyKey(handle)
@@ -370,7 +323,7 @@ class AndroidKeyCustodyTest {
 
         @Test
         fun `destroyKey makes subsequent dhAgree fail with SCP-CRYPTO-4006 whatever the peer`() {
-            val handle = custody.generateKeypair(KeyType.X25519)
+            val handle = custody.generateKeypair(KeyType.HPKE_P256)
             custody.destroyKey(handle)
 
             // dhAgree looks up the key before it checks the peer key, whose format the key's
@@ -403,52 +356,11 @@ class AndroidKeyCustodyTest {
     }
 
     // -------------------------------------------------------------------
-    // X25519 DH agreement
+    // DH agreement refusals (AndroidKeyCustodyP256Test runs HPKE P-256 agreement)
     // -------------------------------------------------------------------
 
     @Nested
     inner class DhAgree {
-
-        @Test
-        fun `dhAgree produces 32-byte shared secret`() {
-            val aliceHandle = custody.generateKeypair(KeyType.X25519)
-            val bobHandle = custody.generateKeypair(KeyType.X25519)
-
-            val alicePub = custody.publicKey(aliceHandle)
-            val bobPub = custody.publicKey(bobHandle)
-
-            val aliceSecret = custody.dhAgree(aliceHandle, bobPub)
-            assertEquals(32, aliceSecret.size)
-        }
-
-        @Test
-        fun `dhAgree is symmetric - both sides derive same secret`() {
-            val aliceHandle = custody.generateKeypair(KeyType.X25519)
-            val bobHandle = custody.generateKeypair(KeyType.X25519)
-
-            val alicePub = custody.publicKey(aliceHandle)
-            val bobPub = custody.publicKey(bobHandle)
-
-            val aliceSecret = custody.dhAgree(aliceHandle, bobPub)
-            val bobSecret = custody.dhAgree(bobHandle, alicePub)
-
-            assertArrayEquals(aliceSecret, bobSecret)
-        }
-
-        @Test
-        fun `dhAgree with different peers produces different secrets`() {
-            val aliceHandle = custody.generateKeypair(KeyType.X25519)
-            val bobHandle = custody.generateKeypair(KeyType.X25519)
-            val charlieHandle = custody.generateKeypair(KeyType.X25519)
-
-            val bobPub = custody.publicKey(bobHandle)
-            val charliePub = custody.publicKey(charlieHandle)
-
-            val secretWithBob = custody.dhAgree(aliceHandle, bobPub)
-            val secretWithCharlie = custody.dhAgree(aliceHandle, charliePub)
-
-            assertTrue(!secretWithBob.contentEquals(secretWithCharlie))
-        }
 
         @Test
         fun `dhAgree throws SCP-CRYPTO-4006 for missing key`() {
@@ -477,34 +389,11 @@ class AndroidKeyCustodyTest {
         @Test
         fun `dhAgree throws SCP-CRYPTO-4060 for a software Ed25519 key`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
-            val peer = custody.publicKey(custody.generateKeypair(KeyType.X25519))
+            val peer = custody.publicKey(custody.generateKeypair(KeyType.HPKE_P256))
             val exception = assertThrows<ScpException> {
                 custody.dhAgree(handle, peer)
             }
             assertEquals("SCP-CRYPTO-4060", exception.code)
-        }
-
-        @Test
-        fun `dhAgree throws SCP-CRYPTO-4060 for wrong-size peerPublic`() {
-            val handle = custody.generateKeypair(KeyType.X25519)
-            for (badSize in listOf(0, 16, 31, 33, 64)) {
-                val exception = assertThrows<ScpException> {
-                    custody.dhAgree(handle, ByteArray(badSize))
-                }
-                assertEquals("SCP-CRYPTO-4060", exception.code)
-            }
-        }
-
-        @Test
-        fun `dhAgree refuses an all-zero low-order peer key with SCP-CRYPTO-4060`() {
-            val handle = custody.generateKeypair(KeyType.X25519)
-            // A 32-byte peer key passes the length check, so only the low order of the point
-            // separates this call from the successful agreements above.
-            val exception = assertThrows<ScpException> {
-                custody.dhAgree(handle, ByteArray(32))
-            }
-            assertEquals("SCP-CRYPTO-4060", exception.code)
-            assertEquals("X25519 agreement failed", exception.cause?.message)
         }
     }
 
@@ -557,10 +446,10 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `derivePseudonym throws SCP-CRYPTO-4060 for X25519 identity key`() {
-            val x25519Handle = custody.generateKeypair(KeyType.X25519)
+        fun `derivePseudonym throws SCP-CRYPTO-4060 for an HPKE P-256 key`() {
+            val hpkeHandle = custody.generateKeypair(KeyType.HPKE_P256)
             val exception = assertThrows<ScpException> {
-                custody.derivePseudonym(x25519Handle, "ctx".toByteArray())
+                custody.derivePseudonym(hpkeHandle, "ctx".toByteArray())
             }
             assertEquals("SCP-CRYPTO-4060", exception.code)
         }
@@ -674,13 +563,6 @@ class AndroidKeyCustodyTest {
             val prefsKey = "scp.ed25519.${handle.id}"
             assertTrue(prefs.contains(prefsKey))
             assertNotNull(prefs.getString(prefsKey, null))
-        }
-
-        @Test
-        fun `generateKeypair X25519 does NOT persist to SharedPreferences`() {
-            val handle = custody.generateKeypair(KeyType.X25519)
-            val prefsKey = "scp.ed25519.${handle.id}"
-            assertTrue(!prefs.contains(prefsKey))
         }
 
         @Test

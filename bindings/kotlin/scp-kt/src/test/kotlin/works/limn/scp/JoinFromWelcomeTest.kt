@@ -197,9 +197,9 @@ class JoinFromWelcomeTest {
                 // to the creator out of band.
                 val reservation = scp.reserveKeyPackage(invitee)
 
-                // The creator seals the bundle to the invitee's #active key
-                // (Ed25519 -> X25519), which the runtime resolves from the
-                // invitee's DID document. `inviteMember` returns the sealed
+                // The creator seals the bundle to the invitee's #active key,
+                // which the runtime resolves from the invitee's DID document.
+                // `inviteMember` returns the sealed
                 // bundle, which is the same wire type the joiner passes to
                 // `contextJoinFromWelcome`.
                 val outcome =

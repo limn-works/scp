@@ -82,8 +82,8 @@ impl TestingCallbackCustody {
             .map_err(ScpError::from)
     }
 
-    /// The public key the adapter holds for `key_id`: 32 bytes (Ed25519,
-    /// X25519), the 33-byte compressed point (P-256 signing) or the 65-byte
+    /// The public key the adapter holds for `key_id`: 32 bytes (Ed25519),
+    /// the 33-byte compressed point (P-256 signing) or the 65-byte
     /// uncompressed point (HPKE P-256).
     ///
     /// # Errors

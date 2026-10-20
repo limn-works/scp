@@ -605,8 +605,8 @@ impl TestingCallbackCustody {
     /// returns the 32-byte shared secret the bridge read from the host.
     ///
     /// `peer_public` reaches the adapter unchanged, so the adapter's own check
-    /// of its length and encoding for the key's type (32 bytes for X25519, the
-    /// 65-byte uncompressed point for `hpke-p256`) is the one that runs.
+    /// of its length and encoding for the key's type (the 65-byte
+    /// uncompressed point for `hpke-p256`) is the one that runs.
     ///
     /// # Errors
     ///

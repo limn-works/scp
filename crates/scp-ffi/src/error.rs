@@ -1428,8 +1428,8 @@ mod tests {
             scp_platform::PlatformError::KeyNotFound,
             scp_platform::PlatformError::PseudonymRejected("x".to_owned()),
             scp_platform::PlatformError::WrongKeyType {
-                expected: scp_platform::traits::KeyType::Ed25519,
-                actual: scp_platform::traits::KeyType::X25519,
+                expected: scp_platform::traits::KeyType::P256Signing,
+                actual: scp_platform::traits::KeyType::HpkeP256,
             },
             scp_platform::PlatformError::NotIdentityKey,
             scp_platform::PlatformError::StorageError("io".to_owned()),

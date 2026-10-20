@@ -782,10 +782,10 @@ export interface KeyPackageReservation {
 }
 
 /**
- * The type of a custody key: Ed25519 or X25519, `"p256"` (ECDSA P-256
- * signing) or `"hpke-p256"` (P-256 ECDH for HPKE).
+ * The type of a custody key: Ed25519, `"p256"` (ECDSA P-256 signing) or
+ * `"hpke-p256"` (P-256 ECDH for HPKE).
  */
-export type CustodyKeyType = "ed25519" | "x25519" | "p256" | "hpke-p256";
+export type CustodyKeyType = "ed25519" | "p256" | "hpke-p256";
 
 /**
  * The role a custody key was minted in: `"identity"` (the only source a
@@ -876,7 +876,7 @@ export interface KeyCustodyProvider {
   /**
    * Return the type, public key and role of `keyId`. `keyType` is the type
    * the key was generated with.
-   * `publicKey` is 32 bytes for Ed25519 and X25519, the 33-byte compressed
+   * `publicKey` is 32 bytes for Ed25519, the 33-byte compressed
    * SEC1 point for `"p256"`, and the 65-byte uncompressed SEC1 point for
    * `"hpke-p256"`. The bridge registers the key under the stated type and
    * rejects a length that does not match it. A provider that holds no key
@@ -899,10 +899,10 @@ export interface KeyCustodyProvider {
    */
   destroyKey(keyId: string): void;
   /**
-   * Return the 32-byte shared secret with `peerPublic`. An X25519 key
-   * receives a 32-byte peer key; an `"hpke-p256"` key receives the 65-byte
-   * uncompressed SEC1 peer point, already validated on the curve, and
-   * returns the ECDH x-coordinate.
+   * Return the 32-byte shared secret with `peerPublic`. Only an
+   * `"hpke-p256"` key agrees: it receives the 65-byte uncompressed SEC1 peer
+   * point, already validated on the curve, and returns the ECDH
+   * x-coordinate.
    */
   dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array;
   /**

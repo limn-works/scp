@@ -345,8 +345,6 @@ pub trait MessageListener: Send + Sync {
 pub enum CustodyKeyType {
     /// An Ed25519 signing key.
     Ed25519,
-    /// An X25519 key-agreement key.
-    X25519,
     /// A P-256 (ECDSA) signing key.
     P256,
     /// A P-256 ECDH key for HPKE.
@@ -357,7 +355,6 @@ impl From<scp_platform::KeyType> for CustodyKeyType {
     fn from(key_type: scp_platform::KeyType) -> Self {
         match key_type {
             scp_platform::KeyType::Ed25519 => Self::Ed25519,
-            scp_platform::KeyType::X25519 => Self::X25519,
             scp_platform::KeyType::P256Signing => Self::P256,
             scp_platform::KeyType::HpkeP256 => Self::HpkeP256,
         }
@@ -368,7 +365,6 @@ impl From<CustodyKeyType> for scp_platform::KeyType {
     fn from(key_type: CustodyKeyType) -> Self {
         match key_type {
             CustodyKeyType::Ed25519 => Self::Ed25519,
-            CustodyKeyType::X25519 => Self::X25519,
             CustodyKeyType::P256 => Self::P256Signing,
             CustodyKeyType::HpkeP256 => Self::HpkeP256,
         }
@@ -408,8 +404,8 @@ impl From<CustodyKeyRole> for scp_platform::KeyRole {
 pub struct CustodyPublicKey {
     /// The key's type.
     pub key_type: CustodyKeyType,
-    /// The public key in that type's one encoding: 32 bytes (Ed25519,
-    /// X25519), the 33-byte compressed SEC1 point (P-256 signing), or the
+    /// The public key in that type's one encoding: 32 bytes (Ed25519), the
+    /// 33-byte compressed SEC1 point (P-256 signing), or the
     /// 65-byte uncompressed SEC1 point (HPKE P-256).
     pub public_key: Vec<u8>,
     /// The role [`KeyCustodyProvider::generate_keypair`] minted the key in.
@@ -476,7 +472,7 @@ pub trait KeyCustodyProvider: Send + Sync {
     /// Return the type and public key of `key_id` as a [`CustodyPublicKey`].
     ///
     /// The bridge types the key by `key_type` alone and requires exactly that
-    /// type's length: 32 bytes (`"ed25519"`, `"x25519"`), the 33-byte
+    /// type's length: 32 bytes (`"ed25519"`), the 33-byte
     /// compressed SEC1 point (P-256 signing), or the 65-byte uncompressed
     /// SEC1 point (HPKE P-256). A length that does not match the stated type,
     /// or an invalid point, is an error, and the bridge binds nothing. The bridge asks this for every key id it has not yet
@@ -515,9 +511,8 @@ pub trait KeyCustodyProvider: Send + Sync {
 
     /// Perform Diffie-Hellman key agreement.
     ///
-    /// `key_id` — the X25519 or HPKE P-256 key handle.
-    /// `peer_public` — the 32-byte peer X25519 public key, or for
-    /// HPKE P-256 the 65-byte uncompressed SEC1 peer point (validated
+    /// `key_id` — the HPKE P-256 key handle.
+    /// `peer_public` — the 65-byte uncompressed SEC1 peer point (validated
     /// on-curve by the bridge before this call).
     ///
     /// Returns the 32-byte shared secret. The private key never leaves the

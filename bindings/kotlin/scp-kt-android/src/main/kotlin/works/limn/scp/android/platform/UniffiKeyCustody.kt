@@ -59,7 +59,6 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
         val publicKey = inner.publicKey(handle)
         val keyType = when (keyTypeOf(keyId, handle)) {
             KeyType.ED25519 -> CustodyKeyType.ED25519
-            KeyType.X25519 -> CustodyKeyType.X25519
             KeyType.P256 -> CustodyKeyType.P256
             KeyType.HPKE_P256 -> CustodyKeyType.HPKE_P256
         }
@@ -83,7 +82,6 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
     override suspend fun generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): String = bridged {
         val androidType = when (keyType) {
             CustodyKeyType.ED25519 -> KeyType.ED25519
-            CustodyKeyType.X25519 -> KeyType.X25519
             CustodyKeyType.P256 -> KeyType.P256
             CustodyKeyType.HPKE_P256 -> KeyType.HPKE_P256
         }

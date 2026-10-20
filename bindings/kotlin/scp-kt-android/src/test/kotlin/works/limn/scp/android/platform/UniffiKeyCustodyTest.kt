@@ -116,7 +116,7 @@ class UniffiKeyCustodyTest {
     fun `generateKeypair returns canonical decimal u64 ids`() {
         runTest {
             repeat(16) {
-                for (type in listOf(CustodyKeyType.ED25519, CustodyKeyType.X25519)) {
+                for (type in listOf(CustodyKeyType.ED25519, CustodyKeyType.HPKE_P256)) {
                     val id = provider.generateKeypair(type, CustodyKeyRole.OPERATIONAL)
                     assertEquals(id, id.toULong().toString(), "id $id is not canonical decimal u64")
                 }
@@ -146,13 +146,13 @@ class UniffiKeyCustodyTest {
     }
 
     @Test
-    fun `operational X25519 keys report their role and agree`() {
+    fun `operational HPKE P-256 keys report their role and agree`() {
         runTest {
-            val alice = provider.generateKeypair(CustodyKeyType.X25519, CustodyKeyRole.OPERATIONAL)
-            val bob = provider.generateKeypair(CustodyKeyType.X25519, CustodyKeyRole.OPERATIONAL)
+            val alice = provider.generateKeypair(CustodyKeyType.HPKE_P256, CustodyKeyRole.OPERATIONAL)
+            val bob = provider.generateKeypair(CustodyKeyType.HPKE_P256, CustodyKeyRole.OPERATIONAL)
             val alicePublic = provider.getPublicKey(alice)
             val bobPublic = provider.getPublicKey(bob)
-            assertEquals(CustodyKeyType.X25519, alicePublic.keyType)
+            assertEquals(CustodyKeyType.HPKE_P256, alicePublic.keyType)
             assertEquals(CustodyKeyRole.OPERATIONAL, alicePublic.role)
 
             val aliceShared = provider.dhAgree(alice, bobPublic.publicKey)
@@ -248,21 +248,10 @@ class UniffiKeyCustodyTest {
     @Test
     fun `an Android error keeps its code and cause`() {
         runTest {
-            val id = provider.generateKeypair(CustodyKeyType.X25519, CustodyKeyRole.OPERATIONAL)
+            val id = provider.generateKeypair(CustodyKeyType.HPKE_P256, CustodyKeyRole.OPERATIONAL)
             val error = cryptoError { provider.sign(id, byteArrayOf(1)) }
             assertEquals("SCP-CRYPTO-4060", error.code)
             assertTrue(error.cause is ScpException)
-        }
-    }
-
-    @Test
-    fun `a non-ScpException failure becomes SCP-CRYPTO-4060 carrying the cause`() {
-        runTest {
-            // Bouncy Castle throws IllegalStateException for a low-order peer key.
-            val id = provider.generateKeypair(CustodyKeyType.X25519, CustodyKeyRole.OPERATIONAL)
-            val error = cryptoError { provider.dhAgree(id, ByteArray(32)) }
-            assertEquals("SCP-CRYPTO-4060", error.code)
-            assertTrue(error.cause?.cause is IllegalStateException)
         }
     }
 

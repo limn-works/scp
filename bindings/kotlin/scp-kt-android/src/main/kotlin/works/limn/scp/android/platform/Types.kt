@@ -26,9 +26,6 @@ enum class KeyType {
     /** Ed25519 signing key (identity keys, active signing keys). */
     ED25519,
 
-    /** X25519 key agreement key (HPKE wrapping keys). */
-    X25519,
-
     /** P-256 signing key: signs a 32-byte digest and returns DER (spec 09 §9.5). */
     P256,
 
@@ -57,7 +54,7 @@ enum class KeyRole {
  *
  * See ADR-006 for the custody model. For a P-256 or HPKE P-256 key, [AndroidKeyCustody]
  * records the custody class when it mints the key, from the security level Keystore's
- * `KeyInfo` reports, and reports the recorded class. For an Ed25519 or X25519 key it reports
+ * `KeyInfo` reports, and reports the recorded class. For an Ed25519 key it reports
  * [HARDWARE] for a Keystore key and [SOFTWARE] for a Bouncy Castle key. No Android adapter
  * reports [IN_MEMORY] for a key it holds; [UniffiKeyCustody] reports `"in_memory"` for an id
  * it does not hold, the weakest class the bridge reads.
@@ -84,8 +81,7 @@ enum class CustodyType {
      * whose `KeyInfo` reports a software security level (an emulator, or a device whose KeyMint
      * runs in software). [AndroidKeyCustody] commits the private key seed of each software
      * Ed25519 key it generates (API 26-32) and the private scalar of each software HPKE P-256
-     * key (API 26-30) to an on-disk EncryptedSharedPreferences file. Software X25519 keys stay
-     * in process memory only.
+     * key (API 26-30) to an on-disk EncryptedSharedPreferences file.
      */
     SOFTWARE,
 }
@@ -124,8 +120,7 @@ data class KeyHandle(
  *   not confirmed, so it never returns `false`. For a Keystore key, the re-fetch asks Keystore
  *   whether it still holds the alias. For a persisted software key (a software Ed25519 seed or a
  *   software HPKE P-256 scalar), the removal is written with `commit()`, which returns after the
- *   write reaches disk, and the re-fetch reads the entry back. For a software X25519 key, the
- *   check reads the in-memory map right after removing the id from it.
+ *   write reaches disk, and the re-fetch reads the entry back.
  */
 data class DestructionAttestation(
     val method: DestructionMethod,
@@ -303,7 +298,6 @@ interface PushProvider {
  *   Bouncy Castle scalar committed to EncryptedSharedPreferences on API 26-30. The store is
  *   chosen by the API level alone, never by catching a failed Keystore create.
  * - Ed25519 keys in Android Keystore on API 33+ and in Bouncy Castle on API 26-32.
- * - X25519 keys in Bouncy Castle process memory at every API level.
  *
  * Each P-256 and HPKE P-256 key has a record, committed when it is minted, that names its type,
  * its store and its custody class; every later operation on the key follows the record.
@@ -374,7 +368,7 @@ interface KeyCustodyProvider {
      * @return For an Ed25519 key, the 64-byte signature. For a P-256 key, the DER-encoded ECDSA
      *   signature Keystore produced; the bridge converts it to raw low-s and verifies it.
      * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
-     * @throws ScpException with code `SCP-CRYPTO-4060` if the key is X25519 or HPKE P-256, or
+     * @throws ScpException with code `SCP-CRYPTO-4060` if the key is HPKE P-256, or
      *   a P-256 [data] is not 32 bytes.
      */
     fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray
@@ -383,7 +377,7 @@ interface KeyCustodyProvider {
      * Return the raw public key bytes for a handle.
      *
      * @param keyHandle Handle to any key type.
-     * @return The raw 32-byte key (Ed25519, X25519), the 33-byte compressed SEC1 point (P-256),
+     * @return The raw 32-byte key (Ed25519), the 33-byte compressed SEC1 point (P-256),
      *   or the 65-byte uncompressed SEC1 point (HPKE P-256).
      * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
      */
@@ -419,21 +413,19 @@ interface KeyCustodyProvider {
     fun destroyKey(keyHandle: KeyHandle): DestructionAttestation
 
     /**
-     * Perform Diffie-Hellman key agreement with an X25519 or HPKE P-256 key.
+     * Perform Diffie-Hellman key agreement with an HPKE P-256 key.
      *
      * No method of this interface returns the private key. The returned secret is a [ByteArray]
      * that [AndroidKeyCustody] does not wipe; the caller owns it.
      *
-     * @param keyHandle Handle to an X25519 or HPKE P-256 key. An Ed25519 or P-256 signing key
-     *   never agrees.
-     * @param peerPublic For X25519, the peer's 32-byte public key. For HPKE P-256, the peer's
-     *   65-byte uncompressed SEC1 point, checked on the curve before the key is used.
-     * @return The 32-byte shared secret: the X25519 output, or the P-256 x-coordinate left-padded
-     *   to 32 bytes.
+     * @param keyHandle Handle to an HPKE P-256 key. An Ed25519 or P-256 signing key never
+     *   agrees.
+     * @param peerPublic The peer's 65-byte uncompressed SEC1 point, checked on the curve before
+     *   the key is used.
+     * @return The 32-byte shared secret: the P-256 x-coordinate left-padded to 32 bytes.
      * @throws ScpException with code `SCP-CRYPTO-4006` if no key sits under [keyHandle].
      * @throws ScpException with code `SCP-CRYPTO-4060` for a key that never agrees, a
-     *   [peerPublic] of the wrong length or off the curve, or an X25519 agreement that yields the
-     *   all-zero secret (a low-order peer key).
+     *   [peerPublic] of the wrong length or off the curve.
      */
     fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray
 

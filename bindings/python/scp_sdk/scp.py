@@ -121,9 +121,9 @@ __all__ = [
 ]
 
 
-CustodyKeyType = Literal["ed25519", "x25519", "p256", "hpke-p256"]
-"""The type of a custody key: Ed25519 or X25519, ``"p256"`` (ECDSA P-256
-signing) or ``"hpke-p256"`` (P-256 ECDH for HPKE)."""
+CustodyKeyType = Literal["ed25519", "p256", "hpke-p256"]
+"""The type of a custody key: Ed25519, ``"p256"`` (ECDSA P-256 signing) or
+``"hpke-p256"`` (P-256 ECDH for HPKE)."""
 
 CustodyKeyRole = Literal["identity", "operational"]
 """The role a custody key was minted in: ``"identity"`` (the only source a
@@ -224,7 +224,7 @@ class KeyCustodyProvider(Protocol):
         """Return the :class:`CustodyPublicKey` of ``key_id``.
 
         ``public_key`` is 32
-        bytes for Ed25519 and X25519, the 33-byte compressed SEC1 point for
+        bytes for Ed25519, the 33-byte compressed SEC1 point for
         ``"p256"``, and the 65-byte uncompressed SEC1 point for
         ``"hpke-p256"``. The bridge registers the key under the stated type
         and rejects a length that does not match it. A provider that holds no
@@ -255,9 +255,9 @@ class KeyCustodyProvider(Protocol):
     def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
         """Return the 32-byte shared secret with ``peer_public``.
 
-        An X25519 key receives a 32-byte peer key. An ``"hpke-p256"`` key
-        receives the 65-byte uncompressed SEC1 peer point, already validated
-        on the curve, and returns the ECDH x-coordinate.
+        Only an ``"hpke-p256"`` key agrees. It receives the 65-byte
+        uncompressed SEC1 peer point, already validated on the curve, and
+        returns the ECDH x-coordinate.
         """
         ...
 

@@ -35,11 +35,11 @@ export interface JsSocket {
 }
 
 /**
- * The type of a custody key: `"ed25519"`, `"x25519"`, `"p256"` (ECDSA P-256
- * signing) or `"hpke-p256"` (P-256 ECDH for HPKE). The same four strings as the
- * native SDK's `CustodyKeyType`.
+ * The type of a custody key: `"ed25519"`, `"p256"` (ECDSA P-256 signing) or
+ * `"hpke-p256"` (P-256 ECDH for HPKE). The same three strings as the native
+ * SDK's `CustodyKeyType`.
  */
-export type CustodyKeyType = "ed25519" | "x25519" | "p256" | "hpke-p256";
+export type CustodyKeyType = "ed25519" | "p256" | "hpke-p256";
 
 /**
  * On-device key custody — the driver's `Signer`
@@ -79,8 +79,8 @@ export interface JsKeyCustody {
    * normalises it to low-`s` and verifies it strictly under the key's public
    * key. This browser seam has no Rust caller yet and checks nothing: a result
    * is not converted from DER, normalised or verified until the slice that
-   * wires a caller routes it through that flow. An `"x25519"` or `"hpke-p256"`
-   * key does not sign.
+   * wires a caller routes it through that flow. An `"hpke-p256"` key does not
+   * sign.
    *
    * The P-256 nonce rules, quoted from spec 09 §9.5:
    *
@@ -111,8 +111,8 @@ export interface JsKeyCustody {
   sign(keyId: string, data: Uint8Array): Uint8Array;
 
   /**
-   * Raw public key bytes for `keyId`: 32 bytes for `"ed25519"` and
-   * `"x25519"`, the 33-byte compressed SEC1 point for `"p256"`, and the
+   * Raw public key bytes for `keyId`: 32 bytes for `"ed25519"`, the 33-byte
+   * compressed SEC1 point for `"p256"`, and the
    * 65-byte uncompressed SEC1 point for `"hpke-p256"`. Throws if `keyId`
    * names no key; no error type or code is fixed for that throw until the
    * seam is wired. SEAM.
@@ -120,7 +120,7 @@ export interface JsKeyCustody {
   getPublicKey(keyId: string): Uint8Array;
 
   /**
-   * Generates a keypair of type `keyType` (`"ed25519"`, `"x25519"`, `"p256"`
+   * Generates a keypair of type `keyType` (`"ed25519"`, `"p256"`
    * for ECDSA P-256 signing, or `"hpke-p256"` for P-256 ECDH under HPKE) and
    * returns its opaque `keyId`. SEAM.
    */
@@ -131,12 +131,10 @@ export interface JsKeyCustody {
 
   /**
    * DH agreement against `peerPublic`, returning the 32-byte shared secret:
-   * X25519 for an `"x25519"` key (32-byte peer key), P-256 ECDH for an
-   * `"hpke-p256"` key (65-byte uncompressed SEC1 peer point; the secret is
-   * the x-coordinate). An `"ed25519"` or `"p256"` key does not agree. Before
-   * calling the host, the native bridges reject an X25519 peer that is not 32
-   * bytes and a P-256 peer that is not a 65-byte uncompressed point on the
-   * curve; after the call they reject a result that is not 32 bytes. This
+   * P-256 ECDH for an `"hpke-p256"` key (65-byte uncompressed SEC1 peer
+   * point; the secret is the x-coordinate). An `"ed25519"` or `"p256"` key
+   * does not agree. Before calling the host, the native bridges reject a
+   * P-256 peer that is not a 65-byte uncompressed point on the curve; after the call they reject a result that is not 32 bytes. This
    * browser seam has no Rust caller yet and validates neither the peer nor
    * the result. SEAM.
    */

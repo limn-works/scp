@@ -216,8 +216,8 @@ fn custody_code_row(
             codes::CRYPTO_4060,
             vec![
                 P::WrongKeyType {
-                    expected: scp_platform::traits::KeyType::Ed25519,
-                    actual: scp_platform::traits::KeyType::X25519,
+                    expected: scp_platform::traits::KeyType::P256Signing,
+                    actual: scp_platform::traits::KeyType::HpkeP256,
                 },
                 P::NotIdentityKey,
                 P::StorageError("storage detail".to_owned()),

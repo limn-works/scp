@@ -28,9 +28,8 @@ import android.content.Context
  *   Keystore at every supported API level and an HPKE P-256 agreement key in Keystore from API
  *   31 (a Bouncy Castle scalar in EncryptedSharedPreferences below it), each with the custody
  *   class read from `KeyInfo` at mint and recorded per key; a Keystore Ed25519 key on API 33+,
- *   reported as [CustodyType.HARDWARE] without reading `KeyInfo`; a Bouncy Castle Ed25519 key
- *   on API 26-32 whose seed is committed to EncryptedSharedPreferences; and an in-memory
- *   software X25519 key at every API level.
+ *   reported as [CustodyType.HARDWARE] without reading `KeyInfo`; and a Bouncy Castle Ed25519 key
+ *   on API 26-32 whose seed is committed to EncryptedSharedPreferences.
  * @property deviceAttestation Play Integrity device attestation, which requests a Classic
  *   token today; story SCP-111 tracks the Standard request ADR-027 requires.
  * @property push Firebase Cloud Messaging; checks only the `scp` wake field of a data-only

@@ -19,7 +19,7 @@ pub enum PlatformError {
 
     /// An operation was attempted with a key of the wrong type.
     ///
-    /// For example, calling `sign` with an X25519 key handle, or calling
+    /// For example, calling `sign` with an HPKE P-256 key handle, or calling
     /// `dh_agree` with an Ed25519 key handle.
     #[error("wrong key type: expected {expected:?}, got {actual:?}")]
     WrongKeyType {
