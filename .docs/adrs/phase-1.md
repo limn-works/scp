@@ -1148,7 +1148,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    /// Sender key epoch advanced — author rotated their key.
    /// Published as an MLS application message (broadcast to group).
    pub struct SenderKeyEpochAdvance {
-       pub sender_did: Identifier,
+       pub sender_did: [u8; 32],
        pub epoch: u64,
        pub signer_key_ref: SigningKeyId,  // Which VM signed: Active or Agent (ADR-039)
        pub signature: P256Signature,  // Signs context_id || sender_did || signer_key_ref || "key_epoch" || epoch
@@ -1157,8 +1157,8 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    /// Request for a sender's current key at a specific epoch.
    /// Sent as an MLS application message with recipient_hint to the key holder.
    pub struct SenderKeyRequest {
-       pub requester_did: Identifier,
-       pub sender_did: Identifier,        // Whose key is being requested
+       pub requester_did: [u8; 32],
+       pub sender_did: [u8; 32],        // Whose key is being requested
        pub epoch: u64,
        pub wrapping_pubkey: HpkeP256PublicKey,
        pub signature: P256Signature,
@@ -1167,7 +1167,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    /// Response with HPKE-encrypted sender key.
    /// Sent as an MLS application message with recipient_hint to the requester.
    pub struct SenderKeyResponse {
-       pub sender_did: Identifier,
+       pub sender_did: [u8; 32],
        pub epoch: u64,
        pub hpke_sealed_key: Vec<u8>,   // HPKE(requester_wrapping_pubkey, sender_key)
        pub ephemeral_pubkey: HpkeP256PublicKey,

@@ -77,7 +77,7 @@ Implement `scp-core/trust/` module. Participation records are computed locally f
 ```rust
 /// Verifiable facts computed from context event logs.
 pub struct ParticipationRecord {
-    pub subject_did: Identifier,
+    pub subject_did: [u8; 32],
     pub context_id: ContextId,
     pub participation_count: u64,
     pub participation_duration_seconds: u64,
@@ -95,8 +95,8 @@ pub struct ParticipationRecord {
 pub struct Attestation {
     pub id: String,
     pub attestation_type: AttestationType,
-    pub issuer: Identifier,
-    pub subject: Identifier,
+    pub issuer: [u8; 32],
+    pub subject: [u8; 32],
     pub claim: serde_json::Value,
     pub evidence: Option<AttestationEvidence>,
     pub issued_at: u64,
@@ -129,7 +129,7 @@ pub struct ChallengeRequest {
 
 pub struct ChallengeResponse {
     pub challenge_id: String,
-    pub responder_did: Identifier,
+    pub responder_did: [u8; 32],
     pub result: serde_json::Value,
     pub completed_at: u64,
     pub signature: P256Signature,
@@ -423,7 +423,7 @@ Implement `scp-core/provenance/` module. `DataProvenance` struct is attached aut
 pub struct DataProvenance {
     pub source_context: ContextId,
     pub source_type: SourceType,
-    pub counterparties: Vec<Identifier>,
+    pub counterparties: Vec<[u8; 32]>,
     pub purpose: Option<String>,
     pub discovery_method: DiscoveryMethod,
     pub age: Duration,
@@ -546,7 +546,7 @@ Implement `scp-core/discovery/` module. Service-record capability resolution ove
 ```rust
 /// Capability entry from a service record.
 pub struct CapabilityEntry {
-    pub did: Identifier,
+    pub did: [u8; 32],
     pub capabilities: Vec<String>,
     pub service_endpoints: Vec<String>,
     pub resolved_at: u64,
@@ -564,7 +564,7 @@ pub struct DiscoveryResult {
 }
 
 pub struct DiscoveryResultEntry {
-    pub did: Identifier,
+    pub did: [u8; 32],
     pub capabilities: Vec<String>,
     pub participation_summary: Option<serde_json::Value>,
     pub provenance: DataProvenance,
@@ -572,7 +572,7 @@ pub struct DiscoveryResultEntry {
 }
 
 pub struct RegistrationEntry {
-    pub did: Identifier,
+    pub did: [u8; 32],
     pub capabilities: Vec<String>,
     pub metadata: serde_json::Value,
     pub entry_id: String,
@@ -1720,11 +1720,11 @@ Scope registration uses **independent structs for all types**, with separate sto
 // All scope types are independent structs
 ScopeRegisterParams   { name: String, target: ScopeTarget, metadata: Option<ScopeMetadata> }
 ScopeLookupParams     { name: String }
-ScopeDeregisterParams { name: String, did: Identifier }
+ScopeDeregisterParams { name: String, did: [u8; 32] }
 ScopeRegisterResult   { status: ScopeRegisterStatus, entry_id: Option<String> }
 ScopeLookupResult     { results: Vec<ScopeEntry> }
 ScopeDeregisterResult { removed: bool }
-ScopeEntry            { name: String, target: ScopeTarget, owner_did: Identifier, registered_at: u64, metadata: ScopeMetadata, entry_id: String }
+ScopeEntry            { name: String, target: ScopeTarget, owner_did: [u8; 32], registered_at: u64, metadata: ScopeMetadata, entry_id: String }
 ScopeMetadata         { description: Option<String>, tags: Option<Vec<String>> }
 ScopeTarget           { context_id: String, relay_urls: Vec<String> }
 ScopeRegisterStatus   :: Registered | Conflict | Updated

@@ -1571,14 +1571,14 @@ pub struct CommitRangeRequest {
     pub context_id: ContextId,
     pub from_epoch: u64,
     pub to_epoch: u64,
-    pub requester_did: Identifier,
+    pub requester_did: [u8; 32],
     pub signature: P256Signature,
 }
 
 pub struct CommitRangeResponse {
     pub context_id: ContextId,
     pub commits: Vec<Vec<u8>>,  // Serialized MLS Commit messages, in epoch order
-    pub responder_did: Identifier,
+    pub responder_did: [u8; 32],
     pub signature: P256Signature,
 }
 ```
@@ -1628,7 +1628,7 @@ When a member has been offline for more than 7 days, or when the epoch catch-up 
 ```rust
 pub struct ResetRequest {
     pub context_id: ContextId,
-    pub member_did: Identifier,
+    pub member_did: [u8; 32],
     pub last_known_epoch: u64,
     pub reason: ResetReason,
     /// 16 random bytes (CSPRNG). Prevents replay of captured requests.
@@ -1848,14 +1848,14 @@ pub fn classify_offline_duration(last_relay_contact: u64, now: u64) -> OfflineTi
 ```rust
 // Additions to EventType in scp-core/event_log/
 MemberReset {
-    member_did: Identifier,
+    member_did: [u8; 32],
     old_epoch: u64,
     new_epoch: u64,
     reason: ResetReason,
-    processed_by: Identifier,
+    processed_by: [u8; 32],
 },
 QueueDrained {
-    member_did: Identifier,
+    member_did: [u8; 32],
     message_count: u64,
     discarded_count: u64,
 },
@@ -1977,7 +1977,7 @@ pub struct Checkpoint {
     /// Full context state snapshot — deterministically serialized.
     pub state_snapshot: ContextStateSnapshot,
     /// The identifier of the checkpoint creator.
-    pub creator_did: Identifier,
+    pub creator_did: [u8; 32],
     /// Unix timestamp of checkpoint creation.
     pub created_at: u64,
     /// P-256 signature over SHA-256(context_id || checkpoint_seq ||
@@ -1990,13 +1990,13 @@ pub struct Checkpoint {
 }
 
 pub struct CosignedCheckpoint {
-    pub signer_did: Identifier,
+    pub signer_did: [u8; 32],
     pub signature: P256Signature,
 }
 
 pub struct ContextStateSnapshot {
-    /// Current membership: Identifier -> role mapping.
-    pub membership: Vec<(Identifier, RoleName)>,
+    /// Current membership: [u8; 32] -> role mapping.
+    pub membership: Vec<([u8; 32], RoleName)>,
     /// Current capability ceiling.
     pub capability_ceiling: Vec<Capability>,
     /// Ceiling policy (locked, governed, admin-only).
@@ -2010,11 +2010,11 @@ pub struct ContextStateSnapshot {
     /// Registered outlets.
     pub outlets: Vec<OutletRegistration>,
     /// Active sender key epochs per member.
-    pub sender_key_epochs: Vec<(Identifier, u64)>,
+    pub sender_key_epochs: Vec<([u8; 32], u64)>,
     /// Current MLS epoch (None for Broadcast contexts).
     pub mls_epoch: Option<u64>,
     /// Active block relationships: (blocker, blocked).
-    pub blocks: Vec<(Identifier, Identifier)>,
+    pub blocks: Vec<([u8; 32], [u8; 32])>,
     /// Context mode (Encrypted or Broadcast).
     pub context_mode: ContextMode,
     /// Parent context IDs (empty for root contexts).
@@ -2554,7 +2554,7 @@ pub trait GovernanceEngine: Send + Sync {
     /// The proposer must hold `GovernancePropose` capability (UCAN-validated).
     fn propose(
         &self,
-        proposer: &Identifier,
+        proposer: &[u8; 32],
         action: GovernanceAction,
         context: &GovernanceContext,
     ) -> Result<ProposalId, GovernanceError>;
@@ -2564,7 +2564,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn approve(
         &self,
         proposal_id: &ProposalId,
-        voter: &Identifier,
+        voter: &[u8; 32],
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2573,7 +2573,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn reject(
         &self,
         proposal_id: &ProposalId,
-        voter: &Identifier,
+        voter: &[u8; 32],
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2582,7 +2582,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn withdraw_vote(
         &self,
         proposal_id: &ProposalId,
-        voter: &Identifier,
+        voter: &[u8; 32],
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2592,7 +2592,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn cancel(
         &self,
         proposal_id: &ProposalId,
-        proposer: &Identifier,
+        proposer: &[u8; 32],
         context: &GovernanceContext,
     ) -> Result<ProposalStatus, GovernanceError>;
 
@@ -2608,7 +2608,7 @@ pub trait GovernanceEngine: Send + Sync {
     fn model_config(&self) -> GovernanceModelConfig;
 
     /// Return the set of identifiers eligible to vote on proposals in this model.
-    fn eligible_voters(&self, context: &GovernanceContext) -> Vec<Identifier>;
+    fn eligible_voters(&self, context: &GovernanceContext) -> Vec<[u8; 32]>;
 }
 
 /// Read-only context snapshot provided to the governance engine.
@@ -2616,8 +2616,8 @@ pub trait GovernanceEngine: Send + Sync {
 /// that the ContextManager executes.
 pub struct GovernanceContext {
     pub context_id: ContextId,
-    pub members: Vec<(Identifier, RoleName)>,
-    pub admin_dids: Vec<Identifier>,
+    pub members: Vec<([u8; 32], RoleName)>,
+    pub admin_dids: Vec<[u8; 32]>,
     pub current_epoch: Option<u64>,
     pub now: u64,
 }
@@ -2636,7 +2636,7 @@ pub enum GovernanceModelConfig {
     /// The creator is the initial (and only) admin. Admin transfer is
     /// a governance action that replaces the admin.
     SingleAdmin {
-        admin_did: Identifier,
+        admin_did: [u8; 32],
     },
 
     /// M-of-N threshold approval. A fixed set of designated signers;
@@ -2646,7 +2646,7 @@ pub enum GovernanceModelConfig {
     Threshold {
         /// The set of identifiers authorized to vote. These identifiers must hold
         /// the `GovernanceVote` capability.
-        signers: Vec<Identifier>,
+        signers: Vec<[u8; 32]>,
         /// Minimum number of approvals required. Must satisfy:
         /// 1 <= threshold <= signers.len().
         threshold: u32,
@@ -2700,7 +2700,7 @@ pub type ProposalId = [u8; 32];
 pub struct GovernanceProposal {
     pub proposal_id: ProposalId,
     pub context_id: ContextId,
-    pub proposer_did: Identifier,
+    pub proposer_did: [u8; 32],
     pub action: GovernanceAction,
     pub status: ProposalStatus,
     pub created_at: u64,
@@ -2717,7 +2717,7 @@ pub struct GovernanceProposal {
 /// A signed vote on a proposal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedVote {
-    pub voter_did: Identifier,
+    pub voter_did: [u8; 32],
     pub vote: VoteType,
     pub timestamp: u64,
     pub signature: P256Signature,
@@ -2751,7 +2751,7 @@ pub enum RejectionReason {
     /// More rejections than approvals (Majority model).
     MajorityRejected,
     /// Any single rejection (Unanimity model).
-    UnanimityBroken { rejector: Identifier },
+    UnanimityBroken { rejector: [u8; 32] },
     /// Threshold of rejections reached making approval impossible
     /// (Threshold model: rejections > signers - threshold).
     ApprovalImpossible,
@@ -2764,11 +2764,11 @@ pub enum RejectionReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceAction {
     /// Add a member to the context.
-    AddMember { did: Identifier, role: RoleName },
+    AddMember { did: [u8; 32], role: RoleName },
     /// Remove a member from the context.
-    RemoveMember { did: Identifier, reason: Option<String> },
+    RemoveMember { did: [u8; 32], reason: Option<String> },
     /// Change a member's role.
-    ChangeRole { did: Identifier, new_role: RoleName },
+    ChangeRole { did: [u8; 32], new_role: RoleName },
     /// Register a new outlet.
     RegisterOutlet { registration: OutletRegistration },
     /// Remove an outlet.
@@ -2782,11 +2782,11 @@ pub enum GovernanceAction {
     /// Modify pruning policy (ADR-030).
     ModifyPruningPolicy { new_policy: PruningPolicy },
     /// Transfer single-admin authority (SingleAdmin model only).
-    TransferAdmin { new_admin: Identifier },
+    TransferAdmin { new_admin: [u8; 32] },
     /// Add a new signer to the threshold set (Threshold model only).
-    AddSigner { did: Identifier },
+    AddSigner { did: [u8; 32] },
     /// Remove a signer from the threshold set (Threshold model only).
-    RemoveSigner { did: Identifier },
+    RemoveSigner { did: [u8; 32] },
     /// Modify the threshold value (Threshold model only).
     ModifyThreshold { new_threshold: u32 },
     /// Create a child context (§5.13).
@@ -2794,7 +2794,7 @@ pub enum GovernanceAction {
     /// Establish an outlet interface with another context (§6.2).
     EstablishOutletInterface { interface: OutletInterface },
     /// Initiate governance-triggered member reset (ADR-029).
-    ResetMember { did: Identifier, reason: String },
+    ResetMember { did: [u8; 32], reason: String },
     /// Resolve a governance conflict (see section 7).
     ResolveConflict { proposal_a: ProposalId, proposal_b: ProposalId, resolution: ConflictResolution },
     /// Promote a context from ephemeral to persistent (§5.10).
@@ -2808,19 +2808,19 @@ pub enum GovernanceAction {
     /// Requires `MemberBan` capability in the context's ceiling (§5.3).
     /// In broadcast contexts: removes subscriber from registry, adds to all
     /// authors' block lists, forces key rotation on all authors (§5.14.8).
-    RevokeReadAccess { did: Identifier, scope: RevocationScope },
+    RevokeReadAccess { did: [u8; 32], scope: RevocationScope },
     /// Restore a member's read access to context content (§9.17).
     /// Always forward-only — historical content from before/during revocation
     /// remains inaccessible (access keys were destroyed, not archived).
     /// Requires `MemberBan` capability in the context's ceiling (§5.3).
-    RestoreReadAccess { did: Identifier },
+    RestoreReadAccess { did: [u8; 32] },
     /// Revoke a member's write access to context content (§9.17).
     /// Full scope: stop publishing + suppress historical content.
     /// FutureOnly scope: stop future publishing only.
-    RevokeWriteAccess { did: Identifier, scope: RevocationScope },
+    RevokeWriteAccess { did: [u8; 32], scope: RevocationScope },
     /// Restore a member's write access to context content (§9.17).
     /// Always forward-only — previously suppressed content remains suppressed.
-    RestoreWriteAccess { did: Identifier },
+    RestoreWriteAccess { did: [u8; 32] },
     /// Context-wide content key rotation (§9.17).
     /// Not identifier-targeted — rotates keys for all members.
     /// Use after compromise detection, bulk revocations, or periodic hygiene.
@@ -2828,7 +2828,7 @@ pub enum GovernanceAction {
     /// Block an author in a broadcast context (§5.14.8).
     /// Removes the author from the broadcast context, destroying their sender
     /// key and preventing future publishing. Requires governance approval.
-    BlockAuthor { did: Identifier, reason: Option<String> },
+    BlockAuthor { did: [u8; 32], reason: Option<String> },
     /// Deadlock recovery: modify governance parameters without changing model type.
     /// Uses fallback quorum (majority-of-active) regardless of original model.
     /// See section 10 (Deadlock Recovery).
@@ -2837,7 +2837,7 @@ pub enum GovernanceAction {
     /// Requires the economic policy to not be locked.
     SetEconomicPolicy { policy: EconomicPolicy },
     /// Approve a spending authorization for a member (§19.5, ADR-033).
-    ApproveSpend { spender: Identifier, amount: Amount, purpose: String },
+    ApproveSpend { spender: [u8; 32], amount: Amount, purpose: String },
     /// Lock the context's economic policy, making it immutable (§19.3).
     /// Once locked, the economic policy cannot be changed through governance.
     LockEconomicPolicy,
@@ -3007,7 +3007,7 @@ Deadlock occurs when the governance model requires votes from members that are p
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceReconfigAction {
     /// Remove an inactive signer (Threshold model).
-    RemoveInactiveSigner { did: Identifier },
+    RemoveInactiveSigner { did: [u8; 32] },
     /// Reduce the threshold (Threshold model). New value must be
     /// >= 1 and <= remaining active signers.
     ReduceThreshold { new_threshold: u32 },
@@ -3016,9 +3016,9 @@ pub enum GovernanceReconfigAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadlockJustification {
     /// The identifiers that are unavailable.
-    pub unavailable_dids: Vec<Identifier>,
+    pub unavailable_dids: Vec<[u8; 32]>,
     /// Evidence of unavailability: consecutive missed voting windows.
-    pub missed_windows: Vec<(Identifier, u32)>,
+    pub missed_windows: Vec<([u8; 32], u32)>,
     /// Timestamp of deadlock detection.
     pub detected_at: u64,
 }
@@ -3135,23 +3135,23 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
 // Additions to EventType in scp-core/event_log/
 GovernanceProposalCreated {
     proposal_id: ProposalId,
-    proposer_did: Identifier,
+    proposer_did: [u8; 32],
     action: GovernanceAction,
     voting_deadline: u64,
 },
 GovernanceVoteCast {
     proposal_id: ProposalId,
-    voter_did: Identifier,
+    voter_did: [u8; 32],
     vote: VoteType,
 },
 GovernanceVoteWithdrawn {
     proposal_id: ProposalId,
-    voter_did: Identifier,
+    voter_did: [u8; 32],
 },
 GovernanceProposalResolved {
     proposal_id: ProposalId,
     status: ProposalStatus,
-    executor_did: Option<Identifier>,
+    executor_did: Option<[u8; 32]>,
     resulting_epoch: Option<u64>,
 },
 GovernanceConflictDetected {
@@ -3169,7 +3169,7 @@ GovernanceDeadlockRecovery {
 GovernanceActionExecuted {
     proposal_id: ProposalId,
     action: GovernanceAction,
-    executor_did: Identifier,
+    executor_did: [u8; 32],
     resulting_epoch: Option<u64>,
 },
 ```
@@ -3326,7 +3326,7 @@ pub struct AccessKey {
     /// Context this key belongs to.
     context_id: ContextId,
     /// The identifier this key belongs to.
-    member_did: Identifier,
+    member_did: [u8; 32],
     /// Epoch counter — incremented on rotation (restoration generates new key).
     epoch: u64,
 }
@@ -3356,7 +3356,7 @@ pub struct WrappedCek {
 
 ```rust
 pub struct AccessKeyRequest {
-    pub requester_did: Identifier,
+    pub requester_did: [u8; 32],
     pub context_id: ContextId,
     pub epoch: u64,
     pub timestamp: u64,  // Unix milliseconds; requests older than 30s are rejected
@@ -3370,7 +3370,7 @@ pub struct AccessKeyRequest {
 
 pub struct AccessKeyResponse {
     pub context_id: ContextId,
-    pub member_did: Identifier,
+    pub member_did: [u8; 32],
     pub epoch: u64,
     pub hpke_sealed_key: Vec<u8>,
     pub ephemeral_pubkey: HpkeP256PublicKey,
