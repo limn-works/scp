@@ -19828,6 +19828,69 @@ mod tests {
         );
     }
 
+    /// A self-join mint whose `Identity` holds an `#active` handle to a key
+    /// other than the one its DID document resolves as `#active` mints nothing
+    /// and fails with `SCP-CRYPTO-4066` (§9.7.1).
+    #[test]
+    #[cfg(feature = "testing")]
+    fn self_join_mint_refuses_a_handle_that_is_not_the_resolved_active_key() {
+        use scp_platform::KeyCustody as _;
+        let rt = runtime();
+        let scp = scp_test();
+        let mut identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        scp.inner.init_context_manager_with_did(&identity.did);
+        let sup = Arc::clone(scp.inner.context_manager_or_error().expect("supervisor"));
+        let handle = Arc::get_mut(&mut identity).expect("the test holds the only handle");
+        let custody = Arc::clone(handle.custody.as_ref().expect("a custodied identity"));
+        let other = rt
+            .block_on(custody.generate_keypair(scp_platform::KeyType::Ed25519))
+            .expect("custody generates a second Ed25519 key");
+        handle
+            .core_id
+            .as_mut()
+            .expect("a custodied identity retains its key handles")
+            .active_signing_key = other;
+
+        let err = rt
+            .block_on(super::mint_self_join_key_package(&sup, &identity))
+            .expect_err("a handle that is not the resolved #active mints nothing");
+        assert!(
+            matches!(&err, ScpError::Crypto { code, .. } if code == codes::CRYPTO_4066),
+            "{err:?}"
+        );
+    }
+
+    /// A self-join mint for an `Identity` whose DID document does not resolve
+    /// mints nothing and fails with `SCP-CRYPTO-4065` (§9.7.1). The identity's
+    /// custody and keys are real; only the DID it carries has no published
+    /// document.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn self_join_mint_fails_closed_when_the_owner_does_not_resolve() {
+        let rt = runtime();
+        let scp = scp_test();
+        let mut identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        scp.inner.init_context_manager_with_did(&identity.did);
+        let sup = Arc::clone(scp.inner.context_manager_or_error().expect("supervisor"));
+        "did:dht:z6MkSelfJoinOwnerNeverPublished".clone_into(
+            &mut Arc::get_mut(&mut identity)
+                .expect("the test holds the only handle")
+                .did,
+        );
+
+        let err = rt
+            .block_on(super::mint_self_join_key_package(&sup, &identity))
+            .expect_err("an owner that does not resolve mints nothing");
+        assert!(
+            matches!(&err, ScpError::Crypto { code, .. } if code == codes::CRYPTO_4065),
+            "{err:?}"
+        );
+    }
+
     /// Join, leave, send, and subscribe read the supervisor actor, so a
     /// despawned actor refuses all four while the handle's cached state still
     /// reads `Active`.

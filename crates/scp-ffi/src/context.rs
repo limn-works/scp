@@ -7564,6 +7564,85 @@ mod tests {
         });
     }
 
+    /// Asserts `err` is a `CryptoError` whose message carries the `[code]`
+    /// prefix the Python wrapper parses the code from.
+    fn assert_crypto_code(py: Python<'_>, err: &PyErr, code: &str) {
+        assert!(
+            err.is_instance_of::<crate::error::CryptoError>(py),
+            "expected CryptoError, got: {err}"
+        );
+        let message = err.value(py).to_string();
+        assert!(message.starts_with(&format!("[{code}] ")), "{message}");
+    }
+
+    /// A self-join mint whose registered `#active` handle holds a key other
+    /// than the one the identity's DID document resolves as `#active` mints
+    /// nothing and raises `SCP-CRYPTO-4066` (§9.7.1).
+    #[test]
+    fn self_join_mint_refuses_a_handle_that_is_not_the_resolved_active_key() {
+        use scp_platform::KeyCustody as _;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let did = scp
+                .identity_create(py, "in_memory", None)
+                .unwrap()
+                .did()
+                .to_owned();
+            crate::runtime::init_context_manager_for_test(&bi);
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            let custody =
+                crate::runtime::with_identity(&bi, &did, |e| Ok(Arc::clone(&e.custody))).unwrap();
+            let other = crate::actor_wait::block_on_released(
+                py,
+                custody.generate_keypair(scp_platform::KeyType::Ed25519),
+            )
+            .unwrap()
+            .expect("custody generates a second Ed25519 key");
+            crate::runtime::with_identity_mut(&bi, &did, |e| {
+                e.identity.active_signing_key = other;
+                Ok(())
+            })
+            .unwrap();
+
+            let err = super::mint_self_join_key_package(py, &bi, &sup, &did)
+                .expect_err("a handle that is not the resolved #active mints nothing");
+            assert_crypto_code(py, &err, codes::CRYPTO_4066);
+        });
+    }
+
+    /// A self-join mint for an identity whose DID document does not resolve
+    /// mints nothing and raises `SCP-CRYPTO-4065` (§9.7.1). The identity's
+    /// custody and keys are real; only the DID it is registered under has no
+    /// published document.
+    #[test]
+    fn self_join_mint_fails_closed_when_the_owner_does_not_resolve() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let did = scp
+                .identity_create(py, "in_memory", None)
+                .unwrap()
+                .did()
+                .to_owned();
+            crate::runtime::init_context_manager_for_test(&bi);
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            let unpublished = "did:dht:z6MkSelfJoinOwnerNeverPublished";
+            let (_, entry) = crate::runtime::identity_registry(&bi)
+                .remove(&did)
+                .expect("the identity is registered");
+            crate::runtime::register_identity(&bi, unpublished, entry);
+
+            let err = super::mint_self_join_key_package(py, &bi, &sup, unpublished)
+                .expect_err("an owner that does not resolve mints nothing");
+            assert_crypto_code(py, &err, codes::CRYPTO_4065);
+        });
+    }
+
     /// Test helper: execute a governance action through the GENUINE
     /// propose flow on a `SingleAdmin` context.
     ///

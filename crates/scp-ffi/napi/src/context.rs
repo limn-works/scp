@@ -6429,6 +6429,80 @@ mod tests {
         );
     }
 
+    /// A self-join mint whose registered `#active` handle holds a key other
+    /// than the one the identity's DID document resolves as `#active` mints
+    /// nothing and fails with `SCP-CRYPTO-4066` (§9.7.1).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_join_mint_refuses_a_handle_that_is_not_the_resolved_active_key() {
+        use scp_platform::KeyCustody as _;
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create succeeds")
+            .inner
+            .did
+            .clone();
+        crate::runtime::init_supervisor(&bi, &did);
+        let custody =
+            crate::runtime::with_identity(&bi, &did, |e| Ok(Arc::clone(&e.custody))).unwrap();
+        let other = custody
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .expect("custody generates a second Ed25519 key");
+        crate::runtime::with_identity_mut(&bi, &did, |e| {
+            e.identity.active_signing_key = other;
+            Ok(())
+        })
+        .unwrap();
+
+        let err = super::mint_self_join_key_package(&bi, &did)
+            .await
+            .expect_err("a handle that is not the resolved #active mints nothing");
+        assert!(
+            err.reason
+                .starts_with(&format!("[{}] ", codes::CRYPTO_4066)),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// A self-join mint for an identity whose DID document does not resolve
+    /// mints nothing and fails with `SCP-CRYPTO-4065` (§9.7.1). The identity's
+    /// custody and keys are real; only the DID it is registered under has no
+    /// published document.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_join_mint_fails_closed_when_the_owner_does_not_resolve() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create succeeds")
+            .inner
+            .did
+            .clone();
+        crate::runtime::init_supervisor(&bi, &did);
+        let unpublished = "did:dht:z6MkSelfJoinOwnerNeverPublished";
+        let (_, entry) = crate::runtime::identity_registry(&bi)
+            .remove(&did)
+            .expect("the identity is registered");
+        crate::runtime::register_identity(&bi, unpublished, entry);
+
+        let err = super::mint_self_join_key_package(&bi, unpublished)
+            .await
+            .expect_err("an owner that does not resolve mints nothing");
+        assert!(
+            err.reason
+                .starts_with(&format!("[{}] ", codes::CRYPTO_4065)),
+            "{}",
+            err.reason
+        );
+    }
+
     /// ADR-049 Phase 2J (orphaned-success fix): a pre-existing (`Occupied`)
     /// FFI-state entry fails `context_join_from_welcome` at the
     /// `register_ffi_state` precheck — which runs BEFORE `spawn_actor_from_welcome`
