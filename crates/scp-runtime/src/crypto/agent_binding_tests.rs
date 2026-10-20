@@ -1,8 +1,10 @@
-//! Negative tests for ADR-039 agent binding (SCP-AB-022).
+//! Negative tests for ADR-039 agent binding.
 //!
-//! Tests key continuity fingerprint behavior, DID document agent key
-//! constraints, UCAN self-delegation / key-scope semantics, and governance
-//! one-vote-per-DID enforcement.
+//! Tests the one-`#agent`-VM DID document constraint (SCP-AB-008), UCAN
+//! self-delegation and key-scope semantics (SCP-AB-012, SCP-AB-013), and
+//! governance one-vote-per-DID enforcement. The §9.11
+//! key-continuity fingerprint has no agent key; its tests live in
+//! `scp_protocol::crypto::key_continuity`.
 
 #[cfg(test)]
 #[allow(
@@ -22,9 +24,6 @@ mod tests {
     use scp_platform::traits::{KeyCustody, KeyType};
 
     use crate::crypto::ucan::mint::{MintParams, mint_ucan};
-    use scp_protocol::crypto::key_continuity::{
-        KeyContinuityParty, compute_key_continuity_fingerprint,
-    };
     use scp_protocol::crypto::ucan::UcanError;
     use scp_protocol::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryRevocationChecker,
@@ -419,167 +418,6 @@ mod tests {
                 GovernanceError::AlreadyVoted | GovernanceError::ProposalNotPending { .. }
             ),
             "expected AlreadyVoted or ProposalNotPending, got: {err:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Test 6: Key continuity fingerprint with and without agent key
-    //
-    // These tests are in the key_continuity module itself. Here we add
-    // additional integration-level tests that combine DidDocument structures
-    // with the fingerprint computation.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn fingerprint_from_did_documents_without_agent_keys() {
-        let alice_did = "did:dht:z6MkAlice";
-        let alice_id = [10u8; 32];
-        let alice_active = [20u8; 32];
-        let bob_did = "did:dht:z6MkBob";
-        let bob_id = [30u8; 32];
-        let bob_active = [40u8; 32];
-
-        let _alice_doc = make_did_document(alice_did, &alice_id, &alice_active, None);
-        let _bob_doc = make_did_document(bob_did, &bob_id, &bob_active, None);
-
-        let alice = KeyContinuityParty {
-            did: alice_did,
-            identity_key: &alice_id,
-            active_key: &alice_active,
-            agent_key: None,
-        };
-        let bob = KeyContinuityParty {
-            did: bob_did,
-            identity_key: &bob_id,
-            active_key: &bob_active,
-            agent_key: None,
-        };
-
-        // Compute fingerprint without agent keys.
-        let fp = compute_key_continuity_fingerprint(&alice, &bob);
-
-        // Deterministic: same inputs produce same output.
-        let fp2 = compute_key_continuity_fingerprint(&alice, &bob);
-        assert_eq!(fp, fp2);
-
-        // Non-zero: not a degenerate output.
-        assert_ne!(fp, [0u8; 32]);
-    }
-
-    #[test]
-    fn fingerprint_changes_when_agent_key_added_to_did_document() {
-        let alice_did = "did:dht:z6MkAlice";
-        let alice_id = [10u8; 32];
-        let alice_active = [20u8; 32];
-        let alice_agent = [50u8; 32];
-        let bob_did = "did:dht:z6MkBob";
-        let bob_id = [30u8; 32];
-        let bob_active = [40u8; 32];
-
-        let alice_no_agent = KeyContinuityParty {
-            did: alice_did,
-            identity_key: &alice_id,
-            active_key: &alice_active,
-            agent_key: None,
-        };
-        let alice_with_agent = KeyContinuityParty {
-            did: alice_did,
-            identity_key: &alice_id,
-            active_key: &alice_active,
-            agent_key: Some(&alice_agent),
-        };
-        let bob = KeyContinuityParty {
-            did: bob_did,
-            identity_key: &bob_id,
-            active_key: &bob_active,
-            agent_key: None,
-        };
-
-        // Before agent binding.
-        let fp_before = compute_key_continuity_fingerprint(&alice_no_agent, &bob);
-
-        // After Alice binds an agent.
-        let fp_after = compute_key_continuity_fingerprint(&alice_with_agent, &bob);
-
-        assert_ne!(
-            fp_before, fp_after,
-            "fingerprint must change when an agent key is added"
-        );
-    }
-
-    #[test]
-    fn fingerprint_with_both_agent_keys_is_deterministic() {
-        let alice_did = "did:dht:z6MkAlice";
-        let alice_id = [10u8; 32];
-        let alice_active = [20u8; 32];
-        let alice_agent = [50u8; 32];
-        let bob_did = "did:dht:z6MkBob";
-        let bob_id = [30u8; 32];
-        let bob_active = [40u8; 32];
-        let bob_agent = [60u8; 32];
-
-        let alice = KeyContinuityParty {
-            did: alice_did,
-            identity_key: &alice_id,
-            active_key: &alice_active,
-            agent_key: Some(&alice_agent),
-        };
-        let bob = KeyContinuityParty {
-            did: bob_did,
-            identity_key: &bob_id,
-            active_key: &bob_active,
-            agent_key: Some(&bob_agent),
-        };
-
-        let fp1 = compute_key_continuity_fingerprint(&alice, &bob);
-        let fp2 = compute_key_continuity_fingerprint(&alice, &bob);
-        assert_eq!(fp1, fp2);
-    }
-
-    #[test]
-    fn fingerprint_agent_absence_differs_from_zero_bytes() {
-        let alice_did = "did:dht:z6MkAlice";
-        let alice_id = [10u8; 32];
-        let alice_active = [20u8; 32];
-        let bob_did = "did:dht:z6MkBob";
-        let bob_id = [30u8; 32];
-        let bob_active = [40u8; 32];
-        let zero_key = [0u8; 32];
-
-        let alice_none = KeyContinuityParty {
-            did: alice_did,
-            identity_key: &alice_id,
-            active_key: &alice_active,
-            agent_key: None,
-        };
-        let bob_none = KeyContinuityParty {
-            did: bob_did,
-            identity_key: &bob_id,
-            active_key: &bob_active,
-            agent_key: None,
-        };
-
-        let alice_zero = KeyContinuityParty {
-            did: alice_did,
-            identity_key: &alice_id,
-            active_key: &alice_active,
-            agent_key: Some(&zero_key),
-        };
-        let bob_zero = KeyContinuityParty {
-            did: bob_did,
-            identity_key: &bob_id,
-            active_key: &bob_active,
-            agent_key: Some(&zero_key),
-        };
-
-        // None agent key uses domain-derived sentinel SHA-256("SCP-ABSENT-AGENT-KEY"),
-        // NOT zero bytes. This prevents collision with the Ed25519 identity point.
-        let fp_none = compute_key_continuity_fingerprint(&alice_none, &bob_none);
-        let fp_zero = compute_key_continuity_fingerprint(&alice_zero, &bob_zero);
-
-        assert_ne!(
-            fp_none, fp_zero,
-            "absent agent key (None) must differ from explicit zero bytes (uses domain-derived sentinel)"
         );
     }
 }
