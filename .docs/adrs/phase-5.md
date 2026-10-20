@@ -388,7 +388,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 2. **`AppleKeyCustody` — Keychain access:**
    - All Keychain items use `kSecAttrAccessGroup: "\(appIdentifierPrefix).dev.limn.scp"`.
    - All Keychain items use `kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
-   - Key items use `kSecClass: kSecClassGenericPassword` with `kSecAttrAccount: "scp.key.<keyHandle>"`.
+   - Key items use `kSecClass: kSecClassGenericPassword` with `kSecAttrAccount: "scp.key.<keyHandle>"` and the fixed `kSecAttrService: "dev.limn.scp.key"`, which every query the adapter runs also carries (amended 2026-10-20; this item previously named the account alone).
    - No Keychain item ever uses `kSecAttrAccessibleAlways` or an iCloud-synced protection class.
 
 3. **`AppleDeviceAttestation` — App Attest:**
