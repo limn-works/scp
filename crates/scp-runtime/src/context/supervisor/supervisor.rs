@@ -19733,11 +19733,12 @@ mod tests {
         (key, resolver)
     }
 
-    /// A signer over a fixed key that no test resolver names.
+    /// The fixed key behind [`kp_other_signer`].
     fn kp_other_signer_key() -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::from_bytes(&[0x3D; 32])
     }
 
+    /// A signer over a fixed key that no test resolver names.
     fn kp_other_signer() -> crate::context::actor::CommandSigner {
         crate::context::actor::CommandSigner::local_ed25519(kp_other_signer_key())
     }

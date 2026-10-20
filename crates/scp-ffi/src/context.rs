@@ -2868,7 +2868,9 @@ impl crate::scp::PyScp {
     /// the context in any state but active or no actor serves it,
     /// `SCP-CTX-2134` when the crash watchdog poisoned it, `SCP-CTX-2135`
     /// when its actor crashed or is mid-respawn, and `SCP-CTX-2138` when the
-    /// Supervisor refused the join because shutdown began.
+    /// Supervisor refused the join because shutdown began; every other failure
+    /// with a dedicated code (`scp_ffi_common::context_error_class::has_dedicated_code`,
+    /// such as a custody failure's custody code) raises its typed exception.
     #[pyo3(signature = (handle, identity_did, spending_ucan_jwt=None))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, UCAN gate, delegates to ContextManager
     pub fn context_join(
@@ -4760,9 +4762,12 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `ContextError` (SCP-CTX-2138) if the Supervisor refused the
-    /// restore because shutdown began, and `RuntimeError` (SCP-CTX-2064) if
-    /// restoration fails otherwise.
+    /// Returns the typed SDK error with its code for a failure that has a
+    /// dedicated code (`scp_ffi_common::context_error_class::has_dedicated_code`:
+    /// `SCP-CTX-2138` when the Supervisor refused the restore because shutdown
+    /// began, a custody failure's custody code, `SCP-CTX-2137` when nothing is
+    /// persisted to restore, ...), and `RuntimeError` naming SCP-CTX-2064 for
+    /// every other failure.
     #[pyo3(signature = (context_id,))]
     pub fn restore_context(&self, py: Python<'_>, context_id: &str) -> PyResult<()> {
         let bi = &*self.inner;
@@ -10400,7 +10405,8 @@ class SlowAgreeCustody(P256Custody):
     }
 
     /// A restore refused because Supervisor shutdown began raises
-    /// `ContextError` with `SCP-CTX-2138`; any other restore failure raises the
+    /// `ContextError` with `SCP-CTX-2138`, as every error with a dedicated code
+    /// raises its typed exception; a failure with no dedicated code raises the
     /// `RuntimeError` naming `SCP-CTX-2064`.
     #[test]
     fn restore_context_failure_keeps_supervisor_shut_down_typed() {
