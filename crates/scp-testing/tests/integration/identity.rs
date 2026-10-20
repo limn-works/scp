@@ -296,45 +296,42 @@ fn continuity_key_state(root: &[[u8; 33]], active: [u8; 33]) -> KeyState {
     }
 }
 
-/// §9.11: the fingerprint is deterministic and does not depend on which party
-/// is supplied first.
+/// §9.11 over an `#active` rotation built as a `KeyState` event builds it:
+/// the new key `Current` and the old key's `Superseded` drop entry listed
+/// ahead of it (`09-security-model.md` §9.7.4.2 R8). The rotating party
+/// carries the higher identifier and a two-member root set. The fingerprint
+/// changes, and both argument orders give one value over the rotated state.
 #[test]
-fn key_continuity_fingerprint_is_deterministic_and_symmetric() {
+fn key_continuity_follows_rotation_with_superseded_drop_entry() {
     let alice_id = Identifier::from_bytes([0xa1; 32]);
     let bob_id = Identifier::from_bytes([0x0b; 32]);
-    let alice = continuity_key_state(&[continuity_key(1), continuity_key(2)], continuity_key(3));
-    let bob = continuity_key_state(&[continuity_key(4)], continuity_key(5));
-
-    let fp1 = compute_key_continuity_fingerprint((&alice_id, &alice), (&bob_id, &bob))
-        .expect("both key states name one #active key and a root set");
-    let fp2 = compute_key_continuity_fingerprint((&alice_id, &alice), (&bob_id, &bob))
-        .expect("both key states name one #active key and a root set");
-    assert_eq!(fp1, fp2, "fingerprint must be deterministic");
-
-    let fp_reversed = compute_key_continuity_fingerprint((&bob_id, &bob), (&alice_id, &alice))
-        .expect("both key states name one #active key and a root set");
-    assert_eq!(fp1, fp_reversed, "fingerprint must be symmetric");
-}
-
-/// §9.11: rotating the `#active` key, which a `KeyState` event does by
-/// listing the new key `Current` and dropping the old one, changes the
-/// fingerprint.
-#[test]
-fn key_continuity_changes_on_active_key_rotation() {
-    let alice_id = Identifier::from_bytes([0xa1; 32]);
-    let bob_id = Identifier::from_bytes([0x0b; 32]);
-    let bob = continuity_key_state(&[continuity_key(4)], continuity_key(5));
-    let alice_before = continuity_key_state(&[continuity_key(1)], continuity_key(3));
-    let alice_after = continuity_key_state(&[continuity_key(1)], continuity_key(6));
+    let bob = continuity_key_state(&[continuity_key(0x61)], continuity_key(0x62));
+    let root = [continuity_key(0x71), continuity_key(0x72)];
+    let alice_before = continuity_key_state(&root, continuity_key(0x73));
+    let mut alice_after = continuity_key_state(&root, continuity_key(0x76));
+    let new_active = alice_after.keys[2];
+    alice_after.keys.insert(
+        2,
+        KeyEntry {
+            key: continuity_key(0x73),
+            condition: KeyCondition::Superseded,
+            ..new_active
+        },
+    );
 
     let fp_before = compute_key_continuity_fingerprint((&alice_id, &alice_before), (&bob_id, &bob))
         .expect("both key states name one #active key and a root set");
     let fp_after = compute_key_continuity_fingerprint((&alice_id, &alice_after), (&bob_id, &bob))
-        .expect("both key states name one #active key and a root set");
+        .expect("the Superseded drop entry is not a second #active key");
     assert_ne!(
         fp_before, fp_after,
         "rotating the #active key must change the fingerprint"
     );
+
+    let fp_from_bob =
+        compute_key_continuity_fingerprint((&bob_id, &bob), (&alice_id, &alice_after))
+            .expect("both key states name one #active key and a root set");
+    assert_eq!(fp_after, fp_from_bob, "fingerprint must be symmetric");
 }
 
 #[tokio::test]

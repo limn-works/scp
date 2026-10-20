@@ -195,11 +195,14 @@ const fn conf_key(tag: u8) -> [u8; 33] {
     key
 }
 
-/// CONF-003: Key Rotation (Active Key Update)
-/// Layer: Identity | Tier: Core | Spec: §3.3, §9.11
+/// The continuity fingerprint over an `#active` rotation built as CONF-003's
+/// step 2 composes it: the fingerprint changes and stays symmetric. This is
+/// the part of CONF-003 that needs no chain; `conf_003_key_rotation` holds
+/// the rest.
+/// Spec: `09-security-model.md` §9.11, §9.7.4.2 R3
 #[test]
-fn conf_003_key_rotation_changes_fingerprint() {
-    println!("=== CONF-003: Key Rotation (Active Key Update) ===");
+fn key_rotation_changes_fingerprint_symmetrically() {
+    println!("=== Key rotation changes the continuity fingerprint ===");
 
     let alice_id = Identifier::from_bytes([0x33; 32]);
     let bob_id = Identifier::from_bytes([0x44; 32]);
@@ -237,6 +240,24 @@ fn conf_003_key_rotation_changes_fingerprint() {
     assert_eq!(fp_after, fp_from_bob, "fingerprint must be symmetric");
 
     println!("  PASS: Key rotation changes fingerprint");
+}
+
+/// CONF-003: Key Rotation (Active Key Update)
+/// Layer: Identity | Tier: Core | Spec: `03-identity.md` §3.2.1 case 1,
+/// `09-security-model.md` §9.11, §9.7.4.2 R3, R8
+#[test]
+#[ignore = "CONF-003 waits for chain signing, validation and replay; see the stub"]
+fn conf_003_key_rotation() {
+    // Stub — see SCP-309. CONF-003 steps that wait for chain verification:
+    // 1. Generate a new P-256 `#active` keypair.
+    // 2. Compose a `KeyState` carrying the new key `Current` in the `#active`
+    //    role and the old key's `Superseded` drop entry.
+    // 3. Sign it with the standing root, publish the chain, and resolve the
+    //    identity again.
+    // 4. Verify the replayed key state reads the old key `Superseded` and
+    //    the continuity fingerprint changed.
+    // Expected outcome also asserted here: a message signed with the old key
+    // still verifies against the retired key (§9.7.1).
 }
 
 /// CONF-004: Agent Binding (Human DID Attests Agent DID)

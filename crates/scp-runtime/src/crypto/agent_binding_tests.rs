@@ -1,7 +1,8 @@
-//! Negative tests for ADR-039 agent binding (SCP-AB-022).
+//! Negative tests for ADR-039 agent binding.
 //!
-//! Tests DID document agent key constraints, UCAN self-delegation / key-scope
-//! semantics, and governance one-vote-per-DID enforcement. The §9.11
+//! Tests the one-`#agent`-VM DID document constraint (SCP-AB-008), UCAN
+//! self-delegation and key-scope semantics (SCP-AB-012, SCP-AB-013), and
+//! governance one-vote-per-DID enforcement. The §9.11
 //! key-continuity fingerprint has no agent key; its tests live in
 //! `scp_protocol::crypto::key_continuity`.
 

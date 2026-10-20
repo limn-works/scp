@@ -591,7 +591,9 @@ fn vector_19_four_leaves_balanced() {
 // ---------------------------------------------------------------------------
 
 /// A key state carrying `root` as its `Current` root members, in that order,
-/// and `active` as its `Current` `#active` key.
+/// and `active` as its `Current` `#active` key. The threshold is 1 whatever
+/// the root-set size, so a count read from the threshold instead of the
+/// member list misses the spec bytes for party A's two-member set.
 fn continuity_key_state(root: &[[u8; 33]], active: [u8; 33]) -> KeyState {
     let entry = |key: [u8; 33], role: KeyRole| KeyEntry {
         key,
@@ -607,7 +609,7 @@ fn continuity_key_state(root: &[[u8; 33]], active: [u8; 33]) -> KeyState {
         .collect();
     keys.push(entry(active, KeyRole::Active));
     KeyState {
-        root_threshold: u32::try_from(root.len()).unwrap(),
+        root_threshold: 1,
         keys,
         witnesses: Vec::new(),
         witnessing_interval: 3600,

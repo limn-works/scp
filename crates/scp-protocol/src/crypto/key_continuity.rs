@@ -23,7 +23,7 @@ use std::cmp::Ordering;
 use scp_did::{Identifier, KeyCondition, KeyRole, KeyState};
 use sha2::{Digest, Sha256};
 
-use super::bip39_wordlist::BIP39_ENGLISH;
+use self::count::RootCount;
 
 /// The §9.11 domain separator, registered in §9.18.2.
 const KEY_CONTINUITY_SEPARATOR: &[u8] = b"SCP-KEY-CONTINUITY-V1:";
@@ -83,7 +83,7 @@ pub enum KeyContinuityError {
 /// One party's block of the §9.11 preimage, read from its key state.
 struct PartyBlock<'a> {
     identifier: &'a Identifier,
-    root_count: [u8; 4],
+    root_count: RootCount,
     root_members: Vec<&'a [u8; 33]>,
     active: &'a [u8; 33],
 }
@@ -128,7 +128,7 @@ impl<'a> PartyBlock<'a> {
                 identifier: *identifier,
             });
         }
-        let root_count = encode_count(identifier, root_members.len())?;
+        let root_count = RootCount::encode(identifier, root_members.len())?;
         Ok(Self {
             identifier,
             root_count,
@@ -139,7 +139,7 @@ impl<'a> PartyBlock<'a> {
 
     fn feed(&self, hasher: &mut Sha256) {
         hasher.update(self.identifier.as_bytes());
-        hasher.update(self.root_count);
+        hasher.update(self.root_count.bytes());
         for member in &self.root_members {
             hasher.update(member);
         }
@@ -147,14 +147,39 @@ impl<'a> PartyBlock<'a> {
     }
 }
 
-/// `BE32(count)` under §9.5.1's repeated-field rule.
-fn encode_count(identifier: &Identifier, count: usize) -> Result<[u8; 4], KeyContinuityError> {
-    u32::try_from(count).map(u32::to_be_bytes).map_err(|_| {
-        KeyContinuityError::RootSetCountOverflow {
-            identifier: *identifier,
-            count,
+/// The root-set count field, sealed in its own module so the one checked
+/// encoder is the only way the preimage gets a count.
+mod count {
+    use scp_did::Identifier;
+
+    use super::KeyContinuityError;
+
+    /// `BE32(count)` of a root set under §9.5.1's repeated-field rule. The
+    /// field is private to this module, so no caller writes an unchecked
+    /// (truncated) count into the preimage.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct RootCount([u8; 4]);
+
+    impl RootCount {
+        /// Encodes `count`, refusing one past `u32::MAX` with
+        /// [`KeyContinuityError::RootSetCountOverflow`] naming `identifier`.
+        pub(super) fn encode(
+            identifier: &Identifier,
+            count: usize,
+        ) -> Result<Self, KeyContinuityError> {
+            u32::try_from(count)
+                .map(|n| Self(n.to_be_bytes()))
+                .map_err(|_| KeyContinuityError::RootSetCountOverflow {
+                    identifier: *identifier,
+                    count,
+                })
         }
-    })
+
+        /// The four big-endian bytes the preimage carries.
+        pub(super) const fn bytes(self) -> [u8; 4] {
+            self.0
+        }
+    }
 }
 
 /// Computes the §9.11 key-continuity fingerprint of two parties.
@@ -189,68 +214,6 @@ pub fn compute_key_continuity_fingerprint(
     lower.feed(&mut hasher);
     higher.feed(&mut hasher);
     Ok(hasher.finalize().into())
-}
-
-/// Converts a fingerprint to a 12-word BIP-39 mnemonic.
-///
-/// §9.11 states no display form; this rendering is an SDK convenience over
-/// the fingerprint's bytes.
-///
-/// Uses the first 128 bits (16 bytes) of the fingerprint hash, appends a
-/// 4-bit SHA-256 checksum (per BIP-39), producing 132 bits split into 12
-/// groups of 11 bits. Each 11-bit value indexes into the 2048-word BIP-39
-/// English word list.
-///
-/// # Returns
-///
-/// A string of 12 space-separated English words.
-#[must_use]
-pub fn fingerprint_to_mnemonic(fingerprint: &[u8; 32]) -> String {
-    // Take first 16 bytes (128 bits) per spec.
-    let entropy = &fingerprint[..16];
-
-    // BIP-39 checksum: SHA-256 of entropy, take first CS bits.
-    // For 128-bit entropy, CS = 128 / 32 = 4 bits.
-    let checksum_hash = Sha256::digest(entropy);
-    let checksum_byte = checksum_hash[0]; // First byte; we need top 4 bits.
-
-    // Build a 132-bit buffer: 128 bits of entropy + 4 bits of checksum.
-    // We work with the 16 entropy bytes plus one extra byte whose top 4 bits
-    // are the checksum.
-    let mut bits = [0u8; 17];
-    bits[..16].copy_from_slice(entropy);
-    bits[16] = checksum_byte & 0xF0; // Only top 4 bits matter.
-
-    // Extract 12 groups of 11 bits each from the 132-bit buffer.
-    // We read a 24-bit window (3 bytes) to avoid overflow when bit_idx > 5.
-    let mut words: Vec<&str> = Vec::with_capacity(12);
-    for i in 0..12 {
-        let bit_offset = i * 11;
-        let byte_idx = bit_offset / 8;
-        let bit_idx = bit_offset % 8;
-
-        // Read a 3-byte window starting at byte_idx. For 17-byte buffer,
-        // byte_idx ranges 0..15. byte_idx+2 is at most 17, but bits has
-        // exactly 17 elements, so use 0 for any out-of-bounds byte.
-        let b0 = u32::from(bits[byte_idx]);
-        let b1 = u32::from(if byte_idx + 1 < bits.len() {
-            bits[byte_idx + 1]
-        } else {
-            0
-        });
-        let b2 = u32::from(if byte_idx + 2 < bits.len() {
-            bits[byte_idx + 2]
-        } else {
-            0
-        });
-        let window = (b0 << 16) | (b1 << 8) | b2;
-        // The 11 bits start at position `bit_idx` from the top of the 24-bit window.
-        let val = (window >> (24 - 11 - bit_idx)) & 0x07FF;
-
-        words.push(BIP39_ENGLISH[val as usize]);
-    }
-
-    words.join(" ")
 }
 
 #[cfg(test)]
@@ -441,114 +404,24 @@ mod tests {
     }
 
     /// A root set past `u32::MAX` members cannot be built in a test, so the
-    /// count encoder is checked at the boundary directly.
+    /// count encoder is checked at the boundary directly. `RootCount` has no
+    /// other constructor, so this check covers every count the preimage
+    /// carries.
     #[cfg(target_pointer_width = "64")]
     #[test]
-    fn encode_count_rejects_count_past_be32() {
+    fn root_count_rejects_count_past_be32() {
         let past = usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX);
         assert_eq!(
-            encode_count(&ID_LOW, past),
+            RootCount::encode(&ID_LOW, past),
             Err(KeyContinuityError::RootSetCountOverflow {
                 identifier: ID_LOW,
                 count: past
             })
         );
         assert_eq!(
-            encode_count(&ID_LOW, usize::try_from(u32::MAX).unwrap_or(0)),
+            RootCount::encode(&ID_LOW, usize::try_from(u32::MAX).unwrap_or(0))
+                .map(RootCount::bytes),
             Ok(u32::MAX.to_be_bytes())
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // BIP-39 mnemonic tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn mnemonic_produces_12_words() {
-        let fp = [0xABu8; 32];
-        let mnemonic = fingerprint_to_mnemonic(&fp);
-        assert_eq!(
-            mnemonic.split(' ').count(),
-            12,
-            "mnemonic must be exactly 12 words"
-        );
-    }
-
-    #[test]
-    fn mnemonic_is_deterministic() {
-        let fp = [0x42u8; 32];
-        let m1 = fingerprint_to_mnemonic(&fp);
-        let m2 = fingerprint_to_mnemonic(&fp);
-        assert_eq!(m1, m2, "same fingerprint must produce same mnemonic");
-    }
-
-    #[test]
-    fn mnemonic_changes_with_the_fingerprint() {
-        assert_ne!(
-            fingerprint_to_mnemonic(&[0x01; 32]),
-            fingerprint_to_mnemonic(&[0x02; 32]),
-            "different fingerprints must produce different mnemonics"
-        );
-    }
-
-    #[test]
-    fn mnemonic_all_words_are_in_bip39_list() {
-        use super::BIP39_ENGLISH;
-
-        let fp = [0x73u8; 32];
-        let mnemonic = fingerprint_to_mnemonic(&fp);
-        for word in mnemonic.split(' ') {
-            assert!(
-                BIP39_ENGLISH.contains(&word),
-                "word '{word}' must be in the BIP-39 word list"
-            );
-        }
-    }
-
-    #[test]
-    fn mnemonic_zero_fingerprint() {
-        // All-zero entropy: each 11-bit group is 0 → "abandon" (index 0).
-        // But the checksum of 16 zero bytes changes the last word.
-        let fp = [0u8; 32];
-        let mnemonic = fingerprint_to_mnemonic(&fp);
-        let words: Vec<&str> = mnemonic.split(' ').collect();
-        assert_eq!(words.len(), 12);
-        // First 11 words should be "abandon" (all zero bits in entropy portion).
-        for word in &words[..11] {
-            assert_eq!(
-                *word, "abandon",
-                "zero entropy bits must map to 'abandon' (index 0)"
-            );
-        }
-        // 12th word includes 4 checksum bits, so it differs from "abandon".
-        // SHA-256(16 zero bytes) starts with 0x37 → top 4 bits = 0011 = 3
-        // Last word's 11 bits: 0000000_0011 = 3 → "about"
-        assert_eq!(
-            words[11], "about",
-            "checksum bits must produce the correct final word"
-        );
-    }
-
-    #[test]
-    fn bip39_wordlist_has_2048_entries() {
-        use super::BIP39_ENGLISH;
-        assert_eq!(
-            BIP39_ENGLISH.len(),
-            2048,
-            "BIP-39 word list must have exactly 2048 entries"
-        );
-    }
-
-    #[test]
-    fn bip39_wordlist_is_sorted() {
-        use super::BIP39_ENGLISH;
-        for i in 1..BIP39_ENGLISH.len() {
-            assert!(
-                BIP39_ENGLISH[i - 1] < BIP39_ENGLISH[i],
-                "BIP-39 word list must be sorted: '{}' >= '{}'",
-                BIP39_ENGLISH[i - 1],
-                BIP39_ENGLISH[i]
-            );
-        }
     }
 }

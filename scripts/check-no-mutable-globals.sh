@@ -113,7 +113,6 @@ fi
 # ---------------------------------------------------------------------------
 ALLOWLIST=(
     # Crypto / constants
-    BIP39_ENGLISH                   # why: 2048-word BIP-39 wordlist, `&'static [&str; 2048]` constant.
     PROTOCOL_REGISTRY               # why: protocol capability registry — frozen lookup table of compile-time-known resources (§Trust registry, LazyLock<HashMap>).
     SYSTEM_REGISTRY                 # why: protocol system-action registry — frozen lookup table of compile-time-known system actions.
 
