@@ -28,12 +28,16 @@ use sha2::{Digest, Sha256};
 use scp_crypto::p256::{
     P256Error, P256PublicKey, P256SecretKey, SeedLabel, sign_prehash_rfc6979, verify_prehash_strict,
 };
-use scp_did::{DID, SigningKeyId};
+use scp_did::{
+    CustodyType, DID, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole, KeyState,
+    SigningKeyId, StandingCommitment,
+};
 use scp_protocol::context::governance::{
     GovernanceAction, VoteType, compute_proposal_id, vote_signing_digest,
 };
 use scp_protocol::context::outlets::interface::InterfaceOffer;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash_bytes};
+use scp_protocol::crypto::key_continuity::compute_key_continuity_fingerprint;
 use scp_protocol::crypto::sender_keys::key_protocol_verify::build_hpke_info;
 use scp_protocol::discovery::push::{
     PushDeregistration, PushPlatform, PushRegistration, push_deregistration_signing_bytes,
@@ -586,43 +590,39 @@ fn vector_19_four_leaves_balanced() {
 // §25.9 Key continuity fingerprint
 // ---------------------------------------------------------------------------
 
-/// One party's §9.11 block: identifier, `BE32(count)`, root-set members, and
-/// the `#active` key, every key a 33-byte compressed point.
-fn continuity_block(identifier: &[u8; 32], root_set: &[[u8; 33]], active: &[u8; 33]) -> Vec<u8> {
-    let mut block = identifier.to_vec();
-    block.extend_from_slice(&(root_set.len() as u32).to_be_bytes());
-    for member in root_set {
-        block.extend_from_slice(member);
-    }
-    block.extend_from_slice(active);
-    block
-}
-
-/// The §9.11 two-party fingerprint preimage, ordering the blocks by
-/// identifier regardless of which party is supplied first.
-fn continuity_preimage(
-    first: (&[u8; 32], &[[u8; 33]], &[u8; 33]),
-    second: (&[u8; 32], &[[u8; 33]], &[u8; 33]),
-) -> Vec<u8> {
-    let (lo, hi) = if first.0 <= second.0 {
-        (first, second)
-    } else {
-        (second, first)
+/// A key state carrying `root` as its `Current` root members, in that order,
+/// and `active` as its `Current` `#active` key.
+fn continuity_key_state(root: &[[u8; 33]], active: [u8; 33]) -> KeyState {
+    let entry = |key: [u8; 33], role: KeyRole| KeyEntry {
+        key,
+        role,
+        condition: KeyCondition::Current,
+        compromised_from: 0,
+        custody_type: CustodyType::Software,
+        key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
     };
-    let mut preimage = b"SCP-KEY-CONTINUITY-V1:".to_vec();
-    preimage.extend(continuity_block(lo.0, lo.1, lo.2));
-    preimage.extend(continuity_block(hi.0, hi.1, hi.2));
-    preimage
+    let mut keys: Vec<KeyEntry> = root
+        .iter()
+        .map(|&key| entry(key, KeyRole::RootMember))
+        .collect();
+    keys.push(entry(active, KeyRole::Active));
+    KeyState {
+        root_threshold: u32::try_from(root.len()).unwrap(),
+        keys,
+        witnesses: Vec::new(),
+        witnessing_interval: 3600,
+        service_key_role: KeyRole::Active,
+        delegator: Identifier::ZERO,
+        standing_commitment: StandingCommitment {
+            commitments: Vec::new(),
+            next_threshold: 1,
+        },
+    }
 }
 
-/// §25.9 Vectors 20 and 38, asserted over the spec bytes with primitives.
-///
-/// Production `compute_key_continuity_fingerprint` is the pre-§9.11
-/// construction over DID strings and 32-byte keys; the §9.11 construction
-/// takes root sets, which production gains with the key-event-log data model
-/// (slice S1, SCP-308). The slice that introduces root sets replaces
-/// `compute_key_continuity_fingerprint` with the §9.11 construction and
-/// asserts these two vectors through it; slices S9 and S10 wire its callers.
+/// §25.9 Vectors 20 and 38 through the production
+/// `compute_key_continuity_fingerprint`. The printed preimage hashes to the
+/// production digest, so the production preimage is byte-identical to it.
 #[test]
 fn vectors_20_38_key_continuity_fingerprint() {
     let key = |seed: u8| {
@@ -630,29 +630,29 @@ fn vectors_20_38_key_continuity_fingerprint() {
             .public_key()
             .to_compressed()
     };
-    let id_a = fixture_identifier_bytes("A");
-    let id_b = fixture_identifier_bytes("B");
-    let a_root = [key(0x41), key(0x42)];
-    let a_active = key(0x43);
-    let b_root = [key(0x44)];
-    let b_active = key(0x45);
+    let id_a = Identifier::from_bytes(fixture_identifier_bytes("A"));
+    let id_b = Identifier::from_bytes(fixture_identifier_bytes("B"));
+    let state_a = continuity_key_state(&[key(0x41), key(0x42)], key(0x43));
+    let state_b = continuity_key_state(&[key(0x44)], key(0x45));
 
-    let preimage = continuity_preimage((&id_a, &a_root, &a_active), (&id_b, &b_root, &b_active));
-    assert_eq!(preimage.len(), 259);
+    let fingerprint = compute_key_continuity_fingerprint((&id_a, &state_a), (&id_b, &state_b))
+        .expect("Vector 20 key states are fingerprintable");
     assert_eq!(
-        hex::encode(&preimage),
-        "5343502d4b45592d434f4e54494e554954592d56313abcdcea594dbb12037950ee2d0f356300ea8e37d9dfb01b87c6249033e871095e0000000202542c432f5a8f756764e2f18c8125e5338e61ba1540057f8c6ee666b07c7aa8d102b945d8e097faded7a70e6c18134caf2a9521bc2b05af0becdf99adc9212789d002e264c93973b59b7699221aff574dcde04a79347335c4f9c4a643c7525cd9b975f30cbaf928e7bd22a3d2f4aecf6573120a0cdddd8600aa685f61e7f72c78e8560000000102c4ed969c4a9e294576355bbeb14270e54b51bf6f00b6d1b587676fd0865ee8a8027a3f3aad1b66ab82d3d67a2e3af15f89f304c4b6369accc5715dda72d2800512"
-    );
-    assert_eq!(
-        hex::encode(sha256(&preimage)),
+        hex::encode(fingerprint),
         "c6cdaa8eeb6d04798e308ee0f7c1ecdc29874f8f4411c7c9df921539ad975466"
     );
+    assert_spec_preimage(
+        "vector 20",
+        "5343502d4b45592d434f4e54494e554954592d56313abcdcea594dbb12037950ee2d0f356300ea8e37d9dfb01b87c6249033e871095e0000000202542c432f5a8f756764e2f18c8125e5338e61ba1540057f8c6ee666b07c7aa8d102b945d8e097faded7a70e6c18134caf2a9521bc2b05af0becdf99adc9212789d002e264c93973b59b7699221aff574dcde04a79347335c4f9c4a643c7525cd9b975f30cbaf928e7bd22a3d2f4aecf6573120a0cdddd8600aa685f61e7f72c78e8560000000102c4ed969c4a9e294576355bbeb14270e54b51bf6f00b6d1b587676fd0865ee8a8027a3f3aad1b66ab82d3d67a2e3af15f89f304c4b6369accc5715dda72d2800512",
+        259,
+        &fingerprint,
+    );
 
-    // Vector 38: party B supplied first yields the same preimage.
-    let reversed = continuity_preimage((&id_b, &b_root, &b_active), (&id_a, &a_root, &a_active));
-    assert_eq!(reversed, preimage);
+    // Vector 38: party B supplied first reaches the same value.
+    let reversed = compute_key_continuity_fingerprint((&id_b, &state_b), (&id_a, &state_a))
+        .expect("Vector 38 key states are fingerprintable");
     assert_eq!(
-        hex::encode(sha256(&reversed)),
+        hex::encode(reversed),
         "c6cdaa8eeb6d04798e308ee0f7c1ecdc29874f8f4411c7c9df921539ad975466"
     );
 }

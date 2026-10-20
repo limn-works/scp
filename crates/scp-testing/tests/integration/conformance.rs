@@ -35,9 +35,7 @@ use scp_core::context::{ContextHandle, ContextState, MembershipState};
 use scp_core::crypto::access_keys::wrapping::{unwrap_cek, wrap_cek};
 use scp_core::crypto::access_keys::{ContentEncryptionKey, generate_access_key};
 use scp_core::crypto::canonical::{CanonicalField, canonical_hash, canonical_hash_bytes};
-use scp_core::crypto::key_continuity::{
-    KeyContinuityParty, compute_key_continuity_fingerprint, fingerprint_to_decimal,
-};
+use scp_core::crypto::key_continuity::compute_key_continuity_fingerprint;
 use scp_core::crypto::sender_keys::{
     decrypt_sender_layer, encrypt_sender_layer, generate_sender_key,
 };
@@ -53,7 +51,10 @@ use scp_core::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
 use scp_core::sync::{
     OfflineTier, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS, classify_offline_duration,
 };
-use scp_did::DID;
+use scp_did::{
+    CustodyType, DID, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole, KeyState,
+    StandingCommitment,
+};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::testing::{APNS_WAKE_BODY, FCM_WAKE_DATA, InMemoryPush};
 use scp_platform::{KeyCustody, KeyType, Push};
@@ -159,39 +160,69 @@ fn conf_002_did_self_certification() {
     println!("  PASS: Self-certification verified");
 }
 
+/// A key state whose `Current` root set is `root` and whose `Current`
+/// `#active` key is `active` (`09-security-model.md` §9.7.4.2).
+fn conf_key_state(root: [u8; 33], active: [u8; 33]) -> KeyState {
+    let entry = |key: [u8; 33], role: KeyRole| KeyEntry {
+        key,
+        role,
+        condition: KeyCondition::Current,
+        compromised_from: 0,
+        custody_type: CustodyType::Software,
+        key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
+    };
+    KeyState {
+        root_threshold: 1,
+        keys: vec![
+            entry(root, KeyRole::RootMember),
+            entry(active, KeyRole::Active),
+        ],
+        witnesses: Vec::new(),
+        witnessing_interval: 3600,
+        service_key_role: KeyRole::Active,
+        delegator: Identifier::ZERO,
+        standing_commitment: StandingCommitment {
+            commitments: Vec::new(),
+            next_threshold: 1,
+        },
+    }
+}
+
+/// A 33-byte compressed-point-shaped key distinct for each `tag`.
+const fn conf_key(tag: u8) -> [u8; 33] {
+    let mut key = [tag; 33];
+    key[0] = 0x02;
+    key
+}
+
 /// CONF-003: Key Rotation (Active Key Update)
 /// Layer: Identity | Tier: Core | Spec: §3.3, §9.11
 #[test]
 fn conf_003_key_rotation_changes_fingerprint() {
     println!("=== CONF-003: Key Rotation (Active Key Update) ===");
 
-    let old_active = [0x11u8; 32];
-    let new_active = [0x22u8; 32];
-    let identity = [0x33u8; 32];
+    let alice_id = Identifier::from_bytes([0x33; 32]);
+    let bob_id = Identifier::from_bytes([0x44; 32]);
+    let bob = conf_key_state(conf_key(0x45), conf_key(0x55));
 
     print_step(1, "Compute fingerprint with old active key");
-    let alice = KeyContinuityParty {
-        did: "did:dht:z6MkAlice",
-        identity_key: &identity,
-        active_key: &old_active,
-        agent_key: None,
-    };
-    let bob = KeyContinuityParty {
-        did: "did:dht:z6MkBob",
-        identity_key: &[0x44; 32],
-        active_key: &[0x55; 32],
-        agent_key: None,
-    };
-    let fp_before = compute_key_continuity_fingerprint(&alice, &bob);
+    let alice = conf_key_state(conf_key(0x34), conf_key(0x11));
+    let fp_before = compute_key_continuity_fingerprint((&alice_id, &alice), (&bob_id, &bob))
+        .expect("both key states name one #active key and a root set");
 
-    print_step(2, "Rotate active key");
-    let alice_after = KeyContinuityParty {
-        did: "did:dht:z6MkAlice",
-        identity_key: &identity,
-        active_key: &new_active,
-        agent_key: None,
-    };
-    let fp_after = compute_key_continuity_fingerprint(&alice_after, &bob);
+    print_step(
+        2,
+        "Rotate active key: new key Current, old key's Superseded drop entry",
+    );
+    let mut alice_after = conf_key_state(conf_key(0x34), conf_key(0x22));
+    let new_active = alice_after.keys[1];
+    alice_after.keys.push(KeyEntry {
+        key: conf_key(0x11),
+        condition: KeyCondition::Superseded,
+        ..new_active
+    });
+    let fp_after = compute_key_continuity_fingerprint((&alice_id, &alice_after), (&bob_id, &bob))
+        .expect("both key states name one #active key and a root set");
 
     print_step(3, "Verify fingerprint changed");
     assert_ne!(
@@ -199,9 +230,11 @@ fn conf_003_key_rotation_changes_fingerprint() {
         "key rotation must change continuity fingerprint"
     );
 
-    print_step(4, "Verify fingerprint is still 60 decimal digits");
-    let decimal = fingerprint_to_decimal(&fp_after);
-    assert_eq!(decimal.len(), 60);
+    print_step(4, "Verify both parties compute the same fingerprint");
+    let fp_from_bob =
+        compute_key_continuity_fingerprint((&bob_id, &bob), (&alice_id, &alice_after))
+            .expect("both key states name one #active key and a root set");
+    assert_eq!(fp_after, fp_from_bob, "fingerprint must be symmetric");
 
     println!("  PASS: Key rotation changes fingerprint");
 }
