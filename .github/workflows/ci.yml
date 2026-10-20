@@ -4685,12 +4685,12 @@ jobs:
           disable-animations: false
           script: echo "snapshot created"
       # The runner runs each `script` line in its own shell, so the directory comes from
-      # `working-directory`. The second line keeps the KeyInfo levels the tests logged,
-      # for job kotlin-android-keyinfo.
+      # `working-directory`. An AOSP emulator's KeyMint runs in software, so
+      # `expectSoftwareKeyInfo=true` makes custodyMatchesKeyInfo also assert that KeyInfo
+      # reported a non-secure level: a comparison that only ever saw "hardware" would pass
+      # against an adapter that always reports "hardware".
       - name: Run the instrumented tests
         uses: reactivecircus/android-emulator-runner@v2
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
         with:
           api-level: ${{ matrix.api-level }}
           arch: x86_64
@@ -4700,8 +4700,7 @@ jobs:
           disable-animations: true
           working-directory: bindings/kotlin
           script: |
-            ./gradlew :scp-kt-android:connectedDebugAndroidTest -Pscp.uniffi.prebuiltBindings=true
-            adb logcat -d -s SCP_KEYINFO:I > ${{ github.workspace }}/keyinfo-api-${{ matrix.api-level }}.txt
+            ./gradlew :scp-kt-android:connectedDebugAndroidTest -Pscp.uniffi.prebuiltBindings=true -Pandroid.testInstrumentationRunnerArguments.expectSoftwareKeyInfo=true
       # `BUILD SUCCESSFUL` proves nothing about what ran. This step fails unless every
       # expected test ran on this leg, none was skipped, and none failed.
       - name: Check the instrumented test results
@@ -4737,47 +4736,6 @@ jobs:
               print(f"::error::{problem}")
           sys.exit(1 if problems else 0)
           PY
-      - name: Upload the KeyInfo levels
-        uses: actions/upload-artifact@v4
-        with:
-          name: keyinfo-api-${{ matrix.api-level }}
-          # No spaces inside the expression: the CI self-test splits an upload's
-          # `path` on whitespace to count its paths.
-          path: keyinfo-api-${{matrix.api-level}}.txt
-          retention-days: 7
-          if-no-files-found: error
-
-  # A test that compares the recorded custody with KeyInfo passes against an adapter that
-  # always reports "hardware" when every leg's emulator reports a secure level. This job
-  # fails unless every leg logged a KeyInfo level and at least one leg observed a
-  # non-secure one, so the comparison is shown to tell the two values apart.
-  kotlin-android-keyinfo:
-    needs: [changes, kotlin-android-instrumented]
-    if: needs.changes.outputs.kotlin == 'true'
-    name: Kotlin / instrumented KeyInfo levels
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: keyinfo-api-*
-          merge-multiple: true
-          path: keyinfo
-      - name: Require a non-secure level on at least one leg
-        run: |
-          set -euo pipefail
-          for leg in 30 33; do
-            file="keyinfo/keyinfo-api-$leg.txt"
-            if ! grep -q 'SCP_KEYINFO' "$file"; then
-              echo "::error::the API $leg leg logged no KeyInfo level"
-              exit 1
-            fi
-            grep 'SCP_KEYINFO' "$file"
-          done
-          if ! grep -qh 'secure=false' keyinfo/*.txt; then
-            echo "::error::no leg observed a non-secure KeyInfo level"
-            exit 1
-          fi
 
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:
@@ -5419,7 +5377,6 @@ jobs:
       - uniffi-cdylib-linux
       - kotlin-test
       - kotlin-android-instrumented
-      - kotlin-android-keyinfo
       - swift-lint
       - swift-build-test
       - fuzz-build

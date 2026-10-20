@@ -8,6 +8,11 @@
 //
 // Every test records the ids it mints; `@After` destroys any still present and asserts that no
 // `scp.key.<id>` alias and no `scp.p256.<id>` or `scp.keymeta.<id>` entry remains for them.
+//
+// The suite runs in the test app's main process, the only process the adapter accepts. An AOSP
+// emulator's KeyMint runs in software, so the CI lane passes the instrumentation argument
+// `expectSoftwareKeyInfo=true`, and `custodyMatchesKeyInfo` then also asserts that `KeyInfo`
+// reported a non-secure level: the leg exercises the software branch the adapter records.
 
 package works.limn.scp.android.platform
 
@@ -16,11 +21,11 @@ import android.content.SharedPreferences
 import android.os.Build
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
-import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import java.math.BigInteger
 import java.security.KeyFactory
 import java.security.KeyStore
@@ -49,8 +54,8 @@ private const val SCALAR_SIZE = 32
 private const val SIGN_ITERATIONS = 32
 private const val AGREE_ITERATIONS = 8
 
-/** The tag the lane's log check reads; one line per key whose `KeyInfo` a test read. */
-private const val KEYINFO_TAG = "SCP_KEYINFO"
+/** The instrumentation argument with which a lane on a software KeyMint asks for that check. */
+private const val EXPECT_SOFTWARE_KEYINFO = "expectSoftwareKeyInfo"
 
 @RunWith(AndroidJUnit4::class)
 class AndroidKeyCustodyP256InstrumentedTest {
@@ -124,6 +129,7 @@ class AndroidKeyCustodyP256InstrumentedTest {
 
     @Test
     fun custodyMatchesKeyInfo(): Unit = runBlocking {
+        val expectSoftware = InstrumentationRegistry.getArguments().getString(EXPECT_SOFTWARE_KEYINFO) == "true"
         val bridge = TestingCallbackCustody(UniffiKeyCustody(AndroidKeyCustody(context)))
         val ids = listOf(
             bridge.generateKeypair(CustodyKeyType.P256),
@@ -137,6 +143,7 @@ class AndroidKeyCustodyP256InstrumentedTest {
                 continue
             }
             val secure = keyInfoSecure(keyAlias)
+            if (expectSoftware) assertFalse("KeyInfo of $keyAlias reported a secure level", secure)
             assertEquals(if (secure) "hardware" else "software", bridge.custodyType(id))
         }
     }
@@ -184,31 +191,16 @@ class AndroidKeyCustodyP256InstrumentedTest {
     }
 
     /**
-     * Whether `KeyInfo`, read here independently of the adapter, places [alias] in secure
-     * hardware: on API 31+ a `securityLevel` of TEE, StrongBox or unknown-secure, below it
-     * `isInsideSecureHardware`. Logs the level under [KEYINFO_TAG] so the lane can show that a
-     * leg observed a non-secure level.
+     * Whether `KeyInfo`, read here from Keystore independently of the adapter, places [alias]
+     * in secure hardware, decided by [isSecureLevel], the function the adapter uses.
      */
     private fun keyInfoSecure(alias: String): Boolean {
         val key = keyStore.getKey(alias, null) as PrivateKey
         val info = KeyFactory.getInstance(key.algorithm, "AndroidKeyStore").getKeySpec(key, KeyInfo::class.java)
-        val secure: Boolean
-        val level: String
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            level = info.securityLevel.toString()
-            secure = info.securityLevel in setOf(
-                KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT,
-                KeyProperties.SECURITY_LEVEL_STRONGBOX,
-                KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE,
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            val inside = info.isInsideSecureHardware
-            level = "insideSecureHardware=$inside"
-            secure = inside
-        }
-        Log.i(KEYINFO_TAG, "api=${Build.VERSION.SDK_INT} alias=$alias level=$level secure=$secure")
-        return secure
+        val sdk = Build.VERSION.SDK_INT
+        val level = if (sdk >= Build.VERSION_CODES.S) info.securityLevel else KeyProperties.SECURITY_LEVEL_SOFTWARE
+        @Suppress("DEPRECATION") // the only security-level reading below API 31
+        return isSecureLevel(level, info.isInsideSecureHardware, sdk)
     }
 
     /** A scalar drawn uniformly from [1, n-1], as 32 bytes. */
