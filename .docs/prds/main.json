@@ -10627,6 +10627,7 @@
         "crates/scp-ffi/common/src/error_codes.rs",
         "crates/scp-ffi/common/src/lib.rs",
         "crates/scp-ffi/common/src/p256_host.rs",
+        "crates/scp-ffi/common/src/test_helpers.rs",
         "crates/scp-ffi/common/src/ucan_errors.rs",
         "crates/scp-ffi/napi-test-stubs/build.rs",
         "crates/scp-ffi/napi/Cargo.toml",

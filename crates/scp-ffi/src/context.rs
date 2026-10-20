@@ -735,7 +735,7 @@ fn typed_supervisor_failure(op: &str, e: &scp_core::context::ContextError) -> Py
 /// `SCP-CTX-2138` for `SupervisorShutDown`, the custody code for `Custody`,
 /// `SCP-VALID-7005` for a malformed invitation `enc`, ...), or `None` for a
 /// variant with no dedicated code.
-fn typed_supervisor_error(
+pub(crate) fn typed_supervisor_error(
     op: &str,
     e: &scp_core::context::ContextError,
 ) -> Option<crate::error::ScpPyError> {
@@ -10308,13 +10308,13 @@ class SlowAgreeCustody(P256Custody):
     }
 
     /// `typed_supervisor_failure` raises `SCP-CTX-2130` for `ContextError::ActorBusy`,
-    /// `SCP-CTX-2138` for `ContextError::SupervisorShutDown`, the custody code
-    /// for `ContextError::Custody`, and keeps the uncoded `RuntimeError` for
-    /// every other variant, on the
+    /// `SCP-CTX-2138` for `ContextError::SupervisorShutDown`, and keeps the
+    /// uncoded `RuntimeError` for every variant with no dedicated code, on the
     /// `reserve_key_package`, `context_join_from_welcome` and `invite_member`
-    /// failure paths.
+    /// failure paths. The custody error table in `error.rs` runs every custody
+    /// failure kind through this path.
     #[test]
-    fn typed_supervisor_failure_types_busy_shutdown_and_custody_only() {
+    fn typed_supervisor_failure_types_busy_and_shutdown() {
         use scp_core::context::ContextError;
         match super::typed_supervisor_error(
             "context_join_from_welcome",
@@ -10346,25 +10346,6 @@ class SlowAgreeCustody(P256Custody):
             .is_none(),
             "a non-busy failure keeps the uncoded RuntimeError"
         );
-        for (kind, expected) in [
-            (
-                scp_crypto::CustodyFailureKind::KeyNotFound,
-                codes::CRYPTO_4006,
-            ),
-            (scp_crypto::CustodyFailureKind::TimedOut, codes::CRYPTO_4062),
-            (scp_crypto::CustodyFailureKind::Failed, codes::CRYPTO_4060),
-        ] {
-            let failure = scp_crypto::CustodyFailure {
-                kind,
-                detail: "custody detail".to_owned(),
-            };
-            match super::typed_supervisor_error("context export", &ContextError::Custody(failure)) {
-                Some(crate::error::ScpPyError::CryptoError { code, .. }) => {
-                    assert_eq!(code, expected);
-                }
-                other => panic!("expected a {expected} CryptoError, got {other:?}"),
-            }
-        }
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let busy = super::typed_supervisor_failure(

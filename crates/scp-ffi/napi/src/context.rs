@@ -5447,7 +5447,7 @@ fn parse_template_id_napi(
 /// `SCP-CTX-2130`, `SupervisorShutDown` `SCP-CTX-2138`, `Custody` its custody
 /// code, a malformed invitation `enc` `SCP-VALID-7005`, and so on. A variant
 /// with no dedicated code reports `code`, the call's fixed fallback.
-fn typed_supervisor_failure(
+pub(crate) fn typed_supervisor_failure(
     op: &str,
     code: &str,
     e: &scp_core::context::ContextError,
@@ -7900,7 +7900,8 @@ mod tests {
     /// A Welcome join, a key-package reservation or an invite that meets a
     /// busy actor reports `SCP-CTX-2130`, one refused because Supervisor
     /// shutdown began reports `SCP-CTX-2138`, and any other failure reads the
-    /// operation's own code.
+    /// operation's own code. The custody error table in `error.rs` runs every
+    /// custody failure kind through this path.
     #[test]
     fn typed_supervisor_failure_keeps_typed_codes() {
         use scp_core::context::ContextError;
@@ -7933,29 +7934,6 @@ mod tests {
                 )),
                 fallback
             );
-            for (kind, expected) in [
-                (
-                    scp_crypto::CustodyFailureKind::KeyNotFound,
-                    codes::CRYPTO_4006,
-                ),
-                (scp_crypto::CustodyFailureKind::TimedOut, codes::CRYPTO_4062),
-                (scp_crypto::CustodyFailureKind::Failed, codes::CRYPTO_4060),
-            ] {
-                let failure = scp_crypto::CustodyFailure {
-                    kind,
-                    detail: "custody detail".to_owned(),
-                };
-                match super::typed_supervisor_failure(
-                    "context_join_from_welcome",
-                    fallback,
-                    &ContextError::Custody(failure),
-                ) {
-                    crate::error::ScpNapiError::Crypto { code, .. } => {
-                        assert_eq!(code, expected);
-                    }
-                    other => panic!("expected a {expected} Crypto error, got {other:?}"),
-                }
-            }
         }
     }
 

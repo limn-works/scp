@@ -19252,77 +19252,79 @@ mod tests {
         }
     }
 
-    /// Every runtime error that carries a custody failure reaches the caller
-    /// with the code `custody_failure_code` assigns (checked here for
-    /// key-not-found, a generic custody failure and a rejected host
-    /// pseudonym). Broadcast publish signing and join key agreement arrive as
-    /// `ContextError::Custody`.
+    /// The custody error table (ADR-006 2026-09-29, 2026-10-11 and
+    /// 2026-10-12 amendments; `sdk-common.md` error codes): for every custody
+    /// failure kind, every carrier this bridge maps reports the row's class
+    /// and code. The carriers are a `CustodyFailure` inside `EnvelopeError`,
+    /// `ContextError`, `SenderKeyError`, `UcanError` and `EventLogError`
+    /// (through `From` and through the checkpoint path), and each bare
+    /// `PlatformError` of that kind. A closed or still-locked store reports
+    /// its `SCP-STORAGE-` code in the `Storage` variant, the one this bridge
+    /// gives every storage code.
     #[test]
     fn custody_failures_carry_the_custody_codes_in_every_carrier() {
-        use scp_crypto::{CustodyFailure, CustodyFailureKind as K};
-        fn failure(kind: K) -> CustodyFailure {
-            CustodyFailure {
-                kind,
-                detail: "custody detail".to_owned(),
-            }
-        }
-        fn crypto_code(e: ScpError) -> String {
-            match e {
-                ScpError::Crypto { code, .. } => code,
-                other => panic!("expected a crypto error, got {other:?}"),
-            }
-        }
-        fn identity_code(e: ScpError) -> String {
-            match e {
-                ScpError::Identity { code, .. } => code,
-                other => panic!("expected an identity error, got {other:?}"),
-            }
-        }
         use scp_core::context::ContextError;
-        assert_eq!(
-            crypto_code(ContextError::Custody(failure(K::KeyNotFound)).into()),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            crypto_code(ContextError::Custody(failure(K::Failed)).into()),
-            codes::CRYPTO_4060
-        );
-        assert_eq!(
-            identity_code(ContextError::Custody(failure(K::PseudonymRejected)).into()),
-            codes::IDENT_1055
-        );
-        assert_eq!(
-            crypto_code(
-                scp_core::crypto::sender_keys::SenderKeyError::Custody(failure(K::KeyNotFound))
-                    .into()
-            ),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            crypto_code(scp_core::crypto::ucan::UcanError::Custody(failure(K::KeyNotFound)).into()),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            crypto_code(scp_core::envelope::EnvelopeError::Custody(failure(K::KeyNotFound)).into()),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            crypto_code(scp_event_log::EventLogError::Custody(failure(K::Failed)).into()),
-            codes::CRYPTO_4060
-        );
-        use scp_platform::PlatformError;
-        assert_eq!(
-            crypto_code(PlatformError::KeyNotFound.into()),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            identity_code(PlatformError::PseudonymRejected("x".to_owned()).into()),
-            codes::IDENT_1055
-        );
-        assert_eq!(
-            crypto_code(PlatformError::CustodyError("x".to_owned()).into()),
-            codes::CRYPTO_4060
-        );
+        use scp_ffi_common::error_codes::CustodyFailureClass as Class;
+        use scp_ffi_common::test_helpers::{custody_code_rows, custody_failure};
+        fn class_and_code(e: &ScpError) -> (&'static str, String) {
+            match e {
+                ScpError::Identity { code, .. } => ("identity", code.clone()),
+                ScpError::Crypto { code, .. } => ("crypto", code.clone()),
+                ScpError::Storage { code, .. } => ("storage", code.clone()),
+                ScpError::Transport { code, .. } => ("transport", code.clone()),
+                other => panic!("not a custody error class: {other:?}"),
+            }
+        }
+        for row in custody_code_rows() {
+            let class = match row.class {
+                Class::Identity => "identity",
+                Class::Crypto => "crypto",
+                Class::Validation => "storage",
+                Class::Transport => "transport",
+            };
+            let expected = (class, row.code.to_owned());
+            let failure = || custody_failure(row.kind);
+            let carriers: [(&str, ScpError); 6] = [
+                (
+                    "EnvelopeError",
+                    scp_core::envelope::EnvelopeError::Custody(failure()).into(),
+                ),
+                ("ContextError", ContextError::Custody(failure()).into()),
+                (
+                    "SenderKeyError",
+                    scp_core::crypto::sender_keys::SenderKeyError::Custody(failure()).into(),
+                ),
+                (
+                    "UcanError",
+                    scp_core::crypto::ucan::UcanError::Custody(failure()).into(),
+                ),
+                (
+                    "EventLogError",
+                    scp_event_log::EventLogError::Custody(failure()).into(),
+                ),
+                (
+                    "EventLogError via checkpoint_error",
+                    ScpError::checkpoint_error(&scp_event_log::EventLogError::Custody(failure())),
+                ),
+            ];
+            for (carrier, error) in carriers {
+                assert_eq!(
+                    class_and_code(&error),
+                    expected,
+                    "{:?} as a CustodyFailure in {carrier}",
+                    row.kind
+                );
+            }
+            for platform_error in row.platform_errors {
+                let debug = format!("{platform_error:?}");
+                assert_eq!(
+                    class_and_code(&platform_error.into()),
+                    expected,
+                    "{:?} as the bare PlatformError {debug}",
+                    row.kind
+                );
+            }
+        }
     }
 
     /// A `KeyCustodyProvider` whose every method returns an error, used to prove
