@@ -58,10 +58,11 @@
             Self.purge(drawn)
         }
 
-        /// Deletes the companion generic-password item and any key item of
-        /// each id, in the file keychain and, on macOS, the data-protection
-        /// keychain. A status other than success is not an error: the item
-        /// is already gone or was never writable by this process.
+        /// Deletes every generic-password item of each id's account, under
+        /// any service, and any key item of each id, in the file keychain
+        /// and, on macOS, the data-protection keychain. A status other than
+        /// success is not an error: the item is already gone or was never
+        /// writable by this process.
         static func purge(_ handles: [String]) {
             for handle in handles {
                 let account = "scp.key.\(handle)"
@@ -77,10 +78,12 @@
             }
         }
 
-        /// Whether a companion generic-password item exists for `handle`.
+        /// Whether a companion generic-password item exists for `handle`
+        /// under the adapter's service.
         static func companionExists(_ handle: String) -> Bool {
             SecItemCopyMatching([
                 kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: AppleKeyCustody.itemService,
                 kSecAttrAccount as String: "scp.key.\(handle)",
                 kSecMatchLimit as String: kSecMatchLimitOne
             ] as CFDictionary, nil) == errSecSuccess

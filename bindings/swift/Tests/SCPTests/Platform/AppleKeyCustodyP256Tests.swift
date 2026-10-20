@@ -689,6 +689,7 @@
             try await store.plant(tag: tag)
             let status = SecItemAdd([
                 kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: AppleKeyCustody.itemService,
                 kSecAttrAccount as String: "scp.key.\(keyId)",
                 kSecAttrLabel as String: "not metadata"
             ] as CFDictionary, nil)
