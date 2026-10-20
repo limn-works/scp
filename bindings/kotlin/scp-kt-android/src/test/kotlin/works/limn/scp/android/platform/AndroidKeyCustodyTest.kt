@@ -1,12 +1,10 @@
 // AndroidKeyCustodyTest.kt — Unit tests for AndroidKeyCustody (SCP-110)
 //
-// These tests exercise the software fallback path (Bouncy Castle) since Android Keystore
-// is not available in JVM unit tests. AndroidKeyCustodyPseudonymLifecycleTest runs the
-// Keystore path (API 33+, CustodyType.HARDWARE) against a fake KeystoreKeys; no on-device
-// test of the real Keystore exists yet. Two checks on a hardware handle throw before they
-// read Keystore, so a JVM test reaches them: dhAgree's SCP-CRYPTO-4003 for a peer key that
-// is not 32 bytes, and dhAgree's SCP-CRYPTO-4005 for a 32-byte peer key, because a Keystore
-// key is Ed25519 and an Ed25519 key never agrees.
+// These tests exercise the Ed25519 and X25519 software path (Bouncy Castle), with
+// JcaFakeKeystoreKeys standing in for Android Keystore, which JVM unit tests cannot reach.
+// AndroidKeyCustodyPseudonymLifecycleTest runs the Keystore Ed25519 path and
+// AndroidKeyCustodyP256Test the P-256 keys; the emulator lane runs the real Keystore. dhAgree
+// refuses a Keystore Ed25519 handle with SCP-CRYPTO-4060, because an Ed25519 key never agrees.
 //
 // Uses InMemorySharedPreferences to inject a test double for EncryptedSharedPreferences,
 // allowing verification of Ed25519 key persistence without the Android framework.
@@ -104,10 +102,9 @@ internal class InMemorySharedPreferences : SharedPreferences {
  *
  * Android Keystore is not available in JVM unit tests. These tests verify:
  * - Software Ed25519 key generation, signing, and public key extraction
- * - Software X25519 key generation and DH agreement, and `SCP-CRYPTO-4003` for a peer key that
- *   is not 32 bytes and `SCP-CRYPTO-4005` for a 32-byte one from dhAgree for a
- *   [CustodyType.HARDWARE] handle, each thrown before it reads Keystore
- * - dhAgree's `SCP-CRYPTO-4005` refusal of a software Ed25519 key
+ * - Software X25519 key generation and DH agreement, and `SCP-CRYPTO-4060` from dhAgree for a
+ *   peer key that is not 32 bytes and for a [CustodyType.HARDWARE] Ed25519 handle
+ * - dhAgree's `SCP-CRYPTO-4060` refusal of a software Ed25519 key
  * - Pseudonym derivation determinism
  * - Key destruction, and the error codes a destroyed handle yields
  * - Error handling (key not found, wrong key type)
@@ -124,7 +121,7 @@ class AndroidKeyCustodyTest {
     @BeforeEach
     fun setUp() {
         prefs = InMemorySharedPreferences()
-        custody = AndroidKeyCustody(prefs)
+        custody = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
     }
 
     // -------------------------------------------------------------------
@@ -242,12 +239,12 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `sign throws SCP-CRYPTO-4003 for X25519 key`() {
+        fun `sign throws SCP-CRYPTO-4060 for X25519 key`() {
             val handle = custody.generateKeypair(KeyType.X25519)
             val exception = assertThrows<ScpException> {
                 custody.sign(handle, "data".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4003", exception.code)
+            assertEquals("SCP-CRYPTO-4060", exception.code)
         }
     }
 
@@ -372,20 +369,16 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `destroyKey makes subsequent dhAgree fail with SCP-CRYPTO-4006 or 4003 for a wrong-length peer`() {
+        fun `destroyKey makes subsequent dhAgree fail with SCP-CRYPTO-4006 whatever the peer`() {
             val handle = custody.generateKeypair(KeyType.X25519)
             custody.destroyKey(handle)
 
-            val destroyed = assertThrows<ScpException> {
-                custody.dhAgree(handle, ByteArray(32))
+            // dhAgree looks up the key before it checks the peer key, whose format the key's
+            // type sets.
+            for (peer in listOf(ByteArray(32), ByteArray(31), ByteArray(65))) {
+                val destroyed = assertThrows<ScpException> { custody.dhAgree(handle, peer) }
+                assertEquals("SCP-CRYPTO-4006", destroyed.code, "peer of ${peer.size} bytes")
             }
-            assertEquals("SCP-CRYPTO-4006", destroyed.code)
-
-            // dhAgree checks the peer key's length before it looks up the handle.
-            val wrongLength = assertThrows<ScpException> {
-                custody.dhAgree(handle, ByteArray(31))
-            }
-            assertEquals("SCP-CRYPTO-4003", wrongLength.code)
         }
 
         @Test
@@ -467,52 +460,51 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `dhAgree throws SCP-CRYPTO-4005 for a hardware handle and never reads Keystore`() {
-            // A Keystore key is Ed25519, so dhAgree refuses a Keystore handle before any
-            // Keystore call; this custody has no Keystore, so a call would fail.
-            val hardwareHandle = KeyHandle(id = "keystore-key", custodyType = CustodyType.HARDWARE)
-            val exception = assertThrows<ScpException> {
-                custody.dhAgree(hardwareHandle, ByteArray(32))
+        fun `dhAgree on a hardware handle is SCP-CRYPTO-4006 without its alias and 4060 for an Ed25519 identity`() {
+            // A Keystore key without a P-256 record is Ed25519, which never agrees.
+            val keys = JcaFakeKeystoreKeys()
+            val keystoreCustody = AndroidKeyCustody.create(InMemorySharedPreferences(), keys, keystoreEd25519 = true)
+            val identity = keystoreCustody.generateKeypair(KeyType.ED25519)
+            val missing = KeyHandle(id = "404", custodyType = CustodyType.HARDWARE)
+            for (peer in listOf(ByteArray(32), ByteArray(31))) {
+                val refused = assertThrows<ScpException> { keystoreCustody.dhAgree(identity, peer) }
+                assertEquals("SCP-CRYPTO-4060", refused.code)
+                val absent = assertThrows<ScpException> { keystoreCustody.dhAgree(missing, peer) }
+                assertEquals("SCP-CRYPTO-4006", absent.code)
             }
-            assertEquals("SCP-CRYPTO-4005", exception.code)
-            // The peer length check still runs first for a hardware handle.
-            val lengthException = assertThrows<ScpException> {
-                custody.dhAgree(hardwareHandle, ByteArray(31))
-            }
-            assertEquals("SCP-CRYPTO-4003", lengthException.code)
         }
 
         @Test
-        fun `dhAgree throws SCP-CRYPTO-4005 for a software Ed25519 key`() {
+        fun `dhAgree throws SCP-CRYPTO-4060 for a software Ed25519 key`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             val peer = custody.publicKey(custody.generateKeypair(KeyType.X25519))
             val exception = assertThrows<ScpException> {
                 custody.dhAgree(handle, peer)
             }
-            assertEquals("SCP-CRYPTO-4005", exception.code)
+            assertEquals("SCP-CRYPTO-4060", exception.code)
         }
 
         @Test
-        fun `dhAgree throws SCP-CRYPTO-4003 for wrong-size peerPublic`() {
+        fun `dhAgree throws SCP-CRYPTO-4060 for wrong-size peerPublic`() {
             val handle = custody.generateKeypair(KeyType.X25519)
             for (badSize in listOf(0, 16, 31, 33, 64)) {
                 val exception = assertThrows<ScpException> {
                     custody.dhAgree(handle, ByteArray(badSize))
                 }
-                assertEquals("SCP-CRYPTO-4003", exception.code)
+                assertEquals("SCP-CRYPTO-4060", exception.code)
             }
         }
 
         @Test
-        fun `dhAgree lets IllegalStateException escape for an all-zero low-order peer key`() {
+        fun `dhAgree refuses an all-zero low-order peer key with SCP-CRYPTO-4060`() {
             val handle = custody.generateKeypair(KeyType.X25519)
             // A 32-byte peer key passes the length check, so only the low order of the point
             // separates this call from the successful agreements above.
-            val exception = assertThrows<IllegalStateException> {
+            val exception = assertThrows<ScpException> {
                 custody.dhAgree(handle, ByteArray(32))
             }
-            // assertThrows fails on an ScpException, which is not an IllegalStateException.
-            assertEquals("X25519 agreement failed", exception.message)
+            assertEquals("SCP-CRYPTO-4060", exception.code)
+            assertEquals("X25519 agreement failed", exception.cause?.message)
         }
     }
 
@@ -565,12 +557,12 @@ class AndroidKeyCustodyTest {
         }
 
         @Test
-        fun `derivePseudonym throws SCP-CRYPTO-4003 for X25519 identity key`() {
+        fun `derivePseudonym throws SCP-CRYPTO-4060 for X25519 identity key`() {
             val x25519Handle = custody.generateKeypair(KeyType.X25519)
             val exception = assertThrows<ScpException> {
                 custody.derivePseudonym(x25519Handle, "ctx".toByteArray())
             }
-            assertEquals("SCP-CRYPTO-4003", exception.code)
+            assertEquals("SCP-CRYPTO-4060", exception.code)
         }
 
         @Test
@@ -697,7 +689,7 @@ class AndroidKeyCustodyTest {
             val originalPubKey = custody.publicKey(handle)
 
             // Simulate process death: create a new AndroidKeyCustody with the same prefs
-            val restored = AndroidKeyCustody(prefs)
+            val restored = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
             val restoredHandle = KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE)
             val restoredPubKey = restored.publicKey(restoredHandle)
 
@@ -710,7 +702,7 @@ class AndroidKeyCustodyTest {
             val originalPubKey = custody.publicKey(handle)
 
             // Simulate process death
-            val restored = AndroidKeyCustody(prefs)
+            val restored = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
             val restoredHandle = KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE)
             val data = "signed after restore".toByteArray(Charsets.UTF_8)
             val signature = restored.sign(restoredHandle, data)
@@ -739,7 +731,7 @@ class AndroidKeyCustodyTest {
             custody.destroyKey(handle)
 
             // Simulate process death — destroyed key should not be restored
-            val restored = AndroidKeyCustody(prefs)
+            val restored = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
             assertThrows<ScpException> {
                 restored.publicKey(
                     KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE),
@@ -751,7 +743,7 @@ class AndroidKeyCustodyTest {
         fun `destroyKey on one instance leaves the key signing on another instance that restored it`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             val originalPubKey = custody.publicKey(handle)
-            val other = AndroidKeyCustody(prefs)
+            val other = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
 
             custody.destroyKey(handle)
 
@@ -774,7 +766,7 @@ class AndroidKeyCustodyTest {
             val pubKeys = handles.map { custody.publicKey(it) }
 
             // Simulate process death
-            val restored = AndroidKeyCustody(prefs)
+            val restored = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
             handles.forEachIndexed { idx, handle ->
                 val restoredHandle = KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE)
                 val restoredPubKey = restored.publicKey(restoredHandle)
