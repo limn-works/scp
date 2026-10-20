@@ -60,20 +60,13 @@ function testCases(n: number): TestCase[] {
 }
 
 import { createInMemoryIdentity } from "./harness-custody";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Guard: skip if native addon unavailable
 // ---------------------------------------------------------------------------
 
-let scp: SCP | null = null;
-let skipReason = "";
-
-try {
-  scp = new SCP({ storage: { type: "in_memory" } });
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+const suite = await napiSuite(() => new SCP({ storage: { type: "in_memory" } }));
 
 /** A genesis `MemberJoined` event for the aggregated subject. */
 const genesisMemberJoined: EventLogEntry = {
@@ -86,11 +79,7 @@ const genesisMemberJoined: EventLogEntry = {
   signature: Array.from({ length: 64 }, () => 0),
 };
 
-if (scp === null) {
-  describe("Trust FFI call-through (SKIPPED)", () => {
-    test.skip(`all tests skipped: ${skipReason}`, () => {});
-  });
-} else {
+suite.describe("Trust FFI call-through", (scp) => {
   const live = scp;
 
   describe("scp.aggregateTrustInput — real-FFI call-through", () => {
@@ -473,4 +462,4 @@ if (scp === null) {
       return (await live.trustGradeResponse(verifier, request, response)).record;
     }
   });
-}
+});

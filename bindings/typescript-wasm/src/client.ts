@@ -425,7 +425,7 @@ export class ScpBrowserClient {
 
   /**
    * The event-log leaf count for `contextId` as a `bigint` (a u64 — never a lossy
-   * `Number`, #1229), or `undefined` if not held.
+   * `Number`), or `undefined` if not held.
    */
   eventLogLeafCount(contextId: string): bigint | undefined {
     return this.#inner.eventLogLeafCount(contextId);
@@ -437,7 +437,7 @@ export class ScpBrowserClient {
   }
 
   /**
-   * The MLS group epoch for `contextId` as a `bigint` (a u64 — #1229), or
+   * The MLS group epoch for `contextId` as a `bigint` (a u64 — never a lossy `Number`), or
    * `undefined` if the context is not held (or poisoned).
    *
    * Returns `undefined` for an absent/poisoned context — symmetric with the
@@ -654,7 +654,7 @@ export function outletStreamSignCredit(params: OutletStreamSignCreditParams): Ui
 
 /**
  * Computes the §5.4.5 credit-grant signature preimage (32 bytes) WITHOUT touching
- * any private key — the #1980-forward WebCrypto seam. An off-wasm signer
+ * any private key — the WebCrypto SEAM the MLS-signing-key → WebCrypto move uses. An off-wasm signer
  * (WebCrypto, hardware custody) signs this preimage; a verifier recomputes it to
  * check a credit's `sig` under the invoker's public key. `grant` is a `u32`;
  * `monotonicSeq` and `streamEpoch` are `u64` → `bigint`.

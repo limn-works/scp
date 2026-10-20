@@ -30,7 +30,7 @@ import { __setBridgeForTests } from "../src/internal/bridge";
 import { SCP } from "../src/scp";
 import { createInMemoryIdentity } from "./harness-custody";
 import { mountMockScp } from "./mock-bridge";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 const LIFECYCLE_METHODS = [
   "identityRotateKey",
@@ -168,25 +168,16 @@ describe("SCP identity-lifecycle surface", () => {
 // Real NAPI bridge (skipped when the platform addon is unavailable)
 // ---------------------------------------------------------------------------
 
-let napiAvailable = false;
-let skipReason = "";
-try {
+const suite = await napiSuite(async () => {
   const probe = new SCP({ storage: { type: "in_memory" } });
   if (typeof (probe as unknown as Record<string, unknown>).identityRotateKey !== "function") {
     throw new Error("SCP missing identityRotateKey — rebuild with the parity changes");
   }
   await createInMemoryIdentity(probe);
-  napiAvailable = true;
   await probe.shutdown(1).catch(() => {});
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+});
 
-if (!napiAvailable) {
-  describe("Real NAPI identity lifecycle (SKIPPED)", () => {
-    test.skip(`all tests skipped: ${skipReason}`, () => {});
-  });
-} else {
+suite.describe("Real NAPI identity lifecycle", () => {
   describe("Real NAPI identity lifecycle", () => {
     test("rotateKey returns an Identity with the same DID", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
@@ -256,4 +247,4 @@ if (!napiAvailable) {
       }
     });
   });
-}
+});

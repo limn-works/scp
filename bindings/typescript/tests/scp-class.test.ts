@@ -21,7 +21,7 @@ import { ValidationError } from "../src/errors";
 import { loadNativeAddon } from "../src/internal/native";
 import { __serializeStorageConfigForTests, clampShutdownMillis, SCP } from "../src/scp";
 import { HARNESS_IN_MEMORY_CUSTODY } from "./harness-custody";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Compile-time guard: storage selection is mandatory (spec §17.6).
@@ -88,30 +88,31 @@ describe("SCP constructor — runtime storage-selection guard (spec §17.6)", ()
 // `src/scp.ts`.
 // ---------------------------------------------------------------------------
 
-// biome-ignore lint/suspicious/noExplicitAny: dynamic native addon loading
-let addon: any = null;
-let skipReason = "";
-
-try {
+const suite = await napiSuite(() => {
   // `loadNativeAddon` is the SDK's one loader, and this file resolves the addon
   // through it so the load this file performs is the load CI's "Assert the
   // downloaded addon loads and constructs" step performs. A specifier built here
   // would name a package that step never installs, which skips this whole suite
   // over an addon CI just verified.
-  addon = loadNativeAddon();
-
+  // biome-ignore lint/suspicious/noExplicitAny: dynamic native addon loading
+  const addon: any = loadNativeAddon();
   if (typeof addon.SCP !== "function") {
     throw new Error("SCP class not exported from native addon — rebuild with the Phase 4 changes");
   }
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+  // The handle-affinity test below mints an identity on one instance and
+  // creates a context with it on another, so both methods must exist.
+  const probe = new addon.SCP(JSON.stringify({ type: "in_memory" }));
+  if (typeof probe.identityCreate !== "function" || typeof probe.contextCreate !== "function") {
+    throw new Error("SCP instances have no identityCreate or contextCreate");
+  }
+  return addon;
+});
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
+suite.describe("SCP class (Phase 4)", (addon) => {
   test("new SCP() constructs an instance with a non-zero instanceId", () => {
     const scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     // instanceId is exposed as a string (u64 doesn't fit in a JS number).
@@ -177,9 +178,6 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
     // in the Rust integration tests.
     const scpA = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     const scpB = new addon.SCP(JSON.stringify({ type: "in_memory" }));
-    if (typeof scpA.identityCreate !== "function" || typeof scpB.contextCreate !== "function") {
-      return; // addon predates per-instance identity/context — covered in Rust
-    }
     expect(scpA.instanceId).not.toBe(scpB.instanceId);
     const identity = await scpA.identityCreate(HARNESS_IN_MEMORY_CUSTODY);
     // contextCreate takes a NapiIdentity handle. Crossing it over to

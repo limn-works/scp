@@ -39,7 +39,7 @@ import { Context } from "../src/context";
 import { SCP } from "../src/scp";
 import type { Relay } from "../src/server";
 import { HARNESS_IN_MEMORY_CUSTODY } from "./harness-custody";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Guard: skip if native addon unavailable
@@ -52,26 +52,17 @@ import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").getBridge>>;
 
-let bridge: NativeBridge | null = null;
-let scp: SCP | null = null;
-let skipReason = "";
-
-try {
+const suite = await napiSuite(async () => {
   const { createNativeBridge } = await import("../src/internal/native.js");
-  scp = new SCP({ storage: { type: "in_memory" } });
-  bridge = createNativeBridge(scp);
+  const scp = new SCP({ storage: { type: "in_memory" } });
+  const bridge: NativeBridge = createNativeBridge(scp);
   if (typeof (scp as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
     throw new Error("SCP missing relayStartInMemory — rebuild with the Phase 4 changes");
   }
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+  return { bridge, scp };
+});
 
-if (bridge === null || scp === null) {
-  describe("E2E relay (SKIPPED)", () => {
-    test.skip(`all tests skipped: ${skipReason}`, () => {});
-  });
-} else {
+suite.describe("E2E relay", ({ bridge, scp }) => {
   const napi = bridge;
   const scpInstance = scp;
 
@@ -602,4 +593,4 @@ if (bridge === null || scp === null) {
       expect(Array.isArray(events)).toBe(true);
     });
   });
-}
+});

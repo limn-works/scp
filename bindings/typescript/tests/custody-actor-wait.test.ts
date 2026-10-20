@@ -33,22 +33,19 @@ import {
   p256SoftwarePseudonymPoint,
 } from "../src/scp";
 import { HpkeP256Keys } from "./hpke-p256-keys";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
-// biome-ignore lint/suspicious/noExplicitAny: the native addon is untyped
-let addon: any = null;
-let skipReason = "";
-try {
-  addon = loadNativeAddon();
+const suite = await napiSuite(() => {
+  // biome-ignore lint/suspicious/noExplicitAny: the native addon is untyped
+  const addon: any = loadNativeAddon();
   const probe = new addon.SCP(JSON.stringify({ type: "in_memory" }));
   if (typeof probe.testingDeliverIncoming !== "function") {
-    addon = null;
-    skipReason = "native addon built without the `testing` feature";
+    throw new Error(
+      "native addon has no testingDeliverIncoming: build it with the `testing` feature",
+    );
   }
-} catch (e: unknown) {
-  addon = null;
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+  return addon;
+});
 
 /** Ed25519 PKCS8 DER prefix; the 32-byte seed follows. */
 const ED25519_PKCS8 = Buffer.from("302e020100300506032b657004220420", "hex");
@@ -171,11 +168,7 @@ const CEILING = [
   "governance:vote",
 ];
 
-if (addon === null) {
-  describe("callback custody under a concurrent actor wait (SKIPPED)", () => {
-    test.skip(`native NAPI addon unavailable: ${skipReason}`, () => {});
-  });
-} else {
+suite.describe("callback custody under a concurrent actor wait", (addon) => {
   describe("callback custody under a concurrent actor wait", () => {
     test("a KeyResponse turn awaiting the host's dhAgree completes while JS awaits contextMemberCount on the same actor", async () => {
       const alice = new addon.SCP(JSON.stringify({ type: "in_memory" }));
@@ -255,4 +248,4 @@ if (addon === null) {
       }
     }, 30_000);
   });
-}
+});

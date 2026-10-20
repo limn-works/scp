@@ -30,7 +30,7 @@
  * it (the bridge would then return zeros), or writes to the host's buffer.
  */
 
-import { describe, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
 import { CryptoError, IdentityError, KeyNotFoundError, mapBridgeError } from "../src/errors";
@@ -44,6 +44,7 @@ import type {
 } from "../src/scp";
 import { p256SoftwarePseudonymPoint } from "../src/scp";
 import { ECDH_VECTOR_PUBLIC_I, ECDH_VECTOR_SCALAR_I, HpkeP256Keys } from "./hpke-p256-keys";
+import { napiSuite } from "./napi-guard";
 
 interface TestingCustody {
   generateKeypair(): Promise<string>;
@@ -67,15 +68,22 @@ type TestingCustodyCtor = new (
   provider: ReturnType<typeof toNativeCustodyProvider>,
 ) => TestingCustody;
 
-let native: Record<string, unknown> = {};
-let skipReason = "";
-try {
-  native = loadNativeAddon();
+const suite = await napiSuite(() => {
+  const native: Record<string, unknown> = loadNativeAddon();
   if (typeof native.TestingCallbackCustody !== "function") {
-    skipReason = "native addon built without the `testing` feature";
+    throw new Error(
+      "native addon has no TestingCallbackCustody: build it with the `testing` feature",
+    );
   }
-} catch (e: unknown) {
-  skipReason = `native addon not available: ${e instanceof Error ? e.message : String(e)}`;
+  return native.TestingCallbackCustody as TestingCustodyCtor;
+});
+
+/** The addon's `TestingCallbackCustody`; only the suite below calls this. */
+function testingCustodyCtor(): TestingCustodyCtor {
+  if (suite.addon === undefined) {
+    throw new Error(`no TestingCallbackCustody: ${suite.skipReason}`);
+  }
+  return suite.addon;
 }
 
 /** A host fault the keychain injects into signing or derivation. */
@@ -284,7 +292,7 @@ class P256Keychain implements KeyCustodyProvider {
 }
 
 function adapter(host: KeyCustodyProvider): TestingCustody {
-  const Ctor = native.TestingCallbackCustody as TestingCustodyCtor;
+  const Ctor = testingCustodyCtor();
   return new Ctor(toNativeCustodyProvider(host));
 }
 
@@ -293,7 +301,7 @@ function adapter(host: KeyCustodyProvider): TestingCustody {
  * can return what a misbehaving host returns.
  */
 function adapterWith(overrides: Record<string, (...args: unknown[]) => unknown>): TestingCustody {
-  const Ctor = native.TestingCallbackCustody as TestingCustodyCtor;
+  const Ctor = testingCustodyCtor();
   const provider = Object.assign(new StoreKeychain(), overrides) as KeyCustodyProvider;
   return new Ctor(toNativeCustodyProvider(provider));
 }
@@ -335,7 +343,7 @@ async function rejectionOf(call: () => Promise<unknown>): Promise<Error & { code
   return mapBridgeError(err);
 }
 
-describe.skipIf(skipReason !== "")("napi callback custody", () => {
+suite.describe("napi callback custody", () => {
   test("an operational key reaches the host as role operational and does not derive", async () => {
     const host = new StoreKeychain();
     const custody = adapter(host);
@@ -376,13 +384,30 @@ describe.skipIf(skipReason !== "")("napi callback custody", () => {
       const vector = crypto.createECDH("prime256v1");
       vector.setPrivateKey(Buffer.from(ECDH_VECTOR_SCALAR_I, "hex"));
       expect(shared.toString("hex")).toBe(vector.computeSecret(Buffer.from(own)).toString("hex"));
-      // A compressed or 32-byte peer is refused before the host is asked.
+      // A compressed peer, a 32-byte peer, and a 65-byte uncompressed point
+      // that is off the curve are each refused before the host is asked.
       const compressed = Buffer.from(vector.getPublicKey(null, "compressed"));
-      for (const bad of [compressed, peer.subarray(1, 33)]) {
+      const offCurve = Buffer.from(peer);
+      offCurve[64] = (offCurve[64] as number) ^ 1;
+      // The flipped y no longer satisfies the curve equation for x, so only
+      // the bridge's on-curve check, not its length check, can refuse it.
+      expect(offCurve.length).toBe(65);
+      expect(offCurve[0]).toBe(0x04);
+      expect(() => vector.computeSecret(offCurve)).toThrow();
+      const badPeers: [string, Buffer][] = [
+        ["compressed", compressed],
+        ["32-byte", peer.subarray(1, 33)],
+        ["off-curve", offCurve],
+      ];
+      for (const [label, bad] of badPeers) {
         const refused = await rejectionOf(() => custody.dhAgree(key, bad));
         expect(refused).toBeInstanceOf(CryptoError);
+        // Keyed by the peer, so a failure names the one that reached the host.
+        expect({ peer: label, hostCalls: host.dhAgreeCalls }).toEqual({
+          peer: label,
+          hostCalls: 1,
+        });
       }
-      expect(host.dhAgreeCalls).toBe(1);
     }
   });
 

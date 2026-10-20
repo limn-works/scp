@@ -26,6 +26,7 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -517,5 +518,377 @@ describe("native addon loader invariant", () => {
   // Reading the one file that must name the packages separates those two cases.
   test("the SDK loader names the platform addon packages", () => {
     expect(stripComments(readFileSync(DISPATCHER_TS, "utf8"))).toContain(NAPI_PACKAGE_PREFIX);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Skip invariant: only napi-guard.ts decides whether a test runs
+// ---------------------------------------------------------------------------
+//
+// CRITERION: under `tests/`, only code in `napi-guard.ts` turns a test into one
+// that does not run, and it does so only when the loader reports the addon
+// absent (SCP-VALID-7081). Every real-NAPI file registers its suite through
+// `napiSuite`, so an addon that fails to load, or one missing an export the
+// file calls, fails the file instead of skipping it.
+//
+// Two checks enforce it on every `.ts` file under `tests/` except
+// `napi-guard.ts`.
+//
+// 1. Registrar allowlist. Every reference to the `describe`, `test` or `it`
+//    that `bun:test` provides is a direct call (`describe(...)`), or a member
+//    in `ALLOWED_MEMBERS` that is called on the spot (`it.each(rows)(...)`).
+//    The reference is resolved through the TypeScript checker, so a renamed
+//    import (`import { describe as d }`) is followed and a local variable that
+//    happens to be named `test` is not. An identifier with no declaration in
+//    the file is bun's global registrar. Every other reference fails: `.skip`,
+//    `.skipIf`, `.todo`, `.if`, `.only`, an element access, an alias, a
+//    destructuring, an object shorthand, or passing the registrar as an
+//    argument. A namespace, default or dynamic load of `bun:test`, a re-export
+//    of it, and a read of a registrar off `globalThis`, `global`, `self` or
+//    `window` also fail.
+// 2. Load catches. Every `try` whose block contains, at any depth, a
+//    `loadNativeAddon(...)` call or a `new SCP(...)` / `new <expr>.SCP(...)`
+//    construction, and that has a `catch`, calls `skipReasonIfAddonAbsent(...)`
+//    in that `catch`. This keeps a file from swallowing a load failure and then
+//    registering its suite conditionally (`if (addon) describe(...)`).
+//
+// Neither check sees a skip reached through another function or module, such
+// as a helper in another file that calls `describe.skip`, or a suite
+// registered inside an `if` whose condition does not come from a load catch.
+
+const REGISTRARS = new Set(["describe", "test", "it"]);
+const ALLOWED_MEMBERS = new Set(["each", "failing"]);
+const GLOBAL_OBJECTS = new Set(["globalThis", "global", "self", "window"]);
+const BUN_TEST = "bun:test";
+const NAPI_GUARD = "napi-guard.ts";
+
+/** `source` bound by a checker of its own: no lib, no module resolution. */
+function boundFile(name: string, source: string): { file: ts.SourceFile; checker: ts.TypeChecker } {
+  const fileName = `/${name}`;
+  const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
+  const host: ts.CompilerHost = {
+    getSourceFile: (n) => (n === fileName ? file : undefined),
+    getDefaultLibFileName: () => "/lib.d.ts",
+    writeFile: () => {},
+    getCurrentDirectory: () => "/",
+    getCanonicalFileName: (n) => n,
+    useCaseSensitiveFileNames: () => true,
+    getNewLine: () => "\n",
+    fileExists: (n) => n === fileName,
+    readFile: (n) => (n === fileName ? source : undefined),
+  };
+  const options: ts.CompilerOptions = { noLib: true, noResolve: true, types: [] };
+  return { file, checker: ts.createProgram([fileName], options, host).getTypeChecker() };
+}
+
+/** Whether `node` names a member or key rather than referring to a value. */
+function isNameSlot(node: ts.Identifier): boolean {
+  const p = node.parent;
+  return (
+    ((ts.isPropertyAccessExpression(p) ||
+      ts.isPropertyAssignment(p) ||
+      ts.isMethodDeclaration(p) ||
+      ts.isPropertyDeclaration(p) ||
+      ts.isPropertySignature(p) ||
+      ts.isMethodSignature(p) ||
+      ts.isGetAccessorDeclaration(p) ||
+      ts.isSetAccessorDeclaration(p) ||
+      ts.isEnumMember(p)) &&
+      p.name === node) ||
+    (ts.isBindingElement(p) && p.propertyName === node) ||
+    (ts.isQualifiedName(p) && p.right === node) ||
+    ts.isImportSpecifier(p) ||
+    ts.isExportSpecifier(p) ||
+    ts.isLabeledStatement(p) ||
+    ts.isBreakOrContinueStatement(p)
+  );
+}
+
+/** Why the registrar reference `node` is not allowed, or `undefined` when it is. */
+function referenceForm(node: ts.Identifier): string | undefined {
+  const p = node.parent;
+  if (ts.isCallExpression(p) && p.expression === node) return undefined;
+  const member = ts.isPropertyAccessExpression(p) && p.expression === node ? p : undefined;
+  if (
+    member &&
+    ALLOWED_MEMBERS.has(member.name.text) &&
+    ts.isCallExpression(member.parent) &&
+    member.parent.expression === member
+  )
+    return undefined;
+  if (member && !ALLOWED_MEMBERS.has(member.name.text)) return `.${member.name.text}`;
+  if (member) return `.${member.name.text} not called`;
+  if (ts.isElementAccessExpression(p) && p.expression === node) return "element access";
+  if (ts.isCallExpression(p) || ts.isNewExpression(p)) return "passed as an argument";
+  return "alias";
+}
+
+/** The local symbols that `import { describe, test as t, ... }` binds to a registrar. */
+function namedRegistrars(bindings: ts.NamedImports, checker: ts.TypeChecker): ts.Symbol[] {
+  return bindings.elements.flatMap((el) => {
+    const symbol = checker.getSymbolAtLocation(el.name);
+    return symbol && REGISTRARS.has((el.propertyName ?? el.name).text) ? [symbol] : [];
+  });
+}
+
+/**
+ * The symbols of the registrars `file` imports from `bun:test`. Reports a
+ * default import, a namespace import or a re-export of `bun:test` through `at`.
+ */
+function bunTestRegistrars(
+  file: ts.SourceFile,
+  checker: ts.TypeChecker,
+  at: (node: ts.Node, form: string) => void,
+): Set<ts.Symbol> {
+  const imported = new Set<ts.Symbol>();
+  for (const stmt of file.statements) {
+    if (!ts.isImportDeclaration(stmt) && !ts.isExportDeclaration(stmt)) continue;
+    const spec = stmt.moduleSpecifier;
+    if (spec === undefined || !ts.isStringLiteral(spec) || spec.text !== BUN_TEST) continue;
+    if (ts.isExportDeclaration(stmt)) at(stmt, "re-export of bun:test");
+    if (!ts.isImportDeclaration(stmt)) continue;
+    const clause = stmt.importClause;
+    if (clause?.name) at(clause, "default import of bun:test");
+    const bindings = clause?.namedBindings;
+    if (bindings && ts.isNamespaceImport(bindings)) at(bindings, "namespace import of bun:test");
+    if (bindings && ts.isNamedImports(bindings)) {
+      for (const symbol of namedRegistrars(bindings, checker)) imported.add(symbol);
+    }
+  }
+  return imported;
+}
+
+/** The disallowed `bun:test` registrar references in `source`, as `line: form`. */
+function registrarViolations(name: string, source: string): string[] {
+  const { file, checker } = boundFile(name, source);
+  const found: string[] = [];
+  const at = (node: ts.Node, form: string): void => {
+    found.push(`${file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1}: ${form}`);
+  };
+  const imported = bunTestRegistrars(file, checker, at);
+  const isRegistrar = (node: ts.Identifier): boolean => {
+    const p = node.parent;
+    const symbol =
+      ts.isShorthandPropertyAssignment(p) && p.name === node
+        ? checker.getShorthandAssignmentValueSymbol(p)
+        : checker.getSymbolAtLocation(node);
+    if (symbol !== undefined) return imported.has(symbol);
+    return REGISTRARS.has(node.text);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) return;
+    if (ts.isIdentifier(node) && !isNameSlot(node) && isRegistrar(node)) {
+      const form = referenceForm(node);
+      if (form !== undefined) at(node, form);
+    }
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      const arg = node.arguments[0];
+      const loads =
+        callee.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(callee) && callee.text === "require");
+      if (loads && arg !== undefined && ts.isStringLiteralLike(arg) && arg.text === BUN_TEST)
+        at(node, "dynamic load of bun:test");
+    }
+    if (
+      ts.isPropertyAccessExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      GLOBAL_OBJECTS.has(node.expression.text) &&
+      REGISTRARS.has(node.name.text)
+    )
+      at(node, "registrar read off the global object");
+    if (
+      ts.isElementAccessExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      GLOBAL_OBJECTS.has(node.expression.text)
+    )
+      at(node, "key read off the global object");
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found;
+}
+
+/** Whether `node` loads the native addon directly. */
+function isAddonLoad(node: ts.Node): boolean {
+  if (
+    ts.isCallExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === "loadNativeAddon"
+  )
+    return true;
+  if (!ts.isNewExpression(node)) return false;
+  const callee = node.expression;
+  if (ts.isIdentifier(callee)) return callee.text === "SCP";
+  if (ts.isPropertyAccessExpression(callee)) return callee.name.text === "SCP";
+  return false;
+}
+
+/** Whether `node` calls `skipReasonIfAddonAbsent`. */
+function isGuardCall(node: ts.Node): boolean {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === "skipReasonIfAddonAbsent"
+  );
+}
+
+/** Whether `root` or any descendant satisfies `predicate`. */
+function containsNode(root: ts.Node, predicate: (node: ts.Node) => boolean): boolean {
+  if (predicate(root)) return true;
+  return ts.forEachChild(root, (child) => containsNode(child, predicate) || undefined) === true;
+}
+
+/** The lines of load-reachable `try`/`catch` statements whose `catch` does not ask the guard. */
+function unguardedLoadCatches(name: string, source: string): number[] {
+  const file = ts.createSourceFile(name, source, ts.ScriptTarget.Latest, true);
+  const lines: number[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isTryStatement(node) && node.catchClause && containsNode(node.tryBlock, isAddonLoad)) {
+      const guarded = containsNode(node.catchClause.block, isGuardCall);
+      if (!guarded) lines.push(file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return lines;
+}
+
+/** The `.ts` files under `tests/` that the skip invariant covers. */
+function checkedTestFiles(): string[] {
+  return readdirSync(TESTS_DIR).filter((name) => name.endsWith(".ts") && name !== NAPI_GUARD);
+}
+
+describe("test skip invariant", () => {
+  test("every bun:test registrar reference outside napi-guard.ts is allowed", () => {
+    const names = checkedTestFiles();
+    // The check read real files, so it cannot pass over an empty file set.
+    expect(names.length).toBeGreaterThan(0);
+    const offenders = names.flatMap((name) =>
+      registrarViolations(name, readFileSync(join(TESTS_DIR, name), "utf8")).map(
+        (v) => `${name}:${v}`,
+      ),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  test("every catch an addon load reaches outside napi-guard.ts calls skipReasonIfAddonAbsent", () => {
+    const names = checkedTestFiles();
+    expect(names.length).toBeGreaterThan(0);
+    const offenders = names.flatMap((name) =>
+      unguardedLoadCatches(name, readFileSync(join(TESTS_DIR, name), "utf8")).map(
+        (l) => `${name}:${l}`,
+      ),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  // The exclusion names the file that holds the one permitted skip; if that
+  // file stopped skipping, the exclusion would name nothing.
+  test("napi-guard.ts holds the one permitted skip", () => {
+    const source = readFileSync(join(TESTS_DIR, NAPI_GUARD), "utf8");
+    expect(registrarViolations(NAPI_GUARD, source)).toContainEqual(
+      expect.stringMatching(/: \.skip$/),
+    );
+  });
+
+  // Controls. Each appends one form to the real lifecycle.test.ts, which
+  // imports `it` from bun:test and reaches `describe` and `test` as globals,
+  // and expects exactly that form reported on the appended line.
+  const LIFECYCLE = "lifecycle.test.ts";
+  const lifecycle = readFileSync(join(TESTS_DIR, LIFECYCLE), "utf8");
+  const appended = (extra: string): { source: string; line: number } => {
+    const source = `${lifecycle}\n${extra}\n`;
+    return { source, line: source.split("\n").length - 1 };
+  };
+
+  test("the real lifecycle.test.ts passes both checks", () => {
+    expect(registrarViolations(LIFECYCLE, lifecycle)).toEqual([]);
+    expect(unguardedLoadCatches(LIFECYCLE, lifecycle)).toEqual([]);
+  });
+
+  const rejected: [string, string, string][] = [
+    ["a skip on the global describe", 'describe.skip("x", () => {});', ".skip"],
+    ["a skip on the imported it", 'it.skip("x", () => {});', ".skip"],
+    ["skipIf", 'test.skipIf(true)("x", () => {});', ".skipIf"],
+    ["todo", 'test.todo("x");', ".todo"],
+    ["if", 'describe.if(false)("x", () => {});', ".if"],
+    ["only", 'test.only("x", () => {});', ".only"],
+    [
+      "an allowed member that is not called on the spot",
+      "const rows = it.each;",
+      ".each not called",
+    ],
+    ["an element access", 'it["skip"]("x", () => {});', "element access"],
+    ["Reflect.get", 'Reflect.get(it, "skip")("x", () => {});', "passed as an argument"],
+    ["an alias", 'const d = describe; d("x", () => {});', "alias"],
+    ["a destructuring", "const { skip } = test;", "alias"],
+    ["an object shorthand", "const registrars = { it };", "alias"],
+    [
+      "a read off globalThis",
+      'globalThis.describe("x", () => {});',
+      "registrar read off the global object",
+    ],
+    [
+      "a key read off globalThis",
+      'globalThis["describe"]("x", () => {});',
+      "key read off the global object",
+    ],
+    ["a require of bun:test", 'require("bun:test");', "dynamic load of bun:test"],
+    ["a dynamic import of bun:test", 'await import("bun:test");', "dynamic load of bun:test"],
+  ];
+  for (const [label, extra, form] of rejected) {
+    test(`the registrar check rejects ${label}`, () => {
+      const { source, line } = appended(extra);
+      expect(registrarViolations(LIFECYCLE, source)).toEqual([`${line}: ${form}`]);
+    });
+  }
+
+  const rejectedImports: [string, string, string][] = [
+    [
+      "a renamed import's skip",
+      'import { describe as d } from "bun:test";\nd.skip("x", () => {});',
+      ".skip",
+    ],
+    ["a namespace import", 'import * as bt from "bun:test";', "namespace import of bun:test"],
+    ["a default import", 'import bt from "bun:test";', "default import of bun:test"],
+    ["a re-export", 'export { describe } from "bun:test";', "re-export of bun:test"],
+  ];
+  for (const [label, extra, form] of rejectedImports) {
+    test(`the registrar check rejects ${label}`, () => {
+      const { source } = appended(extra);
+      expect(registrarViolations(LIFECYCLE, source).map((v) => v.replace(/^\d+: /, ""))).toEqual([
+        form,
+      ]);
+    });
+  }
+
+  const accepted: [string, string][] = [
+    ["a called it.each", 'it.each([1])("x %d", () => {});'],
+    ["a local variable named test", "{ const test = { skip: 1 }; test.skip; }"],
+  ];
+  for (const [label, extra] of accepted) {
+    test(`the registrar check accepts ${label}`, () => {
+      expect(registrarViolations(LIFECYCLE, appended(extra).source)).toEqual([]);
+    });
+  }
+
+  const unguarded: [string, string][] = [
+    ["loadNativeAddon", "try { const a = loadNativeAddon(); void a; } catch {}"],
+    ["new SCP", 'try { new SCP({ storage: { type: "in_memory" } }); } catch {}'],
+    ["new <expr>.SCP", 'try { new addon.SCP("{}"); } catch {}'],
+  ];
+  for (const [label, extra] of unguarded) {
+    test(`the load-catch check flags a catch around ${label} that skips the guard`, () => {
+      const { source, line } = appended(extra);
+      expect(unguardedLoadCatches(LIFECYCLE, source)).toEqual([line]);
+    });
+  }
+
+  test("the load-catch check accepts a catch that asks the guard", () => {
+    const { source } = appended(
+      "try { loadNativeAddon(); } catch (e) { skipReasonIfAddonAbsent(e); }",
+    );
+    expect(unguardedLoadCatches(LIFECYCLE, source)).toEqual([]);
   });
 });
