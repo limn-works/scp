@@ -26,6 +26,7 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -521,59 +522,124 @@ describe("native addon loader invariant", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Skip-guard invariant: only `skipReasonIfAddonAbsent` produces a skip reason
+// Skip-guard invariant: every catch an addon load reaches asks napi-guard
 // ---------------------------------------------------------------------------
 //
 // CRITERION: a real-NAPI test file skips only when `skipReasonIfAddonAbsent`
-// in `tests/napi-guard.ts` says the addon is absent (SCP-VALID-7081). An addon
+// in `tests/napi-guard.ts` reports the addon absent (SCP-VALID-7081). An addon
 // that fails to load, or one missing an export the file calls, fails the file.
 //
-// INDICATOR: a hand-written skip reason, meaning a variable whose name contains
-// `skip` or `reason` assigned a non-empty string or template literal. Such a
-// guard turns any load error, or a missing `testing` export, into a skip, and
-// `bun test` then exits 0 over zero executed NAPI assertions.
+// The check parses each file under `tests/` and finds every `try` statement
+// with a `catch` clause whose `try` block contains, at any depth, a `loadNativeAddon(...)` call or a
+// `new SCP(...)` / `new <expr>.SCP(...)` construction. Each such statement's
+// `catch` block must call `skipReasonIfAddonAbsent(...)`. The check reads the
+// syntax tree, not variable names, so a boolean guard (`return false`) and a
+// skip-reason guard are held to the same rule.
+//
+// It cannot decide a `try` that reaches the loader only through another
+// function, such as an SDK helper that loads the addon on first use; such a
+// `try` is not checked.
 
-/** Matches an assignment of a non-empty string or template literal to a skip variable. */
-const HAND_WRITTEN_SKIP = /\b\w*(?:skip|Skip|reason|Reason)\w*\s*=\s*(?:`[^`]|"[^"]|'[^'])/;
+/** Whether `node` loads the native addon directly. */
+function isAddonLoad(node: ts.Node): boolean {
+  if (
+    ts.isCallExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === "loadNativeAddon"
+  ) {
+    return true;
+  }
+  if (ts.isNewExpression(node)) {
+    const callee = node.expression;
+    if (ts.isIdentifier(callee)) return callee.text === "SCP";
+    if (ts.isPropertyAccessExpression(callee)) return callee.name.text === "SCP";
+  }
+  return false;
+}
 
-/** The lines of `source` (comments stripped) that assign a hand-written skip reason. */
-function handWrittenSkips(source: string): string[] {
-  return stripComments(source)
-    .split("\n")
-    .filter((line) => HAND_WRITTEN_SKIP.test(line))
-    .map((line) => line.trim());
+/** Whether `node` calls `skipReasonIfAddonAbsent`. */
+function isGuardCall(node: ts.Node): boolean {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === "skipReasonIfAddonAbsent"
+  );
+}
+
+/** Whether `root` or any descendant satisfies `predicate`. */
+function containsNode(root: ts.Node, predicate: (node: ts.Node) => boolean): boolean {
+  if (predicate(root)) return true;
+  return ts.forEachChild(root, (child) => containsNode(child, predicate) || undefined) === true;
+}
+
+/** The load-reachable `try`/`catch` statements in `source`, with whether each catch asks the guard. */
+function loadGuards(fileName: string, source: string): { line: number; guarded: boolean }[] {
+  const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
+  const found: { line: number; guarded: boolean }[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isTryStatement(node) && node.catchClause && containsNode(node.tryBlock, isAddonLoad)) {
+      found.push({
+        line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1,
+        guarded: containsNode(node.catchClause.block, isGuardCall),
+      });
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found;
 }
 
 describe("native addon skip-guard invariant", () => {
-  test("no test file assigns a hand-written skip reason", () => {
-    const offenders = readdirSync(TESTS_DIR)
+  test("every catch an addon load reaches calls skipReasonIfAddonAbsent", () => {
+    const guards = readdirSync(TESTS_DIR)
       .filter((name) => name.endsWith(".ts"))
-      // This file holds the indicator's own positive control below.
-      .filter((name) => name !== basename(__filename))
       .flatMap((name) =>
-        handWrittenSkips(readFileSync(join(TESTS_DIR, name), "utf8")).map(
-          (line) => `${name}: ${line}`,
-        ),
+        loadGuards(name, readFileSync(join(TESTS_DIR, name), "utf8")).map((g) => ({
+          ...g,
+          name,
+        })),
       );
-    expect(offenders).toEqual([]);
+    // The check read real guards, so it cannot pass over an empty file set.
+    expect(guards.filter((g) => g.guarded).length).toBeGreaterThan(0);
+    expect(guards.filter((g) => !g.guarded).map((g) => `${g.name}:${g.line}`)).toEqual([]);
   });
 
-  // Positive control: the scan finds each hand-written guard shape and passes
-  // the shared guard's result and the empty initialiser.
-  test("the scan flags hand-written skip reasons and passes the shared guard", () => {
+  // Positive control: the guard shapes of lifecycle.test.ts (a boolean probe
+  // around `new SCP`) and scp-class.test.ts (a module-level `loadNativeAddon`)
+  // with their guard call deleted are each flagged; with it, each passes.
+  test("the check flags the real guard shapes once their guard call is deleted", () => {
+    const lifecycle = (guard: string) => `
+function napiAvailable(): boolean {
+  try {
+    const probe = new SCP({ storage: { type: "in_memory" } });
+    probe.shutdown(1).catch(() => {});
+    return true;
+  } catch (e: unknown) {
+    ${guard}
+    return false;
+  }
+}`;
+    const scpClass = (guard: string) => `
+let addon: any = null;
+let skipReason = "";
+try {
+  addon = loadNativeAddon();
+  if (typeof addon.SCP !== "function") {
+    throw new Error("SCP class not exported from native addon");
+  }
+} catch (e: unknown) {
+  ${guard}
+}`;
+    for (const shape of [lifecycle, scpClass]) {
+      expect(loadGuards("control.ts", shape("")).map((g) => g.guarded)).toEqual([false]);
+    }
     expect(
-      handWrittenSkips(
-        [
-          'skipReason = "native addon built without the `testing` feature";',
-          "  skipReason = `native addon not available`;",
-          "realSkip = 'absent';",
-        ].join("\n"),
-      ),
-    ).toHaveLength(3);
+      loadGuards("control.ts", lifecycle("skipReasonIfAddonAbsent(e);")).map((g) => g.guarded),
+    ).toEqual([true]);
     expect(
-      handWrittenSkips(
-        ['let skipReason = "";', "skipReason = skipReasonIfAddonAbsent(e);"].join("\n"),
+      loadGuards("control.ts", scpClass("skipReason = skipReasonIfAddonAbsent(e);")).map(
+        (g) => g.guarded,
       ),
-    ).toEqual([]);
+    ).toEqual([true]);
   });
 });
