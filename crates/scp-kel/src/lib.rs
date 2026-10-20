@@ -2,12 +2,17 @@
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+mod client_data;
 pub mod constants;
 mod error;
 mod event;
 mod preimage;
 mod routing;
+mod signature;
 
+#[doc(hidden)]
+pub use client_data::parse_client_data_json;
+pub use client_data::{ClientDataError, ClientDataMembers};
 pub use error::{
     DecodeError, DeriveIdentifierError, DidDiscriminatorField, EncodeError, KelDiscriminatorField,
     ListField, PreimageField,
@@ -22,3 +27,7 @@ pub use preimage::{
     prerotation_commitment,
 };
 pub use routing::{RoutingKind, routing_id};
+pub use signature::{
+    AssertionSignature, IndexedSignature, IndexedSignatureError, IndexedSignaturePart,
+    RAW_SIGNATURE_BYTES, key_event_challenge, verify_indexed,
+};

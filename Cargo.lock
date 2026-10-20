@@ -4821,6 +4821,7 @@ dependencies = [
  "scp-relay-mock",
  "serde-wasm-bindgen",
  "serde_json",
+ "sha2 0.10.9",
  "tls_codec",
  "wasm-bindgen",
  "wasm-bindgen-test",

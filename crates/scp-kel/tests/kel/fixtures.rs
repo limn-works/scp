@@ -63,6 +63,12 @@ pub const V41_ACTIVE: &str = "0223702a648232f2d00713de9289753c2fbd4c4efa7e1e3390
 /// Spec 25 Vector 41's witness operator, as its preimage carries it.
 pub const V41_WITNESS: &str = "9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313";
 
+/// Spec 25 Vector 41's raw-form indexed signature over D (64 bytes).
+pub const V41_SIGNATURE: &str = concat!(
+    "274e7cf73b6807ec53619491a1cc094a5fa2a649b4a04a043965597c7faa5e96",
+    "7e7b499be2e9750521b4bfec6fa65bfdd14c8e5c940bb60884d040da9d1e70a0",
+);
+
 /// Spec 25 Vector 42's preimage (364 bytes): Vector 41's with form `0x02`.
 pub const V42_PREIMAGE: &str = concat!(
     "5343502d4b454c2d4556454e542d56313a010000000000000000000000000000",
@@ -82,6 +88,59 @@ pub const V42_PREIMAGE: &str = concat!(
 pub const V42_DIGEST: &str = "9a41b0fdb978014730ab7d8d56b9a77745b4ff4824affc096bbd923d14a569a6";
 /// Spec 25 Vector 42's identifier.
 pub const V42_IDENTIFIER: &str = "bb8f96731d62d4cc81b811c1ce47246bdaa7f8765ca43e62ded190bd38e65c3d";
+/// Spec 25 Vector 42's challenge bytes, `"SCP-KEY-EVENT-V1:" || D` (49 bytes).
+pub const V42_CHALLENGE_BYTES: &str = concat!(
+    "5343502d4b45592d4556454e542d56313a9a41b0fdb978014730ab7d8d56b9a7",
+    "7745b4ff4824affc096bbd923d14a569a6",
+);
+/// Spec 25 Vector 42's challenge, unpadded base64url as clientDataJSON
+/// carries it.
+pub const V42_CHALLENGE: &str =
+    "U0NQLUtFWS1FVkVOVC1WMTqaQbD9uXgBRzCrfY1Wuad3RbT_SCSv_AlrvZI9FKVppg";
+/// Spec 25 Vector 42's authenticatorData (37 bytes): rpIdHash, flags 0x05,
+/// signCount 0.
+pub const V42_AUTHENTICATOR_DATA: &str = concat!(
+    "aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d11689d76",
+    "0500000000",
+);
+/// Spec 25 Vector 42's clientDataJSON (155 bytes), as its printed text.
+pub const V42_CLIENT_DATA_JSON: &str = concat!(
+    r#"{"type":"webauthn.get","challenge":"#,
+    r#""U0NQLUtFWS1FVkVOVC1WMTqaQbD9uXgBRzCrfY1Wuad3RbT_SCSv_AlrvZI9FKVppg","#,
+    r#""origin":"https://ctx.network","crossOrigin":false}"#,
+);
+/// Spec 25 Vector 42's clientDataJSON bytes, as printed in hex.
+pub const V42_CLIENT_DATA_JSON_HEX: &str = concat!(
+    "7b2274797065223a22776562617574686e2e676574222c226368616c6c656e67",
+    "65223a2255304e514c55744657533146566b564f564331574d54716151624439",
+    "75586742527a437266593157756164335262545f534353765f416c72765a4939",
+    "464b56707067222c226f726967696e223a2268747470733a2f2f6374782e6e65",
+    "74776f726b222c2263726f73734f726967696e223a66616c73657d",
+);
+/// Spec 25 Vector 42's `SHA-256(clientDataJSON)`.
+pub const V42_CLIENT_DATA_HASH: &str =
+    "0b33b76a4ecb79e15753a17147ac39f6964ae20523e7e001c258e67d2562c236";
+/// Spec 25 Vector 42's ECDSA message digest,
+/// `SHA-256(authenticatorData || SHA-256(clientDataJSON))`.
+pub const V42_SIGNED_DIGEST: &str =
+    "1f63ea5226c20ce261b3243ad941ef8834b0678cf4681b2f914963b0bffe4d6b";
+/// Spec 25 Vector 42's 64-byte low-s signature.
+pub const V42_SIGNATURE: &str = concat!(
+    "6aee5c6f9b367f8a886fb996c2f08d77fefcddee6399f1b928cf1110cef786d0",
+    "315de3e854e0669d355b4968b5c2bc8075a5630e3c980844049ebcbf9716c424",
+);
+/// Spec 25 Vector 42's assertion-form indexed signature (264 bytes).
+pub const V42_INDEXED_SIGNATURE: &str = concat!(
+    "00000025aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d",
+    "11689d7605000000000000009b7b2274797065223a22776562617574686e2e67",
+    "6574222c226368616c6c656e6765223a2255304e514c55744657533146566b56",
+    "4f564331574d5471615162443975586742527a43726659315775616433526254",
+    "5f534353765f416c72765a4939464b56707067222c226f726967696e223a2268",
+    "747470733a2f2f6374782e6e6574776f726b222c2263726f73734f726967696e",
+    "223a66616c73657d6aee5c6f9b367f8a886fb996c2f08d77fefcddee6399f1b9",
+    "28cf1110cef786d0315de3e854e0669d355b4968b5c2bc8075a5630e3c980844",
+    "049ebcbf9716c424",
+);
 
 /// Spec 25 Vector 47a's point, §25.2's tertiary key.
 pub const V47A_POINT: &str = "026fc6523b7b1e22ff3fbce8740cfbb7cbc816501864bf40f683db69c860d1a670";
