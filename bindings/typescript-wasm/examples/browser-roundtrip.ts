@@ -4,7 +4,7 @@
  * Shows the batteries-included browser path end to end: WebCrypto custody +
  * IndexedDB storage + the managed WebSocket relay transport, then the participant
  * message flow (create → add → join → send → receive). The polished demo pair is
- * Slice-4 / #1951; this is the minimal, correct wiring the SDK's happy path
+ * Slice-4 work; this is the minimal, correct wiring the SDK's happy path
  * produces.
  *
  * Run in a browser (or any host with WebCrypto + IndexedDB + WebSocket). The

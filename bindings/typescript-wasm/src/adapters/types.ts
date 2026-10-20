@@ -100,11 +100,11 @@ export interface JsKeyCustody {
    * §9.5 also states that a hardware signer draws its own nonce.
    *
    * Three facts about a WebCrypto P-256 key. §9.5 names two platform
-   * signers, and WebCrypto is neither. WebCrypto `ECDSA` draws a random
-   * nonce. WebCrypto `ECDSA` hashes its input and has no prehash mode, so a
-   * WebCrypto key cannot sign the 32-byte digest this method receives as
-   * §9.5 requires. {@link WebCryptoCustody} leaves this method failing
-   * closed.
+   * signers, and WebCrypto is neither. WebCrypto does not specify RFC 6979,
+   * and browsers draw randomized nonces. WebCrypto `ECDSA` hashes its input
+   * and has no prehash mode, so a WebCrypto key cannot sign the 32-byte
+   * digest this method receives as §9.5 requires. {@link WebCryptoCustody}
+   * leaves this method failing closed.
    *
    * SEAM: no driver call site in this slice.
    */

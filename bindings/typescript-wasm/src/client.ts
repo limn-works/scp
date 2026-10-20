@@ -425,7 +425,7 @@ export class ScpBrowserClient {
 
   /**
    * The event-log leaf count for `contextId` as a `bigint` (a u64 — never a lossy
-   * `Number`, #1229), or `undefined` if not held.
+   * `Number`), or `undefined` if not held.
    */
   eventLogLeafCount(contextId: string): bigint | undefined {
     return this.#inner.eventLogLeafCount(contextId);
@@ -437,7 +437,7 @@ export class ScpBrowserClient {
   }
 
   /**
-   * The MLS group epoch for `contextId` as a `bigint` (a u64 — #1229), or
+   * The MLS group epoch for `contextId` as a `bigint` (a u64 — never a lossy `Number`), or
    * `undefined` if the context is not held (or poisoned).
    *
    * Returns `undefined` for an absent/poisoned context — symmetric with the
