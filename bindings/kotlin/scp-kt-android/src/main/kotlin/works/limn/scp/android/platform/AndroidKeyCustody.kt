@@ -409,7 +409,7 @@ class AndroidKeyCustody private constructor(
      * @param contextId Raw context ID bytes.
      * @return The 33-byte SEC1 compressed P-256 point.
      * @throws ScpException with code `SCP-CRYPTO-4006` if the identity key or its
-     *   pseudonym secret is not found.
+     *   pseudonym secret is not found, or [keyHandle] names a P-256 mint still pending.
      * @throws ScpException with code `SCP-CRYPTO-4060` if the key is not an Ed25519 identity.
      */
     override fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): ByteArray =
@@ -431,7 +431,7 @@ class AndroidKeyCustody private constructor(
      * @param pseudonymEpoch Rotation epoch counter, mixed in as a big-endian u64.
      * @return The 33-byte SEC1 compressed P-256 point.
      * @throws ScpException with code `SCP-CRYPTO-4006` if the identity key or its
-     *   pseudonym secret is not found.
+     *   pseudonym secret is not found, or [keyHandle] names a P-256 mint still pending.
      * @throws ScpException with code `SCP-CRYPTO-4060` if the key is not an Ed25519 identity.
      */
     override fun deriveRotatablePseudonym(
@@ -454,8 +454,9 @@ class AndroidKeyCustody private constructor(
     }
 
     /**
-     * The pseudonym point of [keyHandle]. A P-256 key (any record) and a software X25519 key are
-     * rejected with `SCP-CRYPTO-4060`, naming [operation]. A hardware identity computes the
+     * The pseudonym point of [keyHandle]. A pending P-256 id is `SCP-CRYPTO-4006`, as for every
+     * operation but destroy; a settled P-256 key and a software X25519 key are rejected with
+     * `SCP-CRYPTO-4060`, naming [operation]. A hardware identity computes the
      * context seed `HMAC-SHA256(pseudonym_secret, contextId || suffix)` inside Keystore, and
      * only while its identity alias exists, so a destroy that removed the identity but not yet
      * the secret cannot leave a derivable pseudonym. A software identity passes its Ed25519 seed
@@ -468,7 +469,7 @@ class AndroidKeyCustody private constructor(
         epoch: Long?,
         suffix: ByteArray,
     ): ByteArray = custodyGuarded {
-        keyRecords.get(keyHandle.id)?.let {
+        settledRecord(keyHandle.id)?.let {
             throw ScpException("$operation requires an Ed25519 key; key '${keyHandle.id}' is ${it.type}", CUSTODY_ERROR)
         }
         softwareKeyTypes.requireEd25519Identity(keyHandle, operation)

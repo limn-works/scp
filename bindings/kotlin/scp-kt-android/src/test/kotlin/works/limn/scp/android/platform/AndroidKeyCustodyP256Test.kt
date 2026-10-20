@@ -827,6 +827,8 @@ class AndroidKeyCustodyP256Test {
                 val pending = KeyHandle(id = "31", custodyType = CustodyType.HARDWARE)
                 assertEquals("SCP-CRYPTO-4006", codeOf { custody.sign(pending, digest()) })
                 assertEquals("SCP-CRYPTO-4006", codeOf { custody.publicKey(pending) })
+                assertEquals("SCP-CRYPTO-4006", codeOf { custody.derivePseudonym(pending, ByteArray(16)) })
+                assertEquals("SCP-CRYPTO-4006", codeOf { custody.deriveRotatablePseudonym(pending, ByteArray(16), 3) })
 
                 val bridge = TestingCallbackCustody(UniffiKeyCustody(custody))
                 assertEquals("in_memory", bridge.custodyType("31"))
