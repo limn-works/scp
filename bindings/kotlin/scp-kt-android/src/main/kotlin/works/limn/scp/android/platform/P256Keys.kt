@@ -198,21 +198,30 @@ internal class P256Keys(
      * record pending under this process's tag belongs to a mint that may still be running, and
      * is left alone.
      *
-     * Best-effort per record: a record that does not parse, or whose key or record cannot be
-     * removed, stays in place and is reported through [warn], and the sweep goes on. Removing an
-     * orphan cleans up an inert leak on which no §9.15 guarantee depends.
+     * Best-effort, and it never throws an [Exception]: an index that cannot be read ends the
+     * sweep with nothing swept, and a record that does not parse, or whose key or record cannot
+     * be removed, stays in place; each is reported through [warn], and the sweep goes on.
+     * Removing an orphan cleans up an inert leak on which no §9.15 guarantee depends.
      */
-    @Suppress("TooGenericExceptionCaught") // one record's failure never stops the sweep
-    fun sweep(): List<String> = records.ids().filter { id ->
-        try {
-            val record = records.get(id) ?: return@filter false
-            if (record.custody != null || record.processTag == processTag) return@filter false
-            deleteMaterial(id, record.backing)
-            records.remove(id)
-            true
+    @Suppress("TooGenericExceptionCaught") // no failure of the sweep may fail construction
+    fun sweep(): List<String> {
+        val ids = try {
+            records.ids()
         } catch (e: Exception) {
-            warn("Abandoned P-256 mint $id could not be swept and stays reserved", e)
-            false
+            warn("The P-256 record index could not be read; no abandoned mint was swept", e)
+            return emptyList()
+        }
+        return ids.filter { id ->
+            try {
+                val record = records.get(id) ?: return@filter false
+                if (record.custody != null || record.processTag == processTag) return@filter false
+                deleteMaterial(id, record.backing)
+                records.remove(id)
+                true
+            } catch (e: Exception) {
+                warn("Abandoned P-256 mint $id could not be swept and stays reserved", e)
+                false
+            }
         }
     }
 

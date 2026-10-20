@@ -146,6 +146,20 @@ private class NoGetAllPrefs(private val inner: SharedPreferences) : SharedPrefer
     override fun getAll(): MutableMap<String, *> = throw AssertionError("AndroidKeyCustody called getAll()")
 }
 
+/**
+ * [SharedPreferences] over [inner] whose `getString` of [unreadableKey] throws the
+ * `ClassCastException` a real store throws for a value that is not a string.
+ */
+private class UnreadableKeyPrefs(
+    private val inner: SharedPreferences,
+    private val unreadableKey: String,
+) : SharedPreferences by inner {
+    override fun getString(key: String?, defValue: String?): String? {
+        if (key == unreadableKey) throw ClassCastException("$key holds a value that is not a String")
+        return inner.getString(key, defValue)
+    }
+}
+
 class AndroidKeyCustodyP256Test {
     private lateinit var prefs: InMemorySharedPreferences
     private lateinit var keys: JcaFakeKeystoreKeys
@@ -735,6 +749,29 @@ class AndroidKeyCustodyP256Test {
             assertTrue(keys.containsAlias(alias("51")))
             assertEquals(1, warnings.size, warnings.toString())
             assertTrue(warnings.single().contains("51"), warnings.single())
+        }
+
+        @Test
+        fun `an unreadable record index warns, and construction succeeds with existing keys working`() {
+            val first = custody(agreementInKeystore = false)
+            val identity = first.generateKeypair(KeyType.ED25519, KeyRole.IDENTITY)
+            val signing = first.generateKeypair(KeyType.P256)
+            val agreement = first.generateKeypair(KeyType.HPKE_P256)
+            val agreementPublic = first.publicKey(agreement)
+
+            val warnings = mutableListOf<String>()
+            val reopened = custody(
+                agreementInKeystore = false,
+                store = UnreadableKeyPrefs(prefs, "scp.keymeta.ids"),
+                warnings = warnings,
+            )
+
+            assertEquals(1, warnings.size, warnings.toString())
+            assertTrue(warnings.single().contains("index"), warnings.single())
+            assertEquals(64, reopened.sign(identity, byteArrayOf(4, 5, 6)).size)
+            assertEquals(2, ASN1Sequence.getInstance(reopened.sign(signing, digest())).size())
+            val peer = randomScalar()
+            assertArrayEquals(testingP256Ecdh(peer, agreementPublic), reopened.dhAgree(agreement, pointOf(peer)))
         }
 
         @Test
