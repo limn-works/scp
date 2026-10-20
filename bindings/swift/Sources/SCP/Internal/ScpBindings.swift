@@ -19098,6 +19098,25 @@ public func p256PseudonymPoint(contextSeed: Data)throws  -> Data  {
 })
 }
 /**
+ * The raw 64-byte low-`s` `r || s` of a DER ECDSA P-256 signature.
+ *
+ * For a Secure Enclave or Android Keystore host whose signer returns DER:
+ * the host's `sign` passes that DER here and returns the result, so it
+ * emits the low form §9.5 requires without its own DER parser.
+ *
+ * # Errors
+ *
+ * `SCP-VALID-7005` when `der` is not strict DER, or `r` or `s` is zero or
+ * not below the group order.
+ */
+public func p256SignatureDerToRawLowS(der: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_p256_signature_der_to_raw_low_s(
+        FfiConverterData.lower(der),$0
+    )
+})
+}
+/**
  * The compressed pseudonym point a software custody derives (§9.10.4.A).
  *
  * From the 32-byte identity key material `ikm`: the v1 point for
@@ -19460,6 +19479,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_p256_pseudonym_point() != 15648) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_p256_signature_der_to_raw_low_s() != 9595) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_p256_software_pseudonym_point() != 30231) {

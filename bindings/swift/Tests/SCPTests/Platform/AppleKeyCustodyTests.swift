@@ -622,11 +622,11 @@
             try await custodyNone.destroyKey(handle)
         }
 
-        @Test("custodyType returns 'unknown' for an id the Keychain does not hold, under either policy")
+        @Test("custodyType returns 'in_memory', the weakest custody, for an id the Keychain does not hold, under either policy")
         func custodyTypeUnknownId() {
             let unknown = String(UInt64.random(in: .min ... .max))
-            #expect(AppleKeyCustody(accessGroup: nil, biometricPolicy: .none).custodyType(unknown) == "unknown")
-            #expect(AppleKeyCustody(accessGroup: nil, biometricPolicy: .required).custodyType(unknown) == "unknown")
+            #expect(AppleKeyCustody(accessGroup: nil, biometricPolicy: .none).custodyType(unknown) == "in_memory")
+            #expect(AppleKeyCustody(accessGroup: nil, biometricPolicy: .required).custodyType(unknown) == "in_memory")
         }
 
         // MARK: - BiometricPolicy.required creates biometric-gated keys
@@ -847,7 +847,7 @@
             #expect(await cryptoCode {
                 _ = try await provider.deriveRotatablePseudonym(keyId: unknown, contextId: context, pseudonymEpoch: 1)
             } == notFound)
-            #expect(provider.custodyType(keyId: unknown) == "unknown")
+            #expect(provider.custodyType(keyId: unknown) == "in_memory")
         }
 
         @Test("a destroyed key is not found afterwards")
@@ -858,7 +858,7 @@
                 _ = try await provider.derivePseudonym(keyId: keyId, contextId: Data("ctx".utf8))
             }
             #expect(code == "SCP-CRYPTO-4006")
-            #expect(provider.custodyType(keyId: keyId) == "unknown")
+            #expect(provider.custodyType(keyId: keyId) == "in_memory")
         }
 
         @Test("a wrong-type operation is the custody error SCP-CRYPTO-4060")
@@ -867,14 +867,6 @@
             let code = await cryptoCode { _ = try await provider.sign(keyId: keyId, message: Data("m".utf8)) }
             #expect(code == "SCP-CRYPTO-4060")
             try await provider.destroyKey(keyId: keyId)
-        }
-
-        @Test("P-256 and HPKE P-256 generation fails closed with SCP-CRYPTO-4060")
-        func p256GenerationFailsClosed() async {
-            for keyType in [CustodyKeyType.p256, .hpkeP256] {
-                let code = await cryptoCode { _ = try await provider.generateKeypair(keyType: keyType, role: .operational) }
-                #expect(code == "SCP-CRYPTO-4060")
-            }
         }
 
         /// The adapter itself is the provider: `identityCreateWithCustody`
@@ -920,10 +912,10 @@
             #expect(try adapter.keyIds(cachingPublicKey: found.publicKey).isEmpty)
         }
 
-        @Test("custodyType reports unknown for an id the Keychain does not hold under a biometric policy")
+        @Test("custodyType reports in_memory for an id the Keychain does not hold under a biometric policy")
         func biometricCustodyTypeUnknownId() {
             let gated: any KeyCustodyProvider = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
-            #expect(gated.custodyType(keyId: String(UInt64.random(in: .min ... .max))) == "unknown")
+            #expect(gated.custodyType(keyId: String(UInt64.random(in: .min ... .max))) == "in_memory")
         }
     }
 

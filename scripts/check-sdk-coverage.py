@@ -122,6 +122,9 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["p256SoftwarePseudonymPoint"],
         "swift": ["p256SoftwarePseudonymPoint"],
     },
+    ("Crypto", "p256_signature_der_to_raw_low_s"): {
+        "swift": ["p256SignatureDerToRawLowS"],
+    },
     # Identity attestations carry the "Link" infix across all SDKs.
     ("Identity", "create_attestation"): {
         "python": ["create_identity_link_attestation"],
