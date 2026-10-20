@@ -1930,6 +1930,17 @@
           }
         },
         {
+          "name": "node_start",
+          "python": true,
+          "typescript": true,
+          "kotlin": false,
+          "swift": true,
+          "notes": "The production node start (construction.md §\"Node start — `NodeStartConfig`\", ADR-052): Python `SCP.node_start(config)`, TypeScript `SCP.nodeStart(config)`, Swift `SCP.nodeStart(config:)`. The Swift wrapper exists on macOS only: it sits inside `#if os(macOS)` in `bindings/swift/Sources/SCP/Server.swift`, so an iOS build of the SDK has no node start.",
+          "exemptions": {
+            "kotlin": "Out of scope for the Kotlin SDK for now. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
+          }
+        },
+        {
           "name": "node_start_in_memory",
           "python": true,
           "typescript": true,
