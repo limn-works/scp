@@ -755,6 +755,16 @@ pub struct Event {
    on `generate_checkpoint` in criterion 8 is a *checkpoint*-signing argument and
    is unaffected.)
 
+   **Amendment (2026-10-20, ADR-066 decision 23).** `Event` carries two fields after
+   `signature`: `signing_key_id`, the identity-key role that signed it, such as
+   `"#active"`, which `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6 and
+   `23-sync-and-offline-strategy.md` §23.13 read, and `key_state_head: [u8; 32]`, the
+   actor's key-state head when it signed (`09-security-model.md` §9.7.1 log-anchored
+   row). The note above that `Event` has no `signing_key_id` field no longer holds.
+   The signature is over the §9.5.2 Event preimage under `"SCP-EVENT-V2:"`, which ends
+   with both fields and is in the log-anchored evidence class, so a member that
+   rebuilds from a checkpoint verifies a leaf whose actor has since rotated that key.
+
    **Timestamp assignment (committer-assigned, copied by every member).** The
    `timestamp` field is convergent by *assignment*, parallel to `sequence`: for a
    commit-ordered event the committing member sets it to the `created_at` of the signed
