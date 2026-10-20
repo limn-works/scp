@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -141,12 +141,37 @@ impl TestServer {
         self.requests.lock().await.clone()
     }
 
-    /// An origin nothing listens on: a send to it fails to connect.
-    pub(super) async fn closed_origin() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-        origin
+    /// An origin nothing listens on, held for as long as the returned
+    /// [`ClosedOrigin`] lives: a send to it fails to connect.
+    pub(super) fn closed_origin() -> ClosedOrigin {
+        ClosedOrigin::reserve()
+    }
+}
+
+/// A loopback port bound but never listening. A connection to it is refused,
+/// and while this value lives no other socket, in this process or another
+/// test process, can bind the port and answer in its place. Releasing the
+/// port instead would let a concurrent test's [`TestServer`] bind it and take
+/// one of that server's scripted replies.
+pub(super) struct ClosedOrigin {
+    origin: String,
+    _reserved: TcpSocket,
+}
+
+impl ClosedOrigin {
+    fn reserve() -> Self {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let origin = format!("http://{}", socket.local_addr().unwrap());
+        Self {
+            origin,
+            _reserved: socket,
+        }
+    }
+
+    /// `http://127.0.0.1:<port>`.
+    pub(super) fn origin(&self) -> &str {
+        &self.origin
     }
 }
 
@@ -196,5 +221,18 @@ async fn serve(
     };
     if !reply.body.is_empty() {
         let _ = stream.send_data(Bytes::from(reply.body), true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_origin_refuses_connections_and_keeps_its_port_from_other_binds() {
+        let closed = TestServer::closed_origin();
+        let addr = closed.origin().trim_start_matches("http://").to_owned();
+        assert!(tokio::net::TcpStream::connect(&addr).await.is_err());
+        assert!(TcpListener::bind(&addr).await.is_err(), "{addr} rebound");
     }
 }

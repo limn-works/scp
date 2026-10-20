@@ -997,10 +997,11 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_endpoints_are_transient() {
-        let origin = TestServer::closed_origin().await;
+        let closed = TestServer::closed_origin();
+        let origin = closed.origin();
         let sender = FcmSender::build(
             config(),
-            &origin,
+            origin,
             format!("{origin}/token"),
             Arc::new(TestClock::new(START)),
         )
@@ -1043,10 +1044,11 @@ mod tests {
         for _ in 0..4 {
             sender.send(&reg_token()).await;
         }
-        let origin = TestServer::closed_origin().await;
+        let closed = TestServer::closed_origin();
+        let origin = closed.origin();
         FcmSender::build(
             config(),
-            &origin,
+            origin,
             format!("{origin}/token"),
             Arc::new(TestClock::new(START)),
         )
