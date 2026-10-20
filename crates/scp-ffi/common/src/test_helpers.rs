@@ -144,38 +144,49 @@ pub struct CustodyCodeRow {
 #[must_use]
 pub fn custody_code_rows() -> Vec<CustodyCodeRow> {
     use scp_crypto::CustodyFailureKind as K;
-    const KINDS: [K; 13] = [
-        K::KeyNotFound,
-        K::PseudonymRejected,
-        K::TimedOut,
-        K::Failed,
-        K::StorageClosed,
-        K::StorageLockHeld,
-        K::AttestationFailed,
-        K::Unsupported,
-        K::PushWakePayloadInvalid,
-        K::PushRegistrationRejected,
-        K::PushVerifierUnavailable,
-        K::PushPlatformUnavailable,
-        K::PushProviderFailed,
-    ];
-    KINDS
-        .into_iter()
-        .map(|kind| {
-            let (class, code, platform_errors) = custody_code_row(kind);
-            CustodyCodeRow {
-                kind,
-                class,
-                code,
-                platform_errors,
-            }
-        })
-        .collect()
+    // Expands one list of kinds into the array the table iterates and into a
+    // match over the same list with no wildcard arm, so a `CustodyFailureKind`
+    // variant missing from the list fails to compile (E0004) and a listed
+    // duplicate is an unreachable pattern: the table covers every kind once.
+    macro_rules! every_kind {
+        ($($kind:ident),+ $(,)?) => {{
+            const _: fn(K) = |kind| match kind {
+                $(K::$kind)|+ => {}
+            };
+            [$(K::$kind),+]
+        }};
+    }
+    every_kind![
+        KeyNotFound,
+        PseudonymRejected,
+        TimedOut,
+        Failed,
+        StorageClosed,
+        StorageLockHeld,
+        AttestationFailed,
+        Unsupported,
+        PushWakePayloadInvalid,
+        PushRegistrationRejected,
+        PushVerifierUnavailable,
+        PushPlatformUnavailable,
+        PushProviderFailed,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let (class, code, platform_errors) = custody_code_row(kind);
+        CustodyCodeRow {
+            kind,
+            class,
+            code,
+            platform_errors,
+        }
+    })
+    .collect()
 }
 
 /// The class, code and bare `PlatformError`s of one custody failure kind. A
 /// kind added to `CustodyFailureKind` fails to compile here until it has an
-/// arm; list it in `KINDS` in [`custody_code_rows`] beside the arm.
+/// arm, and in [`custody_code_rows`] until its list names it.
 fn custody_code_row(
     kind: scp_crypto::CustodyFailureKind,
 ) -> (
