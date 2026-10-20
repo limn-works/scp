@@ -2719,13 +2719,18 @@ mod tests {
         );
     }
 
-    /// §25.19 Vector 30 through production software custody. Until the identity key
-    /// moves to P-256 (SCP-315) the §9.10.4.A ikm is the Ed25519 seed, so the vector's identity scalar is
-    /// imported as that seed; the v1 and v2 (`epoch` = 1) points and routing
-    /// ids on `context-alpha` must equal the spec's literal bytes. Keying the
-    /// derivation on the public key, or dropping a recipe step, fails this.
-    #[tokio::test]
-    async fn derive_pseudonym_reproduces_spec_25_19_vector_30() {
+    /// One §25.19 pseudonym vector through production software custody: the
+    /// v1 and v2 (`epoch` = 1) points and routing ids on `context-alpha`.
+    /// Until the identity key moves to P-256 (SCP-315) the §9.10.4.A ikm is
+    /// the Ed25519 seed, so the vector's identity scalar is imported as that
+    /// seed.
+    async fn assert_spec_25_19_pseudonym_vector(
+        identity_scalar: &str,
+        v1_point: &str,
+        v1_routing_id: &str,
+        v2_point: &str,
+        v2_routing_id: &str,
+    ) {
         fn h(s: &str) -> Vec<u8> {
             (0..s.len())
                 .step_by(2)
@@ -2734,10 +2739,7 @@ mod tests {
         }
         let dir = TempDir::new().unwrap();
         let custody = make_custody(&dir, "pw");
-        let scalar: [u8; 32] =
-            h("32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64")
-                .try_into()
-                .unwrap();
+        let scalar: [u8; 32] = h(identity_scalar).try_into().unwrap();
         let identity = custody
             .import_ed25519_signing_key(&Zeroizing::new(scalar))
             .await
@@ -2745,27 +2747,45 @@ mod tests {
         let ctx = b"context-alpha";
 
         let v1 = custody.derive_pseudonym(&identity, ctx).await.unwrap();
-        assert_eq!(
-            v1.public_key().to_compressed(),
-            h("0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72").as_slice()
-        );
-        assert_eq!(
-            v1.routing_id().as_slice(),
-            h("b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307").as_slice()
-        );
+        assert_eq!(v1.public_key().to_compressed(), h(v1_point).as_slice());
+        assert_eq!(v1.routing_id().as_slice(), h(v1_routing_id).as_slice());
 
         let v2 = custody
             .derive_rotatable_pseudonym(&identity, ctx, 1)
             .await
             .unwrap();
-        assert_eq!(
-            v2.public_key().to_compressed(),
-            h("0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479").as_slice()
-        );
-        assert_eq!(
-            v2.routing_id().as_slice(),
-            h("b19754a5e88c993683f99e48646ba518cba80dec0693f920c5671263650b6ae9").as_slice()
-        );
+        assert_eq!(v2.public_key().to_compressed(), h(v2_point).as_slice());
+        assert_eq!(v2.routing_id().as_slice(), h(v2_routing_id).as_slice());
+    }
+
+    /// §25.19 Vector 30 (identity seed 0x01×32) with the spec's literal
+    /// bytes. Keying the derivation on the public key, or dropping a recipe
+    /// step, fails this.
+    #[tokio::test]
+    async fn derive_pseudonym_reproduces_spec_25_19_vector_30() {
+        assert_spec_25_19_pseudonym_vector(
+            "32c69e4a096fadd1a8d0a21e0a97f124d5c4c8c5b15b96027beadb91c2f3ec64",
+            "0367e9d3809d6f9bc6854132aff27c2a399463bb516db76f844d79a7b0453c8f72",
+            "b7faa05dea2cef1b7aff6a48fa5b7b9ffe217b25f3152d78d597bb9078e98307",
+            "0276c50b92dacbe6ae1a3761d007b7fe75016a4c076f214694c95d13162ff24479",
+            "b19754a5e88c993683f99e48646ba518cba80dec0693f920c5671263650b6ae9",
+        )
+        .await;
+    }
+
+    /// §25.19 Vector 31 (identity seed 0x9d,0x01..0x1f) with the spec's
+    /// literal bytes. A second scalar catches a derivation that matches
+    /// Vector 30 through a constant or a fixed key.
+    #[tokio::test]
+    async fn derive_pseudonym_reproduces_spec_25_19_vector_31() {
+        assert_spec_25_19_pseudonym_vector(
+            "65d56a863d03d31ea15ade82f677058d5bbe53afedc6ff7d2b8846aa25a1bc2b",
+            "0239f7c3213f3567183fd2fcf7aec6c884bc70e0e694c42053284a4b5ebef4fe2d",
+            "cab5ff45d21b6d0425fa7657e89fc68514965cbb4ca2b9549f4ccf430d581e7c",
+            "037967cfe8d3111cdd72288ea3f444c15b710300323162fec63ca9036af73754e3",
+            "3c0ac4dec86c0dafe38195a7b66cdfec6b0ae0d44834c6e8b6b6129e097b5e27",
+        )
+        .await;
     }
 
     #[cfg(unix)]
