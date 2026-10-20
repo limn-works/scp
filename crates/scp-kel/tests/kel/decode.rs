@@ -11,14 +11,15 @@ use scp_kel::constants::{
     MAX_EVENT_BYTES, MAX_NEXT_SET_SIZE, MAX_ROOT_SET_SIZE, MAX_WITNESS_SET_SIZE,
 };
 use scp_kel::{
-    CommitmentRolloverFields, Continuation, DecodeError, DiscriminatorField, EncodeError,
-    EventDiscriminatorField, EventKind, EventPreimage, ListField, PreimageField, SignatureForm,
-    SignerGroup, decode_preimage, encode_preimage,
+    CommitmentRolloverFields, Continuation, DecodeError, DidDiscriminatorField, EncodeError,
+    EventKind, EventPreimage, KelDiscriminatorField, ListField, PreimageField, RootRecoveryFields,
+    SignatureForm, SignerGroup, SignerGroupRole, StandingRootSigning, decode_preimage,
+    encode_preimage,
 };
 
 use crate::fixtures::{
-    TestResult, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V50_PREIMAGE, array, fields, identifier,
-    v41_inception,
+    TestResult, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V50_PREIMAGE, array, bytes, fields,
+    identifier, v41_inception, v41_snapshot, v50_key_state,
 };
 
 // Offsets into Vector 41's 347 field bytes (its 364 printed bytes after the
@@ -100,133 +101,234 @@ fn vector_41_offsets_land_on_their_fields() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// The count-bound rule: each list over its §9.18.17 maximum by one, and each
-// at its maximum, which decodes.
+// The count-bound rule (§9.7.4.2): a list is capped by the `MAX_*` §9.18.17
+// registers for it and otherwise only by the bytes remaining. Every count
+// here is written into the bytes, never through the encoder, so the decoder
+// is tested on wire input the encoder could not produce. Every list that
+// decodes re-encodes to the identical bytes.
 // ---------------------------------------------------------------------------
-
-fn assert_over_max(preimage: &EventPreimage, list: ListField, max: u32) -> TestResult {
-    assert_eq!(
-        decode_preimage(&encode_preimage(preimage)?),
-        Err(DecodeError::CountOverMax {
-            list,
-            count: max + 1,
-            max
-        })
-    );
-    Ok(())
-}
-
-fn assert_decodes(preimage: &EventPreimage) -> TestResult {
-    assert_eq!(&decode_preimage(&encode_preimage(preimage)?)?, preimage);
-    Ok(())
-}
 
 fn n(count: u32) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(usize::try_from(count)?)
 }
 
-fn with_indices(count: u32) -> Result<EventPreimage, Box<dyn std::error::Error>> {
-    let mut preimage = v41_inception(SignatureForm::Raw)?;
-    let group = preimage.signer_groups.first_mut().ok_or("no group")?;
-    group.indices = vec![0; n(count)?];
-    Ok(preimage)
+/// Replaces the list whose count sits at `offset` in `bytes` (holding
+/// `old` elements of `element.len()` bytes) with `count` copies of
+/// `element`, writing the count directly.
+fn splice_list(
+    bytes: &[u8],
+    offset: usize,
+    old: usize,
+    element: &[u8],
+    count: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let end = offset + 4 + old * element.len();
+    let mut out = bytes.get(..offset).ok_or("offset past the end")?.to_vec();
+    out.extend_from_slice(&count.to_be_bytes());
+    for _ in 0..count {
+        out.extend_from_slice(element);
+    }
+    out.extend_from_slice(bytes.get(end..).ok_or("list past the end")?);
+    Ok(out)
 }
 
-fn with_forms(count: u32) -> Result<EventPreimage, Box<dyn std::error::Error>> {
-    let mut preimage = v41_inception(SignatureForm::Raw)?;
-    let group = preimage.signer_groups.first_mut().ok_or("no group")?;
-    group.forms = vec![SignatureForm::Raw; n(count)?];
-    Ok(preimage)
+/// Asserts `bytes` decode and re-encode to the identical bytes.
+fn assert_decodes_identically(bytes: &[u8]) -> TestResult {
+    let decoded = decode_preimage(bytes)?;
+    assert_eq!(encode_preimage(decoded.preimage())?.fields(), bytes);
+    Ok(())
 }
 
-fn with_revealed_keys(count: u32) -> Result<EventPreimage, Box<dyn std::error::Error>> {
-    let mut preimage = v41_inception(SignatureForm::Raw)?;
-    preimage.revealed_keys = vec![[2; 33]; n(count)?];
-    Ok(preimage)
+/// Asserts the list at `offset` decodes at `max` and is rejected at
+/// `max + 1`, with an error that names the list.
+fn assert_capped(
+    bytes: &[u8],
+    offset: usize,
+    old: usize,
+    element: &[u8],
+    list: ListField,
+    max: u32,
+) -> TestResult {
+    assert_decodes_identically(&splice_list(bytes, offset, old, element, max)?)?;
+    let error = decode_preimage(&splice_list(bytes, offset, old, element, max + 1)?)
+        .err()
+        .ok_or("a list over its maximum decoded")?;
+    assert_eq!(
+        error,
+        DecodeError::CountOverMax {
+            list,
+            count: max + 1,
+            max
+        }
+    );
+    assert!(error.to_string().contains(&list.to_string()));
+    Ok(())
 }
 
-fn with_root_members(count: u32) -> Result<EventPreimage, Box<dyn std::error::Error>> {
-    let mut preimage = v41_inception(SignatureForm::Raw)?;
-    let root_set = preimage.installed_root_set.as_mut().ok_or("no root set")?;
-    root_set.members = vec![[3; 33]; n(count)?];
-    Ok(preimage)
+/// Asserts the list at `offset` decodes with `count` entries, past every
+/// registered maximum: §9.18.17 registers none for it.
+fn assert_uncapped(
+    bytes: &[u8],
+    offset: usize,
+    old: usize,
+    element: &[u8],
+    count: u32,
+) -> TestResult {
+    assert_decodes_identically(&splice_list(bytes, offset, old, element, count)?)
 }
 
-fn with_witnesses(count: u32) -> Result<EventPreimage, Box<dyn std::error::Error>> {
-    let mut preimage = v41_inception(SignatureForm::Raw)?;
-    let snapshot = preimage.key_state.as_mut().ok_or("no snapshot")?;
-    snapshot.witnesses = vec![Identifier::from_bytes([9; 32]); n(count)?];
-    Ok(preimage)
+/// One past the largest registered list maximum.
+const PAST_EVERY_CAP: u32 = MAX_WITNESS_SET_SIZE + 1;
+
+fn group() -> SignerGroup {
+    SignerGroup {
+        indices: vec![0],
+        forms: vec![SignatureForm::Raw],
+    }
 }
 
-fn with_commitments(count: u32) -> Result<EventPreimage, Box<dyn std::error::Error>> {
-    let mut preimage = v41_inception(SignatureForm::Raw)?;
-    let Some(Continuation::FixesCommitment(commitment)) = preimage.continuation.as_mut() else {
-        return Err("Vector 41 fixes a commitment".into());
-    };
-    commitment.commitments = vec![
-        CommitmentEntry {
-            commitment: [4; 32],
-            custody_type: CustodyType::Software,
-            key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
-        };
-        n(count)?
-    ];
-    Ok(preimage)
+/// A `CommitmentRollover`'s field bytes: two groups (reveal, then standing
+/// root) of one index and one form each, so field 6's counts sit at 74 and
+/// 79, field 7's at 84 and 89, and the revealed-key count at 94.
+fn rollover_fields() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let rollover = EventPreimage::commitment_rollover(CommitmentRolloverFields {
+        identifier: identifier(V41_IDENTIFIER)?,
+        sequence: 1,
+        predecessor_digest: array(V41_DIGEST)?,
+        reveal_group: group(),
+        standing_root_group: group(),
+        revealed_keys: vec![[2; 33]],
+        continuation: Continuation::Abandons,
+    });
+    let bytes = encode_preimage(&rollover)?.fields().to_vec();
+    for offset in [74, 79, 84, 89, 94] {
+        assert_eq!(count_at(&bytes, offset)?, 1);
+    }
+    Ok(bytes)
+}
+
+/// A co-signed `RootRecovery`'s field bytes: three groups (reveal, K′,
+/// standing root) of one index and one form each, so field 6's counts sit
+/// at 74, 79 and 84, and field 7's at 89, 94 and 99.
+fn root_recovery_fields() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let recovery = EventPreimage::root_recovery(RootRecoveryFields {
+        identifier: identifier(V41_IDENTIFIER)?,
+        sequence: 1,
+        predecessor_digest: array(V41_DIGEST)?,
+        standing_root_signing: StandingRootSigning::CoSigns {
+            standing_root_group: group(),
+        },
+        reveal_group: group(),
+        replacement_root_group: group(),
+        revealed_keys: vec![[2; 33]],
+        key_state: v41_snapshot(3600)?,
+        continuation: Continuation::Abandons,
+    });
+    let bytes = encode_preimage(&recovery)?.fields().to_vec();
+    for offset in [74, 79, 84, 89, 94, 99] {
+        assert_eq!(count_at(&bytes, offset)?, 1);
+    }
+    Ok(bytes)
 }
 
 #[test]
-fn signer_index_list_over_its_maximum_is_rejected() -> TestResult {
-    let max = MAX_ROOT_SET_SIZE.max(MAX_NEXT_SET_SIZE);
-    assert_over_max(&with_indices(max + 1)?, ListField::SignerIndices, max)?;
-    assert_decodes(&with_indices(max)?)
-}
-
-#[test]
-fn signature_form_list_over_its_maximum_is_rejected() -> TestResult {
-    let max = MAX_ROOT_SET_SIZE.max(MAX_NEXT_SET_SIZE);
-    assert_over_max(&with_forms(max + 1)?, ListField::SignatureForms, max)?;
-    assert_decodes(&with_forms(max)?)
-}
-
-#[test]
-fn revealed_keys_over_max_next_set_size_are_rejected() -> TestResult {
-    assert_over_max(
-        &with_revealed_keys(MAX_NEXT_SET_SIZE + 1)?,
-        ListField::RevealedKeys,
+fn reveal_group_index_list_is_capped_at_max_next_set_size() -> TestResult {
+    let list = ListField::SignerIndices(SignerGroupRole::Reveal);
+    assert_capped(&rollover_fields()?, 74, 1, &[0], list, MAX_NEXT_SET_SIZE)?;
+    // The reveal group leads a RootRecovery too.
+    assert_capped(
+        &root_recovery_fields()?,
+        74,
+        1,
+        &[0],
+        list,
         MAX_NEXT_SET_SIZE,
-    )?;
-    assert_decodes(&with_revealed_keys(MAX_NEXT_SET_SIZE)?)
+    )
 }
 
 #[test]
-fn installed_root_set_over_max_root_set_size_is_rejected() -> TestResult {
-    assert_over_max(
-        &with_root_members(MAX_ROOT_SET_SIZE + 1)?,
+fn installed_root_set_is_capped_at_max_root_set_size() -> TestResult {
+    assert_capped(
+        &v41_fields()?,
+        ROOT_SET_COUNT,
+        1,
+        &[3; 33],
         ListField::InstalledRootSet,
         MAX_ROOT_SET_SIZE,
-    )?;
-    assert_decodes(&with_root_members(MAX_ROOT_SET_SIZE)?)
+    )
 }
 
 #[test]
-fn witness_set_over_max_witness_set_size_is_rejected() -> TestResult {
-    assert_over_max(
-        &with_witnesses(MAX_WITNESS_SET_SIZE + 1)?,
+fn witness_set_is_capped_at_max_witness_set_size() -> TestResult {
+    assert_capped(
+        &v41_fields()?,
+        WITNESS_COUNT,
+        1,
+        &[9; 32],
         ListField::Witnesses,
         MAX_WITNESS_SET_SIZE,
-    )?;
-    assert_decodes(&with_witnesses(MAX_WITNESS_SET_SIZE)?)
+    )
 }
 
 #[test]
-fn commitment_list_over_max_next_set_size_is_rejected() -> TestResult {
-    assert_over_max(
-        &with_commitments(MAX_NEXT_SET_SIZE + 1)?,
+fn commitment_list_is_capped_at_max_next_set_size() -> TestResult {
+    let mut entry = vec![4; 32];
+    entry.extend_from_slice(&[
+        CustodyType::Software.to_byte(),
+        KeyAlgorithm::EcdsaP256Sha256.to_byte(),
+    ]);
+    assert_capped(
+        &v41_fields()?,
+        COMMITMENT_COUNT,
+        1,
+        &entry,
         ListField::Commitments,
         MAX_NEXT_SET_SIZE,
-    )?;
-    assert_decodes(&with_commitments(MAX_NEXT_SET_SIZE)?)
+    )
+}
+
+#[test]
+fn a_17_index_root_group_decodes() -> TestResult {
+    assert_uncapped(&v41_fields()?, INDEX_COUNT, 1, &[0], 17)?;
+    assert_uncapped(&v41_fields()?, INDEX_COUNT, 1, &[0], PAST_EVERY_CAP)
+}
+
+#[test]
+fn a_17_entry_form_list_decodes() -> TestResult {
+    assert_uncapped(&v41_fields()?, FORM_COUNT, 1, &[0x02], 17)?;
+    // Every role's form list: a rollover's two and a recovery's three.
+    for offset in [84, 89] {
+        assert_uncapped(&rollover_fields()?, offset, 1, &[0x01], PAST_EVERY_CAP)?;
+    }
+    for offset in [89, 94, 99] {
+        assert_uncapped(&root_recovery_fields()?, offset, 1, &[0x01], PAST_EVERY_CAP)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn every_index_list_but_the_reveal_groups_is_uncapped() -> TestResult {
+    // The rollover's standing-root group, and the recovery's K′ and
+    // standing-root groups.
+    assert_uncapped(&rollover_fields()?, 79, 1, &[0], PAST_EVERY_CAP)?;
+    for offset in [79, 84] {
+        assert_uncapped(&root_recovery_fields()?, offset, 1, &[0], PAST_EVERY_CAP)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn revealed_keys_snapshot_keys_and_seals_are_uncapped() -> TestResult {
+    assert_uncapped(&v41_fields()?, REVEALED_COUNT, 0, &[2; 33], PAST_EVERY_CAP)?;
+    let entry = v41_fields()?.get(ENTRY_0..ENTRY_1).ok_or("short")?.to_vec();
+    assert_uncapped(&v41_fields()?, KEY_COUNT, 2, &entry, PAST_EVERY_CAP)?;
+    assert_uncapped(
+        &fields(V50_PREIMAGE)?,
+        V50_SEAL_COUNT,
+        1,
+        &[5; 32],
+        PAST_EVERY_CAP,
+    )
 }
 
 #[test]
@@ -246,6 +348,117 @@ fn a_count_of_u32_max_is_rejected_before_any_allocation() -> TestResult {
             remaining: V41_FIELD_LEN - KEY_COUNT - 4,
         })
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The encoder reads the same table: a capped list over its maximum is
+// refused before any bytes leave, naming the list.
+// ---------------------------------------------------------------------------
+
+fn assert_encode_over_max(preimage: &EventPreimage, list: ListField, max: u32) -> TestResult {
+    let error = encode_preimage(preimage)
+        .err()
+        .ok_or("a list over its maximum encoded")?;
+    assert_eq!(
+        error,
+        EncodeError::CountOverMax {
+            list,
+            len: n(max)? + 1,
+            max
+        }
+    );
+    assert!(error.to_string().contains(&list.to_string()));
+    Ok(())
+}
+
+#[test]
+fn encoder_refuses_each_capped_list_over_its_maximum() -> TestResult {
+    let over_next = n(MAX_NEXT_SET_SIZE)? + 1;
+    let rollover = EventPreimage::commitment_rollover(CommitmentRolloverFields {
+        identifier: identifier(V41_IDENTIFIER)?,
+        sequence: 1,
+        predecessor_digest: array(V41_DIGEST)?,
+        reveal_group: SignerGroup {
+            indices: vec![0; over_next],
+            ..group()
+        },
+        standing_root_group: group(),
+        revealed_keys: Vec::new(),
+        continuation: Continuation::Abandons,
+    });
+    assert_encode_over_max(
+        &rollover,
+        ListField::SignerIndices(SignerGroupRole::Reveal),
+        MAX_NEXT_SET_SIZE,
+    )?;
+
+    let mut root_set = v41_inception(SignatureForm::Raw)?;
+    root_set
+        .installed_root_set
+        .as_mut()
+        .ok_or("no root set")?
+        .members = vec![[3; 33]; n(MAX_ROOT_SET_SIZE)? + 1];
+    assert_encode_over_max(&root_set, ListField::InstalledRootSet, MAX_ROOT_SET_SIZE)?;
+
+    let mut witnesses = v41_inception(SignatureForm::Raw)?;
+    witnesses.key_state.as_mut().ok_or("no snapshot")?.witnesses =
+        vec![Identifier::from_bytes([9; 32]); n(MAX_WITNESS_SET_SIZE)? + 1];
+    assert_encode_over_max(&witnesses, ListField::Witnesses, MAX_WITNESS_SET_SIZE)?;
+
+    let mut commitments = v41_inception(SignatureForm::Raw)?;
+    let Some(Continuation::FixesCommitment(commitment)) = commitments.continuation.as_mut() else {
+        return Err("Vector 41 fixes a commitment".into());
+    };
+    commitment.commitments = vec![
+        CommitmentEntry {
+            commitment: [4; 32],
+            custody_type: CustodyType::Software,
+            key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
+        };
+        over_next
+    ];
+    assert_encode_over_max(&commitments, ListField::Commitments, MAX_NEXT_SET_SIZE)
+}
+
+#[test]
+fn encoder_accepts_uncapped_lists_past_every_maximum() -> TestResult {
+    let past = n(PAST_EVERY_CAP)?;
+    let mut preimage = v41_inception(SignatureForm::Raw)?;
+    let root_group = preimage.signer_groups.first_mut().ok_or("no group")?;
+    root_group.indices = vec![0; past];
+    root_group.forms = vec![SignatureForm::Raw; past];
+    preimage.revealed_keys = vec![[2; 33]; past];
+    preimage.seals = vec![[5; 32]; past];
+    let encoded = encode_preimage(&preimage)?;
+    assert_eq!(decode_preimage(encoded.fields())?.preimage(), &preimage);
+    Ok(())
+}
+
+#[test]
+fn encoder_refuses_field_bytes_over_max_event_bytes() -> TestResult {
+    // Vector 50's 303 field bytes carry one seal; each further seal adds 32.
+    // 2,039 seals end at 65,519 bytes, under MAX_EVENT_BYTES; 2,040 at 65,551.
+    let mut preimage = v50_key_state()?;
+    preimage.seals = vec![[5; 32]; 2039];
+    let encoded = encode_preimage(&preimage)?;
+    assert!(encoded.fields().len() <= n(MAX_EVENT_BYTES)?);
+    assert_decodes_identically(encoded.fields())?;
+    preimage.seals.push([5; 32]);
+    assert_eq!(
+        encode_preimage(&preimage),
+        Err(EncodeError::PreimageTooLong { len: 65_551 })
+    );
+    Ok(())
+}
+
+#[test]
+fn decoder_refuses_the_signed_preimage_naming_the_separator() -> TestResult {
+    let error = decode_preimage(&bytes(V41_PREIMAGE)?)
+        .err()
+        .ok_or("the signed preimage decoded")?;
+    assert_eq!(error, DecodeError::SignedPreimage);
+    assert!(error.to_string().contains("SCP-KEL-EVENT-V1:"));
     Ok(())
 }
 
@@ -278,39 +491,27 @@ fn assert_over_remaining(
 
 #[test]
 fn signer_index_list_past_the_remaining_bytes_is_rejected() -> TestResult {
-    assert_over_remaining(&v41_fields()?, INDEX_COUNT, 1, ListField::SignerIndices)
+    assert_over_remaining(
+        &v41_fields()?,
+        INDEX_COUNT,
+        1,
+        ListField::SignerIndices(SignerGroupRole::Root),
+    )
 }
 
 #[test]
 fn signature_form_list_past_the_remaining_bytes_is_rejected() -> TestResult {
-    assert_over_remaining(&v41_fields()?, FORM_COUNT, 1, ListField::SignatureForms)
+    assert_over_remaining(
+        &v41_fields()?,
+        FORM_COUNT,
+        1,
+        ListField::SignatureForms(SignerGroupRole::Root),
+    )
 }
 
 #[test]
 fn revealed_keys_past_the_remaining_bytes_are_rejected() -> TestResult {
-    // A CommitmentRollover: two groups of one index and one form each put
-    // the revealed-key count at 74 + 2 * 5 + 2 * 5.
-    let rollover = EventPreimage::commitment_rollover(CommitmentRolloverFields {
-        identifier: identifier(V41_IDENTIFIER)?,
-        sequence: 1,
-        predecessor_digest: array(V41_DIGEST)?,
-        reveal_group: SignerGroup {
-            indices: vec![0],
-            forms: vec![SignatureForm::Raw],
-        },
-        standing_root_group: SignerGroup {
-            indices: vec![0],
-            forms: vec![SignatureForm::Raw],
-        },
-        revealed_keys: vec![[2; 33]],
-        continuation: Continuation::Abandons,
-    });
-    assert_over_remaining(
-        &encode_preimage(&rollover)?,
-        94,
-        33,
-        ListField::RevealedKeys,
-    )
+    assert_over_remaining(&rollover_fields()?, 94, 33, ListField::RevealedKeys)
 }
 
 #[test]
@@ -352,12 +553,12 @@ fn input_over_max_event_bytes_is_rejected() -> TestResult {
     let len = n(MAX_EVENT_BYTES)? + 1;
     assert_eq!(
         decode_preimage(&vec![0x01; len]),
-        Err(DecodeError::EventTooLong { len })
+        Err(DecodeError::PreimageTooLong { len })
     );
     // At exactly MAX_EVENT_BYTES the length rule passes and parsing runs.
     assert!(!matches!(
         decode_preimage(&vec![0x01; len - 1]),
-        Err(DecodeError::EventTooLong { .. })
+        Err(DecodeError::PreimageTooLong { .. })
     ));
     Ok(())
 }
@@ -507,9 +708,9 @@ fn byte_after_the_continuation_sentinel_is_rejected() -> TestResult {
 fn byte_after_abandonment_is_rejected() -> TestResult {
     let mut preimage = v41_inception(SignatureForm::Raw)?;
     preimage.continuation = Some(Continuation::Abandons);
-    let mut bytes = encode_preimage(&preimage)?;
+    let mut bytes = encode_preimage(&preimage)?.fields().to_vec();
     assert_eq!(bytes.last(), Some(&0x00));
-    assert_eq!(decode_preimage(&bytes)?, preimage);
+    assert_eq!(decode_preimage(&bytes)?.preimage(), &preimage);
     bytes.push(0x07);
     assert_eq!(
         decode_preimage(&bytes),
@@ -525,14 +726,14 @@ fn byte_after_abandonment_is_rejected() -> TestResult {
 
 fn assert_unknown(
     bytes: &[u8],
-    field: DiscriminatorField,
+    field: DidDiscriminatorField,
     kind: DiscriminatorKind,
     value: u8,
 ) -> TestResult {
     let error = decode_preimage(bytes).err().ok_or("decoded")?;
     assert_eq!(
         error,
-        DecodeError::UnknownDiscriminator {
+        DecodeError::UnknownDidDiscriminator {
             field,
             source: UnknownDiscriminator { kind, value },
         }
@@ -545,7 +746,7 @@ fn assert_unknown(
 fn unregistered_role_names_the_role_field() -> TestResult {
     assert_unknown(
         &v41_with(ENTRY_0 + ROLE, 0x03)?,
-        DiscriminatorField::Role,
+        DidDiscriminatorField::Role,
         DiscriminatorKind::KeyRole,
         0x03,
     )
@@ -555,7 +756,7 @@ fn unregistered_role_names_the_role_field() -> TestResult {
 fn unregistered_condition_names_the_condition_field() -> TestResult {
     assert_unknown(
         &v41_with(ENTRY_0 + CONDITION, 0x05)?,
-        DiscriminatorField::Condition,
+        DidDiscriminatorField::Condition,
         DiscriminatorKind::KeyCondition,
         0x05,
     )
@@ -565,14 +766,14 @@ fn unregistered_condition_names_the_condition_field() -> TestResult {
 fn unregistered_custody_type_names_the_custody_type_field() -> TestResult {
     assert_unknown(
         &v41_with(ENTRY_1 + CUSTODY, 0x0a)?,
-        DiscriminatorField::CustodyType,
+        DidDiscriminatorField::CustodyType,
         DiscriminatorKind::CustodyType,
         0x0a,
     )?;
     // The continuation's commitment entries carry the same field.
     assert_unknown(
         &v41_with(COMMITMENT_CUSTODY, 0x00)?,
-        DiscriminatorField::CustodyType,
+        DidDiscriminatorField::CustodyType,
         DiscriminatorKind::CustodyType,
         0x00,
     )
@@ -582,13 +783,13 @@ fn unregistered_custody_type_names_the_custody_type_field() -> TestResult {
 fn unregistered_key_algorithm_names_the_key_algorithm_field() -> TestResult {
     assert_unknown(
         &v41_with(ENTRY_0 + ALGORITHM, 0x02)?,
-        DiscriminatorField::KeyAlgorithm,
+        DidDiscriminatorField::KeyAlgorithm,
         DiscriminatorKind::KeyAlgorithm,
         0x02,
     )?;
     assert_unknown(
         &v41_with(COMMITMENT_ALGORITHM, 0x02)?,
-        DiscriminatorField::KeyAlgorithm,
+        DidDiscriminatorField::KeyAlgorithm,
         DiscriminatorKind::KeyAlgorithm,
         0x02,
     )
@@ -598,44 +799,40 @@ fn unregistered_key_algorithm_names_the_key_algorithm_field() -> TestResult {
 fn unregistered_service_key_role_names_the_service_key_role_field() -> TestResult {
     assert_unknown(
         &v41_with(SERVICE_KEY_ROLE, 0x03)?,
-        DiscriminatorField::ServiceKeyRole,
+        DidDiscriminatorField::ServiceKeyRole,
         DiscriminatorKind::KeyRole,
         0x03,
     )
 }
 
-fn assert_unknown_event_byte(
-    offset: usize,
-    value: u8,
-    field: EventDiscriminatorField,
-) -> TestResult {
+fn assert_unknown_event_byte(offset: usize, value: u8, field: KelDiscriminatorField) -> TestResult {
     assert_eq!(
         decode_preimage(&v41_with(offset, value)?),
-        Err(DecodeError::UnknownEventDiscriminator { field, value })
+        Err(DecodeError::UnknownKelDiscriminator { field, value })
     );
     Ok(())
 }
 
 #[test]
 fn unregistered_event_type_is_rejected() -> TestResult {
-    assert_unknown_event_byte(KIND, 0x05, EventDiscriminatorField::EventType)?;
-    assert_unknown_event_byte(KIND, 0x00, EventDiscriminatorField::EventType)
+    assert_unknown_event_byte(KIND, 0x05, KelDiscriminatorField::EventType)?;
+    assert_unknown_event_byte(KIND, 0x00, KelDiscriminatorField::EventType)
 }
 
 #[test]
 fn unregistered_standing_root_is_rejected() -> TestResult {
-    assert_unknown_event_byte(STANDING_ROOT, 0x03, EventDiscriminatorField::StandingRoot)
+    assert_unknown_event_byte(STANDING_ROOT, 0x03, KelDiscriminatorField::StandingRoot)
 }
 
 #[test]
 fn unregistered_signature_form_is_rejected() -> TestResult {
-    assert_unknown_event_byte(FORM, 0x03, EventDiscriminatorField::SignatureForm)?;
-    assert_unknown_event_byte(FORM, 0x00, EventDiscriminatorField::SignatureForm)
+    assert_unknown_event_byte(FORM, 0x03, KelDiscriminatorField::SignatureForm)?;
+    assert_unknown_event_byte(FORM, 0x00, KelDiscriminatorField::SignatureForm)
 }
 
 #[test]
 fn unregistered_continuation_byte_is_rejected() -> TestResult {
-    assert_unknown_event_byte(CONTINUATION, 0x02, EventDiscriminatorField::Continuation)
+    assert_unknown_event_byte(CONTINUATION, 0x02, KelDiscriminatorField::Continuation)
 }
 
 #[test]
@@ -655,7 +852,7 @@ fn decoder_leaves_kind_versus_field_legality_to_the_verifier() -> TestResult {
     let decoded = decode_preimage(&v41_with(KIND, 0x02)?)?;
     let mut expected = v41_inception(SignatureForm::Raw)?;
     expected.kind = EventKind::KeyState;
-    assert_eq!(decoded, expected);
+    assert_eq!(decoded.preimage(), &expected);
     Ok(())
 }
 
@@ -716,6 +913,7 @@ fn compromised_entry_decodes_at_any_position_including_zero() -> TestResult {
             position,
         )?)?;
         let entry = decoded
+            .preimage()
             .key_state
             .as_ref()
             .and_then(|snapshot| snapshot.keys.first())

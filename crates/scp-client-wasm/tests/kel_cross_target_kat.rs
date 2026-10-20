@@ -17,14 +17,14 @@ use fixtures::{
     TestResult, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V41_ROUTING_DID, V41_ROUTING_SVC,
     V41_ROUTING_WCF, V41_ROUTING_WIT, V42_DIGEST, V42_IDENTIFIER, V42_PREIMAGE, V47A_COMMITMENT,
     V47A_POINT, V47B_COMMITMENT, V47B_POINT, V48_ADDRESS, V48_IDENTIFIER, V50_DIGEST, V50_PREIMAGE,
-    V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST, V51_IDENTIFIER, V51_INCEPTION_DIGEST, V51_PREIMAGE,
-    V51_ROUTING_DID, array, bytes, fields, identifier, v41_inception, v50_key_state, v51_inception,
-    v51_key_state,
+    V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST, V51_IDENTIFIER, V51_INCEPTION_DIGEST,
+    V51_INCEPTION_PREIMAGE, V51_PREIMAGE, V51_ROUTING_DID, array, assert_vector, fields,
+    identifier, v41_inception, v50_key_state, v51_inception, v51_key_state,
 };
-use scp_did::Identifier;
+use scp_did::{Identifier, IdentifierError, NonCanonicalReason};
 use scp_kel::{
-    EventPreimage, RoutingKind, SignatureForm, decode_preimage, derive_identifier, encode_preimage,
-    event_digest, key_event_seal, prerotation_commitment, routing_id, signed_preimage,
+    RoutingKind, SignatureForm, decode_preimage, derive_identifier, key_event_seal,
+    prerotation_commitment, routing_id,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -36,13 +36,9 @@ const V57_TEXT: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za
 const V57_UPPERCASE: &str = "scp:FQHX6RDYX2KNWADYGEPPKG5DZSMTINRLB4KU3S7ZYWLVOLSGZ4ZA";
 const V57_PADDED: &str = "scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za====";
 
-fn assert_vector(preimage: &EventPreimage, printed_hex: &str, digest_hex: &str) -> TestResult {
-    assert_eq!(signed_preimage(preimage)?, bytes(printed_hex)?);
-    let field_bytes = fields(printed_hex)?;
-    assert_eq!(encode_preimage(preimage)?, field_bytes);
-    assert_eq!(event_digest(preimage)?, array::<32>(digest_hex)?);
-    assert_eq!(&decode_preimage(&field_bytes)?, preimage);
-    Ok(())
+/// The identifier text error a non-canonical form returns.
+const fn non_canonical(reason: NonCanonicalReason) -> Result<Identifier, IdentifierError> {
+    Err(IdentifierError::NonCanonicalIdentifier { reason })
 }
 
 #[test]
@@ -51,6 +47,10 @@ fn vector_41_inception() -> TestResult {
     let preimage = v41_inception(SignatureForm::Raw)?;
     assert_vector(&preimage, V41_PREIMAGE, V41_DIGEST)?;
     assert_eq!(derive_identifier(&preimage)?, identifier(V41_IDENTIFIER)?);
+    assert_eq!(
+        decode_preimage(&fields(V41_PREIMAGE)?)?.identifier(),
+        identifier(V41_IDENTIFIER)?
+    );
     Ok(())
 }
 
@@ -78,10 +78,7 @@ fn vector_50_key_state_and_seal() -> TestResult {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
 fn vector_51_inception_and_key_state() -> TestResult {
     let inception = v51_inception()?;
-    assert_eq!(
-        event_digest(&inception)?,
-        array::<32>(V51_INCEPTION_DIGEST)?
-    );
+    assert_vector(&inception, V51_INCEPTION_PREIMAGE, V51_INCEPTION_DIGEST)?;
     assert_eq!(derive_identifier(&inception)?, identifier(V51_IDENTIFIER)?);
     assert_vector(&v51_key_state()?, V51_PREIMAGE, V51_DIGEST)?;
     assert_eq!(
@@ -130,15 +127,20 @@ fn vector_57_identifier_text_form() -> TestResult {
     let id = identifier(V41_IDENTIFIER)?;
     assert_eq!(id.to_string(), V57_TEXT);
     assert_eq!(V57_TEXT.parse::<Identifier>()?, id);
-    assert!(V57_UPPERCASE.parse::<Identifier>().is_err());
-    assert!(V57_PADDED.parse::<Identifier>().is_err());
+    // Uppercase letters are outside the lowercase base32 alphabet.
+    assert_eq!(
+        V57_UPPERCASE.parse::<Identifier>(),
+        non_canonical(NonCanonicalReason::Alphabet)
+    );
+    // Padding makes the body longer than 52 characters.
+    assert_eq!(
+        V57_PADDED.parse::<Identifier>(),
+        non_canonical(NonCanonicalReason::Length)
+    );
     // Not a spec 25 variant: one character short of the 56-character form.
-    assert!(
-        V57_TEXT
-            .get(..55)
-            .ok_or("short")?
-            .parse::<Identifier>()
-            .is_err()
+    assert_eq!(
+        V57_TEXT.get(..55).ok_or("short")?.parse::<Identifier>(),
+        non_canonical(NonCanonicalReason::Length)
     );
     Ok(())
 }

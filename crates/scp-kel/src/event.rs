@@ -10,7 +10,7 @@
 //! builds a preimage through the per-kind constructors, which place every
 //! sentinel the kind carries.
 
-use scp_did::{Identifier, KeyEntry, KeyRole, StandingCommitment};
+use scp_did::{Identifier, KeyCondition, KeyEntry, KeyRole, KeyState, StandingCommitment};
 
 /// A key event's kind, the preimage's first field (§9.7.4.2 field 1).
 ///
@@ -28,20 +28,6 @@ pub enum EventKind {
     RootRecovery,
 }
 
-impl EventKind {
-    /// How many indexed signer groups the kind names, for every kind but
-    /// `RootRecovery`, whose count its standing-root declaration decides
-    /// (§9.7.4.2, "Which fields each kind carries in substance").
-    #[must_use]
-    pub const fn fixed_signer_group_count(self) -> Option<usize> {
-        match self {
-            Self::Inception | Self::KeyState => Some(1),
-            Self::CommitmentRollover => Some(2),
-            Self::RootRecovery => None,
-        }
-    }
-}
-
 /// What a `RootRecovery` declares about the standing root (§9.7.4.2 field 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StandingRootDeclaration {
@@ -51,16 +37,46 @@ pub enum StandingRootDeclaration {
     Lost,
 }
 
-impl StandingRootDeclaration {
-    /// How many indexed signer groups a `RootRecovery` carrying this
-    /// declaration names: the reveal group and the K′ group, plus the
-    /// standing-root group where the root co-signs.
-    #[must_use]
-    pub const fn signer_group_count(self) -> usize {
-        match self {
-            Self::CoSigns => 3,
-            Self::Lost => 2,
+/// Which indexed set a signer group signs for, by its position in the kind's
+/// group order (§9.7.4.2, "Which fields each kind carries in substance").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SignerGroupRole {
+    /// The standing root's group of an `Inception` or a `KeyState`, indexing
+    /// the root set.
+    Root,
+    /// The reveal group, indexing the standing commitment list.
+    Reveal,
+    /// A `RootRecovery`'s K′ group, indexing the root set it installs.
+    ReplacementRoot,
+    /// The standing root's group of a `CommitmentRollover`, or of a
+    /// `RootRecovery` whose standing root co-signs.
+    StandingRoot,
+}
+
+/// The signer groups a preimage of `kind` names, in its group order.
+///
+/// `None` for a `RootRecovery` with no standing-root declaration, whose group
+/// count is undefined (§9.7.4.2, "Which fields each kind carries in
+/// substance"). The one table of group order the encoder and decoder read.
+#[must_use]
+pub const fn signer_group_roles(
+    kind: EventKind,
+    standing_root: Option<StandingRootDeclaration>,
+) -> Option<&'static [SignerGroupRole]> {
+    match (kind, standing_root) {
+        (EventKind::Inception | EventKind::KeyState, _) => Some(&[SignerGroupRole::Root]),
+        (EventKind::CommitmentRollover, _) => {
+            Some(&[SignerGroupRole::Reveal, SignerGroupRole::StandingRoot])
         }
+        (EventKind::RootRecovery, Some(StandingRootDeclaration::CoSigns)) => Some(&[
+            SignerGroupRole::Reveal,
+            SignerGroupRole::ReplacementRoot,
+            SignerGroupRole::StandingRoot,
+        ]),
+        (EventKind::RootRecovery, Some(StandingRootDeclaration::Lost)) => {
+            Some(&[SignerGroupRole::Reveal, SignerGroupRole::ReplacementRoot])
+        }
+        (EventKind::RootRecovery, None) => None,
     }
 }
 
@@ -102,9 +118,9 @@ pub struct InstalledRootSet {
 ///
 /// It is the key state minus the standing commitment: the commitment list
 /// travels in the continuation field of the event that fixes it (field 12),
-/// and the snapshot carries no next-set list. `scp_did::KeyState` holds the
-/// derived state with its standing commitment; a verifier composes it from
-/// a snapshot and the latest continuation.
+/// and the snapshot carries no next-set list. [`into_key_state`](Self::into_key_state)
+/// composes it with the latest continuation's commitment into
+/// `scp_did::KeyState`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KeyStateSnapshot {
     /// The signing threshold t of the root set.
@@ -120,6 +136,63 @@ pub struct KeyStateSnapshot {
     pub service_key_role: KeyRole,
     /// The delegating identity, [`Identifier::ZERO`] where undelegated.
     pub delegator: Identifier,
+}
+
+impl KeyStateSnapshot {
+    /// The root set this snapshot names: its `Current` `RootMember` keys in
+    /// snapshot order, which is the root set's own list order, with the
+    /// snapshot's root threshold (§9.7.4.2, the key-state snapshot's order:
+    /// "root members in the root set's own list order", and "A snapshot lists
+    /// the entries it keeps `Current` in their existing order, followed by the
+    /// entries the event drops").
+    #[must_use]
+    pub fn root_set(&self) -> InstalledRootSet {
+        InstalledRootSet {
+            members: self
+                .keys
+                .iter()
+                .filter(|entry| {
+                    entry.role == KeyRole::RootMember && entry.condition == KeyCondition::Current
+                })
+                .map(|entry| entry.key)
+                .collect(),
+            threshold: self.root_threshold,
+        }
+    }
+
+    /// The key state this snapshot and a standing commitment compose
+    /// (§9.7.4.2: "A snapshot carries every component of the key state except
+    /// the standing commitment").
+    ///
+    /// Both types are destructured field by field, so a field added to either
+    /// fails to compile here until it is placed.
+    #[must_use]
+    pub fn into_key_state(self, standing_commitment: StandingCommitment) -> KeyState {
+        let Self {
+            root_threshold,
+            keys,
+            witnesses,
+            witnessing_interval,
+            service_key_role,
+            delegator,
+        } = self;
+        let StandingCommitment {
+            commitments,
+            next_threshold,
+        } = standing_commitment;
+        KeyState {
+            root_threshold,
+            keys,
+            witnesses,
+            witnessing_interval,
+            service_key_role,
+            delegator,
+            standing_commitment: StandingCommitment {
+                commitments,
+                next_threshold,
+            },
+        }
+    }
 }
 
 /// What a commitment-fixing event says about the next set (§9.7.4.2
@@ -164,14 +237,17 @@ pub struct EventPreimage {
 }
 
 /// The fields an inception event carries in substance (§9.7.4.2): one root
-/// group, the installed root set, the key state and the continuation.
+/// group, the key state and the continuation.
+///
+/// The installed root set (field 9) is the key state's
+/// [`root_set`](KeyStateSnapshot::root_set), so the root members and
+/// threshold are written once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InceptionFields {
-    /// The root group, indexing [`installed_root_set`](Self::installed_root_set).
+    /// The root group, indexing the key state's root set.
     pub root_group: SignerGroup,
-    /// The root set the inception installs.
-    pub installed_root_set: InstalledRootSet,
-    /// The identity's first key state.
+    /// The identity's first key state, whose root members and threshold are
+    /// the root set the inception installs.
     pub key_state: KeyStateSnapshot,
     /// The first commitment list, or abandonment.
     pub continuation: Continuation,
@@ -216,10 +292,14 @@ pub struct CommitmentRolloverFields {
     pub continuation: Continuation,
 }
 
-/// Whether the standing root co-signs a `RootRecovery`, carrying its group
-/// where it does (§9.7.4.2 fields 5 to 7).
+/// The standing root's signing part in a `RootRecovery` (§9.7.4.2 fields 5
+/// to 7).
+///
+/// It carries the standing root's signer group where the root co-signs, and
+/// nothing where it is lost. The constructor writes the field 5
+/// [`StandingRootDeclaration`] each variant implies.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RootRecoveryStanding {
+pub enum StandingRootSigning {
     /// The standing root co-signs with this group, the third group.
     CoSigns {
         /// The standing root's group.
@@ -231,10 +311,10 @@ pub enum RootRecoveryStanding {
 
 /// The fields a `RootRecovery` carries in substance (§9.7.4.2).
 ///
-/// They are the
-/// standing-root declaration, the reveal group, the K′ group and (where the
-/// root co-signs) the standing-root group, the revealed keys, the installed
-/// root set, the key state and the continuation.
+/// They are the standing root's signing part, the reveal group, the K′ group,
+/// the revealed keys, the key state and the continuation. The installed root
+/// set (field 9) is the key state's [`root_set`](KeyStateSnapshot::root_set),
+/// so the replacement root members and threshold are written once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootRecoveryFields {
     /// The identity the event extends.
@@ -243,17 +323,16 @@ pub struct RootRecoveryFields {
     pub sequence: u64,
     /// The predecessor event's digest.
     pub predecessor_digest: [u8; 32],
-    /// The standing root's part in the recovery.
-    pub standing_root: RootRecoveryStanding,
+    /// The standing root's signing part in the recovery.
+    pub standing_root_signing: StandingRootSigning,
     /// The group indexing the standing commitment list.
     pub reveal_group: SignerGroup,
     /// The K′ group, indexing the installed root set.
     pub replacement_root_group: SignerGroup,
     /// One point per index the reveal group names.
     pub revealed_keys: Vec<[u8; 33]>,
-    /// The root set the recovery installs.
-    pub installed_root_set: InstalledRootSet,
-    /// The key state the recovery installs.
+    /// The key state the recovery installs, whose `Current` root members and
+    /// threshold are the root set it installs.
     pub key_state: KeyStateSnapshot,
     /// The next commitment list, or abandonment.
     pub continuation: Continuation,
@@ -261,9 +340,11 @@ pub struct RootRecoveryFields {
 
 impl EventPreimage {
     /// An inception preimage: identifier, sequence and predecessor all zero,
-    /// fields 5, 8 and 11 at their sentinels (§9.7.4.2).
+    /// fields 5, 8 and 11 at their sentinels, and field 9 the key state's
+    /// root set (§9.7.4.2).
     #[must_use]
     pub fn inception(fields: InceptionFields) -> Self {
+        let installed_root_set = fields.key_state.root_set();
         Self {
             kind: EventKind::Inception,
             identifier: Identifier::ZERO,
@@ -272,7 +353,7 @@ impl EventPreimage {
             standing_root: None,
             signer_groups: vec![fields.root_group],
             revealed_keys: Vec::new(),
-            installed_root_set: Some(fields.installed_root_set),
+            installed_root_set: Some(installed_root_set),
             key_state: Some(fields.key_state),
             seals: Vec::new(),
             continuation: Some(fields.continuation),
@@ -317,12 +398,14 @@ impl EventPreimage {
         }
     }
 
-    /// A `RootRecovery` preimage: field 11 at its sentinel, and the groups in
-    /// the order reveal, K′, then standing root where it co-signs (§9.7.4.2).
+    /// A `RootRecovery` preimage: field 11 at its sentinel, field 9 the key
+    /// state's root set, and the groups in the order reveal, K′, then
+    /// standing root where it co-signs (§9.7.4.2).
     #[must_use]
     pub fn root_recovery(fields: RootRecoveryFields) -> Self {
-        let (declaration, signer_groups) = match fields.standing_root {
-            RootRecoveryStanding::CoSigns {
+        let installed_root_set = fields.key_state.root_set();
+        let (declaration, signer_groups) = match fields.standing_root_signing {
+            StandingRootSigning::CoSigns {
                 standing_root_group,
             } => (
                 StandingRootDeclaration::CoSigns,
@@ -332,7 +415,7 @@ impl EventPreimage {
                     standing_root_group,
                 ],
             ),
-            RootRecoveryStanding::Lost => (
+            StandingRootSigning::Lost => (
                 StandingRootDeclaration::Lost,
                 vec![fields.reveal_group, fields.replacement_root_group],
             ),
@@ -345,22 +428,17 @@ impl EventPreimage {
             standing_root: Some(declaration),
             signer_groups,
             revealed_keys: fields.revealed_keys,
-            installed_root_set: Some(fields.installed_root_set),
+            installed_root_set: Some(installed_root_set),
             key_state: Some(fields.key_state),
             seals: Vec::new(),
             continuation: Some(fields.continuation),
         }
     }
 
-    /// How many signer groups this preimage's kind names, or `None` for a
-    /// `RootRecovery` carrying no standing-root declaration, which names no
-    /// group count and so admits no encoding.
+    /// The signer groups this preimage's kind names, in group order
+    /// ([`signer_group_roles`]).
     #[must_use]
-    pub const fn expected_signer_group_count(&self) -> Option<usize> {
-        match (self.kind.fixed_signer_group_count(), self.standing_root) {
-            (Some(count), _) => Some(count),
-            (None, Some(declaration)) => Some(declaration.signer_group_count()),
-            (None, None) => None,
-        }
+    pub const fn signer_group_roles(&self) -> Option<&'static [SignerGroupRole]> {
+        signer_group_roles(self.kind, self.standing_root)
     }
 }

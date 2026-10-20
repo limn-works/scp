@@ -8,7 +8,7 @@ use std::fmt;
 
 use scp_did::{KeyCondition, UnknownDiscriminator};
 
-use crate::event::EventKind;
+use crate::event::{EventKind, SignerGroupRole};
 
 /// One of the preimage's twelve fields (§9.7.4.2), named where a decode
 /// runs out of bytes.
@@ -59,13 +59,26 @@ impl fmt::Display for PreimageField {
     }
 }
 
+impl fmt::Display for SignerGroupRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Root => "root group",
+            Self::Reveal => "reveal group",
+            Self::ReplacementRoot => "K′ group",
+            Self::StandingRoot => "standing-root group",
+        })
+    }
+}
+
 /// A count-prefixed list of the preimage (§9.7.4.2, the count-bound rule).
+/// A signer group's two lists carry the group's role, so an error names
+/// which group's list failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ListField {
     /// One group's signer index list (field 6).
-    SignerIndices,
+    SignerIndices(SignerGroupRole),
     /// One group's signature-form list (field 7).
-    SignatureForms,
+    SignatureForms(SignerGroupRole),
     /// The revealed keys (field 8).
     RevealedKeys,
     /// The installed root set's members (field 9).
@@ -82,23 +95,24 @@ pub enum ListField {
 
 impl fmt::Display for ListField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::SignerIndices => "signer index list",
-            Self::SignatureForms => "signature-form list",
-            Self::RevealedKeys => "revealed keys",
-            Self::InstalledRootSet => "installed root set",
-            Self::SnapshotKeys => "snapshot key list",
-            Self::Witnesses => "witness set",
-            Self::Seals => "key-event seals",
-            Self::Commitments => "commitment list",
-        })
+        match self {
+            Self::SignerIndices(role) => write!(f, "{role}'s signer index list"),
+            Self::SignatureForms(role) => write!(f, "{role}'s signature-form list"),
+            Self::RevealedKeys => f.write_str("revealed keys"),
+            Self::InstalledRootSet => f.write_str("installed root set"),
+            Self::SnapshotKeys => f.write_str("snapshot key list"),
+            Self::Witnesses => f.write_str("witness set"),
+            Self::Seals => f.write_str("key-event seals"),
+            Self::Commitments => f.write_str("commitment list"),
+        }
     }
 }
 
-/// A key-state field whose byte is an `scp_did` name-bound enumeration
-/// (§9.7.4.2, the key-state snapshot's order and the continuation).
+/// A preimage byte that is one of `scp_did`'s name-bound enumerations
+/// (`KeyRole`, `KeyCondition`, `CustodyType`, `KeyAlgorithm`), in the
+/// key-state snapshot or the continuation (§9.7.4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DiscriminatorField {
+pub enum DidDiscriminatorField {
     /// A key entry's `role`, a `KeyRole`.
     Role,
     /// A key entry's `condition`, a `KeyCondition`.
@@ -111,7 +125,7 @@ pub enum DiscriminatorField {
     ServiceKeyRole,
 }
 
-impl fmt::Display for DiscriminatorField {
+impl fmt::Display for DidDiscriminatorField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Role => "role",
@@ -123,10 +137,11 @@ impl fmt::Display for DiscriminatorField {
     }
 }
 
-/// A preimage field whose byte is one of this crate's discriminators
-/// (§9.7.4.2 fields 1, 5, 7 and 12).
+/// A preimage byte that is one of this crate's own discriminators
+/// ([`EventKind`], `StandingRootDeclaration`, `SignatureForm`, the
+/// continuation byte; §9.7.4.2 fields 1, 5, 7 and 12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EventDiscriminatorField {
+pub enum KelDiscriminatorField {
     /// Field 1, `event_type`.
     EventType,
     /// Field 5, `standing_root`.
@@ -137,7 +152,7 @@ pub enum EventDiscriminatorField {
     Continuation,
 }
 
-impl fmt::Display for EventDiscriminatorField {
+impl fmt::Display for KelDiscriminatorField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::EventType => "event_type",
@@ -150,9 +165,12 @@ impl fmt::Display for EventDiscriminatorField {
 
 /// Why a preimage cannot be encoded.
 ///
-/// The encoder writes every preimage whose bytes decode back to it. It does
-/// not apply the parse bounds or R3's defect list: a writer may encode a
-/// preimage a verifier rejects, and the verifier classifies it.
+/// The encoder refuses exactly the preimages whose bytes the decoder would
+/// reject or decode to a different value, reading the decoder's own count
+/// bounds and length ceiling, so `encode_preimage` succeeding means
+/// `decode_preimage` of its bytes returns the same preimage. It does not
+/// apply R3's defect list: a writer may encode a preimage a verifier rejects,
+/// and the verifier classifies it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EncodeError {
     /// A list is too long for its 4-byte count.
@@ -161,6 +179,24 @@ pub enum EncodeError {
         /// The list.
         list: ListField,
         /// Its length.
+        len: usize,
+    },
+    /// A list is longer than the `MAX_*` constant §9.18.17 registers for it,
+    /// which the decoder rejects (§9.7.4.2, the count-bound rule).
+    #[error("the {list} has {len} entries, over its maximum {max}")]
+    CountOverMax {
+        /// The list.
+        list: ListField,
+        /// Its length.
+        len: usize,
+        /// The registered maximum.
+        max: u32,
+    },
+    /// The twelve field bytes are longer than `MAX_EVENT_BYTES` (§9.18.17),
+    /// which bounds the whole event and so the preimage within it.
+    #[error("the preimage is {len} bytes, over MAX_EVENT_BYTES")]
+    PreimageTooLong {
+        /// The field bytes' length.
         len: usize,
     },
     /// A `RootRecovery` carries no standing-root declaration, so its signer
@@ -205,12 +241,21 @@ pub enum EncodeError {
 /// Why bytes are not a key-event preimage (§9.7.4.2).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
-    /// The input is longer than `MAX_EVENT_BYTES` (§9.18.17).
+    /// The input is longer than `MAX_EVENT_BYTES` (§9.18.17). That constant
+    /// bounds the whole event, signatures included, so a preimage within it
+    /// is a necessary condition only; the event decoder checks the event.
     #[error("the preimage is {len} bytes, over MAX_EVENT_BYTES")]
-    EventTooLong {
+    PreimageTooLong {
         /// The input's length.
         len: usize,
     },
+    /// The input begins with the `"SCP-KEL-EVENT-V1:"` separator: it is the
+    /// signed preimage, and the decoder reads the twelve field bytes that
+    /// follow the separator.
+    #[error(
+        "the input begins with the SCP-KEL-EVENT-V1: separator; decode the field bytes after it"
+    )]
+    SignedPreimage,
     /// The input ends inside a field.
     #[error("the preimage ends inside its {field}")]
     Truncated {
@@ -237,20 +282,19 @@ pub enum DecodeError {
         /// The bytes left after the count.
         remaining: usize,
     },
-    /// A key-state byte is no registered value of its `scp_did` enumeration.
+    /// A byte is no registered value of its `scp_did` enumeration.
     #[error("unregistered {field} byte: {source}")]
-    UnknownDiscriminator {
+    UnknownDidDiscriminator {
         /// The field being read.
-        field: DiscriminatorField,
+        field: DidDiscriminatorField,
         /// The enumeration and the byte.
         source: UnknownDiscriminator,
     },
-    /// A preimage byte is no registered value of this crate's
-    /// discriminators.
+    /// A byte is no registered value of this crate's own discriminators.
     #[error("unregistered {field} byte 0x{value:02x}")]
-    UnknownEventDiscriminator {
+    UnknownKelDiscriminator {
         /// The field being read.
-        field: EventDiscriminatorField,
+        field: KelDiscriminatorField,
         /// The byte.
         value: u8,
     },

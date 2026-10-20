@@ -9,8 +9,8 @@ use scp_did::{
     StandingCommitment,
 };
 use scp_kel::{
-    Continuation, EventPreimage, InceptionFields, InstalledRootSet, KeyStateFields,
-    KeyStateSnapshot, SignatureForm, SignerGroup, prerotation_commitment,
+    Continuation, EventPreimage, InceptionFields, KeyStateFields, KeyStateSnapshot, SignatureForm,
+    SignerGroup, decode_preimage, encode_preimage, prerotation_commitment,
 };
 
 pub type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -130,6 +130,38 @@ pub const V51_PREROTATION: &str =
     "03f559598152c9e3b313ce1f8c4c606ba94de210265c85490239af871bbadfd52c";
 /// Spec 25 Vector 51's witness operator.
 pub const V51_WITNESS: &str = "edc22d251051440536a8fb98bf3183ad90a8e0a1b8dec9ca340c24182e550fa0";
+/// Spec 25 Vector 51's inception preimage (910 bytes, separator included).
+pub const V51_INCEPTION_PREIMAGE: &str = concat!(
+    "5343502d4b454c2d4556454e542d56313a010000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000100",
+    "0000000101000000000000000802b86554ca49a9bb429e555454b0e81c69242d",
+    "efbed440f7dde65e3fd8aabdf33d02f0c2c400b1a26dc597eba50c752ba083ee",
+    "6f3add7cdbf8049e3024b6c3851e8702c3d4e2a5c319b9869bef14077411afe3",
+    "4743396ee96376b9e07ce907eceb428b0278210550385ce3b0449d868909adf4",
+    "11a9531e886d4909063453347d58c2f437028669c107174e5219e9a66b15c6d2",
+    "805610135b853eafad7e0c6f513d4f4b02b703849d444571033da6292bc75f55",
+    "61eeed6fc4ee8787400ac6ce9daed75620361403b8d687792d2f1ccbe5cca256",
+    "09a949fa39ef2c3c2b50c48aeb0ee954c2b96635026656dfeb9ed86ebd1e0b27",
+    "40d52e9a8f4d69fef61d4157f254dce2fbcd3d21440000000100000001000000",
+    "0902b86554ca49a9bb429e555454b0e81c69242defbed440f7dde65e3fd8aabd",
+    "f33d01010000000000000000010102f0c2c400b1a26dc597eba50c752ba083ee",
+    "6f3add7cdbf8049e3024b6c3851e8701010000000000000000020102c3d4e2a5",
+    "c319b9869bef14077411afe34743396ee96376b9e07ce907eceb428b01010000",
+    "00000000000003010278210550385ce3b0449d868909adf411a9531e886d4909",
+    "063453347d58c2f437010100000000000000000401028669c107174e5219e9a6",
+    "6b15c6d2805610135b853eafad7e0c6f513d4f4b02b701010000000000000000",
+    "050103849d444571033da6292bc75f5561eeed6fc4ee8787400ac6ce9daed756",
+    "20361401010000000000000000060103b8d687792d2f1ccbe5cca25609a949fa",
+    "39ef2c3c2b50c48aeb0ee954c2b96635010100000000000000000701026656df",
+    "eb9ed86ebd1e0b2740d52e9a8f4d69fef61d4157f254dce2fbcd3d2144010100",
+    "00000000000000080102db931079de36ba5f17d6450a9e26378b05fc89704c32",
+    "e6f9bc2ea14597fee28202010000000000000000090100000001edc22d251051",
+    "440536a8fb98bf3183ad90a8e0a1b8dec9ca340c24182e550fa000000e100200",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "00000001000000016644cc0e3ef3eae7dd1274d305e48fb593acce69ed4e4cef",
+    "a9c63683174ed0ac010100000001",
+);
 /// Spec 25 Vector 51's inception digest.
 pub const V51_INCEPTION_DIGEST: &str =
     "d979b6ff80c44e340ae48ffd16f9748f234226c7a5aaf00c9465fb3e982e4645";
@@ -188,6 +220,24 @@ pub fn fields(preimage_hex: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>>
         .to_vec())
 }
 
+/// Asserts a preimage's signed bytes, field bytes and digest against a spec
+/// 25 vector, and that the printed field bytes decode back to the preimage
+/// with the same signed bytes and digest.
+pub fn assert_vector(preimage: &EventPreimage, printed_hex: &str, digest_hex: &str) -> TestResult {
+    let printed = bytes(printed_hex)?;
+    let field_bytes = fields(printed_hex)?;
+    let digest = array::<32>(digest_hex)?;
+    let encoded = encode_preimage(preimage)?;
+    assert_eq!(encoded.signed_preimage(), printed.as_slice());
+    assert_eq!(encoded.fields(), field_bytes.as_slice());
+    assert_eq!(encoded.event_digest(), digest);
+    let decoded = decode_preimage(&field_bytes)?;
+    assert_eq!(decoded.preimage(), preimage);
+    assert_eq!(decoded.signed_preimage(), printed.as_slice());
+    assert_eq!(decoded.event_digest(), digest);
+    Ok(())
+}
+
 const fn current(key: [u8; 33], role: KeyRole, custody_type: CustodyType) -> KeyEntry {
     KeyEntry {
         key,
@@ -230,10 +280,6 @@ pub fn v41_inception(form: SignatureForm) -> Result<EventPreimage, Box<dyn std::
         root_group: SignerGroup {
             indices: vec![0],
             forms: vec![form],
-        },
-        installed_root_set: InstalledRootSet {
-            members: vec![array(V41_ROOT)?],
-            threshold: 1,
         },
         key_state: v41_snapshot(3600)?,
         continuation: Continuation::FixesCommitment(StandingCommitment {
@@ -295,20 +341,13 @@ pub fn v51_snapshot(
     })
 }
 
-/// Vector 51's inception, rebuilt as its text states: the same snapshot at
-/// interval 3600, the eight root members installed 1-of-8, one raw root
-/// signature, and one `Passkey` commitment to the pre-rotation key.
+/// Vector 51's inception, as its text states: the same snapshot at interval
+/// 3600, whose eight root members the inception installs 1-of-8, one raw root
+/// signature, and one `Passkey` `EcdsaP256Sha256` commitment to the
+/// pre-rotation key with next threshold 1.
 pub fn v51_inception() -> Result<EventPreimage, Box<dyn std::error::Error>> {
-    let mut members = Vec::new();
-    for key in V51_KEYS.iter().take(8) {
-        members.push(array(key)?);
-    }
     Ok(EventPreimage::inception(InceptionFields {
         root_group: raw_root_group(),
-        installed_root_set: InstalledRootSet {
-            members,
-            threshold: 1,
-        },
         key_state: v51_snapshot(3600)?,
         continuation: Continuation::FixesCommitment(StandingCommitment {
             commitments: vec![CommitmentEntry {

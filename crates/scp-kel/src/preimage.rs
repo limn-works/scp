@@ -19,22 +19,12 @@ use crate::constants::{
     MAX_ROOT_SET_SIZE, MAX_WITNESS_SET_SIZE, PREROTATION_SEPARATOR,
 };
 use crate::error::{
-    DecodeError, DeriveIdentifierError, DiscriminatorField, EncodeError, EventDiscriminatorField,
+    DecodeError, DeriveIdentifierError, DidDiscriminatorField, EncodeError, KelDiscriminatorField,
     ListField, PreimageField,
 };
 use crate::event::{
     Continuation, EventKind, EventPreimage, InstalledRootSet, KeyStateSnapshot, SignatureForm,
-    SignerGroup, StandingRootDeclaration,
-};
-
-/// The bound on one signer index list and one signature-form list. An index
-/// list indexes a root set or a next set, and §9.18.17 caps both, so a list
-/// longer than the larger cap repeats an index. Both caps are at most 255,
-/// the one-byte index ceiling §9.18.17 states.
-const MAX_SIGNER_LIST: u32 = if MAX_ROOT_SET_SIZE > MAX_NEXT_SET_SIZE {
-    MAX_ROOT_SET_SIZE
-} else {
-    MAX_NEXT_SET_SIZE
+    SignerGroup, SignerGroupRole, StandingRootDeclaration, signer_group_roles,
 };
 
 /// A 33-byte SEC1 compressed point.
@@ -56,6 +46,60 @@ const STANDING_ROOT_ABSENT: u8 = 0x00;
 const CONTINUATION_ABANDONS: u8 = 0x00;
 /// Field 12's commitment-list byte.
 const CONTINUATION_FIXES_COMMITMENT: u8 = 0x01;
+
+/// The count bound of every count-prefixed list in the preimage and its
+/// key-state snapshot: the one table the encoder and the decoder read.
+///
+/// §9.7.4.2's count-bound rule: "The list is bounded by the `MAX_*` constant
+/// §9.18.17 registers for it … Where §9.18.17 registers no `MAX_*` for a
+/// list, the enclosing field's remaining bytes are its whole bound." A list
+/// maps to `Some(max)` exactly where a §9.18.17 row's "Read by" column names
+/// it, directly or through the R3 defect-list clause that caps it, and to
+/// `None` otherwise. Every list is also held to the bytes remaining.
+const fn count_cap(list: ListField) -> Option<u32> {
+    match list {
+        // §9.18.17 `MAX_NEXT_SET_SIZE`, read by "§9.7.4.2 R3's defect list;
+        // the reveal group; the next-threshold recommendation of §9.7.4.1
+        // item 4". The reveal group's index list: "the same one-byte signer
+        // index ceiling of 255 binds the reveal group's indices". The
+        // commitment list: R3's clause "a next set or commitment list over
+        // `MAX_NEXT_SET_SIZE` members, which the verifier reads in the
+        // continuation field of the preimage".
+        ListField::SignerIndices(SignerGroupRole::Reveal) | ListField::Commitments => {
+            Some(MAX_NEXT_SET_SIZE)
+        }
+        // §9.18.17 `MAX_ROOT_SET_SIZE`, read by "§9.7.4.2 R3's defect list;
+        // the installed-root-set field of the key-event preimage".
+        ListField::InstalledRootSet => Some(MAX_ROOT_SET_SIZE),
+        // §9.18.17 `MAX_WITNESS_SET_SIZE`, read by "§9.7.4.2 R3's defect list
+        // and R9's retained-object bound", whose R3 clause is "a witness set
+        // over `MAX_WITNESS_SET_SIZE` entries", derived as "The witness set
+        // is a repeated field of the preimage the key entries sit in".
+        ListField::Witnesses => Some(MAX_WITNESS_SET_SIZE),
+        // No §9.18.17 row names these lists. The snapshot key list is bounded
+        // by `MAX_EVENT_BYTES` (R3: "an event whose encoded length exceeds
+        // `MAX_EVENT_BYTES`, which is what bounds the snapshot's key list").
+        // The other signer groups' index lists, every form list and the
+        // revealed keys reach R3 as author-attributable defects.
+        ListField::SignerIndices(
+            SignerGroupRole::Root
+            | SignerGroupRole::ReplacementRoot
+            | SignerGroupRole::StandingRoot,
+        )
+        | ListField::SignatureForms(_)
+        | ListField::RevealedKeys
+        | ListField::SnapshotKeys
+        | ListField::Seals => None,
+    }
+}
+
+/// Whether `len` field bytes fit `MAX_EVENT_BYTES` (§9.18.17). The constant
+/// bounds the whole event, signatures included, so this is a necessary
+/// condition the preimage codec checks; the event decoder checks the event.
+/// The encoder and the decoder both read this one check.
+fn within_event_bytes(len: usize) -> bool {
+    u32::try_from(len).is_ok_and(|len| len <= MAX_EVENT_BYTES)
+}
 
 /// The event-kind byte (§9.7.4.2 field 1). The one table it is written from.
 const fn kind_byte(kind: EventKind) -> u8 {
@@ -109,49 +153,114 @@ fn sha256(parts: &[&[u8]]) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
+// The encoded preimage
+// ---------------------------------------------------------------------------
+
+/// A key-event preimage with its bytes: the value and the signed preimage
+/// `"SCP-KEL-EVENT-V1:" ‖ fields` it encodes to (§9.7.4.2 R13).
+///
+/// Only [`encode_preimage`] and [`decode_preimage`] construct one, and each
+/// guarantees that the bytes decode to the value and the value encodes to
+/// the bytes. The digest and the identifier therefore read bytes that exist
+/// and cannot fail, and a verifier digests the bytes it received with no
+/// re-encode.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EncodedPreimage {
+    preimage: EventPreimage,
+    signed: Vec<u8>,
+}
+
+impl EncodedPreimage {
+    /// The preimage these bytes encode.
+    #[must_use]
+    pub const fn preimage(&self) -> &EventPreimage {
+        &self.preimage
+    }
+
+    /// The preimage these bytes encode, by value.
+    #[must_use]
+    pub fn into_preimage(self) -> EventPreimage {
+        self.preimage
+    }
+
+    /// The signed preimage `"SCP-KEL-EVENT-V1:" ‖ fields`: the bytes every
+    /// signature, digest and identifier derivation reads, and the bytes
+    /// spec 25 prints as each vector's preimage (§9.7.4.2 R13).
+    #[must_use]
+    pub fn signed_preimage(&self) -> &[u8] {
+        &self.signed
+    }
+
+    /// The twelve field bytes, without the separator: what
+    /// [`decode_preimage`] reads (§9.7.4.2 field order).
+    #[must_use]
+    pub fn fields(&self) -> &[u8] {
+        self.signed
+            .get(KEL_EVENT_SEPARATOR.len()..)
+            .unwrap_or_default()
+    }
+
+    /// The event digest, `SHA-256(signed_preimage)` (ADR-063; §9.7.4.2).
+    #[must_use]
+    pub fn event_digest(&self) -> [u8; 32] {
+        sha256(&[&self.signed])
+    }
+
+    /// The identifier this event belongs to. For an `Inception`, R13's
+    /// derivation `SHA-256("SCP-KEL-ID-V1:" ‖ signed_preimage)`
+    /// (`03-identity.md` §3.1); for every other kind, the field 2 identifier
+    /// it carries.
+    ///
+    /// R13 derives the identifier over an inception whose identifier,
+    /// sequence and predecessor are zero. An inception carrying a nonzero
+    /// one still derives here, over its own bytes, and R3 rejects it; a
+    /// writer that must refuse it calls [`derive_identifier`].
+    #[must_use]
+    pub fn identifier(&self) -> Identifier {
+        match self.preimage.kind {
+            EventKind::Inception => {
+                Identifier::from_bytes(sha256(&[KEL_ID_SEPARATOR, &self.signed]))
+            }
+            EventKind::KeyState | EventKind::CommitmentRollover | EventKind::RootRecovery => {
+                self.preimage.identifier
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Encoding
 // ---------------------------------------------------------------------------
 
-/// The twelve field bytes of a key-event preimage, without the separator
-/// (§9.7.4.2 field order and absent-field sentinel).
+/// Encodes a key-event preimage (§9.7.4.2 field order and absent-field
+/// sentinel).
 ///
 /// # Errors
 ///
-/// [`EncodeError`] where the preimage has no encoding that decodes back to it:
-/// a list too long for its count, a signer group count its kind does not
-/// name, a field whose value would encode as that field's absent sentinel,
-/// or a nonzero `compromised_from` on an entry that is not `Compromised`.
-pub fn encode_preimage(preimage: &EventPreimage) -> Result<Vec<u8>, EncodeError> {
-    let mut out = Vec::new();
-    write_fields(preimage, &mut out)?;
-    Ok(out)
+/// [`EncodeError`] exactly where [`decode_preimage`] would reject the bytes
+/// or decode them to a different preimage: a list over its §9.18.17 maximum
+/// or too long for its count, field bytes over `MAX_EVENT_BYTES`, a signer
+/// group count its kind does not name, a field whose value would encode as
+/// that field's absent sentinel, or a nonzero `compromised_from` on an entry
+/// that is not `Compromised`.
+pub fn encode_preimage(preimage: &EventPreimage) -> Result<EncodedPreimage, EncodeError> {
+    let mut signed = KEL_EVENT_SEPARATOR.to_vec();
+    write_fields(preimage, &mut signed)?;
+    let len = signed.len().saturating_sub(KEL_EVENT_SEPARATOR.len());
+    if !within_event_bytes(len) {
+        return Err(EncodeError::PreimageTooLong { len });
+    }
+    Ok(EncodedPreimage {
+        preimage: preimage.clone(),
+        signed,
+    })
 }
 
-/// `"SCP-KEL-EVENT-V1:" ‖ encode_preimage(preimage)`: the bytes every
-/// signature, digest and identifier derivation reads (§9.7.4.2 R13; spec 25
-/// prints these bytes as each vector's preimage).
+/// The identifier an inception event derives (§9.7.4.2 R13).
 ///
-/// # Errors
-///
-/// As [`encode_preimage`].
-pub fn signed_preimage(preimage: &EventPreimage) -> Result<Vec<u8>, EncodeError> {
-    let mut out = KEL_EVENT_SEPARATOR.to_vec();
-    write_fields(preimage, &mut out)?;
-    Ok(out)
-}
-
-/// The event digest, `SHA-256(signed_preimage)` (ADR-063; §9.7.4.2).
-///
-/// # Errors
-///
-/// As [`encode_preimage`].
-pub fn event_digest(preimage: &EventPreimage) -> Result<[u8; 32], EncodeError> {
-    Ok(sha256(&[&signed_preimage(preimage)?]))
-}
-
-/// The identifier an inception event derives,
-/// `SHA-256("SCP-KEL-ID-V1:" ‖ signed_preimage)` (§9.7.4.2 R13;
-/// `03-identity.md` §3.1).
+/// It is `SHA-256("SCP-KEL-ID-V1:" ‖ signed_preimage)` (`03-identity.md`
+/// §3.1), and this function refuses any preimage that is not an inception
+/// with identifier, sequence and predecessor digest all zero.
 ///
 /// # Errors
 ///
@@ -175,8 +284,7 @@ pub fn derive_identifier(preimage: &EventPreimage) -> Result<Identifier, DeriveI
     if preimage.predecessor_digest != [0; 32] {
         return Err(DeriveIdentifierError::NonzeroPredecessor);
     }
-    let signed = signed_preimage(preimage)?;
-    Ok(Identifier::from_bytes(sha256(&[KEL_ID_SEPARATOR, &signed])))
+    Ok(encode_preimage(preimage)?.identifier())
 }
 
 /// A next-set member's commitment,
@@ -194,20 +302,27 @@ pub fn key_event_seal(sealed_event_digest: &[u8; 32]) -> [u8; 32] {
     sha256(&[KEL_SEAL_SEPARATOR, sealed_event_digest])
 }
 
+/// Writes a list's 4-byte count after checking it against [`count_cap`], the
+/// table the decoder reads.
 fn put_count(out: &mut Vec<u8>, list: ListField, len: usize) -> Result<(), EncodeError> {
+    if let Some(max) = count_cap(list)
+        && u64::try_from(len).map_or(true, |len| len > u64::from(max))
+    {
+        return Err(EncodeError::CountOverMax { list, len, max });
+    }
     let count = u32::try_from(len).map_err(|_| EncodeError::CountOverflow { list, len })?;
     out.extend_from_slice(&count.to_be_bytes());
     Ok(())
 }
 
 fn write_fields(preimage: &EventPreimage, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-    let expected = preimage
-        .expected_signer_group_count()
+    let roles = preimage
+        .signer_group_roles()
         .ok_or(EncodeError::RootRecoveryWithoutStandingRoot)?;
-    if preimage.signer_groups.len() != expected {
+    if preimage.signer_groups.len() != roles.len() {
         return Err(EncodeError::SignerGroupCount {
             kind: preimage.kind,
-            expected,
+            expected: roles.len(),
             actual: preimage.signer_groups.len(),
         });
     }
@@ -224,12 +339,12 @@ fn write_fields(preimage: &EventPreimage, out: &mut Vec<u8>) -> Result<(), Encod
     );
 
     // Field 6, then field 7, each in the kind's group order.
-    for group in &preimage.signer_groups {
-        put_count(out, ListField::SignerIndices, group.indices.len())?;
+    for (group, role) in preimage.signer_groups.iter().zip(roles) {
+        put_count(out, ListField::SignerIndices(*role), group.indices.len())?;
         out.extend_from_slice(&group.indices);
     }
-    for group in &preimage.signer_groups {
-        put_count(out, ListField::SignatureForms, group.forms.len())?;
+    for (group, role) in preimage.signer_groups.iter().zip(roles) {
+        put_count(out, ListField::SignatureForms(*role), group.forms.len())?;
         out.extend(group.forms.iter().map(|form| form_byte(*form)));
     }
 
@@ -326,16 +441,19 @@ fn write_snapshot(snapshot: &KeyStateSnapshot, out: &mut Vec<u8>) -> Result<(), 
 // Decoding
 // ---------------------------------------------------------------------------
 
-/// Decodes the twelve field bytes [`encode_preimage`] writes, over an exact
-/// slice (§9.7.4.2).
+/// Decodes the twelve field bytes, without the separator, over an exact
+/// slice (§9.7.4.2), into the preimage and its bytes.
 ///
-/// Every count is checked against its §9.18.17 `MAX_*` and against the bytes
-/// remaining before any element is read, and no allocation is sized from a
-/// wire count (§9.7.4.2, the count-bound rule). The decoder is structural: a
-/// preimage whose fields its kind does not carry, or that breaks any other
-/// R3 rule, decodes, and the verifier classifies it. It rejects a nonzero
-/// `compromised_from` on an entry that is not `Compromised`, because the
-/// snapshot order defines that field as "zero otherwise".
+/// Every count is checked against the bound [`count_cap`] gives it and
+/// against the bytes remaining before any element is read, and no allocation
+/// is sized from a wire count (§9.7.4.2, the count-bound rule). The slice is
+/// checked against `MAX_EVENT_BYTES`, which bounds the whole event; this is a
+/// necessary condition, and the event decoder checks the event itself. The
+/// decoder is structural: a preimage whose fields its kind does not carry, or
+/// that breaks any other R3 rule, decodes, and the verifier classifies it. It
+/// rejects a nonzero `compromised_from` on an entry that is not
+/// `Compromised`, because the snapshot order defines that field as "zero
+/// otherwise".
 ///
 /// Field 12's absent sentinel `BE32(0)` and its abandonment byte `0x00` are
 /// told apart by where the slice ends, so the slice must hold exactly one
@@ -344,16 +462,30 @@ fn write_snapshot(snapshot: &KeyStateSnapshot, out: &mut Vec<u8>) -> Result<(), 
 /// # Errors
 ///
 /// [`DecodeError`] naming the field or list where the bytes stop being a
-/// preimage.
-pub fn decode_preimage(bytes: &[u8]) -> Result<EventPreimage, DecodeError> {
-    if u32::try_from(bytes.len()).map_or(true, |len| len > MAX_EVENT_BYTES) {
-        return Err(DecodeError::EventTooLong { len: bytes.len() });
+/// preimage, or [`DecodeError::SignedPreimage`] where the slice still begins
+/// with the separator.
+pub fn decode_preimage(bytes: &[u8]) -> Result<EncodedPreimage, DecodeError> {
+    if !within_event_bytes(bytes.len()) {
+        return Err(DecodeError::PreimageTooLong { len: bytes.len() });
     }
+    // No field byte string begins with the separator: its first byte, `S`,
+    // is no event kind.
+    if bytes.starts_with(KEL_EVENT_SEPARATOR) {
+        return Err(DecodeError::SignedPreimage);
+    }
+    let preimage = read_fields(bytes)?;
+    let mut signed = Vec::with_capacity(KEL_EVENT_SEPARATOR.len().saturating_add(bytes.len()));
+    signed.extend_from_slice(KEL_EVENT_SEPARATOR);
+    signed.extend_from_slice(bytes);
+    Ok(EncodedPreimage { preimage, signed })
+}
+
+fn read_fields(bytes: &[u8]) -> Result<EventPreimage, DecodeError> {
     let mut reader = Reader { rest: bytes };
 
     let kind_value = reader.u8(PreimageField::EventType)?;
-    let kind = kind_from_byte(kind_value).ok_or(DecodeError::UnknownEventDiscriminator {
-        field: EventDiscriminatorField::EventType,
+    let kind = kind_from_byte(kind_value).ok_or(DecodeError::UnknownKelDiscriminator {
+        field: KelDiscriminatorField::EventType,
         value: kind_value,
     })?;
     let identifier = Identifier::from_bytes(reader.array(PreimageField::Identifier)?);
@@ -364,41 +496,36 @@ pub fn decode_preimage(bytes: &[u8]) -> Result<EventPreimage, DecodeError> {
         0x01 => Some(StandingRootDeclaration::CoSigns),
         0x02 => Some(StandingRootDeclaration::Lost),
         value => {
-            return Err(DecodeError::UnknownEventDiscriminator {
-                field: EventDiscriminatorField::StandingRoot,
+            return Err(DecodeError::UnknownKelDiscriminator {
+                field: KelDiscriminatorField::StandingRoot,
                 value,
             });
         }
     };
-    let group_count = match (kind.fixed_signer_group_count(), standing_root) {
-        (Some(count), _) => count,
-        (None, Some(declaration)) => declaration.signer_group_count(),
-        (None, None) => return Err(DecodeError::RootRecoveryWithoutStandingRoot),
-    };
+    let roles = signer_group_roles(kind, standing_root)
+        .ok_or(DecodeError::RootRecoveryWithoutStandingRoot)?;
 
     let mut index_lists = Vec::new();
-    for _ in 0..group_count {
+    for role in roles {
         let count = reader.count(
             PreimageField::SignerIndices,
-            ListField::SignerIndices,
-            Some(MAX_SIGNER_LIST),
+            ListField::SignerIndices(*role),
             1,
         )?;
         index_lists.push(reader.bytes(count, PreimageField::SignerIndices)?.to_vec());
     }
     let mut signer_groups = Vec::new();
-    for indices in index_lists {
+    for (indices, role) in index_lists.into_iter().zip(roles) {
         let count = reader.count(
             PreimageField::SignatureForms,
-            ListField::SignatureForms,
-            Some(MAX_SIGNER_LIST),
+            ListField::SignatureForms(*role),
             1,
         )?;
         let mut forms = Vec::new();
         for &value in reader.bytes(count, PreimageField::SignatureForms)? {
             forms.push(
-                form_from_byte(value).ok_or(DecodeError::UnknownEventDiscriminator {
-                    field: EventDiscriminatorField::SignatureForm,
+                form_from_byte(value).ok_or(DecodeError::UnknownKelDiscriminator {
+                    field: KelDiscriminatorField::SignatureForm,
                     value,
                 })?,
             );
@@ -406,14 +533,10 @@ pub fn decode_preimage(bytes: &[u8]) -> Result<EventPreimage, DecodeError> {
         signer_groups.push(SignerGroup { indices, forms });
     }
 
-    let revealed_keys = reader.points(
-        PreimageField::RevealedKeys,
-        ListField::RevealedKeys,
-        Some(MAX_NEXT_SET_SIZE),
-    )?;
+    let revealed_keys = reader.points(PreimageField::RevealedKeys, ListField::RevealedKeys)?;
     let installed_root_set = read_installed_root_set(&mut reader)?;
     let key_state = read_snapshot(&mut reader)?;
-    let seal_count = reader.count(PreimageField::Seals, ListField::Seals, None, DIGEST_BYTES)?;
+    let seal_count = reader.count(PreimageField::Seals, ListField::Seals, DIGEST_BYTES)?;
     let mut seals = Vec::new();
     for _ in 0..seal_count {
         seals.push(reader.array(PreimageField::Seals)?);
@@ -441,7 +564,6 @@ fn read_installed_root_set(
     let count = reader.count(
         PreimageField::InstalledRootSet,
         ListField::InstalledRootSet,
-        Some(MAX_ROOT_SET_SIZE),
         POINT_BYTES,
     )?;
     if count == 0 {
@@ -464,24 +586,19 @@ fn read_snapshot(reader: &mut Reader<'_>) -> Result<Option<KeyStateSnapshot>, De
     if root_threshold == 0 {
         return Ok(None);
     }
-    let key_count = reader.count(field, ListField::SnapshotKeys, None, KEY_ENTRY_BYTES)?;
+    let key_count = reader.count(field, ListField::SnapshotKeys, KEY_ENTRY_BYTES)?;
     let mut keys = Vec::new();
     for _ in 0..key_count {
         keys.push(read_key_entry(reader, keys.len())?);
     }
-    let witness_count = reader.count(
-        field,
-        ListField::Witnesses,
-        Some(MAX_WITNESS_SET_SIZE),
-        DIGEST_BYTES,
-    )?;
+    let witness_count = reader.count(field, ListField::Witnesses, DIGEST_BYTES)?;
     let mut witnesses = Vec::new();
     for _ in 0..witness_count {
         witnesses.push(Identifier::from_bytes(reader.array(field)?));
     }
     let witnessing_interval = u32::from_be_bytes(reader.array(field)?);
     let service_key_role =
-        discriminator::<KeyRole>(reader, field, DiscriminatorField::ServiceKeyRole)?;
+        discriminator::<KeyRole>(reader, field, DidDiscriminatorField::ServiceKeyRole)?;
     let delegator = Identifier::from_bytes(reader.array(field)?);
     Ok(Some(KeyStateSnapshot {
         root_threshold,
@@ -496,8 +613,8 @@ fn read_snapshot(reader: &mut Reader<'_>) -> Result<Option<KeyStateSnapshot>, De
 fn read_key_entry(reader: &mut Reader<'_>, entry_index: usize) -> Result<KeyEntry, DecodeError> {
     let field = PreimageField::KeyState;
     let key = reader.array(field)?;
-    let role = discriminator::<KeyRole>(reader, field, DiscriminatorField::Role)?;
-    let condition = discriminator::<KeyCondition>(reader, field, DiscriminatorField::Condition)?;
+    let role = discriminator::<KeyRole>(reader, field, DidDiscriminatorField::Role)?;
+    let condition = discriminator::<KeyCondition>(reader, field, DidDiscriminatorField::Condition)?;
     let compromised_from = u64::from_be_bytes(reader.array(field)?);
     if condition != KeyCondition::Compromised && compromised_from != 0 {
         return Err(DecodeError::CompromisedFromWithoutCompromise {
@@ -507,9 +624,9 @@ fn read_key_entry(reader: &mut Reader<'_>, entry_index: usize) -> Result<KeyEntr
         });
     }
     let custody_type =
-        discriminator::<CustodyType>(reader, field, DiscriminatorField::CustodyType)?;
+        discriminator::<CustodyType>(reader, field, DidDiscriminatorField::CustodyType)?;
     let key_algorithm =
-        discriminator::<KeyAlgorithm>(reader, field, DiscriminatorField::KeyAlgorithm)?;
+        discriminator::<KeyAlgorithm>(reader, field, DidDiscriminatorField::KeyAlgorithm)?;
     Ok(KeyEntry {
         key,
         role,
@@ -546,8 +663,8 @@ fn read_continuation(reader: &mut Reader<'_>) -> Result<Option<Continuation>, De
             let commitment = read_commitment(reader)?;
             trailing_free(reader.rest).map(|()| Some(Continuation::FixesCommitment(commitment)))
         }
-        Some((&value, _)) => Err(DecodeError::UnknownEventDiscriminator {
-            field: EventDiscriminatorField::Continuation,
+        Some((&value, _)) => Err(DecodeError::UnknownKelDiscriminator {
+            field: KelDiscriminatorField::Continuation,
             value,
         }),
     }
@@ -555,19 +672,14 @@ fn read_continuation(reader: &mut Reader<'_>) -> Result<Option<Continuation>, De
 
 fn read_commitment(reader: &mut Reader<'_>) -> Result<StandingCommitment, DecodeError> {
     let field = PreimageField::Continuation;
-    let count = reader.count(
-        field,
-        ListField::Commitments,
-        Some(MAX_NEXT_SET_SIZE),
-        COMMITMENT_ENTRY_BYTES,
-    )?;
+    let count = reader.count(field, ListField::Commitments, COMMITMENT_ENTRY_BYTES)?;
     let mut commitments = Vec::new();
     for _ in 0..count {
         let commitment = reader.array(field)?;
         let custody_type =
-            discriminator::<CustodyType>(reader, field, DiscriminatorField::CustodyType)?;
+            discriminator::<CustodyType>(reader, field, DidDiscriminatorField::CustodyType)?;
         let key_algorithm =
-            discriminator::<KeyAlgorithm>(reader, field, DiscriminatorField::KeyAlgorithm)?;
+            discriminator::<KeyAlgorithm>(reader, field, DidDiscriminatorField::KeyAlgorithm)?;
         commitments.push(CommitmentEntry {
             commitment,
             custody_type,
@@ -596,13 +708,13 @@ const fn trailing_free(trailing: &[u8]) -> Result<(), DecodeError> {
 fn discriminator<T>(
     reader: &mut Reader<'_>,
     enclosing: PreimageField,
-    field: DiscriminatorField,
+    field: DidDiscriminatorField,
 ) -> Result<T, DecodeError>
 where
     T: TryFrom<u8, Error = UnknownDiscriminator>,
 {
     let value = reader.u8(enclosing)?;
-    T::try_from(value).map_err(|source| DecodeError::UnknownDiscriminator { field, source })
+    T::try_from(value).map_err(|source| DecodeError::UnknownDidDiscriminator { field, source })
 }
 
 /// A cursor over the unread bytes.
@@ -635,17 +747,16 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
-    /// Reads a 4-byte count and checks it against `max` and against the
-    /// bytes left, before the caller reads or allocates any element.
+    /// Reads a 4-byte count and checks it against [`count_cap`] and against
+    /// the bytes left, before the caller reads or allocates any element.
     fn count(
         &mut self,
         field: PreimageField,
         list: ListField,
-        max: Option<u32>,
         element_bytes: usize,
     ) -> Result<u32, DecodeError> {
         let count = u32::from_be_bytes(self.array(field)?);
-        if let Some(max) = max
+        if let Some(max) = count_cap(list)
             && count > max
         {
             return Err(DecodeError::CountOverMax { list, count, max });
@@ -669,9 +780,8 @@ impl<'a> Reader<'a> {
         &mut self,
         field: PreimageField,
         list: ListField,
-        max: Option<u32>,
     ) -> Result<Vec<[u8; 33]>, DecodeError> {
-        let count = self.count(field, list, max, POINT_BYTES)?;
+        let count = self.count(field, list, POINT_BYTES)?;
         let mut points = Vec::new();
         for _ in 0..count {
             points.push(self.array(field)?);

@@ -2,32 +2,25 @@
 //! expected value is a spec 25 constant from `fixtures`; each test names its
 //! vector.
 
+use scp_did::{
+    CommitmentEntry, CustodyType, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
+    KeyState, StandingCommitment,
+};
 use scp_kel::{
-    DeriveIdentifierError, EventKind, EventPreimage, RoutingKind, SignatureForm, decode_preimage,
-    derive_identifier, encode_preimage, event_digest, key_event_seal, prerotation_commitment,
-    routing_id, signed_preimage,
+    Continuation, DeriveIdentifierError, EventKind, InstalledRootSet, RoutingKind, SignatureForm,
+    decode_preimage, derive_identifier, encode_preimage, key_event_seal, prerotation_commitment,
+    routing_id,
 };
 
 use crate::fixtures::{
-    TestResult, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V41_ROUTING_DID, V41_ROUTING_SVC,
-    V41_ROUTING_WCF, V41_ROUTING_WIT, V42_DIGEST, V42_IDENTIFIER, V42_PREIMAGE, V47A_COMMITMENT,
-    V47A_POINT, V47B_COMMITMENT, V47B_POINT, V48_ADDRESS, V48_IDENTIFIER, V50_DIGEST, V50_PREIMAGE,
-    V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST, V51_IDENTIFIER, V51_INCEPTION_DIGEST, V51_PREIMAGE,
-    V51_ROUTING_DID, array, bytes, fields, identifier, v41_inception, v50_key_state, v51_inception,
-    v51_key_state,
+    TestResult, V41_ACTIVE, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V41_ROOT, V41_ROUTING_DID,
+    V41_ROUTING_SVC, V41_ROUTING_WCF, V41_ROUTING_WIT, V41_WITNESS, V42_DIGEST, V42_IDENTIFIER,
+    V42_PREIMAGE, V47A_COMMITMENT, V47A_POINT, V47B_COMMITMENT, V47B_POINT, V48_ADDRESS,
+    V48_IDENTIFIER, V50_DIGEST, V50_PREIMAGE, V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST,
+    V51_IDENTIFIER, V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE, V51_KEYS, V51_PREIMAGE,
+    V51_ROUTING_DID, array, assert_vector, bytes, fields, identifier, v41_inception, v50_key_state,
+    v51_inception, v51_key_state,
 };
-
-/// Asserts a preimage's signed bytes, field bytes and digest against a spec
-/// 25 vector, and that the field bytes decode back to the preimage.
-fn assert_vector(preimage: &EventPreimage, printed_hex: &str, digest_hex: &str) -> TestResult {
-    let printed = bytes(printed_hex)?;
-    assert_eq!(signed_preimage(preimage)?, printed);
-    let field_bytes = fields(printed_hex)?;
-    assert_eq!(encode_preimage(preimage)?, field_bytes);
-    assert_eq!(event_digest(preimage)?, array::<32>(digest_hex)?);
-    assert_eq!(&decode_preimage(&field_bytes)?, preimage);
-    Ok(())
-}
 
 #[test]
 fn vector_41_preimage_digest_and_identifier() -> TestResult {
@@ -35,6 +28,12 @@ fn vector_41_preimage_digest_and_identifier() -> TestResult {
     assert_eq!(bytes(V41_PREIMAGE)?.len(), 364);
     assert_vector(&preimage, V41_PREIMAGE, V41_DIGEST)?;
     assert_eq!(derive_identifier(&preimage)?, identifier(V41_IDENTIFIER)?);
+    // The bytes a verifier received derive the same identifier with no
+    // re-encode.
+    assert_eq!(
+        decode_preimage(&fields(V41_PREIMAGE)?)?.identifier(),
+        identifier(V41_IDENTIFIER)?
+    );
     Ok(())
 }
 
@@ -53,6 +52,11 @@ fn vector_50_key_state_pins_both_composite_sentinels() -> TestResult {
     assert_vector(&preimage, V50_PREIMAGE, V50_DIGEST)?;
     // The last four bytes are field 12's sentinel, never the one byte 0x00.
     assert_eq!(bytes(V50_PREIMAGE)?.get(316..), Some(&[0u8; 4][..]));
+    // A non-inception event's identifier is the field 2 identifier it carries.
+    assert_eq!(
+        encode_preimage(&preimage)?.identifier(),
+        identifier(V41_IDENTIFIER)?
+    );
     Ok(())
 }
 
@@ -73,15 +77,66 @@ fn vector_51_key_state_carries_every_custody_type() -> TestResult {
 }
 
 #[test]
-fn vector_51_rebuilt_inception_digest_and_identifier() -> TestResult {
+fn vector_51_inception_preimage_digest_and_identifier() -> TestResult {
     let inception = v51_inception()?;
-    assert_eq!(
-        event_digest(&inception)?,
-        array::<32>(V51_INCEPTION_DIGEST)?
-    );
+    assert_eq!(bytes(V51_INCEPTION_PREIMAGE)?.len(), 910);
+    assert_vector(&inception, V51_INCEPTION_PREIMAGE, V51_INCEPTION_DIGEST)?;
     assert_eq!(derive_identifier(&inception)?, identifier(V51_IDENTIFIER)?);
-    let encoded = encode_preimage(&inception)?;
-    assert_eq!(decode_preimage(&encoded)?, inception);
+    // Field 9 is the snapshot's eight root members, installed 1-of-8.
+    let mut members = Vec::new();
+    for key in V51_KEYS.iter().take(8) {
+        members.push(array(key)?);
+    }
+    assert_eq!(
+        inception.installed_root_set,
+        Some(InstalledRootSet {
+            members,
+            threshold: 1
+        })
+    );
+    Ok(())
+}
+
+/// The V41 inception's snapshot and its continuation's commitment compose the
+/// key state that inception installs (§9.7.4.2: "A snapshot carries every
+/// component of the key state except the standing commitment").
+#[test]
+fn vector_41_snapshot_composes_its_key_state() -> TestResult {
+    let decoded = decode_preimage(&fields(V41_PREIMAGE)?)?.into_preimage();
+    let snapshot = decoded.key_state.ok_or("V41 carries a snapshot")?;
+    let Some(Continuation::FixesCommitment(commitment)) = decoded.continuation else {
+        return Err("V41 fixes a commitment".into());
+    };
+    let entry = |key, role| -> Result<KeyEntry, Box<dyn std::error::Error>> {
+        Ok(KeyEntry {
+            key: array(key)?,
+            role,
+            condition: KeyCondition::Current,
+            compromised_from: 0,
+            custody_type: CustodyType::Passkey,
+            key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
+        })
+    };
+    let expected = KeyState {
+        root_threshold: 1,
+        keys: vec![
+            entry(V41_ROOT, KeyRole::RootMember)?,
+            entry(V41_ACTIVE, KeyRole::Active)?,
+        ],
+        witnesses: vec![identifier(V41_WITNESS)?],
+        witnessing_interval: 3600,
+        service_key_role: KeyRole::Active,
+        delegator: Identifier::ZERO,
+        standing_commitment: StandingCommitment {
+            commitments: vec![CommitmentEntry {
+                commitment: array(V47A_COMMITMENT)?,
+                custody_type: CustodyType::Passkey,
+                key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
+            }],
+            next_threshold: 1,
+        },
+    };
+    assert_eq!(snapshot.into_key_state(commitment), expected);
     Ok(())
 }
 

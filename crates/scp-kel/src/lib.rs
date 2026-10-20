@@ -9,16 +9,16 @@ mod preimage;
 mod routing;
 
 pub use error::{
-    DecodeError, DeriveIdentifierError, DiscriminatorField, EncodeError, EventDiscriminatorField,
+    DecodeError, DeriveIdentifierError, DidDiscriminatorField, EncodeError, KelDiscriminatorField,
     ListField, PreimageField,
 };
 pub use event::{
     CommitmentRolloverFields, Continuation, EventKind, EventPreimage, InceptionFields,
-    InstalledRootSet, KeyStateFields, KeyStateSnapshot, RootRecoveryFields, RootRecoveryStanding,
-    SignatureForm, SignerGroup, StandingRootDeclaration,
+    InstalledRootSet, KeyStateFields, KeyStateSnapshot, RootRecoveryFields, SignatureForm,
+    SignerGroup, SignerGroupRole, StandingRootDeclaration, StandingRootSigning, signer_group_roles,
 };
 pub use preimage::{
-    decode_preimage, derive_identifier, encode_preimage, event_digest, key_event_seal,
-    prerotation_commitment, signed_preimage,
+    EncodedPreimage, decode_preimage, derive_identifier, encode_preimage, key_event_seal,
+    prerotation_commitment,
 };
 pub use routing::{RoutingKind, routing_id};
