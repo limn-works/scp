@@ -519,3 +519,61 @@ describe("native addon loader invariant", () => {
     expect(stripComments(readFileSync(DISPATCHER_TS, "utf8"))).toContain(NAPI_PACKAGE_PREFIX);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Skip-guard invariant: only `skipReasonIfAddonAbsent` produces a skip reason
+// ---------------------------------------------------------------------------
+//
+// CRITERION: a real-NAPI test file skips only when `skipReasonIfAddonAbsent`
+// in `tests/napi-guard.ts` says the addon is absent (SCP-VALID-7081). An addon
+// that fails to load, or one missing an export the file calls, fails the file.
+//
+// INDICATOR: a hand-written skip reason, meaning a variable whose name contains
+// `skip` or `reason` assigned a non-empty string or template literal. Such a
+// guard turns any load error, or a missing `testing` export, into a skip, and
+// `bun test` then exits 0 over zero executed NAPI assertions.
+
+/** Matches an assignment of a non-empty string or template literal to a skip variable. */
+const HAND_WRITTEN_SKIP = /\b\w*(?:skip|Skip|reason|Reason)\w*\s*=\s*(?:`[^`]|"[^"]|'[^'])/;
+
+/** The lines of `source` (comments stripped) that assign a hand-written skip reason. */
+function handWrittenSkips(source: string): string[] {
+  return stripComments(source)
+    .split("\n")
+    .filter((line) => HAND_WRITTEN_SKIP.test(line))
+    .map((line) => line.trim());
+}
+
+describe("native addon skip-guard invariant", () => {
+  test("no test file assigns a hand-written skip reason", () => {
+    const offenders = readdirSync(TESTS_DIR)
+      .filter((name) => name.endsWith(".ts"))
+      // This file holds the indicator's own positive control below.
+      .filter((name) => name !== basename(__filename))
+      .flatMap((name) =>
+        handWrittenSkips(readFileSync(join(TESTS_DIR, name), "utf8")).map(
+          (line) => `${name}: ${line}`,
+        ),
+      );
+    expect(offenders).toEqual([]);
+  });
+
+  // Positive control: the scan finds each hand-written guard shape and passes
+  // the shared guard's result and the empty initialiser.
+  test("the scan flags hand-written skip reasons and passes the shared guard", () => {
+    expect(
+      handWrittenSkips(
+        [
+          'skipReason = "native addon built without the `testing` feature";',
+          "  skipReason = `native addon not available`;",
+          "realSkip = 'absent';",
+        ].join("\n"),
+      ),
+    ).toHaveLength(3);
+    expect(
+      handWrittenSkips(
+        ['let skipReason = "";', "skipReason = skipReasonIfAddonAbsent(e);"].join("\n"),
+      ),
+    ).toEqual([]);
+  });
+});

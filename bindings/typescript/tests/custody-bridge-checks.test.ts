@@ -44,6 +44,7 @@ import type {
 } from "../src/scp";
 import { p256SoftwarePseudonymPoint } from "../src/scp";
 import { ECDH_VECTOR_PUBLIC_I, ECDH_VECTOR_SCALAR_I, HpkeP256Keys } from "./hpke-p256-keys";
+import { skipReasonIfAddonAbsent } from "./napi-guard";
 
 interface TestingCustody {
   generateKeypair(): Promise<string>;
@@ -72,10 +73,12 @@ let skipReason = "";
 try {
   native = loadNativeAddon();
   if (typeof native.TestingCallbackCustody !== "function") {
-    skipReason = "native addon built without the `testing` feature";
+    throw new Error(
+      "native addon has no TestingCallbackCustody: build it with the `testing` feature",
+    );
   }
 } catch (e: unknown) {
-  skipReason = `native addon not available: ${e instanceof Error ? e.message : String(e)}`;
+  skipReason = skipReasonIfAddonAbsent(e);
 }
 
 /** A host fault the keychain injects into signing or derivation. */
@@ -386,11 +389,20 @@ describe.skipIf(skipReason !== "")("napi callback custody", () => {
       expect(offCurve.length).toBe(65);
       expect(offCurve[0]).toBe(0x04);
       expect(() => vector.computeSecret(offCurve)).toThrow();
-      for (const bad of [compressed, peer.subarray(1, 33), offCurve]) {
+      const badPeers: [string, Buffer][] = [
+        ["compressed", compressed],
+        ["32-byte", peer.subarray(1, 33)],
+        ["off-curve", offCurve],
+      ];
+      for (const [label, bad] of badPeers) {
         const refused = await rejectionOf(() => custody.dhAgree(key, bad));
         expect(refused).toBeInstanceOf(CryptoError);
+        // Keyed by the peer, so a failure names the one that reached the host.
+        expect({ peer: label, hostCalls: host.dhAgreeCalls }).toEqual({
+          peer: label,
+          hostCalls: 1,
+        });
       }
-      expect(host.dhAgreeCalls).toBe(1);
     }
   });
 

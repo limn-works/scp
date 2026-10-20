@@ -42,8 +42,9 @@ try {
   addon = loadNativeAddon();
   const probe = new addon.SCP(JSON.stringify({ type: "in_memory" }));
   if (typeof probe.testingDeliverIncoming !== "function") {
-    addon = null;
-    skipReason = "native addon built without the `testing` feature";
+    throw new Error(
+      "native addon has no testingDeliverIncoming: build it with the `testing` feature",
+    );
   }
 } catch (e: unknown) {
   addon = null;
