@@ -851,6 +851,8 @@ RUST_ONLY_RUNS = {
     "docker-image": True,
     "docker-image-cache": True,
     "fuzz-build": False,
+    "kotlin-android-instrumented": False,
+    "kotlin-android-keyinfo": False,
     "kotlin-lint": False,
     "kotlin-test": True,
     "napi-addon": True,
