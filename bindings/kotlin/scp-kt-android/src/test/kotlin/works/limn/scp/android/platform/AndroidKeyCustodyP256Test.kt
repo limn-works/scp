@@ -189,6 +189,21 @@ class AndroidKeyCustodyP256Test {
 
     private fun alias(id: String) = "scp.key.$id"
 
+    /**
+     * A settled software HPKE key under [id] whose committed scalar is [scalar], written beside
+     * the adapter, so no instance has loaded its pair.
+     */
+    private fun storedSoftwareKey(
+        scalar: ByteArray,
+        id: String = SecureRandom().nextLong().toULong().toString(),
+    ): KeyHandle {
+        val records = KeyRecords(prefs)
+        records.reserve(id, KeyType.HPKE_P256, Backing.SOFTWARE, KeyRole.OPERATIONAL, TAG)
+        records.settle(id, CustodyType.SOFTWARE)
+        prefs.edit().putString("scp.p256.$id", Base64.getEncoder().encodeToString(scalar)).commit()
+        return KeyHandle(id = id, custodyType = CustodyType.SOFTWARE)
+    }
+
     /** The ids of every record [prefs] holds. */
     private fun recordIds(): Set<String> = KeyRecords(prefs).ids()
 
@@ -487,10 +502,9 @@ class AndroidKeyCustodyP256Test {
 
         @Test
         fun `a restored scalar below 2^248 keeps its leading zero byte`() {
-            val handle = custody(agreementInKeystore = false).generateKeypair(KeyType.HPKE_P256)
             val small = BigIntegers.asUnsignedByteArray(32, BigInteger(240, SecureRandom()).add(BigInteger.ONE))
             assertEquals(0.toByte(), small[0])
-            prefs.edit().putString("scp.p256.${handle.id}", Base64.getEncoder().encodeToString(small)).commit()
+            val handle = storedSoftwareKey(small)
 
             val restored = custody(agreementInKeystore = false)
             val hostPublic = restored.publicKey(handle)
@@ -501,10 +515,9 @@ class AndroidKeyCustodyP256Test {
 
         @Test
         fun `a stored scalar that is not a valid 32-byte scalar fails closed`() {
-            val handle = custody(agreementInKeystore = false).generateKeypair(KeyType.HPKE_P256)
             val n = BigIntegers.asUnsignedByteArray(32, CURVE.n)
             for (bad in listOf(ByteArray(31) { 1 }, ByteArray(33) { 1 }, ByteArray(32), n)) {
-                prefs.edit().putString("scp.p256.${handle.id}", Base64.getEncoder().encodeToString(bad)).commit()
+                val handle = storedSoftwareKey(bad)
                 val restored = custody(agreementInKeystore = false)
                 assertEquals("SCP-CRYPTO-4060", codeOf { restored.publicKey(handle) }, "size ${bad.size}")
             }
@@ -515,6 +528,26 @@ class AndroidKeyCustodyP256Test {
             val refusing = custody(agreementInKeystore = false, store = RefusingPrefs(prefs, "scp.p256."))
             assertEquals("SCP-CRYPTO-4060", codeOf { refusing.generateKeypair(KeyType.HPKE_P256) })
             assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")
+        }
+
+        @Test
+        fun `a software key destroyed through one instance stays cached in no other instance`() {
+            val destroying = custody(agreementInKeystore = false)
+            val other = custody(agreementInKeystore = false)
+            val handle = destroying.generateKeypair(KeyType.HPKE_P256)
+            val minted = destroying.publicKey(handle)
+            // The other instance loads the pair.
+            assertArrayEquals(minted, other.publicKey(handle))
+
+            destroying.destroyKey(handle)
+
+            // Under the same id, a new scalar: an instance that still caches the destroyed pair
+            // answers with the destroyed key's point.
+            val scalar = randomScalar()
+            storedSoftwareKey(scalar, id = handle.id)
+            assertArrayEquals(pointOf(scalar), other.publicKey(handle))
+            val peer = randomScalar()
+            assertArrayEquals(testingP256Ecdh(peer, pointOf(scalar)), other.dhAgree(handle, pointOf(peer)))
         }
     }
 

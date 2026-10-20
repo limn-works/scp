@@ -113,7 +113,9 @@ import org.bouncycastle.crypto.signers.Ed25519Signer
  * ## Thread safety
  *
  * Android Keystore operations are thread-safe. The key maps are [ConcurrentHashMap]s, and the
- * persisted id indexes change under one process-wide lock.
+ * persisted id indexes change under one process-wide lock. The software HPKE key pairs loaded
+ * from their scalars sit in one process-wide map under its own lock, which every instance
+ * shares, so a destroy through any instance leaves the pair cached in none.
  *
  * ## Compromise recovery
  *

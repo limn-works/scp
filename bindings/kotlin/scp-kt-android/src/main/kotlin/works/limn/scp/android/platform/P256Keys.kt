@@ -90,15 +90,6 @@ internal class P256Keys(
     private val warn: (String, Throwable) -> Unit,
 ) {
     /**
-     * Software HPKE key pairs loaded from their committed scalars. Every read and change of this
-     * map, and every write of a scalar entry, runs under the map's monitor, so a destroy that
-     * runs while another thread loads the same key cannot leave the pair cached: either the load
-     * finishes first and the destroy removes its pair, or the destroy finishes first and the
-     * load finds no scalar.
-     */
-    private val softwarePairs = HashMap<String, AsymmetricCipherKeyPair>()
-
-    /**
      * Mints a [type] key in [role] under [id] in [backing]: reserves its record (the role in
      * the same commit), creates the key, reads its custody class (from `KeyInfo` for Keystore,
      * "software" otherwise) and settles the record. A failure is rolled back through [rollBack].
@@ -239,11 +230,11 @@ internal class P256Keys(
             .generateKeyPair()
         val scalar = BigIntegers.asUnsignedByteArray(SCALAR_SIZE, (pair.private as ECPrivateKeyParameters).d)
         try {
-            synchronized(softwarePairs) {
+            synchronized(SOFTWARE_PAIRS) {
                 val committed =
                     prefs.edit().putString(scalarKey(id), Base64.getEncoder().encodeToString(scalar)).commit()
                 if (!committed) throw ScpException("Could not commit the scalar of key $id", CUSTODY_ERROR)
-                softwarePairs[id] = pair
+                SOFTWARE_PAIRS[id] = pair
             }
         } finally {
             scalar.fill(0)
@@ -268,11 +259,11 @@ internal class P256Keys(
 
     /**
      * The software key pair of [id], loaded from its committed scalar on first use, under the
-     * monitor of [softwarePairs]. A scalar that is missing, not 32 bytes, or outside [1, n − 1]
+     * monitor of [SOFTWARE_PAIRS]. A scalar that is missing, not 32 bytes, or outside [1, n − 1]
      * is `SCP-CRYPTO-4060`.
      */
-    private fun softwarePair(id: String): AsymmetricCipherKeyPair = synchronized(softwarePairs) {
-        softwarePairs[id]?.let { return@synchronized it }
+    private fun softwarePair(id: String): AsymmetricCipherKeyPair = synchronized(SOFTWARE_PAIRS) {
+        SOFTWARE_PAIRS[id]?.let { return@synchronized it }
         val text = prefs.getString(scalarKey(id), null)
             ?: custodyFailure("The record of key $id names a software scalar that is missing")
         val bytes = Base64.getDecoder().decode(text)
@@ -288,19 +279,19 @@ internal class P256Keys(
         AsymmetricCipherKeyPair(
             ECPublicKeyParameters(DOMAIN.g.multiply(d).normalize(), DOMAIN),
             ECPrivateKeyParameters(d, DOMAIN),
-        ).also { softwarePairs[id] = it }
+        ).also { SOFTWARE_PAIRS[id] = it }
     }
 
     /**
      * Deletes the material of [id] in [backing] and confirms by re-fetch: the alias by
      * `containsAlias`, the scalar by reading the entry back after a `commit()` removal. The
-     * scalar and its cached pair go under the monitor of [softwarePairs].
+     * scalar and its cached pair go under the monitor of [SOFTWARE_PAIRS].
      */
     private fun deleteMaterial(id: String, backing: Backing) {
         when (backing) {
             Backing.KEYSTORE -> if (keystore.containsAlias(keyAlias(id))) keystore.deleteConfirmed(id, keyAlias(id))
-            Backing.SOFTWARE -> synchronized(softwarePairs) {
-                softwarePairs.remove(id)
+            Backing.SOFTWARE -> synchronized(SOFTWARE_PAIRS) {
+                SOFTWARE_PAIRS.remove(id)
                 val committed = prefs.edit().remove(scalarKey(id)).commit()
                 if (!committed || prefs.getString(scalarKey(id), null) != null) {
                     throw ScpException("Key destruction failed: the scalar of key $id persisted", CUSTODY_ERROR)
@@ -338,6 +329,18 @@ internal class P256Keys(
     }
 
     private companion object {
+        /**
+         * The software HPKE key pairs loaded from their committed scalars, by key id, for every
+         * instance in the process. One map serves the process, so a destroy through any instance
+         * leaves no instance holding the destroyed pair; the single-process rule (ADR-027
+         * criterion 1) makes this sound, because every instance reads the same preferences file,
+         * so one id names one scalar. Every read and change of this map, and every write of a
+         * scalar entry, runs under the map's monitor, so a destroy that runs while another thread
+         * loads the same key cannot leave the pair cached: either the load finishes first and the
+         * destroy removes its pair, or the destroy finishes first and the load finds no scalar.
+         */
+        val SOFTWARE_PAIRS = HashMap<String, AsymmetricCipherKeyPair>()
+
         const val SCALAR_SIZE = 32
         const val DIGEST_SIZE = 32
         const val UNCOMPRESSED_SIZE = 65
