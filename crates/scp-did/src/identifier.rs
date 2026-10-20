@@ -6,14 +6,14 @@
 //! base32 encoding of those 32 bytes, lowercase and unpadded: 52 base32
 //! characters and 56 characters in all. A parser rejects every other string,
 //! uppercase or padded base32 and a DID string included, with
-//! [`IdentifierError::NonCanonicalIdentifier`], which the identity API maps to
-//! `IdentityError::NonCanonicalIdentifier` (SCP-IDENT-1106, `03-identity.md`
-//! §3.10.10).
+//! [`IdentifierError::NonCanonicalIdentifier`]. `03-identity.md` §3.1 and
+//! §3.10.10 require the identity API to surface that rejection as
+//! `IdentityError::NonCanonicalIdentifier` (SCP-IDENT-1106).
 
 use std::fmt;
 use std::str::FromStr;
 
-use data_encoding::{BASE32_NOPAD_NOCASE, DecodeKind};
+use data_encoding::BASE32_NOPAD_NOCASE;
 
 /// The prefix every identifier text form starts with.
 const PREFIX: &str = "scp:";
@@ -25,14 +25,17 @@ const BODY_LEN: usize = 52;
 /// signed preimage (`09-security-model.md` §9.7.4.2 R13).
 ///
 /// `Ord` is unsigned byte order over the 32 bytes, which the §9.11 key
-/// continuity construction relies on to order the two parties.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// continuity construction relies on to order the two parties. `Debug` writes
+/// `Identifier(` and the text form, so a log line or a failed assertion shows
+/// the same string every other surface shows.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Identifier([u8; 32]);
 
 impl Identifier {
-    /// The all-zero identifier, which the inception event carries in its
+    /// The all-zero identifier. The inception event carries it in its
     /// `identifier` field because the identifier is the digest of that event
-    /// (`09-security-model.md` §9.7.4.2 preimage field 2).
+    /// (`09-security-model.md` §9.7.4.2 preimage field 2), and a key state
+    /// carries it as its `delegator` where the identity is undelegated.
     pub const ZERO: Self = Self([0u8; 32]);
 
     /// Wraps 32 raw identifier bytes.
@@ -57,29 +60,27 @@ impl fmt::Display for Identifier {
     }
 }
 
-/// Parses only the canonical text form. The string is checked against the
-/// canonical-text predicate before any decoding, and it is never lowercased,
+impl fmt::Debug for Identifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Identifier({self})")
+    }
+}
+
+/// Parses only the canonical text form. The string is never lowercased,
 /// trimmed or unpadded first, so §3.1 admits exactly one text per identifier.
 impl FromStr for Identifier {
     type Err = IdentifierError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        check_canonical_identifier_text(s).map_err(IdentifierError::from)?;
-        let body = s
-            .strip_prefix(PREFIX)
-            .ok_or(IdentifierError::NonCanonicalIdentifier {
-                reason: NonCanonicalReason::Prefix,
-            })?;
-        let decoded = BASE32_NOPAD_NOCASE
-            .decode(body.as_bytes())
-            .map_err(|e| IdentifierError::from(reason_for_decode_kind(e.kind)))?;
-        let bytes = <[u8; 32]>::try_from(decoded.as_slice())
-            .map_err(|_| IdentifierError::from(NonCanonicalReason::Length))?;
-        Ok(Self(bytes))
+        decode_canonical(s).map(Self).map_err(IdentifierError::from)
     }
 }
 
 /// Why a string is not the canonical text form of an identifier.
+///
+/// Parsing applies the rules in the order prefix, length, alphabet, trailing
+/// bits, and reports the first rule the string breaks. A padded base32 body is
+/// 56 characters, so it reports [`Length`](Self::Length).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NonCanonicalReason {
     /// The string does not start with `scp:`.
@@ -87,7 +88,7 @@ pub enum NonCanonicalReason {
     /// The text after `scp:` is not exactly 52 characters.
     Length,
     /// A character after `scp:` is outside the lowercase RFC 4648 base32
-    /// alphabet `[a-z2-7]`, which excludes uppercase and `=` padding.
+    /// alphabet `[a-z2-7]`, an uppercase letter included.
     Alphabet,
     /// The last character sets one of the 4 bits beyond the identifier's 256,
     /// so the string decodes to the same bytes as the canonical one.
@@ -109,8 +110,8 @@ impl fmt::Display for NonCanonicalReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IdentifierError {
     /// The string is not the one canonical text form `03-identity.md` §3.1
-    /// defines. The identity API maps this variant to
-    /// `IdentityError::NonCanonicalIdentifier` (SCP-IDENT-1106, §3.10.10).
+    /// defines. §3.1 and §3.10.10 require the identity API to surface this
+    /// variant as `IdentityError::NonCanonicalIdentifier` (SCP-IDENT-1106).
     #[error("non-canonical identifier text: {reason}")]
     NonCanonicalIdentifier {
         /// Which canonical-form rule the string breaks.
@@ -124,21 +125,14 @@ impl From<NonCanonicalReason> for IdentifierError {
     }
 }
 
-/// Maps a base32 decoder rejection to the canonical-form rule it reflects.
-const fn reason_for_decode_kind(kind: DecodeKind) -> NonCanonicalReason {
-    match kind {
-        DecodeKind::Length => NonCanonicalReason::Length,
-        DecodeKind::Symbol | DecodeKind::Padding => NonCanonicalReason::Alphabet,
-        DecodeKind::Trailing => NonCanonicalReason::TrailingBits,
-    }
-}
-
 /// Returns `true` when `s` is the canonical text form of a 32-byte identifier.
 ///
-/// All of these hold for a canonical string:
+/// All of these hold for a canonical string, and [`NonCanonicalReason`] names
+/// them in this order:
 /// - it starts with `scp:`;
-/// - the rest is exactly 52 characters, each in the lowercase RFC 4648 base32
-///   alphabet `[a-z2-7]` (no padding, no uppercase);
+/// - the rest is exactly 52 characters;
+/// - each of them is in the lowercase RFC 4648 base32 alphabet `[a-z2-7]`
+///   (no padding, no uppercase);
 /// - the last character is `a` or `q`.
 ///
 /// The last rule exists because 52 characters carry 260 bits for 256 bits of
@@ -152,23 +146,52 @@ const fn reason_for_decode_kind(kind: DecodeKind) -> NonCanonicalReason {
 /// parser (`07-trust-validation-and-capabilities.md` §7.3.4.1).
 #[must_use]
 pub fn is_canonical_identifier_text(s: &str) -> bool {
-    check_canonical_identifier_text(s).is_ok()
+    decode_canonical(s).is_ok()
 }
 
-/// The canonical-text predicate, naming the first rule a string breaks.
-fn check_canonical_identifier_text(s: &str) -> Result<(), NonCanonicalReason> {
-    let body = s.strip_prefix(PREFIX).ok_or(NonCanonicalReason::Prefix)?;
-    let bytes = body.as_bytes();
-    if bytes.len() != BODY_LEN {
+/// The one canonical-form check: yields the 32 identifier bytes of a
+/// canonical string, or the first rule it breaks, in the order
+/// [`NonCanonicalReason`] states.
+fn decode_canonical(s: &str) -> Result<[u8; 32], NonCanonicalReason> {
+    let body = s
+        .strip_prefix(PREFIX)
+        .ok_or(NonCanonicalReason::Prefix)?
+        .as_bytes();
+    if body.len() != BODY_LEN {
         return Err(NonCanonicalReason::Length);
     }
-    if !bytes.iter().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')) {
-        return Err(NonCanonicalReason::Alphabet);
+    let mut out = [0u8; 32];
+    // Eight characters carry 40 bits, which are five bytes. The 52 characters
+    // make six full groups and a last group of four characters, which carries
+    // two bytes and 4 trailing bits, so the groups and the output chunks pair
+    // off exactly.
+    for (group, dst) in body.chunks(8).zip(out.chunks_mut(5)) {
+        let mut acc = 0u64;
+        for &c in group {
+            let value = symbol_value(c).ok_or(NonCanonicalReason::Alphabet)?;
+            acc = acc << 5 | u64::from(value);
+        }
+        // Left-align a short group's bits in the group's 40.
+        acc <<= 5 * (8 - group.len());
+        let mut src = acc.to_be_bytes().into_iter().skip(3);
+        for (d, b) in dst.iter_mut().zip(&mut src) {
+            *d = b;
+        }
+        // Bits past the identifier's 256: a string that sets one decodes to
+        // the same 32 bytes as the canonical one.
+        if src.any(|b| b != 0) {
+            return Err(NonCanonicalReason::TrailingBits);
+        }
     }
-    // `a` encodes 0 and `q` encodes 16: the only values whose low 4 bits are zero.
-    match bytes.last() {
-        Some(b'a' | b'q') => Ok(()),
-        _ => Err(NonCanonicalReason::TrailingBits),
+    Ok(out)
+}
+
+/// The 5-bit value of one lowercase RFC 4648 base32 character.
+const fn symbol_value(c: u8) -> Option<u8> {
+    match c {
+        b'a'..=b'z' => Some(c - b'a'),
+        b'2'..=b'7' => Some(c - b'2' + 26),
+        _ => None,
     }
 }
 
@@ -216,6 +239,18 @@ mod tests {
             assert_eq!(s.parse::<Identifier>()?.to_string(), s);
         }
         assert_eq!(Identifier::from_bytes(*id.as_bytes()), id);
+        for id in [Identifier::ZERO, Identifier::from_bytes([0xff; 32])] {
+            assert_eq!(id.to_string().parse::<Identifier>(), Ok(id));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn debug_writes_the_text_form() -> TestResult {
+        assert_eq!(
+            format!("{:?}", vector_57_identifier()?),
+            format!("Identifier({VECTOR_57})")
+        );
         Ok(())
     }
 

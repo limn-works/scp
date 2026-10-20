@@ -36,8 +36,8 @@ pub use identifier::{
     Identifier, IdentifierError, NonCanonicalReason, is_canonical_identifier_text,
 };
 pub use key_state::{
-    CommitmentEntry, CustodyType, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole, KeyState,
-    StandingCommitment, UnknownDiscriminator,
+    CommitmentEntry, CustodyType, DiscriminatorKind, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
+    KeyState, StandingCommitment, UnknownDiscriminator,
 };
 pub use relay_url::{
     BridgeEndpoint, RelayEndpoint, RelayEntryUrlError, RelayUrlError, canonical_relay_url,

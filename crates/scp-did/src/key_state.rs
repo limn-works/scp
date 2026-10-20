@@ -3,22 +3,50 @@
 //!
 //! These are the field lists the spec's key-state table and the sentence
 //! after it state, one name and one type each, so every SDK binding carries
-//! the same names. The snapshot encoding, its decoder, and R3's semantic
-//! checks live in `scp-kel`; the types here hold values and check only that
-//! each one-byte discriminator is a registered value.
+//! the same names. The types hold values and check only that each one-byte
+//! discriminator is a registered value. They neither encode nor decode the
+//! key-state snapshot, and they apply none of R3's semantic checks.
 
 use std::fmt;
+
+use crate::identifier::Identifier;
 
 /// A one-byte discriminator that is not a registered value of its
 /// enumeration. R3 rejects it under its unrecognized-discriminator clause
 /// (`09-security-model.md` §9.7.4.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, thiserror::Error)]
-#[error("unknown {field} discriminator 0x{value:02x}")]
+#[error("unknown {kind} discriminator 0x{value:02x}")]
 pub struct UnknownDiscriminator {
-    /// The type name of the enumeration the byte was read as.
-    pub field: &'static str,
+    /// The enumeration the byte was read as. It names a type, not a field:
+    /// `role` and `service_key_role` both read a [`KeyRole`].
+    pub kind: DiscriminatorKind,
     /// The unregistered byte.
     pub value: u8,
+}
+
+/// The name-bound enumerations that carry a one-byte discriminator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DiscriminatorKind {
+    /// [`KeyRole`].
+    KeyRole,
+    /// [`KeyCondition`].
+    KeyCondition,
+    /// [`CustodyType`].
+    CustodyType,
+    /// [`KeyAlgorithm`].
+    KeyAlgorithm,
+}
+
+/// Writes the type name `09-security-model.md` §9.7.4.2 gives the enumeration.
+impl fmt::Display for DiscriminatorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::KeyRole => "KeyRole",
+            Self::KeyCondition => "KeyCondition",
+            Self::CustodyType => "CustodyType",
+            Self::KeyAlgorithm => "KeyAlgorithm",
+        })
+    }
 }
 
 /// Defines a name-bound enumeration with registered one-byte discriminators:
@@ -52,7 +80,7 @@ macro_rules! name_bound_enum {
             fn try_from(value: u8) -> Result<Self, Self::Error> {
                 match value {
                     $( $byte => Ok(Self::$variant), )+
-                    _ => Err(UnknownDiscriminator { field: stringify!($name), value }),
+                    _ => Err(UnknownDiscriminator { kind: DiscriminatorKind::$name, value }),
                 }
             }
         }
@@ -172,8 +200,8 @@ pub struct StandingCommitment {
 /// An identity's derived key state at a position (`09-security-model.md`
 /// §9.7.4.2, the key state's fields).
 ///
-/// `IdentityBackend::resolve` returns this object to a caller
-/// (`03-identity.md` §3.10.10), so every binding carries these field names.
+/// `03-identity.md` §3.10.10 has `IdentityBackend::resolve` return this
+/// object to a caller, so every binding carries these field names.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KeyState {
     /// The signing threshold t of the standing root.
@@ -183,14 +211,14 @@ pub struct KeyState {
     pub keys: Vec<KeyEntry>,
     /// The designated witnesses, each a community-relay-list operator
     /// identifier.
-    pub witnesses: Vec<[u8; 32]>,
+    pub witnesses: Vec<Identifier>,
     /// The cadence in seconds at which each witness cosigns the head.
     pub witnessing_interval: u32,
     /// The role whose `Current` key signs the service record.
     pub service_key_role: KeyRole,
-    /// The delegating identity's identifier, all-zero where the identity is
-    /// undelegated.
-    pub delegator: [u8; 32],
+    /// The delegating identity's identifier, [`Identifier::ZERO`] where the
+    /// identity is undelegated.
+    pub delegator: Identifier,
     /// The commitment the latest reveal-authorized event at or before this
     /// position fixed.
     pub standing_commitment: StandingCommitment,
@@ -203,7 +231,7 @@ mod tests {
     /// Checks one enumeration against the spec's literal table: each value
     /// encodes to its registered byte and decodes back, and every byte the
     /// table does not list is rejected naming the enumeration.
-    fn assert_byte_table<T>(name: &'static str, table: &[(T, u8)], to_byte: fn(T) -> u8)
+    fn assert_byte_table<T>(kind: DiscriminatorKind, table: &[(T, u8)], to_byte: fn(T) -> u8)
     where
         T: Copy + PartialEq + fmt::Debug + TryFrom<u8, Error = UnknownDiscriminator>,
     {
@@ -211,9 +239,9 @@ mod tests {
             assert_eq!(
                 to_byte(value),
                 byte,
-                "{name}::{value:?} encodes as 0x{byte:02x}"
+                "{kind}::{value:?} encodes as 0x{byte:02x}"
             );
-            assert_eq!(T::try_from(byte), Ok(value), "{name} decodes 0x{byte:02x}");
+            assert_eq!(T::try_from(byte), Ok(value), "{kind} decodes 0x{byte:02x}");
         }
         for byte in u8::MIN..=u8::MAX {
             if table.iter().any(|&(_, b)| b == byte) {
@@ -221,11 +249,8 @@ mod tests {
             }
             assert_eq!(
                 T::try_from(byte),
-                Err(UnknownDiscriminator {
-                    field: name,
-                    value: byte
-                }),
-                "{name} rejects 0x{byte:02x}"
+                Err(UnknownDiscriminator { kind, value: byte }),
+                "{kind} rejects 0x{byte:02x}"
             );
         }
     }
@@ -233,12 +258,12 @@ mod tests {
     #[test]
     fn name_bound_enums_map_every_registered_byte_and_reject_the_rest() {
         assert_byte_table(
-            "KeyRole",
+            DiscriminatorKind::KeyRole,
             &[(KeyRole::RootMember, 0x01), (KeyRole::Active, 0x02)],
             KeyRole::to_byte,
         );
         assert_byte_table(
-            "KeyCondition",
+            DiscriminatorKind::KeyCondition,
             &[
                 (KeyCondition::Current, 0x01),
                 (KeyCondition::Superseded, 0x02),
@@ -248,7 +273,7 @@ mod tests {
             KeyCondition::to_byte,
         );
         assert_byte_table(
-            "CustodyType",
+            DiscriminatorKind::CustodyType,
             &[
                 (CustodyType::Passkey, 0x01),
                 (CustodyType::Fido2Token, 0x02),
@@ -263,7 +288,7 @@ mod tests {
             CustodyType::to_byte,
         );
         assert_byte_table(
-            "KeyAlgorithm",
+            DiscriminatorKind::KeyAlgorithm,
             &[(KeyAlgorithm::EcdsaP256Sha256, 0x01)],
             KeyAlgorithm::to_byte,
         );
@@ -275,5 +300,21 @@ mod tests {
         assert_eq!(KeyCondition::Compromised.to_string(), "Compromised");
         assert_eq!(CustodyType::Fido2Token.to_string(), "Fido2Token");
         assert_eq!(KeyAlgorithm::EcdsaP256Sha256.to_string(), "EcdsaP256Sha256");
+    }
+
+    #[test]
+    fn unknown_discriminator_names_the_spec_type() {
+        for (kind, name) in [
+            (DiscriminatorKind::KeyRole, "KeyRole"),
+            (DiscriminatorKind::KeyCondition, "KeyCondition"),
+            (DiscriminatorKind::CustodyType, "CustodyType"),
+            (DiscriminatorKind::KeyAlgorithm, "KeyAlgorithm"),
+        ] {
+            assert_eq!(kind.to_string(), name);
+        }
+        assert_eq!(
+            KeyCondition::try_from(0x05).map_err(|e| e.to_string()),
+            Err("unknown KeyCondition discriminator 0x05".to_owned())
+        );
     }
 }

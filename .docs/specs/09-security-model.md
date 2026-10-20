@@ -1235,16 +1235,16 @@ The key state carries no platform proof, and adding a proof field is a separator
 Every key the key state names carries a custody type, and that includes each member of the next set, because the next set otherwise left the substrate holding the identity's recovery authority as the one substrate no other party could read anything about.
 
 **The key state** of an identity is: the standing root with each member's custody type; every operational key that is `Current`, by role and by custody type; the standing commitment as of the latest reveal-authorized event at or before that position, which is the commitment digest list, the next threshold, and each committed member's custody type and key algorithm; the witness set with the witnessing interval; the service-key designation; and the delegator. The key list names every key `Current` at that position and, for each key the event drops, one entry naming that key's new condition, which R8 states for a `KeyState` and a `RootRecovery` alike. It names no other key, so the key state's size follows the identity's current configuration and never the chain's length. A verifier replays the log under R8, so restating every key the chain installed would make every state-carrying event grow with the square of the installed-key count and would tell a verifier nothing the replay does not. KERI's key-state notice carries the same shape, under `spec-body` §Validator and KID0003 §Key State Notice Messages.
-**The key state's fields, one name and one type each.** Every SDK binding carries these names, because `IdentityBackend::resolve` returns this object to a caller (`03-identity.md` §3.10.10). Each field's type is the one the key-state snapshot's encoding below already fixes for it.
+**The key state's fields, one name and one type each.** Every SDK binding carries these names, because `IdentityBackend::resolve` returns this object to a caller (`03-identity.md` §3.10.10). Each field's type is the one the key-state snapshot's encoding below already fixes for it. An `Identifier` is an identifier's 32 bytes (`03-identity.md` §3.1), and the encoding carries it as those 32 bytes.
 
 | Field | Type | What it holds |
 |---|---|---|
 | `root_threshold` | `u32` | The signing threshold t of the standing root |
 | `keys` | `Vec<KeyEntry>` | One entry per key the state names: every root member and every operational key |
-| `witnesses` | `Vec<[u8; 32]>` | The designated witnesses, each a community-relay-list operator identifier |
+| `witnesses` | `Vec<Identifier>` | The designated witnesses, each a community-relay-list operator identifier |
 | `witnessing_interval` | `u32` | The cadence in seconds at which each witness cosigns the head |
 | `service_key_role` | `KeyRole` | The role whose `Current` key signs the service record |
-| `delegator` | `[u8; 32]` | The delegating identity's identifier, all-zero where the identity is undelegated |
+| `delegator` | `Identifier` | The delegating identity's identifier, all-zero where the identity is undelegated |
 | `standing_commitment` | `StandingCommitment` | The commitment the latest reveal-authorized event at or before this position fixed |
 
 `KeyEntry` carries `key: [u8; 33]`, `role: KeyRole`, `condition: KeyCondition`, `compromised_from: u64`, `custody_type: CustodyType` and `key_algorithm: KeyAlgorithm`. `StandingCommitment` carries `commitments: Vec<CommitmentEntry>` and `next_threshold: u32`, and `CommitmentEntry` carries `commitment: [u8; 32]`, `custody_type: CustodyType` and `key_algorithm: KeyAlgorithm`.
