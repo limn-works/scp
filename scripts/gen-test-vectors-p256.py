@@ -1691,6 +1691,10 @@ def emit_key_event_signatures() -> None:
     emit_hex("vector_41.preimage_digest", digest_41)
     emit_hex("vector_41.identifier", identifier_41)
     emit_hex("vector_41.routing_id", sha256(b"scp:did:" + identifier_41))
+    # The other three routing derivations of §9.7.4.2 R13 over the same identifier.
+    emit_hex("vector_41.routing_id_wit", sha256(b"scp:wit:" + identifier_41))
+    emit_hex("vector_41.routing_id_wcf", sha256(b"scp:wcf:" + identifier_41))
+    emit_hex("vector_41.routing_id_svc", sha256(b"scp:svc:" + identifier_41))
     raw_sig = ecdsa_sign(REF_KEY_1.d, digest_41)
     assert ecdsa_verify(REF_KEY_1.point, digest_41, raw_sig)
     if _HAVE_CRYPTOGRAPHY:

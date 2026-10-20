@@ -10907,24 +10907,26 @@
         "crates/scp-did/src/lib.rs",
         "crates/scp-kel/src/preimage.rs",
         "crates/scp-kel/src/routing.rs",
-        "crates/scp-kel/src/lib.rs"
+        "crates/scp-kel/src/lib.rs",
+        "crates/scp-protocol/src/crypto/key_continuity.rs"
       ],
       "description": "Architecture slice S1. The key-event data model (`Identifier`, `KeyState`, `KeyEntry`, `StandingCommitment` and the name-bound enumerations) lives in the wasm-safe `scp-did` crate, and the preimage encoding, the identifier derivation and the four routing derivations live in the wasm-safe `scp-kel` leaf crate ADR-063's implementation constraints require. `09-security-model.md` §9.7.4.2's definitions and R13 state every byte. Signature verification is SCP-309.",
       "acceptanceCriteria": [
-        "`encode_preimage` reproduces the preimage bytes of Vectors 41, 42, 50 and 51 of `25-test-vectors.md` §25.26 byte for byte (`09-security-model.md` §9.7.4.2 definitions)",
-        "`event_digest` computes `SHA-256(\"SCP-KEL-EVENT-V1:\" ‖ preimage)` and `derive_identifier` computes `SHA-256(\"SCP-KEL-ID-V1:\" ‖ inception_signed_preimage)` with the identifier and predecessor-digest fields all-zero: known-answer tests over Vectors 41 and 42 (`09-security-model.md` §9.7.4.2 R13)",
-        "The four routing derivations compute `SHA-256(\"scp:did:\" ‖ id)`, `SHA-256(\"scp:wit:\" ‖ id)`, `SHA-256(\"scp:wcf:\" ‖ id)` and `SHA-256(\"scp:svc:\" ‖ id)` over the identifier's 32 raw bytes: a known-answer test per derivation (`09-security-model.md` §9.7.4.2 R13)",
+        "`signed_preimage` reproduces the preimage bytes of Vectors 41, 42, 50 and 51 of `25-test-vectors.md` §25.26 byte for byte, and `encode_preimage` reproduces the same bytes after the 17-byte `\"SCP-KEL-EVENT-V1:\"` separator, because `signed_preimage` is `\"SCP-KEL-EVENT-V1:\" ‖ encode_preimage` (`09-security-model.md` §9.7.4.2 definitions and R13)",
+        "`event_digest` computes `SHA-256` over the signed preimage, `\"SCP-KEL-EVENT-V1:\" ‖ fields`, which `signed_preimage` returns, and `derive_identifier` computes `SHA-256(\"SCP-KEL-ID-V1:\" ‖ inception_signed_preimage)` over that same signed preimage with the identifier and predecessor-digest fields all-zero: known-answer tests over Vectors 41 and 42 (`09-security-model.md` §9.7.4.2 R13)",
+        "The four routing derivations compute `SHA-256(\"scp:did:\" ‖ id)`, `SHA-256(\"scp:wit:\" ‖ id)`, `SHA-256(\"scp:wcf:\" ‖ id)` and `SHA-256(\"scp:svc:\" ‖ id)` over the identifier's 32 raw bytes: a known-answer test per derivation against the four routing ids Vector 41 of `25-test-vectors.md` §25.26 prints, and a second `scp:svc:` test against the address Vector 48 of §25.28 prints (`09-security-model.md` §9.7.4.2 R13)",
         "The pre-rotation commitment reproduces Vector 47 of `25-test-vectors.md` §25.28 byte for byte",
-        "`decode_event` rejects a preimage whose declared lengths run past its buffer and sizes no allocation from a count before reading that many elements: a test per bound (`09-security-model.md` §9.7.4.2 definitions)",
+        "`decode_preimage`, the inverse of `encode_preimage`, rejects a preimage whose declared lengths run past its buffer and sizes no allocation from a count before reading that many elements: a test per bound (`09-security-model.md` §9.7.4.2 definitions). SCP-309's `decode_event` wraps `decode_preimage`",
         "A native-versus-wasm32 known-answer test asserts that every vector above encodes to identical bytes on both targets (ADR-063, implementation constraints)",
         "`cargo tree -p scp-kel` lists no tokio and no async runtime crate",
-        "The identifier's text form encodes Vector 57 of `25-test-vectors.md` §25.29 to `scp:` and 52 lowercase unpadded base32 characters, and the parser returns `IdentityError::NonCanonicalIdentifier` for the uppercase and padded strings Vector 57 lists and for a `did:` string: a test per case (`03-identity.md` §3.1)",
+        "The identifier's text form encodes Vector 57 of `25-test-vectors.md` §25.29 to `scp:` and 52 lowercase unpadded base32 characters, and the `scp-did` parser returns `IdentifierError::NonCanonicalIdentifier` for the uppercase and padded strings Vector 57 lists and for a `did:` string: a test per case. The identity API maps `IdentifierError::NonCanonicalIdentifier` to `IdentityError::NonCanonicalIdentifier`, SCP-IDENT-1106 (`03-identity.md` §3.1, §3.10.10)",
+        "`compute_key_continuity_fingerprint` takes two `(Identifier, KeyState)` pairs and computes the `09-security-model.md` §9.11 construction, reading each party's `Current` `RootMember` entries in the key state's list order and its `Current` `Active` entry: the production function reproduces Vector 20 of `25-test-vectors.md` §25.9, and reproduces Vector 38 with the two parties supplied in reverse order",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Create the `scp-kel` crate and move the data model into `scp-did`, deleting `document.rs`.",
+        "Create the `scp-kel` crate, and add the key-event data model to `scp-did` as new modules beside the legacy code; `document.rs` and the legacy `DID` code stay until SCP-315, architecture slice S12, deletes them.",
         "Implement the preimage encoding, the digest, the identifier derivation, the commitment and the routing derivations.",
-        "Write the known-answer tests and the native-versus-wasm32 parity test."
+        "Write the known-answer tests and the native-versus-wasm32 parity test, and change `compute_key_continuity_fingerprint` to take `(Identifier, KeyState)` pairs."
       ],
       "blockedBy": [
         "SCP-307"
@@ -10945,6 +10947,18 @@
         {
           "file": ".docs/specs/03-identity.md",
           "section": "## 3.1 Root of Identity"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.11 Key Continuity Verification"
+        },
+        {
+          "file": ".docs/specs/25-test-vectors.md",
+          "section": "## 25.9 Key Continuity Fingerprint Vectors (§9.11)"
+        },
+        {
+          "file": ".docs/specs/25-test-vectors.md",
+          "section": "## 25.28 Pre-Rotation Commitment and Service Record Vectors (§9.7.4.2 definitions, `03-identity.md` §3.10.13)"
         }
       ],
       "details": {}
@@ -10969,7 +10983,7 @@
         "The client-data JSON parser rejects a document carrying a duplicate key: a test feeds `{\"challenge\":\"a\",\"challenge\":\"b\"}` and asserts rejection",
         "`validate_chain` returns `AuthorDefect` or `CopyDefect` for every defect R3 lists, with one negative fixture per defect, and returns `Valid` for Vectors 41, 42, 50 and 51 (`09-security-model.md` §9.7.4.2 R3)",
         "`replay` derives the key state from the latest state-carrying event at or before the head, and a `RootRecovery` replaces the whole key state: a test per case (`09-security-model.md` §9.7.4.2 R8)",
-        "Two fuzz targets, one over `decode_event` and one over the client-data parser, build with `cd fuzz && cargo fuzz build` and each runs 60 seconds without a crash",
+        "Two fuzz targets, one over `decode_event`, which wraps SCP-308's `decode_preimage`, and one over the client-data parser, build with `cd fuzz && cargo fuzz build` and each runs 60 seconds without a crash",
         "`validate_chain` returns `Valid` for Vector 41 extended by each of Vectors 53, 54 and 55 of `25-test-vectors.md` §25.29, and returns a defect where a `RootRecovery{CoSigns}` lacks its standing-root group: a test per case (`09-security-model.md` §9.7.4.2 R3)",
         "No unwrap() or expect() in library code"
       ],

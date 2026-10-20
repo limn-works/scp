@@ -1335,7 +1335,7 @@ Domain: `"SCP-KEYPACKAGE-ATTESTATION-V1:"`
 
 The `KeyPackageAttestation` (§9.5.2) binds **all four** of the leaf's public keys — the ephemeral MLS leaf `signature_key`, and three **distinct** DHKEM(P-256) HPKE keys: the LeafNode ratchet-tree `encryption_key`, the KeyPackage `init_key` (the Welcome-seal key), and the `scp_wrapping_key` (`0xFF01`) extension `wrapping_key` — to a DID. It is **context-agnostic** — eight fields, no `context_id`. All four are 65-byte uncompressed SEC1 P-256 points, in the encodings RFC 9420 §5.1.2 and RFC 9180 §7.1 fix and §9.5.2 states in place. The canonical hash uses the §9.5.1 construction; the P-256 signature is computed over the 32-byte hash with the reference key (§25.2). The `scp_keypackage_attestation` (`0xFF03`) LeafNode extension body is the eight fields in preimage order (deterministic length-prefixed binary — NOT MessagePack/JCS) followed by the raw 64-byte signature.
 
-This vector is fully regenerable from the inputs below. `leaf_signature_key` is the §25.2 secondary key in its uncompressed form, standing in for the ephemeral leaf `signature_key` being bound. The three HPKE keys each derive from a **fixed, documented 32-byte seed** under the §25.2 seed-to-scalar rule: `leaf_encryption_key` from `0x33×32`, `init_key` from `0x11×32`, `wrapping_key` from `0x22×32`. These are distinct keys by construction — `init_key != encryption_key` (RFC 9420: the Welcome's `EncryptedGroupSecrets` is HPKE-sealed to the KeyPackage `init_key`, NOT the LeafNode `encryption_key`), and `wrapping_key` is the separate §9.16 sender-key wrapping key.
+This vector is fully regenerable from the inputs below. `leaf_signature_key` is the §25.2 secondary key in its uncompressed form, standing in for the ephemeral leaf `signature_key` being bound. The three HPKE keys each derive from a **fixed, documented 32-byte seed** under the §25.2 seed-to-scalar rule: `leaf_encryption_key` from `0x33×32`, `init_key` from `0x11×32`, `wrapping_key` from `0x22×32`. These are distinct keys by construction — `init_key != encryption_key` (RFC 9420: the Welcome's `EncryptedGroupSecrets` is HPKE-sealed to the KeyPackage `init_key`, NOT the LeafNode `encryption_key`), and `wrapping_key` is the separate §9.16.1 stable wrapping key.
 
 Before 2026-09-10 the `leaf_encryption_key` seed was the §25.2 secondary seed. On P-256 that seed yields the same scalar as `leaf_signature_key`, which would make two of the four bound keys identical and destroy the distinctness this vector exists to demonstrate, so `leaf_encryption_key` now carries its own seed `0x33×32`.
 
@@ -1347,7 +1347,7 @@ Input:
   leaf_signature_key:  0x0423702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20aead0992a08064d996d9268dc511c7430f3a4e614871d4a888b52a8dbecb56d6da6   (65 bytes, §25.2 secondary public key, uncompressed)
   leaf_encryption_key: 0x04bb9fe4749210aad657fb3937fa97a0d79c976c442c54176ccce88477e1b32f304661cb77defd365843a4d43584afc760fed0d9a889d9cb3dd155986b446f4550   (65 bytes, from fixed seed 0x33×32 — LeafNode ratchet-tree HPKE key)
   init_key:            0x041f75a6a31cc4516a2eb0b28511c45160b976b44e8c31ec377b0c2cb67b05f0ad3195794c4fc38b105bd5f5e1239a3c73feb58bd815cbfd2fe049c084f7f88a8a   (65 bytes, from fixed seed 0x11×32 — KeyPackage Welcome-seal HPKE key)
-  wrapping_key:        0x04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac3   (65 bytes, from fixed seed 0x22×32 — scp_wrapping_key 0xFF01 §9.16 sender-key wrapping key)
+  wrapping_key:        0x04ff08966117691da4f3f0a3bbc4a63cab7193008d316127821b1e09b9e2aef925eaa5de2932cc294a2cc58f36e31a9a245f67404ad14d142d0e423901aa44cac3   (65 bytes, from fixed seed 0x22×32 — scp_wrapping_key 0xFF01 §9.16.1 stable wrapping key)
   signing_key_id:      "#active"                               (7 bytes)
   issued_at:           1700000000                              (== leaf Lifetime.not_before)
   expires_at:          1700086400                              (== leaf Lifetime.not_after; issued_at + 86400)
@@ -1468,7 +1468,7 @@ The regenerator is `#[ignore]` by default so the default `cargo test` run does n
 
 ## 25.26 Key-Event Preimage and Indexed-Signature Vectors (§9.7.4.2 definitions, §9.5)
 
-**What these vectors pin.** §9.7.4.2's definitions fix the key-event preimage's field order, so these vectors pin an inception event's own bytes, the digest of those bytes, the identifier that digest derives, and the routing id that identifier derives, then the indexed signature each of the two forms produces over the same event.
+**What these vectors pin.** §9.7.4.2's definitions fix the key-event preimage's field order, so these vectors pin an inception event's own bytes, the digest of those bytes, the identifier that digest derives, and the four routing ids that identifier derives under `09-security-model.md` §9.7.4.2 R13, then the indexed signature each of the two forms produces over the same event.
 
 **The vector identity.** A one-member root set holding §25.2's reference key, one `#active` key which is §25.2's secondary key, a one-member next set whose pre-rotation key is §25.2's tertiary key, one designated witness, and a witnessing interval of 3600 seconds. Every key carries `KeyAlgorithm` `0x01` and `CustodyType` `Passkey` (`0x01`). The key-state snapshot is 171 bytes and the preimage is 364 bytes.
 
@@ -1507,6 +1507,12 @@ Identifier, SHA-256("SCP-KEL-ID-V1:" || preimage):
   2c0f7f4478be94db0078311ef51ba3cc9934362b0f154dcbf9c597572e46cf32
 Routing id, SHA-256("scp:did:" || identifier):
   f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb
+Cosigned-head routing id, SHA-256("scp:wit:" || identifier):
+  e278b66a7481f608d58a5f11b5fa7c4221f23071172ffd0d7ec1fd94494970fe
+Conflict-statement routing id, SHA-256("scp:wcf:" || identifier):
+  31f18999c7207845a6ac3b85ce774a6f9eff1a8da300b37d2b54ff8688e07744
+Service-record routing id, SHA-256("scp:svc:" || identifier) (Vector 48's address):
+  415152a878481430157966302b508188f6715a49e2bc7072bad1c4a54af24f17
 
 Root-set member 0, 33-byte SEC1 compressed point:
   033b1cac23f45cf1cdfdf0b32f8f777b99166c1b69649c2295b1517883d47f30
@@ -1588,7 +1594,7 @@ Indexed signature, BE32(len(authenticatorData)) || authenticatorData || BE32(len
   049ebcbf9716c424
 ```
 
-**Conformance procedure.** Rebuild the preimage from the field order §9.7.4.2's definitions state and compare it byte for byte, recompute the digest, the identifier and the routing id, then run against Vector 42's indexed signature every assertion-signature check those same definitions state.
+**Conformance procedure.** Rebuild the preimage from the field order §9.7.4.2's definitions state and compare it byte for byte, recompute the digest, the identifier and the four routing ids, then run against Vector 42's indexed signature every assertion-signature check those same definitions state.
 
 
 ### Vector 50: a `KeyState` that pins both composite absent-field sentinels
@@ -2186,7 +2192,7 @@ winner:
 
 ### Vector 57: the identifier's text form
 
-`03-identity.md` §3.1 fixes the text form as `scp:` followed by the RFC 4648 base32 encoding of the identifier's 32 bytes, lowercase and without padding. A parser rejects the two variants below with `IdentityError::NonCanonicalIdentifier`.
+`03-identity.md` §3.1 fixes the text form as `scp:` followed by the RFC 4648 base32 encoding of the identifier's 32 bytes, lowercase and without padding. A parser rejects the two variants below with `IdentityError::NonCanonicalIdentifier`, or with a `NonCanonicalIdentifier` error of its own that the identity API maps to that variant (`03-identity.md` §3.1).
 
 ```
 identifier (Vector 41):
