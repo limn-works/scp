@@ -2870,11 +2870,26 @@ impl CoreFields {
     /// Called once during identity system setup, alongside [`Self::set_did_resolver`],
     /// with the SAME [`FfiDhtClient`](crate::dht::FfiDhtClient) `Arc` the resolver was built over.
     /// Subsequent calls are no-ops (`OnceLock` guarantees single
-    /// initialization).
+    /// initialization); [`Self::try_set_dht_client`] reports whether this one
+    /// took effect.
     pub fn set_dht_client(&self, client: Arc<crate::dht::FfiDhtClient>) {
-        if self.dht_client.set(client).is_err() {
+        if self.try_set_dht_client(client).is_err() {
             tracing::warn!("set_dht_client called but client already initialized — ignoring");
         }
+    }
+
+    /// Stores the shared DHT client backing the DID resolver, as
+    /// [`Self::set_dht_client`] does, and reports the outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns `client` unchanged when a client is already stored; the stored
+    /// one stays.
+    pub fn try_set_dht_client(
+        &self,
+        client: Arc<crate::dht::FfiDhtClient>,
+    ) -> Result<(), Arc<crate::dht::FfiDhtClient>> {
+        self.dht_client.set(client)
     }
 
     /// Returns the DID-resolution cache shared with the production resolver, if

@@ -237,19 +237,28 @@ pub fn testing_share_did_resolver(
             msg: "the source instance has no DHT client; create an identity on it first".to_owned(),
             code: codes::VALID_7000.to_owned(),
         })?;
-    if let Some(held) = crate::runtime::resolver_dht_client(&target.inner) {
-        if Arc::ptr_eq(&held, &client) {
-            return Ok(());
-        }
-        return Err(ScpError::Validation {
+    match crate::runtime::set_resolver_dht_client(&target.inner, client) {
+        Ok(()) => Ok(()),
+        Err(refused) => share_refused(&target, &refused),
+    }
+}
+
+/// The outcome of a share whose set the target refused because it already
+/// holds a client: `Ok` when that client is `refused` itself, so the target
+/// already resolves through the source's client, `SCP-VALID-7000` otherwise.
+fn share_refused(
+    target: &crate::scp::Scp,
+    refused: &Arc<scp_ffi_common::dht::FfiDhtClient>,
+) -> Result<(), ScpError> {
+    match crate::runtime::resolver_dht_client(&target.inner) {
+        Some(held) if Arc::ptr_eq(&held, refused) => Ok(()),
+        _ => Err(ScpError::Validation {
             msg: "the target instance already resolves through its own DHT client; share \
                   before its first identity call"
                 .to_owned(),
             code: codes::VALID_7000.to_owned(),
-        });
+        }),
     }
-    crate::runtime::set_resolver_dht_client(&target.inner, client);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -445,5 +454,19 @@ mod tests {
         assert_eq!(err.code(), codes::VALID_7000, "{err:?}");
         let kept = crate::runtime::resolver_dht_client(&target.inner).expect("target client");
         assert!(Arc::ptr_eq(&own, &kept), "the target keeps its own client");
+
+        // A refused set maps by identity: the held client itself is a no-op,
+        // any other client is SCP-VALID-7000.
+        let theirs = crate::runtime::resolver_dht_client(&source.inner).expect("source client");
+        assert!(
+            crate::runtime::set_resolver_dht_client(&target.inner, Arc::clone(&theirs)).is_err(),
+            "the target's set must refuse a second client"
+        );
+        assert!(
+            share_refused(&target, &own).is_ok(),
+            "the held client is a no-op"
+        );
+        let refused = share_refused(&target, &theirs).expect_err("another client is refused");
+        assert_eq!(refused.code(), codes::VALID_7000, "{refused:?}");
     }
 }

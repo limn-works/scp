@@ -22358,9 +22358,13 @@ pub mod tests {
             .block_on(bob.identity_create("in_memory".to_owned(), None))
             .expect("bob's identity");
         let alice = scp_test();
-        crate::runtime::set_resolver_dht_client(
-            &alice.inner,
-            crate::runtime::resolver_dht_client(&bob.inner).expect("bob's DHT client"),
+        assert!(
+            crate::runtime::set_resolver_dht_client(
+                &alice.inner,
+                crate::runtime::resolver_dht_client(&bob.inner).expect("bob's DHT client"),
+            )
+            .is_ok(),
+            "alice holds no DHT client before her first identity call"
         );
         let alice_identity = rt
             .block_on(alice.identity_create("in_memory".to_owned(), None))

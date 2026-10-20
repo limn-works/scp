@@ -338,6 +338,39 @@
 
         // MARK: - Hosts without a Secure Enclave
 
+        /// Operations dispatch on the backing recorded at mint, not on the
+        /// adapter's current probe: a key minted where the enclave was
+        /// available keeps using the enclave store after an adapter whose
+        /// probe reports no enclave reopens it.
+        @Test("a key minted in the enclave stays enclave-backed when a probe without an enclave reopens it")
+        func reopenedEnclaveKeyKeepsItsBacking() async throws {
+            let enclaveStore = SoftwareP256KeyStore()
+            let softwareStore = SoftwareP256KeyStore()
+            let minting = keyIds.p256Adapter(enclaveStore, enclaveAvailable: true, other: softwareStore)
+            let signing = try await minting.generateKeypair(keyType: "p256")
+            let wrapping = try await minting.generateKeypair(keyType: "hpke-p256")
+
+            let reopened = keyIds.p256Adapter(softwareStore, enclaveAvailable: false, other: enclaveStore)
+            #expect(reopened.mintBacking == .software)
+            let bridge = TestingCallbackCustody(provider: reopened)
+            let signingPublic = try await bridge.publicKey(keyId: signing)
+            let digest = P256Fixture.randomDigest()
+            let signature = try await bridge.sign(keyId: signing, data: digest)
+            #expect(try testingP256VerifyStrict(publicKey: signingPublic, digest: digest, signature: signature))
+            let peer = P256.KeyAgreement.PrivateKey()
+            _ = try await bridge.dhAgree(keyId: wrapping, peerPublic: peer.publicKey.x963Representation)
+            #expect(await enclaveStore.signCalls == 1)
+            #expect(await enclaveStore.agreeCalls == 1)
+            #expect(await softwareStore.signCalls == 0)
+            #expect(await softwareStore.agreeCalls == 0)
+            for keyId in [signing, wrapping] {
+                #expect(reopened.custodyType(keyId: keyId) == "hardware")
+                #expect(try bridge.custodyType(keyId: keyId) == "hardware")
+                try await bridge.destroyKey(keyId: keyId)
+                #expect(await !enclaveStore.contains(tag: reopened.applicationTag(for: keyId)))
+            }
+        }
+
         /// Spec 09 §9.5's platform signer: with no enclave, both key types
         /// mint in the software backing, sign and agree correctly, and report
         /// `"software"`, or `"software_biometric"` under `.required`.
@@ -556,17 +589,23 @@
 
         /// A mint that fails after creating its key, with a store whose
         /// delete then fails, keeps the companion: it is the only record
-        /// naming the key and its backing. A later `destroyKey` removes both.
-        @Test("a failed mint whose rollback delete fails keeps the record, and destroyKey later removes both")
+        /// naming the key and its backing. The error names the key id, so the
+        /// caller can destroy it; `destroyKey` of that id removes both. Through
+        /// the bridge the same failure is `SCP-CRYPTO-4060` naming the id.
+        @Test("a failed mint whose rollback delete fails names the key id, and destroyKey of it removes both")
         func failedRollbackKeepsTheRecordForDestroy() async throws {
             let store = SoftwareP256KeyStore()
             let custody = keyIds.p256Adapter(store)
             await store.returnInvalidPoint(true)
             await store.failNextDeletes(1)
-            await #expect(throws: PlatformError.self) {
-                _ = try await custody.generateKeypair(keyType: "p256")
+            var named: String?
+            do {
+                let keyId = try await custody.generateKeypair(keyType: "p256")
+                Issue.record("generateKeypair returned \(keyId) for an off-curve public key")
+            } catch let PlatformError.mintRollbackIncomplete(keyId, _) {
+                named = keyId
             }
-            let keyId = try #require(keyIds.drawn.last)
+            let keyId = try #require(named, "the error must name the key the rollback left")
             let tag = custody.applicationTag(for: keyId)
             #expect(await store.contains(tag: tag), "the store's delete failed, so the key remains")
             #expect(KeyIdRecorder.companionExists(keyId), "the companion must outlive a key the store still holds")
@@ -575,6 +614,18 @@
             #expect(attestation.confirmed)
             #expect(await !store.contains(tag: tag))
             #expect(!KeyIdRecorder.companionExists(keyId))
+
+            await store.failNextDeletes(1)
+            let provider: any KeyCustodyProvider = custody
+            do {
+                let handle = try await provider.generateKeypair(keyType: .p256, role: .operational)
+                Issue.record("the bridge minted \(handle) for an off-curve public key")
+            } catch let ScpError.Crypto(msg, code) {
+                #expect(code == "SCP-CRYPTO-4060")
+                let bridged = try #require(keyIds.drawn.last)
+                #expect(msg.contains("'\(bridged)'"), "the bridge error must name the key id: \(msg)")
+                _ = try await custody.destroyKey(bridged)
+            }
         }
 
         /// A failed mint whose store deletes cleanly leaves nothing.

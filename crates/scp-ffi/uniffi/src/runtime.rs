@@ -2228,12 +2228,16 @@ pub fn resolver_dht_client(
 /// Two instances given one client resolve each other's DIDs, as two processes
 /// sharing the Mainline DHT do. Call it before `bi`'s first identity call: the
 /// resolver keeps the client set first, and a later call changes nothing.
+///
+/// # Errors
+///
+/// Returns `client` when `bi` already holds a client, which stays in place.
 #[cfg(feature = "testing")]
 pub fn set_resolver_dht_client(
     bi: &UniffiBridgeInstance,
     client: Arc<scp_ffi_common::dht::FfiDhtClient>,
-) {
-    bi.core.set_dht_client(client);
+) -> Result<(), Arc<scp_ffi_common::dht::FfiDhtClient>> {
+    bi.core.try_set_dht_client(client)
 }
 
 /// Selects the governance key resolver for a bridge instance core.

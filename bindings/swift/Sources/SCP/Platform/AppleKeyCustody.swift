@@ -39,6 +39,12 @@ public nonisolated enum PlatformError: Error, Sendable {
     /// this failure with a software key: the backing is chosen once, from the
     /// probe, and an enclave host stays an enclave host (ADR-025 criterion 8).
     case secureEnclaveKeyCreationFailed(OSStatus)
+    /// A P-256 mint failed after its key may have been created, and the
+    /// rollback could not confirm that key gone. `keyId` names the key and
+    /// its companion record, both of which remain; ``AppleKeyCustody/destroyKey(_:)``
+    /// of `keyId` removes them. `cause` describes the failure that started
+    /// the rollback.
+    case mintRollbackIncomplete(keyId: String, cause: String)
     /// A general custody operation failed for reasons other than the variants
     /// above.
     case custodyError(String)
@@ -60,6 +66,8 @@ nonisolated extension PlatformError: LocalizedError {
             "Biometric authentication failed: \(detail)"
         case let .secureEnclaveKeyCreationFailed(status):
             "Secure Enclave key generation failed with OSStatus \(status); no software key is substituted"
+        case let .mintRollbackIncomplete(keyId, cause):
+            "Key generation failed (\(cause)) and key id '\(keyId)' could not be confirmed removed; destroy it"
         case let .custodyError(message):
             "Key custody error: \(message)"
         }
@@ -816,8 +824,7 @@ extension AppleKeyCustody {
                 )
                 return handle
             } catch {
-                await rollBackMint(handle: handle, tag: tag, store: store)
-                throw error
+                throw await rollBackMint(handle: handle, tag: tag, store: store, cause: error)
             }
         }
         throw PlatformError.custodyError(
@@ -842,18 +849,26 @@ extension AppleKeyCustody {
         return !taken
     }
 
-    /// Removes what a failed P-256 mint added.
+    /// Removes what a failed P-256 mint added and returns the error the mint
+    /// throws.
     ///
     /// The companion is the only record that names the key and its backing,
-    /// so it is deleted only after the store reports no key under `tag`. When
-    /// the store cannot delete the key or cannot answer, the companion stays
-    /// and a later ``destroyKey(_:)`` of `handle` removes both. Errors here
-    /// are not rethrown: the caller rethrows the failure that started the
-    /// rollback, and what remains is recoverable through `destroyKey`.
-    private nonisolated func rollBackMint(handle: String, tag: Data, store: any P256KeyStore) async {
+    /// so it is deleted only after the store reports no key under `tag`;
+    /// the mint then throws `cause` unchanged. When the store cannot delete
+    /// the key or cannot answer, the key may be permanent and the companion
+    /// stays, so the mint throws
+    /// ``PlatformError/mintRollbackIncomplete(keyId:cause:)`` naming `handle`:
+    /// no caller learns the id of a failed mint any other way, and
+    /// ``destroyKey(_:)`` of that id removes both.
+    private nonisolated func rollBackMint(
+        handle: String, tag: Data, store: any P256KeyStore, cause: Error
+    ) async -> Error {
         _ = try? await store.delete(tag: tag)
-        guard (try? await store.contains(tag: tag)) == false else { return }
+        guard (try? await store.contains(tag: tag)) == false else {
+            return PlatformError.mintRollbackIncomplete(keyId: handle, cause: cause.localizedDescription)
+        }
         try? deleteCompanion(handle: handle)
+        return cause
     }
 
     /// The public key `publicKey(_:)` returns for a `keyType` key whose
@@ -1519,6 +1534,8 @@ public extension AppleKeyCustody {
 /// - an `ScpError` from the shared Rust helpers passes through unchanged;
 /// - ``PlatformError/keyNotFound(_:)`` becomes `SCP-CRYPTO-4006`, which the
 ///   bridge reports as key-not-found;
+/// - ``PlatformError/mintRollbackIncomplete(keyId:cause:)`` becomes
+///   `SCP-CRYPTO-4060` whose message names the key id to destroy;
 /// - every other failure becomes `SCP-CRYPTO-4060`, the custody error,
 ///   carrying the adapter's description.
 ///
@@ -1539,6 +1556,11 @@ extension AppleKeyCustody: KeyCustodyProvider {
             return scpError
         case let PlatformError.keyNotFound(handle):
             return .Crypto(msg: "Key not found for key id '\(handle)'", code: keyNotFoundCode)
+        case let PlatformError.mintRollbackIncomplete(keyId, cause):
+            return .Crypto(
+                msg: "Key generation failed (\(cause)); key id '\(keyId)' remains and must be destroyed",
+                code: custodyErrorCode
+            )
         default:
             return .Crypto(msg: error.localizedDescription, code: custodyErrorCode)
         }

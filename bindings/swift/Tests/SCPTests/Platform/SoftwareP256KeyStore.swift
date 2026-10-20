@@ -23,6 +23,9 @@
         /// How many times `agree` reached a key, so a test can prove the
         /// adapter refused a peer before the agreement ran.
         private(set) var agreeCalls = 0
+        /// How many times `sign` reached a key, so a test can prove which
+        /// store a signature came from.
+        private(set) var signCalls = 0
         /// How many keys `create` made, so a test can prove nothing was
         /// generated.
         private(set) var createCalls = 0
@@ -100,9 +103,11 @@
         }
 
         func sign(tag: Data, digest: Data) throws -> Data {
+            let signer = try key(tag)
+            signCalls += 1
             var cfError: Unmanaged<CFError>?
-            guard let der = try SecKeyCreateSignature(
-                key(tag), .ecdsaSignatureDigestX962SHA256, digest as CFData, &cfError
+            guard let der = SecKeyCreateSignature(
+                signer, .ecdsaSignatureDigestX962SHA256, digest as CFData, &cfError
             ) else {
                 throw KeychainP256KeyStore.operationError("software P-256 signing", tag: tag, cfError)
             }
