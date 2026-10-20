@@ -1656,16 +1656,24 @@ async fn grading_permits_bound_leaked_threads() {
 // ---------------------------------------------------------------------------
 
 async fn invoke(h: &Harness, handler: EvaluatorHandler) -> EvaluatorOutcome {
+    invoke_on(h, &registry(), handler).await
+}
+
+/// [`invoke`] against `registry` in place of the default judge.
+async fn invoke_on(
+    h: &Harness,
+    registry: &OutletRegistry,
+    handler: EvaluatorHandler,
+) -> EvaluatorOutcome {
     let permit = Arc::new(
         h.sup
             .challenge_grading_permit(did(1).as_ref())
             .await
             .unwrap(),
     );
-    let registry = registry();
     invoke_evaluator_outlet(
         &h.sup,
-        Some(&registry),
+        Some(registry),
         Some(handler),
         EvaluatorCall {
             evaluator_context_id: EVAL_CTX,
@@ -1790,6 +1798,120 @@ async fn evaluator_input_refused_by_schema_fails_the_case() {
         EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned())
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// The judge with `output_schema` in place of its own.
+fn registry_with_output_schema(output_schema: Value) -> OutletRegistry {
+    let mut registration = judge();
+    registration.schema.output_schema = output_schema;
+    let mut registry = OutletRegistry::new();
+    registry.insert(registration);
+    registry
+}
+
+/// The case-failed outcome spec 07 §7.3.4 step 3 names for an evaluator
+/// error after the evaluator started.
+fn case_failed() -> EvaluatorOutcome {
+    EvaluatorOutcome::CaseFailed(EVALUATOR_FAILED_REASON.to_owned())
+}
+
+/// A panic after the evaluator started fails the case (spec 07 §7.3.4 step
+/// 3, "a panic"): outcome `CaseFailed`, never a fault. A handler that
+/// panics is caught on its blocking thread; a pipeline task that panics
+/// after the start is caught at its join. A pipeline that panics before the
+/// start ran no evaluator, so that one alone is a fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_panic_after_start_fails_the_case() {
+    let h = Harness::new(evaluator_params()).await;
+    let entered = Arc::new(AtomicUsize::new(0));
+    let panicking: EvaluatorHandler = {
+        let entered = Arc::clone(&entered);
+        Arc::new(move |_| {
+            entered.fetch_add(1, Ordering::SeqCst);
+            panic!("evaluator handler panicked")
+        })
+    };
+    let outcome = invoke(&h, panicking).await;
+    assert_eq!(entered.load(Ordering::SeqCst), 1, "the handler started");
+    assert_eq!(outcome, case_failed(), "a handler panic is CaseFailed");
+
+    let panicked = tokio::spawn(async { panic!("evaluator pipeline panicked") })
+        .await
+        .unwrap_err();
+    assert!(panicked.is_panic());
+    let outcome = classify_evaluator_result(
+        Err(panicked),
+        &AtomicBool::new(true),
+        &Mutex::new(None),
+        &json!({"type": "object"}),
+    );
+    assert_eq!(outcome, case_failed(), "a pipeline panic is CaseFailed");
+
+    let before = tokio::spawn(async { panic!("evaluator pipeline panicked") })
+        .await
+        .unwrap_err();
+    let outcome = classify_evaluator_result(
+        Err(before),
+        &AtomicBool::new(false),
+        &Mutex::new(None),
+        &json!({"type": "object"}),
+    );
+    assert!(
+        matches!(outcome, EvaluatorOutcome::Unavailable(_)),
+        "{outcome:?}"
+    );
+}
+
+/// An evaluator output that its output schema refuses fails the case (spec
+/// 07 §7.3.4 step 3, "an input or output schema mismatch"): outcome
+/// `CaseFailed`, even though the output is a well-formed verdict, because a
+/// verdict the schema refuses is no verdict and the settlement never ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_output_refused_by_schema_fails_the_case() {
+    let h = Harness::new(evaluator_params()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let schema = json!({"type": "object", "required": ["passed", "reason", "score"]});
+    assert!(validate_value_against_schema(&verdict(true), &schema).is_err());
+    let registry = registry_with_output_schema(schema);
+    let outcome = invoke_on(&h, &registry, passing_handler(&calls)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the handler started");
+    assert_eq!(
+        outcome,
+        case_failed(),
+        "an output schema mismatch is CaseFailed"
+    );
+}
+
+/// An evaluator output whose output-schema validation stops at the
+/// regular-expression backtrack limit fails the case (spec 07 §7.3.4 step
+/// 3, "a regular-expression backtracking limit"): outcome `CaseFailed`. The
+/// outlet registration's schema passes no challenge schema gate, so a
+/// backtracking pattern reaches the evaluator path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_output_at_the_backtrack_limit_fails_the_case() {
+    let h = Harness::new(evaluator_params()).await;
+    let schema = json!({
+        "type": "object",
+        "properties": {"reason": {"type": "string", "pattern": "^(a*)*\\1b$"}}
+    });
+    let output = json!({"passed": true, "reason": "a".repeat(64)});
+    let refusal = validate_value_against_schema(&output, &schema).unwrap_err();
+    assert!(
+        refusal.contains("backtracking count exceeded"),
+        "the validation must stop at the backtrack limit, got {refusal}"
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler: EvaluatorHandler = {
+        let calls = Arc::clone(&calls);
+        Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(output.clone())
+        })
+    };
+    let registry = registry_with_output_schema(schema);
+    let outcome = invoke_on(&h, &registry, handler).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the handler started");
+    assert_eq!(outcome, case_failed(), "a backtrack limit is CaseFailed");
 }
 
 // ---------------------------------------------------------------------------
