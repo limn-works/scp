@@ -39,7 +39,7 @@ import {
 import type { SiteConfig } from "../src/types";
 import { createInMemoryIdentity } from "./harness-custody";
 import { mountMockScp } from "./mock-bridge";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Minimal mock for NativeNodeHandle (bypasses native addon loading)
@@ -542,19 +542,9 @@ describe("SCP.nodeStart error codes (SCP-324)", () => {
 // SCP.nodeStart against the real napi addon
 // ---------------------------------------------------------------------------
 
-let realScp: SCP | null = null;
-let realSkip = "";
-try {
-  realScp = new SCP({ storage: { type: "in_memory" } });
-} catch (e: unknown) {
-  realSkip = skipReasonIfAddonAbsent(e);
-}
+const suite = await napiSuite(() => new SCP({ storage: { type: "in_memory" } }));
 
-if (realScp === null) {
-  describe("SCP.nodeStart on the napi addon (SKIPPED)", () => {
-    it.skip(`skipped: ${realSkip}`, () => {});
-  });
-} else {
+suite.describe("SCP.nodeStart on the napi addon", (realScp) => {
   const scp = realScp;
   /** The raw napi `SCP.nodeStart`, for configs the SDK would not lower. */
   const rawNodeStart = (configJson: string, identity: Identity): Promise<unknown> =>
@@ -750,4 +740,4 @@ if (realScp === null) {
       }
     });
   });
-}
+});

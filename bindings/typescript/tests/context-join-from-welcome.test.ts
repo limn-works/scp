@@ -43,7 +43,7 @@ import { SCP } from "../src/scp";
 import type { SealedInvitation } from "../src/types";
 import { createInMemoryIdentity } from "./harness-custody";
 import { mountMockScp } from "./mock-bridge";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 /**
  * The P-256 generator, SEC1-uncompressed: a valid 65-byte DHKEM(P-256) `enc`
@@ -265,21 +265,12 @@ describe("SCP.contextJoinFromWelcome — delegation, sealed-bundle marshaling", 
 // Layer 2 — real NAPI addon
 // ---------------------------------------------------------------------------
 
-let scpAvailable = false;
-let skipReason = "";
-try {
+const suite = await napiSuite(() => {
   const probe = new SCP({ storage: { type: "in_memory" } });
-  scpAvailable = true;
   probe.shutdown(1).catch(() => {});
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+});
 
-if (!scpAvailable) {
-  describe("reserve → invite → join handshake (SKIPPED)", () => {
-    test.skip(`native NAPI addon unavailable: ${skipReason}`, () => {});
-  });
-} else {
+suite.describe("reserve → invite → join handshake", () => {
   describe("SCP.reserveKeyPackage (real NAPI)", () => {
     test("reserves a real KeyPackage under a locally-custodied identity", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
@@ -576,4 +567,4 @@ if (!scpAvailable) {
       }
     });
   });
-}
+});

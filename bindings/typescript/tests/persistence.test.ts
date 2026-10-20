@@ -31,14 +31,14 @@
  * (browser runtime, missing platform binary).
  */
 
-import { describe, expect, it } from "bun:test";
+import { expect, it } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { SCP } from "../src/scp";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 // Stable 32-byte SQLCipher key. The specific value does not matter;
 // only that the same key is reused across the two SCP constructions
@@ -58,24 +58,14 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   }
 }
 
-// Detects whether the NAPI addon is installed. A cheap
-// `new SCP({ storage: { type: "in_memory" } })` runs inside a try/catch, and
-// `skipReasonIfAddonAbsent` skips the suite only when no addon is installed
-// for this platform. Every other construction failure fails the file.
-function napiAvailable(): boolean {
-  try {
-    const probe = new SCP({ storage: { type: "in_memory" } });
-    probe.shutdown(1).catch(() => {});
-    return true;
-  } catch (e: unknown) {
-    skipReasonIfAddonAbsent(e);
-    return false;
-  }
-}
+// The suite skips only when no NAPI addon is installed for this platform
+// (`napiSuite`); every other probe failure fails the file.
+const suite = await napiSuite(() => {
+  const probe = new SCP({ storage: { type: "in_memory" } });
+  probe.shutdown(1).catch(() => {});
+});
 
-const describeNapi = napiAvailable() ? describe : describe.skip;
-
-describeNapi("SCP with SQLite storage (#1549 PR 3)", () => {
+suite.describe("SCP with SQLite storage (#1549 PR 3)", () => {
   it("creates the SQLCipher database file at {path}/scp.db", async () => {
     await withTempDir(async (dir) => {
       const dbPath = join(dir, "scp.db");

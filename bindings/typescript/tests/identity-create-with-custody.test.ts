@@ -34,21 +34,16 @@ import {
   ECDH_VECTOR_SHARED_X,
   HpkeP256Keys,
 } from "./hpke-p256-keys";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Probe: is the NAPI-backed SCP class available in this environment?
 // ---------------------------------------------------------------------------
 
-let scpAvailable = false;
-let skipReason = "";
-try {
+const suite = await napiSuite(() => {
   const probe = new SCP({ storage: { type: "in_memory" } });
-  scpAvailable = true;
   probe.shutdown(1).catch(() => {});
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+});
 
 // ---------------------------------------------------------------------------
 // Real-Ed25519 and real-P-256 custody provider backed by node:crypto
@@ -236,11 +231,7 @@ describe("CryptoKeychain hpke-p256", () => {
   });
 });
 
-if (!scpAvailable) {
-  describe("identityCreateWithCustody (SKIPPED)", () => {
-    test.skip(`native NAPI addon unavailable: ${skipReason}`, () => {});
-  });
-} else {
+suite.describe("identityCreateWithCustody", () => {
   describe("SCP.identityCreateWithCustody (real NAPI)", () => {
     test("creates a did:dht identity backed by a JS custody provider", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
@@ -394,4 +385,4 @@ if (!scpAvailable) {
       }
     });
   });
-}
+});

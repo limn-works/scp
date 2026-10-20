@@ -522,124 +522,80 @@ describe("native addon loader invariant", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Skip-guard invariant: every catch an addon load reaches asks napi-guard
+// Skip invariant: only napi-guard.ts skips a test
 // ---------------------------------------------------------------------------
 //
-// CRITERION: a real-NAPI test file skips only when `skipReasonIfAddonAbsent`
-// in `tests/napi-guard.ts` reports the addon absent (SCP-VALID-7081). An addon
-// that fails to load, or one missing an export the file calls, fails the file.
+// CRITERION: under `tests/`, only code in `napi-guard.ts` turns a test into a
+// skipped one, and it does so only when the loader reports the addon absent
+// (SCP-VALID-7081). Every real-NAPI file registers its suite through
+// `napiSuite`, so an addon that fails to load, or one missing an export the
+// file calls, fails the file instead of skipping it.
 //
-// The check parses each file under `tests/` and finds every `try` statement
-// with a `catch` clause whose `try` block contains, at any depth, a `loadNativeAddon(...)` call or a
-// `new SCP(...)` / `new <expr>.SCP(...)` construction. Each such statement's
-// `catch` block must call `skipReasonIfAddonAbsent(...)`. The check reads the
-// syntax tree, not variable names, so a boolean guard (`return false`) and a
-// skip-reason guard are held to the same rule.
-//
-// It cannot decide a `try` that reaches the loader only through another
-// function, such as an SDK helper that loads the addon on first use; such a
-// `try` is not checked.
+// Indicators the check matches: it parses every `.ts` file under `tests/`
+// except `napi-guard.ts` and flags each property access, string-keyed element
+// access, or destructuring binding named `skip`, `skipIf`, `todo` or `todoIf`,
+// whatever expression it is read from. Matching the property name rather than
+// the receiver catches `describe.skip`, `it.skip`, `test.skip`, `.skipIf(`,
+// `.todo(`, and a `describe` or `test` reached through an alias
+// (`const d = describe; d.skip(...)`, `const { skip } = test`). A key computed
+// at run time (`describe["sk" + "ip"]`) is not seen.
 
-/** Whether `node` loads the native addon directly. */
-function isAddonLoad(node: ts.Node): boolean {
-  if (
-    ts.isCallExpression(node) &&
-    ts.isIdentifier(node.expression) &&
-    node.expression.text === "loadNativeAddon"
-  ) {
-    return true;
-  }
-  if (ts.isNewExpression(node)) {
-    const callee = node.expression;
-    if (ts.isIdentifier(callee)) return callee.text === "SCP";
-    if (ts.isPropertyAccessExpression(callee)) return callee.name.text === "SCP";
-  }
-  return false;
-}
+const SKIP_NAMES = new Set(["skip", "skipIf", "todo", "todoIf"]);
+const NAPI_GUARD = "napi-guard.ts";
 
-/** Whether `node` calls `skipReasonIfAddonAbsent`. */
-function isGuardCall(node: ts.Node): boolean {
-  return (
-    ts.isCallExpression(node) &&
-    ts.isIdentifier(node.expression) &&
-    node.expression.text === "skipReasonIfAddonAbsent"
-  );
-}
-
-/** Whether `root` or any descendant satisfies `predicate`. */
-function containsNode(root: ts.Node, predicate: (node: ts.Node) => boolean): boolean {
-  if (predicate(root)) return true;
-  return ts.forEachChild(root, (child) => containsNode(child, predicate) || undefined) === true;
-}
-
-/** The load-reachable `try`/`catch` statements in `source`, with whether each catch asks the guard. */
-function loadGuards(fileName: string, source: string): { line: number; guarded: boolean }[] {
+/** The 1-based lines in `source` that read a skip construct. */
+function skipSites(fileName: string, source: string): number[] {
   const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
-  const found: { line: number; guarded: boolean }[] = [];
+  const lines: number[] = [];
   const visit = (node: ts.Node): void => {
-    if (ts.isTryStatement(node) && node.catchClause && containsNode(node.tryBlock, isAddonLoad)) {
-      found.push({
-        line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1,
-        guarded: containsNode(node.catchClause.block, isGuardCall),
-      });
+    let name: string | undefined;
+    if (ts.isPropertyAccessExpression(node)) {
+      name = node.name.text;
+    } else if (
+      ts.isElementAccessExpression(node) &&
+      ts.isStringLiteralLike(node.argumentExpression)
+    ) {
+      name = node.argumentExpression.text;
+    } else if (ts.isBindingElement(node)) {
+      const key = node.propertyName ?? node.name;
+      if (ts.isIdentifier(key) || ts.isStringLiteralLike(key)) name = key.text;
+    }
+    if (name !== undefined && SKIP_NAMES.has(name)) {
+      lines.push(file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1);
     }
     ts.forEachChild(node, visit);
   };
   visit(file);
-  return found;
+  return lines;
 }
 
-describe("native addon skip-guard invariant", () => {
-  test("every catch an addon load reaches calls skipReasonIfAddonAbsent", () => {
-    const guards = readdirSync(TESTS_DIR)
-      .filter((name) => name.endsWith(".ts"))
-      .flatMap((name) =>
-        loadGuards(name, readFileSync(join(TESTS_DIR, name), "utf8")).map((g) => ({
-          ...g,
-          name,
-        })),
-      );
-    // The check read real guards, so it cannot pass over an empty file set.
-    expect(guards.filter((g) => g.guarded).length).toBeGreaterThan(0);
-    expect(guards.filter((g) => !g.guarded).map((g) => `${g.name}:${g.line}`)).toEqual([]);
+describe("test skip invariant", () => {
+  test("no file under tests/ other than napi-guard.ts reads a skip construct", () => {
+    const names = readdirSync(TESTS_DIR).filter(
+      (name) => name.endsWith(".ts") && name !== NAPI_GUARD,
+    );
+    // The check read real files, so it cannot pass over an empty file set.
+    expect(names.length).toBeGreaterThan(0);
+    const offenders = names.flatMap((name) =>
+      skipSites(name, readFileSync(join(TESTS_DIR, name), "utf8")).map((line) => `${name}:${line}`),
+    );
+    expect(offenders).toEqual([]);
   });
 
-  // Positive control: the guard shapes of lifecycle.test.ts (a boolean probe
-  // around `new SCP`) and scp-class.test.ts (a module-level `loadNativeAddon`)
-  // with their guard call deleted are each flagged; with it, each passes.
-  test("the check flags the real guard shapes once their guard call is deleted", () => {
-    const lifecycle = (guard: string) => `
-function napiAvailable(): boolean {
-  try {
-    const probe = new SCP({ storage: { type: "in_memory" } });
-    probe.shutdown(1).catch(() => {});
-    return true;
-  } catch (e: unknown) {
-    ${guard}
-    return false;
-  }
-}`;
-    const scpClass = (guard: string) => `
-let addon: any = null;
-let skipReason = "";
-try {
-  addon = loadNativeAddon();
-  if (typeof addon.SCP !== "function") {
-    throw new Error("SCP class not exported from native addon");
-  }
-} catch (e: unknown) {
-  ${guard}
-}`;
-    for (const shape of [lifecycle, scpClass]) {
-      expect(loadGuards("control.ts", shape("")).map((g) => g.guarded)).toEqual([false]);
-    }
-    expect(
-      loadGuards("control.ts", lifecycle("skipReasonIfAddonAbsent(e);")).map((g) => g.guarded),
-    ).toEqual([true]);
-    expect(
-      loadGuards("control.ts", scpClass("skipReason = skipReasonIfAddonAbsent(e);")).map(
-        (g) => g.guarded,
-      ),
-    ).toEqual([true]);
+  // The exclusion above names the file that holds the one permitted skip; if
+  // that file stopped skipping, the exclusion would name nothing.
+  test("napi-guard.ts holds the one permitted skip", () => {
+    const source = readFileSync(join(TESTS_DIR, NAPI_GUARD), "utf8");
+    expect(skipSites(NAPI_GUARD, source).length).toBeGreaterThan(0);
+  });
+
+  // Positive control: the real lifecycle.test.ts passes, and the same text with
+  // a `describe.skip(` suite appended is flagged on the appended line.
+  test("the check flags a describe.skip added to a real test file", () => {
+    const name = "lifecycle.test.ts";
+    const source = readFileSync(join(TESTS_DIR, name), "utf8");
+    expect(skipSites(name, source)).toEqual([]);
+    const mutated = `${source}\ndescribe.skip("control", () => {});\n`;
+    expect(skipSites(name, mutated)).toEqual([mutated.split("\n").length - 1]);
   });
 });

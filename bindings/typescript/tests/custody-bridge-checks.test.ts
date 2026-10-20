@@ -30,7 +30,7 @@
  * it (the bridge would then return zeros), or writes to the host's buffer.
  */
 
-import { describe, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 
 import { CryptoError, IdentityError, KeyNotFoundError, mapBridgeError } from "../src/errors";
@@ -44,7 +44,7 @@ import type {
 } from "../src/scp";
 import { p256SoftwarePseudonymPoint } from "../src/scp";
 import { ECDH_VECTOR_PUBLIC_I, ECDH_VECTOR_SCALAR_I, HpkeP256Keys } from "./hpke-p256-keys";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 interface TestingCustody {
   generateKeypair(): Promise<string>;
@@ -68,17 +68,22 @@ type TestingCustodyCtor = new (
   provider: ReturnType<typeof toNativeCustodyProvider>,
 ) => TestingCustody;
 
-let native: Record<string, unknown> = {};
-let skipReason = "";
-try {
-  native = loadNativeAddon();
+const suite = await napiSuite(() => {
+  const native: Record<string, unknown> = loadNativeAddon();
   if (typeof native.TestingCallbackCustody !== "function") {
     throw new Error(
       "native addon has no TestingCallbackCustody: build it with the `testing` feature",
     );
   }
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
+  return native.TestingCallbackCustody as TestingCustodyCtor;
+});
+
+/** The addon's `TestingCallbackCustody`; only the suite below calls this. */
+function testingCustodyCtor(): TestingCustodyCtor {
+  if (suite.addon === undefined) {
+    throw new Error(`no TestingCallbackCustody: ${suite.skipReason}`);
+  }
+  return suite.addon;
 }
 
 /** A host fault the keychain injects into signing or derivation. */
@@ -287,7 +292,7 @@ class P256Keychain implements KeyCustodyProvider {
 }
 
 function adapter(host: KeyCustodyProvider): TestingCustody {
-  const Ctor = native.TestingCallbackCustody as TestingCustodyCtor;
+  const Ctor = testingCustodyCtor();
   return new Ctor(toNativeCustodyProvider(host));
 }
 
@@ -296,7 +301,7 @@ function adapter(host: KeyCustodyProvider): TestingCustody {
  * can return what a misbehaving host returns.
  */
 function adapterWith(overrides: Record<string, (...args: unknown[]) => unknown>): TestingCustody {
-  const Ctor = native.TestingCallbackCustody as TestingCustodyCtor;
+  const Ctor = testingCustodyCtor();
   const provider = Object.assign(new StoreKeychain(), overrides) as KeyCustodyProvider;
   return new Ctor(toNativeCustodyProvider(provider));
 }
@@ -338,7 +343,7 @@ async function rejectionOf(call: () => Promise<unknown>): Promise<Error & { code
   return mapBridgeError(err);
 }
 
-describe.skipIf(skipReason !== "")("napi callback custody", () => {
+suite.describe("napi callback custody", () => {
   test("an operational key reaches the host as role operational and does not derive", async () => {
     const host = new StoreKeychain();
     const custody = adapter(host);

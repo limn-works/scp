@@ -13,28 +13,18 @@
  * delegates; suspend/resume live only as methods on {@link SCP}.
  */
 
-import { describe, expect, it } from "bun:test";
+import { expect, it } from "bun:test";
 import { SCP } from "../src/scp";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
-// Detects whether the NAPI addon is installed. A cheap
-// `new SCP({ storage: { type: "in_memory" } })` runs inside a try/catch, and
-// `skipReasonIfAddonAbsent` skips the suite only when no addon is installed
-// for this platform. Every other construction failure fails the file.
-function napiAvailable(): boolean {
-  try {
-    const probe = new SCP({ storage: { type: "in_memory" } });
-    probe.shutdown(1).catch(() => {});
-    return true;
-  } catch (e: unknown) {
-    skipReasonIfAddonAbsent(e);
-    return false;
-  }
-}
+// The suite skips only when no NAPI addon is installed for this platform
+// (`napiSuite`); every other probe failure fails the file.
+const suite = await napiSuite(() => {
+  const probe = new SCP({ storage: { type: "in_memory" } });
+  probe.shutdown(1).catch(() => {});
+});
 
-const describeNapi = napiAvailable() ? describe : describe.skip;
-
-describeNapi("bridge lifecycle (SCP.suspend / SCP.resume)", () => {
+suite.describe("bridge lifecycle (SCP.suspend / SCP.resume)", () => {
   it("SCP.suspend on a fresh instance is a no-op", async () => {
     const scp = new SCP({ storage: { type: "in_memory" } });
     try {

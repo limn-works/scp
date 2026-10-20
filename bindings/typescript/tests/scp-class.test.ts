@@ -21,7 +21,7 @@ import { ValidationError } from "../src/errors";
 import { loadNativeAddon } from "../src/internal/native";
 import { __serializeStorageConfigForTests, clampShutdownMillis, SCP } from "../src/scp";
 import { HARNESS_IN_MEMORY_CUSTODY } from "./harness-custody";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Compile-time guard: storage selection is mandatory (spec §17.6).
@@ -88,30 +88,25 @@ describe("SCP constructor — runtime storage-selection guard (spec §17.6)", ()
 // `src/scp.ts`.
 // ---------------------------------------------------------------------------
 
-// biome-ignore lint/suspicious/noExplicitAny: dynamic native addon loading
-let addon: any = null;
-let skipReason = "";
-
-try {
+const suite = await napiSuite(() => {
   // `loadNativeAddon` is the SDK's one loader, and this file resolves the addon
   // through it so the load this file performs is the load CI's "Assert the
   // downloaded addon loads and constructs" step performs. A specifier built here
   // would name a package that step never installs, which skips this whole suite
   // over an addon CI just verified.
-  addon = loadNativeAddon();
-
+  // biome-ignore lint/suspicious/noExplicitAny: dynamic native addon loading
+  const addon: any = loadNativeAddon();
   if (typeof addon.SCP !== "function") {
     throw new Error("SCP class not exported from native addon — rebuild with the Phase 4 changes");
   }
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+  return addon;
+});
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
+suite.describe("SCP class (Phase 4)", (addon) => {
   test("new SCP() constructs an instance with a non-zero instanceId", () => {
     const scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
     // instanceId is exposed as a string (u64 doesn't fit in a JS number).

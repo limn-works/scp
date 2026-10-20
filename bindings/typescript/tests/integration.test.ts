@@ -60,7 +60,7 @@ import {
   HARNESS_IN_MEMORY_CUSTODY,
 } from "./harness-custody";
 import { createMockNativeScp, mockContext, mountMockScp } from "./mock-bridge";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 /**
  * Generates a DHKEM(P-256) wrapping keypair (32-byte secret scalar + 65-byte
@@ -684,10 +684,7 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
 // `scp-class.test.ts`.
 // ---------------------------------------------------------------------------
 
-let napiSkipReason = "";
-let napiAvailable = false;
-
-try {
+const nativeSuite = await napiSuite(() => {
   const probe = new SCP({ storage: { type: "in_memory" } });
   // The Phase 4 refactor added `relayStartInMemory` — a rebuild without
   // those changes would miss the surface. Check before claiming the
@@ -695,19 +692,13 @@ try {
   if (typeof (probe as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
     throw new Error("SCP missing relayStartInMemory — rebuild with the Phase 4 changes");
   }
-  napiAvailable = true;
   // Always shut the probe down — it is disposable and never used by tests.
   // Fresh `new SCP({ storage: { type: "in_memory" } })` instances are minted per-test in the `beforeEach`
   // below, so there is no shared NAPI state between tests.
   probe.shutdown(1).catch(() => {});
-} catch (e: unknown) {
-  napiSkipReason = skipReasonIfAddonAbsent(e);
-}
+});
 
-// Only stateful contexts — everything stateless (mock/harness) is unaffected.
-const describeNapi = napiAvailable ? describe : describe.skip;
-
-describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
+nativeSuite.describe("SCP class real NAPI integration", () => {
   // Per-test isolation (security-reviewer round-1 LOW #3 / #1549):
   // every test gets a fresh `SCP` + in-memory relay. Tests never share
   // bridge state, so a stale subscription, residual UCAN nonce, blocked
@@ -2171,20 +2162,12 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 // `SCP` inside each test body.
 // ---------------------------------------------------------------------------
 
-function napiIsUsable(): boolean {
-  try {
-    const probe = new SCP({ storage: { type: "in_memory" } });
-    probe.shutdown(1).catch(() => {});
-    return true;
-  } catch (e: unknown) {
-    skipReasonIfAddonAbsent(e);
-    return false;
-  }
-}
+const storageSuite = await napiSuite(() => {
+  const probe = new SCP({ storage: { type: "in_memory" } });
+  probe.shutdown(1).catch(() => {});
+});
 
-const describeStorageNapi = napiIsUsable() ? describe : describe.skip;
-
-describeStorageNapi("SCP storage integration (real NAPI)", () => {
+storageSuite.describe("SCP storage integration (real NAPI)", () => {
   it("ephemeral (in_memory) storage — two fresh SCPs mint distinct identities", async () => {
     const a = new SCP({ storage: { type: "in_memory" } });
     const b = new SCP({ storage: { type: "in_memory" } });

@@ -20,7 +20,7 @@ import {
   requireNativeAddon,
 } from "../src/internal/native";
 import { addonLoadError, requireAddonExport } from "../src/scp";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite, skipReasonIfAddonAbsent } from "./napi-guard";
 
 const BROKEN_PACKAGE = "scp-broken-native-addon";
 let root = "";
@@ -194,5 +194,81 @@ describe("skipReasonIfAddonAbsent", () => {
 
   test("throws the guard's error when the addon loads", () => {
     expect(() => skipReasonIfAddonAbsent(guardError, () => ({}))).toThrow(guardError);
+  });
+});
+
+/** A loader that reports the addon absent. */
+function absent(): never {
+  throw new ValidationError("no addon for this platform", NATIVE_ADDON_ABSENT_CODE);
+}
+
+describe("napiSuite", () => {
+  const probeError = new Error("probe threw");
+
+  test("a probe that succeeds yields its value and no skip reason", async () => {
+    const suite = await napiSuite(async () => 42, absent);
+    expect({ addon: suite.addon, skipReason: suite.skipReason }).toEqual({
+      addon: 42,
+      skipReason: "",
+    });
+  });
+
+  test("a probe that throws while the loader reports absence yields a skip reason", async () => {
+    const suite = await napiSuite(() => {
+      throw probeError;
+    }, absent);
+    expect(suite.addon).toBeUndefined();
+    expect(suite.skipReason).toContain("no addon for this platform");
+  });
+
+  test("a probe that throws while the addon loads rejects with the probe's error", async () => {
+    await expect(
+      napiSuite(
+        () => {
+          throw probeError;
+        },
+        () => ({}),
+      ),
+    ).rejects.toBe(probeError);
+  });
+
+  test("a probe that rejects while the addon fails to load rejects with the loader's error", async () => {
+    const loadFailure = new ScpError("dlopen failed", NATIVE_ADDON_LOAD_FAILED_CODE);
+    await expect(
+      napiSuite(
+        async () => {
+          throw probeError;
+        },
+        () => {
+          throw loadFailure;
+        },
+      ),
+    ).rejects.toBe(loadFailure);
+  });
+});
+
+// `describe` runs each suite body when the file is collected, so both counts
+// are settled before any test runs. The absent suite registers one skipped
+// test, which `bun test` reports as a skip.
+const presentBodies: number[] = [];
+(await napiSuite(() => 7, absent)).describe("napiSuite control: addon present", (value) => {
+  presentBodies.push(value);
+});
+let absentBodyCalls = 0;
+(
+  await napiSuite(() => {
+    throw new Error("probe threw");
+  }, absent)
+).describe("napiSuite control: addon absent", () => {
+  absentBodyCalls += 1;
+});
+
+describe("napiSuite registration", () => {
+  test("a present addon runs the body once with the probe's value", () => {
+    expect(presentBodies).toEqual([7]);
+  });
+
+  test("an absent addon never runs the body", () => {
+    expect(absentBodyCalls).toBe(0);
   });
 });

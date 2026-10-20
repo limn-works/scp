@@ -24,7 +24,7 @@ import {
   HARNESS_IN_MEMORY_CUSTODY,
 } from "./harness-custody";
 import { mountMockScp } from "./mock-bridge";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 /** Every custody request value the union carries (spec §3.2.2). */
 const CUSTODY_VALUES: readonly CustodyType[] = ["encrypted_file", "os_keystore"];
@@ -216,12 +216,9 @@ describe("harness custody stays out of the package", () => {
 // The real addon's §3.2.2 codes
 // ---------------------------------------------------------------------------
 
-let addonReason = "";
-try {
+const suite = await napiSuite(() => {
   new SCP({ storage: { type: "in_memory" } }).shutdown(1).catch(() => {});
-} catch (e: unknown) {
-  addonReason = skipReasonIfAddonAbsent(e);
-}
+});
 
 /** The `code` an `SCP` call rejected with. */
 async function rejectionCode(p: Promise<unknown>): Promise<string> {
@@ -230,56 +227,50 @@ async function rejectionCode(p: Promise<unknown>): Promise<string> {
   return (err as { code: string }).code;
 }
 
-if (addonReason !== "") {
-  describe("custody request codes (real NAPI) (SKIPPED)", () => {
-    it.skip(addonReason, () => {});
-  });
-} else {
-  // Like `real-napi.test.ts`, this suite runs against an addon built with the
-  // bridge's `testing` feature, the only build that accepts the harness's raw
-  // `in_memory` string.
-  describe("custody request codes (real NAPI)", () => {
-    async function withScp<T>(body: (scp: SCP) => Promise<T>): Promise<T> {
-      const scp = new SCP({ storage: { type: "in_memory" } });
-      try {
-        return await body(scp);
-      } finally {
-        await scp.shutdown(1000).catch(() => {});
-      }
+// Like `real-napi.test.ts`, this suite runs against an addon built with the
+// bridge's `testing` feature, the only build that accepts the harness's raw
+// `in_memory` string.
+suite.describe("custody request codes (real NAPI)", () => {
+  async function withScp<T>(body: (scp: SCP) => Promise<T>): Promise<T> {
+    const scp = new SCP({ storage: { type: "in_memory" } });
+    try {
+      return await body(scp);
+    } finally {
+      await scp.shutdown(1000).catch(() => {});
     }
+  }
 
-    for (const method of ["identityCreate", "identityCreateWithAgentKey"] as const) {
-      it(`${method}("os_keystore") rejects with SCP-IDENT-1003: it needs a provider`, async () => {
-        const code = await withScp((scp) => rejectionCode(scp[method]("os_keystore")));
-        expect(code).toBe("SCP-IDENT-1003");
-      });
+  for (const method of ["identityCreate", "identityCreateWithAgentKey"] as const) {
+    it(`${method}("os_keystore") rejects with SCP-IDENT-1003: it needs a provider`, async () => {
+      const code = await withScp((scp) => rejectionCode(scp[method]("os_keystore")));
+      expect(code).toBe("SCP-IDENT-1003");
+    });
 
-      for (const retired of ["platform", "software", "file", "callback"]) {
-        it(`${method}(${JSON.stringify(retired)}) rejects with SCP-VALID-7005`, async () => {
-          const code = await withScp((scp) => rejectionCode(callUntyped(scp, method, retired)));
-          expect(code).toBe("SCP-VALID-7005");
-        });
-      }
-
-      it(`${method}("encrypted_file") without SCP_KEY_PASSPHRASE rejects with SCP-VALID-7001`, async () => {
-        // With the variable set, the call would open the key file under the
-        // real HOME, so the test refuses to run rather than touch it.
-        expect(process.env.SCP_KEY_PASSPHRASE).toBeUndefined();
-        const err = await withScp((scp) => rejection(scp[method]("encrypted_file")));
-        expect((err as { code: string }).code).toBe("SCP-VALID-7001");
-        expect((err as Error).message).toContain("SCP_KEY_PASSPHRASE");
+    for (const retired of ["platform", "software", "file", "callback"]) {
+      it(`${method}(${JSON.stringify(retired)}) rejects with SCP-VALID-7005`, async () => {
+        const code = await withScp((scp) => rejectionCode(callUntyped(scp, method, retired)));
+        expect(code).toBe("SCP-VALID-7005");
       });
     }
 
-    for (const [label, create] of [
-      ["createInMemoryIdentity", createInMemoryIdentity],
-      ["createInMemoryIdentityWithAgentKey", createInMemoryIdentityWithAgentKey],
-    ] as const) {
-      it(`${label} creates an in_memory identity on a testing addon`, async () => {
-        const identity = await withScp((scp) => create(scp));
-        expect(identity.did).toMatch(/^did:dht:/);
-        expect(identity.custodyType).toBe("in_memory");
-      });
-    }
-  });
-}
+    it(`${method}("encrypted_file") without SCP_KEY_PASSPHRASE rejects with SCP-VALID-7001`, async () => {
+      // With the variable set, the call would open the key file under the
+      // real HOME, so the test refuses to run rather than touch it.
+      expect(process.env.SCP_KEY_PASSPHRASE).toBeUndefined();
+      const err = await withScp((scp) => rejection(scp[method]("encrypted_file")));
+      expect((err as { code: string }).code).toBe("SCP-VALID-7001");
+      expect((err as Error).message).toContain("SCP_KEY_PASSPHRASE");
+    });
+  }
+
+  for (const [label, create] of [
+    ["createInMemoryIdentity", createInMemoryIdentity],
+    ["createInMemoryIdentityWithAgentKey", createInMemoryIdentityWithAgentKey],
+  ] as const) {
+    it(`${label} creates an in_memory identity on a testing addon`, async () => {
+      const identity = await withScp((scp) => create(scp));
+      expect(identity.did).toMatch(/^did:dht:/);
+      expect(identity.custodyType).toBe("in_memory");
+    });
+  }
+});

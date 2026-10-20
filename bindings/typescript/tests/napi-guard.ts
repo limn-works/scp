@@ -8,8 +8,13 @@
  * method the suite calls, a throw in the `SCP` wrapper's constructor — fails
  * the file, because skipping on it lets `bun test` exit 0 over zero executed
  * NAPI assertions.
+ *
+ * {@link napiSuite} is the one place a test file may skip: every real-NAPI
+ * file builds its suite through it, and `dispatcher-invariant.test.ts` fails
+ * on any other skip construct under `tests/`.
  */
 
+import { describe, test } from "bun:test";
 import { ScpError } from "../src/errors";
 import { loadNativeAddon, NATIVE_ADDON_ABSENT_CODE } from "../src/internal/native";
 
@@ -42,4 +47,55 @@ export function skipReasonIfAddonAbsent(
     throw loadError;
   }
   throw error;
+}
+
+/** A real-NAPI suite: the value its probe built, or why it skips. */
+export interface NapiSuite<T> {
+  /** The probe's value, or `undefined` when no native addon is installed. */
+  readonly addon: T | undefined;
+  /** Why the suite skips; empty when the probe succeeded. */
+  readonly skipReason: string;
+  /**
+   * Registers `body` under `name` and passes it the probe's value. When no
+   * native addon is installed it registers `name` as a skipped suite holding
+   * one test that states the reason, and never calls `body`.
+   */
+  describe(name: string, body: (addon: T) => void): void;
+}
+
+/**
+ * Runs `probe`, which loads the addon and checks every export the file needs,
+ * and returns the suite to register the file's real-NAPI tests under.
+ *
+ * When `probe` throws or rejects, the {@link skipReasonIfAddonAbsent} rule
+ * decides: the suite skips only when the loader reports the addon absent, and
+ * any other failure (an addon that fails to load, a missing export, a throw in
+ * the `SCP` constructor) is rethrown and fails the file.
+ *
+ * @param probe - Builds what the file's tests use; throws on any failure.
+ * @param load - The loader to ask; tests pass a stand-in, files pass nothing.
+ */
+export async function napiSuite<T>(
+  probe: () => T | Promise<T>,
+  load: () => unknown = loadNativeAddon,
+): Promise<NapiSuite<T>> {
+  let addon: T;
+  try {
+    addon = await probe();
+  } catch (error) {
+    const skipReason = skipReasonIfAddonAbsent(error, load);
+    return {
+      addon: undefined,
+      skipReason,
+      describe: (name) =>
+        describe.skip(name, () => {
+          test(`skipped: ${skipReason}`, () => {});
+        }),
+    };
+  }
+  return {
+    addon,
+    skipReason: "",
+    describe: (name, body) => describe(name, () => body(addon)),
+  };
 }
