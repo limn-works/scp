@@ -75,10 +75,17 @@
 
     // MARK: - AppleKeyCustody Tests
 
-    struct AppleKeyCustodyTests {
-        /// Shared custody instance using default Keychain (no access group).
-        /// Suitable for unit tests and simulator.
-        private let custody = AppleKeyCustody(accessGroup: nil)
+    final class AppleKeyCustodyTests: Sendable {
+        private let keyIds = KeyIdRecorder()
+        private let custody: AppleKeyCustody
+
+        init() {
+            custody = keyIds.custody()
+        }
+
+        deinit {
+            keyIds.purge()
+        }
 
         // MARK: - generateKeypair
 
@@ -391,8 +398,17 @@
     // MARK: - Store Tests
 
     /// How a key's Keychain item is stored over an existing one.
-    struct AppleKeyCustodyStoreTests {
-        private let custody = AppleKeyCustody(accessGroup: nil)
+    final class AppleKeyCustodyStoreTests: Sendable {
+        private let keyIds = KeyIdRecorder()
+        private let custody: AppleKeyCustody
+
+        init() {
+            custody = keyIds.custody()
+        }
+
+        deinit {
+            keyIds.purge()
+        }
 
         /// The `kSecAttrComment` of the generic-password item for `account`.
         private func keychainComment(_ account: String) -> String? {
@@ -420,7 +436,7 @@
 
         @Test("storing a key over an existing item replaces it")
         func storeReplacesTheExistingItem() async throws {
-            let handle = UUID().uuidString
+            let handle = keyIds.next()
             let account = "scp.key.\(handle)"
             let first = Data(repeating: 0x11, count: 32)
             let second = Data(repeating: 0x22, count: 32)
@@ -448,9 +464,17 @@
 
     /// Tests for the v2 (rotatable, epoch-bound) pseudonym derivation and the
     /// cross-platform §25.19 known-answer vectors covering both v1 and v2.
-    struct AppleKeyCustodyRotatablePseudonymTests {
-        /// Shared custody instance using default Keychain (no access group).
-        private let custody = AppleKeyCustody(accessGroup: nil)
+    final class AppleKeyCustodyRotatablePseudonymTests: Sendable {
+        private let keyIds = KeyIdRecorder()
+        private let custody: AppleKeyCustody
+
+        init() {
+            custody = keyIds.custody()
+        }
+
+        deinit {
+            keyIds.purge()
+        }
 
         @Test("deriveRotatablePseudonym is deterministic for same inputs")
         func deriveRotatablePseudonymDeterministic() async throws {
@@ -551,7 +575,7 @@
 
                 // Store the ikm as the Ed25519 identity seed the derivation reads.
                 let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: ikm)
-                let handle = UUID().uuidString
+                let handle = keyIds.next()
                 try custody.storePrivateKeyBytes(
                     ikm, for: handle, keyType: .ed25519, role: .identity,
                     publicKeyBytes: signingKey.publicKey.rawRepresentation
@@ -587,7 +611,13 @@
 
     // MARK: - BiometricPolicy Tests
 
-    struct AppleKeyCustodyBiometricPolicyTests {
+    final class AppleKeyCustodyBiometricPolicyTests: Sendable {
+        private let keyIds = KeyIdRecorder()
+
+        deinit {
+            keyIds.purge()
+        }
+
         // MARK: - Default behavior preserved
 
         @Test("BiometricPolicy.none preserves existing behavior")
@@ -597,7 +627,9 @@
 
             // Both should generate keys identically.
             let handle1 = try await custodyDefault.generateKeypair(keyType: "ed25519")
+            defer { KeyIdRecorder.purge([handle1]) }
             let handle2 = try await custodyExplicit.generateKeypair(keyType: "ed25519")
+            defer { KeyIdRecorder.purge([handle2]) }
 
             // Both should sign successfully.
             let data = Data("test".utf8)
@@ -616,7 +648,7 @@
 
         @Test("custodyType returns 'software' for BiometricPolicy.none")
         func custodyTypeNone() async throws {
-            let custodyNone = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
+            let custodyNone = keyIds.custody(policy: .none)
             let handle = try await custodyNone.generateKeypair(keyType: "ed25519")
             #expect(custodyNone.custodyType(handle) == "software")
             try await custodyNone.destroyKey(handle)
@@ -670,7 +702,7 @@
             .enabled(if: biometricKeychainAvailable, "Requires Keychain biometric entitlements")
         )
         func biometricRequiredStoresWithAccessControl() async throws {
-            let custodyBio = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
+            let custodyBio = keyIds.custody(policy: .required)
             let handle = try await custodyBio.generateKeypair(keyType: "ed25519")
 
             // Verify the key exists and has an access control attribute by
@@ -727,8 +759,18 @@
     /// Calls every member of the UniFFI `KeyCustodyProvider` protocol through a
     /// value typed `any KeyCustodyProvider`, so each test exercises exactly the
     /// surface the bridge calls (`crates/scp-ffi/uniffi/src/lib.rs`).
-    struct AppleKeyCustodyProviderConformanceTests {
-        private let adapter = AppleKeyCustody(accessGroup: nil)
+    final class AppleKeyCustodyProviderConformanceTests: Sendable {
+        private let keyIds = KeyIdRecorder()
+        private let adapter: AppleKeyCustody
+
+        init() {
+            adapter = keyIds.custody()
+        }
+
+        deinit {
+            keyIds.purge()
+        }
+
         private var provider: any KeyCustodyProvider {
             adapter
         }
@@ -751,7 +793,7 @@
 
         /// Stores `seed` as an identity Ed25519 key under a fresh decimal id.
         private func storeIdentitySeed(_ seed: Data) throws -> String {
-            let handle = String(UInt64.random(in: .min ... .max))
+            let handle = keyIds.next()
             let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
             try adapter.storePrivateKeyBytes(
                 seed, for: handle, keyType: .ed25519, role: .identity,

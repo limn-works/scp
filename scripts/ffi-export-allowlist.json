@@ -169,7 +169,7 @@
       "name": "bundle",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",
-      "reason": "Getter for the sealed SealedInvitation bundle on the PyInviteMemberOutcome result type (ADR-049 Phase 2J / FFI-02 Option A) \u2014 directly usable as the join input. Not an operation."
+      "reason": "Getter for the sealed SealedInvitation bundle on the PyInviteMemberOutcome result type (ADR-049 Phase 2J / FFI-02 Option A) — directly usable as the join input. Not an operation."
     },
     {
       "name": "enc",
@@ -780,12 +780,6 @@
       "reason": "SCP-307 test hook; feature-gated (testing). Method that mints a host key of the given CustodyKeyType through the adapter's generate path; a method of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
     },
     {
-      "name": "generate_identity_keypair",
-      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
-      "kind": "test-fixture",
-      "reason": "SCP-307 test hook; feature-gated (testing). Method that mints the host identity key through the adapter's identity-key path; a method of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
-    },
-    {
       "name": "public_key",
       "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
       "kind": "test-fixture",
@@ -819,19 +813,13 @@
       "name": "testing_p256_verify_strict",
       "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
       "kind": "test-fixture",
-      "reason": "SCP-307 test oracle; feature-gated (testing). Verifies a raw 64-byte P-256 signature over a 32-byte digest under a 33-byte compressed key with the strict low-s verifier the bridge uses, so a Swift or Kotlin test checks a host signature against Rust rather than against the platform library that made it. Not a protocol operation."
+      "reason": "SCP-307 test oracle; feature-gated (testing). Verifies a raw 64-byte P-256 signature over a 32-byte digest under a 33-byte compressed or 65-byte uncompressed SEC1 key with the strict low-s verifier the bridge uses, so a Swift or Kotlin test checks a host signature against Rust rather than against the platform library that made it. Not a protocol operation."
     },
     {
       "name": "testing_p256_ecdh",
       "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
       "kind": "test-fixture",
       "reason": "SCP-307 test oracle; feature-gated (testing). Computes the P-256 ECDH x-coordinate from a peer's 32-byte scalar and a host's 65-byte public key, so a Swift or Kotlin test checks a host key's dh_agree against Rust rather than against the platform library that made it. Not a protocol operation."
-    },
-    {
-      "name": "p256_signature_der_to_raw_low_s",
-      "path": "crates/scp-ffi/uniffi/src/p256_host.rs",
-      "kind": "bridge-specific",
-      "reason": "SCP-307 custody-host helper (ADR-025 criterion 1, ADR-027 criterion 2): converts the DER ECDSA P-256 signature the Secure Enclave and Android Keystore emit to raw 64-byte r || s with a low s, the form their custody adapters' sign returns. UniFFI only: PyO3 and napi hosts return what their libraries emit and the shared callback custody adapter normalizes it, so no Python or TypeScript host needs the conversion."
     },
     {
       "name": "testing_share_did_resolver",

@@ -31,13 +31,14 @@ public nonisolated enum PlatformError: Error, Sendable {
     /// Keychain refused to release key material because the biometric check
     /// did not succeed.
     case biometricAuthenticationFailed(String)
-    /// The Secure Enclave could not create a P-256 key: the device has no
-    /// enclave (the simulator, a virtual machine, an Intel Mac without a T2
-    /// chip) or the process lacks the keychain entitlement
+    /// The Secure Enclave could not create a P-256 key on a host whose
+    /// availability probe reported an enclave, for example because the
+    /// process lacks the keychain entitlement
     /// (`errSecMissingEntitlement = -34018`). The associated `OSStatus` is the
-    /// status `SecKeyCreateRandomKey` reported. No software key replaces the
-    /// enclave key (ADR-025 criterion 8).
-    case secureEnclaveUnavailable(OSStatus)
+    /// status `SecKeyCreateRandomKey` reported. The adapter never answers
+    /// this failure with a software key: the backing is chosen once, from the
+    /// probe, and an enclave host stays an enclave host (ADR-025 criterion 8).
+    case secureEnclaveKeyCreationFailed(OSStatus)
     /// A general custody operation failed for reasons other than the variants
     /// above.
     case custodyError(String)
@@ -57,7 +58,7 @@ nonisolated extension PlatformError: LocalizedError {
             "Key destruction failed: item persisted for handle '\(handle)'"
         case let .biometricAuthenticationFailed(detail):
             "Biometric authentication failed: \(detail)"
-        case let .secureEnclaveUnavailable(status):
+        case let .secureEnclaveKeyCreationFailed(status):
             "Secure Enclave key generation failed with OSStatus \(status); no software key is substituted"
         case let .custodyError(message):
             "Key custody error: \(message)"
@@ -174,6 +175,26 @@ private nonisolated struct KeyMetadata: Codable {
     /// The ``KeyRole`` raw value the key was minted in. Required: an item
     /// without it fails to decode, so a role is never guessed.
     let role: String
+    /// The custody string `custodyType(_:)` reports for the key, recorded at
+    /// mint from where the key was created and the biometric policy it was
+    /// created under: `"hardware"`, `"software"` or `"software_biometric"`.
+    /// Required, so custody is never derived from the key type.
+    let custodyType: String
+    /// The ``P256Backing`` raw value of a P-256 or HPKE P-256 key, which
+    /// selects the store every later operation on the key uses. `nil` for an
+    /// Ed25519 or X25519 key, whose private bytes the item itself holds.
+    let backing: String?
+
+    /// This record with `publicKey` cached.
+    func with(publicKey: Data) -> KeyMetadata {
+        KeyMetadata(
+            keyType: keyType,
+            publicKeyBase64: publicKey.base64EncodedString(),
+            role: role,
+            custodyType: custodyType,
+            backing: backing
+        )
+    }
 }
 
 /// The role a key was minted in, stored in ``KeyMetadata`` and reported as
@@ -200,7 +221,8 @@ private nonisolated enum KeyRole: String {
 // MARK: - AppleKeyCustody
 
 /// Apple key custody provider: Ed25519 and X25519 keys in the Keychain, and
-/// P-256 signing and HPKE P-256 agreement keys in the Secure Enclave.
+/// P-256 signing and HPKE P-256 agreement keys in the Secure Enclave, or in
+/// the platform signer where the host has no enclave.
 ///
 /// The class conforms to the UniFFI `KeyCustodyProvider` callback interface
 /// (`crates/scp-ffi/uniffi/src/lib.rs`), as ADR-025 requires, so an instance
@@ -221,24 +243,23 @@ private nonisolated enum KeyRole: String {
 ///
 /// Each key has a `kSecClassGenericPassword` Keychain item:
 /// - `kSecAttrAccount`: `"scp.key.<id>"` where `<id>` is the key id.
-/// - `kSecAttrLabel`: JSON-encoded ``KeyMetadata`` (type, role and cached
-///   public key).
+/// - `kSecAttrLabel`: JSON-encoded ``KeyMetadata``: type, role, cached
+///   public key, custody string and, for a P-256 key, its backing.
 /// - `kSecAttrGeneric`: the public key bytes, so a key is found by its
 ///   public key with an exact-match query.
 /// - `kSecAttrAccessGroup`: `"\(appIdentifierPrefix).dev.limn.scp"`.
 /// - `kSecAttrAccessible`: `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
-/// - `kSecValueData`: for Ed25519 and X25519, the 32-byte raw private key;
-///   for P-256 and HPKE P-256, the 65-byte uncompressed public key, because
-///   the private key never leaves the enclave.
+/// - `kSecValueData`: for Ed25519 and X25519, the 32-byte raw private key.
+///   A P-256 key's item has no data.
 ///
-/// A P-256 or HPKE P-256 key itself is a permanent `kSecClassKey` item the
-/// Secure Enclave generates (``SecureEnclaveP256KeyStore``), tagged with the
-/// application tag `"scp.key.<id>"` as `Data`. A key item has no account,
-/// generic or description attribute, so its type, role and policy live in
-/// the generic-password item above, its companion. The enclave signs and
-/// agrees with it; no operation returns its private bytes, and where no
-/// enclave is reachable generation fails closed with
-/// ``PlatformError/secureEnclaveUnavailable(_:)`` (ADR-025 criterion 8).
+/// A P-256 or HPKE P-256 key itself is a permanent `kSecClassKey` item
+/// (``KeychainP256KeyStore``), tagged with the application tag
+/// `"scp.key.<id>"` as `Data`. Its generic-password item, the companion,
+/// exists because the generic-password class is the id registry:
+/// `SecItemAdd` refuses a duplicate account, while `SecKeyCreateRandomKey`
+/// accepts a duplicate tag. The companion also carries the key's type,
+/// role, backing and custody string, which a key item has no attribute for.
+/// No operation returns a P-256 private key's bytes.
 ///
 /// ## Biometric gating
 ///
@@ -250,20 +271,29 @@ private nonisolated enum KeyRole: String {
 /// only, no key material access), and `destroyKey` is a cleanup operation.
 /// If the device has no biometric hardware, the system falls back to device
 /// passcode. The policy applies to every key this instance mints, including
-/// an enclave key, whose access control then requires `.biometryCurrentSet`
-/// on top of `.privateKeyUsage`. See ADR-025 Biometric gating.
+/// a P-256 key, whose access control then requires `.biometryCurrentSet`.
+/// See ADR-025 Biometric gating.
 ///
-/// ## Secure Enclave keys
+/// ## P-256 keys
 ///
-/// The Secure Enclave supports only P-256. It holds every `p256` signing key
-/// and every `hpke-p256` wrapping key (ADR-025 criterion 8); the enclave
-/// signs digests with `.ecdsaSignatureDigestX962SHA256` and agrees with
-/// `.ecdhKeyExchangeStandard`. `sign` returns the 64-byte raw `r || s` with
-/// `s` in the low half of the group order (spec 09 §9.5, ADR-025 criterion
-/// 1), converted from the enclave's DER by the shared Rust helper
-/// `p256SignatureDerToRawLowS`. The bridge reports these keys as
-/// `"hardware"` custody. Ed25519 and X25519 keys stay in the Keychain
-/// because the enclave cannot hold them.
+/// The initializer probes once for a Secure Enclave and fixes the
+/// ``P256Backing`` every P-256 and HPKE P-256 key this instance mints uses:
+/// - With an enclave, the enclave generates and holds each key (ADR-025
+///   criterion 8), and the key's custody is `"hardware"`. A creation failure
+///   is ``PlatformError/secureEnclaveKeyCreationFailed(_:)``; no software
+///   key replaces it.
+/// - Without one, the key is a permanent Security-framework key with no
+///   token id, the platform signer of spec 09 §9.5, and its custody is
+///   `"software"` (or `"software_biometric"` under
+///   ``BiometricPolicy/required``).
+///
+/// The backing and custody are recorded in the companion at mint, and every
+/// later operation reads them from there. A key signs digests with
+/// `.ecdsaSignatureDigestX962SHA256` and agrees with
+/// `.ecdhKeyExchangeStandard`. `sign` returns the store's DER signature; the
+/// Rust bridge converts it to the 64-byte raw low-`s` form and verifies it
+/// (spec 09 §9.5, ADR-025 criterion 1). Ed25519 and X25519 keys stay in the
+/// Keychain because neither store can hold them.
 ///
 /// ## Thread safety
 ///
@@ -303,9 +333,16 @@ public final class AppleKeyCustody: Sendable {
     /// See ADR-025 Biometric gating.
     let biometricPolicy: BiometricPolicy
 
-    /// The store holding every P-256 and HPKE P-256 private key; the Secure
-    /// Enclave in every instance the public initializer builds.
-    let p256Store: any P256KeyStore
+    /// The backing of every P-256 and HPKE P-256 key this instance mints,
+    /// fixed once from the enclave availability probe.
+    let mintBacking: P256Backing
+
+    /// The store of a backing. The public initializer builds a
+    /// ``KeychainP256KeyStore``.
+    private let makeP256Store: @Sendable (P256Backing) -> any P256KeyStore
+
+    /// Draws a candidate key id.
+    private let newKeyId: @Sendable () -> String
 
     // MARK: - Keychain item attribute helpers
 
@@ -320,6 +357,11 @@ public final class AppleKeyCustody: Sendable {
     // MARK: - Initialization
 
     /// Creates a new `AppleKeyCustody` instance.
+    ///
+    /// The instance probes once, with CryptoKit's `SecureEnclave.isAvailable`,
+    /// for a Secure Enclave. With one, every P-256 and HPKE P-256 key it
+    /// mints is an enclave key; without one, every such key is a
+    /// Security-framework platform-signer key (spec 09 §9.5).
     ///
     /// - Parameters:
     ///   - accessGroup: The Keychain access group to use for all key
@@ -338,29 +380,34 @@ public final class AppleKeyCustody: Sendable {
         self.init(
             accessGroup: accessGroup,
             biometricPolicy: biometricPolicy,
-            p256Store: SecureEnclaveP256KeyStore(accessGroup: accessGroup)
+            enclaveAvailable: SecureEnclave.isAvailable,
+            makeP256Store: { KeychainP256KeyStore(backing: $0, accessGroup: accessGroup) },
+            newKeyId: { String(UInt64.random(in: .min ... .max)) }
         )
     }
 
-    /// Creates an instance whose P-256 keys live in `p256Store`.
+    /// Creates an instance whose P-256 stores come from `makeP256Store` and
+    /// whose candidate key ids come from `newKeyId`.
     ///
-    /// Internal: the public initializer always passes the Secure Enclave
-    /// store, so no SDK caller can put a P-256 key anywhere else. Tests use
-    /// this initializer to run the P-256 paths on a host without an enclave.
-    init(accessGroup: String?, biometricPolicy: BiometricPolicy, p256Store: any P256KeyStore) {
+    /// Internal: the public initializer passes the real probe, the Keychain
+    /// stores and random ids. Tests pass a store their unsigned test host
+    /// can reach, a fixed probe result, and an id source that records every
+    /// id it hands out so cleanup and absence checks name exact ids.
+    init(
+        accessGroup: String?,
+        biometricPolicy: BiometricPolicy,
+        enclaveAvailable: Bool,
+        makeP256Store: @escaping @Sendable (P256Backing) -> any P256KeyStore,
+        newKeyId: @escaping @Sendable () -> String
+    ) {
         self.accessGroup = accessGroup
         self.biometricPolicy = biometricPolicy
-        self.p256Store = p256Store
+        mintBacking = enclaveAvailable ? .secureEnclave : .software
+        self.makeP256Store = makeP256Store
+        self.newKeyId = newKeyId
     }
 
     // MARK: - Private Keychain helpers
-
-    /// `kSecAttrDescription` tag recording the biometric policy an item was
-    /// stored under, so a re-store can tell whether the existing item's
-    /// access control matches the current policy.
-    private nonisolated var policyTag: String {
-        "scp.policy.\(biometricPolicy.rawValue)"
-    }
 
     /// Builds a base Keychain query dictionary for a key handle.
     ///
@@ -504,13 +551,28 @@ public final class AppleKeyCustody: Sendable {
     /// Delegates to ``fetchMetadata(for:)`` and extracts the key type.
     /// Does NOT trigger biometric prompts (reads attributes only).
     private nonisolated func fetchKeyType(for handle: String) throws -> KeyType {
-        let metadata = try fetchMetadata(for: handle)
+        try Self.keyType(of: fetchMetadata(for: handle), handle: handle)
+    }
+
+    /// The ``KeyType`` a decoded record names.
+    private nonisolated static func keyType(of metadata: KeyMetadata, handle: String) throws -> KeyType {
         guard let keyType = KeyType(rawValue: metadata.keyType) else {
             throw PlatformError.custodyError(
                 "Unknown key type '\(metadata.keyType)' for handle '\(handle)'"
             )
         }
         return keyType
+    }
+
+    /// The store holding the P-256 key `metadata` records, chosen by the
+    /// backing recorded at mint and never by the key type.
+    private nonisolated func p256Store(for metadata: KeyMetadata, handle: String) throws -> any P256KeyStore {
+        guard let raw = metadata.backing, let backing = P256Backing(rawValue: raw) else {
+            throw PlatformError.custodyError(
+                "Key id '\(handle)' records no P-256 backing (\(metadata.backing ?? "none"))"
+            )
+        }
+        return makeP256Store(backing)
     }
 
     /// Reads the role `handle` was minted in from its metadata label.
@@ -580,7 +642,7 @@ public final class AppleKeyCustody: Sendable {
             break
         case .p256, .hpkeP256:
             throw PlatformError.wrongKeyType(
-                "a \(keyType.rawValue) key lives in the Secure Enclave and has no private bytes to store"
+                "a \(keyType.rawValue) key lives in a P-256 key store and has no private bytes to store"
             )
         }
         let query = try addQuery(
@@ -606,25 +668,19 @@ public final class AppleKeyCustody: Sendable {
         role: CustodyKeyRole,
         publicKeyBytes: Data
     ) throws -> [String: Any] {
-        let metadata = KeyMetadata(
-            keyType: keyType.rawValue,
-            publicKeyBase64: publicKeyBytes.base64EncodedString(),
-            role: KeyRole(role).rawValue
-        )
-        guard
-            let metadataData = try? JSONEncoder().encode(metadata),
-            let metadataLabel = String(data: metadataData, encoding: .utf8)
-        else {
-            throw PlatformError.custodyError(
-                "Failed to encode key metadata for handle '\(handle)'"
-            )
-        }
-
         var query = baseQuery(for: handle)
-        query[kSecAttrLabel as String] = metadataLabel
+        query[kSecAttrLabel as String] = try metadataLabel(
+            handle: handle,
+            metadata: KeyMetadata(
+                keyType: keyType.rawValue,
+                publicKeyBase64: publicKeyBytes.base64EncodedString(),
+                role: KeyRole(role).rawValue,
+                custodyType: softwareCustodyType,
+                backing: nil
+            )
+        )
         query[kSecAttrGeneric as String] = publicKeyBytes as CFData
         query[kSecValueData as String] = bytes as CFData
-        query[kSecAttrDescription as String] = policyTag
 
         switch biometricPolicy {
         case .none:
@@ -655,15 +711,24 @@ extension AppleKeyCustody {
     /// classes, so a live key is never overwritten and never shares its id.
     ///
     /// - Throws: ``PlatformError/keychainError(_:)`` if the add fails,
-    ///   ``PlatformError/secureEnclaveUnavailable(_:)`` if the enclave cannot
-    ///   create a P-256 key, ``PlatformError/custodyError(_:)`` if every drawn
-    ///   id is taken.
+    ///   ``PlatformError/secureEnclaveKeyCreationFailed(_:)`` if the enclave
+    ///   cannot create a P-256 key, ``PlatformError/custodyError(_:)`` if
+    ///   every drawn id is taken.
     nonisolated func mintKey(keyType: KeyType, role: CustodyKeyRole) async throws -> String {
         switch keyType {
         case .ed25519, .x25519:
             return try mintSoftwareKey(keyType: keyType, role: role)
         case .p256, .hpkeP256:
-            return try await mintEnclaveKey(keyType: keyType, role: role)
+            return try await mintP256Key(keyType: keyType, role: role)
+        }
+    }
+
+    /// The custody string of a key whose private bytes or software key this
+    /// instance creates under ``biometricPolicy``.
+    private nonisolated var softwareCustodyType: String {
+        switch biometricPolicy {
+        case .none: "software"
+        case .required: "software_biometric"
         }
     }
 
@@ -687,7 +752,7 @@ extension AppleKeyCustody {
         defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
 
         for _ in 0 ..< Self.mintAttempts {
-            let handle = String(UInt64.random(in: .min ... .max))
+            let handle = newKeyId()
             let query = try addQuery(
                 privateKeyBytes, for: handle, keyType: keyType, role: role, publicKeyBytes: publicKeyBytes
             )
@@ -713,46 +778,82 @@ extension AppleKeyCustody {
         Data(account(for: handle).utf8)
     }
 
-    /// Mints a P-256 or HPKE P-256 key in ``p256Store``.
+    /// Mints a P-256 or HPKE P-256 key in the store of ``mintBacking``.
     ///
     /// 1. Reserves the id by adding the companion generic-password item,
-    ///    which never replaces an existing item.
+    ///    which never replaces an existing item, recording the type, role,
+    ///    backing and custody string.
     /// 2. Draws another id when a key item already carries the tag, since
     ///    `SecKeyCreateRandomKey` does not refuse a duplicate tag.
     /// 3. Creates the key, then records its public key on the companion.
     ///
-    /// Any failure after step 1 deletes what this call added, so a failed
-    /// mint leaves no item in either class.
-    private nonisolated func mintEnclaveKey(keyType: KeyType, role: CustodyKeyRole) async throws -> String {
+    /// A failure after step 1 runs ``rollBackMint(handle:tag:store:)`` and
+    /// rethrows the original error.
+    private nonisolated func mintP256Key(keyType: KeyType, role: CustodyKeyRole) async throws -> String {
+        let backing = mintBacking
+        let store = makeP256Store(backing)
+        let custody = switch backing {
+        case .secureEnclave: "hardware"
+        case .software: softwareCustodyType
+        }
         for _ in 0 ..< Self.mintAttempts {
-            let handle = String(UInt64.random(in: .min ... .max))
-            guard try reserveCompanion(handle: handle, keyType: keyType, role: role) else { continue }
+            let handle = newKeyId()
+            let reservation = KeyMetadata(
+                keyType: keyType.rawValue,
+                publicKeyBase64: nil,
+                role: KeyRole(role).rawValue,
+                custodyType: custody,
+                backing: backing.rawValue
+            )
+            guard try reserveCompanion(handle: handle, metadata: reservation) else { continue }
             let tag = applicationTag(for: handle)
+            guard try await tagIsFree(handle: handle, tag: tag, store: store) else { continue }
             do {
-                if try await p256Store.contains(tag: tag) {
-                    try deleteCompanion(handle: handle)
-                    continue
-                }
-                let uncompressed = try await p256Store.create(tag: tag, policy: biometricPolicy)
-                do {
-                    let publicKey = try Self.p256PublicKey(uncompressed, as: keyType)
-                    try recordCompanionPublicKey(
-                        handle: handle, keyType: keyType, role: role,
-                        publicKey: publicKey, uncompressed: uncompressed
-                    )
-                } catch {
-                    _ = try? await p256Store.delete(tag: tag)
-                    throw error
-                }
+                let uncompressed = try await store.create(tag: tag, policy: biometricPolicy)
+                let publicKey = try Self.p256PublicKey(uncompressed, as: keyType)
+                try recordCompanionPublicKey(
+                    handle: handle, metadata: reservation.with(publicKey: publicKey), publicKey: publicKey
+                )
                 return handle
             } catch {
-                try? deleteCompanion(handle: handle)
+                await rollBackMint(handle: handle, tag: tag, store: store)
                 throw error
             }
         }
         throw PlatformError.custodyError(
             "No free key id after \(Self.mintAttempts) draws"
         )
+    }
+
+    /// Whether no key item carries `tag`. When one does, it is not this
+    /// mint's: the reservation of `handle` is released and that item is left
+    /// alone. A store failure also releases the reservation and propagates.
+    private nonisolated func tagIsFree(handle: String, tag: Data, store: any P256KeyStore) async throws -> Bool {
+        let taken: Bool
+        do {
+            taken = try await store.contains(tag: tag)
+        } catch {
+            try? deleteCompanion(handle: handle)
+            throw error
+        }
+        if taken {
+            try deleteCompanion(handle: handle)
+        }
+        return !taken
+    }
+
+    /// Removes what a failed P-256 mint added.
+    ///
+    /// The companion is the only record that names the key and its backing,
+    /// so it is deleted only after the store reports no key under `tag`. When
+    /// the store cannot delete the key or cannot answer, the companion stays
+    /// and a later ``destroyKey(_:)`` of `handle` removes both. Errors here
+    /// are not rethrown: the caller rethrows the failure that started the
+    /// rollback, and what remains is recoverable through `destroyKey`.
+    private nonisolated func rollBackMint(handle: String, tag: Data, store: any P256KeyStore) async {
+        _ = try? await store.delete(tag: tag)
+        guard (try? await store.contains(tag: tag)) == false else { return }
+        try? deleteCompanion(handle: handle)
     }
 
     /// The public key `publicKey(_:)` returns for a `keyType` key whose
@@ -778,15 +879,9 @@ extension AppleKeyCustody {
         }
     }
 
-    /// Encodes the ``KeyMetadata`` label of a companion item.
-    private nonisolated func companionLabel(
-        handle: String, keyType: KeyType, role: CustodyKeyRole, publicKey: Data?
-    ) throws -> String {
-        let metadata = KeyMetadata(
-            keyType: keyType.rawValue,
-            publicKeyBase64: publicKey?.base64EncodedString(),
-            role: KeyRole(role).rawValue
-        )
+    /// Encodes `metadata` as the `kSecAttrLabel` of the item of `handle`;
+    /// the one encoder every item's label goes through.
+    private nonisolated func metadataLabel(handle: String, metadata: KeyMetadata) throws -> String {
         guard
             let data = try? JSONEncoder().encode(metadata),
             let label = String(data: data, encoding: .utf8)
@@ -796,20 +891,14 @@ extension AppleKeyCustody {
         return label
     }
 
-    /// Adds the companion item that reserves `handle` for an enclave key.
+    /// Adds the companion item that reserves `handle` for a P-256 key.
     /// Returns `false` when an item already holds the id. The item carries
     /// no secret, so it is readable after first unlock whatever the
-    /// biometric policy; the enclave key itself carries the policy.
-    private nonisolated func reserveCompanion(
-        handle: String, keyType: KeyType, role: CustodyKeyRole
-    ) throws -> Bool {
+    /// biometric policy; the P-256 key itself carries the policy.
+    private nonisolated func reserveCompanion(handle: String, metadata: KeyMetadata) throws -> Bool {
         var query = baseQuery(for: handle)
-        query[kSecAttrLabel as String] = try companionLabel(
-            handle: handle, keyType: keyType, role: role, publicKey: nil
-        )
-        query[kSecAttrDescription as String] = policyTag
+        query[kSecAttrLabel as String] = try metadataLabel(handle: handle, metadata: metadata)
         query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        query[kSecValueData as String] = Data() as CFData
         let status = SecItemAdd(query as CFDictionary, nil)
         switch status {
         case errSecSuccess:
@@ -822,17 +911,13 @@ extension AppleKeyCustody {
     }
 
     /// Records the created key's public key on its companion item: the
-    /// label's cached copy, `kSecAttrGeneric` for lookup by public key, and
-    /// the 65-byte uncompressed point as the item's data.
+    /// label's cached copy and `kSecAttrGeneric` for lookup by public key.
     private nonisolated func recordCompanionPublicKey(
-        handle: String, keyType: KeyType, role: CustodyKeyRole, publicKey: Data, uncompressed: Data
+        handle: String, metadata: KeyMetadata, publicKey: Data
     ) throws {
         let update: [String: Any] = try [
-            kSecAttrLabel as String: companionLabel(
-                handle: handle, keyType: keyType, role: role, publicKey: publicKey
-            ),
-            kSecAttrGeneric as String: publicKey as CFData,
-            kSecValueData as String: uncompressed as CFData
+            kSecAttrLabel as String: metadataLabel(handle: handle, metadata: metadata),
+            kSecAttrGeneric as String: publicKey as CFData
         ]
         let status = SecItemUpdate(baseQuery(for: handle) as CFDictionary, update as CFDictionary)
         guard status == errSecSuccess else {
@@ -921,12 +1006,12 @@ extension AppleKeyCustody {
         }
     }
 
-    /// P-256 ECDH inside the store with the HPKE P-256 key `keyHandle`,
-    /// whose type the caller has checked.
+    /// P-256 ECDH with the HPKE P-256 key `keyHandle`, whose record the
+    /// caller has read and type-checked, inside the store that record names.
     ///
     /// The peer is parsed with CryptoKit first, which rejects a point that
-    /// is not on the curve, so an invalid point never reaches the enclave.
-    nonisolated func agreeP256(_ keyHandle: String, peerPublic: Data) async throws -> Data {
+    /// is not on the curve, so an invalid point never reaches the store.
+    private nonisolated func agreeP256(_ keyHandle: String, metadata: KeyMetadata, peerPublic: Data) async throws -> Data {
         guard peerPublic.count == 65 else {
             throw PlatformError.custodyError(
                 "HPKE P-256 peer must be a 65-byte uncompressed point; got \(peerPublic.count) bytes"
@@ -940,7 +1025,7 @@ extension AppleKeyCustody {
                 "HPKE P-256 peer is not a point on the curve: \(error.localizedDescription)"
             )
         }
-        let secret = try await p256Store.agree(
+        let secret = try await p256Store(for: metadata, handle: keyHandle).agree(
             tag: applicationTag(for: keyHandle), peer: peer.x963Representation
         )
         guard secret.count == 32 else {
@@ -1001,7 +1086,8 @@ public extension AppleKeyCustody {
 
     /// Generates a keypair of `keyType`: an Ed25519 or X25519 key whose
     /// private bytes the Apple Keychain holds, or a P-256 or HPKE P-256 key
-    /// the Secure Enclave generates and holds.
+    /// the Secure Enclave or, on a host without one, the platform signer
+    /// generates and holds.
     ///
     /// Ed25519 and X25519 private key bytes are stored as a
     /// `kSecClassGenericPassword` item.
@@ -1021,8 +1107,8 @@ public extension AppleKeyCustody {
     /// - Returns: The key id, a canonical decimal `UInt64` string. Pass this
     ///   to other methods on this instance to perform operations with the key.
     /// - Throws: ``PlatformError/keychainError(_:)`` if the Keychain add fails,
-    ///   ``PlatformError/secureEnclaveUnavailable(_:)`` if the Secure Enclave
-    ///   cannot create a P-256 key (no software key replaces it),
+    ///   ``PlatformError/secureEnclaveKeyCreationFailed(_:)`` if the Secure
+    ///   Enclave cannot create a P-256 key (no software key replaces it),
     ///   ``PlatformError/custodyError(_:)`` for an unknown `keyType` string.
     ///
     /// See ADR-025 Key custody and ADR-006 `generate_keypair`.
@@ -1042,29 +1128,29 @@ public extension AppleKeyCustody {
     ///   signature. Its private key bytes are held in memory only for the
     ///   duration of this call; they are not cached, logged, or returned
     ///   across the FFI boundary.
-    /// - A P-256 key signs the 32-byte digest `data` inside the Secure
-    ///   Enclave (`.ecdsaSignatureDigestX962SHA256`, no second hash) and
-    ///   returns the 64-byte raw `r || s` with `s` in the low half of the
-    ///   group order (spec 09 §9.5, ADR-025 criterion 1). The enclave emits
-    ///   DER; the shared Rust helper `p256SignatureDerToRawLowS` converts it.
+    /// - A P-256 key signs the 32-byte digest `data` in the store its record
+    ///   names (`.ecdsaSignatureDigestX962SHA256`, no second hash) and
+    ///   returns the store's DER `ECDSA-Sig-Value`. The Rust bridge converts
+    ///   it to the 64-byte raw `r || s` with `s` in the low half of the group
+    ///   order and verifies it (spec 09 §9.5, ADR-025 criterion 1).
     ///
     /// - Parameters:
     ///   - keyHandle: The key id of an `"ed25519"` or `"p256"` key.
     ///   - data: The bytes to sign; a 32-byte digest for a P-256 key.
-    /// - Returns: A 64-byte signature.
+    /// - Returns: A 64-byte Ed25519 signature, or a P-256 DER signature.
     /// - Throws: ``PlatformError/wrongKeyType(_:)`` if `keyHandle` refers to
     ///   an X25519 or HPKE P-256 key, ``PlatformError/keyNotFound(_:)`` if the
     ///   handle is unknown, ``PlatformError/biometricAuthenticationFailed(_:)``
     ///   if biometric gating is active and authentication fails,
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
     ///   ``PlatformError/custodyError(_:)`` if CryptoKit rejects Ed25519 key
-    ///   bytes, a P-256 digest is not 32 bytes or the enclave fails. An
-    ///   `ScpError` from the DER helper passes through unchanged.
+    ///   bytes, a P-256 digest is not 32 bytes or the store fails.
     ///
     /// See ADR-025 Key custody and ADR-006 `sign`.
     @concurrent
     func sign(_ keyHandle: String, data: Data) async throws -> Data {
-        let storedType = try fetchKeyType(for: keyHandle)
+        let metadata = try fetchMetadata(for: keyHandle)
+        let storedType = try Self.keyType(of: metadata, handle: keyHandle)
         switch storedType {
         case .ed25519:
             return try signEd25519(keyHandle, data: data)
@@ -1074,8 +1160,8 @@ public extension AppleKeyCustody {
                     "P-256 sign takes a 32-byte digest; got \(data.count) bytes"
                 )
             }
-            let der = try await p256Store.sign(tag: applicationTag(for: keyHandle), digest: data)
-            return try p256SignatureDerToRawLowS(der: der)
+            return try await p256Store(for: metadata, handle: keyHandle)
+                .sign(tag: applicationTag(for: keyHandle), digest: data)
         case .x25519, .hpkeP256:
             throw PlatformError.wrongKeyType(
                 "sign requires an Ed25519 or P-256 key; handle '\(keyHandle)' is \(storedType.rawValue)"
@@ -1094,7 +1180,7 @@ public extension AppleKeyCustody {
     /// prompts on gated keys. Without a cached copy of the expected length,
     /// an Ed25519 or X25519 key derives it from its private bytes (legacy
     /// items that predate the metadata cache) and a P-256 key reads it from
-    /// the enclave key.
+    /// the store its record names.
     ///
     /// - Parameter keyHandle: The key id returned by
     ///   ``generateKeypair(keyType:)``.
@@ -1136,7 +1222,8 @@ public extension AppleKeyCustody {
                 try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKeyBytes).publicKey.rawRepresentation
             }
         case .p256, .hpkeP256:
-            let uncompressed = try await p256Store.publicKey(tag: applicationTag(for: keyHandle))
+            let uncompressed = try await p256Store(for: metadata, handle: keyHandle)
+                .publicKey(tag: applicationTag(for: keyHandle))
             return try Self.p256PublicKey(uncompressed, as: keyType)
         }
     }
@@ -1170,12 +1257,14 @@ public extension AppleKeyCustody {
     /// ## Deletion verification
     ///
     /// An Ed25519 or X25519 key is its generic-password item. A P-256 or
-    /// HPKE P-256 key is an enclave key item plus its companion
-    /// generic-password item; the key item is deleted first, so a failure
-    /// part-way leaves the record of a key that is gone, never a key without
-    /// a record. After each `SecItemDelete` this method re-fetches, and if
-    /// the re-fetch returns anything other than `errSecItemNotFound` it
-    /// throws ``PlatformError/destructionFailed(_:)``.
+    /// HPKE P-256 key is a key item in the store its companion records plus
+    /// that companion; the key item is deleted first, so a failure part-way
+    /// leaves the record of a key that is gone, never a key without a record.
+    /// When the companion is missing or does not decode, the store of
+    /// ``mintBacking`` is still asked for a key under the id's tag, and an
+    /// orphaned key is deleted. After each delete this method re-fetches, and
+    /// if the re-fetch finds the item it throws
+    /// ``PlatformError/destructionFailed(_:)``.
     ///
     /// ## Attestation
     ///
@@ -1188,36 +1277,40 @@ public extension AppleKeyCustody {
     /// - Parameter keyHandle: The key id returned by
     ///   ``generateKeypair(keyType:)``.
     /// - Returns: A ``DestructionAttestation`` confirming software deletion.
-    /// - Throws: ``PlatformError/keyNotFound(_:)`` if the handle is already
-    ///   absent, ``PlatformError/destructionFailed(_:)`` if an item persists
-    ///   after deletion, ``PlatformError/keychainError(_:)`` for other
-    ///   Keychain failures.
+    /// - Throws: ``PlatformError/keyNotFound(_:)`` if neither a companion nor
+    ///   a key item exists, ``PlatformError/destructionFailed(_:)`` if an
+    ///   item persists after deletion, ``PlatformError/keychainError(_:)`` for
+    ///   other Keychain failures.
     ///
     /// See ADR-025 Key destruction attestation and 9.15.
     @concurrent
     @discardableResult
     func destroyKey(_ keyHandle: String) async throws -> DestructionAttestation {
-        // An item whose label does not decode records no type, so the store
-        // is asked whether a key carries its tag; a store failure propagates
-        // and nothing is reported destroyed.
-        let storedType: KeyType?
+        // A missing or undecodable companion records no type or backing, so
+        // the store this instance mints into is asked for an orphaned key; a
+        // store failure propagates and nothing is reported destroyed.
+        let metadata: KeyMetadata?
         do {
-            storedType = try fetchKeyType(for: keyHandle)
-        } catch PlatformError.custodyError {
-            storedType = nil
+            metadata = try fetchMetadata(for: keyHandle)
+        } catch PlatformError.keyNotFound, PlatformError.custodyError {
+            metadata = nil
         }
 
         let tag = applicationTag(for: keyHandle)
-        let holdsEnclaveKey: Bool
-        switch storedType {
-        case .p256, .hpkeP256: holdsEnclaveKey = true
-        case .ed25519, .x25519: holdsEnclaveKey = false
-        case nil: holdsEnclaveKey = try await p256Store.contains(tag: tag)
-        }
-        if holdsEnclaveKey {
-            _ = try await p256Store.delete(tag: tag)
-            guard try await !p256Store.contains(tag: tag) else {
-                throw PlatformError.destructionFailed(keyHandle)
+        var removedKey = false
+        if let metadata {
+            switch try Self.keyType(of: metadata, handle: keyHandle) {
+            case .p256, .hpkeP256:
+                removedKey = try await deleteConfirmed(
+                    keyHandle, tag: tag, from: p256Store(for: metadata, handle: keyHandle)
+                )
+            case .ed25519, .x25519:
+                break
+            }
+        } else {
+            let store = makeP256Store(mintBacking)
+            if try await store.contains(tag: tag) {
+                removedKey = try await deleteConfirmed(keyHandle, tag: tag, from: store)
             }
         }
 
@@ -1226,7 +1319,7 @@ public extension AppleKeyCustody {
         case errSecSuccess:
             break
         case errSecItemNotFound:
-            throw PlatformError.keyNotFound(keyHandle)
+            guard removedKey else { throw PlatformError.keyNotFound(keyHandle) }
         default:
             throw PlatformError.keychainError(deleteStatus)
         }
@@ -1240,6 +1333,18 @@ public extension AppleKeyCustody {
         return DestructionAttestation(method: .softwareOnly, confirmed: true)
     }
 
+    /// Deletes the key under `tag` from `store` and confirms it is gone.
+    /// Returns whether a key was deleted.
+    private nonisolated func deleteConfirmed(
+        _ keyHandle: String, tag: Data, from store: any P256KeyStore
+    ) async throws -> Bool {
+        let deleted = try await store.delete(tag: tag)
+        guard try await !store.contains(tag: tag) else {
+            throw PlatformError.destructionFailed(keyHandle)
+        }
+        return deleted
+    }
+
     // MARK: dhAgree
 
     /// Performs Diffie-Hellman key agreement with an X25519 or HPKE P-256
@@ -1248,10 +1353,10 @@ public extension AppleKeyCustody {
     /// - An X25519 key's private bytes are read from the Keychain, and the
     ///   scalar multiplication happens entirely within this method; the
     ///   local copy of the key bytes is wiped.
-    /// - An HPKE P-256 key agrees inside the Secure Enclave
+    /// - An HPKE P-256 key agrees in the store its record names
     ///   (`.ecdhKeyExchangeStandard`), returning the x-coordinate of the
     ///   agreed point. The peer must be a 65-byte uncompressed point on the
-    ///   curve; CryptoKit checks it before the enclave sees it.
+    ///   curve; CryptoKit checks it before the store sees it.
     ///
     /// A signing key never agrees: an Ed25519 or P-256 key is refused before
     /// any key material is touched, because the custody interface has no
@@ -1272,12 +1377,13 @@ public extension AppleKeyCustody {
     /// See ADR-025 Key custody and ADR-006 `dh_agree`.
     @concurrent
     func dhAgree(_ keyHandle: String, peerPublic: Data) async throws -> Data {
-        let storedType = try fetchKeyType(for: keyHandle)
+        let metadata = try fetchMetadata(for: keyHandle)
+        let storedType = try Self.keyType(of: metadata, handle: keyHandle)
         switch storedType {
         case .x25519:
             return try agreeX25519(keyHandle, peerPublic: peerPublic)
         case .hpkeP256:
-            return try await agreeP256(keyHandle, peerPublic: peerPublic)
+            return try await agreeP256(keyHandle, metadata: metadata, peerPublic: peerPublic)
         case .ed25519, .p256:
             throw PlatformError.wrongKeyType(
                 "dhAgree requires an X25519 or HPKE P-256 key; '\(keyHandle)' is \(storedType.rawValue), and a signing key never agrees"
@@ -1368,17 +1474,20 @@ public extension AppleKeyCustody {
     // MARK: custodyType
 
     /// Returns the custody type of the key `keyHandle` names, in the
-    /// vocabulary the bridge reads (`KeyCustodyProvider.custody_type`).
+    /// vocabulary the bridge reads (`KeyCustodyProvider.custody_type`): the
+    /// custody string recorded in the key's companion at mint, never one
+    /// derived from the key type.
     ///
-    /// - A P-256 or HPKE P-256 key the Secure Enclave holds is
+    /// - A P-256 or HPKE P-256 key the Secure Enclave holds is recorded as
     ///   `"hardware"`: ADR-025's `CustodyType.secureEnclave`, which the
     ///   bridge reads as hardware custody.
-    /// - An Ed25519 or X25519 key the Keychain holds is `"software"` when no
-    ///   biometric policy is active, or `"software_biometric"` when biometric
-    ///   gating is enabled (ADR-025's `CustodyType.keychain`).
-    /// - An id whose metadata the Keychain does not return is `"in_memory"`,
-    ///   the weakest custody the bridge knows, so no unknown key is reported
-    ///   stronger than it is.
+    /// - An Ed25519 or X25519 key, or a P-256 key the platform signer holds
+    ///   on a host without an enclave, is recorded as `"software"`, or
+    ///   `"software_biometric"` when it was minted under
+    ///   ``BiometricPolicy/required`` (ADR-025's `CustodyType.keychain`).
+    /// - An id whose record the Keychain does not return, or whose recorded
+    ///   custody is none of those strings, is `"in_memory"`, the weakest
+    ///   custody the bridge knows, so no key is reported stronger than it is.
     ///
     /// The lookup reads attributes only and never prompts.
     ///
@@ -1389,15 +1498,12 @@ public extension AppleKeyCustody {
     /// - Returns: `"hardware"`, `"software"`, `"software_biometric"` or
     ///   `"in_memory"`.
     nonisolated func custodyType(_ keyHandle: String) -> String {
-        guard let storedType = try? fetchKeyType(for: keyHandle) else { return "in_memory" }
-        switch storedType {
-        case .p256, .hpkeP256:
-            return "hardware"
-        case .ed25519, .x25519:
-            return switch biometricPolicy {
-            case .none: "software"
-            case .required: "software_biometric"
-            }
+        guard let recorded = try? fetchMetadata(for: keyHandle).custodyType else { return "in_memory" }
+        switch recorded {
+        case "hardware", "software", "software_biometric":
+            return recorded
+        default:
+            return "in_memory"
         }
     }
 }
@@ -1417,8 +1523,9 @@ public extension AppleKeyCustody {
 ///   carrying the adapter's description.
 ///
 /// The adapter holds Ed25519 and X25519 keys in the Keychain and P-256 and
-/// HPKE P-256 keys in the Secure Enclave. Where no enclave is reachable a
-/// P-256 or HPKE P-256 request fails closed with `SCP-CRYPTO-4060`.
+/// HPKE P-256 keys in the Secure Enclave, or in the platform signer on a
+/// host without one. An enclave host whose enclave cannot create a key
+/// fails closed with `SCP-CRYPTO-4060`.
 extension AppleKeyCustody: KeyCustodyProvider {
     /// Code the bridge reports as key-not-found.
     private nonisolated static let keyNotFoundCode = "SCP-CRYPTO-4006"

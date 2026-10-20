@@ -18,20 +18,14 @@ use std::sync::Arc;
 
 use scp_crypto::p256::{P256PublicKey, P256SecretKey, ecdh_p256, verify_prehash_strict};
 use scp_ffi_common::error_codes as codes;
-use scp_platform::{CustodyType, KeyCustody, KeyHandle, PlatformError};
+use scp_platform::{CustodyType, KeyCustody, KeyHandle};
 use zeroize::Zeroizing;
 
 use crate::CustodyKeyType;
 use crate::bridge::{CallbackKeyCustody, ScpError};
 
-/// The error production reports for a custody failure: the bridge's
-/// `From<PlatformError>`.
-fn custody_err(e: PlatformError) -> ScpError {
-    ScpError::from(e)
-}
-
 fn testing_handle(key_id: &str) -> Result<KeyHandle, ScpError> {
-    scp_ffi_common::custody_parse::parse_handle("testing", key_id).map_err(custody_err)
+    scp_ffi_common::custody_parse::parse_handle("testing", key_id).map_err(ScpError::from)
 }
 
 fn validation(msg: String) -> ScpError {
@@ -85,21 +79,7 @@ impl TestingCallbackCustody {
             .generate_keypair(key_type.into())
             .await
             .map(|handle| handle.id().to_string())
-            .map_err(custody_err)
-    }
-
-    /// Generates the Ed25519 identity key through the adapter, as
-    /// `KeyCustody::generate_identity_keypair` does in production.
-    ///
-    /// # Errors
-    ///
-    /// The custody error production reports.
-    pub async fn generate_identity_keypair(&self) -> Result<String, ScpError> {
-        self.inner
-            .generate_identity_keypair()
-            .await
-            .map(|handle| handle.id().to_string())
-            .map_err(custody_err)
+            .map_err(ScpError::from)
     }
 
     /// The public key the adapter holds for `key_id`: 32 bytes (Ed25519,
@@ -115,7 +95,7 @@ impl TestingCallbackCustody {
             .public_key(&key)
             .await
             .map(|pk| pk.as_bytes().to_vec())
-            .map_err(custody_err)
+            .map_err(ScpError::from)
     }
 
     /// Signs `data` with `key_id` through the adapter and returns what the
@@ -131,7 +111,7 @@ impl TestingCallbackCustody {
             .sign(&key, &data)
             .await
             .map(|signature| signature.as_bytes().to_vec())
-            .map_err(custody_err)
+            .map_err(ScpError::from)
     }
 
     /// Runs the adapter's `dh_agree` for `key_id` against `peer_public` and
@@ -150,7 +130,7 @@ impl TestingCallbackCustody {
             .dh_agree(&key, &peer_public)
             .await
             .map(|shared| shared.as_bytes().to_vec())
-            .map_err(custody_err)
+            .map_err(ScpError::from)
     }
 
     /// Destroys `key_id` through the adapter.
@@ -160,7 +140,7 @@ impl TestingCallbackCustody {
     /// The custody error production reports.
     pub async fn destroy_key(&self, key_id: String) -> Result<(), ScpError> {
         let key = testing_handle(&key_id)?;
-        self.inner.destroy_key(&key).await.map_err(custody_err)
+        self.inner.destroy_key(&key).await.map_err(ScpError::from)
     }
 
     /// The custody class the bridge reads for `key_id` from the host's
@@ -245,7 +225,8 @@ pub fn testing_p256_ecdh(peer_scalar: Vec<u8>, host_public: Vec<u8>) -> Result<V
 /// # Errors
 ///
 /// `SCP-VALID-7000` when `source` has made no identity call, so it has no
-/// DHT client to share.
+/// DHT client to share, or when `target` already holds a different client,
+/// which its resolver would keep in place of `source`'s.
 #[uniffi::export]
 pub fn testing_share_did_resolver(
     source: Arc<crate::scp::Scp>,
@@ -256,6 +237,17 @@ pub fn testing_share_did_resolver(
             msg: "the source instance has no DHT client; create an identity on it first".to_owned(),
             code: codes::VALID_7000.to_owned(),
         })?;
+    if let Some(held) = crate::runtime::resolver_dht_client(&target.inner) {
+        if Arc::ptr_eq(&held, &client) {
+            return Ok(());
+        }
+        return Err(ScpError::Validation {
+            msg: "the target instance already resolves through its own DHT client; share \
+                  before its first identity call"
+                .to_owned(),
+            code: codes::VALID_7000.to_owned(),
+        });
+    }
     crate::runtime::set_resolver_dht_client(&target.inner, client);
     Ok(())
 }
@@ -431,5 +423,27 @@ mod tests {
             Arc::ptr_eq(&shared, &installed),
             "the target must resolve through the source's client"
         );
+        testing_share_did_resolver(Arc::clone(&source), Arc::clone(&target))
+            .expect("sharing the same client again is a no-op");
+    }
+
+    /// A target that already holds its own client is refused with
+    /// `SCP-VALID-7000` and keeps that client, because its resolver would
+    /// ignore the source's.
+    #[test]
+    fn share_did_resolver_refuses_a_target_that_holds_another_client() {
+        let rt = crate::runtime();
+        let source = crate::scp::Scp::new_in_memory_for_test();
+        let target = crate::scp::Scp::new_in_memory_for_test();
+        rt.block_on(target.identity_create("in_memory".to_owned(), None))
+            .expect("target identity");
+        rt.block_on(source.identity_create("in_memory".to_owned(), None))
+            .expect("source identity");
+        let own = crate::runtime::resolver_dht_client(&target.inner).expect("target client");
+        let err = testing_share_did_resolver(Arc::clone(&source), Arc::clone(&target))
+            .expect_err("the target already holds a different client");
+        assert_eq!(err.code(), codes::VALID_7000, "{err:?}");
+        let kept = crate::runtime::resolver_dht_client(&target.inner).expect("target client");
+        assert!(Arc::ptr_eq(&own, &kept), "the target keeps its own client");
     }
 }

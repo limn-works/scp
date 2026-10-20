@@ -1856,19 +1856,6 @@
           "exemptions": {
             "kotlin": "Kotlin hosts call the UniFFI-generated uniffi.scp.p256SoftwarePseudonymPoint directly (scp-kt-android's P256Pseudonym wraps it); the generated Kotlin is built, not committed, so the scanned scp-kt sources hold no symbol for it."
           }
-        },
-        {
-          "name": "p256_signature_der_to_raw_low_s",
-          "python": false,
-          "typescript": false,
-          "kotlin": false,
-          "swift": true,
-          "notes": "Custody-host helper (ADR-025 criterion 1, ADR-027 criterion 2): converts the DER ECDSA P-256 signature a platform key store emits to the 64-byte raw r || s with s in the low half of the group order, so a host's sign returns the form the custody contract names. Exported by UniFFI only; Swift's AppleKeyCustody.sign calls it on every Secure Enclave signature.",
-          "exemptions": {
-            "python": "The PyO3 callback custody adapter accepts a DER or raw P-256 signature from a Python host and normalizes it to raw low-s itself (scp_ffi_common::callback_custody); ADR-025 criterion 1's raw form binds the Apple adapter's own sign, which no Python host implements.",
-            "typescript": "The napi callback custody adapter accepts a DER or raw P-256 signature from a TypeScript host and normalizes it to raw low-s itself (scp_ffi_common::callback_custody); ADR-025 criterion 1's raw form binds the Apple adapter's own sign, which no TypeScript host implements.",
-            "kotlin": "Kotlin hosts call the UniFFI-generated uniffi.scp.p256SignatureDerToRawLowS directly from the Android Keystore adapter; the generated Kotlin is built, not committed, so the scanned scp-kt sources hold no symbol for it."
-          }
         }
       ]
     },

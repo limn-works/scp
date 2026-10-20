@@ -853,13 +853,66 @@ pub mod fake_host {
 
     use super::HostPublicKey;
 
+    /// The P-256 group order `n`, big-endian.
+    const N: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63,
+        0x25, 0x51,
+    ];
+
     /// Locks `m`, reporting a poisoned lock as a custody error.
     fn locked<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, PlatformError> {
         m.lock()
             .map_err(|_| PlatformError::CustodyError("fake host lock poisoned".into()))
     }
 
-    pub use crate::p256_host::der_fixture::{der, negate};
+    /// A DER length byte. Every length here is below 128, the short form.
+    fn der_len(len: usize) -> u8 {
+        u8::try_from(len).unwrap_or(u8::MAX)
+    }
+
+    /// `n - s` for a big-endian `s < n`.
+    #[must_use]
+    pub fn negate(s: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let mut d = i16::from(N[i]) - i16::from(s[i]) - borrow;
+            borrow = i16::from(d < 0);
+            if d < 0 {
+                d += 256;
+            }
+            // `d` is in 0..=255 here, so its low byte is its value.
+            out[i] = d.to_le_bytes()[0];
+        }
+        out
+    }
+
+    /// Minimal DER encoding of a positive big-endian integer.
+    fn der_int(v: &[u8]) -> Vec<u8> {
+        let mut v = v;
+        while v.len() > 1 && v[0] == 0 && v[1] & 0x80 == 0 {
+            v = &v[1..];
+        }
+        let mut out = vec![0x02];
+        if v[0] & 0x80 != 0 {
+            out.push(der_len(v.len() + 1));
+            out.push(0);
+        } else {
+            out.push(der_len(v.len()));
+        }
+        out.extend_from_slice(v);
+        out
+    }
+
+    /// DER `SEQUENCE { r, s }` of two big-endian integers.
+    #[must_use]
+    pub fn der(r: &[u8], s: &[u8]) -> Vec<u8> {
+        let body = [der_int(r), der_int(s)].concat();
+        let mut out = vec![0x30, der_len(body.len())];
+        out.extend_from_slice(&body);
+        out
+    }
 
     /// A key the host holds, with the role it was minted in.
     enum HostKey {
