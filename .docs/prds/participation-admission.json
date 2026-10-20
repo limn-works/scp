@@ -345,7 +345,7 @@
       "gate": "gate-participation-admission-production",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-crypto/src/p256.rs",
         "crates/scp-protocol/src/trust/participation_seed.rs",

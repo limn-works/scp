@@ -24,6 +24,11 @@
 //! Seed to scalar (§9.10.4, §25.2): [`P256SecretKey::from_seed`] runs the FIPS 186-5
 //! Appendix A.2.1 extra-random-bits method: HKDF-Expand-SHA256 the 32-byte seed
 //! to 48 bytes under a label, reduce modulo `n − 1`, add one.
+//!
+//! Participation signer (§7.3.2.1, §25.32 Vector 66):
+//! [`P256SecretKey::from_participation_seed`] runs HKDF-Extract under a fixed
+//! salt first, expands 48 bytes under an info string that carries the
+//! `context_id`, and applies the same A.2.1 reduction.
 
 use ::p256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use ::p256::ecdsa::{Signature, SigningKey, VerifyingKey};
@@ -53,6 +58,16 @@ const N_MINUS_ONE: NonZero<U384> = NonZero::<U384>::const_new(U384::from_be_hex(
      FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632550",
 ))
 .0;
+
+/// The 27 ASCII bytes whose SHA-256 is the HKDF-Extract salt of the
+/// participation signer derivation (§7.3.2.1, registered in §9.18.3 of the
+/// security-model spec).
+pub const PARTICIPATION_SIGNER_SALT_LABEL: &[u8] = b"SCP-PARTICIPATION-SIGNER-V1";
+
+/// The HKDF-Expand `info` prefix of the participation signer derivation
+/// (§7.3.2.1): the full `info` is this prefix followed by the `context_id`'s
+/// UTF-8 bytes, with no length prefix.
+pub const PARTICIPATION_SIGNER_INFO_PREFIX: &[u8] = b"scp-participation-signer:";
 
 /// Errors from the P-256 primitives. Each variant names one rejected input or
 /// one failed check, so a caller can map it without parsing text.
@@ -270,6 +285,36 @@ impl P256SecretKey {
         Self::from_nonzero_scalar(seed_to_scalar(label, seed))
     }
 
+    /// Derives a context's participation signing key from its
+    /// `participation_signing_seed` (§7.3.2.1, §25.32 Vector 66):
+    ///
+    /// ```text
+    /// salt = SHA-256("SCP-PARTICIPATION-SIGNER-V1")
+    /// info = "scp-participation-signer:" || context_id   // UTF-8, no length prefix
+    /// prk  = HKDF-Extract(salt, seed)
+    /// okm  = HKDF-Expand(prk, info, 48)
+    /// d    = (int(okm) mod (n − 1)) + 1                   // FIPS 186-5 A.2.1
+    /// ```
+    ///
+    /// The reduction is the one [`from_seed`](Self::from_seed) uses.
+    ///
+    /// Wiped: the key's scalar on drop, the 48-byte `okm` (`Zeroizing`), and
+    /// the `U384` and `U256` reduction intermediates. Not wiped: the 32-byte
+    /// `prk`, which hkdf 0.12's `Hkdf::new` returns from Extract and drops;
+    /// the HMAC-SHA256 state keyed by `prk` inside the `Hkdf` value (hmac 0.12
+    /// and sha2 0.10 do not zeroize), whose inner and outer midstates
+    /// recompute `okm` and so `d`; the HMAC block buffer that held the seed
+    /// during Extract; the `T(1)` and `T(2)` Expand blocks inside hkdf; and the
+    /// stack copies of the `NonZeroScalar` moved by value into the signing
+    /// key. The tracking issue "Secret HKDF derivations leave unwiped PRK and
+    /// HMAC state" owns the fix for this and every other secret HKDF path.
+    #[must_use]
+    pub fn from_participation_seed(seed: &[u8; 32], context_id: &str) -> Self {
+        Self::from_nonzero_scalar(wide48_to_scalar(&participation_signer_okm(
+            seed, context_id,
+        )))
+    }
+
     /// The public key `d·G`.
     #[must_use]
     pub fn public_key(&self) -> P256PublicKey {
@@ -298,6 +343,15 @@ impl P256SecretKey {
 /// The 48-byte input carries 128 bits more than `n`, so the bias from uniform
 /// is below 2^-128. There is no reject-and-retry and no direct reduction of the
 /// 32-byte seed, both of which §9.10.4 forbids.
+///
+/// Wiped: the 48-byte `scalar_input` (`Zeroizing`) and the `U384` and `U256`
+/// reduction intermediates. Not wiped: the HMAC-SHA256 state keyed by the seed
+/// itself inside the hkdf 0.12 `Hkdf` value (`from_prk(seed)`; hmac 0.12 and
+/// sha2 0.10 do not zeroize), whose midstates recompute `scalar_input` and so
+/// `d`; the `T(1)` and `T(2)` Expand blocks inside hkdf; and the copies of the
+/// returned `NonZeroScalar` left on the stack when it moves by value. The
+/// tracking issue "Secret HKDF derivations leave unwiped PRK and HMAC state"
+/// owns the fix.
 #[must_use]
 pub(crate) fn seed_to_scalar(label: SeedLabel, seed: &[u8; 32]) -> NonZeroScalar {
     // A 32-byte PRK is `HashLen`, and 48 ≤ 255 · HashLen, so neither call fails.
@@ -308,7 +362,33 @@ pub(crate) fn seed_to_scalar(label: SeedLabel, seed: &[u8; 32]) -> NonZeroScalar
     let Ok(()) = hkdf.expand(label.as_bytes(), okm.as_mut()) else {
         unreachable!("48 bytes is within 255 * HashLen")
     };
+    wide48_to_scalar(&okm)
+}
 
+/// The 48-byte `okm` of the participation signer derivation (§7.3.2.1):
+/// HKDF-Extract under `SHA-256(PARTICIPATION_SIGNER_SALT_LABEL)`, then
+/// HKDF-Expand under `PARTICIPATION_SIGNER_INFO_PREFIX || context_id`.
+fn participation_signer_okm(seed: &[u8; 32], context_id: &str) -> Zeroizing<[u8; 48]> {
+    use sha2::Digest as _;
+
+    let salt = sha2::Sha256::digest(PARTICIPATION_SIGNER_SALT_LABEL);
+    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt.as_slice()), seed);
+    let mut okm = Zeroizing::new([0u8; 48]);
+    // 48 ≤ 255 · HashLen, so the expansion cannot fail.
+    let Ok(()) = hkdf.expand_multi_info(
+        &[PARTICIPATION_SIGNER_INFO_PREFIX, context_id.as_bytes()],
+        okm.as_mut(),
+    ) else {
+        unreachable!("48 bytes is within 255 * HashLen")
+    };
+    okm
+}
+
+/// The FIPS 186-5 A.2.1 reduction both seed-to-scalar derivations share:
+/// `d = (int(okm) mod (n − 1)) + 1`. It wipes its `U384` and `U256`
+/// intermediates; the `NonZeroScalar` it returns by value leaves stack copies
+/// that nothing wipes.
+fn wide48_to_scalar(okm: &Zeroizing<[u8; 48]>) -> NonZeroScalar {
     let mut wide = U384::from_be_slice(okm.as_ref());
     let mut reduced = wide.rem(&N_MINUS_ONE);
     wide.zeroize();
@@ -1002,6 +1082,41 @@ mod tests {
             assert_eq!(P256PublicKey::from_sec1(&pk.to_compressed()).unwrap(), pk);
             assert_eq!(P256PublicKey::from_sec1(&pk.to_uncompressed()).unwrap(), pk);
         }
+    }
+
+    /// §25.32 Vector 66: the participation signer derivation of §7.3.2.1,
+    /// from the seed `00..1f` and the `context_id` `context-alpha`, checked at
+    /// `okm`, at the scalar `d`, and at the compressed and uncompressed public
+    /// key.
+    #[test]
+    fn participation_signer_matches_spec25_vector() {
+        let seed: [u8; 32] = h("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let okm = participation_signer_okm(&seed, "context-alpha");
+        assert_eq!(
+            hex::encode(*okm),
+            "94b394743b1d0d7f09077136f9f6480fbc6a48595db3784e02090535632139f6\
+             1d6f076e62c92fb2317b066580852534"
+        );
+        let key = P256SecretKey::from_participation_seed(&seed, "context-alpha");
+        assert_eq!(
+            hex::encode(*key.to_scalar_bytes()),
+            "0d8976f15845c51e5793b0c8c3ac322299bde6cf0bc448a80008f6b35cd14995"
+        );
+        let pk = key.public_key();
+        assert_eq!(
+            hex::encode(pk.to_compressed()),
+            "02ae8181b600262629a7d73b40f05cb6785e5ae6e34f816db22d260ec50d1ea887"
+        );
+        assert_eq!(
+            hex::encode(pk.to_uncompressed()),
+            "04ae8181b600262629a7d73b40f05cb6785e5ae6e34f816db22d260ec50d1ea8\
+             87a7c9466511badd299368f6880a37710a027e995503b62bd67deeba34655102da"
+        );
+        // The context_id is bound: another context derives another key.
+        assert_ne!(
+            P256SecretKey::from_participation_seed(&seed, "context-beta").public_key(),
+            pk
+        );
     }
 
     /// §25.26 Vectors 41 and 42 intermediates, rebuilt in test code from the
