@@ -143,7 +143,7 @@ export interface BrowserInvokerStreamSessionOptions {
    * zeroizes it (doing so would silently break a caller that reuses the same
    * buffer for a later session). Its lifecycle is the caller's responsibility.
    * Comprehensive in-tab key protection (non-extractable WebCrypto keys) is
-   * deferred to #1980 per the ADR-057 Slice-3 as-built caveat.
+   * waits for the MLS-signing-key → WebCrypto move per the ADR-057 Slice-3 as-built caveat.
    */
   readonly invokerSigningSeed: Uint8Array;
   /**

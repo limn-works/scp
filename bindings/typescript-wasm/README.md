@@ -59,7 +59,7 @@ the first-class `JsSocket` / `JsKeyCustody` / `JsStorage` interfaces:
 | Port | Browser default | Notes |
 |------|-----------------|-------|
 | Socket | `WebSocketRelaySocket` | outbound relay sink + inbound pump + reconnect |
-| Custody | `WebCryptoCustody` | binds the DID (`did()`); signing lands with #1980 |
+| Custody | `WebCryptoCustody` | binds the DID (`did()`); signing lands with the MLS-signing-key → WebCrypto move |
 | Storage | `IndexedDbStorage` (durable) / `InMemoryStorage` (ephemeral) | `InMemoryStorage` is a legitimate ephemeral choice, not a stand-in |
 
 ### Bring your own socket (`create`)
@@ -92,18 +92,18 @@ ws.onmessage = (evt) => client.handleRelayFrame(new Uint8Array(evt.data as Array
 
 ## Caveats (as-built)
 
-- **Non-extractable on-device key custody is NOT yet in effect (lands with #1980).** Despite
+- **Non-extractable on-device key custody is NOT yet in effect (lands with the MLS-signing-key → WebCrypto move).** Despite
   the `WebCryptoCustody` name, in this release the MLS signing key still lives in `scp-mls`
   (wasm linear memory) and is **extractable** — it is not held in non-extractable WebCrypto
   storage. Do NOT rely on WebCrypto non-extractability for signing-key protection this
-  release; that property arrives with the MLS-signing-key → WebCrypto move (#1980).
-- **Native↔browser invitation join / HPKE-open custody is deferred to #1980.** Opening an
+  release; that property arrives with the MLS-signing-key → WebCrypto move.
+- **Native↔browser invitation join / HPKE-open custody waits for the MLS-signing-key → WebCrypto move.** Opening an
   `InvitationBundle` needs a DH against the invitee's on-device custody key, which the
-  browser does not hold pre-#1980. `WebCryptoCustody`'s `sign` / `dhAgree` /
+  browser does not hold before that move. `WebCryptoCustody`'s `sign` / `dhAgree` /
   `getPublicKey` / `generateKeypair` are typed custody **seams that fail closed** (no
   driver call site this slice) — an honest absence, never a stand-in. `did()` is the one
   wired custody call.
-- **Same-human native↔browser pseudonym equality does not hold pre-#1980** (the browser
+- **Same-human native↔browser pseudonym equality does not hold before that move** (the browser
   keys on the per-context MLS key, native on the identity key). Cross-target *algorithm*
   determinism holds and is KAT-pinned (ADR-057 A1).
 - **The shipped wasm is always a `--release` build** (ADR-057 Prereq-4): a `--dev` build

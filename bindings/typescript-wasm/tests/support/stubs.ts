@@ -4,7 +4,7 @@
  * The custody double implements the {@link JsKeyCustody} contract but only its
  * one wired method, `did()`, is exercised by the driver in this slice — exactly
  * the surface a real embedder custody exposes today (the sign/dhAgree seams are
- * #1980, unwired). Storage/socket use the real production adapters.
+ * unwired SEAMs). Storage/socket use the real production adapters.
  */
 
 import type { JsKeyCustody } from "../../src/index";
@@ -16,7 +16,7 @@ import type { JsKeyCustody } from "../../src/index";
  */
 export function stubCustody(did: string): JsKeyCustody {
   const seam = (): never => {
-    throw new Error("custody seam reached — it has no driver call site in this slice (#1980)");
+    throw new Error("custody SEAM reached — it has no driver call site in this slice");
   };
   return {
     did: () => did,

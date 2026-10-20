@@ -82,20 +82,29 @@ export interface JsKeyCustody {
    * wires a caller routes it through that flow. An `"x25519"` or `"hpke-p256"`
    * key does not sign.
    *
-   * The P-256 nonce rule of spec 09 §9.5: a signer that runs in software,
-   * other than a platform signer, MUST derive its per-signature nonce
-   * deterministically under RFC 6979 with SHA-256. A platform signer is one of
-   * two signers: Android Keystore, and Apple's Security framework or CryptoKit
-   * on an Apple platform without a Secure Enclave; it MAY draw its nonce from
-   * the operating system's random source. A hardware signer draws its own
-   * nonce.
+   * The P-256 nonce rules, quoted from spec 09 §9.5:
    *
-   * Two facts follow for a WebCrypto P-256 key. WebCrypto `ECDSA` draws a
-   * random nonce and is not one of the two platform signers §9.5 names, so a
-   * WebCrypto P-256 signer does not satisfy §9.5 as written. WebCrypto `ECDSA`
-   * also hashes its input and has no prehash mode, so a WebCrypto key cannot
-   * sign the 32-byte digest this method receives as §9.5 requires.
-   * {@link WebCryptoCustody} leaves this method failing closed.
+   * > A signer that runs in software, other than a platform signer, MUST
+   * > derive its per-signature nonce deterministically under RFC 6979 with
+   * > SHA-256.
+   *
+   * > A platform signer MAY draw its per-signature nonce from the operating
+   * > system's random source in place of RFC 6979, and from no other source.
+   * > A platform signer is one of two signers that the operating system
+   * > provides and SCP's code does not implement. The first is Android
+   * > Keystore at whatever security level the device provides, including the
+   * > software Keystore of an emulator or a low-end device. The second is
+   * > Apple's Security framework or CryptoKit on an Apple platform without a
+   * > Secure Enclave, such as the Simulator or an Intel Mac without a T2 chip.
+   *
+   * §9.5 also states that a hardware signer draws its own nonce.
+   *
+   * Three facts about a WebCrypto P-256 key. §9.5 names two platform
+   * signers, and WebCrypto is neither. WebCrypto `ECDSA` draws a random
+   * nonce. WebCrypto `ECDSA` hashes its input and has no prehash mode, so a
+   * WebCrypto key cannot sign the 32-byte digest this method receives as
+   * §9.5 requires. {@link WebCryptoCustody} leaves this method failing
+   * closed.
    *
    * SEAM: no driver call site in this slice.
    */

@@ -654,7 +654,7 @@ export function outletStreamSignCredit(params: OutletStreamSignCreditParams): Ui
 
 /**
  * Computes the §5.4.5 credit-grant signature preimage (32 bytes) WITHOUT touching
- * any private key — the #1980-forward WebCrypto seam. An off-wasm signer
+ * any private key — the WebCrypto SEAM the MLS-signing-key → WebCrypto move uses. An off-wasm signer
  * (WebCrypto, hardware custody) signs this preimage; a verifier recomputes it to
  * check a credit's `sig` under the invoker's public key. `grant` is a `u32`;
  * `monotonicSeq` and `streamEpoch` are `u64` → `bigint`.
