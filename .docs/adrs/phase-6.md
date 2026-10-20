@@ -464,7 +464,7 @@ dependencies {
    - Called twice during identity creation: for the Active Signing Key and for the Pre-Rotation Key.
 
 2. **`AndroidKeyCustody.sign(keyHandle, data)`:**
-   - Retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("SHA256withECDSA")`, converts the DER output to the 64-byte raw `r || s` form of `09-security-model.md` §9.5, and normalizes `s` into the low half of the group order.
+   - Retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("SHA256withECDSA")`, and returns the platform signer's output, DER or raw. The Rust bridge converts the output to the 64-byte raw `r || s` form of `09-security-model.md` §9.5 with `s` in the low half of the group order, and verifies it strictly against the key's public key before any caller sees it. (Amended 2026-10-19; this item previously read "converts the DER output to the 64-byte raw `r || s` form of `09-security-model.md` §9.5, and normalizes `s` into the low half of the group order.")
    - Rejects a request to sign under an agreement-only handle with `PlatformError.wrongKeyType`.
    - Returns `ScpException("SCP-CRYPTO-4006")` if handle not found.
 

@@ -76,6 +76,10 @@ pub mod outlet_stream;
 pub mod p256_host;
 pub mod runtime;
 pub mod scp;
+// Test-only custody handle and P-256 oracles for host tests; never in a
+// shipped library.
+#[cfg(feature = "testing")]
+pub mod testing_custody;
 
 // Server startup (relay + application node) — behind the `server` feature on
 // scp-ffi-common.
@@ -736,6 +740,9 @@ pub trait DeviceAttestationProvider: Send + Sync {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod fake_host_provider;
 
 /// Runs a test case in a child process with its own environment, so no test
 /// mutates the environment of a process whose other threads may read it.
