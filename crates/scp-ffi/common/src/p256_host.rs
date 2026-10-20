@@ -15,7 +15,14 @@
 //! wrappers over these functions, so the three bridges share one argument
 //! order, one set of checks and one error code: `SCP-VALID-7005` for an input
 //! of the wrong length.
+//!
+//! [`p256_signature_der_to_raw_low_s`] is the signature-format helper a
+//! hardware host (Secure Enclave, Android Keystore) calls so that its `sign`
+//! returns the 64-byte raw low-`s` `r || s` that ADR-025 criterion 1 and
+//! ADR-027 criterion 2 require, with no per-language DER parser (§9.5,
+//! §9.5.1).
 
+use scp_crypto::p256::{SIGNATURE_LEN, der_to_raw, normalize_low_s};
 use scp_crypto::pseudonym::{PseudonymVersion, derive_pseudonym, pseudonym_from_context_seed};
 use zeroize::Zeroizing;
 
@@ -100,13 +107,160 @@ pub fn p256_software_pseudonym_point(
     Ok(derive_pseudonym(&ikm, context_id, version).to_compressed())
 }
 
+/// The raw 64-byte low-`s` `r || s` of a strict-DER ECDSA P-256 signature.
+///
+/// A hardware signer (`SecKeyCreateSignature` with
+/// `.ecdsaSignatureDigestX962SHA256`, `java.security.Signature` with
+/// `NONEwithECDSA`) emits a DER `ECDSA-Sig-Value` whose `s` may be high.
+/// §9.5 requires every signer to emit the low form, and ADR-025 criterion 1
+/// and ADR-027 criterion 2 require the host's `sign` to return the raw 64
+/// bytes. This parses strict DER, left-padding `r` and `s` to 32 bytes each,
+/// then replaces `s` with `n − s` when `s > n/2`. It does not verify: the
+/// bridge verifies every host signature strictly under the key's registered
+/// public key.
+///
+/// # Errors
+///
+/// [`P256HostError::Validation`] when `der` is not strict DER, or `r` or `s`
+/// is zero or not below the group order.
+pub fn p256_signature_der_to_raw_low_s(der: &[u8]) -> Result<[u8; SIGNATURE_LEN], P256HostError> {
+    let raw = der_to_raw(der).map_err(|e| {
+        P256HostError::Validation(format!("not a strict-DER P-256 ECDSA signature: {e}"))
+    })?;
+    normalize_low_s(&raw)
+        .map_err(|e| P256HostError::Validation(format!("not a valid P-256 ECDSA signature: {e}")))
+}
+
+/// DER encoding and `s` negation for P-256 signature fixtures, shared by
+/// this module's tests and the callback-custody fake host.
+#[cfg(any(test, feature = "testing"))]
+pub mod der_fixture {
+    /// The P-256 group order `n`, big-endian.
+    const N: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63,
+        0x25, 0x51,
+    ];
+
+    /// A DER length byte. Every length here is below 128, the short form.
+    fn der_len(len: usize) -> u8 {
+        u8::try_from(len).unwrap_or(u8::MAX)
+    }
+
+    /// `n - s` for a big-endian `s < n`.
+    #[must_use]
+    pub fn negate(s: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let mut d = i16::from(N[i]) - i16::from(s[i]) - borrow;
+            borrow = i16::from(d < 0);
+            if d < 0 {
+                d += 256;
+            }
+            // `d` is in 0..=255 here, so its low byte is its value.
+            out[i] = d.to_le_bytes()[0];
+        }
+        out
+    }
+
+    /// Minimal DER encoding of a positive big-endian integer.
+    fn der_int(v: &[u8]) -> Vec<u8> {
+        let mut v = v;
+        while v.len() > 1 && v[0] == 0 && v[1] & 0x80 == 0 {
+            v = &v[1..];
+        }
+        let mut out = vec![0x02];
+        if v[0] & 0x80 != 0 {
+            out.push(der_len(v.len() + 1));
+            out.push(0);
+        } else {
+            out.push(der_len(v.len()));
+        }
+        out.extend_from_slice(v);
+        out
+    }
+
+    /// DER `SEQUENCE { r, s }` of two big-endian integers.
+    #[must_use]
+    pub fn der(r: &[u8], s: &[u8]) -> Vec<u8> {
+        let body = [der_int(r), der_int(s)].concat();
+        let mut out = vec![0x30, der_len(body.len())];
+        out.extend_from_slice(&body);
+        out
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use super::der_fixture::{der, negate};
     use super::*;
 
     fn h(s: &str) -> Vec<u8> {
         hex::decode(s).unwrap()
+    }
+
+    /// A real signature in DER converts to the raw low-`s` form that
+    /// verifies strictly, whichever `s` the DER carried.
+    #[test]
+    fn der_helper_returns_raw_low_s_that_verifies_strictly() {
+        use scp_crypto::p256::{
+            P256SecretKey, sign_prehash_rfc6979_unnormalized, verify_prehash_strict,
+        };
+        let key = P256SecretKey::from_scalar_bytes(&[7u8; 32]).unwrap();
+        let mut saw_high = false;
+        for i in 0u8..32 {
+            let digest = [i; 32];
+            let sig = sign_prehash_rfc6979_unnormalized(&key, &digest).unwrap();
+            let r: [u8; 32] = sig[..32].try_into().unwrap();
+            let s: [u8; 32] = sig[32..].try_into().unwrap();
+            for s_form in [s, negate(&s)] {
+                saw_high |= s_form[0] & 0x80 != 0;
+                let raw = p256_signature_der_to_raw_low_s(&der(&r, &s_form)).unwrap();
+                verify_prehash_strict(&key.public_key(), &digest, &raw).unwrap();
+            }
+        }
+        assert!(saw_high, "no high-s form was presented");
+    }
+
+    /// A high `s` comes back as exactly `n − s`, a low `s` unchanged, and a
+    /// one-byte `r` left-padded to 32 bytes.
+    #[test]
+    fn der_helper_negates_exactly_a_high_s_and_left_pads() {
+        let mut r = [0u8; 32];
+        r[31] = 1;
+        let low = [0x33u8; 32];
+        let high = negate(&low);
+        assert!(high[0] & 0x80 != 0);
+        let out = p256_signature_der_to_raw_low_s(&der(&r, &high)).unwrap();
+        assert_eq!(&out[..32], &r);
+        assert_eq!(&out[32..], &low);
+        let out = p256_signature_der_to_raw_low_s(&der(&r, &low)).unwrap();
+        assert_eq!(&out[32..], &low);
+    }
+
+    /// Raw bytes, an empty input, trailing bytes, a zero `s` and an `s` of
+    /// `n` (`negate` of zero) are `SCP-VALID-7005`.
+    #[test]
+    fn der_helper_rejects_non_der_and_out_of_range_input() {
+        let r = [0x22u8; 32];
+        let s = [0x33u8; 32];
+        let mut trailing = der(&r, &s);
+        trailing.push(0);
+        let mut raw64 = r.to_vec();
+        raw64.extend(s);
+        for bad in [
+            Vec::new(),
+            raw64,
+            trailing,
+            der(&r, &[0u8; 32]),
+            der(&r, &negate(&[0u8; 32])),
+        ] {
+            let err = p256_signature_der_to_raw_low_s(&bad).expect_err("rejected input");
+            assert!(matches!(err, P256HostError::Validation(_)), "{err:?}");
+            assert_eq!(err.code(), "SCP-VALID-7005");
+        }
     }
 
     /// §25.19 Vectors 30 and 31: the identity scalar (the software `ikm`)

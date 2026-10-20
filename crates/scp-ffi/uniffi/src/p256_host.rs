@@ -9,6 +9,12 @@
 //! handed (`Zeroizing`), but uniffi's lift and `rustbuffer_free` do not wipe
 //! the transfer buffer that carries them across the boundary. The host wipes
 //! its own arrays.
+//!
+//! [`p256_signature_der_to_raw_low_s`] converts a hardware signer's DER
+//! output to the raw low-`s` form the Swift and Kotlin custody `sign` returns
+//! (ADR-025 criterion 1, ADR-027 criterion 2). It is `UniFFI`-only: the
+//! `PyO3` and napi-rs custody callbacks hand the host's output to the bridge,
+//! which accepts DER and normalises it itself.
 
 use scp_ffi_common::p256_host::{self as shared, P256HostError};
 use zeroize::Zeroizing;
@@ -62,10 +68,46 @@ pub fn p256_software_pseudonym_point(
     )
 }
 
+/// The raw 64-byte low-`s` `r || s` of a DER ECDSA P-256 signature.
+///
+/// For a Secure Enclave or Android Keystore host whose signer returns DER:
+/// the host's `sign` passes that DER here and returns the result, so it
+/// emits the low form §9.5 requires without its own DER parser.
+///
+/// # Errors
+///
+/// `SCP-VALID-7005` when `der` is not strict DER, or `r` or `s` is zero or
+/// not below the group order.
+#[uniffi::export]
+pub fn p256_signature_der_to_raw_low_s(der: Vec<u8>) -> Result<Vec<u8>, ScpError> {
+    Ok(shared::p256_signature_der_to_raw_low_s(&der)
+        .map_err(scp_error)?
+        .to_vec())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// The export returns the shared helper's 64 bytes for valid DER and
+    /// `ScpError::Validation` with `SCP-VALID-7005` for raw bytes.
+    #[test]
+    fn der_export_converts_and_reports_malformed_input_as_valid_7005() {
+        use scp_ffi_common::error_codes as codes;
+        // SEQUENCE { INTEGER 1, INTEGER 2 }.
+        let der = vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
+        let raw = p256_signature_der_to_raw_low_s(der).unwrap();
+        let mut expected = vec![0u8; 64];
+        expected[31] = 1;
+        expected[63] = 2;
+        assert_eq!(raw, expected);
+        let err = p256_signature_der_to_raw_low_s(vec![1; 64]).expect_err("raw input");
+        assert!(
+            matches!(&err, ScpError::Validation { code, .. } if code == codes::VALID_7005),
+            "{err:?}"
+        );
+    }
 
     fn h(s: &str) -> Vec<u8> {
         hex::decode(s).unwrap()

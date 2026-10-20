@@ -19153,7 +19153,7 @@ impl Scp {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub mod tests {
     use super::*;
 
     /// `service_endpoints` lists only the entries §18.2.1 accepts.
@@ -24477,20 +24477,24 @@ mod tests {
 
     // ----- P-256 through the callback-custody adapter -----
 
-    /// A `KeyCustodyProvider` over the shared software host, so a round trip
-    /// runs through `CallbackKeyCustody` and the shared flows. A host
-    /// not-found answers with the typed `SCP-CRYPTO-4006`; `sign_error`, when
-    /// set, replaces every `sign` answer.
-    struct FakeHostProvider {
-        host: Arc<scp_ffi_common::callback_custody::fake_host::FakeHost>,
-        sign_error: Option<ScpError>,
+    /// A `KeyCustodyProvider` over the shared software host.
+    ///
+    /// A round trip runs through `CallbackKeyCustody` and the shared flows. A
+    /// host not-found answers with the typed `SCP-CRYPTO-4006`; `sign_error`,
+    /// when set, replaces every `sign` answer; `custody_type` is the string
+    /// the provider reports for every key.
+    pub struct FakeHostProvider {
+        pub host: Arc<scp_ffi_common::callback_custody::fake_host::FakeHost>,
+        pub sign_error: Option<ScpError>,
+        pub custody_type: &'static str,
     }
 
     impl FakeHostProvider {
-        fn over(host: &Arc<scp_ffi_common::callback_custody::fake_host::FakeHost>) -> Self {
+        pub fn over(host: &Arc<scp_ffi_common::callback_custody::fake_host::FakeHost>) -> Self {
             Self {
                 host: Arc::clone(host),
                 sign_error: None,
+                custody_type: "software",
             }
         }
     }
@@ -24583,7 +24587,7 @@ mod tests {
         }
 
         fn custody_type(&self, _key_id: String) -> String {
-            "software".to_owned()
+            self.custody_type.to_owned()
         }
     }
 
@@ -24766,6 +24770,7 @@ mod tests {
                 msg: "connection reset".to_owned(),
                 code: "SCP-TRANSPORT-0000".to_owned(),
             }),
+            custody_type: "software",
         }));
         let key = transport
             .generate_keypair(KeyType::Ed25519)
