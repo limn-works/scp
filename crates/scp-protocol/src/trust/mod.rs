@@ -18,6 +18,7 @@ pub mod custody_violation;
 pub mod identifier;
 mod language_tag;
 pub mod participation;
+pub mod participation_seed;
 pub mod renewal;
 pub mod schema_gate;
 pub mod sybil;
@@ -81,6 +82,11 @@ pub use participation::{
     ParticipationFact, ParticipationFacts, ParticipationInput, ParticipationProfile,
     ParticipationRecord, ParticipationThreshold, RequireParticipation,
     UnsignedParticipationProfile, compute_participation_record, participation_profile_unsigned,
+};
+pub use participation_seed::{
+    OpenedParticipationSeed, PARTICIPATION_SEED_LEN, PARTICIPATION_SEED_WRAP_INFO_PREFIX,
+    ParticipationSeedError, WrappedParticipationSeed, open_participation_seed,
+    seal_participation_seed,
 };
 pub use schema_gate::{SchemaGate, SchemaVerdict};
 pub use sybil::{
