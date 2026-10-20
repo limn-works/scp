@@ -192,15 +192,21 @@ private nonisolated struct KeyMetadata: Codable {
     /// selects the store every later operation on the key uses. `nil` for an
     /// Ed25519 or X25519 key, whose private bytes the item itself holds.
     let backing: String?
+    /// The ``AppleKeyCustody/currentProcessTag`` of the process minting a
+    /// P-256 key, set on the reservation and cleared when the public key is
+    /// recorded. ``AppleKeyCustody/sweepAbandonedMints(isAbandoned:)`` reads
+    /// it to tell a crashed mint from a live one. `nil` on every settled key.
+    let mintingProcess: String?
 
-    /// This record with `publicKey` cached.
+    /// This record with `publicKey` cached and the mint settled.
     func with(publicKey: Data) -> KeyMetadata {
         KeyMetadata(
             keyType: keyType,
             publicKeyBase64: publicKey.base64EncodedString(),
             role: role,
             custodyType: custodyType,
-            backing: backing
+            backing: backing,
+            mintingProcess: nil
         )
     }
 }
@@ -352,6 +358,11 @@ public final class AppleKeyCustody: Sendable {
     /// Draws a candidate key id.
     private let newKeyId: @Sendable () -> String
 
+    /// Whether the process a pending reservation names is gone; see
+    /// ``sweepAbandonedMints(isAbandoned:)``. The public initializer passes
+    /// ``mintingProcessIsGone(_:)``.
+    private let processIsGone: @Sendable (String) -> Bool
+
     // MARK: - Keychain item attribute helpers
 
     /// Returns the `kSecAttrAccount` value for a key handle.
@@ -394,25 +405,31 @@ public final class AppleKeyCustody: Sendable {
         )
     }
 
-    /// Creates an instance whose P-256 stores come from `makeP256Store` and
-    /// whose candidate key ids come from `newKeyId`.
+    /// Creates an instance whose P-256 stores come from `makeP256Store`,
+    /// whose candidate key ids come from `newKeyId`, and whose mints sweep
+    /// the reservations `processIsGone` reports abandoned.
     ///
     /// Internal: the public initializer passes the real probe, the Keychain
-    /// stores and random ids. Tests pass a store their unsigned test host
-    /// can reach, a fixed probe result, and an id source that records every
-    /// id it hands out so cleanup and absence checks name exact ids.
+    /// stores, random ids and ``mintingProcessIsGone(_:)``. Tests pass a
+    /// store their unsigned test host can reach, a fixed probe result, an id
+    /// source that records every id it hands out so cleanup and absence
+    /// checks name exact ids, and a liveness check that marks only their own
+    /// reservations abandoned, since every adapter in the test process
+    /// shares one Keychain.
     init(
         accessGroup: String?,
         biometricPolicy: BiometricPolicy,
         enclaveAvailable: Bool,
         makeP256Store: @escaping @Sendable (P256Backing) -> any P256KeyStore,
-        newKeyId: @escaping @Sendable () -> String
+        newKeyId: @escaping @Sendable () -> String,
+        processIsGone: @escaping @Sendable (String) -> Bool = AppleKeyCustody.mintingProcessIsGone
     ) {
         self.accessGroup = accessGroup
         self.biometricPolicy = biometricPolicy
         mintBacking = enclaveAvailable ? .secureEnclave : .software
         self.makeP256Store = makeP256Store
         self.newKeyId = newKeyId
+        self.processIsGone = processIsGone
     }
 
     // MARK: - Private Keychain helpers
@@ -684,7 +701,8 @@ public final class AppleKeyCustody: Sendable {
                 publicKeyBase64: publicKeyBytes.base64EncodedString(),
                 role: KeyRole(role).rawValue,
                 custodyType: softwareCustodyType,
-                backing: nil
+                backing: nil,
+                mintingProcess: nil
             )
         )
         query[kSecAttrGeneric as String] = publicKeyBytes as CFData
@@ -801,22 +819,18 @@ extension AppleKeyCustody {
     /// the key is confirmed gone, and
     /// ``PlatformError/mintRollbackIncomplete(keyId:cause:)`` when `create`
     /// returned a key the store cannot confirm deleted.
+    ///
+    /// A process that dies between step 1 and the end of step 3 leaves a
+    /// reservation no caller can name. Before it reserves, every mint runs
+    /// ``sweepAbandonedMints(isAbandoned:)`` with this instance's liveness
+    /// check, which removes such reservations and their keys; a sweep
+    /// failure fails the mint.
     private nonisolated func mintP256Key(keyType: KeyType, role: CustodyKeyRole) async throws -> String {
-        let backing = mintBacking
-        let store = makeP256Store(backing)
-        let custody = switch backing {
-        case .secureEnclave: "hardware"
-        case .software: softwareCustodyType
-        }
+        try await sweepAbandonedMints(isAbandoned: processIsGone)
+        let store = makeP256Store(mintBacking)
         for _ in 0 ..< Self.mintAttempts {
             let handle = newKeyId()
-            let reservation = KeyMetadata(
-                keyType: keyType.rawValue,
-                publicKeyBase64: nil,
-                role: KeyRole(role).rawValue,
-                custodyType: custody,
-                backing: backing.rawValue
-            )
+            let reservation = p256Reservation(keyType: keyType, role: role, mintingProcess: Self.currentProcessTag)
             guard try reserveCompanion(handle: handle, metadata: reservation) else { continue }
             let tag = applicationTag(for: handle)
             guard try await tagIsFree(handle: handle, tag: tag, store: store) else { continue }
@@ -919,13 +933,52 @@ extension AppleKeyCustody {
         return label
     }
 
-    /// Adds the companion item that reserves `handle` for a P-256 key.
-    /// Returns `false` when an item already holds the id. The item carries
-    /// no secret, so it is readable after first unlock whatever the
-    /// biometric policy; the P-256 key itself carries the policy.
+    /// The record that reserves an id for a `keyType` key minted in `role`
+    /// in the store of ``mintBacking`` by `mintingProcess`.
+    private nonisolated func p256Reservation(
+        keyType: KeyType, role: CustodyKeyRole, mintingProcess: String
+    ) -> KeyMetadata {
+        let custody = switch mintBacking {
+        case .secureEnclave: "hardware"
+        case .software: softwareCustodyType
+        }
+        return KeyMetadata(
+            keyType: keyType.rawValue,
+            publicKeyBase64: nil,
+            role: KeyRole(role).rawValue,
+            custodyType: custody,
+            backing: mintBacking.rawValue,
+            mintingProcess: mintingProcess
+        )
+    }
+
+    /// Reserves `handle` as ``mintP256Key(keyType:role:)`` does, for a mint
+    /// by `mintingProcess`, and returns `false` when an item already holds
+    /// the id.
+    ///
+    /// Internal so a test can leave the reservation a crashed mint leaves.
+    nonisolated func reserveP256(
+        handle: String, keyType: KeyType, role: CustodyKeyRole, mintingProcess: String
+    ) throws -> Bool {
+        try reserveCompanion(
+            handle: handle, metadata: p256Reservation(keyType: keyType, role: role, mintingProcess: mintingProcess)
+        )
+    }
+
+    /// The `kSecAttrComment` of a companion whose mint has not settled. An
+    /// exact-match query on it finds every unsettled reservation without
+    /// enumerating the Keychain (see ``keyIds(cachingPublicKey:)``).
+    private nonisolated static let pendingMintMarker = "scp.mint.pending"
+
+    /// Adds the companion item that reserves `handle` for a P-256 key,
+    /// marked with ``pendingMintMarker``. Returns `false` when an item
+    /// already holds the id. The item carries no secret, so it is readable
+    /// after first unlock whatever the biometric policy; the P-256 key
+    /// itself carries the policy.
     private nonisolated func reserveCompanion(handle: String, metadata: KeyMetadata) throws -> Bool {
         var query = baseQuery(for: handle)
         query[kSecAttrLabel as String] = try metadataLabel(handle: handle, metadata: metadata)
+        query[kSecAttrComment as String] = Self.pendingMintMarker
         query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         let status = SecItemAdd(query as CFDictionary, nil)
         switch status {
@@ -940,12 +993,15 @@ extension AppleKeyCustody {
 
     /// Records the created key's public key on its companion item: the
     /// label's cached copy and `kSecAttrGeneric` for lookup by public key.
+    /// The same update clears ``pendingMintMarker``, so a settled key is
+    /// never a sweep candidate.
     private nonisolated func recordCompanionPublicKey(
         handle: String, metadata: KeyMetadata, publicKey: Data
     ) throws {
         let update: [String: Any] = try [
             kSecAttrLabel as String: metadataLabel(handle: handle, metadata: metadata),
-            kSecAttrGeneric as String: publicKey as CFData
+            kSecAttrGeneric as String: publicKey as CFData,
+            kSecAttrComment as String: ""
         ]
         let status = SecItemUpdate(baseQuery(for: handle) as CFDictionary, update as CFDictionary)
         guard status == errSecSuccess else {
@@ -960,6 +1016,128 @@ extension AppleKeyCustody {
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw PlatformError.keychainError(status)
         }
+    }
+
+    /// Removes every P-256 reservation whose minting process
+    /// `isAbandoned` reports gone, with any key under its tag, and returns
+    /// the ids removed.
+    ///
+    /// A reservation is a candidate only while it carries
+    /// ``pendingMintMarker``, its record decodes with a P-256 type and
+    /// backing, no public key is recorded, and it names a minting process.
+    /// Any other item is left alone. For each abandoned one the key is
+    /// deleted from the store its record names and confirmed gone before the
+    /// companion is deleted, so a key is never left without a record.
+    ///
+    /// One sweep can miss a reservation: the macOS file keychain may end a
+    /// multi-item query early, without an error, while another thread changes
+    /// a matching item, as a concurrent mint settling its own reservation
+    /// does. A missed reservation stays as it was and the next mint's sweep
+    /// finds it, so the sweep converges rather than completing in one call.
+    ///
+    /// - Throws: ``PlatformError/keychainError(_:)`` when the query or a
+    ///   companion deletion fails, ``PlatformError/destructionFailed(_:)``
+    ///   when a key persists after deletion, or the store's error. A failed
+    ///   sweep leaves every reservation it did not finish in place.
+    @discardableResult
+    nonisolated func sweepAbandonedMints(isAbandoned: (String) -> Bool) async throws -> [String] {
+        var swept: [String] = []
+        for attrs in try pendingReservations() {
+            guard
+                let account = attrs[kSecAttrAccount as String] as? String,
+                account.hasPrefix(Self.accountPrefix),
+                let metadata = Self.metadata(from: attrs),
+                metadata.publicKeyBase64 == nil,
+                let process = metadata.mintingProcess,
+                let backing = metadata.backing.flatMap(P256Backing.init(rawValue:)),
+                KeyType(rawValue: metadata.keyType).map({ $0 == .p256 || $0 == .hpkeP256 }) == true,
+                isAbandoned(process)
+            else { continue }
+            let handle = String(account.dropFirst(Self.accountPrefix.count))
+            let tag = applicationTag(for: handle)
+            let store = makeP256Store(backing)
+            if try await store.contains(tag: tag) {
+                _ = try await deleteConfirmed(handle, tag: tag, from: store)
+            }
+            try deleteCompanion(handle: handle)
+            swept.append(handle)
+        }
+        return swept
+    }
+
+    /// The number of times ``pendingReservations()`` runs its query when the
+    /// Keychain reports `errSecInvalidRecord`.
+    private nonisolated static let pendingScanAttempts = 4
+
+    /// The attributes of every companion carrying ``pendingMintMarker``.
+    ///
+    /// The macOS file keychain fails a multi-item query with
+    /// `errSecInvalidRecord` when another thread updates or deletes a
+    /// matching item mid-scan, and a concurrent mint settling or rolling back
+    /// its reservation does exactly that. The query is therefore rerun, up
+    /// to ``pendingScanAttempts`` times in all, and the last status is
+    /// thrown if it never completes.
+    private nonisolated func pendingReservations() throws -> [[String: Any]] {
+        var query = itemQuery()
+        query[kSecAttrComment as String] = Self.pendingMintMarker
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitAll
+        var status = errSecInvalidRecord
+        for _ in 0 ..< Self.pendingScanAttempts {
+            var result: AnyObject?
+            status = SecItemCopyMatching(query as CFDictionary, &result)
+            switch status {
+            case errSecSuccess:
+                guard let items = result as? [[String: Any]] else {
+                    throw PlatformError.custodyError("Keychain returned no attributes for pending mints")
+                }
+                return items
+            case errSecItemNotFound:
+                return []
+            case errSecInvalidRecord:
+                continue
+            default:
+                throw PlatformError.keychainError(status)
+            }
+        }
+        throw PlatformError.keychainError(status)
+    }
+
+    /// The tag ``KeyMetadata/mintingProcess`` records for this process:
+    /// `"<pid>:<start seconds>.<start microseconds>"`. The start time tells
+    /// this process from a later one that reuses its pid.
+    nonisolated static let currentProcessTag: String = {
+        let pid = getpid()
+        guard let start = processStartTime(pid) else { return "\(pid):unknown" }
+        return "\(pid):\(start)"
+    }()
+
+    /// The start time of process `pid` as `"<seconds>.<microseconds>"`, or
+    /// `nil` when the kernel does not report it: no such process, or one this
+    /// process may not inspect.
+    nonisolated static func processStartTime(_ pid: pid_t) -> String? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        let start = info.kp_proc.p_un.__p_starttime
+        return "\(start.tv_sec).\(start.tv_usec)"
+    }
+
+    /// Whether the process `tag` names is gone: its pid has no process, or
+    /// the process under that pid started at another time. Fails toward
+    /// alive: this process's own tag, a malformed tag, an unknown start time,
+    /// a pid the kernel will not describe and any other doubt all report
+    /// `false`, so a live mint is never swept.
+    nonisolated static func mintingProcessIsGone(_ tag: String) -> Bool {
+        guard tag != currentProcessTag else { return false }
+        let parts = tag.split(separator: ":", maxSplits: 1).map(String.init)
+        guard parts.count == 2, let pid = pid_t(parts[0]), pid > 0, parts[1] != "unknown" else { return false }
+        if kill(pid, 0) == -1, errno == ESRCH {
+            return true
+        }
+        guard let start = processStartTime(pid) else { return false }
+        return start != parts[1]
     }
 
     /// Whether the generic-password item of `handle` is gone.

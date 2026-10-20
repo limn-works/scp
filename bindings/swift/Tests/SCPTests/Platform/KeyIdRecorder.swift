@@ -27,19 +27,22 @@
         }
 
         /// The adapter tests use: the internal initializer with this
-        /// recorder's ids, the probe result `enclaveAvailable`, and `stores`
-        /// as the store of each backing.
+        /// recorder's ids, the probe result `enclaveAvailable`, `stores` as
+        /// the store of each backing, and `processIsGone` as the liveness
+        /// check its mints sweep with.
         func custody(
             policy: BiometricPolicy = .none,
             enclaveAvailable: Bool,
-            stores: @escaping @Sendable (P256Backing) -> any P256KeyStore
+            stores: @escaping @Sendable (P256Backing) -> any P256KeyStore,
+            processIsGone: @escaping @Sendable (String) -> Bool = AppleKeyCustody.mintingProcessIsGone
         ) -> AppleKeyCustody {
             AppleKeyCustody(
                 accessGroup: nil,
                 biometricPolicy: policy,
                 enclaveAvailable: enclaveAvailable,
                 makeP256Store: stores,
-                newKeyId: { [self] in next() }
+                newKeyId: { [self] in next() },
+                processIsGone: processIsGone
             )
         }
 
