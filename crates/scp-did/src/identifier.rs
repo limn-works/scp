@@ -141,9 +141,10 @@ impl From<NonCanonicalReason> for IdentifierError {
 /// same 32 bytes as the canonical one, and §3.1 admits one text per
 /// identifier.
 ///
-/// The predicate is syntactic: it resolves nothing. Its consumers are
-/// [`Identifier`]'s text parser and the identifier-scoped capability URI
-/// parser (`07-trust-validation-and-capabilities.md` §7.3.4.1).
+/// The predicate is syntactic: it resolves nothing. It returns whether
+/// [`Identifier`]'s text parser accepts `s`, because both run one check. Its
+/// consumer is the identifier-scoped capability URI parser
+/// (`07-trust-validation-and-capabilities.md` §7.3.4.1).
 #[must_use]
 pub fn is_canonical_identifier_text(s: &str) -> bool {
     decode_canonical(s).is_ok()
