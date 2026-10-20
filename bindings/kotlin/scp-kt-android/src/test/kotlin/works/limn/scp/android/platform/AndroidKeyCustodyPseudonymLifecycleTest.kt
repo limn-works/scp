@@ -15,47 +15,6 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
-import java.security.SecureRandom
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
-
-/**
- * [KeystoreKeys] fake: Ed25519 entries are markers (the tests here never sign with the
- * identity), HMAC entries hold a random 32-byte key and compute a real HMAC-SHA256.
- */
-private class FakeKeystoreKeys(
-    private val failHmacGeneration: Boolean = false,
-    /** Aliases whose next [deleteEntry] throws, once each. */
-    val failDeleteOnce: MutableSet<String> = mutableSetOf(),
-) : KeystoreKeys {
-    val ed25519 = mutableSetOf<String>()
-    val hmacKeys = mutableMapOf<String, ByteArray>()
-
-    override fun generateEd25519(alias: String) {
-        ed25519.add(alias)
-    }
-
-    override fun generateHmacSha256(alias: String) {
-        if (failHmacGeneration) throw java.security.ProviderException("injected HMAC generation failure")
-        hmacKeys[alias] = ByteArray(32).also { SecureRandom().nextBytes(it) }
-    }
-
-    override fun hmacSha256(alias: String, vararg parts: ByteArray): ByteArray? {
-        val key = hmacKeys[alias] ?: return null
-        val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(key, "HmacSHA256"))
-        parts.forEach { mac.update(it) }
-        return mac.doFinal()
-    }
-
-    override fun containsAlias(alias: String): Boolean = alias in ed25519 || alias in hmacKeys
-
-    override fun deleteEntry(alias: String) {
-        if (failDeleteOnce.remove(alias)) throw java.security.KeyStoreException("injected delete failure")
-        ed25519.remove(alias)
-        hmacKeys.remove(alias)
-    }
-}
 
 class AndroidKeyCustodyPseudonymLifecycleTest {
     /**
@@ -65,7 +24,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
      */
     @Test
     fun `keystore identity pseudonym secret lives and dies with the identity`() {
-        val keystore = FakeKeystoreKeys()
+        val keystore = JcaFakeKeystoreKeys()
         val custody = AndroidKeyCustody(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
         val identity = custody.generateKeypair(KeyType.ED25519)
         assertEquals(CustodyType.HARDWARE, identity.custodyType)
@@ -87,9 +46,11 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
     /** A failed pseudonym-secret generation leaves no orphaned identity in Keystore. */
     @Test
     fun `failed pseudonym secret generation deletes the identity key`() {
-        val keystore = FakeKeystoreKeys(failHmacGeneration = true)
+        val keystore = JcaFakeKeystoreKeys(failHmacGeneration = true)
         val custody = AndroidKeyCustody(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
-        assertThrows<java.security.ProviderException> { custody.generateKeypair(KeyType.ED25519) }
+        val error = assertThrows<ScpException> { custody.generateKeypair(KeyType.ED25519) }
+        assertEquals("SCP-CRYPTO-4060", error.code)
+        assertTrue(error.cause is java.security.ProviderException)
         assertTrue(keystore.ed25519.isEmpty(), "the Ed25519 alias must be deleted")
         assertTrue(keystore.hmacKeys.isEmpty())
     }
@@ -102,8 +63,8 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
     @Test
     fun `destroying an identity makes its pseudonyms underivable while a bystander still derives`() {
         val custodies = listOf(
-            AndroidKeyCustody(InMemorySharedPreferences()),
-            AndroidKeyCustody(InMemorySharedPreferences(), FakeKeystoreKeys(), keystoreEd25519 = true),
+            AndroidKeyCustody(InMemorySharedPreferences(), JcaFakeKeystoreKeys()),
+            AndroidKeyCustody(InMemorySharedPreferences(), JcaFakeKeystoreKeys(), keystoreEd25519 = true),
         )
         for (custody in custodies) {
             val identity = custody.generateKeypair(KeyType.ED25519)
@@ -129,13 +90,13 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
 
     /**
      * A destroy whose pseudonym-secret delete fails leaves the identity in place and
-     * reports `SCP-CRYPTO-4004`; the identity then still derives. A retry deletes both
+     * reports `SCP-CRYPTO-4060`; the identity then still derives. A retry deletes both
      * aliases, after which derivation fails with `SCP-CRYPTO-4006` and no secret alias
      * is left.
      */
     @Test
     fun `a destroy that fails on the secret alias is completed by a retry`() {
-        val keystore = FakeKeystoreKeys()
+        val keystore = JcaFakeKeystoreKeys()
         val custody = AndroidKeyCustody(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
         val identity = custody.generateKeypair(KeyType.ED25519)
         val secretAlias = PseudonymSecret.alias(identity.id)
@@ -144,7 +105,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
 
         keystore.failDeleteOnce.add(secretAlias)
         val failed = assertThrows<ScpException> { custody.destroyKey(identity) }
-        assertEquals("SCP-CRYPTO-4004", failed.code)
+        assertEquals("SCP-CRYPTO-4060", failed.code)
         assertTrue(keystore.containsAlias("scp.key.${identity.id}"), "the identity must survive a failed destroy")
         assertArrayEquals(point, custody.derivePseudonym(identity, contextId))
 
@@ -161,7 +122,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
      */
     @Test
     fun `an orphaned pseudonym secret is underivable and removed by destroy`() {
-        val keystore = FakeKeystoreKeys()
+        val keystore = JcaFakeKeystoreKeys()
         val custody = AndroidKeyCustody(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
         val identity = custody.generateKeypair(KeyType.ED25519)
         val secretAlias = PseudonymSecret.alias(identity.id)

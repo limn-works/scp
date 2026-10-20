@@ -39,8 +39,8 @@ import uniffi.scp.ScpException as BridgeException
  * exception (carried as the cause), the bridge reports as the custody error `SCP-CRYPTO-4060`.
  * Coroutine cancellation propagates unchanged.
  *
- * The adapter holds Ed25519 and X25519 keys. A P-256 or HPKE P-256 request fails closed with
- * `SCP-CRYPTO-4060`.
+ * The adapter holds all four key types. A P-256 signature is Keystore's DER over the bridge's
+ * 32-byte digest; the bridge converts it to raw low-s and verifies it.
  *
  * @param inner The custody whose keys this adapter exposes.
  */
@@ -57,10 +57,11 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
     override suspend fun getPublicKey(keyId: String): CustodyPublicKey = bridged {
         val handle = inner.resolveKeyHandle(keyId)
         val publicKey = inner.publicKey(handle)
-        // A Keystore key never enters softwareKeyTypes; Keystore holds Ed25519 keys only.
-        val keyType = when (inner.softwareKeyTypes[keyId] ?: KeyType.ED25519) {
+        val keyType = when (keyTypeOf(keyId, handle)) {
             KeyType.ED25519 -> CustodyKeyType.ED25519
             KeyType.X25519 -> CustodyKeyType.X25519
+            KeyType.P256 -> CustodyKeyType.P256
+            KeyType.HPKE_P256 -> CustodyKeyType.HPKE_P256
         }
         val role = when (inner.keyRoles.roleOf(keyId)) {
             KeyRole.IDENTITY -> CustodyKeyRole.IDENTITY
@@ -70,21 +71,21 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
         CustodyPublicKey(keyType = keyType, publicKey = publicKey, role = role)
     }
 
+    /**
+     * Destroys the key [keyId], including a P-256 key whose mint is still pending and a Keystore
+     * alias that has no record, so a key left by a failed or interrupted mint is destroyable.
+     */
     override suspend fun destroyKey(keyId: String) {
-        bridged { inner.destroyKey(inner.resolveKeyHandle(keyId)) }
+        bridged { inner.destroyKeyById(keyId) }
     }
 
-    /**
-     * Mints a [keyType] key in [role] and returns its decimal u64 id. P-256 and HPKE P-256 fail
-     * closed with `SCP-CRYPTO-4060`.
-     */
+    /** Mints a [keyType] key in [role] and returns its decimal u64 id. */
     override suspend fun generateKeypair(keyType: CustodyKeyType, role: CustodyKeyRole): String = bridged {
         val androidType = when (keyType) {
             CustodyKeyType.ED25519 -> KeyType.ED25519
             CustodyKeyType.X25519 -> KeyType.X25519
-            // Stub — see SCP-110
-            CustodyKeyType.P256, CustodyKeyType.HPKE_P256 ->
-                throw ScpException("AndroidKeyCustody does not hold $keyType keys", CUSTODY_ERROR)
+            CustodyKeyType.P256 -> KeyType.P256
+            CustodyKeyType.HPKE_P256 -> KeyType.HPKE_P256
         }
         val androidRole = when (role) {
             CustodyKeyRole.IDENTITY -> KeyRole.IDENTITY
@@ -112,17 +113,37 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
     }
 
     /**
-     * `"hardware"` for a Keystore key, `"software"` for a software key, and `"unknown"` for an id
-     * [inner] does not hold. This member is synchronous and cannot throw to the bridge, which
-     * reads any value other than `"hardware"` and `"software"` as its weakest custody, so an
-     * unknown id is never reported stronger than it is. A Keystore key's `"hardware"` carries
-     * the [AndroidKeyCustody.generateKeypair] caveat: `KeyInfo.securityLevel` is not read.
+     * The custody class of [keyId]: for a P-256 key the class its record holds, read from
+     * `KeyInfo` at mint; `"hardware"` for a Keystore Ed25519 key (which does not read
+     * `KeyInfo`); `"software"` for a software key; and `"in_memory"` for an id [inner] does not
+     * hold, or whose mint is pending. This member is synchronous and cannot throw to the bridge,
+     * so an unknown id reports the weakest custody.
      */
     override fun custodyType(keyId: String): String =
         runCatching { inner.resolveKeyHandle(keyId).custodyType }.fold(
-            onSuccess = { if (it == CustodyType.HARDWARE) "hardware" else "software" },
-            onFailure = { "unknown" },
+            onSuccess = {
+                when (it) {
+                    CustodyType.HARDWARE -> "hardware"
+                    CustodyType.SOFTWARE -> "software"
+                    CustodyType.IN_MEMORY -> "in_memory"
+                }
+            },
+            onFailure = { "in_memory" },
         )
+
+    /**
+     * The type of [keyId]: from its record for a P-256 key, from `softwareKeyTypes` for a
+     * software key, and Ed25519 for a Keystore key without a record, the only type
+     * [AndroidKeyCustody] keeps there. Anything else is `SCP-CRYPTO-4060`.
+     */
+    private fun keyTypeOf(keyId: String, handle: KeyHandle): KeyType =
+        inner.keyRecords.get(keyId)?.type
+            ?: inner.softwareKeyTypes[keyId]
+            ?: if (handle.custodyType == CustodyType.HARDWARE) {
+                KeyType.ED25519
+            } else {
+                throw ScpException("No key type recorded for key $keyId", CUSTODY_ERROR)
+            }
 
     /**
      * Runs [block] on [Dispatchers.IO] and converts its failure as the class KDoc states. An
@@ -136,10 +157,5 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
                 else -> BridgeException.Crypto(e.message ?: e.javaClass.name, CUSTODY_ERROR).apply { initCause(e) }
             }
         }
-    }
-
-    private companion object {
-        /** The custody error code, for every failure that has no more specific one. */
-        const val CUSTODY_ERROR = "SCP-CRYPTO-4060"
     }
 }

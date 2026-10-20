@@ -1,15 +1,27 @@
 // PseudonymSecret.kt — the §9.10.4.A pseudonym secret and §9.10.4 context seed for
-// AndroidKeyCustody.
+// AndroidKeyCustody, and the Android Keystore operations AndroidKeyCustody uses.
 //
-// Provenance: spec §9.10.4 (context seed), §9.10.4.A (pseudonym secret), ADR-027.
+// Provenance: spec §9.10.4 (context seed), §9.10.4.A (pseudonym secret), spec 09 §9.5 (P-256
+// keys), ADR-027.
 
 package works.limn.scp.android.platform
 
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
+import androidx.annotation.RequiresApi
+import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.KeyStore
+import java.security.KeyStoreException
+import java.security.PrivateKey
+import java.security.PublicKey
+import java.security.Signature
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
 import java.security.spec.NamedParameterSpec
+import javax.crypto.KeyAgreement
 import javax.crypto.KeyGenerator
 import javax.crypto.Mac
 import javax.crypto.SecretKey
@@ -47,9 +59,11 @@ internal object PseudonymSecret {
 }
 
 /**
- * The Android Keystore operations of the hardware identity path: the Ed25519 identity
- * key and its HMAC-SHA256 pseudonym secret. [AndroidKeystoreKeys] is the production
- * implementation; JVM tests substitute a fake to run that path without a device.
+ * The Android Keystore operations [AndroidKeyCustody] uses: the Ed25519 identity key and its
+ * HMAC-SHA256 pseudonym secret, and the P-256 signing and agreement keys. [AndroidKeystoreKeys]
+ * is the production implementation; JVM tests substitute a fake to run those paths without a
+ * device. A member lets a Keystore failure escape as the original exception, and
+ * [AndroidKeyCustody] reports it as `SCP-CRYPTO-4060`.
  */
 internal interface KeystoreKeys {
     /** Generates a non-exportable Ed25519 signing key at [alias]. */
@@ -69,16 +83,45 @@ internal interface KeystoreKeys {
 
     /** Deletes the entry at [alias]; a missing entry is not an error. */
     fun deleteEntry(alias: String)
+
+    /**
+     * Generates a non-exportable P-256 signing key at [alias], authorised for `DIGEST_NONE` so
+     * that it signs the bridge's 32-byte digest as given, usable without user authentication.
+     */
+    fun generateP256Signing(alias: String)
+
+    /** Generates a non-exportable P-256 key-agreement key (`PURPOSE_AGREE_KEY`, API 31+) at [alias]. */
+    fun generateP256Agreement(alias: String)
+
+    /** The public key of the P-256 key at [alias], from its certificate, or `null` when [alias] is absent. */
+    fun p256PublicKey(alias: String): ECPublicKey?
+
+    /**
+     * The `NONEwithECDSA` signature of the P-256 key at [alias] over [digest], DER-encoded as
+     * Keystore returns it, or `null` when [alias] is absent.
+     */
+    fun signP256Digest(alias: String, digest: ByteArray): ByteArray?
+
+    /**
+     * The ECDH shared secret (the agreed point's x-coordinate) of the P-256 key at [alias] and
+     * [peer], or `null` when [alias] is absent.
+     */
+    fun agreeP256(alias: String, peer: PublicKey): ByteArray?
+
+    /**
+     * Whether `KeyInfo` places the key at [alias] in secure hardware: from API 31 its
+     * `securityLevel` is the TEE, StrongBox or an unknown secure level; below API 31 its
+     * `isInsideSecureHardware`. A missing alias or an unreadable `KeyInfo` throws; it never
+     * reads as either answer.
+     */
+    fun insideSecureHardware(alias: String): Boolean
 }
 
-/** [KeystoreKeys] over `AndroidKeyStore`. */
-internal object AndroidKeystoreKeys : KeystoreKeys {
-    private const val PROVIDER = "AndroidKeyStore"
-    private const val HMAC = "HmacSHA256"
-    private const val SECRET_BITS = 256
+/** The loaded `AndroidKeyStore`. */
+private fun keyStore(): KeyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
 
-    private fun keyStore(): KeyStore = KeyStore.getInstance(PROVIDER).apply { load(null) }
-
+/** [KeystoreKeys] over `AndroidKeyStore`. It holds no state; every call loads the store. */
+internal class AndroidKeystoreKeys : KeystoreKeys {
     override fun generateEd25519(alias: String) {
         val spec = KeyGenParameterSpec.Builder(
             alias,
@@ -116,4 +159,77 @@ internal object AndroidKeystoreKeys : KeystoreKeys {
     override fun containsAlias(alias: String): Boolean = keyStore().containsAlias(alias)
 
     override fun deleteEntry(alias: String) = keyStore().deleteEntry(alias)
+
+    override fun generateP256Signing(alias: String) {
+        val spec = KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+            .setAlgorithmParameterSpec(ECGenParameterSpec(P256_CURVE))
+            // The bridge passes the 32-byte SHA-256 digest; DIGEST_NONE signs it as given, where
+            // DIGEST_SHA256 would hash it a second time.
+            .setDigests(KeyProperties.DIGEST_NONE)
+            .setUserAuthenticationRequired(false) // SCP signs in the background
+            .build()
+        KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, PROVIDER).apply {
+            initialize(spec)
+            generateKeyPair()
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    override fun generateP256Agreement(alias: String) {
+        val spec = KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_AGREE_KEY)
+            .setAlgorithmParameterSpec(ECGenParameterSpec(P256_CURVE))
+            .setUserAuthenticationRequired(false) // SCP agrees in the background
+            .build()
+        KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, PROVIDER).apply {
+            initialize(spec)
+            generateKeyPair()
+        }
+    }
+
+    override fun p256PublicKey(alias: String): ECPublicKey? =
+        keyStore().getCertificate(alias)?.publicKey as? ECPublicKey
+
+    override fun signP256Digest(alias: String, digest: ByteArray): ByteArray? {
+        val key = keyStore().getKey(alias, null) as? PrivateKey ?: return null
+        return Signature.getInstance("NONEwithECDSA").run {
+            initSign(key)
+            update(digest)
+            sign()
+        }
+    }
+
+    override fun agreeP256(alias: String, peer: PublicKey): ByteArray? {
+        val key = keyStore().getKey(alias, null) as? PrivateKey ?: return null
+        return KeyAgreement.getInstance("ECDH", PROVIDER).run {
+            init(key)
+            doPhase(peer, true)
+            generateSecret()
+        }
+    }
+
+    override fun insideSecureHardware(alias: String): Boolean {
+        val key = keyStore().getKey(alias, null) as? PrivateKey
+            ?: throw KeyStoreException("No private key at $alias")
+        val info = KeyFactory.getInstance(key.algorithm, PROVIDER).getKeySpec(key, KeyInfo::class.java)
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            info.securityLevel in SECURE_LEVELS
+        } else {
+            @Suppress("DEPRECATION") // the only security-level reading below API 31
+            info.isInsideSecureHardware
+        }
+    }
+
+    private companion object {
+        const val PROVIDER = "AndroidKeyStore"
+        const val HMAC = "HmacSHA256"
+        const val SECRET_BITS = 256
+        const val P256_CURVE = "secp256r1"
+
+        /** The `KeyInfo.securityLevel` values that place a key in secure hardware (API 31+). */
+        val SECURE_LEVELS = setOf(
+            KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT,
+            KeyProperties.SECURITY_LEVEL_STRONGBOX,
+            KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE,
+        )
+    }
 }

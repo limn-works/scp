@@ -20,12 +20,7 @@
 package works.limn.scp.android.platform
 
 /**
- * The type of cryptographic key managed by a [KeyHandle].
- *
- * The shipped variants name curves: Ed25519 keys are used for identity and signing,
- * X25519 keys are used for key agreement (HPKE wrapping keys). ADR-006, as amended on
- * 2026-09-10, names the two key types by purpose, `P256Signing` and `P256Agreement`; this
- * enum has not moved to them.
+ * The type of cryptographic key managed by a [KeyHandle], one per UniFFI `CustodyKeyType`.
  */
 enum class KeyType {
     /** Ed25519 signing key (identity keys, active signing keys). */
@@ -33,6 +28,12 @@ enum class KeyType {
 
     /** X25519 key agreement key (HPKE wrapping keys). */
     X25519,
+
+    /** P-256 signing key: signs a 32-byte digest and returns DER (spec 09 §9.5). */
+    P256,
+
+    /** P-256 agreement key for DHKEM(P-256) HPKE (spec 09 §9.5, RFC 9180 §7.1). */
+    HPKE_P256,
 }
 
 /**
