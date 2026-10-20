@@ -10812,7 +10812,21 @@
         "crates/scp-runtime/tests/openmls_shared_storage_validation.rs",
         "crates/scp-testing/src/fullstack/node.rs",
         "crates/scp-testing/tests/integration/compromise_recovery.rs",
-        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs",
+        ".gitignore",
+        "bindings/kotlin/AGENTS.md",
+        "bindings/kotlin/scp-kt-android/src/androidTest/kotlin/works/limn/scp/android/platform/AndroidKeyCustodyP256InstrumentedTest.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/KeyRecords.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/KeyRoles.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/P256Keys.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/PlatformAdapter.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/UniffiKeyCustody.kt",
+        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/AndroidKeyCustodyP256Test.kt",
+        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/JcaFakeKeystoreKeys.kt",
+        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/UniffiKeyCustodyJoinTest.kt",
+        "bindings/swift/Tests/SCPTests/Platform/AppleKeyCustodyP256SweepTests.swift",
+        "bindings/swift/Tests/SCPTests/Platform/AppleKeyCustodyP256Tests.swift",
+        "bindings/swift/Tests/SCPTests/Platform/KeyIdRecorder.swift"
       ],
       "description": "The first architecture slice of the key-event-log identity substrate. ADR-063 moves every SCP key to ECDSA over NIST P-256 with SHA-256, and `09-security-model.md` §9.5 states the encoding and verification rules. This story adds P-256 to the wasm-safe `scp-crypto` crate and to `KeyCustody`, moves MLS to RFC 9420 ciphersuite 2 and HPKE to DHKEM(P-256), and adds the JOSE ES256 codec. SCP-315 wires that codec to UCAN. The key-event preimage types are SCP-308.",
       "acceptanceCriteria": [
