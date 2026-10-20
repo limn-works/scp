@@ -3,7 +3,7 @@
 //!
 //! SCP's MLS leaf `signature_key` is an **ephemeral, context-scoped** key that
 //! is NOT the member's DID identity key (§9.7.4). Admission and attribution are
-//! instead provided by a **`KeyPackage` attestation**: an `#active`/`#agent`-signed
+//! instead provided by a **`KeyPackage` attestation**: an `#active`-signed
 //! statement that binds **all four** of the leaf's own public keys — the P-256
 //! leaf `signature_key`, and the three distinct DHKEM(P-256) HPKE keys (the
 //! `LeafNode` ratchet-tree `encryption_key`, the `KeyPackage` `init_key`, and the
@@ -29,7 +29,7 @@
 //! `SHA-256(signing_preimage())` prehash. The signer MUST compute the
 //! signature over that 32-byte hash — and over **nothing else**. §9.5.2 and
 //! Vector 37 specify a P-256 signature; this module still verifies an Ed25519
-//! signature from the attester's `#active`/`#agent` key until identity signing
+//! signature from the attester's `#active` key until identity signing
 //! moves to P-256 (SCP-307 criterion 15 / SCP-315), and treats the 64 signature bytes as
 //! opaque when it serializes them. It MUST NOT sign the raw `signing_preimage()` bytes, and it MUST NOT
 //! sign the [`to_extension_body`] output. `signing_preimage()` is
@@ -55,7 +55,7 @@
 //! See spec §9.5.2 (field table + wire format) and §9.7.1 (the full model).
 
 use openmls::prelude::*;
-use scp_did::{DidDocument, SigningKeyId};
+use scp_did::SigningKeyId;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 use sha2::{Digest, Sha256};
 
@@ -105,7 +105,7 @@ pub const MAX_ATTESTATION_KEY_RESOLUTION_STALENESS: u64 = 300;
 /// P-256 point (§9.5.2).
 const LEAF_PUBLIC_KEY_SIZE: usize = 65;
 
-/// Size of the attester's resolved Ed25519 `#active`/`#agent` key, which
+/// Size of the attester's resolved Ed25519 `#active` key, which
 /// verifies the signature until identity signing moves to P-256 (SCP-307
 /// criterion 15 / SCP-315).
 const ED25519_PUBLIC_KEY_SIZE: usize = 32;
@@ -148,7 +148,7 @@ pub enum AttestationTrigger<'a> {
     Update,
 }
 
-/// A `KeyPackage` attestation (§9.5.2): an `#active`/`#agent`-signed binding of a
+/// A `KeyPackage` attestation (§9.5.2): an `#active`-signed binding of a
 /// DID to **all four** of an MLS leaf's public keys.
 ///
 /// The struct is deliberately **context-agnostic** — it carries no `context_id`.
@@ -184,8 +184,10 @@ pub struct KeyPackageAttestation {
     /// The `scp_wrapping_key` (`0xFF01`) LeafNode-extension value: a 65-byte
     /// DHKEM(P-256) public key used for §9.16 per-sender-key wrapping (§9.5.2 field 5).
     pub wrapping_key: [u8; LEAF_PUBLIC_KEY_SIZE],
-    /// Which DID verification method signed this attestation (`#active` or
-    /// `#agent` — never `#0`, §9.5.2 field 6).
+    /// Which DID verification method signed this attestation: always
+    /// `#active` (§9.5.2 field 6, §9.7.1 check 1).
+    /// [`from_extension_body`](Self::from_extension_body) refuses any other
+    /// role, and [`verify_attestation`] rejects one.
     pub signing_key_id: SigningKeyId,
     /// Unix seconds; equals the leaf's `Lifetime.not_before` (§9.5.2 field 7).
     pub issued_at: u64,
@@ -222,7 +224,7 @@ impl KeyPackageAttestation {
             CanonicalField::RawBytes(&self.leaf_encryption_key),
             CanonicalField::RawBytes(&self.init_key),
             CanonicalField::RawBytes(&self.wrapping_key),
-            // Field 6: signing_key_id ("#active"/"#agent").
+            // Field 6: signing_key_id ("#active").
             CanonicalField::VarBytes(self.signing_key_id.as_bytes()),
             // Fields 7–8: the two timestamps.
             CanonicalField::U64(self.issued_at),
@@ -292,7 +294,8 @@ impl KeyPackageAttestation {
     /// - non-UTF-8 `did` or `signing_key_id`,
     /// - a public key that is not a valid 65-byte uncompressed P-256 point
     ///   (wrong prefix, off the curve, or a coordinate not below `p`), and
-    /// - a `signing_key_id` that is not exactly `"#active"` or `"#agent"`.
+    /// - a `signing_key_id` that is not exactly `"#active"` (§9.7.1 check 1: a
+    ///   `KeyPackage` attestation is signed by the Active Signing Key only).
     ///
     /// # Errors
     ///
@@ -313,11 +316,14 @@ impl KeyPackageAttestation {
         let skid_bytes = cursor.take_var_bytes()?;
         let skid_str = core::str::from_utf8(skid_bytes)
             .map_err(|_| ext_err("scp_keypackage_attestation signing_key_id is not valid UTF-8"))?;
-        let signing_key_id = SigningKeyId::from_fragment(skid_str).ok_or_else(|| {
-            ext_err(format!(
-                "scp_keypackage_attestation signing_key_id must be \"#active\" or \"#agent\", got {skid_str:?}"
-            ))
-        })?;
+        let signing_key_id = match SigningKeyId::from_fragment(skid_str) {
+            Some(SigningKeyId::Active) => SigningKeyId::Active,
+            Some(SigningKeyId::Agent) | None => {
+                return Err(ext_err(format!(
+                    "scp_keypackage_attestation signing_key_id must be \"#active\", got {skid_str:?}"
+                )));
+            }
+        };
 
         let issued_at = cursor.take_u64()?;
         let expires_at = cursor.take_u64()?;
@@ -394,15 +400,22 @@ pub const CLOCK_SKEW_TOLERANCE_SECS: u64 = 300;
 /// verifier) learns *which* invariant broke without string parsing. The numbers
 /// in each variant's docs are the §9.7.1 check numbers.
 ///
-/// Checks **1 and 2** (the `signing_key_id` names the DID's *current*
-/// `#active`/`#agent` verification method, and the resolving document is no
-/// older than [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`]) are **NOT** in this
-/// enum: they are the runtime caller's responsibility — the caller performs DID
-/// resolution and passes the already-resolved current key in
+/// Check 1's role rule is [`SignerNotActive`](Self::SignerNotActive). Check 1's
+/// current-key resolution and check 2 (the resolving document is no older than
+/// [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`]) are the runtime caller's: the
+/// caller resolves `#active` and passes the resolved current key in
 /// [`AttestationVerificationContext::resolved_current_vm_pubkey`]. See
 /// [`verify_attestation`] for the exact caller contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AttestationVerifyError {
+    /// Check 1 (role): the attestation's or the leaf credential's
+    /// `signing_key_id` names a role other than `#active`. A `KeyPackage`
+    /// attestation is signed by the Active Signing Key only, and a verifier
+    /// takes that role from the specification, never from the record it
+    /// checks. Requiring both to be `#active` also makes check 10 hold.
+    #[error("attestation or credential signing_key_id is not #active")]
+    SignerNotActive,
+
     /// Check 3: the Ed25519 signature does not verify against the resolved
     /// current verification method. This is also what makes **rotation =
     /// revocation** (§9.12): an attestation signed by a rotated-away key fails
@@ -439,11 +452,6 @@ pub enum AttestationVerifyError {
     /// `ScpCredential`.
     #[error("attestation did does not match the leaf credential did")]
     DidMismatch,
-
-    /// Check 10: the attestation's `signing_key_id` does not equal the
-    /// `signing_key_id` in the leaf's `ScpCredential`.
-    #[error("attestation signing_key_id does not match the leaf credential signing_key_id")]
-    SigningKeyIdMismatch,
 
     /// Check 11: the attestation's `[issued_at, expires_at]` window does not
     /// exactly equal the leaf's `Lifetime` `[not_before, not_after]`.
@@ -491,7 +499,7 @@ pub enum AttestationVerifyError {
 /// a fabricated check implying a guarantee the attestation does not make.
 #[derive(Debug, Clone, Copy)]
 pub struct AttestationVerificationContext<'a> {
-    /// The **current** `#active`/`#agent` public key the caller resolved from
+    /// The **current** `#active` public key the caller resolved from
     /// the signer's DID document (raw 32-byte Ed25519, until identity signing
     /// moves to P-256 per SCP-307 criterion 15 / SCP-315). The signature (check 3) is verified
     /// against this key.
@@ -535,6 +543,28 @@ pub struct AttestationVerificationContext<'a> {
     pub trigger: AttestationTrigger<'a>,
 }
 
+/// Rejects a `KeyPackage` attestation whose signer role is not `#active`
+/// (§9.7.1 check 1): `attestation` is the attestation's `signing_key_id` and
+/// `credential` the leaf credential's.
+///
+/// A `KeyPackage` attestation is signed by the Active Signing Key only. A
+/// verifier takes that role from the specification, never from the record it
+/// checks, so it calls this before it resolves any key and then resolves
+/// `#active` itself. [`verify_attestation`] calls it first.
+///
+/// # Errors
+///
+/// [`AttestationVerifyError::SignerNotActive`] if either names another role.
+pub const fn require_active_signer(
+    attestation: SigningKeyId,
+    credential: SigningKeyId,
+) -> Result<(), AttestationVerifyError> {
+    match (attestation, credential) {
+        (SigningKeyId::Active, SigningKeyId::Active) => Ok(()),
+        _ => Err(AttestationVerifyError::SignerNotActive),
+    }
+}
+
 /// Verifies a [`KeyPackageAttestation`] against already-resolved ground-truth
 /// inputs — the **pure** core of §9.7.1 "Verification (MUST) — the checks".
 ///
@@ -546,16 +576,18 @@ pub struct AttestationVerificationContext<'a> {
 ///
 /// # Which checks this performs (pure) vs. the caller's job
 ///
-/// Performs §9.7.1 checks **3–13**: signature (3); the four key bindings (4–6
-/// always, 7 on Add); the RFC 9420 §10.1 malformed-KeyPackage guard (8, Add);
-/// `did` (9) and `signing_key_id` (10) credential equality; the leaf-`Lifetime`
-/// window equality (11); the lifetime cap (12); and freshness/expiry/future-date
-/// (13). See [`AttestationVerifyError`] for the variant each check maps to.
+/// Performs check 1's role rule first ([`require_active_signer`]: the
+/// attestation and the leaf credential both name `#active`, which also makes
+/// check 10 hold), then §9.7.1 checks **3–13**: signature (3); the four key
+/// bindings (4–6 always, 7 on Add); the RFC 9420 §10.1 malformed-KeyPackage
+/// guard (8, Add); `did` equality (9); the leaf-`Lifetime` window equality
+/// (11); the lifetime cap (12); and freshness/expiry/future-date (13). See
+/// [`AttestationVerifyError`] for the variant each check maps to.
 ///
-/// Checks **1–2** — that `attestation.signing_key_id` names the DID's *current*
-/// `#active`/`#agent` verification method and that the resolving document is no
-/// older than [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`] — are the runtime
-/// caller's responsibility and are documented as a contract on
+/// Check 1's resolution — the caller resolves the DID's *current* `#active`
+/// key, never the role the record names — and check 2 (the resolving document
+/// is no older than [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`]) are the
+/// runtime caller's responsibility and are documented as a contract on
 /// [`AttestationVerificationContext::resolved_current_vm_pubkey`]. **This is what
 /// a later wiring slice (S4/S6/S7) MUST enforce before calling**, including the
 /// Add-vs-Update resolution-failure policy (§9.7.1 "Resolution failure policy").
@@ -575,13 +607,19 @@ pub struct AttestationVerificationContext<'a> {
 /// # Errors
 ///
 /// Returns the [`AttestationVerifyError`] for the first failing check (checks
-/// are evaluated signature-first, then bindings, then credential equality, then
-/// the time/lifetime window).
+/// are evaluated role-first, then the signature, then bindings, then credential
+/// equality, then the time/lifetime window).
 pub fn verify_attestation(
     attestation: &KeyPackageAttestation,
     ctx: &AttestationVerificationContext<'_>,
 ) -> Result<(), AttestationVerifyError> {
     use AttestationVerifyError as E;
+
+    // --- Check 1 (role): both records name #active before any signature work.
+    require_active_signer(
+        attestation.signing_key_id,
+        ctx.leaf_credential_signing_key_id,
+    )?;
 
     // --- Check 3: signature over the §9.5.1 signing hash against the CURRENT
     // key (rotation ⇒ revocation). The attestation's eight fields are all inside
@@ -635,10 +673,6 @@ pub fn verify_attestation(
     if attestation.did != ctx.leaf_credential_did {
         return Err(E::DidMismatch);
     }
-    // --- Check 10: signing_key_id equals the leaf credential signing_key_id.
-    if attestation.signing_key_id != ctx.leaf_credential_signing_key_id {
-        return Err(E::SigningKeyIdMismatch);
-    }
 
     // --- Check 11: the attestation window equals the leaf Lifetime exactly (not
     // a wider self-asserted one).
@@ -671,197 +705,112 @@ pub fn verify_attestation(
     Ok(())
 }
 
-/// The leaf/credential ground-truth for [`verify_attestation_with_resolution`].
+/// Builds [`Capabilities`] declaring `0xFF01`, `0xFF02` and `0xFF03`.
 ///
-/// It carries everything needed to build the pure
-/// [`AttestationVerificationContext`], **minus** the two resolution-dependent
-/// inputs that layer supplies itself: the current verification-method key
-/// (extracted from the resolved document, §9.7.1 check 1) and `now` (a
-/// caller-supplied clock read).
+/// Those are every SCP `LeafNode` extension type a context-group leaf needs:
+/// `scp_wrapping_key` (`0xFF01`), the SCP context parameters (`0xFF02`), and
+/// `scp_keypackage_attestation` (`0xFF03`).
 ///
-/// Flat named-field bundle (per the SCP agent-first API standard). It holds
-/// **no** resolved key and **no** timestamps — the resolution seam owns those —
-/// so it cannot be used to smuggle a caller-chosen "current" key past check 1.
-#[derive(Debug, Clone, Copy)]
-pub struct AttestationLeafGroundTruth<'a> {
-    /// The leaf's `ScpCredential`. Its `did` and `signing_key_id` are the
-    /// check-9/10 ground truth, and its `signing_key_id` names the current
-    /// verification method resolved for check 1 via
-    /// [`ScpCredential::resolve_signing_key`].
-    pub credential: &'a ScpCredential,
-    /// The leaf's actual `signature_key` (check 4).
-    pub leaf_signature_key: &'a [u8; LEAF_PUBLIC_KEY_SIZE],
-    /// The leaf's actual ratchet-tree `encryption_key` (check 5).
-    pub leaf_encryption_key: &'a [u8; LEAF_PUBLIC_KEY_SIZE],
-    /// The value of the leaf's `scp_wrapping_key` (`0xFF01`) extension (check 6).
-    pub leaf_wrapping_key: &'a [u8; LEAF_PUBLIC_KEY_SIZE],
-    /// The leaf's `Lifetime.not_before` (check 11).
-    pub leaf_lifetime_not_before: u64,
-    /// The leaf's `Lifetime.not_after` (check 11).
-    pub leaf_lifetime_not_after: u64,
-    /// Which handshake event is being verified — the structural gate for the
-    /// Add-only `init_key` checks (7–8) and the carrier of the `KeyPackage`
-    /// `init_key` on [`AttestationTrigger::Add`].
-    pub trigger: AttestationTrigger<'a>,
-}
-
-/// A typed reason [`verify_attestation_with_resolution`] rejected a
-/// [`KeyPackageAttestation`] (§9.7.1 "Verification (MUST) — the checks",
-/// checks 1–13).
-///
-/// This enum **wraps** the pure-core [`AttestationVerifyError`] (checks 3–13,
-/// [`Delegated`](Self::Delegated)) and adds the two variants for the
-/// resolution-dependent checks the pure core deliberately defers to the caller:
-/// check 2 ([`ResolvedDocumentStale`](Self::ResolvedDocumentStale)) and check 1
-/// ([`CurrentKeyNotFound`](Self::CurrentKeyNotFound)). The pure
-/// [`AttestationVerifyError`] is left **byte-unchanged** — the new checks live
-/// only here (CRYPTO-22 S4; §9.7.1 checks 1–2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum AttestationResolutionVerifyError {
-    /// Check 2 (§9.7.1; §9.18.7): the DID document used to satisfy check 1 was
-    /// resolved more than [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`] (300s)
-    /// before `now`. Enforced **first**, before check 1 and before the pure
-    /// checks 3–13, so a stale document can never mask a later failure.
-    #[error(
-        "DID document for the attestation current-key check is stale: resolved \
-         {age_secs}s before now (max {MAX_ATTESTATION_KEY_RESOLUTION_STALENESS}s)"
-    )]
-    ResolvedDocumentStale {
-        /// `now - resolved_at`, in seconds — how stale the resolving document is.
-        age_secs: u64,
-    },
-
-    /// Check 1 (§9.7.1; §9.12 rotation-is-revocation): the credential's
-    /// `signing_key_id` names **no current** `#active`/`#agent` verification
-    /// method in the resolved document — it is absent, or has been rotated away
-    /// and now lives only under a `#retired-*` fragment. Rejected **without**
-    /// delegating to [`verify_attestation`] (checks 3–13 never run). A key that
-    /// is still present at its `#active`/`#agent` fragment but rotated away is
-    /// instead surfaced by the pure core as
-    /// [`AttestationVerifyError::SignatureInvalid`] (check 3) via
-    /// [`Delegated`](Self::Delegated).
-    #[error(
-        "the credential's signing_key_id names no current #active/#agent \
-         verification method in the resolved DID document (absent or #retired-*)"
-    )]
-    CurrentKeyNotFound,
-
-    /// Checks 3–13: the pure [`verify_attestation`] core rejected. The wrapped
-    /// [`AttestationVerifyError`] is surfaced **verbatim** so a delegated
-    /// failure is indistinguishable from calling the pure core directly.
-    #[error(transparent)]
-    Delegated(#[from] AttestationVerifyError),
-}
-
-/// The wasm-safe current-key + freshness seam for a [`KeyPackageAttestation`].
-///
-/// Enforces §9.7.1 verifier checks **1 and 2**, layered on top of the pure
-/// checks-3–13 core [`verify_attestation`] (CRYPTO-22 S4, Layer A).
-///
-/// This function is deterministic, side-effect-free, and wasm-safe: it performs
-/// **no** DID resolution, **no** network, and **no** clock read. Both
-/// resolution-dependent inputs are caller-supplied — the already-resolved
-/// `resolved_document` and its `resolved_at` timestamp, plus the verifier's
-/// `now` — keeping it reusable by the in-browser MLS client (ADR-057). The
-/// runtime `DidResolver`-backed caller (Layer B,
-/// `scp-runtime`) obtains `resolved_document`/`resolved_at`/`now` and calls
-/// through here.
-///
-/// # Order of checks (§9.7.1 checks 1–2, then 3–13)
-///
-/// 1. **Check 2 first** (freshness): reject with
-///    [`AttestationResolutionVerifyError::ResolvedDocumentStale`] when
-///    `now - resolved_at` exceeds
-///    [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`]. Enforced *before* the
-///    current-key extraction so a stale document cannot pass on the strength of
-///    a still-present key.
-/// 2. **Check 1** (current key): extract the `#active`/`#agent` verification
-///    method named by `ground_truth.credential.signing_key_id` from
-///    `resolved_document` via the existing [`ScpCredential::resolve_signing_key`]
-///    path. If that method is absent — including the rotated-away key that now
-///    lives only under a `#retired-*` fragment — reject with
-///    [`AttestationResolutionVerifyError::CurrentKeyNotFound`] **without**
-///    calling [`verify_attestation`].
-/// 3. **Checks 3–13**: build the [`AttestationVerificationContext`] with
-///    `resolved_current_vm_pubkey` set to the extracted current key and delegate
-///    **unchanged** to [`verify_attestation`]. A rotated-away-but-present key
-///    thus surfaces as the existing [`AttestationVerifyError::SignatureInvalid`]
-///    (check 3, rotation ⇒ revocation, §9.12).
-///
-/// # Errors
-///
-/// Returns the [`AttestationResolutionVerifyError`] for the first failing check
-/// in the order above.
-pub fn verify_attestation_with_resolution(
-    attestation: &KeyPackageAttestation,
-    ground_truth: &AttestationLeafGroundTruth<'_>,
-    resolved_document: &DidDocument,
-    resolved_at: u64,
-    now: u64,
-) -> Result<(), AttestationResolutionVerifyError> {
-    // --- Check 2 (FIRST): the resolving document must be no older than the
-    // §9.18.7 staleness bound. `saturating_sub` so a `resolved_at` that leads
-    // `now` (benign clock skew across the resolve→verify hop) reads as age 0,
-    // never a wrapping underflow.
-    let age_secs = now.saturating_sub(resolved_at);
-    if age_secs > MAX_ATTESTATION_KEY_RESOLUTION_STALENESS {
-        return Err(AttestationResolutionVerifyError::ResolvedDocumentStale { age_secs });
-    }
-
-    // --- Check 1: the credential's signing_key_id must name a CURRENT
-    // #active/#agent verification method in the resolved document. A rotated-away
-    // key that has been retired no longer occupies that fragment, so resolution
-    // fails here and we reject WITHOUT delegating to the pure core (checks 3–13
-    // never run). A rotated-away key still present at its #active/#agent fragment
-    // resolves fine and instead fails check 3 below (SignatureInvalid).
-    let resolved_current_vm_pubkey = ground_truth
-        .credential
-        .resolve_signing_key(resolved_document)
-        .map_err(|_| AttestationResolutionVerifyError::CurrentKeyNotFound)?;
-
-    // --- Checks 3–13: delegate UNCHANGED to the pure core with the extracted
-    // current key as `resolved_current_vm_pubkey`. The `?` maps any
-    // `AttestationVerifyError` through the `#[from]` into `Delegated(..)`.
-    let ctx = AttestationVerificationContext {
-        resolved_current_vm_pubkey: &resolved_current_vm_pubkey,
-        leaf_signature_key: ground_truth.leaf_signature_key,
-        leaf_encryption_key: ground_truth.leaf_encryption_key,
-        leaf_wrapping_key: ground_truth.leaf_wrapping_key,
-        leaf_credential_did: &ground_truth.credential.did,
-        leaf_credential_signing_key_id: ground_truth.credential.signing_key_id,
-        leaf_lifetime_not_before: ground_truth.leaf_lifetime_not_before,
-        leaf_lifetime_not_after: ground_truth.leaf_lifetime_not_after,
-        now,
-        trigger: ground_truth.trigger,
-    };
-    verify_attestation(attestation, &ctx)?;
-    Ok(())
-}
-
-/// Builds [`Capabilities`] declaring both SCP `LeafNode` extension types.
-///
-/// Declares support for BOTH the `scp_wrapping_key` (`0xFF01`) and
-/// `scp_keypackage_attestation` (`0xFF03`) `LeafNode` extension types, in
-/// addition to the SCP ciphersuite defaults.
-///
-/// `OpenMLS` validates (`valn0107`) that any extension present on a `LeafNode`
-/// has its type listed in the node's capabilities. A real SCP leaf carries both
-/// `0xFF01` and `0xFF03`, so it must declare both. This is the superset that a
-/// later wiring slice will adopt at the leaf-creation sites; declaring an extra
-/// supported type that is not (yet) present is harmless. This slice does NOT
-/// change existing call sites — it is additive only.
+/// An attested `KeyPackage` that joins a context group must declare all
+/// three, because the group's context extension requires `0xFF02` of every
+/// member and the leaf carries `0xFF01` and `0xFF03` (`valn0107`).
 #[must_use]
-pub fn scp_capabilities_with_keypackage_attestation() -> Capabilities {
+pub fn scp_capabilities_with_context_params_and_attestation() -> Capabilities {
     Capabilities::new(
         None, // default versions
         None, // default ciphersuites
         Some(&[
             ExtensionType::Unknown(crate::wrapping_extension::SCP_WRAPPING_KEY_EXTENSION_TYPE),
+            ExtensionType::Unknown(scp_protocol::context::SCP_CONTEXT_EXTENSION_TYPE_ID),
             ExtensionType::Unknown(SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE),
         ]),
         None, // default proposals
         None, // default credentials
     )
+}
+
+/// The facts a `KeyPackage`'s leaf states, in the form §9.7.1 verifies.
+///
+/// They are the SCP credential, the four 65-byte P-256 public keys, the
+/// lifetime window, and the `0xFF03` attestation when the leaf carries one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPackageLeafFacts {
+    /// The leaf's SCP credential, parsed from its `BasicCredential` identity.
+    pub credential: ScpCredential,
+    /// The leaf `signature_key`.
+    pub signature_key: [u8; 65],
+    /// The leaf ratchet-tree `encryption_key`.
+    pub encryption_key: [u8; 65],
+    /// The `KeyPackage` `init_key`.
+    pub init_key: [u8; 65],
+    /// The `0xFF01` `wrapping_key`, or `None` when the leaf carries none.
+    pub wrapping_key: Option<[u8; 65]>,
+    /// The `KeyPackage` lifetime's `not_before`, in Unix seconds.
+    pub not_before: u64,
+    /// The `KeyPackage` lifetime's `not_after`, in Unix seconds.
+    pub not_after: u64,
+    /// The `0xFF03` attestation, or `None` when the leaf carries none.
+    pub attestation: Option<KeyPackageAttestation>,
+}
+
+/// Reads the [`KeyPackageLeafFacts`] of `key_package`.
+///
+/// It reads but does not verify: it checks only that each key is a 65-byte
+/// point and that the credential and the two SCP extensions parse. Pass the
+/// result to [`verify_attestation`].
+///
+/// # Errors
+///
+/// - [`MlsError::InvalidCredential`] if the leaf credential is not a
+///   `BasicCredential`, or its identity is not an SCP credential.
+/// - [`MlsError::ExtensionError`] if a leaf key is not 65 bytes, the
+///   encryption key does not re-encode, or the `0xFF01` or `0xFF03` extension
+///   is malformed.
+pub fn leaf_facts(key_package: &KeyPackage) -> Result<KeyPackageLeafFacts, MlsError> {
+    let leaf = key_package.leaf_node();
+    let basic = BasicCredential::try_from(leaf.credential().clone())
+        .map_err(|e| MlsError::InvalidCredential(format!("leaf credential: {e}")))?;
+    let credential = ScpCredential::from_bytes(basic.identity())?;
+    let lifetime = key_package.life_time();
+    Ok(KeyPackageLeafFacts {
+        credential,
+        signature_key: leaf_public_key(leaf.signature_key().as_slice())?,
+        encryption_key: leaf_encryption_key(leaf.encryption_key())?,
+        init_key: leaf_public_key(key_package.hpke_init_key().as_slice())?,
+        wrapping_key: crate::wrapping_extension::extract_wrapping_key(leaf.extensions())?
+            .map(|point| *point.as_bytes()),
+        not_before: lifetime.not_before(),
+        not_after: lifetime.not_after(),
+        attestation: KeyPackageAttestation::extract_attestation(leaf.extensions())?,
+    })
+}
+
+/// Copies a leaf public key into a 65-byte uncompressed P-256 point.
+///
+/// # Errors
+///
+/// [`MlsError::ExtensionError`] if `bytes` is not 65 bytes long.
+pub(crate) fn leaf_public_key(bytes: &[u8]) -> Result<[u8; 65], MlsError> {
+    <[u8; 65]>::try_from(bytes).map_err(|_| {
+        ext_err(format!(
+            "leaf public key is {} bytes, expected 65",
+            bytes.len()
+        ))
+    })
+}
+
+/// Reads the bytes of a leaf `encryption_key`.
+///
+/// `openmls` 0.9.0 exposes no byte accessor for an `EncryptionKey`, so this
+/// re-encodes it: its TLS encoding is the key as one variable-length vector.
+fn leaf_encryption_key(key: &openmls::treesync::EncryptionKey) -> Result<[u8; 65], MlsError> {
+    use tls_codec::{DeserializeBytes as _, Serialize as _};
+    let encoded = key
+        .tls_serialize_detached()
+        .map_err(|e| ext_err(format!("leaf encryption key encode: {e}")))?;
+    let bytes = tls_codec::VLBytes::tls_deserialize_exact_bytes(&encoded)
+        .map_err(|e| ext_err(format!("leaf encryption key decode: {e}")))?;
+    leaf_public_key(bytes.as_slice())
 }
 
 /// Constructs an [`MlsError::ExtensionError`] with the given message.
@@ -1123,16 +1072,18 @@ mod tests {
         assert_eq!(&body[body.len() - SIGNATURE_SIZE..], &att.signature);
     }
 
-    /// Round-trip with the `#agent` signing key id (exercises the other
-    /// `SigningKeyId` arm).
+    /// A body naming `#agent` does not decode: a `KeyPackage` attestation is
+    /// signed by `#active` only (§9.7.1 check 1).
     #[test]
-    fn agent_signing_key_id_roundtrips() {
+    fn from_extension_body_rejects_an_agent_signing_key_id() {
         let mut att = v37_attestation();
         att.signing_key_id = SigningKeyId::Agent;
         let body = att.to_extension_body();
-        let parsed = KeyPackageAttestation::from_extension_body(&body).unwrap();
-        assert_eq!(parsed.signing_key_id, SigningKeyId::Agent);
-        assert_eq!(parsed, att);
+        let err = KeyPackageAttestation::from_extension_body(&body).unwrap_err();
+        assert!(
+            err.to_string().contains("must be \"#active\""),
+            "unexpected error: {err}"
+        );
     }
 
     // -- strict-parse negative tests -----------------------------------------
@@ -1214,7 +1165,7 @@ mod tests {
     #[test]
     fn from_extension_body_rejects_non_utf8_signing_key_id() {
         // signing_key_id bytes 0xFF 0xFE are not valid UTF-8 (rejected at the
-        // UTF-8 check, before the "#active"/"#agent" fragment check).
+        // UTF-8 check, before the "#active" fragment check).
         let bad_skid: &[u8] = &[0xFF, 0xFE];
         let did = V37_DID.as_bytes();
         let body = build_body(
@@ -1307,7 +1258,7 @@ mod tests {
 
     #[test]
     fn capabilities_declare_attestation_and_wrapping_types() {
-        let caps = scp_capabilities_with_keypackage_attestation();
+        let caps = scp_capabilities_with_context_params_and_attestation();
         assert!(
             caps.extensions().contains(&ExtensionType::Unknown(
                 SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE
@@ -1611,14 +1562,37 @@ mod tests {
     }
 
     #[test]
-    fn signing_key_id_mismatch() {
+    fn credential_naming_agent_is_signer_not_active() {
         // Attestation signed under #active; credential claims #agent.
         let (att, mut truth, _s) = valid_fixture(TriggerKind::Add);
         assert_eq!(att.signing_key_id, SigningKeyId::Active);
         truth.skid = SigningKeyId::Agent;
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
-            Err(AttestationVerifyError::SigningKeyIdMismatch)
+            Err(AttestationVerifyError::SignerNotActive)
+        );
+    }
+
+    /// An attestation and credential that both name `#agent`, signed by the
+    /// key the verifier was handed, are refused before the signature check:
+    /// the role comes from the specification, not from the record.
+    #[test]
+    fn agent_signed_attestation_with_agent_credential_is_signer_not_active() {
+        let (mut att, mut truth, signer) = valid_fixture(TriggerKind::Add);
+        att.signing_key_id = SigningKeyId::Agent;
+        sign_in_place(&mut att, &signer);
+        truth.skid = SigningKeyId::Agent;
+        assert_eq!(
+            verify_attestation(&att, &truth.ctx()),
+            Err(AttestationVerifyError::SignerNotActive)
+        );
+        assert_eq!(
+            require_active_signer(SigningKeyId::Agent, SigningKeyId::Agent),
+            Err(AttestationVerifyError::SignerNotActive)
+        );
+        assert_eq!(
+            require_active_signer(SigningKeyId::Active, SigningKeyId::Active),
+            Ok(())
         );
     }
 
@@ -1710,405 +1684,6 @@ mod tests {
         assert_eq!(
             verify_attestation(&att, &truth.ctx()),
             Err(AttestationVerifyError::IssuedInFuture)
-        );
-    }
-}
-
-// ==========================================================================
-// CRYPTO-22 S4 Layer A — verify_attestation_with_resolution (§9.7.1 checks 1–2)
-// ==========================================================================
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod resolution_seam_tests {
-    use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-    use rand::rngs::OsRng;
-
-    const ISSUED: u64 = 1_700_000_000;
-    const EXPIRES: u64 = 1_700_086_400; // ISSUED + 86_400 (1 day)
-    const NOW: u64 = 1_700_000_100; // inside [ISSUED, EXPIRES]
-    const TEST_DID: &str = "did:dht:z6MkResolveSeamTest";
-
-    /// A fresh random Ed25519 public key (a valid curve point — required by
-    /// `decode_multibase_key`, so raw `[u8; 32]` patterns won't do).
-    fn fresh_pub() -> [u8; ED25519_PUBLIC_KEY_SIZE] {
-        SigningKey::generate(&mut OsRng).verifying_key().to_bytes()
-    }
-
-    /// A fresh random 65-byte uncompressed P-256 point for a leaf key position.
-    fn fresh_leaf() -> [u8; LEAF_PUBLIC_KEY_SIZE] {
-        let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut OsRng, &mut seed);
-        scp_crypto::p256::P256SecretKey::from_seed(
-            scp_crypto::p256::SeedLabel::TestVectorKey,
-            &seed,
-        )
-        .public_key()
-        .to_uncompressed()
-    }
-
-    /// Whether the fixture models an Add (`KeyPackage`, distinct `init_key`) or an
-    /// Update (bare ratchet-tree leaf, `init_key == encryption_key`). Mirrors the
-    /// pure-core tests' selector; kept local so this module borrows no private
-    /// item from `mod tests`.
-    #[derive(Clone, Copy)]
-    enum Kind {
-        Add,
-        Update,
-    }
-
-    /// Owned fixture: a fully-valid signed attestation, its leaf ground-truth
-    /// material, the signer's keypair, and a resolved DID document whose
-    /// `#active` verification method is the signer's current key.
-    struct Fx {
-        att: KeyPackageAttestation,
-        credential: ScpCredential,
-        leaf_sig: [u8; LEAF_PUBLIC_KEY_SIZE],
-        leaf_enc: [u8; LEAF_PUBLIC_KEY_SIZE],
-        leaf_wrap: [u8; LEAF_PUBLIC_KEY_SIZE],
-        kp_init: [u8; LEAF_PUBLIC_KEY_SIZE],
-        doc: DidDocument,
-        kind: Kind,
-    }
-
-    impl Fx {
-        fn ground_truth(&self) -> AttestationLeafGroundTruth<'_> {
-            AttestationLeafGroundTruth {
-                credential: &self.credential,
-                leaf_signature_key: &self.leaf_sig,
-                leaf_encryption_key: &self.leaf_enc,
-                leaf_wrapping_key: &self.leaf_wrap,
-                leaf_lifetime_not_before: ISSUED,
-                leaf_lifetime_not_after: EXPIRES,
-                trigger: match self.kind {
-                    Kind::Add => AttestationTrigger::Add {
-                        kp_init_key: &self.kp_init,
-                    },
-                    Kind::Update => AttestationTrigger::Update,
-                },
-            }
-        }
-    }
-
-    /// Builds a DID document whose `#active` verification method carries
-    /// `active_key` (the pattern `resolve_signing_key` decodes back to 32 bytes).
-    fn did_doc_with_active(active_key: &[u8; ED25519_PUBLIC_KEY_SIZE]) -> DidDocument {
-        let identity_key = fresh_pub();
-        let commitment = [0u8; 32];
-        DidDocument::new(TEST_DID, &identity_key, active_key, &commitment)
-    }
-
-    /// A fully-valid `Fx`: the signer's key is the document's current `#active`
-    /// key, the attestation is signed over its §9.5.1 hash, and every pure-core
-    /// binding (checks 3–13) holds. Callers then perturb ONE input to isolate a
-    /// single check.
-    fn valid_fixture(kind: Kind) -> Fx {
-        let signer = SigningKey::generate(&mut OsRng);
-        let signer_pub = signer.verifying_key().to_bytes();
-        let leaf_sig = fresh_leaf();
-        let leaf_enc = fresh_leaf();
-        let leaf_wrap = fresh_leaf();
-        let kp_init = fresh_leaf();
-        let att_init = match kind {
-            Kind::Add => kp_init,
-            Kind::Update => leaf_enc,
-        };
-        let mut att = KeyPackageAttestation {
-            did: TEST_DID.to_owned(),
-            leaf_signature_key: leaf_sig,
-            leaf_encryption_key: leaf_enc,
-            init_key: att_init,
-            wrapping_key: leaf_wrap,
-            signing_key_id: SigningKeyId::Active,
-            issued_at: ISSUED,
-            expires_at: EXPIRES,
-            signature: [0u8; SIGNATURE_SIZE],
-        };
-        att.signature = signer.sign(&att.signing_hash()).to_bytes();
-        Fx {
-            att,
-            credential: ScpCredential::new(TEST_DID.to_owned(), None, SigningKeyId::Active)
-                .unwrap(),
-            leaf_sig,
-            leaf_enc,
-            leaf_wrap,
-            kp_init,
-            doc: did_doc_with_active(&signer_pub),
-            kind,
-        }
-    }
-
-    /// A fully-valid **`#agent`-persona** Add `Fx`: the credential and
-    /// attestation both use [`SigningKeyId::Agent`], the attestation is signed by
-    /// the **agent** key, and the resolved document carries an *unrelated*
-    /// `#active` VM plus (when `include_agent_vm`) an `#agent` VM equal to the
-    /// signer's agent key. The unrelated `#active` is the discriminator: a
-    /// persona-blind verifier that hardwired `#active` would resolve that
-    /// unrelated key and fail check 3, so reaching `Ok` / `CurrentKeyNotFound`
-    /// proves the seam resolved the credential-named `#agent` VM.
-    fn agent_fixture(include_agent_vm: bool) -> Fx {
-        let signer = SigningKey::generate(&mut OsRng);
-        let agent_pub = signer.verifying_key().to_bytes();
-        let leaf_sig = fresh_leaf();
-        let leaf_enc = fresh_leaf();
-        let leaf_wrap = fresh_leaf();
-        let kp_init = fresh_leaf();
-        let mut att = KeyPackageAttestation {
-            did: TEST_DID.to_owned(),
-            leaf_signature_key: leaf_sig,
-            leaf_encryption_key: leaf_enc,
-            init_key: kp_init,
-            wrapping_key: leaf_wrap,
-            signing_key_id: SigningKeyId::Agent,
-            issued_at: ISSUED,
-            expires_at: EXPIRES,
-            signature: [0u8; SIGNATURE_SIZE],
-        };
-        att.signature = signer.sign(&att.signing_hash()).to_bytes();
-        // `#active` is an UNRELATED key — the persona discriminator.
-        let mut doc = did_doc_with_active(&fresh_pub());
-        if include_agent_vm {
-            doc.verification_method.push(scp_did::VerificationMethod {
-                id: format!("{TEST_DID}#agent"),
-                method_type: "Ed25519VerificationKey2020".to_owned(),
-                controller: TEST_DID.to_owned(),
-                public_key_multibase: format!("z{}", bs58::encode(agent_pub).into_string()),
-            });
-        }
-        Fx {
-            att,
-            credential: ScpCredential::new(TEST_DID.to_owned(), None, SigningKeyId::Agent).unwrap(),
-            leaf_sig,
-            leaf_enc,
-            leaf_wrap,
-            kp_init,
-            doc,
-            kind: Kind::Add,
-        }
-    }
-
-    // -- FIX 2: #agent persona resolves the persona-correct VM ----------------
-
-    #[test]
-    fn agent_persona_resolves_agent_vm_and_delegates_ok() {
-        // Check 1 resolves the `#agent` VM (NOT the unrelated `#active`), and
-        // delegation succeeds because the signature verifies against the resolved
-        // agent key. Proves the seam reaches the pure core on the agent persona.
-        let fx = agent_fixture(true);
-        assert_eq!(fx.credential.signing_key_id, SigningKeyId::Agent);
-        assert_eq!(
-            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn agent_persona_missing_agent_vm_is_current_key_not_found() {
-        // The resolved doc lacks an `#agent` VM (only the unrelated `#active`):
-        // check 1 must reject with CurrentKeyNotFound — proving the seam resolves
-        // the VM named by the credential's signing_key_id (`#agent`), never a
-        // hardwired `#active`.
-        let fx = agent_fixture(false);
-        let err =
-            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW)
-                .unwrap_err();
-        assert_eq!(err, AttestationResolutionVerifyError::CurrentKeyNotFound);
-    }
-
-    // -- AC1: the function is pure and callable from a scp-mls unit test -------
-
-    #[test]
-    fn valid_add_with_fresh_resolution_passes() {
-        let fx = valid_fixture(Kind::Add);
-        assert_eq!(
-            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn valid_update_with_fresh_resolution_passes() {
-        let fx = valid_fixture(Kind::Update);
-        assert_eq!(
-            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW),
-            Ok(())
-        );
-    }
-
-    // -- AC2: check-2 freshness boundary (300 pass / 301 reject) ---------------
-
-    #[test]
-    fn freshness_boundary_300s_passes() {
-        // age == MAX_ATTESTATION_KEY_RESOLUTION_STALENESS (300) is accepted (`>`
-        // rejects, so the boundary is inclusive).
-        let fx = valid_fixture(Kind::Add);
-        let resolved_at = NOW - MAX_ATTESTATION_KEY_RESOLUTION_STALENESS; // age = 300
-        assert_eq!(
-            verify_attestation_with_resolution(
-                &fx.att,
-                &fx.ground_truth(),
-                &fx.doc,
-                resolved_at,
-                NOW
-            ),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn freshness_boundary_301s_rejected_before_verify() {
-        // age == 301 > 300 → ResolvedDocumentStale, reached before check 1 and
-        // before the pure checks 3–13.
-        let fx = valid_fixture(Kind::Add);
-        let resolved_at = NOW - (MAX_ATTESTATION_KEY_RESOLUTION_STALENESS + 1); // age = 301
-        let err = verify_attestation_with_resolution(
-            &fx.att,
-            &fx.ground_truth(),
-            &fx.doc,
-            resolved_at,
-            NOW,
-        )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            AttestationResolutionVerifyError::ResolvedDocumentStale { age_secs: 301 }
-        );
-    }
-
-    // -- AC3(a): check-1 absent / #retired-* rejection (no verify_attestation) -
-
-    #[test]
-    fn current_active_absent_is_current_key_not_found() {
-        // The resolved document has NO #active verification method: the signer's
-        // key is simply gone. Check 1 rejects WITHOUT delegating to the pure core.
-        let mut fx = valid_fixture(Kind::Add);
-        fx.doc
-            .verification_method
-            .retain(|vm| !vm.id.ends_with("#active"));
-        let err =
-            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW)
-                .unwrap_err();
-        assert_eq!(err, AttestationResolutionVerifyError::CurrentKeyNotFound);
-        // Prove the pure core was NOT reached: a Delegated(..) variant would mean
-        // verify_attestation ran.
-        assert!(
-            !matches!(err, AttestationResolutionVerifyError::Delegated(_)),
-            "check 1 must reject before delegating to verify_attestation"
-        );
-    }
-
-    #[test]
-    fn current_active_retired_is_current_key_not_found() {
-        // Model rotation-is-revocation (§9.12): the signer's key survives in the
-        // document ONLY under a #retired-1 fragment (the current #active is gone).
-        // `resolve_signing_key("active")` finds nothing → CurrentKeyNotFound, and
-        // the pure core is never reached.
-        let mut fx = valid_fixture(Kind::Add);
-        for vm in &mut fx.doc.verification_method {
-            if vm.id.ends_with("#active") {
-                vm.id = format!("{TEST_DID}#retired-1");
-            }
-        }
-        let err =
-            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW)
-                .unwrap_err();
-        assert_eq!(err, AttestationResolutionVerifyError::CurrentKeyNotFound);
-        assert!(!matches!(
-            err,
-            AttestationResolutionVerifyError::Delegated(_)
-        ));
-    }
-
-    // -- AC3(b): rotated-away-but-PRESENT key → delegated SignatureInvalid -----
-
-    #[test]
-    fn rotated_but_present_key_is_delegated_signature_invalid() {
-        // The document's current #active is a DIFFERENT key than the one that
-        // signed (the signer rotated; a fresh #active is present). Check 1 passes
-        // (an #active VM exists) but the pure core's check 3 fails: the signature
-        // does not verify against the resolved CURRENT key.
-        let mut fx = valid_fixture(Kind::Add);
-        fx.doc = did_doc_with_active(&fresh_pub()); // a new, unrelated #active key
-        let err =
-            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW)
-                .unwrap_err();
-        assert_eq!(
-            err,
-            AttestationResolutionVerifyError::Delegated(AttestationVerifyError::SignatureInvalid)
-        );
-    }
-
-    // -- AC4: check-2 is enforced BEFORE check-1 and before checks 3–13 --------
-
-    #[test]
-    fn staleness_takes_precedence_over_a_valid_current_key() {
-        // A 301s-stale document that ALSO carries a perfectly valid current key
-        // (checks 1 and 3–13 would all pass) must still fail with the staleness
-        // error — never a check-1 or checks-3–13 error.
-        let fx = valid_fixture(Kind::Add);
-        // Sanity: with a FRESH resolution this exact fixture verifies Ok, so any
-        // failure below is attributable solely to staleness ordering.
-        assert_eq!(
-            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW),
-            Ok(())
-        );
-        let resolved_at = NOW - (MAX_ATTESTATION_KEY_RESOLUTION_STALENESS + 1); // age = 301
-        let err = verify_attestation_with_resolution(
-            &fx.att,
-            &fx.ground_truth(),
-            &fx.doc,
-            resolved_at,
-            NOW,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                AttestationResolutionVerifyError::ResolvedDocumentStale { .. }
-            ),
-            "stale document must fail check 2 first, got {err:?}"
-        );
-    }
-
-    // -- AC5-style: a checks-4..13 failure surfaces the EXACT unchanged variant -
-
-    #[test]
-    fn delegated_check4_leaf_signature_key_mismatch_surfaces_verbatim() {
-        // Flip the leaf's actual signature_key (a context-only input): check 2 and
-        // check 1 pass, then the pure core's check 4 fails. The wrapped
-        // AttestationVerifyError must surface verbatim through Delegated(..).
-        let mut fx = valid_fixture(Kind::Add);
-        fx.leaf_sig = fresh_leaf();
-        let err =
-            verify_attestation_with_resolution(&fx.att, &fx.ground_truth(), &fx.doc, NOW, NOW)
-                .unwrap_err();
-        assert_eq!(
-            err,
-            AttestationResolutionVerifyError::Delegated(
-                AttestationVerifyError::LeafSignatureKeyMismatch
-            )
-        );
-    }
-
-    #[test]
-    fn delegated_check13_expired_surfaces_verbatim() {
-        // A check-13 (freshness/expiry) failure also delegates verbatim: `now`
-        // past the attestation's expiry with a FRESH resolution (resolved_at ==
-        // now, so check 2 passes) yields Delegated(Expired), proving the whole
-        // 3–13 band is delegated, not just early checks.
-        let fx = valid_fixture(Kind::Add);
-        let now = EXPIRES + 1;
-        let err = verify_attestation_with_resolution(
-            &fx.att,
-            &fx.ground_truth(),
-            &fx.doc,
-            now, // resolved_at == now ⇒ age 0 ⇒ check 2 passes
-            now,
-        )
-        .unwrap_err();
-        assert_eq!(
-            err,
-            AttestationResolutionVerifyError::Delegated(AttestationVerifyError::Expired)
         );
     }
 }

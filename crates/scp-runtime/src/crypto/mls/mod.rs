@@ -25,12 +25,19 @@
 #[cfg(test)]
 mod wrapping_extension_runtime_tests;
 
-// Async, native `DidResolver`-backed KeyPackage-attestation verification —
-// §9.7.1 verifier checks 1–2 (CRYPTO-22 S4, Layer B). The pure, wasm-safe
-// checks-1–2 seam lives in `scp_mls::verify_attestation_with_resolution`
-// (Layer A); this module resolves the signer DID and supplies the resolved
-// document + honest clock-stamped `resolved_at`.
+// The adder's KeyPackage-attestation verifier over the supervisor's
+// `KeyResolver` — §9.7.1 checks 1 and 3–13 on an Add (CRYPTO-22 S4, Layer B),
+// wired at `Supervisor::invite_member`.
 pub mod attestation_verification;
+
+// The signer of a KeyPackage's `0xFF03` attestation, bound to the owner's
+// resolved `#active` key, and the one mint path every native KeyPackage
+// minter uses (§9.7.1).
+pub mod attestation_signer;
+
+// Test-only minting of attested KeyPackages with a local Ed25519 key.
+#[cfg(test)]
+pub mod test_support;
 
 // Async MLS backend and provider — stay in scp-runtime (tokio-coupled, node-only).
 pub mod backend;

@@ -788,59 +788,6 @@ where
     }
 }
 
-/// The verifying key of an Ed25519 handle, resolving a handle the cache
-/// lacks like every other entry point.
-///
-/// # Errors
-///
-/// [`PlatformError::WrongKeyType`] for another type, or as in [`resolve`].
-async fn require_ed25519<P, PF>(
-    registry: &CallbackKeyRegistry,
-    key: &KeyHandle,
-    host_get_public_key: &P,
-) -> Result<VerifyingKey, PlatformError>
-where
-    P: Fn(String) -> PF + Sync,
-    PF: Future<Output = Result<HostPublicKey, PlatformError>>,
-{
-    match resolve(registry, key, host_get_public_key).await?.0.key {
-        RegisteredKey::Ed25519(vk) => Ok(vk),
-        k => Err(k.wrong_type(KeyType::Ed25519)),
-    }
-}
-
-/// `KeyCustody::ed25519_to_x25519_agree` over a host provider. The host
-/// protocol has no separate birational conversion, so the host's `dh_agree`
-/// runs on the Ed25519 key with the 32-byte X25519 peer.
-///
-/// # Errors
-///
-/// [`PlatformError::WrongKeyType`] for a handle that is not Ed25519, with no
-/// agreement call; any host error; [`PlatformError::CustodyError`] when the
-/// host returns other than 32 bytes; as in [`resolve`].
-pub async fn ed25519_to_x25519_agree<H, HF, P, PF>(
-    registry: &CallbackKeyRegistry,
-    key: &KeyHandle,
-    peer_x25519_public: &[u8; 32],
-    host_dh_agree: H,
-    host_get_public_key: P,
-) -> Result<SharedSecret, PlatformError>
-where
-    H: FnOnce(String, Vec<u8>) -> HF,
-    HF: Future<Output = Result<Vec<u8>, PlatformError>>,
-    P: Fn(String) -> PF + Sync,
-    PF: Future<Output = Result<HostPublicKey, PlatformError>>,
-{
-    require_ed25519(registry, key, &host_get_public_key).await?;
-    let shared = zeroize::Zeroizing::new(
-        host_dh_agree(key.id().to_string(), peer_x25519_public.to_vec()).await?,
-    );
-    Ok(SharedSecret::new(crate::custody_parse::expect_32(
-        "ed25519_to_x25519_agree",
-        &shared,
-    )?))
-}
-
 /// `KeyCustody::derive_pseudonym` (`epoch` `None`) and
 /// `derive_rotatable_pseudonym` over a host provider.
 ///
@@ -1697,8 +1644,8 @@ mod tests {
 
     /// Every entry point resolves an unregistered handle the same way,
     /// with one host lookup, and binds the same operational entry, whichever
-    /// runs first. Before this, `dh_agree` and the Ed25519-only operations
-    /// returned `KeyNotFound` for a handle `sign` would have resolved.
+    /// runs first. Before this, `dh_agree` returned `KeyNotFound` for a
+    /// handle `sign` would have resolved.
     #[tokio::test]
     async fn every_entry_point_resolves_an_unregistered_handle() {
         let e = ed(0x71);
@@ -1715,11 +1662,9 @@ mod tests {
         let cases: Vec<(&HostPublicKey, &str)> = vec![
             (&ed_a, "sign"),
             (&ed_a, "public_key"),
-            (&ed_a, "require_ed25519"),
             (&ed_a, "dh_agree"),
             (&x_a, "dh_agree"),
             (&x_a, "public_key"),
-            (&x_a, "require_ed25519"),
             (&x_a, "sign"),
             (&hpke_a, "dh_agree"),
             (&hpke_a, "sign"),
@@ -1746,7 +1691,6 @@ mod tests {
                 "public_key" => public_key(&registry, &h, &l).await.map(|pk| {
                     assert_eq!(pk.as_bytes(), expected.public_bytes().as_slice());
                 }),
-                "require_ed25519" => require_ed25519(&registry, &h, &l).await.map(|_| ()),
                 "dh_agree" => {
                     let peer = if host_answer.key_type == KeyType::HpkeP256 {
                         peer_p.to_vec()
@@ -1759,12 +1703,11 @@ mod tests {
                 }
                 other => unreachable!("{other}"),
             };
-            // The type decides the outcome, never the order: signing and
-            // Ed25519-only operations need Ed25519, agreement needs an
-            // agreement key.
+            // The type decides the outcome, never the order: signing needs
+            // Ed25519, agreement needs an agreement key.
             let fits = !matches!(
                 (host_answer.key_type.as_str(), first),
-                ("ed25519", "dh_agree") | ("x25519" | "hpke-p256", "sign" | "require_ed25519")
+                ("ed25519", "dh_agree") | ("x25519" | "hpke-p256", "sign")
             );
             assert_eq!(
                 result.is_ok(),
@@ -1818,10 +1761,6 @@ mod tests {
                 missing
             )
             .await,
-            Err(PlatformError::KeyNotFound)
-        ));
-        assert!(matches!(
-            require_ed25519(&registry, &h, &missing).await,
             Err(PlatformError::KeyNotFound)
         ));
         assert!(matches!(
@@ -1905,55 +1844,6 @@ mod tests {
         );
         assert_eq!(cached(&registry), 1);
         assert_eq!(registry.get(&h).unwrap(), Some(entry));
-    }
-
-    /// `require_ed25519` refuses a P-256, an HPKE and an X25519 entry
-    /// with `WrongKeyType`, and returns an Ed25519 one's verifying key.
-    #[tokio::test]
-    async fn require_ed25519_refuses_every_other_type() {
-        let registry = CallbackKeyRegistry::new();
-        let p = p256(0xA1).public_key();
-        live(
-            &registry,
-            1,
-            RegisteredKey::P256Signing(p),
-            KeyRole::Operational,
-        );
-        live(
-            &registry,
-            2,
-            RegisteredKey::HpkeP256(p),
-            KeyRole::Operational,
-        );
-        live(
-            &registry,
-            3,
-            RegisteredKey::X25519([1; 32]),
-            KeyRole::Operational,
-        );
-        live(
-            &registry,
-            4,
-            RegisteredKey::Ed25519(ed(0xA2).verifying_key()),
-            KeyRole::Operational,
-        );
-        for (id, actual) in [
-            (1, KeyType::P256Signing),
-            (2, KeyType::HpkeP256),
-            (3, KeyType::X25519),
-        ] {
-            assert!(matches!(
-                require_ed25519(&registry, &KeyHandle::new(id), &no_lookup).await,
-                Err(PlatformError::WrongKeyType { expected: KeyType::Ed25519, actual: a })
-                    if a == actual
-            ));
-        }
-        assert_eq!(
-            require_ed25519(&registry, &KeyHandle::new(4), &no_lookup)
-                .await
-                .unwrap(),
-            ed(0xA2).verifying_key()
-        );
     }
 
     /// A registered HPKE key whose host point changes after generation

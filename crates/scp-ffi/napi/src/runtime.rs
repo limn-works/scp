@@ -1663,6 +1663,28 @@ pub(crate) fn remove_identity_if_present(bi: &NapiBridgeInstance, did: &str) -> 
     identity_registry(bi).remove(did).is_some()
 }
 
+/// Builds the `#active` custody signer of the locally-custodied identity
+/// `did`. The private key stays in custody (ADR-049 Decision 7a); every
+/// operation that signs as an identity's `#active` key builds its signer here.
+///
+/// # Errors
+///
+/// The [`with_identity`] error (`SCP-IDENT-1001`) when `did` is not a
+/// locally-custodied identity, and the custody's own code when the signer
+/// cannot be built (a destroyed key is `SCP-CRYPTO-4006`).
+pub(crate) async fn identity_active_signer(
+    bi: &NapiBridgeInstance,
+    did: &str,
+) -> napi::Result<scp_core::context::actor::CommandSigner> {
+    let (custody, active_handle) = with_identity(bi, did, |entry| {
+        Ok((entry.custody.clone(), entry.identity.active_signing_key))
+    })
+    .map_err(napi::Error::from)?;
+    scp_ffi_common::signer::identity_command_signer(custody, active_handle)
+        .await
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))
+}
+
 /// Executes a closure with a reference to an identity's retained state on
 /// the given bridge instance.
 ///

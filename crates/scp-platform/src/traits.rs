@@ -700,25 +700,6 @@ pub trait KeyCustody: Send + Sync {
         pseudonym_epoch: u64,
     ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send;
 
-    /// Performs X25519 key agreement using an Ed25519 key via birational conversion.
-    ///
-    /// Converts the Ed25519 key to X25519 internally (`SHA-512(seed)[0..32]` → clamp → scalar),
-    /// then performs X25519 DH with the peer's X25519 public key. The private key never
-    /// leaves the custody boundary.
-    ///
-    /// Used for RFC 9180 HPKE decryption of invitation bundles (spec §5.12.3.1).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an X25519 key
-    /// (use [`dh_agree`](Self::dh_agree) for X25519 keys directly).
-    fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send;
-
     /// Returns the custody type for a given key handle.
     ///
     /// This is a synchronous query against local state — no I/O is required.
@@ -1424,30 +1405,6 @@ pub const fn require_derive_source(role: KeyRole, key_type: KeyType) -> Result<(
         });
     }
     Ok(())
-}
-
-/// Performs X25519 key agreement using an Ed25519 signing key via birational conversion.
-///
-/// Converts the Ed25519 key to X25519 using `to_scalar_bytes()` (`SHA-512(seed)[0..32]`),
-/// then performs X25519 DH with the peer's public key.
-///
-/// This helper eliminates duplication across the `InMemoryKeyCustody`, `FileKeyCustody`,
-/// and `SqliteKeyCustody` implementations.
-#[cfg(feature = "software_platform")]
-#[must_use]
-pub fn x25519_agree_from_ed25519(
-    signing_key: &ed25519_dalek::SigningKey,
-    peer_x25519_public: &[u8; 32],
-) -> SharedSecret {
-    let scalar_bytes = zeroize::Zeroizing::new(signing_key.to_scalar_bytes());
-    let x25519_secret = x25519_dalek::StaticSecret::from(*scalar_bytes);
-    let peer_key = x25519_dalek::PublicKey::from(*peer_x25519_public);
-    let shared = x25519_secret.diffie_hellman(&peer_key);
-    // x25519-dalek v2 SharedSecret implements Zeroize + zeroize(drop) when the
-    // zeroize feature is enabled (which it is). Wrapping in Zeroizing is
-    // defense-in-depth — ensures zeroing even if the feature is ever removed.
-    let shared_bytes = zeroize::Zeroizing::new(shared.to_bytes());
-    SharedSecret::new(*shared_bytes)
 }
 
 #[cfg(test)]

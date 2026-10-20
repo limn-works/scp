@@ -266,8 +266,13 @@
         func dhAgreeEd25519Fails() async throws {
             let handle = try await custody.generateKeypair(keyType: "ed25519")
             let peer = Data(repeating: 0, count: 32)
-            await #expect(throws: PlatformError.self) {
+            await #expect {
                 _ = try await custody.dhAgree(handle, peerPublic: peer)
+            } throws: { error in
+                if case PlatformError.wrongKeyType = error {
+                    return true
+                }
+                return false
             }
             // Cleanup
             try await custody.destroyKey(handle)
@@ -796,30 +801,18 @@
             try await provider.destroyKey(keyId: keyId)
         }
 
-        /// The bridge's `ed25519_to_x25519_agree` calls `dhAgree` with an
-        /// Ed25519 key id. The seed is RFC 8032 §7.1 test 1 and the peer is
-        /// RFC 7748 §6.1 Alice; the expected secret is X25519 of Alice's
-        /// scalar and the seed's converted public key, computed independently.
-        @Test("dhAgree on an Ed25519 key uses the SHA-512(seed) X25519 scalar")
-        func ed25519AgreementMatchesConversionVector() async throws {
+        /// `dhAgree` refuses an Ed25519 key id: an Ed25519 key never agrees,
+        /// so the bridge reports the custody failure code.
+        @Test("dhAgree on an Ed25519 key id is refused")
+        func ed25519AgreementIsRefused() async throws {
             let seed = try hexToData("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
             let peerPublic = try hexToData("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
-            let expected = try hexToData("90f395580ca33f3c54390ac1d7210220b6a336de2c47a61ac90ff56e6be11f18")
             let keyId = try storeIdentitySeed(seed)
 
-            let shared = try await provider.dhAgree(keyId: keyId, peerPublic: peerPublic)
-            #expect(shared == expected)
-
-            // The peer side: Alice's scalar against the converted public key.
-            let alice = try Curve25519.KeyAgreement.PrivateKey(
-                rawRepresentation: hexToData("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
-            )
-            let convertedPublic = try Curve25519.KeyAgreement.PublicKey(
-                rawRepresentation: hexToData("d85e07ec22b0ad881537c2f44d662d1a143cf830c57aca4305d85c7a90f6b62e")
-            )
-            let peerShared = try alice.sharedSecretFromKeyAgreement(with: convertedPublic)
-                .withUnsafeBytes { Data($0) }
-            #expect(peerShared == expected)
+            let code = await cryptoCode {
+                _ = try await provider.dhAgree(keyId: keyId, peerPublic: peerPublic)
+            }
+            #expect(code == "SCP-CRYPTO-4060")
             try await provider.destroyKey(keyId: keyId)
         }
 

@@ -46,7 +46,6 @@ import androidx.security.crypto.MasterKeys
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.KeyStore
-import java.security.MessageDigest
 import java.security.Signature
 import java.util.concurrent.ConcurrentHashMap
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair
@@ -371,23 +370,23 @@ class AndroidKeyCustody internal constructor(
     /**
      * Performs X25519 Diffie-Hellman key agreement.
      *
-     * X25519 wrapping keys are always software-managed (Bouncy Castle); this class does not use
-     * the X25519 key agreement Android Keystore offers from API 33. A software Ed25519 key
-     * agrees through its X25519 scalar `SHA-512(seed)[0..32]`, the birational conversion the
-     * bridge's `ed25519_to_x25519_agree` asks for and Rust's `x25519_agree_from_ed25519`
-     * computes. The scalar multiplication happens inside this class, every local copy of the
-     * seed, hash and scalar is wiped, and no public method of this class returns an X25519
-     * private key. The `internal` [softwareKeys] map still holds the key pair, readable by any
-     * code in this module and by Java code through the map's mangled public JVM getter.
+     * X25519 keys are always software-managed (Bouncy Castle); this class does not use the
+     * X25519 key agreement Android Keystore offers from API 33. Only an X25519 key agrees: an
+     * Ed25519 key, software or Keystore, is refused with `SCP-CRYPTO-4005`, because the custody
+     * interface has no Ed25519-to-X25519 agreement (ADR-021, 2026-10-18 amendment). The scalar
+     * multiplication happens inside this class, and no public method of this class returns an
+     * X25519 private key. The `internal` [softwareKeys] map
+     * still holds the key pair, readable by any code in this module and by Java code through the
+     * map's mangled public JVM getter.
      *
-     * @param keyHandle Handle to an X25519 or software Ed25519 key from [generateKeypair].
+     * @param keyHandle Handle to an X25519 key from [generateKeypair].
      * @param peerPublic 32-byte X25519 public key of the peer.
      * @return 32-byte X25519 shared secret.
      * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long,
      *   checked before any key lookup.
      * @throws ScpException with code `SCP-CRYPTO-4005` for a Keystore handle
-     *   ([CustodyType.HARDWARE]), checked before any key lookup: Keystore never releases an
-     *   Ed25519 key's seed, so its X25519 scalar cannot be computed.
+     *   ([CustodyType.HARDWARE]), checked before any key lookup (every Keystore key here is
+     *   Ed25519), and for a software Ed25519 key: an Ed25519 key never agrees.
      * @throws ScpException with code `SCP-CRYPTO-4006` if no software key sits under
      *   [keyHandle].
      * @throws IllegalStateException from Bouncy Castle ("X25519 agreement failed") if
@@ -405,8 +404,8 @@ class AndroidKeyCustody internal constructor(
         if (keyHandle.custodyType == CustodyType.HARDWARE) {
             // Stub — see SCP-110
             throw ScpException(
-                "dhAgree cannot use Keystore key '${keyHandle.id}': Keystore never releases an " +
-                    "Ed25519 seed, so its X25519 scalar cannot be computed",
+                "dhAgree cannot use Keystore key '${keyHandle.id}': it is an Ed25519 key, and an " +
+                    "Ed25519 key never agrees",
                 "SCP-CRYPTO-4005",
             )
         }
@@ -761,32 +760,26 @@ internal class SoftwareKeyOps(
     }
 
     /**
-     * X25519 agreement of the software key under [keyHandle] with [peerPublic] (32 bytes, checked
-     * by the caller). An X25519 key uses its own scalar; an Ed25519 key uses
-     * `SHA-512(seed)[0..32]`, which X25519 clamps when it multiplies. The seed, hash and scalar
-     * copies are wiped.
+     * X25519 agreement of the software X25519 key under [keyHandle] with [peerPublic] (32 bytes,
+     * checked by the caller).
      *
      * @throws ScpException with code `SCP-CRYPTO-4006` if no software key sits under [keyHandle].
+     * @throws ScpException with code `SCP-CRYPTO-4005` if the key is Ed25519: an Ed25519 key never
+     *   agrees (ADR-021, 2026-10-18 amendment).
      */
     fun agree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray {
         val keyPair = softwareKeys[keyHandle.id]
             ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4006")
-        val agreement = X25519Agreement()
         val private = keyPair.private
-        if (private is Ed25519PrivateKeyParameters) {
-            val seed = private.encoded
-            val digest = MessageDigest.getInstance("SHA-512").digest(seed)
-            val scalar = digest.copyOf(X25519_SCALAR_SIZE)
-            try {
-                agreement.init(X25519PrivateKeyParameters(scalar, 0))
-            } finally {
-                seed.fill(0)
-                digest.fill(0)
-                scalar.fill(0)
-            }
-        } else {
-            agreement.init(private)
+        if (private !is X25519PrivateKeyParameters) {
+            throw ScpException(
+                "dhAgree requires an X25519 key; handle '${keyHandle.id}' is Ed25519, and an " +
+                    "Ed25519 key never agrees",
+                "SCP-CRYPTO-4005",
+            )
         }
+        val agreement = X25519Agreement()
+        agreement.init(private)
         val secret = ByteArray(agreement.agreementSize)
         agreement.calculateAgreement(X25519PublicKeyParameters(peerPublic, 0), secret, 0)
         return secret
@@ -910,9 +903,6 @@ internal class SoftwareKeyOps(
     companion object {
         /** Key prefix for Ed25519 private key entries in EncryptedSharedPreferences. */
         private const val PREFS_KEY_PREFIX = "scp.ed25519."
-
-        /** X25519 scalar size in bytes. */
-        private const val X25519_SCALAR_SIZE = 32
     }
 }
 

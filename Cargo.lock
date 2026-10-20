@@ -5299,7 +5299,6 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
- "x25519-dalek 2.0.1",
  "zeroize",
 ]
 
@@ -5387,7 +5386,6 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
- "x25519-dalek 2.0.1",
  "z-base-32",
  "zeroize",
 ]

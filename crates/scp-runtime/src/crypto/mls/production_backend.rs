@@ -15,7 +15,7 @@
 //!
 //! # Signer-state serialization
 //!
-//! `generate_key_package` returns an opaque [`SignerState`] that the caller later passes back to
+//! `finish_key_package` returns an opaque [`SignerState`] that the caller later passes back to
 //! `join_from_welcome`. The serialization format is MessagePack-encoded
 //! `SerializedSigner` — the byte layout is private to this module and is
 //! not a stable interoperability surface. Callers MUST NOT parse the bytes.
@@ -39,7 +39,9 @@ use super::backend::{
 };
 use super::storage_adapter::OpenMlsStorageAdapter;
 use scp_clock::Clock;
+use scp_did::DID;
 use scp_mls::InMemoryMlsProvider;
+use scp_mls::attested_key_package::{KeyPackageDraft, prepare_key_package};
 use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did};
 use scp_mls::error::MlsError;
@@ -260,14 +262,14 @@ impl ProductionMlsBackend {
     }
 
     /// Read the signer state's own `KeyPackage` from the `KeyPackageBundle`
-    /// that `generate_key_package` stored in the signer state's provider
+    /// that `finish_key_package` stored in the signer state's provider
     /// (ADR-057 §Prereq-1).
     ///
     /// The bundle is SCP's own locally generated record, keyed by the
     /// `KeyPackageRef` of `own_key_package_bytes` (the public bytes the signer
     /// state carries), so its `Lifetime` and HPKE init key are read without
     /// parsing an unverified `KeyPackage`. `KeyPackage::life_time` cannot fail
-    /// on a bundle's `KeyPackage`, whose leaf openmls builds KeyPackage-sourced.
+    /// on a bundle's `KeyPackage`, whose leaf openmls builds `KeyPackage`-sourced.
     ///
     /// # Errors
     ///
@@ -521,6 +523,9 @@ impl MlsBackend for ProductionMlsBackend {
             MlsError::CredentialSerializationFailed(format!("extracting BasicCredential: {e}"))
         })?;
         let credential_did = ScpCredential::from_bytes(basic.identity())?.did;
+        // The leaf facts of the SAME validated KeyPackage, for the adder's
+        // §9.7.1 attestation check.
+        let leaf = scp_mls::keypackage_attestation::leaf_facts(&validated)?;
 
         // Re-serialize to return the canonical validated bytes. Functionally
         // equivalent to the input (OpenMLS does not mutate on validate), but
@@ -530,33 +535,35 @@ impl MlsBackend for ProductionMlsBackend {
         Ok(ValidatedKeyPackage {
             key_package_bytes: bytes,
             credential_did,
+            leaf,
         })
     }
 
-    async fn generate_key_package(
+    async fn prepare_key_package(
         &self,
-        credential: &ScpCredential,
+        owning_did: &DID,
         wrapping_pubkey: &[u8; 65],
-    ) -> Result<GeneratedKeyPackage, MlsError> {
-        // Every pooled KeyPackage must be joinable into an SCP *context* group,
-        // whose `group_context` carries the `scp_context_params` (`0xFF02`)
-        // extension. OpenMLS rejects (`valn0502`, RFC 9420 §12.1.8.2) an Add
-        // whose leaf does not declare support for every `group_context`
-        // extension present in the group — so the KP leaf MUST advertise the
-        // `0xFF02` capability regardless of whether a wrapping key is available.
-        //
-        // `generate_key_package_with_context_params` declares BOTH `0xFF01` +
-        // `0xFF02` capabilities and carries `wrapping_pubkey` as the `0xFF01`
-        // leaf extension, which SCP admission requires of every added leaf
-        // (spec 09 §9.16.1).
+    ) -> Result<KeyPackageDraft, MlsError> {
+        // The draft's leaf declares `0xFF01`, `0xFF02` and `0xFF03`, so the
+        // KeyPackage can be added to an SCP context group, whose
+        // `group_context` carries `0xFF02` (OpenMLS rejects an Add whose leaf
+        // does not declare every group-context extension, `valn0502`, RFC 9420
+        // §12.1.8.2). It carries `wrapping_pubkey` as `0xFF01`, which SCP
+        // admission requires of every added leaf (spec 09 §9.16.1), and the
+        // `0xFF03` attestation the adder verifies (§9.7.1).
         //
         // The injected `Clock` mints the KeyPackage `Lifetime` (ADR-057
         // Prereq-1, #2026) — never wall-clock `SystemTime::now()`.
-        let (bundle, signer, provider) = group::generate_key_package_with_context_params(
-            credential,
-            wrapping_pubkey,
-            self.clock.as_ref(),
-        )?;
+        prepare_key_package(owning_did, wrapping_pubkey, self.clock.as_ref())
+    }
+
+    async fn finish_key_package(
+        &self,
+        draft: KeyPackageDraft,
+        signature: [u8; 64],
+        attesting_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<GeneratedKeyPackage, MlsError> {
+        let (bundle, signer, provider) = draft.finish(signature, attesting_key)?;
 
         let kp_bytes = bundle.key_package().tls_serialize_detached().map_err(|e| {
             MlsError::KeyPackageGenerationFailed(format!("serializing key package: {e}"))
@@ -568,6 +575,17 @@ impl MlsBackend for ProductionMlsBackend {
             key_package_bytes: kp_bytes,
             signer_state,
         })
+    }
+
+    async fn reserved_wrapping_key(
+        &self,
+        signer_state: &SignerState,
+    ) -> Result<Option<scp_protocol::crypto::hpke::p256::P256Point>, MlsError> {
+        let wrapper = parse_signer_state(signer_state)?;
+        let own_key_package_bytes = wrapper.key_package_public_bytes.clone();
+        let (_signer, provider) = signer_and_provider_from_wrapper(wrapper)?;
+        let own_key_package = Self::own_key_package(&provider, &own_key_package_bytes)?;
+        scp_mls::wrapping_extension::extract_wrapping_key(own_key_package.leaf_node().extensions())
     }
 
     async fn join_from_welcome(
@@ -772,6 +790,7 @@ fn assert_groups_equivalent(left: &ScpMlsGroup, right: &ScpMlsGroup) -> Result<(
 mod tests {
     use super::*;
     use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
+    use crate::crypto::mls::test_support::MintAttestedForTest as _;
     use scp_clock::SystemClock;
     use scp_did::SigningKeyId;
     use scp_mls::credential::ScpCredential;
@@ -950,7 +969,7 @@ mod tests {
     async fn signer_from_wrapper_refuses_signer_entry() {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let generated = backend
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("signer-wrapper"),
                 &scp_crypto::p256::testing::uncompressed_point_for("signer-wrapper"),
             )
@@ -1003,7 +1022,7 @@ mod tests {
         // distinct (cryptographically single-use) Welcomes for one init key.
         let kp_cred = test_credential("bob-race");
         let kp_gen = backend
-            .generate_key_package(
+            .mint_attested_for_test(
                 &kp_cred,
                 &scp_crypto::p256::testing::uncompressed_point_for(&kp_cred.did),
             )
@@ -1093,7 +1112,7 @@ mod tests {
         joiner.set_consumed_init_key_store(Arc::clone(&store));
 
         let bob_gen = joiner
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("bob-expired-leaf"),
                 &scp_crypto::p256::testing::uncompressed_point_for("bob-expired-leaf"),
             )
@@ -1151,7 +1170,7 @@ mod tests {
         // Minted at the real present, so openmls's real-clock checks on the
         // adder's side and in `own_consumed_init_key_key` accept it.
         let bob_gen = joiner
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("bob-own-expired"),
                 &scp_crypto::p256::testing::uncompressed_point_for("bob-own-expired"),
             )
@@ -1244,7 +1263,7 @@ mod tests {
             Arc::new(InMemoryStorage::new()),
         )));
         let bob_gen = bob_backend
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("bob-recv-expired"),
                 &scp_crypto::p256::testing::uncompressed_point_for("bob-recv-expired"),
             )
@@ -1267,7 +1286,7 @@ mod tests {
         // Carol's KeyPackage is minted at `real_now`, so its `not_after` is
         // `real_now + KEY_PACKAGE_LIFETIME_SECS`, and Alice adds her.
         let carol_gen = ProductionMlsBackend::new(Arc::new(TestClock::new(real_now)))
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("carol-recv-expired"),
                 &scp_crypto::p256::testing::uncompressed_point_for("carol-recv-expired"),
             )
@@ -1322,7 +1341,7 @@ mod tests {
         let joiner = ProductionMlsBackend::new(Arc::new(scp_clock::TestClock::new(mint_now)));
         joiner.set_consumed_init_key_store(Arc::clone(&store));
         let bob_gen = joiner
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential(name),
                 &scp_crypto::p256::testing::uncompressed_point_for(name),
             )
@@ -1436,7 +1455,7 @@ mod tests {
         let joiner = ProductionMlsBackend::new(Arc::clone(&joiner_clock) as Arc<dyn Clock>);
         joiner.set_consumed_init_key_store(Arc::clone(&store));
         let bob_gen = joiner
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("bob-replay-injected"),
                 &scp_crypto::p256::testing::uncompressed_point_for("bob-replay-injected"),
             )
@@ -1529,7 +1548,7 @@ mod tests {
         let joiner = ProductionMlsBackend::new(Arc::new(TestClock::new(real_now)));
         joiner.set_consumed_init_key_store(Arc::clone(&store));
         let bob_gen = joiner
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("bob-mismatch-own"),
                 &scp_crypto::p256::testing::uncompressed_point_for("bob-mismatch-own"),
             )
@@ -1539,7 +1558,7 @@ mod tests {
         let expired = ProductionMlsBackend::new(Arc::new(TestClock::new(
             real_now - 10 - KEY_PACKAGE_LIFETIME_SECS,
         )))
-        .generate_key_package(
+        .mint_attested_for_test(
             &test_credential("bob-mismatch-expired"),
             &scp_crypto::p256::testing::uncompressed_point_for("bob-mismatch-expired"),
         )
@@ -1599,14 +1618,14 @@ mod tests {
         let joiner = ProductionMlsBackend::new(Arc::clone(&joiner_clock) as Arc<dyn Clock>);
         joiner.set_consumed_init_key_store(Arc::clone(&store));
         let bob_gen = joiner
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("bob-injected-own"),
                 &scp_crypto::p256::testing::uncompressed_point_for("bob-injected-own"),
             )
             .await
             .unwrap();
         let other = joiner
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("bob-injected-other"),
                 &scp_crypto::p256::testing::uncompressed_point_for("bob-injected-other"),
             )
@@ -1667,7 +1686,7 @@ mod tests {
         joiner.set_consumed_init_key_store(Arc::clone(&store));
 
         let bob_gen = joiner
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("bob-over-range-leaf"),
                 &scp_crypto::p256::testing::uncompressed_point_for("bob-over-range-leaf"),
             )
@@ -1793,7 +1812,7 @@ mod tests {
         // Bob generates a KP via the backend.
         let bob_cred = test_credential("bob-add");
         let bob_gen = backend
-            .generate_key_package(
+            .mint_attested_for_test(
                 &bob_cred,
                 &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
             )
@@ -1841,7 +1860,7 @@ mod tests {
             .await
             .unwrap();
         let bob_gen = backend
-            .generate_key_package(
+            .mint_attested_for_test(
                 &bob_cred,
                 &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
             )
@@ -1890,7 +1909,7 @@ mod tests {
             .await
             .unwrap();
         let bob_gen = backend
-            .generate_key_package(
+            .mint_attested_for_test(
                 &bob_cred,
                 &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
             )
@@ -1946,7 +1965,7 @@ mod tests {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let bob_cred = test_credential("bob-val");
         let bob_gen = backend
-            .generate_key_package(
+            .mint_attested_for_test(
                 &bob_cred,
                 &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
             )
@@ -1993,7 +2012,7 @@ mod tests {
         let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("carol-stateless");
         let generated = backend
-            .generate_key_package(
+            .mint_attested_for_test(
                 &cred,
                 &scp_crypto::p256::testing::uncompressed_point_for(&cred.did),
             )
@@ -2034,7 +2053,7 @@ mod tests {
         let minted_at = SystemClock.now_secs();
         let backend = ProductionMlsBackend::new(Arc::new(TestClock::new(minted_at)));
         let generated = backend
-            .generate_key_package(
+            .mint_attested_for_test(
                 &test_credential("dave-boundary"),
                 &scp_crypto::p256::testing::uncompressed_point_for("dave-boundary"),
             )
@@ -2068,14 +2087,14 @@ mod tests {
         // to accept the commit, Alice's group, Bob's KeyPackage, and the
         // subsequent `advance_epoch` call MUST agree on the wrapping
         // extension being present. We pass the same `wrap_pub` to
-        // `create_group`, `generate_key_package`, and `advance_epoch`.
+        // `create_group`, `prepare_key_package` + `finish_key_package`, and `advance_epoch`.
         let wrap_pub = scp_crypto::p256::testing::valid_uncompressed_point(0x42);
 
         let alice_cred = test_credential("alice-pc");
         let bob_cred = test_credential("bob-pc");
         let mut alice_grp = backend.create_group(&alice_cred, &wrap_pub).await.unwrap();
         let bob_gen = backend
-            .generate_key_package(&bob_cred, &wrap_pub)
+            .mint_attested_for_test(&bob_cred, &wrap_pub)
             .await
             .unwrap();
         let added = backend
@@ -2126,7 +2145,7 @@ mod tests {
             .await
             .unwrap();
         let bob_gen = backend
-            .generate_key_package(
+            .mint_attested_for_test(
                 &bob_cred,
                 &scp_crypto::p256::testing::uncompressed_point_for(&bob_cred.did),
             )
@@ -2190,10 +2209,10 @@ mod tests {
 
     /// End-to-end proof of the wrapping-key / context-params coupling
     /// (`valn0502`): a `KeyPackage` produced by the **production**
-    /// [`MlsBackend::generate_key_package`] path (which now declares BOTH
+    /// [`MlsBackend::prepare_key_package`] path (which now declares BOTH
     /// `0xFF01` and `0xFF02`) can be added to, and joined into, an SCP context
     /// group (whose `group_context` carries the `0xFF02` extension). Without the
-    /// context-params switch in `generate_key_package`, the pooled KP would
+    /// context-params switch in `prepare_key_package`, the pooled KP would
     /// declare only `0xFF01` and `OpenMLS` would reject the Add with
     /// `AddMemberFailed`. This is the load-bearing coupling test.
     #[tokio::test]
@@ -2212,12 +2231,12 @@ mod tests {
         )
         .unwrap();
 
-        // Joiner side: KP via the PRODUCTION generate_key_package path WITH a
+        // Joiner side: KP via the PRODUCTION prepare/finish path WITH a
         // wrapping key — now declares 0xFF01 + 0xFF02.
         let bob_cred = test_credential("bob-ctx");
         let bob_wrap = scp_crypto::p256::testing::valid_uncompressed_point(0xB2);
         let bob_gen = backend
-            .generate_key_package(&bob_cred, &bob_wrap)
+            .mint_attested_for_test(&bob_cred, &bob_wrap)
             .await
             .unwrap();
 

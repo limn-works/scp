@@ -831,6 +831,15 @@ pub struct InMemoryMlsProvider {
 }
 
 impl InMemoryMlsProvider {
+    /// Wraps `storage`, which already holds what a build under another
+    /// provider wrote, in a provider with default crypto and [`OsRand`].
+    pub(crate) fn from_storage(storage: InMemoryMlsStorage) -> Self {
+        Self {
+            crypto: RustCrypto::default(),
+            storage,
+        }
+    }
+
     /// Builds a provider whose storage holds `entries`, the `(storage key,
     /// value)` pairs a snapshot captured.
     ///

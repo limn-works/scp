@@ -809,22 +809,6 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
         .await
     }
 
-    async fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> Result<SharedSecret, PlatformError> {
-        let h = &self.host;
-        flow::ed25519_to_x25519_agree(
-            &self.registry,
-            ed25519_handle,
-            peer_x25519_public,
-            |key_id, peer| h.dh_agree(key_id, peer),
-            |key_id| h.get_public_key(key_id),
-        )
-        .await
-    }
-
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         // Sync query. `custody_type` returns immediately on the JS side; we
         // dispatch NonBlocking and, lacking a synchronous return path from a
@@ -1028,29 +1012,6 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::File(kc) => {
                 kc.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
-                    .await
-            }
-        }
-    }
-
-    async fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> Result<SharedSecret, PlatformError> {
-        match self {
-            #[cfg(feature = "testing")]
-            Self::InMemory(kc) => {
-                kc.0.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-                    .await
-            }
-            Self::Callback(kc) => {
-                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-                    .await
-            }
-            #[cfg(feature = "testing")]
-            Self::File(kc) => {
-                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
                     .await
             }
         }
@@ -1649,43 +1610,5 @@ mod adapter_tests {
             Err(PlatformError::CustodyError(_))
         ));
         assert_eq!(host.calls("sign"), 2);
-    }
-
-    /// `ed25519_to_x25519_agree` refuses a P-256 handle, minted or resolved,
-    /// with `WrongKeyType` before any host agreement call; an Ed25519 handle
-    /// passes the type check and reaches the host.
-    #[tokio::test]
-    async fn napi_adapter_ed25519_only_paths_refuse_p256() {
-        let host = Arc::new(FakeHost::default());
-        let custody = adapter(&host);
-        let minted = custody
-            .generate_keypair(KeyType::P256Signing)
-            .await
-            .expect("p256 generation");
-        let resolved = KeyHandle::new(
-            host.generate_keypair(KeyType::P256Signing, KeyRole::Operational)
-                .expect("host-side key")
-                .parse()
-                .expect("numeric id"),
-        );
-        for handle in [minted, resolved] {
-            assert!(matches!(
-                custody.ed25519_to_x25519_agree(&handle, &[9u8; 32]).await,
-                Err(PlatformError::WrongKeyType { .. })
-            ));
-        }
-        assert_eq!(host.calls("dh_agree"), 0);
-
-        // The fake host agrees with HPKE keys only, so its refusal is a
-        // custody error: the call passed the adapter's type check.
-        let ed = custody
-            .generate_keypair(KeyType::Ed25519)
-            .await
-            .expect("ed25519 generation");
-        assert!(matches!(
-            custody.ed25519_to_x25519_agree(&ed, &[9u8; 32]).await,
-            Err(PlatformError::CustodyError(_))
-        ));
-        assert_eq!(host.calls("dh_agree"), 1);
     }
 }

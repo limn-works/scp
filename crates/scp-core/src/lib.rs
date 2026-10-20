@@ -33,8 +33,8 @@ pub mod crypto {
     pub mod mls {
         // Synchronous MLS state machine (wasm-safe) from scp-mls.
         pub use scp_mls::{
-            InMemoryMlsProvider, credential, encrypt, epoch_grace, error, group, key_package,
-            ratchet, wire, wrapping_extension,
+            InMemoryMlsProvider, attested_key_package, credential, encrypt, epoch_grace, error,
+            group, key_package, ratchet, wire, wrapping_extension,
         };
         // Node-only async MLS backend and provider from scp-runtime.
         pub use scp_runtime::crypto::mls::{

@@ -152,7 +152,9 @@ pub struct SealedInvitation {
     pub context_id: String,
     /// Binding hint: the creator did used to build the HPKE `info`/`aad`.
     pub creator_did: DID,
-    /// HPKE encapsulated key (`enc`).
+    /// HPKE encapsulated key (`enc`): the 65-byte uncompressed DHKEM(P-256)
+    /// point (spec 09 §9.16.2), validated by the joiner before any custody
+    /// call.
     #[serde(with = "serde_bytes")]
     pub enc: Vec<u8>,
     /// HPKE ciphertext (`ct = ciphertext || tag`) of the serialized bundle.
@@ -263,7 +265,7 @@ mod tests {
         let inv = SealedInvitation {
             context_id: "ctx:x".to_owned(),
             creator_did: DID::from("did:dht:z6MkCreator"),
-            enc: vec![9u8; 32],
+            enc: scp_crypto::p256::testing::valid_uncompressed_point(9).to_vec(),
             ciphertext: vec![1, 2, 3, 4, 5],
         };
         let bytes = inv.to_wire_bytes().unwrap();

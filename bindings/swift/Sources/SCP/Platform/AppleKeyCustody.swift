@@ -1,4 +1,3 @@
-import CommonCrypto
 import CryptoKit
 import Foundation
 import Security
@@ -639,22 +638,6 @@ public final class AppleKeyCustody: Sendable {
     }
 }
 
-// MARK: - Ed25519 to X25519
-
-extension AppleKeyCustody {
-    /// The X25519 scalar of an Ed25519 key: the first 32 bytes of
-    /// `SHA-512(seed)`, unclamped (X25519 clamps when it multiplies). The
-    /// 64-byte hash buffer is wiped before return.
-    nonisolated static func x25519Scalar(fromEd25519Seed seed: Data) -> Data {
-        var digest = [UInt8](repeating: 0, count: Int(CC_SHA512_DIGEST_LENGTH))
-        defer { digest.withUnsafeMutableBytes { _ = memset_s($0.baseAddress, $0.count, 0, $0.count) } }
-        seed.withUnsafeBytes { buffer in
-            _ = CC_SHA512(buffer.baseAddress, CC_LONG(buffer.count), &digest)
-        }
-        return Data(digest[0 ..< 32])
-    }
-}
-
 // MARK: - Pseudonym derivation
 
 extension AppleKeyCustody {
@@ -903,23 +886,22 @@ public extension AppleKeyCustody {
 
     /// Performs X25519 Diffie-Hellman key agreement.
     ///
-    /// Retrieves the private key bytes from Keychain and computes the shared
-    /// secret with `peerPublic`. For an X25519 key the stored bytes are the
-    /// scalar. For an Ed25519 key the scalar is `SHA-512(seed)[0..32]`, the
-    /// birational Ed25519-to-X25519 conversion the bridge's
-    /// `ed25519_to_x25519_agree` asks for and Rust's
-    /// `x25519_agree_from_ed25519` computes (`SigningKey::to_scalar_bytes`).
-    /// The private key never crosses the `AppleKeyCustody` boundary -- the
-    /// scalar multiplication happens entirely within this method, and every
-    /// local copy of the seed, hash and scalar is wiped.
+    /// Retrieves the X25519 private key bytes from Keychain and computes the
+    /// shared secret with `peerPublic`. Only an X25519 key agrees: an Ed25519
+    /// key is refused before its bytes are read, because the custody
+    /// interface has no Ed25519-to-X25519 agreement (ADR-021, 2026-10-18
+    /// amendment). The private key never crosses the `AppleKeyCustody`
+    /// boundary -- the scalar multiplication happens entirely within this
+    /// method, and the local copy of the key bytes is wiped.
     ///
     /// - Parameters:
     ///   - keyHandle: The key id returned by ``generateKeypair(keyType:)``
-    ///     for an `"x25519"` or `"ed25519"` key.
+    ///     for an `"x25519"` key.
     ///   - peerPublic: The 32-byte X25519 public key of the peer.
     /// - Returns: 32-byte X25519 shared secret.
     /// - Throws: ``PlatformError/keyNotFound(_:)`` if the handle is
-    ///   unknown, ``PlatformError/biometricAuthenticationFailed(_:)`` if
+    ///   unknown, ``PlatformError/wrongKeyType(_:)`` if it names an Ed25519
+    ///   key, ``PlatformError/biometricAuthenticationFailed(_:)`` if
     ///   biometric gating is active and authentication fails,
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
     ///   ``PlatformError/custodyError(_:)`` if the peer public key bytes are
@@ -928,23 +910,18 @@ public extension AppleKeyCustody {
     /// See ADR-025 Key custody and ADR-006 `dh_agree`.
     @concurrent
     func dhAgree(_ keyHandle: String, peerPublic: Data) async throws -> Data {
-        let storedType = try fetchKeyType(for: keyHandle)
+        guard try fetchKeyType(for: keyHandle) == .x25519 else {
+            throw PlatformError.wrongKeyType(
+                "dhAgree requires an X25519 key; '\(keyHandle)' is Ed25519, and an Ed25519 key never agrees"
+            )
+        }
 
         var privateKeyBytes = try fetchPrivateKeyBytes(for: keyHandle)
         defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
 
-        var scalar: Data
-        switch storedType {
-        case .x25519:
-            scalar = Data(privateKeyBytes)
-        case .ed25519:
-            scalar = Self.x25519Scalar(fromEd25519Seed: privateKeyBytes)
-        }
-        defer { scalar.resetBytes(in: 0 ..< scalar.count) }
-
         do {
             let agreementKey = try Curve25519.KeyAgreement.PrivateKey(
-                rawRepresentation: scalar
+                rawRepresentation: privateKeyBytes
             )
             let peerPublicKey = try Curve25519.KeyAgreement.PublicKey(
                 rawRepresentation: peerPublic

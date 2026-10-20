@@ -66,7 +66,7 @@
 //!
 //! The KP private signer-state lives ENTIRELY inside the opaque
 //! [`SignerState`] blob returned by
-//! [`MlsBackend::generate_key_package`] (a fresh isolated OpenMLS provider per
+//! [`MlsBackend::finish_key_package`] (a fresh isolated OpenMLS provider per
 //! KP, serialized) — it is NOT written to any shared OpenMLS keystore. The
 //! actor (in memory) and the durable KP record (at rest) are the only homes
 //! for that material; deleting the KP record on consume/cancel makes a
@@ -108,24 +108,26 @@
 //! On respawn the actor rebuilds `pool` / `reserved` from the DURABLE source
 //! (the persisted records), never from a coalesced snapshot.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use scp_clock::Clock;
 use scp_did::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::crypto::hpke::p256::P256Point;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use crate::context::builder::ContextTransportProvider;
-use crate::crypto::mls::backend::{MlsBackend, SignerState};
+use crate::crypto::mls::attestation_signer::{
+    KeyPackageAttestationSigner, mint_attested_key_package,
+};
+use crate::crypto::mls::backend::{GeneratedKeyPackage, MlsBackend, SignerState};
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 use crate::crypto::wrapping::IdentityWrappingKey;
-use scp_did::SigningKeyId;
-use scp_mls::credential::ScpCredential;
 use scp_mls::error::MlsError;
 use scp_mls::group::ScpMlsGroup;
 
@@ -185,6 +187,14 @@ pub const RESERVATION_TTL_MS: u64 = 10 * 60 * 1000;
 /// footprint a misbehaving (or adversarial) caller can pin in memory and at
 /// rest. Generously above the realistic concurrent-Welcome count.
 pub const MAX_OUTSTANDING_RESERVATIONS: usize = 128;
+
+/// Ceiling on the replies a store holds: `ReserveAny` commands waiting for
+/// their signer check, `ReserveAny` commands that found the pool empty, and
+/// `Replenish` commands waiting for the refill to end. Each queue holds at
+/// most this many; a command past it is
+/// refused with [`ContextError::ActorBusy`]. Equal to the mailbox capacity, so
+/// parking never holds more callers than the mailbox already admits.
+pub const MAX_PARKED_REPLIES: usize = KP_MAILBOX_CAPACITY;
 
 // ---------------------------------------------------------------------------
 // Durable journal key namespaces (ADR-049 §9 — Class S anchors)
@@ -354,6 +364,11 @@ struct PersistedKeyPackage {
     /// Opaque private signer-state (the join material). At rest it lives in
     /// `mls_storage` and is deleted on consume/cancel.
     signer_state: Zeroizing<Vec<u8>>,
+    /// The Ed25519 key the `KeyPackage`'s `0xFF03` attestation verifies under
+    /// (§9.7.1): the owner's `#active` key when it was minted. Reconcile reads
+    /// it back so a respawned store knows which entries a later `#active` key
+    /// supersedes (§9.12).
+    attested_by: [u8; 32],
 }
 
 /// Durable reservation record. Persisted under
@@ -386,11 +401,13 @@ pub type PooledKeyPackages = Vec<(KpRef, Vec<u8>)>;
 // In-memory pool/reservation entries
 // ---------------------------------------------------------------------------
 
-/// A pooled (unreserved) KeyPackage.
+/// A pooled (unreserved) KeyPackage. `attested_by` is the key its `0xFF03`
+/// attestation verifies under.
 struct PooledKeyPackage {
     kp_ref: KpRef,
     public_bytes: Vec<u8>,
     signer_state: Zeroizing<Vec<u8>>,
+    attested_by: [u8; 32],
 }
 
 /// A reserved KeyPackage awaiting confirm/cancel. Holds the private
@@ -400,7 +417,104 @@ struct ReservedKeyPackage {
     kp_ref: KpRef,
     public_bytes: Vec<u8>,
     signer_state: Zeroizing<Vec<u8>>,
+    attested_by: [u8; 32],
     reserved_at_ms: u64,
+}
+
+/// A reply a `ReserveAny` sends: the reservation and the public bytes.
+type ReserveReply = oneshot::Sender<Result<(ReservationId, Vec<u8>), ContextError>>;
+
+/// What one off-turn mint returns: the key its attestation verifies under,
+/// and the minted `KeyPackage` or the mint's error.
+struct MintOutcome {
+    attested_by: [u8; 32],
+    result: Result<GeneratedKeyPackage, ContextError>,
+}
+
+/// A subtask's handle that aborts the subtask when dropped, so a stopped
+/// actor leaves none of its subtasks running.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The one mint in flight, a task of its own. The actor polls its handle
+/// alongside its mailbox, so a slow custody sign never holds a command turn.
+/// Dropping it (the actor stopped) aborts the mint.
+struct MintTask {
+    attested_by: [u8; 32],
+    task: AbortOnDrop<Result<GeneratedKeyPackage, ContextError>>,
+}
+
+/// The one signer check in flight: a `ReserveAny`'s signer whose key is not
+/// the installed signer's, and the task re-resolving the owner's `#active`
+/// key for it ([`KeyPackageAttestationSigner::confirm_still_active`]). The
+/// actor polls it alongside its mailbox, so a slow resolver never holds a
+/// command turn.
+struct SignerCheck {
+    signer: Arc<KeyPackageAttestationSigner>,
+    reply: ReserveReply,
+    task: AbortOnDrop<Result<(), ContextError>>,
+}
+
+/// A refill in progress: how many `KeyPackages` it has pooled, and the
+/// `Replenish` replies waiting for it to end, each with the count pooled when
+/// it parked.
+#[derive(Default)]
+struct Refill {
+    generated: usize,
+    waiters: Vec<(oneshot::Sender<Result<usize, ContextError>>, usize)>,
+}
+
+/// Polls the mint in flight, or never resolves when there is none, so the
+/// run loop's `select!` waits on the mailbox alone.
+async fn next_mint(minting: &mut Option<MintTask>) -> MintOutcome {
+    let Some(mint) = minting else {
+        return std::future::pending().await;
+    };
+    let result = match (&mut mint.task.0).await {
+        Ok(result) => result,
+        Err(e) => Err(ContextError::CryptoFailed(format!(
+            "key package mint task failed: {e}"
+        ))),
+    };
+    MintOutcome {
+        attested_by: mint.attested_by,
+        result,
+    }
+}
+
+/// Polls the signer check in flight, or never resolves when there is none.
+async fn next_signer_check(checking: &mut Option<SignerCheck>) -> Result<(), ContextError> {
+    let Some(check) = checking else {
+        return std::future::pending().await;
+    };
+    match (&mut check.task.0).await {
+        Ok(result) => result,
+        Err(e) => Err(ContextError::CryptoFailed(format!(
+            "attestation signer check task failed: {e}"
+        ))),
+    }
+}
+
+/// A copy of a refill's error for each reply waiting on the refill.
+/// [`ContextError`] is not `Clone`; a mint or pool insert fails only with the
+/// variants matched here, and any other is carried as
+/// [`ContextError::CryptoFailed`] with its message.
+fn refill_error_copy(e: &ContextError) -> ContextError {
+    match e {
+        ContextError::Custody(failure) => ContextError::Custody(failure.clone()),
+        ContextError::AttestationSignerNotActiveKey => ContextError::AttestationSignerNotActiveKey,
+        ContextError::AttestationSignerActiveKeyUnresolved => {
+            ContextError::AttestationSignerActiveKeyUnresolved
+        }
+        ContextError::CryptoFailed(m) => ContextError::CryptoFailed(m.clone()),
+        ContextError::PersistenceFailed(m) => ContextError::PersistenceFailed(m.clone()),
+        other => ContextError::CryptoFailed(format!("key package refill failed: {other}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,8 +536,9 @@ pub enum KeyPackageCommand {
         /// Oneshot reply: `(ReservationId, public KP bytes)` on success.
         reply: oneshot::Sender<Result<(ReservationId, Vec<u8>), ContextError>>,
     },
-    /// Atomically reserve the FIRST pooled KP: replenish-if-empty, pick the
-    /// first pooled ref, and reserve it — ALL inside one command handler.
+    /// Atomically reserve the FIRST pooled KP: pick the first pooled ref and
+    /// reserve it inside one command handler, or wait for the refill when the
+    /// pool is empty.
     ///
     /// This is the reserve entrypoint the supervisor's `reserve_key_package`
     /// uses. Folding replenish + list-first-pooled + reserve into a single
@@ -436,7 +551,32 @@ pub enum KeyPackageCommand {
     /// just took. Returns a fresh `ReservationId` plus the KP's PUBLIC bytes,
     /// exactly like [`Self::Reserve`]; the private signer-state never leaves the
     /// actor.
+    ///
+    /// The command carries the owner's attestation signer (§9.7.1), which
+    /// the supervisor built only after resolving the owner's `#active` key and
+    /// finding the signer holds it. It is the only way a signer reaches the
+    /// store. A signer for another identity is refused with
+    /// [`ContextError::InvalidState`] and nothing changes. A signer over the
+    /// installed signer's key replaces it and the reserve proceeds. A signer
+    /// over any other key waits its turn in a queue of signer checks, run one
+    /// at a time off the command turn: the store resolves the owner's
+    /// `#active` key again, and a signer whose key is no longer it (resolved
+    /// before a rotation, delivered after a newer signer) is refused with
+    /// [`ContextError::AttestationSignerNotActiveKey`], leaving the installed
+    /// signer and the pool as they were. A signer that passes is installed:
+    /// every pooled `KeyPackage` another key attested is burned (record
+    /// deleted, unpublished, index rewritten, §9.12), and every `KeyPackage`
+    /// minted from then on carries an attestation the signer made. More than
+    /// [`MAX_PARKED_REPLIES`] queued checks is [`ContextError::ActorBusy`].
+    ///
+    /// On an empty pool the reply is parked until the refill pools a
+    /// `KeyPackage`, which happens off the command turn; the store's pool fills
+    /// on the first `ReserveAny`. A refill that pools nothing replies with its
+    /// error. More than [`MAX_PARKED_REPLIES`] parked replies is
+    /// [`ContextError::ActorBusy`].
     ReserveAny {
+        /// The owner's attestation signer.
+        signer: Arc<KeyPackageAttestationSigner>,
         /// Oneshot reply: `(ReservationId, public KP bytes)` on success.
         reply: oneshot::Sender<Result<(ReservationId, Vec<u8>), ContextError>>,
     },
@@ -550,8 +690,12 @@ pub enum KeyPackageCommand {
         /// Oneshot reply.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
-    /// Explicitly replenish the pool up to [`MIN_BUFFER`]. Returns the count
-    /// of KPs newly generated.
+    /// Explicitly replenish the pool up to [`MIN_BUFFER`]. The reply waits for
+    /// the refill, which mints off the command turn, and carries the count of
+    /// KPs it pooled after this command arrived: `Ok(0)` when the pool is
+    /// already full, `Ok(n)` when it pooled `n` before it ended or failed, and
+    /// the failure when it pooled none. Without an installed attestation
+    /// signer it replies [`ContextError::NotInitialized`] at once.
     Replenish {
         /// Oneshot reply: count of KPs added to the pool.
         reply: oneshot::Sender<Result<usize, ContextError>>,
@@ -584,6 +728,20 @@ pub enum KeyPackageCommand {
         /// Oneshot reply: the pooled `(KpRef, public KP bytes)` pairs. Empty
         /// when the pool is empty.
         reply: oneshot::Sender<Result<PooledKeyPackages, ContextError>>,
+    },
+    /// Read the `0xFF01` `scp_wrapping_key` of a reserved KeyPackage
+    /// (§9.16.1), from the KeyPackage bundle in the reservation's own signer
+    /// state. Read-only: the reservation stays live. The joiner checks it
+    /// against its custody wrapping key before it opens an invitation or
+    /// consumes the reservation (spec 05 §5.12.3.1, §9.16.2 Open step 2).
+    ReservedWrappingKey {
+        /// The reservation to read.
+        reservation_id: ReservationId,
+        /// Oneshot reply: the reserved KeyPackage's `0xFF01`. An unknown or
+        /// consumed reservation is [`ContextError::InvalidState`]; a
+        /// KeyPackage without `0xFF01`, or an unreadable signer state, is
+        /// [`ContextError::InvalidKeyPackage`].
+        reply: oneshot::Sender<Result<P256Point, ContextError>>,
     },
     /// Test-only fault-injection seam: panic the actor task so the watchdog's
     /// crash/poison/respawn path can be exercised deterministically. Gated
@@ -749,10 +907,28 @@ pub(in crate::context) struct KeyPackageStoreDeps {
 pub struct KeyPackageStoreActor {
     /// The identity this actor owns the pool for.
     identity: DID,
-    /// Credential used to generate KeyPackages (built once at spawn).
-    /// `None` only on a malformed-DID wiring bug, in which case replenish
-    /// fail-closes rather than pooling inert KPs.
-    credential: Option<ScpCredential>,
+    /// The owner's `KeyPackage` attestation signer (§9.7.1), installed by the
+    /// first [`KeyPackageCommand::ReserveAny`]. Without one the actor mints,
+    /// reserves, lists and publishes nothing, so it never serves a
+    /// `KeyPackage` whose attesting key it cannot vouch for.
+    attestation_signer: Option<Arc<KeyPackageAttestationSigner>>,
+    /// The mint in flight, polled alongside the mailbox.
+    minting: Option<MintTask>,
+    /// The signer check in flight, polled alongside the mailbox.
+    checking: Option<SignerCheck>,
+    /// `ReserveAny` commands waiting for their signer check.
+    signer_checks: VecDeque<(Arc<KeyPackageAttestationSigner>, ReserveReply)>,
+    /// Spawns the mint and signer-check subtasks onto the Supervisor's task
+    /// tracker (ADR-049 Decision 16).
+    subtasks: super::supervisor::SubtaskSpawner,
+    /// The refill in progress, if any.
+    refill: Option<Refill>,
+    /// `ReserveAny` replies waiting for the refill to pool a `KeyPackage`.
+    parked_reserves: VecDeque<ReserveReply>,
+    /// Refs of superseded `KeyPackages` whose record delete failed. The index
+    /// keeps naming them so a respawn still reaches the record, and each
+    /// signer install retries the delete.
+    stale_refs: HashSet<KpRef>,
     /// The owning identity's wrapping key (§9.16.1), whose public point every
     /// KeyPackage publishes.
     wrapping_key: Arc<IdentityWrappingKey>,
@@ -779,16 +955,44 @@ pub struct KeyPackageStoreActor {
 }
 
 impl KeyPackageStoreActor {
-    /// Spawns a new actor task on the ambient runtime and returns its handle
-    /// and `JoinHandle`. Test-only: production spawns through
-    /// [`Self::new`] and the Supervisor's task tracker (ADR-049 Decision 16).
+    /// Spawns a new actor task onto a task tracker of its own and returns
+    /// its handle and `JoinHandle`. Test-only: production spawns through
+    /// [`Self::spawn_through`] and the Supervisor's task tracker (ADR-049
+    /// Decision 16).
     #[cfg(test)]
     pub(in crate::context) fn spawn(
         identity: DID,
         deps: KeyPackageStoreDeps,
     ) -> (KeyPackageStoreHandle, tokio::task::JoinHandle<()>) {
-        let (handle, actor) = Self::new(identity, deps);
-        (handle, tokio::spawn(actor.run()))
+        let subtasks = super::supervisor::SubtaskSpawner::standalone();
+        let (handle, actor) = Self::new(identity, deps, subtasks.clone());
+        (handle, subtasks.spawn(actor.run()))
+    }
+
+    /// Like [`Self::spawn`], with `signer` installed through
+    /// [`Self::install_attestation_signer`] (the path `ReserveAny` takes)
+    /// before the actor serves its first command, so a test can drive
+    /// `Replenish` without reserving first.
+    #[cfg(test)]
+    pub(in crate::context) fn spawn_with_signer(
+        identity: DID,
+        deps: KeyPackageStoreDeps,
+        signer: Arc<KeyPackageAttestationSigner>,
+    ) -> (KeyPackageStoreHandle, tokio::task::JoinHandle<()>) {
+        let subtasks = super::supervisor::SubtaskSpawner::standalone();
+        let (handle, mut actor) = Self::new(identity, deps, subtasks.clone());
+        (
+            handle,
+            subtasks.spawn(async move {
+                if let Err(e) = actor.reconcile_from_storage().await {
+                    tracing::error!(error = %e, "test spawn: reconcile failed");
+                }
+                if let Err(e) = actor.install_attestation_signer(signer).await {
+                    tracing::error!(error = %e, "test spawn: signer install refused");
+                }
+                actor.serve().await;
+            }),
+        )
     }
 
     /// Builds a new actor and spawns it through `permit` onto the
@@ -796,8 +1000,9 @@ impl KeyPackageStoreActor {
     /// and `JoinHandle`. The Supervisor attaches a watchdog to the
     /// `JoinHandle` (mirroring the per-context actor watchdog, ADR-049 §10).
     /// On spawn the actor runs the §9 respawn reconciliation from
-    /// `mls_storage` and replenishes to [`MIN_BUFFER`] before serving
-    /// commands.
+    /// `mls_storage` before serving commands. It mints nothing until the
+    /// first [`KeyPackageCommand::ReserveAny`] installs the owner's
+    /// attestation signer; the pool fills on that first reserve.
     ///
     /// The returned handle is the only way to reach the actor — the
     /// `mpsc::Receiver<KeyPackageCommand>` moves into the actor and never
@@ -807,25 +1012,30 @@ impl KeyPackageStoreActor {
         identity: DID,
         deps: KeyPackageStoreDeps,
     ) -> (KeyPackageStoreHandle, tokio::task::JoinHandle<()>) {
-        let (handle, actor) = Self::new(identity, deps);
+        let (handle, actor) = Self::new(identity, deps, permit.subtask_spawner());
         (handle, permit.spawn(actor.run()))
     }
 
     /// Builds a new actor and its handle without spawning it. Private, with
     /// [`Self::run`], so no caller can spawn the actor off the tracker.
-    fn new(identity: DID, deps: KeyPackageStoreDeps) -> (KeyPackageStoreHandle, Self) {
+    /// `subtasks` spawns the actor's mints and signer checks.
+    fn new(
+        identity: DID,
+        deps: KeyPackageStoreDeps,
+        subtasks: super::supervisor::SubtaskSpawner,
+    ) -> (KeyPackageStoreHandle, Self) {
         let (tx, rx) = mpsc::channel::<KeyPackageCommand>(KP_MAILBOX_CAPACITY);
-
-        // Build the credential once. The DID is a genuine local participant
-        // (the supervisor resolves it from `local_dids`); credential
-        // construction only fails on a malformed DID, which would be a
-        // supervisor wiring bug — surface it as a degraded actor whose
-        // replenish FAIL-CLOSES (typed errors), never pooling inert KPs.
-        let credential = ScpCredential::new(identity.0.clone(), None, SigningKeyId::Active).ok();
 
         let actor = Self {
             identity,
-            credential,
+            attestation_signer: None,
+            minting: None,
+            checking: None,
+            signer_checks: VecDeque::new(),
+            subtasks,
+            refill: None,
+            parked_reserves: VecDeque::new(),
+            stale_refs: HashSet::new(),
             wrapping_key: deps.wrapping_key,
             mls: deps.mls,
             mls_storage: deps.mls_storage,
@@ -932,6 +1142,7 @@ impl KeyPackageStoreActor {
     async fn persist_index(&self) -> Result<(), ContextError> {
         let mut refs: Vec<KpRef> = self.pool.iter().map(|p| p.kp_ref.clone()).collect();
         refs.extend(self.reserved.values().map(|r| r.kp_ref.clone()));
+        refs.extend(self.stale_refs.iter().cloned());
         let bytes = rmp_serde::to_vec_named(&refs)
             .map_err(|e| ContextError::PersistenceFailed(format!("kp index encode: {e}")))?;
         self.mls_storage
@@ -1035,10 +1246,12 @@ impl KeyPackageStoreActor {
         kp_ref: &KpRef,
         public_bytes: &[u8],
         signer_state: &[u8],
+        attested_by: [u8; 32],
     ) -> Result<(), ContextError> {
         let record = PersistedKeyPackage {
             public_bytes: public_bytes.to_vec(),
             signer_state: Zeroizing::new(signer_state.to_vec()),
+            attested_by,
         };
         let bytes = rmp_serde::to_vec_named(&record)
             .map(Zeroizing::new)
@@ -1074,9 +1287,10 @@ impl KeyPackageStoreActor {
     // Run loop
     // -----------------------------------------------------------------
 
-    /// Dispatch loop. On startup runs the §9 reconciliation + an initial
-    /// replenish, then serves commands until the inbox closes or a `Shutdown`
-    /// command arrives.
+    /// Dispatch loop. On startup runs the §9 reconciliation, then serves
+    /// commands until the inbox closes or a `Shutdown` command arrives. It
+    /// mints nothing until a `ReserveAny` installs the owner's attestation
+    /// signer.
     async fn run(mut self) {
         if let Err(e) = self.reconcile_from_storage().await {
             tracing::error!(
@@ -1086,28 +1300,32 @@ impl KeyPackageStoreActor {
                 "key-package actor reconciliation failed on spawn; serving from empty pool"
             );
         }
-        // Best-effort initial replenish to the high-water mark. A failure here
-        // is non-fatal: subsequent Reserve/Replenish commands retry.
-        if let Err(e) = self.replenish_to_min().await {
-            tracing::warn!(
-                actor_kind = "key_package_store",
-                identity = %self.identity.0,
-                error = %e,
-                "key-package actor initial replenish failed; pool may be below target"
-            );
-        }
+        self.serve().await;
+    }
 
-        while let Some(cmd) = self.inbox.recv().await {
-            match cmd {
-                KeyPackageCommand::Shutdown => break,
-                #[cfg(feature = "testing")]
-                KeyPackageCommand::TestInducePanic { sentinel } => {
-                    #[allow(clippy::panic)]
-                    {
-                        panic!("{sentinel}");
+    /// Serves the mailbox, the mint in flight and the signer check in flight
+    /// together. A mint (resolver and custody sign) and a signer check
+    /// (resolver) each run as a subtask this loop polls, never inside a
+    /// command turn, so a `ConfirmConsume` is handled while a custody sign or
+    /// a resolution is still pending.
+    async fn serve(mut self) {
+        loop {
+            tokio::select! {
+                cmd = self.inbox.recv() => match cmd {
+                    None | Some(KeyPackageCommand::Shutdown) => break,
+                    #[cfg(feature = "testing")]
+                    Some(KeyPackageCommand::TestInducePanic { sentinel }) => {
+                        #[allow(clippy::panic)]
+                        {
+                            panic!("{sentinel}");
+                        }
                     }
+                    Some(other) => self.dispatch(other).await,
+                },
+                outcome = next_mint(&mut self.minting) => self.handle_minted(outcome).await,
+                checked = next_signer_check(&mut self.checking) => {
+                    self.handle_signer_checked(checked).await;
                 }
-                other => self.dispatch(other).await,
             }
         }
     }
@@ -1122,12 +1340,8 @@ impl KeyPackageStoreActor {
                 // successful reserve drops the pool.
                 self.maybe_replenish().await;
             }
-            KeyPackageCommand::ReserveAny { reply } => {
-                let result = self.handle_reserve_first_pooled().await;
-                let _ = reply.send(result);
-                // Auto-replenish (and sweep expired reservations) after a
-                // successful reserve drops the pool.
-                self.maybe_replenish().await;
+            KeyPackageCommand::ReserveAny { signer, reply } => {
+                self.admit_reserve_any(signer, reply).await;
             }
             KeyPackageCommand::ConfirmConsume {
                 reservation_id,
@@ -1145,19 +1359,23 @@ impl KeyPackageStoreActor {
                 let _ = reply.send(result);
                 self.maybe_replenish().await;
             }
-            KeyPackageCommand::Replenish { reply } => {
-                let result = self.replenish_to_min().await;
-                let _ = reply.send(result);
-            }
+            KeyPackageCommand::Replenish { reply } => self.handle_replenish(reply),
             KeyPackageCommand::Publish { reply } => {
                 let result = self.handle_publish().await;
                 let _ = reply.send(result);
             }
             KeyPackageCommand::ListPooled { reply } => {
-                let _ = reply.send(Ok(self.handle_list_pooled()));
+                let _ = reply.send(self.handle_list_pooled());
             }
-            // Shutdown + TestInducePanic are handled in `run()`; included for
-            // exhaustiveness.
+            KeyPackageCommand::ReservedWrappingKey {
+                reservation_id,
+                reply,
+            } => {
+                let result = self.handle_reserved_wrapping_key(reservation_id).await;
+                let _ = reply.send(result);
+            }
+            // Shutdown + TestInducePanic are handled in `serve()`; included
+            // for exhaustiveness.
             KeyPackageCommand::Shutdown => {}
             #[cfg(feature = "testing")]
             KeyPackageCommand::TestInducePanic { .. } => {}
@@ -1194,15 +1412,22 @@ impl KeyPackageStoreActor {
             )));
         }
 
-        // Find-and-remove from the pool.
-        let Some(pos) = self.pool.iter().position(|p| p.kp_ref == kp_ref) else {
+        // Only a KeyPackage the installed signer's `#active` key attested is
+        // available (§9.7.1, §9.12).
+        let active = self.active_attesting_key()?;
+        let Some(pos) = self
+            .pool
+            .iter()
+            .position(|p| p.kp_ref == kp_ref && p.attested_by == active)
+        else {
             return Err(ContextError::InvalidKeyPackage(format!(
-                "no pooled key package with ref '{kp_ref}'"
+                "no pooled key package with ref '{kp_ref}' attested by the current #active key"
             )));
         };
         let entry = self.pool.remove(pos);
         let public_bytes = entry.public_bytes;
         let signer_state = entry.signer_state;
+        let attested_by = entry.attested_by;
 
         let reservation_id = ReservationId::new_random();
         let reserved_at_ms = self.clock.now_millis();
@@ -1215,6 +1440,7 @@ impl KeyPackageStoreActor {
                 kp_ref: kp_ref.clone(),
                 public_bytes: public_bytes.clone(),
                 signer_state,
+                attested_by,
                 reserved_at_ms,
             },
         );
@@ -1270,39 +1496,271 @@ impl KeyPackageStoreActor {
         Ok((reservation_id, public_bytes))
     }
 
-    /// Atomically reserve the FIRST pooled KP: replenish-if-empty, pick the
-    /// first pooled ref, and reserve it — all within this one handler.
+    /// The `#active` key of the installed attestation signer: the only key
+    /// whose `KeyPackages` the store reserves, publishes or lists.
     ///
-    /// This is the atomic counterpart to composing `Replenish` → `ListPooled`
-    /// → `Reserve` as three separate mailbox round-trips. Because handlers run
-    /// serialized on the actor's single mailbox loop and this handler both
-    /// picks the ref AND reserves it before yielding, two concurrent
-    /// same-identity reserves can never observe the same pooled KP: the first
-    /// call's [`Self::handle_reserve`] has already moved the KP out of `pool`
-    /// into `reserved` before the second call's handler runs, so the second
-    /// picks the NEXT pooled ref and both succeed with DISTINCT reservations.
+    /// # Errors
     ///
-    /// The durable-anchor write + rollback semantics are inherited unchanged
-    /// from [`Self::handle_reserve`], which this delegates to.
-    async fn handle_reserve_first_pooled(
+    /// [`ContextError::NotInitialized`] before a `ReserveAny` installs a
+    /// signer.
+    fn active_attesting_key(&self) -> Result<[u8; 32], ContextError> {
+        self.attestation_signer
+            .as_ref()
+            .map(|s| s.active_key().to_bytes())
+            .ok_or_else(|| {
+                ContextError::NotInitialized(
+                    "key-package store has no attestation signer; a reserve installs the \
+                     owner's #active signer"
+                        .to_owned(),
+                )
+            })
+    }
+
+    /// `KeyPackages` the store holds or has promised: pooled plus reserved.
+    fn stock(&self) -> usize {
+        self.pool.len() + self.reserved.len()
+    }
+
+    /// The installed attestation signer's key, if one is installed.
+    fn installed_key(&self) -> Option<[u8; 32]> {
+        self.attestation_signer
+            .as_ref()
+            .map(|s| s.active_key().to_bytes())
+    }
+
+    /// Admits a `ReserveAny`. A signer for another identity is refused. A
+    /// signer over the installed signer's key, with no check queued ahead of
+    /// it, replaces the installed signer (nothing is burned, the key is the
+    /// same) and the reserve is served. Any other signer joins the queue of
+    /// signer checks.
+    async fn admit_reserve_any(
         &mut self,
-    ) -> Result<(ReservationId, Vec<u8>), ContextError> {
-        // Replenish first if the pool is empty so there is a KP to reserve. A
-        // deterministic barrier (not a sleep): the same explicit fill the
-        // former supervisor-side composite used, now folded in. Propagate a
-        // replenish error only when it leaves us with nothing to reserve.
-        if self.pool.is_empty() {
-            self.replenish_to_min().await?;
+        signer: Arc<KeyPackageAttestationSigner>,
+        reply: ReserveReply,
+    ) {
+        if signer.owner() != &self.identity {
+            let _ = reply.send(Err(ContextError::InvalidState(
+                "attestation signer owner mismatch".to_owned(),
+            )));
+            return;
         }
-        let Some(first) = self.pool.first() else {
+        if self.checking.is_none()
+            && self.signer_checks.is_empty()
+            && self.installed_key() == Some(signer.active_key().to_bytes())
+        {
+            self.attestation_signer = Some(signer);
+            self.serve_reserve_any(reply).await;
+            return;
+        }
+        if self.signer_checks.len() >= MAX_PARKED_REPLIES {
+            let _ = reply.send(Err(ContextError::ActorBusy(format!(
+                "key package store has {MAX_PARKED_REPLIES} reserves waiting for a signer check"
+            ))));
+            return;
+        }
+        self.signer_checks.push_back((signer, reply));
+        self.start_next_signer_check().await;
+    }
+
+    /// Starts the next queued signer check when none runs. A queued signer
+    /// over the installed signer's key needs no check and is served at once;
+    /// a queued reply whose caller has gone is dropped.
+    async fn start_next_signer_check(&mut self) {
+        while self.checking.is_none() {
+            let Some((signer, reply)) = self.signer_checks.pop_front() else {
+                return;
+            };
+            if reply.is_closed() {
+                continue;
+            }
+            if self.installed_key() == Some(signer.active_key().to_bytes()) {
+                self.attestation_signer = Some(signer);
+                self.serve_reserve_any(reply).await;
+                continue;
+            }
+            let checked = Arc::clone(&signer);
+            let task = self
+                .subtasks
+                .spawn(async move { checked.confirm_still_active().await });
+            self.checking = Some(SignerCheck {
+                signer,
+                reply,
+                task: AbortOnDrop(task),
+            });
+        }
+    }
+
+    /// Takes the finished signer check. A signer whose key is still the
+    /// owner's `#active` key is installed and its reserve served; any other
+    /// outcome refuses the reserve and leaves the installed signer and the
+    /// pool as they were. Then the next queued check starts.
+    async fn handle_signer_checked(&mut self, checked: Result<(), ContextError>) {
+        let Some(SignerCheck { signer, reply, .. }) = self.checking.take() else {
+            return;
+        };
+        match checked {
+            Ok(()) => match self.install_attestation_signer(signer).await {
+                Ok(()) => self.serve_reserve_any(reply).await,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    actor_kind = "key_package_store",
+                    identity = %self.identity.0,
+                    error = %e,
+                    "reserve refused: its attestation signer's key is not the owner's \
+                     #active key; the installed signer and the pool are unchanged"
+                );
+                let _ = reply.send(Err(e));
+            }
+        }
+        self.start_next_signer_check().await;
+    }
+
+    /// Serves a `ReserveAny` whose signer is installed, then replenishes.
+    async fn serve_reserve_any(&mut self, reply: ReserveReply) {
+        self.handle_reserve_any(reply).await;
+        self.maybe_replenish().await;
+    }
+
+    /// Installs `signer` as the owner's attestation signer, then burns every
+    /// pooled `KeyPackage` another key attested (§9.12, rotation is
+    /// revocation). A `ReserveAny` reaches this only after its signer check
+    /// found the signer's key is still the owner's `#active` key.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::InvalidState`] when `signer` attests another identity;
+    /// the previous signer stays and nothing is burned.
+    async fn install_attestation_signer(
+        &mut self,
+        signer: Arc<KeyPackageAttestationSigner>,
+    ) -> Result<(), ContextError> {
+        if signer.owner() != &self.identity {
+            return Err(ContextError::InvalidState(
+                "attestation signer owner mismatch".to_owned(),
+            ));
+        }
+        let active = signer.active_key().to_bytes();
+        self.attestation_signer = Some(signer);
+        self.burn_superseded(active).await;
+        Ok(())
+    }
+
+    /// Removes every pooled `KeyPackage` whose attestation verifies under a
+    /// key other than `active`: drops it from the pool and from
+    /// `published_refs`, deletes its record, and rewrites the index. A record
+    /// whose delete fails stays named by the index (through `stale_refs`), so
+    /// a respawn still reaches it, and the next install retries the delete.
+    /// Reserved `KeyPackages` are left to their confirm, cancel or expiry.
+    async fn burn_superseded(&mut self, active: [u8; 32]) {
+        let (current, superseded): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pool)
+            .into_iter()
+            .partition(|p| p.attested_by == active);
+        self.pool = current;
+        if superseded.is_empty() && self.stale_refs.is_empty() {
+            return;
+        }
+        let burned = superseded.len();
+        for entry in superseded {
+            self.published_refs.remove(&entry.kp_ref);
+            self.stale_refs.insert(entry.kp_ref);
+            // `entry.signer_state` is `Zeroizing`; it is wiped here.
+        }
+        let stale: Vec<KpRef> = self.stale_refs.iter().cloned().collect();
+        for kp_ref in stale {
+            match self.delete_kp_record(&kp_ref).await {
+                Ok(()) => {
+                    self.stale_refs.remove(&kp_ref);
+                }
+                Err(e) => tracing::warn!(
+                    actor_kind = "key_package_store",
+                    identity = %self.identity.0,
+                    kp_ref = %kp_ref,
+                    error = %e,
+                    "superseded KP record delete failed; the index keeps it for a retry"
+                ),
+            }
+        }
+        tracing::info!(
+            actor_kind = "key_package_store",
+            identity = %self.identity.0,
+            burned,
+            "burned pooled key packages attested by a superseded #active key"
+        );
+        self.persist_index_best_effort("burn superseded").await;
+    }
+
+    /// Serves a `ReserveAny` after its signer is installed: reserves the
+    /// first pooled `KeyPackage` the signer's key attested, or parks the reply
+    /// until the refill pools one.
+    ///
+    /// Reserving inside one handler keeps two concurrent reserves from
+    /// observing the same pooled `KeyPackage`: handlers run serialized on the
+    /// actor's mailbox, and [`Self::handle_reserve`] moves the entry out of
+    /// `pool` before the next handler runs.
+    async fn handle_reserve_any(&mut self, reply: ReserveReply) {
+        if !self.pool.is_empty() {
+            let result = self.reserve_first_pooled().await;
+            let _ = reply.send(result);
+            return;
+        }
+        if self.parked_reserves.len() >= MAX_PARKED_REPLIES {
+            let _ = reply.send(Err(ContextError::ActorBusy(format!(
+                "key package store has {MAX_PARKED_REPLIES} reserves waiting for a refill"
+            ))));
+            return;
+        }
+        self.parked_reserves.push_back(reply);
+        if !self.ensure_refill() {
+            // The signer is installed, so no refill runs only because pooled
+            // plus reserved reach the reservation ceiling.
+            self.fail_parked_reserves(&ContextError::CreationFailed(format!(
+                "the KeyPackage pool is empty and {} reservations are outstanding, the \
+                 ceiling of {MAX_OUTSTANDING_RESERVATIONS}; no refill runs until one is \
+                 confirmed or cancelled",
+                self.reserved.len()
+            )));
+        }
+    }
+
+    /// Reserves the first pooled `KeyPackage` the installed signer's key
+    /// attested.
+    async fn reserve_first_pooled(&mut self) -> Result<(ReservationId, Vec<u8>), ContextError> {
+        let active = self.active_attesting_key()?;
+        let Some(first) = self.pool.iter().find(|p| p.attested_by == active) else {
             return Err(ContextError::CreationFailed(
-                "reserve_first_pooled: the KeyPackage pool is empty after a \
-                 replenish — cannot reserve a KP for the join"
+                "the KeyPackage pool holds no KeyPackage the current #active key attested"
                     .to_owned(),
             ));
         };
         let kp_ref = first.kp_ref.clone();
         self.handle_reserve(kp_ref).await
+    }
+
+    /// Replies to every parked `ReserveAny` with a copy of `e`.
+    fn fail_parked_reserves(&mut self, e: &ContextError) {
+        for reply in self.parked_reserves.drain(..) {
+            let _ = reply.send(Err(refill_error_copy(e)));
+        }
+    }
+
+    /// Reserves for parked `ReserveAny` replies while the pool has
+    /// `KeyPackages`. A reply whose caller has gone is dropped without
+    /// reserving.
+    async fn serve_parked_reserves(&mut self) {
+        while !self.pool.is_empty() {
+            let Some(reply) = self.parked_reserves.pop_front() else {
+                return;
+            };
+            if reply.is_closed() {
+                continue;
+            }
+            let result = self.reserve_first_pooled().await;
+            let _ = reply.send(result);
+        }
     }
 
     /// Roll back an in-memory reservation on a Class-S persist failure:
@@ -1319,8 +1777,38 @@ impl KeyPackageStoreActor {
                 kp_ref,
                 public_bytes,
                 signer_state: reserved.signer_state,
+                attested_by: reserved.attested_by,
             });
         }
+    }
+
+    /// Reads the `0xFF01` of the reserved KeyPackage from the reservation's
+    /// signer state, leaving the reservation in place.
+    async fn handle_reserved_wrapping_key(
+        &self,
+        reservation_id: ReservationId,
+    ) -> Result<P256Point, ContextError> {
+        let Some(reserved) = self.reserved.get(&reservation_id) else {
+            return Err(ContextError::InvalidState(
+                "unknown or already-consumed reservation".to_owned(),
+            ));
+        };
+        let signer_state = SignerState {
+            bytes: Zeroizing::new(reserved.signer_state.to_vec()),
+        };
+        self.mls
+            .reserved_wrapping_key(&signer_state)
+            .await
+            .map_err(|e| {
+                ContextError::InvalidKeyPackage(format!(
+                    "reserved KeyPackage wrapping key unreadable: {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ContextError::InvalidKeyPackage(
+                    "reserved KeyPackage carries no scp_wrapping_key (0xFF01)".to_owned(),
+                )
+            })
     }
 
     /// Confirm-consume a reservation by FUSING the join into the actor.
@@ -1661,12 +2149,18 @@ impl KeyPackageStoreActor {
     /// happens). Idempotent: a `kp_ref` already published is skipped, and it is
     /// marked published only after the transport accepts it. An empty pool is a
     /// no-op success.
+    ///
+    /// Only `KeyPackages` the installed signer's `#active` key attested are
+    /// published; without a signer the call is
+    /// [`ContextError::NotInitialized`].
     async fn handle_publish(&mut self) -> Result<(), ContextError> {
+        let active = self.active_attesting_key()?;
         // Snapshot the refs+bytes to publish so we don't borrow `self.pool`
         // while mutating `published_refs`. The transport publish is sync.
         let to_publish: Vec<(KpRef, Vec<u8>)> = self
             .pool
             .iter()
+            .filter(|p| p.attested_by == active)
             .map(|p| (p.kp_ref.clone(), p.public_bytes.clone()))
             .collect();
         let owner_did = self.identity.0.clone();
@@ -1691,12 +2185,17 @@ impl KeyPackageStoreActor {
     /// pairs. Read-only — does not move any KP out of the pool. Reserved KPs are
     /// deliberately EXCLUDED: they are not available to reserve, and their
     /// public bytes are already held by whoever reserved them. The private
-    /// signer-state never appears here (only `kp_ref` + public bytes).
-    fn handle_list_pooled(&self) -> PooledKeyPackages {
-        self.pool
+    /// signer-state never appears here (only `kp_ref` + public bytes). Only
+    /// `KeyPackages` the installed signer's `#active` key attested are listed;
+    /// without a signer the call is [`ContextError::NotInitialized`].
+    fn handle_list_pooled(&self) -> Result<PooledKeyPackages, ContextError> {
+        let active = self.active_attesting_key()?;
+        Ok(self
+            .pool
             .iter()
+            .filter(|p| p.attested_by == active)
             .map(|p| (p.kp_ref.clone(), p.public_bytes.clone()))
-            .collect()
+            .collect())
     }
 
     // -----------------------------------------------------------------
@@ -1705,18 +2204,12 @@ impl KeyPackageStoreActor {
 
     /// Sweep expired reservations, then replenish to [`MIN_BUFFER`] if
     /// `pool.len() + reserved.len()` is below [`REPLENISH_THRESHOLD`].
+    ///
+    /// The refill mints off the command turn; see [`Self::ensure_refill`].
     async fn maybe_replenish(&mut self) {
         self.sweep_expired_reservations().await;
-        if self.pool.len() + self.reserved.len() >= REPLENISH_THRESHOLD {
-            return;
-        }
-        if let Err(e) = self.replenish_to_min().await {
-            tracing::warn!(
-                actor_kind = "key_package_store",
-                identity = %self.identity.0,
-                error = %e,
-                "auto-replenish failed; pool below target"
-            );
+        if self.stock() < REPLENISH_THRESHOLD {
+            self.ensure_refill();
         }
     }
 
@@ -1766,120 +2259,201 @@ impl KeyPackageStoreActor {
         }
     }
 
-    /// Generate KeyPackages until `pool.len() + reserved.len()` reaches
-    /// [`MIN_BUFFER`]. Returns the count newly generated.
+    /// Whether the refill mints another `KeyPackage`: a signer is installed,
+    /// and either pooled plus reserved is below [`MIN_BUFFER`], or parked
+    /// reserves outnumber the pool while pooled plus reserved is below
+    /// [`MAX_OUTSTANDING_RESERVATIONS`], the most reservations the store
+    /// holds.
+    fn wants_mint(&self) -> bool {
+        self.attestation_signer.is_some()
+            && (self.stock() < MIN_BUFFER
+                || (self.parked_reserves.len() > self.pool.len()
+                    && self.stock() < MAX_OUTSTANDING_RESERVATIONS))
+    }
+
+    /// Starts a refill when none runs and [`Self::wants_mint`]. Returns
+    /// whether a refill is running.
     ///
-    /// On the first generate error: stop, persist what we have, and reply
-    /// `Ok(count)` if any were generated (partial-retain, mirroring
-    /// `KeyPackageBuffer::replenish`) else `Err(CryptoFailed)`. New pool
-    /// entries are persisted as KP records (Class-C-acceptable: a lost
-    /// unreserved KP is just regenerated; only reserved/consumed transitions
-    /// are Class S). Fail-closes if the credential is absent (malformed-DID
-    /// wiring bug) rather than pooling inert KPs.
-    ///
-    /// # Index/pool consistency (per-KP index persist)
-    ///
-    /// For each generated KP we persist the KP record, push it into the
-    /// in-memory pool, then persist the index — which derives its ref list from
-    /// the live `pool` + `reserved` — so a pooled KP ALWAYS has a matching index
-    /// entry. If that per-KP index persist fails we roll the KP back OUT of the
-    /// pool (and best-effort delete its now-orphaned record) and stop, keeping
-    /// the durable index and the in-memory pool consistent: a pooled KP whose
-    /// index entry was lost can otherwise never be re-pooled or re-published on
-    /// respawn, leaking its record forever. The union-enumeration in
-    /// [`Self::reconcile_from_storage`] is the robust backstop for any residual
-    /// drift, but the source-side per-KP persist closes the leak at the write.
-    async fn replenish_to_min(&mut self) -> Result<usize, ContextError> {
-        let Some(credential) = self.credential.clone() else {
-            return Err(ContextError::CryptoFailed(
-                "key-package actor has no valid credential (malformed owning DID); \
-                 refusing to generate inert key packages"
-                    .to_owned(),
-            ));
+    /// A refill mints one `KeyPackage` at a time as the actor's in-flight mint
+    /// subtask (see [`Self::serve`]) while [`Self::wants_mint`]: it serves
+    /// every parked reserve, then tops pooled plus reserved back up to
+    /// [`MIN_BUFFER`], or ends when a mint fails. Every `KeyPackage` carries a
+    /// `0xFF03` attestation the installed signer made with the owner's
+    /// `#active` key (§9.7.1).
+    fn ensure_refill(&mut self) -> bool {
+        if self.refill.is_some() {
+            return true;
+        }
+        if !self.wants_mint() {
+            return false;
+        }
+        self.refill = Some(Refill::default());
+        self.start_mint();
+        true
+    }
+
+    /// Starts one mint with the installed signer as a subtask on the
+    /// Supervisor's task tracker. The task owns clones of the backend and
+    /// signer, so it borrows nothing from the actor.
+    fn start_mint(&mut self) {
+        let Some(signer) = self.attestation_signer.clone() else {
+            return;
         };
+        let mls = Arc::clone(&self.mls);
+        // The identity's wrapping public key, published as the `0xFF01` leaf
+        // extension. The supervisor's entry never changes once inserted, so
+        // every KeyPackage this store generates carries the same key.
+        let wrapping_public_key = *self.wrapping_key.public();
+        let attested_by = signer.active_key().to_bytes();
+        self.minting = Some(MintTask {
+            attested_by,
+            task: AbortOnDrop(self.subtasks.spawn(async move {
+                mint_attested_key_package(&*mls, &signer, &wrapping_public_key).await
+            })),
+        });
+    }
 
-        let current = self.pool.len() + self.reserved.len();
-        if current >= MIN_BUFFER {
-            return Ok(0);
-        }
-        let deficit = MIN_BUFFER - current;
-
-        let mut generated = 0usize;
-        let mut first_err: Option<ContextError> = None;
-        for _ in 0..deficit {
-            // The identity's wrapping public key, published as the `0xFF01`
-            // leaf extension. The supervisor's entry never changes once
-            // inserted, so every KeyPackage this store generates carries the
-            // same key.
-            let wrapping_public_key = *self.wrapping_key.public();
-            match self
-                .mls
-                .generate_key_package(&credential, &wrapping_public_key)
-                .await
-            {
-                Ok(generated_kp) => {
-                    let kp_ref = Self::derive_kp_ref(&generated_kp.key_package_bytes);
-                    // Persist the KP record (public + private signer-state).
-                    if let Err(e) = self
-                        .persist_kp_record(
-                            &kp_ref,
-                            &generated_kp.key_package_bytes,
-                            &generated_kp.signer_state.bytes,
-                        )
-                        .await
-                    {
-                        first_err = Some(e);
-                        break;
-                    }
-                    // Push into the pool FIRST so the index persist below
-                    // enumerates this ref, then persist the index reliably. If
-                    // the index persist fails, roll the KP back out of the pool
-                    // and best-effort delete its now-orphaned record so a pooled
-                    // KP can never exist without a matching index entry (the
-                    // leak this guards against). Stop on failure.
-                    self.pool.push(PooledKeyPackage {
-                        kp_ref: kp_ref.clone(),
-                        public_bytes: generated_kp.key_package_bytes,
-                        // `signer_state.bytes` is already `Zeroizing<Vec<u8>>`.
-                        signer_state: generated_kp.signer_state.bytes,
-                    });
-                    if let Err(e) = self.persist_index().await {
-                        // Drop the just-pushed entry (last in the pool) and
-                        // delete its orphaned record. Keep durable + in-memory
-                        // consistent: no pooled KP without an index entry.
-                        self.pool.pop();
-                        if let Err(del) = self.delete_kp_record(&kp_ref).await {
-                            tracing::warn!(
-                                actor_kind = "key_package_store",
-                                identity = %self.identity.0,
-                                error = %del,
-                                "replenish: orphaned KP record delete failed after \
-                                 index persist failure (excluded from pool)"
-                            );
-                        }
-                        first_err = Some(e);
-                        break;
-                    }
-                    generated += 1;
+    /// Takes one finished mint. A `KeyPackage` attested by the installed
+    /// signer's key is pooled and serves parked reserves; one attested by a
+    /// key a later `ReserveAny` superseded is dropped unpersisted. The refill
+    /// then mints again, or ends.
+    async fn handle_minted(&mut self, outcome: MintOutcome) {
+        self.minting = None;
+        let current = self
+            .attestation_signer
+            .as_ref()
+            .map(|s| s.active_key().to_bytes());
+        match outcome.result {
+            Ok(minted) if current == Some(outcome.attested_by) => {
+                if let Err(e) = self.pool_minted(minted, outcome.attested_by).await {
+                    self.end_refill(Some(e));
+                    return;
                 }
-                Err(e) => {
-                    first_err = Some(ContextError::CryptoFailed(format!(
-                        "generating key package: {e}"
-                    )));
-                    break;
+                if let Some(refill) = self.refill.as_mut() {
+                    refill.generated += 1;
                 }
+                self.serve_parked_reserves().await;
+            }
+            // Attested by a superseded key: its `Zeroizing` signer-state is
+            // wiped here and the refill mints again with the current signer.
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    actor_kind = "key_package_store",
+                    identity = %self.identity.0,
+                    error = %e,
+                    "key package mint failed; refill ends"
+                );
+                self.end_refill(Some(e));
+                return;
             }
         }
-
-        if generated == 0 {
-            if let Some(e) = first_err {
-                return Err(e);
-            }
-            // deficit was >0 but we generated nothing without an error — only
-            // possible if deficit underflowed, which the guard above prevents.
-            return Ok(0);
+        if self.wants_mint() {
+            self.start_mint();
+        } else {
+            self.end_refill(None);
         }
-        Ok(generated)
+    }
+
+    /// Ends the refill: each waiting `Replenish` gets the count pooled since it
+    /// parked, or the refill's error when that count is zero (`Ok(0)` when the
+    /// refill ended without one). Parked reserves the pool cannot serve get the
+    /// error, or [`ContextError::CreationFailed`] when there is none.
+    fn end_refill(&mut self, error: Option<ContextError>) {
+        let Some(refill) = self.refill.take() else {
+            return;
+        };
+        for (reply, base) in refill.waiters {
+            let pooled = refill.generated.saturating_sub(base);
+            let result = match (&error, pooled) {
+                (Some(e), 0) => Err(refill_error_copy(e)),
+                _ => Ok(pooled),
+            };
+            let _ = reply.send(result);
+        }
+        if !self.parked_reserves.is_empty() {
+            let e = error.unwrap_or_else(|| {
+                ContextError::CreationFailed(format!(
+                    "the KeyPackage refill ended with {MAX_OUTSTANDING_RESERVATIONS} \
+                     KeyPackages reserved, the reservation ceiling"
+                ))
+            });
+            self.fail_parked_reserves(&e);
+        }
+    }
+
+    /// Persists one minted `KeyPackage` and pools it.
+    ///
+    /// The KP record is persisted, the entry pushed into the pool, then the
+    /// index persisted — the index derives its ref list from the live `pool`
+    /// and `reserved`, so a pooled KP always has a matching index entry. If the
+    /// index persist fails the KP is rolled back out of the pool and its
+    /// orphaned record best-effort deleted (a pooled KP whose index entry was
+    /// lost could never be re-pooled or re-published on respawn, leaking its
+    /// record). The union-enumeration in [`Self::reconcile_from_storage`] is
+    /// the backstop for residual drift. Class-C: a lost unreserved KP is just
+    /// minted again.
+    async fn pool_minted(
+        &mut self,
+        minted: GeneratedKeyPackage,
+        attested_by: [u8; 32],
+    ) -> Result<(), ContextError> {
+        let kp_ref = Self::derive_kp_ref(&minted.key_package_bytes);
+        self.persist_kp_record(
+            &kp_ref,
+            &minted.key_package_bytes,
+            &minted.signer_state.bytes,
+            attested_by,
+        )
+        .await?;
+        self.pool.push(PooledKeyPackage {
+            kp_ref: kp_ref.clone(),
+            public_bytes: minted.key_package_bytes,
+            // `signer_state.bytes` is already `Zeroizing<Vec<u8>>`.
+            signer_state: minted.signer_state.bytes,
+            attested_by,
+        });
+        if let Err(e) = self.persist_index().await {
+            self.pool.pop();
+            if let Err(del) = self.delete_kp_record(&kp_ref).await {
+                tracing::warn!(
+                    actor_kind = "key_package_store",
+                    identity = %self.identity.0,
+                    error = %del,
+                    "replenish: orphaned KP record delete failed after \
+                     index persist failure (excluded from pool)"
+                );
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Serves `Replenish`: replies [`ContextError::NotInitialized`] without a
+    /// signer and `Ok(0)` when pooled plus reserved already reach
+    /// [`MIN_BUFFER`]; otherwise parks the reply on the refill (starting one if
+    /// none runs), and [`Self::end_refill`] answers it.
+    fn handle_replenish(&mut self, reply: oneshot::Sender<Result<usize, ContextError>>) {
+        if let Err(e) = self.active_attesting_key() {
+            let _ = reply.send(Err(e));
+            return;
+        }
+        if !self.ensure_refill() {
+            let _ = reply.send(Ok(0));
+            return;
+        }
+        let Some(refill) = self.refill.as_mut() else {
+            let _ = reply.send(Ok(0));
+            return;
+        };
+        if refill.waiters.len() >= MAX_PARKED_REPLIES {
+            let _ = reply.send(Err(ContextError::ActorBusy(format!(
+                "key package store has {MAX_PARKED_REPLIES} replenishes waiting for a refill"
+            ))));
+            return;
+        }
+        let base = refill.generated;
+        refill.waiters.push((reply, base));
     }
 
     // -----------------------------------------------------------------
@@ -2001,6 +2575,27 @@ impl KeyPackageStoreActor {
         }
     }
 
+    /// Drops every consumed ref from `reserved_by_ref`, so a ref a corrupted
+    /// journal names as both reserved and consumed is never restored as a live
+    /// reservation: consumed wins (single use).
+    fn drop_consumed_from_reserved<V>(
+        &self,
+        consumed_refs: &HashSet<KpRef>,
+        reserved_by_ref: &mut HashMap<KpRef, V>,
+    ) {
+        for consumed_ref in consumed_refs {
+            if reserved_by_ref.remove(consumed_ref).is_some() {
+                tracing::error!(
+                    actor_kind = "key_package_store",
+                    identity = %self.identity.0,
+                    kp_ref = %consumed_ref,
+                    "reconcile: kp_ref named by BOTH a live reservation AND a consumed \
+                     tombstone (journal corruption); CONSUMED wins — not restored as reserved"
+                );
+            }
+        }
+    }
+
     /// Rebuild `pool` / `reserved` from the DURABLE journal in `mls_storage`.
     ///
     /// For every `kp_ref` in the UNION of ALL THREE durable enumeration sources
@@ -2028,6 +2623,7 @@ impl KeyPackageStoreActor {
         self.pool.clear();
         self.reserved.clear();
         self.published_refs.clear();
+        self.stale_refs.clear();
 
         let index = self.load_index().await?;
 
@@ -2052,23 +2648,7 @@ impl KeyPackageStoreActor {
         // reserved (it falls through to the consumed exclusion/stale-delete
         // branch instead). A consumed ref must never be restored as reserved OR
         // pooled.
-        for consumed_ref in &consumed_refs {
-            if reserved_by_ref.remove(consumed_ref).is_some() {
-                tracing::error!(
-                    actor_kind = "key_package_store",
-                    identity = %self.identity.0,
-                    kp_ref = %consumed_ref,
-                    "reconcile: kp_ref named by BOTH a live reservation AND a consumed \
-                     tombstone (journal corruption); CONSUMED wins — not restored as reserved"
-                );
-            }
-        }
-        debug_assert!(
-            consumed_refs
-                .iter()
-                .all(|r| !reserved_by_ref.contains_key(r)),
-            "consumed precedence: no consumed ref may remain in reserved_by_ref"
-        );
+        self.drop_consumed_from_reserved(&consumed_refs, &mut reserved_by_ref);
 
         // Enumerate the UNION of ALL THREE durable enumeration sources, not just
         // the index. The KV adapter has no list API, so every persisted ref that
@@ -2103,17 +2683,7 @@ impl KeyPackageStoreActor {
         // Walking the full union and restoring/excluding each ref makes the tail
         // self-heal rewrite the index to a faithful liveness view, so reconcile
         // self-corrects instead of self-amputating (and never leaks at rest).
-        let mut all_refs = index;
-        for kp_ref in reserved_by_ref.keys() {
-            if !all_refs.contains(kp_ref) {
-                all_refs.push(kp_ref.clone());
-            }
-        }
-        for kp_ref in &consumed_refs {
-            if !all_refs.contains(kp_ref) {
-                all_refs.push(kp_ref.clone());
-            }
-        }
+        let all_refs = enumeration_union(index, reserved_by_ref.keys().chain(&consumed_refs));
 
         for kp_ref in all_refs {
             let rec = self
@@ -2127,15 +2697,26 @@ impl KeyPackageStoreActor {
             let PersistedKeyPackage {
                 public_bytes,
                 signer_state,
+                attested_by,
             } = match rmp_serde::from_slice(&bytes) {
                 Ok(p) => p,
                 Err(e) => {
+                    // A record that does not decode cannot be served and may
+                    // hold private material, so it is deleted.
                     tracing::error!(
                         actor_kind = "key_package_store",
                         identity = %self.identity.0,
                         error = %e,
-                        "reconcile: kp record decode failed; skipping"
+                        "reconcile: kp record decode failed; deleting it"
                     );
+                    if let Err(del) = self.delete_kp_record(&kp_ref).await {
+                        tracing::warn!(
+                            actor_kind = "key_package_store",
+                            identity = %self.identity.0,
+                            error = %del,
+                            "reconcile: undecodable kp record delete failed"
+                        );
+                    }
                     continue;
                 }
             };
@@ -2148,6 +2729,7 @@ impl KeyPackageStoreActor {
                         kp_ref: kp_ref.clone(),
                         public_bytes,
                         signer_state,
+                        attested_by,
                         reserved_at_ms,
                     },
                 );
@@ -2180,6 +2762,7 @@ impl KeyPackageStoreActor {
                     kp_ref,
                     public_bytes,
                     signer_state,
+                    attested_by,
                 });
             }
         }
@@ -2372,6 +2955,20 @@ impl KeyPackageStoreActor {
             .await
             .map_err(|e| ContextError::PersistenceFailed(format!("reservation-ids store: {e}")))
     }
+}
+
+/// `index` followed by every ref in `extra` it does not already hold: the
+/// union of the durable sources reconcile walks.
+fn enumeration_union<'a>(
+    mut index: Vec<KpRef>,
+    extra: impl Iterator<Item = &'a KpRef>,
+) -> Vec<KpRef> {
+    for kp_ref in extra {
+        if !index.contains(kp_ref) {
+            index.push(kp_ref.clone());
+        }
+    }
+    index
 }
 
 #[cfg(test)]

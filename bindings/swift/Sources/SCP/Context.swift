@@ -387,10 +387,11 @@ public actor Context {
     /// - Returns: An active ``Context`` re-homed under the joiner's identity.
     /// - Throws: ``ScpError/Identity(msg:code:)`` (`"SCP-IDENT-1054"`) if the
     ///   joiner is not locally custodied; ``ScpError/Validation(msg:code:)`` if
-    ///   the bundle's DIDs, context id, or reservation id are malformed, or the
-    ///   HPKE `enc` is not exactly 32 bytes; or ``ScpError/Context(msg:code:)``
-    ///   if the context id already collides on this instance or the spawn fails
-    ///   (bad/forged/duplicate/replayed bundle, non-encrypted context,
+    ///   the bundle's DIDs or context id are malformed; or
+    ///   ``ScpError/Context(msg:code:)`` if the reservation id is malformed,
+    ///   the context id already collides on this instance, or the spawn fails
+    ///   (an HPKE `enc` that is not a 65-byte uncompressed P-256 point,
+    ///   bad/forged/duplicate/replayed bundle, non-encrypted context,
     ///   first-writer-wins collision, or fail-closed persist failure).
     public static func joinFromWelcome(
         scp: SCP,

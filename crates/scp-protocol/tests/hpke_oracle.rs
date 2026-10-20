@@ -1,148 +1,18 @@
-//! Cross-validation of `scp_protocol::crypto::hpke` against the `hpke-rs`
-//! RFC 9180 reference implementation.
+//! Cross-validation of `scp_protocol::crypto::hpke::p256` against the
+//! `hpke-rs` RFC 9180 reference implementation.
 //!
 //! These tests are the independent backstop for the hand-implemented HPKE
-//! core: any transcription or composition error that the Appendix A.1 KATs
+//! core: any transcription or composition error that the Appendix A.3 KATs
 //! somehow miss would surface here as an interop failure against a separate
 //! codebase. `hpke-rs` is a dev-dependency only — it never ships in
 //! production or wasm32 builds — and this whole file is gated off wasm32.
 #![cfg(not(target_arch = "wasm32"))]
-#![allow(clippy::unwrap_used, clippy::panic)]
 
 use hpke_rs::hpke_types::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm};
 use hpke_rs::{Hpke, HpkePrivateKey, HpkePublicKey, Mode};
 use hpke_rs_rust_crypto::HpkeRustCrypto;
 use rand::rngs::OsRng;
 use scp_protocol::crypto::hpke;
-use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
-/// Construct the SCP suite under the `hpke-rs` reference implementation:
-/// DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM, Base mode.
-fn ref_hpke() -> Hpke<HpkeRustCrypto> {
-    Hpke::<HpkeRustCrypto>::new(
-        Mode::Base,
-        KemAlgorithm::DhKem25519,
-        KdfAlgorithm::HkdfSha256,
-        AeadAlgorithm::Aes128Gcm,
-    )
-}
-
-fn fresh_keypair() -> (StaticSecret, [u8; 32]) {
-    let sk = StaticSecret::random_from_rng(OsRng);
-    let pk = X25519Pub::from(&sk).to_bytes();
-    (sk, pk)
-}
-
-/// Our `seal` → reference `open`. Run across several input shapes.
-///
-/// NOTE: empty-plaintext is intentionally NOT exercised in this direction —
-/// `hpke-rs`'s `open` rejects an empty recovered plaintext as `InvalidInput`
-/// (its `bytes_to_option` maps an empty result to `None`; see hpke-rs lib.rs
-/// §1101). That is a quirk of the reference receiver, not of our seal: the
-/// empty case is covered by our in-crate roundtrip KAT and by the
-/// reference→ours direction below.
-#[test]
-fn our_seal_opens_under_reference() {
-    let cases: &[(&[u8], &[u8], &[u8])] = &[
-        (b"", b"", b"x"),
-        (
-            b"scp-sender-key-v1",
-            b"aad",
-            b"32-byte-payload-padded-to-len!!!",
-        ),
-        (b"info", b"", &[0xAB; 100]),
-        (b"\x00\x01\x02", b"\xff\xfe", b"x"),
-    ];
-
-    for (idx, (info, aad, pt)) in cases.iter().enumerate() {
-        let (sk, pk) = fresh_keypair();
-        let (enc, ct) = hpke::seal(&pk, info, aad, pt).unwrap();
-
-        let reference = ref_hpke();
-        let recovered = reference
-            .open(
-                &enc,
-                &HpkePrivateKey::new(sk.to_bytes().to_vec()),
-                info,
-                aad,
-                &ct,
-                None,
-                None,
-                None,
-            )
-            .unwrap_or_else(|e| panic!("case {idx}: reference open failed: {e:?}"));
-        assert_eq!(recovered.as_slice(), *pt, "case {idx}: plaintext mismatch");
-    }
-}
-
-/// Reference `seal` → our `open`. Run across several input shapes.
-#[test]
-fn reference_seal_opens_under_ours() {
-    let cases: &[(&[u8], &[u8], &[u8])] = &[
-        (b"", b"", b""),
-        (b"scp-access-key-v1", b"aad-bytes", b"the quick brown fox"),
-        (b"info", b"", &[0x5A; 257]),
-        (b"\x10\x20", b"\x30", b"yz"),
-    ];
-
-    for (idx, (info, aad, pt)) in cases.iter().enumerate() {
-        let (sk, pk) = fresh_keypair();
-
-        let mut reference = ref_hpke();
-        let (enc, ct) = reference
-            .seal(
-                &HpkePublicKey::new(pk.to_vec()),
-                info,
-                aad,
-                pt,
-                None,
-                None,
-                None,
-            )
-            .unwrap_or_else(|e| panic!("case {idx}: reference seal failed: {e:?}"));
-
-        let enc_arr: [u8; 32] = enc.as_slice().try_into().unwrap();
-        let recovered = hpke::open(&sk.to_bytes(), &enc_arr, info, aad, &ct).unwrap();
-        assert_eq!(recovered.as_slice(), *pt, "case {idx}: plaintext mismatch");
-    }
-}
-
-/// Reference `seal` → our custody-path `open` (external DH). Confirms the
-/// custody Decap variant interops with the reference too.
-#[test]
-fn reference_seal_opens_under_custody() {
-    let (sk, pk) = fresh_keypair();
-    let info = b"scp-broadcast-key-v1";
-    let aad = b"ctx||author||epoch";
-    let pt = b"broadcast key material 32 bytes!";
-
-    let mut reference = ref_hpke();
-    let (enc, ct) = reference
-        .seal(
-            &HpkePublicKey::new(pk.to_vec()),
-            info,
-            aad,
-            pt,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-    let enc_arr: [u8; 32] = enc.as_slice().try_into().unwrap();
-
-    // Simulate KeyCustody::dh_agree(handle, enc) = DH(skR, enc) and
-    // KeyCustody::public_key(handle) = pkR.
-    let enc_pub = X25519Pub::from(enc_arr);
-    let dh = sk.diffie_hellman(&enc_pub);
-
-    let recovered =
-        hpke::custody::open_with_external_dh(dh.as_bytes(), &pk, &enc_arr, info, aad, &ct).unwrap();
-    assert_eq!(recovered.as_slice(), pt);
-}
-
-// ---------------------------------------------------------------------------
-// DHKEM(P-256, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM (`hpke::p256`)
-// ---------------------------------------------------------------------------
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -173,8 +43,8 @@ fn fresh_p256_recipient() -> Result<([u8; 32], [u8; 65]), Box<dyn std::error::Er
 
 /// Our P-256 `seal` opens under the reference, and the reference's P-256
 /// `seal` opens under our software and custody open paths. Empty plaintext is
-/// only sealed by the reference, for the reason `our_seal_opens_under_reference`
-/// gives.
+/// only sealed by the reference: `hpke-rs`'s `open` rejects an empty recovered
+/// plaintext as `InvalidInput`, a quirk of the reference receiver.
 #[test]
 fn p256_round_trips_against_reference() -> TestResult {
     let cases: &[(&[u8], &[u8], &[u8])] = &[
@@ -234,6 +104,119 @@ fn p256_round_trips_against_reference() -> TestResult {
                 hpke::p256::custody::open_with_external_dh(&dh, &pk, &enc, info, aad, &ref_ct)?;
             assert_eq!(got.as_slice(), ref_pt, "case {idx}: reference → custody");
         }
+    }
+    Ok(())
+}
+
+/// The §5.12.3.1 invitation `info` or `aad`, rebuilt here from the spec's
+/// layout (`label || u32_be(len(context_id)) || context_id ||
+/// u32_be(len(creator_did)) || creator_did`) rather than from the crate's
+/// private builders, so a builder that drifts from the spec fails these tests.
+fn invitation_binding(label: &[u8], context_id: &str, creator_did: &str) -> Vec<u8> {
+    let mut out = label.to_vec();
+    for field in [context_id.as_bytes(), creator_did.as_bytes()] {
+        out.extend_from_slice(&u32::try_from(field.len()).unwrap_or(u32::MAX).to_be_bytes());
+        out.extend_from_slice(field);
+    }
+    out
+}
+
+const INVITE_CONTEXT_ID: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
+const INVITE_CREATOR_DID: &str = "did:dht:z6MkInvitationOracleCreator";
+
+/// An invitation sealed by `hpke_seal_invitation` to a P-256 recipient opens
+/// under the `hpke-rs` reference with the spec's invitation `info` and `aad`,
+/// and its enc is the 65-byte uncompressed point the reference expects.
+#[test]
+fn invitation_info_p256_seal_opens_with_hpke_rs() -> TestResult {
+    use scp_protocol::crypto::envelope_seal::hpke_seal_invitation;
+    let info = invitation_binding(b"scp-invitation-v1", INVITE_CONTEXT_ID, INVITE_CREATOR_DID);
+    let aad = invitation_binding(
+        b"scp-invitation-aad-v1",
+        INVITE_CONTEXT_ID,
+        INVITE_CREATOR_DID,
+    );
+    for pt in [b"x".as_slice(), &[0x5A; 4096]] {
+        let (sk, pk) = fresh_p256_recipient()?;
+        let (ct, enc) = hpke_seal_invitation(
+            pt,
+            &hpke::p256::P256Point::try_from(pk)?,
+            INVITE_CONTEXT_ID,
+            INVITE_CREATOR_DID,
+        )?;
+        assert_eq!(enc.as_bytes().len(), hpke::p256::ENC_LEN);
+        let recovered = ref_hpke_p256()
+            .open(
+                enc.as_bytes(),
+                &HpkePrivateKey::new(sk.to_vec()),
+                &info,
+                &aad,
+                &ct,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| format!("reference open of an invitation: {e:?}"))?;
+        assert_eq!(recovered.as_slice(), pt);
+    }
+    Ok(())
+}
+
+/// An invitation the `hpke-rs` reference seals with the spec's invitation
+/// `info` and `aad` opens through `hpke_open_invitation_with_external_dh`
+/// fed the ECDH a custody computes (`scp_crypto::p256::ecdh_p256` on the
+/// recipient scalar and the enc), and the plaintext equals the reference's
+/// own open of the same ciphertext.
+#[test]
+fn invitation_external_dh_open_equals_hpke_rs_open() -> TestResult {
+    use scp_protocol::crypto::envelope_seal::hpke_open_invitation_with_external_dh;
+    let info = invitation_binding(b"scp-invitation-v1", INVITE_CONTEXT_ID, INVITE_CREATOR_DID);
+    let aad = invitation_binding(
+        b"scp-invitation-aad-v1",
+        INVITE_CONTEXT_ID,
+        INVITE_CREATOR_DID,
+    );
+    for pt in [b"y".as_slice(), &[0xC3; 1500]] {
+        let (sk, pk) = fresh_p256_recipient()?;
+        let (ref_enc, ref_ct) = ref_hpke_p256()
+            .seal(
+                &HpkePublicKey::new(pk.to_vec()),
+                &info,
+                &aad,
+                pt,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| format!("reference seal of an invitation: {e:?}"))?;
+        let reference = ref_hpke_p256()
+            .open(
+                &ref_enc,
+                &HpkePrivateKey::new(sk.to_vec()),
+                &info,
+                &aad,
+                &ref_ct,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| format!("reference open of an invitation: {e:?}"))?;
+
+        let enc = hpke::p256::validate_enc(&ref_enc)?;
+        let dh = scp_crypto::p256::ecdh_p256(
+            &scp_crypto::p256::P256SecretKey::from_scalar_bytes(&sk)?,
+            &scp_crypto::p256::P256PublicKey::from_uncompressed(enc.as_bytes())?,
+        );
+        let ours = hpke_open_invitation_with_external_dh(
+            &ref_ct,
+            &dh,
+            &hpke::p256::P256Point::try_from(&pk[..])?,
+            &enc,
+            INVITE_CONTEXT_ID,
+            INVITE_CREATOR_DID,
+        )?;
+        assert_eq!(ours.as_slice(), reference.as_slice());
+        assert_eq!(ours.as_slice(), pt);
     }
     Ok(())
 }

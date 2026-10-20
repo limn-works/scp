@@ -1042,8 +1042,8 @@ pub struct IdentityLinkVerifyInput<'a> {
 /// resolution, no network request, and no clock read. A caller resolves an
 /// issuer's DID document (§3.5.4 step 1), reads a clock, and states what it did
 /// about a Class 2 proof resource; this function performs every remaining
-/// check. That split mirrors
-/// `scp_mls::keypackage_attestation::verify_attestation_with_resolution`, which
+/// check. That split mirrors `scp_mls::keypackage_attestation::verify_attestation`,
+/// the wasm-safe core a native caller wraps with its own key resolution, which
 /// keeps the same core reusable by an in-browser client (ADR-057).
 ///
 /// # Checks, in order

@@ -610,11 +610,19 @@ mod live_supervisor_send {
         // commits only the creator DID, so any key the resolver maps to
         // `ALICE_DID` validly signs the bundle.
         let alice_bundle_key = SigningKey::from_bytes(&[0xA1; 32]);
-        let _bob_active_key = SigningKey::from_bytes(&[0xB0; 32]);
+        let bob_active_key = SigningKey::from_bytes(&[0xB0; 32]);
         let resolver: KeyResolver = {
             let alice = DID::from(ALICE_DID);
+            let bob = DID::from(BOB_DID);
             let alice_vk = alice_bundle_key.verifying_key();
-            Arc::new(move |did: &DID, _| (did == &alice).then_some(alice_vk))
+            let bob_vk = bob_active_key.verifying_key();
+            Arc::new(move |did: &DID, _| {
+                if did == &alice {
+                    Some(alice_vk)
+                } else {
+                    (did == &bob).then_some(bob_vk)
+                }
+            })
         };
         let (bob_sup, bob) =
             crate::crypto::mls::two_party_test_support::bob_supervisor(BOB_DID, resolver);
@@ -623,7 +631,10 @@ mod live_supervisor_send {
         // Bob's identity wrapping keypair first, and the KP publishes its public
         // key in `0xFF01`; Bob opens sender keys with the same pair.
         let (reservation_id, bob_kp_bytes) = bob_sup
-            .reserve_key_package(DID::from(BOB_DID))
+            .reserve_key_package(
+                DID::from(BOB_DID),
+                &crate::context::actor::CommandSigner::local_ed25519(bob_active_key),
+            )
             .await
             .expect("bob reserves a real KeyPackage from his own store");
 

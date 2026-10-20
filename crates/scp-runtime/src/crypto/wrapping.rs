@@ -1,11 +1,10 @@
 //! The identity's DHKEM(P-256) wrapping key (spec 09 §9.16.1).
 //!
 //! One identity has one wrapping key, published as the `0xFF01` leaf
-//! extension in every context the identity joins. Today the runtime uses it
-//! to open the HPKE-sealed sender keys addressed to the identity (§9.16.2).
-//! Spec 05 §5.12.3.1 also seals the invitation bundle to it; the Welcome join
-//! still opens that bundle with the `#active` key until the join moves to
-//! this key. The supervisor holds it as an [`IdentityWrappingKey`]: a
+//! extension in every context the identity joins. The runtime uses it to
+//! open the HPKE-sealed sender keys addressed to the identity (§9.16.2) and,
+//! at the Welcome join, the invitation bundle spec 05 §5.12.3.1 seals to it
+//! (§9.16.2 Open). The supervisor holds it as an [`IdentityWrappingKey`]: a
 //! custody, the custody's opaque handle, and the public point.
 //!
 //! `KeyCustody` uses return-position `impl Trait`, so it is not object safe.

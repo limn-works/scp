@@ -373,16 +373,16 @@ pub enum IdentityPrivateStateEvent {
     // -------------------------------------------------------------------
     /// Enroll a new device in the identity's device registry.
     ///
-    /// The device's X25519 public key is used for HPKE-wrapped PSK
-    /// distribution (§3.7.2).
+    /// The device's DHKEM(P-256) public key is the recipient of the
+    /// HPKE-wrapped PSK distribution (§3.7.2).
     ///
     /// Commutative for different device IDs.
     EnrollDevice {
         /// Unique device identifier.
         device_id: String,
-        /// Device's X25519 public key (32 bytes) for HPKE key wrapping.
-        #[serde(with = "serde_bytes")]
-        device_x25519_pubkey: Vec<u8>,
+        /// Device's DHKEM(P-256) public key (65-byte uncompressed point) for
+        /// HPKE key wrapping; decoding validates the point (§9.5).
+        device_hpke_pubkey: crate::crypto::hpke::p256::P256Point,
         /// Human-readable device name (e.g., "iPhone 15", "`MacBook` Pro").
         device_name: String,
         /// Unix timestamp (milliseconds) when the device was enrolled.
@@ -536,6 +536,14 @@ impl IdentityPrivateStateEvent {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// A valid P-256 point for a device key field.
+    fn test_point(seed: u8) -> crate::crypto::hpke::p256::P256Point {
+        crate::crypto::hpke::p256::P256Point::try_from(
+            scp_crypto::p256::testing::valid_uncompressed_point(seed),
+        )
+        .unwrap()
+    }
 
     fn did(s: &str) -> DID {
         DID::from(s)
@@ -744,7 +752,7 @@ mod tests {
         let events = vec![
             IdentityPrivateStateEvent::EnrollDevice {
                 device_id: "dev-001".to_owned(),
-                device_x25519_pubkey: vec![0xAA; 32],
+                device_hpke_pubkey: test_point(0xAA),
                 device_name: "iPhone 15".to_owned(),
                 enrolled_at: 1_700_000_000_000,
             },
@@ -948,7 +956,7 @@ mod tests {
     fn identity_private_state_event_enroll_device_ignores_unknown_fields() {
         let event = IdentityPrivateStateEvent::EnrollDevice {
             device_id: "dev-001".to_owned(),
-            device_x25519_pubkey: vec![0xAA; 32],
+            device_hpke_pubkey: test_point(0xAA),
             device_name: "Test Device".to_owned(),
             enrolled_at: 22000,
         };
@@ -1132,7 +1140,7 @@ mod tests {
             },
             IdentityPrivateStateEvent::EnrollDevice {
                 device_id: "dev-001".to_owned(),
-                device_x25519_pubkey: vec![0xBB; 32],
+                device_hpke_pubkey: test_point(0xBB),
                 device_name: "Test Device".to_owned(),
                 enrolled_at: 22000,
             },

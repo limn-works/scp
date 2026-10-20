@@ -162,14 +162,14 @@ class UniffiKeyCustodyTest {
     }
 
     @Test
-    fun `dhAgree on an Ed25519 key uses the SHA-512(seed) X25519 scalar`() {
+    fun `dhAgree on an Ed25519 key is refused with SCP-CRYPTO-4005`() {
         runTest {
-            // RFC 8032 §7.1 test 1 seed against RFC 7748 §6.1 Alice's public key. The expected secret
-            // is X25519 of Alice's private scalar and the seed's converted public key
-            // d85e07ec22b0ad881537c2f44d662d1a143cf830c57aca4305d85c7a90f6b62e, computed independently.
+            // An Ed25519 key never agrees; the refusal keeps its code across the bridge.
             val id = installSeed(unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"))
-            val shared = provider.dhAgree(id, unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"))
-            assertEquals("90f395580ca33f3c54390ac1d7210220b6a336de2c47a61ac90ff56e6be11f18", shared.hex())
+            val error = cryptoError {
+                provider.dhAgree(id, unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"))
+            }
+            assertEquals("SCP-CRYPTO-4005", error.code)
         }
     }
 

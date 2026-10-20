@@ -56,6 +56,12 @@ def _make_scp(native_mock: MagicMock | None = None) -> MagicMock:
 # A syntactically-valid 64-hex context id (ADR-056) for FFI-boundary validation.
 _HEX_CTX_ID = "a" * 64
 _CREATOR_DID = "did:dht:z6MkCreatorAbc"
+# The P-256 generator, SEC1-uncompressed: a valid 65-byte DHKEM(P-256) `enc`
+# (spec 05 §5.12.3.1), so a join with it passes the runtime's `enc` check.
+_P256_G = bytes.fromhex(
+    "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+    "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+)
 
 
 def _sealed() -> SealedInvitation:
@@ -63,7 +69,7 @@ def _sealed() -> SealedInvitation:
     return SealedInvitation(
         context_id=_HEX_CTX_ID,
         creator_did=_CREATOR_DID,
-        enc=b"\x00" * 32,
+        enc=_P256_G,
         ciphertext=b"sealed-bundle-ct",
     )
 
@@ -214,7 +220,7 @@ class TestInviteMemberDelegation:
     @staticmethod
     def _native_sealed_outcome(
         *,
-        enc: bytes = b"\x00" * 32,
+        enc: bytes = _P256_G,
         ciphertext: bytes = b"ct",
         delivered: bool = True,
     ) -> SimpleNamespace:
@@ -256,7 +262,7 @@ class TestInviteMemberDelegation:
 
         native = MagicMock()
         native.invite_member.return_value = self._native_sealed_outcome(
-            enc=b"\x01" * 32,
+            enc=_P256_G,
             ciphertext=b"sealed-ct",
             delivered=False,
         )
@@ -272,7 +278,7 @@ class TestInviteMemberDelegation:
         assert isinstance(outcome.bundle, SealedInvitation)
         assert outcome.bundle.context_id == _HEX_CTX_ID
         assert outcome.bundle.creator_did == _CREATOR_DID
-        assert outcome.bundle.enc == b"\x01" * 32
+        assert outcome.bundle.enc == _P256_G
         assert outcome.bundle.ciphertext == b"sealed-ct"
         assert outcome.delivered is False
 
@@ -329,15 +335,15 @@ class TestJoinerHandshakeRealFfi:
     async def test_context_join_from_welcome_rejects_non_custodied_joiner(self, scp) -> None:
         # The joiner's routing pseudonym is DERIVED from its local custody. A
         # non-custodied joiner hard-fails at the derivation seam BEFORE the
-        # single-use KeyPackage is consumed. `enc` is a valid 32-byte length so
-        # the rejection is the custody gate, not the length precheck.
+        # single-use KeyPackage is consumed. `enc` is a valid P-256 point so the
+        # rejection is the custody gate, not the runtime's `enc` check.
         sealed = SealedInvitation(
             context_id=_HEX_CTX_ID,
             creator_did=_CREATOR_DID,
-            enc=b"\x00" * 32,
+            enc=_P256_G,
             ciphertext=b"not-a-real-sealed-bundle",
         )
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match="SCP-IDENT-1054"):
             await scp.context_join_from_welcome(
                 "did:dht:z6MkNeverCustodiedHere",
                 sealed,
@@ -418,18 +424,21 @@ class TestInviteMemberRealFfi:
 
         # The outcome carries a SealedInvitation `bundle` directly usable as the
         # join input (no re-assembly): its fields are exactly the
-        # `context_join_from_welcome` `sealed` parameter shape. The full two-party
-        # JOIN (a distinct joiner node consuming the bundle) is proven at the
-        # runtime layer (`spawn_from_welcome_tests`); a single instance cannot
-        # self-join its own context (first-writer-wins rejects the second actor
-        # for the same context id).
+        # `context_join_from_welcome` `sealed` parameter shape. The two-instance
+        # join runs in the PyO3 bridge's
+        # `invite_then_join_across_two_instances_*` tests: a single instance
+        # cannot self-join its own context (first-writer-wins rejects the
+        # second actor for the same context id), and two PyO3 instances do not
+        # share a DHT from Python.
         assert isinstance(outcome, Sealed)
         assert isinstance(outcome.bundle, SealedInvitation)
         assert outcome.bundle.context_id == ctx.context_id
         assert outcome.bundle.creator_did == creator.did
-        # RFC 9180 HPKE encapsulated key is exactly 32 bytes.
+        # The bundle is sealed to the invitee KeyPackage's DHKEM(P-256)
+        # wrapping key: `enc` is a 65-byte uncompressed point.
         assert isinstance(outcome.bundle.enc, (bytes, bytearray))
-        assert len(outcome.bundle.enc) == 32
+        assert len(outcome.bundle.enc) == 65
+        assert outcome.bundle.enc[0] == 0x04
         assert isinstance(outcome.bundle.ciphertext, (bytes, bytearray))
         assert len(outcome.bundle.ciphertext) > 0
         assert isinstance(outcome.delivered, bool)

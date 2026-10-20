@@ -148,28 +148,6 @@ impl KeyCustody for FfiKeyCustody {
         }
     }
 
-    async fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> Result<SharedSecret, PlatformError> {
-        match self {
-            #[cfg(feature = "testing")]
-            Self::InMemory(kc) => {
-                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-                    .await
-            }
-            Self::File(kc) => {
-                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-                    .await
-            }
-            Self::Callback(kc) => {
-                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-                    .await
-            }
-        }
-    }
-
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         match self {
             #[cfg(feature = "testing")]
@@ -795,22 +773,6 @@ impl KeyCustody for PyCallbackKeyCustody {
                     pseudonym_epoch,
                 )
             },
-            |key_id| p.host_public_key(key_id),
-        )
-        .await
-    }
-
-    async fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> Result<SharedSecret, PlatformError> {
-        let p = &self.provider;
-        scp_ffi_common::callback_custody::ed25519_to_x25519_agree(
-            &self.registry,
-            ed25519_handle,
-            peer_x25519_public,
-            |key_id, peer| p.call_str_bytes("dh_agree", key_id, peer),
             |key_id| p.host_public_key(key_id),
         )
         .await
@@ -1938,10 +1900,6 @@ class SleepyAgreeCustody(P256Custody):
                 .await,
             Err(PlatformError::KeyNotFound)
         ));
-        assert!(matches!(
-            custody.ed25519_to_x25519_agree(&unknown, &[9u8; 32]).await,
-            Err(PlatformError::KeyNotFound)
-        ));
     }
 
     /// An Ed25519 host signature passes `verify_strict` under the
@@ -2010,47 +1968,6 @@ class SleepyAgreeCustody(P256Custody):
             Err(PlatformError::CustodyError(_))
         ));
         assert_eq!(fake_calls(&transport, "sign"), 1);
-    }
-
-    /// `ed25519_to_x25519_agree` refuses a P-256 handle, minted or resolved,
-    /// with `WrongKeyType` before any host agreement call; an Ed25519 handle
-    /// reaches the host.
-    #[tokio::test]
-    async fn ffi_custody_callback_ed25519_only_paths_refuse_p256() {
-        let custody = fake_py_custody_of(c"P256Custody", None);
-        let minted = custody
-            .generate_keypair(KeyType::P256Signing)
-            .await
-            .expect("p256 key");
-        // A second adapter resolves a P-256 key its host minted directly.
-        let fresh = fake_py_custody_of(c"P256Custody", None);
-        let resolved = Python::with_gil(|py| {
-            fresh
-                .provider
-                .obj
-                .bind(py)
-                .call_method1("generate_keypair", ("p256", "operational"))
-                .and_then(|id| id.extract::<String>())
-                .expect("host-side key")
-        });
-        let resolved = KeyHandle::new(resolved.parse().expect("numeric id"));
-        for (c, handle) in [(&custody, minted), (&fresh, resolved)] {
-            assert!(matches!(
-                c.ed25519_to_x25519_agree(&handle, &[9u8; 32]).await,
-                Err(PlatformError::WrongKeyType { .. })
-            ));
-            assert_eq!(fake_calls(c, "dh_agree"), 0);
-        }
-
-        let ed = custody
-            .generate_keypair(KeyType::Ed25519)
-            .await
-            .expect("ed25519 key");
-        custody
-            .ed25519_to_x25519_agree(&ed, &[9u8; 32])
-            .await
-            .expect("an Ed25519 key agrees");
-        assert_eq!(fake_calls(&custody, "dh_agree"), 1);
     }
 
     /// An operational Ed25519 key is not a derive source; the host is

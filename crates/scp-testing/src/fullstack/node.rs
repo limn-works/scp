@@ -377,10 +377,14 @@ impl FullStackNode {
         //    supervisor (its KeyPackageStoreActor mints + retains the private
         //    signer state; only the reservation id + public bytes come back).
         //    The KeyPackage carries the joiner identity's wrapping key in
-        //    `0xFF01`, which its supervisor loads or creates on first use.
+        //    `0xFF01`, which its supervisor loads or creates on first use, and
+        //    a `0xFF03` attestation signed by the joiner's `#active` key.
+        let joiner_signer = scp_core::context::actor::CommandSigner::local_ed25519(
+            ed25519_dalek::SigningKey::from_bytes(&did_to_seed(&DID::from(member_did))),
+        );
         let (reservation_id, kp_bytes) = joiner
             .manager
-            .reserve_key_package(DID::from(member_did))
+            .reserve_key_package(DID::from(member_did), &joiner_signer)
             .await?;
 
         // 3. Capture the set of existing members BEFORE the add — they need the
@@ -532,35 +536,22 @@ impl FullStackNode {
         // add) and answers this joiner's pull requests below.
         let creator_did = sealed.creator_did.clone();
 
-        // 2. Build this node's #active split custody from the SAME seed the
-        //    network resolver publishes for this DID (so the key the creator
-        //    sealed to is exactly the key this custody opens with).
-        let custody = InMemoryKeyCustody::new();
-        let active_handle = custody
-            .import_ed25519_key(&self.signing_key.to_bytes())
-            .await;
-
-        // 3. Reconstruct the request. The spawn entrypoint rejects `None` /
+        // 2. Reconstruct the request. The spawn entrypoint rejects `None` /
         //    all-zero pseudonyms, so derive a distinct non-zero §9.10.4
         //    pseudonym from this joiner's DID + context.
-        let enc: [u8; 32] = sealed
-            .enc
-            .as_slice()
-            .try_into()
-            .map_err(|_| ContextError::CryptoFailed("sealed enc not 32 bytes".to_owned()))?;
         let req = WelcomeJoinRequest {
             context_id: sealed.context_id.clone(),
             creator_did: sealed.creator_did.clone(),
-            sealed_bundle_enc: enc,
+            sealed_bundle_enc: sealed.enc.clone(),
             sealed_bundle_ct: sealed.ciphertext.clone(),
             reservation_id,
             local_pseudonym: Some(harness_pseudonym(&self.did, context_id_str)),
         };
 
-        // 4. Spawn the live per-context actor from the opened, verified bundle.
+        // 3. Spawn the live per-context actor from the opened, verified bundle.
         let handle = self
             .manager
-            .spawn_actor_from_welcome(self.did.clone(), &custody, &active_handle, req)
+            .spawn_actor_from_welcome(self.did.clone(), req)
             .await?;
 
         // 5. Joiner-side pickup: pending epoch-advance Commits and the pushed

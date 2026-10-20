@@ -448,33 +448,6 @@ impl KeyCustody for InMemoryKeyCustody {
         }
     }
 
-    fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send {
-        let key_id = ed25519_handle.id();
-        let peer = *peer_x25519_public;
-        async move {
-            let store = self.store.lock().await;
-            let key_type = store.lookup_type(KeyHandle::new(key_id))?;
-
-            if key_type != KeyType::Ed25519 {
-                return Err(wrong_type(key_type, KeyType::Ed25519));
-            }
-
-            let signing_key = store
-                .ed25519_keys
-                .get(&key_id)
-                .ok_or(PlatformError::KeyNotFound)?;
-
-            // Convert Ed25519 → X25519 via birational conversion and perform DH.
-            let result = crate::traits::x25519_agree_from_ed25519(signing_key, &peer);
-            drop(store);
-            Ok(result)
-        }
-    }
-
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::InMemory
     }
@@ -1101,13 +1074,6 @@ mod tests {
         assert!(matches!(
             custody.sign(&handle, &[0u8; 33]).await,
             Err(PlatformError::CustodyError(_))
-        ));
-        assert!(matches!(
-            custody.ed25519_to_x25519_agree(&handle, &[1u8; 32]).await,
-            Err(PlatformError::WrongKeyType {
-                expected: KeyType::Ed25519,
-                actual: KeyType::P256Signing
-            })
         ));
     }
 
