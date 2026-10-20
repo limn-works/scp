@@ -8,10 +8,13 @@
 // the store; a failed Keystore create fails the mint and never falls back to software. Every
 // key has a KeyRecords record, and every operation follows the record.
 //
-// What Kotlin cannot wipe: a software key's private scalar lives for the key's life as an
-// immutable BigInteger inside Bouncy Castle's key parameters, and in the preferences as a
-// Base64 String; each ECDH result passes through a BigInteger. Every intermediate ByteArray is
-// zeroed.
+// What Kotlin cannot wipe (ADR-027 Rationale): a software key's private scalar lives for the
+// key's life as an immutable BigInteger inside Bouncy Castle's key parameters, with every
+// BigInteger its arithmetic derives; BigIntegers.asUnsignedByteArray drops the toByteArray copy
+// it trims; the preferences hold it as a Base64 String, and Base64 encoding and decoding
+// allocate their own buffers; EncryptedSharedPreferences and its Tink AEAD allocate plaintext
+// buffers on every write and read; and each ECDH result passes through a BigInteger. Every
+// intermediate ByteArray this file allocates is zeroed.
 //
 // Provenance: ADR-027 (Android Platform Adapter) criteria 1-5, spec 09 §9.5 (P-256 keys),
 // RFC 9180 §7.1.1 (DH of DHKEM(P-256)).
@@ -21,13 +24,14 @@ package works.limn.scp.android.platform
 import android.content.SharedPreferences
 import android.os.Build
 import android.os.Process
+import android.security.keystore.KeyProperties
+import android.util.Log
 import java.math.BigInteger
 import java.security.KeyFactory
 import java.security.SecureRandom
 import java.security.interfaces.ECPublicKey
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
-import java.util.concurrent.ConcurrentHashMap
 import org.bouncycastle.asn1.sec.SECNamedCurves
 import org.bouncycastle.crypto.AsymmetricCipherKeyPair
 import org.bouncycastle.crypto.agreement.ECDHBasicAgreement
@@ -43,6 +47,27 @@ import org.bouncycastle.util.BigIntegers
 internal fun keystoreAgreementAvailable(sdk: Int): Boolean = sdk >= Build.VERSION_CODES.S
 
 /**
+ * Whether a key's `KeyInfo` places it in secure hardware at API level [sdk]: from API 31 its
+ * `securityLevel` [level] is the TEE, StrongBox or an unknown secure level; below API 31, where
+ * `securityLevel` does not exist, its `isInsideSecureHardware` [insideSecureHardware]. The
+ * adapter and the instrumented test both decide with this function.
+ */
+internal fun isSecureLevel(level: Int, insideSecureHardware: Boolean, sdk: Int): Boolean =
+    if (sdk >= Build.VERSION_CODES.S) level in SECURE_LEVELS else insideSecureHardware
+
+/** The `KeyInfo.securityLevel` values that place a key in secure hardware (API 31+). */
+private val SECURE_LEVELS = setOf(
+    KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT,
+    KeyProperties.SECURITY_LEVEL_STRONGBOX,
+    KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE,
+)
+
+/** Logs a custody warning; [message] names a key id, never key material. */
+internal fun logCustodyWarning(message: String, cause: Throwable) {
+    Log.w("ScpKeyCustody", message, cause)
+}
+
+/**
  * This process's tag, `"<pid>:<start elapsed realtime>"`: the pid alone repeats across
  * processes, and the start time tells a restarted process with the same pid apart.
  */
@@ -55,24 +80,32 @@ internal fun currentProcessTag(): String = "${Process.myPid()}:${Process.getStar
  * @param keystore The Keystore operations.
  * @param records The keys' records.
  * @param processTag This process's tag, written into each record a mint reserves.
+ * @param warn Where [sweep] reports a record it leaves in place.
  */
 internal class P256Keys(
     private val prefs: SharedPreferences,
     private val keystore: KeystoreKeys,
     private val records: KeyRecords,
     private val processTag: String,
+    private val warn: (String, Throwable) -> Unit,
 ) {
-    /** Software HPKE key pairs loaded from their committed scalars. */
-    private val softwarePairs = ConcurrentHashMap<String, AsymmetricCipherKeyPair>()
+    /**
+     * Software HPKE key pairs loaded from their committed scalars. Every read and change of this
+     * map, and every write of a scalar entry, runs under the map's monitor, so a destroy that
+     * runs while another thread loads the same key cannot leave the pair cached: either the load
+     * finishes first and the destroy removes its pair, or the destroy finishes first and the
+     * load finds no scalar.
+     */
+    private val softwarePairs = HashMap<String, AsymmetricCipherKeyPair>()
 
     /**
-     * Mints a [type] key under [id] in [backing]: reserves its record, creates the key, reads
-     * its custody class (from `KeyInfo` for Keystore, "software" otherwise) and settles the
-     * record. A failure is rolled back through [rollBack].
+     * Mints a [type] key in [role] under [id] in [backing]: reserves its record (the role in
+     * the same commit), creates the key, reads its custody class (from `KeyInfo` for Keystore,
+     * "software" otherwise) and settles the record. A failure is rolled back through [rollBack].
      */
     @Suppress("TooGenericExceptionCaught") // any failure must roll the mint back
-    fun mint(id: String, type: KeyType, backing: Backing): KeyHandle {
-        records.reserve(id, type, backing, processTag)
+    fun mint(id: String, type: KeyType, backing: Backing, role: KeyRole): KeyHandle {
+        records.reserve(id, type, backing, role, processTag)
         try {
             val custody = when (backing) {
                 Backing.KEYSTORE -> createInKeystore(id, type)
@@ -93,7 +126,7 @@ internal class P256Keys(
         if (digest.size != DIGEST_SIZE) {
             custodyFailure("A P-256 key signs a $DIGEST_SIZE-byte digest, got ${digest.size} bytes")
         }
-        return keystore.signP256Digest(alias(id), digest)
+        return keystore.signP256Digest(keyAlias(id), digest)
             ?: throw ScpException("Key not found in Keystore: $id", KEY_NOT_FOUND)
     }
 
@@ -119,7 +152,7 @@ internal class P256Keys(
             Backing.KEYSTORE -> {
                 val spki = SPKI_PREFIX + peer
                 val peerKey = KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(spki))
-                keystore.agreeP256(alias(id), peerKey)
+                keystore.agreeP256(keyAlias(id), peerKey)
                     ?: throw ScpException("Key not found in Keystore: $id", KEY_NOT_FOUND)
             }
             Backing.SOFTWARE -> {
@@ -136,35 +169,55 @@ internal class P256Keys(
     }
 
     /**
-     * Deletes the key material of [id], confirms it is gone, then removes the record. The method
-     * follows the recorded custody: [DestructionMethod.HARDWARE] only for a recorded
-     * [CustodyType.HARDWARE]; a pending record reports [DestructionMethod.SOFTWARE_ONLY].
+     * Deletes the key material of [id], confirms it is gone, then removes the record, and with
+     * it the key's role. Reports [DestructionMethod.SOFTWARE_ONLY] whatever the recorded
+     * custody: Keystore issues no proof that it destroyed a key, and §9.15 rates a destruction
+     * without a verified platform proof as software-only (ADR-027 criterion 4).
      */
     fun destroy(id: String, record: KeyRecord): DestructionAttestation {
         deleteMaterial(id, record.backing)
         records.remove(id)
-        val method = when (record.custody) {
-            CustodyType.HARDWARE -> DestructionMethod.HARDWARE
-            CustodyType.SOFTWARE, CustodyType.IN_MEMORY, null -> DestructionMethod.SOFTWARE_ONLY
-        }
-        return DestructionAttestation(method = method, confirmed = true)
+        return DestructionAttestation(method = DestructionMethod.SOFTWARE_ONLY, confirmed = true)
     }
 
     /**
-     * Deletes every key whose record is still pending from another process, which died between
-     * reserving the record and settling it, and returns the swept ids. A record pending under
-     * this process's tag belongs to a mint that may still be running, and is left alone.
+     * Destroys the key [id] whose record does not parse: deletes whatever material either store
+     * holds under [id], confirms it is gone, then removes the record.
      */
-    fun sweep(): List<String> = records.ids().filter { id ->
-        val record = records.get(id) ?: return@filter false
-        if (record.custody != null || record.processTag == processTag) return@filter false
-        deleteMaterial(id, record.backing)
+    fun destroyUnreadable(id: String): DestructionAttestation {
+        deleteMaterial(id, Backing.KEYSTORE)
+        deleteMaterial(id, Backing.SOFTWARE)
         records.remove(id)
-        true
+        return DestructionAttestation(method = DestructionMethod.SOFTWARE_ONLY, confirmed = true)
+    }
+
+    /**
+     * Deletes every key whose record is still pending under another process's tag and returns
+     * the swept ids. The adapter runs in one process (ADR-027 criterion 1), so such a record was
+     * left by an earlier process that died between reserving the record and settling it. A
+     * record pending under this process's tag belongs to a mint that may still be running, and
+     * is left alone.
+     *
+     * Best-effort per record: a record that does not parse, or whose key or record cannot be
+     * removed, stays in place and is reported through [warn], and the sweep goes on. Removing an
+     * orphan cleans up an inert leak on which no §9.15 guarantee depends.
+     */
+    @Suppress("TooGenericExceptionCaught") // one record's failure never stops the sweep
+    fun sweep(): List<String> = records.ids().filter { id ->
+        try {
+            val record = records.get(id) ?: return@filter false
+            if (record.custody != null || record.processTag == processTag) return@filter false
+            deleteMaterial(id, record.backing)
+            records.remove(id)
+            true
+        } catch (e: Exception) {
+            warn("Abandoned P-256 mint $id could not be swept and stays reserved", e)
+            false
+        }
     }
 
     private fun createInKeystore(id: String, type: KeyType): CustodyType {
-        val alias = alias(id)
+        val alias = keyAlias(id)
         if (type == KeyType.P256) keystore.generateP256Signing(alias) else keystore.generateP256Agreement(alias)
         val created = keystore.p256PublicKey(alias)
             ?: throw ScpException("Keystore created no public key for key $id", CUSTODY_ERROR)
@@ -177,19 +230,22 @@ internal class P256Keys(
             .generateKeyPair()
         val scalar = BigIntegers.asUnsignedByteArray(SCALAR_SIZE, (pair.private as ECPrivateKeyParameters).d)
         try {
-            val committed = prefs.edit().putString(scalarKey(id), Base64.getEncoder().encodeToString(scalar)).commit()
-            if (!committed) throw ScpException("Could not commit the scalar of key $id", CUSTODY_ERROR)
+            synchronized(softwarePairs) {
+                val committed =
+                    prefs.edit().putString(scalarKey(id), Base64.getEncoder().encodeToString(scalar)).commit()
+                if (!committed) throw ScpException("Could not commit the scalar of key $id", CUSTODY_ERROR)
+                softwarePairs[id] = pair
+            }
         } finally {
             scalar.fill(0)
         }
-        softwarePairs[id] = pair
         return CustodyType.SOFTWARE
     }
 
     /** The validated point of the Keystore key [id]. */
     private fun keystorePoint(id: String): ECPoint = validPoint(
         id,
-        keystore.p256PublicKey(alias(id)) ?: throw ScpException("Key not found in Keystore: $id", KEY_NOT_FOUND),
+        keystore.p256PublicKey(keyAlias(id)) ?: throw ScpException("Key not found in Keystore: $id", KEY_NOT_FOUND),
     )
 
     /** The point of the Keystore public [key] of [id], refused when it is not a valid P-256 point. */
@@ -202,39 +258,39 @@ internal class P256Keys(
     }
 
     /**
-     * The software key pair of [id], loaded from its committed scalar on first use. A scalar that
-     * is missing, not 32 bytes, or outside [1, n − 1] is `SCP-CRYPTO-4060`.
+     * The software key pair of [id], loaded from its committed scalar on first use, under the
+     * monitor of [softwarePairs]. A scalar that is missing, not 32 bytes, or outside [1, n − 1]
+     * is `SCP-CRYPTO-4060`.
      */
-    private fun softwarePair(id: String): AsymmetricCipherKeyPair = softwarePairs[id] ?: run {
+    private fun softwarePair(id: String): AsymmetricCipherKeyPair = synchronized(softwarePairs) {
+        softwarePairs[id]?.let { return@synchronized it }
         val text = prefs.getString(scalarKey(id), null)
-            ?: throw ScpException("The record of key $id names a software scalar that is missing", CUSTODY_ERROR)
+            ?: custodyFailure("The record of key $id names a software scalar that is missing")
         val bytes = Base64.getDecoder().decode(text)
         val d = try {
             if (bytes.size != SCALAR_SIZE) {
-                throw ScpException("The scalar of key $id is ${bytes.size} bytes, not $SCALAR_SIZE", CUSTODY_ERROR)
+                custodyFailure("The scalar of key $id is ${bytes.size} bytes, not $SCALAR_SIZE")
             }
             BigInteger(1, bytes)
         } finally {
             bytes.fill(0)
         }
-        if (d.signum() == 0 || d >= DOMAIN.n) {
-            throw ScpException("The scalar of key $id is outside [1, n - 1]", CUSTODY_ERROR)
-        }
-        val pair = AsymmetricCipherKeyPair(
+        if (d.signum() == 0 || d >= DOMAIN.n) custodyFailure("The scalar of key $id is outside [1, n - 1]")
+        AsymmetricCipherKeyPair(
             ECPublicKeyParameters(DOMAIN.g.multiply(d).normalize(), DOMAIN),
             ECPrivateKeyParameters(d, DOMAIN),
-        )
-        softwarePairs.putIfAbsent(id, pair) ?: pair
+        ).also { softwarePairs[id] = it }
     }
 
     /**
      * Deletes the material of [id] in [backing] and confirms by re-fetch: the alias by
-     * `containsAlias`, the scalar by reading the entry back after a `commit()` removal.
+     * `containsAlias`, the scalar by reading the entry back after a `commit()` removal. The
+     * scalar and its cached pair go under the monitor of [softwarePairs].
      */
     private fun deleteMaterial(id: String, backing: Backing) {
         when (backing) {
-            Backing.KEYSTORE -> if (keystore.containsAlias(alias(id))) keystore.deleteConfirmed(id, alias(id))
-            Backing.SOFTWARE -> {
+            Backing.KEYSTORE -> if (keystore.containsAlias(keyAlias(id))) keystore.deleteConfirmed(id, keyAlias(id))
+            Backing.SOFTWARE -> synchronized(softwarePairs) {
                 softwarePairs.remove(id)
                 val committed = prefs.edit().remove(scalarKey(id)).commit()
                 if (!committed || prefs.getString(scalarKey(id), null) != null) {
@@ -277,7 +333,6 @@ internal class P256Keys(
         const val DIGEST_SIZE = 32
         const val UNCOMPRESSED_SIZE = 65
         const val UNCOMPRESSED_TAG: Byte = 0x04
-        const val KEY_NOT_FOUND = "SCP-CRYPTO-4006"
 
         val DOMAIN = ECDomainParameters(SECNamedCurves.getByName("secp256r1"))
 
@@ -290,8 +345,6 @@ internal class P256Keys(
             0x01, 0x06, 0x08, 0x2a, 0x86.toByte(), 0x48, 0xce.toByte(), 0x3d, 0x03, 0x01, 0x07, 0x03,
             0x42, 0x00,
         )
-
-        fun alias(id: String) = "scp.key.$id"
 
         fun scalarKey(id: String) = "scp.p256.$id"
 

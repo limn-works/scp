@@ -95,7 +95,7 @@ class UniffiKeyCustodyTest {
     @BeforeEach
     fun setUp() {
         prefs = InMemorySharedPreferences()
-        custody = AndroidKeyCustody(prefs, JcaFakeKeystoreKeys())
+        custody = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
         provider = UniffiKeyCustody(custody)
     }
 
@@ -278,7 +278,7 @@ class UniffiKeyCustodyTest {
     fun `an Ed25519 key's role survives a new custody instance`() {
         runTest {
             val id = provider.generateKeypair(CustodyKeyType.ED25519, CustodyKeyRole.IDENTITY)
-            val restored = UniffiKeyCustody(AndroidKeyCustody(prefs, JcaFakeKeystoreKeys()))
+            val restored = UniffiKeyCustody(AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys()))
             assertEquals(CustodyKeyRole.IDENTITY, restored.getPublicKey(id).role)
             assertArrayEquals(provider.getPublicKey(id).publicKey, restored.getPublicKey(id).publicKey)
         }
@@ -297,7 +297,7 @@ class UniffiKeyCustodyTest {
     fun `a role write that does not commit fails closed and leaves no key`() {
         runTest {
             val failingPrefs = FailingPrefs(prefs, "scp.role.", throwOnWrite = false)
-            val failing = AndroidKeyCustody(failingPrefs, JcaFakeKeystoreKeys())
+            val failing = AndroidKeyCustody.create(failingPrefs, JcaFakeKeystoreKeys())
             val error = cryptoError {
                 UniffiKeyCustody(failing).generateKeypair(CustodyKeyType.ED25519, CustodyKeyRole.IDENTITY)
             }
@@ -311,7 +311,7 @@ class UniffiKeyCustodyTest {
     fun `a seed write that throws leaves neither the key nor its role`() {
         runTest {
             val failingPrefs = FailingPrefs(prefs, "scp.ed25519.", throwOnWrite = true)
-            val failing = AndroidKeyCustody(failingPrefs, JcaFakeKeystoreKeys())
+            val failing = AndroidKeyCustody.create(failingPrefs, JcaFakeKeystoreKeys())
             val error = cryptoError {
                 UniffiKeyCustody(failing).generateKeypair(CustodyKeyType.ED25519, CustodyKeyRole.IDENTITY)
             }

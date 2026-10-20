@@ -121,7 +121,7 @@ class AndroidKeyCustodyTest {
     @BeforeEach
     fun setUp() {
         prefs = InMemorySharedPreferences()
-        custody = AndroidKeyCustody(prefs, JcaFakeKeystoreKeys())
+        custody = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
     }
 
     // -------------------------------------------------------------------
@@ -463,7 +463,7 @@ class AndroidKeyCustodyTest {
         fun `dhAgree on a hardware handle is SCP-CRYPTO-4006 without its alias and 4060 for an Ed25519 identity`() {
             // A Keystore key without a P-256 record is Ed25519, which never agrees.
             val keys = JcaFakeKeystoreKeys()
-            val keystoreCustody = AndroidKeyCustody(InMemorySharedPreferences(), keys, keystoreEd25519 = true)
+            val keystoreCustody = AndroidKeyCustody.create(InMemorySharedPreferences(), keys, keystoreEd25519 = true)
             val identity = keystoreCustody.generateKeypair(KeyType.ED25519)
             val missing = KeyHandle(id = "404", custodyType = CustodyType.HARDWARE)
             for (peer in listOf(ByteArray(32), ByteArray(31))) {
@@ -689,7 +689,7 @@ class AndroidKeyCustodyTest {
             val originalPubKey = custody.publicKey(handle)
 
             // Simulate process death: create a new AndroidKeyCustody with the same prefs
-            val restored = AndroidKeyCustody(prefs, JcaFakeKeystoreKeys())
+            val restored = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
             val restoredHandle = KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE)
             val restoredPubKey = restored.publicKey(restoredHandle)
 
@@ -702,7 +702,7 @@ class AndroidKeyCustodyTest {
             val originalPubKey = custody.publicKey(handle)
 
             // Simulate process death
-            val restored = AndroidKeyCustody(prefs, JcaFakeKeystoreKeys())
+            val restored = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
             val restoredHandle = KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE)
             val data = "signed after restore".toByteArray(Charsets.UTF_8)
             val signature = restored.sign(restoredHandle, data)
@@ -731,7 +731,7 @@ class AndroidKeyCustodyTest {
             custody.destroyKey(handle)
 
             // Simulate process death — destroyed key should not be restored
-            val restored = AndroidKeyCustody(prefs, JcaFakeKeystoreKeys())
+            val restored = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
             assertThrows<ScpException> {
                 restored.publicKey(
                     KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE),
@@ -743,7 +743,7 @@ class AndroidKeyCustodyTest {
         fun `destroyKey on one instance leaves the key signing on another instance that restored it`() {
             val handle = custody.generateKeypair(KeyType.ED25519)
             val originalPubKey = custody.publicKey(handle)
-            val other = AndroidKeyCustody(prefs, JcaFakeKeystoreKeys())
+            val other = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
 
             custody.destroyKey(handle)
 
@@ -766,7 +766,7 @@ class AndroidKeyCustodyTest {
             val pubKeys = handles.map { custody.publicKey(it) }
 
             // Simulate process death
-            val restored = AndroidKeyCustody(prefs, JcaFakeKeystoreKeys())
+            val restored = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
             handles.forEachIndexed { idx, handle ->
                 val restoredHandle = KeyHandle(id = handle.id, custodyType = CustodyType.SOFTWARE)
                 val restoredPubKey = restored.publicKey(restoredHandle)

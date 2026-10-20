@@ -25,7 +25,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
     @Test
     fun `keystore identity pseudonym secret lives and dies with the identity`() {
         val keystore = JcaFakeKeystoreKeys()
-        val custody = AndroidKeyCustody(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
+        val custody = AndroidKeyCustody.create(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
         val identity = custody.generateKeypair(KeyType.ED25519)
         assertEquals(CustodyType.HARDWARE, identity.custodyType)
         assertTrue(keystore.containsAlias(PseudonymSecret.alias(identity.id)))
@@ -47,7 +47,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
     @Test
     fun `failed pseudonym secret generation deletes the identity key`() {
         val keystore = JcaFakeKeystoreKeys(failHmacGeneration = true)
-        val custody = AndroidKeyCustody(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
+        val custody = AndroidKeyCustody.create(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
         val error = assertThrows<ScpException> { custody.generateKeypair(KeyType.ED25519) }
         assertEquals("SCP-CRYPTO-4060", error.code)
         assertTrue(error.cause is java.security.ProviderException)
@@ -63,8 +63,8 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
     @Test
     fun `destroying an identity makes its pseudonyms underivable while a bystander still derives`() {
         val custodies = listOf(
-            AndroidKeyCustody(InMemorySharedPreferences(), JcaFakeKeystoreKeys()),
-            AndroidKeyCustody(InMemorySharedPreferences(), JcaFakeKeystoreKeys(), keystoreEd25519 = true),
+            AndroidKeyCustody.create(InMemorySharedPreferences(), JcaFakeKeystoreKeys()),
+            AndroidKeyCustody.create(InMemorySharedPreferences(), JcaFakeKeystoreKeys(), keystoreEd25519 = true),
         )
         for (custody in custodies) {
             val identity = custody.generateKeypair(KeyType.ED25519)
@@ -97,7 +97,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
     @Test
     fun `a destroy that fails on the secret alias is completed by a retry`() {
         val keystore = JcaFakeKeystoreKeys()
-        val custody = AndroidKeyCustody(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
+        val custody = AndroidKeyCustody.create(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
         val identity = custody.generateKeypair(KeyType.ED25519)
         val secretAlias = PseudonymSecret.alias(identity.id)
         val contextId = "retry-context".toByteArray()
@@ -123,7 +123,7 @@ class AndroidKeyCustodyPseudonymLifecycleTest {
     @Test
     fun `an orphaned pseudonym secret is underivable and removed by destroy`() {
         val keystore = JcaFakeKeystoreKeys()
-        val custody = AndroidKeyCustody(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
+        val custody = AndroidKeyCustody.create(InMemorySharedPreferences(), keystore, keystoreEd25519 = true)
         val identity = custody.generateKeypair(KeyType.ED25519)
         val secretAlias = PseudonymSecret.alias(identity.id)
         keystore.ed25519.remove("scp.key.${identity.id}")

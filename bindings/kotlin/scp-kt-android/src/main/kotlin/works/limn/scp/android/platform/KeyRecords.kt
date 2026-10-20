@@ -4,9 +4,10 @@
 //
 // A P-256 key lives in Keystore or, for HPKE on API 26-30, as a Bouncy Castle scalar in
 // EncryptedSharedPreferences, and Keystore reports its security level per key. The record names
-// the key's type, its store and its custody class, and is committed before the key is created,
-// so every operation, the bridge's custody query and a later destroy follow what was minted,
-// never the key type or the probe of the instance that reopens it.
+// the key's type, its store, its custody class and its role, and is committed before the key is
+// created, so every operation, the bridge's custody and role queries and a later destroy follow
+// what was minted, never the key type or the probe of the instance that reopens it. The role
+// lives in the record, so one commit writes both and no role outlives its record.
 //
 // Provenance: ADR-027 (Android Platform Adapter) criteria 1 and 4, spec 09 §9.5 (P-256 keys).
 
@@ -27,18 +28,20 @@ internal enum class Backing(val wire: String) {
  * The record of one P-256 or HPKE P-256 key.
  *
  * @property custody The custody class settled at mint, or `null` while the mint is pending.
+ * @property role The role the key was minted in.
  * @property processTag The tag of the process that reserved the record (see [currentProcessTag]).
  */
 internal data class KeyRecord(
     val type: KeyType,
     val backing: Backing,
     val custody: CustodyType?,
+    val role: KeyRole,
     val processTag: String,
 )
 
 /**
  * The records of an [AndroidKeyCustody]'s P-256 and HPKE P-256 keys, in [prefs] under
- * `scp.keymeta.<id>` as `"<KeyType>|<keystore|software>|<hardware|software|pending>|<tag>"`.
+ * `scp.keymeta.<id>` as `"<KeyType>|<keystore|software>|<hardware|software|pending>|<KeyRole>|<tag>"`.
  *
  * Every write uses `commit()`, and a write that does not commit throws `SCP-CRYPTO-4060`. Reads
  * go to [prefs] each time, so every instance over the same preferences sees every record.
@@ -50,13 +53,13 @@ internal class KeyRecords(private val prefs: SharedPreferences) {
     fun ids(): Set<String> = index.read()
 
     /**
-     * Commits a `pending` record of [type] in [backing] for [id], reserved by [processTag], and
-     * adds [id] to the index in the same commit.
+     * Commits a `pending` record of [type] in [backing] and [role] for [id], reserved by
+     * [processTag], and adds [id] to the index in the same commit.
      */
-    fun reserve(id: String, type: KeyType, backing: Backing, processTag: String) {
+    fun reserve(id: String, type: KeyType, backing: Backing, role: KeyRole, processTag: String) {
         require(type == KeyType.P256 || type == KeyType.HPKE_P256) { "only P-256 keys have records" }
         val committed = index.commit(id, present = true) {
-            it.putString(key(id), encode(KeyRecord(type, backing, null, processTag)))
+            it.putString(key(id), encode(KeyRecord(type, backing, null, role, processTag)))
         }
         if (!committed) throw ScpException("Could not write the record of key $id", CUSTODY_ERROR)
     }
@@ -79,8 +82,11 @@ internal class KeyRecords(private val prefs: SharedPreferences) {
         return decode(text) ?: throw ScpException("The record of key $id is malformed", CUSTODY_ERROR)
     }
 
-    /** Whether a record exists for [id]. */
+    /** Whether a record exists for [id], readable or not. */
     fun contains(id: String): Boolean = prefs.getString(key(id), null) != null
+
+    /** Whether a record exists for [id] and does not parse. */
+    fun isUnreadable(id: String): Boolean = prefs.getString(key(id), null)?.let { decode(it) == null } ?: false
 
     /**
      * Removes the record of [id] and its index entry in one commit, then confirms by re-reading
@@ -99,7 +105,7 @@ internal class KeyRecords(private val prefs: SharedPreferences) {
         const val PREFIX = "scp.keymeta."
         const val INDEX_KEY = "scp.keymeta.ids"
         const val PENDING = "pending"
-        const val FIELDS = 4
+        const val FIELDS = 5
 
         fun encode(record: KeyRecord): String {
             val custody = when (record.custody) {
@@ -108,7 +114,8 @@ internal class KeyRecords(private val prefs: SharedPreferences) {
                 CustodyType.IN_MEMORY -> error("a P-256 record never holds in_memory custody")
                 null -> PENDING
             }
-            return listOf(record.type.name, record.backing.wire, custody, record.processTag).joinToString("|")
+            return listOf(record.type.name, record.backing.wire, custody, record.role.name, record.processTag)
+                .joinToString("|")
         }
 
         fun decode(text: String): KeyRecord? {
@@ -116,15 +123,17 @@ internal class KeyRecords(private val prefs: SharedPreferences) {
             if (parts.size != FIELDS) return null
             val type = KeyType.entries.firstOrNull { it.name == parts[0] }
             val backing = Backing.entries.firstOrNull { it.wire == parts[1] }
+            val role = KeyRole.entries.firstOrNull { it.name == parts[3] }
             val custody = when (parts[2]) {
                 "hardware" -> CustodyType.HARDWARE
                 "software" -> CustodyType.SOFTWARE
-                else -> null
+                PENDING -> null
+                else -> return null
             }
+            if (type == null || backing == null || role == null) return null
             // Only P-256 keys have records, and a P-256 signing key lives only in Keystore.
-            val valid = (type == KeyType.HPKE_P256 || (type == KeyType.P256 && backing == Backing.KEYSTORE)) &&
-                backing != null && (custody != null || parts[2] == PENDING)
-            return if (valid && type != null && backing != null) KeyRecord(type, backing, custody, parts[3]) else null
+            val valid = type == KeyType.HPKE_P256 || (type == KeyType.P256 && backing == Backing.KEYSTORE)
+            return if (valid) KeyRecord(type, backing, custody, role, parts[4]) else null
         }
     }
 }
@@ -163,6 +172,15 @@ internal class PersistedIds(private val prefs: SharedPreferences, private val in
 
 /** The custody error code, for every failure that has no more specific one. */
 internal const val CUSTODY_ERROR = "SCP-CRYPTO-4060"
+
+/** The code for a key the adapter does not hold, or whose mint is still pending. */
+internal const val KEY_NOT_FOUND = "SCP-CRYPTO-4006"
+
+/** The Keystore alias, and the alias prefix, of every key and identity the adapter holds. */
+internal const val KEY_ALIAS_PREFIX = "scp.key."
+
+/** The Keystore alias of key [id]. */
+internal fun keyAlias(id: String): String = "$KEY_ALIAS_PREFIX$id"
 
 /**
  * Runs [block] and rethrows its failure as an [ScpException]: an [ScpException] unchanged, any

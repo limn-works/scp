@@ -43,8 +43,11 @@ private val CURVE = SECNamedCurves.getByName("secp256r1")
 /** This test process's tag, as the instances under test see it. */
 private const val TAG = "100:200"
 
-/** A tag no instance under test holds: a process that died mid-mint. */
+/** A tag no instance under test holds: an earlier process that died mid-mint. */
 private const val FOREIGN_TAG = "77:1"
+
+/** The main process name the instances under test are told they run in. */
+private const val MAIN_PROCESS = "works.limn.app"
 
 /** A uniformly random scalar in [1, n − 1], as 32 bytes. */
 private fun randomScalar(): ByteArray {
@@ -106,6 +109,43 @@ private class RefusingPrefs(
     }
 }
 
+/**
+ * [SharedPreferences] over [inner] whose editors drop every removal of a key starting with
+ * [keepPrefix] and still return `true` from `commit()`: a store that reports a removal it did
+ * not make.
+ */
+private class KeepingPrefs(
+    private val inner: SharedPreferences,
+    private val keepPrefix: String,
+) : SharedPreferences by inner {
+    override fun edit(): SharedPreferences.Editor = Editor(inner.edit())
+
+    private inner class Editor(private val delegate: SharedPreferences.Editor) : SharedPreferences.Editor by delegate {
+        override fun putString(key: String?, value: String?): SharedPreferences.Editor {
+            delegate.putString(key, value)
+            return this
+        }
+
+        override fun remove(key: String?): SharedPreferences.Editor {
+            if (key == null || !key.startsWith(keepPrefix)) delegate.remove(key)
+            return this
+        }
+
+        override fun commit(): Boolean {
+            delegate.commit()
+            return true
+        }
+    }
+}
+
+/**
+ * [SharedPreferences] over [inner] whose `getAll` fails the test: the adapter reads its entries
+ * one by one, because `getAll` on EncryptedSharedPreferences decrypts every value in the file.
+ */
+private class NoGetAllPrefs(private val inner: SharedPreferences) : SharedPreferences by inner {
+    override fun getAll(): MutableMap<String, *> = throw AssertionError("AndroidKeyCustody called getAll()")
+}
+
 class AndroidKeyCustodyP256Test {
     private lateinit var prefs: InMemorySharedPreferences
     private lateinit var keys: JcaFakeKeystoreKeys
@@ -121,7 +161,17 @@ class AndroidKeyCustodyP256Test {
         store: SharedPreferences = prefs,
         ed25519InKeystore: Boolean = false,
         tag: String = TAG,
-    ) = AndroidKeyCustody(store, keys, ed25519InKeystore, agreementInKeystore, tag)
+        warnings: MutableList<String> = mutableListOf(),
+    ) = AndroidKeyCustody.create(
+        encryptedPrefs = store,
+        keystore = keys,
+        keystoreEd25519 = ed25519InKeystore,
+        keystoreAgreement = agreementInKeystore,
+        processTag = tag,
+        processName = MAIN_PROCESS,
+        mainProcessName = MAIN_PROCESS,
+        warn = { message, _ -> warnings += message },
+    )
 
     private fun alias(id: String) = "scp.key.$id"
 
@@ -216,6 +266,23 @@ class AndroidKeyCustodyP256Test {
         }
 
         @Test
+        fun `an unknown or pending id is SCP-CRYPTO-4006 whatever the peer`() {
+            val custody = custody()
+            KeyRecords(prefs).reserve("71", KeyType.HPKE_P256, Backing.KEYSTORE, KeyRole.OPERATIONAL, TAG)
+            keys.generateP256Agreement(alias("71"))
+            val badPeers = listOf(ByteArray(0), ByteArray(3), ByteArray(65))
+            for (id in listOf("999", "71")) {
+                for (custodyType in listOf(CustodyType.HARDWARE, CustodyType.SOFTWARE)) {
+                    for (peer in badPeers) {
+                        val handle = KeyHandle(id = id, custodyType = custodyType)
+                        assertEquals("SCP-CRYPTO-4006", codeOf { custody.dhAgree(handle, peer) }, "$id $custodyType")
+                    }
+                }
+            }
+            assertEquals(0, keys.agreeCalls)
+        }
+
+        @Test
         fun `the bridge refuses an off-curve peer too`() {
             runTest {
                 val bridge = TestingCallbackCustody(UniffiKeyCustody(custody()))
@@ -255,6 +322,9 @@ class AndroidKeyCustodyP256Test {
             val peer = pointOf(randomScalar())
 
             assertEquals("SCP-CRYPTO-4060", codeOf { custody.sign(agreement, digest()) })
+            val softwareAgreement = custody(agreementInKeystore = false).generateKeypair(KeyType.HPKE_P256)
+            assertEquals(Backing.SOFTWARE, KeyRecords(prefs).get(softwareAgreement.id)?.backing)
+            assertEquals("SCP-CRYPTO-4060", codeOf { custody.sign(softwareAgreement, digest()) })
             assertEquals("SCP-CRYPTO-4060", codeOf { custody.dhAgree(signing, peer) })
             assertEquals("SCP-CRYPTO-4060", codeOf { custody.dhAgree(ed25519, peer) })
             for (handle in listOf(signing, agreement)) {
@@ -324,10 +394,56 @@ class AndroidKeyCustodyP256Test {
         }
 
         @Test
+        fun `isSecureLevel reads securityLevel from API 31 and isInsideSecureHardware below`() {
+            val secure = mapOf(
+                android.security.keystore.KeyProperties.SECURITY_LEVEL_SOFTWARE to false,
+                android.security.keystore.KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT to true,
+                android.security.keystore.KeyProperties.SECURITY_LEVEL_STRONGBOX to true,
+                android.security.keystore.KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE to true,
+                android.security.keystore.KeyProperties.SECURITY_LEVEL_UNKNOWN to false,
+            )
+            assertEquals(5, secure.keys.size)
+            for ((level, expected) in secure) {
+                for (inside in listOf(true, false)) {
+                    // API 31: securityLevel decides, whatever isInsideSecureHardware says.
+                    assertEquals(expected, isSecureLevel(level, inside, 31), "level $level at 31")
+                    // API 30: securityLevel does not exist; isInsideSecureHardware decides.
+                    assertEquals(inside, isSecureLevel(level, inside, 30), "level $level at 30")
+                }
+            }
+        }
+
+        @Test
         fun `Keystore agreement starts at API 31`() {
             assertFalse(keystoreAgreementAvailable(30))
             assertTrue(keystoreAgreementAvailable(31))
             assertTrue(keystoreAgreementAvailable(35))
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Roles
+    // -------------------------------------------------------------------
+
+    @Nested
+    inner class Roles {
+        @Test
+        fun `a second instance reads the role a P-256 key was minted in from its record`() {
+            runTest {
+                val first = UniffiKeyCustody(custody())
+                val signing = first.generateKeypair(CustodyKeyType.P256, CustodyKeyRole.IDENTITY)
+                val agreement = first.generateKeypair(CustodyKeyType.HPKE_P256, CustodyKeyRole.OPERATIONAL)
+
+                // The role sits in the record, written by the commit that reserved it; no
+                // separate role entry exists for a crash to split from the record.
+                assertEquals(KeyRole.IDENTITY, KeyRecords(prefs).get(signing)?.role)
+                assertEquals(KeyRole.OPERATIONAL, KeyRecords(prefs).get(agreement)?.role)
+                assertTrue(prefs.all.keys.none { it.startsWith("scp.role.") }, "role entries: ${prefs.all.keys}")
+
+                val second = UniffiKeyCustody(custody())
+                assertEquals(CustodyKeyRole.IDENTITY, second.getPublicKey(signing).role)
+                assertEquals(CustodyKeyRole.OPERATIONAL, second.getPublicKey(agreement).role)
+            }
         }
     }
 
@@ -385,7 +501,6 @@ class AndroidKeyCustodyP256Test {
             val refusing = custody(agreementInKeystore = false, store = RefusingPrefs(prefs, "scp.p256."))
             assertEquals("SCP-CRYPTO-4060", codeOf { refusing.generateKeypair(KeyType.HPKE_P256) })
             assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")
-            assertTrue(refusing.keyRoles.persistedIds().isEmpty())
         }
     }
 
@@ -414,6 +529,34 @@ class AndroidKeyCustodyP256Test {
             val custody = custody()
             assertEquals("SCP-CRYPTO-4060", codeOf { custody.generateKeypair(KeyType.P256) })
             assertTrue(keys.p256Aliases.isEmpty())
+            assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")
+        }
+
+        @Test
+        fun `a record removal that commits but keeps the entry is refused`() {
+            val keeping = KeyRecords(KeepingPrefs(prefs, "scp.keymeta."))
+            keeping.reserve("81", KeyType.P256, Backing.KEYSTORE, KeyRole.OPERATIONAL, TAG)
+            val error = assertThrows<ScpException> { keeping.remove("81") }
+            assertEquals("SCP-CRYPTO-4060", error.code)
+            assertTrue(error.message.orEmpty().contains("Could not remove the record of key 81"), error.message)
+            assertNotNull(KeyRecords(prefs).get("81"))
+        }
+
+        @Test
+        fun `a rollback whose record removal is not confirmed names the id, and destroyKey completes it`() {
+            keys.hidePublicKey = true
+            val custody = custody(store = KeepingPrefs(prefs, "scp.keymeta."))
+            val error = assertThrows<ScpException> { custody.generateKeypair(KeyType.P256) }
+            assertEquals("SCP-CRYPTO-4060", error.code)
+            val id = KeyRecords(prefs).ids().single()
+            assertTrue(error.message.orEmpty().contains("its record could not be removed"), error.message)
+            assertTrue(error.message.orEmpty().contains(id), error.message)
+            assertEquals(1, error.suppressed.size)
+            assertFalse(keys.containsAlias(alias(id)))
+            assertNull(KeyRecords(prefs).get(id)?.custody)
+
+            keys.hidePublicKey = false
+            assertEquals(DestructionMethod.SOFTWARE_ONLY, custody(store = prefs).destroyKeyById(id).method)
             assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")
         }
 
@@ -454,7 +597,7 @@ class AndroidKeyCustodyP256Test {
             keys.ignoreDeletes = true
             assertEquals("SCP-CRYPTO-4060", codeOf { custody.destroyKey(handle) })
             assertNotNull(KeyRecords(prefs).get(handle.id))
-            assertTrue(custody.keyRoles.contains(handle.id))
+            assertEquals(KeyRole.OPERATIONAL, custody.roleOf(handle.id))
 
             keys.ignoreDeletes = false
             custody.destroyKey(handle)
@@ -466,8 +609,31 @@ class AndroidKeyCustodyP256Test {
         fun `destroy deletes an orphan alias that has no record, below API 33`() {
             keys.generateP256Signing(alias("4242"))
             val custody = custody(ed25519InKeystore = false)
-            assertEquals(DestructionMethod.HARDWARE, custody.destroyKeyById("4242").method)
+            assertEquals(DestructionMethod.SOFTWARE_ONLY, custody.destroyKeyById("4242").method)
             assertFalse(keys.containsAlias(alias("4242")))
+        }
+
+        @Test
+        fun `a Keystore Ed25519 identity's destruction reports software-only`() {
+            val custody = custody(ed25519InKeystore = true)
+            val identity = custody.generateKeypair(KeyType.ED25519, KeyRole.IDENTITY)
+            assertEquals(CustodyType.HARDWARE, identity.custodyType)
+            assertEquals(DestructionMethod.SOFTWARE_ONLY, custody.destroyKey(identity).method)
+            assertFalse(keys.containsAlias(alias(identity.id)))
+        }
+
+        @Test
+        fun `a destroy retry after the identity alias is gone removes its secret and role, then reports 4006`() {
+            val custody = custody(ed25519InKeystore = true)
+            val identity = custody.generateKeypair(KeyType.ED25519, KeyRole.IDENTITY)
+            custody.derivePseudonym(identity, byteArrayOf(7))
+            assertEquals(1, keys.hmacKeys.size)
+            keys.deleteEntry(alias(identity.id))
+
+            assertEquals("SCP-CRYPTO-4006", codeOf { custody.destroyKeyById(identity.id) })
+            assertTrue(keys.hmacKeys.isEmpty())
+            assertNull(custody.roleOf(identity.id))
+            assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")
         }
 
         @Test
@@ -481,7 +647,7 @@ class AndroidKeyCustodyP256Test {
         }
 
         @Test
-        fun `a destroyed key is gone and its method follows the recorded custody`() {
+        fun `a destroyed key is gone and every destruction reports software-only`() {
             runTest {
                 val custody = custody(agreementInKeystore = true)
                 val provider = UniffiKeyCustody(custody)
@@ -490,7 +656,9 @@ class AndroidKeyCustodyP256Test {
                 val softKeystore = custody.generateKeypair(KeyType.HPKE_P256)
                 val software = custody(agreementInKeystore = false).generateKeypair(KeyType.HPKE_P256)
 
-                assertEquals(DestructionMethod.HARDWARE, custody.destroyKey(hardware).method)
+                // Keystore issues no proof of destruction, so a hardware key reports software-only too.
+                assertEquals(CustodyType.HARDWARE, KeyRecords(prefs).get(hardware.id)?.custody)
+                assertEquals(DestructionMethod.SOFTWARE_ONLY, custody.destroyKey(hardware).method)
                 assertEquals(DestructionMethod.SOFTWARE_ONLY, custody.destroyKey(softKeystore).method)
                 assertEquals(DestructionMethod.SOFTWARE_ONLY, custody.destroyKey(software).method)
 
@@ -515,24 +683,130 @@ class AndroidKeyCustodyP256Test {
     @Nested
     inner class PendingMints {
         @Test
-        fun `a new instance sweeps the pending mints of another process`() {
-            val records = KeyRecords(prefs)
-            records.reserve("11", KeyType.HPKE_P256, Backing.KEYSTORE, FOREIGN_TAG)
-            keys.generateP256Agreement(alias("11"))
-            records.reserve("12", KeyType.HPKE_P256, Backing.SOFTWARE, FOREIGN_TAG)
-            prefs.edit().putString("scp.p256.12", Base64.getEncoder().encodeToString(randomScalar())).commit()
-            records.reserve("13", KeyType.P256, Backing.KEYSTORE, FOREIGN_TAG)
+        fun `construction outside the main process is refused with SCP-CRYPTO-4060`() {
+            for (processName in listOf("$MAIN_PROCESS:remote", "other.app", null)) {
+                val error = assertThrows<ScpException> {
+                    AndroidKeyCustody.create(prefs, keys, processName = processName, mainProcessName = MAIN_PROCESS)
+                }
+                assertEquals("SCP-CRYPTO-4060", error.code)
+                assertTrue(error.message.orEmpty().contains("only in the app's main process"), error.message)
+            }
+            assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")
+            AndroidKeyCustody.create(prefs, keys, processName = MAIN_PROCESS, mainProcessName = MAIN_PROCESS)
+        }
 
-            custody()
+        @Test
+        fun `a new instance sweeps the pending mints an earlier process left under its own tag`() {
+            // One process runs the adapter at a time, so a pending record under another tag was
+            // left by an earlier process that died mid-mint.
+            val records = KeyRecords(prefs)
+            records.reserve("11", KeyType.HPKE_P256, Backing.KEYSTORE, KeyRole.OPERATIONAL, FOREIGN_TAG)
+            keys.generateP256Agreement(alias("11"))
+            records.reserve("12", KeyType.HPKE_P256, Backing.SOFTWARE, KeyRole.OPERATIONAL, FOREIGN_TAG)
+            prefs.edit().putString("scp.p256.12", Base64.getEncoder().encodeToString(randomScalar())).commit()
+            records.reserve("13", KeyType.P256, Backing.KEYSTORE, KeyRole.IDENTITY, FOREIGN_TAG)
+            assertEquals(KeyRole.IDENTITY, records.get("13")?.role)
+
+            val warnings = mutableListOf<String>()
+            custody(warnings = warnings)
 
             assertTrue(keys.p256Aliases.isEmpty())
             assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")
+            assertTrue(warnings.isEmpty(), warnings.toString())
+        }
+
+        @Test
+        fun `a sweep that cannot delete an orphan leaves it reserved, warns, and construction succeeds`() {
+            // A software identity: the fake does not sign with a Keystore Ed25519 key.
+            val first = custody()
+            val identity = first.generateKeypair(KeyType.ED25519, KeyRole.IDENTITY)
+            val settled = first.generateKeypair(KeyType.P256)
+            KeyRecords(prefs).reserve("51", KeyType.P256, Backing.KEYSTORE, KeyRole.OPERATIONAL, FOREIGN_TAG)
+            keys.generateP256Signing(alias("51"))
+            keys.ignoreDeletes = true
+
+            val warnings = mutableListOf<String>()
+            val reopened = custody(warnings = warnings)
+
+            assertEquals(64, reopened.sign(identity, byteArrayOf(1, 2, 3)).size)
+            assertNotNull(reopened.sign(settled, digest()))
+            assertNull(KeyRecords(prefs).get("51")?.custody)
+            assertNotNull(KeyRecords(prefs).get("51"))
+            assertTrue(keys.containsAlias(alias("51")))
+            assertEquals(1, warnings.size, warnings.toString())
+            assertTrue(warnings.single().contains("51"), warnings.single())
+        }
+
+        @Test
+        fun `a record that does not parse fails only its own id`() {
+            val first = custody()
+            val settled = first.generateKeypair(KeyType.P256)
+            val records = KeyRecords(prefs)
+            records.reserve("61", KeyType.P256, Backing.KEYSTORE, KeyRole.OPERATIONAL, FOREIGN_TAG)
+            keys.generateP256Signing(alias("61"))
+            prefs.edit().putString("scp.keymeta.61", "P256|keystore|garbage").commit()
+
+            runTest {
+                val warnings = mutableListOf<String>()
+                val reopened = custody(warnings = warnings)
+                val provider = UniffiKeyCustody(reopened)
+                assertEquals(1, warnings.size, warnings.toString())
+
+                // Every other key works, and a new mint succeeds.
+                assertNotNull(reopened.sign(settled, digest()))
+                assertEquals("hardware", provider.custodyType(settled.id))
+                val fresh = reopened.generateKeypair(KeyType.HPKE_P256)
+                assertEquals(65, reopened.publicKey(fresh).size)
+
+                // The corrupt id fails closed, and destroy removes it.
+                assertEquals("SCP-CRYPTO-4060", codeOf { reopened.resolveKeyHandle("61") })
+                assertEquals("in_memory", provider.custodyType("61"))
+                assertEquals(DestructionMethod.SOFTWARE_ONLY, reopened.destroyKeyById("61").method)
+                assertFalse(keys.containsAlias(alias("61")))
+                assertFalse(KeyRecords(prefs).contains("61"))
+            }
+        }
+
+        @Test
+        fun `settled keys minted under another tag survive a reopen and still work`() {
+            val minting = custody(tag = FOREIGN_TAG)
+            val signing = minting.generateKeypair(KeyType.P256)
+            val agreement = minting.generateKeypair(KeyType.HPKE_P256)
+            val agreementPublic = minting.publicKey(agreement)
+
+            val reopened = custody(tag = TAG)
+
+            assertNotNull(KeyRecords(prefs).get(signing.id)?.custody)
+            assertNotNull(KeyRecords(prefs).get(agreement.id)?.custody)
+            val bridgeDigest = digest()
+            val der = ASN1Sequence.getInstance(reopened.sign(signing, bridgeDigest))
+            assertEquals(2, der.size())
+            val peer = randomScalar()
+            assertArrayEquals(testingP256Ecdh(peer, agreementPublic), reopened.dhAgree(agreement, pointOf(peer)))
+        }
+
+        @Test
+        fun `restoring an instance never calls getAll`() {
+            val first = custody(agreementInKeystore = false)
+            val identity = first.generateKeypair(KeyType.ED25519, KeyRole.IDENTITY)
+            val signing = first.generateKeypair(KeyType.P256)
+            val agreement = first.generateKeypair(KeyType.HPKE_P256)
+            KeyRecords(prefs).reserve("91", KeyType.HPKE_P256, Backing.SOFTWARE, KeyRole.OPERATIONAL, FOREIGN_TAG)
+
+            val restored = custody(agreementInKeystore = false, store = NoGetAllPrefs(prefs))
+
+            assertEquals(64, restored.sign(identity, byteArrayOf(9)).size)
+            assertNotNull(restored.sign(signing, digest()))
+            assertEquals(65, restored.publicKey(agreement).size)
+            assertFalse(KeyRecords(prefs).contains("91"))
+            restored.destroyKey(agreement)
+            restored.generateKeypair(KeyType.HPKE_P256)
         }
 
         @Test
         fun `a new instance leaves this process's pending mint and settled keys alone`() {
             val settled = custody().generateKeypair(KeyType.P256)
-            KeyRecords(prefs).reserve("21", KeyType.HPKE_P256, Backing.KEYSTORE, TAG)
+            KeyRecords(prefs).reserve("21", KeyType.HPKE_P256, Backing.KEYSTORE, KeyRole.OPERATIONAL, TAG)
             keys.generateP256Agreement(alias("21"))
 
             val reopened = custody()
@@ -548,7 +822,7 @@ class AndroidKeyCustodyP256Test {
         fun `a pending id is unusable and the bridge destroys it`() {
             runTest {
                 val custody = custody()
-                KeyRecords(prefs).reserve("31", KeyType.P256, Backing.KEYSTORE, TAG)
+                KeyRecords(prefs).reserve("31", KeyType.P256, Backing.KEYSTORE, KeyRole.OPERATIONAL, TAG)
                 keys.generateP256Signing(alias("31"))
                 val pending = KeyHandle(id = "31", custodyType = CustodyType.HARDWARE)
                 assertEquals("SCP-CRYPTO-4006", codeOf { custody.sign(pending, digest()) })

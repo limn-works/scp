@@ -63,7 +63,7 @@ class UniffiKeyCustody(private val inner: AndroidKeyCustody) : uniffi.scp.KeyCus
             KeyType.P256 -> CustodyKeyType.P256
             KeyType.HPKE_P256 -> CustodyKeyType.HPKE_P256
         }
-        val role = when (inner.keyRoles.roleOf(keyId)) {
+        val role = when (inner.roleOf(keyId)) {
             KeyRole.IDENTITY -> CustodyKeyRole.IDENTITY
             KeyRole.OPERATIONAL -> CustodyKeyRole.OPERATIONAL
             null -> throw ScpException("No role recorded for key $keyId", CUSTODY_ERROR)

@@ -54,15 +54,15 @@ internal object PseudonymSecret {
     ): ByteArray = keystore.hmacSha256(alias(keyId), contextId, suffix)
         ?: throw ScpException(
             "Pseudonym secret not found in Keystore for identity $keyId",
-            "SCP-CRYPTO-4006",
+            KEY_NOT_FOUND,
         )
 }
 
 /**
  * The Android Keystore operations [AndroidKeyCustody] uses: the Ed25519 identity key and its
- * HMAC-SHA256 pseudonym secret, and the P-256 signing and agreement keys. [AndroidKeystoreKeys]
- * is the production implementation; JVM tests substitute a fake to run those paths without a
- * device. A member lets a Keystore failure escape as the original exception, and
+ * HMAC-SHA256 pseudonym secret, and the P-256 signing and agreement keys. [androidKeystoreKeys]
+ * returns the production implementation; JVM tests substitute a fake to run those paths without
+ * a device. A member lets a Keystore failure escape as the original exception, and
  * [AndroidKeyCustody] reports it as `SCP-CRYPTO-4060`.
  */
 internal interface KeystoreKeys {
@@ -109,10 +109,8 @@ internal interface KeystoreKeys {
     fun agreeP256(alias: String, peer: PublicKey): ByteArray?
 
     /**
-     * Whether `KeyInfo` places the key at [alias] in secure hardware: from API 31 its
-     * `securityLevel` is the TEE, StrongBox or an unknown secure level; below API 31 its
-     * `isInsideSecureHardware`. A missing alias or an unreadable `KeyInfo` throws; it never
-     * reads as either answer.
+     * Whether `KeyInfo` places the key at [alias] in secure hardware, as [isSecureLevel] decides.
+     * A missing alias or an unreadable `KeyInfo` throws; it never reads as either answer.
      */
     fun insideSecureHardware(alias: String): Boolean
 }
@@ -120,8 +118,15 @@ internal interface KeystoreKeys {
 /** The loaded `AndroidKeyStore`. */
 private fun keyStore(): KeyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
 
-/** [KeystoreKeys] over `AndroidKeyStore`. It holds no state; every call loads the store. */
-internal class AndroidKeystoreKeys : KeystoreKeys {
+/** The production [KeystoreKeys], over `AndroidKeyStore`. */
+@JvmSynthetic
+internal fun androidKeystoreKeys(): KeystoreKeys = AndroidKeystoreKeys()
+
+/**
+ * [KeystoreKeys] over `AndroidKeyStore`. It holds no state; every call loads the store. Private
+ * to this file, so no app code reaches it.
+ */
+private class AndroidKeystoreKeys : KeystoreKeys {
     override fun generateEd25519(alias: String) {
         val spec = KeyGenParameterSpec.Builder(
             alias,
@@ -211,12 +216,11 @@ internal class AndroidKeystoreKeys : KeystoreKeys {
         val key = keyStore().getKey(alias, null) as? PrivateKey
             ?: throw KeyStoreException("No private key at $alias")
         val info = KeyFactory.getInstance(key.algorithm, PROVIDER).getKeySpec(key, KeyInfo::class.java)
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            info.securityLevel in SECURE_LEVELS
-        } else {
-            @Suppress("DEPRECATION") // the only security-level reading below API 31
-            info.isInsideSecureHardware
-        }
+        val sdk = Build.VERSION.SDK_INT
+        // securityLevel exists from API 31 only; below it isSecureLevel reads isInsideSecureHardware.
+        val level = if (sdk >= Build.VERSION_CODES.S) info.securityLevel else KeyProperties.SECURITY_LEVEL_SOFTWARE
+        @Suppress("DEPRECATION") // the only security-level reading below API 31
+        return isSecureLevel(level, info.isInsideSecureHardware, sdk)
     }
 
     private companion object {
@@ -224,12 +228,5 @@ internal class AndroidKeystoreKeys : KeystoreKeys {
         const val HMAC = "HmacSHA256"
         const val SECRET_BITS = 256
         const val P256_CURVE = "secp256r1"
-
-        /** The `KeyInfo.securityLevel` values that place a key in secure hardware (API 31+). */
-        val SECURE_LEVELS = setOf(
-            KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT,
-            KeyProperties.SECURITY_LEVEL_STRONGBOX,
-            KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE,
-        )
     }
 }

@@ -98,7 +98,7 @@ enum class CustodyType {
  *   software Ed25519 key that [KeyCustodyProvider.generateKeypair] creates (API 26-32), also to
  *   the EncryptedSharedPreferences entry `scp.ed25519.$id`; for a software HPKE P-256 key
  *   (API 26-30), to the entry `scp.p256.$id`. A P-256 or HPKE P-256 key also has the record
- *   `scp.keymeta.$id`, which names its type, its store and its custody class.
+ *   `scp.keymeta.$id`, which names its type, its store, its custody class and its role.
  * @property custodyType The custody class: for a P-256 or HPKE P-256 key, the class recorded
  *   at mint; otherwise [CustodyType.HARDWARE] for Keystore and [CustodyType.SOFTWARE] for
  *   Bouncy Castle. [AndroidKeyCustody] routes a P-256 or HPKE P-256 key by its record, never
@@ -110,15 +110,11 @@ data class KeyHandle(
 )
 
 /**
-
  * Attestation that a key has been destroyed.
  *
- * For a P-256 or HPKE P-256 key, [method] follows the custody class recorded at mint:
- * [DestructionMethod.HARDWARE] for a recorded [CustodyType.HARDWARE], otherwise
- * [DestructionMethod.SOFTWARE_ONLY]. For a Keystore Ed25519 key, [method] is
- * [DestructionMethod.HARDWARE] because Keystore held the key and deleted it; [AndroidKeyCustody]
- * does not read that key's `KeyInfo`, so the value does not show whether it sat in the TEE or
- * in a software KeyMint. For Bouncy Castle keys, [method] is [DestructionMethod.SOFTWARE_ONLY].
+ * [AndroidKeyCustody] reports [DestructionMethod.SOFTWARE_ONLY] for every key, Keystore keys
+ * included: Keystore issues no proof that it destroyed a key, and section 9.15 rates a
+ * destruction without a verified platform proof as software-only (ADR-027 criterion 4).
  *
  * See section 9.15 of the SCP specification for key destruction requirements.
  *
@@ -143,13 +139,18 @@ data class DestructionAttestation(
  */
 enum class DestructionMethod {
     /**
-     * Key material was deleted from software storage: the Bouncy Castle in-memory map and, for
-     * a persisted software key, its EncryptedSharedPreferences entry, removed with `commit()`;
-     * or from a Keystore whose `KeyInfo` reported a software security level at mint.
+     * Key material was deleted, with no platform proof of the destruction: from software
+     * storage (the Bouncy Castle in-memory map and, for a persisted software key, its
+     * EncryptedSharedPreferences entry, removed with `commit()`), or from Android Keystore,
+     * which confirms only that it no longer holds the alias. Every destruction
+     * [AndroidKeyCustody] performs reports this value.
      */
     SOFTWARE_ONLY,
 
-    /** Key material was deleted from Android Keystore (see [CustodyType.HARDWARE]). */
+    /**
+     * Key material was destroyed in secure hardware that proved the destruction (section 9.15).
+     * [AndroidKeyCustody] never reports it: Keystore issues no such proof.
+     */
     HARDWARE,
 }
 
@@ -426,7 +427,7 @@ interface KeyCustodyProvider {
      * @param keyHandle Handle to an X25519 or HPKE P-256 key. An Ed25519 or P-256 signing key
      *   never agrees.
      * @param peerPublic For X25519, the peer's 32-byte public key. For HPKE P-256, the peer's
-     *   65-byte uncompressed SEC1 point, checked on the curve before any key lookup.
+     *   65-byte uncompressed SEC1 point, checked on the curve before the key is used.
      * @return The 32-byte shared secret: the X25519 output, or the P-256 x-coordinate left-padded
      *   to 32 bytes.
      * @throws ScpException with code `SCP-CRYPTO-4006` if no key sits under [keyHandle].

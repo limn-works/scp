@@ -15,9 +15,13 @@
 // This class performs all signing and DH itself and returns signatures, shared secrets and
 // pseudonym points; no public method returns a private key (ADR-027 acceptance criterion 14).
 // The pseudonym secret of a Keystore identity is a Keystore HMAC-SHA256 key that never leaves
-// Keystore. The softwareKeys map is not behind that boundary: it is `internal`, so any code in
-// this module reads every software Ed25519 and X25519 key pair, and Kotlin compiles it to a
-// public JVM getter with a mangled name that Java code in an app can call.
+// Keystore. The softwareKeys map is `internal`, so code in this module reads every software
+// Ed25519 and X25519 key pair; it and every other internal member carry @JvmSynthetic, so Java
+// code in an app cannot reach them through their mangled public JVM names.
+//
+// The adapter runs in the app's main process only (ADR-027 criterion 1): construction anywhere
+// else throws SCP-CRYPTO-4060, because SharedPreferences.commit() writes a process's whole
+// cached map and two processes would lose each other's records.
 // UniffiKeyCustody wraps this class as the `scp-ffi-uniffi` bridge's
 // `uniffi.scp.KeyCustodyProvider`, so the `os_keystore` custody of spec 03 §3.2.2 reaches
 // Keystore through `SCP.identityCreateWithCustody(UniffiKeyCustody(it))`.
@@ -33,9 +37,12 @@
 
 package works.limn.scp.android.platform
 
+import android.app.ActivityManager
+import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
 import android.os.Build
+import android.os.Process
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import java.nio.ByteBuffer
@@ -72,6 +79,13 @@ import org.bouncycastle.crypto.signers.Ed25519Signer
  * recorded role, a P-256 record or a Keystore alias, so a live key never shares an id. Two
  * concurrent generations draw the same id with probability 2^-64.
  *
+ * ## Process
+ *
+ * The adapter runs in the app's main process only. [SharedPreferences.Editor.commit] writes the
+ * committing process's whole cached map, so two processes over one preferences file lose each
+ * other's records and roles; the production constructor throws `SCP-CRYPTO-4060` in any other
+ * process (ADR-027 criterion 1).
+ *
  * ## Key storage strategy
  *
  * - **P-256 (all API levels):** a Keystore `PURPOSE_SIGN` key over secp256r1 with
@@ -92,8 +106,9 @@ import org.bouncycastle.crypto.signers.Ed25519Signer
  * ## Errors
  *
  * Every public method throws only [ScpException]: `SCP-CRYPTO-4006` for a key it does not hold
- * (or whose mint is still pending), and `SCP-CRYPTO-4060` for every other failure, with the
- * original exception as the cause. An [Error] propagates unchanged.
+ * (or whose mint is still pending, which reads as absent), and `SCP-CRYPTO-4060` for every other
+ * failure, with the original exception as the cause. A P-256 record that does not parse fails
+ * only the operations on its own id. An [Error] propagates unchanged.
  *
  * ## Thread safety
  *
@@ -111,16 +126,19 @@ import org.bouncycastle.crypto.signers.Ed25519Signer
  * @property keystoreEd25519 Whether Ed25519 identities are generated in [keystore] (API 33+).
  * @param keystoreAgreement Whether HPKE P-256 keys are generated in [keystore] (API 31+), from
  *   [keystoreAgreementAvailable]. Only new mints read it; an existing key follows its record.
- * @param processTag This process's tag (see [currentProcessTag]). Construction sweeps every
- *   P-256 mint left pending by a process with another tag.
- * @throws ScpException with code `SCP-CRYPTO-4060` when the restore or the sweep fails.
+ * @param processTag This process's tag (see [currentProcessTag]). Construction sweeps, best
+ *   effort, every P-256 mint left pending under another tag.
+ * @param warn Where the sweep reports a pending mint it leaves in place.
+ * @throws ScpException with code `SCP-CRYPTO-4060` when a persisted Ed25519 seed cannot be
+ *   restored. The sweep never fails construction.
  */
-class AndroidKeyCustody internal constructor(
+class AndroidKeyCustody private constructor(
     private val encryptedPrefs: SharedPreferences,
-    private val keystore: KeystoreKeys = AndroidKeystoreKeys(),
-    private val keystoreEd25519: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
-    private val keystoreAgreement: Boolean = keystoreAgreementAvailable(Build.VERSION.SDK_INT),
-    processTag: String = currentProcessTag(),
+    private val keystore: KeystoreKeys,
+    private val keystoreEd25519: Boolean,
+    private val keystoreAgreement: Boolean,
+    processTag: String,
+    warn: (String, Throwable) -> Unit,
 ) : KeyCustodyProvider {
 
     /**
@@ -129,47 +147,52 @@ class AndroidKeyCustody internal constructor(
      *
      * @param context Android application context. Must be an application context
      *   (not an activity context) to avoid memory leaks from long-lived references.
+     * @throws ScpException with code `SCP-CRYPTO-4060` outside the app's main process, before
+     *   the preferences file is opened.
      */
     constructor(context: Context) : this(
-        EncryptedSharedPreferences.create(
-            PREFS_FILENAME,
-            MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC),
-            context.applicationContext,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-        ),
+        openPreferences(context),
+        androidKeystoreKeys(),
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
+        keystoreAgreementAvailable(Build.VERSION.SDK_INT),
+        currentProcessTag(),
+        ::logCustodyWarning,
     )
 
     /**
      * The software Ed25519 and X25519 key pairs (Bouncy Castle), by key id.
      *
-     * `internal`, not `private`, because the unit tests read it. Kotlin compiles an `internal`
-     * property to a public JVM getter with a mangled name, so Java code in an app can read every
-     * private key in this map.
+     * `internal`, not `private`, because the unit tests read it; `@JvmSynthetic`, so Java code
+     * in an app cannot call its mangled public JVM getter.
      */
+    @get:JvmSynthetic
     internal val softwareKeys = ConcurrentHashMap<String, AsymmetricCipherKeyPair>()
 
     /** The [KeyType] of each key in [softwareKeys]: [KeyType.ED25519] or [KeyType.X25519]. */
+    @get:JvmSynthetic
     internal val softwareKeyTypes = ConcurrentHashMap<String, KeyType>()
 
     private val softwareKeyOps = SoftwareKeyOps(softwareKeys, softwareKeyTypes, encryptedPrefs)
 
     /**
-     * The role each key was minted in. Every key but an X25519 key has its role persisted
-     * beside it in [encryptedPrefs]. `internal` so [UniffiKeyCustody] reports it.
+     * The role of each Ed25519 and X25519 key. Every Ed25519 key has its role persisted beside
+     * it in [encryptedPrefs]; an X25519 key's role lives in memory with the key. A P-256 key's
+     * role lives in its record instead (see [roleOf]).
      */
+    @get:JvmSynthetic
     internal val keyRoles = KeyRoles(encryptedPrefs)
 
-    /** The record of each P-256 and HPKE P-256 key. `internal` so [UniffiKeyCustody] reads its type. */
+    /** The record of each P-256 and HPKE P-256 key, its role included. */
+    @get:JvmSynthetic
     internal val keyRecords = KeyRecords(encryptedPrefs)
 
-    private val p256 = P256Keys(encryptedPrefs, keystore, keyRecords, processTag)
+    private val p256 = P256Keys(encryptedPrefs, keystore, keyRecords, processTag, warn)
 
     init {
         custodyGuarded {
             softwareKeyOps.restorePersistedEd25519Keys(keyRoles.persistedIds())
-            for (swept in p256.sweep()) keyRoles.forget(swept)
         }
+        p256.sweep()
     }
 
     // -----------------------------------------------------------------------
@@ -185,33 +208,44 @@ class AndroidKeyCustody internal constructor(
 
     /**
      * Generates a [keyType] keypair under a fresh decimal `ULong` id (see the class KDoc) and
-     * records [role] for the key's lifetime through [KeyRoles.mint], persisted before the key
-     * is created for every type but X25519. A failure leaves neither the key nor its role,
-     * except the one case [P256Keys.mint] names: a P-256 key whose rollback cannot be confirmed
-     * keeps its pending record, and `SCP-CRYPTO-4060` names the id for [destroyKeyById].
+     * records [role] for the key's lifetime. A P-256 key's record carries its role, committed in
+     * the one write that reserves the record before the key is created; an Ed25519 or X25519 key
+     * records its role through [KeyRoles.mint], persisted before the key is created for Ed25519.
+     * A failure leaves neither the key nor its role, except the one case [P256Keys.mint] names:
+     * a P-256 key whose rollback cannot be confirmed keeps its pending record, and
+     * `SCP-CRYPTO-4060` names the id for [destroyKeyById].
      *
      * @throws ScpException with code `SCP-CRYPTO-4060` if every drawn id is taken, a write does
      *   not commit, or the store fails.
      */
+    @JvmSynthetic
     internal fun generateKeypair(keyType: KeyType, role: KeyRole): KeyHandle = custodyGuarded {
         val keyId = generateSequence { SecureRandom().nextLong().toULong().toString() }
             .take(MINT_ATTEMPTS)
             .firstOrNull { id ->
                 !softwareKeys.containsKey(id) && !keyRoles.contains(id) && !keyRecords.contains(id) &&
-                    !keystore.containsAlias("scp.key.$id")
+                    !keystore.containsAlias(keyAlias(id))
             }
             ?: throw ScpException("No free key id after $MINT_ATTEMPTS draws", CUSTODY_ERROR)
-        keyRoles.mint(keyId, role, persist = keyType != KeyType.X25519) {
-            when (keyType) {
-                KeyType.ED25519 ->
-                    if (keystoreEd25519) keystore.generateIdentity(keyId) else softwareKeyOps.generateEd25519(keyId)
-                KeyType.X25519 -> softwareKeyOps.generateX25519(keyId)
-                KeyType.P256 -> p256.mint(keyId, KeyType.P256, Backing.KEYSTORE)
-                KeyType.HPKE_P256 ->
-                    p256.mint(keyId, KeyType.HPKE_P256, if (keystoreAgreement) Backing.KEYSTORE else Backing.SOFTWARE)
+        when (keyType) {
+            KeyType.P256 -> p256.mint(keyId, KeyType.P256, Backing.KEYSTORE, role)
+            KeyType.HPKE_P256 ->
+                p256.mint(keyId, KeyType.HPKE_P256, if (keystoreAgreement) Backing.KEYSTORE else Backing.SOFTWARE, role)
+            KeyType.ED25519 -> keyRoles.mint(keyId, role, persist = true) {
+                if (keystoreEd25519) keystore.generateIdentity(keyId) else softwareKeyOps.generateEd25519(keyId)
             }
+            KeyType.X25519 -> keyRoles.mint(keyId, role, persist = false) { softwareKeyOps.generateX25519(keyId) }
         }
     }
+
+    /**
+     * The role [keyId] was minted in: from its record for a P-256 key, read on every call, and
+     * from [keyRoles] otherwise; `null` when none is recorded.
+     *
+     * @throws ScpException with code `SCP-CRYPTO-4060` when the key's record does not parse.
+     */
+    @JvmSynthetic
+    internal fun roleOf(keyId: String): KeyRole? = keyRecords.get(keyId)?.role ?: keyRoles.roleOf(keyId)
 
     /**
      * The [KeyHandle] of the key named [keyId]: for a P-256 key, the custody its record holds;
@@ -221,12 +255,13 @@ class AndroidKeyCustody internal constructor(
      * @throws ScpException with code `SCP-CRYPTO-4006` when no store holds [keyId], or its P-256
      *   mint is still pending.
      */
+    @JvmSynthetic
     internal fun resolveKeyHandle(keyId: String): KeyHandle = custodyGuarded {
         val record = settledRecord(keyId)
         when {
             record != null -> KeyHandle(id = keyId, custodyType = checkNotNull(record.custody))
             softwareKeys.containsKey(keyId) -> KeyHandle(id = keyId, custodyType = CustodyType.SOFTWARE)
-            keystoreEd25519 && keystore.containsAlias("scp.key.$keyId") ->
+            keystoreEd25519 && keystore.containsAlias(keyAlias(keyId)) ->
                 KeyHandle(id = keyId, custodyType = CustodyType.HARDWARE)
             else -> throw ScpException("Key not found: $keyId", KEY_NOT_FOUND)
         }
@@ -274,32 +309,39 @@ class AndroidKeyCustody internal constructor(
     override fun destroyKey(keyHandle: KeyHandle): DestructionAttestation = destroyKeyById(keyHandle.id)
 
     /**
-     * Destroys the key named [keyId], confirms by re-fetch that its material is gone (section
-     * 9.15), then removes its role.
+     * Destroys the key named [keyId] and confirms by re-fetch that its material is gone (section
+     * 9.15). Every destruction reports [DestructionMethod.SOFTWARE_ONLY]: Keystore issues no
+     * proof that it destroyed a key, and §9.15 rates a destruction without a verified platform
+     * proof as software-only (ADR-027 criterion 4).
      *
      * - **A P-256 key, settled or pending:** deletes the Keystore alias or the committed scalar,
-     *   then the record. The method follows the recorded custody: [DestructionMethod.HARDWARE]
-     *   for "hardware", [DestructionMethod.SOFTWARE_ONLY] otherwise.
+     *   then the record, which holds the key's role.
+     * - **A P-256 key whose record does not parse:** deletes the alias and the scalar, whichever
+     *   exists, then the record.
      * - **A software Ed25519 or X25519 key:** removes it from [softwareKeys] and an Ed25519 seed
-     *   from [encryptedPrefs] with `commit()`, confirmed by re-reading the entry.
-     *   [DestructionMethod.SOFTWARE_ONLY]. Another instance in the same process that already
-     *   holds the key in its own map keeps it until that instance is gone.
+     *   from [encryptedPrefs] with `commit()`, confirmed by re-reading the entry, then its role.
+     *   Another instance in the same process that already holds the key in its own map keeps it
+     *   until that instance is gone.
      * - **A Keystore alias with no record** (an Ed25519 identity, or a P-256 key left by a crash
-     *   before its record), whatever the API level: deletes the pseudonym secret, then the alias.
-     *   [DestructionMethod.HARDWARE].
+     *   before its record), whatever the API level: deletes the pseudonym secret, then the alias,
+     *   then the role.
      *
-     * A retry after a failure completes the destroy.
+     * A retry after a failure removes what the failed attempt left. When the key material was
+     * already gone, the retry removes any pseudonym secret and role left behind and then throws
+     * `SCP-CRYPTO-4006`, as for a key the adapter never held.
      *
      * @return [DestructionAttestation] with `confirmed = true`; an unconfirmed deletion throws.
      * @throws ScpException with code `SCP-CRYPTO-4006` if no store holds [keyId].
      * @throws ScpException with code `SCP-CRYPTO-4060` if a deletion cannot be confirmed.
      */
+    @JvmSynthetic
     internal fun destroyKeyById(keyId: String): DestructionAttestation = custodyGuarded {
-        val record = keyRecords.get(keyId)
-        val attestation = when {
-            record != null -> p256.destroy(keyId, record)
-            softwareKeys.containsKey(keyId) -> softwareKeyOps.destroy(keyId)
-            else -> destroyKeystoreKey(keyId)
+        if (keyRecords.isUnreadable(keyId)) return@custodyGuarded p256.destroyUnreadable(keyId)
+        keyRecords.get(keyId)?.let { return@custodyGuarded p256.destroy(keyId, it) }
+        val attestation = if (softwareKeys.containsKey(keyId)) {
+            softwareKeyOps.destroy(keyId)
+        } else {
+            destroyKeystoreKey(keyId)
         }
         keyRoles.forget(keyId)
         attestation
@@ -325,7 +367,7 @@ class AndroidKeyCustody internal constructor(
         when {
             record != null -> p256.agree(keyHandle.id, record, peerPublic)
             keyHandle.custodyType == CustodyType.HARDWARE ->
-                if (!keystore.containsAlias("scp.key.${keyHandle.id}")) {
+                if (!keystore.containsAlias(keyAlias(keyHandle.id))) {
                     throw ScpException("Key not found in Keystore: ${keyHandle.id}", KEY_NOT_FOUND)
                 } else {
                     throw ScpException(
@@ -431,7 +473,7 @@ class AndroidKeyCustody internal constructor(
         }
         softwareKeyTypes.requireEd25519Identity(keyHandle, operation)
         if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            if (!keystore.containsAlias("scp.key.${keyHandle.id}")) {
+            if (!keystore.containsAlias(keyAlias(keyHandle.id))) {
                 throw ScpException("Key not found in Keystore: ${keyHandle.id}", KEY_NOT_FOUND)
             }
             val seed = PseudonymSecret.keystoreContextSeed(keystore, keyHandle.id, contextId, suffix)
@@ -463,34 +505,104 @@ class AndroidKeyCustody internal constructor(
      * Deletes the Keystore identity [keyId] and its pseudonym secret and confirms both are gone
      * (section 9.15): the secret first, so a failure between the two leaves the identity, and a
      * retry completes the destroy. An identity alias that is already absent reports
-     * `SCP-CRYPTO-4006`, after deleting any pseudonym secret left behind.
-     *
-     * Reports [DestructionMethod.HARDWARE] without reading `KeyInfo`, so a key that a software
-     * KeyMint held is over-claimed.
+     * `SCP-CRYPTO-4006`, after deleting any pseudonym secret and role left behind.
      */
     private fun destroyKeystoreKey(keyId: String): DestructionAttestation {
-        val keystoreAlias = "scp.key.$keyId"
+        val keystoreAlias = keyAlias(keyId)
         val secretAlias = PseudonymSecret.alias(keyId)
         if (!keystore.containsAlias(keystoreAlias)) {
             if (keystore.containsAlias(secretAlias)) keystore.deleteConfirmed(keyId, secretAlias)
+            if (keyRoles.contains(keyId)) keyRoles.forget(keyId)
             throw ScpException("Key not found: $keyId", KEY_NOT_FOUND)
         }
         keystore.deleteConfirmed(keyId, secretAlias, keystoreAlias)
-        return DestructionAttestation(method = DestructionMethod.HARDWARE, confirmed = true)
+        return DestructionAttestation(method = DestructionMethod.SOFTWARE_ONLY, confirmed = true)
     }
 
     companion object {
         /** Filename for the EncryptedSharedPreferences of the adapter's keys and records. */
         internal const val PREFS_FILENAME = "scp_key_custody"
 
-        /** The code for a key this adapter does not hold. */
-        private const val KEY_NOT_FOUND = "SCP-CRYPTO-4006"
-
         /**
          * The number of fresh ids [generateKeypair] draws before it gives up. Eight collisions
          * in a row among random 64-bit ids means the stores are not behaving, not bad luck.
          */
         private const val MINT_ATTEMPTS = 8
+
+        /** The process name [create] assumes when a test names none: the main process's own. */
+        private const val TEST_PROCESS = "works.limn.scp.test"
+
+        /**
+         * An adapter over [encryptedPrefs] and [keystore], for the JVM tests, after the same
+         * main-process check the production constructor makes: [processName] is this process's
+         * name and [mainProcessName] the app's main process name.
+         *
+         * @throws ScpException with code `SCP-CRYPTO-4060` when [processName] is not
+         *   [mainProcessName].
+         */
+        @JvmSynthetic
+        @Suppress("LongParameterList") // one parameter per injected dependency
+        internal fun create(
+            encryptedPrefs: SharedPreferences,
+            keystore: KeystoreKeys,
+            keystoreEd25519: Boolean = false,
+            keystoreAgreement: Boolean = false,
+            processTag: String = currentProcessTag(),
+            processName: String? = TEST_PROCESS,
+            mainProcessName: String = TEST_PROCESS,
+            warn: (String, Throwable) -> Unit = ::logCustodyWarning,
+        ): AndroidKeyCustody {
+            requireMainProcess(processName, mainProcessName)
+            return AndroidKeyCustody(encryptedPrefs, keystore, keystoreEd25519, keystoreAgreement, processTag, warn)
+        }
+
+        /**
+         * The production preferences, opened only after [requireMainProcess] has checked that
+         * this is the app's main process.
+         */
+        private fun openPreferences(context: Context): SharedPreferences {
+            requireMainProcess(currentProcessName(context), context.applicationInfo.processName)
+            return EncryptedSharedPreferences.create(
+                PREFS_FILENAME,
+                MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC),
+                context.applicationContext,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+            )
+        }
+
+        /**
+         * This process's name: `Application.getProcessName()` from API 28, and below it the
+         * entry of `ActivityManager.runningAppProcesses` whose pid is this process's. `null`
+         * when it cannot be read.
+         */
+        private fun currentProcessName(context: Context): String? =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                Application.getProcessName()
+            } else {
+                (context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager)
+                    ?.runningAppProcesses
+                    ?.firstOrNull { it.pid == Process.myPid() }
+                    ?.processName
+            }
+    }
+}
+
+/**
+ * Refuses to build an adapter outside the app's main process: [processName] is this process's
+ * name, `null` when it could not be read, and [mainProcessName] the app's main process name.
+ *
+ * @throws ScpException with code `SCP-CRYPTO-4060` naming the rule when they differ.
+ */
+internal fun requireMainProcess(processName: String?, mainProcessName: String) {
+    if (processName == null || processName != mainProcessName) {
+        throw ScpException(
+            "AndroidKeyCustody runs only in the app's main process ($mainProcessName), not in " +
+                "${processName ?: "an unnamed process"}: SharedPreferences.commit() writes a " +
+                "process's whole cached map, so two processes lose each other's key records " +
+                "(ADR-027 acceptance criterion 1)",
+            CUSTODY_ERROR,
+        )
     }
 }
 
@@ -526,7 +638,7 @@ private fun Map<String, KeyType>.requireEd25519Identity(keyHandle: KeyHandle, op
  */
 @Suppress("TooGenericExceptionCaught") // any failure must delete the half-made identity
 private fun KeystoreKeys.generateIdentity(keyId: String): KeyHandle {
-    val keystoreAlias = "scp.key.$keyId"
+    val keystoreAlias = keyAlias(keyId)
     generateEd25519(keystoreAlias)
     try {
         generateHmacSha256(PseudonymSecret.alias(keyId))
@@ -545,14 +657,14 @@ private fun KeystoreKeys.generateIdentity(keyId: String): KeyHandle {
 
 /** The Keystore Ed25519 private key entry of [keyId], or `SCP-CRYPTO-4006` when it is absent. */
 private fun KeystoreKeys.ed25519Entry(keyId: String): KeyStore.PrivateKeyEntry {
-    val alias = "scp.key.$keyId"
+    val alias = keyAlias(keyId)
     val entry = if (containsAlias(alias)) {
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.getEntry(alias, null)
     } else {
         null
     }
     return entry as? KeyStore.PrivateKeyEntry
-        ?: throw ScpException("Key not found in Keystore: $keyId", "SCP-CRYPTO-4006")
+        ?: throw ScpException("Key not found in Keystore: $keyId", KEY_NOT_FOUND)
 }
 
 /** Signs [data] with the Keystore Ed25519 key [keyId]; Keystore holds the private key. */
@@ -621,7 +733,7 @@ internal class SoftwareKeyOps(
     /** Signs [data] with the software Ed25519 key under [keyHandle]; any other type is 4060. */
     fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
         val keyPair = softwareKeys[keyHandle.id]
-            ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4006")
+            ?: throw ScpException("Key not found: ${keyHandle.id}", KEY_NOT_FOUND)
         when (val type = softwareKeyTypes[keyHandle.id]) {
             KeyType.ED25519 -> Unit
             KeyType.X25519, KeyType.P256, KeyType.HPKE_P256, null ->
@@ -646,7 +758,7 @@ internal class SoftwareKeyOps(
         // The key comes first: the peer's format depends on its type, so an unknown key is
         // SCP-CRYPTO-4006 whatever the peer.
         val keyPair = softwareKeys[keyHandle.id]
-            ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4006")
+            ?: throw ScpException("Key not found: ${keyHandle.id}", KEY_NOT_FOUND)
         val private = keyPair.private as? X25519PrivateKeyParameters
             ?: throw ScpException(
                 "dhAgree requires an X25519 key; handle '${keyHandle.id}' is Ed25519, and an " +
@@ -666,7 +778,7 @@ internal class SoftwareKeyOps(
     /** The raw 32-byte public key of the software key under [keyHandle]. */
     fun publicKey(keyHandle: KeyHandle): ByteArray {
         val keyPair = softwareKeys[keyHandle.id]
-            ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4006")
+            ?: throw ScpException("Key not found: ${keyHandle.id}", KEY_NOT_FOUND)
         return when (val type = softwareKeyTypes[keyHandle.id]) {
             KeyType.X25519 -> (keyPair.public as X25519PublicKeyParameters).encoded
             KeyType.ED25519 -> (keyPair.public as Ed25519PublicKeyParameters).encoded
