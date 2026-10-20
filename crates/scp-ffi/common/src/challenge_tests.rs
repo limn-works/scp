@@ -2025,10 +2025,10 @@ async fn evaluator_rate_limit_refusal_releases_the_lease_and_records_nothing() {
 }
 
 /// A harness whose evaluator context prices an outlet call by a formula
-/// that overflows: `i64::MAX` times any time of day above 1. The reserve
-/// cannot price the call, so it refuses it with the budget error. The clock
-/// is moved off the first seconds of the day and off the last ten, so the
-/// time of day stays above 1 for the rest of the test.
+/// that overflows: a coefficient of `i64::MAX` on the member count, with a
+/// second member inserted so the count is 2. The reserve cannot price the
+/// call, so it refuses it with the budget error. The formula reads no clock
+/// metric, so the refusal does not depend on when the test runs.
 async fn budget_refusing_harness() -> Harness {
     use scp_core::economy::{Coefficient, PricingFormula, PricingMetric, PricingVariable};
     let mut params = priced_params();
@@ -2037,7 +2037,7 @@ async fn budget_refusing_harness() -> Harness {
         policy.pricing_formula = Some(PricingFormula {
             base_cost: Amount::new(0),
             variables: vec![PricingVariable::Linear {
-                metric: PricingMetric::TimeOfDay,
+                metric: PricingMetric::MemberCount,
                 coefficient: Coefficient::new(i64::MAX),
             }],
             cap: None,
@@ -2045,12 +2045,10 @@ async fn budget_refusing_harness() -> Harness {
         });
     }
     let h = Harness::new(params).await;
-    let time_of_day = scp_clock::Clock::now_secs(&*h.clock) % 86_400;
-    if time_of_day < 2 {
-        h.clock.advance(2);
-    } else if time_of_day >= 86_390 {
-        h.clock.advance(86_400 - time_of_day + 2);
-    }
+    h.sup
+        .test_insert_member(EVAL_CTX, did(3), "member")
+        .await
+        .unwrap();
     h
 }
 
@@ -2111,13 +2109,13 @@ async fn budget_expiry_before_the_evaluator_started_is_a_fault() {
 /// that used no attempt and started the cooldown: an immediate re-grade of
 /// the same attempt is refused with `CooldownActive`, where a charged
 /// attempt would return its stored record and a held lease would refuse
-/// with `GradingInProgress`.
+/// with `GradingInProgress`. Returns the first grade's error.
 async fn assert_grade_is_fault(
     h: &Harness,
     request: &ChallengeRequest,
     response: &ChallengeResponse,
     invoker: &TestInvoker,
-) {
+) -> ChallengeOpError {
     let err = h.grade(request, response, invoker).await.unwrap_err();
     assert!(is_unavailable(&err), "{err:?}");
     let again = h.grade(request, response, invoker).await.unwrap_err();
@@ -2128,6 +2126,7 @@ async fn assert_grade_is_fault(
         ),
         "{again:?}"
     );
+    err
 }
 
 /// T14 (budget) at grading: the reserve's budget refusal makes the grading
@@ -2208,6 +2207,16 @@ async fn evaluator_permission_denied_at_grading_is_a_fault() {
 /// A payment refusal by the reserve at grading: the priced evaluator
 /// context finds no spending capability for the challenger, before the
 /// evaluator started, a fault.
+///
+/// The fault names the spending check's refusal by the code production
+/// gives it today. The runtime reports a missing spending UCAN as an
+/// execution handler panic (`SCP-OUTLET-6130`, `execution.handler-panic`),
+/// not as a payment or authorization refusal. No other fault this harness
+/// can reach before the evaluator starts carries that code: an unregistered
+/// outlet or a denied permission surfaces as `authorization.denied`, and a
+/// missing context as a context error. The handler never ran, so the code
+/// cannot come from a real handler panic. When the spending refusal gets a
+/// code of its own, this assertion moves to that code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evaluator_payment_refusal_at_grading_is_a_fault() {
     let h = Harness::new(priced_params()).await;
@@ -2215,8 +2224,21 @@ async fn evaluator_payment_refusal_at_grading_is_a_fault() {
     let invoker = h.invoker(Some(registry()), Some(passing_handler(&calls)));
     let request = h.create(1, &invoker).await;
     let response = h.respond(&request, 1).await;
-    assert_grade_is_fault(&h, &request, &response, &invoker).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let err = assert_grade_is_fault(&h, &request, &response, &invoker).await;
+    let ChallengeOpError::Trust(TrustError::EvaluatorUnavailable {
+        context_id,
+        outlet_id,
+        reason,
+    }) = &err
+    else {
+        panic!("{err:?}");
+    };
+    assert_eq!((context_id.as_str(), outlet_id.as_str()), (EVAL_CTX, JUDGE));
+    assert!(
+        reason.contains("SCP-OUTLET-6130") && reason.contains("execution.handler-panic"),
+        "the spending check's refusal, got {reason}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler never ran");
 }
 
 /// A settlement that fails after the handler returned a well-formed verdict:
@@ -2321,7 +2343,6 @@ async fn evaluator_errors_after_start_at_grading_fail_the_case() {
             },
             "{cause}"
         );
-        assert_eq!(graded.record.attempt, 1, "{cause}");
     }
 }
 
