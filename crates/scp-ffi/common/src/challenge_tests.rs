@@ -2024,21 +2024,20 @@ async fn evaluator_rate_limit_refusal_releases_the_lease_and_records_nothing() {
     assert_eq!(calls.load(Ordering::SeqCst), 11);
 }
 
-/// T14 (budget): a reserve that cannot price the call refuses it with the
-/// budget error, and the evaluator outcome is a capacity refusal naming the
-/// budget; the handler never runs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn evaluator_budget_refusal_is_a_capacity_refusal() {
+/// A harness whose evaluator context prices an outlet call by a formula
+/// that overflows: a coefficient of `i64::MAX` on the member count, with a
+/// second member inserted so the count is 2. The reserve cannot price the
+/// call, so it refuses it with the budget error. The formula reads no clock
+/// metric, so the refusal does not depend on when the test runs.
+async fn budget_refusing_harness() -> Harness {
     use scp_core::economy::{Coefficient, PricingFormula, PricingMetric, PricingVariable};
     let mut params = priced_params();
     if let Some(policy) = params.economic_policy.as_mut() {
         policy.cost_schedule.per_outlet_call = None;
-        // `i64::MAX` times any time of day above 1 overflows, so the cost
-        // cannot be computed.
         policy.pricing_formula = Some(PricingFormula {
             base_cost: Amount::new(0),
             variables: vec![PricingVariable::Linear {
-                metric: PricingMetric::TimeOfDay,
+                metric: PricingMetric::MemberCount,
                 coefficient: Coefficient::new(i64::MAX),
             }],
             cap: None,
@@ -2046,9 +2045,19 @@ async fn evaluator_budget_refusal_is_a_capacity_refusal() {
         });
     }
     let h = Harness::new(params).await;
-    if scp_clock::Clock::now_secs(&*h.clock) % 86_400 < 2 {
-        h.clock.advance(2);
-    }
+    h.sup
+        .test_insert_member(EVAL_CTX, did(3), "member")
+        .await
+        .unwrap();
+    h
+}
+
+/// T14 (budget): a reserve that cannot price the call refuses it with the
+/// budget error, and the evaluator outcome is a capacity refusal naming the
+/// budget; the handler never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_budget_refusal_is_a_capacity_refusal() {
+    let h = budget_refusing_harness().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let outcome = invoke(&h, passing_handler(&calls)).await;
     assert!(
@@ -2094,6 +2103,251 @@ async fn budget_expiry_before_the_evaluator_started_is_a_fault() {
         "{again:?}"
     );
     drop(stall);
+}
+
+/// Asserts that a grade of `response` is a fault (`EvaluatorUnavailable`)
+/// that used no attempt and started the cooldown: an immediate re-grade of
+/// the same attempt is refused with `CooldownActive`, where a charged
+/// attempt would return its stored record and a held lease would refuse
+/// with `GradingInProgress`. Returns the first grade's error.
+async fn assert_grade_is_fault(
+    h: &Harness,
+    request: &ChallengeRequest,
+    response: &ChallengeResponse,
+    invoker: &TestInvoker,
+) -> ChallengeOpError {
+    let err = h.grade(request, response, invoker).await.unwrap_err();
+    assert!(is_unavailable(&err), "{err:?}");
+    let again = h.grade(request, response, invoker).await.unwrap_err();
+    assert!(
+        matches!(
+            again,
+            ChallengeOpError::Trust(TrustError::CooldownActive { .. })
+        ),
+        "{again:?}"
+    );
+    err
+}
+
+/// T14 (budget) at grading: the reserve's budget refusal makes the grading
+/// a capacity refusal (7146) naming the budget. The lease is released and
+/// neither an attempt nor a fault is recorded: an immediate re-grade passes
+/// Begin (no `GradingInProgress`, no `CooldownActive`) and is refused for
+/// capacity again. The handler never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_budget_refusal_at_grading_releases_the_lease_and_records_nothing() {
+    let h = budget_refusing_harness().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoker = h.invoker(Some(registry()), Some(passing_handler(&calls)));
+    let request = h.create(1, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    for _ in 0..2 {
+        let err = h.grade(&request, &response, &invoker).await.unwrap_err();
+        let ChallengeOpError::Trust(trust) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            matches!(
+                trust,
+                TrustError::GradingCapacityExhausted {
+                    cause: GradingCapacityCause::EvaluatorBudget,
+                    ..
+                }
+            ),
+            "{trust:?}"
+        );
+        assert_eq!(
+            crate::error_codes::trust_error_code(trust),
+            crate::error_codes::VALID_7146
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// An evaluator context whose actor is no longer registered when the
+/// response is graded: the challenge was created against it, so only the
+/// grading can see it gone. The reserve fails before the evaluator started,
+/// a fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_context_unregistered_at_grading_is_a_fault() {
+    let h = Harness::new(evaluator_params()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoker = h.invoker(Some(registry()), Some(passing_handler(&calls)));
+    let request = h.create(1, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    assert!(h.sup.despawn_actor(EVAL_CTX).await);
+    assert_grade_is_fault(&h, &request, &response, &invoker).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// A challenger whose invocation permission on the evaluator outlet is
+/// withdrawn after the challenge was created: its role becomes `observer`,
+/// which holds only `messages:read`. The invocation is refused before the
+/// evaluator started, a fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_permission_denied_at_grading_is_a_fault() {
+    let h = Harness::new(evaluator_params()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoker = h.invoker(Some(registry()), Some(passing_handler(&calls)));
+    let request = h.create(1, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    h.sup
+        .test_insert_member(EVAL_CTX, did(1), "observer")
+        .await
+        .unwrap();
+    let outcome = invoke(&h, passing_handler(&calls)).await;
+    let EvaluatorOutcome::Unavailable(reason) = &outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(reason.contains("authorization.denied"), "{reason}");
+    assert_grade_is_fault(&h, &request, &response, &invoker).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// A payment refusal by the reserve at grading: the priced evaluator
+/// context finds no spending capability for the challenger, before the
+/// evaluator started, a fault.
+///
+/// The fault names the spending check's refusal by the code production
+/// gives it today. The runtime reports a missing spending UCAN as an
+/// execution handler panic (`CODE_EXECUTION_FAULT`, slug
+/// `SLUG_EXECUTION_HANDLER_PANIC`),
+/// not as a payment or authorization refusal. No other fault this harness
+/// can reach before the evaluator starts carries that code: an unregistered
+/// outlet or a denied permission surfaces as `authorization.denied`, and a
+/// missing context as a context error. The handler never ran, so the code
+/// cannot come from a real handler panic. When the spending refusal gets a
+/// code of its own, this assertion moves to that code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_payment_refusal_at_grading_is_a_fault() {
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_EXECUTION_FAULT, SLUG_EXECUTION_HANDLER_PANIC,
+    };
+    let h = Harness::new(priced_params()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoker = h.invoker(Some(registry()), Some(passing_handler(&calls)));
+    let request = h.create(1, &invoker).await;
+    let response = h.respond(&request, 1).await;
+    let err = assert_grade_is_fault(&h, &request, &response, &invoker).await;
+    let ChallengeOpError::Trust(TrustError::EvaluatorUnavailable {
+        context_id,
+        outlet_id,
+        reason,
+    }) = &err
+    else {
+        panic!("{err:?}");
+    };
+    assert_eq!((context_id.as_str(), outlet_id.as_str()), (EVAL_CTX, JUDGE));
+    assert!(
+        reason.contains(CODE_EXECUTION_FAULT) && reason.contains(SLUG_EXECUTION_HANDLER_PANIC),
+        "the spending check's refusal, got {reason}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler never ran");
+}
+
+/// A settlement that fails after the handler returned a well-formed verdict:
+/// the evaluator context dies while the handler runs. The verdict is
+/// discarded and the grading is a fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_settle_failure_at_grading_discards_the_verdict() {
+    let h = Harness::new(evaluator_params()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let request = h
+        .create(
+            1,
+            &h.invoker(Some(registry()), Some(passing_handler(&calls))),
+        )
+        .await;
+    let response = h.respond(&request, 1).await;
+    let poisoning: EvaluatorHandler = {
+        let (sup, calls) = (Arc::clone(&h.sup), Arc::clone(&calls));
+        Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::runtime::Handle::current().block_on(sup.test_poison_context(EVAL_CTX));
+            Ok(verdict(true))
+        })
+    };
+    let invoker = h.invoker(Some(registry()), Some(poisoning));
+    assert_grade_is_fault(&h, &request, &response, &invoker).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the handler ran once");
+}
+
+/// Every evaluator error after the evaluator started, met at grading,
+/// fails its case and charges the attempt: an input or output schema
+/// mismatch, an output schema at the backtrack limit, a handler panic, a
+/// malformed verdict and a handler error. The timeout is
+/// `evaluator_error_and_budget_overrun_fail_the_case`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_errors_after_start_at_grading_fail_the_case() {
+    let h = Harness::new(evaluator_params()).await;
+    let ready = h.invoker(Some(registry()), Some(passing_handler(&Arc::default())));
+    let mut input_refused = judge();
+    input_refused.schema.input_schema = json!({"type": "object", "required": ["missing"]});
+    let mut input_refused_registry = OutletRegistry::new();
+    input_refused_registry.insert(input_refused);
+    let backtracking = json!({
+        "type": "object",
+        "properties": {"reason": {"type": "string", "pattern": "^(a*)*\\1b$"}}
+    });
+    let long_reason = json!({"passed": true, "reason": "a".repeat(64)});
+    let returning = |output: Value| -> EvaluatorHandler { Arc::new(move |_| Ok(output.clone())) };
+    let causes: Vec<(&str, OutletRegistry, EvaluatorHandler)> = vec![
+        (
+            "input schema mismatch",
+            input_refused_registry,
+            returning(verdict(true)),
+        ),
+        (
+            "output schema mismatch",
+            registry_with_output_schema(
+                json!({"type": "object", "required": ["passed", "reason", "score"]}),
+            ),
+            returning(verdict(true)),
+        ),
+        (
+            "backtrack limit",
+            registry_with_output_schema(backtracking),
+            returning(long_reason),
+        ),
+        (
+            "handler panic",
+            registry(),
+            Arc::new(|_| panic!("evaluator handler panicked")),
+        ),
+        (
+            "malformed verdict",
+            registry(),
+            returning(json!({"passed": true})),
+        ),
+        (
+            "handler error",
+            registry(),
+            Arc::new(|_| Err("evaluator crashed".to_owned())),
+        ),
+    ];
+    // Every response is signed before the test clock runs ahead: the
+    // subject side reads the wall clock.
+    let mut challenges = Vec::new();
+    for subject in SUBJECT_SEEDS.take(causes.len()) {
+        let request = h.create_for(subject, 1, &ready).await;
+        let response = h.respond_as(subject, &request, 1).await;
+        challenges.push((request, response));
+    }
+    for ((cause, registry, handler), (request, response)) in causes.into_iter().zip(challenges) {
+        let invoker = h.invoker(Some(registry), Some(handler));
+        let graded = h
+            .grade(&request, &response, &invoker)
+            .await
+            .unwrap_or_else(|e| panic!("{cause}: {e:?}"));
+        assert_eq!(
+            graded.reasons[19],
+            CaseResult {
+                passed: false,
+                reason: Some(EVALUATOR_FAILED_REASON.to_owned()),
+            },
+            "{cause}"
+        );
+    }
 }
 
 /// T16: a supervisor shutdown waits for an evaluator pipeline that has not

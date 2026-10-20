@@ -1380,6 +1380,16 @@ mod tests {
         );
     }
 
+    /// BER long form `0x81 0x06` for a 6-byte body: the value fits the short
+    /// form, so the encoding is not minimal.
+    #[test]
+    fn der_rejects_long_form_sequence_length() {
+        assert_der_rejected(
+            &[0x30, 0x81, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01],
+            P256Error::MalformedDer("SEQUENCE length is not short form"),
+        );
+    }
+
     /// The SEQUENCE length covers the whole input, and a byte follows the
     /// second INTEGER inside it.
     #[test]
@@ -1403,6 +1413,16 @@ mod tests {
         assert_der_rejected(
             &[0x30, 0x06, 0x04, 0x01, 0x01, 0x02, 0x01, 0x01],
             P256Error::MalformedDer("expected INTEGER tag"),
+        );
+    }
+
+    /// BER long form `0x81 0x01` for a 1-byte `r`: the value fits the short
+    /// form, so the encoding is not minimal.
+    #[test]
+    fn der_rejects_long_form_integer_length() {
+        assert_der_rejected(
+            &[0x30, 0x07, 0x02, 0x81, 0x01, 0x01, 0x02, 0x01, 0x01],
+            P256Error::MalformedDer("INTEGER length is not short form"),
         );
     }
 

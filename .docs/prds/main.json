@@ -10558,7 +10558,7 @@
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         ".docs/adrs/phase-1.md",
         ".docs/adrs/phase-4.md",
