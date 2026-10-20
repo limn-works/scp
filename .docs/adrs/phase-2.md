@@ -824,7 +824,7 @@ pub enum EventType {
     // §19 / §5.11A / §9.9 protocol action.
     AdminTransferred,             // TransferAdmin
     CeilingModified,              // ModifyCeiling applied
-    CeilingModificationPending,   // ModifyCeiling delay-window start; ADR-066 decision 18 removed the delay, so no Commit carries it
+    CeilingModificationPending,   // a recording Commit's one leaf: records a ModifyCeiling proposal for a later Commit to execute (ADR-066 decision 20)
     ThresholdModified,            // ModifyThreshold §4b
     SignerAdded,                  // AddSigner §4b
     SignerRemoved,                // RemoveSigner §4b
