@@ -296,9 +296,12 @@ fn continuity_key_state(root: &[[u8; 33]], active: [u8; 33]) -> KeyState {
     }
 }
 
-/// §9.11 over an `#active` rotation built as a `KeyState` event builds it:
-/// the new key `Current` and the old key's `Superseded` drop entry listed
-/// ahead of it (`09-security-model.md` §9.7.4.2 R8). The rotating party
+/// §9.11 over an `#active` rotation composed as a `KeyState`
+/// (`09-security-model.md` §9.7.4.2 R3): the new key `Current` and the old
+/// key's `Superseded` drop entry. No spec clause orders the drop entry
+/// against the new key; this test lists it first by its own choice, and the
+/// fingerprint ignores the position because it reads only `Current`
+/// entries. The rotating party
 /// carries the higher identifier and a two-member root set. The fingerprint
 /// changes, and both argument orders give one value over the rotated state.
 #[test]
