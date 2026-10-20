@@ -466,7 +466,7 @@
       ],
       "description": "Implement the IdentityBackend trait (§3.10.10), the protocol's one resolution entry point. resolve takes the identifier's 32 raw digest bytes and returns a ResolutionOutcome carrying a verdict, key state, and sources. The resolver queries the identity's own relays and the fallback set in parallel, with per-relay 10-second timeouts, and counts a response only where it verified that chain. Fork precedence ranks two diverging chains (§9.7.4.2 R6). The resolver settles and counts only the sources its page walk read to exhaustion (§3.10.4 steps 4 and 5).",
       "acceptanceCriteria": [
-        "IdentityBackend::resolve(&self, identifier: &[u8; 32]) -> Result<ResolutionOutcome, IdentityError> (§3.10.10)",
+        "IdentityBackend::resolve(&self, identifier: &Identifier) -> Result<ResolutionOutcome, IdentityError> (§3.10.10)",
         "ResolutionOutcome carries verdict, key_state, and sources; key_state is present on Confirmed and Adopted alone",
         "ResolutionSources carries relays_reached, unexhausted, declared, proven, and head_provenance, with `declared` and `proven` holding 33-byte SEC1 compressed operator keys because R11's first-contact floor counts keys and never declared operator identifiers (`03-identity.md` §3.10.10, `09-security-model.md` §9.7.4.2 R11)",
         "The resolver queries both relay sets concurrently via tokio::join! (§3.10.4 step 2)",

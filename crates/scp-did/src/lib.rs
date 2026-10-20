@@ -15,15 +15,29 @@
 //! `DidMethod` trait, and lifecycle management — lives in `scp-identity`, which
 //! imports this data model. See ADR-057's Amendment (2026-06-30) for the crate
 //! topology.
+//!
+//! Beside that legacy model, the crate holds the key-event data model
+//! (SCP-308): the [`Identifier`] and its `scp:` text form (`03-identity.md`
+//! §3.1), and the [`KeyState`] with its name-bound enumerations
+//! (`09-security-model.md` §9.7.4.2).
 
 pub mod attestation;
 pub mod document;
+mod identifier;
+mod key_state;
 mod relay_url;
 
 pub use document::{
     ABSENT_BRIDGE_TARGET, BridgeTarget, DidDocument, DidError, DidRotationEvent, MigrationProof,
     PreRotationProof, RelayService, SCP_RELAY_SERVICE_TYPE, Service, VerificationMethod,
     decode_multibase_key,
+};
+pub use identifier::{
+    Identifier, IdentifierError, NonCanonicalReason, is_canonical_identifier_text,
+};
+pub use key_state::{
+    CommitmentEntry, CustodyType, DiscriminatorKind, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
+    KeyState, StandingCommitment, UnknownDiscriminator,
 };
 pub use relay_url::{
     BridgeEndpoint, RelayEndpoint, RelayEntryUrlError, RelayUrlError, canonical_relay_url,

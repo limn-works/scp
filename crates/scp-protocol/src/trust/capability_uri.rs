@@ -35,9 +35,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use scp_did::is_canonical_identifier_text;
 use serde::{Deserialize, Serialize};
-
-use crate::identity::text_form::is_canonical_identifier_text;
 
 // ---------------------------------------------------------------------------
 // Error type

@@ -15,6 +15,11 @@ This crate owns:
   validation.
 - `DidError` — the synchronous errors those types construct.
 - the [`attestation`] module — key-custody and identity-link attestation types.
+- `Identifier` — the 32-byte identity identifier, with its one canonical `scp:`
+  text form and `is_canonical_identifier_text` (`03-identity.md` §3.1).
+- `KeyState`, `KeyEntry`, `StandingCommitment`, `CommitmentEntry` and the
+  name-bound `KeyRole`, `KeyCondition`, `CustodyType` and `KeyAlgorithm` — the
+  key-event data model (`09-security-model.md` §9.7.4.2).
 
 Every type here is a pure synchronous value type with no async, no `tokio`, and
 no `scp-platform` coupling, so the crate compiles to
