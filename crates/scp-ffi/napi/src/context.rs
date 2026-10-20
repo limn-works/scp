@@ -5447,14 +5447,13 @@ fn parse_template_id_napi(
 /// `SCP-CTX-2130`, `SupervisorShutDown` `SCP-CTX-2138`, `Custody` its custody
 /// code, a malformed invitation `enc` `SCP-VALID-7005`, and so on. A variant
 /// with no dedicated code reports `code`, the call's fixed fallback.
-fn typed_supervisor_failure(
+pub(crate) fn typed_supervisor_failure(
     op: &str,
     code: &str,
     e: &scp_core::context::ContextError,
 ) -> ScpNapiError {
-    use scp_ffi_common::context_error_class::{ContextErrorClass, classify_context_error};
     let message = format!("{op} failed: {e}");
-    if matches!(classify_context_error(e), ContextErrorClass::Generic) {
+    if !scp_ffi_common::context_error_class::has_dedicated_code(e) {
         return ScpNapiError::Context {
             message,
             code: code.to_owned(),
@@ -5463,21 +5462,22 @@ fn typed_supervisor_failure(
     ScpNapiError::from_context_error(message, e)
 }
 
-/// Maps a refused `CreateContext` to its SDK error. The core's empty-ceiling
-/// rejection keeps its typed validation code (construction.md M2), and a
-/// create refused because Supervisor shutdown began keeps SCP-CTX-2138; every
-/// other failure carries SCP-CTX-2000.
-fn create_context_failure(e: scp_core::context::builder::ContextCreationError) -> ScpNapiError {
-    match e {
-        scp_core::context::builder::ContextCreationError::StateTransition(
-            scp_core::context::ContextError::CeilingRequired(_)
-            | scp_core::context::ContextError::SupervisorShutDown(_),
-        ) => ScpNapiError::from(e),
-        other => ScpNapiError::Context {
+/// Maps a refused `CreateContext` to its SDK error. A wrapped error with a
+/// dedicated code keeps it (`scp_ffi_common::context_error_class::
+/// coded_creation_failure`): the core's empty-ceiling rejection its validation
+/// code (construction.md M2), a create refused because Supervisor shutdown
+/// began SCP-CTX-2138, a custody failure its custody code. Every other failure
+/// carries SCP-CTX-2000.
+pub(crate) fn create_context_failure(
+    e: scp_core::context::builder::ContextCreationError,
+) -> ScpNapiError {
+    scp_ffi_common::context_error_class::coded_creation_failure(e).map_or_else(
+        |other| ScpNapiError::Context {
             message: format!("create_context failed: {other}"),
             code: codes::CTX_2000.to_owned(),
         },
-    }
+        ScpNapiError::from,
+    )
 }
 
 /// Dispatches `cmd` to `context_id` through the Supervisor `supervisor` still
@@ -6426,6 +6426,80 @@ mod tests {
                 .await
                 .expect("the identity has a custody wrapping key"),
             "0xFF01 is the identity's custody wrapping key"
+        );
+    }
+
+    /// A self-join mint whose registered `#active` handle holds a key other
+    /// than the one the identity's DID document resolves as `#active` mints
+    /// nothing and fails with `SCP-CRYPTO-4066` (§9.7.1).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_join_mint_refuses_a_handle_that_is_not_the_resolved_active_key() {
+        use scp_platform::KeyCustody as _;
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create succeeds")
+            .inner
+            .did
+            .clone();
+        crate::runtime::init_supervisor(&bi, &did);
+        let custody =
+            crate::runtime::with_identity(&bi, &did, |e| Ok(Arc::clone(&e.custody))).unwrap();
+        let other = custody
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .expect("custody generates a second Ed25519 key");
+        crate::runtime::with_identity_mut(&bi, &did, |e| {
+            e.identity.active_signing_key = other;
+            Ok(())
+        })
+        .unwrap();
+
+        let err = super::mint_self_join_key_package(&bi, &did)
+            .await
+            .expect_err("a handle that is not the resolved #active mints nothing");
+        assert!(
+            err.reason
+                .starts_with(&format!("[{}] ", codes::CRYPTO_4066)),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// A self-join mint for an identity whose DID document does not resolve
+    /// mints nothing and fails with `SCP-CRYPTO-4065` (§9.7.1). The identity's
+    /// custody and keys are real; only the DID it is registered under has no
+    /// published document.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_join_mint_fails_closed_when_the_owner_does_not_resolve() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create succeeds")
+            .inner
+            .did
+            .clone();
+        crate::runtime::init_supervisor(&bi, &did);
+        let unpublished = "did:dht:z6MkSelfJoinOwnerNeverPublished";
+        let (_, entry) = crate::runtime::identity_registry(&bi)
+            .remove(&did)
+            .expect("the identity is registered");
+        crate::runtime::register_identity(&bi, unpublished, entry);
+
+        let err = super::mint_self_join_key_package(&bi, unpublished)
+            .await
+            .expect_err("an owner that does not resolve mints nothing");
+        assert!(
+            err.reason
+                .starts_with(&format!("[{}] ", codes::CRYPTO_4065)),
+            "{}",
+            err.reason
         );
     }
 
@@ -7900,7 +7974,8 @@ mod tests {
     /// A Welcome join, a key-package reservation or an invite that meets a
     /// busy actor reports `SCP-CTX-2130`, one refused because Supervisor
     /// shutdown began reports `SCP-CTX-2138`, and any other failure reads the
-    /// operation's own code.
+    /// operation's own code. The custody error table in `error.rs` runs every
+    /// custody failure kind through this path.
     #[test]
     fn typed_supervisor_failure_keeps_typed_codes() {
         use scp_core::context::ContextError;
@@ -7933,29 +8008,6 @@ mod tests {
                 )),
                 fallback
             );
-            for (kind, expected) in [
-                (
-                    scp_crypto::CustodyFailureKind::KeyNotFound,
-                    codes::CRYPTO_4006,
-                ),
-                (scp_crypto::CustodyFailureKind::TimedOut, codes::CRYPTO_4062),
-                (scp_crypto::CustodyFailureKind::Failed, codes::CRYPTO_4060),
-            ] {
-                let failure = scp_crypto::CustodyFailure {
-                    kind,
-                    detail: "custody detail".to_owned(),
-                };
-                match super::typed_supervisor_failure(
-                    "context_join_from_welcome",
-                    fallback,
-                    &ContextError::Custody(failure),
-                ) {
-                    crate::error::ScpNapiError::Crypto { code, .. } => {
-                        assert_eq!(code, expected);
-                    }
-                    other => panic!("expected a {expected} Crypto error, got {other:?}"),
-                }
-            }
         }
     }
 

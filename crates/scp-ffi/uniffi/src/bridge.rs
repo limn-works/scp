@@ -1549,17 +1549,16 @@ impl ScpError {
 
 impl From<scp_core::context::builder::ContextCreationError> for ScpError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
-        // construction.md M2: the runtime's empty-ceiling rejection keeps its
-        // own validation code, and a create refused because Supervisor
-        // shutdown began keeps SCP-CTX-2138 (ADR-049 Decision 16); every other
-        // creation failure is SCP-CTX-2002.
-        if let scp_core::context::builder::ContextCreationError::StateTransition(
-            inner @ (scp_core::context::ContextError::CeilingRequired(_)
-            | scp_core::context::ContextError::SupervisorShutDown(_)),
-        ) = e
-        {
-            return inner.into();
-        }
+        // A wrapped error with a dedicated code keeps it, the one rule every
+        // bridge applies (`coded_creation_failure`): the core's empty-ceiling
+        // rejection keeps its validation code (construction.md M2), a create
+        // refused because Supervisor shutdown began keeps SCP-CTX-2138
+        // (ADR-049 Decision 16), and a custody failure keeps its custody code
+        // (ADR-006 2026-09-29 amendment).
+        let e = match scp_ffi_common::context_error_class::coded_creation_failure(e) {
+            Ok(inner) => return inner.into(),
+            Err(e) => e,
+        };
         Self::Context {
             msg: format!("context creation failed: {e} — check context parameters and identity"),
             code: codes::CTX_2002.to_owned(),
@@ -19252,77 +19251,88 @@ mod tests {
         }
     }
 
-    /// Every runtime error that carries a custody failure reaches the caller
-    /// with the code `custody_failure_code` assigns (checked here for
-    /// key-not-found, a generic custody failure and a rejected host
-    /// pseudonym). Broadcast publish signing and join key agreement arrive as
-    /// `ContextError::Custody`.
+    /// The custody error table (ADR-006 2026-09-29, 2026-10-11 and
+    /// 2026-10-12 amendments; `sdk-common.md` error codes): for every custody
+    /// failure kind, every carrier this bridge maps reports the row's class
+    /// and code. The carriers are a `CustodyFailure` inside `EnvelopeError`,
+    /// `ContextError` (through `From`, which a join and a restore take),
+    /// `ContextCreationError` (through `From`, which `context_create` takes),
+    /// `SenderKeyError`, `UcanError` and `EventLogError` (through `From` and
+    /// through the checkpoint path), and each bare `PlatformError` of that
+    /// kind. A closed or still-locked store reports
+    /// its `SCP-STORAGE-` code in the `Storage` variant, the one this bridge
+    /// gives every storage code.
     #[test]
     fn custody_failures_carry_the_custody_codes_in_every_carrier() {
-        use scp_crypto::{CustodyFailure, CustodyFailureKind as K};
-        fn failure(kind: K) -> CustodyFailure {
-            CustodyFailure {
-                kind,
-                detail: "custody detail".to_owned(),
-            }
-        }
-        fn crypto_code(e: ScpError) -> String {
-            match e {
-                ScpError::Crypto { code, .. } => code,
-                other => panic!("expected a crypto error, got {other:?}"),
-            }
-        }
-        fn identity_code(e: ScpError) -> String {
-            match e {
-                ScpError::Identity { code, .. } => code,
-                other => panic!("expected an identity error, got {other:?}"),
-            }
-        }
         use scp_core::context::ContextError;
-        assert_eq!(
-            crypto_code(ContextError::Custody(failure(K::KeyNotFound)).into()),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            crypto_code(ContextError::Custody(failure(K::Failed)).into()),
-            codes::CRYPTO_4060
-        );
-        assert_eq!(
-            identity_code(ContextError::Custody(failure(K::PseudonymRejected)).into()),
-            codes::IDENT_1055
-        );
-        assert_eq!(
-            crypto_code(
-                scp_core::crypto::sender_keys::SenderKeyError::Custody(failure(K::KeyNotFound))
-                    .into()
-            ),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            crypto_code(scp_core::crypto::ucan::UcanError::Custody(failure(K::KeyNotFound)).into()),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            crypto_code(scp_core::envelope::EnvelopeError::Custody(failure(K::KeyNotFound)).into()),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            crypto_code(scp_event_log::EventLogError::Custody(failure(K::Failed)).into()),
-            codes::CRYPTO_4060
-        );
-        use scp_platform::PlatformError;
-        assert_eq!(
-            crypto_code(PlatformError::KeyNotFound.into()),
-            codes::CRYPTO_4006
-        );
-        assert_eq!(
-            identity_code(PlatformError::PseudonymRejected("x".to_owned()).into()),
-            codes::IDENT_1055
-        );
-        assert_eq!(
-            crypto_code(PlatformError::CustodyError("x".to_owned()).into()),
-            codes::CRYPTO_4060
-        );
+        use scp_ffi_common::error_codes::CustodyFailureClass as Class;
+        use scp_ffi_common::test_helpers::{custody_code_rows, custody_failure};
+        fn class_and_code(e: &ScpError) -> (&'static str, String) {
+            match e {
+                ScpError::Identity { code, .. } => ("identity", code.clone()),
+                ScpError::Crypto { code, .. } => ("crypto", code.clone()),
+                ScpError::Storage { code, .. } => ("storage", code.clone()),
+                ScpError::Transport { code, .. } => ("transport", code.clone()),
+                other => panic!("not a custody error class: {other:?}"),
+            }
+        }
+        for row in custody_code_rows() {
+            let class = match row.class {
+                Class::Identity => "identity",
+                Class::Crypto => "crypto",
+                Class::Validation => "storage",
+                Class::Transport => "transport",
+            };
+            let expected = (class, row.code.to_owned());
+            let failure = || custody_failure(row.kind);
+            let carriers: [(&str, ScpError); 7] = [
+                (
+                    "EnvelopeError",
+                    scp_core::envelope::EnvelopeError::Custody(failure()).into(),
+                ),
+                ("ContextError", ContextError::Custody(failure()).into()),
+                (
+                    "ContextCreationError",
+                    scp_core::context::builder::ContextCreationError::StateTransition(
+                        ContextError::Custody(failure()),
+                    )
+                    .into(),
+                ),
+                (
+                    "SenderKeyError",
+                    scp_core::crypto::sender_keys::SenderKeyError::Custody(failure()).into(),
+                ),
+                (
+                    "UcanError",
+                    scp_core::crypto::ucan::UcanError::Custody(failure()).into(),
+                ),
+                (
+                    "EventLogError",
+                    scp_event_log::EventLogError::Custody(failure()).into(),
+                ),
+                (
+                    "EventLogError via checkpoint_error",
+                    ScpError::checkpoint_error(&scp_event_log::EventLogError::Custody(failure())),
+                ),
+            ];
+            for (carrier, error) in carriers {
+                assert_eq!(
+                    class_and_code(&error),
+                    expected,
+                    "{:?} as a CustodyFailure in {carrier}",
+                    row.kind
+                );
+            }
+            for platform_error in row.platform_errors {
+                let debug = format!("{platform_error:?}");
+                assert_eq!(
+                    class_and_code(&platform_error.into()),
+                    expected,
+                    "{:?} as the bare PlatformError {debug}",
+                    row.kind
+                );
+            }
+        }
     }
 
     /// A `KeyCustodyProvider` whose every method returns an error, used to prove
@@ -19823,6 +19833,69 @@ mod tests {
                 .as_bytes(),
             custody_wrap.expect("the identity has a custody wrapping key"),
             "0xFF01 is the identity's custody wrapping key"
+        );
+    }
+
+    /// A self-join mint whose `Identity` holds an `#active` handle to a key
+    /// other than the one its DID document resolves as `#active` mints nothing
+    /// and fails with `SCP-CRYPTO-4066` (§9.7.1).
+    #[test]
+    #[cfg(feature = "testing")]
+    fn self_join_mint_refuses_a_handle_that_is_not_the_resolved_active_key() {
+        use scp_platform::KeyCustody as _;
+        let rt = runtime();
+        let scp = scp_test();
+        let mut identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        scp.inner.init_context_manager_with_did(&identity.did);
+        let sup = Arc::clone(scp.inner.context_manager_or_error().expect("supervisor"));
+        let handle = Arc::get_mut(&mut identity).expect("the test holds the only handle");
+        let custody = Arc::clone(handle.custody.as_ref().expect("a custodied identity"));
+        let other = rt
+            .block_on(custody.generate_keypair(scp_platform::KeyType::Ed25519))
+            .expect("custody generates a second Ed25519 key");
+        handle
+            .core_id
+            .as_mut()
+            .expect("a custodied identity retains its key handles")
+            .active_signing_key = other;
+
+        let err = rt
+            .block_on(super::mint_self_join_key_package(&sup, &identity))
+            .expect_err("a handle that is not the resolved #active mints nothing");
+        assert!(
+            matches!(&err, ScpError::Crypto { code, .. } if code == codes::CRYPTO_4066),
+            "{err:?}"
+        );
+    }
+
+    /// A self-join mint for an `Identity` whose DID document does not resolve
+    /// mints nothing and fails with `SCP-CRYPTO-4065` (§9.7.1). The identity's
+    /// custody and keys are real; only the DID it carries has no published
+    /// document.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn self_join_mint_fails_closed_when_the_owner_does_not_resolve() {
+        let rt = runtime();
+        let scp = scp_test();
+        let mut identity = rt
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
+            .expect("identity_create failed");
+        scp.inner.init_context_manager_with_did(&identity.did);
+        let sup = Arc::clone(scp.inner.context_manager_or_error().expect("supervisor"));
+        "did:dht:z6MkSelfJoinOwnerNeverPublished".clone_into(
+            &mut Arc::get_mut(&mut identity)
+                .expect("the test holds the only handle")
+                .did,
+        );
+
+        let err = rt
+            .block_on(super::mint_self_join_key_package(&sup, &identity))
+            .expect_err("an owner that does not resolve mints nothing");
+        assert!(
+            matches!(&err, ScpError::Crypto { code, .. } if code == codes::CRYPTO_4065),
+            "{err:?}"
         );
     }
 

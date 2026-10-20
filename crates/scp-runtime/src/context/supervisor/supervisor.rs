@@ -19733,11 +19733,14 @@ mod tests {
         (key, resolver)
     }
 
+    /// The fixed key behind [`kp_other_signer`].
+    fn kp_other_signer_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x3D; 32])
+    }
+
     /// A signer over a fixed key that no test resolver names.
     fn kp_other_signer() -> crate::context::actor::CommandSigner {
-        crate::context::actor::CommandSigner::local_ed25519(ed25519_dalek::SigningKey::from_bytes(
-            &[0x3D; 32],
-        ))
+        crate::context::actor::CommandSigner::local_ed25519(kp_other_signer_key())
     }
 
     /// A `KeyPackage` the production store actor mints for a reserve publishes,
@@ -19822,19 +19825,50 @@ mod tests {
     }
 
     /// N1: a self-join mint whose signer holds a key other than the owner's
-    /// resolved `#active` key is refused with `AttestationSignerNotActiveKey`.
+    /// resolved `#active` key is refused with `AttestationSignerNotActiveKey`
+    /// before custody is asked to sign: the key is resolved and compared
+    /// before the sign, so a wrong handle never triggers a custody sign (a
+    /// biometric prompt or a hardware sign).
     #[tokio::test]
     async fn mint_rejects_a_handle_that_is_not_the_identitys_active_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        /// The other signer's key, counting every sign it is asked for.
+        struct CountingSigner {
+            key: scp_crypto::LocalEd25519Signer,
+            signs: Arc<AtomicUsize>,
+        }
+        impl scp_crypto::ScpSigner for CountingSigner {
+            fn algorithm(&self) -> scp_crypto::SigAlg {
+                scp_crypto::ScpSigner::algorithm(&self.key)
+            }
+            fn public_key(&self) -> Vec<u8> {
+                scp_crypto::ScpSigner::public_key(&self.key)
+            }
+            async fn sign(&self, digest: &[u8; 32]) -> Result<[u8; 64], scp_crypto::SignError> {
+                self.signs.fetch_add(1, Ordering::SeqCst);
+                scp_crypto::ScpSigner::sign(&self.key, digest).await
+            }
+        }
         let did = DID("did:dht:z6MkKpWrongHandleMint".to_owned());
         let (_key, resolver) = kp_owner_key_and_resolver(&did);
         let sup = supervisor_with_resolver(resolver);
+        let signs = Arc::new(AtomicUsize::new(0));
+        let signer = crate::context::actor::CommandSigner::new(Arc::new(CountingSigner {
+            key: scp_crypto::LocalEd25519Signer::new(kp_other_signer_key()),
+            signs: Arc::clone(&signs),
+        }));
         let err = sup
-            .mint_attested_key_package(&did, &kp_other_signer())
+            .mint_attested_key_package(&did, &signer)
             .await
             .unwrap_err();
         assert!(
             matches!(err, ContextError::AttestationSignerNotActiveKey),
             "got {err:?}"
+        );
+        assert_eq!(
+            signs.load(Ordering::SeqCst),
+            0,
+            "a handle that is not the resolved #active key is never asked to sign"
         );
     }
 

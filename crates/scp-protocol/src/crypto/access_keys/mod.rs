@@ -147,8 +147,9 @@ pub enum AccessKeyError {
     #[error("malformed wrapping public key: {0}")]
     MalformedWrappingPublicKey(String),
 
-    /// A key custody call failed (`KeyCustody`). The bridges report the code
-    /// `scp_ffi_common::error_codes::custody_failure_code` assigns to the failure's kind.
+    /// A key custody call failed (`KeyCustody`), keeping the failure's kind.
+    /// No bridge maps an `AccessKeyError` yet: the access-key wire functions
+    /// that raise it have no caller on a bridge path.
     #[error(transparent)]
     Custody(#[from] scp_crypto::CustodyFailure),
 
