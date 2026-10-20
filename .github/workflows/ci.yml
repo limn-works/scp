@@ -4665,25 +4665,16 @@ jobs:
             exit 1
           fi
       - uses: gradle/actions/setup-gradle@v4
-      - name: Restore the AVD snapshot
-        id: avd-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.android/avd/*
-            ~/.android/adb*
-          key: avd-${{ matrix.api-level }}-x86_64-default-v1
-      - name: Create the AVD snapshot
-        if: steps.avd-cache.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: ${{ matrix.api-level }}
-          arch: x86_64
-          target: default
-          force-avd-creation: false
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: false
-          script: echo "snapshot created"
+      # The emulator cold-boots: `-no-snapshot` neither loads nor saves a snapshot, and
+      # `force-avd-creation` builds a fresh AVD. The runner treats
+      # `getprop sys.boot_completed` == 1 as ready and then sends
+      # `adb shell input keyevent 82`, failing the step on any error. On a cold boot
+      # ActivityManagerService sets that property only after SystemServer has published
+      # its services, `input` among them, so the property implies the readiness the
+      # runner assumes. A restored snapshot carries the property's saved value of 1 with
+      # it, so the property no longer says whether the restored framework is serving: one
+      # run loaded snapshot 'default_boot', read 1 two seconds later, and keyevent 82 threw
+      # `No service published for: input`. Do not reintroduce an AVD snapshot cache here.
       # The runner runs each `script` line in its own shell, so the directory comes from
       # `working-directory`. An AOSP emulator's KeyMint runs in software, so
       # `expectSoftwareKeyInfo=true` makes custodyMatchesKeyInfo also assert that KeyInfo
@@ -4695,8 +4686,8 @@ jobs:
           api-level: ${{ matrix.api-level }}
           arch: x86_64
           target: default
-          force-avd-creation: false
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot-save
+          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot
           disable-animations: true
           working-directory: bindings/kotlin
           script: |
