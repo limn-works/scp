@@ -41,6 +41,9 @@
         /// When set, `create` keeps the key it made but returns a 65-byte
         /// point that is not on the curve, so the mint fails after creation.
         private var returnsInvalidPoint = false
+        /// When set, `contains` throws once any `create` has been attempted,
+        /// as a store that cannot answer during a rollback would.
+        private var containsFailsAfterCreate = false
 
         func keepKeysOnDelete(_ keep: Bool) {
             deleteKeepsKey = keep
@@ -56,6 +59,10 @@
 
         func returnInvalidPoint(_ invalid: Bool) {
             returnsInvalidPoint = invalid
+        }
+
+        func failContainsAfterCreate(_ fail: Bool) {
+            containsFailsAfterCreate = fail
         }
 
         /// Adds a key under `tag` without going through the adapter, as an
@@ -137,8 +144,11 @@
             return keys.removeValue(forKey: tag) != nil
         }
 
-        func contains(tag: Data) -> Bool {
-            keys[tag] != nil
+        func contains(tag: Data) throws -> Bool {
+            if containsFailsAfterCreate, !policies.isEmpty {
+                throw PlatformError.keychainError(errSecInteractionNotAllowed)
+            }
+            return keys[tag] != nil
         }
     }
 

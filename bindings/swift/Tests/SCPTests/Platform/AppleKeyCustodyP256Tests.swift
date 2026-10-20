@@ -367,7 +367,7 @@
                 #expect(reopened.custodyType(keyId: keyId) == "hardware")
                 #expect(try bridge.custodyType(keyId: keyId) == "hardware")
                 try await bridge.destroyKey(keyId: keyId)
-                #expect(await !enclaveStore.contains(tag: reopened.applicationTag(for: keyId)))
+                #expect(try await !enclaveStore.contains(tag: reopened.applicationTag(for: keyId)))
             }
         }
 
@@ -436,8 +436,8 @@
             #expect(keyIds.drawn.count == 3)
             for keyId in keyIds.drawn {
                 #expect(!KeyIdRecorder.companionExists(keyId), "no companion may remain for \(keyId)")
-                #expect(await !enclaveStore.contains(tag: custody.applicationTag(for: keyId)))
-                #expect(await !softwareStore.contains(tag: custody.applicationTag(for: keyId)))
+                #expect(try await !enclaveStore.contains(tag: custody.applicationTag(for: keyId)))
+                #expect(try await !softwareStore.contains(tag: custody.applicationTag(for: keyId)))
             }
         }
 
@@ -561,7 +561,7 @@
                     return
                 }
             }
-            #expect(await store.contains(tag: custody.applicationTag(for: keyId)))
+            #expect(try await store.contains(tag: custody.applicationTag(for: keyId)))
             #expect(custody.custodyType(keyId) == "hardware", "the record of a surviving key must remain")
             await store.keepKeysOnDelete(false)
             try await custody.destroyKey(keyId)
@@ -575,11 +575,11 @@
             for keyType in [CustodyKeyType.p256, .hpkeP256] {
                 let keyId = try await provider.generateKeypair(keyType: keyType, role: .operational)
                 let tag = custody.applicationTag(for: keyId)
-                #expect(await store.contains(tag: tag))
+                #expect(try await store.contains(tag: tag))
                 let attestation = try await custody.destroyKey(keyId)
                 #expect(attestation.confirmed)
                 #expect(attestation.method == .softwareOnly)
-                #expect(await !store.contains(tag: tag))
+                #expect(try await !store.contains(tag: tag))
                 #expect(!KeyIdRecorder.companionExists(keyId))
                 #expect(await P256Fixture.cryptoCode { _ = try await provider.getPublicKey(keyId: keyId) } == "SCP-CRYPTO-4006")
                 #expect(await P256Fixture.cryptoCode { try await provider.destroyKey(keyId: keyId) } == "SCP-CRYPTO-4006")
@@ -607,12 +607,12 @@
             }
             let keyId = try #require(named, "the error must name the key the rollback left")
             let tag = custody.applicationTag(for: keyId)
-            #expect(await store.contains(tag: tag), "the store's delete failed, so the key remains")
+            #expect(try await store.contains(tag: tag), "the store's delete failed, so the key remains")
             #expect(KeyIdRecorder.companionExists(keyId), "the companion must outlive a key the store still holds")
 
             let attestation = try await custody.destroyKey(keyId)
             #expect(attestation.confirmed)
-            #expect(await !store.contains(tag: tag))
+            #expect(try await !store.contains(tag: tag))
             #expect(!KeyIdRecorder.companionExists(keyId))
 
             await store.failNextDeletes(1)
@@ -624,7 +624,28 @@
                 #expect(code == "SCP-CRYPTO-4060")
                 let bridged = try #require(keyIds.drawn.last)
                 #expect(msg.contains("'\(bridged)'"), "the bridge error must name the key id: \(msg)")
+                #expect(msg.contains("remains and must be destroyed"), "the dedicated bridge arm: \(msg)")
                 _ = try await custody.destroyKey(bridged)
+            }
+        }
+
+        /// A create that throws makes no key the adapter knows of, so the
+        /// mint throws the store's typed error unchanged even when the store
+        /// cannot then confirm the tag empty.
+        @Test("a create failure keeps its typed error when the rollback cannot query the store")
+        func createFailureKeepsItsTypeWhenRollbackCannotQuery() async throws {
+            let store = SoftwareP256KeyStore()
+            let custody = keyIds.p256Adapter(store, enclaveAvailable: true)
+            await store.failCreate(with: .secureEnclaveKeyCreationFailed(errSecMissingEntitlement))
+            await store.failContainsAfterCreate(true)
+            do {
+                let keyId = try await custody.generateKeypair(keyType: "p256")
+                Issue.record("generateKeypair returned \(keyId) after create threw")
+            } catch let error as PlatformError {
+                guard case .secureEnclaveKeyCreationFailed(errSecMissingEntitlement) = error else {
+                    Issue.record("expected secureEnclaveKeyCreationFailed, got \(error)")
+                    return
+                }
             }
         }
 
@@ -638,7 +659,7 @@
                 _ = try await custody.generateKeypair(keyType: "p256")
             }
             let keyId = try #require(keyIds.drawn.last)
-            #expect(await !store.contains(tag: custody.applicationTag(for: keyId)))
+            #expect(try await !store.contains(tag: custody.applicationTag(for: keyId)))
             #expect(!KeyIdRecorder.companionExists(keyId))
         }
 
@@ -654,7 +675,7 @@
 
             let attestation = try await custody.destroyKey(keyId)
             #expect(attestation.confirmed)
-            #expect(await !store.contains(tag: tag))
+            #expect(try await !store.contains(tag: tag))
         }
 
         /// A key whose companion no longer decodes is still found through
@@ -675,7 +696,7 @@
 
             let attestation = try await custody.destroyKey(keyId)
             #expect(attestation.confirmed)
-            #expect(await !store.contains(tag: tag))
+            #expect(try await !store.contains(tag: tag))
             #expect(!KeyIdRecorder.companionExists(keyId))
         }
 
@@ -739,7 +760,7 @@
                     failure = failure ?? error
                 }
                 #expect(!KeyIdRecorder.companionExists(keyId))
-                #expect(await !store.contains(tag: custody.applicationTag(for: keyId)))
+                #expect(try await !store.contains(tag: custody.applicationTag(for: keyId)))
             }
             if let failure {
                 throw failure

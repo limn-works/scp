@@ -795,8 +795,12 @@ extension AppleKeyCustody {
     ///    `SecKeyCreateRandomKey` does not refuse a duplicate tag.
     /// 3. Creates the key, then records its public key on the companion.
     ///
-    /// A failure after step 1 runs ``rollBackMint(handle:tag:store:)`` and
-    /// rethrows the original error.
+    /// A failure after step 1 runs
+    /// ``rollBackMint(handle:tag:store:cause:keyCreated:)`` and throws the
+    /// error it returns: the original error when `create` itself threw or
+    /// the key is confirmed gone, and
+    /// ``PlatformError/mintRollbackIncomplete(keyId:cause:)`` when `create`
+    /// returned a key the store cannot confirm deleted.
     private nonisolated func mintP256Key(keyType: KeyType, role: CustodyKeyRole) async throws -> String {
         let backing = mintBacking
         let store = makeP256Store(backing)
@@ -816,15 +820,19 @@ extension AppleKeyCustody {
             guard try reserveCompanion(handle: handle, metadata: reservation) else { continue }
             let tag = applicationTag(for: handle)
             guard try await tagIsFree(handle: handle, tag: tag, store: store) else { continue }
+            var keyCreated = false
             do {
                 let uncompressed = try await store.create(tag: tag, policy: biometricPolicy)
+                keyCreated = true
                 let publicKey = try Self.p256PublicKey(uncompressed, as: keyType)
                 try recordCompanionPublicKey(
                     handle: handle, metadata: reservation.with(publicKey: publicKey), publicKey: publicKey
                 )
                 return handle
             } catch {
-                throw await rollBackMint(handle: handle, tag: tag, store: store, cause: error)
+                throw await rollBackMint(
+                    handle: handle, tag: tag, store: store, cause: error, keyCreated: keyCreated
+                )
             }
         }
         throw PlatformError.custodyError(
@@ -854,17 +862,22 @@ extension AppleKeyCustody {
     ///
     /// The companion is the only record that names the key and its backing,
     /// so it is deleted only after the store reports no key under `tag`;
-    /// the mint then throws `cause` unchanged. When the store cannot delete
-    /// the key or cannot answer, the key may be permanent and the companion
-    /// stays, so the mint throws
-    /// ``PlatformError/mintRollbackIncomplete(keyId:cause:)`` naming `handle`:
-    /// no caller learns the id of a failed mint any other way, and
+    /// otherwise it stays.
+    ///
+    /// The returned error is `cause` unchanged, keeping its type (for
+    /// example ``PlatformError/secureEnclaveKeyCreationFailed(_:)``), unless
+    /// `keyCreated` is true, meaning `create` returned and a key is known to
+    /// exist, and the store cannot confirm that key deleted. Then the key may
+    /// be permanent, and the error is
+    /// ``PlatformError/mintRollbackIncomplete(keyId:cause:)`` naming
+    /// `handle`: no caller learns the id of a failed mint any other way, and
     /// ``destroyKey(_:)`` of that id removes both.
     private nonisolated func rollBackMint(
-        handle: String, tag: Data, store: any P256KeyStore, cause: Error
+        handle: String, tag: Data, store: any P256KeyStore, cause: Error, keyCreated: Bool
     ) async -> Error {
         _ = try? await store.delete(tag: tag)
         guard (try? await store.contains(tag: tag)) == false else {
+            guard keyCreated else { return cause }
             return PlatformError.mintRollbackIncomplete(keyId: handle, cause: cause.localizedDescription)
         }
         try? deleteCompanion(handle: handle)
