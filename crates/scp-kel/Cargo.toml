@@ -1,0 +1,27 @@
+[package]
+name = "scp-kel"
+version = "0.1.0-beta.2"
+description = "The SCP key-event log codec: the key-event preimage, its digest, the inception-derived identifier and the routing identifiers — wasm-safe, no async, no I/O"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+publish = false
+keywords = ["protocol", "identity", "key-event-log"]
+categories = ["cryptography", "encoding"]
+
+[dependencies]
+# The key-state data model the snapshot encodes (09-security-model.md §9.7.4.2).
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
+# Every construction here is a SHA-256 over a domain-separated preimage.
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+# Round-trips encode and decode over generated preimages of all four kinds.
+proptest = "1"
+
+[lints]
+workspace = true
