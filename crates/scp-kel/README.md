@@ -1,0 +1,34 @@
+# scp-kel
+
+The **key-event log codec** for SCP (Shared Context Protocol): the byte
+constructions `09-security-model.md` §9.7.4.2 defines over a key event, each
+with exactly one implementation (ADR-063, implementation constraints).
+
+This crate owns:
+
+- `EventPreimage` and its parts (`EventKind`, `StandingRootDeclaration`,
+  `SignerGroup`, `SignatureForm`, `InstalledRootSet`, `KeyStateSnapshot`,
+  `Continuation`) — the twelve-field key-event preimage, with one typed
+  constructor per kind that places every sentinel the kind carries.
+- `encode_preimage`, `signed_preimage` and `event_digest` — the twelve field
+  bytes, the same bytes behind `"SCP-KEL-EVENT-V1:"`, and their SHA-256.
+- `derive_identifier` — `SHA-256("SCP-KEL-ID-V1:" ‖ inception signed preimage)`.
+- `prerotation_commitment` and `key_event_seal` — the pre-rotation commitment
+  and the key-event seal.
+- `decode_preimage` — the inverse of `encode_preimage` over an exact slice,
+  bounding every count before it allocates (§9.7.4.2, the count-bound rule).
+- `routing_id` — the four routing identifiers an identifier's objects are
+  stored under (§9.7.4.2 R13, §9.18.2).
+
+The key-state value types (`Identifier`, `KeyEntry`, `CommitmentEntry`,
+`StandingCommitment` and the four name-bound enumerations) come from `scp-did`.
+
+The crate is a wasm-safe leaf: no async runtime, no I/O, no clock, and no
+pointer-width integer or float on the wire. It compiles to
+`wasm32-unknown-unknown`, and `crates/scp-client-wasm/tests/kel_cross_target_kat.rs`
+pins byte identity between native and wasm32 against `25-test-vectors.md`
+§25.26, §25.28 and §25.29. `scripts/check-protocol-deps.sh` rejects an async-runtime or
+platform edge in its dependency tree.
+
+Chain verification (signatures, R3's defect list, R8) is not here yet; it
+lands with the verifier story, which wraps `decode_preimage`.
