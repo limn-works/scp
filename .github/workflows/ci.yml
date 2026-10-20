@@ -4608,7 +4608,17 @@ jobs:
       - name: Point cargo at the NDK linker
         run: |
           # The same linker build-matrix.yml's Android job names for this triple.
-          echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang" >> "$GITHUB_ENV"
+          # ring's build script and the vendored OpenSSL below compile C through cc-rs,
+          # which otherwise looks for unversioned `x86_64-linux-android-clang` and
+          # `x86_64-linux-android-ranlib` tools that NDK 27 does not ship, so the C
+          # compiler, archiver and ranlib are named too.
+          ndk_bin="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ndk_bin/x86_64-linux-android21-clang"
+            echo "CC_x86_64_linux_android=$ndk_bin/x86_64-linux-android21-clang"
+            echo "AR_x86_64_linux_android=$ndk_bin/llvm-ar"
+            echo "RANLIB_x86_64_linux_android=$ndk_bin/llvm-ranlib"
+          } >> "$GITHUB_ENV"
       - name: Enable KVM for the emulator
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -4642,7 +4652,11 @@ jobs:
       - name: Build the UniFFI cdylib for the emulator
         run: |
           set -euo pipefail
-          cargo build -p scp-ffi-uniffi --features testing --target x86_64-linux-android
+          # SQLCipher needs libcrypto, which the NDK sysroot does not hold and Android
+          # does not expose to apps, so this test library compiles OpenSSL in through
+          # scp-platform's `vendored-openssl`. The library ships nowhere; the feature's
+          # scope gate covers shipped configurations only.
+          cargo build -p scp-ffi-uniffi --features testing,scp-platform/vendored-openssl --target x86_64-linux-android
           jni=bindings/kotlin/scp-kt-android/src/androidTest/jniLibs/x86_64
           mkdir -p "$jni"
           cp target/x86_64-linux-android/debug/libscp_ffi_uniffi.so "$jni/"
