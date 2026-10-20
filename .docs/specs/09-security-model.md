@@ -243,7 +243,7 @@ This section owns the device-attestation signal's publication format, its bindin
 - `accepted_app_ids: Vec<AcceptedAppId>`, empty by default. Each `AcceptedAppId` carries `app_id: String`, `platform: ApplePlatform` (`Ios` or `MacOs`), and `accepted_bundle_versions: Vec<String>`. `app_id` is the string whose SHA-256 Apple writes as the attestation's RP ID: on iOS the App ID `<Team ID>.<bundle ID>`, and on macOS the identifier Apple's "Validating apps that connect to your server" names in place of the bundle ID. An empty list verifies no App Attest entry. A policy that lists one (`app_id`, `platform`) pair in two elements fails validation, because App Attest check 8 would then match two elements whose `accepted_bundle_versions` can differ, and readers would disagree on check 12.
 - `accepted_validation_categories: Vec<u32>`, the launch validation categories of Apple's table that the context accepts. An empty list, the default, accepts category 4 alone, which Apple's table names the App Store. A reader rejects the values 0, 7, 8 and 9 whatever this list says, because Apple's table calls 0 invalid and calls 7, 8 and 9 inappropriate.
 - `require_validation_category: bool`, false by default. When true, an attestation on check 7's iOS path that carries no `apple_validation_category_01` extension fails App Attest check 11. Check 11 requires the extension on the macOS path whatever this flag says.
-- `accepted_android_packages: Vec<AcceptedAndroidPackage>`, empty by default. Each `AcceptedAndroidPackage` carries `package_name: String`, the Android package name; `signing_cert_sha256: [u8; 32]`, the SHA-256 digest of the app's signing certificate that Google reports in `appIntegrity.certificateSha256Digest`; and `verifier_identifier: [u8; 32]`, the identifier of the one party whose verdict this context accepts for that package's tokens. Only a governance action under the context's governance model (`05-contexts.md` §5.9) adds, changes or removes an element, and the context's event log records that action. An empty list verifies no Play Integrity entry. The Play Integrity checks below state who that party is and why a reader needs it.
+- `accepted_android_packages: Vec<AcceptedAndroidPackage>`, empty by default. Each `AcceptedAndroidPackage` carries `package_name: String`, the Android package name; `signing_cert_sha256: [u8; 32]`, the SHA-256 digest of the app's signing certificate that Google reports in `appIntegrity.certificateSha256Digest`; and `verifier_identifier: Identifier`, the identifier of the one party whose verdict this context accepts for that package's tokens. Only a governance action under the context's governance model (`05-contexts.md` §5.9) adds, changes or removes an element, and the context's event log records that action. An empty list verifies no Play Integrity entry. The Play Integrity checks below state who that party is and why a reader needs it.
 
 `ContextSybilPolicy::casual()`, `standard()` and `high_trust()` each set `require_device_attestation` to false, add no `RequiredSignal` for the `DeviceAttestation` category, and set every field above to its default: the challenge to 32 bytes of `0x00`, which procedure step 1 reads as unset, the maximum age to 2,592,000 seconds, the three lists to empty, and `require_validation_category` to false. A preset therefore verifies no entry until the context's creator draws a challenge and names what the context accepts.
 
@@ -1516,7 +1516,7 @@ pub enum RecoveryPhase { Composed, Signed, PublishSent, Confirmed }
 /// `LAST_REVEAL_MARKER_BYTES` (§9.18.17): the identifier, the sequence, and
 /// the preimage digest of the last reveal-authorized event a completed
 /// ceremony published.
-pub struct LastRevealMarker { pub identifier: [u8; 32], pub sequence: u64, pub event_digest: [u8; 32] }
+pub struct LastRevealMarker { pub identifier: Identifier, pub sequence: u64, pub event_digest: [u8; 32] }
 
 /// Whether the controller declares the device that composed a ceremony destroyed.
 pub enum ComposingDevice { Available, ComposerAborted, Destroyed }
@@ -1529,12 +1529,12 @@ pub enum RecoveryKind { CommitmentRollover, RootRecovery(StandingRootDeclaration
 /// digest.
 pub enum RecoveryHandle {
     FixesCommitment {
-        identifier: [u8; 32],
+        identifier: Identifier,
         phase: RecoveryPhase,
         event_digest: [u8; 32],
     },
     Abandons {
-        identifier: [u8; 32],
+        identifier: Identifier,
         phase: RecoveryPhase,
         event_digest: [u8; 32],
     },
@@ -1576,14 +1576,14 @@ impl<S: EncryptedStorage> Recovery<S> {
     pub fn begin(&self, kind: RecoveryKind, signers: SignerPlan)
         -> impl Future<Output = Result<EventOutcome, IdentityError>> + Send;
 
-    pub fn load_pending_recovery(&self, identifier: &[u8; 32])
+    pub fn load_pending_recovery(&self, identifier: &Identifier)
         -> Result<Option<RecoveryHandle>, IdentityError>;
 
     /// Asynchronous, because it drives a publish cycle.
     pub fn resume_recovery(&self, handle: RecoveryHandle)
         -> impl Future<Output = Result<RecoveryCompletion, IdentityError>> + Send;
 
-    pub fn abort_recovery(&self, identifier: &[u8; 32], composing_device: ComposingDevice)
+    pub fn abort_recovery(&self, identifier: &Identifier, composing_device: ComposingDevice)
         -> Result<RemovalOutcome, IdentityError>;
 }
 ```
@@ -2190,7 +2190,7 @@ The frame is **minimal and identity-specific — there is no magic tag and no re
 ```
 KEY-EVENT-RECORD (KeyEventRecordV2) :=
   version:          u8         = 2           # frame version
-  identifier:       [u8; 32]                 # the identity's inception-derived identifier (§9.7.4.2 R13)
+  identifier:       Identifier               # 32 bytes: the identity's inception-derived identifier (§9.7.4.2 R13)
   value:            [u8]                     # trailing remainder = one contiguous segment of the identity's key-event log (§9.6.1, §9.7.4.2 R9)
 ```
 
@@ -2232,17 +2232,17 @@ The fixed prefix is `1 + 32 = 33` bytes, and the total frame length is `33 + len
 ```
 COSIGNED-HEAD-RECORD (CosignedHeadRecordV3) :=
   version:    u8         = 3
-  subject:    [u8; 32]                 # the cosigned identity's identifier (§9.7.4.2 R13)
+  subject:    Identifier               # 32 bytes: the cosigned identity's identifier (§9.7.4.2 R13)
   value:      [u8]                     # trailing remainder = one or more cosigned heads, each of the width §9.7.4.3 fixes
 
 WITNESS-CONFLICT-RECORD (WitnessConflictRecordV4) :=
   version:    u8         = 4
-  subject:    [u8; 32]                 # the subject identifier
+  subject:    Identifier               # 32 bytes: the subject identifier
   value:      [u8]                     # trailing remainder = one or more conflict statements, each of the width §9.7.4.3 fixes
 
 SERVICE-RECORD-FRAME (ServiceRecordFrameV5) :=
   version:    u8         = 5
-  identifier: [u8; 32]                 # the identity's identifier (§9.7.4.2 R13)
+  identifier: Identifier               # 32 bytes: the identity's identifier (§9.7.4.2 R13)
   value:      [u8]                     # trailing remainder = one service record and its 64-byte signature (`03-identity.md` §3.10.13)
 ```
 

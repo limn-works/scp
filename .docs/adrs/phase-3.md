@@ -1073,7 +1073,7 @@ pub enum PaidActionType {
 pub trait PaymentAdapter: Send + Sync {
     fn adapter_id(&self) -> &str;
     fn capabilities(&self) -> AdapterCapabilities;
-    async fn authorize(&self, payer: &[u8; 32], payee: &[u8; 32], amount: Amount,
+    async fn authorize(&self, payer: &Identifier, payee: &Identifier, amount: Amount,
         currency: CurrencyCode, metadata: PaymentMetadata,
     ) -> Result<PaymentAuthorization, PaymentError>;
     async fn capture(&self, auth: &PaymentAuthorization) -> Result<PaymentReceipt, PaymentError>;
@@ -1102,7 +1102,7 @@ pub struct PaymentMetadata {
 
 pub struct PaymentAuthorization {
     pub auth_id: [u8; 32],
-    pub payer: [u8; 32], pub payee: [u8; 32],
+    pub payer: Identifier, pub payee: Identifier,
     pub amount: Amount, pub currency: CurrencyCode,
     pub adapter_id: String,
     pub created_at: u64, pub expires_at: u64,
@@ -1127,7 +1127,7 @@ pub struct EconomicPolicy {
     pub cost_schedule: CostSchedule,
     pub payment_adapters: Vec<PaymentAdapterRef>,
     pub pricing_formula: Option<PricingFormula>,
-    pub payee: [u8; 32],
+    pub payee: Identifier,
 }
 
 pub struct CostSchedule {
@@ -1183,7 +1183,7 @@ pub struct SpendingCapability {
 
 pub struct PaymentReceipt {
     pub receipt_id: [u8; 32],
-    pub payer: [u8; 32], pub payee: [u8; 32],
+    pub payer: Identifier, pub payee: Identifier,
     pub amount: Amount, pub currency: CurrencyCode,
     pub action_type: PaidActionType,
     pub context_id: Option<ContextId>,

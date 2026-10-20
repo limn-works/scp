@@ -135,14 +135,14 @@ Invalid transitions (must return error):
    - Issues UCAN tokens for the joiner's role capabilities (ADR-009).
    - Appends `MemberJoined` event to event log.
 
-4. **`leave_context(handle: &ContextHandle, caller_did: &[u8; 32], member_did: &[u8; 32]) -> Result<(), ContextError>`**
+4. **`leave_context(handle: &ContextHandle, caller_did: &Identifier, member_did: &Identifier) -> Result<(), ContextError>`**
    - Authorization: self-removal (`caller_did == member_did`) is always allowed; otherwise caller must hold `MemberRemove` capability.
    - Calls ADR-001 `remove_member()` to remove from MLS group.
    - Removes member's sender key from all members' stores.
    - Appends `MemberLeft` event to event log.
    - If member count reaches zero, transitions to `Closing`.
 
-5. **`close_context(handle: &ContextHandle, initiator_did: &[u8; 32]) -> Result<(), ContextError>`**
+5. **`close_context(handle: &ContextHandle, initiator_did: &Identifier) -> Result<(), ContextError>`**
    - Verifies initiator has close capability (admin role or governance-permitted).
    - Transitions state to `Closing`.
    - Sends close notification to all members.
@@ -165,7 +165,7 @@ Invalid transitions (must return error):
    - Destroys MLS group state and sender keys per memory scope.
    - Appends `ContextExpired` event to event log.
 
-8. **`send_message(handle: &ContextHandle, sender_did: &[u8; 32], payload: &[u8]) -> Result<(), ContextError>`**
+8. **`send_message(handle: &ContextHandle, sender_did: &Identifier, payload: &[u8]) -> Result<(), ContextError>`**
    - Rejects if state is not `Active`.
    - Validates sender's UCAN for `messages:write` capability (ADR-009).
    - Assigns SCP sequence number (per-sender monotonic, spec section 9.8.5).
@@ -393,7 +393,7 @@ pub struct RoleDefinition {
 
    The auto-grant subscriber pattern extends the context two-tier model — it is not a new primitive.
 
-3. **`assign_role(context: &ContextHandle, member_did: &[u8; 32], role: &str, assigner_did: &[u8; 32]) -> Result<Vec<UcanToken>, ContextError>`**
+3. **`assign_role(context: &ContextHandle, member_did: &Identifier, role: &str, assigner_did: &Identifier) -> Result<Vec<UcanToken>, ContextError>`**
    - Verifies assigner has `RoleAssign` capability (via UCAN validation).
    - Validates role exists in context's role definitions.
    - Mints UCAN tokens for each capability in the role's permission set.
@@ -424,7 +424,7 @@ pub struct RoleDefinition {
 
    **Phase 2 integration tests** exercise steps 1–2, 4–6, 8, 10–11 (the 8 steps that don't require delegation chain depth > 1). Phase 3 adds integration tests for steps 3, 7, 9.
 
-5. **`revoke_ucan(context: &ContextHandle, token_id: &str, revoker_did: &[u8; 32]) -> Result<(), UcanError>`**
+5. **`revoke_ucan(context: &ContextHandle, token_id: &str, revoker_did: &Identifier) -> Result<(), UcanError>`**
    - Verifies revoker has authority (must be the token issuer or the context creator).
    - Adds token to the context's revocation list.
    - Distributes revocation as MLS application message to all members.
@@ -520,7 +520,7 @@ pub struct OutletRegistration {
     pub schema: OutletSchema,              // MCP-compatible JSON Schema
     pub implementation_hash: [u8; 32],   // SHA-256 of implementation
     pub test_vectors: Vec<TestVector>,   // Known input-output pairs
-    pub operator_did: [u8; 32],               // Accountable identity
+    pub operator_did: Identifier,               // Accountable identity
 }
 
 pub struct OutletSchema {
@@ -535,7 +535,7 @@ pub struct TestVector {
 }
 ```
 
-2. **`register_outlet(context: &ContextHandle, registration: OutletRegistration, registrant_did: &[u8; 32]) -> Result<OutletId, OutletError>`**
+2. **`register_outlet(context: &ContextHandle, registration: OutletRegistration, registrant_did: &Identifier) -> Result<OutletId, OutletError>`**
    - Validates registrant has `OutletRegister` capability via UCAN (ADR-009).
    - Validates input and output schemas are valid JSON Schema.
    - Validates implementation hash is 32 bytes.
@@ -544,7 +544,7 @@ pub struct TestVector {
    - Appends `OutletRegistered` event to event log with full registration metadata.
    - Returns the outlet ID.
 
-3. **`invoke_outlet(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &[u8; 32]) -> Result<serde_json::Value, OutletError>`**
+3. **`invoke_outlet(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &Identifier) -> Result<serde_json::Value, OutletError>`**
    - Validates context state is `Active`.
    - Validates invoker has `OutletQuery(outlet_id)`/`OutletQueryAll` (Query) or `OutletCall(outlet_id)`/`OutletCallAll` (Action) capability via UCAN.
    - Validates input against the outlet's input schema.
@@ -562,7 +562,7 @@ Every outlet invocation follows a defined lifecycle with explicit states, timeou
 pub struct OutletRequest {
     pub request_id: String,          // UUID v4, unique per invocation
     pub outlet_id: OutletId,
-    pub invoker_did: [u8; 32],
+    pub invoker_did: Identifier,
     pub input: serde_json::Value,
     pub timeout_ms: u32,             // Caller-specified timeout (max: context ceiling, default: 30_000)
     pub session_id: Option<String>,  // For stateful sessions (§6.2.1)
@@ -613,7 +613,7 @@ pub enum OutletErrorCode {
 - `OutletRequest` and `OutletResponse` are both recorded as events in the context's event log (ADR-011).
 - The event includes: `request_id`, `outlet_id`, `invoker_did`, `status`, `execution_time_ms`, `SHA256(input)`, `SHA256(output)`. Full input/output is NOT recorded (may be large); only content hashes are stored.
 
-4. **`update_outlet(context: &ContextHandle, outlet_id: &OutletId, new_registration: OutletRegistration, updater_did: &[u8; 32]) -> Result<(), OutletError>`**
+4. **`update_outlet(context: &ContextHandle, outlet_id: &OutletId, new_registration: OutletRegistration, updater_did: &Identifier) -> Result<(), OutletError>`**
    - Validates updater is the outlet's operator identifier or has admin role.
    - Records old and new implementation hashes.
    - Updates the outlet registration.
@@ -641,7 +641,7 @@ pub struct OutletInterface {
 
    - **`expose_outlet(context: &ContextHandle, outlet_id: &OutletId, to_context: &ContextId) -> Result<OutletInterface, OutletError>`**: Initiates an outlet interface proposal from the source context. Requires admin capability.
    - **`accept_outlet_interface(context: &ContextHandle, interface: &OutletInterface) -> Result<(), OutletError>`**: Target context accepts the interface. Requires admin capability. Both `approved_by_source` and `approved_by_target` must be true before calls are permitted.
-   - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &[u8; 32]) -> Result<serde_json::Value, OutletError>`**: Invokes an outlet across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
+   - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &Identifier) -> Result<serde_json::Value, OutletError>`**: Invokes an outlet across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
    - Rate limiting enforced per interface.
 
 7. **Stateful outlet sessions (spec section 6.2.1):**
@@ -735,7 +735,7 @@ pub struct EventLog {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub event_type: EventType,
-    pub actor_did: [u8; 32],
+    pub actor_did: Identifier,
     pub timestamp: u64,
     pub sequence: u64,              // Monotonic event sequence within this log
     pub payload: EventPayload,      // Type-specific data
@@ -907,9 +907,9 @@ pub enum EventType {
    carried in the leaf `EventPayload`, not inferred from `actor_did` (which, for
    admin-driven joins/removals/assignments, is the admin):
 
-   - `RoleAssigned` carries `RoleAssignedPayload { subject_did: [u8; 32], role: RoleName }`.
+   - `RoleAssigned` carries `RoleAssignedPayload { subject_did: Identifier, role: RoleName }`.
    - `MemberJoined` / `MemberLeft` carry a membership-change payload
-     `{ subject_did: [u8; 32], role_name: RoleName }`.
+     `{ subject_did: Identifier, role_name: RoleName }`.
 
    These three leaves were previously empty-payload leaves. Adding the payload
    changes their leaf preimage (`SHA-256(0x00 ‖ rmp_serde(Event))`) and therefore
@@ -1152,7 +1152,7 @@ pub struct ProofStep {
 ```rust
 pub struct ConsistencyCheckpoint {
     pub context_id: ContextId,
-    pub sender_did: [u8; 32],
+    pub sender_did: Identifier,
     pub event_count: u64,
     pub merkle_root: [u8; 32],
     pub epoch: Option<u64>,         // Current MLS epoch (None for Broadcast contexts)
@@ -1161,7 +1161,7 @@ pub struct ConsistencyCheckpoint {
 }
 ```
 
-   - **`generate_checkpoint(log: &EventLog, sender_did: &[u8; 32], epoch: u64, signing_key: &KeyHandle, signing_key_id: &str) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state. The `signing_key_id` names the operational role that signed, `"#active"`.
+   - **`generate_checkpoint(log: &EventLog, sender_did: &Identifier, epoch: u64, signing_key: &KeyHandle, signing_key_id: &str) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state. The `signing_key_id` names the operational role that signed, `"#active"`.
    - **`compare_checkpoint(local_log: &EventLog, remote_checkpoint: &ConsistencyCheckpoint) -> CheckpointComparison`**: Compares a received checkpoint against local state. Returns `Consistent`, `Divergent { first_divergent_event: Option<u64> }`, `Behind { missing_events: u64 }`, or `Ahead { extra_events: u64 }`.
    - Checkpoints are generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3).
    - Checkpoints are sent as regular MLS application messages.

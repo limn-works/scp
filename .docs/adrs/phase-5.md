@@ -56,7 +56,7 @@ Implement `scp-media/` crate. Delegated model: context provides identity + trust
 pub struct MediaSession {
     pub session_id: String,
     pub context_id: ContextId,
-    pub participants: Vec<[u8; 32]>,
+    pub participants: Vec<Identifier>,
     pub capabilities: Vec<MediaCapability>,
     pub state: MediaSessionState,
     pub started_at: u64,
@@ -83,14 +83,14 @@ pub enum SignalingMessage {
 
 pub struct SessionDescription {
     pub sdp: String,
-    pub sender_did: [u8; 32],
+    pub sender_did: Identifier,
 }
 
 pub struct Candidate {
     pub candidate: String,
     pub sdp_mid: Option<String>,
     pub sdp_mline_index: Option<u16>,
-    pub sender_did: [u8; 32],
+    pub sender_did: Identifier,
 }
 
 pub struct MediaKeyMaterial {
