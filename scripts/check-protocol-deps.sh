@@ -42,6 +42,23 @@ fi
 
 echo "scp-protocol dependency check passed: no async runtime deps."
 
+# scp-kel computes key-event preimages, digests and routing ids
+# (09-security-model.md §9.7.4.2), which a native node and the wasm32 browser
+# client must compute alike. It stays a pure, synchronous leaf: no async
+# runtime, no MLS, no platform storage, no transport, no runtime crate.
+echo "Checking scp-kel dependency tree..."
+kel_banned="tokio|async-std|smol|futures-executor|scp-platform|openmls|scp-transport|scp-runtime"
+kel_output=$(cargo tree -p scp-kel --edges no-dev --target all 2>&1) || { echo "ERROR: cargo tree failed: $kel_output"; exit 1; }
+kel_matches=$(echo "$kel_output" | grep -iE "$kel_banned" || true)
+
+if [ -n "$kel_matches" ]; then
+    echo "ERROR: scp-kel has banned dependencies:"
+    echo "$kel_matches"
+    exit 1
+fi
+
+echo "scp-kel dependency check passed: a synchronous leaf."
+
 # jsonschema_has_no_resolve_features: a challenge schema compiles with a
 # retriever that fetches nothing (spec 07 §7.3.4 step 1), and jsonschema's
 # `resolve-http` and `resolve-file` features add retrievers that fetch over
