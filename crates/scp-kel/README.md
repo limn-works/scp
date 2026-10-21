@@ -1,8 +1,11 @@
 # scp-kel
 
-The **key-event log codec** for SCP (Shared Context Protocol): the byte
-constructions `09-security-model.md` §9.7.4.2 defines over a key event, each
-with exactly one implementation (ADR-063, implementation constraints).
+The **key-event log** for SCP (Shared Context Protocol), as
+`09-security-model.md` §9.7.4.2 defines it: the codec for a key event's byte
+constructions, the identifier and routing derivations, the validation of an
+entry's served events into chains (R3), and the replay of a validated chain
+into key state (R8). Each has exactly one implementation (ADR-063,
+implementation constraints).
 
 This crate owns:
 
@@ -70,12 +73,15 @@ This crate owns:
   on the identity. `ValidatedChain` is built only here: `extend` reads one
   more unit, `prefix` cuts it at a position, and `validate_change` checks a
   candidate preimage into a `ValidatedChange`. `HeldHead` and `SigningChange`
-  carry the head a signer signs at.
-- `replay` and `key_state_at` — the key state a `ValidatedChain` derives at
-  its head or at one of its events (R8): that position's latest snapshot
-  with the standing commitment there, nothing diffed or merged, as a
+  carry the head a signer signs at. `ValidChains::single` returns the chain
+  of an unforked entry and `None` for a forked one; choosing among forks is
+  R6's fork choice (SCP-310), so no accessor returns one fork of several.
+- `replay` and `key_state_at` — the key state the adopted `ValidatedChain`
+  derives at its head or at one of its events (R8): that position's latest
+  snapshot with the standing commitment there, nothing diffed or merged, as a
   `ReplayedState` carrying the identifier, the position's digest and
-  sequence. `ReplayedState` has no public constructor, so every one comes
+  sequence, and the `#active` key and root count R3 resolved for that
+  snapshot (`active_key`, `root_members`, `root_count`). `ReplayedState` has no public constructor, so every one comes
   from a validated chain; `key_state_at` fails with `NotOnChain` for a
   digest the chain does not hold.
 

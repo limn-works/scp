@@ -17,8 +17,10 @@ enforces two inclusions:
    vectors in `NOT_GENERATED` are exempt, because spec 25 states that no script
    produces their bytes.
 3. Every hexadecimal string literal of 32 or more characters in a Rust vector
-   file appears in the generator's output or in spec 25, so a Rust test cannot
-   assert a byte string the generator no longer produces. A Rust vector file is
+   file appears in the generator's output, so a Rust test cannot assert a byte
+   string the generator no longer produces. Spec 25 printing a value is not
+   enough: check 2 exempts `NOT_GENERATED` vectors and skips `0x`-prefixed
+   tokens, so a value the spec prints can still be one no generator emits. A Rust vector file is
    any tracked `.rs` file that cites spec 25 (`§25`, `25-test-vectors` or
    `spec 25`), found by `git ls-files`, so a new or renamed file joins the scan
    without an edit here. Adjacent pieces of one `concat!` and the lines of one
@@ -85,6 +87,10 @@ FOREIGN: dict[str, tuple[str, frozenset[str]]] = {
             }
         ),
     ),
+    "crates/scp-client-wasm/tests/pseudonym_cross_target_kat.rs": (
+        "Vector 58's pseudonym preimages, which spec 25 states no script generates",
+        frozenset({"4d61919cc6c61257", "66d11a29cd90b328"}),
+    ),
     "crates/scp-crypto/src/p256.rs": (
         "RFC 6979 A.2.5, RFC 7515 A.3, the ECDH vector, P-256 constants",
         frozenset(
@@ -127,6 +133,10 @@ FOREIGN: dict[str, tuple[str, frozenset[str]]] = {
     "crates/scp-mls/src/keypackage_attestation.rs": (
         "the P-256 field prime p",
         frozenset({"8cd3046264c9ea41"}),
+    ),
+    "crates/scp-protocol/src/context/pseudonym.rs": (
+        "Vector 58's pseudonym preimages, which spec 25 states no script generates",
+        frozenset({"4d61919cc6c61257", "66d11a29cd90b328"}),
     ),
     "crates/scp-protocol/src/crypto/hpke/p256.rs": (
         "RFC 9180 A.3 and the P-256 group order n",
@@ -175,6 +185,10 @@ FOREIGN: dict[str, tuple[str, frozenset[str]]] = {
                 "b35121efde20b8d2",
             }
         ),
+    ),
+    "crates/scp-runtime/src/context/pseudonym_rotation_runtime_tests.rs": (
+        "Vector 58's pseudonym preimages, which spec 25 states no script generates",
+        frozenset({"4d61919cc6c61257", "66d11a29cd90b328"}),
     ),
     "crates/scp-runtime/src/crypto/access_keys/wire.rs": (
         "the access-key request JSON golden",
@@ -280,7 +294,6 @@ def problems(generated: str, spec: str, rust_tests: dict[str, str]) -> list[str]
             found.append(
                 f"spec 25 line {number} prints {run[:48]}..., which the generator does not emit"
             )
-    flat_spec = flat_spec.lower()
     vector_files = rust_vector_files(rust_tests)
     literal_count = 0
     for path, source in sorted(vector_files.items()):
@@ -288,7 +301,7 @@ def problems(generated: str, spec: str, rust_tests: dict[str, str]) -> list[str]
         used = set()
         for line, literal in rust_hex_literals(source):
             literal_count += 1
-            if literal in flat_generated or literal in flat_spec:
+            if literal in flat_generated:
                 continue
             key = foreign_key(literal)
             if key in declared:
@@ -296,8 +309,8 @@ def problems(generated: str, spec: str, rust_tests: dict[str, str]) -> list[str]
                 continue
             found.append(
                 f"{path}:{line} asserts {literal[:48]}..., which the generator does "
-                f"not emit and spec 25 does not print; if another source owns it, "
-                f"add {key} to FOREIGN[{path!r}] with that source"
+                f"not emit; if another source owns it, add {key} to "
+                f"FOREIGN[{path!r}] with that source"
             )
         found.extend(
             f"FOREIGN[{path!r}] ({source_name}) lists {key}, which the file no longer holds"
@@ -453,6 +466,26 @@ def self_test(generated: str) -> int:
     kc_source = rust_tests[kc_path]
     assert kc_source.count('"800512",') == 1, "Vector 20's last concat! piece moved"
     uncited = f'const V: &str = "{literal}";\n'
+    # Two values spec 25 prints that the generator does not emit, each of a
+    # kind check 2 lets through: Vector 58's preimage sits under a
+    # NOT_GENERATED heading, and Vector 27's pseudonym_key is `0x`-prefixed,
+    # which SPEC_HEX_TOKEN_RE skips. A Rust literal of either fails unless
+    # FOREIGN declares it in its file.
+    flat_generated = WHITESPACE_RE.sub("", generated).lower()
+    flat_spec = WHITESPACE_RE.sub("", spec).lower()
+    pseudonym_path = "crates/scp-protocol/src/context/pseudonym.rs"
+    not_generated = [
+        value
+        for _, value in rust_hex_literals(rust_tests[pseudonym_path])
+        if value not in flat_generated
+    ]
+    assert not_generated and all(v in flat_spec for v in not_generated), (
+        "pseudonym.rs no longer holds a Vector 58 value spec 25 prints"
+    )
+    vector_27_key = "746573742d70736575646f6e796d2d6b6579"
+    assert f"0x{vector_27_key}" in spec and vector_27_key not in flat_generated, (
+        "Vector 27's pseudonym_key moved or is now generated"
+    )
     cases = {
         f"the first digit of the spec 25 run at line {first_line}": (
             problems(
@@ -483,6 +516,28 @@ def self_test(generated: str) -> int:
                 {**rust_tests, kc_path: kc_source.replace('"800512",', '"800513",')},
             ),
             f"{kc_path}:",
+        ),
+        "an undeclared Vector 58 value in a file that cites spec 25": (
+            problems(
+                generated,
+                spec,
+                {
+                    **rust_tests,
+                    new_path: f'// spec 25 Vector 58\nconst V: &str = "{not_generated[0]}";\n',
+                },
+            ),
+            f"{new_path}:2 ",
+        ),
+        "an undeclared 0x-prefixed spec 25 value in a file that cites spec 25": (
+            problems(
+                generated,
+                spec,
+                {
+                    **rust_tests,
+                    new_path: f'// spec 25 Vector 27\nconst V: &str = "{vector_27_key}";\n',
+                },
+            ),
+            f"{new_path}:2 ",
         ),
         "a spec 25 value in a file that cites no spec 25 section": (
             problems(generated, spec, {**rust_tests, new_path: uncited}),

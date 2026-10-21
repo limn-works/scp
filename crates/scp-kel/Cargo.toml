@@ -1,7 +1,7 @@
 [package]
 name = "scp-kel"
 version = "0.1.0-beta.2"
-description = "The SCP key-event log codec: the key-event preimage, its digest, the inception-derived identifier and the routing identifiers — wasm-safe, no async, no I/O"
+description = "The SCP key-event log: the event codec, the identifier and routing derivations, chain validation, and key-state replay — wasm-safe, no async, no I/O"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true

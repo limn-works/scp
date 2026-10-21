@@ -8,10 +8,14 @@ pull request that added the edge merged green. The same holds when
 `.github/workflows/release.yml` publishes a crate before one it depends on,
 or never publishes a crate a published crate depends on.
 
-The check reads `cargo metadata --locked` for the root workspace and for the
-`fuzz/` workspace, which carries its own lockfile, so a dependency edge one
-lockfile does not record also fails here. For every local package (no
-registry source) it asserts:
+The check reads `cargo metadata --no-deps --offline` for the root workspace
+and for the `fuzz/` workspace. The rules need only each workspace's members,
+their `publish` setting and their declared path dependencies, all of which
+come from the manifests, so the check resolves no registry crate and reads
+nothing from the cargo home: it runs the same with an empty `CARGO_HOME` and
+no network as it does on a warm machine. Whether fuzz/Cargo.lock records every
+edge is fuzz-build's `cargo check --locked`, not this check. Over the members
+of both workspaces it asserts:
 
   1. a publishable package has no normal or build dependency on a local
      package with `publish = false` (dev-dependencies are stripped from the
@@ -40,18 +44,21 @@ PUBLISH_STEP = re.compile(r"^\s*run:\s*cargo publish -p (\S+)", re.MULTILINE)
 SHIPPED_KINDS = (None, "build")
 
 
-class StaleLock(Exception):
+class MetadataFailed(Exception):
     pass
 
 
 def metadata(manifest: Path) -> dict:
+    # --no-deps reads the manifests alone; --offline turns any registry access
+    # a future cargo might attempt into an error here rather than a download.
     out = subprocess.run(
         [
             "cargo",
             "metadata",
             "--format-version",
             "1",
-            "--locked",
+            "--no-deps",
+            "--offline",
             "--manifest-path",
             str(manifest),
         ],
@@ -60,14 +67,19 @@ def metadata(manifest: Path) -> dict:
         text=True,
     )
     if out.returncode != 0:
-        raise StaleLock(
-            f"{manifest.relative_to(ROOT)}: `cargo metadata --locked` failed:\n{out.stderr.strip()}"
+        raise MetadataFailed(
+            f"{manifest.relative_to(ROOT)}: `cargo metadata --no-deps --offline` failed:\n{out.stderr.strip()}"
         )
     return json.loads(out.stdout)
 
 
 def local_packages(meta: dict) -> dict[str, dict]:
-    """Every package built from a path in this checkout, by name."""
+    """Every package built from a path in this checkout, by name.
+
+    Under --no-deps that is every workspace member; a path dependency outside
+    the workspace appears only in its dependent's `dependencies` list, which is
+    why run() checks edges over the members of both workspaces together.
+    """
     return {p["name"]: p for p in meta["packages"] if p.get("source") is None}
 
 
@@ -131,9 +143,12 @@ def check_release(
 
 
 def run(metas: list[tuple[str, dict]], steps: list[str]) -> list[str]:
-    errors = []
-    for label, meta in metas:
-        errors += check_edges(local_packages(meta), label)
+    # One name space over both workspaces: a fuzz member's path dependencies
+    # are root members, which only the root workspace's metadata lists.
+    combined: dict[str, dict] = {}
+    for _, meta in metas:
+        combined.update(local_packages(meta))
+    errors = check_edges(combined, " + ".join(label for label, _ in metas))
     _, root = metas[0]
     local = local_packages(root)
     members = {
@@ -188,6 +203,20 @@ def self_test() -> int:
         if not run([("planted", meta)], steps):
             print(f"self-test FAILED: case `{name}` passed but must fail")
             failed = True
+    # --no-deps lists only a workspace's own members, so a second workspace's
+    # member reaches a root crate only through the combined name space.
+    cross = run(
+        [
+            ("root", _meta(_pkg("a", True, []), _pkg("k", False, []))),
+            ("second", _meta(_pkg("f", True, [("k", None)]))),
+        ],
+        ["a"],
+    )
+    if not cross:
+        print(
+            "self-test FAILED: case `cross-workspace-dep-on-private` passed but must fail"
+        )
+        failed = True
     clean = run([("planted", a_dev_on_private)], ["a"])
     ordered = run(
         [("planted", _meta(_pkg("a", True, [("k", None)]), _pkg("k", True, [])))],
@@ -199,7 +228,7 @@ def self_test() -> int:
     if failed:
         return 1
     print(
-        f"check-publish-graph self-test: {len(cases)} planted defects rejected, 2 clean cases accepted"
+        f"check-publish-graph self-test: {len(cases) + 1} planted defects rejected, 2 clean cases accepted"
     )
     return 0
 
@@ -209,8 +238,8 @@ def main() -> int:
         return self_test()
     try:
         metas = [(str(m.relative_to(ROOT)), metadata(m)) for m in WORKSPACES]
-    except StaleLock as stale:
-        print(f"error: {stale}")
+    except MetadataFailed as failed:
+        print(f"error: {failed}")
         return 1
     steps = PUBLISH_STEP.findall(RELEASE.read_text())
     errors = run(metas, steps)
