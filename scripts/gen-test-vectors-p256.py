@@ -3283,10 +3283,10 @@ def emit_challenge_vectors() -> None:
             var_field(jcs(output)),
         )
         response_digests[attempt] = sha256(pre)
-        emit("%s.output_jcs" % label, jcs(output).decode())
-        emit("%s.preimage_len" % label, len(pre))
-        emit_hex("%s.preimage" % label, pre)
-        emit_hex("%s.digest" % label, response_digests[attempt])
+        emit(f"{label}.output_jcs", jcs(output).decode())
+        emit(f"{label}.preimage_len", len(pre))
+        emit_hex(f"{label}.preimage", pre)
+        emit_hex(f"{label}.digest", response_digests[attempt])
 
     # --- Vectors 62 and 63: the verification records of attempts 1 and 2. ---
     # Vector 63 is graded exactly `cooldown_secs` after Vector 62, the
@@ -3323,15 +3323,15 @@ def emit_challenge_vectors() -> None:
             record_expires_at,
             context_id,
         )
-        emit("%s.attempt" % label, attempt)
-        emit("%s.timestamp" % label, ts)
-        emit("%s.expires_at" % label, record_expires_at)
-        emit("%s.verification_id_preimage_len" % label, len(vid_pre))
-        emit_hex("%s.verification_id_preimage" % label, vid_pre)
-        emit_hex("%s.verification_id" % label, vid)
-        emit("%s.preimage_len" % label, len(pre))
-        emit_hex("%s.preimage" % label, pre)
-        emit_hex("%s.digest" % label, sha256(pre))
+        emit(f"{label}.attempt", attempt)
+        emit(f"{label}.timestamp", ts)
+        emit(f"{label}.expires_at", record_expires_at)
+        emit(f"{label}.verification_id_preimage_len", len(vid_pre))
+        emit_hex(f"{label}.verification_id_preimage", vid_pre)
+        emit_hex(f"{label}.verification_id", vid)
+        emit(f"{label}.preimage_len", len(pre))
+        emit_hex(f"{label}.preimage", pre)
+        emit_hex(f"{label}.digest", sha256(pre))
         assert ABSENT_SENTINEL not in pre, label
 
 
