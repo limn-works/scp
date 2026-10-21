@@ -33,8 +33,8 @@ fn vector_41_preimage_digest_and_identifier() -> TestResult {
     // The bytes a verifier received derive the same identifier with no
     // re-encode.
     assert_eq!(
-        decode_preimage(&fields(V41_PREIMAGE)?)?.identifier(),
-        identifier(V41_IDENTIFIER)?
+        decode_preimage(&fields(V41_PREIMAGE)?)?.inception_identifier(),
+        Some(identifier(V41_IDENTIFIER)?)
     );
     Ok(())
 }
@@ -54,11 +54,11 @@ fn vector_50_key_state_pins_both_composite_sentinels() -> TestResult {
     assert_vector(&preimage, V50_PREIMAGE, V50_DIGEST)?;
     // The last four bytes are field 12's sentinel, never the one byte 0x00.
     assert_eq!(bytes(V50_PREIMAGE)?.get(316..), Some(&[0u8; 4][..]));
-    // A non-inception event's identifier is the field 2 identifier it carries.
-    assert_eq!(
-        encode_preimage(&preimage)?.identifier(),
-        identifier(V41_IDENTIFIER)?
-    );
+    // A non-inception event derives no identifier: its field 2 is the
+    // identifier it claims, which only the preimage's field reports.
+    let encoded = encode_preimage(&preimage)?;
+    assert_eq!(encoded.inception_identifier(), None);
+    assert_eq!(encoded.preimage().identifier, identifier(V41_IDENTIFIER)?);
     Ok(())
 }
 

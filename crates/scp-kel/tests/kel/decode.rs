@@ -1,7 +1,9 @@
 //! `decode_preimage`'s rejections (`09-security-model.md` §9.7.4.2): the
-//! count-bound rule, truncation at every fixed field, trailing bytes,
-//! unregistered discriminators, and the `compromised_from` rule. Each test
-//! mutates one byte or one length of a spec 25 vector's field bytes.
+//! count-bound rule, the form-list pairing, the exact encoded length,
+//! truncation at every fixed field, trailing bytes, unregistered
+//! discriminators, and the `compromised_from` rule. Each test mutates one
+//! byte or one length of a spec 25 vector's field bytes. A header failure
+//! is a `DecodeError::Header` and a body failure a `DecodeError::Body`.
 
 use scp_did::{
     CommitmentEntry, CustodyType, DiscriminatorKind, Identifier, KeyAlgorithm, KeyCondition,
@@ -11,9 +13,10 @@ use scp_kel::constants::{
     MAX_EVENT_BYTES, MAX_NEXT_SET_SIZE, MAX_ROOT_SET_SIZE, MAX_WITNESS_SET_SIZE,
 };
 use scp_kel::{
-    CommitmentRolloverFields, Continuation, DecodeError, DidDiscriminatorField, EncodeError,
-    EventKind, EventPreimage, KelDiscriminatorField, ListField, PreimageField, RootRecoveryFields,
-    SignatureForm, SignerGroup, SignerGroupRole, StandingRootSigning, decode_preimage,
+    BodyError, BodyField, BodyList, CommitmentRolloverFields, Continuation, DecodeError,
+    DidDiscriminatorField, EncodeError, EventKind, EventPreimage, FormListLength,
+    HeaderDiscriminator, HeaderError, HeaderField, ListField, RootRecoveryFields, SignatureForm,
+    SignerGroup, SignerGroupRole, SignerList, StandingRootSigning, decode_preimage,
     encode_preimage,
 };
 
@@ -112,6 +115,41 @@ fn n(count: u32) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(usize::try_from(count)?)
 }
 
+/// The decode error a list's count over its maximum produces: a header
+/// error for a list of fields 6 and 7, a body error otherwise.
+const fn over_max(list: ListField, count: u32, max: u32) -> DecodeError {
+    match list {
+        ListField::Signer(list) => {
+            DecodeError::Header(HeaderError::CountOverMax { list, count, max })
+        }
+        ListField::Body(list) => DecodeError::Body(BodyError::CountOverMax { list, count, max }),
+    }
+}
+
+/// The decode error a list's count past the remaining bytes produces.
+const fn over_remaining(list: ListField, count: u32, remaining: usize) -> DecodeError {
+    match list {
+        ListField::Signer(list) => DecodeError::Header(HeaderError::CountOverRemaining {
+            list,
+            count,
+            remaining,
+        }),
+        ListField::Body(list) => DecodeError::Body(BodyError::CountOverRemaining {
+            list,
+            count,
+            remaining,
+        }),
+    }
+}
+
+const fn header_cut(field: HeaderField) -> DecodeError {
+    DecodeError::Header(HeaderError::Truncated { field })
+}
+
+const fn body_cut(field: BodyField) -> DecodeError {
+    DecodeError::Body(BodyError::Truncated { field })
+}
+
 /// Replaces the list whose count sits at `offset` in `bytes` (holding
 /// `old` elements of `element.len()` bytes) with `count` copies of
 /// `element`, writing the count directly.
@@ -132,6 +170,21 @@ fn splice_list(
     Ok(out)
 }
 
+/// Replaces one signer group's index list (count at `index_offset`) and
+/// form list (count at `form_offset`), each holding one entry, with `count`
+/// copies of `index` and of `form`, so the two lists stay paired. The form
+/// list follows the index list, so it is spliced first and the index
+/// list's offset still holds.
+fn splice_group(
+    bytes: &[u8],
+    index_offset: usize,
+    form_offset: usize,
+    count: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let forms = splice_list(bytes, form_offset, 1, &[0x01], count)?;
+    splice_list(&forms, index_offset, 1, &[0], count)
+}
+
 /// Asserts `bytes` decode and re-encode to the identical bytes.
 fn assert_decodes_identically(bytes: &[u8]) -> TestResult {
     let decoded = decode_preimage(bytes)?;
@@ -139,28 +192,18 @@ fn assert_decodes_identically(bytes: &[u8]) -> TestResult {
     Ok(())
 }
 
-/// Asserts the list at `offset` decodes at `max` and is rejected at
+/// Asserts the list `with_count` writes decodes at `max` and is rejected at
 /// `max + 1`, with an error that names the list.
 fn assert_capped(
-    bytes: &[u8],
-    offset: usize,
-    old: usize,
-    element: &[u8],
+    with_count: impl Fn(u32) -> Result<Vec<u8>, Box<dyn std::error::Error>>,
     list: ListField,
     max: u32,
 ) -> TestResult {
-    assert_decodes_identically(&splice_list(bytes, offset, old, element, max)?)?;
-    let error = decode_preimage(&splice_list(bytes, offset, old, element, max + 1)?)
+    assert_decodes_identically(&with_count(max)?)?;
+    let error = decode_preimage(&with_count(max + 1)?)
         .err()
         .ok_or("a list over its maximum decoded")?;
-    assert_eq!(
-        error,
-        DecodeError::CountOverMax {
-            list,
-            count: max + 1,
-            max
-        }
-    );
+    assert_eq!(error, over_max(list, max + 1, max));
     assert!(error.to_string().contains(&list.to_string()));
     Ok(())
 }
@@ -233,14 +276,17 @@ fn root_recovery_fields() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 
 #[test]
 fn reveal_group_index_list_is_capped_at_max_next_set_size() -> TestResult {
-    let list = ListField::SignerIndices(SignerGroupRole::Reveal);
-    assert_capped(&rollover_fields()?, 74, 1, &[0], list, MAX_NEXT_SET_SIZE)?;
-    // The reveal group leads a RootRecovery too.
+    let list = ListField::Signer(SignerList::Indices(SignerGroupRole::Reveal));
+    let rollover = rollover_fields()?;
     assert_capped(
-        &root_recovery_fields()?,
-        74,
-        1,
-        &[0],
+        |count| splice_group(&rollover, 74, 84, count),
+        list,
+        MAX_NEXT_SET_SIZE,
+    )?;
+    // The reveal group leads a RootRecovery too.
+    let recovery = root_recovery_fields()?;
+    assert_capped(
+        |count| splice_group(&recovery, 74, 89, count),
         list,
         MAX_NEXT_SET_SIZE,
     )
@@ -248,24 +294,20 @@ fn reveal_group_index_list_is_capped_at_max_next_set_size() -> TestResult {
 
 #[test]
 fn installed_root_set_is_capped_at_max_root_set_size() -> TestResult {
+    let bytes = v41_fields()?;
     assert_capped(
-        &v41_fields()?,
-        ROOT_SET_COUNT,
-        1,
-        &[3; 33],
-        ListField::InstalledRootSet,
+        |count| splice_list(&bytes, ROOT_SET_COUNT, 1, &[3; 33], count),
+        ListField::Body(BodyList::InstalledRootSet),
         MAX_ROOT_SET_SIZE,
     )
 }
 
 #[test]
 fn witness_set_is_capped_at_max_witness_set_size() -> TestResult {
+    let bytes = v41_fields()?;
     assert_capped(
-        &v41_fields()?,
-        WITNESS_COUNT,
-        1,
-        &[9; 32],
-        ListField::Witnesses,
+        |count| splice_list(&bytes, WITNESS_COUNT, 1, &[9; 32], count),
+        ListField::Body(BodyList::Witnesses),
         MAX_WITNESS_SET_SIZE,
     )
 }
@@ -277,42 +319,64 @@ fn commitment_list_is_capped_at_max_next_set_size() -> TestResult {
         CustodyType::Software.to_byte(),
         KeyAlgorithm::EcdsaP256Sha256.to_byte(),
     ]);
+    let bytes = v41_fields()?;
     assert_capped(
-        &v41_fields()?,
-        COMMITMENT_COUNT,
-        1,
-        &entry,
-        ListField::Commitments,
+        |count| splice_list(&bytes, COMMITMENT_COUNT, 1, &entry, count),
+        ListField::Body(BodyList::Commitments),
         MAX_NEXT_SET_SIZE,
     )
 }
 
+/// No §9.18.17 row caps a form list, or the index list of any group but the
+/// reveal group, so each such group decodes past every registered maximum,
+/// its form list paired with its index list.
 #[test]
-fn a_17_index_root_group_decodes() -> TestResult {
-    assert_uncapped(&v41_fields()?, INDEX_COUNT, 1, &[0], 17)?;
-    assert_uncapped(&v41_fields()?, INDEX_COUNT, 1, &[0], PAST_EVERY_CAP)
-}
-
-#[test]
-fn a_17_entry_form_list_decodes() -> TestResult {
-    assert_uncapped(&v41_fields()?, FORM_COUNT, 1, &[0x02], 17)?;
-    // Every role's form list: a rollover's two and a recovery's three.
-    for offset in [84, 89] {
-        assert_uncapped(&rollover_fields()?, offset, 1, &[0x01], PAST_EVERY_CAP)?;
-    }
-    for offset in [89, 94, 99] {
-        assert_uncapped(&root_recovery_fields()?, offset, 1, &[0x01], PAST_EVERY_CAP)?;
+fn every_signer_group_but_the_reveal_group_is_uncapped() -> TestResult {
+    for count in [17, PAST_EVERY_CAP] {
+        // Vector 41's root group.
+        assert_decodes_identically(&splice_group(
+            &v41_fields()?,
+            INDEX_COUNT,
+            FORM_COUNT,
+            count,
+        )?)?;
+        // The rollover's standing-root group.
+        assert_decodes_identically(&splice_group(&rollover_fields()?, 79, 89, count)?)?;
+        // The recovery's K′ and standing-root groups.
+        for (index_offset, form_offset) in [(79, 94), (84, 99)] {
+            assert_decodes_identically(&splice_group(
+                &root_recovery_fields()?,
+                index_offset,
+                form_offset,
+                count,
+            )?)?;
+        }
     }
     Ok(())
 }
 
+/// The reveal group's form list carries no cap of its own: past every
+/// maximum it fails only the pairing with its one-entry index list, at step
+/// 4, in either direction.
 #[test]
-fn every_index_list_but_the_reveal_groups_is_uncapped() -> TestResult {
-    // The rollover's standing-root group, and the recovery's K′ and
-    // standing-root groups.
-    assert_uncapped(&rollover_fields()?, 79, 1, &[0], PAST_EVERY_CAP)?;
-    for offset in [79, 84] {
-        assert_uncapped(&root_recovery_fields()?, offset, 1, &[0], PAST_EVERY_CAP)?;
+fn a_form_list_is_bounded_by_its_index_list() -> TestResult {
+    for (form_offset, role) in [
+        (84, SignerGroupRole::Reveal),
+        (89, SignerGroupRole::StandingRoot),
+    ] {
+        for count in [0, 2, PAST_EVERY_CAP] {
+            let bytes = splice_list(&rollover_fields()?, form_offset, 1, &[0x01], count)?;
+            assert_eq!(
+                decode_preimage(&bytes),
+                Err(DecodeError::Header(HeaderError::FormListLength(
+                    FormListLength {
+                        role,
+                        indices: 1,
+                        forms: n(count)?,
+                    }
+                )))
+            );
+        }
     }
     Ok(())
 }
@@ -342,11 +406,11 @@ fn a_count_of_u32_max_is_rejected_before_any_allocation() -> TestResult {
         .copy_from_slice(&u32::MAX.to_be_bytes());
     assert_eq!(
         decode_preimage(&bytes),
-        Err(DecodeError::CountOverRemaining {
-            list: ListField::SnapshotKeys,
-            count: u32::MAX,
-            remaining: V41_FIELD_LEN - KEY_COUNT - 4,
-        })
+        Err(over_remaining(
+            ListField::Body(BodyList::SnapshotKeys),
+            u32::MAX,
+            V41_FIELD_LEN - KEY_COUNT - 4,
+        ))
     );
     Ok(())
 }
@@ -389,7 +453,7 @@ fn encoder_refuses_each_capped_list_over_its_maximum() -> TestResult {
     });
     assert_encode_over_max(
         &rollover,
-        ListField::SignerIndices(SignerGroupRole::Reveal),
+        ListField::Signer(SignerList::Indices(SignerGroupRole::Reveal)),
         MAX_NEXT_SET_SIZE,
     )?;
 
@@ -399,12 +463,20 @@ fn encoder_refuses_each_capped_list_over_its_maximum() -> TestResult {
         .as_mut()
         .ok_or("no root set")?
         .members = vec![[3; 33]; n(MAX_ROOT_SET_SIZE)? + 1];
-    assert_encode_over_max(&root_set, ListField::InstalledRootSet, MAX_ROOT_SET_SIZE)?;
+    assert_encode_over_max(
+        &root_set,
+        ListField::Body(BodyList::InstalledRootSet),
+        MAX_ROOT_SET_SIZE,
+    )?;
 
     let mut witnesses = v41_inception(SignatureForm::Raw)?;
     witnesses.key_state.as_mut().ok_or("no snapshot")?.witnesses =
         vec![Identifier::from_bytes([9; 32]); n(MAX_WITNESS_SET_SIZE)? + 1];
-    assert_encode_over_max(&witnesses, ListField::Witnesses, MAX_WITNESS_SET_SIZE)?;
+    assert_encode_over_max(
+        &witnesses,
+        ListField::Body(BodyList::Witnesses),
+        MAX_WITNESS_SET_SIZE,
+    )?;
 
     let mut commitments = v41_inception(SignatureForm::Raw)?;
     let Some(Continuation::FixesCommitment(commitment)) = commitments.continuation.as_mut() else {
@@ -418,7 +490,11 @@ fn encoder_refuses_each_capped_list_over_its_maximum() -> TestResult {
         };
         over_next
     ];
-    assert_encode_over_max(&commitments, ListField::Commitments, MAX_NEXT_SET_SIZE)
+    assert_encode_over_max(
+        &commitments,
+        ListField::Body(BodyList::Commitments),
+        MAX_NEXT_SET_SIZE,
+    )
 }
 
 #[test]
@@ -432,6 +508,30 @@ fn encoder_accepts_uncapped_lists_past_every_maximum() -> TestResult {
     preimage.seals = vec![[5; 32]; past];
     let encoded = encode_preimage(&preimage)?;
     assert_eq!(decode_preimage(encoded.fields())?.preimage(), &preimage);
+    Ok(())
+}
+
+/// A form list shorter, then longer, than its index list has no encoded
+/// length (§9.18.17), so the encoder refuses it as the decoder would.
+#[test]
+fn encoder_refuses_a_form_list_whose_length_differs_from_its_index_list() -> TestResult {
+    for forms in [vec![], vec![SignatureForm::Raw, SignatureForm::Raw]] {
+        let mut preimage = v41_inception(SignatureForm::Raw)?;
+        preimage
+            .signer_groups
+            .first_mut()
+            .ok_or("no group")?
+            .forms
+            .clone_from(&forms);
+        assert_eq!(
+            encode_preimage(&preimage),
+            Err(EncodeError::FormListLength(FormListLength {
+                role: SignerGroupRole::Root,
+                indices: 1,
+                forms: forms.len(),
+            }))
+        );
+    }
     Ok(())
 }
 
@@ -484,11 +584,7 @@ fn assert_over_remaining(
     let cut = bytes.get(..offset + 4 + needed - 1).ok_or("short")?;
     assert_eq!(
         decode_preimage(cut),
-        Err(DecodeError::CountOverRemaining {
-            list,
-            count,
-            remaining: needed - 1,
-        })
+        Err(over_remaining(list, count, needed - 1))
     );
     Ok(())
 }
@@ -499,7 +595,7 @@ fn signer_index_list_past_the_remaining_bytes_is_rejected() -> TestResult {
         &v41_fields()?,
         INDEX_COUNT,
         1,
-        ListField::SignerIndices(SignerGroupRole::Root),
+        ListField::Signer(SignerList::Indices(SignerGroupRole::Root)),
     )
 }
 
@@ -509,13 +605,18 @@ fn signature_form_list_past_the_remaining_bytes_is_rejected() -> TestResult {
         &v41_fields()?,
         FORM_COUNT,
         1,
-        ListField::SignatureForms(SignerGroupRole::Root),
+        ListField::Signer(SignerList::Forms(SignerGroupRole::Root)),
     )
 }
 
 #[test]
 fn revealed_keys_past_the_remaining_bytes_are_rejected() -> TestResult {
-    assert_over_remaining(&rollover_fields()?, 94, 33, ListField::RevealedKeys)
+    assert_over_remaining(
+        &rollover_fields()?,
+        94,
+        33,
+        ListField::Body(BodyList::RevealedKeys),
+    )
 }
 
 #[test]
@@ -524,52 +625,82 @@ fn installed_root_set_past_the_remaining_bytes_is_rejected() -> TestResult {
         &v41_fields()?,
         ROOT_SET_COUNT,
         33,
-        ListField::InstalledRootSet,
+        ListField::Body(BodyList::InstalledRootSet),
     )
 }
 
 #[test]
 fn snapshot_key_list_past_the_remaining_bytes_is_rejected() -> TestResult {
-    assert_over_remaining(&v41_fields()?, KEY_COUNT, 45, ListField::SnapshotKeys)
+    assert_over_remaining(
+        &v41_fields()?,
+        KEY_COUNT,
+        45,
+        ListField::Body(BodyList::SnapshotKeys),
+    )
 }
 
 #[test]
 fn witness_set_past_the_remaining_bytes_is_rejected() -> TestResult {
-    assert_over_remaining(&v41_fields()?, WITNESS_COUNT, 32, ListField::Witnesses)
+    assert_over_remaining(
+        &v41_fields()?,
+        WITNESS_COUNT,
+        32,
+        ListField::Body(BodyList::Witnesses),
+    )
 }
 
 #[test]
 fn seals_past_the_remaining_bytes_are_rejected() -> TestResult {
-    assert_over_remaining(&fields(V50_PREIMAGE)?, V50_SEAL_COUNT, 32, ListField::Seals)
+    assert_over_remaining(
+        &fields(V50_PREIMAGE)?,
+        V50_SEAL_COUNT,
+        32,
+        ListField::Body(BodyList::Seals),
+    )
 }
 
 #[test]
 fn commitment_list_past_the_remaining_bytes_is_rejected() -> TestResult {
-    assert_over_remaining(&v41_fields()?, COMMITMENT_COUNT, 34, ListField::Commitments)
+    assert_over_remaining(
+        &v41_fields()?,
+        COMMITMENT_COUNT,
+        34,
+        ListField::Body(BodyList::Commitments),
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Length: over MAX_EVENT_BYTES, and truncation inside every fixed field.
 // ---------------------------------------------------------------------------
 
+/// `EventTooLong` carries the exact encoded length, computed once fields 1
+/// through 7 decode and the form lists pair, even where the signed
+/// preimage alone is over `MAX_EVENT_BYTES`; and the header fails before
+/// the body is read, so a body that would decode does not mask it.
 #[test]
-fn input_whose_signed_preimage_passes_max_event_bytes_is_rejected_unread() -> TestResult {
-    // The encoded length is never shorter than the signed preimage, the
-    // 17-byte separator plus the field bytes, so 65,520 field bytes are
-    // over MAX_EVENT_BYTES before any field is read.
-    let len = n(MAX_EVENT_BYTES)? - SEPARATOR_LEN + 1;
+fn event_too_long_reports_the_exact_encoded_length() -> TestResult {
+    // Vector 50 with 2,100 seals: its signed preimage alone is past
+    // MAX_EVENT_BYTES.
+    let bytes = splice_list(&fields(V50_PREIMAGE)?, V50_SEAL_COUNT, 1, &[5; 32], 2100)?;
+    let signed_len = SEPARATOR_LEN + bytes.len();
+    assert!(signed_len > n(MAX_EVENT_BYTES)?);
+    assert_eq!(
+        decode_preimage(&bytes),
+        Err(DecodeError::Header(HeaderError::EventTooLong {
+            encoded_len: u64::try_from(signed_len + 64)?,
+        }))
+    );
+    // Arbitrary bytes past MAX_EVENT_BYTES fail where their fields fail,
+    // with nothing read past the first count that runs out.
+    let len = n(MAX_EVENT_BYTES)?;
     assert_eq!(
         decode_preimage(&vec![0x01; len]),
-        Err(DecodeError::EventTooLong {
-            encoded_len: len + SEPARATOR_LEN
-        })
+        Err(over_remaining(
+            ListField::Signer(SignerList::Indices(SignerGroupRole::Root)),
+            0x0101_0101,
+            len - INDEX_COUNT - 4,
+        ))
     );
-    // At a signed preimage of exactly MAX_EVENT_BYTES the pre-check passes
-    // and parsing runs.
-    assert!(!matches!(
-        decode_preimage(&vec![0x01; len - 1]),
-        Err(DecodeError::EventTooLong { .. })
-    ));
     Ok(())
 }
 
@@ -580,55 +711,63 @@ macro_rules! truncation_test {
             let bytes = v41_fields()?;
             assert_eq!(
                 decode_preimage(bytes.get(..$len).ok_or("short")?),
-                Err(DecodeError::Truncated { field: $field })
+                Err($field)
             );
             Ok(())
         }
     };
 }
 
-truncation_test!(truncated_in_event_type, 0, PreimageField::EventType);
-truncation_test!(truncated_in_identifier, 10, PreimageField::Identifier);
-truncation_test!(truncated_in_sequence, 35, PreimageField::Sequence);
+truncation_test!(
+    truncated_in_event_type,
+    0,
+    header_cut(HeaderField::EventType)
+);
+truncation_test!(
+    truncated_in_identifier,
+    10,
+    header_cut(HeaderField::Identifier)
+);
+truncation_test!(truncated_in_sequence, 35, header_cut(HeaderField::Sequence));
 truncation_test!(
     truncated_in_predecessor_digest,
     50,
-    PreimageField::PredecessorDigest
+    header_cut(HeaderField::PredecessorDigest)
 );
 truncation_test!(
     truncated_in_standing_root,
     STANDING_ROOT,
-    PreimageField::StandingRoot
+    header_cut(HeaderField::StandingRoot)
 );
 truncation_test!(
     truncated_in_signer_index_count,
     INDEX_COUNT + 2,
-    PreimageField::SignerIndices
+    header_cut(HeaderField::SignerIndices)
 );
 truncation_test!(
     truncated_in_signature_form_count,
     FORM_COUNT + 2,
-    PreimageField::SignatureForms
+    header_cut(HeaderField::SignatureForms)
 );
 truncation_test!(
     truncated_in_revealed_key_count,
     REVEALED_COUNT + 2,
-    PreimageField::RevealedKeys
+    body_cut(BodyField::RevealedKeys)
 );
 truncation_test!(
     truncated_in_root_set_count,
     ROOT_SET_COUNT + 2,
-    PreimageField::InstalledRootSet
+    body_cut(BodyField::InstalledRootSet)
 );
 truncation_test!(
     truncated_in_root_set_threshold,
     ROOT_SET_COUNT + 4 + 33 + 2,
-    PreimageField::InstalledRootSet
+    body_cut(BodyField::InstalledRootSet)
 );
 truncation_test!(
     truncated_in_snapshot_root_threshold,
     ROOT_SET_COUNT + 4 + 33 + 4 + 2,
-    PreimageField::KeyState
+    body_cut(BodyField::KeyState)
 );
 // A cut inside a key entry fails the count bound first (CountOverRemaining,
 // `snapshot_key_list_past_the_remaining_bytes_is_rejected`), since entries
@@ -636,42 +775,42 @@ truncation_test!(
 truncation_test!(
     truncated_in_witness_count,
     WITNESS_COUNT + 2,
-    PreimageField::KeyState
+    body_cut(BodyField::KeyState)
 );
 truncation_test!(
     truncated_in_witnessing_interval,
     SERVICE_KEY_ROLE - 2,
-    PreimageField::KeyState
+    body_cut(BodyField::KeyState)
 );
 truncation_test!(
     truncated_in_service_key_role,
     SERVICE_KEY_ROLE,
-    PreimageField::KeyState
+    body_cut(BodyField::KeyState)
 );
 truncation_test!(
     truncated_in_delegator,
     SERVICE_KEY_ROLE + 10,
-    PreimageField::KeyState
+    body_cut(BodyField::KeyState)
 );
 truncation_test!(
     truncated_in_seal_count,
     SEAL_COUNT + 2,
-    PreimageField::Seals
+    body_cut(BodyField::Seals)
 );
 truncation_test!(
     truncated_before_continuation,
     CONTINUATION,
-    PreimageField::Continuation
+    body_cut(BodyField::Continuation)
 );
 truncation_test!(
     truncated_in_commitment_count,
     COMMITMENT_COUNT + 2,
-    PreimageField::Continuation
+    body_cut(BodyField::Continuation)
 );
 truncation_test!(
     truncated_in_next_threshold,
     V41_FIELD_LEN - 2,
-    PreimageField::Continuation
+    body_cut(BodyField::Continuation)
 );
 
 #[test]
@@ -681,9 +820,7 @@ fn truncated_continuation_sentinel_is_rejected() -> TestResult {
     let bytes = fields(V50_PREIMAGE)?;
     assert_eq!(
         decode_preimage(bytes.get(..bytes.len() - 1).ok_or("short")?),
-        Err(DecodeError::Truncated {
-            field: PreimageField::Continuation
-        })
+        Err(body_cut(BodyField::Continuation))
     );
     Ok(())
 }
@@ -698,7 +835,7 @@ fn byte_after_a_commitment_continuation_is_rejected() -> TestResult {
     bytes.push(0x00);
     assert_eq!(
         decode_preimage(&bytes),
-        Err(DecodeError::TrailingBytes { count: 1 })
+        Err(DecodeError::Body(BodyError::TrailingBytes { count: 1 }))
     );
     Ok(())
 }
@@ -709,7 +846,7 @@ fn byte_after_the_continuation_sentinel_is_rejected() -> TestResult {
     bytes.push(0x00);
     assert_eq!(
         decode_preimage(&bytes),
-        Err(DecodeError::TrailingBytes { count: 1 })
+        Err(DecodeError::Body(BodyError::TrailingBytes { count: 1 }))
     );
     Ok(())
 }
@@ -724,7 +861,7 @@ fn byte_after_abandonment_is_rejected() -> TestResult {
     bytes.push(0x07);
     assert_eq!(
         decode_preimage(&bytes),
-        Err(DecodeError::TrailingBytes { count: 1 })
+        Err(DecodeError::Body(BodyError::TrailingBytes { count: 1 }))
     );
     Ok(())
 }
@@ -743,10 +880,10 @@ fn assert_unknown(
     let error = decode_preimage(bytes).err().ok_or("decoded")?;
     assert_eq!(
         error,
-        DecodeError::UnknownDidDiscriminator {
+        DecodeError::Body(BodyError::UnknownDidDiscriminator {
             field,
             source: UnknownDiscriminator { kind, value },
-        }
+        })
     );
     assert!(error.to_string().contains(&field.to_string()));
     Ok(())
@@ -815,41 +952,52 @@ fn unregistered_service_key_role_names_the_service_key_role_field() -> TestResul
     )
 }
 
-fn assert_unknown_event_byte(offset: usize, value: u8, field: KelDiscriminatorField) -> TestResult {
+fn assert_unknown_header_byte(offset: usize, value: u8, field: HeaderDiscriminator) -> TestResult {
     assert_eq!(
         decode_preimage(&v41_with(offset, value)?),
-        Err(DecodeError::UnknownKelDiscriminator { field, value })
+        Err(DecodeError::Header(HeaderError::UnknownDiscriminator {
+            field,
+            value
+        }))
     );
     Ok(())
 }
 
 #[test]
 fn unregistered_event_type_is_rejected() -> TestResult {
-    assert_unknown_event_byte(KIND, 0x05, KelDiscriminatorField::EventType)?;
-    assert_unknown_event_byte(KIND, 0x00, KelDiscriminatorField::EventType)
+    assert_unknown_header_byte(KIND, 0x05, HeaderDiscriminator::EventType)?;
+    assert_unknown_header_byte(KIND, 0x00, HeaderDiscriminator::EventType)
 }
 
 #[test]
 fn unregistered_standing_root_is_rejected() -> TestResult {
-    assert_unknown_event_byte(STANDING_ROOT, 0x03, KelDiscriminatorField::StandingRoot)
+    assert_unknown_header_byte(STANDING_ROOT, 0x03, HeaderDiscriminator::StandingRoot)
 }
 
 #[test]
 fn unregistered_signature_form_is_rejected() -> TestResult {
-    assert_unknown_event_byte(FORM, 0x03, KelDiscriminatorField::SignatureForm)?;
-    assert_unknown_event_byte(FORM, 0x00, KelDiscriminatorField::SignatureForm)
+    assert_unknown_header_byte(FORM, 0x03, HeaderDiscriminator::SignatureForm)?;
+    assert_unknown_header_byte(FORM, 0x00, HeaderDiscriminator::SignatureForm)
 }
 
 #[test]
 fn unregistered_continuation_byte_is_rejected() -> TestResult {
-    assert_unknown_event_byte(CONTINUATION, 0x02, KelDiscriminatorField::Continuation)
+    assert_eq!(
+        decode_preimage(&v41_with(CONTINUATION, 0x02)?),
+        Err(DecodeError::Body(BodyError::UnknownContinuation {
+            value: 0x02
+        }))
+    );
+    Ok(())
 }
 
 #[test]
 fn root_recovery_without_a_standing_root_declaration_is_rejected() -> TestResult {
     assert_eq!(
         decode_preimage(&v41_with(KIND, 0x04)?),
-        Err(DecodeError::RootRecoveryWithoutStandingRoot)
+        Err(DecodeError::Header(
+            HeaderError::RootRecoveryWithoutStandingRoot
+        ))
     );
     Ok(())
 }
@@ -887,11 +1035,13 @@ fn v41_entry_with(
 fn assert_compromised_from_rejected(condition: KeyCondition) -> TestResult {
     assert_eq!(
         decode_preimage(&v41_entry_with(ENTRY_1, condition.to_byte(), 7)?),
-        Err(DecodeError::CompromisedFromWithoutCompromise {
-            entry: 1,
-            condition,
-            compromised_from: 7,
-        })
+        Err(DecodeError::Body(
+            BodyError::CompromisedFromWithoutCompromise {
+                entry: 1,
+                condition,
+                compromised_from: 7,
+            }
+        ))
     );
     Ok(())
 }

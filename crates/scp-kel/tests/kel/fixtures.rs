@@ -11,9 +11,9 @@ use scp_did::{
     StandingCommitment,
 };
 use scp_kel::{
-    CommitmentRolloverFields, Continuation, EventPreimage, InceptionFields, KeyStateFields,
-    KeyStateSnapshot, SignatureForm, SignerGroup, decode_event, decode_preimage, encode_preimage,
-    prerotation_commitment,
+    CommitmentRolloverFields, Continuation, EventPreimage, EventUnit, InceptionFields,
+    KeyStateFields, KeyStateSnapshot, NamedSigner, ReadUnit, SignatureForm, SignerGroup,
+    decode_event, decode_preimage, encode_preimage, prerotation_commitment,
 };
 
 pub type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -443,11 +443,21 @@ pub fn event_unit(
     Ok(unit)
 }
 
+/// The unit at offset 0 of `value`, which must have passed step 4.
+pub fn read_unit(value: &[u8]) -> Result<ReadUnit, Box<dyn std::error::Error>> {
+    match decode_event(value, 0) {
+        EventUnit::Read(read) => Ok(*read),
+        stopped => Err(format!("the unit stopped before its walk: {stopped:?}").into()),
+    }
+}
+
 /// Asserts that `decode_event` reads a spec 25 event's unit whole, with
-/// every stage succeeding: the raw preimage and the body are the printed
-/// bytes, the body's digest is the printed digest, the walked signatures
-/// re-encode to the printed signature field, the header agrees with the
-/// body, and `consumed` is the unit's length. Returns the decoded preimage.
+/// every stage succeeding: the raw preimage is the printed bytes and its
+/// digest the printed digest, the walk consumed the whole unit, each walked
+/// signature is by its signer's index in its signer's form and re-encodes
+/// to the printed signature field, the body re-encodes to the printed
+/// bytes, and the header agrees with the body. Returns the decoded
+/// preimage.
 pub fn assert_event_round_trip(
     preimage_hex: &str,
     digest_hex: &str,
@@ -455,50 +465,46 @@ pub fn assert_event_round_trip(
 ) -> Result<EventPreimage, Box<dyn std::error::Error>> {
     let unit = event_unit(preimage_hex, signature_field_hex)?;
     let printed = bytes(preimage_hex)?;
-    let decoded = decode_event(&unit, 0);
-    assert_eq!(decoded.raw_signed_preimage(), Some(printed.as_slice()));
-    assert_eq!(decoded.consumed(), Some(unit.len()));
-    let header = stage(decoded.header(), "header")?;
-    let groups = stage(decoded.signatures(), "walk")?;
-    let body = stage(decoded.body(), "body")?;
-    assert_eq!(body.signed_preimage(), printed.as_slice());
-    assert_eq!(body.event_digest(), array::<32>(digest_hex)?);
-    let preimage = body.preimage();
+    let read = read_unit(&unit)?;
+    assert_eq!(read.raw().signed_preimage(), printed.as_slice());
+    assert_eq!(read.raw().event_digest(), array::<32>(digest_hex)?);
+    let field = read.signature_field().map_err(Clone::clone)?;
+    assert_eq!(field.consumed(), unit.len());
+    let preimage = read.preimage().map_err(Clone::clone)?;
+    assert_eq!(
+        encode_preimage(preimage)?.signed_preimage(),
+        printed.as_slice()
+    );
+
+    let header = read.header();
     assert_eq!(header.kind(), preimage.kind);
-    assert_eq!(header.identifier(), preimage.identifier);
+    assert_eq!(header.identifier_field(), preimage.identifier);
     assert_eq!(header.sequence(), preimage.sequence);
     assert_eq!(header.predecessor_digest(), &preimage.predecessor_digest);
     assert_eq!(header.standing_root(), preimage.standing_root);
-    assert_eq!(header.signer_groups(), preimage.signer_groups.as_slice());
-    assert_eq!(groups.len(), header.roles().len());
-    let mut field = Vec::new();
-    for ((group, role), signer_group) in groups
+    assert_eq!(header.groups().len(), preimage.signer_groups.len());
+    assert_eq!(field.groups().len(), header.groups().len());
+    let mut walked = Vec::new();
+    for ((group, signer_group), walked_group) in header
+        .groups()
         .iter()
-        .zip(header.roles())
-        .zip(header.signer_groups())
+        .zip(&preimage.signer_groups)
+        .zip(field.groups())
     {
-        assert_eq!(group.role(), *role);
-        assert_eq!(group.signatures().len(), signer_group.indices.len());
-        for (signature, form) in group.signatures().iter().zip(&signer_group.forms) {
-            assert_eq!(signature.form(), *form);
-            field.extend_from_slice(&signature.to_bytes());
+        let indices: Vec<u8> = group.signers().iter().map(NamedSigner::index).collect();
+        let forms: Vec<SignatureForm> = group.signers().iter().map(NamedSigner::form).collect();
+        assert_eq!(indices, signer_group.indices);
+        assert_eq!(forms, signer_group.forms);
+        assert_eq!(walked_group.role(), group.role());
+        assert_eq!(walked_group.signatures().len(), group.signers().len());
+        for (signature, signer) in walked_group.signatures().iter().zip(group.signers()) {
+            assert_eq!(signature.index(), signer.index());
+            assert_eq!(signature.signature().form(), signer.form());
+            walked.extend_from_slice(&signature.signature().to_bytes());
         }
     }
-    assert_eq!(field, bytes(signature_field_hex)?);
+    assert_eq!(walked, bytes(signature_field_hex)?);
     Ok(preimage.clone())
-}
-
-/// The outcome of one `EventUnit` stage, with an absent stage or a failed
-/// one as an owned test error.
-pub fn stage<T, E: std::fmt::Debug>(
-    outcome: Option<Result<T, E>>,
-    name: &str,
-) -> Result<T, Box<dyn std::error::Error>> {
-    match outcome {
-        Some(Ok(value)) => Ok(value),
-        Some(Err(error)) => Err(format!("{name} stage failed: {error:?}").into()),
-        None => Err(format!("no {name} stage").into()),
-    }
 }
 
 pub fn identifier(hex_text: &str) -> Result<Identifier, Box<dyn std::error::Error>> {

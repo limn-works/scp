@@ -92,9 +92,12 @@ pub enum SignatureForm {
 /// One indexed signer group: the indices it names into its indexed set, and
 /// one declared form per signature (§9.7.4.2 fields 6 and 7).
 ///
-/// The two lists are separate because R3 classifies a form list whose length
-/// differs from its index list as an author-attributable defect, so the
-/// decoder must be able to hand that preimage to the verifier.
+/// This is the writer's input, two lists because fields 6 and 7 are two
+/// lists on the wire. A group whose form list differs in length from its
+/// index list has no encoded length (§9.18.17), so the encoder refuses it
+/// with [`EncodeError::FormListLength`](crate::EncodeError::FormListLength)
+/// and the decoder fails it at step 4 (§9.7.4.2); every decoded group pairs
+/// each index with its form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SignerGroup {
     /// The member indices the group's signatures are by, in signature order.

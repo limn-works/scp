@@ -28,14 +28,15 @@ use fixtures::{
     V51_SIGNATURE, V53_DIGEST, V53_PREIMAGE, V53_SIGNATURE_FIELD, V54_DIGEST, V54_PREIMAGE,
     V54_SIGNATURE_FIELD, V55_DIGEST, V55_PREIMAGE, V55_SIGNATURE_FIELD, V68_DIGEST, V68_PREIMAGE,
     V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE, V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array,
-    assert_event_round_trip, assert_signature, assert_vector, bytes, fields, identifier,
-    v41_inception, v50_key_state, v51_inception, v51_key_state, v68_rollover, v69_key_state,
+    assert_event_round_trip, assert_signature, assert_vector, event_unit, fields, identifier,
+    read_unit, v41_inception, v50_key_state, v51_inception, v51_key_state, v68_rollover,
+    v69_key_state,
 };
 use scp_did::{Identifier, IdentifierError, KeyCondition, NonCanonicalReason};
 use scp_kel::{
     IndexedSignature, RoutingKind, SignatureForm, decode_preimage, derive_identifier,
     key_event_challenge, key_event_seal, parse_client_data_json, prerotation_commitment,
-    raw_identifier, routing_id, verify_indexed,
+    routing_id, verify_indexed,
 };
 use sha2::{Digest, Sha256};
 
@@ -60,8 +61,8 @@ fn vector_41_inception() -> TestResult {
     assert_vector(&preimage, V41_PREIMAGE, V41_DIGEST)?;
     assert_eq!(derive_identifier(&preimage)?, identifier(V41_IDENTIFIER)?);
     assert_eq!(
-        decode_preimage(&fields(V41_PREIMAGE)?)?.identifier(),
-        identifier(V41_IDENTIFIER)?
+        decode_preimage(&fields(V41_PREIMAGE)?)?.inception_identifier(),
+        Some(identifier(V41_IDENTIFIER)?)
     );
     Ok(())
 }
@@ -159,19 +160,18 @@ fn every_event_unit_round_trips() -> TestResult {
     Ok(())
 }
 
-/// The raw identifier of Vectors 41 and 42's received preimages is each
-/// vector's printed identifier, on each target.
+/// The identifier Vectors 41 and 42's received preimages recompute to is
+/// each vector's printed identifier, on each target.
 #[test]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
 fn vectors_41_and_42_raw_identifier() -> TestResult {
-    assert_eq!(
-        raw_identifier(&bytes(V41_PREIMAGE)?),
-        identifier(V41_IDENTIFIER)?
-    );
-    assert_eq!(
-        raw_identifier(&bytes(V42_PREIMAGE)?),
-        identifier(V42_IDENTIFIER)?
-    );
+    for (preimage, signature_field, printed) in [
+        (V41_PREIMAGE, V41_SIGNATURE, V41_IDENTIFIER),
+        (V42_PREIMAGE, V42_INDEXED_SIGNATURE, V42_IDENTIFIER),
+    ] {
+        let read = read_unit(&event_unit(preimage, signature_field)?)?;
+        assert_eq!(read.raw().identifier(), identifier(printed)?);
+    }
     Ok(())
 }
 

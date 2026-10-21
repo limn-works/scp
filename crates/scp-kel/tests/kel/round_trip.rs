@@ -68,8 +68,17 @@ fn form() -> impl Strategy<Value = SignatureForm> {
     ]
 }
 
-/// A signer group with `max` indices and forms at most.
+/// A signer group with `max` indices at most, each with its form.
 fn group(max: usize) -> impl Strategy<Value = SignerGroup> {
+    vec((any::<u8>(), form()), 0..=max).prop_map(|signers| {
+        let (indices, forms) = signers.into_iter().unzip();
+        SignerGroup { indices, forms }
+    })
+}
+
+/// A signer group whose form list's length is drawn apart from its index
+/// list's, so it is mostly unpaired.
+fn unpaired_group(max: usize) -> impl Strategy<Value = SignerGroup> {
     (vec(any::<u8>(), 0..=max), vec(form(), 0..=max))
         .prop_map(|(indices, forms)| SignerGroup { indices, forms })
 }
@@ -302,14 +311,16 @@ fn standing_root() -> impl Strategy<Value = Option<StandingRootDeclaration>> {
     ]
 }
 
-/// Mostly the group count the kind names, sometimes any count up to four.
+/// Mostly the group count the kind names with paired form lists, sometimes
+/// unpaired form lists or any count up to four.
 fn signer_groups(
     kind: EventKind,
     standing_root: Option<StandingRootDeclaration>,
 ) -> impl Strategy<Value = Vec<SignerGroup>> {
     let named = signer_group_roles(kind, standing_root).map_or(1, <[_]>::len);
     prop_oneof![
-        9 => vec(group(18), named..=named),
+        8 => vec(group(18), named..=named),
+        1 => vec(unpaired_group(18), named..=named),
         1 => vec(group(18), 0..=4),
     ]
 }

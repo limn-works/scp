@@ -52,12 +52,16 @@ pub(crate) const KEY_EVENT_CHALLENGE_SEPARATOR: &[u8] = b"SCP-KEY-EVENT-V1:";
 
 /// Prefixes the twelve field bytes in the signed preimage every event
 /// digest, signature and identifier derivation reads (§9.7.4.2, R13).
-/// Crate-private: `EncodedPreimage` is the one public path to these bytes.
+/// Crate-private: `EncodedPreimage` and `RawSignedPreimage` are the public
+/// paths to these bytes. Each holds the field bytes and implies the
+/// separator; `preimage::field_bytes` is the one place that strips it.
 pub(crate) const KEL_EVENT_SEPARATOR: &[u8] = b"SCP-KEL-EVENT-V1:";
 
 /// Prefixes the inception event's signed preimage in the identifier
 /// derivation (§9.7.4.2 R13; `03-identity.md` §3.1). Crate-private:
-/// `EncodedPreimage::identifier` is the one public path to the derivation.
+/// `preimage::identifier_of` is the one computation, reached through
+/// `EncodedPreimage::inception_identifier`, `derive_identifier` and
+/// `RawSignedPreimage::identifier`.
 pub(crate) const KEL_ID_SEPARATOR: &[u8] = b"SCP-KEL-ID-V1:";
 
 /// Prefixes a sealed event digest in a key-event seal (§9.7.4.2, field 11).

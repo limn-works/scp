@@ -1,17 +1,19 @@
 //! `decode_event` (`09-security-model.md` §9.7.4.2, the check order;
 //! §9.10.12) and the encoded-length ceiling (§9.18.17 `MAX_EVENT_BYTES`):
-//! one test per stage outcome, the spec 25 round trips, the raw identifier,
-//! the inception zero checks, and `MAX_EVENT_BYTES` on both the encoder and
-//! the decoder. Each negative test mutates one byte or one length of a spec
-//! 25 event unit. Every expected identifier and digest is a §25 constant or
-//! a SHA-256 this file computes, never a value scp-kel returns.
+//! one test per stage outcome, the spec 25 round trips with their decoded
+//! values, the walk and the form-list check at every group and position of
+//! Vector 54's layout, the received preimage's identifier and inception
+//! zero checks, `MAX_EVENT_BYTES` at step 4, and every unit of the fuzz
+//! seed corpus. Each negative test mutates one byte or one length of a spec
+//! 25 event unit. Every expected identifier, key and digest is a §25
+//! constant or a SHA-256 this file computes, never a value scp-kel returns.
 
 use scp_kel::constants::MAX_EVENT_BYTES;
 use scp_kel::{
-    DecodeError, EncodeError, EventPreimage, EventUnit, HeaderError, InceptionHeaderDefect,
-    IndexedSignaturePart, IndexedSignatureReadError, KelDiscriminatorField, ListField,
-    SignatureFieldError, SignatureForm, SignerGroup, SignerGroupRole, decode_event,
-    decode_preimage, encode_preimage, inception_header_zero_checks, raw_identifier,
+    BodyError, DecodeError, EncodeError, EventPreimage, EventUnit, FormListLength,
+    HeaderDiscriminator, HeaderError, HeaderField, InceptionHeaderDefect, IndexedSignaturePart,
+    IndexedSignatureReadError, SignatureFieldError, SignatureForm, SignerGroup, SignerGroupRole,
+    SignerList, decode_event, decode_preimage, encode_preimage,
 };
 use sha2::{Digest, Sha256};
 
@@ -23,8 +25,8 @@ use crate::fixtures::{
     V51_SIGNATURE, V53_DIGEST, V53_PREIMAGE, V53_SIGNATURE_FIELD, V54_DIGEST, V54_PREIMAGE,
     V54_SIGNATURE_FIELD, V55_DIGEST, V55_PREIMAGE, V55_SIGNATURE_FIELD, V68_DIGEST, V68_PREIMAGE,
     V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE, V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE,
-    assert_event_round_trip, bytes, event_unit, identifier, stage, v41_inception, v50_key_state,
-    v51_inception, v51_key_state, v68_rollover, v69_key_state,
+    assert_event_round_trip, bytes, event_unit, fields, identifier, read_unit, v41_inception,
+    v50_key_state, v51_inception, v51_key_state, v68_rollover, v69_key_state,
 };
 
 type Error = Box<dyn std::error::Error>;
@@ -37,12 +39,12 @@ const FIELDS: usize = PREFIX + SEPARATOR_LEN;
 const KIND: usize = 0;
 const IDENTIFIER: usize = 1;
 const SEQUENCE: usize = 33;
-const PREDECESSOR: usize = 41;
 const STANDING_ROOT: usize = 73;
 /// The first signer group's index count, field 6.
 const FIRST_INDEX_COUNT: usize = 74;
-/// Vector 41's one form byte: after its index count and one index, and its
-/// form count.
+/// A one-group event's form count and form: after its index count and one
+/// index (Vectors 41 and 50).
+const ONE_GROUP_FORM_COUNT: usize = 79;
 const V41_FORM: usize = 83;
 /// Vector 41's first key entry's role byte, in field 10: the entry starts
 /// at 137 and its 33-byte key precedes the role.
@@ -55,17 +57,17 @@ fn max_event_bytes() -> Result<usize, Error> {
     Ok(usize::try_from(MAX_EVENT_BYTES)?)
 }
 
-fn sha256(parts: &[&[u8]]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    for part in parts {
-        hasher.update(part);
-    }
-    hasher.finalize().into()
+/// An encoded length as the `u64` the header and the errors carry.
+fn len64(len: usize) -> Result<u64, Error> {
+    Ok(u64::try_from(len)?)
 }
 
 /// `SHA-256("SCP-KEL-ID-V1:" ‖ raw)`, computed here.
 fn expected_raw_identifier(raw: &[u8]) -> [u8; 32] {
-    sha256(&[b"SCP-KEL-ID-V1:", raw])
+    let mut hasher = Sha256::new();
+    hasher.update(b"SCP-KEL-ID-V1:");
+    hasher.update(raw);
+    hasher.finalize().into()
 }
 
 fn v41_unit() -> Result<Vec<u8>, Error> {
@@ -76,12 +78,20 @@ fn v42_unit() -> Result<Vec<u8>, Error> {
     event_unit(V42_PREIMAGE, V42_INDEXED_SIGNATURE)
 }
 
-/// A unit over an encoded preimage's signed bytes and a signature field.
+/// A unit over a signed preimage and a signature field.
 fn unit_of(signed: &[u8], signature_field: &[u8]) -> Result<Vec<u8>, Error> {
     let mut unit = u32::try_from(signed.len())?.to_be_bytes().to_vec();
     unit.extend_from_slice(signed);
     unit.extend_from_slice(signature_field);
     Ok(unit)
+}
+
+/// A unit over field bytes, behind the separator, and a signature field.
+fn unit_of_fields(field_bytes: &[u8], signature_field: &[u8]) -> Result<Vec<u8>, Error> {
+    unit_of(
+        &[b"SCP-KEL-EVENT-V1:".as_slice(), field_bytes].concat(),
+        signature_field,
+    )
 }
 
 fn set(unit: &mut [u8], at: usize, value: u8) -> TestResult {
@@ -96,41 +106,57 @@ fn set_be32(unit: &mut [u8], at: usize, value: u32) -> TestResult {
     Ok(())
 }
 
-/// Asserts step 1 failed: no stage ran and the frame ends.
-fn assert_step_1_failed(unit: &EventUnit) {
-    assert_eq!(unit.raw_signed_preimage(), None);
-    assert!(unit.header().is_none());
-    assert!(unit.signatures().is_none());
-    assert!(unit.body().is_none());
-    assert_eq!(unit.consumed(), None);
+/// Replaces the list whose count sits at `offset` in `bytes`, holding `old`
+/// elements of `element.len()` bytes, with `elements`.
+fn splice_list(
+    bytes: &[u8],
+    offset: usize,
+    old: usize,
+    element_len: usize,
+    elements: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let end = offset + 4 + old * element_len;
+    let mut out = bytes.get(..offset).ok_or("offset past the end")?.to_vec();
+    out.extend_from_slice(&u32::try_from(elements.len() / element_len)?.to_be_bytes());
+    out.extend_from_slice(elements);
+    out.extend_from_slice(bytes.get(end..).ok_or("list past the end")?);
+    Ok(out)
 }
 
-/// Asserts the header stage failed with `error`, and that no later stage ran.
-fn assert_header_failed(unit: &EventUnit, error: &HeaderError) {
-    assert!(unit.raw_signed_preimage().is_some());
-    assert_eq!(unit.header(), Some(Err(error)));
-    assert!(unit.signatures().is_none());
-    assert!(unit.body().is_none());
-    assert_eq!(unit.consumed(), None);
+/// Asserts step 1 failed.
+fn assert_step_1_failed(value: &[u8], offset: usize) {
+    assert_eq!(decode_event(value, offset), EventUnit::Unframed);
+}
+
+/// Asserts step 4 failed with `error`.
+fn assert_header_failed(unit: &[u8], error: &HeaderError) -> TestResult {
+    match decode_event(unit, 0) {
+        EventUnit::HeaderFailed(failed) => {
+            assert_eq!(failed.error(), error);
+            Ok(())
+        }
+        other => Err(format!("expected a header failure, got {other:?}").into()),
+    }
 }
 
 /// Asserts the header and the body passed and the walk failed with `error`.
-fn assert_walk_failed(unit: &EventUnit, error: &SignatureFieldError) -> TestResult {
-    stage(unit.header(), "header")?;
-    stage(unit.body(), "body")?;
-    assert_eq!(unit.signatures(), Some(Err(error)));
-    assert_eq!(unit.consumed(), None);
+fn assert_walk_failed(unit: &[u8], error: &SignatureFieldError) -> TestResult {
+    let read = read_unit(unit)?;
+    read.preimage().map_err(Clone::clone)?;
+    assert_eq!(read.signature_field(), Err(error));
     Ok(())
 }
 
 const fn walk_error(
     role: SignerGroupRole,
     position: usize,
+    index: u8,
     error: IndexedSignatureReadError,
 ) -> SignatureFieldError {
     SignatureFieldError {
         role,
         position,
+        index,
         error,
     }
 }
@@ -174,10 +200,14 @@ fn vector_51_inception_and_key_state_round_trip() -> TestResult {
 }
 
 #[test]
-fn vectors_53_54_and_55_round_trip() -> TestResult {
-    assert_event_round_trip(V53_PREIMAGE, V53_DIGEST, V53_SIGNATURE_FIELD)?;
-    assert_event_round_trip(V54_PREIMAGE, V54_DIGEST, V54_SIGNATURE_FIELD)?;
-    assert_event_round_trip(V55_PREIMAGE, V55_DIGEST, V55_SIGNATURE_FIELD)?;
+fn vectors_53_to_55_round_trip() -> TestResult {
+    for (preimage, digest, field) in [
+        (V53_PREIMAGE, V53_DIGEST, V53_SIGNATURE_FIELD),
+        (V54_PREIMAGE, V54_DIGEST, V54_SIGNATURE_FIELD),
+        (V55_PREIMAGE, V55_DIGEST, V55_SIGNATURE_FIELD),
+    ] {
+        assert_event_round_trip(preimage, digest, field)?;
+    }
     Ok(())
 }
 
@@ -198,37 +228,43 @@ fn consecutive_units_read_at_each_consumed_offset() -> TestResult {
     let first = v41_unit()?;
     let second = event_unit(V50_PREIMAGE, V50_SIGNATURE)?;
     let value = [first.as_slice(), second.as_slice()].concat();
-    let unit = decode_event(&value, 0);
-    assert_eq!(unit.consumed(), Some(first.len()));
-    let next = decode_event(&value, first.len());
+    let unit = read_unit(&value)?;
+    let consumed = unit.signature_field().map_err(Clone::clone)?.consumed();
+    assert_eq!(consumed, first.len());
+    let EventUnit::Read(next) = decode_event(&value, consumed) else {
+        return Err("the second unit stopped".into());
+    };
     assert_eq!(
-        next.raw_signed_preimage(),
-        Some(bytes(V50_PREIMAGE)?.as_slice())
+        next.raw().signed_preimage(),
+        bytes(V50_PREIMAGE)?.as_slice()
     );
-    assert_eq!(next.consumed(), Some(second.len()));
-    assert_step_1_failed(&decode_event(&value, value.len()));
+    assert_eq!(
+        next.signature_field().map_err(Clone::clone)?.consumed(),
+        second.len()
+    );
+    assert_step_1_failed(&value, value.len());
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Step 1 and the stuffed byte.
+// Steps 1 and 2, and the stuffed byte.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn a_prefix_running_past_value_fails_step_1() -> TestResult {
     let unit = v41_unit()?;
     // Three bytes hold no 4-byte prefix.
-    assert_step_1_failed(&decode_event(&unit[..3], 0));
+    assert_step_1_failed(&unit[..3], 0);
     // The prefix declares one byte more than `value` holds after it.
     let preimage_len = bytes(V41_PREIMAGE)?.len();
-    assert_step_1_failed(&decode_event(&unit[..PREFIX + preimage_len - 1], 0));
+    assert_step_1_failed(&unit[..PREFIX + preimage_len - 1], 0);
     // A prefix of u32::MAX.
     let mut huge = unit.clone();
     set_be32(&mut huge, 0, u32::MAX)?;
-    assert_step_1_failed(&decode_event(&huge, 0));
+    assert_step_1_failed(&huge, 0);
     // An offset past `value`, and one at usize::MAX.
-    assert_step_1_failed(&decode_event(&unit, unit.len() + 1));
-    assert_step_1_failed(&decode_event(&unit, usize::MAX));
+    assert_step_1_failed(&unit, unit.len() + 1);
+    assert_step_1_failed(&unit, usize::MAX);
     Ok(())
 }
 
@@ -239,40 +275,41 @@ fn a_stuffed_byte_is_not_consumed_and_fails_as_the_next_unit() -> TestResult {
     let unit = v41_unit()?;
     let mut value = unit.clone();
     value.push(0x00);
-    let decoded = decode_event(&value, 0);
-    assert_eq!(decoded.consumed(), Some(unit.len()));
-    stage(decoded.signatures(), "walk")?;
-    assert_step_1_failed(&decode_event(&value, unit.len()));
+    let read = read_unit(&value)?;
+    assert_eq!(
+        read.signature_field().map_err(Clone::clone)?.consumed(),
+        unit.len()
+    );
+    assert_step_1_failed(&value, unit.len());
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Steps 2 and 4: the header.
-// ---------------------------------------------------------------------------
-
 #[test]
-fn a_flipped_separator_byte_fails_the_separator_check() -> TestResult {
+fn a_flipped_separator_byte_fails_step_2() -> TestResult {
     for at in [PREFIX, PREFIX + SEPARATOR_LEN - 1] {
         let mut unit = v41_unit()?;
         let byte = *unit.get(at).ok_or("short unit")?;
         set(&mut unit, at, byte ^ 0x01)?;
-        assert_header_failed(&decode_event(&unit, 0), &HeaderError::Separator);
+        assert_eq!(decode_event(&unit, 0), EventUnit::NoSeparator);
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Step 4: the header.
+// ---------------------------------------------------------------------------
 
 #[test]
 fn an_unregistered_event_type_fails_the_header() -> TestResult {
     let mut unit = v41_unit()?;
     set(&mut unit, FIELDS + KIND, 0x05)?;
     assert_header_failed(
-        &decode_event(&unit, 0),
-        &HeaderError::Fields(DecodeError::UnknownKelDiscriminator {
-            field: KelDiscriminatorField::EventType,
+        &unit,
+        &HeaderError::UnknownDiscriminator {
+            field: HeaderDiscriminator::EventType,
             value: 0x05,
-        }),
-    );
-    Ok(())
+        },
+    )
 }
 
 #[test]
@@ -280,48 +317,19 @@ fn an_unregistered_standing_root_fails_the_header() -> TestResult {
     let mut unit = v41_unit()?;
     set(&mut unit, FIELDS + STANDING_ROOT, 0x03)?;
     assert_header_failed(
-        &decode_event(&unit, 0),
-        &HeaderError::Fields(DecodeError::UnknownKelDiscriminator {
-            field: KelDiscriminatorField::StandingRoot,
+        &unit,
+        &HeaderError::UnknownDiscriminator {
+            field: HeaderDiscriminator::StandingRoot,
             value: 0x03,
-        }),
-    );
-    Ok(())
+        },
+    )
 }
 
 #[test]
 fn a_root_recovery_without_standing_root_fails_the_header() -> TestResult {
     let mut unit = event_unit(V54_PREIMAGE, V54_SIGNATURE_FIELD)?;
     set(&mut unit, FIELDS + STANDING_ROOT, 0x00)?;
-    assert_header_failed(
-        &decode_event(&unit, 0),
-        &HeaderError::Fields(DecodeError::RootRecoveryWithoutStandingRoot),
-    );
-    Ok(())
-}
-
-/// A form list shorter, then longer, than its index list. The preimage
-/// codec decodes both, and the header refuses them, because the walk has
-/// no form for an index or no index for a form.
-#[test]
-fn a_form_list_whose_length_differs_from_its_index_list_fails_the_header() -> TestResult {
-    for forms in [vec![], vec![SignatureForm::Raw, SignatureForm::Raw]] {
-        let mut preimage = v41_inception(SignatureForm::Raw)?;
-        let group = preimage.signer_groups.first_mut().ok_or("no group")?;
-        group.forms.clone_from(&forms);
-        let encoded = encode_preimage(&preimage)?;
-        decode_preimage(encoded.fields())?;
-        let unit = unit_of(encoded.signed_preimage(), &bytes(V41_SIGNATURE)?)?;
-        assert_header_failed(
-            &decode_event(&unit, 0),
-            &HeaderError::FormListLength {
-                role: SignerGroupRole::Root,
-                indices: 1,
-                forms: forms.len(),
-            },
-        );
-    }
-    Ok(())
+    assert_header_failed(&unit, &HeaderError::RootRecoveryWithoutStandingRoot)
 }
 
 #[test]
@@ -329,13 +337,25 @@ fn an_unregistered_form_fails_the_header() -> TestResult {
     let mut unit = v41_unit()?;
     set(&mut unit, FIELDS + V41_FORM, 0x03)?;
     assert_header_failed(
-        &decode_event(&unit, 0),
-        &HeaderError::Fields(DecodeError::UnknownKelDiscriminator {
-            field: KelDiscriminatorField::SignatureForm,
+        &unit,
+        &HeaderError::UnknownDiscriminator {
+            field: HeaderDiscriminator::SignatureForm,
             value: 0x03,
-        }),
-    );
-    Ok(())
+        },
+    )
+}
+
+/// A preimage cut inside field 3 fails the header naming the field.
+#[test]
+fn a_preimage_ending_inside_the_header_fails_it() -> TestResult {
+    let preimage = bytes(V41_PREIMAGE)?;
+    let unit = unit_of(&preimage[..SEPARATOR_LEN + SEQUENCE + 2], &[])?;
+    assert_header_failed(
+        &unit,
+        &HeaderError::Truncated {
+            field: HeaderField::Sequence,
+        },
+    )
 }
 
 /// Vector 53's reveal group names 17 indices, over `MAX_NEXT_SET_SIZE`.
@@ -344,13 +364,31 @@ fn a_reveal_index_list_over_its_cap_fails_the_header() -> TestResult {
     let mut unit = event_unit(V53_PREIMAGE, V53_SIGNATURE_FIELD)?;
     set_be32(&mut unit, FIELDS + FIRST_INDEX_COUNT, 17)?;
     assert_header_failed(
-        &decode_event(&unit, 0),
-        &HeaderError::Fields(DecodeError::CountOverMax {
-            list: ListField::SignerIndices(SignerGroupRole::Reveal),
+        &unit,
+        &HeaderError::CountOverMax {
+            list: SignerList::Indices(SignerGroupRole::Reveal),
             count: 17,
             max: 16,
-        }),
-    );
+        },
+    )
+}
+
+/// Vector 41's form list emptied, then given a second form: at chain
+/// position zero the form-list check fails the header as it does at every
+/// later position.
+#[test]
+fn a_form_list_whose_length_differs_from_its_index_list_fails_the_header() -> TestResult {
+    for forms in [&[][..], &[0x01, 0x01][..]] {
+        let field_bytes = splice_list(&fields(V41_PREIMAGE)?, ONE_GROUP_FORM_COUNT, 1, 1, forms)?;
+        assert_header_failed(
+            &unit_of_fields(&field_bytes, &bytes(V41_SIGNATURE)?)?,
+            &HeaderError::FormListLength(FormListLength {
+                role: SignerGroupRole::Root,
+                indices: 1,
+                forms: forms.len(),
+            }),
+        )?;
+    }
     Ok(())
 }
 
@@ -360,29 +398,30 @@ fn a_reveal_index_list_over_its_cap_fails_the_header() -> TestResult {
 fn a_body_defect_leaves_the_header_and_the_walk() -> TestResult {
     let mut unit = v41_unit()?;
     set(&mut unit, FIELDS + V41_ENTRY_0_ROLE, 0x09)?;
-    let decoded = decode_event(&unit, 0);
-    stage(decoded.header(), "header")?;
-    stage(decoded.signatures(), "walk")?;
+    let read = read_unit(&unit)?;
     assert!(matches!(
-        decoded.body(),
-        Some(Err(DecodeError::UnknownDidDiscriminator { .. }))
+        read.preimage(),
+        Err(BodyError::UnknownDidDiscriminator { .. })
     ));
-    assert_eq!(decoded.consumed(), Some(unit.len()));
+    assert_eq!(
+        read.signature_field().map_err(Clone::clone)?.consumed(),
+        unit.len()
+    );
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Step 5: the signature-field walk.
+// Step 5: the signature-field walk in each form.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn a_raw_signature_cut_short_fails_the_walk() -> TestResult {
     let unit = v41_unit()?;
-    let short = &unit[..unit.len() - 1];
     assert_walk_failed(
-        &decode_event(short, 0),
+        &unit[..unit.len() - 1],
         &walk_error(
             SignerGroupRole::Root,
+            0,
             0,
             IndexedSignatureReadError::Truncated {
                 part: IndexedSignaturePart::RawSignature,
@@ -396,11 +435,11 @@ fn a_raw_signature_cut_short_fails_the_walk() -> TestResult {
 #[test]
 fn a_stripped_second_group_fails_the_walk_at_that_group() -> TestResult {
     let unit = event_unit(V53_PREIMAGE, V53_SIGNATURE_FIELD)?;
-    let stripped = &unit[..unit.len() - 64];
     assert_walk_failed(
-        &decode_event(stripped, 0),
+        &unit[..unit.len() - 64],
         &walk_error(
             SignerGroupRole::StandingRoot,
+            0,
             0,
             IndexedSignatureReadError::Truncated {
                 part: IndexedSignaturePart::RawSignature,
@@ -432,10 +471,7 @@ fn v42_layout() -> Result<V42Layout, Error> {
 fn assert_v42_walk_fails(at: usize, length: u32, error: IndexedSignatureReadError) -> TestResult {
     let mut unit = v42_unit()?;
     set_be32(&mut unit, at, length)?;
-    assert_walk_failed(
-        &decode_event(&unit, 0),
-        &walk_error(SignerGroupRole::Root, 0, error),
-    )
+    assert_walk_failed(&unit, &walk_error(SignerGroupRole::Root, 0, 0, error))
 }
 
 /// A declared length within its bound that runs past the field.
@@ -456,9 +492,10 @@ fn an_assertion_length_running_past_the_field_fails_the_walk() -> TestResult {
     let mut unit = v42_unit()?;
     set_be32(&mut unit, layout.field, 256)?;
     assert_walk_failed(
-        &decode_event(&unit[..layout.field + 4 + 100], 0),
+        &unit[..layout.field + 4 + 100],
         &walk_error(
             SignerGroupRole::Root,
+            0,
             0,
             IndexedSignatureReadError::Truncated {
                 part: IndexedSignaturePart::AuthenticatorData,
@@ -469,9 +506,10 @@ fn an_assertion_length_running_past_the_field_fails_the_walk() -> TestResult {
     // The 64-byte signature cut by one byte.
     let unit = v42_unit()?;
     assert_walk_failed(
-        &decode_event(&unit[..unit.len() - 1], 0),
+        &unit[..unit.len() - 1],
         &walk_error(
             SignerGroupRole::Root,
+            0,
             0,
             IndexedSignatureReadError::Truncated {
                 part: IndexedSignaturePart::AssertionSignature,
@@ -524,11 +562,11 @@ fn sixteen_indices_over_an_empty_signature_field_fail_at_the_first() -> TestResu
             forms: vec![form; 16],
         };
         let encoded = encode_preimage(&preimage)?;
-        let unit = unit_of(encoded.signed_preimage(), &[])?;
         assert_walk_failed(
-            &decode_event(&unit, 0),
+            &unit_of(&encoded.signed_preimage(), &[])?,
             &walk_error(
                 SignerGroupRole::Root,
+                0,
                 0,
                 IndexedSignatureReadError::Truncated { part, remaining: 0 },
             ),
@@ -538,100 +576,85 @@ fn sixteen_indices_over_an_empty_signature_field_fail_at_the_first() -> TestResu
 }
 
 // ---------------------------------------------------------------------------
-// The raw identifier and the inception zero checks.
+// The received preimage: its identifier and the inception zero checks.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn the_raw_identifier_reproduces_vectors_41_and_42() -> TestResult {
     assert_eq!(
-        raw_identifier(&bytes(V41_PREIMAGE)?),
+        read_unit(&v41_unit()?)?.raw().identifier(),
         identifier(V41_IDENTIFIER)?
     );
     assert_eq!(
-        raw_identifier(&bytes(V42_PREIMAGE)?),
+        read_unit(&v42_unit()?)?.raw().identifier(),
         identifier(V42_IDENTIFIER)?
     );
     Ok(())
 }
 
 /// Vector 41's preimage with one byte appended inside its prefix: the body
-/// fails to decode, and the raw identifier is still the hash of the bytes
-/// received.
+/// fails to decode, and the identifier is still the hash of the bytes
+/// received, as is the digest.
 #[test]
 fn the_raw_identifier_exists_for_an_inception_whose_body_fails() -> TestResult {
     let mut raw = bytes(V41_PREIMAGE)?;
     raw.push(0x00);
-    let unit = unit_of(&raw, &bytes(V41_SIGNATURE)?)?;
-    let decoded = decode_event(&unit, 0);
+    let read = read_unit(&unit_of(&raw, &bytes(V41_SIGNATURE)?)?)?;
+    assert_eq!(read.preimage(), Err(&BodyError::TrailingBytes { count: 1 }));
+    assert_eq!(read.raw().signed_preimage(), raw.as_slice());
     assert_eq!(
-        decoded.body(),
-        Some(Err(&DecodeError::TrailingBytes { count: 1 }))
-    );
-    let received = decoded.raw_signed_preimage().ok_or("no raw preimage")?;
-    assert_eq!(
-        raw_identifier(received).as_bytes(),
+        read.raw().identifier().as_bytes(),
         &expected_raw_identifier(&raw)
     );
-    assert_ne!(raw_identifier(received), identifier(V41_IDENTIFIER)?);
+    assert_ne!(read.raw().identifier(), identifier(V41_IDENTIFIER)?);
+    let digest: [u8; 32] = Sha256::digest(&raw).into();
+    assert_eq!(read.raw().event_digest(), digest);
     Ok(())
+}
+
+/// R3's inception zero checks on the received preimage of `unit`.
+fn zero_checks(unit: &[u8]) -> Result<Result<(), InceptionHeaderDefect>, Error> {
+    Ok(decode_event(unit, 0)
+        .raw()
+        .ok_or("the unit has no received preimage")?
+        .inception_zero_checks())
 }
 
 #[test]
 fn the_inception_zero_checks_pass_vectors_41_42_and_51() -> TestResult {
-    for preimage in [V41_PREIMAGE, V42_PREIMAGE, V51_INCEPTION_PREIMAGE] {
-        inception_header_zero_checks(&bytes(preimage)?)?;
+    for unit in [
+        v41_unit()?,
+        v42_unit()?,
+        event_unit(V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE)?,
+    ] {
+        zero_checks(&unit)??;
     }
     Ok(())
 }
 
+/// A received preimage that ends inside fields 1 to 4 names the field, and
+/// one that ends right after field 4 passes: the checks read no later field.
 #[test]
-fn the_inception_zero_checks_name_each_field() -> TestResult {
-    let raw = bytes(V41_PREIMAGE)?;
-    let cases = [
-        (
-            KIND,
-            0x02,
-            InceptionHeaderDefect::NotInception { value: 0x02 },
-        ),
-        (IDENTIFIER, 0x01, InceptionHeaderDefect::NonzeroIdentifier),
-        (
-            IDENTIFIER + 31,
-            0x01,
-            InceptionHeaderDefect::NonzeroIdentifier,
-        ),
-        (SEQUENCE + 7, 0x01, InceptionHeaderDefect::NonzeroSequence),
-        (PREDECESSOR, 0x01, InceptionHeaderDefect::NonzeroPredecessor),
-        (
-            PREDECESSOR + 31,
-            0x01,
-            InceptionHeaderDefect::NonzeroPredecessor,
-        ),
-    ];
-    for (at, value, defect) in cases {
-        let mut mutated = raw.clone();
-        *mutated
-            .get_mut(SEPARATOR_LEN + at)
-            .ok_or("short preimage")? = value;
-        assert_eq!(inception_header_zero_checks(&mutated), Err(defect));
+fn the_inception_zero_checks_read_only_fields_1_to_4() -> TestResult {
+    let preimage = bytes(V41_PREIMAGE)?;
+    for (len, field) in [
+        (KIND, HeaderField::EventType),
+        (IDENTIFIER + 10, HeaderField::Identifier),
+        (SEQUENCE + 2, HeaderField::Sequence),
+        (STANDING_ROOT - 1, HeaderField::PredecessorDigest),
+    ] {
+        let unit = unit_of(&preimage[..SEPARATOR_LEN + len], &[])?;
+        assert_eq!(
+            zero_checks(&unit)?,
+            Err(InceptionHeaderDefect::Truncated { field })
+        );
     }
-    assert_eq!(
-        inception_header_zero_checks(&bytes(V50_PREIMAGE)?),
-        Err(InceptionHeaderDefect::NotInception { value: 0x02 })
-    );
-    assert_eq!(
-        inception_header_zero_checks(&raw[1..]),
-        Err(InceptionHeaderDefect::Separator)
-    );
-    assert_eq!(
-        inception_header_zero_checks(&raw[..SEPARATOR_LEN + STANDING_ROOT - 1]),
-        Err(InceptionHeaderDefect::Truncated)
-    );
-    inception_header_zero_checks(&raw[..SEPARATOR_LEN + STANDING_ROOT])?;
+    zero_checks(&unit_of(&preimage[..SEPARATOR_LEN + STANDING_ROOT], &[])?)??;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// MAX_EVENT_BYTES: the encoded length on the encoder and the decoder.
+// MAX_EVENT_BYTES: the encoded length on the encoder and at step 4.
 // ---------------------------------------------------------------------------
 
 /// Vector 50's `KeyState` with `group` as its root group, its revealed keys
@@ -657,22 +680,21 @@ fn sized_key_state(
     Ok(preimage)
 }
 
-fn one_index(form: Option<SignatureForm>) -> SignerGroup {
+fn one_index(form: SignatureForm) -> SignerGroup {
     SignerGroup {
         indices: vec![0],
-        forms: form.into_iter().collect(),
+        forms: vec![form],
     }
 }
 
 /// Accepted at exactly `MAX_EVENT_BYTES` and rejected at one byte more, for
-/// each form's ceiling, and for an index with no form, counted at 840.
+/// each form's ceiling, with the exact encoded length.
 #[test]
 fn the_encoder_bounds_the_encoded_length() -> TestResult {
     let max = max_event_bytes()?;
     for (form, ceiling) in [
-        (Some(SignatureForm::Raw), RAW_CEILING),
-        (Some(SignatureForm::WebAuthnAssertion), ASSERTION_CEILING),
-        (None, ASSERTION_CEILING),
+        (SignatureForm::Raw, RAW_CEILING),
+        (SignatureForm::WebAuthnAssertion, ASSERTION_CEILING),
     ] {
         let at_max = sized_key_state(max, one_index(form), ceiling)?;
         let encoded = encode_preimage(&at_max)?;
@@ -681,7 +703,7 @@ fn the_encoder_bounds_the_encoded_length() -> TestResult {
         assert_eq!(
             encode_preimage(&over),
             Err(EncodeError::EventTooLong {
-                encoded_len: max + 1
+                encoded_len: len64(max + 1)?
             })
         );
     }
@@ -693,45 +715,92 @@ fn the_encoder_bounds_the_encoded_length() -> TestResult {
 /// is the four-byte sentinel, so the seals end four bytes from the end and
 /// their count sits before them.
 fn with_one_more_seal(preimage: &EventPreimage) -> Result<Vec<u8>, Error> {
-    let mut fields = encode_preimage(preimage)?.fields().to_vec();
+    let mut field_bytes = encode_preimage(preimage)?.fields().to_vec();
     let seals = preimage.seals.len();
-    let count_at = fields.len() - 4 - 32 * seals - 4;
-    let count = fields.get(count_at..count_at + 4).ok_or("short fields")?;
+    let count_at = field_bytes.len() - 4 - 32 * seals - 4;
+    let count = field_bytes
+        .get(count_at..count_at + 4)
+        .ok_or("short fields")?;
     assert_eq!(count, u32::try_from(seals)?.to_be_bytes());
-    set_be32(&mut fields, count_at, u32::try_from(seals + 1)?)?;
-    let end = fields.len() - 4;
-    fields.splice(end..end, [5; 32]);
-    Ok(fields)
+    set_be32(&mut field_bytes, count_at, u32::try_from(seals + 1)?)?;
+    let end = field_bytes.len() - 4;
+    field_bytes.splice(end..end, [5; 32]);
+    Ok(field_bytes)
 }
 
+/// At exactly `MAX_EVENT_BYTES` every stage decodes; one byte over, step 4
+/// fails with the exact encoded length and no walk or body runs.
 #[test]
-fn the_decoder_bounds_the_encoded_length() -> TestResult {
+fn step_4_bounds_the_encoded_length() -> TestResult {
     let max = max_event_bytes()?;
     for (form, ceiling) in [
         (SignatureForm::Raw, RAW_CEILING),
         (SignatureForm::WebAuthnAssertion, ASSERTION_CEILING),
     ] {
-        // At exactly MAX_EVENT_BYTES every stage decodes.
-        let at_max = sized_key_state(max, one_index(Some(form)), ceiling)?;
+        let at_max = sized_key_state(max, one_index(form), ceiling)?;
         let encoded = encode_preimage(&at_max)?;
         assert_eq!(decode_preimage(encoded.fields())?.preimage(), &at_max);
-        let unit = unit_of(encoded.signed_preimage(), &[0; 64])?;
+        let unit = unit_of(&encoded.signed_preimage(), &[0; 64])?;
+        let read = read_unit(&unit)?;
+        assert_eq!(read.header().encoded_len(), len64(max)?);
+        assert_eq!(read.preimage(), Ok(&at_max));
         if form == SignatureForm::Raw {
-            assert_eq!(decode_event(&unit, 0).consumed(), Some(unit.len()));
+            assert_eq!(
+                read.signature_field().map_err(Clone::clone)?.consumed(),
+                unit.len()
+            );
         }
-        assert_eq!(stage(decode_event(&unit, 0).body(), "body")?, &encoded);
 
         // One byte over: 31 bytes under, plus one 32-byte seal.
-        let under = sized_key_state(max - 31, one_index(Some(form)), ceiling)?;
-        let fields = with_one_more_seal(&under)?;
-        let over = Err(DecodeError::EventTooLong {
-            encoded_len: max + 1,
-        });
-        assert_eq!(decode_preimage(&fields), over);
-        let signed = [b"SCP-KEL-EVENT-V1:".as_slice(), &fields].concat();
-        let decoded = decode_event(&unit_of(&signed, &[0; 64])?, 0);
-        stage(decoded.header(), "header")?;
-        assert_eq!(decoded.body(), Some(over.as_ref()));
+        let under = sized_key_state(max - 31, one_index(form), ceiling)?;
+        let field_bytes = with_one_more_seal(&under)?;
+        let over = HeaderError::EventTooLong {
+            encoded_len: len64(max + 1)?,
+        };
+        assert_eq!(
+            decode_preimage(&field_bytes),
+            Err(DecodeError::Header(over.clone()))
+        );
+        assert_header_failed(&unit_of_fields(&field_bytes, &[0; 64])?, &over)?;
     }
+    Ok(())
+}
+
+/// A group naming 79 assertion-form indices reserves 79 × 840 bytes, past
+/// `MAX_EVENT_BYTES` on its own: step 4 fails before the walk, so no unit
+/// names more signatures to verify than one legal-size event carries.
+#[test]
+fn a_unit_naming_more_signatures_than_a_legal_event_carries_is_not_walked() -> TestResult {
+    let mut field_bytes = fields(V50_PREIMAGE)?;
+    // The form list first, so the index list's offset still holds.
+    field_bytes = splice_list(&field_bytes, ONE_GROUP_FORM_COUNT, 1, 1, &[0x02; 79])?;
+    field_bytes = splice_list(&field_bytes, FIRST_INDEX_COUNT, 1, 1, &[0; 79])?;
+    let encoded_len = SEPARATOR_LEN + field_bytes.len() + 79 * ASSERTION_CEILING;
+    assert!(encoded_len > max_event_bytes()?);
+    assert_header_failed(
+        &unit_of_fields(&field_bytes, &[])?,
+        &HeaderError::EventTooLong {
+            encoded_len: len64(encoded_len)?,
+        },
+    )?;
+    // The same group cut to fit is walked, and fails at its first signature.
+    let mut preimage = v50_key_state()?;
+    *preimage.signer_groups.first_mut().ok_or("no group")? = SignerGroup {
+        indices: vec![0; 77],
+        forms: vec![SignatureForm::WebAuthnAssertion; 77],
+    };
+    let encoded = encode_preimage(&preimage)?;
+    assert_walk_failed(
+        &unit_of(&encoded.signed_preimage(), &[])?,
+        &walk_error(
+            SignerGroupRole::Root,
+            0,
+            0,
+            IndexedSignatureReadError::Truncated {
+                part: IndexedSignaturePart::AuthenticatorDataLength,
+                remaining: 0,
+            },
+        ),
+    )?;
     Ok(())
 }

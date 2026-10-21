@@ -2,7 +2,10 @@
 //!
 //! Each names the field or list it was reading, so the verifier maps a
 //! decode failure to its R3 cause without re-parsing (`09-security-model.md`
-//! §9.7.4.2).
+//! §9.7.4.2). The decode errors split where the check order splits: a
+//! [`HeaderError`] is step 4 (fields 1 through 7, the form-list lengths and
+//! the encoded length), a [`BodyError`] is the decode of fields 8 through
+//! 12, and each admits only the failures its own stage can produce.
 
 use std::fmt;
 
@@ -11,10 +14,10 @@ use scp_did::{KeyCondition, UnknownDiscriminator};
 use crate::event::{EventKind, SignerGroupRole};
 use crate::signature::IndexedSignatureReadError;
 
-/// One of the preimage's twelve fields (§9.7.4.2), named where a decode
-/// runs out of bytes.
+/// One of the preimage's header fields, 1 through 7 (§9.7.4.2), named where
+/// the header runs out of bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PreimageField {
+pub enum HeaderField {
     /// Field 1, `event_type`.
     EventType,
     /// Field 2, `identifier`.
@@ -29,6 +32,26 @@ pub enum PreimageField {
     SignerIndices,
     /// Field 7, the signature-form lists.
     SignatureForms,
+}
+
+impl fmt::Display for HeaderField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::EventType => "event_type",
+            Self::Identifier => "identifier",
+            Self::Sequence => "sequence",
+            Self::PredecessorDigest => "predecessor_digest",
+            Self::StandingRoot => "standing_root",
+            Self::SignerIndices => "signer index list",
+            Self::SignatureForms => "signature-form list",
+        })
+    }
+}
+
+/// One of the preimage's body fields, 8 through 12 (§9.7.4.2), named where
+/// the body runs out of bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BodyField {
     /// Field 8, the revealed keys.
     RevealedKeys,
     /// Field 9, the installed root set and its threshold.
@@ -41,16 +64,9 @@ pub enum PreimageField {
     Continuation,
 }
 
-impl fmt::Display for PreimageField {
+impl fmt::Display for BodyField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::EventType => "event_type",
-            Self::Identifier => "identifier",
-            Self::Sequence => "sequence",
-            Self::PredecessorDigest => "predecessor_digest",
-            Self::StandingRoot => "standing_root",
-            Self::SignerIndices => "signer index list",
-            Self::SignatureForms => "signature-form list",
             Self::RevealedKeys => "revealed keys",
             Self::InstalledRootSet => "installed root set",
             Self::KeyState => "key-state snapshot",
@@ -71,15 +87,29 @@ impl fmt::Display for SignerGroupRole {
     }
 }
 
-/// A count-prefixed list of the preimage (§9.7.4.2, the count-bound rule).
-/// A signer group's two lists carry the group's role, so an error names
-/// which group's list failed.
+/// One signer group's count-prefixed list in the header (§9.7.4.2 fields 6
+/// and 7). Each carries the group's role, so an error names which group's
+/// list failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ListField {
-    /// One group's signer index list (field 6).
-    SignerIndices(SignerGroupRole),
-    /// One group's signature-form list (field 7).
-    SignatureForms(SignerGroupRole),
+pub enum SignerList {
+    /// The group's signer index list (field 6).
+    Indices(SignerGroupRole),
+    /// The group's signature-form list (field 7).
+    Forms(SignerGroupRole),
+}
+
+impl fmt::Display for SignerList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Indices(role) => write!(f, "{role}'s signer index list"),
+            Self::Forms(role) => write!(f, "{role}'s signature-form list"),
+        }
+    }
+}
+
+/// A count-prefixed list of the body (§9.7.4.2 fields 8 through 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BodyList {
     /// The revealed keys (field 8).
     RevealedKeys,
     /// The installed root set's members (field 9).
@@ -94,17 +124,46 @@ pub enum ListField {
     Commitments,
 }
 
+impl fmt::Display for BodyList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::RevealedKeys => "revealed keys",
+            Self::InstalledRootSet => "installed root set",
+            Self::SnapshotKeys => "snapshot key list",
+            Self::Witnesses => "witness set",
+            Self::Seals => "key-event seals",
+            Self::Commitments => "commitment list",
+        })
+    }
+}
+
+/// Any count-prefixed list of the preimage (§9.7.4.2, the count-bound
+/// rule): what the encoder, which writes every field, names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListField {
+    /// A list of fields 6 and 7.
+    Signer(SignerList),
+    /// A list of fields 8 through 12.
+    Body(BodyList),
+}
+
+impl From<SignerList> for ListField {
+    fn from(list: SignerList) -> Self {
+        Self::Signer(list)
+    }
+}
+
+impl From<BodyList> for ListField {
+    fn from(list: BodyList) -> Self {
+        Self::Body(list)
+    }
+}
+
 impl fmt::Display for ListField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SignerIndices(role) => write!(f, "{role}'s signer index list"),
-            Self::SignatureForms(role) => write!(f, "{role}'s signature-form list"),
-            Self::RevealedKeys => f.write_str("revealed keys"),
-            Self::InstalledRootSet => f.write_str("installed root set"),
-            Self::SnapshotKeys => f.write_str("snapshot key list"),
-            Self::Witnesses => f.write_str("witness set"),
-            Self::Seals => f.write_str("key-event seals"),
-            Self::Commitments => f.write_str("commitment list"),
+            Self::Signer(list) => list.fmt(f),
+            Self::Body(list) => list.fmt(f),
         }
     }
 }
@@ -138,40 +197,54 @@ impl fmt::Display for DidDiscriminatorField {
     }
 }
 
-/// A preimage byte that is one of this crate's own discriminators
-/// ([`EventKind`], `StandingRootDeclaration`, `SignatureForm`, the
-/// continuation byte; §9.7.4.2 fields 1, 5, 7 and 12).
+/// A header byte that is one of this crate's own discriminators
+/// ([`EventKind`], `StandingRootDeclaration`, `SignatureForm`; §9.7.4.2
+/// fields 1, 5 and 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KelDiscriminatorField {
+pub enum HeaderDiscriminator {
     /// Field 1, `event_type`.
     EventType,
     /// Field 5, `standing_root`.
     StandingRoot,
     /// One entry of a field 7 signature-form list.
     SignatureForm,
-    /// Field 12's leading byte.
-    Continuation,
 }
 
-impl fmt::Display for KelDiscriminatorField {
+impl fmt::Display for HeaderDiscriminator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::EventType => "event_type",
             Self::StandingRoot => "standing_root",
             Self::SignatureForm => "signature form",
-            Self::Continuation => "continuation",
         })
     }
+}
+
+/// A signer group whose form list differs in length from its index list.
+///
+/// §9.7.4.2's check order fails it at step 4. The encoded length sums one
+/// form's ceiling per named index, so it is undefined for such a group, and
+/// the signature-field walk has no form for some index or no index for
+/// some form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[error("the {role} names {indices} indices but {forms} forms")]
+pub struct FormListLength {
+    /// The group.
+    pub role: SignerGroupRole,
+    /// The index list's length.
+    pub indices: usize,
+    /// The form list's length.
+    pub forms: usize,
 }
 
 /// Why a preimage cannot be encoded.
 ///
 /// The encoder refuses exactly the preimages whose bytes the decoder would
 /// reject or decode to a different value, reading the decoder's own count
-/// bounds and length ceiling, so `encode_preimage` succeeding means
-/// `decode_preimage` of its bytes returns the same preimage. It does not
-/// apply R3's defect list: a writer may encode a preimage a verifier rejects,
-/// and the verifier classifies it.
+/// bounds, form-list check and length ceiling, so `encode_preimage`
+/// succeeding means `decode_preimage` of its bytes returns the same
+/// preimage. It does not apply the rest of R3's defect list: a writer may
+/// encode a preimage a verifier rejects, and the verifier classifies it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EncodeError {
     /// A list is too long for its 4-byte count.
@@ -193,15 +266,18 @@ pub enum EncodeError {
         /// The registered maximum.
         max: u32,
     },
+    /// A signer group's form list differs in length from its index list,
+    /// which the decoder rejects at step 4.
+    #[error(transparent)]
+    FormListLength(FormListLength),
     /// The event's encoded length exceeds `MAX_EVENT_BYTES` (§9.18.17;
-    /// §9.7.4.2 R3): the signed preimage, separator included, plus the
+    /// §9.7.4.2 step 4): the signed preimage, separator included, plus the
     /// reserved ceiling of each named index's form, 64 bytes for `Raw` and
-    /// 840 for `WebAuthnAssertion`. An index its form list gives no form is
-    /// counted at 840, the larger ceiling.
+    /// 840 for `WebAuthnAssertion`.
     #[error("the event's encoded length is {encoded_len} bytes, over MAX_EVENT_BYTES")]
     EventTooLong {
-        /// The encoded length.
-        encoded_len: usize,
+        /// The encoded length, exactly.
+        encoded_len: u64,
     },
     /// A `RootRecovery` carries no standing-root declaration, so its signer
     /// group count is undefined (§9.7.4.2 field 5).
@@ -242,50 +318,96 @@ pub enum EncodeError {
     },
 }
 
-/// Why bytes are not a key-event preimage (§9.7.4.2).
+/// Why an event's header fails the check order's step 4 (§9.7.4.2).
+///
+/// Fields 1 through 7 do not decode, a form list differs in length from
+/// its index list, or the encoded length exceeds `MAX_EVENT_BYTES`, checked
+/// in that order. Every variant reads only the signed preimage, which the
+/// event's digest binds, so every one is an illegality failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum DecodeError {
-    /// The event's encoded length exceeds `MAX_EVENT_BYTES` (§9.18.17;
-    /// §9.7.4.2 R3): the signed preimage, separator included, plus the
-    /// reserved ceiling of each named index's form, 64 bytes for `Raw` and
-    /// 840 for `WebAuthnAssertion`, an index with no form counted at 840.
-    /// Where the signed preimage alone exceeds the constant, the decoder
-    /// reads no field and `encoded_len` is the signed preimage's length, a
-    /// lower bound on the encoded length.
-    #[error("the event's encoded length is at least {encoded_len} bytes, over MAX_EVENT_BYTES")]
-    EventTooLong {
-        /// The encoded length, or the signed preimage's length where the
-        /// fields were not read.
-        encoded_len: usize,
-    },
-    /// The input begins with the `"SCP-KEL-EVENT-V1:"` separator: it is the
-    /// signed preimage, and the decoder reads the twelve field bytes that
-    /// follow the separator.
-    #[error(
-        "the input begins with the SCP-KEL-EVENT-V1: separator; decode the field bytes after it"
-    )]
-    SignedPreimage,
-    /// The input ends inside a field.
+pub enum HeaderError {
+    /// The bytes end inside a header field.
     #[error("the preimage ends inside its {field}")]
     Truncated {
         /// The field being read.
-        field: PreimageField,
+        field: HeaderField,
     },
-    /// A list's count exceeds the `MAX_*` constant §9.18.17 registers for it.
+    /// A signer list's count exceeds the `MAX_*` constant §9.18.17 registers
+    /// for it.
     #[error("the {list} declares {count} entries, over its maximum {max}")]
     CountOverMax {
         /// The list.
-        list: ListField,
+        list: SignerList,
         /// The declared count.
         count: u32,
         /// The registered maximum.
         max: u32,
     },
-    /// A list's count implies more bytes than remain in the preimage.
+    /// A signer list's count implies more bytes than remain in the preimage.
     #[error("the {list} declares {count} entries, more than the {remaining} remaining bytes hold")]
     CountOverRemaining {
         /// The list.
-        list: ListField,
+        list: SignerList,
+        /// The declared count.
+        count: u32,
+        /// The bytes left after the count.
+        remaining: usize,
+    },
+    /// A header byte is no registered value of its discriminator.
+    #[error("unregistered {field} byte 0x{value:02x}")]
+    UnknownDiscriminator {
+        /// The field being read.
+        field: HeaderDiscriminator,
+        /// The byte.
+        value: u8,
+    },
+    /// A `RootRecovery` carries the absent standing-root byte, so its signer
+    /// group count is undefined and fields 6 and 7 cannot be parsed
+    /// (§9.7.4.2 fields 5 and 6).
+    #[error("a RootRecovery carries no standing_root declaration")]
+    RootRecoveryWithoutStandingRoot,
+    /// A signer group's form list differs in length from its index list.
+    #[error(transparent)]
+    FormListLength(FormListLength),
+    /// The event's encoded length exceeds `MAX_EVENT_BYTES` (§9.18.17): the
+    /// signed preimage, separator included, plus the reserved ceiling of each
+    /// named index's form, 64 bytes for `Raw` and 840 for
+    /// `WebAuthnAssertion`.
+    #[error("the event's encoded length is {encoded_len} bytes, over MAX_EVENT_BYTES")]
+    EventTooLong {
+        /// The encoded length, exactly: it is computed only once fields 1
+        /// through 7 decode and every form list has passed.
+        encoded_len: u64,
+    },
+}
+
+/// Why fields 8 through 12 of an event whose header passed do not decode
+/// (§9.7.4.2, the decode of step 8, and at chain position zero the content
+/// step 3 reads).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BodyError {
+    /// The bytes end inside a body field.
+    #[error("the preimage ends inside its {field}")]
+    Truncated {
+        /// The field being read.
+        field: BodyField,
+    },
+    /// A body list's count exceeds the `MAX_*` constant §9.18.17 registers
+    /// for it.
+    #[error("the {list} declares {count} entries, over its maximum {max}")]
+    CountOverMax {
+        /// The list.
+        list: BodyList,
+        /// The declared count.
+        count: u32,
+        /// The registered maximum.
+        max: u32,
+    },
+    /// A body list's count implies more bytes than remain in the preimage.
+    #[error("the {list} declares {count} entries, more than the {remaining} remaining bytes hold")]
+    CountOverRemaining {
+        /// The list.
+        list: BodyList,
         /// The declared count.
         count: u32,
         /// The bytes left after the count.
@@ -299,19 +421,13 @@ pub enum DecodeError {
         /// The enumeration and the byte.
         source: UnknownDiscriminator,
     },
-    /// A byte is no registered value of this crate's own discriminators.
-    #[error("unregistered {field} byte 0x{value:02x}")]
-    UnknownKelDiscriminator {
-        /// The field being read.
-        field: KelDiscriminatorField,
+    /// Field 12's leading byte is neither the abandonment byte nor the
+    /// commitment-list byte, and the field is not the absent sentinel.
+    #[error("unregistered continuation byte 0x{value:02x}")]
+    UnknownContinuation {
         /// The byte.
         value: u8,
     },
-    /// A `RootRecovery` carries the absent standing-root byte, so its signer
-    /// group count is undefined and the rest of the preimage cannot be
-    /// parsed (§9.7.4.2 fields 5 and 6).
-    #[error("a RootRecovery carries no standing_root declaration")]
-    RootRecoveryWithoutStandingRoot,
     /// A key entry carries a nonzero `compromised_from` without the
     /// `Compromised` condition (§9.7.4.2, the key-state snapshot's order:
     /// "the position a `Compromised` entry carries and zero otherwise").
@@ -332,6 +448,25 @@ pub enum DecodeError {
         /// How many.
         count: usize,
     },
+}
+
+/// Why bytes are not a key-event preimage (§9.7.4.2): the header fails, or
+/// the header passes and the body fails.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DecodeError {
+    /// The input begins with the `"SCP-KEL-EVENT-V1:"` separator: it is the
+    /// signed preimage, and the decoder reads the twelve field bytes that
+    /// follow the separator.
+    #[error(
+        "the input begins with the SCP-KEL-EVENT-V1: separator; decode the field bytes after it"
+    )]
+    SignedPreimage,
+    /// The header fails step 4.
+    #[error(transparent)]
+    Header(#[from] HeaderError),
+    /// Fields 8 through 12 do not decode.
+    #[error(transparent)]
+    Body(#[from] BodyError),
 }
 
 /// Why an identifier cannot be derived from a preimage (§9.7.4.2 R13).
@@ -360,44 +495,20 @@ pub enum DeriveIdentifierError {
     Encode(#[from] EncodeError),
 }
 
-/// Why an event unit's signed preimage yields no header (§9.7.4.2, the
-/// check order's steps 2 and 4). Each variant names the check that failed,
-/// and every one reads only bytes the event's digest binds.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum HeaderError {
-    /// The prefixed bytes do not begin with `"SCP-KEL-EVENT-V1:"` (step 2:
-    /// "A decoder MUST reject an event whose prefixed bytes do not begin
-    /// with `SCP-KEL-EVENT-V1:`").
-    #[error("the prefixed bytes do not begin with the SCP-KEL-EVENT-V1: separator")]
-    Separator,
-    /// Fields 1 through 7 do not decode (step 4).
-    #[error("fields 1 through 7 do not decode: {0}")]
-    Fields(DecodeError),
-    /// A signer group's form list differs in length from its index list
-    /// (R3: "a form list whose length differs from its index list"), so the
-    /// signature-field walk has no form for some index or no index for some
-    /// form.
-    #[error("the {role} group names {indices} indices but {forms} forms")]
-    FormListLength {
-        /// The group.
-        role: SignerGroupRole,
-        /// The index list's length.
-        indices: usize,
-        /// The form list's length.
-        forms: usize,
-    },
-}
-
 /// Why an event unit's signature field does not walk under fields 6 and 7
 /// (§9.7.4.2, the check order's step 5; §9.10.12). The check reads the
 /// signature field, which the event's digest does not bind.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("the {role} group's indexed signature at position {position} does not read: {error}")]
+#[error(
+    "the {role}'s indexed signature at position {position}, by index {index}, does not read: {error}"
+)]
 pub struct SignatureFieldError {
     /// The group being walked.
     pub role: SignerGroupRole,
     /// The signature's position in that group's index list.
     pub position: usize,
+    /// The index the signature is by: the index list's entry at `position`.
+    pub index: u8,
     /// Why it does not read.
     pub error: IndexedSignatureReadError,
 }
@@ -410,12 +521,12 @@ pub struct SignatureFieldError {
 /// zero".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InceptionHeaderDefect {
-    /// The bytes do not begin with `"SCP-KEL-EVENT-V1:"`.
-    #[error("the bytes do not begin with the SCP-KEL-EVENT-V1: separator")]
-    Separator,
     /// The bytes end before field 4 does.
-    #[error("the bytes end before the predecessor digest does")]
-    Truncated,
+    #[error("the preimage ends inside its {field}")]
+    Truncated {
+        /// The field being read.
+        field: HeaderField,
+    },
     /// Field 1 is not the `Inception` byte.
     #[error("event_type is 0x{value:02x}, not Inception")]
     NotInception {
