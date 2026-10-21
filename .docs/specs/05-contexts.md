@@ -2241,7 +2241,7 @@ The context's commit-ordered event log is the authors group's (§5.14.13), and e
 - `GovernanceActionExecuted` — every governance action, among them `RevokeAccess` (a ban, an author removal), `RestoreAccess`, and `RotateContentKeys`
 - `TokenRevoked` — a UCAN revocation, a gated subscriber's `messages:read` UCAN included
 
-`WriteAccessRevoked`, `ReadAccessRevoked`, `ReadAccessRestored`, and `ContentKeysRotated` are local `ContextEvent`s that a member surfaces when it applies the `GovernanceActionExecuted` leaf, never leaves. Content is not logged: a `BroadcastEnvelope` is not an MLS message, and no Commit orders it. Whether an author's key epoch advance becomes a log record is open (`00-open-questions.md`, "`KeyEpochAdvance` records").
+`WriteAccessRevoked`, `ReadAccessRevoked`, `ReadAccessRestored`, and `ContentKeysRotated` are local `ContextEvent`s that a member surfaces when it applies the `GovernanceActionExecuted` leaf, never leaves. Content is not logged: a `BroadcastEnvelope` is not an MLS message, and no Commit orders it. No key epoch advance is a log record (ADR-066 decisions 36 and 37): a rotation that a governance Commit causes is recorded by that Commit's `GovernanceActionExecuted` leaf, and a block's rotation is the `BroadcastEpochAdvance` application message (§5.14.8), outside the log and the snapshot. The `KeyEpochAdvance` event type is removed and its tag 18 retired.
 
 `ConsistencyCheckpoint.epoch` is a `u64`; in a broadcast context it is the authors group's MLS epoch.
 

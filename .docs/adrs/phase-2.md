@@ -816,7 +816,11 @@ pub enum EventType {
     ConsistencyCheckpoint,
     AbsenceProofRequested,
     MemberBlocked,          // ADR-007: Signed block notification recorded for auditability
-    KeyEpochAdvance,        // ADR-007: Sender key epoch rotation (shared across Encrypted and Broadcast modes)
+    // Tag 18 is retired: it belonged to KeyEpochAdvance. No key epoch advance is a
+    // log record (ADR-066 decisions 36 and 37): a governance Commit's
+    // GovernanceActionExecuted leaf records the rotation it causes, and a block's
+    // rotation is the SenderKeyEpochAdvance or BroadcastEpochAdvance application
+    // message, outside the log.
     MediaSessionStarted,    // ADR-024: media session start
     MediaSessionEnded,      // ADR-024: media session end
     PaymentReceived,        // §19.6.1: payment captured
@@ -887,7 +891,7 @@ pub enum EventType {
     CommitBroadcastSucceeded,     // §9.9.4 deferred commit broadcast succeeded; payload: operation, attempts
     CommitBroadcastFailed,        // §9.9.4 deferred commit broadcast permanently failed; payload: operation, reason, attempts
     // Compromise-recovery event type (§9.12 step 2 "MLS Update in all active
-    // contexts"). Distinct from the ADR-007 sender-key KeyEpochAdvance: this
+    // contexts"). Distinct from a sender-key epoch advance, which is no log record: this
     // records an MLS *group*-epoch advance (Update + self-Commit, broadcast to
     // members) performed during trust recovery. actor_did = "system:recovery".
     RecoveryEpochAdvanced,        // §9.12 step 2 MLS group-epoch advance; payload: old_epoch, new_epoch

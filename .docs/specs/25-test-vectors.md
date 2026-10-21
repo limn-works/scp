@@ -452,7 +452,7 @@ Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree cons
 
 Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77); the ADR-031 amendment of 2026-10-12 (`phase-6.md`) added the `ModifyPseudonymRotationPolicy` action that `PseudonymRotationPolicyModified` (tag 78) records). The events are signed with the §25.2 reference P-256 key under RFC 6979, so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
 
-**`EventType` tags.** This table is the complete closed `EventType` taxonomy and fixes the `event_type_tag` that the signed value below carries for each variant. The tags are protocol constants and never change. Tag 59 is retired: it belonged to `PseudonymAnnounced`, which is not a durable event, and no event carries it. Row 38 names `CeilingModificationPending`, the name the code carries today: ADR-066 decision 21 renames that variant `GovernanceProposalRecorded`, keeping tag 38, and SCP-335 renames it in the code and in this row together. ADR-066 decision 24 adds `Checkpoint` at tag 79, the leaf a checkpoint Commit carries, and SCP-337 adds the variant to the code and its row to this table together.
+**`EventType` tags.** This table is the complete closed `EventType` taxonomy and fixes the `event_type_tag` that the signed value below carries for each variant. The tags are protocol constants and never change. Tag 59 is retired: it belonged to `PseudonymAnnounced`, which is not a durable event, and no event carries it. Tag 18 is retired: it belonged to `KeyEpochAdvance`, and no key epoch advance is a log record (ADR-066 decisions 36 and 37); SCP-349 removes the variant from the code and this row together. Row 38 names `CeilingModificationPending`, the name the code carries today: ADR-066 decision 21 renames that variant `GovernanceProposalRecorded`, keeping tag 38, and SCP-335 renames it in the code and in this row together. ADR-066 decision 24 adds `Checkpoint` at tag 79, the leaf a checkpoint Commit carries, and SCP-337 adds the variant to the code and its row to this table together.
 
 | Tag | `EventType` variant |
 |-----|---------------------|
@@ -474,7 +474,7 @@ Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log
 | 15 | `ConsistencyCheckpoint` |
 | 16 | `AbsenceProofRequested` |
 | 17 | `MemberBlocked` |
-| 18 | `KeyEpochAdvance` |
+| 18 | retired |
 | 19 | `MediaSessionStarted` |
 | 20 | `MediaSessionEnded` |
 | 21 | `PaymentReceived` |
