@@ -237,7 +237,7 @@ pub enum ContextMode {
 //
 // When `mode == Broadcast`:
 // - The owner and the authors form an MLS group, the authors group, that
-//   orders governance and the subscriber registry (§5.14.13, ADR-066
+//   orders the authors' governance (§5.14.13, ADR-066
 //   decision 38). Content uses per-author AES-256-GCM broadcast keys
 //   instead of MLS group keys.
 // - Subscriber count is unlimited (subscribers are not group members).
@@ -250,8 +250,8 @@ pub enum ContextMode {
 // - `create_context` creates the authors group (step 2) with `context_mode` 1
 //   in its `0xFF02` extension, and initializes the creator's broadcast key at
 //   epoch 0.
-// - `join_context` for subscribers sends a signed registration record that an
-//   author carries in a registration Commit; no MLS add_member.
+// - `join_context` for subscribers registers identity-authenticated subscription
+//   without MLS add_member.
 // - `send_message` encrypts with the author's current broadcast key, wraps in
 //   `BroadcastEnvelope` (§5.14.5), and publishes to the public routing_id.
 // - All other context lifecycle operations (close, expire, TTL, event log)

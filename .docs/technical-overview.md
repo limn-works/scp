@@ -355,7 +355,7 @@ The two most critical checks are the P-256 inner signature and MLS membership_ta
 
 #### Broadcast mode — no MLS
 
-Broadcast contexts encrypt content under per-author AES-256 broadcast keys instead of MLS group keys; the owner and the authors form an MLS group that orders governance and the subscriber registry, and subscribers stay outside it (spec 05 §5.14.13). Key distribution is the same pull-based protocol — an epoch advance (`BroadcastEpochAdvance`), a key request, a key response — and a subscriber's requests and responses travel as relay messages instead of MLS application messages.
+Broadcast contexts encrypt content under per-author AES-256 broadcast keys instead of MLS group keys; the owner and the authors form an MLS group that orders the authors' governance, and subscribers stay outside it (spec 05 §5.14.13). Key distribution is the same pull-based protocol — an epoch advance (`BroadcastEpochAdvance`), a key request, a key response — and a subscriber's requests and responses travel as relay messages instead of MLS application messages.
 
 | Property | Encrypted | Broadcast |
 |---|---|---|
