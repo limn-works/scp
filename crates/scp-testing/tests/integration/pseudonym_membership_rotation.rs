@@ -40,11 +40,9 @@ const BOB: &str = "did:dht:z6MkPush030Bob";
 const CAROL: &str = "did:dht:z6MkPush030Carol";
 const DAVE: &str = "did:dht:z6MkPush030Dave";
 
-/// How long a drain waits for one more event before it decides the channel
-/// is quiet. The rotation arm signals on a zero-length sleep right after the
-/// handler returns and repeats only after a 30 s backoff, so a quiet window
-/// this long separates "one signal" from "two".
-const QUIET: Duration = Duration::from_millis(750);
+/// A bound on one awaited signal, only so a missing signal fails the test
+/// instead of hanging it. No assertion depends on it elapsing.
+const SIGNAL_DEADLINE: Duration = Duration::from_secs(60);
 
 type Events = Receiver<(String, ContextEvent)>;
 
@@ -83,77 +81,80 @@ fn context_id() -> String {
     hex::encode(context_id_to_bytes("push030-membership-rotation"))
 }
 
-/// Every event `rx` receives until it stays quiet for [`QUIET`].
-async fn drain(rx: &mut Events) -> TestResult<Vec<(String, ContextEvent)>> {
-    let mut events = Vec::new();
+/// The epoch of the next `PseudonymRotationDue` signal `rx` receives for
+/// `ctx`, skipping every other event.
+async fn next_signal(rx: &mut Events, ctx: &str) -> TestResult<u64> {
     loop {
-        match tokio::time::timeout(QUIET, rx.recv()).await {
-            Ok(Ok(event)) => events.push(event),
-            Ok(Err(RecvError::Lagged(n))) => {
+        let event = tokio::time::timeout(SIGNAL_DEADLINE, rx.recv())
+            .await
+            .map_err(|_| "no rotation signal arrived")?;
+        match event {
+            Ok((id, ContextEvent::PseudonymRotationDue { pseudonym_epoch })) if id == ctx => {
+                return Ok(pseudonym_epoch);
+            }
+            Ok(_) => {}
+            Err(RecvError::Lagged(n)) => {
                 return Err(format!("the event receiver lagged by {n} events").into());
             }
-            Ok(Err(RecvError::Closed)) | Err(_) => return Ok(events),
+            Err(RecvError::Closed) => return Err("the event channel closed".into()),
         }
     }
 }
 
-/// The epochs of the `PseudonymRotationDue` signals among `events` for `ctx`.
-fn rotation_due(events: &[(String, ContextEvent)], ctx: &str) -> Vec<u64> {
-    events
-        .iter()
-        .filter(|(id, _)| id == ctx)
-        .filter_map(|(_, event)| match event {
-            ContextEvent::PseudonymRotationDue { pseudonym_epoch } => Some(*pseudonym_epoch),
-            _ => None,
-        })
-        .collect()
+/// Whether `node`'s persisted rotation state has a rotation due. The rotation
+/// arm signals only while one is due, so `false` means no further signal.
+fn persisted_due(node: &FullStackNode, ctx: &str) -> TestResult<bool> {
+    Ok(node
+        .persisted_snapshot(ctx)
+        .ok_or("the node persisted the context")?
+        .pseudonym_rotation
+        .rotation_due(Some(&membership_policy()), 0))
 }
 
-/// The rotation signals `rx` receives until it goes quiet.
-async fn signals(rx: &mut Events, ctx: &str) -> TestResult<Vec<u64>> {
-    Ok(rotation_due(&drain(rx).await?, ctx))
-}
-
-/// Rotates `node` at `epoch`, then drains the rotation's own events so the
-/// next count starts clean. The announcement stays in the node's send buffer.
-async fn rotate(
-    node: &FullStackNode,
-    rx: &mut Events,
-    ctx: &str,
-    epoch: u64,
-    rid: [u8; 32],
-) -> TestResult {
+/// Rotates `node` at `epoch` and checks, from its persisted state, that no
+/// rotation is left due. The announcement stays in the node's send buffer.
+///
+/// A second signal for the change this rotation answered would arrive ahead
+/// of the next change's signal, so the caller's next [`next_signal`] would
+/// read this epoch instead of the next one.
+async fn rotate(node: &FullStackNode, ctx: &str, epoch: u64, rid: [u8; 32]) -> TestResult {
     node.rotate_pseudonym(ctx, epoch, rid)
         .await
         .map_err(|e| format!("{} rotates at epoch {epoch}: {e}", node.did.as_ref()))?;
-    assert_eq!(
-        signals(rx, ctx).await?,
-        Vec::<u64>::new(),
+    assert!(
+        !persisted_due(node, ctx)?,
         "a rotation whose announcement went out leaves nothing due"
     );
     Ok(())
 }
 
-/// Bob's persisted registry record for `member`, once the coalesced persist
-/// that follows an announcement has landed (`None` if it never does).
-async fn persisted_record(
+/// Returns once the wall clock has left the second it read on entry.
+///
+/// The shipped proposal ID still hashes the proposer, the action and the
+/// proposal time in whole seconds (`SCP-PROPOSAL-V1`, which spec 09 §9.5.2
+/// retires for the `anchor_seq` preimage of story SCP-331). Re-adding a DID
+/// within the second of its first add proposes the same ID, and the
+/// governance engine refuses it as a duplicate, so a re-add calls this first.
+async fn leave_this_second() {
+    use scp_clock::Clock as _;
+    let entered = scp_clock::SystemClock.now_secs();
+    while scp_clock::SystemClock.now_secs() == entered {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `node`'s persisted registry record for `member`.
+fn persisted_record(
     node: &FullStackNode,
     ctx: &str,
     member: &str,
 ) -> Option<scp_core::context::pseudonym::PseudonymRecord> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let record = node.persisted_snapshot(ctx).and_then(|snapshot| {
-            snapshot
-                .routing
-                .peer_registry()
-                .and_then(|registry| registry.get(&DID::from(member)).copied())
-        });
-        if record.is_some() || tokio::time::Instant::now() >= deadline {
-            return record;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    node.persisted_snapshot(ctx).and_then(|snapshot| {
+        snapshot
+            .routing
+            .peer_registry()
+            .and_then(|registry| registry.get(&DID::from(member)).copied())
+    })
 }
 
 /// PUSH-030 acceptance: one signal per membership-changing Commit on a
@@ -177,19 +178,15 @@ async fn a_non_committer_rotates_once_per_membership_commit_and_deletes_the_remo
     let handle = alice.create_context(&ctx, params()).await?;
     alice.add_member(&handle, BOB).await?;
     bob.join_from_welcome(&ctx, &ctx_bytes).await?;
-    assert_eq!(
-        signals(&mut bob_rx, &ctx).await?,
-        vec![0],
-        "join derivation"
-    );
-    rotate(&bob, &mut bob_rx, &ctx, 0, [0xB0; 32]).await?;
+    assert_eq!(next_signal(&mut bob_rx, &ctx).await?, 0, "join derivation");
+    rotate(&bob, &ctx, 0, [0xB0; 32]).await?;
 
     // Alice adds Carol: Bob processes the Commit and gets exactly one signal.
     alice.add_member(&handle, CAROL).await?;
     bob.feed_pending_incoming(&ctx, &ctx_bytes).await?;
     assert_eq!(
-        signals(&mut bob_rx, &ctx).await?,
-        vec![1],
+        next_signal(&mut bob_rx, &ctx).await?,
+        1,
         "an AddMember Commit Bob did not commit signals one rotation"
     );
     let snapshot = bob
@@ -221,7 +218,7 @@ async fn a_non_committer_rotates_once_per_membership_commit_and_deletes_the_remo
         !snapshot.role_state.member_capabilities.contains_key(CAROL),
         "Bob's persisted role state grants Carol no capability"
     );
-    rotate(&bob, &mut bob_rx, &ctx, 1, [0xB1; 32]).await?;
+    rotate(&bob, &ctx, 1, [0xB1; 32]).await?;
 
     // Bob holds a record for Carol. Carol's own announcement cannot reach
     // Bob here: he records no role for a member a processed Commit adds until
@@ -232,27 +229,25 @@ async fn a_non_committer_rotates_once_per_membership_commit_and_deletes_the_remo
         .seed_peer_pseudonym(&ctx, DID::from(CAROL), [0xC0; 32])
         .await?;
 
-    // Alice adds Dave: one more signal, and the persist that follows carries
-    // Bob's record for Carol.
+    // Alice adds Dave: one more signal, and the persist of the processed
+    // Commit, done before the delivery returns, carries Bob's record for Carol.
     alice.add_member(&handle, DAVE).await?;
     bob.feed_pending_incoming(&ctx, &ctx_bytes).await?;
-    assert_eq!(signals(&mut bob_rx, &ctx).await?, vec![2]);
     assert_eq!(
-        persisted_record(&bob, &ctx, CAROL)
-            .await
-            .map(|r| r.routing_id),
+        persisted_record(&bob, &ctx, CAROL).map(|r| r.routing_id),
         Some([0xC0; 32]),
         "Bob's record for Carol is persisted before her removal"
     );
-    rotate(&bob, &mut bob_rx, &ctx, 2, [0xB2; 32]).await?;
+    assert_eq!(next_signal(&mut bob_rx, &ctx).await?, 2);
+    rotate(&bob, &ctx, 2, [0xB2; 32]).await?;
 
     // Alice removes Carol: Bob processes the Commit, gets exactly one signal,
     // and holds no registry record for Carol.
     alice.remove_member(&handle, CAROL).await?;
     bob.feed_pending_incoming(&ctx, &ctx_bytes).await?;
     assert_eq!(
-        signals(&mut bob_rx, &ctx).await?,
-        vec![3],
+        next_signal(&mut bob_rx, &ctx).await?,
+        3,
         "a RemoveMember Commit Bob did not commit signals one rotation"
     );
     let snapshot = bob
@@ -266,13 +261,15 @@ async fn a_non_committer_rotates_once_per_membership_commit_and_deletes_the_remo
         !registry.contains_key(&DID::from(CAROL)),
         "processing Carol's removal deletes her record (§9.10.4.1 Record lifetime)"
     );
-    rotate(&bob, &mut bob_rx, &ctx, 3, [0xB3; 32]).await?;
+    rotate(&bob, &ctx, 3, [0xB3; 32]).await?;
 
     // Carol rejoins on a fresh device: the re-add is one more AddMember.
     let _carol = network.create_node(CAROL);
+    leave_this_second().await;
     alice.add_member(&handle, CAROL).await?;
     bob.feed_pending_incoming(&ctx, &ctx_bytes).await?;
-    assert_eq!(signals(&mut bob_rx, &ctx).await?, vec![4]);
+    assert_eq!(next_signal(&mut bob_rx, &ctx).await?, 4);
+    rotate(&bob, &ctx, 4, [0xB4; 32]).await?;
     Ok(())
 }
 
@@ -293,8 +290,8 @@ async fn a_failed_persist_after_a_membership_commit_keeps_the_trigger() -> TestR
     let handle = alice.create_context(&ctx, params()).await?;
     alice.add_member(&handle, BOB).await?;
     bob.join_from_welcome(&ctx, &ctx_bytes).await?;
-    assert_eq!(signals(&mut bob_rx, &ctx).await?, vec![0]);
-    rotate(&bob, &mut bob_rx, &ctx, 0, [0xB0; 32]).await?;
+    assert_eq!(next_signal(&mut bob_rx, &ctx).await?, 0);
+    rotate(&bob, &ctx, 0, [0xB0; 32]).await?;
 
     alice.add_member(&handle, CAROL).await?;
     assert!(bob.set_persistence_failing(true));
@@ -304,21 +301,121 @@ async fn a_failed_persist_after_a_membership_commit_keeps_the_trigger() -> TestR
         "a failed persist after a merged Commit is reported, got {delivered:?}"
     );
     assert_eq!(
-        signals(&mut bob_rx, &ctx).await?,
-        vec![1],
+        next_signal(&mut bob_rx, &ctx).await?,
+        1,
         "the membership change is kept in memory, not dropped"
     );
 
+    // `rotate` checks that the persisted state holds nothing due afterwards.
     assert!(bob.set_persistence_failing(false));
-    rotate(&bob, &mut bob_rx, &ctx, 1, [0xB1; 32]).await?;
-    let snapshot = bob
-        .persisted_snapshot(&ctx)
-        .ok_or("Bob persisted the rotation")?;
+    rotate(&bob, &ctx, 1, [0xB1; 32]).await?;
+    Ok(())
+}
+
+/// How the committer removes Carol in [`readd_after_removal`].
+#[derive(Clone, Copy, Debug)]
+enum Removal {
+    /// A governance `RemoveMember` proposal Alice executes.
+    Governance,
+    /// The leave path, `Supervisor::leave_context`, which Alice commits.
+    Leave,
+}
+
+/// Carol sends `payload` and Alice opens it; returns the plaintext Alice
+/// recovered.
+async fn carol_to_alice(
+    alice: &FullStackNode,
+    carol: &FullStackNode,
+    carol_handle: &scp_core::context::ContextHandle,
+    ctx: &str,
+    payload: &[u8],
+) -> TestResult<Vec<u8>> {
+    let ctx_bytes = context_id_to_bytes(ctx);
+    let _ = carol.take_sent_ciphertexts();
+    carol.send_message(carol_handle, payload).await?;
+    let sent = carol.take_sent_ciphertexts();
+    let (_, ciphertext) = sent.first().ok_or("Carol's send produced a ciphertext")?;
+    Ok(alice
+        .decrypt_message(ctx, &ctx_bytes, ciphertext, CAROL)
+        .await?)
+}
+
+/// Alice commits Carol's removal (`removal`), re-adds Carol on a fresh
+/// device, and opens that device's first message, at sequence 1.
+///
+/// Alice opened two messages from Carol's first device, so her receive floor
+/// for Carol stood at sequence 2. The committer's removal runs
+/// `remove_member_state`, which drops Carol's sender key, sequence tracker
+/// and floors; without that teardown the fresh device's sequence 1 would be a
+/// replay below the floor.
+async fn readd_after_removal(removal: Removal) -> TestResult {
+    let ctx = hex::encode(context_id_to_bytes(&format!("push030-readd-{removal:?}")));
+    let ctx_bytes = context_id_to_bytes(&ctx);
+    let network = FullStackNetwork::new();
+    let alice = network.create_node(ALICE);
+    let carol = network.create_node(CAROL);
+
+    let handle = alice.create_context(&ctx, params()).await?;
+    alice.add_member(&handle, CAROL).await?;
+    let carol_handle = carol.join_from_welcome(&ctx, &ctx_bytes).await?;
+    carol
+        .manager
+        .seed_peer_pseudonym(&ctx, DID::from(ALICE), [0xA0; 32])
+        .await?;
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        assert_eq!(
+            carol_to_alice(&alice, &carol, &carol_handle, &ctx, payload).await?,
+            payload
+        );
+    }
+
+    match removal {
+        Removal::Governance => {
+            alice
+                .propose_governance(
+                    &ctx,
+                    scp_core::context::governance::GovernanceAction::RemoveMember {
+                        did: DID::from(CAROL),
+                        reason: None,
+                    },
+                )
+                .await?;
+            let _ = alice.take_sent_ciphertexts();
+        }
+        Removal::Leave => alice.remove_member(&handle, CAROL).await?,
+    }
     assert!(
-        !snapshot
-            .pseudonym_rotation
-            .rotation_due(Some(&membership_policy()), 0),
-        "the rotation the kept trigger admitted is persisted"
+        !alice.manager.is_member(&ctx, CAROL).await,
+        "Alice removed Carol"
+    );
+
+    let fresh = network.create_node(CAROL);
+    leave_this_second().await;
+    alice.add_member(&handle, CAROL).await?;
+    let fresh_handle = fresh.join_from_welcome(&ctx, &ctx_bytes).await?;
+    fresh
+        .manager
+        .seed_peer_pseudonym(&ctx, DID::from(ALICE), [0xA1; 32])
+        .await?;
+    let payload = b"from the fresh device";
+    assert_eq!(
+        carol_to_alice(&alice, &fresh, &fresh_handle, &ctx, payload).await?,
+        payload,
+        "Alice accepts the re-added Carol's message at sequence 1"
     );
     Ok(())
+}
+
+/// The committer's governance removal tears down Carol's receive state, so
+/// Alice accepts the re-added Carol's first message.
+#[tokio::test]
+async fn the_committer_accepts_a_readded_member_after_a_governance_removal() -> TestResult {
+    readd_after_removal(Removal::Governance).await
+}
+
+/// The committer's leave-path removal tears down Carol's receive state, so
+/// Alice accepts the re-added Carol's first message.
+#[tokio::test]
+async fn the_committer_accepts_a_readded_member_after_a_committed_leave() -> TestResult {
+    readd_after_removal(Removal::Leave).await
 }
