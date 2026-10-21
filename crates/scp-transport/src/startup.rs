@@ -1406,11 +1406,11 @@ pub fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError
         .into_iter()
         .chain(fcm.map(PushSender::Fcm))
         .collect();
-    Ok(PushRole::Enabled(PushServiceConfig {
+    Ok(PushRole::Enabled(PushServiceConfig::new(
         store,
-        verifier: Arc::new(scp_identity::push_verify::KelPushVerifier),
-        senders: Arc::from(senders),
-    }))
+        Arc::new(scp_identity::push_verify::KelPushVerifier),
+        Arc::from(senders),
+    )))
 }
 
 /// Logs the push role a relay starts with. No field carries a credential.

@@ -1,6 +1,6 @@
-//! A local HTTP/2 (h2c) server for the push sender tests (PUSH-010,
-//! PUSH-011). Compiled only under `cfg(test)`; the tests never reach
-//! Apple or Google.
+//! A local HTTP/2 (h2c) server for the push sender tests and the relay's
+//! end-to-end wake tests (PUSH-008, PUSH-010, PUSH-011). Compiled only under
+//! `cfg(test)`; the tests never reach Apple or Google.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -14,17 +14,17 @@ use tokio::task::JoinHandle;
 
 /// One request the server received.
 #[derive(Debug, Clone)]
-pub(super) struct CapturedRequest {
-    pub(super) method: String,
-    pub(super) path: String,
+pub struct CapturedRequest {
+    pub method: String,
+    pub path: String,
     /// Every regular header, lowercase name first, in arrival order.
-    pub(super) headers: Vec<(String, String)>,
-    pub(super) body: Vec<u8>,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
 }
 
 impl CapturedRequest {
     /// The first value of header `name` (lowercase).
-    pub(super) fn header(&self, name: &str) -> Option<&str> {
+    pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(n, _)| n == name)
@@ -34,7 +34,7 @@ impl CapturedRequest {
 
 /// A canned response.
 #[derive(Debug, Clone)]
-pub(super) struct Reply {
+pub struct Reply {
     status: u16,
     body: Vec<u8>,
     content_type: Option<&'static str>,
@@ -42,7 +42,7 @@ pub(super) struct Reply {
 
 impl Reply {
     /// A response with `status` and no body.
-    pub(super) fn empty(status: u16) -> Self {
+    pub fn empty(status: u16) -> Self {
         Self {
             status,
             body: Vec::new(),
@@ -52,7 +52,7 @@ impl Reply {
 }
 
 /// A JSON response with `status` and `body`.
-pub(super) fn json_reply(status: u16, body: &serde_json::Value) -> Reply {
+pub fn json_reply(status: u16, body: &serde_json::Value) -> Reply {
     Reply {
         status,
         body: body.to_string().into_bytes(),
@@ -68,7 +68,7 @@ type Routes = Arc<Mutex<Vec<(String, VecDeque<Reply>)>>>;
 
 /// An h2c server on `127.0.0.1` that answers each request with the next canned
 /// reply of the first route whose path prefix matches, and records it.
-pub(super) struct TestServer {
+pub struct TestServer {
     origin: String,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     task: JoinHandle<()>,
@@ -82,12 +82,12 @@ impl Drop for TestServer {
 
 impl TestServer {
     /// A server that answers every path from `replies`, in order.
-    pub(super) async fn start(replies: Vec<Reply>) -> Self {
+    pub async fn start(replies: Vec<Reply>) -> Self {
         Self::start_routed(vec![("/", replies)]).await
     }
 
     /// A server whose replies are chosen by path prefix.
-    pub(super) async fn start_routed(routes: Vec<(&str, Vec<Reply>)>) -> Self {
+    pub async fn start_routed(routes: Vec<(&str, Vec<Reply>)>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let routes: Routes = Arc::new(Mutex::new(
@@ -132,18 +132,18 @@ impl TestServer {
     }
 
     /// `http://127.0.0.1:<port>`.
-    pub(super) fn origin(&self) -> String {
+    pub fn origin(&self) -> String {
         self.origin.clone()
     }
 
     /// Every request received so far, in arrival order.
-    pub(super) async fn requests(&self) -> Vec<CapturedRequest> {
+    pub async fn requests(&self) -> Vec<CapturedRequest> {
         self.requests.lock().await.clone()
     }
 
     /// An origin nothing listens on, held for as long as the returned
     /// [`ClosedOrigin`] lives: a send to it fails to connect.
-    pub(super) fn closed_origin() -> ClosedOrigin {
+    pub fn closed_origin() -> ClosedOrigin {
         ClosedOrigin::reserve()
     }
 }
@@ -153,7 +153,7 @@ impl TestServer {
 /// test process, can bind the port and answer in its place. Releasing the
 /// port instead would let a concurrent test's [`TestServer`] bind it and take
 /// one of that server's scripted replies.
-pub(super) struct ClosedOrigin {
+pub struct ClosedOrigin {
     origin: String,
     _reserved: TcpSocket,
 }
@@ -170,7 +170,7 @@ impl ClosedOrigin {
     }
 
     /// `http://127.0.0.1:<port>`.
-    pub(super) fn origin(&self) -> &str {
+    pub fn origin(&self) -> &str {
         &self.origin
     }
 }

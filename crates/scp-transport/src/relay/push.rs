@@ -4,13 +4,15 @@
 //! request for the registration's platform. [`PushSender`] is the one type the
 //! relay holds per configured platform; its arms are the production senders
 //! [`ApnsSender`] (PUSH-010) and [`FcmSender`] (PUSH-011). Every send returns a
-//! [`PushSendOutcome`], which the dispatcher of PUSH-008 reads to keep or remove
-//! a registration.
+//! [`PushSendOutcome`], which the dispatcher of PUSH-008
+//! ([`push_dispatch`](super::push_dispatch)) reads to keep or remove a
+//! registration.
 //!
-//! No arm of [`PushSender`] accepts a send without performing it: a sender that
-//! reports deliveries that never happened is a nullifier (§17.17.2 of the
-//! persistence spec), so any recording arm PUSH-008 adds compiles only under
-//! `testing`.
+//! No shipped arm of [`PushSender`] accepts a send without performing it. The
+//! `Recording` arm reports scripted outcomes for sends that never happened, so
+//! it is a nullifier (§17.17.2 of the persistence spec) and compiles only under
+//! `testing`; `scripts/check-shipped-feature-graph.sh` keeps `testing` out of
+//! every shipped build.
 //!
 //! Secrets: the APNs signing key, the FCM service-account key, the provider JWT
 //! and the OAuth access token live in zeroizing buffers, and no `Debug`
@@ -92,6 +94,10 @@ pub enum PushSender {
     Apns(ApnsSender),
     /// Sends the FCM row of the §10.7.1 step 5 table.
     Fcm(FcmSender),
+    /// Records each token and returns scripted outcomes without sending
+    /// anything. A nullifier, so it compiles only under `testing`.
+    #[cfg(feature = "testing")]
+    Recording(RecordingSender),
 }
 
 impl PushSender {
@@ -101,6 +107,8 @@ impl PushSender {
         match self {
             Self::Apns(_) => PushPlatform::Apns,
             Self::Fcm(_) => PushPlatform::Fcm,
+            #[cfg(feature = "testing")]
+            Self::Recording(sender) => sender.platform,
         }
     }
 
@@ -112,7 +120,106 @@ impl PushSender {
         match self {
             Self::Apns(sender) => sender.send(token).await,
             Self::Fcm(sender) => sender.send(token).await,
+            #[cfg(feature = "testing")]
+            Self::Recording(sender) => sender.record(token.expose().as_bytes()).await,
         }
+    }
+
+    /// Sends one wake signal to a token as a registration carries it, the
+    /// raw `token` bytes of `PushRegistration` (§22.11.4), and reports the
+    /// outcome.
+    ///
+    /// - APNs: the bytes are the device token, which iOS hands the app as
+    ///   raw bytes; the request path carries their lowercase hex (§10.7.1
+    ///   step 5 `POST /3/device/<APNs device token>`). Empty bytes are
+    ///   `InvalidToken`.
+    /// - FCM: the bytes are the UTF-8 registration token; bytes that are not
+    ///   UTF-8 are `InvalidToken`, because no FCM token can match them.
+    pub async fn send_registered(&self, token: &[u8]) -> PushSendOutcome {
+        match self {
+            Self::Apns(sender) => {
+                if token.is_empty() {
+                    tracing::debug!(platform = "apns", "device token is empty");
+                    return PushSendOutcome::InvalidToken;
+                }
+                sender.send(&PushDeviceToken::new(hex::encode(token))).await
+            }
+            Self::Fcm(sender) => {
+                let Ok(text) = std::str::from_utf8(token) else {
+                    tracing::debug!(platform = "fcm", "registration token is not UTF-8");
+                    return PushSendOutcome::InvalidToken;
+                };
+                sender.send(&PushDeviceToken::new(text)).await
+            }
+            #[cfg(feature = "testing")]
+            Self::Recording(sender) => sender.record(token).await,
+        }
+    }
+}
+
+/// A sender that sends nothing: it records each token it is handed and
+/// returns the next scripted outcome, or `ConfigError` once the script runs
+/// out, so an unscripted send never passes for a delivery.
+///
+/// It reports deliveries that never happened, so it is a nullifier (§17.17.2)
+/// and compiles only under `testing`. Clones share the script and the record.
+#[cfg(feature = "testing")]
+#[derive(Clone)]
+pub struct RecordingSender {
+    platform: PushPlatform,
+    state: std::sync::Arc<tokio::sync::Mutex<RecordingState>>,
+}
+
+/// The script still to play and the tokens handed over so far.
+#[cfg(feature = "testing")]
+struct RecordingState {
+    script: std::collections::VecDeque<PushSendOutcome>,
+    sent: Vec<Zeroizing<Vec<u8>>>,
+}
+
+#[cfg(feature = "testing")]
+impl RecordingSender {
+    /// A recording sender for `platform` that returns `outcomes` in order.
+    pub fn new(
+        platform: PushPlatform,
+        outcomes: impl IntoIterator<Item = PushSendOutcome>,
+    ) -> Self {
+        Self {
+            platform,
+            state: std::sync::Arc::new(tokio::sync::Mutex::new(RecordingState {
+                script: outcomes.into_iter().collect(),
+                sent: Vec::new(),
+            })),
+        }
+    }
+
+    /// Every token handed to this sender so far, in order.
+    pub async fn sent(&self) -> Vec<Vec<u8>> {
+        self.state
+            .lock()
+            .await
+            .sent
+            .iter()
+            .map(|t| t.to_vec())
+            .collect()
+    }
+
+    async fn record(&self, token: &[u8]) -> PushSendOutcome {
+        let mut state = self.state.lock().await;
+        state.sent.push(Zeroizing::new(token.to_vec()));
+        state
+            .script
+            .pop_front()
+            .unwrap_or(PushSendOutcome::ConfigError)
+    }
+}
+
+#[cfg(feature = "testing")]
+impl fmt::Debug for RecordingSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordingSender")
+            .field("platform", &self.platform)
+            .finish_non_exhaustive()
     }
 }
 
@@ -250,6 +357,56 @@ pub(super) fn pem_pkcs8_der(pem: &str) -> Option<Zeroizing<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A build without `testing` holds only the production senders: this
+    /// match names `Apns` and `Fcm` with no wildcard, so it stops compiling
+    /// if any other arm, such as `Recording`, is present.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn sender_without_testing_has_only_production_arms() -> Result<(), Box<dyn std::error::Error>> {
+        fn arm_name(sender: &PushSender) -> &'static str {
+            match sender {
+                PushSender::Apns(_) => "apns",
+                PushSender::Fcm(_) => "fcm",
+            }
+        }
+        let key = scp_crypto::p256::P256SecretKey::from_scalar_bytes(&[7u8; 32])?;
+        let sender = PushSender::Apns(ApnsSender::new(ApnsConfig {
+            signing_key: key,
+            key_id: "ABC123DEFG".to_owned(),
+            team_id: "TEAM456XYZ".to_owned(),
+            topic: "works.limn.app".to_owned(),
+            environment: ApnsEnvironment::Sandbox,
+        })?);
+        assert_eq!(arm_name(&sender), "apns");
+        Ok(())
+    }
+
+    /// The recording sender keeps every token, answers in script order, and
+    /// answers `ConfigError` once the script runs out; its `Debug` prints no
+    /// token.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn recording_sender_follows_its_script() {
+        let recorder = RecordingSender::new(PushPlatform::Fcm, [PushSendOutcome::Delivered]);
+        let sender = PushSender::Recording(recorder.clone());
+        assert_eq!(sender.platform(), PushPlatform::Fcm);
+        assert_eq!(
+            sender.send_registered(b"tok-a").await,
+            PushSendOutcome::Delivered
+        );
+        assert_eq!(
+            sender.send(&PushDeviceToken::new("tok-b")).await,
+            PushSendOutcome::ConfigError
+        );
+        assert_eq!(
+            recorder.sent().await,
+            vec![b"tok-a".to_vec(), b"tok-b".to_vec()]
+        );
+        let shown = format!("{sender:?}");
+        assert!(!shown.contains("tok-a"), "{shown}");
+        assert!(shown.contains("Fcm"), "{shown}");
+    }
 
     #[test]
     fn device_token_debug_prints_no_token_text() {

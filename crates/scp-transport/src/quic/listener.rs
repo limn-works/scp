@@ -922,6 +922,9 @@ async fn handle_publish<S: BlobStorage>(
         .await
     {
         DidPublishGate::Accepted(stored) => {
+            // Queue the wakes for the stored blob without waiting on a send (§10.7.1
+            // step 5, PUSH-008).
+            crate::relay::push_dispatch::notify(&config.push, &routing_id).await;
             let _failed_deliveries = subscription::deliver_to_subscribers(
                 &stored,
                 subscriptions,
@@ -958,6 +961,10 @@ async fn handle_publish<S: BlobStorage>(
             return write_and_finish(send, &err).await;
         }
     };
+
+    // Queue the wakes for the stored blob without waiting on a send (§10.7.1
+    // step 5, PUSH-008).
+    crate::relay::push_dispatch::notify(&config.push, &routing_id).await;
 
     // Deliver to active subscribers with optional jitter (BLACK-001).
     let _failed_deliveries =

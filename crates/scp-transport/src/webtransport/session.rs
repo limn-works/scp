@@ -492,6 +492,9 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
             .await
         {
             DidPublishGate::Accepted(stored) => {
+                // Queue the wakes for the stored blob without waiting on a send (§10.7.1
+                // step 5, PUSH-008).
+                crate::relay::push_dispatch::notify(&self.config.push, &routing_id).await;
                 let _failed_deliveries = subscription::deliver_to_subscribers(
                     &stored,
                     &self.subscriptions,
@@ -530,6 +533,10 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
                 });
             }
         };
+
+        // Queue the wakes for the stored blob without waiting on a send (§10.7.1
+        // step 5, PUSH-008).
+        crate::relay::push_dispatch::notify(&self.config.push, &routing_id).await;
 
         // Deliver to active subscribers with optional jitter (BLACK-001).
         let _failed_deliveries = subscription::deliver_to_subscribers(

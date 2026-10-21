@@ -578,10 +578,20 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/push_dispatch.rs",
-        "crates/scp-transport/src/native/server.rs"
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/relay/mod.rs",
+        "crates/scp-transport/src/relay/push.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-transport/src/relay/push_store.rs",
+        "crates/scp-transport/tests/push_store_conformance.rs",
+        "crates/scp-transport/src/quic/listener.rs",
+        "crates/scp-transport/src/udp/listener.rs",
+        "crates/scp-transport/src/webtransport/session.rs",
+        "crates/scp-transport/src/startup.rs",
+        "crates/scp-transport/src/relay/push_test_server.rs"
       ],
       "description": "The `PushSender` enum has the arms `Apns`, `Fcm` and, under `testing` only, `Recording`; a recording sender reports deliveries that never happened, so it is a nullifier and must stay out of the shipped feature graph. Each `send` returns `Delivered`, `InvalidToken`, `Transient` or `ConfigError`. After `storage.store` succeeds in `handle_publish`, the relay looks up the registrations for the publish's routing ID and queues one job per token on a bounded queue (indicator: 10,000); the publish never waits on a send. A background task drains the queue. Only `InvalidToken` counts toward the 3 consecutive failures of \u00a710.7.1; `Delivered` resets the counter, and at 3 the relay removes the registration. Tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. File location `push_dispatch.rs` is an indicator.",
       "acceptanceCriteria": [
@@ -676,10 +686,12 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/push_apns.rs",
-        "crates/scp-transport/Cargo.toml"
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/relay/push_test_server.rs"
       ],
       "description": "Sends the APNs row of the \u00a710.7.1 step 5 wake-signal table over HTTP/2 to `api.push.apple.com`, or to `api.sandbox.push.apple.com` when the configured environment is `sandbox`. Authenticates with an ES256 provider JWT signed by the .p8 key through the `p256` crate the workspace already uses, carrying the key ID and team ID, refreshed every 50 minutes (indicator). Response mapping: 200 to `Delivered`; 410, or 400 with reason `BadDeviceToken`, to `InvalidToken`; 403 `InvalidProviderToken` or `ExpiredProviderToken` refreshes the JWT once, then `ConfigError`; 429 or 5xx to `Transient`; `DeviceTokenNotForTopic` to `InvalidToken`; `TopicDisallowed` to `ConfigError`. End-to-end tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. Runs in parallel with PUSH-011. File location `push_apns.rs` is an indicator.",
       "acceptanceCriteria": [
@@ -723,10 +735,12 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/push_fcm.rs",
-        "crates/scp-transport/Cargo.toml"
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/relay/push_test_server.rs"
       ],
       "description": "Reads the service-account JSON, mints an RS256 JWT for `https://oauth2.googleapis.com/token` with scope `https://www.googleapis.com/auth/firebase.messaging`, and caches the access token until 60 s before it expires (indicator). Sends the FCM row of the \u00a710.7.1 step 5 wake-signal table to `POST https://fcm.googleapis.com/v1/projects/{project_id}/messages:send`. Response mapping: 200 to `Delivered`; 404 `UNREGISTERED`, or 400 `INVALID_ARGUMENT` naming the token, to `InvalidToken`; 401 refreshes the token once, then `ConfigError`; 403 `SENDER_ID_MISMATCH` to `InvalidToken`; 429 `QUOTA_EXCEEDED`, 503 or 500 to `Transient`. End-to-end tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. Runs in parallel with PUSH-010. File location `push_fcm.rs` is an indicator.",
       "acceptanceCriteria": [

@@ -54,6 +54,7 @@ use super::relay_persistence::RelayPersistence;
 use super::storage::{BlobStorage, BlobStorageBackend};
 use crate::error::TransportError;
 use crate::relay::bridge::{BRIDGE_AUTH_FAILED_MSG, BridgeRegistration, BridgeRegistry};
+use crate::relay::push_dispatch;
 use crate::relay::push_gate::{self, LiveRelayUrl, PushRole};
 use crate::relay::rate_limit::{self, ConnectionTracker, PublishRateLimiter, SubscribeRateLimiter};
 use crate::relay::subscription::{self, SubscriptionRegistry};
@@ -491,6 +492,12 @@ impl RelayServer {
             ttl_expiry_task(storage_for_ttl, did_slots_for_ttl, ttl_interval).await;
         });
 
+        // The push drain (PUSH-008) runs while this accept loop does: the
+        // guard cancels it when `run` returns or its future is dropped.
+        let push_shutdown = CancellationToken::new();
+        let _push_drain_guard = push_shutdown.clone().drop_guard();
+        let _push_drain = push_dispatch::spawn_drain(&self.config.push, push_shutdown);
+
         loop {
             let (stream, addr) = listener
                 .accept()
@@ -557,8 +564,11 @@ impl RelayServer {
     /// binding and spawns the accept loop in a background task. The returned
     /// [`ShutdownHandle`] can be used to gracefully stop the server.
     ///
-    /// Spawns background maintenance tasks (TTL expiry + rate limiter cleanup).
+    /// Spawns background maintenance tasks (TTL expiry, rate limiter cleanup,
+    /// and the push drain of PUSH-008), each stopped by `token`.
     fn spawn_background_tasks(&self, token: &CancellationToken) {
+        let _push_drain = push_dispatch::spawn_drain(&self.config.push, token.clone());
+
         let storage_for_ttl = Arc::clone(&self.storage);
         let did_slots_for_ttl = self.did_slots.clone();
         let ttl_interval = self.config.ttl_check_interval;
@@ -1361,6 +1371,9 @@ async fn handle_publish(
         .await
     {
         DidPublishGate::Accepted(stored) => {
+            // Queue the wakes for the stored blob without waiting on a send
+            // (§10.7.1 step 5, PUSH-008).
+            push_dispatch::notify(&config.push, &routing_id).await;
             let _failed_deliveries = subscription::deliver_to_subscribers(
                 &stored,
                 subscriptions,
@@ -1399,6 +1412,10 @@ async fn handle_publish(
             return;
         }
     };
+
+    // Queue the wakes for the stored blob without waiting on a send (§10.7.1
+    // step 5, PUSH-008).
+    push_dispatch::notify(&config.push, &routing_id).await;
 
     // Deliver to active subscribers with optional jitter (BLACK-001).
     // The return value tracks failed sends (logged inside the function)
@@ -4419,11 +4436,11 @@ mod tests {
         ) -> (SocketAddr, PushRegistrationStore, tempfile::TempDir) {
             let dir = tempfile::tempdir().unwrap();
             let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db")).unwrap();
-            let push = PushRole::Enabled(PushServiceConfig {
-                store: store.clone(),
+            let push = PushRole::Enabled(PushServiceConfig::new(
+                store.clone(),
                 verifier,
-                senders: Arc::from(vec![apns_sender()]),
-            });
+                Arc::from(vec![apns_sender()]),
+            ));
             (start_push_server(push).await, store, dir)
         }
 
@@ -4645,6 +4662,177 @@ mod tests {
                     .is_none(),
                 "a subscriber to the reserved push routing ID received a message"
             );
+        }
+
+        // -- End-to-end wake (§10.7.1 step 5, PUSH-008, PUSH-010, PUSH-011) --
+        //
+        // Each test registers through the relay's gate with `TestPushVerifier`
+        // (a PUBLISH to the reserved routing ID), publishes an ordinary blob
+        // to a registered routing ID, and reads the request the sender made
+        // to the local h2c server standing in for Apple or Google.
+
+        /// A relay with `senders`, `test_verifier()`, and a fresh SQLite store.
+        async fn start_waking(
+            senders: Vec<PushSender>,
+            capacity: usize,
+        ) -> (SocketAddr, PushServiceConfig, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db")).unwrap();
+            let config = PushServiceConfig::with_queue_capacity(
+                store,
+                test_verifier(),
+                Arc::from(senders),
+                capacity,
+            );
+            let addr = start_push_server(PushRole::Enabled(config.clone())).await;
+            (addr, config, dir)
+        }
+
+        /// Registers `token` on `platform` for `[0x11; 32]` and `[0x22; 32]`.
+        async fn register(addr: SocketAddr, platform: PushPlatform, token: &[u8]) {
+            let msg = registration(&key(7), platform, token, now(), PUSH_RELAY_URL);
+            let reply = publish_push(addr, reg_blob(&msg)).await;
+            assert!(
+                matches!(reply, RelayMessage::Ok { blob_id: None, .. }),
+                "registration refused: {reply:?}"
+            );
+        }
+
+        /// Publishes one blob to `[0x11; 32]` and asserts the relay stored it.
+        async fn publish_blob(addr: SocketAddr, blob: Vec<u8>) {
+            let reply = publish_to(addr, [0x11; 32], blob).await;
+            assert!(
+                matches!(
+                    reply,
+                    RelayMessage::Ok {
+                        blob_id: Some(_),
+                        ..
+                    }
+                ),
+                "publish refused: {reply:?}"
+            );
+        }
+
+        /// Waits up to 5 s for a request whose path is `path`.
+        async fn wait_for_request(
+            server: &crate::relay::push_test_server::TestServer,
+            path: &str,
+        ) -> crate::relay::push_test_server::CapturedRequest {
+            for _ in 0..500 {
+                if let Some(found) = server.requests().await.into_iter().find(|r| r.path == path) {
+                    return found;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!(
+                "no request to {path}; received {:?}",
+                server
+                    .requests()
+                    .await
+                    .iter()
+                    .map(|r| r.path.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stored_blob_wakes_the_registered_apns_device() {
+            use crate::relay::push_test_server::{Reply, TestServer};
+            let server = TestServer::start(vec![Reply::empty(200)]).await;
+            let sender = ApnsSender::build(
+                crate::relay::push_apns::tests::config(),
+                server.origin(),
+                Arc::new(scp_clock::SystemClock),
+            )
+            .unwrap();
+            let (addr, config, _dir) = start_waking(
+                vec![PushSender::Apns(sender)],
+                crate::relay::push_dispatch::PUSH_QUEUE_CAPACITY,
+            )
+            .await;
+            let token = [0xA1, 0xB2, 0xC3, 0xD4, 0x05];
+            register(addr, PushPlatform::Apns, &token).await;
+            assert!(
+                server.requests().await.is_empty(),
+                "a registration woke a device"
+            );
+
+            publish_blob(addr, vec![9; 16]).await;
+
+            let request = wait_for_request(&server, "/3/device/a1b2c3d405").await;
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.header("apns-push-type"), Some("background"));
+            assert_eq!(server.requests().await.len(), 1, "one job per stored blob");
+            let stats = config.dispatcher().stats();
+            assert_eq!((stats.enqueued, stats.dropped_full), (1, 0));
+        }
+
+        #[tokio::test]
+        async fn a_stored_blob_wakes_the_registered_fcm_device() {
+            use crate::relay::push_fcm::tests::{SEND_PATH, config, token_reply};
+            use crate::relay::push_test_server::{Reply, TestServer};
+            let server = TestServer::start_routed(vec![
+                ("/token", vec![token_reply("ya29.e2e-access-token", 3600)]),
+                ("/v1/", vec![Reply::empty(200)]),
+            ])
+            .await;
+            let origin = server.origin();
+            let sender = crate::relay::push::FcmSender::build(
+                config(),
+                &origin,
+                format!("{origin}/token"),
+                Arc::new(scp_clock::SystemClock),
+            )
+            .unwrap();
+            let (addr, _config, _dir) = start_waking(
+                vec![PushSender::Fcm(sender)],
+                crate::relay::push_dispatch::PUSH_QUEUE_CAPACITY,
+            )
+            .await;
+            let token = b"fcm-reg-token:e2e";
+            register(addr, PushPlatform::Fcm, token).await;
+
+            publish_blob(addr, vec![9; 16]).await;
+
+            let request = wait_for_request(&server, SEND_PATH).await;
+            assert_eq!(request.method, "POST");
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["message"]["token"], "fcm-reg-token:e2e");
+        }
+
+        #[tokio::test]
+        async fn a_full_push_queue_drops_the_job_and_the_publish_still_succeeds() {
+            // An origin that accepts connections and never answers: the drain
+            // blocks on its first job, so a one-slot queue fills.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let _stall = tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    // Hold the connection open and silent until the test ends.
+                    tokio::spawn(async move {
+                        let _socket = socket;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            });
+            let sender = ApnsSender::build(
+                crate::relay::push_apns::tests::config(),
+                origin,
+                Arc::new(scp_clock::SystemClock),
+            )
+            .unwrap();
+            let (addr, config, _dir) = start_waking(vec![PushSender::Apns(sender)], 1).await;
+            register(addr, PushPlatform::Apns, &[0xAB; 8]).await;
+
+            // At most one job is in the sender and at most one in the queue,
+            // so the third publish finds the queue full whatever the timing.
+            for i in 0..3u8 {
+                publish_blob(addr, vec![i; 16]).await;
+            }
+
+            let stats = config.dispatcher().stats();
+            assert!(stats.dropped_full >= 1, "no job dropped: {stats:?}");
+            assert_eq!(stats.enqueued + stats.dropped_full, 3, "{stats:?}");
         }
     }
 }

@@ -985,6 +985,9 @@ async fn handle_udp_publish<S: BlobStorage>(
         .await
     {
         DidPublishGate::Accepted(_stored) => {
+            // Queue the wakes for the stored blob without waiting on a send (§10.7.1
+            // step 5, PUSH-008).
+            crate::relay::push_dispatch::notify(&config.push, &routing_id).await;
             let ok = RelayMessage::Ok {
                 ref_id,
                 blob_id: Some(blob_id),
@@ -1005,6 +1008,9 @@ async fn handle_udp_publish<S: BlobStorage>(
         .await
     {
         Ok(_stored) => {
+            // Queue the wakes for the stored blob without waiting on a send (§10.7.1
+            // step 5, PUSH-008).
+            crate::relay::push_dispatch::notify(&config.push, &routing_id).await;
             let ok = RelayMessage::Ok {
                 ref_id,
                 blob_id: Some(blob_id),
