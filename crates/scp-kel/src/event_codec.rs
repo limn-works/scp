@@ -300,42 +300,49 @@ impl NamedSignature {
     }
 }
 
-/// One signer group's indexed signatures as the signature field carries
-/// them, in the group's index-list order (§9.7.4.2 fields 6 and 7).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SignerGroupSignatures {
-    role: SignerGroupRole,
-    signatures: Vec<NamedSignature>,
+/// One signer group's walked signatures, read through its header group.
+///
+/// The signatures are in the group's index-list order (§9.7.4.2 fields 6
+/// and 7). The role and the signers are the header group's, so a walked
+/// group cannot name a role its header group does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignerGroupSignatures<'a> {
+    group: &'a HeaderGroup,
+    signatures: &'a [NamedSignature],
 }
 
-impl SignerGroupSignatures {
-    /// The group's role.
+impl<'a> SignerGroupSignatures<'a> {
+    /// The role of the header group the walk ran over.
     #[must_use]
     pub const fn role(&self) -> SignerGroupRole {
-        self.role
+        self.group.role
     }
 
-    /// The group's indexed signatures, each with its index.
+    /// The header group the walk ran over.
     #[must_use]
-    pub fn signatures(&self) -> &[NamedSignature] {
-        &self.signatures
+    pub const fn group(&self) -> &'a HeaderGroup {
+        self.group
+    }
+
+    /// The group's indexed signatures, each with its index, one per named
+    /// signer of [`group`](Self::group).
+    #[must_use]
+    pub const fn signatures(&self) -> &'a [NamedSignature] {
+        self.signatures
     }
 }
 
 /// A signature field that walked under fields 6 and 7 (§9.7.4.2 step 5).
+/// [`ReadUnit::walked_groups`] reads its signatures with the header groups
+/// they were walked under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignatureField {
-    groups: Vec<SignerGroupSignatures>,
+    /// One list per header group, in the header's group order.
+    signatures: Vec<Vec<NamedSignature>>,
     consumed: usize,
 }
 
 impl SignatureField {
-    /// One entry per signer group, in the header's group order.
-    #[must_use]
-    pub fn groups(&self) -> &[SignerGroupSignatures] {
-        &self.groups
-    }
-
     /// The bytes the unit took from `value` at its offset: the 4-byte
     /// prefix, the signed preimage and the walked signature field. The next
     /// unit starts there.
@@ -398,6 +405,27 @@ impl ReadUnit {
     /// not read.
     pub const fn signature_field(&self) -> Result<&SignatureField, &SignatureFieldError> {
         self.signature_field.as_ref()
+    }
+
+    /// Step 5's walked signatures, one entry per header group in the
+    /// header's group order, each read through the group it was walked
+    /// under.
+    ///
+    /// # Errors
+    ///
+    /// The [`SignatureFieldError`] of the first indexed signature that does
+    /// not read.
+    pub fn walked_groups(
+        &self,
+    ) -> Result<impl ExactSizeIterator<Item = SignerGroupSignatures<'_>>, &SignatureFieldError>
+    {
+        let field = self.signature_field.as_ref()?;
+        Ok(self
+            .header
+            .groups()
+            .iter()
+            .zip(&field.signatures)
+            .map(|(group, signatures)| SignerGroupSignatures { group, signatures }))
     }
 
     /// The whole preimage, fields 1 through 12, where fields 8 through 12
@@ -477,8 +505,8 @@ pub fn decode_event(value: &[u8], offset: usize) -> EventUnit {
         Err(error) => return EventUnit::HeaderFailed(HeaderFailedUnit { raw, error }),
     };
     let signature_field =
-        walk_signature_field(&header, field).map(|(groups, rest)| SignatureField {
-            groups,
+        walk_signature_field(&header, field).map(|(signatures, rest)| SignatureField {
+            signatures,
             // Each term is a disjoint part of `value[offset..]`, so the sum
             // is at most `value.len()`.
             consumed: LENGTH_PREFIX_BYTES + prefixed.len() + (field.len() - rest.len()),
@@ -503,12 +531,12 @@ fn prefixed_bytes(value: &[u8], offset: usize) -> Option<(&[u8], &[u8])> {
 }
 
 /// Step 5: reads one indexed signature per named signer, in group order and
-/// in the form field 7 declares for that signer's index, and returns the
-/// groups with the bytes of `field` left after the walk.
+/// in the form field 7 declares for that signer's index, and returns one
+/// signature list per group with the bytes of `field` left after the walk.
 fn walk_signature_field<'a>(
     header: &EventHeader,
     field: &'a [u8],
-) -> Result<(Vec<SignerGroupSignatures>, &'a [u8]), SignatureFieldError> {
+) -> Result<(Vec<Vec<NamedSignature>>, &'a [u8]), SignatureFieldError> {
     let mut rest = field;
     let mut groups = Vec::new();
     for group in header.groups() {
@@ -529,10 +557,7 @@ fn walk_signature_field<'a>(
                 signature,
             });
         }
-        groups.push(SignerGroupSignatures {
-            role: group.role,
-            signatures,
-        });
+        groups.push(signatures);
     }
     Ok((groups, rest))
 }

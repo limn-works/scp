@@ -483,19 +483,20 @@ pub fn assert_event_round_trip(
     assert_eq!(header.predecessor_digest(), &preimage.predecessor_digest);
     assert_eq!(header.standing_root(), preimage.standing_root);
     assert_eq!(header.groups().len(), preimage.signer_groups.len());
-    assert_eq!(field.groups().len(), header.groups().len());
+    let walked_groups = read.walked_groups().map_err(Clone::clone)?;
+    assert_eq!(walked_groups.len(), header.groups().len());
     let mut walked = Vec::new();
     for ((group, signer_group), walked_group) in header
         .groups()
         .iter()
         .zip(&preimage.signer_groups)
-        .zip(field.groups())
+        .zip(walked_groups)
     {
         let indices: Vec<u8> = group.signers().iter().map(NamedSigner::index).collect();
         let forms: Vec<SignatureForm> = group.signers().iter().map(NamedSigner::form).collect();
         assert_eq!(indices, signer_group.indices);
         assert_eq!(forms, signer_group.forms);
-        assert_eq!(walked_group.role(), group.role());
+        assert_eq!(walked_group.group(), group);
         assert_eq!(walked_group.signatures().len(), group.signers().len());
         for (signature, signer) in walked_group.signatures().iter().zip(group.signers()) {
             assert_eq!(signature.index(), signer.index());

@@ -258,22 +258,19 @@ fn assert_layout(
         len64(bytes(preimage_hex)?.len() + RAW_CEILING * layout.roles.len())?
     );
 
-    let field = read.signature_field().map_err(Clone::clone)?;
     let printed = bytes(field_hex)?;
-    let walked: Vec<SignerGroupRole> = field
-        .groups()
-        .iter()
-        .map(scp_kel::SignerGroupSignatures::role)
+    let walked: Vec<SignerGroupRole> = read
+        .walked_groups()
+        .map_err(Clone::clone)?
+        .map(|group| group.role())
         .collect();
     assert_eq!(walked, layout.roles);
-    for ((group, header_group), printed) in field
-        .groups()
-        .iter()
-        .zip(header.groups())
+    for (group, printed) in read
+        .walked_groups()
+        .map_err(Clone::clone)?
         .zip(printed.chunks(RAW_CEILING))
     {
-        assert_eq!(header_group.role(), group.role());
-        let [signer] = header_group.signers() else {
+        let [signer] = group.group().signers() else {
             return Err("each group names one signer".into());
         };
         assert_eq!((signer.index(), signer.form()), (0, SignatureForm::Raw));
@@ -420,34 +417,28 @@ fn consecutive_units_read_at_each_consumed_offset() -> TestResult {
     Ok(())
 }
 
-/// Whether a corpus file name is one libFuzzer gives an input it found: the
-/// 40 lowercase hex digits of the input's SHA-1. A local fuzz run adds such
-/// files beside the seeds, and they need not decode.
-fn is_fuzzer_found(name: &str) -> bool {
-    name.len() == 40
-        && name
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
+/// The seeds `fuzz_kel_decode_event`'s corpus tracks, by file name.
+const SEEDS: [&str; 9] = [
+    "vector_41",
+    "vector_42",
+    "vector_50",
+    "vector_51_inception",
+    "vector_51_key_state",
+    "vector_53",
+    "vector_54",
+    "vector_55",
+    "vectors_41_then_50",
+];
 
-/// Every unit of every seed-corpus file of `fuzz_kel_decode_event` decodes
-/// its body and walks, and the units tile the file, so the fuzz target's
+/// Every unit of every seed of `fuzz_kel_decode_event`'s corpus decodes its
+/// body and walks, and the units tile the file, so the fuzz target's
 /// re-encode and walk invariants run on each seed.
 #[test]
 fn every_seed_corpus_unit_decodes_its_body() -> TestResult {
     let corpus =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/fuzz_kel_decode_event");
-    let mut seeds = 0;
-    for entry in std::fs::read_dir(corpus)? {
-        let path = entry?.path();
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("a corpus file name is not UTF-8")?;
-        if is_fuzzer_found(name) {
-            continue;
-        }
-        let value = std::fs::read(&path)?;
+    for name in SEEDS {
+        let value = std::fs::read(corpus.join(name))?;
         let mut offset = 0;
         while offset < value.len() {
             let EventUnit::Read(read) = decode_event(&value, offset) else {
@@ -457,10 +448,7 @@ fn every_seed_corpus_unit_decodes_its_body() -> TestResult {
             offset += read.signature_field().map_err(Clone::clone)?.consumed();
         }
         assert_eq!(offset, value.len(), "{name}");
-        seeds += 1;
     }
-    // The nine seeds the corpus tracks; adding a seed raises this count.
-    assert_eq!(seeds, 9);
     Ok(())
 }
 
@@ -672,14 +660,7 @@ fn the_walk_names_the_role_position_and_index_where_it_fails() -> TestResult {
     let field_bytes = v54_two_signer_fields()?;
     let signatures = six_signatures();
     let whole = read_unit(&unit_of_fields(&field_bytes, &signatures)?)?;
-    assert_eq!(
-        whole
-            .signature_field()
-            .map_err(Clone::clone)?
-            .groups()
-            .len(),
-        3
-    );
+    assert_eq!(whole.walked_groups().map_err(Clone::clone)?.len(), 3);
     for (group, (role, indices)) in V54_ROLES.iter().zip(V54_INDICES).enumerate() {
         for (position, index) in indices.into_iter().enumerate() {
             let walked = 2 * group + position;

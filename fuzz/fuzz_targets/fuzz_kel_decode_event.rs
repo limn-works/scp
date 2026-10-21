@@ -43,13 +43,13 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(reencoded.signed_preimage(), raw);
         }
 
-        let Ok(field) = read.signature_field() else {
+        let (Ok(field), Ok(groups)) = (read.signature_field(), read.walked_groups()) else {
             break;
         };
         let consumed = field.consumed();
         let mut unit_bytes = u32::try_from(raw.len()).unwrap().to_be_bytes().to_vec();
         unit_bytes.extend_from_slice(&raw);
-        for group in field.groups() {
+        for group in groups {
             for signature in group.signatures() {
                 unit_bytes.extend_from_slice(&signature.signature().to_bytes());
             }
