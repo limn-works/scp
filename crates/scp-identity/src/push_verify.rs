@@ -18,8 +18,9 @@
 //! Two implementations exist:
 //!
 //! - [`KelPushVerifier`], the production verifier. The keri workstream builds
-//!   its body after SCP-308 S1 and the §9.7.4.2 R2, R3 and R8 key-state
-//!   resolution land. Until then it refuses every message with
+//!   its body once the §9.7.4.2 R2, R3 and R8 key-state resolution lands:
+//!   SCP-309's chain validation and replay and SCP-007's `resolve`. Until
+//!   then it refuses every message with
 //!   [`PushVerifyError::VerifierUnavailable`], so a push-enabled relay answers
 //!   `5003` and accepts nothing unverified.
 //! - `TestPushVerifier`, compiled only under `cfg(test)` or the `testing`
@@ -223,8 +224,9 @@ impl PushSignatureVerifier for KelPushVerifier {
         _relay_url: &str,
     ) -> Result<DID, PushVerifyError> {
         // Stub — see PUSH-005. The keri workstream replaces this body with
-        // key-state resolution after SCP-308 S1; until then the verifier
-        // refuses every message and never accepts one.
+        // key-state resolution once SCP-309's chain validation and replay and
+        // SCP-007's `resolve` land; until then the verifier refuses every
+        // message and never accepts one.
         Err(PushVerifyError::VerifierUnavailable)
     }
 }

@@ -151,12 +151,12 @@ impl std::fmt::Display for PushPlatform {
 pub struct PushRegistration {
     /// The registering identity's identifier, the only identity field.
     ///
-    /// §22.11.4 types this field as the SCP-308 `Identifier` and §9.5.2
-    /// encodes it as the 56-byte `scp:` text form. Until SCP-308, the
-    /// key-event data model story of architecture slice S1, lands that type,
-    /// the field holds today's `did:dht` string, so the code lags the spec
-    /// here. S1 changes the bytes inside the field's 4-byte length prefix and
-    /// leaves the `SCP-PUSH-REGISTER-V1:` separator unchanged.
+    /// §22.11.4 types this field as the `Identifier` SCP-308 defines, and
+    /// §9.5.2 encodes it as the 56-byte `scp:` text form. Until SCP-315, the
+    /// slice S12 cut-over of every identity path to the key-event log,
+    /// retypes it, the field holds today's `did:dht` string, so the code lags
+    /// the spec here. The retype changes the bytes inside the field's 4-byte
+    /// length prefix and leaves the `SCP-PUSH-REGISTER-V1:` separator unchanged.
     pub registrant: DID,
     /// Push service platform (APNS, FCM, or `WebPush`).
     pub platform: PushPlatform,
@@ -232,12 +232,12 @@ impl PushRegistration {
 pub struct PushDeregistration {
     /// The deregistering identity's identifier, the only identity field.
     ///
-    /// §22.11.4 types this field as the SCP-308 `Identifier` and §9.5.2
-    /// encodes it as the 56-byte `scp:` text form. Until SCP-308, the
-    /// key-event data model story of architecture slice S1, lands that type,
-    /// the field holds today's `did:dht` string, so the code lags the spec
-    /// here. S1 changes the bytes inside the field's 4-byte length prefix and
-    /// leaves the `SCP-PUSH-DEREGISTER-V1:` separator unchanged.
+    /// §22.11.4 types this field as the `Identifier` SCP-308 defines, and
+    /// §9.5.2 encodes it as the 56-byte `scp:` text form. Until SCP-315, the
+    /// slice S12 cut-over of every identity path to the key-event log,
+    /// retypes it, the field holds today's `did:dht` string, so the code lags
+    /// the spec here. The retype changes the bytes inside the field's 4-byte
+    /// length prefix and leaves the `SCP-PUSH-DEREGISTER-V1:` separator unchanged.
     pub registrant: DID,
     /// Push service platform to deregister from.
     pub platform: PushPlatform,

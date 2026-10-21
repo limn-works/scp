@@ -126,7 +126,8 @@ pub struct KeyStateSnapshot {
     /// The signing threshold t of the root set.
     pub root_threshold: u32,
     /// The keys the snapshot names: the entries kept `Current` in their
-    /// existing order, then the entries the event drops.
+    /// existing order, then the keys the event installs in the order the
+    /// snapshot itself lists them, then the entries the event drops.
     pub keys: Vec<KeyEntry>,
     /// The designated witnesses' operator identifiers.
     pub witnesses: Vec<Identifier>,
@@ -144,7 +145,8 @@ impl KeyStateSnapshot {
     /// snapshot's root threshold (§9.7.4.2, the key-state snapshot's order:
     /// "root members in the root set's own list order", and "A snapshot lists
     /// the entries it keeps `Current` in their existing order, followed by the
-    /// entries the event drops").
+    /// keys the event installs in the order the snapshot itself lists them,
+    /// followed by the entries the event drops, in their existing order").
     #[must_use]
     pub fn root_set(&self) -> InstalledRootSet {
         InstalledRootSet {

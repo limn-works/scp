@@ -1,16 +1,19 @@
-//! Spec 25 §25.26 fixtures shared by the scp-kel integration tests.
+//! Spec 25 §25.26 and §25.29 fixtures shared by the scp-kel integration
+//! tests and by scp-client-wasm's cross-target known-answer test.
 //!
 //! Every hex constant is copied from `.docs/specs/25-test-vectors.md` and
 //! names its vector; none is produced by this crate. The preimage builders
 //! assemble each vector's fields from the values that vector prints.
 
+use scp_crypto::p256::{P256PublicKey, verify_prehash_strict};
 use scp_did::{
     CommitmentEntry, CustodyType, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
     StandingCommitment,
 };
 use scp_kel::{
-    Continuation, EventPreimage, InceptionFields, KeyStateFields, KeyStateSnapshot, SignatureForm,
-    SignerGroup, decode_preimage, encode_preimage, prerotation_commitment,
+    CommitmentRolloverFields, Continuation, EventPreimage, InceptionFields, KeyStateFields,
+    KeyStateSnapshot, SignatureForm, SignerGroup, decode_preimage, encode_preimage,
+    prerotation_commitment,
 };
 
 pub type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -195,6 +198,60 @@ pub const V51_PREIMAGE: &str = concat!(
 /// Spec 25 Vector 51's preimage digest.
 pub const V51_DIGEST: &str = "0347480558d3cb54f5f6fa1dda9f538cdd750b47aaf5b6de7bdc29c8b6c647fb";
 
+/// Spec 25 Vector 51's inception signature: root member 0, raw form, over
+/// the inception digest.
+pub const V51_INCEPTION_SIGNATURE: &str = concat!(
+    "d7104ac11c070044300192427fa05d9ed127ae5d9544067240e3216da92145f3",
+    "4c408c2b1ebdbe3db03f6c81700003f24f3a474ea18352af47a12b461fe6fcf6",
+);
+
+/// Spec 25 Vector 68's preimage (161 bytes): Vector 53's rollover with
+/// field 12 the one byte `0x00`.
+pub const V68_PREIMAGE: &str = concat!(
+    "5343502d4b454c2d4556454e542d56313a032c0f7f4478be94db0078311ef51b",
+    "a3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad526",
+    "57208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7000000000100",
+    "00000001000000000101000000010100000001026fc6523b7b1e22ff3fbce874",
+    "0cfbb7cbc816501864bf40f683db69c860d1a670000000000000000000000000",
+    "00",
+);
+/// Spec 25 Vector 68's preimage digest.
+pub const V68_DIGEST: &str = "9c6a3dcdcff0e73c03859c375debc8ec3e3c70c5834fd111b9f94e055a28b22e";
+/// Spec 25 Vector 68's reveal signature, by the revealed key.
+pub const V68_REVEAL_SIGNATURE: &str = concat!(
+    "87c8850628e69a3e77bf240285c240fd6a38c0149091f380a447c51b2d8da510",
+    "058f10913c5fa2f6abe1345defd0ba55627a1b447f05f22e89f4a9e7233ccf61",
+);
+/// Spec 25 Vector 68's standing-root signature, by Vector 41's root member 0.
+pub const V68_ROOT_SIGNATURE: &str = concat!(
+    "c5f3d73bf438c4f3503a1b33c239934d62819ac8d319079b466b02892b273cf6",
+    "3ee408b9f697d1c5ebac883cde74139dfda09c4fcba7800415bc110bcb57e8dd",
+);
+
+/// Spec 25 Vector 69's preimage (333 bytes).
+pub const V69_PREIMAGE: &str = concat!(
+    "5343502d4b454c2d4556454e542d56313a022c0f7f4478be94db0078311ef51b",
+    "a3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad526",
+    "57208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7000000000100",
+    "000000010100000000000000000000000100000003033b1cac23f45cf1cdfdf0",
+    "b32f8f777b99166c1b69649c2295b1517883d47f302701010000000000000000",
+    "010103111dadf2081befb113b3e43ce763df7d1c34b64f01778fb108087894ac",
+    "ae761c0201000000000000000001010223702a648232f2d00713de9289753c2f",
+    "bd4c4efa7e1e33905e3723a412b20aea02040000000000000001010100000001",
+    "9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313",
+    "00000e1002000000000000000000000000000000000000000000000000000000",
+    "00000000000000000000000000",
+);
+/// Spec 25 Vector 69's preimage digest.
+pub const V69_DIGEST: &str = "12f301331515b7108969e5649b025e98847a14d290fe9ee093dfecc9a5355168";
+/// Spec 25 Vector 69's installed `#active` key.
+pub const V69_ACTIVE: &str = "03111dadf2081befb113b3e43ce763df7d1c34b64f01778fb108087894acae761c";
+/// Spec 25 Vector 69's root signature, by Vector 41's root member 0.
+pub const V69_ROOT_SIGNATURE: &str = concat!(
+    "b622e40aa201d477309172165de6cc4fa7ae83f72efc349152e5e5d82d5bf32c",
+    "0ea4c8119dc25851f952fbd9f8e5607a8b021a4061fbb0219bb70efa3f35d81c",
+);
+
 /// The 17-byte `"SCP-KEL-EVENT-V1:"` separator every signed preimage
 /// begins with.
 pub const SEPARATOR_LEN: usize = 17;
@@ -235,6 +292,14 @@ pub fn assert_vector(preimage: &EventPreimage, printed_hex: &str, digest_hex: &s
     assert_eq!(decoded.preimage(), preimage);
     assert_eq!(decoded.signed_preimage(), printed.as_slice());
     assert_eq!(decoded.event_digest(), digest);
+    Ok(())
+}
+
+/// Verifies a spec 25 raw-form indexed signature with the §9.5.1 strict
+/// verifier.
+pub fn assert_signature(key_hex: &str, digest_hex: &str, signature_hex: &str) -> TestResult {
+    let key = P256PublicKey::from_sec1(&bytes(key_hex)?)?;
+    verify_prehash_strict(&key, &array(digest_hex)?, &bytes(signature_hex)?)?;
     Ok(())
 }
 
@@ -368,6 +433,50 @@ pub fn v51_key_state() -> Result<EventPreimage, Box<dyn std::error::Error>> {
         predecessor_digest: array(V51_INCEPTION_DIGEST)?,
         root_group: raw_root_group(),
         key_state: v51_snapshot(7200)?,
+        seals: Vec::new(),
+    }))
+}
+
+/// Vector 68: an abandoning `CommitmentRollover` at sequence 1 over Vector 41.
+pub fn v68_rollover() -> Result<EventPreimage, Box<dyn std::error::Error>> {
+    Ok(EventPreimage::commitment_rollover(
+        CommitmentRolloverFields {
+            identifier: identifier(V41_IDENTIFIER)?,
+            sequence: 1,
+            predecessor_digest: array(V41_DIGEST)?,
+            reveal_group: raw_root_group(),
+            standing_root_group: raw_root_group(),
+            revealed_keys: vec![array(V47A_POINT)?],
+            continuation: Continuation::Abandons,
+        },
+    ))
+}
+
+/// Vector 69: a `KeyState` at sequence 1 over Vector 41 that keeps the root,
+/// installs a new `#active` key, and drops Vector 41's `#active` key as
+/// `Compromised{from: 1}`.
+pub fn v69_key_state() -> Result<EventPreimage, Box<dyn std::error::Error>> {
+    Ok(EventPreimage::key_state(KeyStateFields {
+        identifier: identifier(V41_IDENTIFIER)?,
+        sequence: 1,
+        predecessor_digest: array(V41_DIGEST)?,
+        root_group: raw_root_group(),
+        key_state: KeyStateSnapshot {
+            root_threshold: 1,
+            keys: vec![
+                current(array(V41_ROOT)?, KeyRole::RootMember, CustodyType::Passkey),
+                current(array(V69_ACTIVE)?, KeyRole::Active, CustodyType::Passkey),
+                KeyEntry {
+                    condition: KeyCondition::Compromised,
+                    compromised_from: 1,
+                    ..current(array(V41_ACTIVE)?, KeyRole::Active, CustodyType::Passkey)
+                },
+            ],
+            witnesses: vec![identifier(V41_WITNESS)?],
+            witnessing_interval: 3600,
+            service_key_role: KeyRole::Active,
+            delegator: Identifier::ZERO,
+        },
         seals: Vec::new(),
     }))
 }

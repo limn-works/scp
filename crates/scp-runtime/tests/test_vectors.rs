@@ -984,7 +984,7 @@ fn vector37_keypackage_attestation() {
 // test checks the production bytes against both the golden hex and a layout
 // the test assembles byte by byte. The registrant is the §25.1 sender fixture
 // in its 56-byte `scp:` text form, the encoding §9.5.2 fixes, so the vectors
-// stay valid when SCP-308 S1 retypes the field.
+// stay valid when SCP-315 retypes the field.
 
 const PUSH_TOKEN_HEX: &str = "0123456789abcdef";
 const PUSH_TIMESTAMP: u64 = 1_700_000_000;
