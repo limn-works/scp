@@ -1375,18 +1375,63 @@ fn uniffi_invite_member_reaches_supervisor_seam() {
     );
 }
 
-// Supervisor level: import is actor-native. The replaceability gate (NEVER
-// overwrite a live context) + the §23.17 epoch-floor capture/teardown/merge
-// run INSIDE the existing actor via `dispatch_prepare_for_replace`
-// (PrepareForReplace), and the imported state is spawned as an owned-state
-// actor via `spawn_actor_with_state`. ADR-049 Phase 2A finalization keystone.
-// Pins the actor-native shape AND the absence of the deleted DashMap
-// dual-write machinery so a regression cannot reintroduce a silent
-// live-context overwrite. Additive assertion.
+/// The body of `fn_name` in `source` with every whitespace character
+/// removed, so a clause matches whatever line breaks rustfmt chose.
+fn compact_body(source: &str, fn_name: &str) -> String {
+    extract_fn_body(source, fn_name)
+        .unwrap_or_else(|| panic!("fn {fn_name} not found"))
+        .split_whitespace()
+        .collect()
+}
+
+/// The argument text of the first call to `callee` in `compact`, from the
+/// opening parenthesis to its balanced close, exclusive.
+fn call_args<'a>(compact: &'a str, callee: &str) -> Option<&'a str> {
+    let open = compact.find(&format!("{callee}("))? + callee.len();
+    let mut depth = 0usize;
+    for (offset, ch) in compact[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&compact[open + 1..open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether the comma-separated top-level argument list `args` holds `arg`.
+fn has_arg(args: Option<&str>, arg: &str) -> bool {
+    args.is_some_and(|args| {
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        let mut found = false;
+        for (i, ch) in args.char_indices() {
+            match ch {
+                '(' | '{' | '[' => depth += 1,
+                ')' | '}' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    found |= &args[start..i] == arg;
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        found || &args[start..] == arg
+    })
+}
+
 // Spec 05 §5.13.3 rules 1-9: every point where an SCP context group enters a
 // member from a caller-supplied description (the Welcome join, import, and
 // restore) runs the shared binding check, which also returns the committed
 // `creation_timestamp_secs` the member installs as `T0` and as the TTL base.
+// The data-flow clauses pin that the returned value is the one installed: a
+// call that discards it and keeps the inviter's, snapshot's, or local clock's
+// value fails here.
 #[test]
 fn welcome_import_and_restore_run_the_committed_t0_binding_check() {
     assert!(
@@ -1405,8 +1450,80 @@ fn welcome_import_and_restore_run_the_committed_t0_binding_check() {
              extension and take T0 from it"
         );
     }
+
+    // Welcome join: the binding check's result is `committed_t0`, which reaches
+    // `build_welcome_joiner_state`; there it is the TTL base and the
+    // pseudonym-rotation base.
+    let welcome = compact_body(SUPERVISOR_SRC, "spawn_actor_from_welcome");
+    assert!(
+        welcome.contains(
+            "letcommitted_t0=crate::context::lifecycle_helpers::verify_scp_context_binding("
+        ),
+        "spawn_actor_from_welcome must bind the binding check's result as committed_t0"
+    );
+    assert!(
+        has_arg(
+            call_args(&welcome, "Self::build_welcome_joiner_state"),
+            "committed_t0"
+        ),
+        "spawn_actor_from_welcome must pass committed_t0 to build_welcome_joiner_state"
+    );
+    let joiner = compact_body(SUPERVISOR_SRC, "build_welcome_joiner_state");
+    assert!(
+        joiner.contains("letcreation_timestamp_secs=committed_t0;"),
+        "build_welcome_joiner_state must take the TTL base from committed_t0"
+    );
+    assert!(
+        has_arg(
+            call_args(&joiner, "PseudonymRotationState::joined"),
+            "Some(committed_t0)"
+        ),
+        "build_welcome_joiner_state must anchor PseudonymRotationState::joined at committed_t0"
+    );
+
+    // Import: the TTL base and the rotation anchor come from the check's result.
+    let import = compact_body(MANAGER_SRC, "import_context");
+    assert!(
+        import.contains("letcommitted_t0=match"),
+        "import_context must bind the binding check's result as committed_t0"
+    );
+    assert!(
+        import.contains("letttl_base_secs=committed_t0.unwrap_or("),
+        "import_context must take its TTL base from committed_t0"
+    );
+    assert!(
+        has_arg(
+            call_args(&import, "PseudonymRotationState::anchored"),
+            "committed_t0"
+        ),
+        "import_context must anchor the rotation schedule at committed_t0"
+    );
+
+    // Restore: the persisted rotation state is re-anchored at the check's
+    // result, and the TTL base comes from it.
+    let restore = compact_body(MANAGER_SRC, "restore_context");
+    assert!(
+        restore.contains("letrestore_committed_t0=match"),
+        "restore_context must bind the binding check's result as restore_committed_t0"
+    );
+    assert!(
+        restore.contains(".with_schedule_t0(restore_committed_t0)"),
+        "restore_context must re-anchor the restored rotation state at the committed T0"
+    );
+    assert!(
+        restore.contains("letrestore_ttl_base_secs=restore_committed_t0.unwrap_or("),
+        "restore_context must take its TTL base from the committed T0"
+    );
 }
 
+// Supervisor level: import is actor-native. The replaceability gate (NEVER
+// overwrite a live context) + the §23.17 epoch-floor capture/teardown/merge
+// run INSIDE the existing actor via `dispatch_prepare_for_replace`
+// (PrepareForReplace), and the imported state is spawned as an owned-state
+// actor via `spawn_actor_with_state`. ADR-049 Phase 2A finalization keystone.
+// Pins the actor-native shape AND the absence of the deleted DashMap
+// dual-write machinery so a regression cannot reintroduce a silent
+// live-context overwrite. Additive assertion.
 #[test]
 fn import_context_is_actor_native_not_dashmap_dual_write() {
     assert!(
