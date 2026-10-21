@@ -736,7 +736,7 @@ On appending a key event the owner builds the chain from the inception event to 
 
 ### 3.10.7 Version Resolution
 
-The sequence orders one chain against its own prefixes, because an event's sequence is its predecessor's plus one and a verifier rejects an event whose sequence is anything else (`09-security-model.md` §9.7.4.2 definitions). Among heads of one chain the highest sequence is the newest, whichever relay served it, and a resolver replaces a stale head by re-publishing the longer chain to the relay that served the shorter one.
+The sequence orders one chain against its own prefixes, because an event's sequence is its predecessor's plus one and a verifier discards an event whose sequence is anything else (`09-security-model.md` §9.7.4.2 definitions). Among heads of one chain the highest sequence is the newest, whichever relay served it, and a resolver replaces a stale head by re-publishing the longer chain to the relay that served the shorter one.
 
 **The sequence decides nothing between two chains that diverge from a shared prefix**, because each chain's author assigned its own sequence numbers past the fork. Fork precedence settles those (`09-security-model.md` §9.7.4.2 R6), and it may adopt a chain whose head sequence is lower than the head the resolver previously held (R12). KERI reaches the same conclusion about a sequence number in `spec-body` §First Seen Policy, where `sn` is a location and never an arbiter.
 
@@ -1043,7 +1043,29 @@ pub enum CheckStep { Unit, Separator, InceptionBinding, Header, Walk, NamedCount
 /// `HELD_HEAD_MARKER_BYTES` (`09-security-model.md` §9.18.17) and read by
 /// §9.7.4.2 R10's signing rule, whose `mode` decides whether the device
 /// signs every event at that head or a reveal-authorized event alone.
-pub struct HeldHeadMarker { pub identifier: Identifier, pub sequence: u64, pub event_digest: [u8; 32], pub mode: MarkerMode }
+/// **Its fields are private, and it has two constructors**: `from_bytes`
+/// reads a persisted marker, and `adopt` writes the marker for a chain the
+/// device adopts, taking the mode as a required argument. The held head is
+/// the head "which its `HeldHeadMarker` names" (§9.7.4.2 R10), so a signer
+/// builds its held head only from a marker, never from the chain it was
+/// handed, and every marker move chooses its mode.
+pub struct HeldHeadMarker { identifier: Identifier, sequence: u64, event_digest: [u8; 32], mode: MarkerMode }
+
+impl HeldHeadMarker {
+    /// The marker at `chain`'s head, a chain R3's check order accepted
+    /// (`ValidatedChain`, which only that check order constructs).
+    pub fn adopt(chain: &ValidatedChain, mode: MarkerMode) -> HeldHeadMarker;
+    /// Decodes `HELD_HEAD_MARKER_BYTES`, refusing any other length and any
+    /// mode byte other than `0x00` or `0x01`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<HeldHeadMarker, HeldHeadMarkerError>;
+    pub fn to_bytes(&self) -> [u8; HELD_HEAD_MARKER_BYTES];
+    pub fn identifier(&self) -> Identifier;
+    pub fn sequence(&self) -> u64;
+    pub fn event_digest(&self) -> [u8; 32];
+    pub fn mode(&self) -> MarkerMode;
+}
+
+pub enum HeldHeadMarkerError { Length { len: usize }, Mode { byte: u8 } }
 
 /// `RevealOnly` is written only by R10's third exit under `Contested`;
 /// every other marker move writes `Any`.

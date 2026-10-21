@@ -3,10 +3,11 @@
 //!
 //! [`EventPreimage`] is a faithful twelve-field value: each `Option` is `None`
 //! exactly where the field carries its absent-field sentinel. It represents
-//! every preimage a well-formed byte string decodes to, including one R3
-//! rejects (a `CommitmentRollover` carrying a key state, a form list whose
-//! length differs from its index list), because classifying those defects is
-//! the verifier's job and the decoder must hand them over intact. A writer
+//! every preimage a well-formed byte string decodes to, including a defective
+//! one R3 discards (a `CommitmentRollover` carrying a key state, a form list
+//! whose length differs from its index list), because classifying those
+//! defects is the verifier's job and the decoder must hand them over
+//! intact. A writer
 //! builds a preimage through the per-kind constructors, which place every
 //! sentinel the kind carries.
 
@@ -26,6 +27,20 @@ pub enum EventKind {
     CommitmentRollover,
     /// A reveal-authorized event that replaces the root set.
     RootRecovery,
+}
+
+impl EventKind {
+    /// Whether the kind is reveal-authorized: signed by revealing keys of
+    /// the standing commitment, so it carries field 8 in substance and a
+    /// `RevealOnly` marker admits it (§9.7.4.2 R4, R10). The one definition
+    /// both rules read.
+    #[must_use]
+    pub const fn is_reveal_authorized(self) -> bool {
+        match self {
+            Self::CommitmentRollover | Self::RootRecovery => true,
+            Self::Inception | Self::KeyState => false,
+        }
+    }
 }
 
 /// What a `RootRecovery` declares about the standing root (§9.7.4.2 field 5).

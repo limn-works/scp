@@ -10,6 +10,7 @@ mod event_codec;
 mod preimage;
 mod routing;
 mod signature;
+mod validate;
 
 pub use client_data::ClientDataError;
 #[doc(hidden)]
@@ -36,4 +37,11 @@ pub use routing::{RoutingKind, routing_id};
 pub use signature::{
     AssertionSignature, IndexedSignature, IndexedSignatureError, IndexedSignaturePart,
     IndexedSignatureReadError, key_event_challenge, verify_indexed,
+};
+pub use validate::{
+    ChangeEffect, CheckStep, ContentDefect, Discarded, DistinctList, EntryValidation, EntryVerdict,
+    EventDefect, FailureClass, HeldHead, HeldHeadMarker, HeldHeadMarkerError, InceptionDefect,
+    InceptionRefusal, MarkerMode, NamedKey, SignerGroupSpec, SigningChange, SigningRefusal,
+    ThresholdField, ValidChains, ValidatedChain, ValidatedChange, validate_entry,
+    validate_inception,
 };

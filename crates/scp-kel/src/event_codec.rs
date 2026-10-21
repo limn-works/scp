@@ -357,6 +357,7 @@ impl SignatureField {
 pub struct HeaderFailedUnit {
     raw: RawSignedPreimage,
     error: HeaderError,
+    predecessor: Option<[u8; 32]>,
 }
 
 impl HeaderFailedUnit {
@@ -370,6 +371,14 @@ impl HeaderFailedUnit {
     #[must_use]
     pub const fn error(&self) -> &HeaderError {
         &self.error
+    }
+
+    /// Field 4, the predecessor digest, where fields 1 through 4 read
+    /// before step 4 failed: a verifier places the unit below the event it
+    /// names, as it places a unit that passed step 4.
+    #[must_use]
+    pub const fn predecessor(&self) -> Option<&[u8; 32]> {
+        self.predecessor.as_ref()
     }
 }
 
@@ -497,12 +506,34 @@ pub fn decode_event(value: &[u8], offset: usize) -> EventUnit {
     let Some((prefixed, field)) = prefixed_bytes(value, offset) else {
         return EventUnit::Unframed;
     };
+    decode_prefixed(prefixed, field)
+}
+
+/// An unsigned candidate's signed preimage, separator included, read through
+/// the same stages [`decode_event`] runs past step 1, so a candidate and a
+/// signed unit of the same preimage reach every check through one decode
+/// (§9.7.4.2 R10: a device runs "the same checks" over the preimage it
+/// signs). A candidate carries no signature field: its walk runs over no
+/// bytes, and the unsigned checks never read the walk's outcome.
+pub fn decode_candidate(signed_preimage: &[u8]) -> EventUnit {
+    decode_prefixed(signed_preimage, &[])
+}
+
+/// Steps 2 and 4, then step 5 over `field` and the decode of fields 8
+/// through 12, for the bytes a unit's length prefix covers.
+fn decode_prefixed(prefixed: &[u8], field: &[u8]) -> EventUnit {
     let Some(raw) = RawSignedPreimage::new(prefixed) else {
         return EventUnit::NoSeparator;
     };
     let (header, preimage) = match read_event(raw.fields(), raw.signed_len()) {
         Ok(read) => read,
-        Err(error) => return EventUnit::HeaderFailed(HeaderFailedUnit { raw, error }),
+        Err(failure) => {
+            return EventUnit::HeaderFailed(HeaderFailedUnit {
+                raw,
+                error: failure.error,
+                predecessor: failure.predecessor,
+            });
+        }
     };
     let signature_field =
         walk_signature_field(&header, field).map(|(signatures, rest)| SignatureField {
