@@ -311,6 +311,7 @@ scp-ffi-common
 scp-ffi-napi
 scp-ffi-uniffi
 scp-identity
+scp-kel
 scp-mcp
 scp-media
 scp-mls
