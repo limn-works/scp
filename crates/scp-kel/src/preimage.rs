@@ -82,7 +82,7 @@ const fn count_cap(list: ListField) -> Option<u32> {
         // by `MAX_EVENT_BYTES` (R3: "an event whose encoded length exceeds
         // `MAX_EVENT_BYTES`, which is what bounds the snapshot's key list").
         // The other signer groups' index lists, every form list and the
-        // revealed keys reach R3 as author-attributable defects.
+        // revealed keys reach R3 as defects.
         ListField::Signer(
             SignerList::Indices(
                 SignerGroupRole::Root
