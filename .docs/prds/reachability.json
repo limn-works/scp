@@ -51,7 +51,8 @@
       "stories": [
         "SCP-339",
         "SCP-340",
-        "SCP-344"
+        "SCP-344",
+        "SCP-346"
       ]
     },
     {
@@ -972,7 +973,7 @@
         "crates/scp-transport/src/provider.rs",
         "crates/scp-relay-client/src/error.rs"
       ],
-      "description": "Implements the self-hosted relay's side and the peer's side of `10-infrastructure-and-self-hosting.md` §10.12.4 **Sessions**, over the frames and bridge sessions of SCP-339. Today the native relay client discards every relay-side `BRIDGE_DATA` (`RelayMessage::BridgeData` falls into an empty match arm in `crates/scp-transport/src/native/client.rs` and `adapter.rs`), so a node behind a bridge handles nothing a peer sends it. This story serves each session the bridge opens as one connection of the self-hosted relay's frame handling, multiplexed over its one bridge connection, under the credit, session bound and close rules of §10.12.4, and gives a peer one call that opens a session through a bridge and exchanges ADR-004 frames over it, which the tier 3 KeyPackage fetch and the tier 3 push registrar (PUSH-035) both use. SCP-344 adds the node's KeyPackage admission (§10.7.1 **KeyPackage admission at the node**). The node's `BRIDGE_REGISTER`, which makes a bridge forward anything to a production node, is tracked by the issue in PUSH-033's `blockedByIssues`; this story's tests register the self-hosted relay with the bridge directly. Function and type names are indicators.",
+      "description": "Implements the self-hosted relay's side and the peer's side of `10-infrastructure-and-self-hosting.md` §10.12.4 **Sessions**, over the frames and bridge sessions of SCP-339. Today the native relay client discards every relay-side `BRIDGE_DATA` (`RelayMessage::BridgeData` falls into an empty match arm in `crates/scp-transport/src/native/client.rs` and `adapter.rs`), so a node behind a bridge handles nothing a peer sends it. This story serves each session the bridge opens as one connection of the self-hosted relay's frame handling, multiplexed over its one bridge connection, under the credit, session bound and close rules of §10.12.4, and gives a peer one call that opens a session through a bridge and exchanges ADR-004 frames over it, which a peer's KeyPackage fetch from a bridged node (§10.7.1 **KeyPackages at the node**) and the tier 3 push registrar (PUSH-035) both use. SCP-344 adds the node's KeyPackage admission (§10.7.1 **KeyPackage admission at the node**). The node's `BRIDGE_REGISTER`, which makes a bridge forward anything to a production node, is tracked by the issue in PUSH-033's `blockedByIssues`; this story's tests register the self-hosted relay with the bridge directly. Function and type names are indicators.",
       "acceptanceCriteria": [
         "Sessions are served as connections (§10.12.4 **Sessions**): a `BRIDGE_SESSION_OPEN` from the bridge starts a session that goes through the same frame handling a listener connection goes through, with its own subscriptions and its own per-connection limits, and with each limit ADR-004 keys on an address keyed on the session's `source_tag`, so two sessions carrying one tag share one `rate_limit_publish` allowance and two sessions carrying different tags get one each, and two listener connections from two IPv6 addresses in one /64 likewise share one allowance (ADR-004 `ipv6_source_prefix`), and every relay-to-client frame that handling writes goes back as a `BRIDGE_DATA` with the session's ID, in order. A session payload that does not decode as a client frame gets, on that session, the `ERR` `4000` a listener connection gets for it, and the bridge connection and the other sessions stay open.",
         "Operations work unchanged over a session, each in an in-process test with a bridge whose broker role is enabled, a self-hosted relay registered with it, and a peer holding one session: a `PUBLISH` gets `OK` with `blob_id` and the blob is stored; a `QUERY` at a routing ID holding three blobs gets three `BLOB` frames and the `query_complete` `EVENT`; a `SUBSCRIBE` gets its `OK`, its backfill `BLOB` frames and `backfill_complete`, and a blob a listener client publishes at that routing ID afterwards reaches the peer as a live `BLOB` on the session; an `ACK` for that delivery gets the handling and the answer it gets on a listener connection; a `DELETE` gets the answer it gets on a listener connection and an `UNSUBSCRIBE` gets `OK`; a `PING` gets `PONG`; a refused operation gets its `ERR`. Each inner frame echoes the inner `ref` the peer set.",
@@ -980,7 +981,7 @@
         "Credit at the self-hosted relay (§10.12.4 **Backpressure**): the self-hosted relay grants the bridge at least `max_blob_size` plus 1,024 bytes of credit when it receives the bridge's `BRIDGE_SESSION_OPEN`, before any other frame for the session, and grants more as it consumes frames, and it sends no `BRIDGE_DATA` beyond the credit the bridge granted it. A test in which the peer grants no credit shows the self-hosted relay's frames for that session wait while its other sessions keep flowing, and the waiting session is closed with `BRIDGE_SESSION_CLOSE` `4012` when its held frames would exceed the self-hosted relay's held-frame bound.",
         "Session bound and close (§10.12.4 **Caps**, **Closing**, **Connection loss**): the self-hosted relay's session bound and held-frame bound are named fields of its flat relay config (ADR-052), defaulting to 256 sessions and 1 MiB, held in no global; a `BRIDGE_SESSION_OPEN` beyond the session bound is answered with `BRIDGE_SESSION_CLOSE` `4012`. After a `BRIDGE_SESSION_CLOSE` from the bridge, after its own `BRIDGE_SESSION_CLOSE`, and after its bridge connection closes, the self-hosted relay holds no state for the session, which a test asserts by the session table's length, the session's subscriptions end, and a later frame naming that session ID produces no frame.",
         "Peer session call: the native relay client exposes one call that opens a session through a bridge to a target routing ID and returns a handle on which the caller sends client frames and receives the self-hosted relay's frames in order, with credit granted and honoured inside the call, including the opening grant of at least `max_blob_size` plus 1,024 bytes when the bridge's `OK` arrives (indicator name: `open_bridge_session`); dropping or closing the handle sends `BRIDGE_SESSION_CLOSE` `0`. It returns typed errors that keep apart `4030`, `4031`, `4032` and `4003` on open, a session the bridge or the self-hosted relay closed (carrying the `BRIDGE_SESSION_CLOSE` code), and a dropped connection, and it never surfaces a frame of a session ID it did not open. Unit tests cover each.",
-        "KeyPackage read through a bridge (§10.7.1 **Recipient key**, **What bounds the read**): an in-process test stores 2,500 valid KeyPackages of the self-hosted relay's identity at its KeyPackage routing ID (`09-security-model.md` §9.7.4 **KeyPackage routing ID**) and reads all 2,500 on one session with three `QUERY` frames of `limit` 1,000, paged with `since` and `after_blob`, the `query_complete` counts being 1,000, 1,000 and 500 and each `BLOB` byte-for-byte equal to the stored blob; with the bridge's rate cap lowered under a paused Tokio clock, the same read completes after the clock advances and the session is never closed.",
+        "KeyPackage read through a bridge (§10.7.1 **KeyPackages at the node**, §10.12.4 **Caps**): an in-process test stores 2,500 valid KeyPackages of the self-hosted relay's identity at its KeyPackage routing ID (`09-security-model.md` §9.7.4 **KeyPackage routing ID**) and reads all 2,500 on one session with three `QUERY` frames of `limit` 1,000, paged with `since` and `after_blob`, the `query_complete` counts being 1,000, 1,000 and 500 and each `BLOB` byte-for-byte equal to the stored blob; with the bridge's rate cap lowered under a paused Tokio clock, the same read completes after the clock advances and the session is never closed.",
         "The KeyPackage publisher cites the definition of the routing ID it publishes at (`09-security-model.md` §9.7.4 **KeyPackage routing ID**): the `ContextTransportProvider` publish method doc in `crates/scp-runtime/src/context/builder.rs` and the publish comment in `crates/scp-transport/src/provider.rs`, which cite `spec §5.12.3` for `derive_key_package_routing_id` today, cite `09-security-model.md` §9.7.4 instead. A unit test in `crates/scp-transport/src/provider.rs` computes `SHA-256(BE32(len(did)) || did || \"scp-key-packages\")` with `sha2` directly for one fixture identifier and asserts that the routing ID the provider publishes a KeyPackage at equals those 32 bytes. The Welcome-delivery citation of §5.12.3 in `builder.rs` is correct and stays. Check: `git grep -n -A1 derive_key_package_routing_id -- crates/scp-runtime/src/context/builder.rs crates/scp-transport/src/provider.rs` prints no line containing `§5.12.3`."
       ],
       "actionItems": [
@@ -1118,6 +1119,61 @@
       ],
       "details": {
         "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-346",
+      "title": "A node names its device's wrapping-key entry in each tier 3 entry it publishes",
+      "gate": "gate-reachability-4",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-did/src/document.rs",
+        "crates/scp-did/src/lib.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/published_state.rs",
+        "crates/scp-node/src/republish.rs",
+        "scripts/gen-test-vectors-p256.py"
+      ],
+      "description": "Implements the writer and reader sides of the `wrappingKey` property of a tier 3 `SCPRelay` entry (`18-addressability-and-deployment.md` §18.2.1 **`wrappingKey`**) and its bytes in the signed service record (`03-identity.md` §3.10.13). Alec ruled on 2026-10-21 that the node's signed tier 3 relay entry names the node device's wrapping-key entry (`00-open-questions.md` **Which device's wrapping key a tier 3 client seals to**). The tier 3 push client of PUSH-035 seals to the key this field names, after it checks the key's condition in the identity's key state (`10-infrastructure-and-self-hosting.md` §10.7.1 **Recipient key**). SCP-328, the story that publishes a bridge's routing target as `bridgeTarget`, is done; this story adds the second field to the entry that SCP-328's `RelayService` bridge form builds. The value is the 33-byte `key` of the node's device's wrapping-key entry, a role keri P7 adds to the key state (`09-security-model.md` §9.7.4.2), which the issue in `blockedByIssues` tracks. Function and type names are indicators.",
+      "acceptanceCriteria": [
+        "JSON form (§18.2.1 **`wrappingKey`**): scp-did's `Service` carries `wrapping_key`, serialized as `wrappingKey`, 66 lowercase hex digits decoding to 33 bytes; a unit test round-trips a document holding a bridge entry with a `wrappingKey`, a bridge entry without one, and a plain entry, and only the first entry's JSON carries `wrappingKey`.",
+        "Reader rejections (§18.2.1 **`wrappingKey`**): `DidDocument::from_json` drops the entry, and keeps the record's other entries in their order, for each of these `wrappingKey` values, one test case each: 64 hex digits, 68 hex digits, 66 uppercase hex digits, a non-hex character, `null`, and 66 hex digits whose first byte is `0x04`; and for a valid `wrappingKey` on an `SCPRelay` entry with no `bridgeTarget` and on an entry whose `type` is not `SCPRelay`. A bridge entry with no `wrappingKey` is kept and `relay_services()` returns it.",
+        "Signed bytes (§3.10.13): the service-record preimage encoder writes, after each `SCPRelay` entry's 32 `bridgeTarget` bytes, `BE32(33) || key` for an entry naming a key and `BE32(32) || SHA-256(0x00)` for an entry naming none; a known-answer test over the four entries of `25-test-vectors.md` Vector 48 reproduces its `entries` field, preimage and canonical hash byte for byte, and the decoder rejects the record for a `wrappingKey` value of 31 or 34 bytes and for a 32-byte value other than `SHA-256(0x00)`, one test per case.",
+        "Writer (§18.2.1 **`wrappingKey`**): a node on tier 3 publishes each bridge entry with `wrappingKey` equal to the key its identity's key state lists `Current` as the wrapping-key entry of the device whose instance runs the node, and publishes no `wrappingKey` on a non-bridge entry; an in-process test resolves the published record and compares the field with the key state.",
+        "Rotation (§18.2.1 **`wrappingKey`**, §10.7.1 **Current wrapping key**): after the node's device rotates its wrapping key from K1 to K2, the node's next service-record write names K2 on every tier 3 entry, and a test resolves the record after the rotation and finds K2 and no entry naming K1.",
+        "`python3.12 scripts/check-test-vectors-p256.py` passes, and a Rust test asserts Vector 48's canonical hash `6281d761d844bb8893bba4d55ee893902ff516414d9430043a59f0c750a70b18`."
+      ],
+      "actionItems": [
+        "Add `wrapping_key` with a 66-digit lowercase hex serde helper to scp-did's `Service` and to `RelayService`'s bridge form, and drop every entry §18.2.1 rejects in the deserializer.",
+        "Encode `wrappingKey` in the §3.10.13 service-record preimage after `bridgeTarget`.",
+        "Make scp-node write the device's `Current` wrapping key on each tier 3 entry and re-publish on rotation."
+      ],
+      "blockedBy": [],
+      "blockedByIssues": [
+        2874
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.1 SCPRelay"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.13 The Service Record"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        }
+      ],
+      "details": {
+        "crate": "scp-did"
       }
     }
   ]
