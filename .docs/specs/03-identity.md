@@ -1034,6 +1034,8 @@ pub enum IdentityError {
 /// second half is the verdict `Invalid` and is never a discard. `NamedCount`
 /// is step 7's sub-check 7a and `VerifiedCount` its sub-check 7b, so the
 /// stage alone says which side of R3's illegality test a step-7 failure is on.
+/// `Header` is step 4: fields 1 through 7, the form-list lengths and the
+/// encoded-length bound, every one of them an illegality failure.
 pub enum CheckStep { Unit, Separator, InceptionBinding, Header, Walk, NamedCount, VerifiedCount, Content, Signatures }
 
 /// The head a device that holds a key-event member last adopted, and never
