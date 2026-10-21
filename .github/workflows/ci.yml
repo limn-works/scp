@@ -1361,9 +1361,9 @@ jobs:
 
   # `.docs/specs/25-test-vectors.md` §25 says `scripts/gen-test-vectors-p256.py`
   # produces every keyed byte it prints. This job regenerates the vectors and fails when
-  # spec 25 or a Rust vector test (`crates/scp-runtime/tests/test_vectors.rs`,
-  # `crates/scp-event-log/tests/test_vectors.rs`) holds a value the generator no longer
-  # emits, or when spec 25 lacks a value the generator emits. It runs on every pull
+  # spec 25 or a Rust vector file (every tracked `.rs` file that cites spec 25) holds a
+  # value the generator no longer emits, or when spec 25 lacks a value the generator
+  # emits. It runs on every pull
   # request, without a paths filter, because the `ci` aggregator counts a skipped job as
   # a pass.
   test-vectors:
