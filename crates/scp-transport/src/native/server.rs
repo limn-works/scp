@@ -4358,7 +4358,7 @@ mod tests {
             };
             msg.signature = sign(
                 signer,
-                &push_registration_signing_bytes(&msg, relay_url).unwrap(),
+                &push_registration_signing_bytes(&msg, relay_url, None).unwrap(),
             );
             msg
         }
@@ -4377,7 +4377,7 @@ mod tests {
             };
             msg.signature = sign(
                 signer,
-                &push_deregistration_signing_bytes(&msg, PUSH_RELAY_URL).unwrap(),
+                &push_deregistration_signing_bytes(&msg, PUSH_RELAY_URL, None).unwrap(),
             );
             msg
         }
@@ -4535,7 +4535,7 @@ mod tests {
                 msg.routing_ids = vec![[0x33; 32]];
                 msg.signature = sign(
                     &key(7),
-                    &push_registration_signing_bytes(&msg, PUSH_RELAY_URL).unwrap(),
+                    &push_registration_signing_bytes(&msg, PUSH_RELAY_URL, None).unwrap(),
                 );
                 let reply = publish_push(addr, reg_blob(&msg)).await;
                 assert_eq!(err_code(&reply), code::PUSH_REGISTRATION_STALE);

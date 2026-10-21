@@ -8,8 +8,9 @@
 //! verifier by injection as `Arc<dyn PushSignatureVerifier>` (ADR-062,
 //! capability injection) and never reaches it through a global.
 //!
-//! A verifier takes the typed message and the relay's own canonical URL, and
-//! computes the signature preimage only through
+//! A verifier takes the typed message, the relay's own canonical URL and the
+//! tier 3 `bridge_target` of the relay entry whose push routing ID the
+//! PUBLISH arrived at, and computes the signature preimage only through
 //! [`push_registration_signing_bytes`] and
 //! [`push_deregistration_signing_bytes`], the two functions that own the
 //! §9.5.2 push preimages. It never takes raw signed bytes, so no caller can
@@ -32,7 +33,7 @@
 
 use std::fmt::Debug;
 
-use scp_did::DID;
+use scp_did::{BridgeTarget, DID};
 use scp_protocol::discovery::push::{
     PushDeregistration, PushMessageError, PushRegistration, push_deregistration_signing_bytes,
     push_registration_signing_bytes,
@@ -68,17 +69,25 @@ impl PushMessage<'_> {
         }
     }
 
-    /// Builds the message's §9.5.2 signature preimage for the relay at
-    /// `relay_url`, through the one signing-bytes function of its type.
+    /// Builds the message's §9.5.2 signature preimage for the relay entry at
+    /// `relay_url` with `bridge_target`, through the one signing-bytes
+    /// function of its type. `None` names a relay reached at its
+    /// `"scp-push-registration"` ID and writes the absent sentinel.
     ///
     /// # Errors
     ///
     /// Returns [`PushVerifyError::Malformed`] carrying the
     /// [`PushMessageError`] of the signing-bytes function.
-    pub fn signing_bytes(&self, relay_url: &str) -> Result<Vec<u8>, PushVerifyError> {
+    pub fn signing_bytes(
+        &self,
+        relay_url: &str,
+        bridge_target: Option<BridgeTarget>,
+    ) -> Result<Vec<u8>, PushVerifyError> {
         match self {
-            Self::Registration(m) => push_registration_signing_bytes(m, relay_url),
-            Self::Deregistration(m) => push_deregistration_signing_bytes(m, relay_url),
+            Self::Registration(m) => push_registration_signing_bytes(m, relay_url, bridge_target),
+            Self::Deregistration(m) => {
+                push_deregistration_signing_bytes(m, relay_url, bridge_target)
+            }
         }
         .map_err(PushVerifyError::Malformed)
     }
@@ -99,7 +108,8 @@ pub enum PushVerifyError {
     #[error("push registrant key state is unavailable")]
     KeyStateUnavailable,
     /// The signature does not verify against the key that verification
-    /// selected, including a signature over another relay's canonical URL.
+    /// selected, including a signature over another relay's canonical URL or
+    /// another tier 3 entry's target.
     #[error("push message signature does not verify")]
     SignatureInvalid,
     /// The key that verifies the signature is not `Current` in the `#active`
@@ -154,7 +164,7 @@ mod sealed {
 /// one. A third implementor needs an edit to this module.
 ///
 /// ```compile_fail
-/// use scp_did::DID;
+/// use scp_did::{BridgeTarget, DID};
 /// use scp_identity::push_verify::{PushMessage, PushSignatureVerifier, PushVerifyError};
 ///
 /// #[derive(Debug)]
@@ -166,6 +176,7 @@ mod sealed {
 ///         &self,
 ///         message: PushMessage<'_>,
 ///         _relay_url: &str,
+///         _bridge_target: Option<BridgeTarget>,
 ///     ) -> Result<DID, PushVerifyError> {
 ///         Ok(message.registrant().clone())
 ///     }
@@ -184,13 +195,16 @@ mod sealed {
 /// ```
 #[async_trait::async_trait]
 pub trait PushSignatureVerifier: sealed::Sealed + Debug + Send + Sync {
-    /// Verifies `message`'s signature for the relay whose URL is `relay_url`.
+    /// Verifies `message`'s signature for the relay entry whose URL is
+    /// `relay_url` and whose tier 3 target is `bridge_target`.
     ///
-    /// `relay_url` is the URL from which the relay derived the reserved push
-    /// routing ID the PUBLISH arrived at, never a URL the client supplied
-    /// (§10.7.1 step 3). An implementation builds the preimage with
-    /// [`PushMessage::signing_bytes`] and checks the signature over the
-    /// SHA-256 of those bytes.
+    /// `relay_url` and `bridge_target` are the URL and target from which the
+    /// relay derived the reserved push routing ID the PUBLISH arrived at,
+    /// never values the client supplied (§10.7.1 step 3). `bridge_target` is
+    /// `None` when that ID is the `"scp-push-registration"` form, and the
+    /// preimage then ends with the absent sentinel. An implementation builds
+    /// the preimage with [`PushMessage::signing_bytes`] and checks the
+    /// signature over the SHA-256 of those bytes.
     ///
     /// # Errors
     ///
@@ -201,6 +215,7 @@ pub trait PushSignatureVerifier: sealed::Sealed + Debug + Send + Sync {
         &self,
         message: PushMessage<'_>,
         relay_url: &str,
+        bridge_target: Option<BridgeTarget>,
     ) -> Result<DID, PushVerifyError>;
 }
 
@@ -222,6 +237,7 @@ impl PushSignatureVerifier for KelPushVerifier {
         &self,
         _message: PushMessage<'_>,
         _relay_url: &str,
+        _bridge_target: Option<BridgeTarget>,
     ) -> Result<DID, PushVerifyError> {
         // Stub — see PUSH-005. SCP-315 replaces this body with key-state
         // resolution through SCP-309's chain validation and replay and
@@ -239,7 +255,7 @@ mod test_verifier {
     use std::collections::HashMap;
 
     use scp_crypto::p256::{P256PublicKey, verify_prehash_strict};
-    use scp_did::DID;
+    use scp_did::{BridgeTarget, DID};
     use sha2::{Digest, Sha256};
 
     use super::{PushMessage, PushSignatureVerifier, PushVerifyError, sealed};
@@ -277,8 +293,9 @@ mod test_verifier {
             &self,
             message: PushMessage<'_>,
             relay_url: &str,
+            bridge_target: Option<BridgeTarget>,
         ) -> Result<DID, PushVerifyError> {
-            let preimage = message.signing_bytes(relay_url)?;
+            let preimage = message.signing_bytes(relay_url, bridge_target)?;
             let registrant = message.registrant();
             let key = self
                 .keys
@@ -317,6 +334,14 @@ mod tests {
     }
 
     fn registration(key: &P256SecretKey, relay_url: &str) -> PushRegistration {
+        registration_for(key, relay_url, None)
+    }
+
+    fn registration_for(
+        key: &P256SecretKey,
+        relay_url: &str,
+        target: Option<BridgeTarget>,
+    ) -> PushRegistration {
         let mut msg = PushRegistration {
             registrant: DID::from(REGISTRANT),
             platform: PushPlatform::Apns,
@@ -327,12 +352,20 @@ mod tests {
         };
         msg.signature = sign(
             key,
-            &push_registration_signing_bytes(&msg, relay_url).unwrap(),
+            &push_registration_signing_bytes(&msg, relay_url, target).unwrap(),
         );
         msg
     }
 
     fn deregistration(key: &P256SecretKey, relay_url: &str) -> PushDeregistration {
+        deregistration_for(key, relay_url, None)
+    }
+
+    fn deregistration_for(
+        key: &P256SecretKey,
+        relay_url: &str,
+        target: Option<BridgeTarget>,
+    ) -> PushDeregistration {
         let mut msg = PushDeregistration {
             registrant: DID::from(REGISTRANT),
             platform: PushPlatform::Fcm,
@@ -342,7 +375,7 @@ mod tests {
         };
         msg.signature = sign(
             key,
-            &push_deregistration_signing_bytes(&msg, relay_url).unwrap(),
+            &push_deregistration_signing_bytes(&msg, relay_url, target).unwrap(),
         );
         msg
     }
@@ -365,13 +398,13 @@ mod tests {
         let control = test_verifier(&key);
         assert!(
             control
-                .verify(PushMessage::Registration(&reg), RELAY)
+                .verify(PushMessage::Registration(&reg), RELAY, None)
                 .await
                 .is_ok()
         );
         assert!(
             control
-                .verify(PushMessage::Deregistration(&dereg), RELAY)
+                .verify(PushMessage::Deregistration(&dereg), RELAY, None)
                 .await
                 .is_ok()
         );
@@ -381,7 +414,7 @@ mod tests {
             PushMessage::Registration(&reg),
             PushMessage::Deregistration(&dereg),
         ] {
-            let err = stub.verify(message, RELAY).await.unwrap_err();
+            let err = stub.verify(message, RELAY, None).await.unwrap_err();
             assert_eq!(err, PushVerifyError::VerifierUnavailable);
             assert_eq!(err.wire_code(), 5003);
         }
@@ -401,7 +434,7 @@ mod tests {
             (PushMessage::Registration(&unsigned), "not a url"),
         ] {
             assert_eq!(
-                stub.verify(message, url).await,
+                stub.verify(message, url, None).await,
                 Err(PushVerifyError::VerifierUnavailable)
             );
         }
@@ -415,7 +448,7 @@ mod tests {
         let dereg = deregistration(&key, RELAY);
         assert_eq!(
             verifier
-                .verify(PushMessage::Registration(&reg), RELAY)
+                .verify(PushMessage::Registration(&reg), RELAY, None)
                 .await,
             Ok(DID::from(REGISTRANT))
         );
@@ -424,7 +457,8 @@ mod tests {
             verifier
                 .verify(
                     PushMessage::Deregistration(&dereg),
-                    "WSS://Relay.Example:443/"
+                    "WSS://Relay.Example:443/",
+                    None
                 )
                 .await,
             Ok(DID::from(REGISTRANT))
@@ -439,16 +473,65 @@ mod tests {
         let dereg = deregistration(&key, OTHER_RELAY);
         assert_eq!(
             verifier
-                .verify(PushMessage::Registration(&reg), RELAY)
+                .verify(PushMessage::Registration(&reg), RELAY, None)
                 .await,
             Err(PushVerifyError::SignatureInvalid)
         );
         assert_eq!(
             verifier
-                .verify(PushMessage::Deregistration(&dereg), RELAY)
+                .verify(PushMessage::Deregistration(&dereg), RELAY, None)
                 .await,
             Err(PushVerifyError::SignatureInvalid)
         );
+    }
+
+    /// §10.7.1 step 3: the relay rebuilds the preimage with the target of the
+    /// entry whose routing ID the PUBLISH arrived at, so a message signed for
+    /// one tier 3 entry fails at another entry behind the same bridge URL, at
+    /// the bridge URL with no target, and a sentinel-signed message fails at a
+    /// tier 3 entry.
+    #[tokio::test]
+    async fn test_verifier_binds_the_bridge_target() {
+        const BRIDGE: &str = "wss://bridge.example.com/scp/v1";
+        let key = secret(7);
+        let verifier = test_verifier(&key);
+        let target_a = BridgeTarget::new([0xA1; 32]).unwrap();
+        let target_b = BridgeTarget::new([0xB2; 32]).unwrap();
+
+        let reg = registration_for(&key, BRIDGE, Some(target_a));
+        let dereg = deregistration_for(&key, BRIDGE, Some(target_a));
+        for message in [
+            PushMessage::Registration(&reg),
+            PushMessage::Deregistration(&dereg),
+        ] {
+            assert_eq!(
+                verifier.verify(message, BRIDGE, Some(target_a)).await,
+                Ok(DID::from(REGISTRANT))
+            );
+            for held in [Some(target_b), None] {
+                assert_eq!(
+                    verifier.verify(message, BRIDGE, held).await,
+                    Err(PushVerifyError::SignatureInvalid),
+                    "held target {held:?}"
+                );
+            }
+        }
+
+        let reg = registration_for(&key, BRIDGE, None);
+        let dereg = deregistration_for(&key, BRIDGE, None);
+        for message in [
+            PushMessage::Registration(&reg),
+            PushMessage::Deregistration(&dereg),
+        ] {
+            assert_eq!(
+                verifier.verify(message, BRIDGE, None).await,
+                Ok(DID::from(REGISTRANT))
+            );
+            assert_eq!(
+                verifier.verify(message, BRIDGE, Some(target_a)).await,
+                Err(PushVerifyError::SignatureInvalid)
+            );
+        }
     }
 
     #[tokio::test]
@@ -468,7 +551,7 @@ mod tests {
             tamper(&mut msg);
             assert_eq!(
                 verifier
-                    .verify(PushMessage::Registration(&msg), RELAY)
+                    .verify(PushMessage::Registration(&msg), RELAY, None)
                     .await,
                 Err(PushVerifyError::SignatureInvalid)
             );
@@ -485,7 +568,7 @@ mod tests {
             tamper(&mut msg);
             assert_eq!(
                 verifier
-                    .verify(PushMessage::Deregistration(&msg), RELAY)
+                    .verify(PushMessage::Deregistration(&msg), RELAY, None)
                     .await,
                 Err(PushVerifyError::SignatureInvalid)
             );
@@ -500,7 +583,8 @@ mod tests {
             verifier
                 .verify(
                     PushMessage::Registration(&registration(&wrong, RELAY)),
-                    RELAY
+                    RELAY,
+                    None
                 )
                 .await,
             Err(PushVerifyError::SignatureInvalid)
@@ -509,7 +593,8 @@ mod tests {
             verifier
                 .verify(
                     PushMessage::Deregistration(&deregistration(&wrong, RELAY)),
-                    RELAY
+                    RELAY,
+                    None
                 )
                 .await,
             Err(PushVerifyError::SignatureInvalid)
@@ -524,7 +609,7 @@ mod tests {
         msg.signature = [0; 64];
         assert_eq!(
             verifier
-                .verify(PushMessage::Registration(&msg), RELAY)
+                .verify(PushMessage::Registration(&msg), RELAY, None)
                 .await,
             Err(PushVerifyError::SignatureInvalid)
         );
@@ -536,14 +621,14 @@ mod tests {
         high.signature = high_s_twin(&msg.signature);
         assert_ne!(high.signature, msg.signature);
         let digest: [u8; 32] =
-            Sha256::digest(push_registration_signing_bytes(&high, RELAY).unwrap()).into();
+            Sha256::digest(push_registration_signing_bytes(&high, RELAY, None).unwrap()).into();
         assert!(
             verify_prehash_lenient(&key.public_key(), &digest, &high.signature).is_ok(),
             "the twin must be a valid high-s signature for the test to mean anything"
         );
         assert_eq!(
             verifier
-                .verify(PushMessage::Registration(&high), RELAY)
+                .verify(PushMessage::Registration(&high), RELAY, None)
                 .await,
             Err(PushVerifyError::SignatureInvalid)
         );
@@ -574,7 +659,11 @@ mod tests {
             TestPushVerifier::new([(DID::from("did:dht:someone-else"), key.public_key())]);
         assert_eq!(
             verifier
-                .verify(PushMessage::Registration(&registration(&key, RELAY)), RELAY)
+                .verify(
+                    PushMessage::Registration(&registration(&key, RELAY)),
+                    RELAY,
+                    None
+                )
                 .await,
             Err(PushVerifyError::IdentifierUnresolvable)
         );
@@ -588,7 +677,7 @@ mod tests {
         msg.routing_ids.clear();
         assert_eq!(
             verifier
-                .verify(PushMessage::Registration(&msg), RELAY)
+                .verify(PushMessage::Registration(&msg), RELAY, None)
                 .await,
             Err(PushVerifyError::Malformed(
                 PushMessageError::EmptyRoutingIds
@@ -598,7 +687,7 @@ mod tests {
         msg.token.clear();
         assert_eq!(
             verifier
-                .verify(PushMessage::Deregistration(&msg), RELAY)
+                .verify(PushMessage::Deregistration(&msg), RELAY, None)
                 .await,
             Err(PushVerifyError::Malformed(PushMessageError::EmptyToken))
         );

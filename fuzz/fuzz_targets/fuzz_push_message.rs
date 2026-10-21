@@ -19,12 +19,12 @@ use scp_protocol::discovery::push::{
 fuzz_target!(|data: &[u8]| {
     if let Ok(reg) = PushRegistration::from_msgpack(data) {
         assert!(!reg.routing_ids.is_empty());
-        push_registration_signing_bytes(&reg, "wss://relay.example").unwrap();
+        push_registration_signing_bytes(&reg, "wss://relay.example", None).unwrap();
         let again = PushRegistration::from_msgpack(&reg.to_msgpack().unwrap()).unwrap();
         assert_eq!(again, reg);
     }
     if let Ok(dereg) = PushDeregistration::from_msgpack(data) {
-        push_deregistration_signing_bytes(&dereg, "wss://relay.example").unwrap();
+        push_deregistration_signing_bytes(&dereg, "wss://relay.example", None).unwrap();
         let again = PushDeregistration::from_msgpack(&dereg.to_msgpack().unwrap()).unwrap();
         assert_eq!(again, dereg);
     }

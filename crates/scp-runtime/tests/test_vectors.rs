@@ -28,16 +28,22 @@ use sha2::{Digest, Sha256};
 use scp_crypto::p256::{
     P256Error, P256PublicKey, P256SecretKey, SeedLabel, sign_prehash_rfc6979, verify_prehash_strict,
 };
-use scp_did::{DID, SigningKeyId};
+use scp_did::{
+    ABSENT_BRIDGE_TARGET, BridgeEndpoint, BridgeTarget, CustodyType, DID, Identifier, KeyAlgorithm,
+    KeyCondition, KeyEntry, KeyRole, KeyState, RelayEndpoint, RelayService, SigningKeyId,
+    StandingCommitment,
+};
 use scp_protocol::context::governance::{
     GovernanceAction, VoteType, compute_proposal_id, vote_signing_digest,
 };
 use scp_protocol::context::outlets::interface::InterfaceOffer;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash_bytes};
+use scp_protocol::crypto::key_continuity::compute_key_continuity_fingerprint;
 use scp_protocol::crypto::sender_keys::key_protocol_verify::build_hpke_info;
 use scp_protocol::discovery::push::{
     PushDeregistration, PushPlatform, PushRegistration, push_deregistration_signing_bytes,
-    push_registration_routing_id, push_registration_signing_bytes,
+    push_registration_routing_id, push_registration_signing_bytes, relay_service_push_routing_id,
+    tier3_push_routing_id,
 };
 use scp_protocol::envelope::inner::compute_canonical_hash;
 use scp_protocol::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
@@ -120,6 +126,10 @@ fn unhex32(s: &str) -> [u8; 32] {
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+fn fixture_identifier_bytes(role: &str) -> [u8; 32] {
+    sha256(format!("SCP test vector identifier {role}").as_bytes())
 }
 
 fn reference_key() -> P256SecretKey {
@@ -579,6 +589,79 @@ fn vector_19_four_leaves_balanced() {
 }
 
 // ---------------------------------------------------------------------------
+// §25.9 Key continuity fingerprint
+// ---------------------------------------------------------------------------
+
+/// A key state carrying `root` as its `Current` root members, in that order,
+/// and `active` as its `Current` `#active` key. The threshold is 1 whatever
+/// the root-set size, so a count read from the threshold instead of the
+/// member list misses the spec bytes for party A's two-member set.
+fn continuity_key_state(root: &[[u8; 33]], active: [u8; 33]) -> KeyState {
+    let entry = |key: [u8; 33], role: KeyRole| KeyEntry {
+        key,
+        role,
+        condition: KeyCondition::Current,
+        compromised_from: 0,
+        custody_type: CustodyType::Software,
+        key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
+    };
+    let mut keys: Vec<KeyEntry> = root
+        .iter()
+        .map(|&key| entry(key, KeyRole::RootMember))
+        .collect();
+    keys.push(entry(active, KeyRole::Active));
+    KeyState {
+        root_threshold: 1,
+        keys,
+        witnesses: Vec::new(),
+        witnessing_interval: 3600,
+        service_key_role: KeyRole::Active,
+        delegator: Identifier::ZERO,
+        standing_commitment: StandingCommitment {
+            commitments: Vec::new(),
+            next_threshold: 1,
+        },
+    }
+}
+
+/// §25.9 Vectors 20 and 38 through the production
+/// `compute_key_continuity_fingerprint`. The printed preimage hashes to the
+/// production digest, so the production preimage is byte-identical to it.
+#[test]
+fn vectors_20_38_key_continuity_fingerprint() {
+    let key = |seed: u8| {
+        P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[seed; 32])
+            .public_key()
+            .to_compressed()
+    };
+    let id_a = Identifier::from_bytes(fixture_identifier_bytes("A"));
+    let id_b = Identifier::from_bytes(fixture_identifier_bytes("B"));
+    let state_a = continuity_key_state(&[key(0x41), key(0x42)], key(0x43));
+    let state_b = continuity_key_state(&[key(0x44)], key(0x45));
+
+    let fingerprint = compute_key_continuity_fingerprint((&id_a, &state_a), (&id_b, &state_b))
+        .expect("Vector 20 key states are fingerprintable");
+    assert_eq!(
+        hex::encode(fingerprint),
+        "c6cdaa8eeb6d04798e308ee0f7c1ecdc29874f8f4411c7c9df921539ad975466"
+    );
+    assert_spec_preimage(
+        "vector 20",
+        "5343502d4b45592d434f4e54494e554954592d56313abcdcea594dbb12037950ee2d0f356300ea8e37d9dfb01b87c6249033e871095e0000000202542c432f5a8f756764e2f18c8125e5338e61ba1540057f8c6ee666b07c7aa8d102b945d8e097faded7a70e6c18134caf2a9521bc2b05af0becdf99adc9212789d002e264c93973b59b7699221aff574dcde04a79347335c4f9c4a643c7525cd9b975f30cbaf928e7bd22a3d2f4aecf6573120a0cdddd8600aa685f61e7f72c78e8560000000102c4ed969c4a9e294576355bbeb14270e54b51bf6f00b6d1b587676fd0865ee8a8027a3f3aad1b66ab82d3d67a2e3af15f89f304c4b6369accc5715dda72d2800512",
+        259,
+        &fingerprint,
+    );
+
+    // Vector 38: party B supplied first reaches the same value.
+    let reversed = compute_key_continuity_fingerprint((&id_b, &state_b), (&id_a, &state_a))
+        .expect("Vector 38 key states are fingerprintable");
+    assert_eq!(
+        hex::encode(reversed),
+        "c6cdaa8eeb6d04798e308ee0f7c1ecdc29874f8f4411c7c9df921539ad975466"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // §25.11 Proposal ID
 // ---------------------------------------------------------------------------
 
@@ -895,15 +978,16 @@ fn vector37_keypackage_attestation() {
 }
 
 // ---------------------------------------------------------------------------
-// Push preimages and the reserved push routing ID (§9.5.2, §9.18.2)
+// Push preimages and push routing IDs (§9.5.2, §9.18.2; §25.28 Vector 70)
 // ---------------------------------------------------------------------------
 //
-// §25 prints no push vector, so these golden values are pinned here. Each was
-// computed from the §9.5.2 tables outside the production builder, and each
-// test checks the production bytes against both the golden hex and a layout
-// the test assembles byte by byte. The registrant is the §25.1 sender fixture
-// in its 56-byte `scp:` text form, the encoding §9.5.2 fixes, so the vectors
-// stay valid when SCP-315 retypes the field.
+// `scripts/gen-test-vectors-p256.py` computes these values from the §9.5.2
+// tables outside the production builder, and §25.28 Vector 70 prints them.
+// Each test checks the production bytes against both the golden hex and a
+// layout the test assembles byte by byte. The registrant is the §25.1 sender
+// fixture in its 56-byte `scp:` text form, the encoding §9.5.2 fixes, so the
+// vectors stay valid when SCP-315 retypes the field. The bridge entry is
+// Vector 48's entry 3.
 
 const PUSH_TOKEN_HEX: &str = "0123456789abcdef";
 const PUSH_TIMESTAMP: u64 = 1_700_000_000;
@@ -911,14 +995,28 @@ const PUSH_DEREGISTER_TIMESTAMP: u64 = 1_700_000_300;
 const PUSH_RELAY_A: &str = "wss://relay.example";
 const PUSH_RELAY_B: &str = "wss://relay.example/scp/v1";
 
-const PUSH_REGISTER_A_HEX: &str = "5343502d505553482d52454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6101000000080123456789abcdef00000002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1ef6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725356e000000006553f100000000137773733a2f2f72656c61792e6578616d706c65";
-const PUSH_REGISTER_B_HEX: &str = "5343502d505553482d52454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6101000000080123456789abcdef00000002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1ef6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725356e000000006553f1000000001a7773733a2f2f72656c61792e6578616d706c652f7363702f7631";
-const PUSH_DEREGISTER_A_HEX: &str = "5343502d505553482d444552454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6102000000080123456789abcdef000000006553f22c000000137773733a2f2f72656c61792e6578616d706c65";
-const PUSH_DEREGISTER_B_HEX: &str = "5343502d505553482d444552454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6102000000080123456789abcdef000000006553f22c0000001a7773733a2f2f72656c61792e6578616d706c652f7363702f7631";
+const PUSH_REGISTER_A_HEX: &str = "5343502d505553482d52454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6101000000080123456789abcdef00000002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1ef6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725356e000000006553f100000000137773733a2f2f72656c61792e6578616d706c656e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d";
+const PUSH_REGISTER_B_HEX: &str = "5343502d505553482d52454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6101000000080123456789abcdef00000002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1ef6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725356e000000006553f1000000001a7773733a2f2f72656c61792e6578616d706c652f7363702f76316e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d";
+const PUSH_DEREGISTER_A_HEX: &str = "5343502d505553482d444552454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6102000000080123456789abcdef000000006553f22c000000137773733a2f2f72656c61792e6578616d706c656e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d";
+const PUSH_DEREGISTER_B_HEX: &str = "5343502d505553482d444552454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6102000000080123456789abcdef000000006553f22c0000001a7773733a2f2f72656c61792e6578616d706c652f7363702f76316e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d";
 const PUSH_ROUTING_ID_A_HEX: &str =
     "b980a702c8f9cc2504a164bde90549a079621c8306fdf64d2c3adefd2739367a";
 const PUSH_ROUTING_ID_B_HEX: &str =
     "b2f96d91d7b43038f18f9d1b686a5e033f8e07635e9baa819754d6a829942fcd";
+const PUSH_BRIDGE_URL: &str = "wss://bridge.example.com/scp/v1";
+const PUSH_BRIDGE_TARGET_HEX: &str =
+    "f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb";
+const PUSH_REGISTER_BRIDGE_HEX: &str = "5343502d505553482d52454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6101000000080123456789abcdef00000002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1ef6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725356e000000006553f1000000001f7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb";
+const PUSH_DEREGISTER_BRIDGE_HEX: &str = "5343502d505553482d444552454749535445522d56313a000000387363703a68763661337066733471636962746868336b61656b7a68666f327878716c666e696537757073366876637371736d6b6970796c6102000000080123456789abcdef000000006553f22c0000001f7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb";
+const PUSH_TIER3_PREIMAGE_HEX: &str = "7363702d707573682d6272696467653a7773733a2f2f6272696467652e6578616d706c652e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb";
+const PUSH_TIER3_ROUTING_ID_HEX: &str =
+    "733a76fce10004826ffaecd3c85ba27169282665cd64a902000275a52ba640a1";
+const PUSH_BRIDGE_RELAY_ROUTING_ID_HEX: &str =
+    "e47cce36c946ac50a2ee3dbc40f0416d7012bf82344c8f24a756c0f62242eea1";
+
+fn push_bridge_target() -> BridgeTarget {
+    BridgeTarget::new(unhex(PUSH_BRIDGE_TARGET_HEX).try_into().unwrap()).unwrap()
+}
 
 fn push_routing_ids() -> [[u8; 32]; 2] {
     [
@@ -954,8 +1052,14 @@ fn push_var(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// The §9.5.2 `bridge_target` field: the target's 32 bytes, or
+/// `SHA-256(0x00)` when absent.
+fn push_target_bytes(target: Option<BridgeTarget>) -> [u8; 32] {
+    target.map_or_else(|| sha256(&[0x00]), BridgeTarget::to_bytes)
+}
+
 /// The §9.5.2 `PushRegistration` table, assembled field by field.
-fn push_register_layout(relay_url: &str) -> Vec<u8> {
+fn push_register_layout(relay_url: &str, target: Option<BridgeTarget>) -> Vec<u8> {
     let mut out = b"SCP-PUSH-REGISTER-V1:".to_vec();
     assert_eq!(ID_SENDER.len(), 56);
     push_var(&mut out, ID_SENDER.as_bytes());
@@ -967,63 +1071,86 @@ fn push_register_layout(relay_url: &str) -> Vec<u8> {
     }
     out.extend_from_slice(&PUSH_TIMESTAMP.to_be_bytes());
     push_var(&mut out, relay_url.as_bytes());
+    out.extend_from_slice(&push_target_bytes(target));
     out
 }
 
 /// The §9.5.2 `PushDeregistration` table, assembled field by field.
-fn push_deregister_layout(relay_url: &str) -> Vec<u8> {
+fn push_deregister_layout(relay_url: &str, target: Option<BridgeTarget>) -> Vec<u8> {
     let mut out = b"SCP-PUSH-DEREGISTER-V1:".to_vec();
     push_var(&mut out, ID_SENDER.as_bytes());
     out.push(0x02);
     push_var(&mut out, &unhex(PUSH_TOKEN_HEX));
     out.extend_from_slice(&PUSH_DEREGISTER_TIMESTAMP.to_be_bytes());
     push_var(&mut out, relay_url.as_bytes());
+    out.extend_from_slice(&push_target_bytes(target));
     out
 }
 
 #[test]
 fn push_registration_signing_bytes_match_golden_vectors() {
     let reg = push_registration_fixture();
-    for (url, golden) in [
-        (PUSH_RELAY_A, PUSH_REGISTER_A_HEX),
-        (PUSH_RELAY_B, PUSH_REGISTER_B_HEX),
+    for (url, target, golden) in [
+        (PUSH_RELAY_A, None, PUSH_REGISTER_A_HEX),
+        (PUSH_RELAY_B, None, PUSH_REGISTER_B_HEX),
+        (
+            PUSH_BRIDGE_URL,
+            Some(push_bridge_target()),
+            PUSH_REGISTER_BRIDGE_HEX,
+        ),
     ] {
-        let produced = push_registration_signing_bytes(&reg, url).unwrap();
+        let produced = push_registration_signing_bytes(&reg, url, target).unwrap();
         assert_eq!(hex::encode(&produced), golden, "{url}: golden vector");
-        assert_eq!(produced, push_register_layout(url), "{url}: §9.5.2 layout");
+        assert_eq!(
+            produced,
+            push_register_layout(url, target),
+            "{url}: §9.5.2 layout"
+        );
     }
-    assert_eq!(unhex(PUSH_REGISTER_A_HEX).len(), 193);
+    assert_eq!(unhex(PUSH_REGISTER_A_HEX).len(), 225);
+    assert_eq!(unhex(PUSH_REGISTER_B_HEX).len(), 232);
+    assert_eq!(
+        unhex(PUSH_REGISTER_A_HEX)[193..],
+        ABSENT_BRIDGE_TARGET,
+        "relay A ends with the absent sentinel"
+    );
 }
 
 #[test]
 fn push_deregistration_signing_bytes_match_golden_vectors() {
     let dereg = push_deregistration_fixture();
-    for (url, golden) in [
-        (PUSH_RELAY_A, PUSH_DEREGISTER_A_HEX),
-        (PUSH_RELAY_B, PUSH_DEREGISTER_B_HEX),
+    for (url, target, golden) in [
+        (PUSH_RELAY_A, None, PUSH_DEREGISTER_A_HEX),
+        (PUSH_RELAY_B, None, PUSH_DEREGISTER_B_HEX),
+        (
+            PUSH_BRIDGE_URL,
+            Some(push_bridge_target()),
+            PUSH_DEREGISTER_BRIDGE_HEX,
+        ),
     ] {
-        let produced = push_deregistration_signing_bytes(&dereg, url).unwrap();
+        let produced = push_deregistration_signing_bytes(&dereg, url, target).unwrap();
         assert_eq!(hex::encode(&produced), golden, "{url}: golden vector");
         assert_eq!(
             produced,
-            push_deregister_layout(url),
+            push_deregister_layout(url, target),
             "{url}: §9.5.2 layout"
         );
     }
-    assert_eq!(unhex(PUSH_DEREGISTER_A_HEX).len(), 127);
+    assert_eq!(unhex(PUSH_DEREGISTER_A_HEX).len(), 159);
+    assert_eq!(unhex(PUSH_DEREGISTER_B_HEX).len(), 166);
 }
 
 #[test]
 fn push_preimages_differ_across_relay_urls() {
     let reg = push_registration_fixture();
     assert_ne!(
-        push_registration_signing_bytes(&reg, PUSH_RELAY_A).unwrap(),
-        push_registration_signing_bytes(&reg, PUSH_RELAY_B).unwrap()
+        push_registration_signing_bytes(&reg, PUSH_RELAY_A, None).unwrap(),
+        push_registration_signing_bytes(&reg, PUSH_RELAY_B, None).unwrap()
     );
     let dereg = push_deregistration_fixture();
     assert_ne!(
-        push_deregistration_signing_bytes(&dereg, PUSH_RELAY_A).unwrap(),
-        push_deregistration_signing_bytes(&dereg, PUSH_RELAY_B).unwrap()
+        push_deregistration_signing_bytes(&dereg, PUSH_RELAY_A, None).unwrap(),
+        push_deregistration_signing_bytes(&dereg, PUSH_RELAY_B, None).unwrap()
     );
 }
 
@@ -1031,12 +1158,16 @@ fn push_preimages_differ_across_relay_urls() {
 fn push_preimages_are_equal_across_spellings_of_one_relay_url() {
     let reg = push_registration_fixture();
     assert_eq!(
-        hex::encode(push_registration_signing_bytes(&reg, "WSS://Relay.Example:443/").unwrap()),
+        hex::encode(
+            push_registration_signing_bytes(&reg, "WSS://Relay.Example:443/", None).unwrap()
+        ),
         PUSH_REGISTER_A_HEX
     );
     let dereg = push_deregistration_fixture();
     assert_eq!(
-        hex::encode(push_deregistration_signing_bytes(&dereg, "WSS://Relay.Example:443/").unwrap()),
+        hex::encode(
+            push_deregistration_signing_bytes(&dereg, "WSS://Relay.Example:443/", None).unwrap()
+        ),
         PUSH_DEREGISTER_A_HEX
     );
 }
@@ -1053,6 +1184,49 @@ fn push_registration_routing_id_matches_golden_vectors() {
     assert_eq!(
         hex::encode(push_registration_routing_id(PUSH_RELAY_B).unwrap()),
         PUSH_ROUTING_ID_B_HEX
+    );
+}
+
+/// §9.18.2 **Tier 3 push routing ID** over Vector 48's bridge entry, and the
+/// bridge relay's own `"scp-push-registration"` ID, which differs from it.
+#[test]
+fn tier3_push_routing_id_matches_golden_vector() {
+    let preimage = unhex(PUSH_TIER3_PREIMAGE_HEX);
+    assert_eq!(preimage.len(), 79);
+    assert_eq!(
+        preimage,
+        [
+            b"scp-push-bridge:".as_slice(),
+            PUSH_BRIDGE_URL.as_bytes(),
+            &push_bridge_target().to_bytes(),
+        ]
+        .concat()
+    );
+    assert_eq!(hex::encode(sha256(&preimage)), PUSH_TIER3_ROUTING_ID_HEX);
+
+    let bridge = RelayService::bridge(
+        BridgeEndpoint::new(PUSH_BRIDGE_URL).unwrap(),
+        push_bridge_target(),
+    );
+    assert_eq!(
+        hex::encode(relay_service_push_routing_id(&bridge)),
+        PUSH_TIER3_ROUTING_ID_HEX
+    );
+    assert_eq!(
+        hex::encode(tier3_push_routing_id(
+            &RelayEndpoint::new(PUSH_BRIDGE_URL).unwrap(),
+            push_bridge_target()
+        )),
+        PUSH_TIER3_ROUTING_ID_HEX
+    );
+    let direct = RelayService::direct(RelayEndpoint::new(PUSH_BRIDGE_URL).unwrap());
+    assert_eq!(
+        hex::encode(relay_service_push_routing_id(&direct)),
+        PUSH_BRIDGE_RELAY_ROUTING_ID_HEX
+    );
+    assert_eq!(
+        hex::encode(push_registration_routing_id(PUSH_BRIDGE_URL).unwrap()),
+        PUSH_BRIDGE_RELAY_ROUTING_ID_HEX
     );
 }
 
