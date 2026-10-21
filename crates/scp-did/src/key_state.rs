@@ -187,14 +187,33 @@ pub struct CommitmentEntry {
     pub key_algorithm: KeyAlgorithm,
 }
 
-/// The commitment list and next threshold the latest commitment-fixing event
-/// at or before a position fixed (`09-security-model.md` §9.7.4.2).
+/// The commitment list and next threshold a commitment-fixing event fixes
+/// (`09-security-model.md` §9.7.4.2, the key state's fields).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct StandingCommitment {
+pub struct FixedCommitment {
     /// One entry per member of the next set.
     pub commitments: Vec<CommitmentEntry>,
     /// The next threshold n a reveal must meet.
     pub next_threshold: u32,
+}
+
+/// The commitment the latest reveal-authorized event at or before a
+/// position fixed, or the abandonment that ended the chain
+/// (`09-security-model.md` §9.7.4.2 definitions and R4).
+///
+/// It is `Fixed` until an abandoning `CommitmentRollover` and `Abandoned`
+/// from that position on; no later event exists on that chain (R4).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum StandingCommitment {
+    /// The list and threshold the latest commitment-fixing event fixed.
+    Fixed(FixedCommitment),
+    /// The abandoning `CommitmentRollover` ended the chain.
+    Abandoned {
+        /// The abandoning rollover's sequence.
+        at_sequence: u64,
+        /// The abandoning rollover's preimage digest.
+        event_digest: [u8; 32],
+    },
 }
 
 /// An identity's derived key state at a position (`09-security-model.md`
@@ -220,7 +239,7 @@ pub struct KeyState {
     /// identity is undelegated.
     pub delegator: Identifier,
     /// The commitment the latest reveal-authorized event at or before this
-    /// position fixed.
+    /// position fixed, or the abandonment that ended the chain.
     pub standing_commitment: StandingCommitment,
 }
 

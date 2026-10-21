@@ -29,8 +29,8 @@ use scp_crypto::p256::{
     P256Error, P256PublicKey, P256SecretKey, SeedLabel, sign_prehash_rfc6979, verify_prehash_strict,
 };
 use scp_did::{
-    CustodyType, DID, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole, KeyState,
-    SigningKeyId, StandingCommitment,
+    CustodyType, DID, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
+    KeyState, SigningKeyId, StandingCommitment,
 };
 use scp_protocol::context::governance::{
     GovernanceAction, VoteType, compute_proposal_id, vote_signing_digest,
@@ -615,10 +615,10 @@ fn continuity_key_state(root: &[[u8; 33]], active: [u8; 33]) -> KeyState {
         witnessing_interval: 3600,
         service_key_role: KeyRole::Active,
         delegator: Identifier::ZERO,
-        standing_commitment: StandingCommitment {
+        standing_commitment: StandingCommitment::Fixed(FixedCommitment {
             commitments: Vec::new(),
             next_threshold: 1,
-        },
+        }),
     }
 }
 

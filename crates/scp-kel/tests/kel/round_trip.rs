@@ -11,8 +11,8 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
 use scp_did::{
-    CommitmentEntry, CustodyType, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
-    StandingCommitment,
+    CommitmentEntry, CustodyType, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition,
+    KeyEntry, KeyRole,
 };
 use scp_kel::{
     CommitmentRolloverFields, Continuation, EventKind, EventPreimage, InceptionFields,
@@ -172,7 +172,7 @@ fn continuation(max: usize) -> impl Strategy<Value = Continuation> {
         Just(Continuation::Abandons),
         (vec(commitment_entry(), 0..=max), any::<u32>()).prop_map(
             |(commitments, next_threshold)| {
-                Continuation::FixesCommitment(StandingCommitment {
+                Continuation::FixesCommitment(FixedCommitment {
                     commitments,
                     next_threshold,
                 })

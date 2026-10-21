@@ -218,7 +218,7 @@ pub fn compute_key_continuity_fingerprint(
 
 #[cfg(test)]
 mod tests {
-    use scp_did::{CustodyType, KeyAlgorithm, KeyEntry, StandingCommitment};
+    use scp_did::{CustodyType, FixedCommitment, KeyAlgorithm, KeyEntry, StandingCommitment};
 
     use super::*;
 
@@ -250,10 +250,10 @@ mod tests {
             witnessing_interval: 3600,
             service_key_role: KeyRole::Active,
             delegator: Identifier::ZERO,
-            standing_commitment: StandingCommitment {
+            standing_commitment: StandingCommitment::Fixed(FixedCommitment {
                 commitments: Vec::new(),
                 next_threshold: 1,
-            },
+            }),
         }
     }
 

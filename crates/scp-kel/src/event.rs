@@ -11,7 +11,9 @@
 //! builds a preimage through the per-kind constructors, which place every
 //! sentinel the kind carries.
 
-use scp_did::{Identifier, KeyCondition, KeyEntry, KeyRole, KeyState, StandingCommitment};
+use scp_did::{
+    FixedCommitment, Identifier, KeyCondition, KeyEntry, KeyRole, KeyState, StandingCommitment,
+};
 
 /// A key event's kind, the preimage's first field (§9.7.4.2 field 1).
 ///
@@ -184,8 +186,8 @@ impl KeyStateSnapshot {
     /// (§9.7.4.2: "A snapshot carries every component of the key state except
     /// the standing commitment").
     ///
-    /// Both types are destructured field by field, so a field added to either
-    /// fails to compile here until it is placed.
+    /// The snapshot is destructured field by field, so a field added to
+    /// either type fails to compile here until it is placed.
     #[must_use]
     pub fn into_key_state(self, standing_commitment: StandingCommitment) -> KeyState {
         let Self {
@@ -196,10 +198,6 @@ impl KeyStateSnapshot {
             service_key_role,
             delegator,
         } = self;
-        let StandingCommitment {
-            commitments,
-            next_threshold,
-        } = standing_commitment;
         KeyState {
             root_threshold,
             keys,
@@ -207,10 +205,7 @@ impl KeyStateSnapshot {
             witnessing_interval,
             service_key_role,
             delegator,
-            standing_commitment: StandingCommitment {
-                commitments,
-                next_threshold,
-            },
+            standing_commitment,
         }
     }
 }
@@ -220,7 +215,7 @@ impl KeyStateSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Continuation {
     /// The event fixes a commitment list and its next threshold.
-    FixesCommitment(StandingCommitment),
+    FixesCommitment(FixedCommitment),
     /// The identity declares itself terminal: no next set exists.
     Abandons,
 }

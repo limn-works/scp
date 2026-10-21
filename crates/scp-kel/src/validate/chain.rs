@@ -12,18 +12,6 @@ use super::defect::Discarded;
 use super::verdicts::Strict;
 use crate::{EventKind, InstalledRootSet, KeyStateSnapshot, prerotation_commitment};
 
-/// The commitment standing after an event: the list and threshold the
-/// latest commitment-fixing event fixed, or the abandonment that ended the
-/// chain (R4).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Standing {
-    Fixed(StandingCommitment),
-    Abandoned {
-        at_sequence: u64,
-        event_digest: [u8; 32],
-    },
-}
-
 /// One event of a valid chain and the state standing after it. The three
 /// states are shared with every chain that holds the event, so a fork or a
 /// prefix copies no state.
@@ -35,7 +23,7 @@ pub(super) struct ChainEvent {
     /// The root standing after the event.
     pub(super) root: Arc<InstalledRootSet>,
     /// The commitment standing after the event.
-    pub(super) commitment: Arc<Standing>,
+    pub(super) commitment: Arc<StandingCommitment>,
     /// The latest snapshot at or before the event.
     pub(super) snapshot: Arc<KeyStateSnapshot>,
 }

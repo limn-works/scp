@@ -52,8 +52,8 @@ use scp_core::sync::{
     OfflineTier, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS, classify_offline_duration,
 };
 use scp_did::{
-    CustodyType, DID, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole, KeyState,
-    StandingCommitment,
+    CustodyType, DID, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
+    KeyState, StandingCommitment,
 };
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::testing::{APNS_WAKE_BODY, FCM_WAKE_DATA, InMemoryPush};
@@ -181,10 +181,10 @@ fn conf_key_state(root: [u8; 33], active: [u8; 33]) -> KeyState {
         witnessing_interval: 3600,
         service_key_role: KeyRole::Active,
         delegator: Identifier::ZERO,
-        standing_commitment: StandingCommitment {
+        standing_commitment: StandingCommitment::Fixed(FixedCommitment {
             commitments: Vec::new(),
             next_threshold: 1,
-        },
+        }),
     }
 }
 

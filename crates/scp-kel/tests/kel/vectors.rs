@@ -3,8 +3,8 @@
 //! its vector.
 
 use scp_did::{
-    CommitmentEntry, CustodyType, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
-    KeyState, StandingCommitment,
+    CommitmentEntry, CustodyType, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition,
+    KeyEntry, KeyRole, KeyState, StandingCommitment,
 };
 use scp_kel::{
     Continuation, DeriveIdentifierError, EventKind, InstalledRootSet, RoutingKind, SignatureForm,
@@ -164,16 +164,19 @@ fn vector_41_snapshot_composes_its_key_state() -> TestResult {
         witnessing_interval: 3600,
         service_key_role: KeyRole::Active,
         delegator: Identifier::ZERO,
-        standing_commitment: StandingCommitment {
+        standing_commitment: StandingCommitment::Fixed(FixedCommitment {
             commitments: vec![CommitmentEntry {
                 commitment: array(V47A_COMMITMENT)?,
                 custody_type: CustodyType::Passkey,
                 key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
             }],
             next_threshold: 1,
-        },
+        }),
     };
-    assert_eq!(snapshot.into_key_state(commitment), expected);
+    assert_eq!(
+        snapshot.into_key_state(StandingCommitment::Fixed(commitment)),
+        expected
+    );
     Ok(())
 }
 

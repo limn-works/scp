@@ -10,9 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use scp_crypto::p256::P256PublicKey;
-use scp_did::{Identifier, KeyCondition, KeyEntry, KeyRole, StandingCommitment};
+use scp_did::{FixedCommitment, Identifier, KeyCondition, KeyEntry, KeyRole, StandingCommitment};
 
-use super::chain::{ChainEvent, Standing, ValidatedChain};
+use super::chain::{ChainEvent, ValidatedChain};
 use super::change::{ChangeEffect, NamedKey, SignerGroupSpec};
 use super::defect::{ContentDefect, DistinctList, ThresholdField};
 use super::verdicts::KeySet;
@@ -42,7 +42,7 @@ impl Position<'_> {
 /// What an event that passed step 8 adds to the chain.
 pub(super) struct Applied {
     pub(super) root: Arc<InstalledRootSet>,
-    pub(super) commitment: Arc<Standing>,
+    pub(super) commitment: Arc<StandingCommitment>,
     pub(super) snapshot: Arc<KeyStateSnapshot>,
     /// The keys the event installs, with their roles.
     pub(super) installed: Vec<([u8; 33], KeyRole)>,
@@ -76,12 +76,13 @@ pub(super) fn root_key_set(root: &InstalledRootSet) -> KeySet {
 /// list's member at the index, at the standing next threshold. An abandoned
 /// commitment has no key set.
 pub(super) fn reveal_key_set(
-    standing: &Standing,
+    standing: &StandingCommitment,
     group: &HeaderGroup,
     revealed_keys: &[[u8; 33]],
 ) -> Option<KeySet> {
-    let Standing::Fixed(commitment) = standing else {
-        return None;
+    let commitment = match standing {
+        StandingCommitment::Fixed(commitment) => commitment,
+        StandingCommitment::Abandoned { .. } => return None,
     };
     let mut first: BTreeMap<u8, Option<[u8; 33]>> = BTreeMap::new();
     for (signer, key) in group.signers().iter().zip(revealed_keys) {
@@ -154,12 +155,12 @@ pub(super) fn check_content(
         }
     };
     let fixed = match continuation.as_ref() {
-        Some(Standing::Fixed(commitment)) => commitment
+        Some(StandingCommitment::Fixed(commitment)) => commitment
             .commitments
             .iter()
             .map(|entry| entry.commitment)
             .collect(),
-        Some(Standing::Abandoned { .. }) | None => Vec::new(),
+        Some(StandingCommitment::Abandoned { .. }) | None => Vec::new(),
     };
 
     let head = match position {
@@ -223,8 +224,9 @@ fn snapshot_entry(snapshot: &KeyStateSnapshot, key: &[u8; 33]) -> Option<KeyEntr
 /// The checks that read the chain at the predecessor alone: abandonment
 /// (R4), the kind at its position, the identifier field and the sequence.
 fn check_link(chain: &ValidatedChain, preimage: &EventPreimage) -> Result<(), ContentDefect> {
-    if matches!(*chain.head().commitment, Standing::Abandoned { .. }) {
-        return Err(ContentDefect::AfterAbandonment);
+    match *chain.head().commitment {
+        StandingCommitment::Fixed(_) => {}
+        StandingCommitment::Abandoned { .. } => return Err(ContentDefect::AfterAbandonment),
     }
     if preimage.kind == EventKind::Inception {
         return Err(ContentDefect::KindAtPosition {
@@ -384,8 +386,11 @@ fn check_groups(
         let role = group.role();
         let keys = match (role, position) {
             (SignerGroupRole::Reveal, Position::Next(chain)) => {
-                let Standing::Fixed(commitment) = &*chain.head().commitment else {
-                    return Err(ContentDefect::AfterAbandonment);
+                let commitment = match &*chain.head().commitment {
+                    StandingCommitment::Fixed(commitment) => commitment,
+                    StandingCommitment::Abandoned { .. } => {
+                        return Err(ContentDefect::AfterAbandonment);
+                    }
                 };
                 check_reveal(group, commitment, &preimage.revealed_keys)?;
                 reveal_key_set(&chain.head().commitment, group, &preimage.revealed_keys)
@@ -436,7 +441,7 @@ fn check_groups(
 /// each key's commitment the standing list's member at its index.
 fn check_reveal(
     group: &HeaderGroup,
-    commitment: &StandingCommitment,
+    commitment: &FixedCommitment,
     revealed_keys: &[[u8; 33]],
 ) -> Result<(), ContentDefect> {
     if group.signers().len() != revealed_keys.len() {
@@ -701,7 +706,7 @@ fn check_next_commitment(
     continuation: Option<&Continuation>,
     root_after: &InstalledRootSet,
     digest: [u8; 32],
-) -> Result<Option<Standing>, ContentDefect> {
+) -> Result<Option<StandingCommitment>, ContentDefect> {
     match continuation {
         None => Ok(None),
         Some(Continuation::Abandons) => {
@@ -710,7 +715,7 @@ fn check_next_commitment(
             if matches!(position, Position::Inception { .. }) {
                 return Err(ContentDefect::InceptionFixesNoCommitment);
             }
-            Ok(Some(Standing::Abandoned {
+            Ok(Some(StandingCommitment::Abandoned {
                 at_sequence: preimage.sequence,
                 event_digest: digest,
             }))
@@ -732,7 +737,7 @@ fn check_next_commitment(
                     root_threshold: root_after.threshold,
                 });
             }
-            Ok(Some(Standing::Fixed(commitment.clone())))
+            Ok(Some(StandingCommitment::Fixed(commitment.clone())))
         }
     }
 }
@@ -785,17 +790,17 @@ fn check_freshness(
     position: Position<'_>,
     preimage: &EventPreimage,
     snapshot: Option<&AppliedSnapshot>,
-    continuation: Option<&Standing>,
+    continuation: Option<&StandingCommitment>,
 ) -> Result<(), ContentDefect> {
     let installed: &[([u8; 33], KeyRole)] =
         snapshot.map_or(&[], |applied| applied.installed.as_slice());
     let fixed: Vec<[u8; 32]> = match continuation {
-        Some(Standing::Fixed(commitment)) => commitment
+        Some(StandingCommitment::Fixed(commitment)) => commitment
             .commitments
             .iter()
             .map(|entry| entry.commitment)
             .collect(),
-        Some(Standing::Abandoned { .. }) | None => Vec::new(),
+        Some(StandingCommitment::Abandoned { .. }) | None => Vec::new(),
     };
     let seen = AtOrBefore {
         chain: match position {

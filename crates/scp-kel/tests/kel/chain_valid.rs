@@ -4,8 +4,8 @@
 //! equivalence of `extend`, and `prefix`.
 
 use scp_did::{
-    CommitmentEntry, CustodyType, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
-    StandingCommitment,
+    CommitmentEntry, CustodyType, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition,
+    KeyEntry, KeyRole,
 };
 use scp_kel::{
     ChangeEffect, CheckStep, Continuation, Discarded, EntryValidation, EntryVerdict, EventKind,
@@ -194,7 +194,7 @@ fn commitment_to(point: &[u8; 33]) -> [u8; 32] {
 
 /// One `Passkey` `EcdsaP256Sha256` commitment to `point` at next threshold 1.
 fn fixes_one(point: &[u8; 33]) -> Continuation {
-    Continuation::FixesCommitment(StandingCommitment {
+    Continuation::FixesCommitment(FixedCommitment {
         commitments: vec![CommitmentEntry {
             commitment: commitment_to(point),
             custody_type: CustodyType::Passkey,

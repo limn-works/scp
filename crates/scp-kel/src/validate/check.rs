@@ -349,7 +349,7 @@ fn remaining<'u>(
 mod tests {
     use scp_crypto::p256::{P256SecretKey, SeedLabel};
     use scp_did::{
-        CommitmentEntry, CustodyType, KeyAlgorithm, KeyCondition, KeyEntry, StandingCommitment,
+        CommitmentEntry, CustodyType, FixedCommitment, KeyAlgorithm, KeyCondition, KeyEntry,
     };
 
     use super::*;
@@ -435,7 +435,7 @@ mod tests {
         let inception = encode_preimage(&EventPreimage::inception(InceptionFields {
             root_group: root_group(),
             key_state: snapshot(3600),
-            continuation: Continuation::FixesCommitment(StandingCommitment {
+            continuation: Continuation::FixesCommitment(FixedCommitment {
                 commitments: vec![CommitmentEntry {
                     commitment: prerotation_commitment(&point(3)),
                     custody_type: CustodyType::Passkey,

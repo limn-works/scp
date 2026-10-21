@@ -15,8 +15,8 @@
 
 use scp_core::crypto::key_continuity::compute_key_continuity_fingerprint;
 use scp_did::{
-    CustodyType, DidDocument, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole, KeyState,
-    SigningKeyId, StandingCommitment,
+    CustodyType, DidDocument, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition, KeyEntry,
+    KeyRole, KeyState, SigningKeyId, StandingCommitment,
 };
 use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
@@ -289,10 +289,10 @@ fn continuity_key_state(root: &[[u8; 33]], active: [u8; 33]) -> KeyState {
         witnessing_interval: 3600,
         service_key_role: KeyRole::Active,
         delegator: Identifier::ZERO,
-        standing_commitment: StandingCommitment {
+        standing_commitment: StandingCommitment::Fixed(FixedCommitment {
             commitments: Vec::new(),
             next_threshold: 1,
-        },
+        }),
     }
 }
 

@@ -9,8 +9,8 @@
 //! integer or float reaches the bytes.
 
 use scp_did::{
-    CommitmentEntry, CustodyType, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
-    StandingCommitment, UnknownDiscriminator,
+    CommitmentEntry, CustodyType, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition,
+    KeyEntry, KeyRole, UnknownDiscriminator,
 };
 use sha2::{Digest, Sha256};
 
@@ -879,7 +879,7 @@ fn read_continuation(reader: &mut Reader<'_>) -> Result<Option<Continuation>, Bo
     }
 }
 
-fn read_commitment(reader: &mut Reader<'_>) -> Result<StandingCommitment, BodyError> {
+fn read_commitment(reader: &mut Reader<'_>) -> Result<FixedCommitment, BodyError> {
     let field = BodyField::Continuation;
     let count = reader.count(field, BodyList::Commitments, COMMITMENT_ENTRY_BYTES)?;
     let mut commitments = Vec::new();
@@ -896,7 +896,7 @@ fn read_commitment(reader: &mut Reader<'_>) -> Result<StandingCommitment, BodyEr
         });
     }
     let next_threshold = u32::from_be_bytes(reader.array(field)?);
-    Ok(StandingCommitment {
+    Ok(FixedCommitment {
         commitments,
         next_threshold,
     })
