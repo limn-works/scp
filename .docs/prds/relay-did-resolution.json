@@ -656,13 +656,15 @@
         "crates/scp-transport/src/storage/mod.rs",
         "crates/scp-transport/src/relay/query.rs",
         "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/native/client.rs",
         "crates/scp-relay-client/src/error.rs",
         "crates/scp-transport/tests/"
       ],
       "description": "Architecture slice S5. A validating relay executes the duties `09-security-model.md` §9.10.12 and §9.7.4.2 assign to it: the `retain` duty and its three refusals, the admission precondition R10's diverged arm depends on, and the accepted-chain rule of R9, and the R3 check order on every event it stores (`09-security-model.md` §9.7.4.2 R10). Every listed relay signs a relay proof of control over each QUERY response. ADR-063 lists these sites by party under its heading *The relay's storage policy moved to the relay ADR on 2026-09-21*; what a relay keeps, reclaims or charges for is ADR-065's, the relay ADR, pending; the tag `archive/kel-combined-pre-split` preserves the combined text. `key_event_validation.rs` replaces `did_record_validation.rs`, and `KelRegistry` replaces `DidSlotRegistry`.",
       "acceptanceCriteria": [
         "A validating relay rejects a PUBLISH at a retained kind that does not set `retain`, rejects `retain` on any other kind, and rejects a PUBLISH carrying both `retain` and `blob_ttl`: one test per refusal (`09-security-model.md` §9.10.12)",
-        "A relay that does not validate rejects a PUBLISH carrying `retain: true`: a test asserts it (`09-security-model.md` §9.10.12)",
+        "The relay has no non-validating mode: `DidRecordValidation` and every successor enum have no `Disabled` variant, and a no-flag PUBLISH whose blob is a record of a retained kind for its routing id gets the retain duties, refused with `4040` (missing flag) or `4044` (illegal event): a test per kind, `scp:did:`, `scp:svc:`, `scp:wit:` and `scp:wcf:` (`09-security-model.md` §9.10.12, `10-infrastructure-and-self-hosting.md` §10.12.4); `DidRecordValidation::Disabled` leaves the production configuration surface with the `server.rs` doc that calls validation an OPTIONAL capability, and the tests that construct it in `crates/scp-transport/src/native/server.rs` and `crates/scp-transport/src/native/client.rs` move to a test-only opaque storage mock in `crates/scp-transport/tests/`",
         "`BlobStorage::store` persists the `retain` flag in every storage backend, and purge skips every retained record: one test per backend",
         "`KelRegistry` admits a frame only where its first event is one the relay does not hold and that event is the inception event recomputing to the routing id's identifier or one whose predecessor the relay holds, and answers every other frame `4040`: a test per case, including a re-segmentation of a held chain (`09-security-model.md` §9.7.4.2 R10); `KelRegistry` holds each chain it accepted as an `scp_kel::ValidatedChain` and checks each admitted event with `ValidatedChain::extend` on the chain at its predecessor (`prefix` where the predecessor is not a head)",
         "A validating relay answers `DELETE` of a record at `scp:did:`, `scp:svc:`, `scp:wit:` or `scp:wcf:` with `4041` RETAINED_RECORD and keeps the record: a test per kind (ADR-004, `09-security-model.md` §9.10.12)",
@@ -677,12 +679,12 @@
         "A relay serves only frames it has checked: a test writes the illegal frame of the C16-on-V41 criterion into the storage backend directly, restarts the relay, and asserts that a QUERY serves Vector 41's frame alone (`09-security-model.md` §9.7.4.2 R10)",
         "Each relay refusal stage is reachable: a `KeyState` on Vector 41 signed by a key outside Vector 41's root (C13-on-V41) is refused with `4044` at `Threshold`, and an inception that recomputes to another identifier is refused with `4040`: a test per case (`09-security-model.md` §9.7.4.2 R10)",
         "A frame of `MAX_EVENTS_PER_FRAME` + 1 events is refused with `4040` before any signature is verified: a test over a counting verifier (`09-security-model.md` §9.10.12, §9.18.17)",
-        "A refused frame published again is answered `4044` with zero verifier calls (a counting verifier), and a restarted relay serves a tagged frame with zero verifier calls and re-checks a frame whose tag fails: a test per case (`09-security-model.md` §9.7.4.2 R10)",
+        "The refusal cache holds `4044` refusals only, keyed on SHA-256(`routing_id ‖ frame`), and the stored-frame tag is a MAC over `check_order_version ‖ routing_id ‖ frame`: a test per case asserts that a frame refused `4044` and published again at the same routing id is answered `4044` with zero verifier calls (a counting verifier); that a frame refused `4040` because its predecessor was absent, published again after the predecessor lands, is checked and stored; that the same bytes refused at a wrong routing id leave the correct routing id's PUBLISH checked and stored; that a restarted relay serves a tagged frame with zero verifier calls and re-checks a frame whose tag fails; and that a raised `check_order_version` empties the cache and re-checks every stored frame (`09-security-model.md` §9.7.4.2 R10)",
         "A frame whose first event is illegal costs one event's verification: a test over a counting verifier (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Replace `did_record_validation.rs` with `key_event_validation.rs` and `DidSlotRegistry` with `KelRegistry`.",
+        "Replace `did_record_validation.rs` with `key_event_validation.rs` and `DidSlotRegistry` with `KelRegistry`; delete `DidRecordValidation::Disabled`, its OPTIONAL-capability doc in `server.rs` and the `RelayConfig` field that selects it, and move the tests that use it to a test-only opaque storage mock in `crates/scp-transport/tests/`.",
         "Persist `retain` in every `BlobStorage` backend and skip retained records on purge.",
         "Recompute the accepted chain by R6 after each accepted frame.",
         "Sign and attach the relay proof on `query_complete`.",
