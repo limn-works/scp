@@ -1,6 +1,6 @@
 //! Known-answer tests against spec 25 §25.26, §25.28 and §25.29. Each
-//! expected value is a spec 25 constant from `fixtures`; each test names its
-//! vector.
+//! expected value is a spec 25 constant from `fixtures`, and each test names
+//! its vector.
 
 use scp_did::{
     CommitmentEntry, CustodyType, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
@@ -17,9 +17,11 @@ use crate::fixtures::{
     V41_ROUTING_SVC, V41_ROUTING_WCF, V41_ROUTING_WIT, V41_WITNESS, V42_DIGEST, V42_IDENTIFIER,
     V42_PREIMAGE, V47A_COMMITMENT, V47A_POINT, V47B_COMMITMENT, V47B_POINT, V48_ADDRESS,
     V48_IDENTIFIER, V50_DIGEST, V50_PREIMAGE, V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST,
-    V51_IDENTIFIER, V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE, V51_KEYS, V51_PREIMAGE,
-    V51_ROUTING_DID, array, assert_vector, bytes, fields, identifier, v41_inception, v50_key_state,
-    v51_inception, v51_key_state,
+    V51_IDENTIFIER, V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE,
+    V51_KEYS, V51_PREIMAGE, V51_ROUTING_DID, V68_DIGEST, V68_PREIMAGE, V68_REVEAL_SIGNATURE,
+    V68_ROOT_SIGNATURE, V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array, assert_signature,
+    assert_vector, bytes, fields, identifier, v41_inception, v50_key_state, v51_inception,
+    v51_key_state, v68_rollover, v69_key_state,
 };
 
 #[test]
@@ -95,6 +97,41 @@ fn vector_51_inception_preimage_digest_and_identifier() -> TestResult {
         })
     );
     Ok(())
+}
+
+#[test]
+fn vector_51_inception_signature_verifies_under_root_member_0() -> TestResult {
+    assert_signature(V51_KEYS[0], V51_INCEPTION_DIGEST, V51_INCEPTION_SIGNATURE)
+}
+
+#[test]
+fn vector_68_abandoning_rollover_preimage_digest_and_signatures() -> TestResult {
+    let preimage = v68_rollover()?;
+    assert_eq!(bytes(V68_PREIMAGE)?.len(), 161);
+    assert_vector(&preimage, V68_PREIMAGE, V68_DIGEST)?;
+    // Field 12 is the one byte 0x00, the registered abandonment value, and
+    // nothing follows it.
+    assert_eq!(bytes(V68_PREIMAGE)?.last(), Some(&0x00));
+    // The reveal group verifies against the revealed key and the
+    // standing-root group against Vector 41's root member 0.
+    assert_signature(V47A_POINT, V68_DIGEST, V68_REVEAL_SIGNATURE)?;
+    assert_signature(V41_ROOT, V68_DIGEST, V68_ROOT_SIGNATURE)
+}
+
+#[test]
+fn vector_69_compromised_key_state_preimage_digest_and_signature() -> TestResult {
+    let preimage = v69_key_state()?;
+    assert_eq!(bytes(V69_PREIMAGE)?.len(), 333);
+    assert_vector(&preimage, V69_PREIMAGE, V69_DIGEST)?;
+    let snapshot = decode_preimage(&fields(V69_PREIMAGE)?)?
+        .into_preimage()
+        .key_state
+        .ok_or("Vector 69 carries a snapshot")?;
+    let dropped = snapshot.keys.get(2).ok_or("Vector 69 lists three keys")?;
+    assert_eq!(dropped.key, array::<33>(V41_ACTIVE)?);
+    assert_eq!(dropped.condition, KeyCondition::Compromised);
+    assert_eq!(dropped.compromised_from, 1);
+    assert_signature(V41_ROOT, V69_DIGEST, V69_ROOT_SIGNATURE)
 }
 
 /// The V41 inception's snapshot and its continuation's commitment compose the

@@ -49,8 +49,8 @@
 //! # Identity field
 //!
 //! `registrant` carries today's identity string (a `did:dht` identifier) until
-//! SCP-308 S1 defines the identity identifier type that the §22.11.4 wire table
-//! names. The store treats it as an opaque string.
+//! SCP-315 retypes it to the `Identifier` SCP-308 defines, the type the
+//! §22.11.4 wire table names. The store treats it as an opaque string.
 
 use std::path::Path;
 use std::sync::Arc;

@@ -5120,6 +5120,7 @@ version = "0.1.0-beta.2"
 dependencies = [
  "hex",
  "proptest",
+ "scp-crypto",
  "scp-did",
  "sha2 0.10.9",
  "thiserror 2.0.18",
