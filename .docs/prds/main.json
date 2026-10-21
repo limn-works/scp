@@ -307,7 +307,8 @@
         "SCP-315",
         "SCP-316",
         "SCP-317",
-        "SCP-318"
+        "SCP-318",
+        "SCP-345"
       ]
     }
   ],
@@ -636,10 +637,10 @@
         "crates/scp-identity/src/config.rs",
         "crates/scp-did/src/document.rs"
       ],
-      "description": "Implement identity creation in the scp-identity crate, over the wasm-safe identity data model in scp-did. The module handles creation, verification, and key-state management. An identity's first key event is its inception event, and the identifier is SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) — 32 raw digest bytes that encode no key, which is what makes the identifier self-certifying (security spec §9.7.4.2 R13). The module abstracts the identity backend behind the `IdentityBackend` seam `03-identity.md` §3.10.10 states, which carries six methods; that section names them and this story states no list of its own, because a second list drifts from the declaration it copies. The shipped crate carries `generate_ephemeral_ed25519_seed`, which names the superseded curve; the code workstream that moves the key material to P-256 renames it, and this story names it as it ships today rather than inventing a name no author chose (ADR-054). Creation takes two custody providers: key_custody holds the operational keys, and pre_rotation_custody holds the pre-rotation key, because §9.7.4.1 item 3 forbids the operational provider from holding the recovery key. Where no substrate satisfies §9.7.4.1 item 3a's independent-residence requirement, every creation path fails closed with IdentityError::NoIndependentSubstrate (SCP-IDENT-1100, `03-identity.md` §3.10.10). Publication and resolution are SCP-007; rotation is SCP-008.",
+      "description": "Implement identity creation in the scp-identity crate, over the wasm-safe identity data model in scp-did. The module handles creation, verification, and key-state management. An identity's first key event is its inception event, and the identifier is SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage) — 32 raw digest bytes that encode no key, which is what makes the identifier self-certifying (security spec §9.7.4.2 R13). The module abstracts the identity backend behind the `IdentityBackend` seam `03-identity.md` §3.10.10 states, which carries six methods; that section names them and this story states no list of its own, because a second list drifts from the declaration it copies. The shipped crate carries `generate_ephemeral_ed25519_seed`, which names the superseded curve; the code workstream that moves the key material to P-256 renames it, and this story names it as it ships today rather than inventing a name no author chose (ADR-054). Creation takes two custody providers: key_custody holds the root members and the operational keys, and a `NextSetCustody` (SCP-345) holds each next-set key, because §9.7.4.1 item 3 forbids the operational provider from holding the recovery key. Where no substrate satisfies §9.7.4.1 item 3a's independent-residence requirement, every creation path fails closed with IdentityError::NoIndependentSubstrate (SCP-IDENT-1100, `03-identity.md` §3.10.10). Publication and resolution are SCP-007; rotation is SCP-008.",
       "acceptanceCriteria": [
-        "`Identity::create(config, signers)` returns `Result<(Identity<S>, EventOutcome), IdentityError>` under the collection flow `03-identity.md` §3.10.10 states, publishing the inception event in the same call under `SignerPlan::ThisSdk`, and generates the root member (#0) and the Active Signing Key (#active) as ECDSA P-256 keypairs in the custody the config names (`03-identity.md` §3.10.10, §9.5, §9.7.4.2 definitions)",
-        "The identity-creation path draws the pre-rotation seed from key_custody.generate_ephemeral_ed25519_seed(), hands it to pre_rotation_custody.store_committed_pre_rotation_key, and never writes the pre-rotation private key into key_custody — §9.7.4.1 item 3 (storage isolation) forbids the operational provider from holding it",
+        "`Identity::create(config, signers)` returns `Result<(Identity<S>, EventOutcome), IdentityError>` under the collection flow `03-identity.md` §3.10.10 states, publishing the inception event in the same call under `SignerPlan::ThisSdk`, and generates the root member (#0) and the Active Signing Key (#active) as ECDSA P-256 keypairs, with each root member minted by `generate_key_event_keypair` as `KeyType::P256KeyEvent`, in the custody the config names (`03-identity.md` §3.10.10, §9.5, §9.7.4.2 definitions)",
+        "The identity-creation path generates each next-set key inside `NextSetCustody::generate`, reads its 33-byte SEC1 public key through `reveal_public_key`, and moves no next-set private key byte across any trait; key_custody never holds it — §9.7.4.1 item 3 (storage isolation)",
         "The identity-creation path computes the pre-rotation commitment as SHA-256(\"SCP-PREROTATION-COMMITMENT-V1:\" || pre_rotation_public_key) over the 33-byte SEC1 compressed point (§9.7.4.2 definitions)",
         "The identity-creation path derives the identifier as SHA-256(\"SCP-KEL-ID-V1:\" || inception_signed_preimage), with the preimage's identifier and predecessor-digest fields all-zero, and stores those 32 raw digest bytes on the ScpIdentity (§9.7.4.2 R13)",
         "The identity-creation path builds the key state the inception event carries: the standing root with its threshold and each member's custody type, the Active Signing Key in the #active role, the standing commitment list with its next threshold, the witness set with its interval, the service-key designation, and the all-zero delegator (§9.7.4.2 definitions)",
@@ -652,6 +653,7 @@
         "The identity API maps `IdentifierError::NonCanonicalIdentifier` to `IdentityError::NonCanonicalIdentifier`, SCP-IDENT-1106 (`03-identity.md` §3.1, §3.10.10)",
         "All public items have /// doc comments",
         "Unit tests for create, verify_did, and key-state construction",
+        "A build without `testing` that configures no `NextSetCustody` fails `create` with `IdentityError::NoPreRotationBackend` (SCP-IDENT-1059) and generates no key: a test (ADR-054)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -669,7 +671,8 @@
         "Write unit tests asserting that creation fails closed with NoIndependentSubstrate where no substrate satisfies §9.7.4.1 item 3a"
       ],
       "blockedBy": [
-        "SCP-001"
+        "SCP-001",
+        "SCP-345"
       ],
       "sources": [
         {
@@ -708,7 +711,7 @@
       ],
       "description": "Implement publishing an identity's key-event log to SCP relays and resolving it back, with caching, staleness detection, and automatic republishing. A publisher splits the chain into frame-sized segments and publishes them to the identity's own relays and to the fallback set (§3.10.5). A validating relay honors the PUBLISH's `retain` flag and gives the record no TTL; §9.7.4.2 R9 states that a relay may stop holding what it once held on terms its operator declares, and §9.7.4.2 R10 states the cadence that re-publishes where an entry no longer holds the record. The cycle keeps alive the copies a transport that cannot validate stores as opaque blobs under the shared TTL (§9.10.12). This story owns the self-observation cadence of §9.7.4.2 R10 and the `observe_self` operation `03-identity.md` §3.10.10 declares on the identity handle; SCP-008 composes the events that cadence re-publishes, and SCP-305 carries the recovery entry points.",
       "acceptanceCriteria": [
-        "IdentityBackend::publish splits the chain into frame-sized segments and publishes them to both relay sets in sequence order (§3.10.5)",
+        "IdentityBackend::publish splits the chain into frame-sized segments of at most `MAX_EVENTS_PER_FRAME` events and publishes them to both relay sets in sequence order (§3.10.5, `09-security-model.md` §9.18.17)",
         "The root signs every establishment event and an operational key signs none (§9.7.4.2)",
         "An event's sequence is its predecessor's plus one, and the inception event's is zero (§9.7.4.2)",
         "Idempotent: a frame whose event digests all match the chain's leaves what the relay holds unchanged, which is a relay's own write rule and which ADR-065, the relay ADR, pending, states; the tag `archive/kel-combined-pre-split` preserves the combined text",
@@ -717,7 +720,7 @@
         "Each retry re-reads the fallback set from the community relay list the SDK last accepted from the relay-list context (§18.5.1)",
         "After 6 consecutive failures, emit a publish-degraded warning to the application layer",
         "The self-observation cadence starts when an identity is loaded (Identity::load or Identity::create) and stops when that identity is unloaded or the SDK shuts down, and the SDK runs exactly one cadence loop per loaded identity: a test loads one identity, counts the cadence tasks the identity module spawned for it, and asserts one (`09-security-model.md` §9.7.4.2 R10)",
-        "Each cadence pass fetches from every entry of the publication set `03-identity.md` §3.10.5 names, on every launch and at least once per witnessing interval, and `Identity::observe_self` returns one `EntryObservation` per entry of that set, each entry exactly once (`03-identity.md` §3.10.10)",
+        "Each cadence pass fetches from every entry of the publication set `03-identity.md` §3.10.5 names, on every launch and at least once per witnessing interval, and `Identity::observe_self` returns a `SelfObservation` whose `entries` carry one `EntryObservation` per entry of that set, each entry exactly once (`03-identity.md` §3.10.10)",
         "An entry that answers nothing yields `EntryReach::Unreachable`: a test serves no answer from one entry and asserts that observation, an alert, and no PUBLISH to that entry (`09-security-model.md` §9.7.4.2 R10)",
         "An entry the page walk did not read to exhaustion yields `EntryReach::Unexhausted`: a test stops the walk at the fetch bound and asserts that observation, an alert naming the entry, and no PUBLISH to it (`09-security-model.md` §9.7.4.2 R10)",
         "An empty entry yields one `ChainObservation` whose `relation` is `Absent`, whose `alerted` is false, and whose `republished` is present, after the SDK re-published its chain from the inception event and its service record; an entry whose frames chain to nothing yields the same observation with `alerted` true: a test serves each case and asserts both (`09-security-model.md` §9.7.4.2 R10)",
@@ -728,7 +731,7 @@
         "On SDK initialization the self-observation cadence runs one pass immediately for every persisted active identity, over every entry of that identity's publication set, and publishes under the relations R10 names and under no unconditional startup republish (`09-security-model.md` §9.7.4.2 R10)",
         "resolve(identifier) returns a ResolutionOutcome from the SCP relay network, the one resolution layer (§3.10.4)",
         "resolve recomputes the identifier from the inception event and discards a differing response (§9.7.4.2 R2)",
-        "resolve verifies every later event under the standing root and discards a defective chain (§9.7.4.2 R3)",
+        "resolve verifies every later event under the standing root, discards a defective event past the inception, and returns `Invalid` only for a defective inception (§9.7.4.2 R3, R14)",
         "resolve derives the key state from the latest state-carrying event at or before the adopted head (§9.7.4.2 R8)",
         "Content signed under a key the resolved log's replay marks `Superseded` or `Retired` is judged by the class the classification table of `09-security-model.md` §9.7.1 assigns its separator: an attestation-class signature fails, a content-class signature verifies only for content that reached the party under an epoch before that context's boundary for the key, and a log-anchored signature verifies only where the key was `Current` at the position its `key_state_head` names: a test per class, each signed under the `Superseded` key of a chain whose `KeyState` installs a new `#active` key (`09-security-model.md` §9.7.1, §9.7.4.2 R8)",
         "resolve caches results: 24-hour refresh for active contacts, 7-day for inactive (§9.10.7)",
@@ -738,6 +741,12 @@
         "Unit tests for cache TTL behavior (24h active, 7d inactive)",
         "Unit tests for staleness detection",
         "`publish` sends each entry only the events that entry does not hold, starting at the first event it lacks: a test publishes a two-event extension to an entry holding the rest of the chain and asserts that the frame opens at the first new event (`03-identity.md` §3.10.5)",
+        "resolve returns key state only as a `ResolvedState`, self-observation holds the controller's own key state only as `scp_kel::ReplayedState`, and the retained log is persisted as raw units and re-validated with `validate_chain` on load, never deserialized into a `ValidatedChain`: a test reloads a retained log carrying one illegal own event and asserts it is discarded on load (`09-security-model.md` §9.7.4.2 R3, R10)",
+        "A fixture puts an own `KeyState` carrying A26 into the retained log through the test-only signer, and a relay prepends a separator-flipped junk unit at the same position; `observe_self` returns one `DiscardedOwnEvent{class: Change, stage: Content}` naming the own event's digest, makes no republish call for it, and alerts; a foreign threshold-signed A26 at that position, absent from the retained log, yields an alert and no `DiscardedOwnEvent` (`09-security-model.md` §9.7.4.2 R10)",
+        "resolve skips an illegal event a non-conforming relay served: an in-memory relay mock that stores every frame opaquely serves [Vector 41, C16-on-V41, the legal `KeyState` at sequence 1], and resolve returns the key state of [Vector 41, the legal `KeyState`]; serving [Vector 41, C16-on-V41] alone returns Vector 41's key state; neither returns `Invalid` (`09-security-model.md` §9.7.4.2 R3, R14)",
+        "A mock relay answers `4044` KEY_EVENT_ILLEGAL to a legal frame: the SDK records the entry as non-conforming, produces no `DiscardedOwnEvent` and no compromise alert, and sends that frame to that entry in no later cycle: a test across two cycles (`09-security-model.md` §9.7.4.2 R10, ADR-004)",
+        "A frame holding an own event the retained log's check discards, answered `4044`, yields one `DiscardedOwnEvent` and no re-send: a test (`09-security-model.md` §9.7.4.2 R10)",
+        "resolve over an entry serving [Vector 41, A@1, B@1], two legal `KeyState`s signed by Vector 41's root, returns `Contested`: a test (`09-security-model.md` §9.7.4.2 R6, R7)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -803,15 +812,15 @@
       "description": "Implement the key-event-log rotation and recovery kinds. Under ADR-063, the inception-derived key-event-log identity substrate, the identifier is the digest of the inception event and never changes (`09-security-model.md` §9.7.4.2 R13), so there is no migration and no migration proof: `\"SCP-MIGRATION-V1:\"` is registered as retired in §9.18.2's separator registry. Every change to an identity's keys is an event appended to its one chain. This story implements the three event kinds a controller signs and the ceremony §9.7.4.2 R10 orders. (1) A `KeyState` event installs a fresh `#active` key under the standing root and changes no commitment; the key state carries the keys that are current and no history, so the replaced key leaves the list with a condition entry and a verifier derives any earlier key's condition by replaying the log (§9.7.4.2 R8). (2) A `CommitmentRollover` reveals the standing commitment under the standing root and fixes the next one, which is what a controller signs on suspicion of a copied pre-rotation key. (3) A `RootRecovery` at either `standing_root` value installs a fresh root set K' under a reveal, which is what a controller signs when it must retire or has lost its root. R10's situation table decides which of the three a controller signs. The two reveal-authorized kinds carry the ceremony duties R10 states: the persist of the `RecoveryHandle` precedes the signature, the controller durably retains the signed event before it destroys the spent keys, and confirmed publication is that retention together with acceptance by at least one entry of the fallback set. The self-observation cadence that adopts or withholds a served chain is SCP-007's, and the recovery entry points are SCP-305's; this story owns the extending arm's fork, which the controller composes from the adopted log.",
       "acceptanceCriteria": [
         "rotate_active_key(identity, key_custody) -> Identity generates a fresh P-256 keypair, appends a `KeyState` event at the predecessor's sequence plus one that lists the new key `Current` in the `#active` role and lists the replaced key with a condition entry, and signs that event under a threshold of the standing root and never under the replaced active key (`09-security-model.md` §9.7.4.2 R3, R8).",
-        "A `KeyState` event changes no commitment: a test asserts that an event whose standing commitment differs from its predecessor's is rejected at verification with the R1 defect, because a commitment changes only in a reveal-authorized event (`09-security-model.md` §9.7.4.2 R1).",
+        "A `KeyState` event changes no commitment: a test asserts that an event whose standing commitment differs from its predecessor's is refused at composition with SCP-IDENT-1117, and that a hand-signed copy is discarded at verification, because a commitment changes only in a reveal-authorized event (`09-security-model.md` §9.7.4.2 R1).",
         "After rotate_active_key the identifier is byte-identical and the standing root set is byte-identical: a test asserts both against the values the inception event fixed (`09-security-model.md` §9.7.4.2 R13, R2).",
-        "The key state lists at most one key `Current` in the `#active` role: a test builds a snapshot listing two and asserts the verifier rejects it with the R3 author-attributable defect, and a second test asserts the replaced key appears exactly once in the list, carrying a condition other than `Current` (`09-security-model.md` §9.7.4.2 R3, R8).",
+        "The key state lists at most one key `Current` in the `#active` role: a test builds a snapshot listing two and asserts the composer refuses it with SCP-IDENT-1117 before any sign call, and that `validate_chain` over a hand-signed copy discards it at stage `Content`, and a second test asserts the replaced key appears exactly once in the list, carrying a condition other than `Current` (`09-security-model.md` §9.7.4.2 R3, R8).",
         "rotate_active_key publishes the extended chain through `IdentityBackend::publish` and returns its `PublishOutcome`; a cycle no fallback-set entry accepted returns a per-entry list carrying `Refused` or `Failed` at each such entry and no error variant, because `IdentityError` carries no rate-limit variant, and the caller reports a failed publication (`03-identity.md` §3.10.5, §3.10.6, §3.10.10).",
-        "compose_commitment_rollover(identity, pre_rotation_custody, key_custody) -> CommitmentRollover reveals the standing commitment at the index the commitment list names, fixes the next commitment list and next threshold inside the same event, and carries the reveal group's signer index list; a test asserts a revealed key whose commitment is not the standing list's member at the named index is rejected with the R3 defect (`09-security-model.md` §9.7.4.2 R1, R3).",
-        "compose_root_recovery(identity, standing_root, pre_rotation_custody, key_custody) -> RootRecovery installs a fresh root set K' and its threshold under a reveal, and carries the standing-root signature group at `standing_root: CoSigns` and omits it at `standing_root: Lost`; a test asserts the SDK refuses to sign `standing_root: Lost` with `IdentityError::RootThresholdHeld` while it holds a threshold of the standing root (`09-security-model.md` §9.7.4.2 R3, `03-identity.md` §3.10.10).",
+        "compose_commitment_rollover(identity, next_set_custody, key_custody) -> CommitmentRollover reveals the standing commitment at the index the commitment list names, fixes the next commitment list and next threshold inside the same event, and carries the reveal group's signer index list; a test asserts a revealed key whose commitment is not the standing list's member at the named index is refused at composition with SCP-IDENT-1117, and that a hand-signed copy is discarded at verification (`09-security-model.md` §9.7.4.2 R1, R3).",
+        "compose_root_recovery(identity, standing_root, next_set_custody, key_custody) -> RootRecovery installs a fresh root set K' and its threshold under a reveal, and carries the standing-root signature group at `standing_root: CoSigns` and omits it at `standing_root: Lost`; a test asserts the SDK refuses to sign `standing_root: Lost` with `IdentityError::RootThresholdHeld` while it holds a threshold of the standing root (`09-security-model.md` §9.7.4.2 R3, `03-identity.md` §3.10.10).",
         "The ceremony order holds: a test drives each reveal-authorized kind and asserts that the display confirmation precedes the `Composed` handle write, that the `RecoveryHandle` reaches every member of the store set, which is keyed on the pre-rotation credential, before the signature, and that a controller that crashes between the two resumes from that handle rather than composing a fresh next set (`09-security-model.md` §9.7.4.2 R10).",
         "One reveal at a time: a test asserts the SDK refuses with `IdentityError::RevealAlreadyPending` while it can observe an unpublished reveal-authorized event or a pending `RecoveryHandle` for that identity in any store of the set, and asserts a `resume_recovery` that completes removes the handle from every one of those stores (`09-security-model.md` §9.7.4.2 R10).",
-        "The controller durably retains the signed event byte for byte before it destroys the spent keys, and destroys every key the reveal revealed and no unexposed member the superseding list re-commits; a test asserts both (`09-security-model.md` §9.7.4.2 R5, R10, §9.7.4.1 item 8).",
+        "The controller durably retains the signed event byte for byte before it destroys the spent keys, and destroys every key the reveal revealed and no unexposed member the superseding list re-commits; R5's destruction is `destroy_spent_keys(chain: &ValidatedChain, event_digest, ..)`, which refuses unless `chain` contains `event_digest`; a test asserts each (`09-security-model.md` §9.7.4.2 R5, R10, §9.7.4.1 item 8).",
         "A device lagging one honest `CommitmentRollover` adopts it and wins at rank 1: a test builds a controller whose second device's retained log ends one event below a `CommitmentRollover` the controller signed on its first device, serves that rollover and a thief's `RootRecovery{Lost}` above it, and asserts that the second device adopts the rollover, withholds the `{Lost}` event, composes its fork at that event's predecessor from the adopted key state, and that R6 ranks the fork 1 against the thief's suffix at rank 2 (`09-security-model.md` §9.7.4.2 R6, R10).",
         "An SDK that reaches some members of a non-empty store set and not every member refuses to compose with `IdentityError::StorePartiallyUnreadable`, and an SDK that reaches no member refuses with the same error: one test per case asserts the error and that no event was signed (`09-security-model.md` §9.7.4.2 R10).",
         "A member that answers bytes the SDK cannot decode as a `RecoveryHandle` counts as unreached: a test serves such bytes from one member and asserts `IdentityError::StorePartiallyUnreadable` (`09-security-model.md` §9.7.4.2 R10).",
@@ -820,6 +829,10 @@
         "The ceremony's first step runs a self-observation pass and adopts what the extending arm adopts: a test completes a `CommitmentRollover` on one device, then calls `begin` on a second device whose retained log lacks it, and asserts that the second device adopts the rollover and reveals the next commitment rather than the one the rollover consumed (`09-security-model.md` §9.7.4.2 R10)",
         "The consumed-commitment rule holds with reserve members: a test builds a 2-of-4 next set whose rollover reveals two members and re-commits the other two, then calls `begin` on a device whose adopted log carries that rollover, composing at the rollover's predecessor, and asserts `IdentityError::RevealAlreadyPending` and no signature (`09-security-model.md` §9.7.4.2 R10)",
         "Where the adopted log already carries a reveal-authorized event whose predecessor is a withheld `{Lost}` event's predecessor, the extending arm composes nothing and alerts: a test asserts no composition and one alert (`09-security-model.md` §9.7.4.2 R10)",
+        "An illegal `CommitmentRollover` produced by the test-only signer and driven through the ceremony leaves every next-set key undestroyed, writes no marker, and yields `DiscardedOwnEvent{class: Reveal}`; a marker naming a preimage that fails step 8 is treated as naming no event, with one alert, while a marked event whose only copy has stripped signatures yields `LastRevealUnadopted`: a test per case (`09-security-model.md` §9.7.4.2 R10)",
+        "`compose_root_recovery` mints every K′ member and the installed root through `generate_key_event_keypair`, and each record's type is `P256KeyEvent`: a test reads the record of each handle the composed event names (`09-security-model.md` §9.7.4.2 R10)",
+        "A next-set holder whose retained log is one event below the composer's chain refuses the reveal through `HeldHead::check_next` with `SigningBaseStale` (SCP-IDENT-1118) and makes zero `sign_change` calls: a test (`09-security-model.md` §9.7.4.2 R10)",
+        "An illegal reveal produced by the test-only signer moves the handle to `Discarded`; a legal reveal of the same commitment then composes, is co-signed by a cosigner holding the old record, and publishes: a test (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code."
       ],
       "actionItems": [
@@ -831,7 +844,8 @@
         "Write tests for rotation (identifier and root-set invariance, the one-current-key rule, the unchanged commitment), for each reveal-authorized kind (commitment match at the named index, the `Lost` refusal), for the ceremony order, for the store-set refusals, and for the lagging-device fork."
       ],
       "blockedBy": [
-        "SCP-007"
+        "SCP-007",
+        "SCP-345"
       ],
       "sources": [
         {
@@ -10474,11 +10488,11 @@
         "crates/scp-identity/src/recovery.rs",
         "crates/scp-identity/src/lib.rs"
       ],
-      "description": "Implement the ceremony's four entry points on the `Recovery` type that `09-security-model.md` §9.7.4.2 R10 declares, obtained through `identity.recovery()` over the identity's own persistence, custody and backend slots. `RecoveryPhase` has four values, `Composed`, `Signed`, `PublishSent` and `Confirmed`, and the ceremony removes the handle from every member of the store set once, after the spent keys are destroyed at `Confirmed`. `abort_recovery` refuses with `IdentityError::SignedRevealUnpublished` (SCP-IDENT-1107, `03-identity.md` §3.10.10) where the device's own store holds the signed event, and clears the handle otherwise. The ceremony's event composition is SCP-008; the bridge exports are SCP-314. `begin` composes a `PendingEvent`, and SCP-312's `Identity::cosign` and `Identity::attach` complete it.",
+      "description": "Implement the ceremony's four entry points on the `Recovery` type that `09-security-model.md` §9.7.4.2 R10 declares, obtained through `identity.recovery()` over the identity's own persistence, custody and backend slots. `RecoveryPhase` has five values, `Composed`, `Signed`, `PublishSent`, `Confirmed` and `Discarded`, and the ceremony removes the handle from every member of the store set once, after the spent keys are destroyed at `Confirmed`. `abort_recovery` refuses with `IdentityError::SignedRevealUnpublished` (SCP-IDENT-1107, `03-identity.md` §3.10.10) where the device's own store holds the signed event, and clears the handle otherwise. The ceremony's event composition is SCP-008; the bridge exports are SCP-314. `begin` composes a `PendingEvent`, and SCP-312's `Identity::cosign` and `Identity::attach` complete it.",
       "acceptanceCriteria": [
         "`Recovery::begin(kind, signers)` runs the ceremony order from its first step through the `Composed` handle write and returns a `PendingEvent` whose preimage binds each group's signer index list and form list from `signers`; `RecoveryKind::RootRecovery(declaration)` sets `standing_root` to the declaration and `begin` refuses `Lost` with `RootThresholdHeld` where the SDK holds a threshold of the standing root: one test per kind (`09-security-model.md` §9.7.4.2 R10)",
         "`RecoveryKind` declares exactly the variants `CommitmentRollover`, `RootRecovery(StandingRootDeclaration)` and `Abandon` (`09-security-model.md` §9.7.4.2 R10)",
-        "`RecoveryPhase` declares exactly four variants, `Composed`, `Signed`, `PublishSent` and `Confirmed`, and `grep -rn 'Submitted' crates/scp-identity/src` prints nothing (`09-security-model.md` §9.7.4.2 R10)",
+        "`RecoveryPhase` declares exactly five variants, `Composed`, `Signed`, `PublishSent`, `Confirmed` and `Discarded`, and `grep -rn 'Submitted' crates/scp-identity/src` prints nothing (`09-security-model.md` §9.7.4.2 R10)",
         "`Identity::recovery(&self) -> Recovery<S>` builds the `Recovery` over the identity's own persistence, custody and backend slots, and `Recovery` has no public constructor and no public field: a trybuild compile-fail test asserts that a struct literal of `Recovery` outside the crate does not compile (`09-security-model.md` §9.7.4.2 R10)",
         "The ceremony writes the handle at each of the four phases into every member of the store set: a test injects a crash after each phase's write and asserts that `load_pending_recovery` returns the handle at that phase (`09-security-model.md` §9.7.4.2 R10)",
         "`resume_recovery` re-enters the ceremony order at the phase the handle names, from `Signed` on, and performs no step the order has passed: a test crashes after the `Signed` write and asserts the resumed ceremony signs no new event and publishes the signed event from the SDK's own store (`09-security-model.md` §9.7.4.2 R10)",
@@ -10496,6 +10510,8 @@
         "A cosigner writes the `Composed` handle into its own store set before it signs, records the event's digest with each revealed commitment, and refuses a different event revealing a commitment a standing record names with `RevealAlreadyPending`; the cosigner's `abort_recovery` with `ComposingDevice::Available` refuses that handle with `RevealAlreadyPending`, and with `ComposingDevice::ComposerAborted` or `ComposingDevice::Destroyed` clears the handle and the record, after which it co-signs a corrected event: a test per case (`09-security-model.md` §9.7.4.2 R10)",
         "A composer confirming its own event on a second device that shares its store set confirms it, and refuses only where the pending handle's digest differs from the event it confirms: a test per case (`09-security-model.md` §9.7.4.2 R10)",
         "A device whose adopted log lacks the marked event adopts it from its own platform-account member when no relay serves it, and re-publishes it: a test asserts the adoption and the PUBLISH (`09-security-model.md` §9.7.4.2 R10)",
+        "`Recovery::begin` composes its event only from a candidate `HeldHead::check_next` accepts against the adopted log, and refuses an illegal candidate with `IdentityError::IllegalKeyEvent` (SCP-IDENT-1117) before any sign call: a test composes a `RootRecovery` whose installed root set differs from its snapshot and asserts 1117 and zero sign calls (`09-security-model.md` §9.7.4.2 R10)",
+        "`abort_recovery` removes a handle at `Discarded` from every member on any device: a test (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -11017,39 +11033,55 @@
         ".github/workflows/fuzz.yml",
         ".github/workflows/ci.yml",
         ".docs/standards/rust.md",
-        ".docs/architecture.md"
+        ".docs/architecture.md",
+        "crates/scp-kel/src/event.rs",
+        "crates/scp-did/src/key_state.rs",
+        "crates/scp-did/src/lib.rs",
+        "crates/scp-protocol/src/crypto/key_continuity.rs",
+        "crates/scp-protocol/Cargo.toml",
+        "crates/scp-runtime/tests/test_vectors.rs",
+        "crates/scp-testing/tests/integration/identity.rs"
       ],
-      "description": "Architecture slice S2. `decode_event` in `event_codec.rs` reads one event's signed preimage and signature field out of a §9.10.12 frame. `verify_indexed` verifies an indexed signature group in either signature form, raw or WebAuthn assertion, and the WebAuthn form needs the client-data JSON parser in `client_data.rs`, which applies the clientDataJSON acceptance set of `09-security-model.md` §9.7.4.2, because `serde_json` keeps the last duplicate. `validate_chain` applies R1 through R4 and returns `Valid`, `AuthorDefect` or `CopyDefect`, and `replay` derives the key state under R8. `09-security-model.md` §9.7.4.2 states each rule. Ranking is SCP-310.",
+      "description": "Architecture slice S2. `decode_event` in `event_codec.rs` reads one event's signed preimage and signature field out of a §9.10.12 frame. `verify_indexed` verifies an indexed signature group in either signature form, raw or WebAuthn assertion, and the WebAuthn form needs the client-data JSON parser in `client_data.rs`, which applies the clientDataJSON acceptance set of `09-security-model.md` §9.7.4.2, because `serde_json` keeps the last duplicate. `validate_chain` applies R1 through R4 to one assembled path and returns `InceptionInvalid`, `NoInception` or `Valid` with every `Discarded`; `validate_entry` first assembles an entry's units into paths by predecessor digest; `ValidatedChain::validate_change`, `validate_inception` and `HeldHead::check_next` run the same check order over an unsigned candidate; and `replay` derives the key state under R8. A verifier discards every illegal event past the inception, whoever signed it, and only a defective inception that recomputes to the served identifier is `InceptionInvalid`. In the criteria, \"Discarded{stage}\" means `Valid` with exactly one `Discarded` at the fixture's position, carrying that stage. `09-security-model.md` §9.7.4.2 states each rule. Ranking is SCP-310.",
       "acceptanceCriteria": [
         "`verify_indexed` verifies Vectors 41 and 42 of `25-test-vectors.md` §25.26 and checks, for the assertion form, the challenge, the UP and UV flags and low-s: one negative test per check (`09-security-model.md` §9.7.4.2 definitions)",
         "The client-data JSON parser rejects a document carrying a duplicate key: a test feeds `{\"challenge\":\"a\",\"challenge\":\"b\"}` and asserts rejection",
-        "`validate_chain` returns `AuthorDefect` or `CopyDefect` for every defect R3 lists, with one negative fixture per defect, and returns `Valid` for Vectors 41, 42, 50 and 51 (`09-security-model.md` §9.7.4.2 R3)",
+        "`validate_chain` returns `InceptionInvalid` for every R2 or R3 defect in an inception that recomputes to the served identifier, and a `Discarded` carrying its `CheckStep` for every defect at a position past the inception, with one negative fixture per defect, and returns `Valid` with no `Discarded` for Vectors 41, 42, 50 and 51 (`09-security-model.md` §9.7.4.2 R3)",
         "`replay` derives the key state from the latest state-carrying event at or before the head, and a `RootRecovery` replaces the whole key state: a test per case (`09-security-model.md` §9.7.4.2 R8)",
         "Two fuzz targets, `fuzz_kel_decode_event` over `decode_event`, which wraps SCP-308's `decode_preimage`, and `fuzz_kel_client_data` over the client-data parser, build with `cd fuzz && cargo fuzz build` and each runs 60 seconds without a crash",
-        "`validate_chain` returns `Valid` for Vector 41 extended by each of Vectors 53, 54 and 55 of `25-test-vectors.md` §25.29, and returns a defect where a `RootRecovery{CoSigns}` lacks its standing-root group: a test per case (`09-security-model.md` §9.7.4.2 R3)",
-        "`validate_chain` returns `AuthorDefect` for an `Inception` and for a `RootRecovery` whose installed root set (field 9) differs from the `Current` `RootMember` entries and `root_threshold` of its snapshot, in members, in member order, and in threshold: a test per kind and difference (`09-security-model.md` §9.7.4.2 R3)",
+        "`validate_chain` returns `Valid` for Vector 41 extended by each of Vectors 53, 54 and 55 of `25-test-vectors.md` §25.29, and discards at stage `Walk` a `RootRecovery{CoSigns}` whose signature field lacks its standing-root group's signatures (C4): a test per case (`09-security-model.md` §9.7.4.2 R3)",
+        "`validate_chain` returns `InceptionInvalid` for an `Inception`, and Discarded{Content} for a `RootRecovery` on Vector 41 signed at threshold, whose installed root set (field 9) differs from the `Current` `RootMember` entries and `root_threshold` of its snapshot, in members, in member order, and in threshold: a test per kind and difference (`09-security-model.md` §9.7.4.2 R3)",
         "An event whose encoded length, its signed preimage with the separator plus 64 bytes per `Raw` index and 840 per `WebAuthnAssertion` index its signer groups name, exceeds `MAX_EVENT_BYTES` is rejected, and one at exactly `MAX_EVENT_BYTES` is accepted; one function computes that length and both `encode_preimage` and `decode_event` call it: a test per side (`09-security-model.md` §9.7.4.2 R3, §9.18.17)",
         "`decode_event` returns a copy-level defect for an event whose prefixed bytes do not begin with `SCP-KEL-EVENT-V1:`: a test flips one separator byte (`09-security-model.md` §9.7.4.2 R3)",
         "`verify_indexed` verifies the inception signature of Vector 51 of `25-test-vectors.md` §25.26 under root member 0: a test calls `verify_indexed` on that event, beside the known-answer test in `crates/scp-kel/tests/kel/vectors.rs` that checks the same signature through `verify_prehash_strict`; and `validate_chain` returns `Valid` for Vector 51's inception followed by Vector 51's `KeyState`",
-        "`validate_chain` returns `Valid` for Vector 41 extended by Vector 68 and for Vector 41 extended by Vector 69 of `25-test-vectors.md` §25.29, and rejects any event after Vector 68 (R4); `replay` of [Vector 41, Vector 68] records the abandonment, and `replay` of [Vector 41, Vector 69] yields Vector 41's `#active` key as `Compromised` with `compromised_from` 1: a test per case (`09-security-model.md` §9.7.4.2 R4, R8)",
+        "`validate_chain` returns `Valid` for Vector 41 extended by Vector 68 and for Vector 41 extended by Vector 69 of `25-test-vectors.md` §25.29, and returns Discarded{Content} with defect A34 at position 2 for [Vector 41, Vector 68, a `KeyState` signed by Vector 41's root] (R4); `replay` of [Vector 41, Vector 68] records the abandonment, and `replay` of [Vector 41, Vector 69] yields Vector 41's `#active` key as `Compromised` with `compromised_from` 1: a test per case (`09-security-model.md` §9.7.4.2 R4, R8)",
         "The client-data parser applies the nine-item clientDataJSON acceptance set of `09-security-model.md` §9.7.4.2, with at least one rejection test per clause of every item: item 1, a leading `EF BB BF`, an overlong UTF-8 form, an encoded surrogate and a code point above U+10FFFF; item 2, a top-level array and trailing non-whitespace after the top-level object; item 3, an unescaped control character; item 4, a lone high-surrogate escape, a lone low-surrogate escape, and a raw supplementary character followed by `\\uDC00`; item 6, the malformed numbers `01`, `+1` and `.5`; item 7, a duplicate member name in a nested object and a duplicate that differs only by escapes; item 8, a `type` or `challenge` that is absent, one that is not a string, and a top level missing `challenge` whose only correct `challenge` sits in a nested object. Acceptance tests cover a U+FEFF inside a string, `1e400`, nesting 200 levels deep inside 512 bytes, and an unknown member",
         "The challenge comparison reads the decoded JSON string: a `challenge` whose expected base64url text is written with `\\u` escapes is accepted, and a `challenge` carrying `=` padding, a character outside the base64url alphabet, or nonzero trailing bits is rejected: a test per case (`09-security-model.md` §9.7.4.2 definitions)",
-        "`validate_chain` returns a defect for each field a kind carries as a sentinel holding any other value: one fixture per pair, `Inception` fields 5, 8 and 11, `KeyState` fields 5, 8, 9 and 12, `CommitmentRollover` fields 5, 9, 10 and 11, and `RootRecovery` field 11 (`09-security-model.md` §9.7.4.2 R3)",
-        "`validate_chain` returns `AuthorDefect` wherever installed keys and fixed commitments meet, in either direction: no key installed in any role has a commitment equal to any commitment fixed on the chain at or before the installing event, and no commitment an event fixes equals the commitment of any key installed in any role at or before that event. One named fixture per case: a commitment whose preimage is a key that same event installs; a commitment whose preimage is a key installed as a root member at an earlier event; a `CommitmentRollover` that commits to the `#active` key an earlier `KeyState` installed; a `RootRecovery` that installs into K′ an unrevealed member of the standing next set; a `KeyState` that installs an unrevealed member of the standing next set as `#active`; and a `KeyState` that installs as `#active` a key whose commitment was fixed in a commitment list an earlier event superseded (`09-security-model.md` §9.7.4.2 R3, commitment freshness)",
-        "`validate_chain` returns `AuthorDefect` for a state-carrying event that silently drops a key `Current` at its predecessor, a dropped entry `Superseded` where no installed key takes its role, a dropped entry `Retired` where one does, a key listed in a role other than the one it was installed in, and a key list out of the snapshot order: a test per case (`09-security-model.md` §9.7.4.2 definitions, R3, R8)",
-        "`validate_chain` verifies each signer group against the key set R3's table *The key set each signer group verifies against* in `09-security-model.md` §9.7.4.2 names for it, and returns a defect where a K′ group verifies under the standing root but not under the event's field 9, where a `RootRecovery{CoSigns}` standing-root group verifies under K′ but not under the root standing at the event's predecessor, and where a reveal group meets the threshold the event fixes but not the standing next threshold: a test per case; and returns `Valid` for [Vector 41, Vector 54, a `KeyState` signed by Vector 54's K′], which shows the root standing after a recovery is K′",
+        "`validate_chain` returns `InceptionInvalid` for each `Inception` fixture and Discarded{Content} for each other fixture, for each field a kind carries as a sentinel holding any other value: one fixture per pair, `Inception` fields 5, 8 and 11, `KeyState` fields 5, 8, 9 and 12, `CommitmentRollover` fields 5, 9, 10 and 11, and `RootRecovery` field 11 (`09-security-model.md` §9.7.4.2 R3)",
+        "`validate_chain` returns Discarded{Content} for every fixture past the inception, and `InceptionInvalid` for a fixture at the inception, wherever installed keys and fixed commitments meet, in either direction: no key installed in any role has a commitment equal to any commitment fixed on the chain at or before the installing event, and no commitment an event fixes equals the commitment of any key installed in any role at or before that event. One named fixture per case: a commitment whose preimage is a key that same event installs; a commitment whose preimage is a key installed as a root member at an earlier event; a `CommitmentRollover` that commits to the `#active` key an earlier `KeyState` installed; a `RootRecovery` that installs into K′ an unrevealed member of the standing next set; a `KeyState` that installs an unrevealed member of the standing next set as `#active`; and a `KeyState` that installs as `#active` a key whose commitment was fixed in a commitment list an earlier event superseded (`09-security-model.md` §9.7.4.2 R3, commitment freshness)",
+        "`validate_chain` returns Discarded{Content} for a state-carrying event that silently drops a key `Current` at its predecessor, a dropped entry `Superseded` where no installed key takes its role, a dropped entry `Retired` where one does, a key listed in a role other than the one it was installed in, and a key list out of the snapshot order: a test per case (`09-security-model.md` §9.7.4.2 definitions, R3, R8)",
+        "`validate_chain` verifies each signer group against the key set R3's table *The key set each signer group verifies against* in `09-security-model.md` §9.7.4.2 names for it, and returns Discarded{Signatures} where a K′ group verifies under the standing root but not under the event's field 9, Discarded{Signatures} where a `RootRecovery{CoSigns}` standing-root group verifies under K′ but not under the root standing at the event's predecessor (C11), and Discarded{Threshold} where a `RootRecovery{Lost}`'s reveal group meets the threshold the event fixes but not the standing next threshold (A40): a test per case; and returns `Valid` for [Vector 41, Vector 54, a `KeyState` signed by Vector 54's K′], which shows the root standing after a recovery is K′",
         "A chain-level test in `crates/scp-kel/tests/kel/` replays Vector 41 extended by a `KeyState` re-signed by Vector 41's root that installs a new `#active` key, and asserts the old `#active` key is `Superseded` and the key-continuity fingerprint changes (`09-security-model.md` §9.7.4.2 R8, §9.11)",
-        "The assertion-form checks are closed: `verify_indexed` accepts an otherwise valid assertion signature whose `rpIdHash` is not SHA-256(\"ctx.network\"), one whose `signCount` is zero and one whose `signCount` is not zero, one with the AT, ED, BE and BS flag bits of byte 32 set, and one whose `authenticatorData` carries extension data: one acceptance test per case (`09-security-model.md` §9.7.4.2, *The assertion-form checks are closed*)",
-        "`validate_chain` returns `AuthorDefect` for each header field whose value the kind or the chain fixes: fixture A41a, an inception identifier field that is not zero; A41b, an inception sequence that is not zero; A41c, an inception predecessor digest that is not zero; A41d, a kind other than `Inception` at position zero; A41e, an `Inception` at a later position; and an event after the inception whose identifier field differs from the chain's identifier: a test per fixture, with the R2 recompute reading the raw identifier field and never `EncodedPreimage::identifier()` (`09-security-model.md` §9.7.4.2 R2, R3)",
-        "Fixture A45: `validate_chain` rejects a chain whose identifier field differs from the identifier a relay served it under (`09-security-model.md` §9.7.4.2 R2)",
-        "Fixture A47: `validate_chain` returns `AuthorDefect` for a snapshot whose service-key role discriminator is `RootMember`, because `Active` is the one registered value (`09-security-model.md` §9.7.4.2 definitions, key role)",
+        "The assertion-form checks are closed: `verify_indexed` accepts an otherwise valid assertion signature whose `rpIdHash` is not SHA-256(\"ctx.network\"), one whose `signCount` is zero and one whose `signCount` is not zero, one with the AT, ED, BE and BS flag bits of byte 32 set, one with reserved bit 1 set (flags `0x07`), one with reserved bit 5 set (`0x25`), and one with every bit of byte 32 set (`0xFF`, reserved bits 1 and 5 beside AT, ED, BE, BS, UP and UV), and one whose `authenticatorData` carries extension data: one acceptance test per case (`09-security-model.md` §9.7.4.2, *The assertion-form checks are closed*)",
+        "`validate_chain` returns `InceptionInvalid` for A41a to A41d, each served under the identifier its raw preimage recomputes to, and Discarded{Content} for A41e and for an event after the inception whose identifier field differs from the chain's identifier, for each header field whose value the kind or the chain fixes: fixture A41a, an inception identifier field that is not zero; A41b, an inception sequence that is not zero; A41c, an inception predecessor digest that is not zero; A41d, a kind other than `Inception` at position zero; A41e, an `Inception` at a later position; and an event after the inception whose identifier field differs from the chain's identifier: a test per fixture, with the R2 recompute reading the raw identifier field and never `EncodedPreimage::identifier()` (`09-security-model.md` §9.7.4.2 R2, R3)",
+        "Fixture A45: `validate_chain` returns `NoInception` with one `Discarded{0, None, InceptionBinding}` for a chain served under an identifier its inception does not recompute to (`09-security-model.md` §9.7.4.2 R2)",
+        "Fixture A47: `validate_chain` returns `InceptionInvalid` for an inception, and Discarded{Content} for a `KeyState` on Vector 41, whose snapshot whose service-key role discriminator is `RootMember`, because `Active` is the one registered value (`09-security-model.md` §9.7.4.2 definitions, key role)",
         "`replay` of [Vector 41, Vector 50] yields Vector 50's snapshot with Vector 41's commitment; [Vector 41, Vector 53] yields Vector 41's snapshot with Vector 53's commitment; [Vector 41, Vector 54] replaces the whole state, with K′ installed and the old keys `Superseded`; and `key_state_at` of [Vector 41, Vector 53] at Vector 41's digest yields Vector 41's commitment: a test per case (`09-security-model.md` §9.7.4.2 R8)",
+        "`ValidatedChain`, `ValidatedChange`, `SigningChange` and `ReplayedState` have no public constructor: a `compile_fail,E0451` doctest per type writes its struct literal outside the crate, a `compile_fail,E0599` doctest per type calls `new` and another calls `default`, and each sits beside a positive control that compiles; no doctest is a bare `compile_fail` (`09-security-model.md` §9.7.4.2 R3, R10)",
+        "`replay` of [Vector 41, Vector 68] yields `standing_commitment() == StandingCommitment::Abandoned { at_sequence: 1, event_digest }` with the digest of Vector 68, and `key_state_at` of that chain at Vector 41's digest yields `StandingCommitment::Fixed`: a test per case (`09-security-model.md` §9.7.4.2 R4, R8)",
+        "`validate_chain` applies the candidate rule: [Vector 41, C16-on-V41, the legal `KeyState` at sequence 1 of `25-test-vectors.md` §25.26] is `Valid` with both events' successor in the chain and one `Discarded{1, Some(digest), Content}` (`09-security-model.md` §9.7.4.2 R3)",
+        "`validate_entry` assembles an entry's units by predecessor digest and runs `validate_chain` on every inception-to-leaf path: [Vector 41, A@1, B@1], two legal `KeyState`s signed by Vector 41's root, yields `Valid{[V41, A], []}` and `Valid{[V41, B], []}` with `unplaced` empty (C21); [Vector 41, the separator-flipped `KeyState`, the legal `KeyState`] yields `Valid{[V41, KeyState], []}` with `unplaced` `[Discarded{1, None, Separator}]` (C22); and [Vector 41, X], X's predecessor digest naming no served or held event, yields `Valid{[V41], []}` with `unplaced` `[Discarded{1, None, Header}]` (C23): a test per fixture (`09-security-model.md` §9.7.4.2 R3, R9)",
+        "At position 0 the check order runs steps 1, 2 and 3, then 5, 6, 7 and 9: Vector 41 with one signature byte flipped yields `NoInception{[Discarded{0, Some(d8ba4ebad52657208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7), Threshold}]}`, and [Vector 41, the §25.26 `KeyState` with one signature byte flipped] yields `Valid{[V41], [Discarded{1, Some(4b56f7b97027fdcd5e480ecb88528441e30186b5e2b54db0fefd7b53ad1a120d), Threshold}]}` (C3); Vector 41 with one byte appended inside its unit after the signature field yields `NoInception{[Discarded{0, None, Walk}]}` (C5b); each expected digest is a §25 constant or a `sha2::Sha256` the test computes, never a value scp-kel returns: a test per fixture (`09-security-model.md` §9.7.4.2 R3)",
+        "`HeldHead::check_next(chain, preimage)` refuses with `Stale { handed, held }` unless the handed chain's head digest equals the held head's digest, comparing digests and never sequences, then runs steps 1 to 9 on the candidate as the next position and returns a `SigningChange`; `HeldHead` is built only by `of_log(&ValidatedChain)` and `from_marker(&HeldHeadMarker)`, and only `HeldHead::check_next` and `SigningChange::inception`, over an R2-checked inception, construct a `SigningChange`: a test hands an equal-height chain whose head is the other branch's event and asserts `Stale` (`09-security-model.md` §9.7.4.2 R10)",
+        "`ValidatedChain::extend(self, unit)` runs steps 1 to 9 on one unit as the next position and returns `Result<ValidatedChain, (ValidatedChain, Discarded)>`, handing the chain back on failure with no per-event chain copy, and `prefix(position)` returns the valid chain through that position: a test asserts that extending Vector 41 unit by unit along a valid chain yields the chain `validate_chain` yields, and that an illegal unit returns the unchanged chain with its `Discarded` (`09-security-model.md` §9.7.4.2 R3, R10)",
+        "`compute_key_continuity_fingerprint` takes two `&ReplayedState`, Vectors 20 and 38 run as unit tests in `crates/scp-protocol/src/crypto/key_continuity.rs` through a `pub(crate) fingerprint_of` over the §25 bytes, and the callers in `crates/scp-runtime/tests/test_vectors.rs`, `crates/scp-testing/tests/integration/conformance.rs` and `crates/scp-testing/tests/integration/identity.rs` reach the fingerprint through `replay` or are deleted: the known-answer tests pass and `cargo test -p scp-protocol` passes (`09-security-model.md` §9.11)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
         "Implement `verify_indexed` for both signature forms and the strict client-data parser.",
-        "Implement `validate_chain` over R1 through R4 and `replay` under R8.",
-        "Write one negative fixture per R3 defect and add the two fuzz targets."
+        "Implement `validate_entry`, `validate_chain` over R1 through R4 in R3's check order, `ValidatedChain::extend`, `validate_change`, `validate_inception`, `HeldHead` and `SigningChange`, and `replay` under R8 with `StandingCommitment::Abandoned`.",
+        "Write one negative fixture per R3 defect, fixtures C1 to C23, and the two fuzz targets.",
+        "Move `compute_key_continuity_fingerprint` onto `&ReplayedState` and rewrite its callers."
       ],
       "blockedBy": [
         "SCP-308"
@@ -11089,9 +11121,10 @@
         "crates/scp-kel/src/rank.rs",
         "crates/scp-kel/src/retention.rs",
         "crates/scp-kel/src/verdict.rs",
-        "crates/scp-kel/src/relation.rs"
+        "crates/scp-kel/src/relation.rs",
+        "crates/scp-testing/tests/integration/key_state_params.rs"
       ],
-      "description": "Architecture slice S3. `rank_suffix` implements R6, `resolve_set` compares chains pairwise, `RetentionSet::admit` applies R9's count bound, byte bound and eviction rank, `classify` applies R11, R12 and R14 and yields a verdict only from an exhausted source apart from R9's rank-1 early stop, and `classify_relation` decides R10's relation over a chain's valid prefix. `09-security-model.md` §9.7.4.2 states each rule.",
+      "description": "Architecture slice S3. `rank_suffix` implements R6, `resolve_set` compares chains pairwise, `RetentionSet::admit` applies R9's count bound, byte bound and eviction rank, `classify` maps SCP-309's `ChainValidation` and applies R11, R12 and R14, constructs the `ResolvedState` a `Confirmed` or `Adopted` outcome carries, and yields a verdict only from an exhausted source apart from R9's rank-1 early stop, and `classify_relation` decides R10's relation over a chain's valid prefix. `09-security-model.md` §9.7.4.2 states each rule.",
       "acceptanceCriteria": [
         "A property test asserts that a suffix's rank does not change when the suffix is extended (`09-security-model.md` §9.7.4.2 R6)",
         "A property test asserts that `resolve_set` returns the same outcome for every order of its input chains (`09-security-model.md` §9.7.4.2 R6, R7)",
@@ -11100,6 +11133,10 @@
         "`classify` returns `Inconclusive{MissingEvents}` for a complete chain read from an unexhausted source, and returns `Contested{Rank1Terminal}` from an unexhausted source holding two rank-1 suffixes: a test per case (`09-security-model.md` §9.7.4.2 R9)",
         "The five worked examples of `09-security-model.md` §9.7.4.2 each run as a test that reproduces the outcome the table row they trace names",
         "`resolve_set` over Vector 54's and Vector 55's suffixes of `25-test-vectors.md` §25.29 ranks them 1 and 2 and adopts Vector 54's head, in either input order (`09-security-model.md` §9.7.4.2 R6)",
+        "`classify` matches `ChainValidation` exhaustively with no wildcard arm, under `#![deny(clippy::wildcard_enum_match_arm)]` in `verdict.rs`: `InceptionInvalid` maps to `ResolutionVerdict::Invalid`, a unit variant, and `NoInception` and `Valid` map to the R11, R12 and R14 verdicts; a `compile_fail,E0559` doctest writes `ResolutionVerdict::Invalid { at_event: 3 }` beside a positive control that compiles (`09-security-model.md` §9.7.4.2 R14, `03-identity.md` §3.10.10)",
+        "`classify_relation` passes a discarded event's `Discarded` to the caller and decides the relation over the prefix before it: a test per relation (`09-security-model.md` §9.7.4.2 R10)",
+        "`ResolvedState` in `crates/scp-kel/src/verdict.rs` carries the `ReplayedState` and the resolution instant, only the verdict classifier constructs it, on `Confirmed` or `Adopted`, and `is_fresh(now)` is false once `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS` has passed since the resolution: a `compile_fail,E0451` doctest for its struct literal beside a positive control, and a test on each side of the bound (`03-identity.md` §3.10.10, `09-security-model.md` §9.18.7)",
+        "`crates/scp-testing/tests/integration/key_state_params.rs` walks with `syn` every type node of every parameter of a `pub fn` and of a method of a `pub trait`, and of every field of a `pub struct`, over `crates/*/src` and `crates/scp-ffi/*/src`, scp-did included, through references, `Option`, slices, `Arc` and generic bounds, and fails on `KeyState`, `KeyStateView` or `ReplayedState`; it exempts the defining impls of those three types in scp-did and scp-kel, scp-kel's `replay` and verdict modules, and `compute_key_continuity_fingerprint`; it first runs on the must-fail inputs `pub fn f(k: Option<&scp_did::KeyState>) {}` and `pub fn g(r: &[ReplayedState]) {}` and asserts one hit each, and any hit on main is fixed in the same PR",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -11117,41 +11154,61 @@
         {
           "file": ".docs/specs/25-test-vectors.md",
           "section": "## 25.29 Reveal-Authorized Event, Ranking and Identifier Text-Form Vectors (§9.7.4.2 definitions, R3, R6, `03-identity.md` §3.1)"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.10 IdentityBackend, the Resolution Trait"
         }
       ],
       "details": {}
     },
     {
       "id": "SCP-311",
-      "title": "Implement the custody traits, the passkey callbacks, and the headless backup methods",
+      "title": "Implement the passkey and FIDO2 signers, every production next-set custody, the headless backup methods, and their host callbacks",
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
       "status": "pending",
       "files": [
-        "crates/scp-platform/src/credential_signer.rs",
         "crates/scp-platform/src/recovery_handle_store.rs",
         "crates/scp-platform/src/headless_backup.rs",
-        "crates/scp-client-wasm/src/credentials.rs"
+        "crates/scp-client-wasm/src/credentials.rs",
+        "crates/scp-platform/src/next_set/",
+        "crates/scp-ffi/src/custody.rs",
+        "crates/scp-ffi/napi/src/custody.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "bindings/swift/Sources/SCP/Platform/",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/",
+        "bindings/typescript/src/internal/",
+        "bindings/python/scp_sdk/",
+        "crates/scp-testing/src/conformance/next_set_custody.rs",
+        ".docs/standards/sdk-capability-matrix.json"
       ],
-      "description": "Architecture slice S8. A root or pre-rotation key held in a passkey signs through a `CredentialSigner` trait whose implementation each platform supplies through a host callback, and the store set R10 names is reached through a `RecoveryHandleStore` trait. The headless profile offers the three copyable methods `09-security-model.md` §9.7.4.1 names. §9.7.4.1 states which method conforms on which profile.",
+      "description": "Architecture slice S8. A root or pre-rotation key held in a passkey signs through the `KeyEventSigner` contract of SCP-345, whose assertion-arm implementation each platform supplies through a host callback; the ADR-057 browser client implements `KeyEventSigner` directly over `navigator.credentials`, and the store set R10 names is reached through a `RecoveryHandleStore` trait. The headless profile offers the three copyable methods `09-security-model.md` §9.7.4.1 names. §9.7.4.1 states which method conforms on which profile. This story owns the production implementors: the passkey and FIDO2 `KeyEventSigner`s, every production `NextSetCustody`, the headless copyable methods as `NextSetCustody::seal_backup` and `restore`, the ADR-054 callback interfaces in PyO3, UniFFI and napi, and the four SDK host adapters. SCP-345 owns the contract and the raw-arm implementors.",
       "acceptanceCriteria": [
-        "`CredentialSigner` returns a WebAuthn assertion whose client-data challenge is the event digest, on Swift through `ASAuthorization`, on Kotlin through Credential Manager, and in the browser through `navigator.credentials`: one test per platform against a platform fake (`09-security-model.md` §9.7.4.1 item 4)",
+        "The passkey `KeyEventSigner` returns `IndexedSignature::WebAuthnAssertion` whose client-data challenge is `change.key_event_challenge()`, on Swift through `ASAuthorization`, on Kotlin through Credential Manager, and in the browser through `navigator.credentials`: one test per platform against a platform fake (`09-security-model.md` §9.7.4.1 item 4)",
         "`RecoveryHandleStore` reads and writes the platform-account member and the `largeBlob` member of the store set, and reports a `largeBlob` write that does not land: a test per member (`09-security-model.md` §9.7.4.2 R10)",
-        "The encrypted offline backup uses AES-256-GCM under an Argon2id key with the one parameterization `17-persistence-and-storage.md` §17.8 states, and an auto-generated passphrase carries at least 128 bits of entropy: a known-answer test and an entropy test (`09-security-model.md` §9.7.4.1 item 4)",
-        "The Shamir method splits a key 3-of-5 over GF(2^8) into 34-byte shares, and any three shares reconstruct it: a property test (`09-security-model.md` §9.7.4.1 item 4)",
-        "The paper method encodes a key as a 24-word BIP39 mnemonic and decodes it back: a known-answer test (`09-security-model.md` §9.7.4.1 item 4)",
+        "The encrypted offline backup, through `NextSetCustody::seal_backup` and `restore`, uses AES-256-GCM under an Argon2id key with the one parameterization `17-persistence-and-storage.md` §17.8 states, and an auto-generated passphrase carries at least 128 bits of entropy: a known-answer test and an entropy test (`09-security-model.md` §9.7.4.1 item 4)",
+        "The Shamir method, through `NextSetCustody::seal_backup` and `restore`, splits a key 3-of-5 over GF(2^8) into 34-byte shares, and any three shares reconstruct it: a property test (`09-security-model.md` §9.7.4.1 item 4)",
+        "The paper method, through `NextSetCustody::seal_backup` and `restore`, encodes a key as a 24-word BIP39 mnemonic and decodes it back: a known-answer test (`09-security-model.md` §9.7.4.1 item 4)",
         "The SDK offers each method only on the profiles the method-by-profile table marks as conforming: a test per table row (`09-security-model.md` §9.7.4.1 item 4)",
+        "A FIDO2 token over CTAP is a `KeyEventSigner` and a `NextSetCustody` for `PreRotationCustodyKind::HardwareSecurityKey`, returning `IndexedSignature::WebAuthnAssertion` over `change.key_event_challenge()`: a test against a CTAP fake (`09-security-model.md` §9.7.4.1)",
+        "PyO3, UniFFI and napi each declare the ADR-054 next-set callback interface with exactly the methods `generate`, `public_key` (33 bytes), `sign_change` (`signChange`, receiving the 32-byte digest), `sign_probe` (`signProbe`, receiving the 32-byte probe digest) and `destroy`, and the host implements the raw arm only: a test per bridge drives each method through a host fake (ADR-054)",
+        "The Swift, Kotlin, TypeScript and Python SDKs each ship a host adapter for that callback interface, and the SDK capability matrix lists each adapter for each SDK: a test per SDK calls each method",
+        "`next_set_custody_conformance!()` runs against every `NextSetCustody` implementor this story ships (`16-test-infrastructure.md` §16.12.3a)",
+        "`seal_backup` is offered only on the `Headless` profile and only at generation, and every implementor that is not `Headless` returns `NextSetCustodyError::MethodNotOffered`; the codecs in `crates/scp-platform/src/headless_backup.rs` are `pub(crate)` to scp-platform: a test per implementor (`09-security-model.md` §9.7.4.1)",
+        "`restore` refuses an artifact whose key does not match the expected commitment, and no public function outside scp-platform returns a reconstructed scalar: a test per method (`09-security-model.md` §9.7.4.1 item 5d)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Declare `CredentialSigner` and `RecoveryHandleStore` in `scp-platform`.",
+        "Declare `RecoveryHandleStore` in `scp-platform`, and implement the passkey and FIDO2 `KeyEventSigner`s and every production `NextSetCustody`.",
         "Wire the Swift, Kotlin and browser host callbacks.",
         "Implement the three headless backup methods.",
         "Write the tests the acceptance criteria name."
       ],
       "blockedBy": [
-        "SCP-307"
+        "SCP-307",
+        "SCP-345"
       ],
       "sources": [
         {
@@ -11165,6 +11222,10 @@
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
           "section": "## 17.8 Platform-Specific Key Custody"
+        },
+        {
+          "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md",
+          "section": "### Canonical method names (locked across bindings)"
         }
       ],
       "details": {}
@@ -11178,9 +11239,10 @@
       "status": "pending",
       "files": [
         "crates/scp-identity/src/write.rs",
-        "crates/scp-identity/src/lib.rs"
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-identity/src/error.rs"
       ],
-      "description": "The write API `03-identity.md` §3.10.10 declares. Every event that needs a root threshold is composed as a `PendingEvent`: `Identity::create` composes the inception event, `rotate_active` and `set_witnesses` each compose a `KeyState`, and `Recovery::begin` (SCP-305) composes the reveal-authorized events. Each holder of a named member calls `Identity::cosign`, and `Identity::attach` checks the signatures and publishes. SCP-008 implements the event composition these operations call.",
+      "description": "The write API `03-identity.md` §3.10.10 declares. Every event that needs a root threshold is composed as a `PendingEvent`: `Identity::create` composes the inception event, `rotate_active` and `set_witnesses` each compose a `KeyState`, and `Recovery::begin` (SCP-305) composes the reveal-authorized events. Each holder of a named member calls `Identity::cosign`, and `Identity::attach` checks the signatures and publishes. SCP-008 implements the event composition these operations call. Every signing path signs only a `SigningChange`, which SCP-309's `HeldHead::check_next` builds against the head the signing device holds, through SCP-345's `KeyEventSigner` (`09-security-model.md` §9.7.4.2 R10).",
       "acceptanceCriteria": [
         "`Identity<S>` declares `create`, `rotate_active`, `set_witnesses`, `cosign` and `attach` with the signatures `03-identity.md` §3.10.10 declares: a compile test calls each",
         "A root threshold of 1 held by this SDK completes in one call: `Identity::create(config, SignerPlan::ThisSdk)`, `rotate_active(reason, SignerPlan::ThisSdk)` and `set_witnesses(.., SignerPlan::ThisSdk)` each return `EventOutcome::Published`, and `SignerPlan::ThisSdk` on an identity whose threshold this SDK's members do not meet returns `IdentityError::SignatureSetIncomplete`: a test per method and one for the shortfall (`03-identity.md` §3.10.10)",
@@ -11193,6 +11255,13 @@
         "`cosign` and `attach` each refuse a `PendingEvent` whose `event_digest` differs from SHA-256 of its `preimage` with `IdentityError::PendingDigestMismatch` (SCP-IDENT-1114): a test per operation (`03-identity.md` §3.10.10)",
         "`cosign`'s confirmation shows every field the event's kind carries: a test composes a `set_witnesses` event and asserts that the display lists the identifier, the sequence, the predecessor digest, each `Current` key with its role, each dropped key with its condition, the witness set and the seals (`09-security-model.md` §9.7.4.2 R10)",
         "`create` and every composing method refuse a root set or next set of more than one member whose threshold is at or below half its size with `IdentityError::ThresholdAdmitsDisjointQuorums` (SCP-IDENT-1115), and accept a 3-of-4 set: a test per case (`09-security-model.md` §9.7.4.1)",
+        "One signing path: `Identity::cosign`, `Identity::attach`, and the `SignerPlan::ThisSdk` path of `create`, `rotate_active`, `set_witnesses` and recovery `begin` (SCP-305) each obtain a `SigningChange` first, `create` through `SigningChange::inception` and every other operation through `HeldHead::check_next`, and sign only through `KeyEventSigner::sign_change`; no public function in scp-identity, scp-ffi or any binding accepts key-event preimage bytes and returns a signature (`09-security-model.md` §9.7.4.2 R10)",
+        "`PendingEvent` carries `chain`, the encoded event units from the inception through the predecessor; `cosign` runs `validate_chain` over `chain` against `pending.identifier`, then `HeldHead::check_next` on `pending.preimage`, checks `digest() == pending.event_digest` (SCP-IDENT-1114), checks that its custody key is a member of the group whose index it signs, and displays the event's effect before it signs: a test per check (`03-identity.md` §3.10.10)",
+        "`attach` runs `validate_chain` over `chain` followed by the signed unit before it publishes, and publishes nothing on a discard: a test (`09-security-model.md` §9.7.4.2 R10)",
+        "`IdentityError::IllegalKeyEvent { stage: CheckStep }`, SCP-IDENT-1117, is returned by `cosign` and `attach` and by the composers of SCP-006, SCP-008 and SCP-305: `cosign` with a `chain` carrying one flipped byte of Vector 41 returns 1117 or the resolve error and makes zero sign calls, and `cosign` on an A26 preimage returns 1117 and makes zero sign calls (`03-identity.md` §3.10.10)",
+        "`Identity::create` under `SignerPlan::ThisSdk` signs only an R2-checked inception: an inception carrying two `Current` `#active` keys is refused with SCP-IDENT-1117 and makes zero sign calls (`09-security-model.md` §9.7.4.2 R10)",
+        "`cosign` signs only at the head this device holds: a test hands a cosigner the genuine prefix of its own chain truncated one event below its head, with a legal change on top, and asserts `SigningBaseStale` (SCP-IDENT-1118) and zero sign calls; an equal-height test hands a chain whose head at the cosigner's held sequence is the other branch's event and asserts `SigningBaseStale` and zero sign calls; a device with no retained log adopts the head through one self-observation pass, writes its `HeldHeadMarker`, and signs; and a device with no log, no marker and no reachable relay refuses with `SigningBaseStale` (`09-security-model.md` §9.7.4.2 R10)",
+        "`Identity::create` mints each root member through `generate_key_event_keypair`, each custody record's type is `P256KeyEvent`, and `create` makes zero calls to `generate_identity_keypair`: a test over a counting custody wrapper (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -11201,7 +11270,9 @@
         "Write one test per acceptance criterion."
       ],
       "blockedBy": [
-        "SCP-008"
+        "SCP-008",
+        "SCP-309",
+        "SCP-345"
       ],
       "sources": [
         {
@@ -11277,12 +11348,15 @@
       ],
       "description": "Architecture slice S11. PyO3, UniFFI and napi export identical identity and recovery functions, and each SDK wraps them under the names the shared scaffold's naming table gives, including `identity.recovery()` and `observe_self`. Every name-bound enumeration keeps the spec's PascalCase in every language. This satisfies the integration checklist's second, third and fifth checks.",
       "acceptanceCriteria": [
-        "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self`, `identity_rotate_active`, `identity_set_witnesses`, `identity_cosign`, `identity_attach` and the `recovery_*` functions, `recovery_begin` included: `ffi_conformance.rs` asserts each export on each bridge",
+        "PyO3, UniFFI and napi each export `identity_create`, `identity_resolve`, `identity_publish`, `identity_read_service_record`, `identity_publish_service_record`, `identity_read_policy`, `identity_fallback_set`, `identity_observe_self`, `identity_rotate_active`, `identity_set_witnesses`, `identity_cosign`, `identity_attach` and the `recovery_*` functions, `recovery_begin` included, where `identity_cosign` takes a `PendingEvent` including `chain` and no bridge exports a key-event signer over raw bytes: `ffi_conformance.rs` asserts each export on each bridge",
         "Each SDK wraps each export under the name the shared scaffold's naming table gives: a test per SDK calls each wrapper",
-        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind`, `ComposingDevice`, `SignatureGroup`, `SignerPlan`, `EventOutcome`, `RotationReason` and `ResolutionVerdict` carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
+        "`EntryReach`, `ChainRelation`, `ExtendingAct`, `EntryResult`, `NotSentReason`, `RecoveryPhase`, `RecoveryKind`, `ComposingDevice`, `SignatureGroup`, `SignerPlan`, `EventOutcome`, `RotationReason`, `ResolutionVerdict`, `CheckStep`, `OwnDiscardClass`, `StandingCommitment` and `KeyStateView`, with `RecoveryPhase` including `Discarded`, carry their spec variant names verbatim in every SDK: a conformance test compares the variant names across the five languages (`03-identity.md` §3.10.10)",
         "One conformance fixture of identity operations replays in Rust, Python, TypeScript, Swift and Kotlin with identical results",
         "The SDK capability matrix lists every operation above for every SDK",
-        "The agent-key exports, `identity_migrate`, the DID-document classes and the FFI DHT client are absent from all three bridges: a grep per name prints nothing"
+        "The agent-key exports, `identity_migrate`, the DID-document classes and the FFI DHT client are absent from all three bridges: a grep per name prints nothing",
+        "In each bridge, a test passes `identity_cosign` a `PendingEvent` whose preimage carries A26 (two `Current` `#active` keys) and asserts code SCP-IDENT-1117 and zero calls on the custody provider's sign callback (`09-security-model.md` §9.7.4.2 R10)",
+        "Each bridge returns `ResolutionOutcome.key_state` as a `KeyStateView` built from the `ResolvedState` through `From<&ResolvedState>`, and no bridge export or SDK function takes a `KeyStateView` parameter: a test per bridge resolves [Vector 41, Vector 50] and asserts every field (`03-identity.md` §3.10.10)",
+        "Each bridge maps SCP-IDENT-1116, 1117 and 1118 to the host error type and exposes `SelfObservation.discarded_own` with `DiscardedOwnEvent` and `OwnDiscardClass`: a test per bridge per code, and one per bridge for the observation (`03-identity.md` §3.10.10)"
       ],
       "actionItems": [
         "Add the bridge exports and the SDK wrappers.",
@@ -11342,7 +11416,8 @@
         "`grep -rn -i 'ed25519' crates/scp-platform/src` prints nothing",
         "A UCAN carries an ES256 signature: a round-trip test signs a UCAN with a P-256 key and verifies it (`09-security-model.md` §9.5)",
         "`PushRegistration::registrant` and `PushDeregistration::registrant` hold the `Identifier` SCP-308 defines, encoded as the 56-byte `scp:` text form, and the push store and the push golden vectors carry that form; the `SCP-PUSH-REGISTER-V1:` and `SCP-PUSH-DEREGISTER-V1:` separators are unchanged (`22-human-readable-addressing.md` §22.11.4, `09-security-model.md` §9.5.2)",
-        "`KelPushVerifier::verify` replaces the refuse-all stub PUSH-005 left: it resolves the registrant's key-event log through SCP-007's `resolve`, validates and replays it through SCP-309's `validate_chain` and `replay`, and verifies the message's signature against the `#active` key `Current` in the replayed key state. A test accepts a registration and a deregistration signed by the `#active` key of a valid chain and returns the registrant, and refuses one signed by a key the replayed state holds as `Superseded` or `Compromised`, one whose chain fails validation, and one whose identifier resolves to no chain, each with a typed `PushVerifyError` (`22-human-readable-addressing.md` §22.11.4, `09-security-model.md` §9.5.2, §9.7.4.2 R8)"
+        "`KelPushVerifier::verify` replaces the refuse-all stub PUSH-005 left: it resolves the registrant through SCP-007's `resolve` and verifies the message's signature against the `#active` key `Current` in the `ResolvedState` the `ResolutionOutcome` carries. A test accepts a registration and a deregistration signed by the `#active` key of a valid chain, and returns the registrant. A test accepts one signed by the `#active` key of a chain whose later event was discarded (a served chain [Vector 41, C16-on-V41], verified under Vector 41's `#active`). It refuses, each with the named `PushVerifyError` variant: a signature by a key the resolved state holds `Superseded`, `Retired` or `Compromised` → `NotCurrentActive`; a resolution whose verdict is `Invalid` (a defective inception) → `IdentifierUnresolvable`; a resolution that carries no key state on any other verdict (`Inconclusive` of any cause, including every source answering empty, and `Contested`, `Discarded`), or a `ResolvedState` that is no longer fresh → `KeyStateUnavailable`, which the push gate answers with its retryable code `5004`; a signature that does not verify under the `#active` key → `SignatureInvalid`; a message that does not decode → `Malformed`; and a verifier constructed with no resolver → `VerifierUnavailable`. One test per case (`22-human-readable-addressing.md` §22.11.4, `09-security-model.md` §9.5.2, §9.7.4.2 R8, R14)",
+        "`PreRotationCustody`, `store_committed_pre_rotation_key`, `destroy_after_migration` and `PreRotationKeyHandle` are absent: `git grep -n` for each name under `crates/` prints nothing"
       ],
       "actionItems": [
         "Switch each path to the key-event log and delete the legacy symbol in the same pull request.",
@@ -12042,6 +12117,99 @@
         "integrationChecklistItem1": "Item 1 of the integration checklist in AGENTS.md, which asks for a Supervisor `dispatch_*` method, does not apply, because node start is a bridge constructor and not a Supervisor operation.",
         "kotlin": "Kotlin is out of scope. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later\"."
       }
+    },
+    {
+      "id": "SCP-345",
+      "title": "One signer contract for key-event members: `KeyType::P256KeyEvent`, its mint, `KeyEventSigner`, `NextSetCustody`, and the raw-arm implementors",
+      "gate": "gate-kel",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-kel/src/key_event_signer.rs",
+        "crates/scp-kel/src/lib.rs",
+        "crates/scp-platform/src/traits.rs",
+        "crates/scp-platform/Cargo.toml",
+        "crates/scp-platform/src/testing/",
+        "crates/scp-platform/src/file.rs",
+        "crates/scp-platform/src/sqlite/key_custody.rs",
+        "crates/scp-ffi/common/src/callback_custody.rs",
+        "crates/scp-ffi/napi/src/custody.rs",
+        "crates/scp-ffi/src/custody.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-runtime/src/crypto/dh_counting_custody.rs",
+        "crates/scp-runtime/src/crypto/key_loss_custody.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidKeyCustody.kt",
+        "bindings/typescript/src/internal/custody-adapter.ts",
+        "bindings/typescript/src/scp.ts",
+        "bindings/python/scp_sdk/scp.py",
+        "crates/scp-client-wasm/src/custody.rs",
+        "crates/scp-testing/src/conformance/key_custody.rs"
+      ],
+      "description": "Every key-event member, a root member, a K′ member or a next-set member, signs through one contract, `KeyEventSigner`, declared with `CustodyProbe` and `KeyEventSignError` in scp-kel at `crates/scp-kel/src/key_event_signer.rs`, so the ADR-057 browser client, which depends on no scp-platform, implements it directly. The contract hands a substrate only a checked change's digest (the raw arm), its `key_event_challenge()` (the assertion arm), or a custody probe's fixed bytes, and its one change input is a `SigningChange`, which only SCP-309's `HeldHead::check_next` and `SigningChange::inception` construct (`09-security-model.md` §9.7.4.2 R10, *A device signs only a legal event at the head it holds* and *What the signing rule cannot reach*). A key-event key is `KeyType::P256KeyEvent`, minted only by `KeyCustody::generate_key_event_keypair`; raw `sign` refuses it. `KeyCustody` and `NextSetCustody` take `KeyEventSigner` as a supertrait, so a missing implementation does not compile. This story owns the contract, the mint, the `NextSetCustody` trait, the Rust-side custody record that fixes a callback key's type, and every raw-arm implementor. SCP-311 owns the assertion arm (passkey and FIDO2), every production `NextSetCustody` implementor, the headless backup methods and the ADR-054 callbacks. `generate_identity_keypair` and the pseudonym derivations are unchanged until SCP-315.",
+      "acceptanceCriteria": [
+        "`KeyType` gains `P256KeyEvent`, host string `p256-key-event`, and `KeyCustody::generate_key_event_keypair` is its one mint: it generates a P-256 key in `KeyRole::Operational` recorded as `P256KeyEvent`; `generate_keypair(KeyType::P256KeyEvent)` returns `PlatformError::WrongKeyType`; and `generate_identity_keypair`, `derive_pseudonym`, `derive_rotatable_pseudonym` and `require_derive_source` keep their behavior on main (ADR-006, ADR-021)",
+        "`KeyEventSigner` in `crates/scp-kel/src/key_event_signer.rs` declares `type Member`, `sign_change(&self, member, change: &SigningChange)` and `sign_probe(&self, member, probe: &CustodyProbe)`, each returning `Result<IndexedSignature, KeyEventSignError>`; its futures are `Send` on every target but `wasm32`, where a wasm-bindgen `JsFuture` is not `Send`; and `cargo build -p scp-kel --target wasm32-unknown-unknown` passes (`09-security-model.md` §9.7.4.2 R10)",
+        "`CustodyProbe` is built in Rust from the 32-byte nonce; its raw-arm digest is SHA-256(\"SCP-CUSTODY-PROBE-V1:\" || nonce) and its assertion-arm challenge is the one `09-security-model.md` §9.7.4.1 item 5d fixes: a known-answer test per arm",
+        "`KeyCustody: KeyEventSigner<Member = KeyHandle>` and `NextSetCustody: KeyEventSigner<Member = NextSetKeyHandle>`; `NextSetCustody` declares `generate`, `reveal_public_key` returning the 33-byte SEC1 compressed point, `destroy` and `custody_kind`, and no method that returns key material: a compile test implements each trait without `sign_change` and asserts the build fails with error E0046 (`09-security-model.md` §9.7.4.1)",
+        "An in-memory `NextSetCustody` lives at `crates/scp-platform/src/testing/next_set_custody.rs` behind the `testing` feature, is the first caller of `next_set_custody_conformance!()`, and is reachable from no shipped build: `scripts/check-shipped-feature-graph.sh` exits 0 (`16-test-infrastructure.md` §16.12.3a)",
+        "`crates/scp-ffi/common/src/callback_custody.rs`: `CallbackKeyRegistry` is backed by a `CustodyRecordStore` declared in scp-platform (`put(handle, KeyType, KeyRole)`, `get(handle)`), injected through each bridge adapter's constructor, and stored in the bridge runtime's SQLCipher storage in production; an adapter built with no record store refuses `generate_key_event_keypair` and every sign of an unrecorded handle with a typed error; `generate_key_event` records `P256KeyEvent` before it returns the handle; `resolve` refuses with `CustodyError` a host `get_public_key` answer that disagrees with the record; and the `P256KeyEvent` refusal lives once, in `callback_custody::sign` (ADR-021)",
+        "Per bridge (PyO3, UniFFI, napi): a test mints a key-event key, drops and rebuilds the adapter over the same record store, has the host report `p256` for that key, calls `sign`, and asserts the refusal and zero host `sign` calls",
+        "Per bridge: `sign_change` through the host's existing `sign` callback hands the host the 32-byte `change.digest()` and yields a signature `verify_prehash_strict` accepts over that digest, and `sign_probe` hands the host exactly SHA-256(\"SCP-CUSTODY-PROBE-V1:\" || nonce) and never the nonce: a test per bridge per method",
+        "File custody: `StoredKeyType` gains a `P256KeyEvent` byte that `entry_aad` binds, and a conformance case flips the stored type byte of a key-event entry and asserts decryption fails; SQLite custody stores the type inside SQLCipher's authenticated pages, and a case asserts the round trip (`17-persistence-and-storage.md` §17.8)",
+        "`key_custody_conformance!()` case `key_event_refuses_sign`: `sign` on a `generate_key_event_keypair` handle returns `WrongKeyType` (`16-test-infrastructure.md` §16.12.3)",
+        "`key_custody_conformance!()` case `key_event_refuses_dh_agree`: `dh_agree` on a key-event handle returns `WrongKeyType` (`16-test-infrastructure.md` §16.12.3)",
+        "`key_custody_conformance!()` case `key_event_refuses_derive_pseudonym`: `derive_pseudonym` on a key-event handle returns `NotIdentityKey`, because `require_derive_source` checks the role before the type, and the custody performs no derivation (`16-test-infrastructure.md` §16.12.3)",
+        "`key_custody_conformance!()` case `key_event_refuses_derive_rotatable_pseudonym`: `derive_rotatable_pseudonym` on a key-event handle returns `NotIdentityKey` and the custody performs no derivation (`16-test-infrastructure.md` §16.12.3)",
+        "`key_custody_conformance!()` case `key_event_not_minted_by_generate_keypair`: `generate_keypair(KeyType::P256KeyEvent)` returns `WrongKeyType` (`16-test-infrastructure.md` §16.12.3)",
+        "`key_custody_conformance!()` case `identity_mint_never_key_event`: the custody record of a `generate_identity_keypair` handle has type `Ed25519` (`16-test-infrastructure.md` §16.12.3)",
+        "`key_custody_conformance!()` case `key_event_signs_change`: `sign_change` on a `SigningChange` over Vector 41's preimage returns a signature `verify_prehash_strict` accepts under the handle's public key (`16-test-infrastructure.md` §16.12.3)",
+        "`key_custody_conformance!()` case `signing_key_refuses_sign_change`: `sign_change` on a `P256Signing` handle returns `WrongKeyType` (`16-test-infrastructure.md` §16.12.3)",
+        "`key_custody_conformance!()` case `no_import_as_key_event`: every import method `KeyCustody` has, `import_ed25519_signing_key` included, returns a handle whose `KeyType` is not `P256KeyEvent` (`16-test-infrastructure.md` §16.12.3)",
+        "`Identity::create` mints each root member through `generate_key_event_keypair`, each custody record's type is `P256KeyEvent`, and `create` makes zero calls to `generate_identity_keypair`: a test over a counting custody wrapper (`09-security-model.md` §9.7.4.2 R10)",
+        "Every implementor: the callback custody and the napi, PyO3 and UniFFI adapters delegate to the shared flows and take the record store in their constructors; `NoOpCustody` in scp-node refuses `sign_change` as its `sign` refuses; file and SQLite custody sign with the stored P-256 scalar where the record's type is `P256KeyEvent`; the in-memory testing custody signs in memory; the counting, key-loss and lock-checking wrappers delegate; the Swift `p256KeyEvent = \"p256-key-event\"` and Kotlin `P256_KEY_EVENT(\"p256-key-event\")` cases generate, sign with and report a P-256 key as `p256-key-event`; TypeScript `KEY_TYPES` and `CustodyKeyType` and Python `CustodyKeyType` add `p256-key-event`; and the ADR-057 browser client implements `KeyEventSigner` directly through SCP-311's passkey signer, its `CustodyKeyType` gains no value, and a case in its custody tests asserts that `generateKeypair(\"p256-key-event\")` is refused. `git grep -n \"impl.*KeyCustody for\"` lists no implementor this criterion leaves out",
+        "No unwrap() or expect() in library code"
+      ],
+      "actionItems": [
+        "Declare `KeyEventSigner`, `CustodyProbe` and `KeyEventSignError` in `crates/scp-kel/src/key_event_signer.rs`.",
+        "Add `KeyType::P256KeyEvent`, `generate_key_event_keypair`, the `KeyEventSigner` supertrait on `KeyCustody`, and the `NextSetCustody` trait with its in-memory testing implementor in scp-platform.",
+        "Back `CallbackKeyRegistry` with a `CustodyRecordStore` and move the `P256KeyEvent` refusal into `callback_custody::sign`.",
+        "Implement the raw arm in every `KeyCustody` implementor and add `p256-key-event` to every host key-type set.",
+        "Add the key-event cases to `key_custody_conformance!()`."
+      ],
+      "blockedBy": [
+        "SCP-309"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-006: Platform Abstraction (In-Memory Testing Adapter)"
+        },
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-021: UniFFI Bridge Definitions"
+        },
+        {
+          "file": ".docs/adrs/ADR-054-pre-rotation-custody-substrate-isolation.md",
+          "section": "### Canonical method names (locked across bindings)"
+        },
+        {
+          "file": ".docs/specs/16-test-infrastructure.md",
+          "section": "### 16.12.3 `key_custody_conformance!()`"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.1 Pre-Rotation Key Custody"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.4.2 Root-Authority Recovery and Fork Precedence"
+        }
+      ],
+      "details": {}
     }
   ]
 }

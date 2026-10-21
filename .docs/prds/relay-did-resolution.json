@@ -655,20 +655,30 @@
         "crates/scp-transport/src/relay/kel_registry.rs",
         "crates/scp-transport/src/storage/mod.rs",
         "crates/scp-transport/src/relay/query.rs",
-        "crates/scp-transport/Cargo.toml"
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-relay-client/src/error.rs",
+        "crates/scp-transport/tests/"
       ],
-      "description": "Architecture slice S5. A validating relay executes the duties `09-security-model.md` §9.10.12 and §9.7.4.2 assign to it: the `retain` duty and its three refusals, the admission precondition R10's diverged arm depends on, and the accepted-chain rule of R9. Every listed relay signs a relay proof of control over each QUERY response. ADR-063 lists these sites by party under its heading *The relay's storage policy moved to the relay ADR on 2026-09-21*; what a relay keeps, reclaims or charges for is ADR-065's, the relay ADR, pending; the tag `archive/kel-combined-pre-split` preserves the combined text. `key_event_validation.rs` replaces `did_record_validation.rs`, and `KelRegistry` replaces `DidSlotRegistry`.",
+      "description": "Architecture slice S5. A validating relay executes the duties `09-security-model.md` §9.10.12 and §9.7.4.2 assign to it: the `retain` duty and its three refusals, the admission precondition R10's diverged arm depends on, and the accepted-chain rule of R9, and the R3 check order on every event it stores (`09-security-model.md` §9.7.4.2 R10). Every listed relay signs a relay proof of control over each QUERY response. ADR-063 lists these sites by party under its heading *The relay's storage policy moved to the relay ADR on 2026-09-21*; what a relay keeps, reclaims or charges for is ADR-065's, the relay ADR, pending; the tag `archive/kel-combined-pre-split` preserves the combined text. `key_event_validation.rs` replaces `did_record_validation.rs`, and `KelRegistry` replaces `DidSlotRegistry`.",
       "acceptanceCriteria": [
         "A validating relay rejects a PUBLISH at a retained kind that does not set `retain`, rejects `retain` on any other kind, and rejects a PUBLISH carrying both `retain` and `blob_ttl`: one test per refusal (`09-security-model.md` §9.10.12)",
         "A relay that does not validate rejects a PUBLISH carrying `retain: true`: a test asserts it (`09-security-model.md` §9.10.12)",
         "`BlobStorage::store` persists the `retain` flag in every storage backend, and purge skips every retained record: one test per backend",
-        "`KelRegistry` admits a frame only where its first event is one the relay does not hold and that event is the inception event recomputing to the routing id's identifier or one whose predecessor the relay holds, and answers every other frame `4040`: a test per case, including a re-segmentation of a held chain (`09-security-model.md` §9.7.4.2 R10)",
+        "`KelRegistry` admits a frame only where its first event is one the relay does not hold and that event is the inception event recomputing to the routing id's identifier or one whose predecessor the relay holds, and answers every other frame `4040`: a test per case, including a re-segmentation of a held chain (`09-security-model.md` §9.7.4.2 R10); `KelRegistry` holds each chain it accepted as an `scp_kel::ValidatedChain` and checks each admitted event with `ValidatedChain::extend` on the chain at its predecessor (`prefix` where the predecessor is not a head)",
         "A validating relay answers `DELETE` of a record at `scp:did:`, `scp:svc:`, `scp:wit:` or `scp:wcf:` with `4041` RETAINED_RECORD and keeps the record: a test per kind (ADR-004, `09-security-model.md` §9.10.12)",
         "`KelRegistry` keys events by preimage digest, so a byte-different copy of an event it holds leaves the held copy in place: a test asserts it (`09-security-model.md` §9.7.4.2 R9)",
         "After each accepted frame the relay holds as accepted the chain that wins every pairwise R6 comparison, and where no chain wins every comparison it keeps the chain it held first: a test per case (`09-security-model.md` §9.7.4.2 R9)",
         "The relay serves frames in receipt order, whichever chain it holds as accepted: a test asserts the served order after a rank-1 chain displaces an earlier one (`09-security-model.md` §9.7.4.2 R9)",
         "The QUERY handler signs a `RelayProof` under the operator key over the response's blob bytes, a response with no blob included, and attaches it to `query_complete`: a known-answer test reproduces Vector 44 of `25-test-vectors.md` §25.27 (`09-security-model.md` §9.10.12)",
         "`cargo tree -p scp-transport` lists no `scp-identity`",
+        "A validating relay refuses an illegal event: a test publishes Vector 41's frame, then a frame carrying fixture C16-on-V41 — a `KeyState` at sequence 1 carrying A26 (two `Current` `#active` keys), signed by Vector 41's root at threshold, so it fails at R3's step 8 (`Content`) — and asserts `ERR 4044` KEY_EVENT_ILLEGAL and that a QUERY of the routing id serves Vector 41's frame alone (`09-security-model.md` §9.7.4.2 R10, §9.10.12, ADR-004)",
+        "A validating relay stores a legal event: a test publishes Vector 41's frame and then the frame carrying the `KeyState` at sequence 1 of Vector 41's identity from `25-test-vectors.md` §25.26, and asserts both are stored and served in receipt order",
+        "A frame carrying a legal event followed by an illegal one is refused whole: a test asserts `4044` and that neither event is stored (`09-security-model.md` §9.7.4.2 R10)",
+        "A relay serves only frames it has checked: a test writes the illegal frame of the C16-on-V41 criterion into the storage backend directly, restarts the relay, and asserts that a QUERY serves Vector 41's frame alone (`09-security-model.md` §9.7.4.2 R10)",
+        "Each relay refusal stage is reachable: a `KeyState` on Vector 41 signed by a key outside Vector 41's root (C13-on-V41) is refused with `4044` at `Threshold`, and an inception that recomputes to another identifier is refused with `4040`: a test per case (`09-security-model.md` §9.7.4.2 R10)",
+        "A frame of `MAX_EVENTS_PER_FRAME` + 1 events is refused with `4040` before any signature is verified: a test over a counting verifier (`09-security-model.md` §9.10.12, §9.18.17)",
+        "A refused frame published again is answered `4044` with zero verifier calls (a counting verifier), and a restarted relay serves a tagged frame with zero verifier calls and re-checks a frame whose tag fails: a test per case (`09-security-model.md` §9.7.4.2 R10)",
+        "A frame whose first event is illegal costs one event's verification: a test over a counting verifier (`09-security-model.md` §9.7.4.2 R10)",
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
@@ -676,11 +686,13 @@
         "Persist `retain` in every `BlobStorage` backend and skip retained records on purge.",
         "Recompute the accepted chain by R6 after each accepted frame.",
         "Sign and attach the relay proof on `query_complete`.",
-        "Remove the `scp-identity` dependency from `scp-transport`."
+        "Remove the `scp-identity` dependency from `scp-transport`.",
+        "Add scp-kel as a regular dependency of scp-transport, and run R3's check order on every event of an admitted frame."
       ],
       "blockedBy": [
         "SCP-310",
-        "SCP-RELAYRES-009"
+        "SCP-RELAYRES-009",
+        "SCP-309"
       ],
       "sources": [
         {
