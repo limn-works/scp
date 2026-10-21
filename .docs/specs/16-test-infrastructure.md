@@ -53,6 +53,7 @@ crates/
         transport.rs         # transport_conformance!()
         storage.rs           # storage_conformance!()
         key_custody.rs       # key_custody_conformance!()
+        next_set_custody.rs  # next_set_custody_conformance!()
         attestation.rs       # attestation_conformance!()
         push.rs              # push_conformance!()
         blob_store.rs        # blob_store_conformance!()
@@ -1178,6 +1179,118 @@ macro_rules! key_custody_conformance {
             async fn sign_with_invalid_handle_errors() {
                 // Attempt sign with a fabricated handle, verify error.
             }
+
+            // A key-event key (`KeyType::P256KeyEvent`, minted only by
+            // `generate_key_event_keypair` in `KeyRole::Operational`) signs
+            // only through `KeyEventSigner` over a `SigningChange`
+            // (`09-security-model.md` §9.7.4.2 R10). Each case below runs on a
+            // handle from `generate_key_event_keypair` unless it names another.
+
+            #[tokio::test]
+            async fn key_event_refuses_sign() {
+                // `sign(handle, digest)` returns `WrongKeyType`.
+            }
+
+            #[tokio::test]
+            async fn key_event_refuses_dh_agree() {
+                // `dh_agree` returns `WrongKeyType`.
+            }
+
+            #[tokio::test]
+            async fn key_event_refuses_derive_pseudonym() {
+                // `derive_pseudonym` returns `NotIdentityKey`, because
+                // `require_derive_source` checks the role before the type, and
+                // the custody performs no derivation.
+            }
+
+            #[tokio::test]
+            async fn key_event_refuses_derive_rotatable_pseudonym() {
+                // `derive_rotatable_pseudonym` returns `NotIdentityKey`, for the
+                // same reason, and the custody performs no derivation.
+            }
+
+            #[tokio::test]
+            async fn key_event_not_minted_by_generate_keypair() {
+                // `generate_keypair(KeyType::P256KeyEvent)` returns `WrongKeyType`.
+            }
+
+            #[tokio::test]
+            async fn identity_mint_never_key_event() {
+                // The custody record of a `generate_identity_keypair` handle has
+                // type `Ed25519`.
+            }
+
+            #[tokio::test]
+            async fn key_event_signs_change() {
+                // `sign_change` on a `SigningChange` over Vector 41's preimage
+                // returns a signature that `verify_prehash_strict` accepts over
+                // the change's digest under the handle's public key.
+            }
+
+            #[tokio::test]
+            async fn signing_key_refuses_sign_change() {
+                // `sign_change` on a `P256Signing` handle returns `WrongKeyType`.
+            }
+
+            #[tokio::test]
+            async fn no_import_as_key_event() {
+                // Every import method the trait has returns a handle whose
+                // `KeyType` is not `P256KeyEvent`.
+            }
+        }
+    };
+}
+```
+
+### 16.12.3a `next_set_custody_conformance!()`
+
+The macro runs against every `NextSetCustody` implementor (`09-security-model.md` §9.7.4.1, §9.7.4.2 R10).
+
+```rust
+/// scp-testing/src/conformance/next_set_custody.rs
+
+/// Generates a test module verifying the NextSetCustody contract.
+///
+/// Usage:
+/// ```rust
+/// #[cfg(test)]
+/// next_set_custody_conformance!(|| InMemoryNextSetCustody::new());
+/// ```
+#[macro_export]
+macro_rules! next_set_custody_conformance {
+    ($constructor:expr) => {
+        #[cfg(test)]
+        mod next_set_custody_conformance {
+            use super::*;
+
+            #[tokio::test]
+            async fn generate_then_reveal_gives_compressed_point() {
+                // `generate`, then `reveal_public_key` returns a 33-byte SEC1
+                // compressed point.
+            }
+
+            #[tokio::test]
+            async fn sign_change_verifies() {
+                // `sign_change` on a `SigningChange` returns a signature that
+                // verifies over the change's digest under the revealed key.
+            }
+
+            #[tokio::test]
+            async fn sign_probe_signs_the_probe_preimage_only() {
+                // `sign_probe` returns a signature that verifies over
+                // SHA-256("SCP-CUSTODY-PROBE-V1:" || nonce) and never over a
+                // key-event challenge.
+            }
+
+            #[tokio::test]
+            async fn destroy_prevents_sign() {
+                // `destroy`, then `sign_change` with the same handle fails.
+            }
+
+            #[tokio::test]
+            async fn invalid_handle_errors() {
+                // A handle this custody did not generate errors on every method.
+            }
         }
     };
 }
@@ -1556,6 +1669,7 @@ Every simulation component maps to a specific protocol mechanism or threat:
 | `transport_conformance!()` | ADR-005 | TransportAdapter contract |
 | `storage_conformance!()` | ADR-006, §17.2 | Storage contract (6 methods, ordering guarantee) |
 | `key_custody_conformance!()` | ADR-006 | KeyCustody contract |
+| `next_set_custody_conformance!()` | ADR-054, `09-security-model.md` §9.7.4.1 | NextSetCustody contract |
 | `attestation_conformance!()` | ADR-006 | DeviceAttestation contract |
 | `push_conformance!()` | ADR-006 | Push contract |
 | `blob_store_conformance!()` | §17.11 | BlobStorage contract (5 methods, TTL, concurrent access) |
