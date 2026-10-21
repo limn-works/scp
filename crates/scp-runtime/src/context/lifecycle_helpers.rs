@@ -2036,72 +2036,18 @@ fn generate_initial_access_key_store(
 // 12. import_context (bootstrap; constructs fresh PerContextState)
 // ---------------------------------------------------------------------------
 
-/// A snapshot's MLS crypto rebuilt as OWNED material, with the Class-M floors
-/// it carried, before anything is merged into the Supervisor-owned registry.
-///
-/// [`build_restored_crypto`] is the only constructor, and
-/// [`restore_crypto_state_with_floor_guard`] the only consumer that applies the
-/// floors. The split lets a caller verify the rebuilt group's committed
-/// `0xFF02` extension (spec 05 §5.13.3, [`verify_scp_context_binding`]) after
-/// the rebuild and before the floor merge, so a refused group leaves the
-/// registry unchanged by the order of construction rather than by rollback.
-pub(in crate::context) struct RestoredCrypto {
-    owned: Option<crate::crypto::mls::provider::OwnedMlsCryptoState>,
-    floors: crate::crypto::mls::provider::RestoredFloors,
-}
-
-impl RestoredCrypto {
-    /// The rebuilt group and sender-key material, or `None` for an empty
-    /// (keyless / needs-reconnect) `mls_state`.
-    pub(in crate::context) const fn owned(
-        &self,
-    ) -> Option<&crate::crypto::mls::provider::OwnedMlsCryptoState> {
-        self.owned.as_ref()
-    }
-}
-
-/// Rebuilds `mls_state` as OWNED crypto material plus the Class-M floors it
-/// carried. A pure function of its inputs: it touches no provider state, no
-/// floor registry, and no wrapping key. An empty `mls_state` yields no owned
-/// crypto and empty floors (cold path / keyless needs-reconnect snapshot).
-///
-/// # Errors
-///
-/// Returns `ContextError::PersistenceFailed`, prefixed with `site`, if the
-/// crypto rebuild fails.
-pub(in crate::context) fn build_restored_crypto(
-    ctx_id_bytes: &[u8; 32],
-    mls_state: &[u8],
-    site: &str,
-) -> Result<RestoredCrypto, ContextError> {
-    if mls_state.is_empty() {
-        return Ok(RestoredCrypto {
-            owned: None,
-            floors: crate::crypto::mls::provider::RestoredFloors::default(),
-        });
-    }
-    let (owned, floors) =
-        crate::crypto::mls::provider::NodeMlsFactory::build_restored_owned(ctx_id_bytes, mls_state)
-            .map_err(|e| {
-                ContextError::PersistenceFailed(format!("{site}: crypto state restore failed: {e}"))
-            })?;
-    Ok(RestoredCrypto {
-        owned: Some(owned),
-        floors,
-    })
-}
-
 /// §23.17 Invariant 2/3/4 — the SINGLE floor-guarded crypto-restore path for
-/// import, `PrepareForReplace`, respawn, and restore. Merges the floors a
-/// [`build_restored_crypto`] rebuild recovered INTO the authoritative
-/// Supervisor-owned Class-M registry (ADR-049 PR-6) and returns the owned
-/// crypto. EVERY crypto-restore site — the actor-side `PrepareForReplace`
-/// handler, `import_context`, and `restore_context` — routes through here so
-/// the replay (floor-regression) guard cannot be bypassed.
+/// import, `PrepareForReplace`, respawn, and restore. Merges the floors of a
+/// [`VerifiedRestoredCrypto`](crate::context::restored_crypto::VerifiedRestoredCrypto)
+/// INTO the authoritative Supervisor-owned Class-M registry (ADR-049 PR-6).
+/// EVERY crypto-restore site — the actor-side `PrepareForReplace` handler,
+/// `import_context`, and `restore_context` — routes through here so the replay
+/// (floor-regression) guard cannot be bypassed.
 ///
-/// A caller that verifies the rebuilt group's `0xFF02` binding does so on
-/// [`RestoredCrypto::owned`] BEFORE calling this, so a refused group never
-/// reaches the registry.
+/// The input is [`VerifiedFloors`](crate::context::restored_crypto::VerifiedFloors),
+/// which only a `VerifiedRestoredCrypto` yields, so floors from a group whose
+/// `0xFF02` binding (spec 05 §5.13.3) was not verified cannot reach the
+/// registry.
 ///
 /// The registry is the authoritative live floor home and is NOT torn down here,
 /// so there is no pre-teardown "capture" step: the snapshot floors are the merge
@@ -2110,12 +2056,11 @@ pub(in crate::context) fn build_restored_crypto(
 /// COLD restart (empty live registry, non-empty snapshot) still POPULATES the
 /// registry — closing the cold-restart replay window (D2).
 ///
-/// Returns `Ok(Some(owned))` with the rebuilt OWNED crypto material for the
-/// caller to seed onto a `PerContextState` (`import_context`,
-/// `restore_context`), or `Ok(None)` when the snapshot carried no MLS group
-/// (keyless / needs-reconnect). A terminating caller (`PrepareForReplace`)
-/// drops the returned owned material — it still runs the floor gate below but
-/// seeds nothing (ADR-049 PR-7 C3 seed-vs-terminal resolution).
+/// Import and restore reach it through
+/// [`VerifiedRestoredCrypto::merge_floors`](crate::context::restored_crypto::VerifiedRestoredCrypto::merge_floors),
+/// which returns the owned group for the seed only after this merge succeeds.
+/// The terminating `PrepareForReplace` actor calls it with the floors alone
+/// and seeds nothing (ADR-049 PR-7 C3 seed-vs-terminal resolution).
 ///
 /// `trusted_local` selects the spec §23.17.2 merge semantics:
 ///
@@ -2133,19 +2078,17 @@ pub(in crate::context) fn build_restored_crypto(
 /// Returns `ContextError::CryptoFailed` (from `From<FloorAdvanceError>`, the
 /// §23.17 replay-protection rejection the registry's `validate_and_merge_*`
 /// sink returns) if a per-sender floor regresses (import path) or overshoots
-/// (both paths); the owned crypto is dropped on rejection (the `SenderKey` and
-/// the `ScpMlsGroup`'s Ed25519 signer zeroize on drop) and the registry is left
-/// unchanged (validate-before-apply across both axes).
+/// (both paths), and the registry is left unchanged (validate-before-apply
+/// across both axes).
 pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     deps: &ActorDeps,
     ctx_id_bytes: &[u8; 32],
-    restored: RestoredCrypto,
+    floors: &crate::context::restored_crypto::VerifiedFloors,
     trusted_local: bool,
-) -> Result<Option<crate::crypto::mls::provider::OwnedMlsCryptoState>, ContextError> {
+) -> Result<(), ContextError> {
     // #2148 (ADR-049 birth-into-actor): the crypto is ACTOR-owned end to end —
     // the provider holds NO per-context state, so there is no provider-resident
     // crypto to tear down first.
-    let RestoredCrypto { owned, floors } = restored;
 
     // Map the restore's `trusted_local` bool to the registry merge's §23.17.2
     // `MergePolicy`: a trusted-local respawn max-merges and tolerates the
@@ -2165,18 +2108,19 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     // `incoming.is_empty()` — NOT on the live floors — so on a COLD restart
     // (empty live registry, NON-empty snapshot) it RUNS and POPULATES the
     // registry, closing D2. FAIL-CLOSED via `?`; `From<FloorAdvanceError>` maps
-    // a rejection to `ContextError::CryptoFailed`. On rejection `owned` is
-    // dropped at the `?` return (zeroizing on drop), so a rejected restore is
-    // never seeded onto an actor and writes no durable snapshot.
+    // a rejection to `ContextError::CryptoFailed`. On rejection
+    // `VerifiedRestoredCrypto::merge_floors` drops the owned group at its `?`
+    // return (zeroizing on drop), so a rejected restore is never seeded onto an
+    // actor and writes no durable snapshot.
     deps.supervisor.validate_and_merge_all_floors(
         ctx_id_bytes,
-        floors.sender_epochs,
-        floors.recv_sequence,
+        floors.sender_epochs().to_vec(),
+        floors.recv_sequence().to_vec(),
         scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
         policy,
     )?;
 
-    Ok(owned)
+    Ok(())
 }
 
 /// Verifies a joined or rehydrated MLS group's committed `scp_context_params`
@@ -2277,6 +2221,29 @@ pub(in crate::context) fn verify_scp_context_binding(
              unreadable (§5.13.3): {e}"
         )),
     }
+}
+
+/// Persists an import's event-log data, if it carries any.
+///
+/// Takes the import's floor-guarded crypto, which exists only after the
+/// group's `0xFF02` binding was verified and its floors merged, so the foreign
+/// log cannot be persisted for a refused import.
+///
+/// # Errors
+///
+/// Propagates the event-log provider's import failure.
+async fn hydrate_imported_event_log(
+    deps: &ActorDeps,
+    _floor_guarded: &crate::context::restored_crypto::FloorGuardedCrypto,
+    ctx_id_bytes: &[u8; 32],
+    event_log_data: &[u8],
+) -> Result<(), ContextError> {
+    if !event_log_data.is_empty() {
+        deps.event_log
+            .import_event_log_data(ctx_id_bytes, event_log_data)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Imports a previously exported context.
@@ -2470,14 +2437,19 @@ pub async fn import_context(
     // no registry write) and verify its committed `0xFF02` binding BEFORE any
     // side effect: before the `PrepareForReplace` floor gate and terminal claim
     // on a prior actor, before the replay-floor merge, and before the event-log
-    // import. A refused import therefore leaves the registry's floors, any prior
-    // actor, and the event log as they were, by the order of construction.
+    // import. Each of those steps takes the `VerifiedRestoredCrypto` the binding
+    // check returns, or data only it yields, so no other order compiles, and a
+    // refused import leaves the registry's floors, any prior actor, and the
+    // event log as they were.
     //
     // Crypto state is read from the SIGNED snapshot field (ADR-050: all
     // importer-restored state lives in the signed preimage), never from an
     // unsigned envelope blob. Validated by `validate_export_for_import` above.
-    let imported_crypto =
-        build_restored_crypto(&ctx_id_bytes, &export.snapshot.mls_crypto_state, "import")?;
+    let imported_crypto = crate::context::restored_crypto::build_restored_crypto(
+        &ctx_id_bytes,
+        &export.snapshot.mls_crypto_state,
+        "import",
+    )?;
 
     // §5.13.3 rule 1 (FFI-02, load-time binding). Verify that the rebuilt
     // group's committed `scp_context_params` (`0xFF02`) extension binds the SAME
@@ -2490,30 +2462,28 @@ pub async fn import_context(
     // an SCP context) or any rule 2-6 mismatch is rejected as a forged/corrupt
     // import; the owned material is dropped (the `SenderKey` and the group's
     // signer zeroize on drop) so no forged crypto is ever seeded. A keyless
-    // (needs-reconnect) snapshot has no owned group to bind, so it is skipped.
+    // (needs-reconnect) snapshot has no owned group to bind, so it verifies as
+    // `RestoredBinding::Keyless`.
     //
-    // The check returns the committed `T0` (§5.13.3 rule 9), which becomes the
+    // The check carries the committed `T0` (§5.13.3 rule 9), which becomes the
     // pseudonym-rotation base and the TTL base below. A keyless import has no
     // committed extension, so `committed_t0` is `None`: it runs no rotation
     // schedule, and its local TTL close uses the deadline the imported
     // (exporter's) snapshot records (rule 9's keyless clause).
-    let committed_t0 = match imported_crypto.owned() {
-        None => None,
-        Some(owned) => Some(
-            verify_scp_context_binding(
-                owned
-                    .mls_group
-                    .group_context_extension()
-                    .map_err(|e| e.to_string()),
-                &context_id,
-                export.snapshot.role_state.creator_did.as_str(),
-                &export.snapshot.context_params,
-                deps.clock.now_secs(),
-                Some(export.snapshot.creation_timestamp_secs),
-                "context import",
-            )
-            .map_err(|reason| ContextError::ImportRejected { reason })?,
-        ),
+    let imported_crypto =
+        crate::context::restored_crypto::VerifiedRestoredCrypto::verify_scp_context_binding(
+            imported_crypto,
+            &context_id,
+            export.snapshot.role_state.creator_did.as_str(),
+            &export.snapshot.context_params,
+            deps.clock.now_secs(),
+            export.snapshot.creation_timestamp_secs,
+            "context import",
+        )
+        .map_err(|reason| ContextError::ImportRejected { reason })?;
+    let committed_t0 = match imported_crypto.binding() {
+        crate::context::restored_crypto::RestoredBinding::Committed { t0 } => Some(t0),
+        crate::context::restored_crypto::RestoredBinding::Keyless => None,
     };
     // The TTL base (§5.13.3 rule 9): the committed `T0`, which the binding check
     // above proved equal to the snapshot's `creation_timestamp_secs`. A keyless
@@ -2537,7 +2507,7 @@ pub async fn import_context(
     if deps.supervisor.lookup(&context_id)?.is_some() {
         match deps
             .supervisor
-            .dispatch_prepare_for_replace(&context_id, export.snapshot.mls_crypto_state.0.clone())
+            .dispatch_prepare_for_replace(&context_id, imported_crypto.replace_floors())
             .await
         {
             Ok(()) => {
@@ -2575,15 +2545,16 @@ pub async fn import_context(
     // `trusted_local = false`. The merge is idempotent with the
     // `PrepareForReplace` gate. The owned group is seeded onto the fresh
     // `PerContextState` at "6b" further down.
-    let imported_owned =
-        restore_crypto_state_with_floor_guard(deps, &ctx_id_bytes, imported_crypto, false)?;
+    let imported_crypto = imported_crypto.merge_floors(deps, &ctx_id_bytes, false)?;
 
     // 3. Import event log data if present.
-    if !export.event_log_data.is_empty() {
-        deps.event_log
-            .import_event_log_data(&ctx_id_bytes, &export.event_log_data)
-            .await?;
-    }
+    hydrate_imported_event_log(
+        deps,
+        &imported_crypto,
+        &ctx_id_bytes,
+        &export.event_log_data,
+    )
+    .await?;
 
     // 4. Reconstruct the ContextHandle.
     let handle = ContextHandle::new(context_id.clone(), export.snapshot.context_params.clone());
@@ -2955,7 +2926,7 @@ pub async fn import_context(
     //     `None` — nothing to seed; the actor keeps its default-empty encrypted
     //     mode until a reconnect Welcome arrives. (Import is encrypted-only — a
     //     broadcast export is rejected at the top of this function.)
-    if let Some(owned) = imported_owned {
+    if let Some(owned) = imported_crypto.into_owned() {
         per_context.seed_encrypted_crypto_from_owned(owned);
     }
 
@@ -3105,8 +3076,16 @@ pub async fn load_persisted_context_state(
 }
 
 /// Best-effort event log restore from persistence.
+///
+/// Takes the restore's floor-guarded crypto, which exists only after the
+/// group's `0xFF02` binding was verified and its floors merged, so a refused
+/// restore never hydrates the log.
 #[allow(dead_code)] // Transitive of `restore_context` — see bootstrap rationale.
-async fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
+async fn restore_event_log_best_effort(
+    deps: &ActorDeps,
+    _floor_guarded: &crate::context::restored_crypto::FloorGuardedCrypto,
+    context_id: &str,
+) {
     use crate::context::state::context_id_to_bytes;
     let ctx_id_bytes = context_id_to_bytes(context_id);
     if let Err(e) = deps.event_log.restore_event_log(&ctx_id_bytes).await {
@@ -3217,7 +3196,9 @@ pub async fn restore_context(
     // #2148 (ADR-049 birth-into-actor) restore/respawn/cold-restart seam:
     // rehydrate the per-context MLS crypto as OWNED material and SEED it directly
     // onto the actor's `PerContextState` below (`build_restored_crypto` → verify
-    // the binding → merge floors → `seed_encrypted_crypto_from_owned`). This is
+    // the binding → merge floors → hydrate the event log →
+    // `seed_encrypted_crypto_from_owned`, each step taking the previous step's
+    // typed output, so no other order compiles). This is
     // the RESPAWN (`Supervisor::respawn_from_snapshot`) AND COLD-RESTART
     // (`restore_all_contexts`) path — both reach here through `restore_context`.
     // `build_restored_crypto` is a pure function of the snapshot: it touches no
@@ -3225,8 +3206,11 @@ pub async fn restore_context(
     // none; the keypair is one per identity, owned by the supervisor, spec 09
     // §9.16.1). The actor is the SOLE crypto authority by construction.
     let ctx_id_bytes = context_id_to_bytes(context_id);
-    let restored_crypto =
-        build_restored_crypto(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state, "restore")?;
+    let restored_crypto = crate::context::restored_crypto::build_restored_crypto(
+        &ctx_id_bytes,
+        &ctx_snapshot.mls_crypto_state,
+        "restore",
+    )?;
 
     // §5.13.3 rule 1 (FFI-02, load-time binding). Verify the rehydrated group's
     // committed `scp_context_params` (`0xFF02`) extension binds the SAME
@@ -3242,23 +3226,20 @@ pub async fn restore_context(
     // The check also returns the committed `T0` (§5.13.3 rule 9), refusing a
     // snapshot whose recorded creation timestamp differs from it; `None` for a
     // keyless (needs-reconnect) snapshot, which carries no group.
-    let restore_committed_t0 = match restored_crypto.owned() {
-        None => None,
-        Some(owned) => Some(
-            verify_scp_context_binding(
-                owned
-                    .mls_group
-                    .group_context_extension()
-                    .map_err(|e| e.to_string()),
-                context_id,
-                ctx_snapshot.role_state.creator_did.as_str(),
-                &ctx_snapshot.context_params,
-                deps.clock.now_secs(),
-                Some(ctx_snapshot.creation_timestamp_secs),
-                "context restore",
-            )
-            .map_err(ContextError::PersistenceFailed)?,
-        ),
+    let restored_crypto =
+        crate::context::restored_crypto::VerifiedRestoredCrypto::verify_scp_context_binding(
+            restored_crypto,
+            context_id,
+            ctx_snapshot.role_state.creator_did.as_str(),
+            &ctx_snapshot.context_params,
+            deps.clock.now_secs(),
+            ctx_snapshot.creation_timestamp_secs,
+            "context restore",
+        )
+        .map_err(ContextError::PersistenceFailed)?;
+    let restore_committed_t0 = match restored_crypto.binding() {
+        crate::context::restored_crypto::RestoredBinding::Committed { t0 } => Some(t0),
+        crate::context::restored_crypto::RestoredBinding::Keyless => None,
     };
 
     // §23.17 Invariant 2 (trusted-local self-respawn / process-restart):
@@ -3269,12 +3250,11 @@ pub async fn restore_context(
     // that lag and rejects only a corrupt overshoot beyond `MAX_EPOCH_ADVANCE`.
     // This routes the cold-restart (empty-registry) floors through the SAME
     // sink, closing the D2 replay window on first boot.
-    let restored_owned =
-        restore_crypto_state_with_floor_guard(deps, &ctx_id_bytes, restored_crypto, true)?;
+    let restored_crypto = restored_crypto.merge_floors(deps, &ctx_id_bytes, true)?;
 
     // Hydrate the event log only now that every refusal has passed. The TTL
     // deadline below reads it for the fail-safe `TtlExtended` term.
-    restore_event_log_best_effort(deps, context_id).await;
+    restore_event_log_best_effort(deps, &restored_crypto, context_id).await;
 
     // Resolve the ABSOLUTE convergent TTL re-arm deadline through the partitioned
     // single-source deadline (§5.10 / §5.10.1, ADR-049 §9), AFTER the binding
@@ -3626,8 +3606,8 @@ pub async fn restore_context(
     // (epoch, send_sequence) AAD pairing on the next seal). Floors are NOT seeded
     // here — the Supervisor-owned Class-M registry is authoritative and was
     // already merged above. Broadcast contexts carry no MLS crypto
-    // (`restored_owned` is `None`) and keep their reconstructed `Broadcast` mode.
-    if let Some(owned) = restored_owned {
+    // (`into_owned` yields `None`) and keep their reconstructed `Broadcast` mode.
+    if let Some(owned) = restored_crypto.into_owned() {
         per_context.seed_encrypted_crypto_from_owned(owned);
     }
 

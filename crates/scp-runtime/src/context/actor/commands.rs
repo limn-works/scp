@@ -3766,18 +3766,21 @@ pub enum LifecycleControlCommand {
     /// an imported context with the same id. Running on its own owned
     /// `PerContextState`, the actor checks it is replaceable (lifecycle
     /// state `Closing | Closed | Expired | Tombstoned` — NEVER overwrite
-    /// a live context), then atomically captures, tears down, restores,
-    /// and validate/merges the per-sender MLS epoch floors (§23.17 Inv
-    /// 3/4) against the incoming crypto bytes. On success it transitions
+    /// a live context), then validate/merges the incoming export's
+    /// verified per-sender MLS floors (§23.17 Inv 3/4) into the
+    /// Supervisor-owned registry. On success it transitions
     /// its own lifecycle to a terminal claim and the dispatch loop exits,
     /// so the supervisor can despawn it and spawn the imported state.
     /// Because each actor processes one command at a time, this is the
     /// serialization point the legacy `write_lock`-guarded import gate
     /// provided.
     PrepareForReplace {
-        /// The incoming export's MLS crypto bytes (empty = no incoming
-        /// crypto state) — the only handler-side payload import needs.
-        mls_state: zeroize::Zeroizing<Vec<u8>>,
+        /// The incoming export's Class-M floors, taken from the
+        /// `VerifiedRestoredCrypto` import built after verifying the group's
+        /// `0xFF02` binding (spec 05 §5.13.3). Only that verified value
+        /// yields a `VerifiedFloors`, so this gate cannot run on an
+        /// unverified group. Empty for a keyless export.
+        floors: crate::context::restored_crypto::VerifiedFloors,
         /// `Ok(())` iff the context was replaceable AND crypto teardown +
         /// epoch-floor validate/merge succeeded. On failure the actor stays
         /// live (no terminal claim) and surfaces the reason: `MembershipFailed`
@@ -3785,7 +3788,7 @@ pub enum LifecycleControlCommand {
         /// `SnapshotFloorRegression` (the §23.17 replay-guard rejection — a
         /// per-sender epoch floor regressed; the import caller MUST propagate
         /// it, never route it to a recovery/re-restore path), or
-        /// `PersistenceFailed` (`restore_crypto_state` failed). The
+        /// `CryptoFailed` (the floor merge overshot). The
         /// supervisor-side `dispatch_prepare_for_replace` additionally maps a
         /// dropped reply / unreachable actor to `ContextNotRegistered` — the
         /// ONLY error the import caller treats as a stale-handle retry.

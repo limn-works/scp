@@ -20634,6 +20634,28 @@ mod tests {
         .expect("build test 0xFF02 extension")
     }
 
+    /// The floors of `blob` (an [`actor_export`] of a [`test_ctx_ext`] group, or
+    /// empty for a keyless snapshot) after the real `0xFF02` binding check, the
+    /// only source of a `VerifiedFloors`.
+    fn verified_test_floors(
+        ctx: &[u8; 32],
+        blob: &[u8],
+    ) -> crate::context::restored_crypto::VerifiedFloors {
+        let restored = crate::context::restored_crypto::build_restored_crypto(ctx, blob, "test")
+            .expect("the blob rebuilds");
+        crate::context::restored_crypto::VerifiedRestoredCrypto::verify_scp_context_binding(
+            restored,
+            &hex::encode(ctx),
+            "",
+            &scp_protocol::context::ContextParams::default(),
+            1_700_000_000,
+            1_700_000_000,
+            "test",
+        )
+        .expect("the test_ctx_ext binding verifies")
+        .replace_floors()
+    }
+
     /// #2148 (ADR-049 birth-into-actor): BIRTH an owned context group on `crypto`
     /// via the owned-return `create_mls_group_with_context` and seed it onto a
     /// throwaway actor `PerContextState` — the actor-native replacement for the
@@ -23559,7 +23581,7 @@ mod tests {
         let result: Result<(), ContextError> = handle
             .send(|reply| {
                 ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
-                    mls_state: zeroize::Zeroizing::default(),
+                    floors: verified_test_floors(&ctx_id_bytes, &[]),
                     reply,
                 })
             })
@@ -23621,7 +23643,7 @@ mod tests {
         let result: Result<(), ContextError> = handle
             .send(|reply| {
                 ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
-                    mls_state: zeroize::Zeroizing::default(),
+                    floors: verified_test_floors(&ctx_id_bytes, &[]),
                     reply,
                 })
             })
@@ -27634,8 +27656,7 @@ mod tests {
         crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &fresh_deps,
             &ctx,
-            crate::context::lifecycle_helpers::build_restored_crypto(&ctx, &blob, "test")
-                .expect("the blob rebuilds"),
+            &verified_test_floors(&ctx, &blob),
             true,
         )
         .expect("cold restore must SUCCEED and populate the empty registry");
@@ -27748,8 +27769,7 @@ mod tests {
         let err = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &importer_deps,
             &ctx,
-            crate::context::lifecycle_helpers::build_restored_crypto(&ctx, &blob, "test")
-                .expect("the blob rebuilds"),
+            &verified_test_floors(&ctx, &blob),
             false,
         )
         .expect_err("a regressing untrusted import must be rejected");
@@ -27830,8 +27850,7 @@ mod tests {
         crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &fresh_deps,
             &ctx,
-            crate::context::lifecycle_helpers::build_restored_crypto(&ctx, &blob, "test")
-                .expect("the blob rebuilds"),
+            &verified_test_floors(&ctx, &blob),
             true,
         )
         .expect("a high-epoch (>MAX_EPOCH_ADVANCE) context must restore under trusted-local");
@@ -27922,8 +27941,7 @@ mod tests {
         let err = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &importer_deps,
             &ctx,
-            crate::context::lifecycle_helpers::build_restored_crypto(&ctx, &blob, "test")
-                .expect("the blob rebuilds"),
+            &verified_test_floors(&ctx, &blob),
             false,
         )
         .expect_err("a recv-floor regression on an untrusted import must be rejected");

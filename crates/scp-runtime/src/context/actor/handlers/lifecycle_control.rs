@@ -63,8 +63,8 @@ pub(crate) async fn dispatch(
             let _ = reply.send(Ok(()));
             Outcome::ok_mutated(())
         }
-        LifecycleControlCommand::PrepareForReplace { mls_state, reply } => {
-            handle_prepare_for_replace(cell, deps, &mls_state, reply)
+        LifecycleControlCommand::PrepareForReplace { floors, reply } => {
+            handle_prepare_for_replace(cell, deps, &floors, reply)
         }
         // The test-only fault-injection variant is intercepted by the
         // actor's `dispatch_state` (in `actor/mod.rs`) BEFORE it reaches
@@ -89,14 +89,15 @@ pub(crate) async fn dispatch(
 /// handler rejects unless the context's lifecycle state is `Closing |
 /// Closed | Expired | Tombstoned`. A second concurrent
 /// `PrepareForReplace` is rejected by the terminal-claim check on
-/// `state.lifecycle_state` (the first sets it to `Closed`). The crypto
-/// teardown / epoch-floor validate+merge (§23.17 Inv 3/4) is a verbatim
-/// move of the former import-gate closure. On success the actor claims
-/// itself terminal and the run loop exits.
+/// `state.lifecycle_state` (the first sets it to `Closed`). The epoch-floor
+/// validate+merge (§23.17 Inv 3/4) runs on `floors`, which only a
+/// `VerifiedRestoredCrypto` yields, so this gate never runs for a group whose
+/// `0xFF02` binding (spec 05 §5.13.3) was not verified. On success the actor
+/// claims itself terminal and the run loop exits.
 fn handle_prepare_for_replace(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
-    mls_state: &[u8],
+    floors: &crate::context::restored_crypto::VerifiedFloors,
     reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let ctx_id_bytes = cell.context_id;
@@ -141,35 +142,19 @@ fn handle_prepare_for_replace(
     //
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C3 seed-vs-terminal: this actor is
     // TERMINATING (it claims itself `Closed` and exits just below), so it SEEDS
-    // NOTHING — the OWNED crypto material the helper rebuilds here is DROPPED
-    // immediately (the `Ok(_owned)` arm), zeroizing on drop. Its ONLY purpose on
-    // this path is to run the floor gate as the reject-before-terminal barrier.
-    // `import_context` rebuilds + SEEDS the owned crypto onto the fresh
-    // replacement actor after this actor is despawned; the floor merge is
-    // idempotent, so running it here (gate) and there (seed) is safe, and no two
-    // live copies ever seal (the dropped copy never encrypts anything).
-    // `import_context` verified this group's `0xFF02` binding (spec 05 §5.13.3)
-    // on its own rebuild of the same signed bytes before dispatching here, so a
-    // refused import never reaches this gate or the terminal claim below.
-    let gated = crate::context::lifecycle_helpers::build_restored_crypto(
+    // NOTHING and receives no crypto material, only the verified floors. Its
+    // ONLY purpose on this path is to run the floor gate as the
+    // reject-before-terminal barrier. `import_context` SEEDS the owned crypto
+    // onto the fresh replacement actor after this actor is despawned; the floor
+    // merge is idempotent, so running it here (gate) and there (seed) is safe.
+    if let Err(e) = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+        deps,
         &ctx_id_bytes,
-        mls_state,
-        "import",
-    )
-    .and_then(|restored| {
-        crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
-            deps,
-            &ctx_id_bytes,
-            restored,
-            false,
-        )
-    });
-    match gated {
-        Ok(_owned) => { /* terminal actor seeds nothing — drop the owned material */ }
-        Err(e) => {
-            let _ = reply.send(Err(e));
-            return Outcome::ok(());
-        }
+        floors,
+        false,
+    ) {
+        let _ = reply.send(Err(e));
+        return Outcome::ok(());
     }
 
     // Claim the slot terminal (rejects a racing second PrepareForReplace)

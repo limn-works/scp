@@ -792,7 +792,7 @@ impl SupervisorHandle {
     ///
     /// - `Err(MembershipFailed)` if the context is live (not replaceable)
     ///   or already claimed by a concurrent replace.
-    /// - `Err(PersistenceFailed)` / crypto error from the floor merge.
+    /// - `Err(CryptoFailed)` from the floor merge.
     /// - `Err(ContextNotRegistered)` if no actor is registered, or the
     ///   mailbox send / reply failed (a stale handle whose actor already
     ///   exited) — the caller re-checks `lookup` and falls back to the
@@ -800,7 +800,7 @@ impl SupervisorHandle {
     pub(in crate::context) async fn dispatch_prepare_for_replace(
         &self,
         context_id: &str,
-        mls_state: zeroize::Zeroizing<Vec<u8>>,
+        floors: crate::context::restored_crypto::VerifiedFloors,
     ) -> Result<(), ContextError> {
         use crate::context::actor::commands::{ContextCommand, LifecycleControlCommand};
 
@@ -809,7 +809,7 @@ impl SupervisorHandle {
         };
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let cmd = ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
-            mls_state,
+            floors,
             reply: reply_tx,
         });
         if actor
