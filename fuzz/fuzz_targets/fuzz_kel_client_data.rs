@@ -15,55 +15,103 @@
 //!   compared: a document the validator accepts is a JSON object whose
 //!   top-level `type` and `challenge` are the strings the validator
 //!   returned; a document the validator rejects as malformed JSON is one
-//!   serde_json rejects too. Where serde_json's `Value` refuses a number it
-//!   cannot convert, the comparison falls back to `IgnoredAny`, which checks
-//!   the grammar without converting, and compares accept against reject.
-//!   `IgnoredAny` decodes no string, so the fallback adds `std`'s UTF-8
-//!   check and skips a lone-surrogate rejection: pairing surrogates in a
-//!   document that also holds an out-of-range number is the one case
-//!   neither serde_json pass decides, and every other document compares it.
-//!   Duplicate names are skipped, because serde_json resolves them
-//!   last-wins and the acceptance set is stricter by design; inputs outside
-//!   1..=512 bytes are skipped, because the `AssertionSignature` bound
-//!   rejects them before the validator runs.
+//!   serde_json rejects too. serde_json reads a copy in which every number
+//!   token outside a string is `0`: its `Value` refuses a number past the
+//!   `f64` range, and a number's value is not in the acceptance set, so the
+//!   rewrite leaves every verdict and every string as it was and the
+//!   comparison runs on every document. Duplicate names are skipped,
+//!   because serde_json resolves them last-wins and the acceptance set is
+//!   stricter by design; inputs outside 1..=512 bytes are skipped, because
+//!   the `AssertionSignature` bound rejects them before the validator runs.
 
 use libfuzzer_sys::fuzz_target;
 use scp_kel::{
     AssertionSignature, ClientDataError, IndexedSignature, SignatureForm, parse_client_data_json,
 };
-use serde::Deserialize;
-use serde::de::IgnoredAny;
 use serde_json::Value;
 
-/// Parses `data` as `T` with serde_json's recursion limit disabled.
-fn unbounded<'a, T: Deserialize<'a>>(data: &'a [u8]) -> serde_json::Result<T> {
+/// Parses `data` as a `Value` with serde_json's recursion limit disabled.
+fn unbounded(data: &[u8]) -> serde_json::Result<Value> {
     let mut deserializer = serde_json::Deserializer::from_slice(data);
     deserializer.disable_recursion_limit();
-    let value = T::deserialize(&mut deserializer)?;
+    let value = serde::Deserialize::deserialize(&mut deserializer)?;
     deserializer.end()?;
     Ok(value)
 }
 
-/// The validator's verdict on whether `data` is JSON: `Some(true)` when it
-/// read the whole document as JSON (accepted, or rejected only for its
-/// top-level members), `Some(false)` when it found the bytes malformed, and
-/// `None` when it stopped early on a rule serde_json does not share (a
-/// duplicate name, a top level other than an object), so the rest of the
-/// document was never judged.
-const fn read_as_json(
-    result: &Result<scp_kel::ClientDataMembers, ClientDataError>,
-) -> Option<bool> {
-    match result {
-        Ok(_)
-        | Err(
-            ClientDataError::MissingType
-            | ClientDataError::TypeNotString
-            | ClientDataError::MissingChallenge
-            | ClientDataError::ChallengeNotString,
-        ) => Some(true),
-        Err(ClientDataError::DuplicateMember { .. } | ClientDataError::TopLevelNotObject) => None,
-        Err(_) => Some(false),
+/// Whether `run` matches the RFC 8259 §6 number grammar
+/// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+fn is_json_number(run: &[u8]) -> bool {
+    fn digits(run: &[u8], at: usize) -> usize {
+        run[at..].iter().take_while(|b| b.is_ascii_digit()).count()
     }
+    let mut at = usize::from(run.first() == Some(&b'-'));
+    match run.get(at) {
+        Some(b'0') => at += 1,
+        Some(b'1'..=b'9') => at += digits(run, at),
+        _ => return false,
+    }
+    if run.get(at) == Some(&b'.') {
+        let fraction = digits(run, at + 1);
+        if fraction == 0 {
+            return false;
+        }
+        at += 1 + fraction;
+    }
+    if matches!(run.get(at), Some(b'e' | b'E')) {
+        at += 1;
+        if matches!(run.get(at), Some(b'+' | b'-')) {
+            at += 1;
+        }
+        let exponent = digits(run, at);
+        if exponent == 0 {
+            return false;
+        }
+        at += exponent;
+    }
+    at == run.len()
+}
+
+/// A copy of `data` in which every maximal run of number bytes outside a
+/// string that is a well-formed JSON number becomes `0`. A run that is not a
+/// well-formed number stays, so a malformed document stays malformed; a
+/// number token in well-formed JSON is always such a run, since the bytes
+/// around it (`:`, `,`, `[`, `]`, `}`, whitespace) are not number bytes.
+fn zero_numbers(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut at = 0;
+    let mut in_string = false;
+    while let Some(&byte) = data.get(at) {
+        if in_string {
+            match byte {
+                b'\\' => {
+                    out.extend_from_slice(&data[at..(at + 2).min(data.len())]);
+                    at += 2;
+                    continue;
+                }
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b'-' || byte.is_ascii_digit() {
+            let len = data[at..]
+                .iter()
+                .take_while(|b| matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'))
+                .count();
+            let run = &data[at..at + len];
+            if is_json_number(run) {
+                out.push(b'0');
+            } else {
+                out.extend_from_slice(run);
+            }
+            at += len;
+            continue;
+        }
+        out.push(byte);
+        at += 1;
+    }
+    out
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -77,25 +125,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let ours = parse_client_data_json(&assertion);
-    let theirs = unbounded::<Value>(data);
-    if let Err(error) = &theirs {
-        if error.to_string().contains("number out of range") {
-            // `Value` converts numbers; `IgnoredAny` checks the grammar only.
-            if matches!(ours, Err(ClientDataError::LoneSurrogate { .. })) {
-                return;
-            }
-            if let Some(json) = read_as_json(&ours) {
-                let grammar = unbounded::<IgnoredAny>(data);
-                let utf8 = std::str::from_utf8(data).is_ok();
-                assert_eq!(
-                    json,
-                    utf8 && grammar.is_ok(),
-                    "accept/reject disagreement past the float range: {ours:?} vs utf8 {utf8}, {grammar:?}"
-                );
-            }
-            return;
-        }
-    }
+    let theirs = unbounded(&zero_numbers(data));
     match ours {
         Ok(members) => {
             let value = theirs.expect("the validator accepted JSON serde_json rejects");
