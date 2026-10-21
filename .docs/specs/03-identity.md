@@ -773,7 +773,7 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
-**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds, after it refuses a `PendingEvent` whose `chain` ends at a head other than the one this device holds, and refuses with `IdentityError::SignaturePending` an event at a sequence where this device's `PendingSignatureRecord` names a different event (`09-security-model.md` §9.7.4.2 R10). **`Identity::abandon_pending` is local**: the device's own user discards that device's own `PendingSignatureRecord` for the `PendingEvent` and, on the composing device, the composition it keeps, after which that device's `attach` refuses the composition with `IdentityError::NoPendingSignature`; no other device's state changes, and the call refuses with `IdentityError::NoPendingSignature` where the device holds neither (R10). **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
+**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds, after it refuses a `PendingEvent` whose `chain` ends at a head other than the one this device holds, and refuses with `IdentityError::SignaturePending` an event at a sequence where this device's `PendingSignatureRecord` names a different event (`09-security-model.md` §9.7.4.2 R10). **`Identity::abandon_pending` is local**: the device's own user discards that device's own `PendingSignatureRecord` for the `PendingEvent` and, on the composing device, its `KeptComposition`, after which that device's `attach` refuses the composition with `IdentityError::NoPendingSignature`; no other device's state changes, and the call refuses with `IdentityError::NoPendingSignature` where the device holds neither (R10). **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
 
 ```rust
 impl<S: EncryptedStorage> Identity<S> {
@@ -1021,9 +1021,9 @@ pub enum IdentityError {
     /// the record clears (`09-security-model.md` §9.7.4.2 R10).
     SignaturePending { sequence: u64, event_digest: [u8; 32] },
     /// SCP-IDENT-1120. `abandon_pending` named an event for which this
-    /// device holds neither a `PendingSignatureRecord` nor a kept composition,
+    /// device holds neither a `PendingSignatureRecord` nor a `KeptComposition`,
     /// so nothing cleared, or `attach` was handed an event that is not
-    /// reveal-authorized and whose composition this device does not keep, so
+    /// reveal-authorized and whose `KeptComposition` this device does not hold, so
     /// nothing was published (`09-security-model.md` §9.7.4.2 R10).
     NoPendingSignature { event_digest: [u8; 32] },
 }
@@ -1039,14 +1039,26 @@ pub enum CheckStep { Unit, Separator, InceptionBinding, Header, Walk, NamedCount
 /// The head a device that holds a key-event member last adopted, and never
 /// an event it signed and has not adopted, persisted at
 /// `HELD_HEAD_MARKER_BYTES` (`09-security-model.md` §9.18.17) and read by
-/// §9.7.4.2 R10's signing rule.
-pub struct HeldHeadMarker { pub identifier: Identifier, pub sequence: u64, pub event_digest: [u8; 32] }
+/// §9.7.4.2 R10's signing rule, whose `mode` decides whether the device
+/// signs every event at that head or a reveal-authorized event alone.
+pub struct HeldHeadMarker { pub identifier: Identifier, pub sequence: u64, pub event_digest: [u8; 32], pub mode: MarkerMode }
+
+/// `RevealOnly` is written only by R10's third exit under `Contested`;
+/// every other marker move writes `Any`.
+pub enum MarkerMode { Any, RevealOnly }
 
 /// An event that is not reveal-authorized, which a device signed and has not
 /// adopted, persisted at `PENDING_SIGNATURE_RECORD_BYTES`
 /// (`09-security-model.md` §9.18.17). §9.7.4.2 R10's signing rule states the
 /// four ways it clears.
 pub struct PendingSignatureRecord { pub identifier: Identifier, pub sequence: u64, pub event_digest: [u8; 32] }
+
+/// An event that is not reveal-authorized, which this device composed and
+/// returned as `EventOutcome::AwaitingSignatures` and has not published,
+/// persisted at `KEPT_COMPOSITION_BYTES` (`09-security-model.md` §9.18.17)
+/// before the composing method returns; `attach` publishes only an event
+/// whose `KeptComposition` the device holds (§9.7.4.2 R10).
+pub struct KeptComposition { pub identifier: Identifier, pub sequence: u64, pub event_digest: [u8; 32] }
 
 /// One relay entry's declared write policy, as that entry publishes it at
 /// `.well-known/scp`. **The type carries three fields and no others**, which
