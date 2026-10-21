@@ -653,6 +653,8 @@
       "files": [
         "crates/scp-transport/src/relay/key_event_validation.rs",
         "crates/scp-transport/src/relay/kel_registry.rs",
+        "crates/scp-transport/src/relay/mod.rs",
+        "crates/scp-transport/src/relay/did_record_validation.rs",
         "crates/scp-transport/src/storage/mod.rs",
         "crates/scp-transport/src/relay/query.rs",
         "crates/scp-transport/Cargo.toml",
@@ -689,7 +691,7 @@
         "A frame of `MAX_EVENTS_PER_FRAME` + 1 events is refused with `4040` before any signature is verified: a test over a counting verifier (`09-security-model.md` §9.10.12, §9.18.17)",
         "The refusal cache holds `4044` refusals only, keyed on SHA-256(`routing_id ‖ frame`), and the stored-frame tag is a MAC over `check_order_version ‖ routing_id ‖ frame`: a test per case asserts that a frame refused `4044` and published again at the same routing id is answered `4044` with zero verifier calls (a counting verifier); that a frame refused `4040` because its predecessor was absent, published again after the predecessor lands, is checked and stored; that the same bytes refused at a wrong routing id leave the correct routing id's PUBLISH checked and stored; that a restarted relay serves a tagged frame with zero verifier calls and re-checks a frame whose tag fails; and that a raised `check_order_version` empties the cache and re-checks every stored frame (`09-security-model.md` §9.7.4.2 R10)",
         "A frame whose first event is illegal costs one event's verification: a test over a counting verifier (`09-security-model.md` §9.7.4.2 R10)",
-        "No relay transport keeps a validation switch: `RelayConfig` in `native/server.rs`, the QUIC listener config in `quic/listener.rs`, the WebTransport session config in `webtransport/session.rs`, `webtransport/server.rs`, `udp/listener.rs`, `native/did_slot.rs`, `native/relay_publisher.rs`, `scp-node/src/http.rs` and `scp-node/src/self_host.rs` carry no validation-mode field, argument or doc, and `git grep -n did_record_validation` prints nothing (`09-security-model.md` §9.10.12, `10-infrastructure-and-self-hosting.md` §10.12.4)",
+        "No relay transport keeps a validation switch: `RelayConfig` in `native/server.rs`, the QUIC listener config in `quic/listener.rs`, the WebTransport session config in `webtransport/session.rs`, `webtransport/server.rs`, `udp/listener.rs`, `native/did_slot.rs`, `native/relay_publisher.rs`, `scp-node/src/http.rs` and `scp-node/src/self_host.rs` carry no validation-mode field, argument or doc, `crates/scp-transport/src/relay/mod.rs` declares no `did_record_validation` module and `crates/scp-transport/src/relay/did_record_validation.rs` does not exist, and `git grep -n -i did_record_validation -- crates bindings` and `git grep -n DidRecordValidation -- crates bindings` each print nothing (`09-security-model.md` §9.10.12, `10-infrastructure-and-self-hosting.md` §10.12.4)",
         "A malformed unit past the inception is refused with `4040`, not `4044`: a test publishes Vector 41's frame, then a frame carrying the §25.26 `KeyState` at sequence 1 followed by a unit whose length prefix runs past `value`, then one whose second unit's signature field does not walk, and asserts `4040` for each and that a QUERY serves Vector 41's frame alone; a frame whose second event's predecessor digest differs from the digest of the event before it gets `4044`: a test per case (`09-security-model.md` §9.7.4.2 R10, §9.10.12)",
         "No unwrap() or expect() in library code"
       ],
