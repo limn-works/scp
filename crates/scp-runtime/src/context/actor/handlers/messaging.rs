@@ -900,38 +900,25 @@ async fn handle_deliver_incoming(
     }
 
     // Spec 09 §9.10.4.1 "Membership trigger" and "Record lifetime": the merged
-    // Commit's membership changes (the removals and the rotation trigger)
-    // reach the actor state through a fail-closed, keep-direction commit, the
-    // rule every commit-path persist follows. The MLS group has already merged
-    // the Commit, so the changes are never rolled back: on persist failure
-    // they stay in memory for the next persist and the durability error
-    // replaces the reply, keeping any delivery error in its message.
+    // Commit's rotation trigger and registry-record deletions reach the actor
+    // state through a fail-closed, keep-direction commit, the rule every
+    // commit-path persist follows. The MLS group has already merged the Commit,
+    // so they are never rolled back: on persist failure they stay in memory for
+    // the next persist and the durability error replaces the reply.
+    // `deliver_incoming` fills `processed_commit` only on the arm that returns
+    // `Ok(DeliverOutcome::Handled)` at once, so `reply_result` is `Ok` here and
+    // no delivery error can be lost.
     let reply_result = if let Some(commit) = processed_commit.take() {
-        let applied = cell
-            .commit_class_s_keep(deps, context_id, |mut v| {
-                crate::context::actor::pseudonym_rotation::note_processed_commit(
-                    v.rest_mut(),
-                    context_id,
-                    deps.crypto.local_did(),
-                    &commit,
-                    |did| {
-                        deps.supervisor.remove_member_floors(
-                            &crate::context::state::context_id_to_bytes(context_id),
-                            did,
-                        );
-                    },
-                )
-            })
-            .await;
-        match applied {
-            Ok(()) => reply_result,
-            Err(persist_err) => Err(match reply_result {
-                Ok(_) => persist_err,
-                Err(deliver_err) => ContextError::PersistenceFailed(format!(
-                    "{persist_err} (after a delivery error: {deliver_err})"
-                )),
-            }),
-        }
+        cell.commit_class_s_keep(deps, context_id, |mut v| {
+            crate::context::actor::pseudonym_rotation::note_processed_commit(
+                v.rest_mut(),
+                deps.crypto.local_did(),
+                &commit,
+            );
+            Ok(())
+        })
+        .await
+        .and(reply_result)
     } else {
         reply_result
     };

@@ -1271,10 +1271,12 @@ pub async fn execute_add_member(
     // command envelope by the invitation-sealing caller
     // ([`crate::context::supervisor::Supervisor::invite_member`]) and threaded
     // through the governance dispatch to here. `Some(..)` on the real
-    // invitation path; `None` on the paths that never carried a real add
-    // (the generic FFI `AddMember` arm and `execute_reset_member` — issue
-    // #2029), where production `add_member` errors and `cfg(test)`/`testing`
-    // returns an empty `AddMemberOutput` (preserving the non-crypto pipeline).
+    // invitation path; `None` on the generic FFI `AddMember` arm, which never
+    // carried a real add, where production `add_member` errors and
+    // `cfg(test)`/`testing` returns an empty `AddMemberOutput` (preserving the
+    // non-crypto pipeline). `execute_reset_member` does not come here: it
+    // builds its one remove-and-add Commit itself and refuses a missing key
+    // package.
     key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
 ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
@@ -2748,7 +2750,7 @@ pub async fn execute_establish_outlet_interface(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "single-pipeline member-reset orchestration (remove+add+broadcast+rotate+drain) with the detailed §9 residual-of-coalescing rationale inline"
+    reason = "single-pipeline member-reset orchestration (one remove-and-add Commit, broadcast, rotate, drain)"
 )]
 pub async fn execute_reset_member(
     cell: &mut crate::context::actor::class_s::ClassSCell,
@@ -2756,8 +2758,12 @@ pub async fn execute_reset_member(
     context_id: &str,
     did: &DID,
     _reason: &str,
+    // The reset member's TLS-serialized MLS `KeyPackage` for its fresh leaf.
+    // `None` refuses the reset with `InvalidKeyPackage` before any MLS
+    // mutation (ADR-066 decision 7).
+    key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
-) -> Result<(), ContextError> {
+) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): reset now takes the whole `ClassSCell`
     // (was a `ClassCMut` view) so the sender-key ROTATION can go through
     // `commit_class_s_keep`→`rest_mut` — §9 classifies rotation as Class-S (the
@@ -2783,77 +2789,43 @@ pub async fn execute_reset_member(
         return Err(ContextError::MemberNotFound(did.to_string()));
     }
 
-    // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
-    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the MLS group is actor-owned, so the
-    // remove+add mutate the actor's OWNED group via `rest_mut()`. The whole
-    // `&mut PerContextState` these MLS ops require is reachable ONLY through a
-    // Class-S combinator (the coalesced Class-C view is field-granular by
-    // construction and cannot hand out `rest_mut()`), so the net-neutral
-    // remove+add pair is persisted fail-closed via `commit_class_s_keep` — a safe
-    // over-persist versus the former provider path's coalesced write (reset is a
-    // rare governance op, not the hot send path; the membership effect is
-    // net-neutral, so nothing security-critical rides on the persist class). The
-    // two commit-byte outputs drive the async broadcasts below. `local_did` is
-    // node-resident (retained `deps.crypto.local_did()`), read once here and
-    // reused by the rotation block below.
+    // Spec 07 §7.3.1.1 step 1.6: a `ResetMember` for X is ONE Commit holding
+    // one Remove of X's leaf and one Add of a fresh leaf of X (ADR-066
+    // decision 11: no action spans two Commits). A missing KeyPackage is
+    // refused here, read-only, so the epoch, the persisted state and the
+    // cell's `mutation_epoch` stay unchanged and nothing is broadcast.
+    let key_package = key_package.ok_or_else(|| {
+        ContextError::InvalidKeyPackage(format!(
+            "a reset of {did} needs a key package for its new leaf"
+        ))
+    })?;
+    // The MLS group is actor-owned, so the Commit is built on it through
+    // `rest_mut()`, reachable only through a Class-S combinator, and persisted
+    // fail-closed. Every refusal inside `reset_member` returns before the
+    // merge, and `commit_class_s_keep` returns the closure's error before it
+    // bumps the epoch or persists. `local_did` is read once here and reused by
+    // the rotation block below.
     let local_did = deps.crypto.local_did().to_owned();
-    let (remove_output, add_output) = cell
+    let reset_output = cell
         .commit_class_s_keep(deps, context_id, |mut v| {
-            let s = v.rest_mut();
-            let remove_output = s
-                .remove_member(&local_did, did.as_ref(), deps.clock.as_ref())
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-            let add_output = s
-                .add_member(did.as_ref(), None, deps.clock.as_ref())
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-            Ok((remove_output, add_output))
+            v.rest_mut().reset_member(
+                &local_did,
+                did.as_ref(),
+                Some(key_package),
+                deps.clock.as_ref(),
+            )
         })
         .await?;
 
-    // Member reset operates on a coalesced `ClassCMut` view (best-effort). The
-    // broadcasts are async; on failure the retry-queue bookkeeping is applied
-    // through the same coalesced view (`view.commit_broadcast_borrows()`), so a
-    // crash before the ≤50 ms persist tick can drop the `commit_fault`/retry
-    // bookkeeping. RESIDUAL of coalescing here (be honest): a lost reset Commit
-    // leaves remaining members on an epoch where the reset member's OLD
-    // (rotated-out, possibly compromised) keys still decrypt until the Commit is
-    // re-delivered — the same desync class the safety-gated sites fail-close
-    // against. Coalesced is nonetheless the correct/defensible class for reset,
-    // for three reasons: (1) reset is a same-member key REFRESH — the member is
-    // removed and IMMEDIATELY re-added in the same operation and remains
-    // authorized throughout, so it is net-neutral versus a true `RemoveMember`
-    // (no authority is being withdrawn from anyone); (2) §9 classifies the
-    // membership effect as Class-M, not a downward-authorization Class-S
-    // transition, so it carries no §9 fail-closed obligation; and (3) it matches
-    // the pre-async coalesced `ClassCMut` shape exactly — coalescing here is
-    // parity, NOT a regression introduced by the async-transport hoist. (The
-    // fail-closed sites — remove/rotate/leave/recovery — genuinely withdraw
-    // authority or re-key away from a compromised party, which reset does not.)
+    // The broadcast is async; on failure the retry-queue bookkeeping is
+    // applied through the coalesced Class-C view, as for every
+    // epoch-advancing Commit.
     if let Some(failure) = try_broadcast_commit(
         deps,
         context_id,
-        remove_output.commit_bytes,
+        reset_output.commit_bytes.clone(),
         &CommitOperation::ResetMember {
             target_did: did.clone(),
-            is_remove: true,
-        },
-    )
-    .await
-    {
-        apply_broadcast_failure(
-            cell.class_c_view().commit_broadcast_borrows(),
-            deps,
-            context_id,
-            failure,
-        );
-    }
-    if let Some(failure) = try_broadcast_commit(
-        deps,
-        context_id,
-        add_output.commit_bytes,
-        &CommitOperation::ResetMember {
-            target_did: did.clone(),
-            is_remove: false,
         },
     )
     .await
@@ -2962,7 +2934,7 @@ pub async fn execute_reset_member(
             .push(did.clone());
     }
 
-    Ok(())
+    Ok(reset_output)
 }
 
 // ---------------------------------------------------------------------------
@@ -4918,6 +4890,9 @@ pub async fn dispatch_content_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
+    // The `KeyPackage` the governance dispatch carries; only `ResetMember`
+    // reads it, as the reset member's fresh leaf.
+    key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let CommitMeta {
@@ -4987,12 +4962,13 @@ pub async fn dispatch_content_governance_action(
             Ok(GovernanceActionResult::OutletInterfaceEstablished)
         }
         GovernanceAction::ResetMember { did, reason } => {
-            execute_reset_member(
+            let reset_output = execute_reset_member(
                 cell,
                 deps,
                 context_id,
                 did,
                 reason,
+                key_package,
                 CommitMeta {
                     pid,
                     actor_did,
@@ -5000,7 +4976,14 @@ pub async fn dispatch_content_governance_action(
                 },
             )
             .await?;
-            Ok(GovernanceActionResult::MemberReset)
+            Ok(GovernanceActionResult::MemberReset {
+                welcome_bytes: scp_protocol::context::membership::RedactedBytes(
+                    reset_output.welcome_bytes,
+                ),
+                commit_bytes: scp_protocol::context::membership::RedactedBytes(
+                    reset_output.commit_bytes,
+                ),
+            })
         }
         GovernanceAction::ResolveConflict {
             proposal_a,
@@ -5348,6 +5331,7 @@ pub async fn dispatch_context_governance_action(
                 deps,
                 context_id,
                 action,
+                key_package,
                 CommitMeta {
                     pid,
                     actor_did,

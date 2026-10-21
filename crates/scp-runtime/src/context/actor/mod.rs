@@ -1869,7 +1869,6 @@ mod tests {
 
         note_processed_commit(
             &mut state,
-            &ctx_hex(0x35),
             LOCAL,
             &ProcessedCommit {
                 committer_did: DIRECT_ALICE.to_owned(),
@@ -1878,41 +1877,19 @@ mod tests {
                     removed_dids: vec![DIRECT_BOB.to_owned()],
                 },
             },
-            |did| deps.supervisor.remove_member_floors(&[0x35; 32], did),
-        )
-        .expect("the removal applies");
+        );
         let registry = state.routing.peer_registry().expect("encrypted ⇒ registry");
         assert!(!registry.contains_key(&scp_did::DID(DIRECT_BOB.to_owned())));
-        // The removal also leaves the membership and role state, so the
-        // removed DID's announcement is refused until it is added again.
-        assert!(!state.membership.contains(DIRECT_BOB));
+        // Spec 07 §7.3.1.1 step 3: the unverified leaf diff leaves the
+        // membership and role state alone, so the DID stays a member here
+        // and only the record deletion changes what is admitted. This test
+        // is therefore no evidence for the rejoin clause of PUSH-030 AC2,
+        // which waits on the verified leaves of SCP-330.
+        assert!(state.membership.contains(DIRECT_BOB));
         assert!(
-            !state
+            state
                 .role_state
                 .member_has_capability(DIRECT_BOB, &Capability::MessagesWrite)
-        );
-        let removed =
-            ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 3, 0, [0x52; 32]).await;
-        assert!(
-            matches!(removed, Err(ContextError::MemberNotFound(_))),
-            "a removed DID is not a member; got {removed:?}"
-        );
-
-        // The rejoin's add, built by hand. It stands in for SCP-330's apply
-        // step, under which a non-committer records a re-added member only
-        // from the verified `MemberJoined` leaf of the re-adding Commit (spec
-        // 07 §7.3.1.1 "Fail closed"). This test is therefore no evidence for
-        // the rejoin clause of PUSH-030 AC2; it shows only that the removal's
-        // record deletion admits the lower epoch once the DID is a member.
-        state.membership.add_member(
-            scp_did::DID(DIRECT_BOB.to_owned()),
-            "member".to_owned(),
-            Vec::new(),
-        );
-        state.role_state.members.insert(DIRECT_BOB.to_owned());
-        state.role_state.member_capabilities.insert(
-            DIRECT_BOB.to_owned(),
-            std::iter::once(Capability::MessagesWrite).collect(),
         );
         assert!(
             ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 3, 0, [0x52; 32])

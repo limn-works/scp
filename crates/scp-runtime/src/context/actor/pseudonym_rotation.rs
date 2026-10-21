@@ -411,50 +411,46 @@ pub(crate) struct ProcessedCommit {
 /// state (spec 09 §9.10.4.1). Call it inside the Class-S commit that persists
 /// them.
 ///
-/// - **Record lifetime and removal:** tears down every DID the Commit removes,
-///   other than the local member, as the committer's removal does: its sender
-///   key, its sender-epoch and receive-sequence floors through
-///   `remove_floors`, and, through [`PerContextState::remove_member_state`],
-///   its pseudonym-registry record, so a rejoining member's new epoch sequence
-///   is accepted, and its membership, role state (spec §5.6.1), access key and
-///   read exclusion. Without the floor prune a rejoiner's sender key, which
-///   restarts its epochs, is refused as a rollback.
+/// It changes two things and nothing else:
+///
+/// - **Record lifetime:** it deletes the pseudonym-registry record of every
+///   DID the Commit removes, other than the local member, so a rejoining
+///   member's new epoch sequence is accepted.
 /// - **Membership trigger:** when the Commit applies at least one `AddMember` or
-///   `RemoveMember`, records one pending rotation unless the local member is the
-///   committer (it rotates after its own commit) or is removed. A removed local
-///   member discards its grace instead ("Leave, close and expiry during a
+///   `RemoveMember`, it records one pending rotation unless the local member is
+///   the committer (it rotates after its own commit) or is removed. A removed
+///   local member discards its grace instead ("Leave, close and expiry during a
 ///   grace"). [`PseudonymRotationState::note_membership_change`] records
 ///   nothing unless the policy sets `on_membership_change`.
 ///
-/// A DID the Commit adds gets no membership entry, role or token here. A
-/// receiver assigns no role it inferred: the added member's role comes only
-/// from the verified `MemberJoined` governance leaf the Commit carries (spec
-/// 07 §7.3.1.1 "Fail closed", ADR-066 decision 7), which story SCP-330
-/// applies. Until then the added member's messages fail authorization with
-/// `MemberNotFound`.
-///
-/// # Errors
-///
-/// [`PerContextState::remove_member_sender_key`]'s error on a context
-/// without MLS state. Removals applied before the error stay in memory for
-/// the next persist.
+/// It reads the membership change from the MLS leaf diff, which no
+/// governance check has verified, so it touches no membership, role, access
+/// key, read exclusion, sender key, sender-epoch floor, sequence tracker or
+/// reorder buffer for any DID, added or removed. A receiver derives role and
+/// membership changes only from the verified governance leaves the Commit
+/// carries (spec 07 §7.3.1.1 step 3 and "Fail closed", ADR-066 decision 7),
+/// which story SCP-330 applies; an unverified leaf diff that tore down a
+/// member's state would let any leaf holder delete another member's role,
+/// the sole admin's included, at every receiver. Until SCP-330 lands, an added
+/// member's messages fail authorization with `MemberNotFound`, and a removed
+/// member keeps its membership and role at this receiver.
+/// [`PerContextState::remove_member_state`] stays the teardown of the
+/// committer's own removal and of the local member's committed leave.
 pub(crate) fn note_processed_commit(
     state: &mut PerContextState,
-    context_id: &str,
     local_did: &str,
     commit: &ProcessedCommit,
-    mut remove_floors: impl FnMut(&str),
-) -> Result<(), scp_protocol::context::ContextError> {
-    for did in &commit.change.removed_dids {
-        if did != local_did {
-            state.remove_member_sender_key(did)?;
-            remove_floors(did);
-            state.remove_member_state(context_id, &scp_did::DID::from(did.as_str()));
+) {
+    if let Some(registry) = state.routing.peer_registry_mut() {
+        for did in &commit.change.removed_dids {
+            if did != local_did {
+                registry.remove(&scp_did::DID::from(did.as_str()));
+            }
         }
     }
     if commit.change.removed_dids.iter().any(|d| d == local_did) {
         state.class_s.pseudonym_rotation.discard_grace();
-        return Ok(());
+        return;
     }
     if commit.committer_did != local_did && !commit.change.is_empty() {
         let policy = state.handle.params().pseudonym_rotation;
@@ -463,7 +459,6 @@ pub(crate) fn note_processed_commit(
             .pseudonym_rotation
             .note_membership_change(policy.as_ref());
     }
-    Ok(())
 }
 
 /// The local member's routing IDs in one context (spec 09 §9.10.4.1), the
@@ -863,22 +858,7 @@ mod tests {
     const CTX: &str = "ctx-push-030";
 
     fn apply(state: &mut PerContextState, commit: &ProcessedCommit) {
-        let mut pruned = Vec::new();
-        note_processed_commit(state, CTX, LOCAL, commit, |did| {
-            pruned.push(did.to_owned());
-        })
-        .unwrap();
-        let removed_peers: Vec<String> = commit
-            .change
-            .removed_dids
-            .iter()
-            .filter(|d| d.as_str() != LOCAL)
-            .cloned()
-            .collect();
-        assert_eq!(
-            pruned, removed_peers,
-            "every removed peer's floors are pruned"
-        );
+        note_processed_commit(state, LOCAL, commit);
     }
 
     /// "Membership trigger": a peer's Commit that adds or removes a member
@@ -1024,41 +1004,27 @@ mod tests {
         ]
     }
 
-    /// A processed removal takes the removed DID out of the membership, the
-    /// role state, the access-key store, the read-exclusion list, the
-    /// pseudonym registry and the sequence tracker, keeps
-    /// every other member, and keeps the local member when it is the one
-    /// removed.
+    /// Fail closed (spec 07 §7.3.1.1 step 3, ADR-066 decision 7): a processed
+    /// removal deletes only the removed DID's pseudonym record. Its
+    /// membership, active-member entry, role, access key, read exclusion and
+    /// sequence tracker stay until the verified leaves of story SCP-330 apply
+    /// the removal, and every other member is untouched, the local member
+    /// included when it is the one removed.
     #[test]
-    fn a_processed_removal_removes_the_dids_membership_and_keeps_the_rest() {
+    fn a_processed_removal_deletes_only_the_removed_dids_record() {
         let mut state = context_state(None);
         for did in [PEER, COMMITTER, LOCAL] {
             admit(&mut state, did);
         }
         apply(&mut state, &processed(COMMITTER, &[], &[PEER]));
-        assert_eq!(admitted(&state, PEER), [false; 7]);
+        assert_eq!(
+            admitted(&state, PEER),
+            [true, true, true, true, true, false, true]
+        );
         assert_eq!(admitted(&state, COMMITTER), [true; 7]);
         assert_eq!(admitted(&state, LOCAL), [true; 7]);
 
         apply(&mut state, &processed(COMMITTER, &[], &[LOCAL]));
         assert_eq!(admitted(&state, LOCAL), [true; 7]);
-    }
-
-    /// A removed member that processes the Commit removing it does not rotate;
-    /// it discards its grace and pending work.
-    #[test]
-    fn the_removed_local_member_does_not_rotate_and_discards_its_grace() {
-        let policy = membership_policy();
-        let mut state = context_state(Some(policy));
-        state
-            .class_s
-            .pseudonym_rotation
-            .record_rotation(0, [1; 32], Some(&policy), T0)
-            .unwrap();
-        apply(&mut state, &processed(COMMITTER, &[PEER], &[LOCAL]));
-        let rotation = &state.class_s.pseudonym_rotation;
-        assert!(!rotation.membership_change_pending);
-        assert_eq!(rotation.previous(), None);
-        assert!(!rotation.announce_pending());
     }
 }

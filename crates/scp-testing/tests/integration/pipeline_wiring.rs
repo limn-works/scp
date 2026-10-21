@@ -2252,13 +2252,14 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
 /// `MessagingCommand::DeliverIncoming`, the messaging handler calls
 /// `deliver_incoming`, which counts the Commit's membership changes by DID with
 /// `classify_commit_membership`. The handler then applies them through the
-/// fail-closed keep-direction commit to `note_processed_commit`, which tears
-/// down each removed DID's sender key, its floors through the handler's
-/// `remove_member_floors`, and its record, membership and role state through
-/// `remove_member_state`, the teardown the committed removal and leave share,
-/// and records the trigger through `note_membership_change`;
-/// the actor's rotation arm turns the trigger into the `PseudonymRotationDue`
-/// signal.
+/// fail-closed keep-direction commit to `note_processed_commit`, which deletes
+/// each removed DID's registry record and records the trigger through
+/// `note_membership_change`, and changes nothing else: the leaf diff is
+/// unverified, so membership, role, sender-key and floor state change only
+/// from the verified governance leaves of spec 07 §7.3.1.1 step 3. The
+/// committed removal and leave keep `remove_member_state` as their teardown,
+/// and a reset is one Commit built by `reset_member` (step 1.6). The actor's
+/// rotation arm turns the trigger into the `PseudonymRotationDue` signal.
 #[test]
 fn processed_membership_commit_reaches_rotation_and_registry() {
     assert!(
@@ -2283,13 +2284,16 @@ fn processed_membership_commit_reaches_rotation_and_registry() {
         "&mut processed_commit",
         "commit_class_s_keep(",
         "note_processed_commit(",
-        ".remove_member_floors(",
     ] {
         assert!(
             handler.contains(step),
             "handle_deliver_incoming must contain `{step}`"
         );
     }
+    assert!(
+        !handler.contains(".remove_member_floors("),
+        "a processed Commit must not prune floors from an unverified leaf diff"
+    );
     let deliver = extract_fn_body(MANAGER_SRC, "deliver_incoming")
         .expect("messaging_helpers::deliver_incoming exists");
     assert!(
@@ -2299,18 +2303,34 @@ fn processed_membership_commit_reaches_rotation_and_registry() {
     let note = extract_fn_body(PSEUDONYM_ROTATION_SRC, "note_processed_commit")
         .expect("note_processed_commit exists");
     assert!(
-        note.contains(".remove_member_state(")
-            && note.contains(".remove_member_sender_key(")
-            && note.contains("remove_floors(did)")
-            && note.contains(".note_membership_change("),
-        "note_processed_commit must tear down removed DIDs' state and record the trigger"
+        note.contains("registry.remove(") && note.contains(".note_membership_change("),
+        "note_processed_commit must delete removed DIDs' records and record the trigger"
     );
+    for teardown in [
+        ".remove_member_state(",
+        ".remove_member_sender_key(",
+        "floors",
+    ] {
+        assert!(
+            !note.contains(teardown),
+            "note_processed_commit must not tear down state from an unverified leaf diff \
+             (`{teardown}`)"
+        );
+    }
     for removal in ["execute_remove_member", "leave_context"] {
         assert!(
             fn_body_contains(MANAGER_SRC, removal, ".remove_member_state("),
             "{removal} must tear down the departed member through remove_member_state"
         );
     }
+    let reset =
+        extract_fn_body(MANAGER_SRC, "execute_reset_member").expect("execute_reset_member exists");
+    assert!(
+        reset.contains(".reset_member(")
+            && !reset.contains(".remove_member(")
+            && !reset.contains("execute_add_member("),
+        "execute_reset_member must build its one remove-and-add Commit through reset_member"
+    );
     assert!(
         fn_body_contains(
             ACTOR_MOD_SRC,

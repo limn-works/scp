@@ -152,15 +152,12 @@ pub enum CommitOperation {
         /// Optional human-readable reason recorded with the rotation.
         reason: Option<String>,
     },
-    /// Commit produced by `execute_reset_member` (remove + re-add for MLS
-    /// state reset). The variant carries which sub-step the commit corresponds
-    /// to so that retries do not conflate the two distinct commits in
-    /// observability events.
+    /// Commit produced by `execute_reset_member`: one Commit holding the
+    /// Remove of the member's leaf and the Add of its fresh leaf (spec 07
+    /// §7.3.1.1 step 1.6).
     ResetMember {
         /// The DID being reset.
         target_did: DID,
-        /// `true` for the remove half of the reset, `false` for the re-add.
-        is_remove: bool,
     },
     /// Commit produced by `leave_context` for the local member's departure.
     LeaveContext {
@@ -188,12 +185,7 @@ impl CommitOperation {
             Self::AddMember { .. } => "AddMember".to_owned(),
             Self::RemoveMember { .. } => "RemoveMember".to_owned(),
             Self::RotateContentKeys { .. } => "RotateContentKeys".to_owned(),
-            Self::ResetMember {
-                is_remove: true, ..
-            } => "ResetMemberRemove".to_owned(),
-            Self::ResetMember {
-                is_remove: false, ..
-            } => "ResetMemberAdd".to_owned(),
+            Self::ResetMember { .. } => "ResetMember".to_owned(),
             Self::LeaveContext { .. } => "LeaveContext".to_owned(),
             Self::RecoveryAdvanceEpoch => "RecoveryAdvanceEpoch".to_owned(),
         }
@@ -519,8 +511,16 @@ pub enum GovernanceActionResult {
     ChildContextCreated,
     /// A outlet interface was established.
     OutletInterfaceEstablished,
-    /// A member was reset (ADR-029, Tier 3).
-    MemberReset,
+    /// A member was reset (ADR-029, Tier 3) by one Commit that removes its
+    /// leaf and adds a fresh one. Carries the MLS `Welcome` for the fresh leaf
+    /// (for the reset member) and the Commit `execute_reset_member` already
+    /// broadcast, as redacting-`Debug` byte wrappers like `MemberAdded`.
+    MemberReset {
+        /// TLS-serialized MLS `Welcome` for the reset member's fresh leaf.
+        welcome_bytes: RedactedBytes,
+        /// TLS-serialized MLS `Commit` for the remaining members.
+        commit_bytes: RedactedBytes,
+    },
     /// A governance conflict was resolved (ADR-031 §7).
     ConflictResolved,
     /// The context was promoted from ephemeral to persistent.
