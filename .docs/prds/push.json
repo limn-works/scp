@@ -24,7 +24,10 @@
         "PUSH-009",
         "PUSH-010",
         "PUSH-011",
-        "PUSH-012"
+        "PUSH-012",
+        "PUSH-032",
+        "PUSH-033",
+        "PUSH-034"
       ]
     },
     {
@@ -41,7 +44,8 @@
         "PUSH-028",
         "PUSH-029",
         "PUSH-030",
-        "PUSH-031"
+        "PUSH-031",
+        "PUSH-035"
       ]
     },
     {
@@ -899,7 +903,8 @@
         "Against a relay wired with `KelPushVerifier`, `register` returns `PushError::VerifierUnavailable` for each relay.",
         "Joining a context triggers exactly one re-registration on the affected relay.",
         "The signed bytes contain no context ID (D7); a test checks the preimage against the context ID bytes.",
-        "`pipeline_wiring.rs` has a step assertion for `push.register`, from the registrar down to the relay PUBLISH."
+        "`pipeline_wiring.rs` has a step assertion for `push.register`, from the registrar down to the relay PUBLISH.",
+        "Preimage target field (\u00a79.5.2 field 7 of `PushRegistration`, field 6 of `PushDeregistration`): for a relay that is not a tier 3 entry, `register` and `deregister` sign `bridge_target` = `SHA-256(0x00)`; a test checks that each signed preimage ends with those 32 bytes. Registration with a tier 3 entry is PUSH-035."
       ],
       "actionItems": [
         "Write the registrar and its re-registration triggers.",
@@ -908,7 +913,8 @@
       ],
       "blockedBy": [
         "PUSH-013",
-        "PUSH-007"
+        "PUSH-007",
+        "PUSH-032"
       ],
       "sources": [
         {
@@ -926,6 +932,10 @@
         {
           "file": ".docs/specs/09-security-model.md",
           "section": "#### 9.10.4.1 Pseudonym Rotation (BLACK-001 Mitigation)"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
         }
       ],
       "details": {
@@ -1940,6 +1950,304 @@
         }
       ],
       "details": {}
+    },
+    {
+      "id": "PUSH-032",
+      "title": "Derive the tier 3 push routing ID, bind bridge_target into the push preimages, and reserve the tier 3 ID on a bridged node",
+      "gate": "gate-push-relay",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/discovery/push.rs",
+        "crates/scp-identity/src/push_verify.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/quic/listener.rs",
+        "crates/scp-transport/src/udp/listener.rs",
+        "crates/scp-transport/src/webtransport/session.rs",
+        "crates/scp-node/src/published_state.rs",
+        "crates/scp-node/src/lib.rs",
+        "scripts/gen-test-vectors-p256.py",
+        "crates/scp-runtime/tests/test_vectors.rs",
+        ".docs/specs/25-test-vectors.md"
+      ],
+      "description": "Implements the tier 3 push routing ID that `09-security-model.md` \u00a79.18.2 **Tier 3 push routing ID** defines, `SHA-256(\"scp-push-bridge:\" || bridge_url || bridge_target)`, for an `SCPRelay` entry that carries a `bridgeTarget` (`18-addressability-and-deployment.md` \u00a718.2.1). Alec chose the option in which \"a relay entry becomes `{url, bridge_target}`\" and the push routing ID is derived from the canonical URL plus the target. Today `reserve_push_routing_id` in `crates/scp-node/src/published_state.rs` carries `// Stub \u2014 see PUSH-032` and leaves a bridged node's relay reserving its previous URL's ID, and `relay_endpoint_push_routing_id` in `crates/scp-protocol/src/discovery/push.rs` computes only the `\"scp-push-registration\"` form; this story adds the tier 3 form beside it, so the code holds one derivation per form. The story also adds field 7 of the `PushRegistration` preimage and field 6 of the `PushDeregistration` preimage, `bridge_target`, 32 bare bytes holding the entry's target or `SHA-256(0x00)` (\u00a79.5.2, `22-human-readable-addressing.md` \u00a722.11.4), because `relay_url` alone is the bridge relay's URL and would let a message signed for the bridge relay, or for one node behind it, verify at every other node behind the same bridge. The separators stay `-V1:` (\u00a79.5.2 note). `10-infrastructure-and-self-hosting.md` \u00a710.7.1 **Tier 3 relays** states each party's role: the bridged node reserves the tier 3 ID and does not reserve the bridge relay's own ID, the bridge relay computes nothing, and the client publishes inside `BRIDGE_DATA`. Delivery of a registration that arrives inside a forwarded `BRIDGE_DATA` is PUSH-033, which needs the node's bridge registration; this story covers the derivation, the preimages, the verifier, the shared relay URL handle and every listener. A client that registers with a tier 3 relay is not in this story: a context's relay list cannot name a tier 3 relay's target, which `00-open-questions.md` records as open, and the client registrar stories take the new preimage field when they sign. Function names and file locations are indicators.",
+      "acceptanceCriteria": [
+        "Derivation (\u00a79.18.2 'Tier 3 push routing ID'): one function in `scp-protocol` takes an `SCPRelay` entry (indicator: `relay_service_push_routing_id(&RelayService) -> [u8; 32]`) and returns `SHA-256(\"scp-push-bridge:\" || canonical URL || 32 target bytes)` for an entry with a `bridgeTarget` and the existing `\"scp-push-registration\"` form for an entry without one. A unit test pins the bridge entry `wss://bridge.example.com/scp/v1` with target `f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb` to `733a76fce10004826ffaecd3c85ba27169282665cd64a902000275a52ba640a1`, and the direct entry with the same URL to `e47cce36c946ac50a2ee3dbc40f0416d7012bf82344c8f24a756c0f62242eea1`.",
+        "Non-collision (\u00a79.18.2 'Why no tier 3 ID equals another push routing ID'): a test shows a bridge entry whose target is 32 printable ASCII bytes T has a tier 3 ID different from the `\"scp-push-registration\"` ID of the URL formed by the entry's URL followed by T; two bridge entries that differ only in target, and two that differ only in URL, have different IDs.",
+        "Relay URL handle carries the target: the relay's URL value (indicator: `RelayUrl` in `push_gate.rs`) built from a bridge entry holds the entry's canonical URL, its target and the tier 3 ID; built from a direct entry or from `RelayUrl::new(url)` it holds no target and the `\"scp-push-registration\"` ID. No conversion from an `SCPRelay` entry drops the target.",
+        "Preimage field (\u00a79.5.2 field 7 of `PushRegistration`, field 6 of `PushDeregistration`): the signing-bytes functions take the target and append 32 bare bytes, `SHA-256(0x00)` = `6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d` when the relay has no target. The four existing goldens in `crates/scp-runtime/tests/test_vectors.rs` grow by 32 bytes each and end with the sentinel: `PUSH_REGISTER_A_HEX` from 193 to 225 bytes, `PUSH_REGISTER_B_HEX` from 200 to 232, `PUSH_DEREGISTER_A_HEX` from 127 to 159, and `PUSH_DEREGISTER_B_HEX` from 134 to 166. One new registration golden and one new deregistration golden end with the target above.",
+        "Verification (\u00a710.7.1 step 3): `PushSignatureVerifier::verify` receives the target with the canonical URL, and the push gate passes the target of the relay URL the PUBLISH's routing ID came from, never a value from the message. With the signature-checking test verifier, a registration signed for (bridge URL, target A) is stored at a relay whose handle holds (bridge URL, target A), and is rejected with `4060` and stores nothing at a relay whose handle holds (bridge URL, target B) and at one whose handle holds the bridge URL with no target. A registration signed with the sentinel for the bridge URL is rejected with `4060` at the relay holding (bridge URL, target A). The same holds for a deregistration.",
+        "Reservation replaces the stub (\u00a710.7.1 'Tier 3 relays'): `reserve_push_routing_id` moves the shared handle to every tier 3 entry the node publishes, each with its own URL and target (a node MAY publish one entry per bridge relay, \u00a710.12.4 'Multiple bridges'), so the relay reserves one tier 3 ID per entry, and `git grep -n \"Stub \u2014 see PUSH-032\" crates/` prints nothing. Both callers, the startup path in `crates/scp-node/src/lib.rs` and `apply_tier_change`, reach it with the entries the node publishes, before it publishes.",
+        "Node behavior (\u00a710.7.1 'Tier 3 relays'): a node test that changes the tier to a bridge entry shows a PUBLISH to the entry's tier 3 ID at the node's listener intercepted (a relay without push answers `4063`; a relay with push verifies with the entry's URL and target; a QUERY and a SUBSCRIBE at that ID afterwards return nothing), and a PUBLISH to the bridge relay's own `\"scp-push-registration\"` ID stored as an ordinary blob that a QUERY returns. The test that today asserts the reserved ID stays in place on a change to a bridge entry (indicator: `tier_change_to_a_bridge_entry_publishes_it_and_keeps_the_reserved_id`) is rewritten to these assertions. A later change from the bridge entry back to a direct entry moves the reservation to the direct entry's `\"scp-push-registration\"` ID. A node that publishes two tier 3 entries with different bridge URLs and the same target reserves both tier 3 IDs: a PUBLISH at each ID is intercepted and verified with that entry's URL and target, a registration signed for entry A is rejected with `4060` at entry B's ID, and a change to a single entry releases the other entry's ID.",
+        "Every listener (WebSocket, QUIC, UDP/DTLS, WebTransport) intercepts the tier 3 ID once the handle holds a bridge entry, shown by one test per listener.",
+        "Golden check (Python generator against Rust): `.docs/specs/25-test-vectors.md` \u00a725.28 gains a vector (indicator: the next free vector number, after Vector 48) that prints the six push signing-bytes goldens above in hex, and the tier 3 vector of \u00a79.18.2: bridge URL, target, the 79-byte preimage and the ID `733a76fce10004826ffaecd3c85ba27169282665cd64a902000275a52ba640a1`. `scripts/gen-test-vectors-p256.py` builds each of those values from its inputs and emits it, so `python3.12 scripts/check-test-vectors-p256.py`, which fails when a hex value spec 25 prints is missing from the generator output, compares the spec against an implementation independent of the Rust code. `test_vectors.rs` asserts the same hex against the Rust functions, and `cargo test -p scp-runtime --test test_vectors --features testing` passes. Today spec 25 prints no push golden and the generator holds no push code, so no check compares the push goldens with a second implementation until this criterion lands."
+      ],
+      "actionItems": [
+        "Add the tier 3 derivation beside `relay_endpoint_push_routing_id` in `crates/scp-protocol/src/discovery/push.rs`, with a constant for `scp-push-bridge:`, and one entry-taking function that selects the form from the entry.",
+        "Add the target to the relay URL value in `push_gate.rs` and to its conversion from `RelayService`.",
+        "Append the target to both signing-bytes functions and thread it through `PushMessage::signing_bytes`, `PushSignatureVerifier::verify`, `KelPushVerifier`, the test verifier and the push gate.",
+        "Replace the stub branch of `reserve_push_routing_id` and rewrite the node tests.",
+        "Regenerate the push goldens, add the tier 3 goldens and the spec 25 vector, and run the vector gate."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.1 SCPRelay"
+        },
+        {
+          "file": ".docs/specs/22-human-readable-addressing.md",
+          "section": "### 22.11.4 Push Notifications"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-033",
+      "title": "A bridged node opens and handles a sealed push registration that arrives on a bridge session",
+      "gate": "gate-push-relay",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/client.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-transport/src/relay/bridge.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-protocol/src/crypto/hpke/p256.rs",
+        "crates/scp-protocol/src/discovery/push.rs",
+        "scripts/gen-test-vectors-p256.py",
+        "crates/scp-runtime/tests/test_vectors.rs",
+        ".docs/specs/25-test-vectors.md"
+      ],
+      "description": "Implements the delivery half of `10-infrastructure-and-self-hosting.md` \u00a710.7.1 **Tier 3 relays** and the opening half of **Tier 3 envelope**: the registrant sends a PUBLISH frame whose payload is an HPKE envelope sealed to the wrapping key of the node's device, the device of the identity that publishes the tier 3 entry whose SCP instance runs the node, as a `BRIDGE_DATA` on a session the registrant opened to the node's `bridgeTarget`; the bridge relay carries it without parsing it (\u00a710.12.4 **Sessions**); and the bridged node opens the envelope through that device's `KeyCustody` and applies every rule of \u00a710.7.1 to the message inside, as it does for a PUBLISH on its own listener. A node MAY publish several tier 3 entries, one per bridge relay, and it reserves and opens per entry, with that entry's URL and target. SCP-340 serves each bridge session as a connection of the node relay's frame handling, so the node's answer returns on the session; no code in `scp-node` sends the `BRIDGE_REGISTER` that makes the bridge forward anything, which the linked issue in `blockedByIssues` tracks. PUSH-032 supplies the tier 3 ID, the preimage field and the reservation this story routes into. The node answers a registration on a session with one of the three frames \u00a710.7.1 **Tier 3 envelope** permits, `OK`, `4060` or `5000`, each with an empty `msg`, so the bridge relay learns accepted, rejected or ask again and nothing about the sealed message. The scp-protocol HPKE core (`crates/scp-protocol/src/crypto/hpke/p256.rs`, `open_with_external_dh`) already opens a Base-mode ciphertext from a Diffie-Hellman output computed in custody, which is the shape this story needs. File locations and type names are indicators.",
+      "acceptanceCriteria": [
+        "A PUBLISH at the node's reserved tier 3 push routing ID that arrives as a `BRIDGE_DATA` on a bridge session goes through the same push gate a listener PUBLISH goes through, after the envelope opens: with push enabled and the signature-checking test verifier, a registration signed for the bridge entry's URL and target and sealed to the node's device's wrapping key is stored in the node's registration store, and one signed for another target and sealed correctly is rejected and stores nothing.",
+        "An in-process test with a bridge relay whose broker role is enabled, a node registered with it, and a peer: the peer opens a session to the node's `bridgeTarget` and sends a `BRIDGE_DATA` carrying a PUBLISH whose payload is a sealed, signed `PushRegistration`, the peer receives a `BRIDGE_DATA` on the session carrying the node's `OK` with no `blob_id`, the node's store holds the registration, and the bridge relay's blob storage holds nothing at the tier 3 ID.",
+        "A session payload that does not decode as a relay frame gets, on that session, the `ERR` `4000` a listener connection gets for it, and the node's relay connection to the bridge relay and the session stay open.",
+        "Answers on a bridge session (\u00a710.7.1 'Tier 3 envelope', **Opening, and what a failure does**): for a PUBLISH at a reserved tier 3 ID on a bridge session, the node sends exactly one frame in answer, carrying `OK` without `blob_id` when it accepts, `ERR` `4060` for every `4xxx` rejection and `ERR` `5000` for every `5xxx` rejection, each with an empty `msg`. One test per collapsed code drives a rejection the node would answer on a listener with `4061`, `4062`, `4063`, `4064`, `5003` and `5004` and asserts the bytes of the answer frame equal those of the `4060` frame (for `4xxx`) or the `5000` frame (for `5xxx`) apart from the echoed inner `ref`; the same messages on a listener connection get their own codes.",
+        "Envelope opening (`10-infrastructure-and-self-hosting.md` \u00a710.7.1 **Tier 3 envelope**): the node's relay validates `enc` (65 bytes, led by `0x04`, on the curve) before any Diffie-Hellman, computes the Diffie-Hellman output with `KeyCustody::dh_agree` on the identity's wrapping-key handle, opens `ct` with `info = \"scp-push-bridge-seal-v1\" || BE32(len(bridge_url)) || bridge_url || bridge_target` and `aad = BE32(len(bridge_url)) || bridge_url || bridge_target` built from the entry the PUBLISH arrived at, and strips the \u00a79.10.3 bucket padding before it decodes. The same opening applies to a PUBLISH at the tier 3 ID that arrives on one of the node's own listeners.",
+        "Opener injection: the relay receives the envelope opener through its push configuration, beside the tier 3 reservation, as a trait object the relay crate defines and `scp-node` implements over the identity's `KeyCustody` (ADR-062, capability injection; indicator name: `PushEnvelopeOpener`). A relay configured with a tier 3 reservation and no opener cannot be constructed, and no global, singleton or `static` holds the opener or the key handle; `scripts/check-no-mutable-globals.sh` passes.",
+        "Misaddressed envelopes are rejected: five tests seal a correctly signed registration (a) with the `info` and `aad` of another bridge URL, (b) with those of another target, (c) to another identity's wrapping key (the \u00a725.2 tertiary key where the node holds the secondary), (d) to the wrapping key of another device of the node's own identity, and (e) correctly for one tier 3 entry of a node that publishes two tier 3 entries with different bridge URLs and the same target, but delivered at the other entry's tier 3 ID. Each is rejected: the node's store and its stored timestamps are unchanged, the peer receives `ERR` `4060` with an empty `msg` on the session, and the same envelope sent on a listener connection gets `4060` PUSH_REGISTRATION_REJECTED. In case (e), the same node accepts an envelope sealed for each entry at that entry's own ID, which shows both entries are reserved and each opens with its own URL and target.",
+        "Malformed envelopes are rejected with the same effects: a payload shorter than 65 + 16 + 256 bytes, a payload whose length minus 81 is not a \u00a79.10.3 bucket size, a payload whose length minus 81 is the 256 KB bucket (above the tier 3 **Size ceiling**), an `enc` not led by `0x04` and one off the curve, a `ct` with one flipped bit, an opened plaintext whose length suffix exceeds the bytes before it, and an opened blob that does not decode. A test asserts `KeyCustody::dh_agree` is never called for the invalid `enc` cases.",
+        "Stored form: after an envelope opens and the registration is accepted, the node's registration store holds the decoded registration and no byte of the envelope; a test reads the store row and asserts it equals the row a direct listener registration of the same message produces.",
+        "The bridge relay cannot read the payload: in the in-process test, the bytes the bridge relay receives in the `BRIDGE_DATA` contain neither the registrant's 32 identifier bytes nor its `scp:` text form, nor the token, nor any listed routing ID, nor the 8-byte timestamp; and two registrations from one device that list different numbers of routing IDs but whose blobs fill the same \u00a79.10.3 bucket (indicator: an APNs token with one and with two routing IDs; the test asserts both blobs fall in one bucket before it compares) produce `BRIDGE_DATA` payloads of equal length. The `BRIDGE_DATA` bytes the bridge relay receives from the node for an accepted registration and for one rejected with each code of the previous criterion contain none of those values either.",
+        "Envelope vector (`10-infrastructure-and-self-hosting.md` \u00a710.7.1 **Tier 3 envelope**; `.docs/specs/25-test-vectors.md`): spec 25 gains a vector (indicator: in \u00a725.12, the HPKE vectors, as the next free vector number) with fixed inputs: recipient key the \u00a725.2 secondary key, ephemeral private scalar the \u00a725.2 tertiary private scalar, bridge URL `wss://bridge.example.com/scp/v1`, target `f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb`, and blob the 32 ASCII bytes `scp tier 3 push envelope vector!`. It prints `info`, `aad`, the 256-byte padded plaintext, `enc` and the 337-byte payload in hex. `scripts/gen-test-vectors-p256.py` gains the RFC 9180 Base-mode `SetupBaseS` with a fixed ephemeral scalar for DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and AES-128-GCM, builds each printed value from those inputs and emits it, so `python3.12 scripts/check-test-vectors-p256.py` passes. `crates/scp-runtime/tests/test_vectors.rs` asserts `info` and `aad` against the Rust builders and opens the printed payload with the secondary private scalar to the printed padded plaintext and the blob. The vector is printed in the same change that adds the generator code, because the gate fails on a printed hex value the generator does not emit; the generator holds no HPKE seal today."
+      ],
+      "actionItems": [
+        "Pass a PUBLISH at a reserved tier 3 ID that arrives through SCP-340's forwarded-frame handling through the envelope opener and the push gate, with the shared relay URL handle.",
+        "Map the push gate's rejection codes to the three reply frames on the bridge path only.",
+        "Add the in-process bridge test."
+      ],
+      "blockedBy": [
+        "PUSH-032",
+        "SCP-340"
+      ],
+      "blockedByIssues": [
+        2955
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.1 SCPRelay"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.4 Tier 3: Relay Bridging"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.16.2 Key Distribution (Pull-Based)"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.3 Fixed Bucket Padding"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.3 Key Derivation and HPKE Labels"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-034",
+      "title": "A bridge relay rejects a PUBLISH at the tier 3 push routing ID of a node it brokers",
+      "gate": "gate-push-relay",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-transport/src/relay/bridge.rs",
+        "crates/scp-transport/src/native/server.rs"
+      ],
+      "description": "Implements **Misdirected registrations** in `10-infrastructure-and-self-hosting.md` \u00a710.7.1 **Tier 3 relays**. A client that sends a tier 3 registration to the bridge relay directly, instead of inside `BRIDGE_DATA`, would otherwise have the bridge relay store the plaintext registration as a blob and deliver the identity's token to any subscriber of that routing ID. The bridge relay already holds both inputs of the tier 3 push routing ID, its own canonical URL and each routing ID registered through `BRIDGE_REGISTER` (\u00a710.12.4), so it computes each ID with PUSH-032's derivation and rejects a PUBLISH at it with `4060` PUSH_REGISTRATION_REJECTED (ADR-004), without verifying a signature. The rule is defense in depth under the relay tenet: the bridge relay is untrusted, and no client relies on it. This story owns bridge-relay PUBLISH handling; the node side is PUSH-032 and PUSH-033. File locations are indicators.",
+      "acceptanceCriteria": [
+        "A relay whose broker role is enabled and which holds a `BRIDGE_REGISTER` registration for target T rejects a PUBLISH at `SHA-256(\"scp-push-bridge:\" || its own canonical URL || T)` with `4060`, whatever the push role, and a QUERY and a SUBSCRIBE at that ID afterwards return nothing.",
+        "After the registration for T ends (the registrant disconnects), a PUBLISH at that ID is stored as an ordinary blob, so the rule covers only targets the relay currently holds.",
+        "A PUBLISH at the tier 3 ID built from another URL with T, or from the relay's own URL with a target it holds no registration for, is stored as an ordinary blob.",
+        "A relay holding registrations for two targets rejects a PUBLISH at the tier 3 ID of each with `4060`."
+      ],
+      "actionItems": [
+        "Keep the set of tier 3 push routing IDs of held targets beside the bridge registry, updated on register and deregister.",
+        "Reject a PUBLISH at an ID in that set with `4060` before storage, in the same gate the reserved push routing ID passes through.",
+        "Add the tests to the native server's push tests."
+      ],
+      "blockedBy": [
+        "PUSH-032"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.4 Tier 3: Relay Bridging"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "n/a",
+          "ffi": "n/a",
+          "sdk": "n/a",
+          "pw": "n/a",
+          "matrix": "n/a"
+        }
+      }
+    },
+    {
+      "id": "PUSH-035",
+      "title": "The client seals a tier 3 push registration to the publishing identity and sends it on a bridge session",
+      "gate": "gate-push-client",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/push/mod.rs",
+        "crates/scp-transport/src/native/client.rs",
+        "crates/scp-protocol/src/crypto/hpke/p256.rs",
+        "crates/scp-protocol/src/discovery/push.rs"
+      ],
+      "description": "Implements the registrant client's role in `10-infrastructure-and-self-hosting.md` \u00a710.7.1 **Tier 3 relays**: for a relay held as an `SCPRelay` entry that carries a `bridgeTarget` (`18-addressability-and-deployment.md` \u00a718.2.1), the registrar computes the entry's tier 3 push routing ID (`09-security-model.md` \u00a79.18.2), signs over the entry's canonical URL and target (\u00a79.5.2), and sends the PUBLISH frame on a session it opens through the bridge relay to the target (\u00a710.12.4 **Sessions**), never as a direct PUBLISH to the bridge relay. The story cannot start until the first open question in `00-open-questions.md`, how a context's relay list names a tier 3 relay, is decided, because the registrar learns its relays from the contexts it belongs to and that list carries no target today; the linked issue in `blockedByIssues` tracks the decision, since `blockedBy` names stories only. The registrar itself is PUSH-014 and the derivation is PUSH-032. File locations are indicators. The client also seals each tier 3 message in the `10-infrastructure-and-self-hosting.md` \u00a710.7.1 **Tier 3 envelope**: it reads the wrapping key of the node's device, the device of the identity whose service record carries the tier 3 entry whose SCP instance runs the node, from a KeyPackage that device published, authenticates it by the leaf's `scp_keypackage_attestation`, and seals the signed, padded message to it, so the bridge relay forwards ciphertext. The client fetches those KeyPackages from the node behind the tier 3 entry with ordinary paged `QUERY` frames on a bridge session (\u00a710.12.4 **Sessions**, SCP-340), and seals only to the wrapping key the identity's key state lists `Current` for the node's device (**Current wrapping key**). That rule reads the per-device wrapping-key role keri P7 adds to the key state (`09-security-model.md` \u00a79.7.4.2), which the second issue in `blockedByIssues` tracks. The story also cannot start until the open question in `00-open-questions.md` on which device's wrapping key a tier 3 client seals to is decided, because nothing the client reads today names the node's device. It reads the node's `OK`, `4060` or `5000` on the session. A tier 3 message's blob is at most 65,532 bytes (**Size ceiling**).",
+      "acceptanceCriteria": [
+        "For a tier 3 entry, `register` publishes to the entry's tier 3 push routing ID and signs a preimage ending with the entry's canonical URL and `bridgeTarget`; a test checks both against PUSH-032's derivation.",
+        "The registrar sends that PUBLISH only as a `BRIDGE_DATA` on a session it opened with a `BRIDGE_SESSION_OPEN` whose `target_routing_id` is the entry's `bridgeTarget`, and the PUBLISH payload is the sealed envelope, never the plain message; a test with a recording relay connection shows no direct PUBLISH at the tier 3 ID and no `BRIDGE_DATA` payload that decodes as a `PushRegistration`.",
+        "`deregister` for a tier 3 entry follows the same route and signs the same target.",
+        "An in-process test with a bridge relay and a bridged node stores the registration in the node's store and nothing in the bridge relay's blob storage, and `register` returns success only after the node's `OK` arrives on the session. With the node made to reject (a registration signed for another target), `register` returns a typed rejection from the node's `4060`; with the node made to answer `5000`, a typed retryable error; and with the session closed before the answer arrives (a test bridge that sends `BRIDGE_SESSION_CLOSE` after it carries the PUBLISH), a typed error stating that the outcome is unknown, after which the next `register` signs a newer `timestamp` and the node stores it; and with the client's connection to the bridge relay dropped after the bridge carries the PUBLISH and before the answer (`10-infrastructure-and-self-hosting.md` \u00a710.7.1 **The registrant client**), the same typed outcome-unknown error, after which the next `register`, on a new connection and session, signs a `timestamp` newer than the first attempt's and the node stores it.",
+        "Recipient key (`10-infrastructure-and-self-hosting.md` \u00a710.7.1 **Tier 3 envelope**): the client fetches the identity's KeyPackages from the node with a `QUERY` at the identity's KeyPackage routing ID (`09-security-model.md` \u00a79.7.4 **KeyPackage routing ID**) sent on a session opened with SCP-340's bridge session call to the entry's `bridgeTarget`, a recording bridge connection showing that `QUERY` before the registration's `BRIDGE_DATA`, and takes `pkR` from field 5, `wrapping_key`, of the `scp_keypackage_attestation` of a KeyPackage the identity published, and refuses to seal, with a typed error and no PUBLISH, when that attestation names another identifier than the identity whose service record carries the tier 3 entry, fails to verify against the key that identity's key state lists `Current` in the `#active` role, or has an `expires_at` at or before the client's clock. One test per refusal.",
+        "Sealing: the client pads the message's blob under \u00a79.10.3, seals it in HPKE Base mode under the \u00a79.5 suite to `pkR` with `info = \"scp-push-bridge-seal-v1\" || BE32(len(bridge_url)) || bridge_url || bridge_target` and the matching `aad` built from the entry, and frames the payload as `enc || ct`; a test opens the recorded payload with the recipient's private key and recovers the signed message byte for byte, and checks the payload length is 65 + bucket + 16.",
+        "A ciphertext addressed to another node or target is rejected: in the in-process test, an envelope the client seals for entry A and that is delivered to the node at entry B (another `bridgeTarget`, and separately another bridge URL) stores nothing in the node's store; an envelope sealed to a second identity's wrapping key and delivered to the first identity's node stores nothing.",
+        "The bridge relay cannot read the payload: in the in-process test, the `BRIDGE_DATA` bytes the bridge relay receives from the client contain neither the registrant's identifier in raw or `scp:` form, nor the token, nor any listed routing ID.",
+        "Fresh key per message: after the node's device rotates its wrapping key, the key state lists the new key `Current` for that device, and the device publishes KeyPackages carrying it, the client's next `register` and `deregister` seal to the new key, and a test shows the node, holding only the new key, stores the registration.",
+        "Current wrapping key (\u00a710.7.1 **Current wrapping key**): given valid attestations naming K1, the node's device's `Current` wrapping-key entry, K2, another device's `Current` entry, and K0, an entry of the node's device the key state lists `Superseded`, in any order in the `QUERY` answer and whatever their `issued_at` values, the client seals to K1. A fetch that returns only K0 and K2 refuses to seal, with a typed error (indicator: `Tier3WrappingKeySuperseded`) and no `BRIDGE_DATA`, and so does a fetch whose only KeyPackage of the node's device names a key the key state lists `Compromised{from: N}`.",
+        "Size ceiling (\u00a710.7.1 **Size ceiling**): a registration whose blob is 65,532 bytes is sealed in the 64 KB bucket and sent, with a payload of 65,617 bytes; one whose blob is 65,533 bytes is refused before any `BRIDGE_DATA`, with a typed error (indicator: `Tier3RegistrationTooLarge`) that names the ceiling; and a bridge relay configured with a `max_blob_size` below the `BRIDGE_DATA` that carries a 64 KB-bucket envelope closes the session with `BRIDGE_SESSION_CLOSE` `4010`, which `register` returns as the bridge relay's typed refusal.",
+        "Full KeyPackage read (\u00a710.7.1 **Recipient key**, **What bounds the read**): the client pages its `QUERY` on one session with `since` and `after_blob` until a `query_complete` reports a `count` below its `limit`, and seals to the node's device's `Current` key wherever in the read it appears; a test whose node store holds 1,001 KeyPackages of another device, stored before the one KeyPackage of the node's device, with `limit` 1,000, seals to the node's device's key. The client refuses to seal, with a typed error and no registration `BRIDGE_DATA`, when a `QUERY` of the read gets an `ERR`, when the session closes before the read ends, when the connection drops before the read ends, and when the read outlasts the client's read bound, a named field of its flat configuration (ADR-052) tested under a paused clock: one test per case, each with a recording bridge connection that shows no registration `BRIDGE_DATA` after the refusal. A test that publishes, from a second identity, a saved unexpired KeyPackage naming the old wrapping key at the first identity's KeyPackage routing ID, after the first identity deleted its old-key KeyPackages and while the store also holds one naming the new key, shows a first-fetch client seals to the new key.",
+        "Future `issued_at` (\u00a710.7.1 **Recipient key**, `09-security-model.md` \u00a79.7.1 check 13): under an injected clock, an attestation whose `issued_at` is more than 300 seconds after the client's clock is not accepted, so a test whose only KeyPackage naming the node's device's `Current` key carries such an attestation refuses to seal, with a typed error and no `BRIDGE_DATA`. An attestation whose `issued_at` is exactly 300 seconds after the client's clock is accepted and the client seals to its key."
+      ],
+      "actionItems": [
+        "Carry the entry's target with each relay the registrar registers with.",
+        "Route a tier 3 registration over a bridge session on the bridge relay connection."
+      ],
+      "blockedBy": [
+        "PUSH-014",
+        "PUSH-033",
+        "SCP-344"
+      ],
+      "blockedByIssues": [
+        2970,
+        2874
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.5.2 Signed Structure Definitions"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.1 SCPRelay"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.7.1 MLS-to-SCP Concept Mapping"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.3 Fixed Bucket Padding"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.3 Key Derivation and HPKE Labels"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.4 Tier 3: Relay Bridging"
+        }
+      ],
+      "details": {
+        "checklist": {
+          "dispatch": "PUSH-013",
+          "ffi": "PUSH-015",
+          "sdk": "PUSH-015",
+          "pw": "n/a",
+          "matrix": "PUSH-015"
+        }
+      }
     }
   ]
 }

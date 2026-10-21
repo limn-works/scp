@@ -542,6 +542,12 @@ All identity private state event types, organized by category:
 | `EnrollDevice` | `device_id: String, device_hpke_pubkey: [u8; 65], device_name: String, enrolled_at: u64` | Yes | New device enrollment |
 | `UnenrollDevice` | `device_id: String, timestamp: u64` | Yes | Device removal |
 
+**KeyPackage events (`10-infrastructure-and-self-hosting.md` §10.7.1 **Retired init keys**):**
+
+| Event type | Fields | Commutative | Notes |
+|-----------|--------|-------------|-------|
+| `RetireInitKey` | `init_key: [u8; 65], expires_at: u64, timestamp: u64` | Yes | A device consumed or deleted the KeyPackage carrying `init_key`; the identity's node refuses that `init_key` until `expires_at` |
+
 **Recovery contact events:**
 
 | Event type | Fields | Commutative | Notes |
