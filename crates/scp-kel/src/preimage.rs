@@ -539,7 +539,7 @@ pub fn decode_preimage(bytes: &[u8]) -> Result<EncodedPreimage, DecodeError> {
     if bytes.starts_with(KEL_EVENT_SEPARATOR) {
         return Err(DecodeError::SignedPreimage);
     }
-    let (_, preimage) = read_event(bytes, signed_len_of(bytes))?;
+    let (_, preimage) = read_event(bytes, signed_len_of(bytes)).map_err(|failure| failure.error)?;
     Ok(EncodedPreimage {
         preimage: preimage?,
         fields: bytes.to_vec(),
@@ -586,10 +586,14 @@ pub fn identifier_of(fields: &[u8]) -> Identifier {
 /// The body's outcome is kept apart from the header's, because a header
 /// that passes step 4 bounds the signature-field walk whether or not the
 /// body decodes.
+///
+/// # Errors
+///
+/// The [`HeaderFailure`] step 4 reports.
 pub fn read_event(
     fields: &[u8],
     signed_len: usize,
-) -> Result<(EventHeader, Result<EventPreimage, BodyError>), HeaderError> {
+) -> Result<(EventHeader, Result<EventPreimage, BodyError>), HeaderFailure> {
     let mut reader = Reader { rest: fields };
     let header = read_header(&mut reader, signed_len)?;
     let preimage = read_body(&mut reader, &header);
@@ -650,10 +654,37 @@ pub fn read_inception_zero_checks(fields: &[u8]) -> Result<(), InceptionHeaderDe
     Ok(())
 }
 
+/// A header that failed step 4, with the predecessor digest where fields 1
+/// through 4 read before the failure: the one field a verifier needs to
+/// place the unit below the event it names (§9.7.4.2 R3, the candidate
+/// rule).
+pub struct HeaderFailure {
+    /// Why step 4 failed.
+    pub error: HeaderError,
+    /// Field 4, where fields 1 through 4 read.
+    pub predecessor: Option<[u8; DIGEST_BYTES]>,
+}
+
 /// Step 4: fields 1 through 7 decode, then each form list pairs with its
 /// index list, then the encoded length is within `MAX_EVENT_BYTES`.
-fn read_header(reader: &mut Reader<'_>, signed_len: usize) -> Result<EventHeader, HeaderError> {
-    let leading = read_leading(reader).map_err(|field| HeaderError::Truncated { field })?;
+fn read_header(reader: &mut Reader<'_>, signed_len: usize) -> Result<EventHeader, HeaderFailure> {
+    let leading = read_leading(reader).map_err(|field| HeaderFailure {
+        error: HeaderError::Truncated { field },
+        predecessor: None,
+    })?;
+    let predecessor = leading.predecessor_digest;
+    read_header_after_leading(reader, &leading, signed_len).map_err(|error| HeaderFailure {
+        error,
+        predecessor: Some(predecessor),
+    })
+}
+
+/// Step 4 past fields 1 through 4.
+fn read_header_after_leading(
+    reader: &mut Reader<'_>,
+    leading: &Leading,
+    signed_len: usize,
+) -> Result<EventHeader, HeaderError> {
     let kind = kind_from_byte(leading.kind).ok_or(HeaderError::UnknownDiscriminator {
         field: HeaderDiscriminator::EventType,
         value: leading.kind,

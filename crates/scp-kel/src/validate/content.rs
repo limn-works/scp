@@ -252,10 +252,7 @@ fn check_link(chain: &ValidatedChain, preimage: &EventPreimage) -> Result<(), Co
 /// [`check_continuation_present`].
 fn check_sentinels(preimage: &EventPreimage) -> Result<(), ContentDefect> {
     let kind = preimage.kind;
-    let reveals = matches!(
-        kind,
-        EventKind::CommitmentRollover | EventKind::RootRecovery
-    );
+    let reveals = kind.is_reveal_authorized();
     let installs_root = matches!(kind, EventKind::Inception | EventKind::RootRecovery);
     let carries_snapshot = kind != EventKind::CommitmentRollover;
     let carries_seals = kind == EventKind::KeyState;
@@ -385,23 +382,20 @@ fn check_groups(
     let mut key_sets = Vec::new();
     for group in header.groups() {
         let role = group.role();
-        let (size, keys) = match (role, position) {
+        let keys = match (role, position) {
             (SignerGroupRole::Reveal, Position::Next(chain)) => {
                 let Standing::Fixed(commitment) = &*chain.head().commitment else {
                     return Err(ContentDefect::AfterAbandonment);
                 };
                 check_reveal(group, commitment, &preimage.revealed_keys)?;
-                let keys = reveal_key_set(&chain.head().commitment, group, &preimage.revealed_keys)
-                    .ok_or(ContentDefect::AfterAbandonment)?;
-                (commitment.commitments.len(), keys)
+                reveal_key_set(&chain.head().commitment, group, &preimage.revealed_keys)
+                    .ok_or(ContentDefect::AfterAbandonment)?
             }
             (SignerGroupRole::Root | SignerGroupRole::StandingRoot, Position::Next(chain)) => {
-                let root = &chain.head().root;
-                (root.members.len(), root_key_set(root))
+                root_key_set(&chain.head().root)
             }
             (SignerGroupRole::Root | SignerGroupRole::ReplacementRoot, _) => {
-                let root = installed_root.ok_or(ContentDefect::FieldAbsent { field: 9 })?;
-                (root.members.len(), root_key_set(root))
+                root_key_set(installed_root.ok_or(ContentDefect::FieldAbsent { field: 9 })?)
             }
             // An inception carries one root group; the decoder reads no
             // other group for it.
@@ -420,7 +414,9 @@ fn check_groups(
             if !seen.insert(index) {
                 return Err(ContentDefect::RepeatedIndex { role, index });
             }
-            if usize::from(index) >= size {
+            // The index names a key of the set the group verifies against,
+            // the one map 7a, 7b and step 9 read too.
+            if !keys.keys.contains_key(&index) {
                 return Err(ContentDefect::IndexOutOfRange { role, index });
             }
         }
@@ -630,17 +626,20 @@ fn successor_key_list(
         // installation, so a dropped key listed `Current` again fails below
         // as installed twice: a dropped key "signs nothing new" (§9.7.4.2
         // key conditions) and a key "is installed by at most one event".
-        // A `RootRecovery` installs every key its snapshot lists `Current`
-        // (R8: it "replaces the entire key state in one event"). Whether it
-        // may keep one is open (`00-open-questions.md`, 2026-10-20), so a
-        // kept key fails closed below as installed twice. Elsewhere a kept
-        // key is listed, not installed.
-        let installs = match segment {
-            Segment::Added => true,
-            Segment::Kept(_) => kind == EventKind::RootRecovery,
-            Segment::Dropped(_) => false,
-        };
-        if installs {
+        // A kept key is listed, not installed, whatever the kind: "listing
+        // an already-installed key in a later snapshot is not an
+        // installation". A `RootRecovery` may re-list an uncompromised
+        // operational key (§9.12, "the controller's own key re-listed
+        // otherwise"). Whether it may keep a root member, which would sit in
+        // field 9 that installs K′, is open (`00-open-questions.md`), so
+        // that case alone fails closed with its own defect.
+        if kind == EventKind::RootRecovery
+            && entry.role == KeyRole::RootMember
+            && matches!(segment, Segment::Kept(_))
+        {
+            return Err(ContentDefect::KeptRootMember { key: entry.key });
+        }
+        if segment == Segment::Added {
             if chain.installed_role(&entry.key).is_some() {
                 return Err(ContentDefect::KeyInstalledTwice { key: entry.key });
             }
@@ -738,6 +737,43 @@ fn check_next_commitment(
     }
 }
 
+/// The reveals, installations and fixed commitments at or before an event:
+/// the event's own over the chain's through its predecessor. Every
+/// freshness rule reads "at or before the event" through this one view, so
+/// no rule can read the chain's half without the event's.
+struct AtOrBefore<'c> {
+    chain: Option<&'c ValidatedChain>,
+    revealed: BTreeSet<[u8; 33]>,
+    revealed_commitments: BTreeSet<[u8; 32]>,
+    installed_commitments: BTreeSet<[u8; 32]>,
+    fixed: BTreeSet<[u8; 32]>,
+}
+
+impl AtOrBefore<'_> {
+    fn was_revealed(&self, key: &[u8; 33]) -> bool {
+        self.revealed.contains(key) || self.chain.is_some_and(|chain| chain.was_revealed(key))
+    }
+
+    fn was_fixed(&self, commitment: &[u8; 32]) -> bool {
+        self.fixed.contains(commitment)
+            || self.chain.is_some_and(|chain| chain.was_fixed(commitment))
+    }
+
+    fn commits_to_installed(&self, commitment: &[u8; 32]) -> bool {
+        self.installed_commitments.contains(commitment)
+            || self
+                .chain
+                .is_some_and(|chain| chain.installed_commitment(commitment))
+    }
+
+    fn commits_to_revealed(&self, commitment: &[u8; 32]) -> bool {
+        self.revealed_commitments.contains(commitment)
+            || self
+                .chain
+                .is_some_and(|chain| chain.revealed_commitment(commitment))
+    }
+}
+
 /// Commitment freshness and the installed-key rules (R4, R3): no installed
 /// key was revealed, installed keys and fixed commitments are disjoint in
 /// both directions at or before the event, and no fixed commitment commits
@@ -748,10 +784,6 @@ fn check_freshness(
     snapshot: Option<&AppliedSnapshot>,
     continuation: Option<&Standing>,
 ) -> Result<(), ContentDefect> {
-    let chain = match position {
-        Position::Next(chain) => Some(chain),
-        Position::Inception { .. } => None,
-    };
     let installed: &[([u8; 33], KeyRole)] =
         snapshot.map_or(&[], |applied| applied.installed.as_slice());
     let fixed: Vec<[u8; 32]> = match continuation {
@@ -762,35 +794,38 @@ fn check_freshness(
             .collect(),
         Some(Standing::Abandoned { .. }) | None => Vec::new(),
     };
-    let own_revealed: BTreeSet<[u8; 33]> = preimage.revealed_keys.iter().copied().collect();
-
-    let mut installed_commitments = BTreeSet::new();
+    let seen = AtOrBefore {
+        chain: match position {
+            Position::Next(chain) => Some(chain),
+            Position::Inception { .. } => None,
+        },
+        revealed: preimage.revealed_keys.iter().copied().collect(),
+        revealed_commitments: preimage
+            .revealed_keys
+            .iter()
+            .map(prerotation_commitment)
+            .collect(),
+        installed_commitments: installed
+            .iter()
+            .map(|(key, _)| prerotation_commitment(key))
+            .collect(),
+        fixed: fixed.iter().copied().collect(),
+    };
     for (key, _) in installed {
-        if own_revealed.contains(key) || chain.is_some_and(|chain| chain.was_revealed(key)) {
+        if seen.was_revealed(key) {
             return Err(ContentDefect::InstalledKeyRevealed { key: *key });
         }
-        let commitment = prerotation_commitment(key);
-        if fixed.contains(&commitment) || chain.is_some_and(|chain| chain.was_fixed(&commitment)) {
+        if seen.was_fixed(&prerotation_commitment(key)) {
             return Err(ContentDefect::InstalledKeyCommitted { key: *key });
         }
-        installed_commitments.insert(commitment);
     }
-    let revealed_commitments: BTreeSet<[u8; 32]> = preimage
-        .revealed_keys
-        .iter()
-        .map(prerotation_commitment)
-        .collect();
     for commitment in &fixed {
-        if installed_commitments.contains(commitment)
-            || chain.is_some_and(|chain| chain.installed_commitment(commitment))
-        {
+        if seen.commits_to_installed(commitment) {
             return Err(ContentDefect::CommitmentToInstalledKey {
                 commitment: *commitment,
             });
         }
-        if revealed_commitments.contains(commitment)
-            || chain.is_some_and(|chain| chain.revealed_commitment(commitment))
-        {
+        if seen.commits_to_revealed(commitment) {
             return Err(ContentDefect::CommitmentToRevealedKey {
                 commitment: *commitment,
             });

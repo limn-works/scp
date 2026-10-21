@@ -6,10 +6,11 @@
 
 use scp_did::{CustodyType, Identifier, KeyCondition, KeyRole};
 use scp_kel::{
-    BodyError, BodyList, ChainValidation, CheckStep, ContentDefect, Continuation,
-    DidDiscriminatorField, DistinctList, EventPreimage, HeaderDiscriminator, HeaderError,
-    InceptionDefect, InceptionHeaderDefect, InceptionRefusal, InstalledRootSet, SignerGroupRole,
-    StandingRootDeclaration, ThresholdField, decode_preimage, validate_chain, validate_inception,
+    BodyError, BodyList, CheckStep, ContentDefect, Continuation, DidDiscriminatorField,
+    DistinctList, EntryOutcome, EntryValidation, EventPreimage, FailureClass, HeaderDiscriminator,
+    HeaderError, InceptionDefect, InceptionHeaderDefect, InceptionRefusal, InstalledRootSet,
+    SignerGroupRole, StandingRootDeclaration, ThresholdField, decode_preimage, validate_entry,
+    validate_inception,
 };
 
 use super::chain_support::{
@@ -19,6 +20,7 @@ use super::chain_support::{
     service_role_at, sign_inception, sign_inception_wire, signature_field_at, signed_of, v41,
     v41_digest, v41_next, vector,
 };
+use super::chain_valid::valid;
 use super::fixtures::{
     TestResult, V41_ACTIVE, V41_IDENTIFIER, V41_PREIMAGE, V41_ROOT, V50_PREIMAGE, V50_SIGNATURE,
     array, event_unit, identifier,
@@ -68,9 +70,11 @@ fn check(row: &Row) -> TestResult {
     let name = row.name;
     let signed = signed_of(&row.unit)?;
     let served = identifier_of(signed);
-    let ChainValidation::InceptionInvalid { defect } = validate_chain(&served, &[&row.unit]) else {
-        return Err(format!("{name}: {:?}", validate_chain(&served, &[&row.unit])).into());
+    let EntryValidation { outcome, discarded } = validate_entry(&served, &[&row.unit]);
+    let EntryOutcome::InceptionInvalid { defect } = outcome else {
+        return Err(format!("{name}: {outcome:?} with {discarded:?}").into());
     };
+    assert!(discarded.is_empty(), "{name}: {discarded:?}");
     assert!(row.expect.matches(&defect), "{name}: {defect:?}");
     match validate_inception(signed) {
         Err(refusal @ InceptionRefusal::Invalid(_)) => {
@@ -551,14 +555,26 @@ fn count_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
 
 /// Rows the header or the zero check refuses.
 fn header_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
-    let mut rows = vec![
+    Ok(vec![
         row(
-            "A18a",
+            "A18a-short",
             patched_v41(ring, |wire| {
                 wire.forms = 0_u32.to_be_bytes().to_vec();
                 Ok(())
             })?,
-            Expect::Header(|e| matches!(e, HeaderError::FormListLength(_))),
+            Expect::Header(
+                |e| matches!(e, HeaderError::FormListLength(l) if l.indices == 1 && l.forms == 0),
+            ),
+        ),
+        row(
+            "A18a-long",
+            patched_v41(ring, |wire| {
+                wire.forms = vec![0, 0, 0, 2, 1, 1];
+                Ok(())
+            })?,
+            Expect::Header(
+                |e| matches!(e, HeaderError::FormListLength(l) if l.indices == 1 && l.forms == 2),
+            ),
         ),
         row(
             "A18b",
@@ -626,7 +642,12 @@ fn header_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
             })?,
             Expect::Header(|e| matches!(e, HeaderError::EventTooLong { .. })),
         ),
-    ];
+    ])
+}
+
+/// Rows holding a field an inception carries as its sentinel.
+fn sentinel_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
+    let mut rows = Vec::new();
     let sentinels: [SentinelCase; 3] = [
         ("A48-Inception-5", 5, |p| {
             p.standing_root = Some(StandingRootDeclaration::CoSigns);
@@ -647,8 +668,9 @@ fn header_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
 #[test]
 fn every_inception_defect_makes_the_identifier_invalid() -> TestResult {
     let ring = Ring::new()?;
-    let builders: [Builder; 8] = [
+    let builders: [Builder; 9] = [
         signer_rows,
+        sentinel_rows,
         threshold_rows,
         mismatch_rows,
         snapshot_rows,
@@ -681,9 +703,12 @@ fn a_later_event_derives_no_inception_identifier() -> TestResult {
 /// Every unit served for position zero is discarded: the verdict is
 /// `NoInception` with each discard.
 fn no_inception(units: &[&[u8]]) -> Result<Vec<scp_kel::Discarded>, Error> {
-    match validate_chain(&identifier(V41_IDENTIFIER)?, units) {
-        ChainValidation::NoInception { discarded } => Ok(discarded),
-        other => Err(format!("expected NoInception, got {other:?}").into()),
+    let EntryValidation { outcome, discarded } =
+        validate_entry(&identifier(V41_IDENTIFIER)?, units);
+    if outcome == EntryOutcome::NoInception {
+        Ok(discarded)
+    } else {
+        Err(format!("expected NoInception, got {outcome:?}").into())
     }
 }
 
@@ -691,18 +716,25 @@ fn v41_unit() -> Result<Vec<u8>, Error> {
     Ok(v41()?.units.first().ok_or("no V41 unit")?.clone())
 }
 
-/// One discard at position zero, at `stage`, carrying `digest`.
-fn assert_single(
-    discarded: &[scp_kel::Discarded],
+/// What one discard of the first served unit carries.
+struct Single {
     stage: CheckStep,
+    class: FailureClass,
+    /// The position the unit was read for; `None` where it joined no chain.
+    read_for: Option<u64>,
     digest: Option<[u8; 32]>,
-) -> TestResult {
+}
+
+/// One discard, of the first served unit.
+fn assert_single(discarded: &[scp_kel::Discarded], expected: &Single) -> TestResult {
     let [discard] = discarded else {
         return Err(format!("discards {discarded:?}").into());
     };
-    assert_eq!(discard.at_position(), 0);
-    assert_eq!(discard.stage(), stage, "{discard:?}");
-    assert_eq!(discard.digest(), digest, "{discard:?}");
+    assert_eq!(discard.served_index(), 0, "{discard:?}");
+    assert_eq!(discard.read_for(), expected.read_for, "{discard:?}");
+    assert_eq!(discard.stage(), expected.stage, "{discard:?}");
+    assert_eq!(discard.class(), expected.class, "{discard:?}");
+    assert_eq!(discard.digest(), expected.digest, "{discard:?}");
     Ok(())
 }
 
@@ -714,8 +746,12 @@ fn an_inception_that_recomputes_elsewhere_is_discarded() -> TestResult {
     let flipped = flip(&unit, last)?;
     assert_single(
         &no_inception(&[&flipped])?,
-        CheckStep::InceptionBinding,
-        None,
+        &Single {
+            stage: CheckStep::InceptionBinding,
+            class: FailureClass::ProvesNothing,
+            read_for: Some(0),
+            digest: None,
+        },
     )
 }
 
@@ -727,8 +763,12 @@ fn an_inception_whose_signature_fails_is_discarded_with_its_digest() -> TestResu
     let flipped = flip(&unit, signature_field_at(&unit)? + 10)?;
     assert_single(
         &no_inception(&[&flipped])?,
-        CheckStep::VerifiedCount,
-        Some(v41_digest()?),
+        &Single {
+            stage: CheckStep::VerifiedCount,
+            class: FailureClass::CopyDamage,
+            read_for: Some(0),
+            digest: Some(v41_digest()?),
+        },
     )
 }
 
@@ -738,23 +778,33 @@ fn an_inception_whose_signature_fails_is_discarded_with_its_digest() -> TestResu
 #[test]
 fn bytes_no_unit_frames_are_discarded() -> TestResult {
     let unit = v41_unit()?;
-    let ChainValidation::Valid { chain, discarded } =
-        validate_chain(&identifier(V41_IDENTIFIER)?, &[&unit, &[0x00]])
-    else {
-        return Err("C5 is not Valid".into());
-    };
+    let (chain, discarded) = valid(&identifier(V41_IDENTIFIER)?, &[&unit, &[0x00]])?;
     assert_eq!(chain.head_digest(), v41_digest()?);
     let [discard] = discarded.as_slice() else {
         return Err(format!("discards {discarded:?}").into());
     };
     assert_eq!(
-        (discard.at_position(), discard.stage(), discard.digest()),
-        (1, CheckStep::Unit, None)
+        (
+            discard.served_index(),
+            discard.read_for(),
+            discard.stage(),
+            discard.class(),
+            discard.digest()
+        ),
+        (1, None, CheckStep::Unit, FailureClass::ProvesNothing, None)
     );
 
     let mut appended = unit;
     appended.push(0x00);
-    assert_single(&no_inception(&[&appended])?, CheckStep::Walk, None)
+    assert_single(
+        &no_inception(&[&appended])?,
+        &Single {
+            stage: CheckStep::Walk,
+            class: FailureClass::CopyDamage,
+            read_for: Some(0),
+            digest: None,
+        },
+    )
 }
 
 /// C10: a flipped separator byte; C12: a length prefix past the unit.
@@ -762,7 +812,15 @@ fn bytes_no_unit_frames_are_discarded() -> TestResult {
 fn unframed_and_unseparated_inceptions_are_discarded() -> TestResult {
     let unit = v41_unit()?;
     let unseparated = flip(&unit, 4)?;
-    assert_single(&no_inception(&[&unseparated])?, CheckStep::Separator, None)?;
+    assert_single(
+        &no_inception(&[&unseparated])?,
+        &Single {
+            stage: CheckStep::Separator,
+            class: FailureClass::Illegal,
+            read_for: None,
+            digest: None,
+        },
+    )?;
     match validate_inception(signed_of(&unseparated)?) {
         Err(InceptionRefusal::Discarded(discard)) => {
             assert_eq!(discard.stage(), CheckStep::Separator);
@@ -773,7 +831,15 @@ fn unframed_and_unseparated_inceptions_are_discarded() -> TestResult {
     let mut unframed = unit;
     let prefix = unframed.first_chunk_mut::<4>().ok_or("no prefix")?;
     *prefix = (u32::from_be_bytes(*prefix) + 1000).to_be_bytes();
-    assert_single(&no_inception(&[&unframed])?, CheckStep::Unit, None)
+    assert_single(
+        &no_inception(&[&unframed])?,
+        &Single {
+            stage: CheckStep::Unit,
+            class: FailureClass::ProvesNothing,
+            read_for: None,
+            digest: None,
+        },
+    )
 }
 
 /// R2 accepts Vector 41 unsigned, and the signature field of 64 zero bytes
@@ -783,5 +849,84 @@ fn vector_41_passes_validate_inception() -> TestResult {
     let unit = v41_unit()?;
     let change = validate_inception(signed_of(&unit)?).map_err(|refusal| format!("{refusal:?}"))?;
     assert_eq!(change.preimage(), signed_of(&unit)?);
+    Ok(())
+}
+
+/// Vector 41 with `extra` more commitments and `seals` key-event seals, as
+/// an unsigned-check unit signed by its root.
+fn v41_padded(ring: &Ring, extra: usize, seals: usize) -> Result<Vec<u8>, Error> {
+    signed_v41(ring, |p| {
+        if let Some(Continuation::FixesCommitment(commitment)) = p.continuation.as_mut() {
+            for n in 0..extra {
+                let mut entry = scp_did::CommitmentEntry {
+                    commitment: [0x40; 32],
+                    custody_type: CustodyType::Passkey,
+                    key_algorithm: scp_did::KeyAlgorithm::EcdsaP256Sha256,
+                };
+                entry.commitment[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                commitment.commitments.push(entry);
+            }
+        }
+        p.seals = (0..seals)
+            .map(|n| {
+                let mut seal = [0x33; 32];
+                seal[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                seal
+            })
+            .collect();
+    })
+}
+
+/// Criterion 8 at position zero: an inception whose encoded length, its
+/// signed preimage plus the one raw root signature, is exactly
+/// `MAX_EVENT_BYTES` passes step 4's length check, and one seal more fails
+/// it with the encoded length. An inception carries field 11 as its
+/// sentinel, so seals are the one list that fills it to the bound, and the
+/// unit at the bound fails step 3's second half at that sentinel instead.
+#[test]
+fn an_inception_at_max_event_bytes_passes_the_length_check() -> TestResult {
+    let ring = Ring::new()?;
+    // Commitments are 34 bytes and seals 32, so some count of extra
+    // commitments leaves room for a whole number of seals.
+    let mut found = None;
+    for extra in 0..15 {
+        let empty = v41_padded(&ring, extra, 0)?;
+        let encoded = signed_of(&empty)?.len() + 64;
+        let room = 65_536 - encoded;
+        if room.is_multiple_of(32) {
+            found = Some((extra, room / 32));
+            break;
+        }
+    }
+    let (extra, seals) = found.ok_or("no commitment count aligns the seals")?;
+    let at_bound = v41_padded(&ring, extra, seals)?;
+    assert_eq!(signed_of(&at_bound)?.len() + 64, 65_536);
+    let over = v41_padded(&ring, extra, seals + 1)?;
+    for (unit, expected) in [
+        (
+            at_bound,
+            InceptionDefect::Content(ContentDefect::SentinelHeld { field: 11 }),
+        ),
+        (
+            over,
+            InceptionDefect::Header(HeaderError::EventTooLong {
+                encoded_len: 65_568,
+            }),
+        ),
+    ] {
+        let served = identifier_of(signed_of(&unit)?);
+        let EntryValidation { outcome, discarded } = validate_entry(&served, &[&unit]);
+        assert!(discarded.is_empty(), "{discarded:?}");
+        assert_eq!(
+            outcome,
+            EntryOutcome::InceptionInvalid {
+                defect: expected.clone()
+            }
+        );
+        assert_eq!(
+            validate_inception(signed_of(&unit)?),
+            Err(InceptionRefusal::Invalid(expected))
+        );
+    }
     Ok(())
 }

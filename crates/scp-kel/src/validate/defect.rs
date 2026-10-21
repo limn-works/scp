@@ -14,8 +14,8 @@ use crate::{
 ///
 /// Step 6 computes the digest and cannot fail, so it has no variant.
 /// `InceptionBinding` is step 3's first half; a failure at step 3's second
-/// half is [`ChainValidation::InceptionInvalid`](super::ChainValidation)
-/// and never a discard. `NamedCount` is sub-check 7a and `VerifiedCount`
+/// half is [`EntryOutcome::InceptionInvalid`](super::EntryOutcome) and
+/// never a discard. `NamedCount` is sub-check 7a and `VerifiedCount`
 /// sub-check 7b.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CheckStep {
@@ -285,6 +285,17 @@ pub enum ContentDefect {
         /// The key.
         key: [u8; 33],
     },
+    /// A `RootRecovery` whose snapshot keeps a root member `Current` from
+    /// its predecessor. Whether a recovery may keep one is open in
+    /// `00-open-questions.md` (a kept root member sits in field 9, which
+    /// installs K′), so the verifier fails closed on that case alone; a kept
+    /// operational key is valid (§9.12, "the controller's own key re-listed
+    /// otherwise").
+    #[error("a RootRecovery keeps a root member Current")]
+    KeptRootMember {
+        /// The kept key.
+        key: [u8; 33],
+    },
     /// An installed key that a reveal on the chain revealed.
     #[error("an installed key was revealed as a next-set key")]
     InstalledKeyRevealed {
@@ -490,31 +501,54 @@ impl EventDefect {
     }
 }
 
-/// One unit a verifier discarded, at the chain position it was read for
-/// (§9.7.4.2 R3, the candidate rule).
+/// One unit a verifier discarded (§9.7.4.2 R3, the candidate rule).
 ///
-/// Its stage, class and digest are read off the defect, so no discard can
-/// carry a digest before step 6 or a stage its defect does not name.
+/// It names the unit by its index in the units the call was given, and
+/// separately the chain position the unit was read for, which is `None`
+/// for a unit that joined no chain: one that failed before its predecessor
+/// digest decoded, or that names a predecessor no chain holds. Its stage,
+/// class and digest are read off the defect, so no discard can carry a
+/// digest before step 6 or a stage its defect does not name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discarded {
-    at_position: u64,
+    served_index: usize,
+    read_for: Option<u64>,
     defect: EventDefect,
 }
 
 impl Discarded {
-    pub(super) const fn new(at_position: u64, defect: EventDefect) -> Self {
+    /// A unit read for chain position `position` that failed there.
+    pub(super) const fn read(served_index: usize, position: u64, defect: EventDefect) -> Self {
         Self {
-            at_position,
+            served_index,
+            read_for: Some(position),
             defect,
         }
     }
 
-    /// The chain position the unit was read for. For a unit
-    /// [`validate_entry`](super::validate_entry) places in no chain, the
-    /// unit's index in the served list.
+    /// A unit that joined no chain.
+    pub(super) const fn unplaced(served_index: usize, defect: EventDefect) -> Self {
+        Self {
+            served_index,
+            read_for: None,
+            defect,
+        }
+    }
+
+    /// The unit's index in the units the call was given: the served list
+    /// for [`validate_entry`](super::validate_entry), and zero for the one
+    /// unit or candidate `extend`, `validate_change` and
+    /// `validate_inception` take.
     #[must_use]
-    pub const fn at_position(&self) -> u64 {
-        self.at_position
+    pub const fn served_index(&self) -> usize {
+        self.served_index
+    }
+
+    /// The chain position the unit was read for, or `None` where it joined
+    /// no chain.
+    #[must_use]
+    pub const fn read_for(&self) -> Option<u64> {
+        self.read_for
     }
 
     /// The failing check.

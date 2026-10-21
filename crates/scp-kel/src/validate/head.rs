@@ -9,7 +9,6 @@ use super::chain::ValidatedChain;
 use super::change::ValidatedChange;
 use super::defect::{CheckStep, Discarded};
 use super::{InceptionRefusal, validate_inception};
-use crate::EventKind;
 use crate::constants::HELD_HEAD_MARKER_BYTES;
 
 /// The bytes of an encoded [`HeldHeadMarker`].
@@ -40,16 +39,34 @@ impl MarkerMode {
 /// It persists at `HELD_HEAD_MARKER_BYTES`: the 32-byte identifier, the 8-byte
 /// big-endian sequence, the 32-byte preimage digest and the 1-byte mode
 /// (`03-identity.md` §3.10; §9.18.17).
+///
+/// Its fields are private. [`adopt`](Self::adopt), which takes the mode as
+/// a required argument, and [`from_bytes`](Self::from_bytes) are its only
+/// constructors, so no marker names a head no valid chain ended at or drops
+/// a persisted `RevealOnly`.
+///
+/// ```compile_fail,E0451
+/// # use scp_kel::{HeldHeadMarker, MarkerMode};
+/// let marker = HeldHeadMarker {
+///     identifier: scp_did::Identifier::ZERO,
+///     sequence: 0,
+///     event_digest: [0; 32],
+///     mode: MarkerMode::Any,
+/// };
+/// ```
+///
+/// The positive control:
+///
+/// ```
+/// # use scp_kel::HeldHeadMarker;
+/// assert!(HeldHeadMarker::from_bytes(&[0; 73]).is_ok());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HeldHeadMarker {
-    /// The identifier.
-    pub identifier: Identifier,
-    /// The head's sequence.
-    pub sequence: u64,
-    /// The head's preimage digest.
-    pub event_digest: [u8; 32],
-    /// What the signing rule signs at the head.
-    pub mode: MarkerMode,
+    identifier: Identifier,
+    sequence: u64,
+    event_digest: [u8; 32],
+    mode: MarkerMode,
 }
 
 /// Why bytes do not decode to a [`HeldHeadMarker`].
@@ -68,6 +85,42 @@ pub enum HeldHeadMarkerError {
 }
 
 impl HeldHeadMarker {
+    /// The marker a device writes when it adopts `chain`'s head, with the
+    /// mode the signing rule signs under there (§9.7.4.2 R10).
+    #[must_use]
+    pub fn adopt(chain: &ValidatedChain, mode: MarkerMode) -> Self {
+        Self {
+            identifier: chain.identifier(),
+            sequence: chain.head_sequence(),
+            event_digest: chain.head_digest(),
+            mode,
+        }
+    }
+
+    /// The identifier.
+    #[must_use]
+    pub const fn identifier(&self) -> Identifier {
+        self.identifier
+    }
+
+    /// The head's sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// The head's preimage digest.
+    #[must_use]
+    pub const fn event_digest(&self) -> [u8; 32] {
+        self.event_digest
+    }
+
+    /// What the signing rule signs at the marked head.
+    #[must_use]
+    pub const fn mode(&self) -> MarkerMode {
+        self.mode
+    }
+
     /// The marker's `HELD_HEAD_MARKER_BYTES` encoding.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; MARKER_LEN] {
@@ -116,14 +169,14 @@ impl HeldHeadMarker {
     }
 }
 
-/// The head a signing device holds: its retained log's head, or its
-/// persisted [`HeldHeadMarker`] (§9.7.4.2 R10).
+/// The head a signing device holds (§9.7.4.2 R10).
+///
+/// It is the head "which its `HeldHeadMarker` names".
+/// [`from_marker`](Self::from_marker) is its only constructor, so the
+/// marker's mode always reaches the signing rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HeldHead {
-    identifier: Identifier,
-    sequence: u64,
-    digest: [u8; 32],
-    mode: MarkerMode,
+    marker: HeldHeadMarker,
 }
 
 /// Why [`HeldHead::check_next`] refuses to hand a candidate to a signer.
@@ -162,37 +215,16 @@ impl SigningRefusal {
 }
 
 impl HeldHead {
-    /// The head of a device's retained log, signing every legal event.
-    #[must_use]
-    pub fn of_log(log: &ValidatedChain) -> Self {
-        Self {
-            identifier: log.identifier(),
-            sequence: log.head_sequence(),
-            digest: log.head_digest(),
-            mode: MarkerMode::Any,
-        }
-    }
-
-    /// The head a persisted marker names, with its mode.
+    /// The head a marker names, with its mode.
     #[must_use]
     pub const fn from_marker(marker: &HeldHeadMarker) -> Self {
-        Self {
-            identifier: marker.identifier,
-            sequence: marker.sequence,
-            digest: marker.event_digest,
-            mode: marker.mode,
-        }
+        Self { marker: *marker }
     }
 
-    /// The marker that persists this head.
+    /// The marker that names this head.
     #[must_use]
     pub const fn marker(&self) -> HeldHeadMarker {
-        HeldHeadMarker {
-            identifier: self.identifier,
-            sequence: self.sequence,
-            event_digest: self.digest,
-            mode: self.mode,
-        }
+        self.marker
     }
 
     /// R10's signing rule for an event past the inception: the chain must
@@ -213,21 +245,21 @@ impl HeldHead {
         candidate_preimage: &[u8],
     ) -> Result<SigningChange, SigningRefusal> {
         let handed = chain.head_digest();
-        if handed != self.digest {
+        if handed != self.marker.event_digest {
             return Err(SigningRefusal::Stale {
                 handed,
-                held: self.digest,
+                held: self.marker.event_digest,
             });
         }
         let change = chain
             .validate_change(candidate_preimage)
             .map_err(SigningRefusal::Illegal)?;
-        let reveal_authorized = matches!(
-            change.effect().kind,
-            EventKind::CommitmentRollover | EventKind::RootRecovery
-        );
-        if self.mode == MarkerMode::RevealOnly && !reveal_authorized {
-            return Err(SigningRefusal::RevealOnly { held: self.digest });
+        if self.marker.mode == MarkerMode::RevealOnly
+            && !change.effect().kind.is_reveal_authorized()
+        {
+            return Err(SigningRefusal::RevealOnly {
+                held: self.marker.event_digest,
+            });
         }
         Ok(SigningChange { change })
     }

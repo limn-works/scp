@@ -2,17 +2,19 @@
 //! §9.7.4.2 R3): each row serves a base chain and one unit, and expects
 //! `Valid` at the base's head with one `Discarded` at the next position.
 //!
-//! Each row also checks that `extend` on the base returns the same
-//! `Discarded` with the chain unchanged, and that `validate_change` on the
-//! unit's signed preimage fails at the same check where that check reads no
-//! signature, and passes or fails later where it does.
+//! Each row runs through `validate_entry`, which names the unit by its
+//! served index and, where the unit was read for a position, that position.
+//! It also checks that `extend` on the base returns the same defect with the
+//! chain unchanged, and that `validate_change` on the unit's signed preimage
+//! fails at the same check where that check reads no signature, and passes
+//! or fails later where it does.
 
 use scp_did::{CustodyType, Identifier, KeyCondition, KeyEntry, KeyRole};
 use scp_kel::{
     BodyError, BodyList, CheckStep, ContentDefect, Continuation, DidDiscriminatorField,
-    DistinctList, EventDefect, EventKind, EventPreimage, HeaderDiscriminator, HeaderError,
-    InstalledRootSet, KeyStateSnapshot, SignerGroupRole, SignerList, StandingRootDeclaration,
-    StandingRootSigning, ThresholdField, prerotation_commitment,
+    DistinctList, EventDefect, EventKind, EventPreimage, FailureClass, HeaderDiscriminator,
+    HeaderError, HeaderField, InstalledRootSet, KeyStateSnapshot, SignerGroupRole, SignerList,
+    StandingRootDeclaration, StandingRootSigning, ThresholdField, prerotation_commitment,
 };
 
 use super::chain_support::{
@@ -34,6 +36,9 @@ pub enum Expect {
     Content(ContentDefect),
     Body(fn(&BodyError) -> bool),
     Header(fn(&HeaderError) -> bool),
+    /// A header failure inside fields 1 through 4, before the predecessor
+    /// digest decodes, so the unit joins no chain.
+    LeadingHeader(fn(&HeaderError) -> bool),
     NamedCount,
     VerifiedCount,
     Walk,
@@ -46,7 +51,7 @@ impl Expect {
     const fn stage(&self) -> CheckStep {
         match self {
             Self::Content(_) | Self::Body(_) => CheckStep::Content,
-            Self::Header(_) | Self::Predecessor => CheckStep::Header,
+            Self::Header(_) | Self::LeadingHeader(_) | Self::Predecessor => CheckStep::Header,
             Self::NamedCount => CheckStep::NamedCount,
             Self::VerifiedCount => CheckStep::VerifiedCount,
             Self::Walk => CheckStep::Walk,
@@ -67,7 +72,9 @@ impl Expect {
                     defect: ContentDefect::Body(error),
                 },
             ) => *d == digest && check(error),
-            (Self::Header(check), EventDefect::Header(error)) => check(error),
+            (Self::Header(check) | Self::LeadingHeader(check), EventDefect::Header(error)) => {
+                check(error)
+            }
             (Self::NamedCount, EventDefect::NamedCountShort { digest: d })
             | (Self::VerifiedCount, EventDefect::VerifiedCountShort { digest: d }) => *d == digest,
             (Self::Walk, EventDefect::Walk(_) | EventDefect::UnconsumedBytes { .. })
@@ -83,6 +90,30 @@ impl Expect {
                 },
             ) => *d == digest && r == role && i == index,
             _ => false,
+        }
+    }
+
+    /// Whether the unit joins no chain in `validate_entry`: it failed before
+    /// its predecessor digest decoded, or names a predecessor no chain
+    /// holds.
+    const fn unplaced(&self) -> bool {
+        matches!(
+            self,
+            Self::Separator | Self::LeadingHeader(_) | Self::Predecessor
+        )
+    }
+
+    /// The class §9.7.4.2 R3 gives the failing check.
+    const fn class(&self) -> FailureClass {
+        match self {
+            Self::Predecessor => FailureClass::ProvesNothing,
+            Self::Walk | Self::VerifiedCount | Self::Signature(..) => FailureClass::CopyDamage,
+            Self::Content(_)
+            | Self::Body(_)
+            | Self::Header(_)
+            | Self::LeadingHeader(_)
+            | Self::NamedCount
+            | Self::Separator => FailureClass::Illegal,
         }
     }
 }
@@ -117,18 +148,22 @@ const fn rank(step: CheckStep) -> u8 {
     }
 }
 
-/// Runs one row through `validate_chain`, `extend` and `validate_change`.
+/// Runs one row through `validate_entry`, `extend` and `validate_change`.
 pub fn check(row: &Row) -> TestResult {
     let name = row.name;
     let (chain, discarded) = valid(&row.base.identifier, &row.base.with(&row.unit))
         .map_err(|error| format!("{name}: {error}"))?;
-    assert_eq!(chain.head_digest(), row.base.head, "{name}");
+    assert_eq!(chain, chain_of(&row.base)?, "{name}");
     let [discard] = discarded.as_slice() else {
         return Err(format!("{name}: discards {discarded:?}").into());
     };
-    assert_eq!(discard.at_position(), row.base.len(), "{name}");
+    let position = row.base.len();
+    assert_eq!(discard.served_index(), usize::try_from(position)?, "{name}");
+    let read_for = (!row.expect.unplaced()).then_some(position);
+    assert_eq!(discard.read_for(), read_for, "{name}: {discard:?}");
     let stage = row.expect.stage();
     assert_eq!(discard.stage(), stage, "{name}: {discard:?}");
+    assert_eq!(discard.class(), row.expect.class(), "{name}: {discard:?}");
     let signed = signed_of(&row.unit)?;
     let digest = digest_of(signed);
     assert!(
@@ -150,7 +185,9 @@ pub fn check(row: &Row) -> TestResult {
         Ok(_) => return Err(format!("{name}: extend accepted the unit").into()),
         Err((back, extended)) => {
             assert_eq!(back, base, "{name}");
-            assert_eq!(&extended, discard, "{name}");
+            assert_eq!(extended.defect(), discard.defect(), "{name}");
+            assert_eq!(extended.read_for(), Some(position), "{name}");
+            assert_eq!(extended.served_index(), 0, "{name}");
         }
     }
     let reads_no_signature = matches!(
@@ -158,7 +195,11 @@ pub fn check(row: &Row) -> TestResult {
         CheckStep::Separator | CheckStep::Header | CheckStep::NamedCount | CheckStep::Content
     );
     match change {
-        Err(refused) if reads_no_signature => assert_eq!(&refused, discard, "{name}"),
+        Err(refused) if reads_no_signature => {
+            assert_eq!(refused.defect(), discard.defect(), "{name}");
+            assert_eq!(refused.read_for(), Some(position), "{name}");
+            assert_eq!(refused.served_index(), 0, "{name}");
+        }
         Ok(_) if reads_no_signature => {
             return Err(format!("{name}: validate_change accepted").into());
         }
@@ -259,10 +300,9 @@ const fn content(defect: ContentDefect) -> Expect {
     Expect::Content(defect)
 }
 
-/// The rows on a `KeyState` after Vector 41.
+/// The rows on a `KeyState` after Vector 41 whose signer index list is
+/// illegal or names too few keys.
 fn key_state_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
-    let (_, active) = v41_keys()?;
-    let new_active = point("pr3-active-2");
     let base = v41()?;
     let mut rows = Vec::new();
 
@@ -272,7 +312,15 @@ fn key_state_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
     let named_one = key_state(ring, &f3, one_index, |preimage| {
         preimage.signer_groups = vec![group(&[0])];
     })?;
-    rows.push(row("A1/C9", f3, named_one, Expect::NamedCount));
+    rows.push(row("A1/C9", f3.clone(), named_one, Expect::NamedCount));
+    // A repeated index counts once toward the 2-of-3 root's threshold, so
+    // 7a fails before 7b reads either signature.
+    let mut twice = f3_inception()?.key_state.ok_or("F3 carries a snapshot")?;
+    twice.witnessing_interval = 7200;
+    let named_twice = key_state(ring, &f3, twice, |preimage| {
+        preimage.signer_groups = vec![group(&[0, 0])];
+    })?;
+    rows.push(row("A1-repeated", f3, named_twice, Expect::NamedCount));
 
     rows.push(v41_row(
         "A2",
@@ -294,6 +342,37 @@ fn key_state_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
             index: 5,
         }),
     )?);
+    // The boundary: index 1 against Vector 41's one-member root.
+    rows.push(v41_row(
+        "A3-boundary",
+        key_state(ring, &base, v41_changed()?, |p| {
+            p.signer_groups = vec![group(&[0, 1])];
+        })?,
+        content(ContentDefect::IndexOutOfRange {
+            role: SignerGroupRole::Root,
+            index: 1,
+        }),
+    )?);
+    // A repeated index keeps the first signature the list names there:
+    // valid then garbage passes 7b and fails step 8; garbage then valid
+    // fails 7b.
+    let reference = reference()?;
+    let mut repeated = key_state_on(&base, v41_changed()?);
+    repeated.signer_groups = vec![group(&[0, 0])];
+    let repeated_fields = Wire::of(&repeated).fields();
+    rows.push(v41_row(
+        "A2-valid-then-garbage",
+        unit(&repeated_fields, &[Some(&reference), None])?,
+        content(ContentDefect::RepeatedIndex {
+            role: SignerGroupRole::Root,
+            index: 0,
+        }),
+    )?);
+    rows.push(v41_row(
+        "A2-garbage-then-valid",
+        unit(&repeated_fields, &[None, Some(&reference)])?,
+        Expect::VerifiedCount,
+    )?);
     rows.push(v41_row(
         "A3-keyless",
         key_state(ring, &base, v41_changed()?, |p| {
@@ -301,7 +380,16 @@ fn key_state_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
         })?,
         Expect::NamedCount,
     )?);
+    Ok(rows)
+}
 
+/// The rows on a `KeyState` after Vector 41 whose sequence or snapshot is
+/// illegal.
+fn key_state_change_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
+    let (_, active) = v41_keys()?;
+    let new_active = point("pr3-active-2");
+    let base = v41()?;
+    let mut rows = Vec::new();
     rows.push(v41_row(
         "A7",
         v41_key_state(ring, |s| {
@@ -487,6 +575,108 @@ fn key_state_header_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
     }
 
     Ok(rows)
+}
+
+/// The header failures after field 4 that `key_state_header_rows` does not
+/// reach: the preimage ends inside field 5, 6 or 7, or a signer list's count
+/// implies more bytes than remain. Field 4 decoded, so each unit is read for
+/// position 1.
+fn key_state_short_header_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
+    let mut rows = Vec::new();
+    let header_rows: [HeaderCase; 4] = [
+        (
+            "Truncated-standing-root",
+            |wire| {
+                wire.head.truncate(STANDING_ROOT_AT);
+                after_field(wire, 5);
+                Ok(())
+            },
+            |e| {
+                matches!(
+                    e,
+                    HeaderError::Truncated {
+                        field: HeaderField::StandingRoot
+                    }
+                )
+            },
+        ),
+        (
+            "Truncated-indices",
+            |wire| {
+                wire.indices.truncate(2);
+                after_field(wire, 6);
+                Ok(())
+            },
+            |e| {
+                matches!(
+                    e,
+                    HeaderError::Truncated {
+                        field: HeaderField::SignerIndices
+                    }
+                )
+            },
+        ),
+        (
+            "Truncated-forms",
+            |wire| {
+                wire.forms.truncate(2);
+                after_field(wire, 7);
+                Ok(())
+            },
+            |e| {
+                matches!(
+                    e,
+                    HeaderError::Truncated {
+                        field: HeaderField::SignatureForms
+                    }
+                )
+            },
+        ),
+        (
+            "CountOverRemaining",
+            |wire| {
+                wire.indices = 15_u32.to_be_bytes().to_vec();
+                after_field(wire, 6);
+                Ok(())
+            },
+            |e| {
+                matches!(
+                    e,
+                    HeaderError::CountOverRemaining {
+                        list: SignerList::Indices(SignerGroupRole::Root),
+                        count: 15,
+                        remaining: 0
+                    }
+                )
+            },
+        ),
+    ];
+    for (name, patch, expected) in header_rows {
+        let unit = v41_key_state_wire(ring, |_| {}, patch)?;
+        rows.push(v41_row(name, unit, Expect::Header(expected))?);
+    }
+
+    Ok(rows)
+}
+
+/// Empties every field of `wire` after field `last`, so the preimage ends
+/// inside or at the end of it.
+fn after_field(wire: &mut Wire, last: u8) {
+    if last < 6 {
+        wire.indices.clear();
+    }
+    if last < 7 {
+        wire.forms.clear();
+    }
+    for later in [
+        &mut wire.revealed,
+        &mut wire.installed,
+        &mut wire.snapshot,
+        &mut wire.seals,
+        &mut wire.continuation,
+    ] {
+        later.clear();
+    }
 }
 
 fn key_state_snapshot_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
@@ -1297,6 +1487,18 @@ fn chained_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
         }),
     ));
 
+    // A36-same-event: Vector 53 re-commits the key it reveals.
+    rows.push(v41_row(
+        "A36-same-event",
+        on_v41(
+            ring,
+            &v53_with(|p| p.continuation = Some(fixes(&[ter], 1)))?,
+        )?,
+        content(ContentDefect::CommitmentToRevealedKey {
+            commitment: prerotation_commitment(&ter),
+        }),
+    )?);
+
     // A34: any event after an abandonment.
     let abandoned = v41_v68()?;
     rows.push(row(
@@ -1538,6 +1740,60 @@ fn chained_f2_fx_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
     Ok(rows)
 }
 
+/// Vector 54 on Vector 41 with its snapshot's keys replaced by `keys`, field
+/// 9 following the snapshot's root.
+fn v54_keeping(ring: &Ring, keys: Vec<KeyEntry>) -> Result<Vec<u8>, Error> {
+    let mut kept = vector(V54_PREIMAGE)?
+        .key_state
+        .ok_or("Vector 54 carries a snapshot")?;
+    kept.keys = keys;
+    on_v41(ring, &v54_with(|p| set_snapshot(p, kept))?)
+}
+
+/// A `RootRecovery` that keeps Vector 41's root member `Current`: whether a
+/// recovery may keep one is open, so it fails closed with its own defect.
+fn recovery_kept_rows(ring: &Ring) -> Result<Vec<Row>, Error> {
+    let (root, active) = v41_keys()?;
+    let k_prime = point("scp-25-recovery-cosigns-root");
+    let unit = v54_keeping(
+        ring,
+        vec![
+            root,
+            current(k_prime, KeyRole::RootMember),
+            current(point("scp-25-recovery-cosigns-active"), KeyRole::Active),
+            entry(active.key, KeyRole::Active, KeyCondition::Superseded),
+        ],
+    )?;
+    Ok(vec![v41_row(
+        "recovery-keeps-root-member",
+        unit,
+        content(ContentDefect::KeptRootMember { key: root.key }),
+    )?])
+}
+
+/// A `RootRecovery` that re-lists the controller's own `#active` key keeps
+/// it: "listing an already-installed key in a later snapshot is not an
+/// installation" (§9.7.4.2), and §9.12 re-lists an uncompromised key.
+#[test]
+fn a_recovery_that_keeps_active_is_valid() -> TestResult {
+    let ring = Ring::new()?;
+    let (root, active) = v41_keys()?;
+    let k_prime = current(point("scp-25-recovery-cosigns-root"), KeyRole::RootMember);
+    let superseded_root = entry(root.key, KeyRole::RootMember, KeyCondition::Superseded);
+    let unit = v54_keeping(&ring, vec![active, k_prime, superseded_root])?;
+    let base = v41()?;
+    let (chain, discarded) = valid(&base.identifier, &base.with(&unit))?;
+    assert!(discarded.is_empty(), "{discarded:?}");
+    assert_eq!(chain.head_digest(), digest_of(signed_of(&unit)?));
+    let change = chain_of(&base)?
+        .validate_change(signed_of(&unit)?)
+        .map_err(|discard| format!("{discard:?}"))?;
+    assert_eq!(change.effect().kind, EventKind::RootRecovery);
+    assert_eq!(change.effect().installed_keys, vec![k_prime]);
+    assert_eq!(change.effect().dropped_keys, vec![superseded_root]);
+    Ok(())
+}
+
 /// The `KeyState` units on Vector 41 one seal over and exactly at
 /// `MAX_EVENT_BYTES`: the encoded length is the signed preimage plus 64
 /// bytes for the one raw root index.
@@ -1568,6 +1824,14 @@ pub fn seal_bound(ring: &Ring) -> Result<(Vec<u8>, Vec<u8>), Error> {
 const SEPARATOR_AT: usize = 4;
 const PREDECESSOR_AT: usize = 4 + 17 + 41;
 
+/// A unit whose signed preimage ends one byte into field 4, with no
+/// signature field.
+fn truncated_in_field_4(unit: &[u8]) -> Result<Vec<u8>, Error> {
+    let signed = signed_of(unit)?;
+    let cut = signed.get(..PREDECESSOR_AT - 4 + 1).ok_or("short")?;
+    super::chain_support::unit_of(cut, &[])
+}
+
 /// Rows on Vector 50's own unit, served after the wrong base or with a
 /// byte flipped.
 fn vector_rows() -> Result<Vec<Row>, Error> {
@@ -1590,6 +1854,18 @@ fn vector_rows() -> Result<Vec<Row>, Error> {
             super::chain_support::flip(&v50, SEPARATOR_AT)?,
             Expect::Separator,
         )?,
+        v41_row(
+            "C10-leading",
+            truncated_in_field_4(&v50)?,
+            Expect::LeadingHeader(|e| {
+                matches!(
+                    e,
+                    HeaderError::Truncated {
+                        field: HeaderField::PredecessorDigest
+                    }
+                )
+            }),
+        )?,
     ])
 }
 
@@ -1600,8 +1876,10 @@ type Builder = fn(&Ring) -> Result<Vec<Row>, Error>;
 pub fn rows() -> Result<Vec<Row>, Error> {
     let ring = Ring::new()?;
     let mut rows = vector_rows()?;
-    let builders: [Builder; 18] = [
+    let builders: [Builder; 21] = [
         key_state_rows,
+        key_state_change_rows,
+        key_state_short_header_rows,
         key_state_discriminator_rows,
         key_state_header_rows,
         key_state_snapshot_rows,
@@ -1614,6 +1892,7 @@ pub fn rows() -> Result<Vec<Row>, Error> {
         recovery_rows,
         recovery_continuation_rows,
         recovery_root_rows,
+        recovery_kept_rows,
         recovery_signature_rows,
         chained_rows,
         chained_reinstall_rows,

@@ -44,10 +44,9 @@ pub(super) struct ChainEvent {
 /// an inception that recomputes to the chain's identifier (§9.7.4.2 R2, R3).
 ///
 /// Its fields are private and it has no `new`, `Default`, `From` or
-/// deserializer: [`validate_chain`](super::validate_chain),
-/// [`validate_entry`](super::validate_entry), [`extend`](Self::extend) and
-/// [`prefix`](Self::prefix) are the only ways to hold one, and it is never
-/// empty.
+/// deserializer: [`validate_entry`](super::validate_entry),
+/// [`extend`](Self::extend) and [`prefix`](Self::prefix) are the only ways
+/// to hold one, and it is never empty.
 ///
 /// ```compile_fail,E0451
 /// # use scp_kel::ValidatedChain;
@@ -64,19 +63,19 @@ pub(super) struct ChainEvent {
 /// let chain = ValidatedChain::default();
 /// ```
 ///
-/// The positive control: [`validate_chain`](super::validate_chain) holds
+/// The positive control: [`validate_entry`](super::validate_entry) holds
 /// one.
 ///
 /// ```
-/// # use scp_kel::{ChainValidation, validate_chain};
-/// fn head(validation: ChainValidation) -> Option<[u8; 32]> {
-///     match validation {
-///         ChainValidation::Valid { chain, .. } => Some(chain.head_digest()),
-///         ChainValidation::InceptionInvalid { .. } | ChainValidation::NoInception { .. } => None,
+/// # use scp_kel::{EntryOutcome, validate_entry};
+/// fn head(outcome: EntryOutcome) -> Option<[u8; 32]> {
+///     match outcome {
+///         EntryOutcome::Valid { chains } => Some(chains.first().head_digest()),
+///         EntryOutcome::InceptionInvalid { .. } | EntryOutcome::NoInception => None,
 ///     }
 /// }
 /// let units: [&[u8]; 0] = [];
-/// assert_eq!(head(validate_chain(&scp_did::Identifier::ZERO, &units)), None);
+/// assert_eq!(head(validate_entry(&scp_did::Identifier::ZERO, &units).outcome), None);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedChain {
@@ -206,8 +205,9 @@ impl ValidatedChain {
     /// unchanged with the unit's [`Discarded`] (§9.7.4.2 R3, R10). The chain
     /// moves through, so neither outcome copies it.
     ///
-    /// It runs the code [`validate_chain`](super::validate_chain) runs for
-    /// that position.
+    /// It runs the code [`validate_entry`](super::validate_entry) runs for
+    /// a unit read for that position. The [`Discarded`] names the unit as
+    /// served index zero.
     ///
     /// # Errors
     ///
@@ -221,7 +221,7 @@ impl ValidatedChain {
             }
             Err(defect) => {
                 let position = self.next_position();
-                Err((self, Discarded::new(position, defect)))
+                Err((self, Discarded::read(0, position, defect)))
             }
         }
     }
@@ -275,7 +275,7 @@ impl ValidatedChain {
     pub fn validate_change(&self, candidate_preimage: &[u8]) -> Result<ValidatedChange, Discarded> {
         check_successor(self, candidate_preimage, Signing::Unsigned, &mut Strict)
             .map(ValidatedChange::from_accepted)
-            .map_err(|defect| Discarded::new(self.next_position(), defect))
+            .map_err(|defect| Discarded::read(0, self.next_position(), defect))
     }
 }
 

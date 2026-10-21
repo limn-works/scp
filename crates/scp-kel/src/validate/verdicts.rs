@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_index_costs_one_verification_across_7b_and_step_9() {
+    fn one_group_verifies_a_repeated_index_once() {
         let signature = raw();
         let mut group = GroupVerdicts::new(
             keys(),

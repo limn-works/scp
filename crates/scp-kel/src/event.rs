@@ -29,6 +29,20 @@ pub enum EventKind {
     RootRecovery,
 }
 
+impl EventKind {
+    /// Whether the kind is reveal-authorized: signed by revealing keys of
+    /// the standing commitment, so it carries field 8 in substance and a
+    /// `RevealOnly` marker admits it (§9.7.4.2 R4, R10). The one definition
+    /// both rules read.
+    #[must_use]
+    pub const fn is_reveal_authorized(self) -> bool {
+        match self {
+            Self::CommitmentRollover | Self::RootRecovery => true,
+            Self::Inception | Self::KeyState => false,
+        }
+    }
+}
+
 /// What a `RootRecovery` declares about the standing root (§9.7.4.2 field 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StandingRootDeclaration {

@@ -39,9 +39,9 @@ pub use signature::{
     IndexedSignatureReadError, key_event_challenge, verify_indexed,
 };
 pub use validate::{
-    ChainValidation, ChangeEffect, CheckStep, ContentDefect, Discarded, DistinctList,
-    EntryValidation, EventDefect, FailureClass, HeldHead, HeldHeadMarker, HeldHeadMarkerError,
-    InceptionDefect, InceptionRefusal, MarkerMode, NamedKey, SignerGroupSpec, SigningChange,
-    SigningRefusal, ThresholdField, ValidatedChain, ValidatedChange, validate_chain,
-    validate_entry, validate_inception,
+    ChangeEffect, CheckStep, ContentDefect, Discarded, DistinctList, EntryOutcome, EntryValidation,
+    EventDefect, FailureClass, HeldHead, HeldHeadMarker, HeldHeadMarkerError, InceptionDefect,
+    InceptionRefusal, MarkerMode, NamedKey, SignerGroupSpec, SigningChange, SigningRefusal,
+    ThresholdField, ValidChains, ValidatedChain, ValidatedChange, validate_entry,
+    validate_inception,
 };

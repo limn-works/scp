@@ -5,35 +5,96 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use scp_did::Identifier;
 
-use super::defect::{Discarded, EventDefect};
-use super::{Builder, ChainValidation, Copies, successor};
+use super::check::{Accepted, InceptionFailure};
+use super::defect::{Discarded, EventDefect, InceptionDefect};
+use super::{Copies, ValidatedChain, inception, successor};
 use crate::{EventUnit, decode_event};
 
 /// What R3's check order makes of every unit one entry served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryValidation {
-    /// One verdict per inception-to-leaf path, in the order the paths
-    /// branch. Where the inception is invalid or absent, one verdict.
-    pub chains: Vec<ChainValidation>,
-    /// Every unit that joined no chain, at its index in the served list: a
-    /// unit that failed before its predecessor digest decoded, or that names
-    /// a predecessor no chain holds.
-    pub unplaced: Vec<Discarded>,
+    /// What the entry's units prove about the identifier.
+    pub outcome: EntryOutcome,
+    /// Every served unit no chain holds, once each, in served order: a
+    /// unit discarded where it was read, one that joined no chain, and one
+    /// that names a predecessor no chain holds. Copies merged by event
+    /// digest (R9) report once, as their first copy, and only where no copy
+    /// passed.
+    pub discarded: Vec<Discarded>,
 }
 
-/// One event's copies, the served index of each, and the identifier they
-/// recompute to.
+/// What an entry's units prove about the identifier they were served under
+/// (§9.7.4.2 R3, R14).
+///
+/// Only the inception can make an identifier invalid, so no variant carries
+/// a later position together with an invalid class, and `Valid` holds at
+/// least one chain.
+///
+/// ```compile_fail,E0559
+/// # use scp_kel::{EntryOutcome, InceptionDefect};
+/// fn invalid(defect: InceptionDefect) -> EntryOutcome {
+///     EntryOutcome::InceptionInvalid { defect, at_sequence: 3 }
+/// }
+/// ```
+///
+/// The positive control:
+///
+/// ```
+/// # use scp_kel::{EntryOutcome, InceptionDefect};
+/// fn invalid(defect: InceptionDefect) -> EntryOutcome {
+///     EntryOutcome::InceptionInvalid { defect }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryOutcome {
+    /// A unit read for position zero recomputes to the served identifier
+    /// and fails R2 or an R3 indicator (step 3's second half): the
+    /// identifier names no valid chain, R14's `Invalid`.
+    InceptionInvalid {
+        /// The defect.
+        defect: InceptionDefect,
+    },
+    /// No unit read for position zero passed every step.
+    NoInception,
+    /// The inception is valid; each chain is one inception-to-leaf path.
+    Valid {
+        /// Every valid chain, at least one.
+        chains: ValidChains,
+    },
+}
+
+/// One valid chain per inception-to-leaf path, in the order the paths
+/// branch, depth first with sibling events in served order. Never empty:
+/// the fields are private and only [`validate_entry`] builds one.
+///
+/// Two events that name one predecessor with different digests start two
+/// chains, so a fork is two chains and never a discard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidChains {
+    first: ValidatedChain,
+    rest: Vec<ValidatedChain>,
+}
+
+impl ValidChains {
+    /// The first path: the inception's first passing successor, and so on
+    /// to a leaf.
+    #[must_use]
+    pub const fn first(&self) -> &ValidatedChain {
+        &self.first
+    }
+
+    /// Every path, first included.
+    pub fn iter(&self) -> impl Iterator<Item = &ValidatedChain> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+}
+
+/// One event's copies, the served index of its first copy, and the
+/// identifier they recompute to.
 struct Group<'u> {
     copies: Copies<'u>,
-    served: Vec<usize>,
+    first_served: usize,
     recomputed: Identifier,
-}
-
-impl<'u> Group<'u> {
-    fn add(&mut self, unit: &'u [u8], index: usize) {
-        self.copies.rest.push(unit);
-        self.served.push(index);
-    }
 }
 
 /// The served units, merged by event digest and assembled by predecessor
@@ -62,31 +123,32 @@ impl<'u> Assembly<'u> {
         assembly
     }
 
-    /// Places one unit by the bytes its decode read: a unit that stopped
-    /// before its predecessor digest decoded joins no chain, unless it
-    /// recomputes to the served identifier and so is the inception.
+    /// Places one unit by the bytes its decode read. A unit whose field 4
+    /// decoded, whether or not step 4 passed, goes below the event it
+    /// names; a unit that recomputes to the served identifier is read for
+    /// position zero; any other unit joins no chain.
     fn place(&mut self, identifier: Identifier, index: usize, unit: &'u [u8]) {
-        let at = u64::try_from(index).unwrap_or(u64::MAX);
         let (raw, predecessor) = match decode_event(unit, 0) {
             EventUnit::Unframed => {
                 self.unplaced
-                    .push(Discarded::new(at, EventDefect::Unframed));
+                    .push(Discarded::unplaced(index, EventDefect::Unframed));
                 return;
             }
             EventUnit::NoSeparator => {
                 self.unplaced
-                    .push(Discarded::new(at, EventDefect::NoSeparator));
+                    .push(Discarded::unplaced(index, EventDefect::NoSeparator));
                 return;
             }
             EventUnit::HeaderFailed(failed) => {
-                if failed.raw().identifier() != identifier {
-                    self.unplaced.push(Discarded::new(
-                        at,
+                let predecessor = failed.predecessor().copied();
+                if predecessor.is_none() && failed.raw().identifier() != identifier {
+                    self.unplaced.push(Discarded::unplaced(
+                        index,
                         EventDefect::Header(failed.error().clone()),
                     ));
                     return;
                 }
-                (failed.raw().clone(), None)
+                (failed.raw().clone(), predecessor)
             }
             EventUnit::Read(read) => (
                 read.raw().clone(),
@@ -94,16 +156,18 @@ impl<'u> Assembly<'u> {
             ),
         };
         let digest = raw.event_digest();
-        if let Some(&group) = self.by_digest.get(&digest) {
-            if let Some(group) = self.groups.get_mut(group) {
-                group.add(unit, index);
-            }
+        if let Some(group) = self
+            .by_digest
+            .get(&digest)
+            .and_then(|&group| self.groups.get_mut(group))
+        {
+            group.copies.rest.push(unit);
             return;
         }
         let group = self.groups.len();
         self.groups.push(Group {
             copies: Copies::one(unit),
-            served: vec![index],
+            first_served: index,
             recomputed: raw.identifier(),
         });
         self.by_digest.insert(digest, group);
@@ -115,124 +179,136 @@ impl<'u> Assembly<'u> {
             _ => self.inception.push(group),
         }
     }
+
+    /// The groups naming `head`, in served order.
+    fn children_of(&self, head: &[u8; 32]) -> impl Iterator<Item = (usize, &Group<'u>)> {
+        self.children
+            .get(head)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter_map(|&group| self.groups.get(group).map(|found| (group, found)))
+    }
 }
 
 /// Assembles every unit one entry served into chains by predecessor digest,
 /// merging units that share an event digest, then runs R3's check order on
 /// every inception-to-leaf path (§9.7.4.2 R3, R9).
 ///
-/// Two units that name one predecessor and carry different digests start
-/// two chains, each reported as its own [`ChainValidation::Valid`], so a
-/// fork is never a discard. Each unit is one event unit, `BE32(len) ‖
-/// signed preimage ‖ signature field`.
+/// This is the one reader of an entry's units. Two units that name one
+/// predecessor and carry different digests start two chains, so a fork is
+/// never a discard, and each served unit no chain holds is reported once in
+/// [`EntryValidation::discarded`]. Each unit is one event unit, `BE32(len)
+/// ‖ signed preimage ‖ signature field`.
 #[must_use]
 pub fn validate_entry(identifier: &Identifier, units: &[&[u8]]) -> EntryValidation {
     let assembly = Assembly::new(*identifier, units);
     let mut visited = BTreeSet::new();
-    let mut builder = Builder::new(*identifier);
-    for &group in &assembly.inception {
-        visited.insert(group);
-        let Some(group) = assembly.groups.get(group) else {
+    let mut discarded = Vec::new();
+    let mut root = None;
+    let mut invalid = None;
+    for &index in &assembly.inception {
+        visited.insert(index);
+        let Some(group) = assembly.groups.get(index) else {
             continue;
         };
         // The identifier binds the whole signed preimage, as the digest
         // does, so at most one merged group recomputes to it; every other
         // group read for position zero fails step 3's first half.
         if group.recomputed != *identifier {
-            builder.discarded.push(Discarded::new(
+            discarded.push(Discarded::read(
+                group.first_served,
                 0,
                 EventDefect::IdentifierMismatch {
                     recomputed: group.recomputed,
                 },
             ));
-        } else if let Err(defect) = builder.offer(&group.copies) {
-            return EntryValidation {
-                chains: vec![ChainValidation::InceptionInvalid { defect }],
-                unplaced: unvisited(assembly, &visited),
-            };
+            continue;
+        }
+        match inception(*identifier, &group.copies) {
+            Ok(accepted) => root = Some(ValidatedChain::from_inception(*identifier, &accepted)),
+            Err(InceptionFailure::Invalid(defect)) => invalid = Some(defect),
+            Err(InceptionFailure::Discard(defect)) => {
+                discarded.push(Discarded::read(group.first_served, 0, defect));
+            }
         }
     }
-    let chains = if builder.chain.is_some() {
-        branches(&assembly, builder, &mut visited)
-    } else {
-        vec![builder.finish()]
+    let outcome = match (invalid, root) {
+        (Some(defect), _) => EntryOutcome::InceptionInvalid { defect },
+        (None, Some(root)) => EntryOutcome::Valid {
+            chains: branches(&assembly, root, &mut visited, &mut discarded),
+        },
+        (None, None) => EntryOutcome::NoInception,
     };
-    let unplaced = unvisited(assembly, &visited);
-    EntryValidation { chains, unplaced }
-}
-
-/// Runs the check order down every path from the inception, depth first
-/// over an explicit stack. At each head, the groups naming it are each
-/// offered at the next position; each that passes starts its own branch,
-/// and each that fails is a discard every branch below that head carries.
-fn branches(
-    assembly: &Assembly<'_>,
-    root: Builder,
-    visited: &mut BTreeSet<usize>,
-) -> Vec<ChainValidation> {
-    let mut chains = Vec::new();
-    let mut stack = vec![root];
-    while let Some(builder) = stack.pop() {
-        let Some(chain) = builder.chain.as_ref() else {
-            chains.push(builder.finish());
-            continue;
-        };
-        let position = chain.next_position();
-        let mut passed = Vec::new();
-        let mut failed = Vec::new();
-        for &group in assembly
-            .children
-            .get(&chain.head_digest())
-            .map_or(&[][..], Vec::as_slice)
-        {
-            if !visited.insert(group) {
-                continue;
-            }
-            let Some(copies) = assembly.groups.get(group).map(|group| &group.copies) else {
-                continue;
-            };
-            match successor(chain, copies) {
-                Ok(accepted) => passed.push(accepted),
-                Err(defect) => failed.push(Discarded::new(position, defect)),
-            }
-        }
-        if passed.is_empty() {
-            let mut leaf = builder;
-            leaf.discarded.extend(failed);
-            chains.push(leaf.finish());
-            continue;
-        }
-        // Pushed in reverse so the branches pop in served order.
-        for accepted in passed.iter().rev() {
-            let mut branch = builder.clone();
-            branch.discarded.extend(failed.iter().cloned());
-            if let Some(chain) = branch.chain.as_mut() {
-                chain.push(accepted);
-            }
-            stack.push(branch);
-        }
-    }
-    chains
-}
-
-/// Every unit no path reached: one naming a predecessor no chain holds, at
-/// its served index, in served order.
-fn unvisited(assembly: Assembly<'_>, visited: &BTreeSet<usize>) -> Vec<Discarded> {
-    let mut unplaced = assembly.unplaced;
+    discarded.extend(assembly.unplaced.iter().cloned());
     for (group, named) in &assembly.named {
         if visited.contains(group) {
             continue;
         }
-        let Some(served) = assembly.groups.get(*group).map(|group| &group.served) else {
-            continue;
-        };
-        for index in served {
-            unplaced.push(Discarded::new(
-                u64::try_from(*index).unwrap_or(u64::MAX),
+        if let Some(found) = assembly.groups.get(*group) {
+            discarded.push(Discarded::unplaced(
+                found.first_served,
                 EventDefect::PredecessorMismatch { named: *named },
             ));
         }
     }
-    unplaced.sort_by_key(Discarded::at_position);
-    unplaced
+    discarded.sort_by_key(Discarded::served_index);
+    EntryValidation { outcome, discarded }
+}
+
+/// Runs the check order down every path from the inception, depth first.
+/// The first path is followed to its leaf before any sibling, so the result
+/// holds at least one chain by construction.
+fn branches(
+    assembly: &Assembly<'_>,
+    root: ValidatedChain,
+    visited: &mut BTreeSet<usize>,
+    discarded: &mut Vec<Discarded>,
+) -> ValidChains {
+    let mut stack = Vec::new();
+    let first = descend(assembly, root, visited, discarded, &mut stack);
+    let mut rest = Vec::new();
+    while let Some(branch) = stack.pop() {
+        rest.push(descend(assembly, branch, visited, discarded, &mut stack));
+    }
+    ValidChains { first, rest }
+}
+
+/// Extends `chain` by its first passing successor until none passes, and
+/// returns the leaf. At each head, every group naming it is offered once at
+/// the next position: the first that passes extends `chain`, each later
+/// one that passes starts a branch on `stack`, and each that fails is
+/// discarded there.
+fn descend(
+    assembly: &Assembly<'_>,
+    mut chain: ValidatedChain,
+    visited: &mut BTreeSet<usize>,
+    discarded: &mut Vec<Discarded>,
+    stack: &mut Vec<ValidatedChain>,
+) -> ValidatedChain {
+    loop {
+        let position = chain.next_position();
+        let mut passed: Vec<Accepted> = Vec::new();
+        for (index, group) in assembly.children_of(&chain.head_digest()) {
+            if !visited.insert(index) {
+                continue;
+            }
+            match successor(&chain, &group.copies) {
+                Ok(accepted) => passed.push(accepted),
+                Err(defect) => {
+                    discarded.push(Discarded::read(group.first_served, position, defect));
+                }
+            }
+        }
+        let mut passed = passed.into_iter();
+        let Some(next) = passed.next() else {
+            return chain;
+        };
+        // Pushed in reverse so the branches pop in served order.
+        stack.extend(passed.rev().map(|accepted| {
+            let mut branch = chain.clone();
+            branch.push(&accepted);
+            branch
+        }));
+        chain.push(&next);
+    }
 }

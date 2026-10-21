@@ -357,6 +357,7 @@ impl SignatureField {
 pub struct HeaderFailedUnit {
     raw: RawSignedPreimage,
     error: HeaderError,
+    predecessor: Option<[u8; 32]>,
 }
 
 impl HeaderFailedUnit {
@@ -370,6 +371,14 @@ impl HeaderFailedUnit {
     #[must_use]
     pub const fn error(&self) -> &HeaderError {
         &self.error
+    }
+
+    /// Field 4, the predecessor digest, where fields 1 through 4 read
+    /// before step 4 failed: a verifier places the unit below the event it
+    /// names, as it places a unit that passed step 4.
+    #[must_use]
+    pub const fn predecessor(&self) -> Option<&[u8; 32]> {
+        self.predecessor.as_ref()
     }
 }
 
@@ -518,7 +527,13 @@ fn decode_prefixed(prefixed: &[u8], field: &[u8]) -> EventUnit {
     };
     let (header, preimage) = match read_event(raw.fields(), raw.signed_len()) {
         Ok(read) => read,
-        Err(error) => return EventUnit::HeaderFailed(HeaderFailedUnit { raw, error }),
+        Err(failure) => {
+            return EventUnit::HeaderFailed(HeaderFailedUnit {
+                raw,
+                error: failure.error,
+                predecessor: failure.predecessor,
+            });
+        }
     };
     let signature_field =
         walk_signature_field(&header, field).map(|(signatures, rest)| SignatureField {

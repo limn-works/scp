@@ -307,18 +307,23 @@ fn vector_42_assertion_indexed_signature_verifies() -> TestResult {
     Ok(())
 }
 
-/// The chain `validate_chain` returns over `units`, with every discard.
+/// The one chain `validate_entry` returns over `units`, with every discard.
 fn chain_verdict(
     identifier_hex: &str,
     units: &[&[u8]],
 ) -> Result<(scp_kel::ValidatedChain, Vec<scp_kel::Discarded>), Box<dyn std::error::Error>> {
-    match scp_kel::validate_chain(&identifier(identifier_hex)?, units) {
-        scp_kel::ChainValidation::Valid { chain, discarded } => Ok((chain, discarded)),
-        other => Err(format!("expected Valid, got {other:?}").into()),
+    let validation = scp_kel::validate_entry(&identifier(identifier_hex)?, units);
+    let scp_kel::EntryOutcome::Valid { chains } = &validation.outcome else {
+        return Err(format!("expected Valid, got {:?}", validation.outcome).into());
+    };
+    let mut paths = chains.iter();
+    match (paths.next(), paths.next()) {
+        (Some(chain), None) => Ok((chain.clone(), validation.discarded)),
+        _ => Err(format!("expected one chain, got {chains:?}").into()),
     }
 }
 
-/// `validate_chain` (§9.7.4.2 R3) accepts every spec 25 chain at the head
+/// `validate_entry` (§9.7.4.2 R3) accepts every spec 25 chain at the head
 /// digest spec 25 prints, on both targets.
 #[test]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -351,7 +356,7 @@ fn spec_25_chains_validate() -> TestResult {
     Ok(())
 }
 
-/// `validate_chain` discards a damaged unit at the step spec 09 names, with
+/// `validate_entry` discards a damaged unit at the step spec 09 names, with
 /// the digest only a unit that reached step 6 carries, on both targets.
 #[test]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
@@ -364,22 +369,35 @@ fn damaged_units_are_discarded_at_their_step() -> TestResult {
     *forged.get_mut(signature_at + 10).ok_or("short unit")? ^= 0x01;
     let mut unseparated = v50.clone();
     *unseparated.get_mut(4).ok_or("short unit")? ^= 0x01;
-    let (chain, discarded) = chain_verdict(V41_IDENTIFIER, &[&v41, &forged, &unseparated, &v50])?;
-    assert_eq!(chain.head_digest(), array::<32>(V50_DIGEST)?);
+    let (chain, discarded) = chain_verdict(V41_IDENTIFIER, &[&v41, &forged, &unseparated])?;
+    assert_eq!(chain.head_digest(), array::<32>(V41_DIGEST)?);
     let verdicts: Vec<_> = discarded
         .iter()
-        .map(|discard| (discard.at_position(), discard.stage(), discard.digest()))
+        .map(|discard| {
+            (
+                discard.served_index(),
+                discard.read_for(),
+                discard.stage(),
+                discard.digest(),
+            )
+        })
         .collect();
     assert_eq!(
         verdicts,
         [
             (
                 1,
+                Some(1),
                 scp_kel::CheckStep::VerifiedCount,
                 Some(array::<32>(V50_DIGEST)?)
             ),
-            (1, scp_kel::CheckStep::Separator, None),
+            (2, None, scp_kel::CheckStep::Separator, None),
         ]
     );
+    // A clean copy of the damaged event merges with it (R9), so the chain
+    // reaches Vector 50 and the damaged copy is no discard.
+    let (chain, discarded) = chain_verdict(V41_IDENTIFIER, &[&v41, &forged, &unseparated, &v50])?;
+    assert_eq!(chain.head_digest(), array::<32>(V50_DIGEST)?);
+    assert_eq!(discarded.len(), 1, "{discarded:?}");
     Ok(())
 }

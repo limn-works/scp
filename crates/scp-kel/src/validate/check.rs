@@ -344,3 +344,135 @@ fn remaining<'u>(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use scp_crypto::p256::{P256SecretKey, SeedLabel};
+    use scp_did::{
+        CommitmentEntry, CustodyType, KeyAlgorithm, KeyCondition, KeyEntry, StandingCommitment,
+    };
+
+    use super::*;
+    use crate::constants::KEL_EVENT_SEPARATOR;
+    use crate::preimage::identifier_of;
+    use crate::{
+        Continuation, InceptionFields, IndexedSignature, IndexedSignatureError, KeyStateFields,
+        KeyStateSnapshot, SignatureForm, SignerGroup, encode_preimage, prerotation_commitment,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Counts calls and accepts every signature.
+    struct Counting(usize);
+
+    impl Verify for Counting {
+        fn verify(
+            &mut self,
+            _: &[u8; 33],
+            _: &[u8; 32],
+            _: SignatureForm,
+            _: &IndexedSignature,
+        ) -> Result<(), IndexedSignatureError> {
+            self.0 = self.0.saturating_add(1);
+            Ok(())
+        }
+    }
+
+    fn point(seed: u8) -> [u8; 33] {
+        P256SecretKey::from_seed(SeedLabel::TestVectorKey, &[seed; 32])
+            .public_key()
+            .to_compressed()
+    }
+
+    const fn current(key: [u8; 33], role: KeyRole) -> KeyEntry {
+        KeyEntry {
+            key,
+            role,
+            condition: KeyCondition::Current,
+            compromised_from: 0,
+            custody_type: CustodyType::Passkey,
+            key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
+        }
+    }
+
+    fn snapshot(witnessing_interval: u32) -> KeyStateSnapshot {
+        KeyStateSnapshot {
+            root_threshold: 1,
+            keys: vec![
+                current(point(1), KeyRole::RootMember),
+                current(point(2), KeyRole::Active),
+            ],
+            witnesses: vec![Identifier::from_bytes([9; 32])],
+            witnessing_interval,
+            service_key_role: KeyRole::Active,
+            delegator: Identifier::ZERO,
+        }
+    }
+
+    fn root_group() -> SignerGroup {
+        SignerGroup {
+            indices: vec![0],
+            forms: vec![SignatureForm::Raw],
+        }
+    }
+
+    /// `BE32(len) ‖ separator ‖ fields ‖ one zeroed raw signature`, which
+    /// [`Counting`] accepts.
+    fn unit(fields: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let signed = [KEL_EVENT_SEPARATOR, fields].concat();
+        let mut unit = u32::try_from(signed.len())?.to_be_bytes().to_vec();
+        unit.extend_from_slice(&signed);
+        unit.extend_from_slice(&[0; 64]);
+        Ok(unit)
+    }
+
+    /// The bound §9.7.4.2 states for 7b and step 9 together: "Across 7b and
+    /// step 9 a verifier verifies at most one signature per distinct index
+    /// of each group's key set". Run through `check_successor`, so step 9
+    /// must reuse the verdict 7b reached rather than verify again.
+    #[test]
+    fn step_9_reuses_every_verdict_7b_reached() -> TestResult {
+        let inception = encode_preimage(&EventPreimage::inception(InceptionFields {
+            root_group: root_group(),
+            key_state: snapshot(3600),
+            continuation: Continuation::FixesCommitment(StandingCommitment {
+                commitments: vec![CommitmentEntry {
+                    commitment: prerotation_commitment(&point(3)),
+                    custody_type: CustodyType::Passkey,
+                    key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
+                }],
+                next_threshold: 1,
+            }),
+        }))?;
+        let identifier = identifier_of(inception.fields());
+        let mut counting = Counting(0);
+        let accepted = check_inception(
+            &unit(inception.fields())?,
+            Some(identifier),
+            Signing::Signed,
+            &mut counting,
+        )
+        .map_err(|failure| format!("{failure:?}"))?;
+        assert_eq!(counting.0, 1);
+        let chain = ValidatedChain::from_inception(identifier, &accepted);
+
+        let key_state = encode_preimage(&EventPreimage::key_state(KeyStateFields {
+            identifier,
+            sequence: 1,
+            predecessor_digest: chain.head_digest(),
+            root_group: root_group(),
+            key_state: snapshot(7200),
+            seals: Vec::new(),
+        }))?;
+        let mut counting = Counting(0);
+        check_successor(
+            &chain,
+            &unit(key_state.fields())?,
+            Signing::Signed,
+            &mut counting,
+        )
+        .map_err(|defect| format!("{defect:?}"))?;
+        assert_eq!(counting.0, 1);
+        Ok(())
+    }
+}
