@@ -358,6 +358,14 @@ impl BridgeTarget {
     }
 }
 
+/// The 64 lowercase hex digits of the target bytes, as `bridgeTarget` carries
+/// them (§18.2.1).
+impl std::fmt::LowerHex for BridgeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
 /// One `SCPRelay` entry a reader accepts under §18.2.1.
 ///
 /// `18-addressability-and-deployment.md` §18.2.1 requires a relay URL with a
@@ -425,8 +433,14 @@ impl RelayService {
 
     /// The service entry for this relay, numbered `n` within `did`.
     fn entry(&self, did: &str, n: usize) -> Service {
+        self.entry_with_id(format!("{did}#scp-relay-{n}"))
+    }
+
+    /// The service entry for this relay under `id`. The one place a
+    /// [`BridgeTarget`] becomes the wire entry's `bridgeTarget` bytes.
+    fn entry_with_id(&self, id: String) -> Service {
         Service {
-            id: format!("{did}#scp-relay-{n}"),
+            id,
             service_type: SCP_RELAY_SERVICE_TYPE.to_owned(),
             service_endpoint: self.url().to_owned(),
             bridge_target: self.bridge_target.map(BridgeTarget::to_bytes),
@@ -815,8 +829,8 @@ impl DidDocument {
             .find(|s| s.service_type == SCP_RELAY_SERVICE_TYPE)
         {
             Some(entry) => {
-                relay.url().clone_into(&mut entry.service_endpoint);
-                entry.bridge_target = relay.bridge_target().map(BridgeTarget::to_bytes);
+                let id = std::mem::take(&mut entry.id);
+                *entry = relay.entry_with_id(id);
             }
             None => self.insert_preferred_relay(relay),
         }
@@ -1892,6 +1906,19 @@ mod tests {
         let entry = RelayService::bridge(BridgeEndpoint::new(BRIDGE_URL).unwrap(), target);
         assert_eq!(entry.bridge_target(), Some(target));
         assert_eq!(relay(BRIDGE_URL).bridge_target(), None);
+    }
+
+    #[test]
+    fn bridge_target_lower_hex_writes_64_lowercase_digits() {
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::try_from(i * 7 + 0x0a).unwrap();
+        }
+        let target = BridgeTarget::new(bytes).unwrap();
+        assert_eq!(
+            format!("{target:x}"),
+            "0a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3"
+        );
     }
 
     #[test]
