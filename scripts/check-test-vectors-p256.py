@@ -56,6 +56,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GENERATOR = ROOT / "scripts" / "gen-test-vectors-p256.py"
@@ -199,8 +200,12 @@ FOREIGN: dict[str, tuple[str, frozenset[str]]] = {
 SECTION_RE = re.compile(r"^--- (.*) ---$")
 HEX_LINE_RE = re.compile(r"^(\S+) = 0x([0-9a-fA-F]+)$")
 RUST_HEX_STRING_RE = re.compile(r'"((?:[0-9a-fA-F]|\\\n\s*)+)"')
+# Whitespace is consumed in one place per piece: after `concat!(`, then after
+# each piece and after its comma, which separates the two runs. No two adjacent
+# iterations can split the same characters two ways, so a scan that fails, such
+# as an unclosed `concat!(` over many pieces, stays linear.
 RUST_CONCAT_RE = re.compile(
-    r'concat!\(((?:\s*"[0-9a-fA-F]*"\s*,?|\s*//[^\n]*\n)+)\s*\)'
+    r'concat!\(\s*((?:(?:"[0-9a-fA-F]*"|//[^\n]*\n)\s*(?:,\s*)?)+)\)'
 )
 RUST_CONCAT_PIECE_RE = re.compile(r'"([0-9a-fA-F]*)"')
 RUST_CONTINUATION_RE = re.compile(r"\\\n\s*")
@@ -466,6 +471,11 @@ def self_test(generated: str) -> int:
     kc_source = rust_tests[kc_path]
     assert kc_source.count('"800512",') == 1, "Vector 20's last concat! piece moved"
     uncited = f'const V: &str = "{literal}";\n'
+    # An unclosed `concat!(` over many empty pieces: a regex whose pieces can
+    # share whitespace two ways backtracks exponentially on it.
+    started = time.monotonic()
+    rust_hex_literals("concat!(" + ' ""' * 5000)
+    unclosed_concat_seconds = time.monotonic() - started
     # Two values spec 25 prints that the generator does not emit, each of a
     # kind check 2 lets through: Vector 58's preimage sits under a
     # NOT_GENERATED heading, and Vector 27's pseudonym_key is `0x`-prefixed,
@@ -542,6 +552,12 @@ def self_test(generated: str) -> int:
         "a spec 25 value in a file that cites no spec 25 section": (
             problems(generated, spec, {**rust_tests, new_path: uncited}),
             "cites no spec 25 section",
+        ),
+        "an unclosed concat! of 5,000 pieces scanned in under one second": (
+            [f"scanned in {unclosed_concat_seconds:.3f}s"]
+            if unclosed_concat_seconds < 1.0
+            else [],
+            "scanned in ",
         ),
         "an empty generator run": (
             problems("", spec, rust_tests),
