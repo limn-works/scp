@@ -241,6 +241,10 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
     // and rejects a self-authored echo (see `process_inbound`).
     let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
     let processed = process_inbound(g, &group.provider, protocol_message)?;
+    // A past-epoch message whose signing leaf no longer holds its index is
+    // refused here as on the other decrypt paths (see `sender_member`).
+    let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    sender_member(g, &group.provider, &processed)?;
 
     // Extract the application message content.
     match processed.into_content() {
@@ -249,26 +253,104 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
     }
 }
 
+/// The leaves openmls kept for each retained past epoch, read back from the
+/// group's stored `MessageSecretsStore`.
+///
+/// openmls 0.9.0 verifies a past-epoch message against the sender's leaf in
+/// `MessageSecretsStore::past_epoch_trees`, a list of `{ epoch, leaves }`
+/// records stored under the group ID, and exposes no accessor for those
+/// leaves. This type deserializes only those two fields and skips the stored
+/// message secrets, so [`past_epoch_signature_key`] reads the leaf the
+/// signature was verified against. A stored layout this type cannot read
+/// fails the decrypt; it never admits the message.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredPastEpochs {
+    past_epoch_trees: Vec<StoredEpochTree>,
+}
+
+/// One retained past epoch in [`StoredPastEpochs`].
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredEpochTree {
+    epoch: u64,
+    leaves: Vec<Member>,
+}
+
+impl openmls_traits::storage::Entity<{ openmls_traits::storage::CURRENT_VERSION }>
+    for StoredPastEpochs
+{
+}
+impl openmls_traits::storage::traits::MessageSecrets<{ openmls_traits::storage::CURRENT_VERSION }>
+    for StoredPastEpochs
+{
+}
+
+/// The signature public key of the leaf at `index` in the retained past epoch
+/// `epoch`: the key openmls verified a message from that epoch against.
+///
+/// # Errors
+///
+/// [`MlsError::DecryptionFailed`] when the storage read fails, when no message
+/// secrets are stored for the group, or when the stored past epochs hold no
+/// leaf at `index` for `epoch`.
+fn past_epoch_signature_key(
+    group: &MlsGroup,
+    provider: &crate::InMemoryMlsProvider,
+    epoch: GroupEpoch,
+    index: LeafNodeIndex,
+) -> Result<Vec<u8>, MlsError> {
+    use openmls_traits::storage::StorageProvider as _;
+
+    let stored: Option<StoredPastEpochs> = provider
+        .storage()
+        .message_secrets(group.group_id())
+        .map_err(|e| MlsError::DecryptionFailed(format!("reading past-epoch leaves: {e}")))?;
+    stored
+        .ok_or_else(|| MlsError::DecryptionFailed("no past-epoch leaves stored".to_string()))?
+        .past_epoch_trees
+        .into_iter()
+        .find(|tree| tree.epoch == epoch.as_u64())
+        .and_then(|tree| tree.leaves.into_iter().find(|m| m.index == index))
+        .map(|m| m.signature_key)
+        .ok_or_else(|| {
+            MlsError::DecryptionFailed(format!(
+                "no retained leaf {index:?} in past epoch {}",
+                epoch.as_u64()
+            ))
+        })
+}
+
 /// The leaf index of the member that sent a processed message, and the DID in
 /// the credential openmls verified its signature against.
 ///
 /// openmls opens a message from up to `max_past_epochs` past epochs and
-/// verifies it against the sender's leaf in the epoch it was sent in
-/// ([`ProcessedMessage::credential`]). The sender is attributed by that
-/// verified credential, never by whoever holds the leaf index now, and the
-/// message is accepted only while the same DID still holds that leaf in the
-/// current tree. A member removed since it sent the message, whose leaf is
-/// now blank or held by a member added after it, is refused (spec 07
-/// §7.3.1.1 step 3: a removed member's past-epoch message installs no state).
+/// verifies it against the sender's leaf in the epoch it was sent in. A
+/// current-epoch message was verified against the current leaf. A past-epoch
+/// message is refused unless the leaf that signed it still holds its index in
+/// the current tree: the signature public key of the sender's leaf in the
+/// message's epoch must equal the signature public key of the current leaf at
+/// that index. A DID comparison cannot decide this, because every leaf of one
+/// DID carries identical `ScpCredential` bytes, and a reset, or a remove
+/// followed by a re-add, puts the DID's fresh leaf into the same index.
+///
+/// So a past-epoch message is refused when its sender's index is now blank or
+/// held by another member, when a reset or a re-add replaced its leaf, and
+/// when the leaf's own Update changed its signature key (spec 07 §7.3.1.1
+/// step 3: a removed member's past-epoch message installs no state). A
+/// message of either epoch is also refused when the current leaf names a DID
+/// other than the verified credential's. The check runs after openmls
+/// processes the message and before any caller acts on it, so a refused
+/// message changes no SCP state.
 ///
 /// # Errors
 ///
-/// [`MlsError::DecryptionFailed`] when the sender is not a member, when the
-/// sender's leaf is absent from the current tree, or when the current leaf at
-/// that index names another DID; and the credential errors of
-/// [`credential_to_did`].
+/// [`MlsError::DecryptionFailed`] when the sender is not a member; when the
+/// sender's index holds no leaf in the current tree; when the sender's leaf in
+/// the past message epoch cannot be read, or carries a signature key other
+/// than the current leaf's; or when the current leaf names another DID. Also
+/// the credential errors of [`credential_to_did`].
 fn sender_member(
     group: &MlsGroup,
+    provider: &crate::InMemoryMlsProvider,
     processed: &ProcessedMessage,
 ) -> Result<(LeafNodeIndex, String), MlsError> {
     let Sender::Member(sender_leaf_index) = processed.sender() else {
@@ -277,16 +359,22 @@ fn sender_member(
         ));
     };
     let sender_did = credential_to_did(processed.credential())?;
-    let current_credential = group
-        .members()
-        .find(|m| m.index == *sender_leaf_index)
-        .map(|m| m.credential)
-        .ok_or_else(|| {
-            MlsError::DecryptionFailed(format!(
-                "sender leaf index {sender_leaf_index:?} not found in group members"
-            ))
-        })?;
-    if credential_to_did(&current_credential)? != sender_did {
+    let current = group.member_at(*sender_leaf_index).ok_or_else(|| {
+        MlsError::DecryptionFailed(format!(
+            "sender leaf index {sender_leaf_index:?} not found in group members"
+        ))
+    })?;
+    if processed.epoch() != group.epoch() {
+        let signed_with =
+            past_epoch_signature_key(group, provider, processed.epoch(), *sender_leaf_index)?;
+        if signed_with != current.signature_key {
+            return Err(MlsError::DecryptionFailed(format!(
+                "sender leaf index {sender_leaf_index:?} no longer holds the signature key \
+                 that signed this past-epoch message"
+            )));
+        }
+    }
+    if credential_to_did(&current.credential)? != sender_did {
         return Err(MlsError::DecryptionFailed(format!(
             "sender leaf index {sender_leaf_index:?} no longer holds the sender's credential"
         )));
@@ -389,7 +477,7 @@ fn decrypt_protocol_message_with_sender_did(
     // Resolve the sender DID from their leaf credential before consuming the
     // ProcessedMessage.
     let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let (sender_leaf_index, sender_did) = sender_member(g, &processed)?;
+    let (sender_leaf_index, sender_did) = sender_member(g, &group.provider, &processed)?;
 
     // Dispatch based on the processed message content type.
     match processed.into_content() {
@@ -718,7 +806,7 @@ pub fn decrypt_with_membership_changes(
     // Resolve the sender DID from their leaf credential before consuming the
     // ProcessedMessage.
     let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let (sender_leaf_index, sender_did) = sender_member(g, &processed)?;
+    let (sender_leaf_index, sender_did) = sender_member(g, &group.provider, &processed)?;
 
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app_msg) => {
@@ -2046,6 +2134,175 @@ mod tests {
             bob_epoch_before,
             "a rejected (AAD-tampered) add-Commit must NOT advance the epoch"
         );
+    }
+
+    /// Alice (the committer), Bob and Carol share a group at epoch 2. Bob and
+    /// Carol each seal one application message at epoch 2; Alice then resets
+    /// Bob: one Commit removes Bob's leaf and adds a fresh leaf of Bob's DID,
+    /// under a new signature key, moving the group to epoch 3.
+    ///
+    /// Returns Alice's group at epoch 3, Bob's epoch-2 ciphertext, Carol's
+    /// epoch-2 ciphertext, and the leaf index Bob held at epoch 2.
+    #[allow(clippy::unwrap_used)]
+    fn reset_bob_after_epoch_two_messages() -> (ScpMlsGroup, Vec<u8>, Vec<u8>, LeafNodeIndex) {
+        let alice_cred = test_credential("alice");
+        let mut alice_group = create_group(
+            &alice_cred,
+            &scp_crypto::p256::testing::uncompressed_point_for(&alice_cred.did),
+            &SystemClock,
+        )
+        .unwrap();
+
+        let bob_cred = test_credential("bob");
+        let bob_wk = scp_crypto::p256::testing::valid_uncompressed_point(0xBB);
+        let (bob_kp_bundle, bob_signer, bob_provider) =
+            generate_key_package(&bob_cred, &bob_wk, &SystemClock).unwrap();
+        let add_bob = add_member(
+            &mut alice_group,
+            bob_kp_bundle.key_package().clone().into(),
+            &SystemClock,
+        )
+        .unwrap();
+        let mut bob_group =
+            join_group(&add_bob.welcome, bob_provider, bob_signer, &SystemClock).unwrap();
+
+        let carol_cred = test_credential("carol");
+        let carol_wk = scp_crypto::p256::testing::valid_uncompressed_point(0xCC);
+        let (carol_kp_bundle, carol_signer, carol_provider) =
+            generate_key_package(&carol_cred, &carol_wk, &SystemClock).unwrap();
+        let add_carol = add_member_with_convergent_timestamp(
+            &mut alice_group,
+            carol_kp_bundle.key_package().clone().into(),
+            &SystemClock,
+            SystemClock.now_secs(),
+        )
+        .unwrap();
+        decrypt_with_membership_changes(
+            &mut bob_group,
+            &add_carol.commit.tls_serialize_detached().unwrap(),
+        )
+        .unwrap();
+        let mut carol_group = join_group(
+            &add_carol.welcome,
+            carol_provider,
+            carol_signer,
+            &SystemClock,
+        )
+        .unwrap();
+        assert_eq!(alice_group.epoch().unwrap(), 2);
+        assert_eq!(bob_group.epoch().unwrap(), 2);
+        assert_eq!(carol_group.epoch().unwrap(), 2);
+
+        let bob_ct = encrypt(&mut bob_group, b"sealed by bob's first leaf")
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap();
+        let carol_ct = encrypt(&mut carol_group, b"sealed by carol's leaf")
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap();
+
+        let bob_index = bob_group.own_leaf_index().unwrap();
+        let old_bob_key = alice_group
+            .group
+            .as_ref()
+            .unwrap()
+            .member_at(bob_index)
+            .unwrap()
+            .signature_key;
+        let (fresh_kp_bundle, _fresh_signer, _fresh_provider) =
+            generate_key_package(&bob_cred, &bob_wk, &SystemClock).unwrap();
+        crate::group::reset_member(
+            &mut alice_group,
+            bob_index,
+            fresh_kp_bundle.key_package().clone().into(),
+            &SystemClock,
+        )
+        .unwrap();
+        assert_eq!(alice_group.epoch().unwrap(), 3);
+
+        // The premise the refusal must not depend on DIDs for: the fresh leaf
+        // sits in the slot Bob's first leaf held and names the same DID, under
+        // a different signature key.
+        let fresh = alice_group
+            .group
+            .as_ref()
+            .unwrap()
+            .member_at(bob_index)
+            .unwrap();
+        assert_eq!(
+            credential_to_did(&fresh.credential).unwrap(),
+            bob_cred.did,
+            "the reset's fresh leaf names Bob's DID"
+        );
+        assert_ne!(
+            fresh.signature_key, old_bob_key,
+            "the reset's fresh leaf carries a new signature key"
+        );
+
+        (alice_group, bob_ct, carol_ct, bob_index)
+    }
+
+    /// RFC 9420 §15.2 keeps past-epoch secrets only for delayed messages; spec
+    /// 07 §7.3.1.1 step 3: a past-epoch message from a leaf a reset replaced,
+    /// in the same slot and for the same DID, opens under the retained epoch-2
+    /// secrets but is refused by every decrypt function, because the leaf
+    /// that signed it no longer holds the slot.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_past_epoch_message_from_a_leaf_a_reset_replaced_is_refused() {
+        type Decrypt = fn(&mut ScpMlsGroup, &[u8]) -> Result<(), MlsError>;
+        let paths: [(&str, Decrypt); 3] = [
+            ("decrypt", |g, ct| decrypt(g, ct).map(drop)),
+            ("decrypt_with_sender_did", |g, ct| {
+                decrypt_with_sender_did(g, ct).map(drop)
+            }),
+            ("decrypt_with_membership_changes", |g, ct| {
+                decrypt_with_membership_changes(g, ct).map(drop)
+            }),
+        ];
+        for (name, path) in paths {
+            let (mut alice_group, bob_ct, _carol_ct, bob_index) =
+                reset_bob_after_epoch_two_messages();
+            let err = path(&mut alice_group, &bob_ct).unwrap_err();
+            assert!(
+                matches!(&err, MlsError::DecryptionFailed(m)
+                    if m.contains(&format!("{bob_index:?}")) && m.contains("signature key")),
+                "{name}: a past-epoch message signed by the replaced leaf must be refused \
+                 for its signature key, got {err:?}"
+            );
+            assert_eq!(alice_group.epoch().unwrap(), 3, "{name}: no epoch change");
+        }
+    }
+
+    /// The control for the refusal above: a past-epoch message from a leaf
+    /// the Commit left unchanged still opens and is attributed to its sender.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::panic)]
+    fn a_past_epoch_message_from_an_unchanged_leaf_is_accepted() {
+        let (mut alice_group, _bob_ct, carol_ct, _bob_index) = reset_bob_after_epoch_two_messages();
+        match decrypt_with_sender_did(&mut alice_group, &carol_ct).unwrap() {
+            DecryptedContent::Application {
+                plaintext,
+                sender_did,
+            } => {
+                assert_eq!(plaintext, b"sealed by carol's leaf");
+                assert_eq!(sender_did, "did:dht:z6Mkcarol");
+            }
+            other => panic!("expected an application message, got {other:?}"),
+        }
+
+        let (mut alice_group, _bob_ct, carol_ct, _bob_index) = reset_bob_after_epoch_two_messages();
+        assert_eq!(
+            decrypt(&mut alice_group, &carol_ct).unwrap(),
+            b"sealed by carol's leaf"
+        );
+
+        let (mut alice_group, _bob_ct, carol_ct, _bob_index) = reset_bob_after_epoch_two_messages();
+        assert!(matches!(
+            decrypt_with_membership_changes(&mut alice_group, &carol_ct).unwrap(),
+            InboundChange::Application { .. }
+        ));
     }
 
     mod proptest_tests {
