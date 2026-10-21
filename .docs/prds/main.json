@@ -11035,10 +11035,11 @@
         "The client-data parser applies the nine-item clientDataJSON acceptance set of `09-security-model.md` §9.7.4.2, with at least one rejection test per clause of every item: item 1, a leading `EF BB BF`, an overlong UTF-8 form, an encoded surrogate and a code point above U+10FFFF; item 2, a top-level array and trailing non-whitespace after the top-level object; item 3, an unescaped control character; item 4, a lone high-surrogate escape, a lone low-surrogate escape, and a raw supplementary character followed by `\\uDC00`; item 6, the malformed numbers `01`, `+1` and `.5`; item 7, a duplicate member name in a nested object and a duplicate that differs only by escapes; item 8, a `type` or `challenge` that is absent, one that is not a string, and a top level missing `challenge` whose only correct `challenge` sits in a nested object. Acceptance tests cover a U+FEFF inside a string, `1e400`, nesting 200 levels deep inside 512 bytes, and an unknown member",
         "The challenge comparison reads the decoded JSON string: a `challenge` whose expected base64url text is written with `\\u` escapes is accepted, and a `challenge` carrying `=` padding, a character outside the base64url alphabet, or nonzero trailing bits is rejected: a test per case (`09-security-model.md` §9.7.4.2 definitions)",
         "`validate_chain` returns a defect for each field a kind carries as a sentinel holding any other value: one fixture per pair, `Inception` fields 5, 8 and 11, `KeyState` fields 5, 8, 9 and 12, `CommitmentRollover` fields 5, 9, 10 and 11, and `RootRecovery` field 11 (`09-security-model.md` §9.7.4.2 R3)",
-        "`validate_chain` returns `AuthorDefect` wherever installed keys and fixed commitments meet, in either direction: a commitment whose preimage is a key that same event installs; a commitment whose preimage is a key installed as a root member at an earlier event; a `RootRecovery` that installs into K′ an unrevealed member of the standing next set; and a `KeyState` that installs an unrevealed member of the standing next set as `#active`: one named fixture per case (`09-security-model.md` §9.7.4.2 R3, commitment freshness)",
+        "`validate_chain` returns `AuthorDefect` wherever installed keys and fixed commitments meet, in either direction: no key installed in any role has a commitment equal to any commitment fixed on the chain at or before the installing event, and no commitment an event fixes equals the commitment of any key installed in any role at or before that event. One named fixture per case: a commitment whose preimage is a key that same event installs; a commitment whose preimage is a key installed as a root member at an earlier event; a `CommitmentRollover` that commits to the `#active` key an earlier `KeyState` installed; a `RootRecovery` that installs into K′ an unrevealed member of the standing next set; a `KeyState` that installs an unrevealed member of the standing next set as `#active`; and a `KeyState` that installs as `#active` a key whose commitment was fixed in a commitment list an earlier event superseded (`09-security-model.md` §9.7.4.2 R3, commitment freshness)",
         "`validate_chain` returns `AuthorDefect` for a state-carrying event that silently drops a key `Current` at its predecessor, a dropped entry `Superseded` where no installed key takes its role, a dropped entry `Retired` where one does, a key listed in a role other than the one it was installed in, and a key list out of the snapshot order: a test per case (`09-security-model.md` §9.7.4.2 definitions, R3, R8)",
         "`validate_chain` verifies each signer group against the key set R3's table *The key set each signer group verifies against* in `09-security-model.md` §9.7.4.2 names for it, and returns a defect where a K′ group verifies under the standing root but not under the event's field 9, where a `RootRecovery{CoSigns}` standing-root group verifies under K′ but not under the root standing at the event's predecessor, and where a reveal group meets the threshold the event fixes but not the standing next threshold: a test per case; and returns `Valid` for [Vector 41, Vector 54, a `KeyState` signed by Vector 54's K′], which shows the root standing after a recovery is K′",
         "A chain-level test in `crates/scp-kel/tests/kel/` replays Vector 41 extended by a `KeyState` re-signed by Vector 41's root that installs a new `#active` key, and asserts the old `#active` key is `Superseded` and the key-continuity fingerprint changes (`09-security-model.md` §9.7.4.2 R8, §9.11)",
+        "The assertion-form checks are closed: `verify_indexed` accepts an otherwise valid assertion signature whose `rpIdHash` is not SHA-256(\"ctx.network\"), one whose `signCount` is zero and one whose `signCount` is not zero, one with the AT, ED, BE and BS flag bits of byte 32 set, and one whose `authenticatorData` carries extension data: one acceptance test per case (`09-security-model.md` §9.7.4.2, *The assertion-form checks are closed*)",
         "`validate_chain` returns `AuthorDefect` for each header field whose value the kind or the chain fixes: fixture A41a, an inception identifier field that is not zero; A41b, an inception sequence that is not zero; A41c, an inception predecessor digest that is not zero; A41d, a kind other than `Inception` at position zero; A41e, an `Inception` at a later position; and an event after the inception whose identifier field differs from the chain's identifier: a test per fixture, with the R2 recompute reading the raw identifier field and never `EncodedPreimage::identifier()` (`09-security-model.md` §9.7.4.2 R2, R3)",
         "Fixture A45: `validate_chain` rejects a chain whose identifier field differs from the identifier a relay served it under (`09-security-model.md` §9.7.4.2 R2)",
         "Fixture A47: `validate_chain` returns `AuthorDefect` for a snapshot whose service-key role discriminator is `RootMember`, because `Active` is the one registered value (`09-security-model.md` §9.7.4.2 definitions, key role)",
@@ -11324,7 +11325,12 @@
         "crates/scp-protocol/src/crypto/ucan/",
         "crates/scp-protocol/src/discovery/push.rs",
         "crates/scp-transport/src/relay/push_store.rs",
-        "crates/scp-runtime/tests/test_vectors.rs"
+        "crates/scp-runtime/tests/test_vectors.rs",
+        "crates/scp-identity/src/push_verify.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/startup.rs",
+        "crates/scp-transport/tests/push_store_conformance.rs"
       ],
       "description": "Architecture slice S12. Each identity path switches to the key-event log and deletes the legacy symbol it replaces in the same pull request, with no dual mode and no fallback. ADR-063 states that did:dht is not SCP's method and that the Mainline distributed hash table is removed. A capability with no real backend returns a typed error, and no stand-in reaches a production path.",
       "acceptanceCriteria": [
@@ -11335,7 +11341,8 @@
         "The full workspace test suite passes after the deletion",
         "`grep -rn -i 'ed25519' crates/scp-platform/src` prints nothing",
         "A UCAN carries an ES256 signature: a round-trip test signs a UCAN with a P-256 key and verifies it (`09-security-model.md` §9.5)",
-        "`PushRegistration::registrant` and `PushDeregistration::registrant` hold the `Identifier` SCP-308 defines, encoded as the 56-byte `scp:` text form, and the push store and the push golden vectors carry that form; the `SCP-PUSH-REGISTER-V1:` and `SCP-PUSH-DEREGISTER-V1:` separators are unchanged (`22-human-readable-addressing.md` §22.11.4, `09-security-model.md` §9.5.2)"
+        "`PushRegistration::registrant` and `PushDeregistration::registrant` hold the `Identifier` SCP-308 defines, encoded as the 56-byte `scp:` text form, and the push store and the push golden vectors carry that form; the `SCP-PUSH-REGISTER-V1:` and `SCP-PUSH-DEREGISTER-V1:` separators are unchanged (`22-human-readable-addressing.md` §22.11.4, `09-security-model.md` §9.5.2)",
+        "`KelPushVerifier::verify` replaces the refuse-all stub PUSH-005 left: it resolves the registrant's key-event log through SCP-007's `resolve`, validates and replays it through SCP-309's `validate_chain` and `replay`, and verifies the message's signature against the `#active` key `Current` in the replayed key state. A test accepts a registration and a deregistration signed by the `#active` key of a valid chain and returns the registrant, and refuses one signed by a key the replayed state holds as `Superseded` or `Compromised`, one whose chain fails validation, and one whose identifier resolves to no chain, each with a typed `PushVerifyError` (`22-human-readable-addressing.md` §22.11.4, `09-security-model.md` §9.5.2, §9.7.4.2 R8)"
       ],
       "actionItems": [
         "Switch each path to the key-event log and delete the legacy symbol in the same pull request.",
@@ -11344,7 +11351,9 @@
         "Run the shipped-feature-graph gate and the full test suite."
       ],
       "blockedBy": [
-        "SCP-314"
+        "SCP-314",
+        "SCP-309",
+        "SCP-007"
       ],
       "sources": [
         {
