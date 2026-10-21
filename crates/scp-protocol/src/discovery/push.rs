@@ -9,9 +9,10 @@
 //! This module owns the only code that builds a push preimage:
 //! [`push_registration_signing_bytes`] and
 //! [`push_deregistration_signing_bytes`]. The signer and the relay's
-//! verifier both call them, and each takes the relay URL whose §9.18.2
-//! canonical form it writes and the tier 3 `bridge_target` that ends the
-//! preimage, so a signature binds to one relay entry.
+//! verifier both call them with a [`PushRelay`], which holds the relay URL's
+//! §9.18.2 canonical form and the tier 3 `bridge_target` that ends the
+//! preimage as one value, so a signature binds to one relay entry and no
+//! caller can pair a bridge URL with a missing target.
 //!
 //! It also owns the two push routing ID derivations of §9.18.2: the
 //! `"scp-push-registration"` form of a relay URL
@@ -311,43 +312,121 @@ impl PushDeregistration {
 }
 
 // ---------------------------------------------------------------------------
+// PushRelay: the relay entry a push message is signed for
+// ---------------------------------------------------------------------------
+
+/// The relay entry a push message is signed for and verified at: the relay
+/// URL in its §9.18.2 canonical form and the entry's tier 3 `bridgeTarget`,
+/// held together (§9.5.2, §10.7.1 step 3).
+///
+/// A tier 3 entry's URL is the bridge relay's own URL, which every node
+/// behind that bridge shares, so a preimage that carried the URL without the
+/// target would verify at each of those nodes. The two constructors are the
+/// only way to build the value: [`PushRelay::direct`] takes a URL and holds
+/// no target, and the conversion from an `SCPRelay` entry
+/// ([`RelayService`]) keeps the entry's target. No constructor takes a URL
+/// and a target as separate arguments, so a bridge entry's URL never reaches
+/// a preimage without its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushRelay {
+    canonical: String,
+    bridge_target: Option<BridgeTarget>,
+}
+
+impl PushRelay {
+    /// A relay reached at its `"scp-push-registration"` push routing ID,
+    /// with no tier 3 target. `url` is canonicalized with
+    /// [`canonical_relay_url`], so every spelling of one relay URL yields one
+    /// value.
+    ///
+    /// # Errors
+    ///
+    /// [`PushMessageError::InvalidRelayUrl`] when `url` has no §9.18.2
+    /// canonical form.
+    pub fn direct(url: &str) -> Result<Self, PushMessageError> {
+        Ok(Self {
+            canonical: canonical_relay_url(url)?,
+            bridge_target: None,
+        })
+    }
+
+    /// The §9.18.2 canonical relay URL.
+    #[must_use]
+    pub fn canonical_url(&self) -> &str {
+        &self.canonical
+    }
+
+    /// The tier 3 `bridgeTarget`, or `None` for a relay reached at its
+    /// `"scp-push-registration"` ID.
+    #[must_use]
+    pub const fn bridge_target(&self) -> Option<BridgeTarget> {
+        self.bridge_target
+    }
+
+    /// The push routing ID this relay entry reserves (§9.18.2): the tier 3
+    /// form with a target, otherwise the `"scp-push-registration"` form.
+    #[must_use]
+    pub fn push_routing_id(&self) -> [u8; 32] {
+        self.bridge_target.map_or_else(
+            || routing_id_of_canonical(&self.canonical),
+            |target| tier3_routing_id_of_canonical(&self.canonical, target),
+        )
+    }
+
+    /// The 32 `bridge_target` bytes that end a push preimage: the target, or
+    /// [`ABSENT_BRIDGE_TARGET`] when there is none (§9.5.2). A
+    /// [`BridgeTarget`] never holds those bytes, so only a value with no
+    /// target signs them.
+    fn preimage_target(&self) -> [u8; 32] {
+        self.bridge_target
+            .map_or(ABSENT_BRIDGE_TARGET, BridgeTarget::to_bytes)
+    }
+}
+
+impl From<&RelayService> for PushRelay {
+    /// The relay entry an `SCPRelay` entry names, with its `bridgeTarget`.
+    /// The entry holds its §9.18.2 canonical URL by construction, so the
+    /// conversion cannot fail.
+    fn from(relay: &RelayService) -> Self {
+        Self {
+            canonical: relay.url().to_owned(),
+            bridge_target: relay_service_bridge_target(relay),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Canonical signing bytes (§9.5.2)
 // ---------------------------------------------------------------------------
 
-/// Builds the §9.5.2 `PushRegistration` signature preimage for the relay
-/// entry at `relay_url` with `bridge_target`.
+/// Builds the §9.5.2 `PushRegistration` signature preimage for `relay`.
 ///
 /// The bytes are `"SCP-PUSH-REGISTER-V1:" || BE32(len) || registrant ||
 /// platform_tag || BE32(len) || token || BE32(count) || routing_ids ||
 /// BE64(timestamp) || BE32(len) || canonical relay_url || bridge_target`.
 /// `signature` is not read. The signer signs, and the verifier checks, the
-/// SHA-256 of these bytes. `relay_url` is canonicalized with
-/// [`canonical_relay_url`] first, so every spelling of one relay URL yields one
-/// preimage.
+/// SHA-256 of these bytes. `relay` already holds the canonical URL, so every
+/// spelling of one relay URL yields one preimage.
 ///
 /// `bridge_target` is the target of the tier 3 entry whose push routing ID
-/// the message is published to, or `None` for a relay reached at its
-/// `"scp-push-registration"` ID; `None` writes the 32 bytes
-/// [`ABSENT_BRIDGE_TARGET`] (§9.5.2 field 7). A [`BridgeTarget`] never holds
-/// those bytes, so `None` is the only way to sign them.
+/// the message is published to; a relay with no target writes the 32 bytes
+/// [`ABSENT_BRIDGE_TARGET`] (§9.5.2 field 7).
 ///
 /// This function and [`push_deregistration_signing_bytes`] are the only code
 /// that builds a push preimage.
 ///
 /// # Errors
 ///
-/// Returns any error of [`PushRegistration::validate`],
-/// [`PushMessageError::InvalidRelayUrl`], or
+/// Returns any error of [`PushRegistration::validate`], or
 /// [`PushMessageError::FieldTooLarge`].
 pub fn push_registration_signing_bytes(
     registration: &PushRegistration,
-    relay_url: &str,
-    bridge_target: Option<BridgeTarget>,
+    relay: &PushRelay,
 ) -> Result<Vec<u8>, PushMessageError> {
     validate_common(&registration.registrant, &registration.token)?;
     let count = routing_id_count(&registration.routing_ids)?;
-    let url = canonical_relay_url(relay_url)?;
-    let target = preimage_bridge_target(bridge_target);
+    let url = relay.canonical_url();
+    let target = relay.preimage_target();
 
     let mut fields = Vec::with_capacity(7 + registration.routing_ids.len());
     fields.push(CanonicalField::VarBytes(registration.registrant.as_bytes()));
@@ -365,28 +444,25 @@ pub fn push_registration_signing_bytes(
     )?)
 }
 
-/// Builds the §9.5.2 `PushDeregistration` signature preimage for the relay
-/// entry at `relay_url` with `bridge_target`.
+/// Builds the §9.5.2 `PushDeregistration` signature preimage for `relay`.
 ///
 /// The bytes are `"SCP-PUSH-DEREGISTER-V1:" || BE32(len) || registrant ||
 /// platform_tag || BE32(len) || token || BE64(timestamp) || BE32(len) ||
-/// canonical relay_url || bridge_target`. `signature` is not read. `relay_url`
-/// is canonicalized with [`canonical_relay_url`] first. `bridge_target` takes
-/// the values [`push_registration_signing_bytes`] states (§9.5.2 field 6).
+/// canonical relay_url || bridge_target`. `signature` is not read.
+/// `bridge_target` takes the values [`push_registration_signing_bytes`]
+/// states (§9.5.2 field 6).
 ///
 /// # Errors
 ///
-/// Returns any error of [`PushDeregistration::validate`],
-/// [`PushMessageError::InvalidRelayUrl`], or
+/// Returns any error of [`PushDeregistration::validate`], or
 /// [`PushMessageError::FieldTooLarge`].
 pub fn push_deregistration_signing_bytes(
     deregistration: &PushDeregistration,
-    relay_url: &str,
-    bridge_target: Option<BridgeTarget>,
+    relay: &PushRelay,
 ) -> Result<Vec<u8>, PushMessageError> {
     deregistration.validate()?;
-    let url = canonical_relay_url(relay_url)?;
-    let target = preimage_bridge_target(bridge_target);
+    let url = relay.canonical_url();
+    let target = relay.preimage_target();
 
     Ok(canonical_hash_bytes(
         PUSH_DEREGISTER_DOMAIN.as_bytes(),
@@ -399,12 +475,6 @@ pub fn push_deregistration_signing_bytes(
             CanonicalField::Fixed32(&target),
         ],
     )?)
-}
-
-/// The 32 `bridge_target` bytes that end a push preimage: the target, or
-/// [`ABSENT_BRIDGE_TARGET`] for `None` (§9.5.2).
-fn preimage_bridge_target(bridge_target: Option<BridgeTarget>) -> [u8; 32] {
-    bridge_target.map_or(ABSENT_BRIDGE_TARGET, BridgeTarget::to_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -439,11 +509,7 @@ pub fn relay_endpoint_push_routing_id(endpoint: &RelayEndpoint) -> [u8; 32] {
 /// `"scp-push-registration"` ID ([`relay_endpoint_push_routing_id`]).
 #[must_use]
 pub fn tier3_push_routing_id(endpoint: &RelayEndpoint, target: BridgeTarget) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(PUSH_BRIDGE_ROUTING_PREFIX.as_bytes());
-    hasher.update(endpoint.as_str().as_bytes());
-    hasher.update(target.to_bytes());
-    hasher.finalize().into()
+    tier3_routing_id_of_canonical(endpoint.as_str(), target)
 }
 
 /// The `bridgeTarget` of an `SCPRelay` entry, or `None` for an entry that
@@ -454,9 +520,10 @@ pub fn tier3_push_routing_id(endpoint: &RelayEndpoint, target: BridgeTarget) -> 
 /// [`BridgeTarget::new`] accepts them. Its one refusal is for
 /// [`ABSENT_BRIDGE_TARGET`], which `03-identity.md` §3.10.13 decodes as "no
 /// target", so the refusal maps to `None` and every reader decodes those
-/// bytes one way.
+/// bytes one way. Other crates read the target through
+/// [`PushRelay::bridge_target`] on `PushRelay::from(&entry)`.
 #[must_use]
-pub fn relay_service_bridge_target(relay: &RelayService) -> Option<BridgeTarget> {
+fn relay_service_bridge_target(relay: &RelayService) -> Option<BridgeTarget> {
     relay
         .bridge_target()
         .and_then(|bytes| BridgeTarget::new(bytes).ok())
@@ -481,6 +548,16 @@ fn routing_id_of_canonical(canonical: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(PUSH_ROUTING_PREFIX.as_bytes());
     hasher.update(canonical.as_bytes());
+    hasher.finalize().into()
+}
+
+/// `SHA-256("scp-push-bridge:" || canonical || target)` over a bridge URL
+/// already in its §9.18.2 canonical form.
+fn tier3_routing_id_of_canonical(canonical: &str, target: BridgeTarget) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PUSH_BRIDGE_ROUTING_PREFIX.as_bytes());
+    hasher.update(canonical.as_bytes());
+    hasher.update(target.to_bytes());
     hasher.finalize().into()
 }
 
@@ -610,6 +687,11 @@ mod tests {
             timestamp: 1_700_000_000,
             signature: [0x55; 64],
         }
+    }
+
+    /// The [`PushRelay`] of a relay reached at its `"scp-push-registration"` ID.
+    fn relay(url: &str) -> PushRelay {
+        PushRelay::direct(url).unwrap()
     }
 
     fn deregistration() -> PushDeregistration {
@@ -757,24 +839,67 @@ mod tests {
     #[test]
     fn signing_bytes_refuse_invalid_messages() {
         assert_eq!(
-            push_registration_signing_bytes(&registration(Vec::new()), "wss://r.example", None),
+            push_registration_signing_bytes(&registration(Vec::new()), &relay("wss://r.example")),
             Err(PushMessageError::EmptyRoutingIds)
         );
         let mut dereg = deregistration();
         dereg.token.clear();
         assert_eq!(
-            push_deregistration_signing_bytes(&dereg, "wss://r.example", None),
+            push_deregistration_signing_bytes(&dereg, &relay("wss://r.example")),
             Err(PushMessageError::EmptyToken)
         );
+    }
+
+    /// A URL with no §9.18.2 canonical form never becomes a [`PushRelay`],
+    /// so no preimage exists for it.
+    #[test]
+    fn push_relay_direct_refuses_a_url_with_no_canonical_form() {
         assert_eq!(
-            push_registration_signing_bytes(
-                &registration(vec![[1; 32]]),
-                "https://r.example",
-                None
-            ),
+            PushRelay::direct("https://r.example"),
             Err(PushMessageError::InvalidRelayUrl(
                 RelayUrlError::UnsupportedScheme
             ))
+        );
+    }
+
+    /// Every spelling of one relay URL yields one value and one preimage, and
+    /// a direct relay holds no target and the `"scp-push-registration"` ID.
+    #[test]
+    fn push_relay_direct_canonicalizes_and_holds_no_target() {
+        let a = relay("WSS://R.Example:443/");
+        let b = relay("wss://r.example");
+        assert_eq!(a, b);
+        assert_eq!(a.canonical_url(), "wss://r.example");
+        assert_eq!(a.bridge_target(), None);
+        assert_eq!(
+            a.push_routing_id(),
+            push_registration_routing_id("wss://r.example").unwrap()
+        );
+        let reg = registration(vec![[1; 32]]);
+        assert_eq!(
+            push_registration_signing_bytes(&reg, &a).unwrap(),
+            push_registration_signing_bytes(&reg, &b).unwrap()
+        );
+    }
+
+    /// The conversion from an `SCPRelay` entry keeps the target of a bridge
+    /// entry and the routing ID of each form, so no conversion drops it.
+    #[test]
+    fn push_relay_from_relay_service_keeps_the_target_and_the_routing_id() {
+        let entry = bridge_entry(BRIDGE_URL, vector_target());
+        let held = PushRelay::from(&entry);
+        assert_eq!(held.canonical_url(), BRIDGE_URL);
+        assert_eq!(held.bridge_target(), Some(vector_target()));
+        assert_eq!(
+            held.push_routing_id(),
+            relay_service_push_routing_id(&entry)
+        );
+
+        let direct = direct_entry(BRIDGE_URL);
+        assert_eq!(PushRelay::from(&direct), relay(BRIDGE_URL));
+        assert_eq!(
+            PushRelay::from(&direct).push_routing_id(),
+            relay_service_push_routing_id(&direct)
         );
     }
 
@@ -784,8 +909,8 @@ mod tests {
         let mut b = a.clone();
         b.signature = [0; 64];
         assert_eq!(
-            push_registration_signing_bytes(&a, "wss://r.example", None).unwrap(),
-            push_registration_signing_bytes(&b, "wss://r.example", None).unwrap()
+            push_registration_signing_bytes(&a, &relay("wss://r.example")).unwrap(),
+            push_registration_signing_bytes(&b, &relay("wss://r.example")).unwrap()
         );
     }
 
@@ -802,8 +927,8 @@ mod tests {
         let mut one = registration(vec![r1]);
         one.timestamp = u64::from_be_bytes(r2[..8].try_into().unwrap());
 
-        let a = push_registration_signing_bytes(&two, "wss://r.example", None).unwrap();
-        let b = push_registration_signing_bytes(&one, "wss://r.example", None).unwrap();
+        let a = push_registration_signing_bytes(&two, &relay("wss://r.example")).unwrap();
+        let b = push_registration_signing_bytes(&one, &relay("wss://r.example")).unwrap();
         assert_ne!(a, b);
 
         // The list starts after the separator, the registrant, the platform
@@ -826,8 +951,8 @@ mod tests {
             signature: reg.signature,
         };
         assert_ne!(
-            push_registration_signing_bytes(&reg, "wss://r.example", None).unwrap(),
-            push_deregistration_signing_bytes(&dereg, "wss://r.example", None).unwrap()
+            push_registration_signing_bytes(&reg, &relay("wss://r.example")).unwrap(),
+            push_deregistration_signing_bytes(&dereg, &relay("wss://r.example")).unwrap()
         );
     }
 
@@ -876,6 +1001,11 @@ mod tests {
 
     fn direct_entry(url: &str) -> RelayService {
         RelayService::direct(RelayEndpoint::new(url).unwrap())
+    }
+
+    /// The [`PushRelay`] of the tier 3 entry at `url` with target `t`.
+    fn bridge(url: &str, t: BridgeTarget) -> PushRelay {
+        PushRelay::from(&bridge_entry(url, t))
     }
 
     /// §9.18.2 **Tier 3 push routing ID** prints both IDs.
@@ -962,10 +1092,10 @@ mod tests {
         let reg = registration(vec![[1; 32]]);
         let dereg = deregistration();
         let t = vector_target();
-        let reg_none = push_registration_signing_bytes(&reg, BRIDGE_URL, None).unwrap();
-        let reg_some = push_registration_signing_bytes(&reg, BRIDGE_URL, Some(t)).unwrap();
-        let dereg_none = push_deregistration_signing_bytes(&dereg, BRIDGE_URL, None).unwrap();
-        let dereg_some = push_deregistration_signing_bytes(&dereg, BRIDGE_URL, Some(t)).unwrap();
+        let reg_none = push_registration_signing_bytes(&reg, &relay(BRIDGE_URL)).unwrap();
+        let reg_some = push_registration_signing_bytes(&reg, &bridge(BRIDGE_URL, t)).unwrap();
+        let dereg_none = push_deregistration_signing_bytes(&dereg, &relay(BRIDGE_URL)).unwrap();
+        let dereg_some = push_deregistration_signing_bytes(&dereg, &bridge(BRIDGE_URL, t)).unwrap();
         for (none, some) in [(&reg_none, &reg_some), (&dereg_none, &dereg_some)] {
             assert_eq!(none.len(), some.len());
             assert_eq!(none[none.len() - 32..], ABSENT_BRIDGE_TARGET);
@@ -980,8 +1110,8 @@ mod tests {
             BRIDGE_URL.as_bytes()
         );
         assert_ne!(
-            push_registration_signing_bytes(&reg, BRIDGE_URL, Some(target([0xA1; 32]))).unwrap(),
-            push_registration_signing_bytes(&reg, BRIDGE_URL, Some(target([0xB2; 32]))).unwrap()
+            push_registration_signing_bytes(&reg, &bridge(BRIDGE_URL, target([0xA1; 32]))).unwrap(),
+            push_registration_signing_bytes(&reg, &bridge(BRIDGE_URL, target([0xB2; 32]))).unwrap()
         );
     }
 

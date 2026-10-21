@@ -4316,8 +4316,8 @@ mod tests {
         use scp_did::DID;
         use scp_identity::push_verify::{KelPushVerifier, PushSignatureVerifier, TestPushVerifier};
         use scp_protocol::discovery::push::{
-            PushDeregistration, PushPlatform, PushRegistration, push_deregistration_signing_bytes,
-            push_registration_signing_bytes,
+            PushDeregistration, PushPlatform, PushRegistration, PushRelay,
+            push_deregistration_signing_bytes, push_registration_signing_bytes,
         };
         use sha2::{Digest, Sha256};
 
@@ -4358,7 +4358,8 @@ mod tests {
             };
             msg.signature = sign(
                 signer,
-                &push_registration_signing_bytes(&msg, relay_url, None).unwrap(),
+                &push_registration_signing_bytes(&msg, &PushRelay::direct(relay_url).unwrap())
+                    .unwrap(),
             );
             msg
         }
@@ -4377,7 +4378,11 @@ mod tests {
             };
             msg.signature = sign(
                 signer,
-                &push_deregistration_signing_bytes(&msg, PUSH_RELAY_URL, None).unwrap(),
+                &push_deregistration_signing_bytes(
+                    &msg,
+                    &PushRelay::direct(PUSH_RELAY_URL).unwrap(),
+                )
+                .unwrap(),
             );
             msg
         }
@@ -4535,7 +4540,11 @@ mod tests {
                 msg.routing_ids = vec![[0x33; 32]];
                 msg.signature = sign(
                     &key(7),
-                    &push_registration_signing_bytes(&msg, PUSH_RELAY_URL, None).unwrap(),
+                    &push_registration_signing_bytes(
+                        &msg,
+                        &PushRelay::direct(PUSH_RELAY_URL).unwrap(),
+                    )
+                    .unwrap(),
                 );
                 let reply = publish_push(addr, reg_blob(&msg)).await;
                 assert_eq!(err_code(&reply), code::PUSH_REGISTRATION_STALE);

@@ -41,9 +41,9 @@ use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 use scp_protocol::crypto::key_continuity::compute_key_continuity_fingerprint;
 use scp_protocol::crypto::sender_keys::key_protocol_verify::build_hpke_info;
 use scp_protocol::discovery::push::{
-    PushDeregistration, PushPlatform, PushRegistration, push_deregistration_signing_bytes,
-    push_registration_routing_id, push_registration_signing_bytes, relay_service_push_routing_id,
-    tier3_push_routing_id,
+    PushDeregistration, PushPlatform, PushRegistration, PushRelay,
+    push_deregistration_signing_bytes, push_registration_routing_id,
+    push_registration_signing_bytes, relay_service_push_routing_id, tier3_push_routing_id,
 };
 use scp_protocol::envelope::inner::compute_canonical_hash;
 use scp_protocol::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
@@ -1087,6 +1087,15 @@ fn push_deregister_layout(relay_url: &str, target: Option<BridgeTarget>) -> Vec<
     out
 }
 
+/// The [`PushRelay`] a golden is signed for: the tier 3 entry at `url` with
+/// `target`, or the relay at `url` with no target.
+fn push_relay(url: &str, target: Option<BridgeTarget>) -> PushRelay {
+    target.map_or_else(
+        || PushRelay::direct(url).unwrap(),
+        |t| PushRelay::from(&RelayService::bridge(BridgeEndpoint::new(url).unwrap(), t)),
+    )
+}
+
 #[test]
 fn push_registration_signing_bytes_match_golden_vectors() {
     let reg = push_registration_fixture();
@@ -1099,7 +1108,7 @@ fn push_registration_signing_bytes_match_golden_vectors() {
             PUSH_REGISTER_BRIDGE_HEX,
         ),
     ] {
-        let produced = push_registration_signing_bytes(&reg, url, target).unwrap();
+        let produced = push_registration_signing_bytes(&reg, &push_relay(url, target)).unwrap();
         assert_eq!(hex::encode(&produced), golden, "{url}: golden vector");
         assert_eq!(
             produced,
@@ -1128,7 +1137,7 @@ fn push_deregistration_signing_bytes_match_golden_vectors() {
             PUSH_DEREGISTER_BRIDGE_HEX,
         ),
     ] {
-        let produced = push_deregistration_signing_bytes(&dereg, url, target).unwrap();
+        let produced = push_deregistration_signing_bytes(&dereg, &push_relay(url, target)).unwrap();
         assert_eq!(hex::encode(&produced), golden, "{url}: golden vector");
         assert_eq!(
             produced,
@@ -1144,13 +1153,13 @@ fn push_deregistration_signing_bytes_match_golden_vectors() {
 fn push_preimages_differ_across_relay_urls() {
     let reg = push_registration_fixture();
     assert_ne!(
-        push_registration_signing_bytes(&reg, PUSH_RELAY_A, None).unwrap(),
-        push_registration_signing_bytes(&reg, PUSH_RELAY_B, None).unwrap()
+        push_registration_signing_bytes(&reg, &push_relay(PUSH_RELAY_A, None)).unwrap(),
+        push_registration_signing_bytes(&reg, &push_relay(PUSH_RELAY_B, None)).unwrap()
     );
     let dereg = push_deregistration_fixture();
     assert_ne!(
-        push_deregistration_signing_bytes(&dereg, PUSH_RELAY_A, None).unwrap(),
-        push_deregistration_signing_bytes(&dereg, PUSH_RELAY_B, None).unwrap()
+        push_deregistration_signing_bytes(&dereg, &push_relay(PUSH_RELAY_A, None)).unwrap(),
+        push_deregistration_signing_bytes(&dereg, &push_relay(PUSH_RELAY_B, None)).unwrap()
     );
 }
 
@@ -1159,14 +1168,19 @@ fn push_preimages_are_equal_across_spellings_of_one_relay_url() {
     let reg = push_registration_fixture();
     assert_eq!(
         hex::encode(
-            push_registration_signing_bytes(&reg, "WSS://Relay.Example:443/", None).unwrap()
+            push_registration_signing_bytes(&reg, &push_relay("WSS://Relay.Example:443/", None))
+                .unwrap()
         ),
         PUSH_REGISTER_A_HEX
     );
     let dereg = push_deregistration_fixture();
     assert_eq!(
         hex::encode(
-            push_deregistration_signing_bytes(&dereg, "WSS://Relay.Example:443/", None).unwrap()
+            push_deregistration_signing_bytes(
+                &dereg,
+                &push_relay("WSS://Relay.Example:443/", None)
+            )
+            .unwrap()
         ),
         PUSH_DEREGISTER_A_HEX
     );

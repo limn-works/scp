@@ -29,15 +29,12 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use scp_did::{BridgeTarget, canonical_relay_url};
+use scp_did::BridgeTarget;
 #[cfg(feature = "push-store")]
 use scp_identity::push_verify::{PushMessage, PushSignatureVerifier};
 #[cfg(feature = "push-store")]
 use scp_protocol::discovery::push::{PushDeregistration, PushPlatform, PushRegistration};
-use scp_protocol::discovery::push::{
-    PushMessageError, push_registration_routing_id, relay_service_bridge_target,
-    relay_service_push_routing_id,
-};
+use scp_protocol::discovery::push::{PushMessageError, PushRelay};
 use scp_relay_client::{RelayMessage, code};
 
 #[cfg(feature = "push-store")]
@@ -54,21 +51,19 @@ pub const PUSH_TIMESTAMP_SKEW_SECS: u64 = 300;
 #[cfg(feature = "push-store")]
 pub const PUSH_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The relay's own URL in its §9.18.2 canonical form, the tier 3
-/// `bridge_target` it is reached with, and the reserved push routing ID
-/// derived from both (§10.7.1 step 2).
+/// The relay's own [`PushRelay`] (its URL in §9.18.2 canonical form and the
+/// tier 3 `bridge_target` it is reached with) and the reserved push routing
+/// ID derived from both (§10.7.1 step 2).
 ///
-/// [`RelayUrl::new`] canonicalizes through [`canonical_relay_url`], holds no
-/// target, and derives the `"scp-push-registration"` ID through
-/// [`push_registration_routing_id`]. The conversion from an `SCPRelay` entry
-/// keeps the entry's target and derives the ID through
-/// [`relay_service_push_routing_id`], the tier 3 form when a target is
-/// present. Either way the relay rebuilds every preimage with the URL and
-/// target its reserved routing ID came from (§10.7.1 step 3).
+/// [`RelayUrl::new`] builds the relay with [`PushRelay::direct`], which holds
+/// no target, so the ID is the `"scp-push-registration"` form. The conversion
+/// from an `SCPRelay` entry goes through `PushRelay::from`, which keeps the
+/// entry's target, so the ID is the tier 3 form when a target is present.
+/// Either way the relay hands the verifier the one [`PushRelay`] its reserved
+/// routing ID came from (§10.7.1 step 3), and no conversion drops the target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayUrl {
-    canonical: String,
-    bridge_target: Option<BridgeTarget>,
+    relay: PushRelay,
     push_routing_id: [u8; 32],
 }
 
@@ -82,27 +77,27 @@ impl RelayUrl {
     /// [`PushMessageError::InvalidRelayUrl`] when `url` has no §9.18.2
     /// canonical form.
     pub fn new(url: &str) -> Result<Self, PushMessageError> {
-        let canonical = canonical_relay_url(url)?;
-        let push_routing_id = push_registration_routing_id(&canonical)?;
-        Ok(Self {
-            canonical,
-            bridge_target: None,
-            push_routing_id,
-        })
+        Ok(Self::from(PushRelay::direct(url)?))
+    }
+
+    /// The relay entry the reserved routing ID was derived from, which the
+    /// relay passes to the verifier (§10.7.1 step 3).
+    #[must_use]
+    pub const fn push_relay(&self) -> &PushRelay {
+        &self.relay
     }
 
     /// The §9.18.2 canonical URL.
     #[must_use]
     pub fn canonical(&self) -> &str {
-        &self.canonical
+        self.relay.canonical_url()
     }
 
     /// The tier 3 `bridge_target` the reserved routing ID was derived with,
-    /// or `None` for the `"scp-push-registration"` form. The relay passes it
-    /// to the verifier, which ends the preimage with it (§9.5.2).
+    /// or `None` for the `"scp-push-registration"` form.
     #[must_use]
     pub const fn bridge_target(&self) -> Option<BridgeTarget> {
-        self.bridge_target
+        self.relay.bridge_target()
     }
 
     /// The reserved push routing ID: `SHA-256("scp-push-bridge:" ||
@@ -114,16 +109,23 @@ impl RelayUrl {
     }
 }
 
+impl From<PushRelay> for RelayUrl {
+    /// Holds `relay` and derives its reserved push routing ID once.
+    fn from(relay: PushRelay) -> Self {
+        let push_routing_id = relay.push_routing_id();
+        Self {
+            relay,
+            push_routing_id,
+        }
+    }
+}
+
 impl From<&scp_did::RelayService> for RelayUrl {
     /// The relay URL of an `SCPRelay` entry, with the entry's `bridgeTarget`.
     /// The entry holds its §9.18.2 canonical URL by construction, so the
     /// conversion cannot fail.
     fn from(relay: &scp_did::RelayService) -> Self {
-        Self {
-            canonical: relay.url().to_owned(),
-            bridge_target: relay_service_bridge_target(relay),
-            push_routing_id: relay_service_push_routing_id(relay),
-        }
+        Self::from(PushRelay::from(relay))
     }
 }
 
@@ -500,11 +502,9 @@ async fn handle(
     // routing ID came from, never a client-supplied URL (§10.7.1 step 3).
     let verified = tokio::time::timeout(
         PUSH_VERIFY_TIMEOUT,
-        service.verifier.verify(
-            decoded.message(),
-            relay_url.canonical(),
-            relay_url.bridge_target(),
-        ),
+        service
+            .verifier
+            .verify(decoded.message(), relay_url.push_relay()),
     )
     .await
     .map_err(|_| {
@@ -566,6 +566,8 @@ pub(crate) fn test_relay_url() -> LiveRelayUrl {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use scp_protocol::discovery::push::push_registration_routing_id;
+
     use super::*;
 
     #[test]
@@ -622,6 +624,11 @@ mod tests {
             push_registration_routing_id(BRIDGE_URL).unwrap()
         );
         assert_ne!(url, direct);
+
+        // The handle yields the one `PushRelay` the ID was derived from.
+        assert_eq!(url.push_relay(), &PushRelay::from(&entry));
+        assert_eq!(url.push_relay().push_routing_id(), url.push_routing_id());
+        assert_eq!(direct.push_relay().bridge_target(), None);
     }
 
     /// Two entries behind one bridge URL are different relay URLs: setting
@@ -783,15 +790,14 @@ mod tests {
     }
 
     /// A registration (`deregister` false) or deregistration for the APNs
-    /// token `tok`, signed by `gate_key()` for the bridge URL and `target`.
+    /// token `tok`, signed by `gate_key()` for `relay`.
     #[cfg(feature = "push-store")]
-    fn signed_for(deregister: bool, target: Option<[u8; 32]>) -> Vec<u8> {
+    fn signed_for(deregister: bool, relay: &PushRelay) -> Vec<u8> {
         use scp_protocol::discovery::push::{
             push_deregistration_signing_bytes, push_registration_signing_bytes,
         };
         use sha2::{Digest, Sha256};
 
-        let target = target.map(|t| BridgeTarget::new(t).unwrap());
         let sign = |preimage: Vec<u8>| {
             let digest: [u8; 32] = Sha256::digest(preimage).into();
             scp_crypto::p256::sign_prehash_rfc6979(&gate_key(), &digest).unwrap()
@@ -804,8 +810,7 @@ mod tests {
                 timestamp: GATE_NOW,
                 signature: [0; 64],
             };
-            msg.signature =
-                sign(push_deregistration_signing_bytes(&msg, BRIDGE_URL, target).unwrap());
+            msg.signature = sign(push_deregistration_signing_bytes(&msg, relay).unwrap());
             rmp_serde::to_vec_named(&msg).unwrap()
         } else {
             let mut msg = PushRegistration {
@@ -816,8 +821,7 @@ mod tests {
                 timestamp: GATE_NOW,
                 signature: [0; 64],
             };
-            msg.signature =
-                sign(push_registration_signing_bytes(&msg, BRIDGE_URL, target).unwrap());
+            msg.signature = sign(push_registration_signing_bytes(&msg, relay).unwrap());
             rmp_serde::to_vec_named(&msg).unwrap()
         }
     }
@@ -863,8 +867,8 @@ mod tests {
         let held_b = RelayUrl::from(&bridge_entry([0xB2; 32]));
         let held_none = RelayUrl::new(BRIDGE_URL).unwrap();
         for deregister in [false, true] {
-            let for_a = signed_for(deregister, Some([0xA1; 32]));
-            let sentinel = signed_for(deregister, None);
+            let for_a = signed_for(deregister, held_a.push_relay());
+            let sentinel = signed_for(deregister, held_none.push_relay());
 
             let (gate, stored) = present(&held_a, &for_a).await;
             assert_eq!(gate, PushPublishGate::Accepted, "deregister {deregister}");
