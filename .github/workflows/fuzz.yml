@@ -162,6 +162,12 @@ jobs:
             dict: client_data_json.dict
             max_len: 600
             time: 300
+          # 09-security-model.md §9.7.4.2 and §9.18.17: one event unit is a
+          # 4-byte length prefix and at most MAX_EVENT_BYTES (65,536) more.
+          - target: fuzz_kel_decode_event
+            dict: kel_event.dict
+            max_len: 65540
+            time: 300
           # ADR-057 §Prereq-4: a tampered or malformed MLS ciphertext must yield a
           # typed error, never a panic. No dictionary: the input is raw MLS wire
           # ciphertext and the target self-generates a valid frame to tamper. It

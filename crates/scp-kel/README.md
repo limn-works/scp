@@ -12,11 +12,33 @@ This crate owns:
   with one typed constructor per kind that places every sentinel the kind
   carries and derives field 9 from the snapshot.
 - `encode_preimage` and `decode_preimage` — the only constructors of
-  `EncodedPreimage`, which holds a preimage with its signed bytes
-  `"SCP-KEL-EVENT-V1:" ‖ fields`. Its `event_digest` and `identifier` read
-  those bytes and cannot fail. Both directions read one count-bound table, so
-  encode succeeds exactly where decode of its output succeeds (§9.7.4.2, the
-  count-bound rule).
+  `EncodedPreimage`, which holds a preimage with its field bytes; the
+  signed preimage is `"SCP-KEL-EVENT-V1:" ‖ fields`, with the separator
+  implied, so no accessor strips it. Its `event_digest` and
+  `inception_identifier` (`None` for every kind but `Inception`) read those
+  bytes and cannot fail. Both directions read one count-bound table, pair
+  each form list with its index list (`FormListLength` where the lengths
+  differ) and read one encoded-length function over the pairs (the signed
+  preimage plus each named signer's form ceiling, at most `MAX_EVENT_BYTES`),
+  so encode succeeds exactly where decode of its output succeeds (§9.7.4.2,
+  the count-bound rule; §9.18.17). Decode errors split by stage:
+  `HeaderError` for fields 1 to 7 and step 4's checks, `BodyError` for
+  fields 8 to 12.
+- `decode_event` — reads one §9.10.12 event unit (`BE32(len)`, the signed
+  preimage, the signature field) into an `EventUnit` whose variant is the
+  stage of §9.7.4.2's check order that stopped it: `Unframed` (step 1),
+  `NoSeparator` (step 2), `HeaderFailed` (step 4, with its `HeaderError`) or
+  `Read`. A `ReadUnit` holds the `EventHeader` of fields 1 to 7, whose
+  `HeaderGroup`s pair each index with its form (`NamedSigner`), the
+  signature-field walk (step 5) as a `SignatureField` of `NamedSignature`s
+  with the bytes the unit consumed, or a `SignatureFieldError`, and the
+  body decode, kept apart. Fields 1 to 12 are parsed once.
+- `RawSignedPreimage` — the received signed preimage of a unit past step 2,
+  built only by `decode_event`, which strips the separator once and keeps
+  the field bytes: its `identifier` (hashed from the received
+  bytes, so it exists even when the body fails to decode), its
+  `event_digest`, and `inception_zero_checks`, R3's inception header checks
+  read with the header's own reader (`InceptionHeaderDefect`).
 - `derive_identifier` — `SHA-256("SCP-KEL-ID-V1:" ‖ inception signed preimage)`,
   refusing any preimage that is not a zero-position inception.
 - `prerotation_commitment` and `key_event_seal` — the pre-rotation commitment
@@ -53,4 +75,4 @@ pins byte identity between native and wasm32 against `25-test-vectors.md`
 platform edge in its dependency tree.
 
 Chain verification (signatures, R3's defect list, R8) is not here yet; it
-lands with the verifier story, which wraps `decode_preimage`.
+lands with the verifier story, which reads `decode_event`'s stages.

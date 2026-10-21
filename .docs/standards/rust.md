@@ -302,7 +302,7 @@ explicitly as `cargo +<channel>`, the channel its `toolchain` job reads from
 `fuzz/rust-toolchain.toml`:
 
 ```sh
-cd fuzz && cargo fuzz list          # list all 29 targets
+cd fuzz && cargo fuzz list          # list all 30 targets
 cd fuzz && cargo fuzz run <target> \
   -- -dict=fuzz/dicts/<dict> -max_total_time=60    # run one target locally
 cd fuzz && cargo check              # compile-check (no fuzzing)

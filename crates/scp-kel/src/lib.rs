@@ -6,6 +6,7 @@ mod client_data;
 pub mod constants;
 mod error;
 mod event;
+mod event_codec;
 mod preimage;
 mod routing;
 mod signature;
@@ -14,13 +15,18 @@ pub use client_data::ClientDataError;
 #[doc(hidden)]
 pub use client_data::{ClientDataMembers, parse_client_data_json};
 pub use error::{
-    DecodeError, DeriveIdentifierError, DidDiscriminatorField, EncodeError, KelDiscriminatorField,
-    ListField, PreimageField,
+    BodyError, BodyField, BodyList, DecodeError, DeriveIdentifierError, DidDiscriminatorField,
+    EncodeError, FormListLength, HeaderDiscriminator, HeaderError, HeaderField,
+    InceptionHeaderDefect, ListField, SignatureFieldError, SignerList,
 };
 pub use event::{
     CommitmentRolloverFields, Continuation, EventKind, EventPreimage, InceptionFields,
     InstalledRootSet, KeyStateFields, KeyStateSnapshot, RootRecoveryFields, SignatureForm,
     SignerGroup, SignerGroupRole, StandingRootDeclaration, StandingRootSigning, signer_group_roles,
+};
+pub use event_codec::{
+    EventHeader, EventUnit, HeaderFailedUnit, HeaderGroup, NamedSignature, NamedSigner,
+    RawSignedPreimage, ReadUnit, SignatureField, SignerGroupSignatures, decode_event,
 };
 pub use preimage::{
     EncodedPreimage, decode_preimage, derive_identifier, encode_preimage, key_event_seal,

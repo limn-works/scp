@@ -229,7 +229,18 @@ impl IndexedSignature {
         form: SignatureForm,
         field: &[u8],
     ) -> Result<(Self, usize), IndexedSignatureReadError> {
-        let mut reader = FieldReader { field, pos: 0 };
+        let (signature, rest) = Self::read_front(form, field)?;
+        // `rest` is a suffix of `field`.
+        Ok((signature, field.len() - rest.len()))
+    }
+
+    /// [`read`](Self::read), returning the bytes of `field` after the
+    /// signature in place of the count it took.
+    pub(crate) fn read_front(
+        form: SignatureForm,
+        field: &[u8],
+    ) -> Result<(Self, &[u8]), IndexedSignatureReadError> {
+        let mut reader = FieldReader { rest: field };
         let signature = match form {
             SignatureForm::Raw => Self::Raw {
                 signature: reader.signature(IndexedSignaturePart::RawSignature)?,
@@ -252,7 +263,7 @@ impl IndexedSignature {
                 })
             }
         };
-        Ok((signature, reader.pos))
+        Ok((signature, reader.rest))
     }
 
     /// The signature-field bytes of this indexed signature, which
@@ -421,8 +432,8 @@ fn check_client_data_json_length(len: usize) -> Result<(), IndexedSignatureReadE
 
 /// A cursor over a signature field.
 struct FieldReader<'a> {
-    field: &'a [u8],
-    pos: usize,
+    /// The bytes not yet read.
+    rest: &'a [u8],
 }
 
 impl<'a> FieldReader<'a> {
@@ -432,16 +443,14 @@ impl<'a> FieldReader<'a> {
         len: usize,
         part: IndexedSignaturePart,
     ) -> Result<&'a [u8], IndexedSignatureReadError> {
-        let remaining = self.field.len().saturating_sub(self.pos);
-        let end = self
-            .pos
-            .checked_add(len)
-            .ok_or(IndexedSignatureReadError::Truncated { part, remaining })?;
-        let out = self
-            .field
-            .get(self.pos..end)
-            .ok_or(IndexedSignatureReadError::Truncated { part, remaining })?;
-        self.pos = end;
+        let (out, rest) =
+            self.rest
+                .split_at_checked(len)
+                .ok_or(IndexedSignatureReadError::Truncated {
+                    part,
+                    remaining: self.rest.len(),
+                })?;
+        self.rest = rest;
         Ok(out)
     }
 

@@ -4,6 +4,7 @@
 
 mod client_data;
 mod decode;
+mod event_codec;
 mod fixtures;
 mod round_trip;
 mod signature;

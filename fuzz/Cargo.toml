@@ -46,7 +46,8 @@ scp-clock = { path = "../crates/scp-clock" }
 scp-did = { path = "../crates/scp-did" }
 scp-mls = { path = "../crates/scp-mls" }
 scp-crypto = { path = "../crates/scp-crypto" }
-# `parse_client_data_json` and `IndexedSignature::read` for fuzz_kel_client_data.
+# `parse_client_data_json` and `IndexedSignature::read` for fuzz_kel_client_data;
+# `decode_event` for fuzz_kel_decode_event.
 scp-kel = { path = "../crates/scp-kel" }
 rand = "0.8"
 zeroize = "1"
@@ -146,6 +147,12 @@ doc = false
 [[bin]]
 name = "fuzz_kel_client_data"
 path = "fuzz_targets/fuzz_kel_client_data.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_kel_decode_event"
+path = "fuzz_targets/fuzz_kel_decode_event.rs"
 test = false
 doc = false
 
