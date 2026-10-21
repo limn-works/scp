@@ -1,6 +1,7 @@
 //! Cross-target known-answer tests for the key-event preimage, digest,
 //! identifier, seal, commitment and routing ids (`09-security-model.md`
-//! §9.7.4.2, R13), and the identifier's text form (`03-identity.md` §3.1).
+//! §9.7.4.2, R13), the raw-form signatures spec 25 prints for Vectors 51, 68
+//! and 69, and the identifier's text form (`03-identity.md` §3.1).
 //!
 //! The browser client verifies a key event log in wasm32 and a native node
 //! verifies the same log, so both must compute the same bytes. Each test
@@ -14,14 +15,17 @@
 mod fixtures;
 
 use fixtures::{
-    TestResult, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V41_ROUTING_DID, V41_ROUTING_SVC,
-    V41_ROUTING_WCF, V41_ROUTING_WIT, V42_DIGEST, V42_IDENTIFIER, V42_PREIMAGE, V47A_COMMITMENT,
-    V47A_POINT, V47B_COMMITMENT, V47B_POINT, V48_ADDRESS, V48_IDENTIFIER, V50_DIGEST, V50_PREIMAGE,
-    V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST, V51_IDENTIFIER, V51_INCEPTION_DIGEST,
-    V51_INCEPTION_PREIMAGE, V51_PREIMAGE, V51_ROUTING_DID, array, assert_vector, fields,
-    identifier, v41_inception, v50_key_state, v51_inception, v51_key_state,
+    TestResult, V41_ACTIVE, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V41_ROOT, V41_ROUTING_DID,
+    V41_ROUTING_SVC, V41_ROUTING_WCF, V41_ROUTING_WIT, V42_DIGEST, V42_IDENTIFIER, V42_PREIMAGE,
+    V47A_COMMITMENT, V47A_POINT, V47B_COMMITMENT, V47B_POINT, V48_ADDRESS, V48_IDENTIFIER,
+    V50_DIGEST, V50_PREIMAGE, V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST, V51_IDENTIFIER,
+    V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE, V51_KEYS, V51_PREIMAGE,
+    V51_ROUTING_DID, V68_DIGEST, V68_PREIMAGE, V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE,
+    V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array, assert_signature, assert_vector, fields,
+    identifier, v41_inception, v50_key_state, v51_inception, v51_key_state, v68_rollover,
+    v69_key_state,
 };
-use scp_did::{Identifier, IdentifierError, NonCanonicalReason};
+use scp_did::{Identifier, IdentifierError, KeyCondition, NonCanonicalReason};
 use scp_kel::{
     RoutingKind, SignatureForm, decode_preimage, derive_identifier, key_event_seal,
     prerotation_commitment, routing_id,
@@ -86,6 +90,36 @@ fn vector_51_inception_and_key_state() -> TestResult {
         array::<32>(V51_ROUTING_DID)?
     );
     Ok(())
+}
+
+#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+fn vector_51_inception_signature() -> TestResult {
+    let root_member_0 = V51_KEYS.first().ok_or("Vector 51 lists root member 0")?;
+    assert_signature(root_member_0, V51_INCEPTION_DIGEST, V51_INCEPTION_SIGNATURE)
+}
+
+#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+fn vector_68_abandoning_rollover() -> TestResult {
+    assert_vector(&v68_rollover()?, V68_PREIMAGE, V68_DIGEST)?;
+    assert_signature(V47A_POINT, V68_DIGEST, V68_REVEAL_SIGNATURE)?;
+    assert_signature(V41_ROOT, V68_DIGEST, V68_ROOT_SIGNATURE)
+}
+
+#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+fn vector_69_compromised_key_state() -> TestResult {
+    assert_vector(&v69_key_state()?, V69_PREIMAGE, V69_DIGEST)?;
+    let snapshot = decode_preimage(&fields(V69_PREIMAGE)?)?
+        .into_preimage()
+        .key_state
+        .ok_or("Vector 69 carries a snapshot")?;
+    let dropped = snapshot.keys.get(2).ok_or("Vector 69 lists three keys")?;
+    assert_eq!(dropped.key, array::<33>(V41_ACTIVE)?);
+    assert_eq!(dropped.condition, KeyCondition::Compromised);
+    assert_eq!(dropped.compromised_from, 1);
+    assert_signature(V41_ROOT, V69_DIGEST, V69_ROOT_SIGNATURE)
 }
 
 #[test]

@@ -1641,7 +1641,7 @@ indexed signature (raw form, 64):  6e8b92a9e7cc10d9233ab31f0465590526b1096fca872
 
 Every other one-byte discriminator of the key-event preimage is registered with its value, and `CustodyType`'s nine are too (`09-security-model.md` §9.7.4.2 definitions). The byte rides in every 45-byte key entry of the key-state snapshot, so it sits inside the inception preimage the identifier digests: two bindings numbering the nine differently derive two identifiers for one identity, and R2 then makes each binding reject every identity the other created. **This fixture identity carries a 1-of-8 root and one `#active` key, so its snapshot's nine key entries carry the nine registered values, one each, and pin every byte.** Vector 41's identity carries a 1-of-1 root and pins one value, `Passkey` `0x01`.
 
-Its private scalars are a fixture's, derived from the seeds `SHA-256("scp-25-custody-root-" ‖ index)` for the eight root members, `SHA-256("scp-25-custody-active")` for the `#active` key, and `SHA-256("scp-25-custody-prerotation")` for the pre-rotation key, each run through the §25.2 seed-to-scalar rule.
+Its private scalars are a fixture's, derived from the seeds `SHA-256("scp-25-custody-root-" ‖ index)` for the eight root members, the index being one byte, `0x00` through `0x07`, and never an ASCII digit, `SHA-256("scp-25-custody-active")` for the `#active` key, and `SHA-256("scp-25-custody-prerotation")` for the pre-rotation key, each run through the §25.2 seed-to-scalar rule.
 
 | Variant | Byte | Key (33-byte SEC1 compressed) | Role |
 |---|---|---|---|
@@ -1703,6 +1703,12 @@ preimage_len:         603
   0000000000000000000000000000000000000000000000000000000000000000
   00000001000000016644cc0e3ef3eae7dd1274d305e48fb593acce69ed4e4cef
   a9c63683174ed0ac010100000001
+```
+
+**The inception's root group names root member 0 in the raw form**, so its signature field is one 64-byte indexed signature over `inception digest`, by root member 0's key under RFC 6979 with a low `s`:
+
+```
+inception indexed signature (raw form, 64):  d7104ac11c070044300192427fa05d9ed127ae5d9544067240e3216da92145f34c408c2b1ebdbe3db03f6c81700003f24f3a474ea18352af47a12b461fe6fcf6
 ```
 
 **Preimage (603 bytes), including the `"SCP-KEL-EVENT-V1:"` separator:**
@@ -2051,9 +2057,9 @@ Signature, secondary key (470 bytes on the wire):
 
 ## 25.29 Reveal-Authorized Event, Ranking and Identifier Text-Form Vectors (§9.7.4.2 definitions, R3, R6, `03-identity.md` §3.1)
 
-Vectors 53 through 55 each extend Vector 41's identity at sequence 1, so each reveal consumes the commitment Vector 41's inception fixed over §25.2's tertiary key, and the standing root at each event's predecessor is Vector 41's one-member root, §25.2's reference key. Every indexed signature takes the raw form, and each vector prints the signature field as the concatenation of its groups' indexed signatures in the kind's group order (§9.7.4.2 R3). The generator derives each fresh key from `SHA-256` of the ASCII seed string it names, under §25.2's test-vector key label.
+Vectors 53 through 55, 68 and 69 each extend Vector 41's identity at sequence 1, so each reveal consumes the commitment Vector 41's inception fixed over §25.2's tertiary key, and the standing root at each event's predecessor is Vector 41's one-member root, §25.2's reference key. Every indexed signature takes the raw form, and each vector prints the signature field as the concatenation of its groups' indexed signatures in the kind's group order (§9.7.4.2 R3). The generator derives each fresh key from `SHA-256` of the ASCII seed string it names, under §25.2's test-vector key label.
 
-**Snapshot order.** Vectors 54 and 55 list the `Current` entries first and each dropped entry after them, each dropped key `Superseded` because a successor takes its role, under the snapshot-order rule §9.7.4.2's definitions state.
+**Snapshot order.** Vectors 54, 55 and 69 list the `Current` entries first and each dropped entry after them, under the snapshot-order rule §9.7.4.2's definitions state. Each dropped key in Vectors 54 and 55 is `Superseded`, because a successor takes its role; Vector 69's dropped key is `Compromised{from: 1}`, because the standing root asserts the compromise.
 
 ### Vector 53: a `CommitmentRollover` group layout
 
@@ -2238,6 +2244,77 @@ rejected, uppercase:
 rejected, padded:
   scp:fqhx6rdyx2knwadygeppkg5dzsmtinrlb4ku3s7zywlvolsgz4za====
 ```
+
+### Vector 68: a root-co-signed `CommitmentRollover` that abandons
+
+Vector 53's event with field 12 declaring abandonment: the one byte `0x00` and nothing after it, so the preimage is 42 bytes shorter than Vector 53's. The standing root co-signs, which R4 requires of every abandoning rollover. Every byte before field 12 equals Vector 53's, and the groups, the revealed key and the consumed commitment are Vector 53's.
+
+```
+continuation:          0x00   (Abandons)
+consumed commitment:
+  421be508c6ed135a9737895007e5ba16f9542e1b3440f6d00a515de80a3e43eb
+
+Preimage (161 bytes):
+  5343502d4b454c2d4556454e542d56313a032c0f7f4478be94db0078311ef51b
+  a3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad526
+  57208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7000000000100
+  00000001000000000101000000010100000001026fc6523b7b1e22ff3fbce874
+  0cfbb7cbc816501864bf40f683db69c860d1a670000000000000000000000000
+  00
+Preimage digest:
+  9c6a3dcdcff0e73c03859c375debc8ec3e3c70c5834fd111b9f94e055a28b22e
+
+Reveal group, member 0, signed by the revealed key:
+  87c8850628e69a3e77bf240285c240fd6a38c0149091f380a447c51b2d8da510
+  058f10913c5fa2f6abe1345defd0ba55627a1b447f05f22e89f4a9e7233ccf61
+Standing-root group, member 0, signed by §25.2's reference key:
+  c5f3d73bf438c4f3503a1b33c239934d62819ac8d319079b466b02892b273cf6
+  3ee408b9f697d1c5ebac883cde74139dfda09c4fcba7800415bc110bcb57e8dd
+Signature field (128 bytes):
+  87c8850628e69a3e77bf240285c240fd6a38c0149091f380a447c51b2d8da510
+  058f10913c5fa2f6abe1345defd0ba55627a1b447f05f22e89f4a9e7233ccf61
+  c5f3d73bf438c4f3503a1b33c239934d62819ac8d319079b466b02892b273cf6
+  3ee408b9f697d1c5ebac883cde74139dfda09c4fcba7800415bc110bcb57e8dd
+```
+
+**Conformance procedure.** A chain of Vector 41 then Vector 68 is valid and terminal: R4 rejects any event whose predecessor chain contains Vector 68. An implementation that writes field 12's abandonment as `BE32(0)`, the absent-field sentinel, produces a 164-byte preimage and a different digest.
+
+### Vector 69: a `KeyState` that drops a key as `Compromised{from: N}`
+
+A `KeyState` at sequence 1, signed by the standing root alone, that keeps root member 0, installs a fresh `#active` key, and drops Vector 41's `#active` key (§25.2's secondary key) as `Compromised` from position 1. N is the event's own sequence, the largest value R8 admits on this event. Fields 5, 8, 9 and 12 carry their sentinels, field 11 is an empty list, and the witness set and witnessing interval are Vector 41's.
+
+```
+installed #active key (seed "scp-25-compromise-active"):
+  03111dadf2081befb113b3e43ce763df7d1c34b64f01778fb108087894acae76
+  1c
+compromised key (§25.2 secondary):
+  0223702a648232f2d00713de9289753c2fbd4c4efa7e1e33905e3723a412b20a
+  ea
+compromised_from:      1   (the entry's eight bytes 0000000000000001)
+key_state_bytes:       216
+key entries:           root member 0 Current; new #active Current; old #active Compromised
+
+Preimage (333 bytes):
+  5343502d4b454c2d4556454e542d56313a022c0f7f4478be94db0078311ef51b
+  a3cc9934362b0f154dcbf9c597572e46cf320000000000000001d8ba4ebad526
+  57208736f4cac675352f5f9cc0aa837620f8d742dbf42aeedbd7000000000100
+  000000010100000000000000000000000100000003033b1cac23f45cf1cdfdf0
+  b32f8f777b99166c1b69649c2295b1517883d47f302701010000000000000000
+  010103111dadf2081befb113b3e43ce763df7d1c34b64f01778fb108087894ac
+  ae761c0201000000000000000001010223702a648232f2d00713de9289753c2f
+  bd4c4efa7e1e33905e3723a412b20aea02040000000000000001010100000001
+  9d94df95bc0a13f1963f484414c320354c73c75bb86e96559e97765f5bc2d313
+  00000e1002000000000000000000000000000000000000000000000000000000
+  00000000000000000000000000
+Preimage digest:
+  12f301331515b7108969e5649b025e98847a14d290fe9ee093dfecc9a5355168
+
+Root group, member 0, signed by §25.2's reference key:
+  b622e40aa201d477309172165de6cc4fa7ae83f72efc349152e5e5d82d5bf32c
+  0ea4c8119dc25851f952fbd9f8e5607a8b021a4061fbb0219bb70efa3f35d81c
+```
+
+**Conformance procedure.** Replaying Vector 41 then Vector 69 yields the third entry with condition `Compromised` and `compromised_from` 1. An implementation that drops the entry on replay, or that writes `compromised_from` as zero, loses the record the log-anchored evidence class of `09-security-model.md` §9.7.1 reads.
 
 ## 25.30 WebPush Token, Wake Body and VAPID JWT Vectors (`22-human-readable-addressing.md` §22.11.4, `10-infrastructure-and-self-hosting.md` §10.7.1)
 
