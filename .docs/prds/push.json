@@ -447,7 +447,7 @@
         "crates/scp-transport/src/relay/push_store.rs",
         "crates/scp-transport/src/relay/mod.rs"
       ],
-      "description": "An enum-dispatched relay store for push registrations. The shipped arm is `Sqlite` (indicator: through `scp-sqlite-pools`). The `InMemory` arm compiles only under the `testing` feature, so no shipped relay can select it. Selection has no `Default` (ADR-062, capability injection; \u00a717.17.1). The store indexes registrations by registration key (identity identifier, platform, token) and by routing ID, and keeps a consecutive invalid-token counter per key. File location `push_store.rs` is an indicator. Relay-internal, so every integration-checklist row is n/a.",
+      "description": "An enum-dispatched relay store for push registrations. The shipped arm is `Sqlite` (indicator: through `scp-sqlite-pools`). The `InMemory` arm compiles only under the `testing` feature, so no shipped relay can select it. Selection has no `Default` (ADR-062, capability injection; \u00a717.17.1). The store indexes registrations by registration key (identity identifier, platform, token) and by routing ID, and keeps a consecutive invalid-token counter per token, keyed by (platform, token) and shared by every registration key holding that token, because \u00a710.7.1 removes registrations after 3 consecutive delivery failures for the same token. File location `push_store.rs` is an indicator. Relay-internal, so every integration-checklist row is n/a.",
       "acceptanceCriteria": [
         "`upsert` with a newer timestamp replaces the stored registration and its routing-ID index entries.",
         "`upsert` with an identical token and routing-ID set leaves the index unchanged.",

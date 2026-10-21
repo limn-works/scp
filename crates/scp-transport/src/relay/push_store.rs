@@ -9,9 +9,12 @@
 //! - by routing ID, so a message arriving on a routing ID finds every token to
 //!   wake.
 //!
-//! It also keeps, per key, a count of consecutive invalid-token responses from
-//! the push service, which the sender uses to deregister a token after three
-//! failures (§10.7.1, `PushDeregistration`).
+//! It also keeps, per token, a count of consecutive invalid-token responses
+//! from the push service, and removes every registration holding a token
+//! whose count reaches [`INVALID_TOKEN_REMOVAL_THRESHOLD`] (§10.7.1
+//! `PushDeregistration`: "3 consecutive delivery failures for the same
+//! token"). The count is keyed by (platform, token), not by registration key,
+//! because the push service judges the token, whoever registered it.
 //!
 //! # Freshness floor
 //!
@@ -68,6 +71,31 @@ pub const MAX_REGISTRATIONS_PER_REGISTRANT: usize = 16;
 
 /// A relay routing ID (32 bytes).
 pub type RoutingId = [u8; 32];
+
+/// The consecutive invalid-token responses for one token after which the
+/// relay removes every registration holding it (§10.7.1 `PushDeregistration`).
+pub const INVALID_TOKEN_REMOVAL_THRESHOLD: u32 = 3;
+
+/// What [`PushRegistrationStore::record_invalid_token`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidTokenOutcome {
+    /// The token's consecutive count rose to `failures`, still below
+    /// [`INVALID_TOKEN_REMOVAL_THRESHOLD`]; every registration stays.
+    Counted {
+        /// The token's consecutive invalid-token count after this response.
+        failures: u32,
+    },
+    /// The count reached [`INVALID_TOKEN_REMOVAL_THRESHOLD`]: the store
+    /// removed every registration holding the token, as
+    /// [`PushRegistrationStore::remove`] does for each, and dropped the count.
+    Removed {
+        /// How many registrations held the token.
+        registrations: usize,
+    },
+    /// No registration holds the token, so nothing was counted. A
+    /// deregistration can land between a job's enqueue and its send.
+    NotRegistered,
+}
 
 /// The key a registration is stored under: (registrant, platform, token).
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -259,8 +287,10 @@ impl PushRegistrationStore {
     ///   routing IDs and timestamp, and leaves the index untouched when the
     ///   routing-ID set is unchanged. The cap never refuses a stored key.
     ///
-    /// The consecutive invalid-token count survives a replacement, because a
-    /// re-registration says nothing about whether the token is valid.
+    /// The token's consecutive invalid-token count survives a replacement and
+    /// applies to a new registrant of the same token, because the count belongs
+    /// to the token and a registration says nothing about whether the token is
+    /// valid.
     ///
     /// # Errors
     ///
@@ -296,11 +326,11 @@ impl PushRegistrationStore {
         }
     }
 
-    /// Deletes the registration under `key`, its routing-ID index entries and
-    /// its invalid-token count, as the relay does after three consecutive
-    /// invalid-token responses (§10.7.1). The registration's timestamp stays
-    /// as the key's deregistration floor. Returns whether a registration
-    /// existed. The registrant's other registrations stay in place.
+    /// Deletes the registration under `key` and its routing-ID index entries,
+    /// and the token's invalid-token count once no registration holds the
+    /// token. The registration's timestamp stays as the key's deregistration
+    /// floor. Returns whether a registration existed. The registrant's other
+    /// registrations stay in place.
     ///
     /// # Errors
     ///
@@ -403,55 +433,66 @@ impl PushRegistrationStore {
         }
     }
 
-    /// Adds one to the consecutive invalid-token count under `key` and returns
-    /// the new count, or `None` when no registration exists under `key`.
+    /// Counts one invalid-token response from the push service for the
+    /// (`platform`, `token`) pair, whoever registered it (§10.7.1).
+    ///
+    /// In one transaction, the store adds one to the token's consecutive count
+    /// and, when the count reaches [`INVALID_TOKEN_REMOVAL_THRESHOLD`], removes
+    /// every registration holding the token as [`Self::remove`] does (each
+    /// key keeps its registration's timestamp as its deregistration floor) and
+    /// drops the count. With no registration holding the token it counts
+    /// nothing.
     ///
     /// # Errors
     ///
-    /// [`PushStoreError::Storage`] when the database fails.
+    /// [`PushStoreError::Storage`] when the database fails; the transaction
+    /// then changes nothing.
     pub async fn record_invalid_token(
         &self,
-        key: &PushRegistrationKey,
-    ) -> Result<Option<u32>, PushStoreError> {
+        platform: PushPlatform,
+        token: &[u8],
+    ) -> Result<InvalidTokenOutcome, PushStoreError> {
         match self {
-            Self::Sqlite(s) => s.record_invalid_token(key).await,
+            Self::Sqlite(s) => s.record_invalid_token(platform, token).await,
             #[cfg(feature = "testing")]
-            Self::InMemory(s) => Ok(s.record_invalid_token(key).await),
+            Self::InMemory(s) => s.record_invalid_token(platform, token).await,
         }
     }
 
-    /// Resets the consecutive invalid-token count under `key` to zero, as a
-    /// delivery the push service accepted does. Returns whether a
-    /// registration exists under `key`.
+    /// Resets the (`platform`, `token`) pair's consecutive invalid-token count
+    /// to zero, as a delivery the push service accepted does. Returns whether
+    /// any registration holds the token.
     ///
     /// # Errors
     ///
     /// [`PushStoreError::Storage`] when the database fails.
     pub async fn clear_invalid_tokens(
         &self,
-        key: &PushRegistrationKey,
+        platform: PushPlatform,
+        token: &[u8],
     ) -> Result<bool, PushStoreError> {
         match self {
-            Self::Sqlite(s) => s.clear_invalid_tokens(key).await,
+            Self::Sqlite(s) => s.clear_invalid_tokens(platform, token).await,
             #[cfg(feature = "testing")]
-            Self::InMemory(s) => Ok(s.clear_invalid_tokens(key).await),
+            Self::InMemory(s) => Ok(s.clear_invalid_tokens(platform, token).await),
         }
     }
 
-    /// Returns the consecutive invalid-token count under `key`, or `None`
-    /// when no registration exists under `key`.
+    /// Returns the (`platform`, `token`) pair's consecutive invalid-token
+    /// count, or `None` when no registration holds the token.
     ///
     /// # Errors
     ///
     /// [`PushStoreError::Storage`] when the database fails.
     pub async fn invalid_token_failures(
         &self,
-        key: &PushRegistrationKey,
+        platform: PushPlatform,
+        token: &[u8],
     ) -> Result<Option<u32>, PushStoreError> {
         match self {
-            Self::Sqlite(s) => s.invalid_token_failures(key).await,
+            Self::Sqlite(s) => s.invalid_token_failures(platform, token).await,
             #[cfg(feature = "testing")]
-            Self::InMemory(s) => Ok(s.invalid_token_failures(key).await),
+            Self::InMemory(s) => Ok(s.invalid_token_failures(platform, token).await),
         }
     }
 }
@@ -628,6 +669,81 @@ fn delete_index(conn: &Connection, key: &PushRegistrationKey) -> Result<(), Push
     Ok(())
 }
 
+/// Removes the registration under `key` inside the caller's transaction, as
+/// [`PushRegistrationStore::remove`] and [`PushRegistrationStore::deregister`]
+/// describe, and drops the token's invalid-token count once no registration
+/// holds the token.
+fn remove_in(
+    conn: &Connection,
+    key: &PushRegistrationKey,
+    deregistered_at: Option<u64>,
+) -> Result<bool, PushStoreError> {
+    if let Some(offered) = deregistered_at {
+        check_fresh(last_accepted(conn, key)?, offered)?;
+    }
+    let registered_at = stored_timestamp(conn, key)?;
+    let floor = floor_after_removal(deregistered_at, registered_at);
+    delete_index(conn, key)?;
+    conn.execute(
+        "DELETE FROM push_registrations
+         WHERE registrant = ?1 AND platform = ?2 AND token = ?3",
+        params![key.registrant, key.platform.tag_byte(), key.token],
+    )
+    .map_err(|e| storage("delete", &e))?;
+    if let Some(floor) = floor {
+        conn.execute(
+            "INSERT INTO push_deregistrations (registrant, platform, token, timestamp)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (registrant, platform, token) DO UPDATE SET timestamp = ?4",
+            params![
+                key.registrant,
+                key.platform.tag_byte(),
+                key.token,
+                timestamp_to_column(floor)?
+            ],
+        )
+        .map_err(|e| storage("write floor", &e))?;
+    }
+    conn.execute(
+        "DELETE FROM push_token_failures
+         WHERE platform = ?1 AND token = ?2
+           AND NOT EXISTS (SELECT 1 FROM push_registrations WHERE platform = ?1 AND token = ?2)",
+        params![key.platform.tag_byte(), key.token],
+    )
+    .map_err(|e| storage("drop token count", &e))?;
+    Ok(registered_at.is_some())
+}
+
+/// Every registration key holding (`platform`, `token`), through
+/// `idx_push_registrations_by_token`.
+fn keys_for_token(
+    conn: &Connection,
+    platform: PushPlatform,
+    token: &[u8],
+) -> Result<Vec<PushRegistrationKey>, PushStoreError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT registrant FROM push_registrations
+             WHERE platform = ?1 AND token = ?2
+             ORDER BY registrant",
+        )
+        .map_err(|e| storage("prepare token keys", &e))?;
+    let rows = stmt
+        .query_map(params![platform.tag_byte(), token], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| storage("query token keys", &e))?;
+    let mut keys = Vec::new();
+    for row in rows {
+        keys.push(PushRegistrationKey {
+            registrant: row.map_err(|e| storage("read token key", &e))?,
+            platform,
+            token: token.to_vec(),
+        });
+    }
+    Ok(keys)
+}
+
 impl SqlitePushStore {
     /// Opens (or creates) the store at `path`.
     ///
@@ -655,8 +771,15 @@ impl SqlitePushStore {
                  platform INTEGER NOT NULL,
                  token BLOB NOT NULL,
                  timestamp INTEGER NOT NULL,
-                 invalid_token_failures INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (registrant, platform, token)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS idx_push_registrations_by_token
+                 ON push_registrations (platform, token);
+             CREATE TABLE IF NOT EXISTS push_token_failures (
+                 platform INTEGER NOT NULL,
+                 token BLOB NOT NULL,
+                 failures INTEGER NOT NULL,
+                 PRIMARY KEY (platform, token)
              ) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS push_routing_index (
                  routing_id BLOB NOT NULL,
@@ -782,35 +905,10 @@ impl SqlitePushStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| storage("begin", &e))?;
-        if let Some(offered) = deregistered_at {
-            check_fresh(last_accepted(&tx, key)?, offered)?;
-        }
-        let registered_at = stored_timestamp(&tx, key)?;
-        let floor = floor_after_removal(deregistered_at, registered_at);
-        delete_index(&tx, key)?;
-        tx.execute(
-            "DELETE FROM push_registrations
-             WHERE registrant = ?1 AND platform = ?2 AND token = ?3",
-            params![key.registrant, key.platform.tag_byte(), key.token],
-        )
-        .map_err(|e| storage("delete", &e))?;
-        if let Some(floor) = floor {
-            tx.execute(
-                "INSERT INTO push_deregistrations (registrant, platform, token, timestamp)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (registrant, platform, token) DO UPDATE SET timestamp = ?4",
-                params![
-                    key.registrant,
-                    key.platform.tag_byte(),
-                    key.token,
-                    timestamp_to_column(floor)?
-                ],
-            )
-            .map_err(|e| storage("write floor", &e))?;
-        }
+        let existed = remove_in(&tx, key, deregistered_at)?;
         tx.commit().map_err(|e| storage("commit", &e))?;
         drop(conn);
-        Ok(registered_at.is_some())
+        Ok(existed)
     }
 
     async fn accepted_timestamp(
@@ -893,56 +991,82 @@ impl SqlitePushStore {
 
     async fn record_invalid_token(
         &self,
-        key: &PushRegistrationKey,
-    ) -> Result<Option<u32>, PushStoreError> {
-        let conn = self.conn.lock().await;
-        let count = conn
+        platform: PushPlatform,
+        token: &[u8],
+    ) -> Result<InvalidTokenOutcome, PushStoreError> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| storage("begin", &e))?;
+        let keys = keys_for_token(&tx, platform, token)?;
+        if keys.is_empty() {
+            drop(tx);
+            drop(conn);
+            return Ok(InvalidTokenOutcome::NotRegistered);
+        }
+        let failures = tx
             .query_row(
-                "UPDATE push_registrations
-                 SET invalid_token_failures = invalid_token_failures + 1
-                 WHERE registrant = ?1 AND platform = ?2 AND token = ?3
-                 RETURNING invalid_token_failures",
-                params![key.registrant, key.platform.tag_byte(), key.token],
+                "INSERT INTO push_token_failures (platform, token, failures) VALUES (?1, ?2, 1)
+                 ON CONFLICT (platform, token) DO UPDATE SET failures = failures + 1
+                 RETURNING failures",
+                params![platform.tag_byte(), token],
                 |row| row.get::<_, u32>(0),
             )
-            .optional()
-            .map_err(|e| storage("record failure", &e))?;
+            .map_err(|e| storage("count token failure", &e))?;
+        let outcome = if failures >= INVALID_TOKEN_REMOVAL_THRESHOLD {
+            for key in &keys {
+                remove_in(&tx, key, None)?;
+            }
+            InvalidTokenOutcome::Removed {
+                registrations: keys.len(),
+            }
+        } else {
+            InvalidTokenOutcome::Counted { failures }
+        };
+        tx.commit().map_err(|e| storage("commit", &e))?;
         drop(conn);
-        Ok(count)
+        Ok(outcome)
     }
 
     async fn clear_invalid_tokens(
         &self,
-        key: &PushRegistrationKey,
+        platform: PushPlatform,
+        token: &[u8],
     ) -> Result<bool, PushStoreError> {
-        let conn = self.conn.lock().await;
-        let updated = conn
-            .execute(
-                "UPDATE push_registrations SET invalid_token_failures = 0
-                 WHERE registrant = ?1 AND platform = ?2 AND token = ?3",
-                params![key.registrant, key.platform.tag_byte(), key.token],
-            )
-            .map_err(|e| storage("clear failures", &e))?;
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| storage("begin", &e))?;
+        tx.execute(
+            "DELETE FROM push_token_failures WHERE platform = ?1 AND token = ?2",
+            params![platform.tag_byte(), token],
+        )
+        .map_err(|e| storage("clear token failures", &e))?;
+        let held = !keys_for_token(&tx, platform, token)?.is_empty();
+        tx.commit().map_err(|e| storage("commit", &e))?;
         drop(conn);
-        Ok(updated > 0)
+        Ok(held)
     }
 
     async fn invalid_token_failures(
         &self,
-        key: &PushRegistrationKey,
+        platform: PushPlatform,
+        token: &[u8],
     ) -> Result<Option<u32>, PushStoreError> {
         let conn = self.conn.lock().await;
+        if keys_for_token(&conn, platform, token)?.is_empty() {
+            return Ok(None);
+        }
         let count = conn
             .query_row(
-                "SELECT invalid_token_failures FROM push_registrations
-                 WHERE registrant = ?1 AND platform = ?2 AND token = ?3",
-                params![key.registrant, key.platform.tag_byte(), key.token],
+                "SELECT failures FROM push_token_failures WHERE platform = ?1 AND token = ?2",
+                params![platform.tag_byte(), token],
                 |row| row.get::<_, u32>(0),
             )
             .optional()
-            .map_err(|e| storage("read failures", &e))?;
+            .map_err(|e| storage("read token failures", &e))?;
         drop(conn);
-        Ok(count)
+        Ok(Some(count.unwrap_or(0)))
     }
 }
 
@@ -955,30 +1079,45 @@ pub use in_memory::InMemoryPushStore;
 
 #[cfg(feature = "testing")]
 mod in_memory {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::sync::Arc;
 
+    use scp_protocol::discovery::push::PushPlatform;
     use tokio::sync::Mutex;
 
     use super::{
-        MAX_REGISTRATIONS_PER_REGISTRANT, PushRegistrationKey, PushRegistrationRecord,
-        PushStoreError, RoutingId, UpsertOutcome, check_fresh, floor_after_removal,
+        INVALID_TOKEN_REMOVAL_THRESHOLD, InvalidTokenOutcome, MAX_REGISTRATIONS_PER_REGISTRANT,
+        PushRegistrationKey, PushRegistrationRecord, PushStoreError, RoutingId, UpsertOutcome,
+        check_fresh, floor_after_removal,
     };
+
+    /// A (platform, token) pair, the key of the invalid-token count.
+    type TokenId = (PushPlatform, Vec<u8>);
+
+    fn token_id(key: &PushRegistrationKey) -> TokenId {
+        (key.platform, key.token.clone())
+    }
 
     #[derive(Debug, Default)]
     struct InMemoryState {
-        records: HashMap<PushRegistrationKey, (PushRegistrationRecord, u32)>,
+        records: HashMap<PushRegistrationKey, PushRegistrationRecord>,
         by_routing_id: HashMap<RoutingId, HashSet<PushRegistrationKey>>,
+        /// The registrants holding each token, ordered like the SQLite arm's
+        /// `ORDER BY registrant`.
+        by_token: HashMap<TokenId, BTreeSet<String>>,
         per_registrant: HashMap<String, usize>,
         /// Deregistration floors; a key never holds a record and a floor.
         floors: HashMap<PushRegistrationKey, u64>,
+        /// Consecutive invalid-token counts; a token holds one only while a
+        /// registration holds the token.
+        token_failures: HashMap<TokenId, u32>,
     }
 
     impl InMemoryState {
         fn last_accepted(&self, key: &PushRegistrationKey) -> Option<u64> {
             self.records
                 .get(key)
-                .map(|(record, _)| record.timestamp)
+                .map(|record| record.timestamp)
                 .or_else(|| self.floors.get(key).copied())
         }
 
@@ -1001,6 +1140,48 @@ mod in_memory {
                     .insert(key.clone());
             }
         }
+
+        fn holders(&self, id: &TokenId) -> bool {
+            self.by_token.get(id).is_some_and(|r| !r.is_empty())
+        }
+
+        /// Mirrors the SQLite arm's `remove_in`.
+        fn remove(
+            &mut self,
+            key: &PushRegistrationKey,
+            deregistered_at: Option<u64>,
+        ) -> Result<bool, PushStoreError> {
+            if let Some(offered) = deregistered_at {
+                check_fresh(self.last_accepted(key), offered)?;
+            }
+            let Some(record) = self.records.remove(key) else {
+                if let Some(floor) = floor_after_removal(deregistered_at, None) {
+                    self.floors.insert(key.clone(), floor);
+                }
+                return Ok(false);
+            };
+            self.unindex(key, &record.routing_ids);
+            let id = token_id(key);
+            if let Some(registrants) = self.by_token.get_mut(&id) {
+                registrants.remove(&key.registrant);
+                if registrants.is_empty() {
+                    self.by_token.remove(&id);
+                }
+            }
+            if !self.holders(&id) {
+                self.token_failures.remove(&id);
+            }
+            if let Some(count) = self.per_registrant.get_mut(&key.registrant) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.per_registrant.remove(&key.registrant);
+                }
+            }
+            if let Some(floor) = floor_after_removal(deregistered_at, Some(record.timestamp)) {
+                self.floors.insert(key.clone(), floor);
+            }
+            Ok(true)
+        }
     }
 
     /// The durability-only push registration store. Compiled only under the
@@ -1021,8 +1202,8 @@ mod in_memory {
             let previous = state
                 .records
                 .get(&key)
-                .map(|(stored, failures)| (stored.routing_ids.clone(), *failures));
-            let outcome = if let Some((routing_ids, failures)) = previous {
+                .map(|stored| stored.routing_ids.clone());
+            let outcome = if let Some(routing_ids) = previous {
                 let outcome = if routing_ids == record.routing_ids {
                     UpsertOutcome::Refreshed
                 } else {
@@ -1030,7 +1211,7 @@ mod in_memory {
                     state.index(&key, &record.routing_ids);
                     UpsertOutcome::Replaced
                 };
-                state.records.insert(key, (record, failures));
+                state.records.insert(key, record);
                 outcome
             } else {
                 let held = state
@@ -1048,8 +1229,13 @@ mod in_memory {
                     .entry(record.registrant.clone())
                     .or_insert(0) += 1;
                 state.index(&key, &record.routing_ids);
+                state
+                    .by_token
+                    .entry(token_id(&key))
+                    .or_default()
+                    .insert(key.registrant.clone());
                 state.floors.remove(&key);
-                state.records.insert(key, (record, 0));
+                state.records.insert(key, record);
                 UpsertOutcome::Inserted
             };
             drop(state);
@@ -1060,12 +1246,7 @@ mod in_memory {
             &self,
             key: &PushRegistrationKey,
         ) -> Option<PushRegistrationRecord> {
-            self.state
-                .lock()
-                .await
-                .records
-                .get(key)
-                .map(|(record, _)| record.clone())
+            self.state.lock().await.records.get(key).cloned()
         }
 
         /// Mirrors `SqlitePushStore::remove`.
@@ -1074,29 +1255,7 @@ mod in_memory {
             key: &PushRegistrationKey,
             deregistered_at: Option<u64>,
         ) -> Result<bool, PushStoreError> {
-            let mut state = self.state.lock().await;
-            if let Some(offered) = deregistered_at {
-                check_fresh(state.last_accepted(key), offered)?;
-            }
-            let Some((record, _)) = state.records.remove(key) else {
-                if let Some(floor) = floor_after_removal(deregistered_at, None) {
-                    state.floors.insert(key.clone(), floor);
-                }
-                drop(state);
-                return Ok(false);
-            };
-            state.unindex(key, &record.routing_ids);
-            if let Some(count) = state.per_registrant.get_mut(&key.registrant) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    state.per_registrant.remove(&key.registrant);
-                }
-            }
-            if let Some(floor) = floor_after_removal(deregistered_at, Some(record.timestamp)) {
-                state.floors.insert(key.clone(), floor);
-            }
-            drop(state);
-            Ok(true)
+            self.state.lock().await.remove(key, deregistered_at)
         }
 
         pub(super) async fn accepted_timestamp(&self, key: &PushRegistrationKey) -> Option<u64> {
@@ -1131,43 +1290,71 @@ mod in_memory {
             });
             let records = keys
                 .into_iter()
-                .filter_map(|key| state.records.get(key).map(|(record, _)| record.clone()))
+                .filter_map(|key| state.records.get(key).cloned())
                 .collect();
             drop(state);
             records
         }
 
-        pub(super) async fn record_invalid_token(&self, key: &PushRegistrationKey) -> Option<u32> {
+        /// Mirrors `SqlitePushStore::record_invalid_token`; the one lock is
+        /// the transaction.
+        pub(super) async fn record_invalid_token(
+            &self,
+            platform: PushPlatform,
+            token: &[u8],
+        ) -> Result<InvalidTokenOutcome, PushStoreError> {
             let mut state = self.state.lock().await;
-            let count = state.records.get_mut(key).map(|(_, failures)| {
-                *failures = failures.saturating_add(1);
-                *failures
-            });
+            let id = (platform, token.to_vec());
+            let Some(registrants) = state.by_token.get(&id).cloned() else {
+                return Ok(InvalidTokenOutcome::NotRegistered);
+            };
+            let failures = {
+                let count = state.token_failures.entry(id).or_insert(0);
+                *count = count.saturating_add(1);
+                *count
+            };
+            if failures < INVALID_TOKEN_REMOVAL_THRESHOLD {
+                return Ok(InvalidTokenOutcome::Counted { failures });
+            }
+            for registrant in &registrants {
+                let key = PushRegistrationKey {
+                    registrant: registrant.clone(),
+                    platform,
+                    token: token.to_vec(),
+                };
+                state.remove(&key, None)?;
+            }
             drop(state);
-            count
+            Ok(InvalidTokenOutcome::Removed {
+                registrations: registrants.len(),
+            })
         }
 
-        pub(super) async fn clear_invalid_tokens(&self, key: &PushRegistrationKey) -> bool {
+        pub(super) async fn clear_invalid_tokens(
+            &self,
+            platform: PushPlatform,
+            token: &[u8],
+        ) -> bool {
             let mut state = self.state.lock().await;
-            let found = state
-                .records
-                .get_mut(key)
-                .map(|(_, failures)| *failures = 0)
-                .is_some();
+            let id = (platform, token.to_vec());
+            state.token_failures.remove(&id);
+            let held = state.holders(&id);
             drop(state);
-            found
+            held
         }
 
         pub(super) async fn invalid_token_failures(
             &self,
-            key: &PushRegistrationKey,
+            platform: PushPlatform,
+            token: &[u8],
         ) -> Option<u32> {
-            self.state
-                .lock()
-                .await
-                .records
-                .get(key)
-                .map(|(_, failures)| *failures)
+            let state = self.state.lock().await;
+            let id = (platform, token.to_vec());
+            let count = state
+                .holders(&id)
+                .then(|| state.token_failures.get(&id).copied().unwrap_or(0));
+            drop(state);
+            count
         }
     }
 }
