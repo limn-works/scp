@@ -574,6 +574,7 @@ jobs:
               - 'crates/scp-did/**'
               - 'crates/scp-event-log/**'
               - 'crates/scp-identity/**'
+              - 'crates/scp-kel/**'
               - 'crates/scp-mls/**'
               - 'crates/scp-platform/**'
               - 'crates/scp-protocol/**'

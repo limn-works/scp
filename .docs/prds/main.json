@@ -10991,7 +10991,7 @@
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-kel/Cargo.toml",
         "crates/scp-kel/README.md",

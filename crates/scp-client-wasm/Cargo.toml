@@ -109,8 +109,11 @@ scp-relay-client = { path = "../scp-relay-client" }
 # §25.26 through §25.29 on native and wasm32 (09-security-model.md §9.7.4.2).
 # It includes scp-kel's test fixtures by path, and they decode their hex with
 # `hex`. scp-kel is a leaf with no I/O and no runtime, inside the ADR-057 fence.
+# `sha2` recomputes Vector 42's two assertion hashes on each target, so the
+# indexed-signature KAT checks the WebAuthn message as well as the verdict.
 scp-kel = { path = "../scp-kel" }
 hex = { workspace = true }
+sha2 = { workspace = true }
 
 # The pseudonym-derivation cross-target KAT exercises the wasm-safe
 # `scp-crypto::pseudonym` derivation (§9.10.4.A, ADR-057 Option A) on BOTH native

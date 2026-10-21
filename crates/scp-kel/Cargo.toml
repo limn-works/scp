@@ -14,14 +14,15 @@ categories = ["cryptography", "encoding"]
 [dependencies]
 # The key-state data model the snapshot encodes (09-security-model.md §9.7.4.2).
 scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
+# P-256 point validation and the §9.5 strict (low-s) verifier every indexed
+# signature is checked with (09-security-model.md §9.7.4.2, "Signature form").
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 # Every construction here is a SHA-256 over a domain-separated preimage.
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
-# Verifies the spec 25 indexed signatures with the §9.5.1 strict verifier.
-scp-crypto = { path = "../scp-crypto" }
 # Round-trips encode and decode over generated preimages of all four kinds.
 proptest = "1"
 

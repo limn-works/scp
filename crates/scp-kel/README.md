@@ -23,9 +23,26 @@ This crate owns:
   and the key-event seal.
 - `routing_id` — the four routing identifiers an identifier's objects are
   stored under (§9.7.4.2 R13, §9.18.2).
+- `IndexedSignature` (`Raw` or `WebAuthnAssertion(AssertionSignature)`),
+  `IndexedSignature::read` and `to_bytes` (failing with
+  `IndexedSignatureReadError`), and `verify_indexed` (failing with
+  `IndexedSignatureError`) — one entry of a signature field, read with every
+  declared length checked against its §9.18.17 bound, and verified under the
+  form field 7 declares with `scp-crypto`'s strict low-`s` P-256 verifier:
+  over `D` for the raw form, and for the assertion form over
+  `SHA-256(authenticatorData ‖ SHA-256(clientDataJSON))` after the UP and UV
+  flags, the `type`, and the challenge are checked (§9.7.4.2, "Signature
+  form").
+- `key_event_challenge` — the 49 challenge bytes `"SCP-KEY-EVENT-V1:" ‖ D` a
+  signer passes to its authenticator.
+- `parse_client_data_json` (hidden; public for the fuzz target) and
+  `ClientDataError` — the strict `clientDataJSON` acceptance set, a
+  hand-written validator with an explicit stack over an
+  `AssertionSignature`'s at most 512 bytes.
 
 The key-state value types (`Identifier`, `KeyEntry`, `CommitmentEntry`,
-`StandingCommitment` and the four name-bound enumerations) come from `scp-did`.
+`StandingCommitment` and the four name-bound enumerations) come from `scp-did`;
+P-256 point validation and signature verification come from `scp-crypto`.
 
 The crate is a wasm-safe Layer 1 crate (`.docs/architecture.md`, "Layered
 Dependency Graph"): no async runtime, no I/O, no clock, and no pointer-width

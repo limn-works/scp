@@ -30,7 +30,9 @@ rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
-serde_json = "1"
+# `unbounded_depth` lets fuzz_kel_client_data compare documents nested past
+# 128 levels; it adds a method and changes no default.
+serde_json = { version = "1", features = ["unbounded_depth"] }
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
@@ -44,6 +46,8 @@ scp-clock = { path = "../crates/scp-clock" }
 scp-did = { path = "../crates/scp-did" }
 scp-mls = { path = "../crates/scp-mls" }
 scp-crypto = { path = "../crates/scp-crypto" }
+# `parse_client_data_json` and `IndexedSignature::read` for fuzz_kel_client_data.
+scp-kel = { path = "../crates/scp-kel" }
 rand = "0.8"
 zeroize = "1"
 
@@ -136,6 +140,12 @@ doc = false
 [[bin]]
 name = "fuzz_deserialize_export"
 path = "fuzz_targets/fuzz_deserialize_export.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_kel_client_data"
+path = "fuzz_targets/fuzz_kel_client_data.rs"
 test = false
 doc = false
 
