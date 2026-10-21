@@ -7,7 +7,7 @@
 use scp_did::{CustodyType, Identifier, KeyCondition, KeyRole};
 use scp_kel::{
     BodyError, BodyList, CheckStep, ContentDefect, Continuation, DidDiscriminatorField,
-    DistinctList, EntryOutcome, EntryValidation, EventPreimage, FailureClass, HeaderDiscriminator,
+    DistinctList, EntryValidation, EntryVerdict, EventPreimage, FailureClass, HeaderDiscriminator,
     HeaderError, InceptionDefect, InceptionHeaderDefect, InceptionRefusal, InstalledRootSet,
     SignerGroupRole, StandingRootDeclaration, ThresholdField, decode_preimage, validate_entry,
     validate_inception,
@@ -70,9 +70,9 @@ fn check(row: &Row) -> TestResult {
     let name = row.name;
     let signed = signed_of(&row.unit)?;
     let served = identifier_of(signed);
-    let EntryValidation { outcome, discarded } = validate_entry(&served, &[&row.unit]);
-    let EntryOutcome::InceptionInvalid { defect } = outcome else {
-        return Err(format!("{name}: {outcome:?} with {discarded:?}").into());
+    let EntryValidation { verdict, discarded } = validate_entry(&served, &[&row.unit]);
+    let EntryVerdict::InceptionInvalid { defect } = verdict else {
+        return Err(format!("{name}: {verdict:?} with {discarded:?}").into());
     };
     assert!(discarded.is_empty(), "{name}: {discarded:?}");
     assert!(row.expect.matches(&defect), "{name}: {defect:?}");
@@ -703,12 +703,12 @@ fn a_later_event_derives_no_inception_identifier() -> TestResult {
 /// Every unit served for position zero is discarded: the verdict is
 /// `NoInception` with each discard.
 fn no_inception(units: &[&[u8]]) -> Result<Vec<scp_kel::Discarded>, Error> {
-    let EntryValidation { outcome, discarded } =
+    let EntryValidation { verdict, discarded } =
         validate_entry(&identifier(V41_IDENTIFIER)?, units);
-    if outcome == EntryOutcome::NoInception {
+    if verdict == EntryVerdict::NoInception {
         Ok(discarded)
     } else {
-        Err(format!("expected NoInception, got {outcome:?}").into())
+        Err(format!("expected NoInception, got {verdict:?}").into())
     }
 }
 
@@ -915,11 +915,11 @@ fn an_inception_at_max_event_bytes_passes_the_length_check() -> TestResult {
         ),
     ] {
         let served = identifier_of(signed_of(&unit)?);
-        let EntryValidation { outcome, discarded } = validate_entry(&served, &[&unit]);
+        let EntryValidation { verdict, discarded } = validate_entry(&served, &[&unit]);
         assert!(discarded.is_empty(), "{discarded:?}");
         assert_eq!(
-            outcome,
-            EntryOutcome::InceptionInvalid {
+            verdict,
+            EntryVerdict::InceptionInvalid {
                 defect: expected.clone()
             }
         );

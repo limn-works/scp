@@ -525,7 +525,7 @@ State:
 │  │                       │  │                      │            │
 │  │ • create_group        │  │ • create_token       │            │
 │  │ • add_member          │  │   (mandatory nonce)  │            │
-│  │   (Welcome + HPKE)    │  │ • validate_entry     │            │
+│  │   (Welcome + HPKE)    │  │ • validate_chain     │            │
 │  │ • remove_member       │  │ • check_revocation   │            │
 │  │   (Commit + epoch     │  │ • delegate           │            │
 │  │    advance)           │  │                      │            │

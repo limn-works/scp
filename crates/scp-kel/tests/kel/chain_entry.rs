@@ -3,7 +3,7 @@
 
 use scp_did::Identifier;
 use scp_kel::{
-    CheckStep, Discarded, EntryOutcome, EventKind, FailureClass, HeldHead, HeldHeadMarker,
+    CheckStep, Discarded, EntryVerdict, EventKind, FailureClass, HeldHead, HeldHeadMarker,
     HeldHeadMarkerError, InceptionDefect, InceptionRefusal, MarkerMode, SigningChange,
     SigningRefusal, ValidatedChain, validate_entry,
 };
@@ -256,12 +256,12 @@ fn discards_are_reported_in_served_order() -> TestResult {
     assert_discard(third, &unseparated_at(3))
 }
 
-/// The chains of a `Valid` outcome, in the order `validate_entry` returns
+/// The chains of a `Valid` verdict, in the order `validate_entry` returns
 /// them, and its discards.
 fn entry_chains(units: &[&[u8]]) -> Result<(Vec<ValidatedChain>, Vec<Discarded>), Error> {
     let validation = validate_entry(&served()?, units);
-    match validation.outcome {
-        EntryOutcome::Valid { chains } => {
+    match validation.verdict {
+        EntryVerdict::Valid { chains } => {
             Ok((chains.iter().cloned().collect(), validation.discarded))
         }
         other => Err(format!("expected Valid, got {other:?}").into()),

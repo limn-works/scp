@@ -14,7 +14,7 @@ use crate::{
 ///
 /// Step 6 computes the digest and cannot fail, so it has no variant.
 /// `InceptionBinding` is step 3's first half; a failure at step 3's second
-/// half is [`EntryOutcome::InceptionInvalid`](super::EntryOutcome) and
+/// half is [`EntryVerdict::InceptionInvalid`](super::EntryVerdict) and
 /// never a discard. `NamedCount` is sub-check 7a and `VerifiedCount`
 /// sub-check 7b.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

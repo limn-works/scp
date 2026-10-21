@@ -313,8 +313,8 @@ fn chain_verdict(
     units: &[&[u8]],
 ) -> Result<(scp_kel::ValidatedChain, Vec<scp_kel::Discarded>), Box<dyn std::error::Error>> {
     let validation = scp_kel::validate_entry(&identifier(identifier_hex)?, units);
-    let scp_kel::EntryOutcome::Valid { chains } = &validation.outcome else {
-        return Err(format!("expected Valid, got {:?}", validation.outcome).into());
+    let scp_kel::EntryVerdict::Valid { chains } = &validation.verdict else {
+        return Err(format!("expected Valid, got {:?}", validation.verdict).into());
     };
     let mut paths = chains.iter();
     match (paths.next(), paths.next()) {

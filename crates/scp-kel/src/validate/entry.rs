@@ -14,7 +14,7 @@ use crate::{EventUnit, decode_event};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryValidation {
     /// What the entry's units prove about the identifier.
-    pub outcome: EntryOutcome,
+    pub verdict: EntryVerdict,
     /// Every served unit no chain holds, once each, in served order: a
     /// unit discarded where it was read, one that joined no chain, and one
     /// that names a predecessor no chain holds. Copies merged by event
@@ -31,22 +31,22 @@ pub struct EntryValidation {
 /// least one chain.
 ///
 /// ```compile_fail,E0559
-/// # use scp_kel::{EntryOutcome, InceptionDefect};
-/// fn invalid(defect: InceptionDefect) -> EntryOutcome {
-///     EntryOutcome::InceptionInvalid { defect, at_sequence: 3 }
+/// # use scp_kel::{EntryVerdict, InceptionDefect};
+/// fn invalid(defect: InceptionDefect) -> EntryVerdict {
+///     EntryVerdict::InceptionInvalid { defect, at_sequence: 3 }
 /// }
 /// ```
 ///
 /// The positive control:
 ///
 /// ```
-/// # use scp_kel::{EntryOutcome, InceptionDefect};
-/// fn invalid(defect: InceptionDefect) -> EntryOutcome {
-///     EntryOutcome::InceptionInvalid { defect }
+/// # use scp_kel::{EntryVerdict, InceptionDefect};
+/// fn invalid(defect: InceptionDefect) -> EntryVerdict {
+///     EntryVerdict::InceptionInvalid { defect }
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EntryOutcome {
+pub enum EntryVerdict {
     /// A unit read for position zero recomputes to the served identifier
     /// and fails R2 or an R3 indicator (step 3's second half): the
     /// identifier names no valid chain, R14's `Invalid`.
@@ -232,12 +232,12 @@ pub fn validate_entry(identifier: &Identifier, units: &[&[u8]]) -> EntryValidati
             }
         }
     }
-    let outcome = match (invalid, root) {
-        (Some(defect), _) => EntryOutcome::InceptionInvalid { defect },
-        (None, Some(root)) => EntryOutcome::Valid {
+    let verdict = match (invalid, root) {
+        (Some(defect), _) => EntryVerdict::InceptionInvalid { defect },
+        (None, Some(root)) => EntryVerdict::Valid {
             chains: branches(&assembly, root, &mut visited, &mut discarded),
         },
-        (None, None) => EntryOutcome::NoInception,
+        (None, None) => EntryVerdict::NoInception,
     };
     discarded.extend(assembly.unplaced.iter().cloned());
     for (group, named) in &assembly.named {
@@ -252,7 +252,7 @@ pub fn validate_entry(identifier: &Identifier, units: &[&[u8]]) -> EntryValidati
         }
     }
     discarded.sort_by_key(Discarded::served_index);
-    EntryValidation { outcome, discarded }
+    EntryValidation { verdict, discarded }
 }
 
 /// Runs the check order down every path from the inception, depth first.

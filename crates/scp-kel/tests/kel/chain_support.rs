@@ -1,4 +1,4 @@
-//! Support for the `validate_chain` tests (`09-security-model.md` §9.7.4.2
+//! Support for the `validate_entry` tests (`09-security-model.md` §9.7.4.2
 //! R3): keys from spec 25's seeds and from test labels, a field writer that
 //! applies none of the encoder's refusals, units signed slot by slot, and
 //! the base chains the fixtures extend.

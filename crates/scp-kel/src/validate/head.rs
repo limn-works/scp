@@ -40,10 +40,14 @@ impl MarkerMode {
 /// big-endian sequence, the 32-byte preimage digest and the 1-byte mode
 /// (`03-identity.md` §3.10; §9.18.17).
 ///
-/// Its fields are private. [`adopt`](Self::adopt), which takes the mode as
-/// a required argument, and [`from_bytes`](Self::from_bytes) are its only
-/// constructors, so no marker names a head no valid chain ended at or drops
-/// a persisted `RevealOnly`.
+/// Its fields are private, and it has two constructors.
+/// [`adopt`](Self::adopt) takes the mode as a required argument and builds
+/// the marker from a [`ValidatedChain`]'s head, so a marker a device writes
+/// names a head a valid chain ended at. [`from_bytes`](Self::from_bytes)
+/// decodes a persisted marker and checks only its length and its mode byte:
+/// it cannot tell whether a valid chain ended at the head the bytes name,
+/// so that holds for a decoded marker only as far as the device's own store
+/// is intact. Neither constructor drops a `RevealOnly`.
 ///
 /// ```compile_fail,E0451
 /// # use scp_kel::{HeldHeadMarker, MarkerMode};

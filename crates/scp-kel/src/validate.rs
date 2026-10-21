@@ -6,7 +6,7 @@
 //! leaves the position open, reads the next unit as a candidate for it, and
 //! reports every unit it discards. The one invalid case is an inception that
 //! recomputes to the served identifier and fails R2 or an R3 indicator,
-//! which [`EntryOutcome::InceptionInvalid`] alone carries.
+//! which [`EntryVerdict::InceptionInvalid`] alone carries.
 //!
 //! [`validate_entry`] is the one reader of an entry's served units: it
 //! assembles them by predecessor digest before any check runs, so no caller
@@ -30,7 +30,7 @@ pub use defect::{
     CheckStep, ContentDefect, Discarded, DistinctList, EventDefect, FailureClass, InceptionDefect,
     ThresholdField,
 };
-pub use entry::{EntryOutcome, EntryValidation, ValidChains, validate_entry};
+pub use entry::{EntryValidation, EntryVerdict, ValidChains, validate_entry};
 pub use head::{
     HeldHead, HeldHeadMarker, HeldHeadMarkerError, MarkerMode, SigningChange, SigningRefusal,
 };

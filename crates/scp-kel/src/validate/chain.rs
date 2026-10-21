@@ -67,15 +67,15 @@ pub(super) struct ChainEvent {
 /// one.
 ///
 /// ```
-/// # use scp_kel::{EntryOutcome, validate_entry};
-/// fn head(outcome: EntryOutcome) -> Option<[u8; 32]> {
-///     match outcome {
-///         EntryOutcome::Valid { chains } => Some(chains.first().head_digest()),
-///         EntryOutcome::InceptionInvalid { .. } | EntryOutcome::NoInception => None,
+/// # use scp_kel::{EntryVerdict, validate_entry};
+/// fn head(verdict: EntryVerdict) -> Option<[u8; 32]> {
+///     match verdict {
+///         EntryVerdict::Valid { chains } => Some(chains.first().head_digest()),
+///         EntryVerdict::InceptionInvalid { .. } | EntryVerdict::NoInception => None,
 ///     }
 /// }
 /// let units: [&[u8]; 0] = [];
-/// assert_eq!(head(validate_entry(&scp_did::Identifier::ZERO, &units).outcome), None);
+/// assert_eq!(head(validate_entry(&scp_did::Identifier::ZERO, &units).verdict), None);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedChain {

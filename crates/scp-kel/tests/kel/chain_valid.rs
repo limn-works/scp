@@ -8,7 +8,7 @@ use scp_did::{
     StandingCommitment,
 };
 use scp_kel::{
-    ChangeEffect, CheckStep, Continuation, Discarded, EntryOutcome, EntryValidation, EventKind,
+    ChangeEffect, CheckStep, Continuation, Discarded, EntryValidation, EntryVerdict, EventKind,
     InstalledRootSet, NamedKey, SignerGroupRole, SignerGroupSpec, ValidatedChain, ValidatedChange,
     validate_entry, validate_inception,
 };
@@ -26,15 +26,15 @@ use super::fixtures::{
     event_unit, identifier,
 };
 
-/// The one chain and the discards of a `Valid` outcome holding exactly one
+/// The one chain and the discards of a `Valid` verdict holding exactly one
 /// path, or the validation as an error.
 pub fn valid(
     identifier: &Identifier,
     units: &[&[u8]],
 ) -> Result<(ValidatedChain, Vec<Discarded>), Error> {
-    let EntryValidation { outcome, discarded } = validate_entry(identifier, units);
-    let EntryOutcome::Valid { chains } = &outcome else {
-        return Err(format!("expected Valid, got {outcome:?} with {discarded:?}").into());
+    let EntryValidation { verdict, discarded } = validate_entry(identifier, units);
+    let EntryVerdict::Valid { chains } = &verdict else {
+        return Err(format!("expected Valid, got {verdict:?} with {discarded:?}").into());
     };
     let mut paths = chains.iter();
     match (paths.next(), paths.next()) {

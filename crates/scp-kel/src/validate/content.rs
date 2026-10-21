@@ -741,11 +741,16 @@ fn check_next_commitment(
 /// the event's own over the chain's through its predecessor. Every
 /// freshness rule reads "at or before the event" through this one view, so
 /// no rule can read the chain's half without the event's.
+///
+/// The event's own installations carry no set here: a commitment the event
+/// fixes that equals the commitment of a key the event installs is that
+/// key's `InstalledKeyCommitted`, which [`check_freshness`] tests first, so
+/// [`commits_to_installed`](Self::commits_to_installed) reads the chain's
+/// installations alone.
 struct AtOrBefore<'c> {
     chain: Option<&'c ValidatedChain>,
     revealed: BTreeSet<[u8; 33]>,
     revealed_commitments: BTreeSet<[u8; 32]>,
-    installed_commitments: BTreeSet<[u8; 32]>,
     fixed: BTreeSet<[u8; 32]>,
 }
 
@@ -760,10 +765,8 @@ impl AtOrBefore<'_> {
     }
 
     fn commits_to_installed(&self, commitment: &[u8; 32]) -> bool {
-        self.installed_commitments.contains(commitment)
-            || self
-                .chain
-                .is_some_and(|chain| chain.installed_commitment(commitment))
+        self.chain
+            .is_some_and(|chain| chain.installed_commitment(commitment))
     }
 
     fn commits_to_revealed(&self, commitment: &[u8; 32]) -> bool {
@@ -804,10 +807,6 @@ fn check_freshness(
             .revealed_keys
             .iter()
             .map(prerotation_commitment)
-            .collect(),
-        installed_commitments: installed
-            .iter()
-            .map(|(key, _)| prerotation_commitment(key))
             .collect(),
         fixed: fixed.iter().copied().collect(),
     };
