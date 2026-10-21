@@ -304,7 +304,10 @@ pub async fn seed_from_startup_publish(
 /// one this node's relay may intercept. While `advertised` carries a
 /// `bridgeTarget`, the handle stays on its current URL, whose routing ID this
 /// node's relay keeps intercepting, and the caller still publishes
-/// `advertised`. No artifact yet defines a tier 3 node's push routing ID.
+/// `advertised`. `09-security-model.md` §9.18.2 **Tier 3 push routing ID**
+/// defines a tier 3 node's push routing ID; PUSH-032's second pull request
+/// (acceptance criterion 6) replaces this branch with the reservation of that
+/// tier 3 ID.
 pub fn reserve_push_routing_id(relay: &LiveRelayUrl, advertised: &RelayService) {
     if advertised.bridge_target().is_some() {
         // Stub — see PUSH-032
