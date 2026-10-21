@@ -773,7 +773,7 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
-**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds, after it refuses a `PendingEvent` whose `chain` ends at a head other than the one this device holds, and refuses with `IdentityError::SignaturePending` an event at a sequence where this device's `PendingSignatureRecord` names a different event (`09-security-model.md` §9.7.4.2 R10). **`Identity::abandon_pending` clears that record** on the composing device when it abandons the `PendingEvent`, and on each cosigner when the application carries the abandonment to it. **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
+**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds, after it refuses a `PendingEvent` whose `chain` ends at a head other than the one this device holds, and refuses with `IdentityError::SignaturePending` an event at a sequence where this device's `PendingSignatureRecord` names a different event (`09-security-model.md` §9.7.4.2 R10). **`Identity::abandon_pending` clears that record on the device whose user abandons the `PendingEvent`**, with no authentication because the call is that user's own, and returns an `AbandonNotice` signed by the member that device signed the event with; **`Identity::accept_abandon` clears the record on another holder's device only after it verifies that notice** under R10, and refuses any other with `IdentityError::AbandonNoticeUnverified`. Both refuse with `IdentityError::NoPendingSignature` where the device holds no record naming the event. **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
 
 ```rust
 impl<S: EncryptedStorage> Identity<S> {
@@ -802,11 +802,18 @@ impl<S: EncryptedStorage> Identity<S> {
     pub fn attach(&self, pending: PendingEvent, signatures: Vec<IndexedSignature>)
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
 
-    /// Called on the composing device when it abandons a `PendingEvent`, and
-    /// on a cosigner when the application carries that abandonment to it:
-    /// clears the `PendingSignatureRecord` naming `pending.event_digest`
-    /// (`09-security-model.md` §9.7.4.2 R10).
+    /// Called on a device whose own user abandons a `PendingEvent`: clears
+    /// the `PendingSignatureRecord` naming `pending.event_digest` with no
+    /// authentication, and returns the `AbandonNotice` the member this device
+    /// signed the event with signs, for the application to carry to the other
+    /// holders (`09-security-model.md` §9.7.4.2 R10).
     pub fn abandon_pending(custody: &KeyCustodySlot, pending: &PendingEvent)
+        -> Result<AbandonNotice, IdentityError>;
+
+    /// Called on a holder's device when the application carries another
+    /// holder's `AbandonNotice` to it: verifies the notice under R10 and only
+    /// then clears the `PendingSignatureRecord` naming its event's digest.
+    pub fn accept_abandon(custody: &KeyCustodySlot, notice: &AbandonNotice)
         -> Result<(), IdentityError>;
 }
 
@@ -920,7 +927,7 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of this trait's six methods and of the three recovery entry
-/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twenty
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twenty-two
 /// variants and no others. A refusal the protocol mandates carries one of these
 /// variants, so four bindings mint one code rather than four and a caller tells
 /// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
@@ -933,7 +940,7 @@ pub trait IdentityBackend: Send + Sync {
 ///
 /// The codes take `SCP-IDENT-1100` through `SCP-IDENT-1199`, the first free
 /// hundred-block of the `SCP-IDENT-` range `.docs/standards/sdk-common.md`
-/// reserves: `SCP-IDENT-1000` through `SCP-IDENT-1062` are allocated against
+/// reserves: `SCP-IDENT-1000` through `SCP-IDENT-1063` are allocated against
 /// the superseded identity model, and a redesign variant reusing one of those
 /// numbers would fire a caller's handler for a condition it never named.
 pub enum IdentityError {
@@ -1005,9 +1012,9 @@ pub enum IdentityError {
     CustodyRequired,
     /// SCP-IDENT-1117. The candidate key event fails R3's check order, or R2
     /// for an inception, at `stage`, so no device signs it; or the recovery
-    /// ceremony's confirm check found the signed event's copy failing at a
-    /// step other than step 8, so the ceremony destroyed nothing
-    /// (`09-security-model.md` §9.7.4.2 R10).
+    /// ceremony's confirm check found the signed event's copy failing with a
+    /// failure that is not an illegality failure (R3), so the ceremony
+    /// destroyed nothing (`09-security-model.md` §9.7.4.2 R10).
     IllegalKeyEvent { stage: CheckStep },
     /// SCP-IDENT-1118. The chain a signing device was handed ends at
     /// `handed_head`, and the head that device holds is `held_head`, so a
@@ -1019,6 +1026,15 @@ pub enum IdentityError {
     /// that sequence, so a signature would fork the identity's own chain until
     /// the record clears (`09-security-model.md` §9.7.4.2 R10).
     SignaturePending { sequence: u64, event_digest: [u8; 32] },
+    /// SCP-IDENT-1120. `abandon_pending` or `accept_abandon` named an event
+    /// for which this device holds no `PendingSignatureRecord`, so nothing
+    /// cleared (`09-security-model.md` §9.7.4.2 R10).
+    NoPendingSignature { event_digest: [u8; 32] },
+    /// SCP-IDENT-1121. An `AbandonNotice` failed R10's verification: its
+    /// preimage digest differs from the record's, its chain does not validate
+    /// to the head this device holds, or its signature does not verify
+    /// against the key its group and index name, so the record stands.
+    AbandonNoticeUnverified,
 }
 
 /// The step of `09-security-model.md` §9.7.4.2 R3's check order at which an
@@ -1038,6 +1054,12 @@ pub struct HeldHeadMarker { pub identifier: Identifier, pub sequence: u64, pub e
 /// (`09-security-model.md` §9.18.17). §9.7.4.2 R10's signing rule states the
 /// four ways it clears.
 pub struct PendingSignatureRecord { pub identifier: Identifier, pub sequence: u64, pub event_digest: [u8; 32] }
+
+/// The authenticated abandonment of a `PendingEvent`: the event itself, and
+/// the signature, by the member at `signature.group` and `signature.index` that signed the event, over
+/// `SHA-256("SCP-KEL-ABANDON-V1:" ‖ identifier ‖ sequence ‖ event_digest)`
+/// (`09-security-model.md` §9.7.4.2 R10).
+pub struct AbandonNotice { pub pending: PendingEvent, pub signature: IndexedSignature }
 
 /// One relay entry's declared write policy, as that entry publishes it at
 /// `.well-known/scp`. **The type carries three fields and no others**, which
