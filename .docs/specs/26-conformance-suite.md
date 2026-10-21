@@ -60,7 +60,7 @@ Each test specifies:
 | **Steps** | 1. Generate a new P-256 `#active` keypair. 2. Compose a `KeyState` carrying the new key `Current` in the `#active` role and the old key's `Superseded` drop entry. 3. Sign it with the standing root, publish the chain, and resolve the identity again. 4. Verify the old key reads `Superseded` and the fingerprint changed. |
 | **Expected Outcome** | The derived key state lists the new key `Current`, and a replay reads the old key `Superseded` from that event's drop entry: a condition retires a key, not an absence. The key continuity fingerprint (§9.11) reflects the change. Messages signed with the old key still verify, because a content signature verifies against a retired key (§9.7.1). |
 
-### CONF-004: A Chain Claiming Delegation Is Rejected
+### CONF-004: An Identifier Whose Inception Names a Delegator Is Invalid
 
 | Field | Value |
 |-------|-------|
@@ -69,7 +69,7 @@ Each test specifies:
 | **Spec Sections** | `09-security-model.md` §9.1 invariants 1 and 4, §9.7.4.2 R3, `00-open-questions.md` |
 | **Preconditions** | A human identity and a second identity whose inception event names the human as its delegator. |
 | **Steps** | 1. Publish both chains. 2. Resolve the second identity. |
-| **Expected Outcome** | R3 rejects every chain whose delegator field is nonzero, so the second identity does not resolve and signs no autonomous action. This test asserts the fail-closed rejection that stands until the delegation model lands (`00-open-questions.md`). |
+| **Expected Outcome** | R3 returns `Invalid` for an identifier whose inception names a nonzero delegator, so the second identity does not resolve and signs no autonomous action. This test asserts the fail-closed `Invalid` verdict that stands until the delegation model lands (`00-open-questions.md`). |
 
 ### CONF-005: Multi-Device (One Identity, Different Device Leaf Keys)
 

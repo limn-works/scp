@@ -2266,6 +2266,18 @@ SERVICE_RECORD_RELAY_TYPE = "SCPRelay"
 # The absent `bridgeTarget` of an SCPRelay entry: §9.5.1's absent-optional
 # value for a fixed-length field, bare.
 SERVICE_RECORD_ABSENT_BRIDGE_TARGET = sha256(b"\x00")
+# The absent `wrappingKey` of an SCPRelay entry: §9.5.1's absent-optional
+# value for a variable-length field, SHA-256(0x00) under a 4-byte length.
+SERVICE_RECORD_ABSENT_WRAPPING_KEY = sha256(b"\x00")
+# The bridge entry's `wrappingKey`: a fixture key standing for the wrapping-key
+# entry of the node's device (`18-addressability-and-deployment.md` §18.2.1).
+# Vector 41's key state carries no wrapping-key entry, so the vector pins the
+# encoding and not a key-state lookup.
+SERVICE_RECORD_WRAPPING_KEY = keypair_from_seed(
+    sha256(b"scp-25-service-record-wrapping-key"),
+    TEST_VECTOR_KEY_LABEL,
+    "node device wrapping key",
+)
 
 
 def service_record_bridge_target(identifier: bytes) -> bytes:
@@ -2284,29 +2296,41 @@ def service_record_bridge_target(identifier: bytes) -> bytes:
     return target
 
 
-def service_record_entries(identifier: bytes) -> list[tuple[str, str, str, bytes | None]]:
+ServiceRecordEntry = tuple[str, str, str, bytes | None, bytes | None]
+
+
+def service_record_entries(identifier: bytes) -> list[ServiceRecordEntry]:
     """Four entries in the order a record carries them, as (id, type,
-    serviceEndpoint, bridgeTarget).
+    serviceEndpoint, bridgeTarget, wrappingKey).
 
     Each encodes its three strings under §9.5.1's variable-length rule, in the
     order id, type, serviceEndpoint, and carries no type discriminator beside
-    them; an SCPRelay entry then encodes bridgeTarget as 32 bare bytes, and
-    SHA-256(0x00) there means "no target" (`03-identity.md` §3.10.13)."""
+    them; an SCPRelay entry then encodes bridgeTarget as 32 bare bytes, where
+    SHA-256(0x00) means "no target", and wrappingKey under the variable-length
+    rule, where the 32 bytes SHA-256(0x00) mean "no key" (`03-identity.md`
+    §3.10.13)."""
     return [
-        ("#scp-relay-1", "SCPRelay", "wss://relay.example.com/scp/v1", None),
-        ("#scp-relay-2", "SCPRelay", "wss://relay2.example.com/scp/v1", None),
-        ("#private-state-1", "IdentityPrivateState", "wss://relay.example.com/scp/v1", None),
+        ("#scp-relay-1", "SCPRelay", "wss://relay.example.com/scp/v1", None, None),
+        ("#scp-relay-2", "SCPRelay", "wss://relay2.example.com/scp/v1", None, None),
+        (
+            "#private-state-1",
+            "IdentityPrivateState",
+            "wss://relay.example.com/scp/v1",
+            None,
+            None,
+        ),
         (
             "#scp-relay-3",
             "SCPRelay",
             "wss://bridge.example.com/scp/v1",
             service_record_bridge_target(identifier),
+            SERVICE_RECORD_WRAPPING_KEY.compressed,
         ),
     ]
 
 
 def service_record_entry_bridge_target(entry_type: str, bridge_target: bytes | None) -> bytes:
-    """The 32 trailing bytes an SCPRelay entry signs; empty for any other type."""
+    """The 32 bytes an SCPRelay entry signs after its strings; empty for any other type."""
     if entry_type != SERVICE_RECORD_RELAY_TYPE:
         assert bridge_target is None, "only an SCPRelay entry carries bridgeTarget"
         return b""
@@ -2316,17 +2340,34 @@ def service_record_entry_bridge_target(entry_type: str, bridge_target: bytes | N
     return bridge_target
 
 
-def service_record_entries_field(
-    entries: list[tuple[str, str, str, bytes | None]],
+def service_record_entry_wrapping_key(
+    entry_type: str, bridge_target: bytes | None, wrapping_key: bytes | None
 ) -> bytes:
+    """The value an SCPRelay entry signs as wrappingKey, before its length
+    prefix: the 33-byte compressed key, or SHA-256(0x00) when absent; empty for
+    any other type."""
+    if entry_type != SERVICE_RECORD_RELAY_TYPE:
+        assert wrapping_key is None, "only an SCPRelay entry carries wrappingKey"
+        return b""
+    if wrapping_key is None:
+        return SERVICE_RECORD_ABSENT_WRAPPING_KEY
+    assert bridge_target is not None, "only a bridge entry carries wrappingKey"
+    assert len(wrapping_key) == 33 and wrapping_key[0] in (2, 3), wrapping_key.hex()
+    return wrapping_key
+
+
+def service_record_entries_field(entries: list[ServiceRecordEntry]) -> bytes:
     """The `entries` field: a 4-byte count, then each entry under its type's layout."""
-    body = b"".join(
-        var_field(entry_id)
-        + var_field(entry_type)
-        + var_field(endpoint)
-        + service_record_entry_bridge_target(entry_type, bridge_target)
-        for entry_id, entry_type, endpoint, bridge_target in entries
-    )
+    body = b""
+    for entry_id, entry_type, endpoint, bridge_target, wrapping_key in entries:
+        body += var_field(entry_id) + var_field(entry_type) + var_field(endpoint)
+        if entry_type == SERVICE_RECORD_RELAY_TYPE:
+            body += service_record_entry_bridge_target(entry_type, bridge_target)
+            body += var_field(
+                service_record_entry_wrapping_key(entry_type, bridge_target, wrapping_key)
+            )
+        else:
+            assert bridge_target is None and wrapping_key is None, entry_type
     return u32(len(entries)) + body
 
 
@@ -2359,13 +2400,18 @@ def emit_commitment_and_service_record() -> None:
     emit_hex("vector_48.identifier", identifier)
     emit("vector_48.sequence", SERVICE_RECORD_SEQUENCE)
     emit("vector_48.entry_count", len(record_entries))
-    for index, (entry_id, entry_type, endpoint, bridge_target) in enumerate(record_entries):
+    for index, (entry_id, entry_type, endpoint, bridge_target, wrapping_key) in enumerate(
+        record_entries
+    ):
         emit(f"vector_48.entry_{index}.id", entry_id)
         emit(f"vector_48.entry_{index}.type", entry_type)
         emit(f"vector_48.entry_{index}.serviceEndpoint", endpoint)
         signed_target = service_record_entry_bridge_target(entry_type, bridge_target)
         if signed_target:
             emit_hex(f"vector_48.entry_{index}.bridgeTarget", signed_target)
+        signed_key = service_record_entry_wrapping_key(entry_type, bridge_target, wrapping_key)
+        if signed_key:
+            emit_hex(f"vector_48.entry_{index}.wrappingKey", signed_key)
     emit("vector_48.entries_len", len(entries))
     emit_hex("vector_48.entries", entries)
     emit("vector_48.field_bytes", len(fields))
@@ -3237,10 +3283,10 @@ def emit_challenge_vectors() -> None:
             var_field(jcs(output)),
         )
         response_digests[attempt] = sha256(pre)
-        emit("%s.output_jcs" % label, jcs(output).decode())
-        emit("%s.preimage_len" % label, len(pre))
-        emit_hex("%s.preimage" % label, pre)
-        emit_hex("%s.digest" % label, response_digests[attempt])
+        emit(f"{label}.output_jcs", jcs(output).decode())
+        emit(f"{label}.preimage_len", len(pre))
+        emit_hex(f"{label}.preimage", pre)
+        emit_hex(f"{label}.digest", response_digests[attempt])
 
     # --- Vectors 62 and 63: the verification records of attempts 1 and 2. ---
     # Vector 63 is graded exactly `cooldown_secs` after Vector 62, the
@@ -3277,15 +3323,15 @@ def emit_challenge_vectors() -> None:
             record_expires_at,
             context_id,
         )
-        emit("%s.attempt" % label, attempt)
-        emit("%s.timestamp" % label, ts)
-        emit("%s.expires_at" % label, record_expires_at)
-        emit("%s.verification_id_preimage_len" % label, len(vid_pre))
-        emit_hex("%s.verification_id_preimage" % label, vid_pre)
-        emit_hex("%s.verification_id" % label, vid)
-        emit("%s.preimage_len" % label, len(pre))
-        emit_hex("%s.preimage" % label, pre)
-        emit_hex("%s.digest" % label, sha256(pre))
+        emit(f"{label}.attempt", attempt)
+        emit(f"{label}.timestamp", ts)
+        emit(f"{label}.expires_at", record_expires_at)
+        emit(f"{label}.verification_id_preimage_len", len(vid_pre))
+        emit_hex(f"{label}.verification_id_preimage", vid_pre)
+        emit_hex(f"{label}.verification_id", vid)
+        emit(f"{label}.preimage_len", len(pre))
+        emit_hex(f"{label}.preimage", pre)
+        emit_hex(f"{label}.digest", sha256(pre))
         assert ABSENT_SENTINEL not in pre, label
 
 

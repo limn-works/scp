@@ -110,8 +110,7 @@ The split is what keeps the root cold across a transport change, which `03-ident
 
 **What the split buys.** This record depends on nothing in ADR-065, the relay ADR, pending, so it merges at `Accepted` while that record stays `Proposed` until its own review converges. **A verifier, a controller, a witness, an SDK or a relay executes every rule this record states, and these sites bind a relay, each naming its party:**
 
-- **a validating relay**: the no-TTL duty and the three refusals of `09-security-model.md` §9.10.12; the accepted-chain rule of §9.7.4.2 R9, under which the relay holds as accepted the chain that wins every pairwise R6 comparison and keeps the chain it held first on a tie; the frame-admission rule of §9.7.4.2 R10; and the refusal of ADR-004's `DELETE` at a retained kind;
-- **a relay that does not validate**: the rejection of a PUBLISH carrying `retain: true` (§9.10.12);
+- **a validating relay**: the no-TTL duty and the three refusals of `09-security-model.md` §9.10.12; the accepted-chain rule of §9.7.4.2 R9, under which the relay holds as accepted the chain that wins every pairwise R6 comparison and keeps the chain it held first on a tie; the frame-admission rule of §9.7.4.2 R10; the R3 check order on every event of an admitted frame, with the refusal `4044` (§9.7.4.2 R10, §9.10.12); and the refusal of ADR-004's `DELETE` at a retained kind;
 - **every listed relay**: the relay proof of control §9.7.4.2's definitions state, which R11 reads on every page of a first-contact walk.
 
 **None of these sites decides what a relay keeps, reclaims or charges for, or what it refuses on terms its operator declares**, which is the seam ADR-065 owns. Four rules read a relay's answer as the publisher's own input and never as a verdict: `IdentityBackend::read_policy` reads one entry's declared write policy; `publish` segments the chain per entry against that entry's declared `max_blob_size`; `EntryResult` records what one entry answered; and `03-identity.md` §3.10.6 obliges the SDK to report the ceiling and the retry interval where every fallback-set entry refuses. `09-security-model.md` §9.7.4.2 R9 states that a verifier reaches its verdict from the events it read and from the community relay list it accepted, and from nothing a relay asserts.
@@ -227,7 +226,7 @@ Each rule below is KERI's, and the SCP section that carries it cites KERI.
 
 **Six items are tracked outside the specification corpus.**
 
-1. **The delegation model** waits on ADR-064, cooperative delegation, and until it lands a verifier rejects every chain naming a delegator.
+1. **The delegation model** waits on ADR-064, cooperative delegation, and until it lands a verifier makes `Invalid` every identifier whose inception names a nonzero delegator, and discards every later event that names one.
 2. **The identifier's text form** is settled, and `03-identity.md` §3.1 states it.
 3. **The two non-compromise retired conditions.** Whether `Superseded` and `Retired` collapse into one condition is an upstream question for the next draft of this record, and no specification pass decides it. **The key-event seal's fate is closed and this draft closes it:** the seal ships, at fixed position 11 of the key-event preimage, with no live reader, because adding the field later would bump the separator's version suffix and invalidate every signature made under the old one.
 4. **The ripple sweep** covers the stale sites outside the four core homes, in three classes: the agent verification method, the DID document, and did:dht with the Mainline distributed hash table.
