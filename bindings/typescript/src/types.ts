@@ -794,7 +794,8 @@ export function checkProposalResponse(raw: string): string {
  * {@link SCP.contextJoinFromWelcome} on the joiner side.
  *
  * Flat named-field object mirroring the runtime wire type and the PyO3/UniFFI
- * reference bridges. `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and
+ * reference bridges. `enc` is the RFC 9180 HPKE encapsulated key, a 65-byte
+ * uncompressed DHKEM(P-256) point (spec 05 §5.12.3.1), and
  * `ciphertext` is the HPKE ciphertext (`ct = ciphertext || tag`) of the
  * serialized, signed `InvitationBundle` carrying the authoritative genesis
  * params + MLS Welcome. Both are opaque bytes — the joiner does not interpret
@@ -809,7 +810,11 @@ export interface SealedInvitation {
   readonly contextId: string;
   /** Binding hint: the creator DID the bundle was sealed by. */
   readonly creatorDid: string;
-  /** RFC 9180 HPKE encapsulated key (`enc`) — exactly 32 bytes. */
+  /**
+   * RFC 9180 HPKE encapsulated key (`enc`): a 65-byte uncompressed
+   * DHKEM(P-256) point. The join rejects any other form before it makes a
+   * custody call or consumes the KeyPackage.
+   */
   readonly enc: Uint8Array;
   /** RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`). */
   readonly ciphertext: Uint8Array;
@@ -2387,15 +2392,16 @@ export const RETRIES_EXHAUSTED_CODE = "SCP-VALID-7104";
 export const COOLDOWN_ACTIVE_CODE = "SCP-VALID-7105";
 
 /**
- * Code the bridge raises when the challenge closed after a pass or after its
- * last allowed attempt. Maps from `TrustError::ChallengeClosed`.
+ * The challenge is closed: passed or out of attempts. The attempt check returns
+ * this code at begin and at commit (spec 07 §7.3.4). Maps from
+ * `TrustError::ChallengeClosed`.
  */
 export const CHALLENGE_CLOSED_CODE = "SCP-VALID-7106";
 
 /**
- * Code the bridge raises when the challenger's ledger holds no live challenge
- * with the request's id, request digest and subject. Maps from
- * `TrustError::UnknownChallenge`.
+ * No challenge the challenger holds answers this lookup: no live challenge has
+ * this id, digest and subject, or a closed one graded no response with this
+ * `D_r` (spec 07 §7.3.4). Maps from `TrustError::UnknownChallenge`.
  */
 export const UNKNOWN_CHALLENGE_CODE = "SCP-VALID-7107";
 

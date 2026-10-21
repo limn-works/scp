@@ -701,27 +701,23 @@ impl ChallengerLedgerActor {
     ) -> Result<(), ChallengeLedgerError> {
         self.ensure_loaded().await?;
         let now = self.clock.now_secs();
-        let entry = self
-            .entries()?
+        // Spec 07 §7.3.4 step 3.2: every miss is `UnknownChallenge`,
+        // including a closed entry with no stored attempt for `D_r`; a
+        // closed entry serves only a resubmit of a response it graded.
+        // `ChallengeClosed` is the attempt check's code, at begin and commit.
+        self.entries()?
             .get(challenge_id)
             .filter(|entry| {
                 !entry.is_prunable(now)
                     && entry.request_digest == *request_digest
                     && entry.subject_key == *subject.key()
+                    && (entry.closed.is_none()
+                        || entry
+                            .attempts
+                            .iter()
+                            .any(|x| x.response_digest == *response_digest))
             })
             .ok_or_else(|| unknown(challenge_id))?;
-        // A closed entry serves only a resubmit of a response it graded.
-        if entry.closed.is_some()
-            && !entry
-                .attempts
-                .iter()
-                .any(|x| x.response_digest == *response_digest)
-        {
-            return Err(TrustError::ChallengeClosed {
-                challenge_id: hex::encode(challenge_id),
-            }
-            .into());
-        }
         Ok(())
     }
 

@@ -95,7 +95,7 @@ class UniffiKeyCustodyTest {
     @BeforeEach
     fun setUp() {
         prefs = InMemorySharedPreferences()
-        custody = AndroidKeyCustody(prefs)
+        custody = AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys())
         provider = UniffiKeyCustody(custody)
     }
 
@@ -116,7 +116,7 @@ class UniffiKeyCustodyTest {
     fun `generateKeypair returns canonical decimal u64 ids`() {
         runTest {
             repeat(16) {
-                for (type in listOf(CustodyKeyType.ED25519, CustodyKeyType.X25519)) {
+                for (type in listOf(CustodyKeyType.ED25519, CustodyKeyType.HPKE_P256)) {
                     val id = provider.generateKeypair(type, CustodyKeyRole.OPERATIONAL)
                     assertEquals(id, id.toULong().toString(), "id $id is not canonical decimal u64")
                 }
@@ -146,13 +146,13 @@ class UniffiKeyCustodyTest {
     }
 
     @Test
-    fun `operational X25519 keys report their role and agree`() {
+    fun `operational HPKE P-256 keys report their role and agree`() {
         runTest {
-            val alice = provider.generateKeypair(CustodyKeyType.X25519, CustodyKeyRole.OPERATIONAL)
-            val bob = provider.generateKeypair(CustodyKeyType.X25519, CustodyKeyRole.OPERATIONAL)
+            val alice = provider.generateKeypair(CustodyKeyType.HPKE_P256, CustodyKeyRole.OPERATIONAL)
+            val bob = provider.generateKeypair(CustodyKeyType.HPKE_P256, CustodyKeyRole.OPERATIONAL)
             val alicePublic = provider.getPublicKey(alice)
             val bobPublic = provider.getPublicKey(bob)
-            assertEquals(CustodyKeyType.X25519, alicePublic.keyType)
+            assertEquals(CustodyKeyType.HPKE_P256, alicePublic.keyType)
             assertEquals(CustodyKeyRole.OPERATIONAL, alicePublic.role)
 
             val aliceShared = provider.dhAgree(alice, bobPublic.publicKey)
@@ -162,14 +162,14 @@ class UniffiKeyCustodyTest {
     }
 
     @Test
-    fun `dhAgree on an Ed25519 key uses the SHA-512(seed) X25519 scalar`() {
+    fun `dhAgree on an Ed25519 key is refused with SCP-CRYPTO-4060`() {
         runTest {
-            // RFC 8032 §7.1 test 1 seed against RFC 7748 §6.1 Alice's public key. The expected secret
-            // is X25519 of Alice's private scalar and the seed's converted public key
-            // d85e07ec22b0ad881537c2f44d662d1a143cf830c57aca4305d85c7a90f6b62e, computed independently.
+            // An Ed25519 key never agrees; the refusal keeps its code across the bridge.
             val id = installSeed(unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"))
-            val shared = provider.dhAgree(id, unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"))
-            assertEquals("90f395580ca33f3c54390ac1d7210220b6a336de2c47a61ac90ff56e6be11f18", shared.hex())
+            val error = cryptoError {
+                provider.dhAgree(id, unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"))
+            }
+            assertEquals("SCP-CRYPTO-4060", error.code)
         }
     }
 
@@ -228,7 +228,7 @@ class UniffiKeyCustodyTest {
             for ((name, call) in calls) {
                 assertEquals("SCP-CRYPTO-4006", cryptoError(call).code, name)
             }
-            assertEquals("unknown", provider.custodyType(unknown))
+            assertEquals("in_memory", provider.custodyType(unknown))
         }
     }
 
@@ -248,32 +248,10 @@ class UniffiKeyCustodyTest {
     @Test
     fun `an Android error keeps its code and cause`() {
         runTest {
-            val id = provider.generateKeypair(CustodyKeyType.X25519, CustodyKeyRole.OPERATIONAL)
+            val id = provider.generateKeypair(CustodyKeyType.HPKE_P256, CustodyKeyRole.OPERATIONAL)
             val error = cryptoError { provider.sign(id, byteArrayOf(1)) }
-            assertEquals("SCP-CRYPTO-4003", error.code)
-            assertTrue(error.cause is ScpException)
-        }
-    }
-
-    @Test
-    fun `a non-ScpException failure becomes SCP-CRYPTO-4060 carrying the cause`() {
-        runTest {
-            // Bouncy Castle throws IllegalStateException for a low-order peer key.
-            val id = provider.generateKeypair(CustodyKeyType.X25519, CustodyKeyRole.OPERATIONAL)
-            val error = cryptoError { provider.dhAgree(id, ByteArray(32)) }
             assertEquals("SCP-CRYPTO-4060", error.code)
-            assertTrue(error.cause is IllegalStateException)
-        }
-    }
-
-    @Test
-    fun `P256 and HPKE P256 fail closed with SCP-CRYPTO-4060`() {
-        runTest {
-            for (type in listOf(CustodyKeyType.P256, CustodyKeyType.HPKE_P256)) {
-                val error = cryptoError { provider.generateKeypair(type, CustodyKeyRole.OPERATIONAL) }
-                assertEquals("SCP-CRYPTO-4060", error.code, type.name)
-            }
-            assertTrue(custody.softwareKeys.isEmpty())
+            assertTrue(error.cause is ScpException)
         }
     }
 
@@ -289,7 +267,7 @@ class UniffiKeyCustodyTest {
     fun `an Ed25519 key's role survives a new custody instance`() {
         runTest {
             val id = provider.generateKeypair(CustodyKeyType.ED25519, CustodyKeyRole.IDENTITY)
-            val restored = UniffiKeyCustody(AndroidKeyCustody(prefs))
+            val restored = UniffiKeyCustody(AndroidKeyCustody.create(prefs, JcaFakeKeystoreKeys()))
             assertEquals(CustodyKeyRole.IDENTITY, restored.getPublicKey(id).role)
             assertArrayEquals(provider.getPublicKey(id).publicKey, restored.getPublicKey(id).publicKey)
         }
@@ -307,7 +285,8 @@ class UniffiKeyCustodyTest {
     @Test
     fun `a role write that does not commit fails closed and leaves no key`() {
         runTest {
-            val failing = AndroidKeyCustody(FailingPrefs(prefs, "scp.role.", throwOnWrite = false))
+            val failingPrefs = FailingPrefs(prefs, "scp.role.", throwOnWrite = false)
+            val failing = AndroidKeyCustody.create(failingPrefs, JcaFakeKeystoreKeys())
             val error = cryptoError {
                 UniffiKeyCustody(failing).generateKeypair(CustodyKeyType.ED25519, CustodyKeyRole.IDENTITY)
             }
@@ -320,12 +299,13 @@ class UniffiKeyCustodyTest {
     @Test
     fun `a seed write that throws leaves neither the key nor its role`() {
         runTest {
-            val failing = AndroidKeyCustody(FailingPrefs(prefs, "scp.ed25519.", throwOnWrite = true))
+            val failingPrefs = FailingPrefs(prefs, "scp.ed25519.", throwOnWrite = true)
+            val failing = AndroidKeyCustody.create(failingPrefs, JcaFakeKeystoreKeys())
             val error = cryptoError {
                 UniffiKeyCustody(failing).generateKeypair(CustodyKeyType.ED25519, CustodyKeyRole.IDENTITY)
             }
             assertEquals("SCP-CRYPTO-4060", error.code)
-            assertTrue(error.cause is IllegalStateException)
+            assertTrue(error.cause?.cause is IllegalStateException)
             assertTrue(failing.softwareKeys.isEmpty())
             assertTrue(failing.softwareKeyTypes.isEmpty())
             assertTrue(prefs.all.isEmpty(), "left behind: ${prefs.all.keys}")

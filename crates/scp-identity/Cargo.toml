@@ -26,7 +26,7 @@ scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 # with a typed `IdentityError` (SCP-IDENT-1059) rather than mint the nullifier —
 # so `scp-platform/testing` is gone from the shipped graph. The `testing`
 # crate-feature (below) re-adds it for the test harness only. `software_platform`
-# supplies the Ed25519/X25519 crypto primitives. `in-memory-storage` is NOT
+# supplies the Ed25519/P-256 crypto primitives. `in-memory-storage` is NOT
 # enabled on this normal edge: `InMemoryStorage` is used only by `config.rs`'s
 # `#[cfg(test)]` persisted-round-trip test, which reaches it via the `testing`
 # dev-dependency (which pulls `in-memory-storage`) — no non-test code needs it.

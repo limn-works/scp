@@ -9,7 +9,7 @@
 //! - The host's `get_public_key` answers with a typed [`HostPublicKey`]: the
 //!   key's [`KeyType`], its public key, and the [`KeyRole`] the host minted it
 //!   in. [`registered_key`] requires the exact length for the stated type
-//!   (Ed25519 32, X25519 32, P-256 signing 33, HPKE P-256 65) and a valid key.
+//!   (Ed25519 32, P-256 signing 33, HPKE P-256 65) and a valid key.
 //!   The bridge never infers a type from a length.
 //! - [`CallbackKeyRegistry`] caches the type, public key and role of each
 //!   handle this adapter minted or resolved. The host owns whether a key
@@ -58,7 +58,7 @@ use scp_platform::traits::{
 pub struct HostPublicKey {
     /// The key's type.
     pub key_type: KeyType,
-    /// The public key: 32 bytes (Ed25519, X25519), the 33-byte compressed
+    /// The public key: 32 bytes (Ed25519), the 33-byte compressed
     /// SEC1 point ([`KeyType::P256Signing`]), or the 65-byte uncompressed SEC1
     /// point ([`KeyType::HpkeP256`]).
     pub public_key: Vec<u8>,
@@ -103,8 +103,6 @@ impl HostPublicKey {
 pub enum RegisteredKey {
     /// An Ed25519 key and its verifying key.
     Ed25519(VerifyingKey),
-    /// An X25519 key and its public key.
-    X25519([u8; 32]),
     /// A P-256 signing key and its public key.
     P256Signing(P256PublicKey),
     /// A P-256 HPKE key and its public key.
@@ -117,7 +115,6 @@ impl RegisteredKey {
     pub const fn key_type(&self) -> KeyType {
         match self {
             Self::Ed25519(_) => KeyType::Ed25519,
-            Self::X25519(_) => KeyType::X25519,
             Self::P256Signing(_) => KeyType::P256Signing,
             Self::HpkeP256(_) => KeyType::HpkeP256,
         }
@@ -130,7 +127,6 @@ impl RegisteredKey {
     pub fn public_bytes(&self) -> Vec<u8> {
         match self {
             Self::Ed25519(vk) => vk.to_bytes().to_vec(),
-            Self::X25519(pk) => pk.to_vec(),
             Self::P256Signing(pk) => pk.to_compressed().to_vec(),
             Self::HpkeP256(pk) => pk.to_uncompressed().to_vec(),
         }
@@ -273,7 +269,7 @@ impl CallbackKeyRegistry {
 /// Validates a host's `get_public_key` answer.
 ///
 /// The public key must have exactly the stated type's length (Ed25519 32,
-/// X25519 32, P-256 signing 33, HPKE P-256 65) and be a valid key: a non-weak
+/// P-256 signing 33, HPKE P-256 65) and be a valid key: a non-weak
 /// Ed25519 point, or a P-256 point on the curve that is not the identity.
 ///
 /// # Errors
@@ -292,7 +288,7 @@ pub fn registered_key(
         KeyType::HpkeP256 => Ok(RegisteredKey::HpkeP256(p256_public_key(
             method, key_type, bytes,
         )?)),
-        KeyType::Ed25519 | KeyType::X25519 => {
+        KeyType::Ed25519 => {
             let raw: [u8; 32] = bytes.try_into().map_err(|_| {
                 PlatformError::CustodyError(format!(
                     "KeyCustodyProvider.{method} returned {} bytes for a {} key, expected 32",
@@ -300,9 +296,6 @@ pub fn registered_key(
                     key_type.as_str()
                 ))
             })?;
-            if key_type == KeyType::X25519 {
-                return Ok(RegisteredKey::X25519(raw));
-            }
             match VerifyingKey::from_bytes(&raw) {
                 Ok(vk) if !vk.is_weak() => Ok(RegisteredKey::Ed25519(vk)),
                 _ => Err(PlatformError::CustodyError(format!(
@@ -331,7 +324,7 @@ pub fn p256_public_key(
     let expected_len = match key_type {
         KeyType::P256Signing => COMPRESSED_POINT_LEN,
         KeyType::HpkeP256 => UNCOMPRESSED_POINT_LEN,
-        KeyType::Ed25519 | KeyType::X25519 => {
+        KeyType::Ed25519 => {
             return Err(PlatformError::CustodyError(format!(
                 "{key_type:?} is not a P-256 key type"
             )));
@@ -441,20 +434,6 @@ pub fn p256_peer_for_host(
     peer_public: &[u8],
 ) -> Result<[u8; UNCOMPRESSED_POINT_LEN], PlatformError> {
     scp_platform::traits::hpke_p256_peer(peer_public).map(|pk| pk.to_uncompressed())
-}
-
-/// Requires a 32-byte X25519 peer public key.
-///
-/// # Errors
-///
-/// [`PlatformError::CustodyError`] when `peer_public` is not 32 bytes.
-pub fn x25519_peer(peer_public: &[u8]) -> Result<[u8; 32], PlatformError> {
-    peer_public.try_into().map_err(|_| {
-        PlatformError::CustodyError(format!(
-            "an X25519 peer public key is 32 bytes, got {}",
-            peer_public.len()
-        ))
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -673,7 +652,6 @@ where
         RegisteredKey::Ed25519(vk) => {
             ed25519_host_signature(&vk, data, host_sign(key_id, data.to_vec()).await?)
         }
-        k @ RegisteredKey::X25519(_) => Err(k.wrong_type(KeyType::Ed25519)),
         k @ RegisteredKey::HpkeP256(_) => Err(k.wrong_type(KeyType::P256Signing)),
     }
 }
@@ -721,8 +699,8 @@ where
 
 /// `KeyCustody::dh_agree` over a host provider.
 ///
-/// An HPKE P-256 key requires a valid 65-byte uncompressed peer point, an
-/// X25519 key a 32-byte peer, both checked before the host call. A signing
+/// An HPKE P-256 key requires a valid 65-byte uncompressed peer point,
+/// checked before the host call. A signing
 /// key is [`PlatformError::WrongKeyType`] without a host call. The host must
 /// return exactly 32 bytes, which are zeroized once copied.
 ///
@@ -745,9 +723,9 @@ where
 {
     let peer = match resolve(registry, key, &host_get_public_key).await?.0.key {
         RegisteredKey::HpkeP256(_) => p256_peer_for_host(peer_public)?.to_vec(),
-        RegisteredKey::X25519(_) => x25519_peer(peer_public)?.to_vec(),
-        k @ RegisteredKey::Ed25519(_) => return Err(k.wrong_type(KeyType::X25519)),
-        k @ RegisteredKey::P256Signing(_) => return Err(k.wrong_type(KeyType::HpkeP256)),
+        k @ (RegisteredKey::Ed25519(_) | RegisteredKey::P256Signing(_)) => {
+            return Err(k.wrong_type(KeyType::HpkeP256));
+        }
     };
     let shared = zeroize::Zeroizing::new(host_dh_agree(key.id().to_string(), peer).await?);
     Ok(SharedSecret::new(crate::custody_parse::expect_32(
@@ -786,59 +764,6 @@ where
         }
         Err(e) => Err(e),
     }
-}
-
-/// The verifying key of an Ed25519 handle, resolving a handle the cache
-/// lacks like every other entry point.
-///
-/// # Errors
-///
-/// [`PlatformError::WrongKeyType`] for another type, or as in [`resolve`].
-async fn require_ed25519<P, PF>(
-    registry: &CallbackKeyRegistry,
-    key: &KeyHandle,
-    host_get_public_key: &P,
-) -> Result<VerifyingKey, PlatformError>
-where
-    P: Fn(String) -> PF + Sync,
-    PF: Future<Output = Result<HostPublicKey, PlatformError>>,
-{
-    match resolve(registry, key, host_get_public_key).await?.0.key {
-        RegisteredKey::Ed25519(vk) => Ok(vk),
-        k => Err(k.wrong_type(KeyType::Ed25519)),
-    }
-}
-
-/// `KeyCustody::ed25519_to_x25519_agree` over a host provider. The host
-/// protocol has no separate birational conversion, so the host's `dh_agree`
-/// runs on the Ed25519 key with the 32-byte X25519 peer.
-///
-/// # Errors
-///
-/// [`PlatformError::WrongKeyType`] for a handle that is not Ed25519, with no
-/// agreement call; any host error; [`PlatformError::CustodyError`] when the
-/// host returns other than 32 bytes; as in [`resolve`].
-pub async fn ed25519_to_x25519_agree<H, HF, P, PF>(
-    registry: &CallbackKeyRegistry,
-    key: &KeyHandle,
-    peer_x25519_public: &[u8; 32],
-    host_dh_agree: H,
-    host_get_public_key: P,
-) -> Result<SharedSecret, PlatformError>
-where
-    H: FnOnce(String, Vec<u8>) -> HF,
-    HF: Future<Output = Result<Vec<u8>, PlatformError>>,
-    P: Fn(String) -> PF + Sync,
-    PF: Future<Output = Result<HostPublicKey, PlatformError>>,
-{
-    require_ed25519(registry, key, &host_get_public_key).await?;
-    let shared = zeroize::Zeroizing::new(
-        host_dh_agree(key.id().to_string(), peer_x25519_public.to_vec()).await?,
-    );
-    Ok(SharedSecret::new(crate::custody_parse::expect_32(
-        "ed25519_to_x25519_agree",
-        &shared,
-    )?))
 }
 
 /// `KeyCustody::derive_pseudonym` (`epoch` `None`) and
@@ -1037,7 +962,7 @@ pub mod fake_host {
         ///
         /// # Errors
         ///
-        /// An X25519 key type.
+        /// A poisoned key or role map.
         pub fn generate_keypair(
             &self,
             key_type: KeyType,
@@ -1056,11 +981,6 @@ pub mod fake_host {
                 }
                 KeyType::P256Signing => HostKey::P256(p256()?),
                 KeyType::HpkeP256 => HostKey::HpkeP256(p256()?),
-                KeyType::X25519 => {
-                    return Err(PlatformError::CustodyError(
-                        "fake host does not hold x25519 keys".into(),
-                    ));
-                }
             };
             locked(&self.roles)?.insert(id.to_string(), role);
             locked(&self.keys)?.insert(id.to_string(), key);
@@ -1386,14 +1306,9 @@ mod tests {
     fn host_answers_bind_by_stated_type_and_exact_length() {
         let p = p256(0x21).public_key();
         let e = ed(0x31).verifying_key();
-        let x = [9u8; 32];
         assert_eq!(
             registered_key("m", &answer(KeyType::Ed25519, &e.to_bytes())).unwrap(),
             RegisteredKey::Ed25519(e)
-        );
-        assert_eq!(
-            registered_key("m", &answer(KeyType::X25519, &x)).unwrap(),
-            RegisteredKey::X25519(x)
         );
         assert_eq!(
             registered_key("m", &answer(KeyType::P256Signing, &p.to_compressed())).unwrap(),
@@ -1409,12 +1324,11 @@ mod tests {
         identity[0] = 1;
         let refused: Vec<HostPublicKey> = vec![
             answer(KeyType::Ed25519, &p.to_compressed()),
-            answer(KeyType::X25519, &p.to_compressed()),
             answer(KeyType::P256Signing, &e.to_bytes()),
             answer(KeyType::P256Signing, &p.to_uncompressed()),
             answer(KeyType::HpkeP256, &p.to_compressed()),
             answer(KeyType::Ed25519, &[0u8; 31]),
-            answer(KeyType::X25519, &[0u8; 33]),
+            answer(KeyType::Ed25519, &[0u8; 33]),
             answer(KeyType::Ed25519, &identity),
             answer(KeyType::P256Signing, &[&[0x02][..], &[0xFF; 32]].concat()),
         ];
@@ -1467,8 +1381,6 @@ mod tests {
         assert!(p256_peer_for_host(&bad_prefix).is_err());
         assert!(p256_peer_for_host(&[4u8; 65]).is_err());
         assert!(p256_peer_for_host(&[]).is_err());
-        assert!(x25519_peer(&[0u8; 32]).is_ok());
-        assert!(x25519_peer(&[0u8; 65]).is_err());
     }
 
     /// An Ed25519 handle, minted or resolved, rejects a host that returns
@@ -1697,30 +1609,24 @@ mod tests {
 
     /// Every entry point resolves an unregistered handle the same way,
     /// with one host lookup, and binds the same operational entry, whichever
-    /// runs first. Before this, `dh_agree` and the Ed25519-only operations
-    /// returned `KeyNotFound` for a handle `sign` would have resolved.
+    /// runs first. Before this, `dh_agree` returned `KeyNotFound` for a
+    /// handle `sign` would have resolved.
     #[tokio::test]
     async fn every_entry_point_resolves_an_unregistered_handle() {
         let e = ed(0x71);
         let p = p256(0x72);
-        let x25519 = [0x73u8; 32];
         let h = KeyHandle::new(42);
         let peer_x = [5u8; 32];
         let peer_p = p256(0x74).public_key().to_uncompressed();
 
         // (answer, the entry point run first); each must resolve and bind.
         let ed_a = ed_answer(&e);
-        let x_a = answer(KeyType::X25519, &x25519);
         let hpke_a = hpke_answer(&p);
         let cases: Vec<(&HostPublicKey, &str)> = vec![
             (&ed_a, "sign"),
             (&ed_a, "public_key"),
-            (&ed_a, "require_ed25519"),
             (&ed_a, "dh_agree"),
-            (&x_a, "dh_agree"),
-            (&x_a, "public_key"),
-            (&x_a, "require_ed25519"),
-            (&x_a, "sign"),
+            (&hpke_a, "public_key"),
             (&hpke_a, "dh_agree"),
             (&hpke_a, "sign"),
         ];
@@ -1746,7 +1652,6 @@ mod tests {
                 "public_key" => public_key(&registry, &h, &l).await.map(|pk| {
                     assert_eq!(pk.as_bytes(), expected.public_bytes().as_slice());
                 }),
-                "require_ed25519" => require_ed25519(&registry, &h, &l).await.map(|_| ()),
                 "dh_agree" => {
                     let peer = if host_answer.key_type == KeyType::HpkeP256 {
                         peer_p.to_vec()
@@ -1759,12 +1664,11 @@ mod tests {
                 }
                 other => unreachable!("{other}"),
             };
-            // The type decides the outcome, never the order: signing and
-            // Ed25519-only operations need Ed25519, agreement needs an
-            // agreement key.
+            // The type decides the outcome, never the order: signing needs
+            // Ed25519, agreement needs an agreement key.
             let fits = !matches!(
                 (host_answer.key_type.as_str(), first),
-                ("ed25519", "dh_agree") | ("x25519" | "hpke-p256", "sign" | "require_ed25519")
+                ("ed25519", "dh_agree") | ("hpke-p256", "sign")
             );
             assert_eq!(
                 result.is_ok(),
@@ -1821,10 +1725,6 @@ mod tests {
             Err(PlatformError::KeyNotFound)
         ));
         assert!(matches!(
-            require_ed25519(&registry, &h, &missing).await,
-            Err(PlatformError::KeyNotFound)
-        ));
-        assert!(matches!(
             public_key(&registry, &h, missing).await,
             Err(PlatformError::KeyNotFound)
         ));
@@ -1842,7 +1742,7 @@ mod tests {
             answer(KeyType::Ed25519, &p.public_key().to_compressed()),
             answer(KeyType::P256Signing, &p.public_key().to_uncompressed()),
             answer(KeyType::HpkeP256, &p.public_key().to_compressed()),
-            answer(KeyType::X25519, &[1u8; 31]),
+            answer(KeyType::HpkeP256, &[4u8; 64]),
         ] {
             let registry = CallbackKeyRegistry::new();
             let calls = AtomicUsize::new(0);
@@ -1907,55 +1807,6 @@ mod tests {
         assert_eq!(registry.get(&h).unwrap(), Some(entry));
     }
 
-    /// `require_ed25519` refuses a P-256, an HPKE and an X25519 entry
-    /// with `WrongKeyType`, and returns an Ed25519 one's verifying key.
-    #[tokio::test]
-    async fn require_ed25519_refuses_every_other_type() {
-        let registry = CallbackKeyRegistry::new();
-        let p = p256(0xA1).public_key();
-        live(
-            &registry,
-            1,
-            RegisteredKey::P256Signing(p),
-            KeyRole::Operational,
-        );
-        live(
-            &registry,
-            2,
-            RegisteredKey::HpkeP256(p),
-            KeyRole::Operational,
-        );
-        live(
-            &registry,
-            3,
-            RegisteredKey::X25519([1; 32]),
-            KeyRole::Operational,
-        );
-        live(
-            &registry,
-            4,
-            RegisteredKey::Ed25519(ed(0xA2).verifying_key()),
-            KeyRole::Operational,
-        );
-        for (id, actual) in [
-            (1, KeyType::P256Signing),
-            (2, KeyType::HpkeP256),
-            (3, KeyType::X25519),
-        ] {
-            assert!(matches!(
-                require_ed25519(&registry, &KeyHandle::new(id), &no_lookup).await,
-                Err(PlatformError::WrongKeyType { expected: KeyType::Ed25519, actual: a })
-                    if a == actual
-            ));
-        }
-        assert_eq!(
-            require_ed25519(&registry, &KeyHandle::new(4), &no_lookup)
-                .await
-                .unwrap(),
-            ed(0xA2).verifying_key()
-        );
-    }
-
     /// A registered HPKE key whose host point changes after generation
     /// is a custody error from `public_key`; so is one whose host now states
     /// another type for the same bytes, or another role for the same key.
@@ -2009,32 +1860,33 @@ mod tests {
         );
     }
 
-    /// An X25519 handle given a 33-byte peer is a custody error with no
-    /// host call; a 32-byte peer reaches the host.
+    /// An HPKE P-256 handle given a compressed peer point is a custody error
+    /// with no host call; a 65-byte uncompressed point reaches the host.
     #[tokio::test]
-    async fn x25519_agree_checks_the_peer_before_the_host() {
+    async fn hpke_agree_checks_the_peer_before_the_host() {
         let registry = CallbackKeyRegistry::new();
         live(
             &registry,
             3,
-            RegisteredKey::X25519([2; 32]),
+            RegisteredKey::HpkeP256(p256(0x93).public_key()),
             KeyRole::Operational,
         );
         let h = KeyHandle::new(3);
+        let peer = p256(0x94).public_key();
         let agreed = AtomicUsize::new(0);
         let host = |_: String, peer: Vec<u8>| {
             agreed.fetch_add(1, Ordering::Relaxed);
             async move {
-                assert_eq!(peer.len(), 32);
+                assert_eq!(peer.len(), 65);
                 Ok(vec![7u8; 32])
             }
         };
         assert!(matches!(
-            dh_agree(&registry, &h, &[4u8; 33], host, no_lookup).await,
+            dh_agree(&registry, &h, &peer.to_compressed(), host, no_lookup).await,
             Err(PlatformError::CustodyError(_))
         ));
         assert_eq!(agreed.load(Ordering::Relaxed), 0);
-        let shared = dh_agree(&registry, &h, &[4u8; 32], host, no_lookup)
+        let shared = dh_agree(&registry, &h, &peer.to_uncompressed(), host, no_lookup)
             .await
             .unwrap();
         assert_eq!(shared.as_bytes(), &[7u8; 32]);
@@ -2230,7 +2082,7 @@ mod tests {
         let e = ed(6);
         let cases: Vec<Case> = vec![
             (KeyType::Ed25519, "not-a-number", Ok(ed_answer(&e))),
-            (KeyType::X25519, "", Ok(answer(KeyType::X25519, &[1; 32]))),
+            (KeyType::HpkeP256, "", Ok(hpke_answer(&valid))),
             (KeyType::P256Signing, "-1", Ok(p256_answer(&valid))),
             (KeyType::HpkeP256, "0x10", Ok(hpke_answer(&valid))),
             (KeyType::P256Signing, "07", Ok(p256_answer(&valid))),
@@ -2265,12 +2117,8 @@ mod tests {
             ),
             // The host states another type than the one requested.
             (KeyType::P256Signing, "15", Ok(hpke_answer(&valid))),
-            (
-                KeyType::Ed25519,
-                "16",
-                Ok(answer(KeyType::X25519, &e.verifying_key().to_bytes())),
-            ),
-            (KeyType::X25519, "17", Ok(ed_answer(&e))),
+            (KeyType::Ed25519, "16", Ok(p256_answer(&valid))),
+            (KeyType::HpkeP256, "17", Ok(ed_answer(&e))),
             // The host reports another role than the one requested.
             (KeyType::Ed25519, "18", Ok(as_identity(ed_answer(&e)))),
             (

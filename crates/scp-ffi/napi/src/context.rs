@@ -30,61 +30,6 @@ use crate::runtime::NapiBridgeInstance;
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
-// MLS key package generation for context join (#1294)
-// ---------------------------------------------------------------------------
-
-/// Generates TLS-serialized MLS key package bytes for a DID.
-///
-/// Creates an `ScpCredential` from the DID, generates a fresh
-/// `KeyPackage` via `scp_core::crypto::mls::group::generate_key_package`,
-/// and TLS-serializes it to bytes suitable for
-/// `ContextCryptoProvider::validate_key_package` and `add_member`.
-///
-/// Uses `generate_key_package_with_context_params` so the leaf **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
-/// be added to an encrypted context group (`valn0502`, §5.13.3). The base
-/// `generate_key_package` declares no `0xFF02` capability and real MLS rejects
-/// it from a context group. The leaf carries `wrapping_public` as its `0xFF01`
-/// extension: the identity's wrapping public key, whose secret the supervisor
-/// holds (spec 09 §9.16.1).
-///
-/// # Errors
-///
-/// Returns `ScpNapiError::Crypto` if the DID format is invalid (must be
-/// `did:dht:z...`), key package generation fails, or TLS serialization
-/// fails.
-fn generate_mls_key_package_bytes(
-    did: &str,
-    wrapping_public: &[u8; 65],
-) -> Result<Vec<u8>, ScpNapiError> {
-    use scp_core::crypto::mls::credential::ScpCredential;
-    use scp_core::crypto::mls::group::generate_key_package_with_context_params;
-    use tls_codec::Serialize as TlsSerializeTrait;
-
-    let cred =
-        ScpCredential::new(did.to_owned(), None, scp_did::SigningKeyId::Active).map_err(|e| {
-            ScpNapiError::Crypto {
-                message: format!("failed to create SCP credential for MLS key package: {e}"),
-                code: codes::CRYPTO_4010.to_owned(),
-            }
-        })?;
-
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, wrapping_public, &scp_clock::SystemClock)
-            .map_err(|e| ScpNapiError::Crypto {
-            message: format!("MLS key package generation failed: {e}"),
-            code: codes::CRYPTO_4011.to_owned(),
-        })?;
-
-    kp_bundle
-        .key_package()
-        .tls_serialize_detached()
-        .map_err(|e| ScpNapiError::Crypto {
-            message: format!("MLS key package TLS serialization failed: {e}"),
-            code: codes::CRYPTO_4012.to_owned(),
-        })
-}
-
-// ---------------------------------------------------------------------------
 // NapiContextHandle — opaque JS class for SCP contexts
 // ---------------------------------------------------------------------------
 
@@ -476,19 +421,11 @@ async fn announce_pseudonym_best_effort(
     context_id: &str,
     params: scp_core::context::ContextParams,
 ) {
-    // Extract custody + key handle from the registry (sync), then export the
-    // signing key asynchronously — avoids block_on inside an async fn.
-    let Some((custody, key_handle)) = crate::runtime::with_identity(bi, did, |entry| {
-        Ok((entry.custody.clone(), entry.identity.active_signing_key))
-    })
-    .ok() else {
-        return;
-    };
     // Best effort by design (see the UniFFI bridge's
     // `announce_pseudonym_best_effort`): peers recover on the next explicit
     // announcement. A failure is logged, never discarded silently. The
     // announcement signs through custody (ADR-049 Decision 7a).
-    let signer = match scp_ffi_common::signer::identity_command_signer(custody, key_handle).await {
+    let signer = match crate::runtime::identity_active_signer(bi, did).await {
         Ok(signer) => signer,
         Err(e) => {
             tracing::warn!(
@@ -1050,11 +987,7 @@ pub(crate) async fn context_join_on(
     // validated by NodeMlsFactory::validate_key_package before MLS
     // group addition. It runs after derivation, so a joiner with no key
     // material fails with derivation's `SCP-IDENT-1054` first.
-    let wrapping_public = crate::runtime::supervisor(bi)?
-        .wrapping_public_key(&DID(identity_did.clone()))
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-    let kp_bytes = generate_mls_key_package_bytes(&identity_did, &wrapping_public)?;
+    let kp_bytes = mint_self_join_key_package(bi, &identity_did).await?;
 
     let key_package = scp_core::context::membership::KeyPackage {
         owner_did: DID(identity_did.clone()),
@@ -1160,7 +1093,7 @@ pub struct NapiKeyPackageReservation {
 /// named-field object per the agent-first API tenet, mirroring the `PyO3`
 /// reference bridge's `PySealedInvitation` and the runtime wire type
 /// [`SealedInvitation`](scp_core::context::invitation_helpers::SealedInvitation):
-/// `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and `ciphertext` is
+/// `enc` is the RFC 9180 DHKEM(P-256) encapsulated key (65 bytes) and `ciphertext` is
 /// the HPKE ciphertext (`ct = ciphertext || tag`) of the serialized, signed
 /// `InvitationBundle`. Both are opaque bytes — the joiner does not interpret
 /// them; the runtime opens the bundle and authenticates it. `context_id` /
@@ -1172,8 +1105,9 @@ pub struct NapiSealedInvitation {
     pub context_id: String,
     /// Binding hint: the creator DID the bundle was sealed by.
     pub creator_did: String,
-    /// RFC 9180 HPKE encapsulated key (`enc`). Length is validated to be
-    /// exactly 32 bytes at the join boundary (fail-closed).
+    /// RFC 9180 DHKEM(P-256) encapsulated key (`enc`): a 65-byte
+    /// uncompressed point. The join validates it before any custody call
+    /// (spec 09 §9.16.2, fail-closed).
     pub enc: Vec<u8>,
     /// RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`).
     pub ciphertext: Vec<u8>,
@@ -1311,6 +1245,21 @@ fn ensure_local_custody(bi: &NapiBridgeInstance, did: &str) -> napi::Result<()> 
     crate::runtime::with_identity(bi, did, |_| Ok(())).map_err(NapiError::from)
 }
 
+/// Mints the `KeyPackage` `identity_did` joins a context with: its leaf carries
+/// the identity's wrapping key (`0xFF01`) and a `0xFF03` attestation signed
+/// through the identity's `#active` custody key (spec 09 §9.7.1). A mint
+/// failure keeps its typed `ContextError` code.
+async fn mint_self_join_key_package(
+    bi: &NapiBridgeInstance,
+    identity_did: &str,
+) -> napi::Result<Vec<u8>> {
+    let active_signer = crate::runtime::identity_active_signer(bi, identity_did).await?;
+    crate::runtime::supervisor(bi)?
+        .mint_attested_key_package(&DID(identity_did.to_owned()), &active_signer)
+        .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))
+}
+
 /// Per-bridge-instance implementation of `reserve_key_package`.
 ///
 /// Reserves one of the owning identity's pooled MLS `KeyPackage`s for a
@@ -1336,18 +1285,21 @@ pub(crate) async fn reserve_key_package_on(
     // one and refuses with SCP-CTX-2000 until an earlier operation has.
     crate::runtime::init_supervisor(bi, &owning_did);
 
+    // Every pooled KeyPackage carries a `0xFF03` attestation signed through
+    // the identity's `#active` custody key (spec 09 §9.7.1).
+    let active_signer = crate::runtime::identity_active_signer(bi, &owning_did).await?;
     let sup = crate::runtime::supervisor(bi)?;
     let sup = Arc::clone(sup);
-    let (reservation_id, kp_public) =
-        sup.reserve_key_package(DID(owning_did))
-            .await
-            .map_err(|e| {
-                NapiError::from(typed_supervisor_failure(
-                    "reserve_key_package",
-                    codes::CTX_2000,
-                    &e,
-                ))
-            })?;
+    let (reservation_id, kp_public) = sup
+        .reserve_key_package(DID(owning_did), &active_signer)
+        .await
+        .map_err(|e| {
+            NapiError::from(typed_supervisor_failure(
+                "reserve_key_package",
+                codes::CTX_2000,
+                &e,
+            ))
+        })?;
 
     Ok(NapiKeyPackageReservation {
         reservation_id: reservation_id.to_string(),
@@ -1428,20 +1380,6 @@ pub(crate) async fn context_join_from_welcome_on(
     let local_pseudonym =
         derive_member_pseudonym_required(bi, &owning_did, &sealed.context_id).await?;
 
-    // Fail-closed: the HPKE encapsulated key (`enc`) MUST be exactly 32 bytes.
-    // Reject a malformed length BEFORE any registry mutation or the irreversible
-    // KeyPackage consume, rather than letting a short/long buffer fail deep
-    // inside the HPKE open.
-    let sealed_bundle_enc =
-        scp_ffi_common::custody_parse::expect_32("sealed_bundle_enc", &sealed.enc).map_err(
-            |e| {
-                NapiError::from(ScpNapiError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7005.to_owned(),
-                })
-            },
-        )?;
-
     // Reconstruct the opaque reservation id via its sanctioned transparent serde
     // form (a bare string). It is a lookup key, not a capability — a bogus id
     // simply fails the fused consume match downstream, it grants nothing. Parsed
@@ -1466,11 +1404,11 @@ pub(crate) async fn context_join_from_welcome_on(
     let sup = Arc::clone(sup);
 
     // Resolve the joiner's OWN custody provider + `#active` KeyHandle (the same
-    // locally-custodied identity the pseudonym was derived from). The runtime
-    // needs these to open the sealed bundle and drive the join under the joiner's
-    // key material — private keys never cross the FFI, only the opaque custody
-    // handle + KeyHandle do (ADR-006). Retained (custody `Arc` cloned,
-    // `KeyHandle` is `Copy`) so the returned handle can sign subsequent ops.
+    // locally-custodied identity the pseudonym was derived from), retained
+    // (custody `Arc` cloned, `KeyHandle` is `Copy`) so the returned handle can
+    // sign subsequent ops. The join itself opens the sealed bundle through the
+    // supervisor's own wrapping key for this identity (spec 09 §9.16.1); no
+    // private key crosses the FFI (ADR-006).
     let (custody, active_handle) = crate::runtime::with_identity(bi, &owning_did, |entry| {
         Ok((entry.custody.clone(), entry.identity.active_signing_key))
     })
@@ -1495,7 +1433,7 @@ pub(crate) async fn context_join_from_welcome_on(
     let req = scp_core::context::supervisor::WelcomeJoinRequest {
         creator_did: DID(sealed.creator_did.clone()),
         context_id: sealed.context_id.clone(),
-        sealed_bundle_enc,
+        sealed_bundle_enc: sealed.enc.clone(),
         sealed_bundle_ct: sealed.ciphertext.clone(),
         reservation_id: reservation,
         local_pseudonym: Some(local_pseudonym),
@@ -1507,14 +1445,15 @@ pub(crate) async fn context_join_from_welcome_on(
     // discovery entry) back so an errored join leaves no orphaned bridge state
     // beside a runtime that never committed.
     let core_handle = match sup
-        .spawn_actor_from_welcome(DID(owning_did.clone()), &*custody, &active_handle, req)
+        .spawn_actor_from_welcome(DID(owning_did.clone()), req)
         .await
     {
         Ok(handle) => handle,
         Err(e) => {
             crate::runtime::remove_context(bi, &sealed.context_id);
-            // A typed custody failure keeps its custody code (a destroyed
-            // `#active` key is `SCP-CRYPTO-4006`) through `typed_supervisor_failure`.
+            // A typed custody failure keeps its custody code (a wrapping key
+            // the custody cannot agree with is `SCP-CRYPTO-4006`) through
+            // `typed_supervisor_failure`.
             return Err(NapiError::from(typed_supervisor_failure(
                 "context_join_from_welcome",
                 codes::CTX_2013,
@@ -1628,13 +1567,7 @@ pub(crate) async fn invite_member_on(
     // SCP-IDENT-1001, before any context lookup), then build the custody signer
     // the invite signs through (ADR-049 Decision 7a). The private key stays in
     // custody.
-    let (custody, active_handle) = crate::runtime::with_identity(bi, &creator_did, |entry| {
-        Ok((entry.custody.clone(), entry.identity.active_signing_key))
-    })
-    .map_err(NapiError::from)?;
-    let signer = scp_ffi_common::signer::identity_command_signer(custody, active_handle)
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    let signer = crate::runtime::identity_active_signer(bi, &creator_did).await?;
 
     let outcome = sup
         .invite_member(
@@ -3675,19 +3608,8 @@ pub(crate) async fn context_reconnect_on(
     // Resolve the local member's Ed25519 signing key from the identity
     // registry (used to sign the Phase-3 consistency checkpoint). Private
     // key never crosses FFI beyond this in-process driver call.
-    let (custody, key_handle) = crate::runtime::with_identity(bi, &identity_did, |entry| {
-        Ok((entry.custody.clone(), entry.identity.active_signing_key))
-    })
-    .map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("cannot resolve signing key for reconnect: {e}"),
-            code: codes::IDENT_1001.to_owned(),
-        })
-    })?;
     // The Phase-3 checkpoint signs through custody (ADR-049 Decision 7a).
-    let signer = scp_ffi_common::signer::identity_command_signer(custody, key_handle)
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    let signer = crate::runtime::identity_active_signer(bi, &identity_did).await?;
 
     let contacts: std::collections::HashMap<String, u64> = last_relay_contacts
         .unwrap_or_default()
@@ -5518,51 +5440,44 @@ fn parse_template_id_napi(
     }
 }
 
-/// Maps a failed supervisor call that otherwise reports every failure under
-/// one fixed `code` to the bridge error, keeping `ActorBusy` and
-/// `SupervisorShutDown` apart.
+/// Maps a failed supervisor call named `op` to the bridge error.
 ///
-/// `ActorBusy` reports `SCP-CTX-2130` (ADR-049 §10), whose producers and retry
-/// behaviour the `ContextError::ActorBusy` doc states. `SupervisorShutDown`
-/// reports `SCP-CTX-2138`. `Custody` keeps its custody code
-/// ([`ScpNapiError::custody_failure`]: a destroyed `#active` key is
-/// `SCP-CRYPTO-4006`). Every other failure reports `code`.
-/// The Welcome join, the key-package reservation and the invite map their
-/// errors through it.
-fn typed_supervisor_failure(
+/// Every variant the shared `classify_context_error` gives a dedicated code
+/// keeps that code (through `From<ContextError>`): `ActorBusy` reports
+/// `SCP-CTX-2130`, `SupervisorShutDown` `SCP-CTX-2138`, `Custody` its custody
+/// code, a malformed invitation `enc` `SCP-VALID-7005`, and so on. A variant
+/// with no dedicated code reports `code`, the call's fixed fallback.
+pub(crate) fn typed_supervisor_failure(
     op: &str,
     code: &str,
     e: &scp_core::context::ContextError,
 ) -> ScpNapiError {
-    let code = match e {
-        scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
-        scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
-        scp_core::context::ContextError::Custody(failure) => {
-            return ScpNapiError::custody_failure(format!("{op} failed: {e}"), failure);
-        }
-        _ => code,
-    };
-    ScpNapiError::Context {
-        message: format!("{op} failed: {e}"),
-        code: code.to_owned(),
+    let message = format!("{op} failed: {e}");
+    if !scp_ffi_common::context_error_class::has_dedicated_code(e) {
+        return ScpNapiError::Context {
+            message,
+            code: code.to_owned(),
+        };
     }
+    ScpNapiError::from_context_error(message, e)
 }
 
-/// Maps a refused `CreateContext` to its SDK error. The core's empty-ceiling
-/// rejection keeps its typed validation code (construction.md M2), and a
-/// create refused because Supervisor shutdown began keeps SCP-CTX-2138; every
-/// other failure carries SCP-CTX-2000.
-fn create_context_failure(e: scp_core::context::builder::ContextCreationError) -> ScpNapiError {
-    match e {
-        scp_core::context::builder::ContextCreationError::StateTransition(
-            scp_core::context::ContextError::CeilingRequired(_)
-            | scp_core::context::ContextError::SupervisorShutDown(_),
-        ) => ScpNapiError::from(e),
-        other => ScpNapiError::Context {
+/// Maps a refused `CreateContext` to its SDK error. A wrapped error with a
+/// dedicated code keeps it (`scp_ffi_common::context_error_class::
+/// coded_creation_failure`): the core's empty-ceiling rejection its validation
+/// code (construction.md M2), a create refused because Supervisor shutdown
+/// began SCP-CTX-2138, a custody failure its custody code. Every other failure
+/// carries SCP-CTX-2000.
+pub(crate) fn create_context_failure(
+    e: scp_core::context::builder::ContextCreationError,
+) -> ScpNapiError {
+    scp_ffi_common::context_error_class::coded_creation_failure(e).map_or_else(
+        |other| ScpNapiError::Context {
             message: format!("create_context failed: {other}"),
             code: codes::CTX_2000.to_owned(),
         },
-    }
+        ScpNapiError::from,
+    )
 }
 
 /// Dispatches `cmd` to `context_id` through the Supervisor `supervisor` still
@@ -6042,12 +5957,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_from_welcome_rejects_non_locally_custodied_joiner() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        // A well-formed 32-byte `enc` so the failure isolates the custody gate
-        // (which runs BEFORE the enc-length check), not a length rejection.
+        // A valid 65-byte P-256 `enc`, so the failure isolates the custody
+        // gate rather than the runtime's enc validation.
         let sealed = super::NapiSealedInvitation {
             context_id: "0".repeat(64),
             creator_did: "did:dht:z6MkSomeNapiCreator".to_owned(),
-            enc: vec![0u8; 32],
+            enc: scp_crypto::p256::testing::valid_uncompressed_point(1).to_vec(),
             ciphertext: b"not-a-real-bundle".to_vec(),
         };
         let Err(err) = super::context_join_from_welcome_on(
@@ -6068,49 +5983,50 @@ mod tests {
         );
     }
 
-    /// ADR-049 Phase 2J / FFI-02 Option A (reshape): the reshaped
-    /// `context_join_from_welcome` no longer takes caller `params`, so there is no
-    /// `mode` field to inspect — broadcast rejection moved INSIDE the runtime (a
-    /// broadcast context carries no MLS Welcome, spec §5.14, so it fails at the
-    /// fused `ConfirmConsume`). The NEW bridge-level fail-closed boundary is the
-    /// HPKE `enc` length: it MUST be exactly 32 bytes (RFC 9180 X25519
-    /// encapsulated key). A wrong-length `enc` is rejected BEFORE the irreversible
-    /// `KeyPackage` consume.
+    /// Spec 09 §9.16.2 Open step 1: the join validates the HPKE `enc` as a
+    /// 65-byte uncompressed P-256 point before any custody call or the
+    /// irreversible `KeyPackage` consume. The bridge passes `enc` through
+    /// unchanged; the runtime's rejection reaches the caller and the failed
+    /// join leaves no FFI state.
     ///
-    /// Not false-green: a locally-custodied joiner is used so the custody gate
-    /// SUCCEEDS and control reaches the enc-length check; were that check removed,
-    /// the malformed `enc` would instead fail deep inside the HPKE open with a
-    /// different message, not the exact "expected 32" surfaced here.
+    /// Each §9.5 must-fail form is driven through the real entry point with a
+    /// locally-custodied joiner, so the custody gate passes. Were the runtime
+    /// check removed, every row would instead fail at the bogus reservation
+    /// with a different message, not "invitation enc".
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn context_join_from_welcome_rejects_non_32_byte_enc() {
+    async fn context_join_from_welcome_rejects_a_malformed_enc() {
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        // Locally-custodied joiner so the pseudonym-derivation custody gate passes
-        // and control reaches the fail-closed enc-length check.
         let joiner_did = register_in_memory_joiner(&bi).await;
+        let ctx_id = "c".repeat(64);
 
-        // 31-byte `enc` — one short of the required 32.
-        let sealed = super::NapiSealedInvitation {
-            context_id: "c".repeat(64),
-            creator_did: "did:dht:z6MkNapiEncLenCreator".to_owned(),
-            enc: vec![0u8; 31],
-            ciphertext: b"bogus-ciphertext".to_vec(),
-        };
-        let Err(err) = super::context_join_from_welcome_on(
-            &bi,
-            joiner_did,
-            sealed,
-            "bogus-reservation-id".to_owned(),
-        )
-        .await
-        else {
-            panic!("a non-32-byte HPKE enc must be rejected at the bridge boundary");
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("expected 32"),
-            "expected a fail-closed 32-byte enc-length rejection, got: {msg}"
-        );
+        for (name, enc) in scp_crypto::p256::testing::invalid_point_encodings(2) {
+            let sealed = super::NapiSealedInvitation {
+                context_id: ctx_id.clone(),
+                creator_did: "did:dht:z6MkNapiEncLenCreator".to_owned(),
+                enc,
+                ciphertext: b"bogus-ciphertext".to_vec(),
+            };
+            let Err(err) = super::context_join_from_welcome_on(
+                &bi,
+                joiner_did.clone(),
+                sealed,
+                "bogus-reservation-id".to_owned(),
+            )
+            .await
+            else {
+                panic!("{name}: a malformed HPKE enc must be rejected");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(codes::VALID_7005),
+                "{name}: expected the runtime's enc rejection as SCP-VALID-7005, got: {msg}"
+            );
+            assert!(
+                crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
+                "{name}: FFI (UCAN) state must NOT survive a failed join"
+            );
+        }
     }
 
     /// ADR-049 Phase 2J (orphaned-success fix): `context_join_from_welcome`
@@ -6139,13 +6055,13 @@ mod tests {
         let _closed_handle = active_handle_for(&bi, &ctx_id, "did:dht:z6MkNapiRollbackCreator");
         crate::runtime::release_context(&bi, &ctx_id);
 
-        // A well-formed 32-byte `enc` passes the bridge enc-length check, so the
-        // failure is the runtime join itself (bogus reservation + ciphertext) —
-        // exactly the register -> spawn seam the rollback guards.
+        // A valid 65-byte P-256 `enc`, so the failure is the runtime join
+        // itself (bogus reservation + ciphertext) — exactly the register ->
+        // spawn seam the rollback guards.
         let sealed = super::NapiSealedInvitation {
             context_id: ctx_id.clone(),
             creator_did: "did:dht:z6MkNapiRollbackCreator".to_owned(),
-            enc: vec![0u8; 32],
+            enc: scp_crypto::p256::testing::valid_uncompressed_point(3).to_vec(),
             ciphertext: b"bogus-bundle-ciphertext".to_vec(),
         };
         let Err(err) = super::context_join_from_welcome_on(
@@ -6411,48 +6327,179 @@ mod tests {
         );
     }
 
-    /// A join whose `#active` key custody no longer holds fails at the
-    /// runtime's invitation KEM agreement (the first step of the join) with a
-    /// typed custody failure, which the bridge reports as `SCP-CRYPTO-4006`
-    /// through `typed_supervisor_failure` and still rolls its reversible state
-    /// back.
+    /// A join whose custody no longer holds the identity's wrapping key fails
+    /// at the runtime's custody check of that key (spec 09 §9.16.2 Open step
+    /// 2) with a typed custody failure, which the bridge reports as
+    /// `SCP-CRYPTO-4006` through `typed_supervisor_failure`, and still rolls
+    /// its reversible state back.
+    ///
+    /// The reservation is real, so the join reaches the custody call; the
+    /// wrapping key is destroyed after the reservation loaded it.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn join_from_welcome_with_a_destroyed_active_key_is_crypto_4006() {
-        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        let joiner_did = register_in_memory_joiner(&bi).await;
-        let (custody, active) = crate::runtime::with_identity(&bi, &joiner_did, |entry| {
-            Ok((entry.custody.clone(), entry.identity.active_signing_key))
-        })
-        .expect("the joiner is registered");
-        scp_platform::traits::KeyCustody::destroy_key(custody.as_ref(), &active)
+    async fn join_from_welcome_with_a_destroyed_wrapping_key_is_crypto_4006() {
+        use scp_platform::traits::KeyCustody as _;
+        // `identity_create` installs the resolver the reservation's
+        // attestation signer reads, as production does.
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let joiner_did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create succeeds")
+            .inner
+            .did
+            .clone();
+        let reservation = super::reserve_key_package_on(&bi, joiner_did.clone())
+            .await
+            .expect("the joiner reserves a KeyPackage")
+            .reservation_id;
+        let custody =
+            crate::runtime::with_identity(&bi, &joiner_did, |entry| Ok(entry.custody.clone()))
+                .expect("the joiner is registered");
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+        let handle = sup
+            .testing_wrapping_key_handle(&DID(joiner_did.clone()))
+            .await
+            .expect("the reservation loaded the wrapping key");
+        custody
+            .destroy_key(&handle)
             .await
             .expect("destroy_key should succeed");
+
         let ctx_id = "b".repeat(64);
         let sealed = super::NapiSealedInvitation {
             context_id: ctx_id.clone(),
-            creator_did: "did:dht:z6MkNapiDestroyedActiveCreator".to_owned(),
-            enc: vec![0u8; 32],
+            creator_did: "did:dht:z6MkNapiDestroyedWrappingCreator".to_owned(),
+            enc: scp_crypto::p256::testing::valid_uncompressed_point(5).to_vec(),
             ciphertext: b"bogus-bundle-ciphertext".to_vec(),
         };
-        let Err(err) = super::context_join_from_welcome_on(
-            &bi,
-            joiner_did,
-            sealed,
-            "bogus-reservation-id".to_owned(),
-        )
-        .await
+        let Err(err) =
+            super::context_join_from_welcome_on(&bi, joiner_did, sealed, reservation).await
         else {
-            panic!("a join under a destroyed #active key must fail");
+            panic!("a join under a destroyed wrapping key must fail");
         };
         assert!(
             err.reason.contains(codes::CRYPTO_4006),
-            "expected CRYPTO_4006 for a destroyed #active key, got: {}",
+            "expected CRYPTO_4006 for a destroyed wrapping key, got: {}",
             err.reason
         );
         assert!(
             crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_err(),
             "FFI (UCAN) state must NOT survive a failed join"
+        );
+    }
+
+    /// The `KeyPackage` a plain join mints verifies as an adder verifies it
+    /// (§9.7.1): its `0xFF03` attestation verifies against the identity's
+    /// resolved `#active` key, and its `0xFF01` is the identity's custody
+    /// wrapping key.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_join_key_package_carries_a_verifying_attestation() {
+        // `identity_create` publishes the DID document and installs the
+        // resolver the supervisor's key resolver reads, as production does.
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create succeeds")
+            .inner
+            .did
+            .clone();
+        // A plain join refuses until an earlier operation attached the
+        // supervisor, so attach it as that operation would.
+        crate::runtime::init_supervisor(&bi, &did);
+        let kp = super::mint_self_join_key_package(&bi, &did)
+            .await
+            .expect("the self-join mint succeeds");
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+        let owner = DID(did);
+        let wrap = sup
+            .verify_key_package_attestation(&owner, &kp)
+            .await
+            .expect("the attestation verifies against the identity's #active key");
+        assert_eq!(
+            *wrap.as_bytes(),
+            sup.wrapping_public_key(&owner)
+                .await
+                .expect("the identity has a custody wrapping key"),
+            "0xFF01 is the identity's custody wrapping key"
+        );
+    }
+
+    /// A self-join mint whose registered `#active` handle holds a key other
+    /// than the one the identity's DID document resolves as `#active` mints
+    /// nothing and fails with `SCP-CRYPTO-4066` (§9.7.1).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_join_mint_refuses_a_handle_that_is_not_the_resolved_active_key() {
+        use scp_platform::KeyCustody as _;
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create succeeds")
+            .inner
+            .did
+            .clone();
+        crate::runtime::init_supervisor(&bi, &did);
+        let custody =
+            crate::runtime::with_identity(&bi, &did, |e| Ok(Arc::clone(&e.custody))).unwrap();
+        let other = custody
+            .generate_keypair(scp_platform::KeyType::Ed25519)
+            .await
+            .expect("custody generates a second Ed25519 key");
+        crate::runtime::with_identity_mut(&bi, &did, |e| {
+            e.identity.active_signing_key = other;
+            Ok(())
+        })
+        .unwrap();
+
+        let err = super::mint_self_join_key_package(&bi, &did)
+            .await
+            .expect_err("a handle that is not the resolved #active mints nothing");
+        assert!(
+            err.reason
+                .starts_with(&format!("[{}] ", codes::CRYPTO_4066)),
+            "{}",
+            err.reason
+        );
+    }
+
+    /// A self-join mint for an identity whose DID document does not resolve
+    /// mints nothing and fails with `SCP-CRYPTO-4065` (§9.7.1). The identity's
+    /// custody and keys are real; only the DID it is registered under has no
+    /// published document.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn self_join_mint_fails_closed_when_the_owner_does_not_resolve() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = Arc::clone(&scp.inner);
+        let did = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create succeeds")
+            .inner
+            .did
+            .clone();
+        crate::runtime::init_supervisor(&bi, &did);
+        let unpublished = "did:dht:z6MkSelfJoinOwnerNeverPublished";
+        let (_, entry) = crate::runtime::identity_registry(&bi)
+            .remove(&did)
+            .expect("the identity is registered");
+        crate::runtime::register_identity(&bi, unpublished, entry);
+
+        let err = super::mint_self_join_key_package(&bi, unpublished)
+            .await
+            .expect_err("an owner that does not resolve mints nothing");
+        assert!(
+            err.reason
+                .starts_with(&format!("[{}] ", codes::CRYPTO_4065)),
+            "{}",
+            err.reason
         );
     }
 
@@ -6476,13 +6523,13 @@ mod tests {
         // Pre-occupy the FFI-state slot for this context id.
         crate::runtime::register_test_context(&bi, &ctx_id);
 
-        // A well-formed 32-byte `enc` so control passes the bridge enc-length
-        // check and reaches the `register_ffi_state` Occupied precheck (which runs
-        // BEFORE the KeyPackage consume).
+        // A valid 65-byte P-256 `enc`, so the only defect is the occupied
+        // slot, checked by the `register_ffi_state` precheck BEFORE the
+        // KeyPackage consume.
         let sealed = super::NapiSealedInvitation {
             context_id: ctx_id.clone(),
             creator_did: "did:dht:z6MkNapiOccupiedCreator".to_owned(),
-            enc: vec![0u8; 32],
+            enc: scp_crypto::p256::testing::valid_uncompressed_point(4).to_vec(),
             ciphertext: b"bogus-bundle-ciphertext".to_vec(),
         };
         let Err(err) = super::context_join_from_welcome_on(
@@ -6506,6 +6553,49 @@ mod tests {
         assert!(
             crate::runtime::with_context(&bi, &ctx_id, |_| Ok(())).is_ok(),
             "the pre-existing FFI state must be preserved on an Occupied-precheck failure"
+        );
+    }
+
+    /// A `KeyPackage` the inviter rejects (§9.7.1) reports `SCP-CRYPTO-4067`,
+    /// the code every bridge reports for `ContextError::InvalidKeyPackage`,
+    /// not the call's `SCP-CTX-2013` fallback. The context is live and
+    /// single-admin, so the `KeyPackage` check is the first step that fails.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invite_member_rejects_an_invalid_key_package_with_its_code() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let creator = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create should succeed");
+        let params_json = serde_json::json!({
+            "mode": "encrypted",
+            "ceiling": ["messages:read", "member:invite"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create_on(&bi, &creator, params_json)
+            .await
+            .expect("context_create should succeed");
+
+        let Err(err) = super::invite_member_on(
+            &bi,
+            handle.context_id.clone(),
+            creator.inner.did.clone(),
+            "did:dht:z6MkNapiInviteeBadKeyPackage".to_owned(),
+            b"bogus-key-package".to_vec(),
+        )
+        .await
+        else {
+            panic!("an invalid KeyPackage must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::CRYPTO_4067) && !msg.contains(codes::CTX_2013),
+            "expected {}, got: {msg}",
+            codes::CRYPTO_4067
         );
     }
 
@@ -7884,7 +7974,8 @@ mod tests {
     /// A Welcome join, a key-package reservation or an invite that meets a
     /// busy actor reports `SCP-CTX-2130`, one refused because Supervisor
     /// shutdown began reports `SCP-CTX-2138`, and any other failure reads the
-    /// operation's own code.
+    /// operation's own code. The custody error table in `error.rs` runs every
+    /// custody failure kind through this path.
     #[test]
     fn typed_supervisor_failure_keeps_typed_codes() {
         use scp_core::context::ContextError;
@@ -7917,29 +8008,6 @@ mod tests {
                 )),
                 fallback
             );
-            for (kind, expected) in [
-                (
-                    scp_crypto::CustodyFailureKind::KeyNotFound,
-                    codes::CRYPTO_4006,
-                ),
-                (scp_crypto::CustodyFailureKind::TimedOut, codes::CRYPTO_4062),
-                (scp_crypto::CustodyFailureKind::Failed, codes::CRYPTO_4060),
-            ] {
-                let failure = scp_crypto::CustodyFailure {
-                    kind,
-                    detail: "custody detail".to_owned(),
-                };
-                match super::typed_supervisor_failure(
-                    "context_join_from_welcome",
-                    fallback,
-                    &ContextError::Custody(failure),
-                ) {
-                    crate::error::ScpNapiError::Crypto { code, .. } => {
-                        assert_eq!(code, expected);
-                    }
-                    other => panic!("expected a {expected} Crypto error, got {other:?}"),
-                }
-            }
         }
     }
 

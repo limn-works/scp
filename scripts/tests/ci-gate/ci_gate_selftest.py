@@ -851,6 +851,7 @@ RUST_ONLY_RUNS = {
     "docker-image": True,
     "docker-image-cache": True,
     "fuzz-build": False,
+    "kotlin-android-instrumented": False,
     "kotlin-lint": False,
     "kotlin-test": True,
     "napi-addon": True,
@@ -6798,7 +6799,7 @@ RUST_TEST_SHARDS = (
     ),
     (
         f"{NEXTEST} -p scp-alloc -p scp-sqlite-pools -p scp-clock -p scp-crypto -p scp-did "
-        "-p scp-dht -p scp-identity -p scp-event-log -p scp-protocol "
+        "-p scp-kel -p scp-dht -p scp-identity -p scp-event-log -p scp-protocol "
         "-p scp-relay-client -p scp-mls -p scp-client -p scp-client-wasm -p scp-relay-mock "
         "-p scp-transport -p scp-mcp -p scp-media -p scp-node -p scp-relay --features "
         "serde_json/unbounded_depth,rustix/net,scp-crypto/testing,scp-identity/testing,scp-testing/testing,"

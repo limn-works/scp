@@ -104,6 +104,14 @@ scp-did = { path = "../scp-did", features = ["testing"] }
 # so it stays inside the D5 fence.
 scp-relay-client = { path = "../scp-relay-client" }
 
+# The key-event cross-target KAT (`tests/kel_cross_target_kat.rs`) checks
+# scp-kel's preimage, digest, seal, commitment and routing ids against spec 25
+# §25.26 through §25.29 on native and wasm32 (09-security-model.md §9.7.4.2).
+# It includes scp-kel's test fixtures by path, and they decode their hex with
+# `hex`. scp-kel is a leaf with no I/O and no runtime, inside the ADR-057 fence.
+scp-kel = { path = "../scp-kel" }
+hex = { workspace = true }
+
 # The pseudonym-derivation cross-target KAT exercises the wasm-safe
 # `scp-crypto::pseudonym` derivation (§9.10.4.A, ADR-057 Option A) on BOTH native
 # and wasm32, asserting byte-parity against the §25.19 golden vectors. A

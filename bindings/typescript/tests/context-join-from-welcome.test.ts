@@ -28,11 +28,11 @@
  *
  *  2. **Real NAPI addon.** When the platform addon is built (with
  *     `testing`), exercises the real reserve → invite → join
- *     handshake: the SingleAdmin unilateral invite produces a real sealed bundle
- *     from a `reserveKeyPackage` KeyPackage (the invitee KP declares the 0xFF02
- *     context-binding extension), a malformed/garbage sealed bundle is rejected
- *     after arg marshaling, and the custody gates reject non-custodied
- *     inviter/joiner DIDs. Skips when the addon is absent, matching
+ *     handshake across two `SCP` instances: the SingleAdmin unilateral invite
+ *     seals to the invitee KeyPackage's DHKEM(P-256) wrapping key (a 65-byte
+ *     `enc`) and the invitee opens it and joins. A malformed `enc` or a
+ *     garbage sealed bundle is rejected after arg marshaling, and the custody
+ *     gates reject non-custodied inviter/joiner DIDs. Skips when the addon is absent, matching
  *     `identity-create-with-custody.test.ts` / `real-napi.test.ts`.
  */
 
@@ -43,7 +43,20 @@ import { SCP } from "../src/scp";
 import type { SealedInvitation } from "../src/types";
 import { createInMemoryIdentity } from "./harness-custody";
 import { mountMockScp } from "./mock-bridge";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
+
+/**
+ * The P-256 generator, SEC1-uncompressed: a valid 65-byte DHKEM(P-256) `enc`
+ * (spec 05 §5.12.3.1), so a join with it passes the runtime's `enc` check and
+ * fails at a later gate.
+ */
+const P256_G = new Uint8Array(
+  Buffer.from(
+    "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296" +
+      "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+    "hex",
+  ),
+);
 
 // ---------------------------------------------------------------------------
 // Layer 1 — delegation / marshaling via the mock native handle
@@ -238,7 +251,7 @@ describe("SCP.contextJoinFromWelcome — delegation, sealed-bundle marshaling", 
     const sealed: SealedInvitation = {
       contextId: "ctx-x",
       creatorDid: "did:dht:creator",
-      enc: new Uint8Array(32),
+      enc: P256_G,
       ciphertext: new Uint8Array([1, 2, 3]),
     };
 
@@ -252,21 +265,12 @@ describe("SCP.contextJoinFromWelcome — delegation, sealed-bundle marshaling", 
 // Layer 2 — real NAPI addon
 // ---------------------------------------------------------------------------
 
-let scpAvailable = false;
-let skipReason = "";
-try {
+const suite = await napiSuite(() => {
   const probe = new SCP({ storage: { type: "in_memory" } });
-  scpAvailable = true;
   probe.shutdown(1).catch(() => {});
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+});
 
-if (!scpAvailable) {
-  describe("reserve → invite → join handshake (SKIPPED)", () => {
-    test.skip(`native NAPI addon unavailable: ${skipReason}`, () => {});
-  });
-} else {
+suite.describe("reserve → invite → join handshake", () => {
   describe("SCP.reserveKeyPackage (real NAPI)", () => {
     test("reserves a real KeyPackage under a locally-custodied identity", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
@@ -306,9 +310,12 @@ if (!scpAvailable) {
         // Well-formed DID that passes format validation but is not a locally
         // custodied identity on this instance — the bridge custody gate fails
         // closed BEFORE any KeyPackage is consumed.
-        await expect(scp.reserveKeyPackage("did:dht:not-custodied-here")).rejects.toThrow(
-          /SCP-IDENT-1001/,
+        const err = await scp.reserveKeyPackage("did:dht:not-custodied-here").then(
+          () => undefined,
+          (e: unknown) => e,
         );
+        expect(err).toBeInstanceOf(IdentityError);
+        expect((err as IdentityError).code).toBe("SCP-IDENT-1001");
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }
@@ -362,16 +369,16 @@ if (!scpAvailable) {
 
         // The outcome carries a SealedInvitation `bundle` directly usable as the
         // join input (no re-assembly): its fields are exactly the
-        // `contextJoinFromWelcome` `sealed` parameter shape. The full two-party
-        // JOIN (a distinct joiner node consuming the bundle) is proven at the
-        // runtime layer (`spawn_from_welcome_tests`); a single BridgeInstance
-        // cannot self-join its own context (first-writer-wins rejects the second
-        // actor for the same context id).
+        // `contextJoinFromWelcome` `sealed` parameter shape. The join itself
+        // runs in "reserve → invite → join handshake (real NAPI)": one instance
+        // cannot self-join its own context (first-writer-wins rejects the
+        // second actor for the same context id).
         expect(outcome.bundle.contextId).toBe(ctx.contextId);
         expect(outcome.bundle.creatorDid).toBe(creator.did);
-        // RFC 9180 HPKE encapsulated key is exactly 32 bytes.
+        // A DHKEM(P-256) encapsulated key is a 65-byte uncompressed point.
         expect(outcome.bundle.enc).toBeInstanceOf(Uint8Array);
-        expect(outcome.bundle.enc.length).toBe(32);
+        expect(outcome.bundle.enc.length).toBe(65);
+        expect(outcome.bundle.enc[0]).toBe(0x04);
         // Non-empty HPKE ciphertext of the signed InvitationBundle.
         expect(outcome.bundle.ciphertext).toBeInstanceOf(Uint8Array);
         expect(outcome.bundle.ciphertext.length).toBeGreaterThan(0);
@@ -400,14 +407,19 @@ if (!scpAvailable) {
         // Well-formed DID that is not custodied on this instance: the invite is
         // signed under the inviter's `#active` key, so the identity-registry
         // lookup fails closed before the runtime driver call.
-        await expect(
-          scp.inviteMember(
+        const err = await scp
+          .inviteMember(
             ctx.contextId,
             "did:dht:not-custodied-here",
             invitee.did,
             reservation.keyPackagePublic,
-          ),
-        ).rejects.toThrow();
+          )
+          .then(
+            () => undefined,
+            (e: unknown) => e,
+          );
+        expect(err).toBeInstanceOf(IdentityError);
+        expect((err as IdentityError).code).toBe("SCP-IDENT-1001");
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }
@@ -424,41 +436,54 @@ if (!scpAvailable) {
         // A real reservation id from the pool — parses cleanly at the bridge.
         const reservation = await scp.reserveKeyPackage(joiner.did);
 
-        // A 32-byte `enc` passes the fail-closed length gate; the garbage
-        // ciphertext then fails deep in the real HPKE open / ConfirmConsume,
-        // proving the marshaled sealed-bundle bytes actually reached the native
-        // join and the wrapper does not mask the failure.
+        // A valid P-256 point passes the runtime's `enc` check; the garbage
+        // ciphertext then fails deep in the real HPKE open, proving the
+        // marshaled sealed-bundle bytes actually reached the native join and
+        // the wrapper does not mask the failure.
         const sealed: SealedInvitation = {
           contextId: "ctx-welcome-spawn",
           creatorDid: creator.did,
-          enc: new Uint8Array(32),
+          enc: P256_G,
           ciphertext: new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]),
         };
-        await expect(
-          scp.contextJoinFromWelcome(joiner.did, sealed, reservation.reservationId),
-        ).rejects.toThrow();
+        const err = await scp
+          .contextJoinFromWelcome(joiner.did, sealed, reservation.reservationId)
+          .then(
+            () => undefined,
+            (e: unknown) => e,
+          );
+        expect(err).toBeInstanceOf(Error);
+        expect((err as Error).message).not.toMatch(/invitation enc/);
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }
     });
 
-    test("join rejects a malformed (non-32-byte) enc at the boundary", async () => {
+    test("join rejects an enc that is not a 65-byte P-256 point", async () => {
       const scp = new SCP({ storage: { type: "in_memory" } });
       try {
         const joiner = await createInMemoryIdentity(scp);
         const creator = await createInMemoryIdentity(scp);
         const reservation = await scp.reserveKeyPackage(joiner.did);
 
-        // enc length gate is fail-closed: a 3-byte enc is rejected up front.
-        const sealed: SealedInvitation = {
-          contextId: "ctx-badenc",
-          creatorDid: creator.did,
-          enc: new Uint8Array([1, 2, 3]),
-          ciphertext: new Uint8Array([9]),
-        };
-        await expect(
-          scp.contextJoinFromWelcome(joiner.did, sealed, reservation.reservationId),
-        ).rejects.toThrow();
+        // The runtime validates `enc` before any custody call or the
+        // KeyPackage consume (spec 09 §9.16.2 Open step 1). The retired
+        // 32-byte X25519 width is rejected like any other length.
+        for (const enc of [new Uint8Array([1, 2, 3]), new Uint8Array(32)]) {
+          const sealed: SealedInvitation = {
+            contextId: "ctx-badenc",
+            creatorDid: creator.did,
+            enc,
+            ciphertext: new Uint8Array([9]),
+          };
+          const err = await scp
+            .contextJoinFromWelcome(joiner.did, sealed, reservation.reservationId)
+            .then(
+              () => undefined,
+              (e: unknown) => e,
+            );
+          expect((err as { code?: string } | undefined)?.code).toBe("SCP-VALID-7005");
+        }
       } finally {
         await scp.shutdown(1000).catch(() => {});
       }
@@ -472,7 +497,7 @@ if (!scpAvailable) {
         const sealed: SealedInvitation = {
           contextId: "ctx-nocustody",
           creatorDid: "did:dht:creator",
-          enc: new Uint8Array(32),
+          enc: P256_G,
           ciphertext: new Uint8Array([1, 2, 3]),
         };
         await expect(
@@ -487,4 +512,59 @@ if (!scpAvailable) {
       }
     });
   });
-}
+
+  describe("reserve → invite → join handshake (real NAPI)", () => {
+    test("bob seals to alice's P-256 wrapping key and alice joins from a second instance", async () => {
+      // napi instances in one process share one DHT, so each resolves the
+      // other's DID.
+      const bobScp = new SCP({ storage: { type: "in_memory" } });
+      const aliceScp = new SCP({ storage: { type: "in_memory" } });
+      try {
+        const bob = await createInMemoryIdentity(bobScp);
+        const alice = await createInMemoryIdentity(aliceScp);
+        const ctx = await bobScp.contextCreate(
+          bob,
+          JSON.stringify({
+            ceiling: [
+              "messages:read",
+              "messages:write",
+              "role:assign",
+              "member:invite",
+              "governance:propose",
+              "governance:vote",
+            ],
+            memoryScope: "ephemeral",
+            mode: "Encrypted",
+            governance: "single_admin",
+          }),
+        );
+
+        const reservation = await aliceScp.reserveKeyPackage(alice.did);
+        // Bob verifies the KeyPackage's attestation against alice's resolved
+        // `#active` and seals to its 0xFF01 key (spec 05 §5.12.3.1).
+        const outcome = await bobScp.inviteMember(
+          ctx.contextId,
+          bob.did,
+          alice.did,
+          reservation.keyPackagePublic,
+        );
+        expect(outcome.bundle.enc.length).toBe(65);
+        expect(outcome.bundle.enc[0]).toBe(0x04);
+
+        // Alice opens through `dh_agree` on her custody wrapping handle (spec
+        // 09 §9.16.2) and stands up the context.
+        const joined = await aliceScp.contextJoinFromWelcome(
+          alice.did,
+          outcome.bundle,
+          reservation.reservationId,
+        );
+        expect(joined).toBeInstanceOf(Context);
+        expect(joined.contextId).toBe(ctx.contextId);
+        expect(joined.identityDid).toBe(alice.did);
+      } finally {
+        await aliceScp.shutdown(1000).catch(() => {});
+        await bobScp.shutdown(1000).catch(() => {});
+      }
+    });
+  });
+});

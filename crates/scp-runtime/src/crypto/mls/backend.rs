@@ -16,8 +16,8 @@
 //!
 //! # Method contracts
 //!
-//! - `validate_key_package` / `generate_key_package` are cancel-safe and
-//!   side-effect-free on `ScpMlsGroup`. They construct fresh values; no
+//! - `validate_key_package`, `prepare_key_package` and `finish_key_package`
+//!   are cancel-safe and side-effect-free on `ScpMlsGroup`. They construct fresh values; no
 //!   caller state changes if the future is dropped mid-flight.
 //! - All other mutating methods are **cancel-hostile** on `&mut ScpMlsGroup`:
 //!   the group's internal epoch state may advance (via `merge_pending_commit`
@@ -46,10 +46,13 @@ use openmls::prelude::LeafNodeIndex;
 
 use super::storage_adapter::OpenMlsStorageAdapter;
 use scp_clock::Clock;
+use scp_did::DID;
+use scp_mls::attested_key_package::KeyPackageDraft;
 use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::DecryptedContent;
 use scp_mls::error::MlsError;
 use scp_mls::group::ScpMlsGroup;
+use scp_protocol::crypto::hpke::p256::P256Point;
 
 // ---------------------------------------------------------------------------
 // Wrapper output types
@@ -111,9 +114,14 @@ pub struct ValidatedKeyPackage {
     /// against the expected owner / member DID to bind the `KeyPackage` to an
     /// identity, with no second validation pass.
     pub credential_did: String,
+    /// The facts the same validated leaf states: its credential, its four
+    /// keys, its lifetime window, and its `0xFF01` wrapping key and `0xFF03`
+    /// attestation when it carries them (§9.7.1). An add path verifies the
+    /// attestation against these facts.
+    pub leaf: scp_mls::keypackage_attestation::KeyPackageLeafFacts,
 }
 
-/// Output of `generate_key_package` — pairs the wire bytes with the opaque
+/// Output of `finish_key_package` — pairs the wire bytes with the opaque
 /// signer state the caller must retain to later join from a Welcome.
 #[derive(Debug, Clone)]
 pub struct GeneratedKeyPackage {
@@ -131,7 +139,7 @@ pub struct GeneratedKeyPackage {
     pub signer_state: SignerState,
 }
 
-/// Opaque signer-state handle produced by `generate_key_package` and consumed
+/// Opaque signer-state handle produced by `finish_key_package` and consumed
 /// by `join_from_welcome`.
 ///
 /// The byte layout is defined by the [`MlsBackend`] implementation. Callers
@@ -179,7 +187,8 @@ impl std::fmt::Debug for SignerState {
 ///
 /// # Cancel-safety
 ///
-/// - `validate_key_package`, `generate_key_package`: cancel-safe,
+/// - `validate_key_package`, `prepare_key_package`, `finish_key_package`:
+///   cancel-safe,
 ///   side-effect-free on external state.
 /// - All other methods: cancel-hostile on `&mut ScpMlsGroup`. The supervisor
 ///   layer owns the rollback discipline (see saga journal).
@@ -297,22 +306,67 @@ pub trait MlsBackend: Send + Sync {
         clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError>;
 
-    /// Generates a fresh `KeyPackage` for `credential` whose leaf carries
-    /// `wrapping_pubkey` as its `scp_wrapping_key` extension. Returns the TLS-serialized KP
-    /// bytes plus an opaque signer-state handle the caller retains to later
-    /// join a group from a Welcome addressed to this KP.
+    /// Plans a fresh `KeyPackage` for `owning_did` whose credential and
+    /// `0xFF03` attestation (§9.7.1) both name the `#active` key, whose leaf
+    /// carries `wrapping_pubkey` as its `0xFF01` extension, and whose lifetime
+    /// is read from the backend's injected clock. The owner's `#active` key
+    /// signs the draft's [`KeyPackageDraft::signing_hash`], and
+    /// [`Self::finish_key_package`] builds the `KeyPackage` only when that
+    /// signature verifies under the attesting key the caller names.
     ///
     /// # Errors
     ///
-    /// See [`MlsError`]. Side-effect-free on external state.
-    async fn generate_key_package(
+    /// See [`scp_mls::attested_key_package::prepare_key_package`].
+    /// Side-effect-free on external state.
+    async fn prepare_key_package(
         &self,
-        credential: &ScpCredential,
+        owning_did: &DID,
         wrapping_pubkey: &[u8; 65],
+    ) -> Result<KeyPackageDraft, MlsError>;
+
+    /// Verifies `signature` over `draft`'s attestation hash under
+    /// `attesting_key`, then builds the `KeyPackage` with that signature in its
+    /// `0xFF03` attestation and returns the TLS-serialized bytes plus an
+    /// opaque signer-state handle the caller retains to later join a group
+    /// from a Welcome addressed to this KP.
+    ///
+    /// The signature check makes the attestation verify under
+    /// `attesting_key`; whether `attesting_key` is the owner's resolved
+    /// `#active` key is the caller's to establish (the runtime's
+    /// `KeyPackageAttestationSigner` resolves it before every mint).
+    ///
+    /// # Errors
+    ///
+    /// [`MlsError::KeyPackageAttestationSignatureInvalid`] when `signature`
+    /// does not verify under `attesting_key`, nothing built; otherwise see
+    /// [`KeyPackageDraft::finish`], and [`MlsError`] when the bundle does not
+    /// serialize. Side-effect-free on external state.
+    async fn finish_key_package(
+        &self,
+        draft: KeyPackageDraft,
+        signature: [u8; 64],
+        attesting_key: &ed25519_dalek::VerifyingKey,
     ) -> Result<GeneratedKeyPackage, MlsError>;
 
+    /// Returns the `0xFF01` `scp_wrapping_key` (§9.16.1) of the `KeyPackage`
+    /// that `signer_state` was generated for, read from the signer state's own
+    /// locally built `KeyPackageBundle`, or `None` when that leaf carries no
+    /// `0xFF01`. It parses no externally supplied `KeyPackage` and runs no
+    /// lifetime check, so a reservation's key reads the same whenever it is
+    /// asked.
+    ///
+    /// # Errors
+    ///
+    /// See [`MlsError`]: an unreadable signer state, a signer state with no
+    /// bundle for its own `KeyPackage`, or an `0xFF01` that is not a valid
+    /// P-256 point.
+    async fn reserved_wrapping_key(
+        &self,
+        signer_state: &SignerState,
+    ) -> Result<Option<P256Point>, MlsError>;
+
     /// Joins a group from a TLS-serialized MLS Welcome message using the
-    /// opaque `signer_state` previously returned by `generate_key_package`.
+    /// opaque `signer_state` previously returned by `finish_key_package`.
     ///
     /// `key_package_public_bytes` is the TLS-serialized public `KeyPackage`
     /// this signer-state was generated for. It is the single-use anchor's

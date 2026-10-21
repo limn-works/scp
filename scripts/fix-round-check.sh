@@ -101,7 +101,7 @@
 #      that reads a diff range, and every other gate in that list reads the working tree.
 #   6. Every compile of a crate source that the native `cargo check` above does not
 #      reach. `cargo check -p … --target wasm32-unknown-unknown` over scp-alloc,
-#      scp-clock, scp-crypto, scp-did, scp-protocol, scp-relay-client, scp-mls, scp-client,
+#      scp-clock, scp-crypto, scp-did, scp-kel, scp-protocol, scp-relay-client, scp-mls, scp-client,
 #      scp-event-log and scp-client-wasm, which the `wasm-protocol` job runs and which
 #      rejects a host-only API a native check accepts; `wasm-pack test` over
 #      scp-client-wasm, which the `wasm-test` job runs; `cargo doc --workspace --no-deps
@@ -703,6 +703,7 @@ WASM_TARGET_CRATES=(
     scp-clock
     scp-crypto
     scp-did
+    scp-kel
     scp-protocol
     scp-relay-client
     scp-mls

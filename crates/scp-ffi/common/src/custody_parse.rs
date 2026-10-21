@@ -153,8 +153,8 @@ mod tests {
             ),
             (
                 PlatformError::WrongKeyType {
-                    expected: scp_platform::traits::KeyType::Ed25519,
-                    actual: scp_platform::traits::KeyType::X25519,
+                    expected: scp_platform::traits::KeyType::P256Signing,
+                    actual: scp_platform::traits::KeyType::HpkeP256,
                 },
                 codes::CRYPTO_4060,
             ),

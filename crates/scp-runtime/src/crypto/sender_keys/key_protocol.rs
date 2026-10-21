@@ -215,7 +215,7 @@ pub async fn request_sender_key(
 /// # HPKE Assembly
 ///
 /// Seals via RFC 9180 HPKE Base mode (§9.16.2) through the shared
-/// `scp_protocol::crypto::hpke` core: a fresh ephemeral keypair performs
+/// `scp_protocol::crypto::hpke::p256` suite: a fresh ephemeral keypair performs
 /// DHKEM Encap to the requester's wrapping pubkey, `KeySchedule_base` derives
 /// the AEAD key/nonce, and a single seq-0 `Seal` produces the 48-byte
 /// ciphertext. The `ephemeral_pubkey` (HPKE `enc`) is returned in the

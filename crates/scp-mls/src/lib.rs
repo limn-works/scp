@@ -42,6 +42,8 @@
 //!   drop and refuses to store the MLS signer (persistence spec §17.9).
 //! - [`error`] — MLS-specific error types.
 //! - [`admission`] — SCP leaf admission for added and replaced leaves.
+//! - [`attested_key_package`] — Mints a `KeyPackage` whose leaf carries a
+//!   `0xFF03` attestation over the keys the leaf holds (§9.7.1).
 //!
 //! See ADR-001 in `.docs/adrs/phase-1.md` for the MLS wrapper design and
 //! ADR-057 for the `scp-mls` extraction.
@@ -51,6 +53,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod attested_key_package;
 pub mod context_extension;
 pub mod convergent_timestamp;
 pub mod credential;
@@ -77,11 +80,10 @@ pub use credential::ScpCredential;
 pub use encrypt::{DecryptedContent, InboundChange};
 pub use error::{MlsError, SignerDefect};
 pub use keypackage_attestation::{
-    AttestationLeafGroundTruth, AttestationResolutionVerifyError, AttestationTrigger,
-    AttestationVerifyError, KeyPackageAttestation, MAX_ATTESTATION_KEY_RESOLUTION_STALENESS,
-    MAX_KEYPACKAGE_ATTESTATION_LIFETIME, SCP_KEYPACKAGE_ATTESTATION_DOMAIN,
-    SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE, scp_capabilities_with_keypackage_attestation,
-    verify_attestation_with_resolution,
+    AttestationTrigger, AttestationVerifyError, KeyPackageAttestation,
+    MAX_ATTESTATION_KEY_RESOLUTION_STALENESS, MAX_KEYPACKAGE_ATTESTATION_LIFETIME,
+    SCP_KEYPACKAGE_ATTESTATION_DOMAIN, SCP_KEYPACKAGE_ATTESTATION_EXTENSION_TYPE,
+    require_active_signer,
 };
 
 // The MLS signing key pair appears in this crate's public op signatures

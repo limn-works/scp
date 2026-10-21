@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { loadNativeAddon } from "../src/internal/native";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 const PACKAGE_ROOT = join(import.meta.dir, "..");
 const README = join(PACKAGE_ROOT, "README.md");
@@ -83,16 +83,6 @@ async function runReadmeBlock(
   }
 }
 
-function addonInstalled(): boolean {
-  try {
-    loadNativeAddon();
-    return true;
-  } catch (e: unknown) {
-    skipReasonIfAddonAbsent(e);
-    return false;
-  }
-}
-
 describe("README block extraction", () => {
   it("reads the typescript block under the heading, not an earlier one", () => {
     const text =
@@ -108,9 +98,11 @@ describe("README block extraction", () => {
   });
 });
 
-const describeNapi = addonInstalled() ? describe : describe.skip;
+// The suite skips only when no NAPI addon is installed for this platform
+// (`napiSuite`); every other probe failure fails the file.
+const suite = await napiSuite(() => loadNativeAddon());
 
-describeNapi("README examples", () => {
+suite.describe("README examples", () => {
   it("the quick start runs and prints the DID and context it created", async () => {
     const { stdout, stderr, exitCode } = await runReadmeBlock(QUICK_START);
     expect(exitCode, `the README quick start failed:\n${stderr}`).toBe(0);

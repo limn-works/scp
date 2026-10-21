@@ -92,8 +92,8 @@ pub(crate) fn bob_signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0xB0; 32])
 }
 
-/// Resolves `alice_did` / `bob_did` to their fixed verifying keys (all else
-/// `None`). The joiner verifies the creator (`alice`) signature; the seal
+/// The shared test resolver over `alice_did` / `bob_did`: `#active` resolves
+/// to their fixed keys, `#agent` to other keys, all else `None`. The joiner verifies the creator (`alice`) signature; the seal
 /// addresses the invitee (`bob`) #active key. `pub(crate)` (crate-internal) so
 /// seam-level e2e tests can hand a real DID→key resolver to a production
 /// `ActorDeps` (e.g. to verify a §9.16.2 sender-key request signature). The
@@ -103,19 +103,10 @@ pub(crate) fn bob_signing_key() -> SigningKey {
 /// crate-wide).
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn pair_resolver(alice_did: &str, bob_did: &str) -> KeyResolver {
-    let alice = DID::from(alice_did);
-    let bob = DID::from(bob_did);
-    let alice_vk = alice_signing_key().verifying_key();
-    let bob_vk = bob_signing_key().verifying_key();
-    Arc::new(move |did: &DID, _| {
-        if did == &alice {
-            Some(alice_vk)
-        } else if did == &bob {
-            Some(bob_vk)
-        } else {
-            None
-        }
-    })
+    super::test_support::role_resolver(&[
+        (DID::from(alice_did), alice_signing_key()),
+        (DID::from(bob_did), bob_signing_key()),
+    ])
 }
 
 /// The joiner's legible context parameters (encrypted, single-admin) — the same
@@ -281,7 +272,10 @@ fn stand_up_two_party_blocking(ctx_str: &str, alice_did: &str, bob_did: &str) ->
             // key read back from his supervisor. The KP also declares `0xFF02`
             // (`scp_context_params`) unconditionally.
             let (reservation_id, kp_public_bytes) = bob_sup
-                .reserve_key_package(bob.clone())
+                .reserve_key_package(
+                    bob.clone(),
+                    &crate::context::actor::CommandSigner::local_ed25519(bob_signing_key()),
+                )
                 .await
                 .expect("bob reserves a real KeyPackage from his own store");
             let bob_wrapping = bob_sup

@@ -19,7 +19,8 @@ import XCTest
 /// the co-located Rust bridge tests, the join tests exercise: the reserve
 /// round-trip, single-use distinctness, the local-custody gate on both ops
 /// (fails BEFORE the `KeyPackage` is consumed), the DID validation gate, the
-/// 32-byte HPKE `enc` gate, and the real bundle opener rejecting a bogus bundle.
+/// runtime's P-256 `enc` check, and the real bundle opener rejecting a bogus
+/// bundle.
 final class ContextJoinFromWelcomeTests: XCTestCase {
     // Implicitly unwrapped because XCTest `setUp` initializes it before any
     // test method runs — the XCTest lifecycle guarantees non-nil.
@@ -32,6 +33,19 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     /// A valid creator DID for the join gate tests (custody-gate / enc-length
     /// checks fire before the bundle is opened, so the value need only parse).
     private static let sampleCreatorDid = "did:dht:z6MkCreatorForWelcomeJoinTest"
+
+    /// The P-256 generator, SEC1-uncompressed: a valid 65-byte DHKEM(P-256)
+    /// `enc` (spec 05 §5.12.3.1), so a join with it passes the runtime's `enc`
+    /// check and fails at a later gate.
+    private static let p256Generator = Data(
+        [0x04]
+            + [0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47, 0xF8, 0xBC, 0xE6, 0xE5,
+               0x63, 0xA4, 0x40, 0xF2, 0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33, 0xA0,
+               0xF4, 0xA1, 0x39, 0x45, 0xD8, 0x98, 0xC2, 0x96]
+            + [0x4F, 0xE3, 0x42, 0xE2, 0xFE, 0x1A, 0x7F, 0x9B, 0x8E, 0xE7, 0xEB, 0x4A,
+               0x7C, 0x0F, 0x9E, 0x16, 0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE,
+               0xCB, 0xB6, 0x40, 0x68, 0x37, 0xBF, 0x51, 0xF5] as [UInt8]
+    )
 
     override func setUpWithError() throws {
         try super.setUpWithError()
@@ -202,9 +216,10 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
             let contextId = await ctx.contextId
             switch outcome {
             case let .sealed(bundle, _):
-                XCTAssertFalse(
-                    bundle.enc.isEmpty, "sealed bundle enc (HPKE encapsulated key) must be non-empty"
-                )
+                // Sealed to the invitee's DHKEM(P-256) wrapping key: a 65-byte
+                // uncompressed point.
+                XCTAssertEqual(bundle.enc.count, 65, "a DHKEM(P-256) enc is 65 bytes")
+                XCTAssertEqual(bundle.enc.first, 0x04, "an uncompressed SEC1 point")
                 XCTAssertFalse(bundle.ciphertext.isEmpty, "sealed bundle ciphertext must be non-empty")
                 XCTAssertEqual(bundle.contextId, contextId)
                 XCTAssertEqual(bundle.creatorDid, creator.did())
@@ -256,7 +271,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
                 identity: loaded,
                 sealed: self.makeSealed(
                     creatorDid: Self.sampleCreatorDid,
-                    enc: Data(repeating: 0x00, count: 32),
+                    enc: Self.p256Generator,
                     ciphertext: Data([0x00, 0x01, 0x02])
                 ),
                 reservationId: "unused-reservation-id"
@@ -275,7 +290,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
                 identity: joiner,
                 sealed: makeSealed(
                     creatorDid: "not-a-did",
-                    enc: Data(repeating: 0x00, count: 32),
+                    enc: Self.p256Generator,
                     ciphertext: Data([0x00])
                 ),
                 reservationId: "unused-reservation-id"
@@ -289,33 +304,36 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
     }
 
     /// A custodied joiner with a real reservation but an HPKE `enc` that is not
-    /// exactly 32 bytes is rejected fail-closed by the length gate
-    /// (`ScpError.Validation`) BEFORE the bundle is opened or the reservation
-    /// consumed.
-    func testJoinFromWelcomeRejectsNon32ByteEnc() async throws {
+    /// a 65-byte uncompressed P-256 point is rejected by the runtime
+    /// (`ScpError.Validation`, `SCP-VALID-7005`) before any custody call or the reservation is
+    /// consumed (spec 09 §9.16.2 Open step 1). The retired 32-byte X25519
+    /// width is rejected like any other length.
+    func testJoinFromWelcomeRejectsAnEncThatIsNotAP256Point() async throws {
         let joiner = try await createInMemoryIdentity(scp)
         let reservation = try await scp.reserveKeyPackage(identity: joiner)
 
-        do {
-            _ = try await Context.joinFromWelcome(
-                scp: scp,
-                identity: joiner,
-                sealed: makeSealed(
-                    creatorDid: Self.sampleCreatorDid,
-                    enc: Data([0x00, 0x01, 0x02]),
-                    ciphertext: Data(repeating: 0xEE, count: 64)
-                ),
-                reservationId: reservation.reservationId
-            )
-            XCTFail("expected a non-32-byte HPKE enc to be rejected")
-        } catch let ScpError.Validation(_, code) {
-            XCTAssertFalse(code.isEmpty, "validation error must carry a code")
-        } catch {
-            XCTFail("expected ScpError.Validation, got \(error)")
+        for enc in [Data([0x00, 0x01, 0x02]), Data(repeating: 0x00, count: 32)] {
+            do {
+                _ = try await Context.joinFromWelcome(
+                    scp: scp,
+                    identity: joiner,
+                    sealed: makeSealed(
+                        creatorDid: Self.sampleCreatorDid,
+                        enc: enc,
+                        ciphertext: Data(repeating: 0xEE, count: 64)
+                    ),
+                    reservationId: reservation.reservationId
+                )
+                XCTFail("expected a \(enc.count)-byte HPKE enc to be rejected")
+            } catch let ScpError.Validation(_, code) {
+                XCTAssertEqual(code, "SCP-VALID-7005")
+            } catch {
+                XCTFail("expected ScpError.Validation, got \(error)")
+            }
         }
     }
 
-    /// With a custodied joiner, a real reservation, and a 32-byte `enc`, a bogus
+    /// With a custodied joiner, a real reservation, and a valid P-256 `enc`, a bogus
     /// (garbage) sealed bundle reaches the real HPKE opener and is rejected with
     /// an `ScpError` — the join does not silently succeed.
     func testJoinFromWelcomeRejectsBogusBundle() async throws {
@@ -328,7 +346,7 @@ final class ContextJoinFromWelcomeTests: XCTestCase {
                 identity: joiner,
                 sealed: makeSealed(
                     creatorDid: Self.sampleCreatorDid,
-                    enc: Data(repeating: 0xEE, count: 32),
+                    enc: Self.p256Generator,
                     ciphertext: Data(repeating: 0xEE, count: 64)
                 ),
                 reservationId: reservation.reservationId

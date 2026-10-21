@@ -4,7 +4,7 @@
 
 An identity's identifier is the digest of its inception event's signed preimage, and it encodes no key (`09-security-model.md` §9.7.4.2 R13). It is not a username, not an email, and not an account on someone's server.
 
-**The identifier's text form is `scp:` followed by the RFC 4648 base32 encoding of its 32 bytes, in lowercase and without padding**, which is 52 base32 characters and 56 characters in all. **That form is the one canonical form, and a parser MUST reject every other string with `IdentityError::NonCanonicalIdentifier`**, uppercase or padded base32 and a DID string included (§3.10.10). Every field that carries an identifier as a string carries this form: every signed structure `09-security-model.md` §9.5.2 enumerates, a UCAN's `iss` and `aud`, a context's membership records, and the runtime's keys. Vector 57 of `25-test-vectors.md` §25.29 pins the encoding.
+**The identifier's text form is `scp:` followed by the RFC 4648 base32 encoding of its 32 bytes, in lowercase and without padding**, which is 52 base32 characters and 56 characters in all. **That form is the one canonical form, and a parser MUST reject every other string with `IdentityError::NonCanonicalIdentifier`, or with a `NonCanonicalIdentifier` error of its own that the identity API maps to that variant**, uppercase or padded base32 and a DID string included (§3.10.10). Every field that carries an identifier as a string carries this form: every signed structure `09-security-model.md` §9.5.2 enumerates, a UCAN's `iss` and `aud`, a context's membership records, and the runtime's keys. Vector 57 of `25-test-vectors.md` §25.29 pins the encoding.
 
 The identifier never changes. A root change installs a fresh root set under the same identifier, so a relying party re-verifies key continuity against that set rather than reading a rename (`09-security-model.md` §9.11).
 
@@ -819,7 +819,7 @@ pub enum SignatureGroup { Reveal, InstalledRoot, StandingRoot }
 
 /// A composed event awaiting its signatures.
 pub struct PendingEvent {
-    pub identifier: [u8; 32],
+    pub identifier: Identifier,
     pub preimage: Vec<u8>,
     pub event_digest: [u8; 32],
 }
@@ -830,7 +830,7 @@ pub struct IndexedSignature { pub group: SignatureGroup, pub index: u8, pub sign
 
 /// One designated witness: the operator identifier its community-relay-list
 /// entry declares (`09-security-model.md` §9.7.4.2 definitions).
-pub struct WitnessDesignation { pub operator: [u8; 32] }
+pub struct WitnessDesignation { pub operator: Identifier }
 
 /// Why `rotate_active` replaces the `#active` key, which decides the replaced
 /// key's condition.
@@ -845,10 +845,10 @@ The one unit a section outside this one reproduces, delimited here so it reprodu
 ```rust
 /// Key-state resolution across the SCP relay network (§3.10.4).
 pub trait IdentityBackend: Send + Sync {
-    /// `identifier` is the 32 raw digest bytes of the inception-derived
-    /// identifier (`09-security-model.md` §9.7.4.2 R13), never its text form,
+    /// `identifier` is the inception-derived identifier as its 32 raw digest
+    /// bytes (`09-security-model.md` §9.7.4.2 R13), never its text form,
     /// because every derivation this trait performs consumes the digest.
-    fn resolve(&self, identifier: &[u8; 32])
+    fn resolve(&self, identifier: &Identifier)
         -> impl Future<Output = Result<ResolutionOutcome, IdentityError>> + Send;
 
     /// Publishes the identity's key-event chain at its routing id (§3.10.5).
@@ -864,17 +864,17 @@ pub trait IdentityBackend: Send + Sync {
     /// an entry's declared ceiling admits no segment of the chain the publisher
     /// sends nothing to that entry and records
     /// `EntryResult::NotSent { reason: SegmentTooLarge }` for it (§3.10.5).
-    fn publish(&self, identifier: &[u8; 32], chain: &[Vec<u8>])
+    fn publish(&self, identifier: &Identifier, chain: &[Vec<u8>])
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
 
     /// Reads the identity's service record at `SHA-256("scp:svc:" ‖ identifier)`
     /// under the settlement rules of §3.10.13.
-    fn read_service_record(&self, identifier: &[u8; 32])
+    fn read_service_record(&self, identifier: &Identifier)
         -> impl Future<Output = Result<ServiceRecordVerdict, IdentityError>> + Send;
 
     /// Publishes the identity's service record under its designated key
     /// (§3.10.13), addressing the same publication set `publish` addresses.
-    fn publish_service_record(&self, identifier: &[u8; 32], record: &[u8])
+    fn publish_service_record(&self, identifier: &Identifier, record: &[u8])
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
 
     /// Reads one relay entry's declared write policy from the `relay_config`
@@ -1602,7 +1602,7 @@ pub fn scpid_challenge(
 pub async fn scpid_sign(
     custody: &impl KeyCustody,
     signing_key: &KeyHandle,
-    identifier: &[u8; 32],
+    identifier: &Identifier,
     signing_key_id: SigningKeyId,  // Active — the identity's one operational role
     challenge: &ScpIdChallenge,
 ) -> Result<ScpIdResponse, ScpIdError>;
@@ -1628,7 +1628,7 @@ pub async fn scpid_verify(
 ) -> Result<ScpIdAuthentication, ScpIdError>;
 
 pub struct ScpIdAuthentication {
-    pub identifier: [u8; 32],
+    pub identifier: Identifier,
     pub signing_key_id: SigningKeyId,
     pub signed_at: u64,
 }

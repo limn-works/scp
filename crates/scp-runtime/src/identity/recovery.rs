@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use scp_did::DID;
+use scp_protocol::crypto::hpke::p256::P256Point;
 
 // ContextManager type deleted in ADR-049 §15; recovery binds to
 // the supervisor directly.
@@ -326,12 +327,13 @@ pub struct PskRotationParams {
     /// preventing a wrap intended for one identity from opening under another.
     pub did: String,
 
-    /// X25519 public keys of all enrolled devices.
-    pub enrolled_device_pubkeys: Vec<Vec<u8>>,
+    /// `DHKEM(P-256)` public keys (65-byte uncompressed points) of all
+    /// enrolled devices. Decoding validates each point (§9.5).
+    pub enrolled_device_pubkeys: Vec<P256Point>,
 
-    /// If the compromise involved a device, its X25519 public key to exclude
-    /// from new PSK distribution.
-    pub compromised_device_pubkey: Option<Vec<u8>>,
+    /// If the compromise involved a device, its `DHKEM(P-256)` public key to
+    /// exclude from new PSK distribution.
+    pub compromised_device_pubkey: Option<P256Point>,
 }
 
 // ---------------------------------------------------------------------------
@@ -761,8 +763,8 @@ const PSK_HPKE_INFO_PREFIX: &[u8] = b"scp-private-state-v1";
 /// Purpose string for PSK rotation re-wraps (§3.7.2, spec edit S5).
 const PSK_PURPOSE_ROTATE: &[u8] = b"psk-rotate";
 
-/// Wire length of a wrapped PSK: HPKE `enc` (32) || `ct` (48) = 80 bytes.
-const WRAPPED_PSK_LEN: usize = 32 + 48;
+/// Wire length of a wrapped PSK: HPKE `enc` (65) || `ct` (48) = 113 bytes.
+const WRAPPED_PSK_LEN: usize = 65 + 48;
 
 /// Builds the §3.7.2 PSK HPKE `info`:
 /// `"scp-private-state-v1" || BE32(len(did)) || did || purpose`.
@@ -785,19 +787,28 @@ fn build_psk_hpke_info(did: &str, purpose: &[u8]) -> Vec<u8> {
 }
 
 /// Wraps a 32-byte PSK for a single device via RFC 9180 HPKE Base mode
-/// (§3.7.2). AES-128-GCM (the X25519 KEM is the ~128-bit floor; §9.5).
+/// (§3.7.2) over the §9.5 suite: `DHKEM(P-256, HKDF-SHA256)`, `HKDF-SHA256`,
+/// `AES-128-GCM`.
 ///
-/// Returns `Some(wrapped)` where `wrapped` is `enc(32) || ct(48)` = 80 bytes,
-/// or `None` if HPKE sealing fails. The `info` binds the identity `did` and
-/// the `purpose` string (`"psk-rotate"` for rotation re-wraps); `aad` is empty.
-fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Option<Vec<u8>> {
+/// Returns `wrapped` = `enc(65) || ct(48)` = 113 bytes. The `info` binds the
+/// identity `did` and the `purpose` string (`"psk-rotate"` for rotation
+/// re-wraps); `aad` is empty.
+///
+/// # Errors
+///
+/// The [`HpkeError`](scp_protocol::crypto::hpke::HpkeError) of the seal.
+fn wrap_psk_for_device(
+    psk: &[u8; 32],
+    device_pk: &P256Point,
+    did: &str,
+) -> Result<Vec<u8>, scp_protocol::crypto::hpke::HpkeError> {
     let info = build_psk_hpke_info(did, PSK_PURPOSE_ROTATE);
-    let (enc, ct) = scp_protocol::crypto::hpke::seal(device_pk, &info, &[], psk).ok()?;
+    let (enc, ct) = scp_protocol::crypto::hpke::p256::seal(device_pk, &info, &[], psk)?;
 
     let mut wrapped = Vec::with_capacity(WRAPPED_PSK_LEN);
-    wrapped.extend_from_slice(&enc);
+    wrapped.extend_from_slice(enc.as_bytes());
     wrapped.extend_from_slice(&ct);
-    Some(wrapped)
+    Ok(wrapped)
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,25 +1256,19 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Step 6: Rotate the PSK and re-encrypt identity private state.
         //
         // Generate a fresh 32-byte PSK, then wrap it for each enrolled
-        // device's X25519 public key (excluding the compromised device if
-        // specified) using X25519 ECDH + HKDF + AES-256-GCM (HPKE mode
-        // Base, matching the sender key wrapping pattern in §9.16.2).
+        // device's DHKEM(P-256) public key (excluding the compromised device
+        // if specified) with HPKE Base mode, the §9.5 suite the sender key
+        // wrapping of §9.16.2 also uses.
         // The wrapped PSKs are distributed as a recovery notification.
 
         use rand::RngCore as _;
         use zeroize::Zeroizing;
 
         // Filter out the compromised device, if any.
-        let eligible_devices: Vec<&[u8]> = params
+        let eligible_devices: Vec<&P256Point> = params
             .enrolled_device_pubkeys
             .iter()
-            .filter(|pk| {
-                params
-                    .compromised_device_pubkey
-                    .as_ref()
-                    .is_none_or(|cpk| pk.as_slice() != cpk.as_slice())
-            })
-            .map(Vec::as_slice)
+            .filter(|pk| params.compromised_device_pubkey.as_ref() != Some(*pk))
             .collect();
 
         // Must have at least one eligible device to distribute the new PSK.
@@ -1273,29 +1278,28 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Generate a fresh PSK (32 bytes of random data). Held in `Zeroizing`
         // so the plaintext PSK is wiped on drop regardless of which return
-        // path is taken (including the early `device_pk.len() != 32` reject
-        // below), preserving forward secrecy of the rotated key.
+        // path is taken (including a failed seal below), preserving forward
+        // secrecy of the rotated key.
         let mut new_psk = Zeroizing::new([0u8; 32]);
         rand::rngs::OsRng.fill_bytes(new_psk.as_mut());
 
         // For each eligible device, wrap the new PSK via RFC 9180 HPKE Base
-        // mode (§3.7.2): DHKEM(X25519, HKDF-SHA256) Encap to the device key,
+        // mode (§3.7.2): DHKEM(P-256, HKDF-SHA256) Encap to the device key,
         // AES-128-GCM seal under info "scp-private-state-v1" || len(did) ||
-        // did || "psk-rotate". Output is enc(32) || ct(48) = 80 bytes; the
+        // did || "psk-rotate". Output is enc(65) || ct(48) = 113 bytes; the
         // AEAD nonce is internal per RFC 9180. Only the holder of the device's
-        // X25519 private key can complete Decap and unwrap the PSK.
+        // P-256 private key (in its custody) can complete Decap and unwrap
+        // the PSK. Each device key was validated as a P-256 point when the
+        // params were built or decoded.
         let mut wrapped_psks: Vec<Vec<u8>> = Vec::with_capacity(eligible_devices.len());
         for device_pk in &eligible_devices {
-            // Device public key must be exactly 32 bytes (X25519).
-            if device_pk.len() != 32 {
-                return false;
-            }
-            let mut pk_bytes = [0u8; 32];
-            pk_bytes.copy_from_slice(device_pk);
-            match wrap_psk_for_device(&new_psk, &pk_bytes, &params.did) {
-                // `&new_psk` deref-coerces `&Zeroizing<[u8; 32]>` to `&[u8; 32]`.
-                Some(wrapped) => wrapped_psks.push(wrapped),
-                None => return false,
+            // `&new_psk` deref-coerces `&Zeroizing<[u8; 32]>` to `&[u8; 32]`.
+            match wrap_psk_for_device(&new_psk, device_pk, &params.did) {
+                Ok(wrapped) => wrapped_psks.push(wrapped),
+                Err(e) => {
+                    tracing::warn!(error = %e, "PSK wrap to an enrolled device failed");
+                    return false;
+                }
             }
         }
 
@@ -1343,6 +1347,12 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A valid P-256 device key, distinct per `seed`.
+    fn device_key(seed: u8) -> P256Point {
+        P256Point::try_from(scp_crypto::p256::testing::valid_uncompressed_point(seed))
+            .expect("valid point")
+    }
 
     fn did(s: &str) -> DID {
         DID::from(s)
@@ -1666,7 +1676,7 @@ mod tests {
         let contacts = HashSet::from([did("did:dht:bob"), did("did:dht:carol")]);
         let psk_params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
+            enrolled_device_pubkeys: vec![device_key(1), device_key(2)],
             compromised_device_pubkey: None,
         };
         let backend = MockRecoveryBackend::new();
@@ -1699,7 +1709,7 @@ mod tests {
         let contacts = HashSet::from([did("did:dht:bob")]);
         let psk_params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32]],
+            enrolled_device_pubkeys: vec![device_key(1)],
             compromised_device_pubkey: None,
         };
         let backend = MockRecoveryBackend::new();
@@ -1922,8 +1932,8 @@ mod tests {
         // Device 2 is compromised.
         let psk_params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]],
-            compromised_device_pubkey: Some(vec![2u8; 32]),
+            enrolled_device_pubkeys: vec![device_key(1), device_key(2), device_key(3)],
+            compromised_device_pubkey: Some(device_key(2)),
         };
 
         let result = orch
@@ -1951,8 +1961,8 @@ mod tests {
 
         let psk_params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32]],
-            compromised_device_pubkey: Some(vec![1u8; 32]),
+            enrolled_device_pubkeys: vec![device_key(1)],
+            compromised_device_pubkey: Some(device_key(1)),
         };
 
         // Backend reports PSK rotation failure (no remaining devices).
@@ -2063,7 +2073,7 @@ mod tests {
         let contacts = HashSet::from([did("did:dht:bob"), did("did:dht:carol")]);
         let psk_params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
+            enrolled_device_pubkeys: vec![device_key(1), device_key(2)],
             compromised_device_pubkey: None,
         };
         let backend = MockRecoveryBackend::new();
@@ -2185,8 +2195,8 @@ mod tests {
     fn psk_rotation_params_serialization_roundtrip() {
         let params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
-            compromised_device_pubkey: Some(vec![2u8; 32]),
+            enrolled_device_pubkeys: vec![device_key(1), device_key(2)],
+            compromised_device_pubkey: Some(device_key(2)),
         };
         let json = serde_json::to_string(&params).unwrap();
         let parsed: PskRotationParams = serde_json::from_str(&json).unwrap();
@@ -2462,7 +2472,7 @@ mod tests {
 
         let params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
+            enrolled_device_pubkeys: vec![device_key(1), device_key(2)],
             compromised_device_pubkey: None,
         };
 
@@ -2478,8 +2488,8 @@ mod tests {
 
         let params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]],
-            compromised_device_pubkey: Some(vec![2u8; 32]),
+            enrolled_device_pubkeys: vec![device_key(1), device_key(2), device_key(3)],
+            compromised_device_pubkey: Some(device_key(2)),
         };
 
         let result = backend.rotate_psk(&params).await;
@@ -2497,8 +2507,8 @@ mod tests {
         // All devices compromised.
         let params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32]],
-            compromised_device_pubkey: Some(vec![1u8; 32]),
+            enrolled_device_pubkeys: vec![device_key(1)],
+            compromised_device_pubkey: Some(device_key(1)),
         };
 
         let result = backend.rotate_psk(&params).await;
@@ -2561,7 +2571,7 @@ mod tests {
         let contacts = HashSet::from([bob]);
         let psk_params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
+            enrolled_device_pubkeys: vec![device_key(1), device_key(2)],
             compromised_device_pubkey: None,
         };
 
@@ -2604,7 +2614,7 @@ mod tests {
         let contacts = HashSet::from([bob, carol]);
         let psk_params = PskRotationParams {
             did: "did:dht:zRecoveryTestIdentity".to_owned(),
-            enrolled_device_pubkeys: vec![vec![1u8; 32]],
+            enrolled_device_pubkeys: vec![device_key(1)],
             compromised_device_pubkey: None,
         };
 
@@ -2672,132 +2682,169 @@ mod tests {
     // wrap_psk_for_device unit tests (RFC 9180, §3.7.2)
     //
     // These verify the PRODUCTION wrap path (`wrap_psk_for_device`, called by
-    // `rotate_psk`). The device-side open counterpart is exercised here by
-    // calling `scp_protocol::crypto::hpke::open` directly against the wrapped
-    // wire (`enc(32) || ct(48)`), reconstructing the §3.7.2 `info` via the
-    // shared `build_psk_hpke_info` helper that the production wrap also uses.
-    // Opening through `hpke::open` keeps every negative ciphertext-level: a
-    // real AEAD verification failure, not a builder-string comparison.
+    // `rotate_psk`) against a device whose P-256 key lives in custody: the
+    // open computes `DH(skR, enc)` through the custody's `dh_agree` and
+    // completes HPKE Open with `p256::custody::open_with_external_dh`,
+    // rebuilding the §3.7.2 `info` with the same `build_psk_hpke_info` the
+    // wrap uses. Every negative is ciphertext-level: a real AEAD failure.
     // -----------------------------------------------------------------------
 
-    /// Device-side open of a wrapped PSK, mirroring what a device that receives
-    /// a `PskRotated` / `DeviceWrappedPsk` entry does: split `enc(32) || ct(48)`,
-    /// rebuild the §3.7.2 `info`, and HPKE-open with the device X25519 secret.
+    /// A device: its custody, the handle of its `HpkeP256` key, and the
+    /// key's public point.
+    struct Device {
+        custody: scp_platform::testing::InMemoryKeyCustody,
+        handle: scp_platform::traits::KeyHandle,
+        public: P256Point,
+    }
+
+    async fn new_device() -> Device {
+        use scp_platform::traits::{KeyCustody as _, KeyType};
+        let custody = scp_platform::testing::InMemoryKeyCustody::new();
+        let handle = custody
+            .generate_keypair(KeyType::HpkeP256)
+            .await
+            .expect("generate device key");
+        let public = P256Point::try_from(
+            custody
+                .public_key(&handle)
+                .await
+                .expect("device public key")
+                .as_bytes(),
+        )
+        .expect("device key is a P-256 point");
+        Device {
+            custody,
+            handle,
+            public,
+        }
+    }
+
+    /// Device-side open of a wrapped PSK, as a device receiving a
+    /// `PskRotated` entry does: split `enc(65) || ct(48)`, agree through its
+    /// custody, rebuild the §3.7.2 `info`, and finish HPKE Open.
     ///
-    /// Returns `None` on wrong wire length, invalid `enc`, or any HPKE/AEAD
-    /// failure (wrong device key, wrong `did`, tampered ciphertext) — exactly
-    /// the failure surface the negatives below assert against.
-    fn open_wrapped_psk(wrapped: &[u8], device_sk: &[u8; 32], did: &str) -> Option<[u8; 32]> {
+    /// Returns `None` on wrong wire length, an invalid `enc`, a refused
+    /// agreement, or any AEAD failure (wrong device, wrong `did`, tampering).
+    async fn open_wrapped_psk(wrapped: &[u8], device: &Device, did: &str) -> Option<[u8; 32]> {
+        use scp_platform::traits::KeyCustody as _;
         if wrapped.len() != super::WRAPPED_PSK_LEN {
             return None;
         }
-        let enc: [u8; 32] = wrapped[..32].try_into().ok()?;
-        let ct = &wrapped[32..];
-
-        // Reconstruct the §3.7.2 info via the SAME helper the production wrap
-        // uses, so the test cannot drift from the wrap's info construction.
+        let (enc, ct) = wrapped.split_at(65);
+        let enc = scp_protocol::crypto::hpke::p256::validate_enc(enc).ok()?;
+        let dh = device
+            .custody
+            .dh_agree(&device.handle, enc.as_bytes())
+            .await
+            .ok()?;
         let info = super::build_psk_hpke_info(did, super::PSK_PURPOSE_ROTATE);
-        let plaintext = zeroize::Zeroizing::new(
-            scp_protocol::crypto::hpke::open(device_sk, &enc, &info, &[], ct).ok()?,
-        );
+        let plaintext = scp_protocol::crypto::hpke::p256::custody::open_with_external_dh(
+            dh.as_bytes(),
+            device.public.as_bytes(),
+            &enc,
+            &info,
+            &[],
+            ct,
+        )
+        .ok()?;
         plaintext.as_slice().try_into().ok()
     }
 
-    #[test]
-    fn psk_wrapping_is_80_bytes_with_fresh_enc() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
-        let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let device_public = X25519Pub::from(&device_secret);
+    #[tokio::test]
+    async fn psk_wrapping_is_113_bytes_with_fresh_enc() {
+        let device = new_device().await;
         let psk = [0xABu8; 32];
         let did = "did:dht:zPskTest";
 
-        let wrapped1 =
-            super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap 1 failed");
-        let wrapped2 =
-            super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap 2 failed");
+        let wrapped1 = super::wrap_psk_for_device(&psk, &device.public, did).expect("wrap 1");
+        let wrapped2 = super::wrap_psk_for_device(&psk, &device.public, did).expect("wrap 2");
 
-        // Wire layout: enc(32) || ct(48) = 80 bytes. No external nonce.
-        assert_eq!(wrapped1.len(), 80);
-        assert_eq!(wrapped2.len(), 80);
+        // Wire layout: enc(65) || ct(48) = 113 bytes. No external nonce.
+        assert_eq!(wrapped1.len(), 113);
+        assert_eq!(wrapped2.len(), 113);
+        assert_eq!(wrapped1[0], 0x04, "enc is an uncompressed P-256 point");
 
-        // Each wrap uses a fresh ephemeral keypair → the encapsulated key
-        // (`enc`, bytes 0..32) differs every time, even for the same PSK and
-        // device. This is what makes each HPKE context single-use.
+        // Each wrap uses a fresh ephemeral key, so `enc` differs every time.
         assert_ne!(
-            &wrapped1[..32],
-            &wrapped2[..32],
+            &wrapped1[..65],
+            &wrapped2[..65],
             "enc must be fresh per wrap"
         );
     }
 
-    #[test]
-    fn psk_wrapping_roundtrip() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
-        let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let device_public = X25519Pub::from(&device_secret);
+    #[tokio::test]
+    async fn psk_wrapped_to_a_p256_device_key_opens_with_the_device_custody() {
+        let device = new_device().await;
         let psk = [0x42u8; 32];
         let did = "did:dht:zPskTest";
 
-        // Production wrap → device-side open via hpke::open must recover the PSK.
-        let wrapped =
-            super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap failed");
+        let wrapped = super::wrap_psk_for_device(&psk, &device.public, did).expect("wrap");
 
-        let recovered =
-            open_wrapped_psk(&wrapped, &device_secret.to_bytes(), did).expect("open failed");
+        let recovered = open_wrapped_psk(&wrapped, &device, did)
+            .await
+            .expect("the device custody opens the wrapped PSK");
         assert_eq!(recovered, psk, "roundtrip mismatch");
     }
 
-    #[test]
-    fn psk_opening_rejects_wrong_did() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
-        let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let device_public = X25519Pub::from(&device_secret);
+    #[tokio::test]
+    async fn psk_opening_rejects_wrong_did() {
+        let device = new_device().await;
         let psk = [0x42u8; 32];
 
-        let wrapped = super::wrap_psk_for_device(&psk, device_public.as_bytes(), "did:dht:zAlice")
-            .expect("wrap failed");
+        let wrapped =
+            super::wrap_psk_for_device(&psk, &device.public, "did:dht:zAlice").expect("wrap");
 
-        // A different DID changes the HPKE info → AEAD open fails.
+        // A different DID changes the HPKE info, so the AEAD open fails.
         assert!(
-            open_wrapped_psk(&wrapped, &device_secret.to_bytes(), "did:dht:zBob").is_none(),
+            open_wrapped_psk(&wrapped, &device, "did:dht:zBob")
+                .await
+                .is_none(),
             "wrong DID must fail to open"
         );
     }
 
-    #[test]
-    fn psk_opening_rejects_wrong_device_and_tamper() {
-        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
-
-        let device_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let device_public = X25519Pub::from(&device_secret);
-        let wrong_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    #[tokio::test]
+    async fn psk_opening_rejects_wrong_device_and_tamper() {
+        let device = new_device().await;
+        let other = new_device().await;
         let psk = [0x42u8; 32];
         let did = "did:dht:zPskTest";
 
-        let wrapped =
-            super::wrap_psk_for_device(&psk, device_public.as_bytes(), did).expect("wrap failed");
+        let wrapped = super::wrap_psk_for_device(&psk, &device.public, did).expect("wrap");
 
-        // Wrong device key.
+        // Another device's custody.
         assert!(
-            open_wrapped_psk(&wrapped, &wrong_secret.to_bytes(), did).is_none(),
+            open_wrapped_psk(&wrapped, &other, did).await.is_none(),
             "wrong device key must fail"
         );
 
         // Tampered ciphertext.
         let mut tampered = wrapped.clone();
-        tampered[40] ^= 0x01;
+        tampered[80] ^= 0x01;
         assert!(
-            open_wrapped_psk(&tampered, &device_secret.to_bytes(), did).is_none(),
+            open_wrapped_psk(&tampered, &device, did).await.is_none(),
             "tampered ciphertext must fail"
         );
 
         // Wrong length.
         assert!(
-            open_wrapped_psk(&wrapped[..79], &device_secret.to_bytes(), did).is_none(),
+            open_wrapped_psk(&wrapped[..112], &device, did)
+                .await
+                .is_none(),
             "wrong length must fail"
+        );
+    }
+
+    #[test]
+    fn psk_rotation_params_reject_a_32_byte_device_key_on_decode() {
+        let json = serde_json::json!({
+            "did": "did:dht:zPskTest",
+            "enrolled_device_pubkeys": [vec![1u8; 32]],
+            "compromised_device_pubkey": null,
+        });
+        assert!(
+            serde_json::from_value::<PskRotationParams>(json).is_err(),
+            "a 32-byte X25519-sized key is not a P-256 point"
         );
     }
 }

@@ -40,6 +40,14 @@ unsound = "all"
 ignore = [
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained — awaiting upstream migration
     "RUSTSEC-2024-0436",  # paste unmaintained — transitive via netlink-packet-utils (natpmp); no safe upgrade
+    # basic-toml: unmaintained (repository archived); the advisory reports no known
+    # vulnerability. Transitive via uniffi_bindgen -> askama (feature `config`) ->
+    # askama_derive (proc-macro), at compile time only; it links into no binary. Every
+    # uniffi release through 0.32.2 enables `config`, and every askama_derive through
+    # 0.16.1 pulls basic-toml under it. Remove this entry once an askama release that
+    # uses `toml` reaches us through a uniffi bump. Approved by Alec on 2026-10-20.
+    # Upstream: https://github.com/askama-rs/askama/issues/594
+    "RUSTSEC-2026-0374",
     # proc-macro-error2: unmaintained (fork of proc-macro-error, also
     # unmaintained). Build-time proc-macro support crate, transitive via
     # hax-lib-macros <- hax-lib <- libcrux-sha3 <- hpke-rs <- openmls_rust_crypto:

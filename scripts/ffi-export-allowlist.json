@@ -766,6 +766,66 @@
       "path": "crates/scp-ffi/uniffi/src/server.rs",
       "kind": "lifecycle",
       "reason": "Instance lifecycle (shutdown); not a parity operation."
+    },
+    {
+      "name": "new",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Constructor of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
+    },
+    {
+      "name": "generate_keypair",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method that mints a host key of the given CustodyKeyType through the adapter's generate path; a method of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
+    },
+    {
+      "name": "public_key",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method that reads a host key's public key through the adapter's length and point checks; a method of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
+    },
+    {
+      "name": "sign",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method that signs through the adapter, which verifies the host signature strictly and normalizes it to raw low-s; a method of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
+    },
+    {
+      "name": "dh_agree",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method that agrees through the adapter, whose peer and shared-secret checks run on the host's output; a method of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
+    },
+    {
+      "name": "destroy_key",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method that destroys a host key through the adapter; a method of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
+    },
+    {
+      "name": "custody_type",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Method returning the adapter's mapping of the host's custody-type string (hardware, software or in_memory), so a test shows a Secure Enclave key reaches Rust as hardware; a method of TestingCallbackCustody, which wraps a Swift or Kotlin KeyCustodyProvider in the production UniFFI callback custody adapter so SDK tests reach that adapter's checks, its custody-type mapping and its error codes. Not a protocol operation."
+    },
+    {
+      "name": "testing_p256_verify_strict",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test oracle; feature-gated (testing). Verifies a raw 64-byte P-256 signature over a 32-byte digest under a 33-byte compressed or 65-byte uncompressed SEC1 key with the strict low-s verifier the bridge uses, so a Swift or Kotlin test checks a host signature against Rust rather than against the platform library that made it. Not a protocol operation."
+    },
+    {
+      "name": "testing_p256_ecdh",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test oracle; feature-gated (testing). Computes the P-256 ECDH x-coordinate from a peer's 32-byte scalar and a host's 65-byte public key, so a Swift or Kotlin test checks a host key's dh_agree against Rust rather than against the platform library that made it. Not a protocol operation."
+    },
+    {
+      "name": "testing_share_did_resolver",
+      "path": "crates/scp-ffi/uniffi/src/testing_custody.rs",
+      "kind": "test-fixture",
+      "reason": "SCP-307 test hook; feature-gated (testing). Makes one instance resolve DIDs through another instance's DHT client, as two processes sharing the Mainline DHT do, so a Swift or Kotlin test can invite an identity whose custody is a host KeyCustodyProvider from a second instance and open the sealed invitation through the host's dh_agree. Not a protocol operation."
     }
   ],
   "napi": [
@@ -1145,7 +1205,7 @@
       "name": "dh_agree",
       "path": "crates/scp-ffi/napi/src/testing.rs",
       "kind": "test-fixture",
-      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Returns the shared secret the adapter read from the host's dhAgree, so a test shows the bridge reads the secret intact before the TypeScript adapter zeroes its copy; the peer key reaches the adapter unchanged, so the adapter's own peer check for the key's type (32 bytes for X25519, the 65-byte uncompressed point for hpke-p256) runs, and its refusal or a host failure is SCP-CRYPTO-4006 for key-not-found or SCP-CRYPTO-4060. Not a protocol operation."
+      "reason": "SCP-307 test hook; feature-gated (testing). Method of TestingCallbackCustody, which wraps a JS custody provider in the production napi callback custody adapter so TypeScript tests reach that adapter's checks and error codes. Returns the shared secret the adapter read from the host's dhAgree, so a test shows the bridge reads the secret intact before the TypeScript adapter zeroes its copy; the peer key reaches the adapter unchanged, so the adapter's own peer check for the key's type (the 65-byte uncompressed point for hpke-p256) runs, and its refusal or a host failure is SCP-CRYPTO-4006 for key-not-found or SCP-CRYPTO-4060. Not a protocol operation."
     },
     {
       "name": "take",

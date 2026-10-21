@@ -2,19 +2,17 @@
 //!
 //! This is the single, authoritative HPKE core for all SCP key-distribution
 //! paths (sender keys §9.16.2, access keys §9.17.1, broadcast keys §5.14.2,
-//! invitations §5.12.3.1, PSK distribution §3.7.2). It holds two RFC 9180
-//! ciphersuites that share the labeled KDF, `KeySchedule`, and AEAD layers
-//! below:
+//! invitations §5.12.3.1, PSK distribution §3.7.2). This module root holds
+//! the labeled KDF, `KeySchedule`, and AEAD layers that every suite shares.
 //!
-//! - [`p256`]: the suite §9.5 mandates, `DHKEM(P-256, HKDF-SHA256)` (KEM
-//!   `0x0010`), `HKDF-SHA256` (KDF `0x0001`), `AES-128-GCM` (AEAD `0x0001`),
-//!   with a 65-byte uncompressed SEC1 `enc` and public key.
-//! - The functions at this module's root: `DHKEM(X25519, HKDF-SHA256)` (KEM
-//!   `0x0020`), `HKDF-SHA256`, `AES-128-GCM`, with a 32-byte `enc`. The
-//!   distribution paths above still call this suite until they move to
-//!   [`p256`].
+//! [`p256`] is the suite §9.5 mandates: `DHKEM(P-256, HKDF-SHA256)` (KEM
+//! `0x0010`), `HKDF-SHA256` (KDF `0x0001`), `AES-128-GCM` (AEAD `0x0001`),
+//! with a 65-byte uncompressed SEC1 `enc` and public key.
 //!
-//! Only the **single-shot Base mode** is implemented: each [`seal`] generates a
+//! It is the only suite: every caller, the invitation seal and the PSK
+//! recovery wrap included, seals to a P-256 key.
+//!
+//! Only the **single-shot Base mode** is implemented: each seal generates a
 //! fresh ephemeral keypair, the HPKE context performs exactly one `Seal`
 //! (sequence number 0), so the AEAD nonce is always `base_nonce` (no sequence
 //! counter, no `ComputeNonce` increment is ever exercised). This matches the
@@ -27,18 +25,16 @@
 //! hand-rolled "HPKE" copies got wrong (they skipped DHKEM `ExtractAndExpand`
 //! and `KeySchedule`, used a custom `info`, and put a random nonce on the
 //! wire). Re-implementing it here — over the RustCrypto-family `hkdf`/`sha2`/`aes-gcm`
-//! and `x25519-dalek` primitives already in this crate — keeps the wasm32
-//! artifact free of extra transitive crates and makes the construction fully
-//! auditable. Correctness is pinned by the RFC 9180 Appendix A.1 (X25519) and
-//! A.3 (P-256) known-answer tests, including intermediate values, and
-//! cross-validated against the
-//! `hpke-rs` reference implementation as a dev-dependency oracle.
+//! primitives already in this crate — keeps the wasm32 artifact free of extra
+//! transitive crates and makes the construction fully auditable. Correctness
+//! is pinned by the RFC 9180 Appendix A.3 (P-256) known-answer tests, including intermediate values, and cross-validated
+//! against the `hpke-rs` reference implementation as a dev-dependency oracle.
 //!
 //! # Custody Decap
 //!
-//! For recipient secret keys held inside a `KeyCustody` boundary, the raw
-//! X25519 DH scalar multiplication happens in custody and only the DH output
-//! crosses the boundary. [`custody::open_with_external_dh`] completes RFC 9180
+//! For recipient secret keys held inside a `KeyCustody` boundary, the raw DH
+//! scalar multiplication happens in custody and only the DH output crosses
+//! the boundary. [`p256::custody::open_with_external_dh`] completes RFC 9180
 //! DHKEM Decap + `KeySchedule` + AEAD open from that DH output plus the
 //! recipient public key. See that function's documentation for the strict
 //! caller contract.
@@ -47,19 +43,15 @@
 //!
 //! All secret intermediates (`dh`, `eae_prk`, `shared_secret`, `secret`,
 //! `key`, `base_nonce`, and the seq-0 AEAD nonce derived from it) are wrapped
-//! in [`Zeroizing`] for their full memory lifetime. `x25519-dalek`
-//! `EphemeralSecret`/`SharedSecret` zeroize on drop with the in-tree `zeroize`
-//! feature; each `.as_bytes()` copy is wrapped in [`Zeroizing`]. NOTE:
-//! `hkdf::Hkdf<Sha256>` does not zeroize its internal PRK/HMAC state on drop —
-//! a known, accepted, codebase-wide limitation of the RustCrypto-family `hkdf` crate;
-//! no custom wrapper is added.
+//! in [`Zeroizing`] for their full memory lifetime. NOTE: `hkdf::Hkdf<Sha256>`
+//! does not zeroize its internal PRK/HMAC state on drop — a known, accepted,
+//! codebase-wide limitation of the RustCrypto-family `hkdf` crate; no custom
+//! wrapper is added.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Nonce};
 use hkdf::Hkdf;
-use rand::rngs::OsRng;
 use sha2::Sha256;
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 pub mod p256;
@@ -68,17 +60,11 @@ pub mod p256;
 // Suite constants
 // ---------------------------------------------------------------------------
 
-/// KEM id for `DHKEM(X25519, HKDF-SHA256)` — RFC 9180 §7.1.
-pub const HPKE_KEM_ID: u16 = 0x0020;
-
 /// KDF id for `HKDF-SHA256` — RFC 9180 §7.2.
 pub const HPKE_KDF_ID: u16 = 0x0001;
 
 /// AEAD id for `AES-128-GCM` — RFC 9180 §7.3.
 pub const HPKE_AEAD_ID: u16 = 0x0001;
-
-/// Length of the X25519 encapsulated key (`enc`), bytes.
-pub const HPKE_ENC_LEN: usize = 32;
 
 /// AEAD tag length: `ct.len() == pt.len() + HPKE_TAG_LEN`.
 pub const HPKE_TAG_LEN: usize = 16;
@@ -89,11 +75,9 @@ const HPKE_AEAD_KEY_LEN: usize = 16;
 /// AEAD nonce length (`Nn` for AES-128-GCM), bytes.
 const HPKE_AEAD_NONCE_LEN: usize = 12;
 
-/// DHKEM shared-secret length (`Nsecret` for DHKEM(X25519, HKDF-SHA256)), bytes.
+/// DHKEM shared-secret length (`Nsecret`), bytes: 32 for
+/// DHKEM(P-256, HKDF-SHA256).
 const HPKE_NSECRET: usize = 32;
-
-/// X25519 raw scalar/point length, bytes.
-const X25519_LEN: usize = 32;
 
 /// RFC 9180 §4 version label, prefixed to every labeled-KDF input.
 const HPKE_VERSION_LABEL: &[u8] = b"HPKE-v1";
@@ -138,16 +122,6 @@ const fn hpke_suite_id_for(kem_id: u16, kdf_id: u16, aead_id: u16) -> [u8; 10] {
     let f = kdf_id.to_be_bytes();
     let a = aead_id.to_be_bytes();
     [b'H', b'P', b'K', b'E', k[0], k[1], f[0], f[1], a[0], a[1]]
-}
-
-/// The X25519 suite's KEM `suite_id`.
-const fn kem_suite_id() -> [u8; 5] {
-    kem_suite_id_for(HPKE_KEM_ID)
-}
-
-/// The X25519 suite's HPKE `suite_id`.
-const fn hpke_suite_id() -> [u8; 10] {
-    hpke_suite_id_for(HPKE_KEM_ID, HPKE_KDF_ID, HPKE_AEAD_ID)
 }
 
 /// `LabeledExtract(salt, label, ikm)` (RFC 9180 §4):
@@ -225,8 +199,7 @@ fn labeled_expand(
 /// `shared_secret = LabeledExpand(eae_prk, "shared_secret", kem_context, Nsecret)`.
 ///
 /// `kem_suite_id` is the suite's **KEM** suite id. `Nsecret` is 32 bytes for
-/// both DHKEM(X25519, HKDF-SHA256) and DHKEM(P-256, HKDF-SHA256). `dh` is
-/// 32 bytes for both: the X25519 output, or the P-256 x-coordinate.
+/// DHKEM(P-256, HKDF-SHA256), and `dh` is the 32-byte P-256 x-coordinate.
 fn dhkem_extract_and_expand(
     kem_suite_id: [u8; 5],
     dh: &[u8; 32],
@@ -339,447 +312,4 @@ fn aead_open(ks: &KeyScheduleOutput, aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, H
             Payload { msg: ct, aad },
         )
         .map_err(|e| HpkeError::OpenFailed(e.to_string()))
-}
-
-// ---------------------------------------------------------------------------
-// Public single-shot API
-// ---------------------------------------------------------------------------
-
-/// Single-shot Base-mode HPKE seal.
-///
-/// Generates a fresh ephemeral X25519 keypair, performs DHKEM Encap to the
-/// recipient public key, runs `KeySchedule_base`, and AEAD-seals `pt` at
-/// sequence 0.
-///
-/// Returns `(enc, ct)` where `enc` is the 32-byte encapsulated key (the
-/// ephemeral public key) and `ct` is `ciphertext || tag` (`pt.len() + 16`
-/// bytes). Every SCP wire format carries `enc` as its own field, so the tuple
-/// shape requires zero reassembly at call sites.
-///
-/// # Errors
-///
-/// [`HpkeError::SealFailed`] if KDF or AEAD encryption fails (operationally
-/// unreachable with valid inputs).
-pub fn seal(
-    recipient_pk: &[u8; 32],
-    info: &[u8],
-    aad: &[u8],
-    pt: &[u8],
-) -> Result<([u8; HPKE_ENC_LEN], Vec<u8>), HpkeError> {
-    let ephemeral = EphemeralSecret::random_from_rng(OsRng);
-    let enc = X25519Pub::from(&ephemeral);
-    seal_with_ephemeral_secret(ephemeral, enc, recipient_pk, info, aad, pt)
-}
-
-/// Single-shot Base-mode HPKE open with a **software-held** recipient secret.
-///
-/// `pkRm` (the recipient public key needed for `kem_context = enc || pkRm`) is
-/// derived internally from `recipient_sk` via the X25519 basepoint
-/// multiplication. For custody-held secrets use
-/// [`custody::open_with_external_dh`] instead.
-///
-/// # Errors
-///
-/// [`HpkeError::InvalidKey`] if `enc` is not a valid X25519 point usable for
-/// DH; [`HpkeError::OpenFailed`] if KDF or AEAD verification fails (wrong key,
-/// wrong `info`/`aad`, tampered `enc`/`ct`).
-pub fn open(
-    recipient_sk: &[u8; 32],
-    enc: &[u8; HPKE_ENC_LEN],
-    info: &[u8],
-    aad: &[u8],
-    ct: &[u8],
-) -> Result<Vec<u8>, HpkeError> {
-    // Recipient static secret (zeroize-on-drop) and its public key (pkRm).
-    let sk_copy = Zeroizing::new(*recipient_sk);
-    let sk = StaticSecret::from(*sk_copy);
-    let pk_rm = X25519Pub::from(&sk);
-
-    // DHKEM Decap: dh = DH(skR, enc).
-    let enc_pub = X25519Pub::from(*enc);
-    let dh = sk.diffie_hellman(&enc_pub);
-    let dh_bytes = Zeroizing::new(*dh.as_bytes());
-
-    decap_and_open(&dh_bytes, &pk_rm.to_bytes(), enc, info, aad, ct)
-}
-
-/// Deterministic seal core, exercised by the RFC 9180 A.1 KATs.
-///
-/// `#[cfg(test)]` + `pub(crate)` ONLY: a deterministic ephemeral is a footgun
-/// if reachable from production; it exists solely to inject the fixed RFC 9180
-/// A.1 `skEm` into the known-answer tests.
-#[cfg(test)]
-pub(crate) fn seal_with_ephemeral(
-    eph_sk: [u8; 32],
-    recipient_pk: &[u8; 32],
-    info: &[u8],
-    aad: &[u8],
-    pt: &[u8],
-) -> Result<([u8; HPKE_ENC_LEN], Vec<u8>), HpkeError> {
-    // Build a StaticSecret from the fixed scalar-seed bytes. x25519-dalek
-    // StaticSecret::from clamps on use; RFC 9180 A.1 skEm is already a valid
-    // X25519 secret, so this reproduces enc/pkEm exactly.
-    let sk_copy = Zeroizing::new(eph_sk);
-    let static_sk = StaticSecret::from(*sk_copy);
-    let enc = X25519Pub::from(&static_sk);
-    let recipient = X25519Pub::from(*recipient_pk);
-    let dh = static_sk.diffie_hellman(&recipient);
-    let dh_bytes = Zeroizing::new(*dh.as_bytes());
-    finish_seal(&dh_bytes, &enc.to_bytes(), recipient_pk, info, aad, pt)
-}
-
-// ---------------------------------------------------------------------------
-// Internal seal/decap helpers
-// ---------------------------------------------------------------------------
-
-/// Encap + `KeySchedule` + AEAD seal from an `EphemeralSecret`.
-fn seal_with_ephemeral_secret(
-    ephemeral: EphemeralSecret,
-    enc: X25519Pub,
-    recipient_pk: &[u8; 32],
-    info: &[u8],
-    aad: &[u8],
-    pt: &[u8],
-) -> Result<([u8; HPKE_ENC_LEN], Vec<u8>), HpkeError> {
-    let recipient = X25519Pub::from(*recipient_pk);
-    let dh = ephemeral.diffie_hellman(&recipient);
-    let dh_bytes = Zeroizing::new(*dh.as_bytes());
-    finish_seal(&dh_bytes, &enc.to_bytes(), recipient_pk, info, aad, pt)
-}
-
-/// Shared Encap tail: `kem_context = enc || pkR`, `ExtractAndExpand`,
-/// `KeySchedule`, AEAD seal.
-fn finish_seal(
-    dh_bytes: &[u8; X25519_LEN],
-    enc_bytes: &[u8; HPKE_ENC_LEN],
-    recipient_pk: &[u8; 32],
-    info: &[u8],
-    aad: &[u8],
-    pt: &[u8],
-) -> Result<([u8; HPKE_ENC_LEN], Vec<u8>), HpkeError> {
-    // kem_context = enc || pkRm
-    let mut kem_context = [0u8; HPKE_ENC_LEN + 32];
-    kem_context[..HPKE_ENC_LEN].copy_from_slice(enc_bytes);
-    kem_context[HPKE_ENC_LEN..].copy_from_slice(recipient_pk);
-
-    let shared_secret = dhkem_extract_and_expand(kem_suite_id(), dh_bytes, &kem_context)?;
-    let ks = key_schedule_base(&hpke_suite_id(), &shared_secret, info)?;
-    let ct = aead_seal(&ks, aad, pt)?;
-    Ok((*enc_bytes, ct))
-}
-
-/// Shared Decap tail: `kem_context = enc || pkRm`, `ExtractAndExpand`,
-/// `KeySchedule`, AEAD open. `dh_bytes` is `DH(skR, enc)`.
-fn decap_and_open(
-    dh_bytes: &[u8; X25519_LEN],
-    recipient_pk: &[u8; 32],
-    enc: &[u8; HPKE_ENC_LEN],
-    info: &[u8],
-    aad: &[u8],
-    ct: &[u8],
-) -> Result<Vec<u8>, HpkeError> {
-    let mut kem_context = [0u8; HPKE_ENC_LEN + 32];
-    kem_context[..HPKE_ENC_LEN].copy_from_slice(enc);
-    kem_context[HPKE_ENC_LEN..].copy_from_slice(recipient_pk);
-
-    let shared_secret = dhkem_extract_and_expand(kem_suite_id(), dh_bytes, &kem_context)?;
-    let ks = key_schedule_base(&hpke_suite_id(), &shared_secret, info)?;
-    aead_open(&ks, aad, ct)
-}
-
-// ---------------------------------------------------------------------------
-// Custody Decap variant
-// ---------------------------------------------------------------------------
-
-/// HPKE open paths for recipient keys held inside a `KeyCustody` boundary.
-pub mod custody {
-    use super::{HPKE_ENC_LEN, HpkeError, X25519_LEN, decap_and_open};
-
-    /// Single-shot Base-mode HPKE open where the KEM Diffie-Hellman output was
-    /// computed inside a `KeyCustody` boundary.
-    ///
-    /// RFC 9180 DHKEM Decap is `shared_secret = ExtractAndExpand(dh, enc ||
-    /// pkRm)` where `dh = DH(skR, enc)`. The scalar multiplication `DH(skR,
-    /// enc)` is the only step that must touch the non-extractable recipient
-    /// secret; everything after it (`ExtractAndExpand`, `KeySchedule`, AEAD open)
-    /// is pure. This function takes that custody-computed `dh` plus the
-    /// recipient public key `pkRm` and completes the open in software, so the
-    /// wrapping private key never leaves custody.
-    ///
-    /// # Caller contract (load-bearing — read this)
-    ///
-    /// The ONLY sound inputs are, for one and the same custody key handle `h`
-    /// and one and the same encapsulated key `enc`:
-    ///
-    /// - `dh` = `KeyCustody::dh_agree(h, enc)` — the raw X25519 DH output for
-    ///   `h` against this exact `enc`.
-    /// - `recipient_pk` (`pkRm`) = `KeyCustody::public_key(h)` — the X25519
-    ///   public key of that same handle `h`.
-    /// - `enc` — the exact encapsulated key the seal produced and the same one
-    ///   passed to `dh_agree`.
-    ///
-    /// Same handle, same `enc`, throughout. A mismatched `dh`, `pkRm`, or `enc`
-    /// fails closed (AEAD tag mismatch), but indistinguishably from a
-    /// wrong-key error — there is no separate signal. Binding `enc || pkRm`
-    /// into the shared secret (which the legacy hand-rolled paths did NOT do)
-    /// closes the unknown-key-share gap: a ciphertext sealed to one recipient
-    /// cannot be reinterpreted as sealed to another.
-    ///
-    /// # Errors
-    ///
-    /// [`HpkeError::OpenFailed`] if the KDF or AEAD verification fails (wrong
-    /// `dh`/`pkRm`/`enc`/`info`/`aad`, or tampered `ct`).
-    pub fn open_with_external_dh(
-        dh: &[u8; X25519_LEN],
-        recipient_pk: &[u8; 32],
-        enc: &[u8; HPKE_ENC_LEN],
-        info: &[u8],
-        aad: &[u8],
-        ct: &[u8],
-    ) -> Result<Vec<u8>, HpkeError> {
-        decap_and_open(dh, recipient_pk, enc, info, aad, ct)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests — RFC 9180 Appendix A.1 KATs + roundtrips + negatives
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
-
-    // RFC 9180 Appendix A.1 — DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
-    // AES-128-GCM, Base mode. Values transcribed verbatim from
-    // https://www.rfc-editor.org/rfc/rfc9180#appendix-A.1
-    const A1_INFO: &str = "4f6465206f6e2061204772656369616e2055726e";
-    const A1_SKEM: &str = "52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736";
-    const A1_PKEM: &str = "37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431";
-    const A1_SKRM: &str = "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8";
-    const A1_PKRM: &str = "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d";
-    const A1_SHARED_SECRET: &str =
-        "fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc";
-    const A1_KEY: &str = "4531685d41d65f03dc48f6b8302c05b0";
-    const A1_BASE_NONCE: &str = "56d890e5accaaf011cff4b7d";
-    // seq 0
-    const A1_PT: &str = "4265617574792069732074727574682c20747275746820626561757479";
-    const A1_AAD: &str = "436f756e742d30";
-    const A1_CT: &str = "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a";
-
-    fn unhex(s: &str) -> Vec<u8> {
-        hex::decode(s).unwrap()
-    }
-
-    fn arr32(s: &str) -> [u8; 32] {
-        unhex(s).try_into().unwrap()
-    }
-
-    /// A.1: `enc` / `pkEm` derived from the fixed `skEm` matches the RFC.
-    #[test]
-    fn a1_enc_matches() {
-        let sk = arr32(A1_SKEM);
-        let static_sk = StaticSecret::from(sk);
-        let enc = X25519Pub::from(&static_sk);
-        assert_eq!(
-            hex::encode(enc.to_bytes()),
-            A1_PKEM,
-            "A.1 enc/pkEm mismatch"
-        );
-    }
-
-    /// A.1: DHKEM `ExtractAndExpand` reproduces the RFC `shared_secret`.
-    #[test]
-    fn a1_shared_secret_matches() {
-        // dh = DH(skEm, pkRm)
-        let static_sk = StaticSecret::from(arr32(A1_SKEM));
-        let pk_rm = X25519Pub::from(arr32(A1_PKRM));
-        let dh = static_sk.diffie_hellman(&pk_rm);
-
-        // kem_context = enc || pkRm
-        let mut kem_context = Vec::new();
-        kem_context.extend_from_slice(&unhex(A1_PKEM));
-        kem_context.extend_from_slice(&unhex(A1_PKRM));
-
-        let ss = dhkem_extract_and_expand(kem_suite_id(), dh.as_bytes(), &kem_context).unwrap();
-        assert_eq!(
-            hex::encode(ss.as_ref()),
-            A1_SHARED_SECRET,
-            "A.1 shared_secret mismatch"
-        );
-    }
-
-    /// A.1: `KeySchedule_base` reproduces the RFC `key` and `base_nonce`.
-    #[test]
-    fn a1_key_schedule_matches() {
-        let shared_secret: [u8; HPKE_NSECRET] = unhex(A1_SHARED_SECRET).try_into().unwrap();
-        let info = unhex(A1_INFO);
-        let ks = key_schedule_base(&hpke_suite_id(), &shared_secret, &info).unwrap();
-        assert_eq!(hex::encode(ks.key.as_ref()), A1_KEY, "A.1 key mismatch");
-        assert_eq!(
-            hex::encode(ks.base_nonce.as_ref()),
-            A1_BASE_NONCE,
-            "A.1 base_nonce mismatch"
-        );
-    }
-
-    /// A.1: full deterministic seal (fixed `skEm`) reproduces `enc` and the
-    /// seq-0 ciphertext byte-for-byte.
-    #[test]
-    fn a1_seal_seq0_matches() {
-        let info = unhex(A1_INFO);
-        let aad = unhex(A1_AAD);
-        let pt = unhex(A1_PT);
-        let pk_rm = arr32(A1_PKRM);
-
-        let (enc, ct) = seal_with_ephemeral(arr32(A1_SKEM), &pk_rm, &info, &aad, &pt).unwrap();
-        assert_eq!(hex::encode(enc), A1_PKEM, "A.1 seal enc mismatch");
-        assert_eq!(hex::encode(&ct), A1_CT, "A.1 seal ct mismatch");
-    }
-
-    /// A.1: software `open` recovers the plaintext from the RFC vector.
-    #[test]
-    fn a1_open_recovers_pt() {
-        let info = unhex(A1_INFO);
-        let aad = unhex(A1_AAD);
-        let enc = arr32(A1_PKEM);
-        let ct = unhex(A1_CT);
-        let sk_rm = arr32(A1_SKRM);
-
-        let pt = open(&sk_rm, &enc, &info, &aad, &ct).unwrap();
-        assert_eq!(hex::encode(&pt), A1_PT, "A.1 open plaintext mismatch");
-    }
-
-    /// A.1: custody-path open (external DH = `DH(skRm, enc)`) recovers the
-    /// plaintext from the same RFC vector.
-    #[test]
-    fn a1_custody_open_recovers_pt() {
-        let info = unhex(A1_INFO);
-        let aad = unhex(A1_AAD);
-        let enc = arr32(A1_PKEM);
-        let ct = unhex(A1_CT);
-        let pk_rm = arr32(A1_PKRM);
-
-        // Simulate KeyCustody::dh_agree(handle, enc) = DH(skRm, enc).
-        let sk_rm = StaticSecret::from(arr32(A1_SKRM));
-        let enc_pub = X25519Pub::from(enc);
-        let dh = sk_rm.diffie_hellman(&enc_pub);
-
-        let pt =
-            custody::open_with_external_dh(dh.as_bytes(), &pk_rm, &enc, &info, &aad, &ct).unwrap();
-        assert_eq!(
-            hex::encode(&pt),
-            A1_PT,
-            "A.1 custody open plaintext mismatch"
-        );
-    }
-
-    /// Randomized roundtrip: software seal → software open.
-    #[test]
-    fn roundtrip_seal_open() {
-        let sk = StaticSecret::random_from_rng(OsRng);
-        let pk = X25519Pub::from(&sk);
-
-        for len in [0usize, 1, 16, 32, 64, 1000] {
-            let pt = vec![0xA5u8; len];
-            let info = b"scp-test-info";
-            let aad = b"scp-test-aad";
-            let (enc, ct) = seal(&pk.to_bytes(), info, aad, &pt).unwrap();
-            assert_eq!(ct.len(), pt.len() + HPKE_TAG_LEN);
-            let got = open(&sk.to_bytes(), &enc, info, aad, &ct).unwrap();
-            assert_eq!(got, pt, "roundtrip len {len}");
-        }
-    }
-
-    /// Randomized roundtrip: software seal → custody-path open.
-    #[test]
-    fn roundtrip_seal_custody_open() {
-        let sk = StaticSecret::random_from_rng(OsRng);
-        let pk = X25519Pub::from(&sk);
-        let pt = b"the quick brown fox jumps over the lazy dog";
-        let info = b"info";
-        let aad = b"aad";
-
-        let (enc, ct) = seal(&pk.to_bytes(), info, aad, pt).unwrap();
-
-        let enc_pub = X25519Pub::from(enc);
-        let dh = sk.diffie_hellman(&enc_pub);
-        let got =
-            custody::open_with_external_dh(dh.as_bytes(), &pk.to_bytes(), &enc, info, aad, &ct)
-                .unwrap();
-        assert_eq!(got.as_slice(), pt);
-    }
-
-    /// Negative: tampered ciphertext fails.
-    #[test]
-    fn tampered_ct_fails() {
-        let sk = StaticSecret::random_from_rng(OsRng);
-        let pk = X25519Pub::from(&sk);
-        let (enc, mut ct) = seal(&pk.to_bytes(), b"i", b"a", b"secret").unwrap();
-        ct[0] ^= 0x01;
-        assert!(open(&sk.to_bytes(), &enc, b"i", b"a", &ct).is_err());
-    }
-
-    /// Negative: tampered `enc` fails.
-    #[test]
-    fn tampered_enc_fails() {
-        let sk = StaticSecret::random_from_rng(OsRng);
-        let pk = X25519Pub::from(&sk);
-        let (mut enc, ct) = seal(&pk.to_bytes(), b"i", b"a", b"secret").unwrap();
-        enc[0] ^= 0x01;
-        assert!(open(&sk.to_bytes(), &enc, b"i", b"a", &ct).is_err());
-    }
-
-    /// Negative: wrong recipient key fails.
-    #[test]
-    fn wrong_recipient_fails() {
-        let sk = StaticSecret::random_from_rng(OsRng);
-        let pk = X25519Pub::from(&sk);
-        let wrong = StaticSecret::random_from_rng(OsRng);
-        let (enc, ct) = seal(&pk.to_bytes(), b"i", b"a", b"secret").unwrap();
-        assert!(open(&wrong.to_bytes(), &enc, b"i", b"a", &ct).is_err());
-    }
-
-    /// Negative: wrong `info` (domain separation) fails.
-    #[test]
-    fn wrong_info_fails() {
-        let sk = StaticSecret::random_from_rng(OsRng);
-        let pk = X25519Pub::from(&sk);
-        let (enc, ct) = seal(&pk.to_bytes(), b"info-a", b"a", b"secret").unwrap();
-        assert!(open(&sk.to_bytes(), &enc, b"info-b", b"a", &ct).is_err());
-    }
-
-    /// Negative: wrong `aad` fails.
-    #[test]
-    fn wrong_aad_fails() {
-        let sk = StaticSecret::random_from_rng(OsRng);
-        let pk = X25519Pub::from(&sk);
-        let (enc, ct) = seal(&pk.to_bytes(), b"i", b"aad-a", b"secret").unwrap();
-        assert!(open(&sk.to_bytes(), &enc, b"i", b"aad-b", &ct).is_err());
-    }
-
-    /// Negative: custody open with the wrong `pkRm` (right `dh`) fails — the
-    /// `kem_context` binding catches the mismatch.
-    #[test]
-    fn custody_wrong_pkrm_fails() {
-        let sk = StaticSecret::random_from_rng(OsRng);
-        let pk = X25519Pub::from(&sk);
-        let (enc, ct) = seal(&pk.to_bytes(), b"i", b"a", b"secret").unwrap();
-
-        let enc_pub = X25519Pub::from(enc);
-        let dh = sk.diffie_hellman(&enc_pub);
-
-        let wrong_pk = X25519Pub::from(&StaticSecret::random_from_rng(OsRng));
-        assert!(
-            custody::open_with_external_dh(
-                dh.as_bytes(),
-                &wrong_pk.to_bytes(),
-                &enc,
-                b"i",
-                b"a",
-                &ct
-            )
-            .is_err()
-        );
-    }
 }

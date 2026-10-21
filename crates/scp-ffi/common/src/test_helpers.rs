@@ -109,3 +109,177 @@ pub fn document_with_rejected_services() -> scp_did::DidDocument {
     let json = record.to_json().expect("the record serializes");
     scp_did::DidDocument::from_json(&json).expect("the record deserializes")
 }
+
+/// One row of the custody error table each bridge's error test runs: a
+/// custody failure kind, the error class and code every bridge reports for
+/// it, and the bare `PlatformError`s whose kind it is.
+///
+/// The codes are the ones `.docs/standards/sdk-common.md` registers (ADR-006
+/// 2026-09-29, 2026-10-11 and 2026-10-12 amendments), written as constants
+/// here rather than read from `custody_failure_code`, so a wrong production
+/// mapping fails the table.
+#[derive(Debug)]
+pub struct CustodyCodeRow {
+    /// The custody failure kind.
+    pub kind: scp_crypto::CustodyFailureKind,
+    /// The error class the bridge reports.
+    pub class: crate::error_codes::CustodyFailureClass,
+    /// The code the bridge reports.
+    pub code: &'static str,
+    /// The bare `PlatformError`s whose kind is `kind`. Empty for
+    /// [`TimedOut`](scp_crypto::CustodyFailureKind::TimedOut): a custody sign
+    /// past the ADR-049 Decision 7a budget is never a `PlatformError` (ADR-006
+    /// 2026-10-11 amendment), so it reaches a bridge only as a `CustodyFailure`.
+    pub platform_errors: Vec<scp_platform::PlatformError>,
+}
+
+/// The custody error table: one row per [`CustodyFailureKind`](scp_crypto::CustodyFailureKind).
+///
+/// Key-not-found is `SCP-CRYPTO-4006`, a rejected host pseudonym
+/// `SCP-IDENT-1055`, a custody sign past its budget `SCP-CRYPTO-4062`, a
+/// closed or still-locked store `SCP-STORAGE-8006` or `SCP-STORAGE-8005`, a
+/// device attestation failure `SCP-ATTEST-9001`, an unsupported operation
+/// `SCP-CRYPTO-4061`, each push failure its own code from `SCP-TRANS-5080` to
+/// `SCP-TRANS-5084`, and every other custody failure `SCP-CRYPTO-4060`.
+#[must_use]
+pub fn custody_code_rows() -> Vec<CustodyCodeRow> {
+    use scp_crypto::CustodyFailureKind as K;
+    // Expands one list of kinds into the array the table iterates and into a
+    // match over the same list with no wildcard arm, so a `CustodyFailureKind`
+    // variant missing from the list fails to compile (E0004) and a listed
+    // duplicate is an unreachable pattern: the table covers every kind once.
+    macro_rules! every_kind {
+        ($($kind:ident),+ $(,)?) => {{
+            const _: fn(K) = |kind| match kind {
+                $(K::$kind)|+ => {}
+            };
+            [$(K::$kind),+]
+        }};
+    }
+    every_kind![
+        KeyNotFound,
+        PseudonymRejected,
+        TimedOut,
+        Failed,
+        StorageClosed,
+        StorageLockHeld,
+        AttestationFailed,
+        Unsupported,
+        PushWakePayloadInvalid,
+        PushRegistrationRejected,
+        PushVerifierUnavailable,
+        PushPlatformUnavailable,
+        PushProviderFailed,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let (class, code, platform_errors) = custody_code_row(kind);
+        CustodyCodeRow {
+            kind,
+            class,
+            code,
+            platform_errors,
+        }
+    })
+    .collect()
+}
+
+/// The class, code and bare `PlatformError`s of one custody failure kind. A
+/// kind added to `CustodyFailureKind` fails to compile here until it has an
+/// arm, and in [`custody_code_rows`] until its list names it.
+fn custody_code_row(
+    kind: scp_crypto::CustodyFailureKind,
+) -> (
+    crate::error_codes::CustodyFailureClass,
+    &'static str,
+    Vec<scp_platform::PlatformError>,
+) {
+    use crate::error_codes::{self as codes, CustodyFailureClass as Class};
+    use scp_crypto::CustodyFailureKind as K;
+    use scp_platform::{PlatformError as P, PushFailureKind as Push};
+    fn push(kind: Push) -> P {
+        P::PushError {
+            kind,
+            detail: "push detail".to_owned(),
+        }
+    }
+    match kind {
+        K::KeyNotFound => (Class::Crypto, codes::CRYPTO_4006, vec![P::KeyNotFound]),
+        K::PseudonymRejected => (
+            Class::Identity,
+            codes::IDENT_1055,
+            vec![P::PseudonymRejected("pseudonym detail".to_owned())],
+        ),
+        K::TimedOut => (Class::Crypto, codes::CRYPTO_4062, Vec::new()),
+        K::Failed => (
+            Class::Crypto,
+            codes::CRYPTO_4060,
+            vec![
+                P::WrongKeyType {
+                    expected: scp_platform::traits::KeyType::P256Signing,
+                    actual: scp_platform::traits::KeyType::HpkeP256,
+                },
+                P::NotIdentityKey,
+                P::StorageError("storage detail".to_owned()),
+                P::CustodyError("custody detail".to_owned()),
+            ],
+        ),
+        K::StorageClosed => (
+            Class::Validation,
+            codes::STORAGE_8006,
+            vec![P::StorageClosed],
+        ),
+        K::StorageLockHeld => (
+            Class::Validation,
+            codes::STORAGE_8005,
+            vec![P::StorageLockHeld {
+                dir: "/tmp/scp".to_owned(),
+                lock_path: "/tmp/scp/scp.db.lock".to_owned(),
+            }],
+        ),
+        K::AttestationFailed => (
+            Class::Identity,
+            codes::ATTEST_9001,
+            vec![P::AttestationError("attestation detail".to_owned())],
+        ),
+        K::Unsupported => (
+            Class::Crypto,
+            codes::CRYPTO_4061,
+            vec![P::Unsupported("unsupported detail")],
+        ),
+        K::PushWakePayloadInvalid => (
+            Class::Transport,
+            codes::TRANS_5080,
+            vec![push(Push::WakePayloadInvalid)],
+        ),
+        K::PushRegistrationRejected => (
+            Class::Transport,
+            codes::TRANS_5081,
+            vec![push(Push::RegistrationRejected)],
+        ),
+        K::PushVerifierUnavailable => (
+            Class::Transport,
+            codes::TRANS_5082,
+            vec![push(Push::VerifierUnavailable)],
+        ),
+        K::PushPlatformUnavailable => (
+            Class::Transport,
+            codes::TRANS_5083,
+            vec![push(Push::PlatformUnavailable)],
+        ),
+        K::PushProviderFailed => (
+            Class::Transport,
+            codes::TRANS_5084,
+            vec![push(Push::ProviderFailed)],
+        ),
+    }
+}
+
+/// A [`CustodyFailure`](scp_crypto::CustodyFailure) of `kind`.
+#[must_use]
+pub fn custody_failure(kind: scp_crypto::CustodyFailureKind) -> scp_crypto::CustodyFailure {
+    scp_crypto::CustodyFailure {
+        kind,
+        detail: "custody detail".to_owned(),
+    }
+}

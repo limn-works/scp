@@ -91,7 +91,7 @@ pub struct NapiKeyCustodyProvider {
     /// The host never reuses a key id: an id it returns here names no other
     /// key for the host's lifetime, even after that key is destroyed.
     #[napi(
-        ts_type = "(args: [\"ed25519\" | \"x25519\" | \"p256\" | \"hpke-p256\", \"identity\" | \"operational\"]) => { ok: boolean; value?: string; code?: string; message?: string }"
+        ts_type = "(args: [\"ed25519\" | \"p256\" | \"hpke-p256\", \"identity\" | \"operational\"]) => { ok: boolean; value?: string; code?: string; message?: string }"
     )]
     pub generate_keypair:
         Function<'static, (NapiCustodyKeyType, NapiCustodyKeyRole), HostStringResult>,
@@ -106,8 +106,8 @@ pub struct NapiKeyCustodyProvider {
     )]
     pub sign: Function<'static, (String, Vec<u8>), HostBytesResult>,
     /// `(keyId: string) => { keyType, publicKey, role }` — the key's type
-    /// (`"ed25519"`, `"x25519"`, `"p256"` or `"hpke-p256"`) and its public
-    /// key: exactly 32 bytes (Ed25519 / X25519), the 33-byte compressed SEC1
+    /// (`"ed25519"`, `"p256"` or `"hpke-p256"`) and its public
+    /// key: exactly 32 bytes (Ed25519), the 33-byte compressed SEC1
     /// point (`"p256"`) or the 65-byte uncompressed SEC1 point
     /// (`"hpke-p256"`). The bridge types the key from `keyType`, never from
     /// the length, and refuses any other length. A key id the host does not
@@ -119,7 +119,7 @@ pub struct NapiKeyCustodyProvider {
     /// reports `"identity"` for a key it minted as `"operational"` lets that
     /// key derive pseudonyms, which is outside Rust's control.
     #[napi(
-        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: \"ed25519\" | \"x25519\" | \"p256\" | \"hpke-p256\"; publicKey: number[]; role: \"identity\" | \"operational\" }; code?: string; message?: string }"
+        ts_type = "(keyId: string) => { ok: boolean; value?: { keyType: \"ed25519\" | \"p256\" | \"hpke-p256\"; publicKey: number[]; role: \"identity\" | \"operational\" }; code?: string; message?: string }"
     )]
     pub get_public_key: Function<'static, String, HostPublicKeyResult>,
     /// `(keyId: string) => void` — destroy key material.
@@ -179,9 +179,6 @@ pub enum NapiCustodyKeyType {
     /// An Ed25519 signing key.
     #[napi(value = "ed25519")]
     Ed25519,
-    /// An X25519 key-agreement key.
-    #[napi(value = "x25519")]
-    X25519,
     /// A P-256 signing key.
     #[napi(value = "p256")]
     P256,
@@ -194,7 +191,6 @@ impl From<KeyType> for NapiCustodyKeyType {
     fn from(key_type: KeyType) -> Self {
         match key_type {
             KeyType::Ed25519 => Self::Ed25519,
-            KeyType::X25519 => Self::X25519,
             KeyType::P256Signing => Self::P256,
             KeyType::HpkeP256 => Self::HpkeP256,
         }
@@ -205,7 +201,6 @@ impl From<NapiCustodyKeyType> for KeyType {
     fn from(key_type: NapiCustodyKeyType) -> Self {
         match key_type {
             NapiCustodyKeyType::Ed25519 => Self::Ed25519,
-            NapiCustodyKeyType::X25519 => Self::X25519,
             NapiCustodyKeyType::P256 => Self::P256Signing,
             NapiCustodyKeyType::HpkeP256 => Self::HpkeP256,
         }
@@ -809,22 +804,6 @@ impl<H: JsCustodyHost> KeyCustody for CallbackAdapter<H> {
         .await
     }
 
-    async fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> Result<SharedSecret, PlatformError> {
-        let h = &self.host;
-        flow::ed25519_to_x25519_agree(
-            &self.registry,
-            ed25519_handle,
-            peer_x25519_public,
-            |key_id, peer| h.dh_agree(key_id, peer),
-            |key_id| h.get_public_key(key_id),
-        )
-        .await
-    }
-
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         // Sync query. `custody_type` returns immediately on the JS side; we
         // dispatch NonBlocking and, lacking a synchronous return path from a
@@ -1028,29 +1007,6 @@ impl KeyCustody for NapiKeyCustody {
             #[cfg(feature = "testing")]
             Self::File(kc) => {
                 kc.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
-                    .await
-            }
-        }
-    }
-
-    async fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> Result<SharedSecret, PlatformError> {
-        match self {
-            #[cfg(feature = "testing")]
-            Self::InMemory(kc) => {
-                kc.0.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-                    .await
-            }
-            Self::Callback(kc) => {
-                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
-                    .await
-            }
-            #[cfg(feature = "testing")]
-            Self::File(kc) => {
-                kc.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
                     .await
             }
         }
@@ -1271,7 +1227,7 @@ mod tests {
     ///     public point;
     /// (b) peers of 32, 33, 64 and 66 bytes are rejected;
     /// (c) an off-curve 65-byte point and a `0x00`-led one are rejected;
-    /// (d) an Ed25519 or X25519 handle with a 65-byte peer is rejected, and so
+    /// (d) an Ed25519 or P-256 signing handle with a 65-byte peer is rejected, and so
     ///     is the HPKE handle with a 32-byte peer.
     #[tokio::test]
     async fn napi_key_custody_in_memory_hpke_p256_dh_agree() {
@@ -1347,12 +1303,15 @@ mod tests {
             .generate_keypair(KeyType::Ed25519)
             .await
             .expect("Ed25519");
-        let x = custody
-            .generate_keypair(KeyType::X25519)
+        let signing = custody
+            .generate_keypair(KeyType::P256Signing)
             .await
-            .expect("X25519");
+            .expect("P-256 signing");
         assert!(custody.dh_agree(&ed, &fixed_pub).await.is_err(), "Ed25519");
-        assert!(custody.dh_agree(&x, &fixed_pub).await.is_err(), "X25519");
+        assert!(
+            custody.dh_agree(&signing, &fixed_pub).await.is_err(),
+            "P-256 signing"
+        );
         assert!(
             custody.dh_agree(&a, &[7u8; 32]).await.is_err(),
             "HPKE handle, 32-byte peer"
@@ -1649,43 +1608,5 @@ mod adapter_tests {
             Err(PlatformError::CustodyError(_))
         ));
         assert_eq!(host.calls("sign"), 2);
-    }
-
-    /// `ed25519_to_x25519_agree` refuses a P-256 handle, minted or resolved,
-    /// with `WrongKeyType` before any host agreement call; an Ed25519 handle
-    /// passes the type check and reaches the host.
-    #[tokio::test]
-    async fn napi_adapter_ed25519_only_paths_refuse_p256() {
-        let host = Arc::new(FakeHost::default());
-        let custody = adapter(&host);
-        let minted = custody
-            .generate_keypair(KeyType::P256Signing)
-            .await
-            .expect("p256 generation");
-        let resolved = KeyHandle::new(
-            host.generate_keypair(KeyType::P256Signing, KeyRole::Operational)
-                .expect("host-side key")
-                .parse()
-                .expect("numeric id"),
-        );
-        for handle in [minted, resolved] {
-            assert!(matches!(
-                custody.ed25519_to_x25519_agree(&handle, &[9u8; 32]).await,
-                Err(PlatformError::WrongKeyType { .. })
-            ));
-        }
-        assert_eq!(host.calls("dh_agree"), 0);
-
-        // The fake host agrees with HPKE keys only, so its refusal is a
-        // custody error: the call passed the adapter's type check.
-        let ed = custody
-            .generate_keypair(KeyType::Ed25519)
-            .await
-            .expect("ed25519 generation");
-        assert!(matches!(
-            custody.ed25519_to_x25519_agree(&ed, &[9u8; 32]).await,
-            Err(PlatformError::CustodyError(_))
-        ));
-        assert_eq!(host.calls("dh_agree"), 1);
     }
 }

@@ -3050,6 +3050,29 @@ mod tests {
         ));
     }
 
+    /// Step 5(b): a `verification_id` that is not the derivation is refused
+    /// with `ChallengeVerificationIdMismatch` naming both identifiers. The
+    /// record is re-signed after the edit, so the signature check (a) would
+    /// pass and only check (b) can refuse it.
+    #[test]
+    fn verify_rejects_verification_id_not_derived() {
+        let fx = fixture();
+        let genuine = record(&fx);
+        let mut v = genuine.clone();
+        v.verification_id[0] ^= 1;
+        fx.resign(&mut v).unwrap();
+        match verify(&fx, &v) {
+            Err(TrustError::ChallengeVerificationIdMismatch {
+                verification_id,
+                expected,
+            }) => {
+                assert_eq!(verification_id, hex::encode(v.verification_id));
+                assert_eq!(expected, hex::encode(genuine.verification_id));
+            }
+            other => panic!("expected ChallengeVerificationIdMismatch, got {other:?}"),
+        }
+    }
+
     /// Test 17.
     #[test]
     fn verify_rejects_future_timestamp() {

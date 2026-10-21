@@ -195,6 +195,10 @@ env:
 #   fuzz              `fuzz/target/debug` — fuzz-build, whose `cargo check` compiles a
 #                     separate workspace on the nightly `fuzz/rust-toolchain.toml`
 #                     names, under the dev profile.
+#   android-x86_64-testing
+#                     `target/x86_64-linux-android/debug` under `--features testing` —
+#                     kotlin-android-instrumented, whose API 33 leg on `main` writes and
+#                     whose API 30 leg restores.
 #
 # rust-doctest reads `workspace-debug`, and rust-doc reads `workspace-check`,
 # without matching the entry in full. Each job's command adds
@@ -211,7 +215,7 @@ env:
 # The cap is per repository, so `.github/workflows/fuzz.yml` counts against the same
 # 10 GB: it writes one further group, `fuzz-run`, holding
 # `fuzz/target/<host triple>/release` under `cargo fuzz run`'s RUSTFLAGS (its group
-# comment on job fuzz-nightly says more). Fourteen groups per generation across the two
+# comment on job fuzz-nightly says more). Fifteen groups per generation across the two
 # workflows, where the two together wrote thirty-six entries before. The
 # bridge-artifact entries the producer jobs save are not rust-cache groups; the
 # comment above job pyo3-module counts them.
@@ -233,7 +237,8 @@ env:
 # (apple-transport-platform),
 # pyo3-module (workspace-ci-bridge), typescript-wasm-check
 # (wasm32), xcframework (apple-uniffi-ci-bridge), pyo3-module-macos
-# (apple-parity-ci-bridge) and
+# (apple-parity-ci-bridge), kotlin-android-instrumented's API 33 leg
+# (android-x86_64-testing) and
 # fuzz-build (fuzz): in each group, the job that compiles the most of that directory
 # under that mode.
 #
@@ -511,6 +516,10 @@ jobs:
               - 'crates/scp-protocol/**'
               - 'crates/scp-event-log/**'
               - 'crates/scp-relay-client/**'
+              # A dev-dependency, not in the closure above: the wasm32 key-event
+              # KAT (crates/scp-client-wasm/tests/kel_cross_target_kat.rs)
+              # checks scp-kel and includes scp-kel's test fixtures.
+              - 'crates/scp-kel/**'
               # scp-client-wasm is member 15 of the root workspace, so
               # `wasm-pack build` resolves every `dep = { workspace = true }`
               # entry in the crates above against the root manifest's
@@ -1521,7 +1530,7 @@ jobs:
           shared-key: wasm32
           save-if: false
       - uses: ./.github/actions/cargo-fetch
-      - run: cargo check -p scp-alloc -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
+      - run: cargo check -p scp-alloc -p scp-clock -p scp-crypto -p scp-did -p scp-kel -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
 
   wasm-test:
     needs: changes
@@ -1905,7 +1914,7 @@ jobs:
       - name: Run every other member's tests
         if: matrix.leg == 'all' || matrix.leg == 'rest'
         run: |
-          cargo nextest run --no-tests=fail -p scp-alloc -p scp-sqlite-pools -p scp-clock -p scp-crypto -p scp-did -p scp-dht -p scp-identity -p scp-event-log -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-client-wasm -p scp-relay-mock -p scp-transport -p scp-mcp -p scp-media -p scp-node -p scp-relay --features serde_json/unbounded_depth,rustix/net,scp-crypto/testing,scp-identity/testing,scp-testing/testing,scp-core/outlet-capability-test-grant,scp-mcp/testing,scp-node/allow_unencrypted_storage,scp-node/testing
+          cargo nextest run --no-tests=fail -p scp-alloc -p scp-sqlite-pools -p scp-clock -p scp-crypto -p scp-did -p scp-kel -p scp-dht -p scp-identity -p scp-event-log -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-client-wasm -p scp-relay-mock -p scp-transport -p scp-mcp -p scp-media -p scp-node -p scp-relay --features serde_json/unbounded_depth,rustix/net,scp-crypto/testing,scp-identity/testing,scp-testing/testing,scp-core/outlet-capability-test-grant,scp-mcp/testing,scp-node/allow_unencrypted_storage,scp-node/testing
 
   # ── Optional-feature test lanes ─────────────────────────────────────────────
   #
@@ -4546,6 +4555,183 @@ jobs:
             exit 1
           fi
 
+  # Runs scp-kt-android's src/androidTest suite on an x86_64 emulator against the real
+  # Android Keystore and EncryptedSharedPreferences (ADR-027, SCP-307). The JVM suite in
+  # kotlin-test runs the same adapter against a fake Keystore, which cannot show that
+  # Keystore accepts the P-256 signing and agreement specs, that the API-level probe picks
+  # the store a device supports, or that the recorded custody equals what KeyInfo reports.
+  # API 30 is the last level without Keystore ECDH, so its leg runs the software HPKE
+  # store; API 33 runs the Keystore agreement store.
+  #
+  # The cdylib is built here for x86_64-linux-android with `--features testing`, from
+  # the same commit and features as the `scp.kt` bindings uniffi-cdylib-linux uploads,
+  # so UniFFI's contract checksums match; a mismatch fails every test at load time. The
+  # library goes under src/androidTest/jniLibs only, never src/main, so no published
+  # artifact can carry the testing build.
+  kotlin-android-instrumented:
+    needs: [changes, uniffi-cdylib-linux]
+    if: needs.changes.outputs.kotlin == 'true'
+    name: Kotlin / instrumented (API ${{ matrix.api-level }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [30, 33]
+    steps:
+      - name: Free disk space when the runner is short of it
+        run: |
+          # Conditional for the reason job rust-test's copy of this step states in full.
+          AVAILABLE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "available: ${AVAILABLE_GB}G"
+          if [ "$AVAILABLE_GB" -lt 40 ]; then
+            echo "under 40G — reclaiming the preinstalled SDK trees"
+            sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+        with:
+          # kotlin-test's copy of this input states why `tools` must not be requested.
+          packages: platform-tools
+      - name: Accept Android SDK licenses
+        run: |
+          mkdir -p "$ANDROID_HOME/licenses"
+          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
+          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
+          echo -e "\nd56f5187479451eabf01fb78af6dfcb131a6481e" > "$ANDROID_HOME/licenses/google-gdk-license"
+          echo -e "\ne9acab5b5fbb560a72797e9277c5b0adfeed3bca" > "$ANDROID_HOME/licenses/intel-android-extra-license"
+          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/android-googletv-license"
+          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/android-googlexr-license"
+          echo -e "\ne7ce8e93e13705710e8a1b7fdea3c49f149b1386" > "$ANDROID_HOME/licenses/mips-android-sysimage-license"
+      - run: sdkmanager "platforms;android-35" "ndk;27.2.12479018"
+      - name: Point cargo at the NDK linker
+        run: |
+          # The same linker build-matrix.yml's Android job names for this triple.
+          # ring's build script and the vendored OpenSSL below compile C through cc-rs,
+          # which otherwise looks for unversioned `x86_64-linux-android-clang` and
+          # `x86_64-linux-android-ranlib` tools that NDK 27 does not ship, so the C
+          # compiler, archiver and ranlib are named too.
+          ndk_bin="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$ndk_bin/x86_64-linux-android21-clang"
+            echo "CC_x86_64_linux_android=$ndk_bin/x86_64-linux-android21-clang"
+            echo "AR_x86_64_linux_android=$ndk_bin/llvm-ar"
+            echo "RANLIB_x86_64_linux_android=$ndk_bin/llvm-ranlib"
+          } >> "$GITHUB_ENV"
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The artifact root is the workspace (see the upload in uniffi-cdylib-linux). This
+      # job reads only the generated `scp.kt`; it builds its own Android cdylib below.
+      - name: Download the UniFFI Kotlin bindings
+        uses: actions/download-artifact@v4
+        with:
+          name: uniffi-kotlin-linux
+          path: .
+      - name: Assert the downloaded bindings are present
+        run: |
+          set -euo pipefail
+          bindings=bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt
+          if [ ! -s "$bindings" ]; then
+            echo "::error::artifact uniffi-kotlin-linux placed nothing at $bindings"
+            exit 1
+          fi
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          targets: x86_64-linux-android
+      # One writer for the group: the API 33 leg on main. Both legs compile the same
+      # units, so the API 30 leg restores what the API 33 leg saved.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-x86_64-testing
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.api-level == 33 }}
+      - uses: ./.github/actions/cargo-fetch
+      - name: Build the UniFFI cdylib for the emulator
+        run: |
+          set -euo pipefail
+          # SQLCipher needs libcrypto, which the NDK sysroot does not hold and Android
+          # does not expose to apps, so this test library compiles OpenSSL in through
+          # scp-platform's `vendored-openssl`. The library ships nowhere; the feature's
+          # scope gate covers shipped configurations only.
+          cargo build -p scp-ffi-uniffi --features testing,scp-platform/vendored-openssl --target x86_64-linux-android
+          jni=bindings/kotlin/scp-kt-android/src/androidTest/jniLibs/x86_64
+          mkdir -p "$jni"
+          cp target/x86_64-linux-android/debug/libscp_ffi_uniffi.so "$jni/"
+          if [ -e bindings/kotlin/scp-kt-android/src/main/jniLibs ]; then
+            echo "::error::src/main/jniLibs exists; the testing cdylib must reach no main source set"
+            exit 1
+          fi
+      - uses: gradle/actions/setup-gradle@v4
+      # The emulator cold-boots: `-no-snapshot` neither loads nor saves a snapshot, and
+      # `force-avd-creation` builds a fresh AVD. The runner treats
+      # `getprop sys.boot_completed` == 1 as ready and then sends
+      # `adb shell input keyevent 82`, failing the step on any error. On a cold boot
+      # ActivityManagerService sets that property only after SystemServer has published
+      # its services, `input` among them, so the property implies the readiness the
+      # runner assumes. A restored snapshot carries the property's saved value of 1 with
+      # it, so the property no longer says whether the restored framework is serving: one
+      # run loaded snapshot 'default_boot', read 1 two seconds later, and keyevent 82 threw
+      # `No service published for: input`. Do not reintroduce an AVD snapshot cache here.
+      # The runner runs each `script` line in its own shell, so the directory comes from
+      # `working-directory`. An AOSP emulator's KeyMint runs in software, so
+      # `expectSoftwareKeyInfo=true` makes custodyMatchesKeyInfo also assert that KeyInfo
+      # reported a non-secure level: a comparison that only ever saw "hardware" would pass
+      # against an adapter that always reports "hardware".
+      - name: Run the instrumented tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          target: default
+          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot
+          disable-animations: true
+          working-directory: bindings/kotlin
+          script: |
+            ./gradlew :scp-kt-android:connectedDebugAndroidTest -Pscp.uniffi.prebuiltBindings=true -Pandroid.testInstrumentationRunnerArguments.expectSoftwareKeyInfo=true
+      # `BUILD SUCCESSFUL` proves nothing about what ran. This step fails unless every
+      # expected test ran on this leg, none was skipped, and none failed.
+      - name: Check the instrumented test results
+        if: ${{ !cancelled() }}
+        working-directory: bindings/kotlin
+        run: |
+          python3 - <<'PY'
+          import glob
+          import sys
+          import xml.etree.ElementTree as ET
+
+          expected = {
+              "p256SignVerifiesStrictly",
+              "hpkeAgreementMatchesOracle",
+              "custodyMatchesKeyInfo",
+              "keysSurviveANewInstance",
+              "destroyRemovesEverything",
+          }
+          files = sorted(glob.glob("scp-kt-android/build/outputs/androidTest-results/connected/**/*.xml", recursive=True))
+          ran, problems = set(), []
+          for path in files:
+              for case in ET.parse(path).getroot().iter("testcase"):
+                  name = case.get("name")
+                  ran.add(name)
+                  for kind in ("skipped", "failure", "error"):
+                      if case.find(kind) is not None:
+                          problems.append(f"{case.get('classname')}.{name}: {kind}")
+          print(f"{len(files)} result files, {len(ran)} tests: {sorted(ran)}")
+          if not ran:
+              problems.append("no test ran")
+          problems += [f"{name}: did not run" for name in sorted(expected - ran)]
+          for problem in problems:
+              print(f"::error::{problem}")
+          sys.exit(1 if problems else 0)
+          PY
+
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:
     needs: changes
@@ -5185,6 +5371,7 @@ jobs:
       - kotlin-lint
       - uniffi-cdylib-linux
       - kotlin-test
+      - kotlin-android-instrumented
       - swift-lint
       - swift-build-test
       - fuzz-build

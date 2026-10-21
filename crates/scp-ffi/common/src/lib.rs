@@ -22,6 +22,7 @@
 // (ADR-049 Decision 7a; `scripts/check-bridge-block-on.py`).
 #[cfg(feature = "resolvers")]
 pub mod bridge_wait;
+pub mod context_error_class;
 pub mod custody_request;
 pub mod error_codes;
 pub mod outlet_id;

@@ -61,12 +61,15 @@ class JoinFromWelcomeTest {
         private const val MISSING_KEY_MATERIAL_CODE = "SCP-IDENT-1054"
 
         /**
-         * Length in bytes of an RFC 9180 HPKE encapsulated key under DHKEM
-         * X25519-HKDF-SHA256 — the KEM the sealed invitation uses. A join
-         * boundary validates `SealedInvitation.enc` against exactly this many
-         * bytes.
+         * Length in bytes of an RFC 9180 HPKE encapsulated key under
+         * DHKEM(P-256, HKDF-SHA256), the KEM that seals an invitation to the
+         * invitee KeyPackage's wrapping key (spec 05 §5.12.3.1): an
+         * uncompressed SEC1 point.
          */
-        private const val HPKE_ENCAPSULATED_KEY_BYTES = 32
+        private const val HPKE_ENCAPSULATED_KEY_BYTES = 65
+
+        /** The SEC1 tag of an uncompressed point. */
+        private const val SEC1_UNCOMPRESSED_TAG: Byte = 0x04
 
         /** A syntactically-valid 64-hex context id (ADR-056). */
         private const val HEX_CONTEXT_ID =
@@ -194,9 +197,9 @@ class JoinFromWelcomeTest {
                 // to the creator out of band.
                 val reservation = scp.reserveKeyPackage(invitee)
 
-                // The creator seals the bundle to the invitee's #active key
-                // (Ed25519 -> X25519), which the runtime resolves from the
-                // invitee's DID document. `inviteMember` returns the sealed
+                // The creator seals the bundle to the invitee's #active key,
+                // which the runtime resolves from the invitee's DID document.
+                // `inviteMember` returns the sealed
                 // bundle, which is the same wire type the joiner passes to
                 // `contextJoinFromWelcome`.
                 val outcome =
@@ -213,10 +216,11 @@ class JoinFromWelcomeTest {
                 // reference assertions in
                 // `bindings/python/tests/test_join_from_welcome.py`
                 // (`test_invite_member_seals_for_single_admin_context`). The
-                // two-party JOIN is proven at the runtime layer
-                // (`spawn_from_welcome_tests`): one instance cannot self-join
-                // its own context, because first-writer-wins rejects a second
-                // actor for the same context id.
+                // two-instance JOIN runs in the PyO3 bridge's
+                // `invite_then_join_across_two_instances_*` tests and the
+                // TypeScript "reserve → invite → join handshake": one instance
+                // cannot self-join its own context, because first-writer-wins
+                // rejects a second actor for the same context id.
                 val sealedOutcome = outcome as InviteMemberOutcome.Sealed
                 val sealed = sealedOutcome.bundle
                 assertEquals(
@@ -229,11 +233,17 @@ class JoinFromWelcomeTest {
                     sealed.creatorDid,
                     "the sealed bundle must name the inviting creator's DID",
                 )
-                // RFC 9180 HPKE encapsulated key is exactly 32 bytes.
+                // The bundle is sealed to the invitee's DHKEM(P-256) wrapping
+                // key, so `enc` is a 65-byte uncompressed point.
                 assertEquals(
                     HPKE_ENCAPSULATED_KEY_BYTES,
                     sealed.enc.size,
-                    "the HPKE encapsulated key must be 32 bytes (RFC 9180 DHKEM X25519)",
+                    "the HPKE encapsulated key must be 65 bytes (RFC 9180 DHKEM(P-256))",
+                )
+                assertEquals(
+                    SEC1_UNCOMPRESSED_TAG,
+                    sealed.enc[0],
+                    "the HPKE encapsulated key must be an uncompressed point",
                 )
                 // `ct = ciphertext || tag`, so real sealing never yields an
                 // empty ciphertext.

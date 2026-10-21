@@ -24,13 +24,12 @@ import android.content.Context
  * UniFFI-generated `uniffi.scp.KeyCustodyProvider`, which [keyCustody] does not implement;
  * `UniffiKeyCustody(AndroidKeyCustody(context))` does.
  *
- * @property keyCustody Android Keystore and Bouncy Castle key management (Keystore-held Ed25519
- *   on API 33+ today, reported as [CustodyType.HARDWARE] without a `KeyInfo.securityLevel`
- *   check; on API 26-32 a Bouncy Castle software Ed25519 key in process memory, whose seed
- *   [AndroidKeyCustody] writes to EncryptedSharedPreferences; and in-memory software X25519 key
- *   agreement at every API level; ADR-027 requires a P-256 signing key in
- *   Keystore at every supported API level and P-256 key agreement in Keystore from API 31;
- *   story SCP-110 tracks both moves).
+ * @property keyCustody Android Keystore and Bouncy Castle key management: a P-256 signing key in
+ *   Keystore at every supported API level and an HPKE P-256 agreement key in Keystore from API
+ *   31 (a Bouncy Castle scalar in EncryptedSharedPreferences below it), each with the custody
+ *   class read from `KeyInfo` at mint and recorded per key; a Keystore Ed25519 key on API 33+,
+ *   reported as [CustodyType.HARDWARE] without reading `KeyInfo`; and a Bouncy Castle Ed25519 key
+ *   on API 26-32 whose seed is committed to EncryptedSharedPreferences.
  * @property deviceAttestation Play Integrity device attestation, which requests a Classic
  *   token today; story SCP-111 tracks the Standard request ADR-027 requires.
  * @property push Firebase Cloud Messaging; checks only the `scp` wake field of a data-only
@@ -79,12 +78,12 @@ data class AndroidPlatformAdapterImpl(
  * unavailable or FCM not configured). [make] does neither. It calls the four constructors once,
  * passes no `cloudProjectNumber`, and probes no provider:
  *
- * - [AndroidKeyCustody]'s constructor gets or creates the Keystore master key, opens
- *   EncryptedSharedPreferences, and restores every persisted software Ed25519 seed from it.
- *   An exception from any of the three reaches the caller as thrown, not wrapped in
- *   [ScpException]. The restore decrypts every entry of the file and Base64-decodes each
- *   seed, so a file the master key no longer decrypts, such as after a backup restore, or a
- *   seed that is not valid Base64 makes [make] throw.
+ * - [AndroidKeyCustody]'s constructor gets or creates the Keystore master key and opens
+ *   EncryptedSharedPreferences; an exception from either reaches the caller as thrown, not
+ *   wrapped in [ScpException]. It then restores each persisted software Ed25519 seed, entry by
+ *   entry through the role index, and deletes every P-256 key another process left pending; a
+ *   failure there, such as a file the master key no longer decrypts after a backup restore, is
+ *   [ScpException] `SCP-CRYPTO-4060`.
  * - [AndroidDeviceAttestation] creates its `IntegrityManager` inside each
  *   [AndroidDeviceAttestation.attest] call, so an absent Play Integrity service surfaces at
  *   that call.

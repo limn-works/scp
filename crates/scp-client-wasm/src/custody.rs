@@ -94,7 +94,7 @@ mod wasm_impl {
         fn sign(this: &JsKeyCustody, key_id: &str, data: Vec<u8>) -> Result<Vec<u8>, JsValue>;
 
         /// Returns the raw public key bytes for `key_id`: 32 bytes for
-        /// `"ed25519"` / `"x25519"`, the 33-byte compressed SEC1 point for
+        /// `"ed25519"`, the 33-byte compressed SEC1 point for
         /// `"p256"`, the 65-byte uncompressed SEC1 point for `"hpke-p256"`.
         /// Throws if absent.
         ///
@@ -102,7 +102,7 @@ mod wasm_impl {
         #[wasm_bindgen(method, catch, js_name = "getPublicKey")]
         fn get_public_key(this: &JsKeyCustody, key_id: &str) -> Result<Vec<u8>, JsValue>;
 
-        /// Generates a keypair of type `key_type` (`"ed25519"`, `"x25519"`,
+        /// Generates a keypair of type `key_type` (`"ed25519"`,
         /// `"p256"` or `"hpke-p256"`) and returns its opaque `key_id`.
         ///
         /// SEAM: see [`JsKeyCustody::sign`].
@@ -117,8 +117,8 @@ mod wasm_impl {
         fn destroy_key(this: &JsKeyCustody, key_id: &str) -> Result<(), JsValue>;
 
         /// Performs DH agreement against `peer_public`, returning the 32-byte
-        /// shared secret: X25519 for an `"x25519"` key (32-byte peer), P-256
-        /// ECDH for an `"hpke-p256"` key (65-byte uncompressed SEC1 peer). No
+        /// shared secret: P-256 ECDH for an `"hpke-p256"` key (65-byte
+        /// uncompressed SEC1 peer). No
         /// Rust caller exists yet, and nothing here validates the peer point
         /// or the 32-byte result; the wiring described at
         /// [`JsKeyCustody::sign`] routes it through

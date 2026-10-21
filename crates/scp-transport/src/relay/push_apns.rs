@@ -821,7 +821,8 @@ mod tests {
     #[tokio::test]
     async fn unreachable_gateway_is_transient() {
         let clock = Arc::new(TestClock::new(START));
-        let sender = ApnsSender::build(config(), TestServer::closed_origin().await, clock)
+        let closed = TestServer::closed_origin();
+        let sender = ApnsSender::build(config(), closed.origin().to_owned(), clock)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(sender.send(&token()).await, PushSendOutcome::Transient);
     }
@@ -854,9 +855,10 @@ mod tests {
         for _ in 0..5 {
             sender.send(&token()).await;
         }
+        let closed = TestServer::closed_origin();
         let unreachable = ApnsSender::build(
             config(),
-            TestServer::closed_origin().await,
+            closed.origin().to_owned(),
             Arc::new(TestClock::new(START)),
         )
         .unwrap_or_else(|e| panic!("{e}"));

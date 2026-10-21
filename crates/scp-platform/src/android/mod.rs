@@ -34,8 +34,7 @@
 //!   `KeyCustodyProvider` callback except `custody_type`, and it names the
 //!   callback's `get_public_key` `publicKey`, the name the Rust trait's
 //!   `public_key` takes in Kotlin. The [`crate::traits::KeyCustody`] trait
-//!   also declares `custody_type`,
-//!   `ed25519_to_x25519_agree`, `import_ed25519_signing_key` and
+//!   also declares `custody_type`, `import_ed25519_signing_key` and
 //!   `generate_ephemeral_ed25519_seed`, which the Kotlin interface lacks. The
 //!   Kotlin methods name a key by a Kotlin `KeyHandle`, a data class of a
 //!   `String` id and a `CustodyType`, while the trait's [`KeyHandle`] is a
@@ -91,11 +90,10 @@
 //!
 //! - [`key_custody`] — Android Keystore key management (Keystore-held Ed25519
 //!   on API 33+, reported as hardware custody without a `KeyInfo.securityLevel`
-//!   check, Bouncy Castle software fallback on API 26-32, and in-memory
-//!   software X25519 key agreement at every API level, today; ADR-027
-//!   requires a P-256 signing key in Keystore at every supported API level and
-//!   P-256 key agreement in Keystore from API 31; story SCP-110 tracks both
-//!   moves).
+//!   check, Bouncy Castle software fallback on API 26-32, a P-256 signing key
+//!   in Keystore at every API level, and HPKE P-256 key agreement in Keystore
+//!   from API 31 with a Bouncy Castle software key below it, as ADR-027
+//!   requires).
 //! - [`device_attestation`] — Play Integrity device attestation (a Classic
 //!   request today; story SCP-111 tracks the Standard request ADR-027 requires).
 //! - [`push_provider`] — Firebase Cloud Messaging; checks only the `scp` wake

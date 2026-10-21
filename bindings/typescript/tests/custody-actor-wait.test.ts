@@ -33,34 +33,28 @@ import {
   p256SoftwarePseudonymPoint,
 } from "../src/scp";
 import { HpkeP256Keys } from "./hpke-p256-keys";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
-// biome-ignore lint/suspicious/noExplicitAny: the native addon is untyped
-let addon: any = null;
-let skipReason = "";
-try {
-  addon = loadNativeAddon();
+const suite = await napiSuite(() => {
+  // biome-ignore lint/suspicious/noExplicitAny: the native addon is untyped
+  const addon: any = loadNativeAddon();
   const probe = new addon.SCP(JSON.stringify({ type: "in_memory" }));
   if (typeof probe.testingDeliverIncoming !== "function") {
-    addon = null;
-    skipReason = "native addon built without the `testing` feature";
+    throw new Error(
+      "native addon has no testingDeliverIncoming: build it with the `testing` feature",
+    );
   }
-} catch (e: unknown) {
-  addon = null;
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+  return addon;
+});
 
 /** Ed25519 PKCS8 DER prefix; the 32-byte seed follows. */
 const ED25519_PKCS8 = Buffer.from("302e020100300506032b657004220420", "hex");
-/** X25519 PKCS8 DER prefix; the 32-byte scalar follows. */
-const X25519_PKCS8 = Buffer.from("302e020100300506032b656e04220420", "hex");
-/** X25519 SPKI DER prefix; the 32-byte point follows. */
-const X25519_SPKI = Buffer.from("302a300506032b656e032100", "hex");
 
 /**
- * Ed25519 identity seeds and real HPKE P-256 keys. An Ed25519 key agrees as
- * its RFC 7748 X25519 mapping, which opens a Welcome sealed to the identity
- * key. `onWrappingAgree`, when set, runs once inside the next `hpke-p256`
+ * Ed25519 identity seeds and real HPKE P-256 keys. Only an `hpke-p256` key
+ * agrees: the join opens the sealed invitation through the wrapping key
+ * (spec 09 §9.16.2), so an agreement on an Ed25519 key fails the test.
+ * `onWrappingAgree`, when set, runs once inside the next `hpke-p256`
  * agreement, before the host answers.
  */
 class WrappingAgreeKeychain implements KeyCustodyProvider {
@@ -133,20 +127,7 @@ class WrappingAgreeKeychain implements KeyCustodyProvider {
       hook?.();
       return this.#hpke.agree(keyId, peerPublic);
     }
-    // RFC 8032 §5.1.5: the X25519 scalar is the first half of SHA-512(seed);
-    // X25519 clamps it.
-    const scalar = crypto.createHash("sha512").update(this.#seed(keyId)).digest().subarray(0, 32);
-    const privateKey = crypto.createPrivateKey({
-      key: Buffer.concat([X25519_PKCS8, scalar]),
-      format: "der",
-      type: "pkcs8",
-    });
-    const publicKey = crypto.createPublicKey({
-      key: Buffer.concat([X25519_SPKI, Buffer.from(peerPublic)]),
-      format: "der",
-      type: "spki",
-    });
-    return new Uint8Array(crypto.diffieHellman({ privateKey, publicKey }));
+    throw new Error(`dhAgree on a non-wrapping key: ${keyId}`);
   }
 
   derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array {
@@ -187,11 +168,7 @@ const CEILING = [
   "governance:vote",
 ];
 
-if (addon === null) {
-  describe("callback custody under a concurrent actor wait (SKIPPED)", () => {
-    test.skip(`native NAPI addon unavailable: ${skipReason}`, () => {});
-  });
-} else {
+suite.describe("callback custody under a concurrent actor wait", (addon) => {
   describe("callback custody under a concurrent actor wait", () => {
     test("a KeyResponse turn awaiting the host's dhAgree completes while JS awaits contextMemberCount on the same actor", async () => {
       const alice = new addon.SCP(JSON.stringify({ type: "in_memory" }));
@@ -271,4 +248,4 @@ if (addon === null) {
       }
     }, 30_000);
   });
-}
+});

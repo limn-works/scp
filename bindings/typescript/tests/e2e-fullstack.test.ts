@@ -20,7 +20,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { loadNativeAddon } from "../src/internal/native";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 // ---------------------------------------------------------------------------
 // Load the raw native addon — the fullstack methods live on `SCP` (gated
@@ -28,17 +28,14 @@ import { skipReasonIfAddonAbsent } from "./napi-guard";
 // per-test `SCP` instance instead of module-level free functions.
 // ---------------------------------------------------------------------------
 
-// biome-ignore lint/suspicious/noExplicitAny: dynamic native addon loading
-let addon: any = null;
-let skipReason = "";
-
-try {
+const suite = await napiSuite(() => {
   // `loadNativeAddon` is the SDK's one loader, and this file resolves the addon
   // through it so the load this file performs is the load CI's "Assert the
   // downloaded addon loads and constructs" step performs. A specifier built here
   // would name a package that step never installs, which skips this whole suite
   // over an addon CI just verified.
-  addon = loadNativeAddon();
+  // biome-ignore lint/suspicious/noExplicitAny: dynamic native addon loading
+  const addon: any = loadNativeAddon();
 
   if (typeof addon.SCP !== "function") {
     throw new Error("SCP class not exported from native addon — rebuild with the Phase 4 changes");
@@ -51,15 +48,10 @@ try {
   if (typeof probe.fullstackCreateNode !== "function") {
     throw new Error("SCP.fullstackCreateNode not found — rebuild with testing feature");
   }
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+  return addon;
+});
 
-if (addon === null) {
-  describe("A+ Full-stack encrypt/decrypt roundtrip (SKIPPED)", () => {
-    test.skip(`all tests skipped: ${skipReason}`, () => {});
-  });
-} else {
+suite.describe("A+ Full-stack encrypt/decrypt roundtrip", (addon) => {
   describe("A+ Full-stack encrypt/decrypt roundtrip", () => {
     // Per-test SCP instance. A fresh instance isolates each case's
     // `FullStackNetwork` and handles from neighbours, matching the lifecycle
@@ -361,4 +353,4 @@ if (addon === null) {
       expect(Buffer.from(d2)).toEqual(msg);
     });
   });
-}
+});

@@ -28,7 +28,7 @@ the platform code and dependencies it needs:
 
 | Feature | Provides |
 |---------|----------|
-| `software_platform` | In-process `Ed25519` / `X25519` crypto primitives (no HSM) |
+| `software_platform` | In-process `Ed25519` / `P-256` crypto primitives (no HSM) |
 | `testing` | In-memory custody / attestation adapters for tests (implies `software_platform`, ADR-006) |
 | `sqlite` | `SQLCipher`-encrypted `Storage` with raw-key or `Argon2id`-passphrase key material (spec §17.6) |
 | `apple` | Apple `SQLCipher` storage adapter (key supplied from the Keychain) |

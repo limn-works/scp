@@ -301,8 +301,14 @@ android {
 }
 
 dependencies {
-    // SCP core Kotlin SDK
-    implementation(project(":scp-kt"))
+    // SCP core Kotlin SDK. `:scp-kt` is a JVM module and depends on the JNA jar; on
+    // Android the `jna@aar` below supplies the same classes plus the native stubs, so the
+    // jar is excluded from this edge. With both, an APK holds every `com.sun.jna` class
+    // twice and `checkDebugAndroidTestDuplicateClasses` fails. An exclude on a
+    // configuration would drop the aar too, since both share one module coordinate.
+    implementation(project(":scp-kt")) {
+        exclude(group = "net.java.dev.jna", module = "jna")
+    }
 
     // Bouncy Castle — software Ed25519 fallback for API 26-32 (ADR-027)
     implementation("org.bouncycastle:bcprov-jdk18on:1.80")
@@ -363,6 +369,13 @@ dependencies {
     // Available in all test variants so Robolectric can resolve ComponentActivity
     // in both debug and release unit tests (see #144)
     testImplementation("androidx.compose.ui:ui-test-manifest")
+
+    // Instrumented tests (src/androidTest), run on an emulator by CI's
+    // kotlin-android-instrumented lane against the real Keystore (ADR-027, SCP-307).
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:core:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("junit:junit:4.13.2")
 }
 
 detekt {

@@ -20,19 +20,17 @@
 package works.limn.scp.android.platform
 
 /**
- * The type of cryptographic key managed by a [KeyHandle].
- *
- * The shipped variants name curves: Ed25519 keys are used for identity and signing,
- * X25519 keys are used for key agreement (HPKE wrapping keys). ADR-006, as amended on
- * 2026-09-10, names the two key types by purpose, `P256Signing` and `P256Agreement`; this
- * enum has not moved to them.
+ * The type of cryptographic key managed by a [KeyHandle], one per UniFFI `CustodyKeyType`.
  */
 enum class KeyType {
     /** Ed25519 signing key (identity keys, active signing keys). */
     ED25519,
 
-    /** X25519 key agreement key (HPKE wrapping keys). */
-    X25519,
+    /** P-256 signing key: signs a 32-byte digest and returns DER (spec 09 §9.5). */
+    P256,
+
+    /** P-256 agreement key for DHKEM(P-256) HPKE (spec 09 §9.5, RFC 9180 §7.1). */
+    HPKE_P256,
 }
 
 /**
@@ -54,10 +52,12 @@ enum class KeyRole {
  * The custody type for a given key, indicating where the key material is stored
  * and how it is protected.
  *
- * See ADR-006 for the custody model. [AndroidKeyCustody] reports [HARDWARE] for a
- * Keystore key and [SOFTWARE] for a Bouncy Castle key. No Android adapter reports
- * [IN_MEMORY]; the value matches the custody type of ADR-006's in-memory testing
- * adapter, which is Rust code and reports the Rust `CustodyType`.
+ * See ADR-006 for the custody model. For a P-256 or HPKE P-256 key, [AndroidKeyCustody]
+ * records the custody class when it mints the key, from the security level Keystore's
+ * `KeyInfo` reports, and reports the recorded class. For an Ed25519 key it reports
+ * [HARDWARE] for a Keystore key and [SOFTWARE] for a Bouncy Castle key. No Android adapter
+ * reports [IN_MEMORY] for a key it holds; [UniffiKeyCustody] reports `"in_memory"` for an id
+ * it does not hold, the weakest class the bridge reads.
  */
 enum class CustodyType {
     /**
@@ -67,18 +67,21 @@ enum class CustodyType {
     IN_MEMORY,
 
     /**
-     * Key material is held by Android Keystore, which does not hand the private bytes to the
-     * app. [AndroidKeyCustody] reports this value for every Keystore key without reading
-     * `KeyInfo.securityLevel`, so the value does not show whether Keystore put the key in the
-     * TEE or, on a device whose KeyMint runs in software, in software.
+     * Key material is held by Android Keystore in secure hardware, which does not hand the
+     * private bytes to the app. A P-256 or HPKE P-256 key reports this value only when
+     * `KeyInfo` places it in the TEE, in StrongBox, or at an unknown secure level. A Keystore
+     * Ed25519 key reports it without [AndroidKeyCustody] reading `KeyInfo`, so for that key the
+     * value does not show whether Keystore put it in the TEE or, on a device whose KeyMint runs
+     * in software, in software.
      */
     HARDWARE,
 
     /**
-     * Key material is held by Bouncy Castle in the app process, not by Android Keystore.
-     * [AndroidKeyCustody] also writes the private key seed of each software Ed25519 key it
-     * generates (API 26-32) to an on-disk EncryptedSharedPreferences file. Software X25519
-     * keys and derived pseudonym keys stay in process memory only.
+     * Key material is held in software: by Bouncy Castle in the app process, or by a Keystore
+     * whose `KeyInfo` reports a software security level (an emulator, or a device whose KeyMint
+     * runs in software). [AndroidKeyCustody] commits the private key seed of each software
+     * Ed25519 key it generates (API 26-32) and the private scalar of each software HPKE P-256
+     * key (API 26-30) to an on-disk EncryptedSharedPreferences file.
      */
     SOFTWARE,
 }
@@ -87,12 +90,15 @@ enum class CustodyType {
  * Opaque handle to a cryptographic key managed by a [KeyCustodyProvider] implementation.
  *
  * @property id Unique identifier for the key. For Android Keystore keys, this maps to
- *   alias `scp.key.$id`. For software keys, this maps to a [ConcurrentHashMap] entry and,
- *   for a software Ed25519 key that [KeyCustodyProvider.generateKeypair] creates (API 26-32),
- *   also to the EncryptedSharedPreferences entry `scp.ed25519.$id`. A derived pseudonym key
- *   is also a software Ed25519 key, and it has no EncryptedSharedPreferences entry.
- * @property custodyType Where the key material is stored ([CustodyType.HARDWARE] for Keystore,
- *   [CustodyType.SOFTWARE] for Bouncy Castle fallback).
+ *   alias `scp.key.$id`. For software keys, this maps to an in-memory entry and, for a
+ *   software Ed25519 key that [KeyCustodyProvider.generateKeypair] creates (API 26-32), also to
+ *   the EncryptedSharedPreferences entry `scp.ed25519.$id`; for a software HPKE P-256 key
+ *   (API 26-30), to the entry `scp.p256.$id`. A P-256 or HPKE P-256 key also has the record
+ *   `scp.keymeta.$id`, which names its type, its store, its custody class and its role.
+ * @property custodyType The custody class: for a P-256 or HPKE P-256 key, the class recorded
+ *   at mint; otherwise [CustodyType.HARDWARE] for Keystore and [CustodyType.SOFTWARE] for
+ *   Bouncy Castle. [AndroidKeyCustody] routes a P-256 or HPKE P-256 key by its record, never
+ *   by this field.
  */
 data class KeyHandle(
     val id: String,
@@ -100,32 +106,21 @@ data class KeyHandle(
 )
 
 /**
-
  * Attestation that a key has been destroyed.
  *
- * For Android Keystore keys, [method] is [DestructionMethod.HARDWARE] because Keystore held
- * the key and deleted it. [AndroidKeyCustody] does not read `KeyInfo.securityLevel`, so
- * [DestructionMethod.HARDWARE] does not show whether the key sat in the TEE or in a software
- * KeyMint. For Bouncy Castle keys, [method] is [DestructionMethod.SOFTWARE_ONLY].
+ * [AndroidKeyCustody] reports [DestructionMethod.SOFTWARE_ONLY] for every key, Keystore keys
+ * included: Keystore issues no proof that it destroyed a key, and section 9.15 rates a
+ * destruction without a verified platform proof as software-only (ADR-027 criterion 4).
  *
  * See section 9.15 of the SCP specification for key destruction requirements.
  *
  * @property method The mechanism by which key material was destroyed.
- * @property confirmed Always `true` in an attestation [AndroidKeyCustody] returns. After
- *   deleting, [AndroidKeyCustody] checks that no key sits under the handle's id and throws
- *   [ScpException] with code `SCP-CRYPTO-4004` when one does, so it never returns `false`, and
- *   the field says no more than that [KeyCustodyProvider.destroyKey] returned. For a Keystore
- *   key, the check asks Keystore whether it still holds the alias. For a software key, the check
- *   reads the in-memory map right after removing the id from it, so it fails only when another
- *   call inserts the same id between the removal and the check. Apart from its constructor,
- *   which restores the ids of persisted software Ed25519 seeds before any
- *   [KeyCustodyProvider.destroyKey] call can run, [AndroidKeyCustody] inserts only fresh random
- *   `ULong` ids that name no live key. It does not read the EncryptedSharedPreferences entry that holds
- *   the seed of a software Ed25519 key that [KeyCustodyProvider.generateKeypair] creates
- *   (API 26-32). [AndroidKeyCustody] removes that entry with
- *   `apply()`, which returns before the removal reaches disk, so `confirmed` is `true` while the
- *   seed can still be on disk. When the process dies before the write lands, the next
- *   [AndroidKeyCustody] instance restores the seed at startup and the key signs again.
+ * @property confirmed Always `true` in an attestation [AndroidKeyCustody] returns: it confirms
+ *   each deletion by re-fetch and throws [ScpException] with code `SCP-CRYPTO-4060` when one is
+ *   not confirmed, so it never returns `false`. For a Keystore key, the re-fetch asks Keystore
+ *   whether it still holds the alias. For a persisted software key (a software Ed25519 seed or a
+ *   software HPKE P-256 scalar), the removal is written with `commit()`, which returns after the
+ *   write reaches disk, and the re-fetch reads the entry back.
  */
 data class DestructionAttestation(
     val method: DestructionMethod,
@@ -139,14 +134,18 @@ data class DestructionAttestation(
  */
 enum class DestructionMethod {
     /**
-     * Key material was deleted from software storage: the Bouncy Castle in-memory map and,
-     * for a software Ed25519 key that [KeyCustodyProvider.generateKeypair] creates
-     * (API 26-32), its EncryptedSharedPreferences entry. [AndroidKeyCustody]
-     * removes that entry with `apply()`, which writes the removal to disk asynchronously.
+     * Key material was deleted, with no platform proof of the destruction: from software
+     * storage (the Bouncy Castle in-memory map and, for a persisted software key, its
+     * EncryptedSharedPreferences entry, removed with `commit()`), or from Android Keystore,
+     * which confirms only that it no longer holds the alias. Every destruction
+     * [AndroidKeyCustody] performs reports this value.
      */
     SOFTWARE_ONLY,
 
-    /** Key material was deleted from Android Keystore (see [CustodyType.HARDWARE]). */
+    /**
+     * Key material was destroyed in secure hardware that proved the destruction (section 9.15).
+     * [AndroidKeyCustody] never reports it: Keystore issues no such proof.
+     */
     HARDWARE,
 }
 
@@ -154,16 +153,13 @@ enum class DestructionMethod {
  * SCP-specific exception with structured error codes.
  *
  * Error codes follow the pattern `SCP-{DOMAIN}-{NUMBER}`:
- * - `SCP-CRYPTO-4006`: Key not found (a software or Keystore lookup, any key type, X25519
- *   included, or a Keystore identity's pseudonym secret)
- * - `SCP-CRYPTO-4003`: Wrong key type for operation, or a [KeyCustodyProvider.dhAgree] peer
- *   public key that is not 32 bytes long. [KeyCustodyProvider.dhAgree] raises it for a wrong
- *   key type only when the handle names a software Ed25519 key.
- * - `SCP-CRYPTO-4004`: Key destruction failed
- * - `SCP-CRYPTO-4005`: Key agreement refused, because the handle is a Keystore handle
- *   (thrown only by [KeyCustodyProvider.dhAgree], from [KeyHandle.custodyType] before any key
- *   lookup: Keystore never releases the Ed25519 seed the X25519 scalar comes from; retrying
- *   cannot succeed)
+ * - `SCP-CRYPTO-4006`: Key not found (a software or Keystore lookup, any key type, a P-256
+ *   key whose mint has not settled, or a Keystore identity's pseudonym secret)
+ * - `SCP-CRYPTO-4060`: Every other [KeyCustodyProvider] failure of [AndroidKeyCustody]: a key
+ *   of the wrong type for the operation, an input of the wrong length or an invalid peer point,
+ *   a deletion that cannot be confirmed, a preferences write that does not commit, and any
+ *   Keystore, JCA or Bouncy Castle exception, carried as the cause. No other exception leaves
+ *   an [AndroidKeyCustody] method.
  * - `SCP-TRANS-5080`: Wake payload invalid: the push payload has no `scp` field, or its
  *   `scp` field is not `"1"`
  * - `SCP-STORAGE-8001`: Storage key not found. Defined as `AndroidStorage.ERROR_KEY_NOT_FOUND`
@@ -293,15 +289,19 @@ interface PushProvider {
  * Platform trait for cryptographic key custody.
  *
  * Abstracts key generation, signing, key agreement, and pseudonym derivation
- * behind a uniform interface. The Android implementation ([AndroidKeyCustody])
- * uses Android Keystore for Ed25519 on API 33+ and Bouncy Castle
- * for software fallback on API 26-32, and it performs key agreement with a software X25519 key
- * that Bouncy Castle holds in process memory at every API level. ADR-027, as amended on
- * 2026-09-10, requires a different scheme: an EC P-256 signing key in Keystore at every
- * supported API level, and P-256 key agreement in Keystore from API 31 with a Bouncy Castle
- * software P-256 agreement key, stored in EncryptedSharedPreferences, below it. Story SCP-110
- * tracks both moves.
+ * behind a uniform interface. The Android implementation ([AndroidKeyCustody]) holds Ed25519,
+ * P-256 signing and HPKE P-256 keys (ADR-027):
  *
+ * - P-256 signing keys in Android Keystore at every supported API level, signing the bridge's
+ *   32-byte digest with `NONEwithECDSA` under a `DIGEST_NONE` key.
+ * - HPKE P-256 agreement keys in Android Keystore (`PURPOSE_AGREE_KEY`) from API 31, and as a
+ *   Bouncy Castle scalar committed to EncryptedSharedPreferences on API 26-30. The store is
+ *   chosen by the API level alone, never by catching a failed Keystore create.
+ * - Ed25519 keys in Android Keystore on API 33+ and in Bouncy Castle on API 26-32.
+ *
+ * Each P-256 and HPKE P-256 key has a record, committed when it is minted, that names its type,
+ * its store and its custody class; every later operation on the key follows the record.
+
  * This interface matches neither Rust declaration. It is not the `scp-ffi-uniffi`
  * `KeyCustodyProvider` callback protocol, whose key ids are u64 strings; [UniffiKeyCustody]
  * implements that protocol over [AndroidKeyCustody], whose key ids are decimal u64 strings.
@@ -310,13 +310,14 @@ interface PushProvider {
  *   `crates/scp-ffi/uniffi/src/lib.rs` except `custody_type`, and it names the callback's
  *   `get_public_key` [publicKey], the name the Rust trait's `public_key` takes in Kotlin. The
  *   Rust `KeyCustody` trait in `crates/scp-platform/src/traits.rs` also declares
- *   `custody_type`, `ed25519_to_x25519_agree`, `import_ed25519_signing_key` and
- *   `generate_ephemeral_ed25519_seed`, which this interface lacks. No method of this interface
+ *   `custody_type`, `import_ed25519_signing_key` and `generate_ephemeral_ed25519_seed`, which
+ *   this interface lacks. No method of this interface
  *   returns a private key (ADR-027 acceptance criterion 14, private key isolation).
  * - Parameters: its methods name a key by a [KeyHandle], a data class of a `String` id and a
  *   [CustodyType]. The Rust trait's `KeyHandle` is a different type, an opaque `u64`, and the
  *   UniFFI callback's methods take a `String` key ID. [generateKeypair] takes a [KeyType] enum,
- *   as the Rust trait's takes a `KeyType` enum of the same two variants, while the UniFFI
+ *   as the Rust trait's takes a `KeyType` enum of the same key types (Ed25519, P-256 signing and
+ *   HPKE P-256), while the UniFFI
  *   callback's takes a `String` key type. [deriveRotatablePseudonym] takes `pseudonymEpoch` as
  *   a signed `Long`, while both Rust declarations take a `u64`, which UniFFI generates in Kotlin
  *   as `ULong`.
@@ -335,85 +336,41 @@ interface PushProvider {
  *   class, and the Rust trait returns a `PlatformError`. ADR-027 states that a UniFFI callback
  *   that throws any exception other than the generated one panics the Rust caller.
  *
- * [AndroidKeyCustody] converts one exception to [ScpException]: [destroyKey] throws a
- * `KeyStoreException` from `deleteEntry` as `SCP-CRYPTO-4004`. Otherwise each method throws
- * [ScpException] only for the codes its `@throws` lines name, and every other failure escapes as
- * the original throwable, so a `catch (e: ScpException)` does not catch it. The Keystore path, which an
- * Ed25519 [generateKeypair] takes on API 33+ and each other method below takes for a
- * [CustodyType.HARDWARE] handle, can let these escape:
- *
- * - [generateKeypair]: `KeyPairGenerator.getInstance` and `KeyGenerator.getInstance` throw
- *   `NoSuchAlgorithmException` or `NoSuchProviderException`, `initialize` and `init` throw
- *   `InvalidAlgorithmParameterException`, and `generateKeyPair` and `generateKey` throw
- *   `ProviderException` when Keystore fails to generate the identity key or its pseudonym
- *   secret. A failure generating the secret deletes the identity key before it escapes.
- * - [derivePseudonym] and [deriveRotatablePseudonym], which compute the context seed with the
- *   identity's Keystore HMAC pseudonym secret: `KeyStore.getInstance` throws
- *   `KeyStoreException`, `KeyStore.load` throws `IOException`, `NoSuchAlgorithmException` or
- *   `CertificateException`, `containsAlias` throws `KeyStoreException`, `KeyStore.getKey`
- *   throws `KeyStoreException`, `NoSuchAlgorithmException` or `UnrecoverableKeyException`,
- *   `Mac.getInstance` throws `NoSuchAlgorithmException`, and `Mac.init` throws
- *   `InvalidKeyException`.
- * - [sign]: `KeyStore.getInstance` throws `KeyStoreException`,
- *   `KeyStore.load` throws `IOException`, `NoSuchAlgorithmException` or `CertificateException`,
- *   `KeyStore.getEntry` throws `KeyStoreException`, `NoSuchAlgorithmException` or
- *   `UnrecoverableEntryException`, `Signature.getInstance` throws `NoSuchAlgorithmException`,
- *   `Signature.initSign` throws `InvalidKeyException`, and `Signature.sign` throws
- *   `SignatureException`.
- * - [publicKey]: the same `KeyStore.getInstance`, `KeyStore.load` and `KeyStore.getEntry`
- *   exceptions, and `IllegalStateException` when the encoded public key is not the 44-byte
- *   X.509 Ed25519 SubjectPublicKeyInfo.
- * - [destroyKey]: the same `KeyStore.getInstance` and `KeyStore.load` exceptions, and
- *   `KeyStoreException` from `containsAlias`. A `KeyStoreException` from `deleteEntry` is
- *   thrown as `SCP-CRYPTO-4004`.
- *
- * [dhAgree] does not reach Keystore, and it still lets one
- * non-[ScpException] escape, and remote input causes it: [dhAgree] passes a 32-byte peer key to
- * Bouncy Castle with no point-order check, so a low-order peer key, such as 32 zero bytes, makes
- * Bouncy Castle throw `IllegalStateException` ("X25519 agreement failed") because the shared
- * secret is all zero.
- *
- * The software path writes to EncryptedSharedPreferences, whose editor encrypts each entry's
- * name and value and throws `SecurityException` when that encryption fails. Two methods let it
- * escape:
- *
- * - [generateKeypair] for an Ed25519 key on API 26-32 writes the key's seed after it adds the
- *   key to this instance's software key map, so the exception escapes with the key in the map
- *   and no handle returned.
- * - [destroyKey] for a [CustodyType.SOFTWARE] handle removes the handle's seed entry after it
- *   removes the key from the software key map and before its `SCP-CRYPTO-4006` and
- *   `SCP-CRYPTO-4004` checks, so the exception escapes with the key gone from the map and any
- *   persisted seed still on disk. A retry reaches the same removal before the `SCP-CRYPTO-4006`
- *   check, and an [AndroidKeyCustody] constructed later restores the key from a seed still on
- *   disk.
+ * [AndroidKeyCustody] throws [ScpException] and nothing else from every method of this
+ * interface: `SCP-CRYPTO-4006` for a key it does not hold, and `SCP-CRYPTO-4060` for every
+ * other failure, with the Keystore, JCA, Bouncy Castle or preferences exception as the cause.
+ * Every write to EncryptedSharedPreferences uses `commit()`, and a write that does not commit
+ * fails the call with `SCP-CRYPTO-4060`.
  *
  * See ADR-006 for the platform abstraction design and ADR-027 for the Android adapter.
  */
 interface KeyCustodyProvider {
     /**
-     * Generate a new keypair of the specified type.
+     * Generate a new keypair of the specified type, in the store the interface KDoc names.
      *
-     * Ed25519 keys may be Keystore keys ([CustodyType.HARDWARE], API 33+).
-     * X25519 wrapping keys are always software-managed (Bouncy Castle) and held in process
-     * memory only, which diverges from ADR-027's P-256 agreement key (see the interface KDoc).
-     *
-     * [AndroidKeyCustody] throws [ScpException] from this method only with `SCP-CRYPTO-4060`,
-     * when every key id it draws is taken. A Keystore or EncryptedSharedPreferences failure
-     * escapes as the original exception, listed in the interface KDoc.
+     * A P-256 or HPKE P-256 mint commits the key's record before it creates the key and settles
+     * the record's custody class after. A mint that fails deletes what it created and its record;
+     * when it cannot confirm the deletion it keeps the record and throws `SCP-CRYPTO-4060` naming
+     * the key id, which [destroyKey] then removes.
      *
      * @param keyType The type of key to generate.
      * @return An opaque [KeyHandle] referencing the generated key.
+     * @throws ScpException with code `SCP-CRYPTO-4060` if every key id drawn is taken, a
+     *   preferences write does not commit, or the store fails to create the key.
      */
     fun generateKeypair(keyType: KeyType): KeyHandle
 
     /**
-     * Sign data with an Ed25519 identity key.
+     * Sign data with an Ed25519 or P-256 signing key.
      *
-     * @param keyHandle Handle to an Ed25519 key.
-     * @param data The message.
-     * @return A 64-byte Ed25519 signature.
+     * @param keyHandle Handle to an Ed25519 or P-256 key.
+     * @param data For an Ed25519 key, the message. For a P-256 key, the 32-byte digest the
+     *   bridge computed (§9.5.1), signed as given with no second hash.
+     * @return For an Ed25519 key, the 64-byte signature. For a P-256 key, the DER-encoded ECDSA
+     *   signature Keystore produced; the bridge converts it to raw low-s and verifies it.
      * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if key is X25519.
+     * @throws ScpException with code `SCP-CRYPTO-4060` if the key is HPKE P-256, or
+     *   a P-256 [data] is not 32 bytes.
      */
     fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray
 
@@ -421,7 +378,8 @@ interface KeyCustodyProvider {
      * Return the raw public key bytes for a handle.
      *
      * @param keyHandle Handle to any key type.
-     * @return The raw 32-byte public key.
+     * @return The raw 32-byte key (Ed25519), the 33-byte compressed SEC1 point (P-256),
+     *   or the 65-byte uncompressed SEC1 point (HPKE P-256).
      * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
      */
     fun publicKey(keyHandle: KeyHandle): ByteArray
@@ -429,25 +387,16 @@ interface KeyCustodyProvider {
     /**
      * Destroy key material associated with a handle.
      *
-     * After this call, operations with the same handle on the same [AndroidKeyCustody] instance
-     * throw [ScpException] with code `SCP-CRYPTO-4006`, with one exception: [dhAgree] throws
-     * `SCP-CRYPTO-4003` when its peer key is not 32 bytes, because it checks the peer key's
-     * length before any key lookup.
-     * Each [AndroidKeyCustody] instance holds its own map of software keys and restores every
-     * persisted software Ed25519 seed into it when constructed, so another instance in the same
-     * process that already holds a software key keeps signing with it after this call. The
-     * other direction also holds: an instance constructed before another instance generated a
-     * software Ed25519 key does not hold that key, yet its destroyKey queues removal of the key's
-     * persisted seed and then throws `SCP-CRYPTO-4006` because its own map lacks the key. The
-     * instance that holds the key keeps signing with it until its process ends, and no process
-     * started after the removal reaches disk restores it.
-     * [AndroidKeyCustody] removes the persisted seed of a software Ed25519 key that
-     * [generateKeypair] creates (API 26-32) with an asynchronous `apply()`, so a later process
-     * can restore the key when this process dies before the removal reaches disk (see
-     * [DestructionAttestation.confirmed]).
-     * A `KeyStoreException` from the Keystore `deleteEntry` is thrown as `SCP-CRYPTO-4004`; every
-     * other Keystore or EncryptedSharedPreferences failure escapes as the original exception,
-     * listed in the interface KDoc.
+     * Every deletion is confirmed by re-fetch: a Keystore alias by `containsAlias`, a persisted
+     * software seed or scalar by reading the entry back after a `commit()` removal. After this
+     * call, operations with the same handle throw [ScpException] with code `SCP-CRYPTO-4006`.
+     * A P-256 or HPKE P-256 key's record is removed only after its key material is confirmed
+     * gone, so a destroy that fails can be retried. A key whose mint never settled (a
+     * `pending` record) and a Keystore alias `scp.key.<id>` with no record are destroyed too.
+     *
+     * Each [AndroidKeyCustody] instance keeps its own in-memory map of software keys, so another
+     * instance in the same process that already loaded a software key keeps using it until that
+     * instance is dropped; no instance constructed after this call loads it.
      *
      * No pseudonym key exists to destroy: once the identity (and, for a Keystore identity, its
      * pseudonym secret) is gone, deriving any of its pseudonyms fails with `SCP-CRYPTO-4006`
@@ -455,38 +404,29 @@ interface KeyCustodyProvider {
      *
      * @param keyHandle Handle to destroy.
      * @return A [DestructionAttestation] naming the destruction method, with
-     *   [DestructionAttestation.confirmed] always `true`: a failed post-deletion check throws
-     *   `SCP-CRYPTO-4004` instead.
-     * @throws ScpException with code `SCP-CRYPTO-4006` if no key sits under the handle: for a
-     *   Keystore handle, Keystore holds no alias `scp.key.<id>` (any pseudonym secret left
-     *   behind is deleted first); for a software handle, this instance's software key map holds
-     *   no entry, and the persisted seed under the handle's ID is already queued for removal
-     *   when this is thrown.
-     * @throws ScpException with code `SCP-CRYPTO-4004` if destruction cannot be confirmed.
+     *   [DestructionAttestation.confirmed] always `true`: an unconfirmed deletion throws
+     *   `SCP-CRYPTO-4060` instead.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if no key sits under the handle (for a
+     *   Keystore identity, any pseudonym secret left behind is deleted first).
+     * @throws ScpException with code `SCP-CRYPTO-4060` if a deletion cannot be confirmed or a
+     *   store fails.
      */
     fun destroyKey(keyHandle: KeyHandle): DestructionAttestation
 
     /**
-     * Perform X25519 Diffie-Hellman key agreement.
+     * Perform Diffie-Hellman key agreement with an HPKE P-256 key.
      *
-     * Returns the 32-byte shared secret. No method of this interface returns the X25519 private
-     * key. See
-     * [AndroidKeyCustody.dhAgree] for where the software implementation holds the key.
+     * No method of this interface returns the private key. The returned secret is a [ByteArray]
+     * that [AndroidKeyCustody] does not wipe; the caller owns it.
      *
-     * @param keyHandle Handle to an X25519 key, or to a software Ed25519 key, which agrees
-     *   through its X25519 scalar `SHA-512(seed)[0..32]`.
-     * @param peerPublic 32-byte X25519 public key of the peer.
-     * @return 32-byte X25519 shared secret.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if [peerPublic] is not 32 bytes long,
-     *   checked before any key lookup.
-     * @throws ScpException with code `SCP-CRYPTO-4005` for a Keystore Ed25519 handle
-     *   ([CustodyType.HARDWARE]): Keystore never releases the seed the scalar comes from.
-     * @throws ScpException with code `SCP-CRYPTO-4006` if no software key sits under
-     *   [keyHandle].
-     * @throws IllegalStateException from Bouncy Castle ("X25519 agreement failed") if
-     *   [peerPublic] is 32 bytes long but a low-order point, such as 32 zero bytes, which makes
-     *   the shared secret all zero. No point order is checked, so a `catch (e: ScpException)`
-     *   does not catch it.
+     * @param keyHandle Handle to an HPKE P-256 key. An Ed25519 or P-256 signing key never
+     *   agrees.
+     * @param peerPublic The peer's 65-byte uncompressed SEC1 point, checked on the curve before
+     *   the key is used.
+     * @return The 32-byte shared secret: the P-256 x-coordinate left-padded to 32 bytes.
+     * @throws ScpException with code `SCP-CRYPTO-4006` if no key sits under [keyHandle].
+     * @throws ScpException with code `SCP-CRYPTO-4060` for a key that never agrees, a
+     *   [peerPublic] of the wrong length or off the curve.
      */
     fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray
 
@@ -502,7 +442,7 @@ interface KeyCustodyProvider {
      *
      * Software custody: `pseudonym_secret = HKDF-SHA256(ikm = ed25519_private_seed,
      * salt = "scp-pseudonym-secret-v1")`, the §9.10.4.A native interim until the identity key
-     * moves to P-256 (story SCP-110); the steps after it match every other software custody
+     * moves to P-256 (story SCP-315); the steps after it match every other software custody
      * byte for byte (§25.19). Keystore custody ([CustodyType.HARDWARE]): `pseudonym_secret` is
      * a device-local HMAC-SHA256 key that [AndroidKeyCustody] generates inside Android Keystore
      * at [generateKeypair]. Keystore computes step 1, the secret never leaves it, and no
@@ -517,7 +457,7 @@ interface KeyCustodyProvider {
      * @param contextId Raw context ID bytes.
      * @return The 33-byte SEC1 compressed P-256 point.
      * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
+     * @throws ScpException with code `SCP-CRYPTO-4060` if key is not Ed25519.
      */
     fun derivePseudonym(keyHandle: KeyHandle, contextId: ByteArray): ByteArray
 
@@ -540,7 +480,7 @@ interface KeyCustodyProvider {
      *
      * Software custody: `pseudonym_secret = HKDF-SHA256(ikm = ed25519_private_seed,
      * salt = "scp-pseudonym-secret-v1")`, the §9.10.4.A native interim until the identity key
-     * moves to P-256 (story SCP-110); the steps after it match every other software custody
+     * moves to P-256 (story SCP-315); the steps after it match every other software custody
      * byte for byte (§25.19). Keystore custody ([CustodyType.HARDWARE]): `pseudonym_secret` is
      * a device-local HMAC-SHA256 key that [AndroidKeyCustody] generates inside Android Keystore
      * at [generateKeypair]. Keystore computes step 1, the secret never leaves it, and no
@@ -556,7 +496,7 @@ interface KeyCustodyProvider {
      * @param pseudonymEpoch Rotation epoch counter, mixed in as a big-endian u64.
      * @return The 33-byte SEC1 compressed P-256 point.
      * @throws ScpException with code `SCP-CRYPTO-4006` if key not found.
-     * @throws ScpException with code `SCP-CRYPTO-4003` if key is not Ed25519.
+     * @throws ScpException with code `SCP-CRYPTO-4060` if key is not Ed25519.
      */
     fun deriveRotatablePseudonym(
         keyHandle: KeyHandle,

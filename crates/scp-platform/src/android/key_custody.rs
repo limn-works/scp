@@ -12,14 +12,14 @@
 //! stands: the trait criterion, the Keystore-attested key-destruction
 //! criterion, the criteria for the move to P-256, the P-256 pseudonym
 //! keypair and the TEE-generated pseudonym secret, which the shipped Ed25519
-//! and X25519 keys and the signature-derived pseudonym secret fail. This
+//! keys and the signature-derived pseudonym secret fail. This
 //! module documents the Rust-side contract and
 //! re-exports the trait with its handle, key-type and custody-type types for
 //! Android builds.
 //!
 //! # Key Storage Strategy
 //!
-//! The Kotlin adapter ships an Ed25519 and X25519 scheme:
+//! The Kotlin adapter ships an Ed25519, P-256 signing and HPKE P-256 scheme:
 //!
 //! - **Ed25519 on API 33+ (Android 13+):** Android Keystore natively supports
 //!   `EdDSA` with `Ed25519` parameter spec. Keystore holds the key and does
@@ -32,15 +32,11 @@
 //! - **Ed25519 on API 26-32:** Bouncy Castle software Ed25519 fallback.
 //!   [`CustodyType::Software`] is reported.
 //!
-//! - **X25519 (all API levels):** Always software-managed via Bouncy Castle.
-//!   The adapter does not use the X25519 key agreement Android Keystore offers
-//!   from API 33. [`CustodyType::Software`] is reported.
+//! - **P-256 signing (all API levels):** Android Keystore.
 //!
-//! ADR-027, as amended on 2026-09-10, requires a different scheme: an EC
-//! P-256 signing key in Keystore at every supported API level, and P-256 key
-//! agreement in Keystore from API 31 with a Bouncy Castle software P-256
-//! agreement key below it. The adapter has not moved to P-256; story SCP-110
-//! tracks that move.
+//! - **HPKE P-256:** Android Keystore key agreement from API 31, and a Bouncy
+//!   Castle software P-256 scalar below it, as ADR-027 (amended 2026-09-10)
+//!   requires.
 //!
 //! # `StrongBox`
 //!

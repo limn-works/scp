@@ -447,10 +447,29 @@ pub mod custody {
     }
 }
 
+/// [`seal`] with a caller-fixed ephemeral key, so a known-answer test of a
+/// construction built on [`seal`] reproduces its `enc` and ciphertext (spec 25
+/// §25.32 Vector 67 fixes the ephemeral to the §25.2 secondary scalar).
+///
+/// Compiled only under `cfg(test)`, so no production path can seal with a
+/// reused ephemeral key.
+#[cfg(test)]
+pub(crate) fn seal_with_fixed_ephemeral(
+    ephemeral: &P256SecretKey,
+    recipient_pk: &P256Point,
+    info: &[u8],
+    aad: &[u8],
+    pt: &[u8],
+) -> Result<(P256Point, Vec<u8>), HpkeError> {
+    let (_, ct) = seal_with_ephemeral(ephemeral, recipient_pk.as_bytes(), info, aad, pt)?;
+    Ok((P256Point::from(&ephemeral.public_key()), ct))
+}
+
 /// Encap from a given ephemeral key + `KeySchedule` + AEAD seal at sequence 0.
 ///
 /// Private: the only production caller is [`seal`], which passes a fresh
-/// random ephemeral. The known-answer tests pass the RFC 9180 A.3 `skEm`.
+/// random ephemeral. The known-answer tests pass the RFC 9180 A.3 `skEm`, and
+/// `seal_with_fixed_ephemeral` (test-only) passes the §25.32 Vector 67 one.
 fn seal_with_ephemeral(
     ephemeral: &P256SecretKey,
     recipient_pk: &[u8; PUBLIC_KEY_LEN],

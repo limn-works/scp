@@ -719,43 +719,28 @@ impl PyContextParams {
 
 /// The Python exception for a failed supervisor call named `op`.
 ///
-/// `ContextError::ActorBusy` raises `ContextError` with `SCP-CTX-2130` (its
-/// doc states producers and retry behaviour), and
-/// `ContextError::SupervisorShutDown` raises `ContextError` with
-/// `SCP-CTX-2138`, and `ContextError::Custody` keeps its custody code
-/// ([`crate::error::ScpPyError::custody_failure`]: a destroyed `#active` key is
-/// `SCP-CRYPTO-4006`); every other variant raises the `RuntimeError` this
-/// call site raised before.
-fn typed_supervisor_failure(op: &str, e: &scp_core::context::ContextError) -> PyErr {
+/// Every variant the shared `classify_context_error` gives a dedicated code
+/// raises its typed exception with that code ([`typed_supervisor_error`]);
+/// a variant with no dedicated code raises the `RuntimeError` this call site
+/// raised before.
+pub(crate) fn typed_supervisor_failure(op: &str, e: &scp_core::context::ContextError) -> PyErr {
     typed_supervisor_error(op, e).map_or_else(
         || PyRuntimeError::new_err(format!("{op} failed: {e}")),
         PyErr::from,
     )
 }
 
-/// The typed error [`typed_supervisor_failure`] raises: `SCP-CTX-2130` for
-/// `ContextError::ActorBusy`, `SCP-CTX-2138` for
-/// `ContextError::SupervisorShutDown`, the custody code for
-/// `ContextError::Custody`, or `None` for every other variant.
-fn typed_supervisor_error(
+/// The typed error [`typed_supervisor_failure`] raises: the bridge error the
+/// shared classification names (`SCP-CTX-2130` for `ActorBusy`,
+/// `SCP-CTX-2138` for `SupervisorShutDown`, the custody code for `Custody`,
+/// `SCP-VALID-7005` for a malformed invitation `enc`, ...), or `None` for a
+/// variant with no dedicated code.
+pub(crate) fn typed_supervisor_error(
     op: &str,
     e: &scp_core::context::ContextError,
 ) -> Option<crate::error::ScpPyError> {
-    let code = match e {
-        scp_core::context::ContextError::ActorBusy(_) => codes::CTX_2130,
-        scp_core::context::ContextError::SupervisorShutDown(_) => codes::CTX_2138,
-        scp_core::context::ContextError::Custody(failure) => {
-            return Some(crate::error::ScpPyError::custody_failure(
-                format!("{op} failed: {e}"),
-                failure,
-            ));
-        }
-        _ => return None,
-    };
-    Some(crate::error::ScpPyError::ContextError {
-        message: format!("{op} failed: {e}"),
-        code: code.to_owned(),
-    })
+    scp_ffi_common::context_error_class::has_dedicated_code(e)
+        .then(|| crate::error::ScpPyError::from_context_error(format!("{op} failed: {e}"), e))
 }
 
 /// Extracts a `pseudonym_rotation` dict (spec 09 §9.10.4.1). The dict holds
@@ -1224,7 +1209,7 @@ impl PyContextParams {
 /// it from the field names plus one example, with no positional-argument
 /// footgun. Mirrors the runtime wire type
 /// [`SealedInvitation`](scp_core::context::invitation_helpers::SealedInvitation):
-/// `enc` is the RFC 9180 HPKE encapsulated key (32 bytes) and `ciphertext` is
+/// `enc` is the RFC 9180 DHKEM(P-256) encapsulated key (65 bytes) and `ciphertext` is
 /// the HPKE ciphertext (`ct = ciphertext || tag`) of the serialized, signed
 /// `InvitationBundle`. Both are opaque bytes — the joiner does not interpret
 /// them; the runtime opens the bundle and authenticates it.
@@ -1235,8 +1220,9 @@ pub struct PySealedInvitation {
     context_id: String,
     /// Binding hint: the creator DID the bundle was sealed by.
     creator_did: String,
-    /// RFC 9180 HPKE encapsulated key (`enc`). Length is validated to be
-    /// exactly 32 bytes at the join boundary (fail-closed).
+    /// RFC 9180 DHKEM(P-256) encapsulated key (`enc`): a 65-byte
+    /// uncompressed point. The join validates it before any custody call
+    /// (spec 09 §9.16.2, fail-closed).
     enc: Vec<u8>,
     /// RFC 9180 HPKE ciphertext (`ct = ciphertext || tag`).
     ciphertext: Vec<u8>,
@@ -1604,57 +1590,6 @@ fn resolve_future(
 }
 
 // ---------------------------------------------------------------------------
-// MLS key package generation helper (#1324)
-// ---------------------------------------------------------------------------
-
-/// Generates serialized MLS key package bytes for a given DID.
-///
-/// Ported from the NAPI bridge (`generate_mls_key_package_bytes` in
-/// `napi/src/context.rs`) as part of issue #1324. Creates an SCP credential
-/// for the DID, generates a fresh MLS key package, and returns the
-/// TLS-serialized bytes suitable for passing to
-/// `ContextManager::join_context`.
-///
-/// Uses [`generate_key_package_with_context_params`](scp_core::crypto::mls::group::generate_key_package_with_context_params) with `None` so the leaf
-/// **declares the `0xFF02` (`scp_context_params`) capability** — mandatory to
-/// be added to an encrypted context group (`valn0502`, §5.13.3). The base
-/// `generate_key_package` (which declares no `0xFF02` capability) produces a KP
-/// that real MLS rejects from a context group ("the capabilities of the add
-/// proposal are insufficient for this group"). The leaf carries `wrapping_public`
-/// as its `0xFF01` extension: the identity's wrapping public key, whose secret
-/// the supervisor holds (spec 09 §9.16.1).
-fn generate_mls_key_package_bytes(
-    did: &str,
-    wrapping_public: &[u8; 65],
-) -> Result<Vec<u8>, crate::error::ScpPyError> {
-    use scp_core::crypto::mls::credential::ScpCredential;
-    use scp_core::crypto::mls::group::generate_key_package_with_context_params;
-    use tls_codec::Serialize as TlsSerializeTrait;
-
-    let cred =
-        ScpCredential::new(did.to_owned(), None, scp_did::SigningKeyId::Active).map_err(|e| {
-            crate::error::ScpPyError::crypto(format!(
-                "failed to create SCP credential for MLS key package: {e}"
-            ))
-        })?;
-
-    let (kp_bundle, _signer, _provider) =
-        generate_key_package_with_context_params(&cred, wrapping_public, &scp_clock::SystemClock)
-            .map_err(|e| {
-            crate::error::ScpPyError::crypto(format!("MLS key package generation failed: {e}"))
-        })?;
-
-    kp_bundle
-        .key_package()
-        .tls_serialize_detached()
-        .map_err(|e| {
-            crate::error::ScpPyError::crypto(format!(
-                "MLS key package TLS serialization failed: {e}"
-            ))
-        })
-}
-
-// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -1913,6 +1848,24 @@ pub(crate) fn resolve_signer(
     )?
     .map_err(crate::error::ScpPyError::from)?;
     Ok(signer)
+}
+
+/// Mints the `KeyPackage` `identity_did` joins a context with: its leaf carries
+/// the identity's wrapping key (`0xFF01`) and a `0xFF03` attestation signed
+/// through the identity's `#active` custody key (spec 09 §9.7.1). A mint
+/// failure keeps its typed `ContextError` code.
+fn mint_self_join_key_package(
+    py: Python<'_>,
+    bi: &crate::runtime::PyBridgeInstance,
+    sup: &scp_core::context::supervisor::Supervisor,
+    identity_did: &str,
+) -> PyResult<Vec<u8>> {
+    let active_signer = resolve_signer(py, bi, identity_did)?;
+    crate::actor_wait::block_on_released(
+        py,
+        sup.mint_attested_key_package(&scp_did::DID(identity_did.to_owned()), &active_signer),
+    )?
+    .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))
 }
 
 /// Resolves the [`ResolvedMessageSigner`](scp_ffi_common::persona::ResolvedMessageSigner)
@@ -2725,10 +2678,12 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Returns `TypeError` if params contains invalid types, `ValueError` if
-    /// parameter values are out of range, the typed SDK error for a failure
-    /// `keeps_create_failure_code` keeps (`ContextError` with `SCP-CTX-2138`
-    /// when the Supervisor refused the create because shutdown began), or
-    /// `RuntimeError` if context creation fails otherwise.
+    /// parameter values are out of range, the typed SDK error with its code
+    /// for a failure that has a dedicated code
+    /// (`scp_ffi_common::context_error_class::has_dedicated_code`: a custody
+    /// failure's custody code, `SCP-CTX-2138` when the Supervisor refused the
+    /// create because shutdown began, ...), or `RuntimeError` if context
+    /// creation fails otherwise.
     #[pyo3(signature = (identity_did, params))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, registers FFI state, delegates to ContextManager, returns handle
     pub fn context_create(
@@ -2824,11 +2779,7 @@ impl crate::scp::PyScp {
             .map_err(|e| {
                 // Clean up FFI state on ContextManager failure.
                 crate::runtime::remove_context(bi, &context_id);
-                if keeps_create_failure_code(&e) {
-                    PyErr::from(crate::error::ScpPyError::from(e))
-                } else {
-                    PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
-                }
+                typed_supervisor_failure("ContextManager create_context", &e)
             })?;
         }
 
@@ -2917,7 +2868,9 @@ impl crate::scp::PyScp {
     /// the context in any state but active or no actor serves it,
     /// `SCP-CTX-2134` when the crash watchdog poisoned it, `SCP-CTX-2135`
     /// when its actor crashed or is mid-respawn, and `SCP-CTX-2138` when the
-    /// Supervisor refused the join because shutdown began.
+    /// Supervisor refused the join because shutdown began; every other failure
+    /// with a dedicated code (`scp_ffi_common::context_error_class::has_dedicated_code`,
+    /// such as a custody failure's custody code) raises its typed exception.
     #[pyo3(signature = (handle, identity_did, spending_ucan_jwt=None))]
     #[allow(clippy::too_many_lines)] // orchestration: validates, UCAN gate, delegates to ContextManager
     pub fn context_join(
@@ -2991,15 +2944,11 @@ impl crate::scp::PyScp {
             // The key package contains the joiner's SCP credential (DID) and is
             // validated by NodeMlsFactory::validate_key_package before MLS
             // group addition. It runs after derivation, so a joiner with no
-            // key material fails with derivation's `SCP-IDENT-1054` first; a
-            // wrapping-key failure keeps its typed `ContextError` code.
-            let wrapping_public = crate::actor_wait::block_on_released(
-                py,
-                sup.wrapping_public_key(&scp_did::DID(member_did.clone())),
-            )?
-            .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
-            let kp_bytes = generate_mls_key_package_bytes(identity_did, &wrapping_public)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // key material fails with derivation's `SCP-IDENT-1054` first. The
+            // leaf carries the identity's wrapping key (`0xFF01`) and a `0xFF03`
+            // attestation signed through its `#active` custody key (spec 09
+            // §9.7.1); a mint failure keeps its typed `ContextError` code.
+            let kp_bytes = mint_self_join_key_package(py, bi, &sup, identity_did)?;
 
             let key_package = scp_core::context::membership::KeyPackage {
                 owner_did: scp_did::DID(member_did.clone()),
@@ -3020,13 +2969,7 @@ impl crate::scp::PyScp {
                 )
                 .await
             })?
-            .map_err(|e| {
-                if keeps_join_failure_code(&e) {
-                    PyErr::from(crate::error::ScpPyError::from(e))
-                } else {
-                    PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}"))
-                }
-            })?;
+            .map_err(|e| typed_supervisor_failure("ContextManager join_context", &e))?;
 
             // §9.10.4: Send pseudonym announcement to inform existing members.
             if local_pseudonym.is_some()
@@ -3144,8 +3087,11 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
         let owning = scp_did::DID(owning_did.to_owned());
+        // Every pooled KeyPackage carries a `0xFF03` attestation signed through
+        // the identity's `#active` custody key (spec 09 §9.7.1).
+        let active_signer = resolve_signer(py, bi, owning_did)?;
         let (reservation_id, kp_public) = crate::actor_wait::block_on_released(py, async move {
-            sup.reserve_key_package(owning).await
+            sup.reserve_key_package(owning, &active_signer).await
         })?
         .map_err(|e| typed_supervisor_failure("reserve_key_package", &e))?;
         Ok((reservation_id.to_string(), kp_public))
@@ -3243,14 +3189,6 @@ impl crate::scp::PyScp {
         // KeyPackage is consumed.
         let local_pseudonym = derive_member_pseudonym(py, bi, &owning_did, &sealed.context_id)?;
 
-        // Fail-closed: the HPKE encapsulated key (`enc`) MUST be exactly 32
-        // bytes. Reject a malformed length BEFORE any registry mutation or the
-        // irreversible KeyPackage consume, rather than letting a short/long
-        // buffer fail deep inside the HPKE open.
-        let sealed_bundle_enc =
-            scp_ffi_common::custody_parse::expect_32("sealed_bundle_enc", &sealed.enc)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
         // Reconstruct the opaque reservation id via its sanctioned transparent
         // serde form (a bare string): the id round-trips through the FFI as a
         // string. It is a lookup key, not a capability — a bogus id simply fails
@@ -3266,16 +3204,6 @@ impl crate::scp::PyScp {
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let sup = Arc::clone(sup);
 
-        // Resolve the joiner's OWN custody provider + `#active` KeyHandle (the
-        // same locally-custodied identity the pseudonym was derived from). The
-        // runtime needs these to open the sealed bundle and drive the join under
-        // the joiner's key material — private keys never cross the FFI, only the
-        // opaque custody handle + KeyHandle do (ADR-006).
-        let (custody, active_handle) = crate::runtime::with_identity(bi, &owning_did, |entry| {
-            Ok((entry.custody.clone(), entry.identity.active_signing_key))
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
         // A pre-existing FFI-state entry for this id fails the join here, before
         // `spawn_actor_from_welcome` consumes the single-use `KeyPackage`, and
         // the entry is left untouched.
@@ -3287,7 +3215,7 @@ impl crate::scp::PyScp {
         let req = scp_core::context::supervisor::WelcomeJoinRequest {
             creator_did: scp_did::DID(sealed.creator_did.clone()),
             context_id: sealed.context_id.clone(),
-            sealed_bundle_enc,
+            sealed_bundle_enc: sealed.enc.clone(),
             sealed_bundle_ct: sealed.ciphertext.clone(),
             reservation_id: reservation,
             local_pseudonym: Some(local_pseudonym),
@@ -3297,13 +3225,12 @@ impl crate::scp::PyScp {
         // register the context actor. Nothing is registered on this bridge
         // before the spawn succeeds, so a failed spawn leaves the id's bridge
         // state and release mark as they were.
-        // A typed custody failure keeps its custody code (a destroyed
-        // `#active` key is `SCP-CRYPTO-4006`) through `typed_supervisor_failure`.
-        let joined = crate::actor_wait::block_on_released(
-            py,
-            sup.spawn_actor_from_welcome(owning, &*custody, &active_handle, req),
-        )?
-        .map_err(|e| typed_supervisor_failure("context_join_from_welcome", &e))?;
+        // A typed custody failure keeps its custody code (a wrapping key the
+        // custody cannot agree with is `SCP-CRYPTO-4006`) through
+        // `typed_supervisor_failure`.
+        let joined =
+            crate::actor_wait::block_on_released(py, sup.spawn_actor_from_welcome(owning, req))?
+                .map_err(|e| typed_supervisor_failure("context_join_from_welcome", &e))?;
 
         // Clearing the id's release mark and registering its FFI state run in
         // one critical section. When the entry is occupied, the mark stays and
@@ -4835,9 +4762,12 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Returns `ContextError` (SCP-CTX-2138) if the Supervisor refused the
-    /// restore because shutdown began, and `RuntimeError` (SCP-CTX-2064) if
-    /// restoration fails otherwise.
+    /// Returns the typed SDK error with its code for a failure that has a
+    /// dedicated code (`scp_ffi_common::context_error_class::has_dedicated_code`:
+    /// `SCP-CTX-2138` when the Supervisor refused the restore because shutdown
+    /// began, a custody failure's custody code, `SCP-CTX-2137` when nothing is
+    /// persisted to restore, ...), and `RuntimeError` naming SCP-CTX-2064 for
+    /// every other failure.
     #[pyo3(signature = (context_id,))]
     pub fn restore_context(&self, py: Python<'_>, context_id: &str) -> PyResult<()> {
         let bi = &*self.inner;
@@ -6266,48 +6196,28 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Whether a refused create keeps its typed SDK code: the core's empty-ceiling
-/// rejection keeps its validation code (construction.md M2), and a create
-/// refused because Supervisor shutdown began keeps SCP-CTX-2138.
-const fn keeps_create_failure_code(e: &scp_core::context::ContextError) -> bool {
-    matches!(
-        e,
-        scp_core::context::ContextError::CeilingRequired(_)
-            | scp_core::context::ContextError::SupervisorShutDown(_)
+/// The Python exception for a refused `RestoreContext` at `stage`: an error
+/// with a dedicated code raises its typed exception with that code
+/// ([`typed_supervisor_error`]: `SCP-CTX-2138` when Supervisor shutdown began,
+/// a custody failure's custody code, ...); every other failure raises the
+/// `RuntimeError` naming SCP-CTX-2064.
+pub(crate) fn restore_context_failure(stage: &str, e: scp_core::context::ContextError) -> PyErr {
+    typed_supervisor_error(stage, &e).map_or_else(
+        || PyRuntimeError::new_err(format!("SCP-CTX-2064: {stage} failed: {e}")),
+        PyErr::from,
     )
 }
 
-/// Whether a refused join keeps its typed SDK code: a join refused because
-/// Supervisor shutdown began keeps SCP-CTX-2138.
-const fn keeps_join_failure_code(e: &scp_core::context::ContextError) -> bool {
-    matches!(e, scp_core::context::ContextError::SupervisorShutDown(_))
-}
-
-/// The Python exception for a refused `RestoreContext` at `stage`: a restore
-/// refused because Supervisor shutdown began raises `ContextError` with
-/// SCP-CTX-2138; every other failure raises the `RuntimeError` naming
-/// SCP-CTX-2064.
-fn restore_context_failure(stage: &str, e: scp_core::context::ContextError) -> PyErr {
-    if matches!(e, scp_core::context::ContextError::SupervisorShutDown(_)) {
-        PyErr::from(crate::error::ScpPyError::from(e))
-    } else {
-        PyRuntimeError::new_err(format!("SCP-CTX-2064: {stage} failed: {e}"))
-    }
-}
-
-/// Flattens a refused create to a [`scp_core::context::ContextError`], keeping
-/// the variants [`keeps_create_failure_code`] names typed.
-fn create_context_failure(
+/// Flattens a refused create to a [`scp_core::context::ContextError`]: a
+/// wrapped error with a dedicated code stays itself
+/// (`scp_ffi_common::context_error_class::coded_creation_failure`), and every
+/// other failure becomes `CreationFailed`, which `context_create` raises as
+/// its `RuntimeError`.
+pub(crate) fn create_context_failure(
     e: scp_core::context::builder::ContextCreationError,
 ) -> scp_core::context::ContextError {
-    match e {
-        scp_core::context::builder::ContextCreationError::StateTransition(inner)
-            if keeps_create_failure_code(&inner) =>
-        {
-            inner
-        }
-        other => scp_core::context::ContextError::CreationFailed(other.to_string()),
-    }
+    scp_ffi_common::context_error_class::coded_creation_failure(e)
+        .unwrap_or_else(|other| scp_core::context::ContextError::CreationFailed(other.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -6321,18 +6231,6 @@ mod tests {
     use crate::runtime::RECEIVE_BUFFER_CAPACITY;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A join refused because Supervisor shutdown began keeps its typed code;
-    /// any other join failure does not.
-    #[test]
-    fn join_failure_keeps_only_supervisor_shut_down_typed() {
-        assert!(keeps_join_failure_code(
-            &scp_core::context::ContextError::SupervisorShutDown("join".to_owned())
-        ));
-        assert!(!keeps_join_failure_code(
-            &scp_core::context::ContextError::TransportFailed("join".to_owned())
-        ));
-    }
-
     /// A create refused because Supervisor shutdown began stays typed and maps
     /// to SCP-CTX-2138; an unrelated create failure is flattened.
     #[test]
@@ -6341,7 +6239,6 @@ mod tests {
         let shut_down = create_context_failure(ContextCreationError::StateTransition(
             scp_core::context::ContextError::SupervisorShutDown("create".to_owned()),
         ));
-        assert!(keeps_create_failure_code(&shut_down));
         match crate::error::ScpPyError::from(shut_down) {
             crate::error::ScpPyError::ContextError { code, .. } => {
                 assert_eq!(code, scp_ffi_common::error_codes::CTX_2138);
@@ -6349,7 +6246,6 @@ mod tests {
             other => panic!("expected a context error, got {other:?}"),
         }
         let flattened = create_context_failure(ContextCreationError::TransportNotConnected);
-        assert!(!keeps_create_failure_code(&flattened));
         assert!(matches!(
             flattened,
             scp_core::context::ContextError::CreationFailed(_)
@@ -6990,13 +6886,12 @@ mod tests {
                 inner: std::sync::Arc::clone(&bi_arc),
             };
             let err = Python::with_gil(|_py| {
-                // A well-formed 32-byte `enc` so the failure isolates the custody
-                // gate (which runs BEFORE the enc-length check), not a length
-                // rejection.
+                // A valid 65-byte P-256 `enc`, so the failure isolates the
+                // custody gate rather than the runtime's enc validation.
                 let sealed = __sealed(
                     &"0".repeat(64),
                     "did:dht:z6MkSomeCreator",
-                    vec![0u8; 32],
+                    scp_crypto::p256::testing::valid_uncompressed_point(1).to_vec(),
                     b"not-a-real-bundle".to_vec(),
                 );
                 scp.context_join_from_welcome(
@@ -7015,52 +6910,53 @@ mod tests {
         });
     }
 
-    /// ADR-049 Phase 2J / FFI-02 Option A (reshape): the reshaped
-    /// `context_join_from_welcome` no longer takes caller `params`, so there is
-    /// no `mode` field to inspect — broadcast rejection moved INSIDE the runtime
-    /// (a broadcast context carries no MLS Welcome, spec §5.14, so it fails at
-    /// the fused `ConfirmConsume`). The NEW bridge-level fail-closed boundary is
-    /// the HPKE `enc` length: it MUST be exactly 32 bytes (RFC 9180 X25519
-    /// encapsulated key). A wrong-length `enc` is rejected BEFORE the irreversible
-    /// `KeyPackage` consume.
+    /// Spec 09 §9.16.2 Open step 1: the join validates the HPKE `enc` as a
+    /// 65-byte uncompressed P-256 point before any custody call or the
+    /// irreversible `KeyPackage` consume. The bridge passes `enc` through
+    /// unchanged; the runtime's rejection reaches the caller and the failed
+    /// join leaves no FFI state.
     ///
-    /// Not false-green: a locally-custodied joiner is used so the custody gate
-    /// SUCCEEDS and control reaches the enc-length check; were that check removed,
-    /// the malformed `enc` would instead fail deep inside the HPKE open with a
-    /// different message, not the exact "expected 32" surfaced here.
+    /// Each §9.5 must-fail form is driven through the real entry point with a
+    /// locally-custodied joiner, so the custody gate passes. Were the runtime
+    /// check removed, every row would instead fail at the bogus reservation
+    /// with a different message, not "invitation enc".
     #[test]
     #[cfg(feature = "testing")]
-    fn context_join_from_welcome_rejects_non_32_byte_enc() {
+    fn context_join_from_welcome_rejects_a_malformed_enc() {
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
         Python::with_gil(|py| {
             let scp = crate::scp::PyScp::new_in_memory_for_test();
-
-            // Locally-custodied joiner so the pseudonym-derivation custody gate
-            // passes and control reaches the fail-closed enc-length check.
+            let bi = Arc::clone(&scp.inner);
             let joiner = scp.identity_create(py, "in_memory", None).unwrap();
             let joiner_did = joiner.did().to_owned();
+            let ctx_id = "c".repeat(64);
 
-            // 31-byte `enc` — one short of the required 32.
-            let sealed = __sealed(
-                &"c".repeat(64),
-                "did:dht:z6MkEncLenCreator",
-                vec![0u8; 31],
-                b"bogus-ciphertext".to_vec(),
-            );
-            let err = scp
-                .context_join_from_welcome(
-                    py,
-                    joiner_did,
-                    sealed,
-                    "bogus-reservation-id".to_owned(),
-                )
-                .expect_err("a non-32-byte HPKE enc must be rejected at the bridge boundary")
-                .to_string();
-            assert!(
-                err.contains("expected 32"),
-                "expected a fail-closed 32-byte enc-length rejection, got: {err}"
-            );
+            for (name, enc) in scp_crypto::p256::testing::invalid_point_encodings(2) {
+                let sealed = __sealed(
+                    &ctx_id,
+                    "did:dht:z6MkEncLenCreator",
+                    enc,
+                    b"bogus-ciphertext".to_vec(),
+                );
+                let err = scp
+                    .context_join_from_welcome(
+                        py,
+                        joiner_did.clone(),
+                        sealed,
+                        "bogus-reservation-id".to_owned(),
+                    )
+                    .expect_err("a malformed HPKE enc must be rejected")
+                    .to_string();
+                assert!(
+                    err.contains("SCP-VALID-7005"),
+                    "{name}: expected the runtime's enc rejection as SCP-VALID-7005, got: {err}"
+                );
+                assert!(
+                    crate::runtime::with_ffi_state(&bi, &ctx_id, |_| Ok(())).is_err(),
+                    "{name}: FFI state must NOT survive a failed join"
+                );
+            }
         });
     }
 
@@ -7102,13 +6998,12 @@ mod tests {
                     in_flight: false,
                 },
             );
-            // A well-formed 32-byte `enc` passes the bridge enc-length check, so
-            // the failure is the runtime join itself (bogus reservation +
-            // ciphertext).
+            // A valid 65-byte P-256 `enc`, so the failure is the runtime join
+            // itself (bogus reservation + ciphertext).
             let sealed = __sealed(
                 &ctx_id,
                 "did:dht:z6MkRollbackCreator",
-                vec![0u8; 32],
+                scp_crypto::p256::testing::valid_uncompressed_point(3).to_vec(),
                 b"bogus-bundle-ciphertext".to_vec(),
             );
 
@@ -7149,14 +7044,17 @@ mod tests {
         });
     }
 
-    /// A join whose `#active` key custody no longer holds fails at the
-    /// runtime's invitation KEM agreement (the first step of the join) with a
-    /// typed custody failure, which the bridge reports as `SCP-CRYPTO-4006`
-    /// through `typed_supervisor_failure` and still rolls its reversible state
-    /// back.
+    /// A join whose custody no longer holds the identity's wrapping key fails
+    /// at the runtime's custody check of that key (spec 09 §9.16.2 Open step
+    /// 2) with a typed custody failure, which the bridge reports as
+    /// `SCP-CRYPTO-4006` through `typed_supervisor_failure`, and still rolls
+    /// its reversible state back.
+    ///
+    /// The reservation is real, so the join reaches the custody call; the
+    /// wrapping key is destroyed after the reservation loaded it.
     #[test]
     #[cfg(feature = "testing")]
-    fn join_from_welcome_with_a_destroyed_active_key_is_crypto_4006() {
+    fn join_from_welcome_with_a_destroyed_wrapping_key_is_crypto_4006() {
         use scp_platform::KeyCustody as _;
         pyo3::prepare_freethreaded_python();
         crate::init_runtime().ok();
@@ -7165,33 +7063,33 @@ mod tests {
             let bi = Arc::clone(&scp.inner);
             let joiner = scp.identity_create(py, "in_memory", None).unwrap();
             let joiner_did = joiner.did().to_owned();
-            let (custody, active) = crate::runtime::with_identity(&bi, &joiner_did, |entry| {
-                Ok((
-                    Arc::clone(&entry.custody),
-                    entry.identity.active_signing_key,
-                ))
+            let (reservation, _kp) = scp
+                .reserve_key_package(py, &joiner_did)
+                .expect("the joiner reserves a KeyPackage");
+            let custody = crate::runtime::with_identity(&bi, &joiner_did, |entry| {
+                Ok(Arc::clone(&entry.custody))
             })
             .expect("registered identity");
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            let owner = scp_did::DID(joiner_did.clone());
             crate::runtime()
                 .unwrap()
-                .block_on(custody.destroy_key(&active))
+                .block_on(async {
+                    let handle = sup.testing_wrapping_key_handle(&owner).await.unwrap();
+                    custody.destroy_key(&handle).await
+                })
                 .expect("destroy_key should succeed");
 
             let ctx_id = "b".repeat(64);
             let sealed = __sealed(
                 &ctx_id,
-                "did:dht:z6MkDestroyedActiveCreator",
-                vec![0u8; 32],
+                "did:dht:z6MkDestroyedWrappingCreator",
+                scp_crypto::p256::testing::valid_uncompressed_point(5).to_vec(),
                 b"bogus-bundle-ciphertext".to_vec(),
             );
             let err = scp
-                .context_join_from_welcome(
-                    py,
-                    joiner_did,
-                    sealed,
-                    "bogus-reservation-id".to_owned(),
-                )
-                .expect_err("a join under a destroyed #active key must fail")
+                .context_join_from_welcome(py, joiner_did, sealed, reservation)
+                .expect_err("a join under a destroyed wrapping key must fail")
                 .to_string();
             assert!(
                 err.contains("SCP-CRYPTO-4006"),
@@ -7202,6 +7100,124 @@ mod tests {
                 "FFI state must NOT survive a failed join"
             );
         });
+    }
+
+    /// Bob invites Alice from a second instance and Alice joins (spec 05
+    /// §5.12.3.1, spec 09 §9.16.2). Bob's invite verifies Alice's `KeyPackage`
+    /// attestation and seals to her 0xFF01 DHKEM(P-256) key, so `enc` is a
+    /// 65-byte uncompressed point. Alice's join opens it through `dh_agree` on
+    /// her custody wrapping handle and registers the context. With
+    /// `alice_host`, Alice's keys live in that Python host, and the host must
+    /// have agreed with exactly the sealed `enc`.
+    #[cfg(feature = "testing")]
+    fn invite_then_join_across_two_instances(alice_host: Option<Py<PyAny>>) {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let bob = crate::scp::PyScp::new_in_memory_for_test();
+            let bob_did = bob
+                .identity_create(py, "in_memory", None)
+                .expect("bob's identity")
+                .did()
+                .to_owned();
+            let alice = crate::scp::PyScp::new_in_memory_for_test();
+            // One DHT for both instances, so each resolves the other's DID.
+            crate::runtime::set_resolver_dht_client(
+                &alice.inner,
+                crate::runtime::resolver_dht_client(&bob.inner).expect("bob's DHT client"),
+            );
+            let alice_did = alice_host
+                .as_ref()
+                .map_or_else(
+                    || alice.identity_create(py, "in_memory", None),
+                    |host| alice.identity_create_with_custody(py, host.clone_ref(py)),
+                )
+                .expect("alice's identity")
+                .did()
+                .to_owned();
+
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            params
+                .set_item(
+                    "ceiling",
+                    vec![
+                        "messages:read",
+                        "messages:write",
+                        "role:assign",
+                        "member:invite",
+                        "governance:propose",
+                        "governance:vote",
+                    ],
+                )
+                .unwrap();
+            params.set_item("governance", "single_admin").unwrap();
+            let ctx_id = bob
+                .context_create(py, &bob_did, &params)
+                .expect("bob creates the context")
+                .context_id;
+
+            let (reservation, key_package) = alice
+                .reserve_key_package(py, &alice_did)
+                .expect("alice reserves a KeyPackage");
+            let invite = bob
+                .invite_member(
+                    py,
+                    ctx_id.clone(),
+                    bob_did.clone(),
+                    alice_did.clone(),
+                    key_package,
+                )
+                .expect("bob invites alice");
+            assert_eq!(invite.bundle.context_id, ctx_id);
+            assert_eq!(invite.bundle.creator_did, bob_did);
+            assert_eq!(
+                invite.bundle.enc.len(),
+                65,
+                "a DHKEM(P-256) enc is a 65-byte uncompressed point"
+            );
+            assert_eq!(invite.bundle.enc[0], 0x04, "uncompressed SEC1 tag");
+            let enc = invite.bundle.enc.clone();
+
+            let handle = alice
+                .context_join_from_welcome(py, alice_did, invite.bundle, reservation)
+                .expect("alice opens the sealed invitation and joins");
+            assert_eq!(handle.context_id, ctx_id);
+            assert!(
+                crate::runtime::with_ffi_state(&alice.inner, &ctx_id, |_| Ok(())).is_ok(),
+                "the joined context is registered on alice's instance"
+            );
+            if let Some(host) = &alice_host {
+                let peers: Vec<Vec<u8>> = host
+                    .bind(py)
+                    .getattr("dh_peers")
+                    .and_then(|p| p.extract())
+                    .expect("the host records each agreement's peer");
+                assert_eq!(
+                    peers,
+                    vec![enc],
+                    "the join agrees once, on the wrapping key, with the sealed enc"
+                );
+            }
+        });
+    }
+
+    /// [`invite_then_join_across_two_instances`] with Alice's keys in the
+    /// bridge's in-memory custody.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn invite_then_join_across_two_instances_opens_the_p256_sealed_invitation() {
+        invite_then_join_across_two_instances(None);
+    }
+
+    /// [`invite_then_join_across_two_instances`] with Alice's keys in a
+    /// `P256Custody` Python host, which agrees by real P-256 ECDH.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn invite_then_join_across_two_instances_opens_through_a_host_custody() {
+        pyo3::prepare_freethreaded_python();
+        let (_custody, host) = crate::custody::test_fakes::p256_py_custody_and_host();
+        invite_then_join_across_two_instances(Some(host));
     }
 
     /// ADR-049 Phase 2J (orphaned-success fix): a pre-existing (`Occupied`)
@@ -7232,13 +7248,12 @@ mod tests {
             crate::runtime::register_context(&bi, &ctx_id, "did:dht:z6MkOccupiedCreator", &[])
                 .unwrap();
 
-            // A well-formed 32-byte `enc` so control passes the bridge
-            // enc-length check and reaches the occupancy check (which runs
-            // BEFORE the KeyPackage consume).
+            // A valid 65-byte P-256 `enc`, so the only defect is the occupied
+            // slot, checked BEFORE the KeyPackage consume.
             let sealed = __sealed(
                 &ctx_id,
                 "did:dht:z6MkOccupiedCreator",
-                vec![0u8; 32],
+                scp_crypto::p256::testing::valid_uncompressed_point(4).to_vec(),
                 b"bogus-bundle-ciphertext".to_vec(),
             );
 
@@ -7267,22 +7282,61 @@ mod tests {
         });
     }
 
+    /// A `KeyPackage` the inviter rejects (§9.7.1) raises `CryptoError` with
+    /// `SCP-CRYPTO-4067`, the code every bridge reports for
+    /// `ContextError::InvalidKeyPackage`, never a bare `RuntimeError`. The
+    /// context is live and single-admin, so the `KeyPackage` check is the
+    /// first step that fails.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn invite_member_rejects_an_invalid_key_package_with_its_code() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let creator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = creator.did().to_owned();
+            let params = PyDict::new(py);
+            params.set_item("mode", "encrypted").unwrap();
+            params
+                .set_item("ceiling", vec!["messages:read", "member:invite"])
+                .unwrap();
+            params.set_item("governance", "single_admin").unwrap();
+            let handle = scp
+                .context_create(py, &creator_did, &params)
+                .expect("encrypted single-admin context_create succeeds");
+
+            let err = scp
+                .invite_member(
+                    py,
+                    handle.context_id,
+                    creator_did,
+                    "did:dht:z6MkInviteeBadKeyPackage".to_owned(),
+                    b"bogus-key-package".to_vec(),
+                )
+                .expect_err("an invalid KeyPackage must be rejected");
+            assert!(
+                err.is_instance_of::<crate::error::CryptoError>(py),
+                "expected CryptoError, got: {err}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(codes::CRYPTO_4067),
+                "expected {}, got: {msg}",
+                codes::CRYPTO_4067
+            );
+        });
+    }
+
     /// ADR-049 Phase 2J / FFI-02 Option A (invite export wiring): the new
     /// `invite_member` bridge export is wired end-to-end — DID validation ->
     /// supervisor resolution -> inviter signing-key resolution -> live-context
     /// lookup -> typed error mapping — and rejects the two reachable failure
     /// modes on the pre-add path.
     ///
-    /// NOTE ON SCOPE: the `"sealed"` happy-path (and the full creator-seal ->
-    /// joiner-open round-trip) is NOT asserted here because it terminates in the
-    /// MLS add-member step, which is not green on THIS branch — the same
-    /// pre-existing gap the untouched `plain_join_registers_known_context_for_joiner`
-    /// test hits ("the capabilities of the add proposal are insufficient for this
-    /// group"). That is the §5.13.3 `0xFF02` KeyPackage-capabilities work FFI-02
-    /// gates, not a defect in this bridge reshape. The sealed round-trip is
-    /// covered at the E2E layer once that add-member path lands. This test pins
-    /// what IS reachable on the pre-add path so the export is not merely
-    /// compiled-but-dead.
+    /// The `"sealed"` outcome and the creator-seal to joiner-open round trip
+    /// are asserted by `invite_then_join_across_two_instances`. This test pins
+    /// the two failures on the pre-add path.
     ///
     /// Not false-green: assertion (a) uses a REAL custodied inviter so
     /// signing-key resolution SUCCEEDS and the error is the live-context lookup
@@ -7428,6 +7482,121 @@ mod tests {
                 for_joiner.iter().any(|(cid, _)| cid == &ctx_id),
                 "plain join must register the joiner's known-context entry for discovery"
             );
+        });
+    }
+
+    /// The `KeyPackage` a plain join mints verifies as an adder verifies it
+    /// (§9.7.1): its `0xFF03` attestation verifies against the identity's
+    /// resolved `#active` key, and its `0xFF01` is the identity's custody
+    /// wrapping key.
+    #[test]
+    fn self_join_key_package_carries_a_verifying_attestation() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let joiner = scp.identity_create(py, "in_memory", None).unwrap();
+            let did = joiner.did().to_owned();
+            crate::runtime::init_context_manager_for_test(&bi);
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+
+            let kp = super::mint_self_join_key_package(py, &bi, &sup, &did)
+                .expect("the self-join mint succeeds");
+            let owner = scp_did::DID(did);
+            let (verified, custody_wrap) = crate::actor_wait::block_on_released(py, async {
+                (
+                    sup.verify_key_package_attestation(&owner, &kp).await,
+                    sup.wrapping_public_key(&owner).await,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                *verified
+                    .expect("the attestation verifies against the identity's #active key")
+                    .as_bytes(),
+                custody_wrap.expect("the identity has a custody wrapping key"),
+                "0xFF01 is the identity's custody wrapping key"
+            );
+        });
+    }
+
+    /// Asserts `err` is a `CryptoError` whose message carries the `[code]`
+    /// prefix the Python wrapper parses the code from.
+    fn assert_crypto_code(py: Python<'_>, err: &PyErr, code: &str) {
+        assert!(
+            err.is_instance_of::<crate::error::CryptoError>(py),
+            "expected CryptoError, got: {err}"
+        );
+        let message = err.value(py).to_string();
+        assert!(message.starts_with(&format!("[{code}] ")), "{message}");
+    }
+
+    /// A self-join mint whose registered `#active` handle holds a key other
+    /// than the one the identity's DID document resolves as `#active` mints
+    /// nothing and raises `SCP-CRYPTO-4066` (§9.7.1).
+    #[test]
+    fn self_join_mint_refuses_a_handle_that_is_not_the_resolved_active_key() {
+        use scp_platform::KeyCustody as _;
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let did = scp
+                .identity_create(py, "in_memory", None)
+                .unwrap()
+                .did()
+                .to_owned();
+            crate::runtime::init_context_manager_for_test(&bi);
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            let custody =
+                crate::runtime::with_identity(&bi, &did, |e| Ok(Arc::clone(&e.custody))).unwrap();
+            let other = crate::actor_wait::block_on_released(
+                py,
+                custody.generate_keypair(scp_platform::KeyType::Ed25519),
+            )
+            .unwrap()
+            .expect("custody generates a second Ed25519 key");
+            crate::runtime::with_identity_mut(&bi, &did, |e| {
+                e.identity.active_signing_key = other;
+                Ok(())
+            })
+            .unwrap();
+
+            let err = super::mint_self_join_key_package(py, &bi, &sup, &did)
+                .expect_err("a handle that is not the resolved #active mints nothing");
+            assert_crypto_code(py, &err, codes::CRYPTO_4066);
+        });
+    }
+
+    /// A self-join mint for an identity whose DID document does not resolve
+    /// mints nothing and raises `SCP-CRYPTO-4065` (§9.7.1). The identity's
+    /// custody and keys are real; only the DID it is registered under has no
+    /// published document.
+    #[test]
+    fn self_join_mint_fails_closed_when_the_owner_does_not_resolve() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = Arc::clone(&scp.inner);
+            let did = scp
+                .identity_create(py, "in_memory", None)
+                .unwrap()
+                .did()
+                .to_owned();
+            crate::runtime::init_context_manager_for_test(&bi);
+            let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            let unpublished = "did:dht:z6MkSelfJoinOwnerNeverPublished";
+            let (_, entry) = crate::runtime::identity_registry(&bi)
+                .remove(&did)
+                .expect("the identity is registered");
+            crate::runtime::register_identity(&bi, unpublished, entry);
+
+            let err = super::mint_self_join_key_package(py, &bi, &sup, unpublished)
+                .expect_err("an owner that does not resolve mints nothing");
+            assert_crypto_code(py, &err, codes::CRYPTO_4065);
         });
     }
 
@@ -9342,34 +9511,13 @@ mod tests {
     #[cfg(feature = "testing")]
     const SLOW_AGREE_PY: &std::ffi::CStr = c"
 import threading
-from fake_custody import P256Custody, ed_expand
-
-def x25519(k, u):
-    # RFC 7748 Montgomery ladder; k is already clamped.
-    p, a24 = 2**255 - 19, 121665
-    x1 = int.from_bytes(bytes(u), 'little') & ((1 << 255) - 1)
-    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
-    for t in reversed(range(255)):
-        bit = (k >> t) & 1
-        if swap ^ bit:
-            x2, x3, z2, z3 = x3, x2, z3, z2
-        swap = bit
-        a, b, c, d = x2 + z2, x2 - z2, x3 + z3, x3 - z3
-        aa, bb, da, cb = a * a % p, b * b % p, d * a % p, c * b % p
-        e = aa - bb
-        x3, z3 = (da + cb) ** 2 % p, x1 * (da - cb) ** 2 % p
-        x2, z2 = aa * bb % p, e * (aa + a24 * e) % p
-    if swap:
-        x2, z2 = x3, z3
-    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, 'little')
+from fake_custody import P256Custody
 
 class SlowAgreeCustody(P256Custody):
     # Signals when an HPKE dh_agree starts, holds it until the test sets
     # release_agree, signals that the hold is over, then answers with the
     # P-256 ECDH of its key. release_agree starts set, so setup agrees
-    # without holding; the test clears it before the agree it watches. The
-    # #active Ed25519 key agrees by real X25519, so this identity can open a
-    # Welcome.
+    # without holding; the test clears it before the agree it watches.
 
     def __init__(self):
         super().__init__()
@@ -9384,8 +9532,6 @@ class SlowAgreeCustody(P256Custody):
             if not self.release_agree.wait(120.0):
                 raise RuntimeError('the test never released the agree')
             self.agree_done.set()
-        elif self._key_types.get(key_id) == 'ed25519':
-            return x25519(ed_expand(self._seed(key_id))[0], peer_public)
         return super().dh_agree(key_id, peer_public)
 ";
 
@@ -10198,13 +10344,13 @@ class SlowAgreeCustody(P256Custody):
     }
 
     /// `typed_supervisor_failure` raises `SCP-CTX-2130` for `ContextError::ActorBusy`,
-    /// `SCP-CTX-2138` for `ContextError::SupervisorShutDown`, the custody code
-    /// for `ContextError::Custody`, and keeps the uncoded `RuntimeError` for
-    /// every other variant, on the
+    /// `SCP-CTX-2138` for `ContextError::SupervisorShutDown`, and keeps the
+    /// uncoded `RuntimeError` for every variant with no dedicated code, on the
     /// `reserve_key_package`, `context_join_from_welcome` and `invite_member`
-    /// failure paths.
+    /// failure paths. The custody error table in `error.rs` runs every custody
+    /// failure kind through this path.
     #[test]
-    fn typed_supervisor_failure_types_busy_shutdown_and_custody_only() {
+    fn typed_supervisor_failure_types_busy_and_shutdown() {
         use scp_core::context::ContextError;
         match super::typed_supervisor_error(
             "context_join_from_welcome",
@@ -10236,25 +10382,6 @@ class SlowAgreeCustody(P256Custody):
             .is_none(),
             "a non-busy failure keeps the uncoded RuntimeError"
         );
-        for (kind, expected) in [
-            (
-                scp_crypto::CustodyFailureKind::KeyNotFound,
-                codes::CRYPTO_4006,
-            ),
-            (scp_crypto::CustodyFailureKind::TimedOut, codes::CRYPTO_4062),
-            (scp_crypto::CustodyFailureKind::Failed, codes::CRYPTO_4060),
-        ] {
-            let failure = scp_crypto::CustodyFailure {
-                kind,
-                detail: "custody detail".to_owned(),
-            };
-            match super::typed_supervisor_error("context export", &ContextError::Custody(failure)) {
-                Some(crate::error::ScpPyError::CryptoError { code, .. }) => {
-                    assert_eq!(code, expected);
-                }
-                other => panic!("expected a {expected} CryptoError, got {other:?}"),
-            }
-        }
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let busy = super::typed_supervisor_failure(
@@ -10278,7 +10405,8 @@ class SlowAgreeCustody(P256Custody):
     }
 
     /// A restore refused because Supervisor shutdown began raises
-    /// `ContextError` with `SCP-CTX-2138`; any other restore failure raises the
+    /// `ContextError` with `SCP-CTX-2138`, as every error with a dedicated code
+    /// raises its typed exception; a failure with no dedicated code raises the
     /// `RuntimeError` naming `SCP-CTX-2064`.
     #[test]
     fn restore_context_failure_keeps_supervisor_shut_down_typed() {

@@ -29,9 +29,9 @@ Phase 1-5 ADRs
 
 ## ADR-027: Android Platform Adapter
 
-**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-29 (SCP-307, the hardware pseudonym secret); 2026-10-10 (SCP-307, identity generation creates that secret, and the agreement-key helpers of the sketch take the `HpkeP256` name); 2026-09-27 (the device-attestation binding and the named verifier); 2026-10-10 (the custody request vocabulary: the adapter is reached as `os_keystore`, with edits to the Decision's `PlatformAdapter.kt` item, the SDK injection point, the ADR-028 item of the Dependencies list and acceptance criterion 12, each of which marks its own); 2026-10-11 (`UniffiKeyCustody` implements `uniffi.scp.KeyCustodyProvider` over `AndroidKeyCustody`, an edit to the custody request vocabulary amendment, which marks its own); 2026-10-12 (the FCM wake signal of `10-infrastructure-and-self-hosting.md` §10.7.1 step 5 and the push call order, with edits to the Decision's `AndroidPushProvider.kt` item and FCM payload paragraph, the `AndroidPushProvider.kt` code block and acceptance criterion 10, each of which marks its own) — see the amendments below.
+**Status:** Decided. **Amended:** 2026-09-10 (the P-256 curve ruling); 2026-09-29 (SCP-307, the hardware pseudonym secret); 2026-10-10 (SCP-307, identity generation creates that secret, and the agreement-key helpers of the sketch take the `HpkeP256` name); 2026-09-27 (the device-attestation binding and the named verifier); 2026-10-10 (the custody request vocabulary: the adapter is reached as `os_keystore`, with edits to the Decision's `PlatformAdapter.kt` item, the SDK injection point, the ADR-028 item of the Dependencies list and acceptance criterion 12, each of which marks its own); 2026-10-11 (`UniffiKeyCustody` implements `uniffi.scp.KeyCustodyProvider` over `AndroidKeyCustody`, an edit to the custody request vocabulary amendment, which marks its own); 2026-10-12 (the FCM wake signal of `10-infrastructure-and-self-hosting.md` §10.7.1 step 5 and the push call order, with edits to the Decision's `AndroidPushProvider.kt` item and FCM payload paragraph, the `AndroidPushProvider.kt` code block and acceptance criterion 10, each of which marks its own); 2026-10-20 (SCP-307: the custody class is recorded per key at mint from the security level Keystore reports; the agreement-key floor is API 31; P-256 signing uses `DIGEST_NONE`; the `kotlin-android-instrumented` emulator lane; the adapter's custody is single-process; an abandoned mint's sweep is best-effort; a pending id reads as absent; every destruction reports `SOFTWARE_ONLY`; a P-256 key's role lives in its record, with edits to the 2026-09-10 amendment, the Context, the Decision's `AndroidKeyCustody.kt` item, the Minimum API level, the Rationale, the `AndroidKeyCustody.kt` code block, the ADR-025 item of the Dependencies list and acceptance criteria 1 to 5 and 13, each of which marks its own) — see the amendments below.
 
-**Amendment (2026-09-10 — every SCP key is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. This ADR's Rationale called hardware-backed Ed25519 at API 33 and above "a direct win over Apple, where Secure Enclave's P-256 limitation forces software key storage". **That paragraph is withdrawn.** The gap it named came from SCP's own curve choice and not from either vendor's hardware: Apple's Secure Enclave performs P-256 operations, Android Keystore has held P-256 keys in the Trusted Execution Environment since API 23, and SCP signed with a curve only one of the two implemented. Under the ruling both adapters hold every SCP signing key in hardware, and ADR-025, the Apple platform adapter, carries the matching amendment. Two further consequences follow for this ADR. The Bouncy Castle software fallback for API levels 26 through 32 has nothing left to fall back from, because Keystore holds a P-256 signing key at every API level this SDK supports; it survives only for key agreement below API 31, which is the first level at which Keystore performs ECDH. And the root member is held by a passkey through the platform's credential provider (`09-security-model.md` §9.7.4.1 item 4), so `AndroidKeyCustody` neither generates nor stores it.
+**Amendment (2026-09-10 — every SCP key is ECDSA on P-256).** ADR-063, inception-derived self-certifying identity over a key-event log, carries the curve ruling in §The curve and the root's custody, which names §9.5 of `09-security-model.md` as the home of its reason, and carries the provenance of the curve it superseded in §Alternatives considered. This ADR's Rationale called hardware-backed Ed25519 at API 33 and above "a direct win over Apple, where Secure Enclave's P-256 limitation forces software key storage". **That paragraph is withdrawn.** The gap it named came from SCP's own curve choice and not from either vendor's hardware: Apple's Secure Enclave performs P-256 operations, Android Keystore has held P-256 keys in the Trusted Execution Environment since API 23, and SCP signed with a curve only one of the two implemented. Under the ruling both adapters hold every SCP signing key in the operating system's platform signer, and ADR-025, the Apple platform adapter, carries the matching amendment. Whether that signer holds a given key in hardware is a fact about the key, which this adapter reads from `KeyInfo` when it mints the key and records (acceptance criterion 1). (Amended 2026-10-20; this sentence previously read "Under the ruling both adapters hold every SCP signing key in hardware, and ADR-025, the Apple platform adapter, carries the matching amendment.") Two further consequences follow for this ADR. The Bouncy Castle software fallback for API levels 26 through 32 has nothing left to fall back from, because Keystore holds a P-256 signing key at every API level this SDK supports; it survives only for key agreement below API 31, which is the first level at which Keystore performs ECDH. And the root member is held by a passkey through the platform's credential provider (`09-security-model.md` §9.7.4.1 item 4), so `AndroidKeyCustody` neither generates nor stores it.
 
 **Amendment (2026-09-29 — SCP-307, the hardware pseudonym secret).** For a Keystore identity key, `pseudonym_secret` is a 256-bit Keystore HMAC-SHA256 key that identity generation (`generate_identity_keypair`, amended 2026-10-10; this clause previously named `generate_keypair`) creates beside the identity key, non-exportable and usable without user authentication. The HMAC that yields the §9.10.4 context seed runs inside Keystore: the adapter passes the Keystore key to `Mac.init`, so the secret never enters process memory. Nothing is derived from a signature. The `derivePseudonym` sketch below is superseded on four points: its `// HKDF (software) or TEE-sign (hardware)` comment; its `SecretKeySpec(pseudonymSecret, ...)`, which would hold the hardware secret as exported bytes; its `seedToScalar(seed)` call, which names no Kotlin function; and its `PseudonymKeyHandle` return. The adapter turns the seed into the pseudonym point with the UniFFI export `uniffi.scp.p256PseudonymPoint(contextSeed)`, and a Bouncy Castle software identity derives its point with `uniffi.scp.p256SoftwarePseudonymPoint`. `derivePseudonym` returns that 33-byte point and stores no pseudonym key (§9.10.4.A). Destroying the identity deletes the secret before the identity key, so a failed destroy leaves the identity present and a retry deletes both. Derivation confirms that the identity key exists before it uses the secret, and a Keystore identity key generated before the secret existed fails pseudonym derivation with `SCP-CRYPTO-4006` (§9.10.4.A).
 
@@ -45,7 +45,7 @@ Phase 1-5 ADRs
 
 SCP's platform adapter layer (ADR-006) abstracts device-specific capabilities behind four traits: `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage`. These traits are exposed as UniFFI callback interfaces (ADR-021), allowing Kotlin implementations to be injected into the Rust engine. The Android adapter implements all four traits using Android's native platform security stack.
 
-Android and Apple reach the same key-custody floor. Android Keystore has generated and used EC P-256 keys inside the Trusted Execution Environment since API 23, and Apple's Secure Enclave performs P-256 operations, so every SCP signing key is hardware-held on both platforms once every SCP key is a P-256 key (`09-security-model.md` §9.5). The two adapters differ in their key-agreement floor and in their attestation service, not in whether a signing key reaches hardware: Keystore performs ECDH from API 31, and below that level this adapter agrees keys in software. Until 2026-09-10 this paragraph named a fundamental difference, which the amendment above traces to SCP's superseded curve rather than to either vendor's hardware.
+Android and Apple reach the same key-custody floor. Android Keystore has generated and used EC P-256 keys since API 23 and holds each at whatever security level the device provides: the Trusted Execution Environment or StrongBox on most devices, and software KeyMint on an emulator or a low-end device, which is still the operating system's platform signer under `09-security-model.md` §9.5. Apple's Secure Enclave performs P-256 operations, so on both platforms the operating system's signer holds every SCP signing key once every SCP key is a P-256 key (§9.5). The adapter records each key's custody class at mint from the level Keystore reports for that key: `"hardware"` for the TEE, StrongBox or an unknown secure level, and `"software"` otherwise. (Amended 2026-10-20; these sentences previously read "Android Keystore has generated and used EC P-256 keys inside the Trusted Execution Environment since API 23, and Apple's Secure Enclave performs P-256 operations, so every SCP signing key is hardware-held on both platforms once every SCP key is a P-256 key (`09-security-model.md` §9.5).") The two adapters differ in their key-agreement floor and in their attestation service, not in whether a signing key reaches hardware: Keystore performs ECDH from API 31, and below that level this adapter agrees keys in software. Until 2026-09-10 this paragraph named a fundamental difference, which the amendment above traces to SCP's superseded curve rather than to either vendor's hardware.
 
 Android's hardware security landscape has two tiers: TEE (Trusted Execution Environment), present on virtually all modern Android devices, and StrongBox, an isolated secure element chip present on a subset of flagship devices. StrongBox operations are dramatically slower (10-100x) than TEE operations. For SCP's frequent signing operations during protocol participation, StrongBox latency is prohibitive. TEE-backed Keystore is the correct default.
 
@@ -53,13 +53,13 @@ Android's hardware security landscape has two tiers: TEE (Trusted Execution Envi
 
 Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/`. Five files implement the four platform traits plus a factory:
 
-- **`AndroidKeyCustody.kt`** — `KeyCustodyProvider` implementation using Android Keystore. EC P-256 signing keys in Keystore at every supported API level; Keystore key agreement at API 31+, with a Bouncy Castle software P-256 agreement key below it. TEE-backed by default; StrongBox explicitly opt-out.
+- **`AndroidKeyCustody.kt`** — `KeyCustodyProvider` implementation using Android Keystore. EC P-256 signing keys in Keystore at every supported API level; Keystore key agreement at API 31+, with a Bouncy Castle software P-256 agreement key below it. TEE-backed by default; StrongBox explicitly opt-out. The adapter runs in the app's main process only (acceptance criterion 1). (Amended 2026-10-20; the last sentence is new.)
 - **`AndroidDeviceAttestation.kt`** — `DeviceAttestationProvider` implementation using Play Integrity Standard API. Standard (server-side, low-latency) preferred over Classic (offline, high-cost) attestation.
 - **`AndroidPushProvider.kt`** — `PushProvider` implementation using Firebase Cloud Messaging. Opaque data-only message: the FCM row of the §10.7.1 step 5 wake-signal table, whose `data` map is `{"scp": "1"}` (amended 2026-10-12; this item previously gave the payload as `{"data": {"scp": "1"}}` and cited no table). No context ID, sender identifier, or message content in any notification payload.
 - **`AndroidStorage.kt`** — `StorageProvider` implementation using SQLCipher. The SQLCipher key is derived as `17-persistence-and-storage.md` §17.6 requires: a non-exportable HMAC-SHA-256 key in Android Keystore MACs a fixed label, and HKDF-SHA-256 expands that MAC output into the 32-byte key. Key ID: `scp.storage.key`. (Amended 2026-10-12; this item previously named a TEE-backed AES-256 Keystore key.)
 - **`PlatformAdapter.kt`** — `AndroidPlatformAdapter` factory. `AndroidPlatformAdapter.make()` constructs and injects all four providers. Called by the Kotlin SDK when the caller requests `os_keystore` custody (`03-identity.md` §3.2.2). (Amended 2026-10-10; this item previously ended "Called by the Kotlin SDK's `SCP.create()` when `custody = "platform"`.")
 
-**Minimum API level:** API 26 (Android 8.0) for the SDK. Keystore has backed EC P-256 signing keys in hardware since API 23, so every device this SDK supports reports `CustodyType.Hardware` for a signing key. API 31 (Android 12) is the first level at which Keystore performs ECDH, so a device on API 26-32 holds its key-agreement key as a software Bouncy Castle P-256 key with `CustodyType.Software`.
+**Minimum API level:** API 26 (Android 8.0) for the SDK. Keystore has held EC P-256 signing keys since API 23, at the security level the device provides, so every device this SDK supports holds a signing key in Keystore; the key's handle reports `CustodyType.HARDWARE` when `KeyInfo` places it in the TEE, StrongBox or an unknown secure level, and `CustodyType.SOFTWARE` otherwise. API 31 (Android 12) is the first level at which Keystore performs ECDH, so a device on API 26-30 holds its key-agreement key as a software Bouncy Castle P-256 key with `CustodyType.SOFTWARE`. (Amended 2026-10-20; this paragraph previously read "Keystore has backed EC P-256 signing keys in hardware since API 23, so every device this SDK supports reports `CustodyType.Hardware` for a signing key. API 31 (Android 12) is the first level at which Keystore performs ECDH, so a device on API 26-32 holds its key-agreement key as a software Bouncy Castle P-256 key with `CustodyType.Software`.")
 
 **TEE vs StrongBox policy:** TEE is the default and only option. StrongBox is not used. StrongBox operations are dramatically slower — 10-100x latency increase over TEE for signing — which would make SCP protocol participation visibly laggy. There is no user-visible opt-in to StrongBox.
 
@@ -69,13 +69,13 @@ Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-kt-andr
 
 ### Rationale
 
-- **P-256 signing keys are hardware-backed at every supported API level:** Android Keystore generates an EC P-256 key with `ECGenParameterSpec("secp256r1")` inside the TEE from API 23, so the private bytes never leave the TEE and every signature happens there. This ADR previously claimed a direct win over Apple on this point; the amendment at the head of the ADR withdraws that claim and states why.
-- **Software agreement key below API 31:** API 26 is the SDK minimum (matching the JVM 11+ target and Android 8.0). `KeyProperties.PURPOSE_AGREE_KEY` arrived at API 31, so on API 26-32 Keystore signs in hardware and cannot perform ECDH; the adapter therefore generates the key-agreement key with Bouncy Castle, stores it encrypted in EncryptedSharedPreferences (Jetpack Security), and reports `CustodyType.Software` for that key alone.
+- **P-256 signing keys are held by Keystore at every supported API level:** Android Keystore generates an EC P-256 key with `ECGenParameterSpec("secp256r1")` from API 23 at the security level the device provides, so the private bytes never leave Keystore and every signature happens there. On an emulator or a low-end device that level is software KeyMint, still the platform signer of `09-security-model.md` §9.5, and the adapter records `"software"` for such a key from `KeyInfo` rather than claiming hardware from the key type. (Amended 2026-10-20; this item previously read "**P-256 signing keys are hardware-backed at every supported API level:** Android Keystore generates an EC P-256 key with `ECGenParameterSpec("secp256r1")` inside the TEE from API 23, so the private bytes never leave the TEE and every signature happens there.") This ADR previously claimed a direct win over Apple on this point; the amendment at the head of the ADR withdraws that claim and states why.
+- **Software agreement key below API 31:** API 26 is the SDK minimum (matching the JVM 11+ target and Android 8.0). `KeyProperties.PURPOSE_AGREE_KEY` arrived at API 31, so on API 26-30 Keystore signs and cannot perform ECDH (amended 2026-10-20; this clause previously read "on API 26-32 Keystore signs in hardware"); the adapter therefore generates the key-agreement key with Bouncy Castle, stores it encrypted in EncryptedSharedPreferences (Jetpack Security), and reports `CustodyType.Software` for that key alone.
 - **TEE over StrongBox:** StrongBox is present on a fraction of devices and operates orders of magnitude slower than TEE. SCP signs messages during every send operation and during key agreement. StrongBox latency would accumulate visibly in normal usage. The TEE provides hardware isolation with acceptable latency. StrongBox is not offered as an option — "opt-in slowness" is a footgun.
 - **Play Integrity Standard over Classic:** Standard integrity requests return a verdict signed by Google's servers, sufficient for SCP's attestation purpose. Classic attestation (APK certificate chain) requires a dedicated Google Play Developer API call per attestation with stricter rate limits and is designed for offline scenarios SCP does not have. Standard is lower-cost, lower-latency, and simpler.
 - **FCM data-only payload for opacity:** FCM notification payloads visible to the device OS (notification fields) must contain no SCP-meaningful content. A data-only message with `{"scp": "1"}` carries no information except "wake up and pull" — satisfying §10.7. The FCM data payload is not displayed to the user, not logged by the OS notification system, and carries no identifying information.
 - **SQLCipher with a Keystore-rooted key:** SQLCipher provides transparent full-database encryption. Its key is derived as `17-persistence-and-storage.md` §17.6 requires; the `AndroidStorage.kt` item under Decision and the `AndroidStorage` class KDoc state the derivation. (Amended 2026-10-12; this item previously described a Keystore AES-256 key that wrapped the SQLCipher key material through AES-GCM.)
-- **Private keys never cross the FFI boundary:** Every P-256 signature and every P-256 ECDH agreement happens inside `AndroidKeyCustody.kt`. The Rust engine calls the UniFFI callback interface methods with data to sign and receives signatures back. Raw private key bytes stay inside the Kotlin adapter, inside the Android Keystore TEE.
+- **Private keys never cross the FFI boundary:** Every P-256 signature and every P-256 ECDH agreement happens inside `AndroidKeyCustody.kt`. The Rust engine calls the UniFFI callback interface methods with data to sign and receives signatures back. Raw private key bytes stay inside the Kotlin adapter: a Keystore key stays inside Keystore at the security level Keystore reports for it, and the API 26-30 agreement scalar lives in EncryptedSharedPreferences and enters process memory during agreement. Kotlin cannot wipe these copies of that scalar's material: the immutable `BigInteger` private value Bouncy Castle holds for the key's life, in a key pair that stays in one process-wide cache until the key is destroyed or the process exits, including after the `AndroidKeyCustody` instance that loaded it is dropped, and every `BigInteger` its arithmetic derives from it; the `ByteArray` that `BigIntegers.asUnsignedByteArray` takes from `BigInteger.toByteArray` and drops; the Base64 `String` the preferences file stores and the buffers Base64 encoding and decoding allocate; the plaintext buffers EncryptedSharedPreferences and its Tink AEAD allocate when they encrypt or decrypt a value; the decrypted values `SharedPreferences.getAll` returns, which is why restore reads each recorded id with `getString` and never calls `getAll`; and the `BigInteger` the ECDH computation returns. The adapter zeroes every intermediate `ByteArray` it allocates itself. On API 26-30 Bouncy Castle multiplies the peer point by the scalar with a variable-time windowed NAF, so code that can time agreements on the device learns about the scalar. (Amended 2026-10-20; this sentence previously read "Raw private key bytes stay inside the Kotlin adapter, inside the Android Keystore TEE.")
 - **Kotlin over Rust for Android platform code:** Android Keystore, Play Integrity, and FCM are Java/Kotlin APIs with no Rust bindings. Writing thin Kotlin adapters that call these APIs and satisfy the UniFFI callback interfaces is the correct approach — it uses the idiomatic Android API surface without maintaining a JNI bridge to Rust Android Keystore bindings.
 
 ### Implementation
@@ -92,6 +92,8 @@ bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/
 ```
 
 **`AndroidKeyCustody.kt` — P-256 key generation via Android Keystore:**
+
+(Amended 2026-10-20: the sample now signs with `NONEwithECDSA` over the bridge's 32-byte digest under a key authorised for `DIGEST_NONE` and returns Keystore's DER unchanged, reads each Keystore key's custody class from `KeyInfo`, and generates the API 26-30 agreement key with Bouncy Castle's lightweight `ECKeyPairGenerator` and commits its scalar. It previously signed with `SHA256withECDSA`, which hashes the bridge's precomputed digest a second time, converted the DER itself through `derToRawLowS`, returned `CustodyType.HARDWARE` for every Keystore key, and asked the JCA for an `"EC"` generator from the `"BC"` provider, which Android's platform build strips. Its `destroyKey` and `dhAgree` chose the store from the handle's custody class, which a software KeyMint key contradicts, and `destroyKey` returned nothing; both now dispatch on the record's backing, and `destroyKey` reports `SOFTWARE_ONLY` (acceptance criterion 4). The agreement-key lookup also threw `SCP-CRYPTO-4002` for an absent key, a code no custody operation uses for it. Acceptance criteria 1 to 5 state the record, the rollback and the peer checks the sample leaves out.)
 
 ```kotlin
 class AndroidKeyCustody : KeyCustodyProvider {
@@ -114,37 +116,58 @@ class AndroidKeyCustody : KeyCustodyProvider {
             KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
         )
             .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
-            .setDigests(KeyProperties.DIGEST_SHA256)
+            .setDigests(KeyProperties.DIGEST_NONE)  // the bridge passes a 32-byte digest
             .setUserAuthenticationRequired(false)  // SCP requires background processing
             .build()
         val keyPairGenerator = KeyPairGenerator.getInstance(
             KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore"
         )
         keyPairGenerator.initialize(spec)
-        keyPairGenerator.generateKeyPair()
-        return KeyHandle(id = keyId, custodyType = CustodyType.HARDWARE)
+        val privateKey = keyPairGenerator.generateKeyPair().private
+        // The custody class is the level Keystore reports for this key, never the key type.
+        val info = KeyFactory.getInstance(privateKey.algorithm, "AndroidKeyStore")
+            .getKeySpec(privateKey, KeyInfo::class.java)
+        val secure = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            info.securityLevel in setOf(
+                KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT,
+                KeyProperties.SECURITY_LEVEL_STRONGBOX,
+                KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE,
+            )
+        } else {
+            info.isInsideSecureHardware
+        }
+        return KeyHandle(id = keyId, custodyType = if (secure) CustodyType.HARDWARE else CustodyType.SOFTWARE)
     }
 
     private fun generateSoftwareHpkeP256(keyId: String): KeyHandle {
-        // Bouncy Castle P-256 agreement key for API 26-30; stored in EncryptedSharedPreferences
-        val keyPair = KeyPairGenerator.getInstance("EC", "BC").apply {
-            initialize(ECGenParameterSpec("secp256r1"), SecureRandom())
+        // Bouncy Castle lightweight P-256 agreement key for API 26-30. The 32-byte scalar is
+        // committed to EncryptedSharedPreferences before the handle is returned.
+        val curve = SECNamedCurves.getByName("secp256r1")
+        val pair = ECKeyPairGenerator().apply {
+            init(ECKeyGenerationParameters(ECDomainParameters(curve), SecureRandom()))
         }.generateKeyPair()
-        softwareKeys[keyId] = keyPair
+        val scalar = BigIntegers.asUnsignedByteArray(32, (pair.private as ECPrivateKeyParameters).d)
+        try {
+            check(prefs.edit().putString("scp.p256.$keyId", Base64.encodeToString(scalar, Base64.NO_WRAP)).commit())
+        } finally {
+            scalar.fill(0)
+        }
+        softwareKeys[keyId] = pair
         return KeyHandle(id = keyId, custodyType = CustodyType.SOFTWARE)
     }
 
     override fun sign(keyHandle: KeyHandle, data: ByteArray): ByteArray {
+        require(data.size == 32)  // the bridge's SHA-256 digest; anything else is SCP-CRYPTO-4060
         val entry = KeyStore.getInstance("AndroidKeyStore")
             .apply { load(null) }
             .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry
-        val der = Signature.getInstance("SHA256withECDSA").apply {
+        // NONEwithECDSA signs the digest as given; SHA256withECDSA would hash it again.
+        // Keystore returns DER, and the Rust bridge converts it to the 64-byte low-s form of
+        // §9.5 and verifies it strictly before any caller sees it.
+        return Signature.getInstance("NONEwithECDSA").apply {
             initSign(entry.privateKey)
             update(data)
         }.sign()
-        // Keystore returns DER; §9.5 of the security spec fixes the 64-byte raw r || s form
-        // with s in the low half of the group order.
-        return derToRawLowS(der)
     }
 
     override fun publicKey(keyHandle: KeyHandle): ByteArray {
@@ -155,23 +178,31 @@ class AndroidKeyCustody : KeyCustodyProvider {
         return compressSec1(entry.certificate.publicKey as ECPublicKey)
     }
 
-    override fun destroyKey(keyHandle: KeyHandle) {
-        if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry("scp.key.${keyHandle.id}")
-        } else {
-            softwareKeys.remove(keyHandle.id)
+    override fun destroyKey(keyHandle: KeyHandle): DestructionAttestation {
+        // The record, never the handle's custody class, names where the key lives.
+        when (records.get(keyHandle.id)?.backing) {
+            Backing.KEYSTORE ->
+                KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry("scp.key.${keyHandle.id}")
+            Backing.SOFTWARE -> check(prefs.edit().remove("scp.p256.${keyHandle.id}").commit())
+            null -> throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4006")
         }
+        softwareKeys.remove(keyHandle.id)
+        records.remove(keyHandle.id)
+        // Keystore issues no proof that it destroyed a key, so §9.15 rates every destruction software-only.
+        return DestructionAttestation(method = DestructionMethod.SOFTWARE_ONLY, confirmed = true)
     }
 
     override fun dhAgree(keyHandle: KeyHandle, peerPublic: ByteArray): ByteArray {
-        // Keystore agrees inside the TEE at API 31+; below it the key is software.
-        val privateKey = if (keyHandle.custodyType == CustodyType.HARDWARE) {
-            (KeyStore.getInstance("AndroidKeyStore")
-                .apply { load(null) }
-                .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry).privateKey
-        } else {
-            softwareKeys[keyHandle.id]?.private
-                ?: throw ScpException("P-256 agreement key not found: ${keyHandle.id}", "SCP-CRYPTO-4002")
+        // Keystore agrees at API 31+, at its reported level; below it the key is software. The record's
+        // backing, never the handle's custody class, picks the store.
+        val record = records.get(keyHandle.id)
+            ?: throw ScpException("P-256 agreement key not found: ${keyHandle.id}", "SCP-CRYPTO-4006")
+        val privateKey = when (record.backing) {
+            Backing.KEYSTORE ->
+                (KeyStore.getInstance("AndroidKeyStore")
+                    .apply { load(null) }
+                    .getEntry("scp.key.${keyHandle.id}", null) as KeyStore.PrivateKeyEntry).privateKey
+            Backing.SOFTWARE -> softwareKeys.getValue(keyHandle.id).private
         }
         // The shared secret is the 32-byte x-coordinate of the agreed P-256 point.
         return KeyAgreement.getInstance("ECDH").apply {
@@ -214,6 +245,7 @@ class AndroidKeyCustody : KeyCustodyProvider {
     }
 
     private val softwareKeys = ConcurrentHashMap<String, AsymmetricCipherKeyPair>()
+    private val records = KeyRecords(prefs)  // {type, backing, custody, role} per P-256 key, criterion 1
 }
 ```
 
@@ -451,34 +483,46 @@ dependencies {
 
 - **ADR-006 (Platform Abstraction Traits):** `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage` trait signatures implemented here. The UniFFI callback interface names (`KeyCustodyProvider`, `DeviceAttestationProvider`, `PushProvider`, `StorageProvider`) map directly to these traits.
 - **ADR-021 (UniFFI Bridge):** Platform traits are exposed as UniFFI callback interfaces. `AndroidKeyCustody`, `AndroidDeviceAttestation`, `AndroidPushProvider`, and `AndroidStorage` are Kotlin implementations of those callback interfaces, injected from Kotlin into the Rust engine. Five callback interfaces total: `KeyCustodyProvider`, `StorageProvider`, `PushProvider`, `DeviceAttestationProvider`, `MessageListener`.
-- **ADR-025 (Apple Platform Adapter):** Structural reference. Both adapters implement the same four traits via the same UniFFI callback interface pattern, and since the curve ruling of 2026-09-10 both hold every SCP signing key in hardware. They differ in attestation service and in the API level at which the platform performs key agreement.
+- **ADR-025 (Apple Platform Adapter):** Structural reference. Both adapters implement the same four traits via the same UniFFI callback interface pattern, and since the curve ruling of 2026-09-10 both hold every SCP signing key in the platform signer, at the custody class each records per key (amended 2026-10-20; this clause previously read "both hold every SCP signing key in hardware"). They differ in attestation service and in the API level at which the platform performs key agreement.
 - **ADR-028 (Kotlin SDK):** The Kotlin SDK calls `AndroidPlatformAdapter.make(context)` when the caller requests `os_keystore` custody (`03-identity.md` §3.2.2); this item previously named the `SCP.create()` factory and `custody = "platform"` (amended 2026-10-10). The SDK owns the injection point; the platform adapter owns the implementations.
 
 ### Acceptance Criteria
 
 1. **`AndroidKeyCustody.generateKeypair(keyType)`:**
-   - For a P-256 signing key at every supported API level: generates the key in `AndroidKeyStore` using `KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")` with `ECGenParameterSpec("secp256r1")`. Returns `KeyHandle` with `custodyType = CustodyType.HARDWARE`.
-   - For a P-256 agreement key on API 31+: generates the key in `AndroidKeyStore` with `KeyProperties.PURPOSE_AGREE_KEY`. Returns `KeyHandle` with `custodyType = CustodyType.HARDWARE`.
-   - For a P-256 agreement key on API 26-30: generates a Bouncy Castle software key and stores it in `EncryptedSharedPreferences`. Returns `KeyHandle` with `custodyType = CustodyType.SOFTWARE`.
+   - For a P-256 signing key at every supported API level: generates the key in `AndroidKeyStore` using `KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")` with `ECGenParameterSpec("secp256r1")` and `KeyProperties.DIGEST_NONE`. Returns `KeyHandle` whose `custodyType` is the class recorded for the key, below.
+   - For a P-256 agreement key on API 31+: generates the key in `AndroidKeyStore` with `KeyProperties.PURPOSE_AGREE_KEY`. Returns `KeyHandle` whose `custodyType` is the class recorded for the key.
+   - For a P-256 agreement key on API 26-30: generates a Bouncy Castle software key and commits its 32-byte scalar to `EncryptedSharedPreferences` before it returns. Returns `KeyHandle` with `custodyType = CustodyType.SOFTWARE`.
+   - The store for an agreement key is chosen by the probe `Build.VERSION.SDK_INT >= 31`, read once when the adapter is constructed, never by catching a failure. A Keystore agreement-key create that fails on API 31+ fails the mint and never falls back to software.
+   - Before it creates anything, the adapter commits a record for the key holding `{type, backing, custody, role}`, with `backing` either Keystore or software and `custody` pending until the key exists. `role` is the role the key is minted in, committed in the same write that reserves the record, so no role outlives its record, and every read of a P-256 key's role reads the record. It then settles `custody` to `"hardware"` when `KeyInfo` places the key in the TEE, StrongBox or an unknown secure level (`securityLevel` from API 31, `isInsideSecureHardware` below it), and to `"software"` otherwise and for every software key. Every later operation dispatches on the record's type and backing, never on the probe or the handle, and the handle's `custodyType` comes from the record.
+   - A mint that fails after the record is committed rolls back: it deletes the alias or the scalar and confirms the deletion by re-reading. When it cannot confirm the deletion it keeps the record and throws `ScpException("SCP-CRYPTO-4060")` naming the key id, and `destroyKey` on that id retries. A record whose process tag (pid and process start time) differs from the current process's is left by an earlier process that died mid-mint, because the adapter runs in one process (below), and it is swept, alias or scalar included, when an adapter is constructed; an adapter never sweeps the current process's own pending record. The sweep is best-effort per record: a record whose key or record it cannot remove stays pending, the adapter logs its id with `Log.w` and no key material, and construction succeeds, because removing an orphan cleans up an inert leak on which no §9.15 guarantee depends. A record that does not decode fails only the operations on its own id.
+   - An id whose record is pending reads as absent: every operation on it but `destroyKey` throws `ScpException("SCP-CRYPTO-4006")`, and the bridge's custody query reports `"in_memory"`.
+   - **Single process.** `AndroidKeyCustody` runs in the app's main process only. `SharedPreferences.commit()` writes the committing process's whole cached map, so two processes over one preferences file lose each other's records and roles whatever else the adapter checks. Construction in any other process throws `ScpException("SCP-CRYPTO-4060")` whose message names this rule. The adapter reads its process name with `Application.getProcessName()` from API 28 and from `ActivityManager.runningAppProcesses` by pid below it, compares it with `applicationInfo.processName`, and refuses when it cannot read the name.
+   - (Amended 2026-10-20; the first three items previously returned `CustodyType.HARDWARE` for every Keystore key, named no digest, and said the software key was stored without saying when, and the five items after them did not exist.)
    - For the root member: generates nothing. `09-security-model.md` §9.7.4.1 item 4 places the root in the platform credential provider as a passkey.
    - Called twice during identity creation: for the Active Signing Key and for the Pre-Rotation Key.
 
 2. **`AndroidKeyCustody.sign(keyHandle, data)`:**
-   - Retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("SHA256withECDSA")`, converts the DER output to the 64-byte raw `r || s` form of `09-security-model.md` §9.5, and normalizes `s` into the low half of the group order.
-   - Rejects a request to sign under an agreement-only handle with `PlatformError.wrongKeyType`.
+   - Requires `data` to be the bridge's 32-byte digest, retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("NONEwithECDSA")` under a key authorised for `KeyProperties.DIGEST_NONE`, and returns the platform signer's output, DER or raw. Input that is not 32 bytes throws `ScpException("SCP-CRYPTO-4060")`. (Amended 2026-10-20; this item previously read "Retrieves `PrivateKeyEntry` from `AndroidKeyStore`, calls `Signature.getInstance("SHA256withECDSA")`", which hashed the bridge's digest a second time.) The Rust bridge converts the output to the 64-byte raw `r || s` form of `09-security-model.md` §9.5 with `s` in the low half of the group order, and verifies it strictly against the key's public key before any caller sees it. (Amended 2026-10-19; this item previously read "converts the DER output to the 64-byte raw `r || s` form of `09-security-model.md` §9.5, and normalizes `s` into the low half of the group order.")
+   - Rejects a request to sign under an agreement-only handle with `ScpException("SCP-CRYPTO-4060")`. (Amended 2026-10-20; this item previously named `PlatformError.wrongKeyType`, which the Kotlin surface does not have.)
    - Returns `ScpException("SCP-CRYPTO-4006")` if handle not found.
 
 3. **`AndroidKeyCustody.publicKey(keyHandle)`:**
-   - Extracts the P-256 public point from the Keystore certificate and returns the 33-byte SEC1 compressed encoding of `09-security-model.md` §9.5.
+   - Extracts the P-256 public point from the Keystore certificate, or from the software key pair. A signing key returns the 33-byte SEC1 compressed encoding of `09-security-model.md` §9.5; an agreement key returns the 65-byte SEC1 uncompressed encoding HPKE uses. (Amended 2026-10-20; this item previously read "Extracts the P-256 public point from the Keystore certificate and returns the 33-byte SEC1 compressed encoding of `09-security-model.md` §9.5.")
 
 4. **`AndroidKeyCustody.destroyKey(keyHandle)`:**
-   - For hardware handles: calls `KeyStore.deleteEntry("scp.key.${id}")`.
-   - For software handles: removes from in-memory map.
+   - For a Keystore key: calls `KeyStore.deleteEntry("scp.key.${id}")`, then confirms with `containsAlias`.
+   - For a software key: removes the committed scalar with `commit()`, confirms by re-reading the preferences, and drops the in-memory key pair.
+   - A deletion it cannot confirm throws `ScpException("SCP-CRYPTO-4060")` and keeps the key's record, so a retry can act on it. It accepts a key whose record is still pending and an alias with no record.
+   - The destruction attestation's method is `DestructionMethod.SOFTWARE_ONLY` for every key, the rule ADR-025 criterion 9 states for Apple: Keystore deletes a key it holds but issues no proof that it did, and §9.15 of `09-security-model.md` rates a destruction without a verified platform proof as software-only.
+   - (Amended 2026-10-20; the first two items previously read "For hardware handles: calls `KeyStore.deleteEntry("scp.key.${id}")`." and "For software handles: removes from in-memory map.", and the last two did not exist.)
    - Key destruction is verifiable: subsequent `sign()` or `publicKey()` calls return `ScpException("SCP-CRYPTO-4006")`.
 
 5. **`AndroidKeyCustody.dhAgree(keyHandle, peerPublic)`:**
-   - Performs P-256 ECDH in `AndroidKeyStore` at API 31+ and through Bouncy Castle below it. Returns the 32-byte x-coordinate of the agreed point.
-   - Rejects a request to agree under a signing-only handle with `PlatformError.wrongKeyType`.
+   - Before the key is used, requires the peer key to be 65 bytes, uncompressed (prefix `0x04`), and a valid point on P-256 other than infinity (Bouncy Castle `SecP256R1Curve.decodePoint` and `isValid`); any other peer throws `ScpException("SCP-CRYPTO-4060")`.
+   - Performs P-256 ECDH in `AndroidKeyStore` for a key the record says Keystore holds, building the peer key from `X509EncodedKeySpec` over the fixed P-256 SubjectPublicKeyInfo prefix and the 65-byte point, and through Bouncy Castle for a software key. Returns the 32-byte x-coordinate of the agreed point, left-padded to 32 bytes.
+   - Rejects a request to agree under a signing-only handle with `ScpException("SCP-CRYPTO-4060")`.
+   - The returned secret is a `ByteArray` the adapter does not wipe; the caller owns it. For a software key the agreement also leaves an immutable `BigInteger` that Kotlin cannot wipe.
+   - (Amended 2026-10-20; the first and fourth items did not exist, and the third previously named `PlatformError.wrongKeyType`.)
 
 6. **`AndroidKeyCustody.derivePseudonym(keyHandle, contextId)`:**
    - Computes `HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`. Derives a P-256 keypair from the first 32 bytes through the seed-to-scalar step of §9.10.4 of the security-model spec.
@@ -527,8 +571,9 @@ dependencies {
 
 13. **Conformance test suite:**
     - Same conformance macros as the in-memory adapter (ADR-006): `key_custody_conformance!()`, `device_attestation_conformance!()`, `push_provider_conformance!()`, `storage_conformance!()`.
-    - Hardware tests run on API 33+ physical device or API 33 emulator with Play Store.
-    - Software fallback tests run on API 26-32 emulator — verify `CustodyType.SOFTWARE` reported, valid signatures produced.
+    - Key-custody tests run in the CI lane `kotlin-android-instrumented` on x86_64 AOSP emulator images at API 30, where the agreement key is software, and API 33, where Keystore performs agreement. They check that each key's recorded custody class equals what `KeyInfo` reports for it, that signatures verify strictly through the Rust bridge, and that agreement matches an independent ECDH. Each leg passes the instrumentation argument `expectSoftwareKeyInfo=true`, under which the custody test also requires `KeyInfo` to report a non-secure level, as an AOSP emulator's software KeyMint does; a run on a real device omits the argument. The custody tests run in the test app's main process, as the single-process rule of criterion 1 requires.
+    - Play Integrity tests need Google Play services, which an AOSP image does not have, so no lane runs them and this criterion is unmet for them.
+    - (Amended 2026-10-20; these items previously read "Hardware tests run on API 33+ physical device or API 33 emulator with Play Store." and "Software fallback tests run on API 26-32 emulator — verify `CustodyType.SOFTWARE` reported, valid signatures produced.")
     - FCM tests use Firebase Test Lab or mock `FirebaseMessaging` via dependency injection.
     - SQLCipher tests verify database is not readable without the Keystore-derived key (open raw SQLite file, confirm unreadable).
 

@@ -765,6 +765,37 @@ pub const CRYPTO_4061: &str = "SCP-CRYPTO-4061";
 /// Not a transport timeout: an unanswered biometric prompt or host callback is
 /// not a retryable network fault.
 pub const CRYPTO_4062: &str = "SCP-CRYPTO-4062";
+/// No key custody is registered for the identity's wrapping key (spec 09
+/// §9.16.1), so the invitation cannot be opened and no `KeyPackage` can carry
+/// the key.
+///
+/// Maps from `ContextError::WrappingKeyCustodyUnavailable`.
+pub const CRYPTO_4063: &str = "SCP-CRYPTO-4063";
+/// The stored wrapping key handle is not held by the identity's custody, or
+/// the custody's public key differs from the recorded one (spec 09 §9.16.1).
+///
+/// Maps from `ContextError::WrappingKeyHandleInvalid`.
+pub const CRYPTO_4064: &str = "SCP-CRYPTO-4064";
+/// The `KeyPackage` owner's `#active` key does not resolve, so a `KeyPackage`
+/// attestation (spec 09 §9.7.1) can be neither signed nor checked.
+///
+/// Maps from `ContextError::AttestationSignerActiveKeyUnresolved`.
+pub const CRYPTO_4065: &str = "SCP-CRYPTO-4065";
+/// The handle offered to sign a `KeyPackage` attestation is not the owner's
+/// resolved `#active` key (spec 09 §9.7.1); nothing was minted.
+///
+/// Maps from `ContextError::AttestationSignerNotActiveKey`.
+pub const CRYPTO_4066: &str = "SCP-CRYPTO-4066";
+/// A `KeyPackage` the inviter checks (spec 09 §9.7.1) is rejected.
+///
+/// It does not validate, its credential names another identity, it carries no
+/// `0xFF01` or no `0xFF03`, its `0xFF01` is not a P-256 point, or its
+/// attestation does not verify against the owner's resolved `#active` key
+/// (including an attestation naming another role). A joiner's own reserved
+/// `KeyPackage` that fails at join reports this code too.
+///
+/// Maps from `ContextError::InvalidKeyPackage`.
+pub const CRYPTO_4067: &str = "SCP-CRYPTO-4067";
 
 // -------------------------------------------------------------------------
 // Transport (SCP-TRANS- 5000--5999)
@@ -1158,10 +1189,15 @@ pub const VALID_7104: &str = "SCP-VALID-7104";
 /// A response arrived inside the cooldown after the previous attempt
 /// ([`TrustError::CooldownActive`](scp_protocol::trust::TrustError::CooldownActive)).
 pub const VALID_7105: &str = "SCP-VALID-7105";
-/// The challenge is closed: passed or out of attempts
+/// The challenge is closed: passed or out of attempts.
+///
+/// The attempt check returns this code at begin and at commit (spec 07 §7.3.4)
 /// ([`TrustError::ChallengeClosed`](scp_protocol::trust::TrustError::ChallengeClosed)).
 pub const VALID_7106: &str = "SCP-VALID-7106";
-/// The challenger holds no open challenge with this id, digest and subject
+/// No challenge the challenger holds answers this lookup.
+///
+/// No live challenge has this id, digest and subject, or a closed one graded
+/// no response with this `D_r` (spec 07 §7.3.4)
 /// ([`TrustError::UnknownChallenge`](scp_protocol::trust::TrustError::UnknownChallenge)).
 pub const VALID_7107: &str = "SCP-VALID-7107";
 /// A response does not answer its request: another challenge or digest, or

@@ -16,15 +16,13 @@ import { type ScpError, ValidationError } from "../src/errors";
 import { p256PseudonymPoint, p256SoftwarePseudonymPoint } from "../src/index";
 import { loadNativeAddon } from "../src/internal/native";
 import { __p256HostInvokeForTests } from "../src/scp";
+import { napiSuite } from "./napi-guard";
 
-let skipReason = "";
-try {
+const suite = await napiSuite(() => {
   if (typeof loadNativeAddon().p256SoftwarePseudonymPoint !== "function") {
-    skipReason = "native addon predates the P-256 host helpers";
+    throw new Error("native addon has no p256SoftwarePseudonymPoint export");
   }
-} catch (e: unknown) {
-  skipReason = `native addon not available: ${e instanceof Error ? e.message : String(e)}`;
-}
+});
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 const unhex = (s: string) => new Uint8Array(Buffer.from(s, "hex"));
@@ -49,7 +47,7 @@ const VECTORS = [
   },
 ];
 
-describe.skipIf(skipReason !== "")(`P-256 host helpers ${skipReason}`, () => {
+suite.describe("P-256 host helpers", () => {
   const contextAlpha = new TextEncoder().encode("context-alpha");
 
   for (const v of VECTORS) {

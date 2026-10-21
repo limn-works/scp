@@ -13,10 +13,11 @@
 //! key continuity fingerprints, and `SigningKeyId` variants using real
 //! `InMemoryKeyCustody` and `InMemoryDhtClient` implementations.
 
-use scp_core::crypto::key_continuity::{
-    KeyContinuityParty, compute_key_continuity_fingerprint, fingerprint_to_decimal,
+use scp_core::crypto::key_continuity::compute_key_continuity_fingerprint;
+use scp_did::{
+    CustodyType, DidDocument, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole, KeyState,
+    SigningKeyId, StandingCommitment,
 };
-use scp_did::{DidDocument, SigningKeyId};
 use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
@@ -258,141 +259,82 @@ async fn agent_key_validation() {
     );
 }
 
-#[tokio::test]
-async fn key_continuity_fingerprint() {
-    let alice_id = [1u8; 32];
-    let alice_active = [2u8; 32];
-    let bob_id = [3u8; 32];
-    let bob_active = [4u8; 32];
-
-    let alice = KeyContinuityParty {
-        did: "did:dht:z6MkAlice",
-        identity_key: &alice_id,
-        active_key: &alice_active,
-        agent_key: None,
-    };
-    let bob = KeyContinuityParty {
-        did: "did:dht:z6MkBob",
-        identity_key: &bob_id,
-        active_key: &bob_active,
-        agent_key: None,
-    };
-
-    let fp1 = compute_key_continuity_fingerprint(&alice, &bob);
-    let fp2 = compute_key_continuity_fingerprint(&alice, &bob);
-
-    assert_eq!(fp1.len(), 32, "fingerprint must be 32 bytes");
-    assert_eq!(fp1, fp2, "fingerprint must be deterministic");
-
-    // Symmetry: order of arguments must not matter.
-    let fp_reversed = compute_key_continuity_fingerprint(&bob, &alice);
-    assert_eq!(fp1, fp_reversed, "fingerprint must be symmetric");
+/// A 33-byte compressed-point-shaped key distinct for each `tag`.
+const fn continuity_key(tag: u8) -> [u8; 33] {
+    let mut key = [tag; 33];
+    key[0] = 0x02;
+    key
 }
 
-#[tokio::test]
-async fn key_continuity_changes_on_agent_rotate() {
-    let alice_id = [1u8; 32];
-    let alice_active = [2u8; 32];
-    let alice_agent_v1 = [10u8; 32];
-    let alice_agent_v2 = [20u8; 32];
-    let bob_id = [3u8; 32];
-    let bob_active = [4u8; 32];
-
-    let alice_v1 = KeyContinuityParty {
-        did: "did:dht:z6MkAlice",
-        identity_key: &alice_id,
-        active_key: &alice_active,
-        agent_key: Some(&alice_agent_v1),
+/// A key state whose `Current` root set is `root`, in that order, and whose
+/// `Current` `#active` key is `active` (`09-security-model.md` §9.7.4.2).
+fn continuity_key_state(root: &[[u8; 33]], active: [u8; 33]) -> KeyState {
+    let entry = |key: [u8; 33], role: KeyRole| KeyEntry {
+        key,
+        role,
+        condition: KeyCondition::Current,
+        compromised_from: 0,
+        custody_type: CustodyType::Software,
+        key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
     };
-    let bob = KeyContinuityParty {
-        did: "did:dht:z6MkBob",
-        identity_key: &bob_id,
-        active_key: &bob_active,
-        agent_key: None,
-    };
+    let mut keys: Vec<KeyEntry> = root
+        .iter()
+        .map(|&key| entry(key, KeyRole::RootMember))
+        .collect();
+    keys.push(entry(active, KeyRole::Active));
+    KeyState {
+        root_threshold: 1,
+        keys,
+        witnesses: Vec::new(),
+        witnessing_interval: 3600,
+        service_key_role: KeyRole::Active,
+        delegator: Identifier::ZERO,
+        standing_commitment: StandingCommitment {
+            commitments: Vec::new(),
+            next_threshold: 1,
+        },
+    }
+}
 
-    let fp_before = compute_key_continuity_fingerprint(&alice_v1, &bob);
+/// §9.11 over an `#active` rotation composed as a `KeyState`
+/// (`09-security-model.md` §9.7.4.2 R3): the new key `Current` and the old
+/// key's `Superseded` drop entry. No spec clause orders the drop entry
+/// against the new key; this test lists it first by its own choice, and the
+/// fingerprint ignores the position because it reads only `Current`
+/// entries. The rotating party
+/// carries the higher identifier and a two-member root set. The fingerprint
+/// changes, and both argument orders give one value over the rotated state.
+#[test]
+fn key_continuity_follows_rotation_with_superseded_drop_entry() {
+    let alice_id = Identifier::from_bytes([0xa1; 32]);
+    let bob_id = Identifier::from_bytes([0x0b; 32]);
+    let bob = continuity_key_state(&[continuity_key(0x61)], continuity_key(0x62));
+    let root = [continuity_key(0x71), continuity_key(0x72)];
+    let alice_before = continuity_key_state(&root, continuity_key(0x73));
+    let mut alice_after = continuity_key_state(&root, continuity_key(0x76));
+    let new_active = alice_after.keys[2];
+    alice_after.keys.insert(
+        2,
+        KeyEntry {
+            key: continuity_key(0x73),
+            condition: KeyCondition::Superseded,
+            ..new_active
+        },
+    );
 
-    let alice_v2 = KeyContinuityParty {
-        did: "did:dht:z6MkAlice",
-        identity_key: &alice_id,
-        active_key: &alice_active,
-        agent_key: Some(&alice_agent_v2),
-    };
-    let fp_after = compute_key_continuity_fingerprint(&alice_v2, &bob);
-
+    let fp_before = compute_key_continuity_fingerprint((&alice_id, &alice_before), (&bob_id, &bob))
+        .expect("both key states name one #active key and a root set");
+    let fp_after = compute_key_continuity_fingerprint((&alice_id, &alice_after), (&bob_id, &bob))
+        .expect("the Superseded drop entry is not a second #active key");
     assert_ne!(
         fp_before, fp_after,
-        "rotating agent key must change the fingerprint"
-    );
-}
-
-#[tokio::test]
-async fn absent_agent_key_sentinel() {
-    use sha2::{Digest, Sha256};
-
-    let sentinel: [u8; 32] = Sha256::digest(b"SCP-ABSENT-AGENT-KEY").into();
-
-    let alice_id = [1u8; 32];
-    let alice_active = [2u8; 32];
-    let bob_id = [3u8; 32];
-    let bob_active = [4u8; 32];
-
-    // None agent key.
-    let alice_none = KeyContinuityParty {
-        did: "did:dht:z6MkAlice",
-        identity_key: &alice_id,
-        active_key: &alice_active,
-        agent_key: None,
-    };
-    let bob_none = KeyContinuityParty {
-        did: "did:dht:z6MkBob",
-        identity_key: &bob_id,
-        active_key: &bob_active,
-        agent_key: None,
-    };
-
-    // Explicit sentinel value as agent key.
-    let alice_sentinel = KeyContinuityParty {
-        did: "did:dht:z6MkAlice",
-        identity_key: &alice_id,
-        active_key: &alice_active,
-        agent_key: Some(&sentinel),
-    };
-    let bob_sentinel = KeyContinuityParty {
-        did: "did:dht:z6MkBob",
-        identity_key: &bob_id,
-        active_key: &bob_active,
-        agent_key: Some(&sentinel),
-    };
-
-    let fp_none = compute_key_continuity_fingerprint(&alice_none, &bob_none);
-    let fp_sentinel = compute_key_continuity_fingerprint(&alice_sentinel, &bob_sentinel);
-
-    assert_eq!(
-        fp_none, fp_sentinel,
-        "None agent key must produce the same fingerprint as the sentinel value"
-    );
-}
-
-#[tokio::test]
-async fn fingerprint_to_decimal_format() {
-    let fp = [0xABu8; 32];
-    let decimal = fingerprint_to_decimal(&fp);
-
-    assert_eq!(
-        decimal.len(),
-        60,
-        "decimal representation must be exactly 60 digits"
-    );
-    assert!(
-        decimal.chars().all(|c| c.is_ascii_digit()),
-        "must be all digits, got: {decimal}"
+        "rotating the #active key must change the fingerprint"
     );
 
-    // Deterministic.
-    let decimal2 = fingerprint_to_decimal(&fp);
-    assert_eq!(decimal, decimal2, "must be deterministic");
+    let fp_from_bob =
+        compute_key_continuity_fingerprint((&bob_id, &bob), (&alice_id, &alice_after))
+            .expect("both key states name one #active key and a root set");
+    assert_eq!(fp_after, fp_from_bob, "fingerprint must be symmetric");
 }
 
 #[tokio::test]

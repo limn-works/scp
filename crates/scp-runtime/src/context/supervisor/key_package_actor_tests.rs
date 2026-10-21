@@ -26,23 +26,29 @@ use super::{
     KeyPackageCommand, KeyPackageStoreActor, KeyPackageStoreDeps, KeyPackageStoreHandle, KpRef,
     MIN_BUFFER, ReservationId,
 };
+use crate::context::actor::CommandSigner;
 use crate::context::builder::{
     ContextCreationError, ContextTransportProvider, NotConfiguredTransportProvider,
 };
 use crate::context::supervisor::faulty_storage::FaultyStorage;
+use crate::crypto::mls::attestation_signer::KeyPackageAttestationSigner;
 use crate::crypto::mls::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
 };
 use crate::crypto::mls::production_backend::ProductionMlsBackend;
 use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
+use crate::crypto::mls::test_support::{MintAttestedForTest as _, role_resolver};
+use ed25519_dalek::SigningKey;
 use openmls::prelude::LeafNodeIndex;
+use scp_mls::attested_key_package::KeyPackageDraft;
 use scp_mls::credential::ScpCredential;
 use scp_mls::encrypt::DecryptedContent;
 use scp_mls::error::MlsError;
 use scp_mls::group::ScpMlsGroup;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::traits::Storage;
+use scp_protocol::context::governance::KeyResolver;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -50,6 +56,49 @@ use scp_platform::traits::Storage;
 
 fn alice() -> DID {
     DID("did:dht:z6MkAliceKeyPackages".to_owned())
+}
+
+/// Alice's fixed `#active` key, the key [`alice_resolver`] names.
+fn alice_identity_key() -> SigningKey {
+    SigningKey::from_bytes(&[0xA7; 32])
+}
+
+/// The shared test resolver over Alice alone: `#active` resolves to
+/// [`alice_identity_key`], `#agent` to another key.
+fn alice_resolver() -> KeyResolver {
+    role_resolver(&[(alice(), alice_identity_key())])
+}
+
+/// An attestation signer for `owner` over `key`, built the way the supervisor
+/// builds one: resolved against `resolver`.
+async fn attestation_signer(
+    owner: DID,
+    key: SigningKey,
+    resolver: KeyResolver,
+) -> Arc<KeyPackageAttestationSigner> {
+    Arc::new(
+        KeyPackageAttestationSigner::resolve(owner, CommandSigner::local_ed25519(key), resolver)
+            .await
+            .expect("the signer holds the resolved #active key"),
+    )
+}
+
+/// Alice's attestation signer over her `#active` key, unresolved.
+fn alice_attestation_signer() -> Arc<KeyPackageAttestationSigner> {
+    Arc::new(KeyPackageAttestationSigner::for_test(
+        alice(),
+        CommandSigner::local_ed25519(alice_identity_key()),
+        alice_identity_key().verifying_key(),
+    ))
+}
+
+/// Spawns `identity`'s store with Alice's attestation signer installed, the
+/// state a first `ReserveAny` leaves it in.
+fn spawn_with_alice_signer(
+    identity: DID,
+    deps: KeyPackageStoreDeps,
+) -> (KeyPackageStoreHandle, tokio::task::JoinHandle<()>) {
+    KeyPackageStoreActor::spawn_with_signer(identity, deps, alice_attestation_signer())
 }
 
 fn real_backend() -> Arc<dyn MlsBackend> {
@@ -133,7 +182,7 @@ async fn spawn_filled(
     storage: Arc<dyn OpenMlsStorageAdapter>,
 ) -> (KeyPackageStoreHandle, tokio::task::JoinHandle<()>) {
     let mls = backend_with_consumed_set(&storage);
-    let (handle, join) = KeyPackageStoreActor::spawn(
+    let (handle, join) = spawn_with_alice_signer(
         alice(),
         deps_with(mls, Arc::clone(&storage), no_transport()).await,
     );
@@ -210,7 +259,7 @@ async fn real_welcome_for(mls: &Arc<dyn MlsBackend>, kp_public_bytes: &[u8]) -> 
 async fn reserve_then_confirm_deletes_key_and_clears_reservation() {
     let storage = in_memory_storage();
     let mls = backend_with_consumed_set(&storage);
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -313,7 +362,7 @@ async fn cancel_burns_kp_not_returned_to_pool() {
 async fn double_confirm_of_same_reservation_rejected() {
     let storage = in_memory_storage();
     let mls = backend_with_consumed_set(&storage);
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -381,7 +430,7 @@ async fn second_join_same_init_key_rejected_at_backend() {
     // consumes the init key durably; the second must be rejected.
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls
-        .generate_key_package(
+        .mint_attested_for_test(
             &joiner,
             &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
         )
@@ -430,7 +479,7 @@ async fn join_without_consumed_store_fails_closed() {
 
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls
-        .generate_key_package(
+        .mint_attested_for_test(
             &joiner,
             &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
         )
@@ -462,7 +511,7 @@ async fn join_with_mismatched_public_bytes_rejected() {
 
     let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls
-        .generate_key_package(
+        .mint_attested_for_test(
             &joiner,
             &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
         )
@@ -470,7 +519,7 @@ async fn join_with_mismatched_public_bytes_rejected() {
         .unwrap();
     // A DIFFERENT KP — its public bytes do not match `generated.signer_state`.
     let other = mls
-        .generate_key_package(
+        .mint_attested_for_test(
             &joiner,
             &scp_crypto::p256::testing::uncompressed_point_for(&joiner.did),
         )
@@ -535,7 +584,7 @@ async fn unknown_ref_and_unknown_reservation_yield_typed_errors() {
 async fn reserve_when_empty_returns_typed_err_not_hang() {
     let storage = in_memory_storage();
     let failing: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(0));
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(failing, Arc::clone(&storage), no_transport()).await,
     );
@@ -559,7 +608,7 @@ async fn reserve_when_empty_returns_typed_err_not_hang() {
 #[tokio::test]
 async fn replenish_refills_to_min_and_reports_count() {
     let storage = in_memory_storage();
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
@@ -617,7 +666,7 @@ async fn drain_below_threshold_triggers_auto_replenish() {
 async fn replenish_generate_failure_yields_typed_err_when_zero_generated() {
     let storage = in_memory_storage();
     let failing: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(0));
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(failing, Arc::clone(&storage), no_transport()).await,
     );
@@ -635,7 +684,7 @@ async fn replenish_generate_failure_yields_typed_err_when_zero_generated() {
 async fn replenish_partial_retain_returns_count_on_late_failure() {
     let storage = in_memory_storage();
     let failing: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(3));
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&failing), Arc::clone(&storage), no_transport()).await,
     );
@@ -650,10 +699,10 @@ async fn replenish_partial_retain_returns_count_on_late_failure() {
 }
 
 /// A KP actor whose owning DID is malformed has NO valid credential (the
-/// `ScpCredential::new(...).ok()` in `spawn` yields `None`). `replenish_to_min`
-/// must FAIL CLOSED — refuse to generate/pool inert KeyPackages (which would be
-/// signed against a non-existent credential) — rather than silently pooling
-/// them. Pins the credential-absent guard.
+/// mint's `ScpCredential::new` fails). `replenish_to_min` must FAIL CLOSED —
+/// refuse to generate/pool inert `KeyPackages` (which would be signed against a
+/// non-existent credential) — rather than silently pooling them. Pins the
+/// credential-absent guard.
 #[tokio::test]
 async fn replenish_fails_closed_when_credential_absent() {
     // A DID that `ScpCredential::new` rejects (not `did:dht:z*` / `did:test:` /
@@ -667,9 +716,16 @@ async fn replenish_fails_closed_when_credential_absent() {
 
     let storage = in_memory_storage();
     let mls = backend_with_consumed_set(&storage);
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let any_key = alice_identity_key().verifying_key();
+    let (handle, _join) = KeyPackageStoreActor::spawn_with_signer(
         malformed.clone(),
         deps_with(mls, Arc::clone(&storage), no_transport()).await,
+        attestation_signer(
+            malformed.clone(),
+            alice_identity_key(),
+            Arc::new(move |_: &DID, _| Some(any_key)),
+        )
+        .await,
     );
 
     let err = handle
@@ -711,7 +767,7 @@ async fn reserve_persist_failure_returns_kp_to_pool_and_errs() {
     let faulty = Arc::new(FaultyStorage::new(Arc::clone(&healthy)));
     let storage: Arc<dyn OpenMlsStorageAdapter> =
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
@@ -766,7 +822,7 @@ async fn reserve_id_set_persist_failure_returns_kp_and_cleans_record() {
     let faulty = Arc::new(FaultyStorage::new(Arc::clone(&healthy)));
     let storage: Arc<dyn OpenMlsStorageAdapter> =
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
@@ -831,7 +887,7 @@ async fn confirm_persist_failure_retains_reservation_and_errs() {
     let storage: Arc<dyn OpenMlsStorageAdapter> =
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let mls = backend_with_consumed_set(&storage);
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -893,7 +949,7 @@ async fn confirm_tombstone_failure_then_healed_retry_completes_consume_but_errs_
     // (`scp-kp-consumed/`) are distinct prefixes, so failing only the latter
     // leaves the marker durably written by the internal join.
     let mls = backend_with_consumed_set(&storage);
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -995,7 +1051,7 @@ async fn confirm_reservation_record_delete_failure_eventually_reclaimed_no_orpha
     let storage: Arc<dyn OpenMlsStorageAdapter> =
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let mls = backend_with_consumed_set(&storage);
-    let (handle, join) = KeyPackageStoreActor::spawn(
+    let (handle, join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -1075,7 +1131,7 @@ async fn confirm_reservation_record_delete_failure_eventually_reclaimed_no_orpha
     // the consumed tombstone AND the surviving reservation record — no permanent
     // orphan.
     let mls2 = backend_with_consumed_set(&storage);
-    let (handle2, _join2) = KeyPackageStoreActor::spawn(
+    let (handle2, _join2) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
@@ -1122,7 +1178,7 @@ async fn confirm_tombstone_delete_failure_eventually_reclaimed_no_orphan() {
     let storage: Arc<dyn OpenMlsStorageAdapter> =
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let mls = backend_with_consumed_set(&storage);
-    let (handle, join) = KeyPackageStoreActor::spawn(
+    let (handle, join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -1193,7 +1249,7 @@ async fn confirm_tombstone_delete_failure_eventually_reclaimed_no_orphan() {
     // tombstone → resolves CONSUMED, sees the KP record gone, and the GC reclaims
     // the surviving tombstone — no permanent orphan.
     let mls2 = backend_with_consumed_set(&storage);
-    let (handle2, _join2) = KeyPackageStoreActor::spawn(
+    let (handle2, _join2) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
@@ -1235,7 +1291,7 @@ async fn gc_reservation_record_delete_failure_eventually_reclaimed_no_orphan() {
     let storage: Arc<dyn OpenMlsStorageAdapter> =
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let mls = backend_with_consumed_set(&storage);
-    let (handle, join) = KeyPackageStoreActor::spawn(
+    let (handle, join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -1373,7 +1429,7 @@ async fn gc_tombstone_delete_failure_eventually_reclaimed_no_orphan() {
     let storage: Arc<dyn OpenMlsStorageAdapter> =
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let mls = backend_with_consumed_set(&storage);
-    let (handle, join) = KeyPackageStoreActor::spawn(
+    let (handle, join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -1503,7 +1559,7 @@ async fn respawn_restores_reservation_as_reserved_not_pooled() {
     handle.send_shutdown().await.unwrap();
     let _ = join.await;
 
-    let (handle2, _join2) = KeyPackageStoreActor::spawn(
+    let (handle2, _join2) = spawn_with_alice_signer(
         alice(),
         deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
@@ -1530,7 +1586,7 @@ async fn respawn_restores_reservation_as_reserved_not_pooled() {
 async fn respawn_after_confirm_keeps_key_absent() {
     let storage = in_memory_storage();
     let mls = backend_with_consumed_set(&storage);
-    let (handle, join) = KeyPackageStoreActor::spawn(
+    let (handle, join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -1558,7 +1614,7 @@ async fn respawn_after_confirm_keeps_key_absent() {
     handle.send_shutdown().await.unwrap();
     let _ = join.await;
 
-    let (handle2, _join2) = KeyPackageStoreActor::spawn(
+    let (handle2, _join2) = spawn_with_alice_signer(
         alice(),
         deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
@@ -1622,7 +1678,7 @@ async fn consumed_kp_with_surviving_record_not_repooled_on_respawn() {
     );
 
     // Respawn: reconcile must EXCLUDE the consumed ref from the pool.
-    let (handle2, _join2) = KeyPackageStoreActor::spawn(
+    let (handle2, _join2) = spawn_with_alice_signer(
         alice(),
         deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
@@ -1706,7 +1762,7 @@ async fn consumed_kp_with_surviving_record_and_lost_index_entry_reclaimed_on_dou
     // (it is NOT in the index), exclude it from the pool, and best-effort delete
     // its stale record.
     let mls2 = backend_with_consumed_set(&storage);
-    let (handle2, join2) = KeyPackageStoreActor::spawn(
+    let (handle2, join2) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
@@ -1737,7 +1793,7 @@ async fn consumed_kp_with_surviving_record_and_lost_index_entry_reclaimed_on_dou
     // SECOND respawn: with the record now gone, the GC pass reclaims the
     // tombstone + reservation record (bounded durable growth).
     let mls3 = backend_with_consumed_set(&storage);
-    let (handle3, _join3) = KeyPackageStoreActor::spawn(
+    let (handle3, _join3) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls3), Arc::clone(&storage), no_transport()).await,
     );
@@ -1829,7 +1885,7 @@ async fn gc_reclaims_consumed_tombstone_and_reservation_record_after_respawn() {
     // sees the KP record absent, and the GC reclaims the tombstone + reservation
     // record.
     let mls2 = backend_with_consumed_set(&storage);
-    let (handle2, _join2) = KeyPackageStoreActor::spawn(
+    let (handle2, _join2) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
@@ -1868,7 +1924,7 @@ async fn gc_reclaims_consumed_tombstone_and_reservation_record_after_respawn() {
 async fn malformed_consumed_tombstone_reconciles_fail_closed_and_a2_still_rejects() {
     let (storage, inner) = in_memory_storage_with_inner();
     let mls = backend_with_consumed_set(&storage);
-    let (handle, join) = KeyPackageStoreActor::spawn(
+    let (handle, join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -1908,7 +1964,7 @@ async fn malformed_consumed_tombstone_reconciles_fail_closed_and_a2_still_reject
 
     // (a) Respawn: reconcile must NOT panic on the malformed tombstone.
     let mls2 = backend_with_consumed_set(&storage);
-    let (handle2, _join2) = KeyPackageStoreActor::spawn(
+    let (handle2, _join2) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
@@ -2015,7 +2071,7 @@ async fn malformed_tombstone_recovers_consumed_ref_from_reservation_record() {
     // Respawn. Reconcile must NOT panic, must recover the consumed kp_ref from
     // the surviving reservation record, exclude it, and delete the stale record.
     let mls2 = backend_with_consumed_set(&storage);
-    let (handle2, _join2) = KeyPackageStoreActor::spawn(
+    let (handle2, _join2) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
@@ -2071,7 +2127,7 @@ async fn confirm_replay_with_surviving_kp_record_errs_not_false_ok() {
     let storage: Arc<dyn OpenMlsStorageAdapter> =
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let mls = backend_with_consumed_set(&storage);
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -2200,7 +2256,7 @@ async fn consumed_precedence_overlapping_reservation_and_tombstone_not_restored(
 
     // Respawn. CONSUMED must win: the ref is excluded, never restored as reserved.
     let mls2 = backend_with_consumed_set(&storage);
-    let (handle2, _join2) = KeyPackageStoreActor::spawn(
+    let (handle2, _join2) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
@@ -2363,7 +2419,7 @@ async fn reserved_kp_with_lost_index_entry_restored_as_reserved_on_respawn() {
     // union of the index and the reserved spine — NOT lose it.
     faulty.clear_fail();
     let mls2 = backend_with_consumed_set(&storage);
-    let (handle2, _join2) = KeyPackageStoreActor::spawn(
+    let (handle2, _join2) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls2), Arc::clone(&storage), no_transport()).await,
     );
@@ -2448,7 +2504,7 @@ async fn pooled_kp_lost_index_replenishes_to_min_without_record_leak() {
     // out of the pool and its record deleted. The pool stays empty, no orphan
     // records accumulate.
     faulty.fail_prefix("scp-kp-index/");
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
     );
@@ -2517,7 +2573,7 @@ async fn confirm_retry_with_different_welcome_completes_without_second_join() {
     let storage: Arc<dyn OpenMlsStorageAdapter> =
         Arc::new(SpawnBlockingStorageAdapter::new(Arc::clone(&faulty)));
     let mls = backend_with_consumed_set(&storage);
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -2636,7 +2692,7 @@ async fn expired_reservation_is_swept_and_kp_burned() {
             clock: Arc::clone(&clock) as Arc<dyn Clock>,
             wrapping_key: test_wrapping_key_in_memory().await,
         };
-        KeyPackageStoreActor::spawn(alice(), deps)
+        spawn_with_alice_signer(alice(), deps)
     };
     let _ = handle
         .send(|reply| KeyPackageCommand::Replenish { reply })
@@ -2749,7 +2805,7 @@ async fn publish_emits_one_call_per_pooled_kp() {
     let storage = in_memory_storage();
     let recorder = Arc::new(RecordingTransport::new());
     let transport: Arc<dyn ContextTransportProvider> = Arc::clone(&recorder) as _;
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(real_backend(), Arc::clone(&storage), transport).await,
     );
@@ -2785,7 +2841,7 @@ async fn publish_empty_pool_is_noop() {
     let transport: Arc<dyn ContextTransportProvider> = Arc::clone(&recorder) as _;
     // A backend that generates ZERO KPs, so the pool stays empty.
     let empty_backend: Arc<dyn MlsBackend> = Arc::new(FailingBackend::new(0));
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(empty_backend, Arc::clone(&storage), transport).await,
     );
@@ -2804,7 +2860,7 @@ async fn publish_is_idempotent_and_errors_leave_ref_unmarked() {
     let storage = in_memory_storage();
     let recorder = Arc::new(RecordingTransport::new());
     let transport: Arc<dyn ContextTransportProvider> = Arc::clone(&recorder) as _;
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(real_backend(), Arc::clone(&storage), transport).await,
     );
@@ -2875,7 +2931,7 @@ async fn publish_is_idempotent_and_errors_leave_ref_unmarked() {
 async fn fused_welcome_confirm_flow_joins_real_reserved_kp() {
     let storage = in_memory_storage();
     let mls = backend_with_consumed_set(&storage);
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -3035,7 +3091,7 @@ async fn fused_confirm_rejects_own_key_package_expired_under_joiner_clock_as_inv
         Arc::clone(&joiner_clock) as Arc<dyn Clock>
     ));
     backend.set_consumed_init_key_store(Arc::clone(&storage));
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(backend, Arc::clone(&storage), no_transport()).await,
     );
@@ -3104,7 +3160,7 @@ async fn confirm_retry_after_completed_join_finishes_consume_once_own_key_packag
         Arc::clone(&joiner_clock) as Arc<dyn Clock>
     ));
     backend.set_consumed_init_key_store(Arc::clone(&storage));
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(backend, Arc::clone(&storage), no_transport()).await,
     );
@@ -3220,7 +3276,7 @@ async fn confirm_with_bad_welcome_keeps_reservation_for_retry() {
     // the reservation survives, so a cancel still works afterward.
     let storage = in_memory_storage();
     let mls = backend_with_consumed_set(&storage);
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
     );
@@ -3270,7 +3326,7 @@ async fn confirm_with_bad_welcome_keeps_reservation_for_retry() {
 // Test backends / transports / storage / clocks
 // ---------------------------------------------------------------------------
 
-/// An `MlsBackend` that succeeds `n` `generate_key_package` calls then fails
+/// An `MlsBackend` whose `prepare_key_package` succeeds `n` times then fails
 /// every subsequent call. Delegates all other methods to a real backend.
 struct FailingBackend {
     inner: ProductionMlsBackend,
@@ -3339,11 +3395,11 @@ impl MlsBackend for FailingBackend {
             .validate_key_package(key_package_bytes, clock)
             .await
     }
-    async fn generate_key_package(
+    async fn prepare_key_package(
         &self,
-        credential: &ScpCredential,
+        owning_did: &DID,
         wrapping_pubkey: &[u8; 65],
-    ) -> Result<GeneratedKeyPackage, MlsError> {
+    ) -> Result<KeyPackageDraft, MlsError> {
         loop {
             let cur = self.remaining.load(Ordering::Acquire);
             if cur == 0 {
@@ -3360,8 +3416,24 @@ impl MlsBackend for FailingBackend {
             }
         }
         self.inner
-            .generate_key_package(credential, wrapping_pubkey)
+            .prepare_key_package(owning_did, wrapping_pubkey)
             .await
+    }
+    async fn finish_key_package(
+        &self,
+        draft: KeyPackageDraft,
+        attestation_signature: [u8; 64],
+        attesting_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<GeneratedKeyPackage, MlsError> {
+        self.inner
+            .finish_key_package(draft, attestation_signature, attesting_key)
+            .await
+    }
+    async fn reserved_wrapping_key(
+        &self,
+        signer_state: &SignerState,
+    ) -> Result<Option<scp_protocol::crypto::hpke::p256::P256Point>, MlsError> {
+        self.inner.reserved_wrapping_key(signer_state).await
     }
     async fn join_from_welcome(
         &self,
@@ -3508,11 +3580,17 @@ async fn reserve_any_returns_distinct_reservations() {
     let (handle, _join) = spawn_filled(Arc::clone(&storage)).await;
 
     let (rid1, public1) = handle
-        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: alice_attestation_signer(),
+            reply,
+        })
         .await
         .expect("first ReserveAny succeeds");
     let (rid2, public2) = handle
-        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: alice_attestation_signer(),
+            reply,
+        })
         .await
         .expect("second ReserveAny succeeds despite the first holding a reservation");
 
@@ -3537,10 +3615,9 @@ async fn reserve_any_returns_distinct_reservations() {
 #[tokio::test]
 async fn reserve_any_replenishes_empty_pool_then_reserves() {
     let storage = in_memory_storage();
-    // Fresh spawn WITHOUT a warm-up Replenish barrier: the actor's startup
-    // replenish still fills the pool before serving commands, but ReserveAny
-    // owns its own replenish-if-empty step regardless, so a single ReserveAny
-    // must succeed on the first command.
+    // A fresh store has no signer and mints nothing at spawn: the first
+    // ReserveAny installs the signer, parks on the empty pool, and is
+    // answered by the refill it starts.
     let mls = backend_with_consumed_set(&storage);
     let (handle, _join) = KeyPackageStoreActor::spawn(
         alice(),
@@ -3548,12 +3625,28 @@ async fn reserve_any_replenishes_empty_pool_then_reserves() {
     );
 
     let (_rid, public_bytes) = handle
-        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: alice_attestation_signer(),
+            reply,
+        })
         .await
         .expect("ReserveAny fills the pool and reserves in one command");
     assert!(
         !public_bytes.is_empty(),
         "ReserveAny returns PUBLIC bytes (not private signer-state)"
+    );
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("the refill the reserve started ends");
+    let pooled = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds");
+    assert_eq!(
+        pooled.len(),
+        MIN_BUFFER - 1,
+        "the first reserve filled the pool"
     );
 
     handle.send_shutdown().await.unwrap();
@@ -3633,14 +3726,17 @@ fn kp_record_encodes_like_plain_fields() {
     struct Plain {
         public_bytes: Vec<u8>,
         signer_state: Vec<u8>,
+        attested_by: [u8; 32],
     }
     let record = super::PersistedKeyPackage {
         public_bytes: vec![0x11; 200],
         signer_state: zeroize::Zeroizing::new(vec![0x5A; 300]),
+        attested_by: [0x22; 32],
     };
     let plain = Plain {
         public_bytes: vec![0x11; 200],
         signer_state: vec![0x5A; 300],
+        attested_by: [0x22; 32],
     };
     assert_eq!(
         rmp_serde::to_vec_named(&record).unwrap(),
@@ -3648,12 +3744,13 @@ fn kp_record_encodes_like_plain_fields() {
     );
 }
 
-/// Spec 09 §9.16.1: every KeyPackage the store actor mints on replenish
-/// publishes, in its leaf's `0xFF01` extension, the public point of the owner's
-/// wrapping key as custody holds it.
+/// Spec 09 §9.7.1 and §9.16.1: every `KeyPackage` the store actor mints on
+/// replenish carries a `0xFF03` attestation that verifies, as an Add, against
+/// the owner's resolved `#active` key, and publishes in `0xFF01` the public
+/// point of the owner's wrapping key as custody holds it.
 #[tokio::test]
-async fn replenished_key_packages_carry_the_custody_wrapping_public_key() {
-    use openmls::prelude::{OpenMlsProvider as _, ProtocolVersion};
+async fn store_minted_key_packages_carry_a_verifying_attestation() {
+    use crate::crypto::mls::attestation_verification::verify_add_attestation;
     use scp_platform::traits::KeyCustody as _;
     let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
     let wrapping_key = crate::crypto::wrapping::test_wrapping_key(&custody)
@@ -3664,7 +3761,7 @@ async fn replenished_key_packages_carry_the_custody_wrapping_public_key() {
         .await
         .expect("custody holds the wrapping key");
     let storage = in_memory_storage();
-    let (handle, _join) = KeyPackageStoreActor::spawn(
+    let (handle, _join) = spawn_with_alice_signer(
         alice(),
         KeyPackageStoreDeps {
             wrapping_key,
@@ -3681,18 +3778,456 @@ async fn replenished_key_packages_carry_the_custody_wrapping_public_key() {
         .await
         .expect("list pooled succeeds");
     assert!(pooled.len() >= MIN_BUFFER, "the pool is filled");
-    let provider = scp_mls::InMemoryMlsProvider::default();
+    let mls = real_backend();
+    let resolver = alice_resolver();
     for (_ref, public_bytes) in &pooled {
-        let verified = scp_mls::wire::parse_key_package_in(public_bytes)
-            .unwrap()
-            .validate(provider.crypto(), ProtocolVersion::Mls10)
-            .unwrap();
-        let published =
-            scp_mls::wrapping_extension::extract_wrapping_key(verified.leaf_node().extensions())
-                .unwrap()
-                .expect("every minted KeyPackage publishes 0xFF01");
-        assert_eq!(published.as_bytes().as_slice(), custody_public.as_bytes());
+        let validated = mls
+            .validate_key_package(public_bytes, &SystemClock)
+            .await
+            .expect("a minted KeyPackage validates");
+        let leaf = &validated.leaf;
+        let wrapping = leaf
+            .wrapping_key
+            .expect("every minted KeyPackage publishes 0xFF01");
+        assert_eq!(wrapping.as_slice(), custody_public.as_bytes());
+        let attestation = leaf
+            .attestation
+            .as_ref()
+            .expect("every minted KeyPackage carries 0xFF03");
+        verify_add_attestation(
+            Arc::clone(&resolver),
+            &SystemClock,
+            leaf,
+            &wrapping,
+            attestation,
+        )
+        .await
+        .expect("the attestation verifies against alice's resolved #active key");
     }
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// Spec 09 §9.7.1: a store spawned without a signer mints, lists and
+/// publishes nothing, and writes no `KeyPackage` record or index entry.
+#[tokio::test]
+async fn a_store_without_a_signer_mints_lists_and_publishes_nothing() {
+    let storage = in_memory_storage();
+    let transport = Arc::new(RecordingTransport::new());
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(real_backend(), Arc::clone(&storage), transport.clone()).await,
+    );
+    let err = handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect_err("a store without a signer mints nothing");
+    assert!(
+        matches!(err, ContextError::NotInitialized(_)),
+        "got {err:?}"
+    );
+    let err = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect_err("a store without a signer lists nothing");
+    assert!(
+        matches!(err, ContextError::NotInitialized(_)),
+        "got {err:?}"
+    );
+    let err = handle
+        .send(|reply| KeyPackageCommand::Publish { reply })
+        .await
+        .expect_err("a store without a signer publishes nothing");
+    assert!(
+        matches!(err, ContextError::NotInitialized(_)),
+        "got {err:?}"
+    );
+    assert_eq!(transport.count(), 0);
+    assert!(live_index(&storage, &alice()).await.is_empty());
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// A signer for Bob, resolved against the shared resolver over Bob, so only
+/// the owner check can refuse it in Alice's store.
+async fn bob_attestation_signer() -> Arc<KeyPackageAttestationSigner> {
+    let bob = DID("did:dht:z6MkBobKeyPackages".to_owned());
+    let bob_key = SigningKey::from_bytes(&[0xB0; 32]);
+    let resolver = role_resolver(&[(bob.clone(), bob_key.clone())]);
+    attestation_signer(bob, bob_key, resolver).await
+}
+
+/// Spec 09 §9.7.1: a reserve that supplies a signer for another identity is
+/// refused with `InvalidState` before anything is minted, and the signer is
+/// not installed, so the store still mints nothing.
+#[tokio::test]
+async fn reserve_any_rejects_a_signer_for_another_identity() {
+    let storage = in_memory_storage();
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
+    );
+    let bob_signer = bob_attestation_signer().await;
+    let err = handle
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: bob_signer,
+            reply,
+        })
+        .await
+        .expect_err("a signer for another identity is refused");
+    assert!(
+        matches!(&err, ContextError::InvalidState(m) if m.contains("owner mismatch")),
+        "got {err:?}"
+    );
+    let err = handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect_err("the refused signer was not installed");
+    assert!(
+        matches!(err, ContextError::NotInitialized(_)),
+        "got {err:?}"
+    );
+    assert!(live_index(&storage, &alice()).await.is_empty());
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// The `#active` key Alice rotates to in the rotation tests.
+fn alice_rotated_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x7E; 32])
+}
+
+/// Alice's signer over her rotated `#active` key.
+fn alice_rotated_signer() -> Arc<KeyPackageAttestationSigner> {
+    Arc::new(KeyPackageAttestationSigner::for_test(
+        alice(),
+        CommandSigner::local_ed25519(alice_rotated_key()),
+        alice_rotated_key().verifying_key(),
+    ))
+}
+
+/// Verifies `public_bytes`' `0xFF03` against `active` as Alice's `#active`
+/// key.
+async fn attested_by(public_bytes: &[u8], active: &SigningKey) -> bool {
+    use crate::crypto::mls::attestation_verification::verify_add_attestation;
+    let validated = real_backend()
+        .validate_key_package(public_bytes, &SystemClock)
+        .await
+        .expect("a minted KeyPackage validates");
+    let leaf = &validated.leaf;
+    let wrapping = leaf.wrapping_key.expect("0xFF01");
+    let attestation = leaf.attestation.as_ref().expect("0xFF03");
+    verify_add_attestation(
+        role_resolver(&[(alice(), active.clone())]),
+        &SystemClock,
+        leaf,
+        &wrapping,
+        attestation,
+    )
+    .await
+    .is_ok()
+}
+
+/// Spec 09 §9.12, rotation is revocation: a reserve whose signer holds a new
+/// `#active` key burns every pooled `KeyPackage` the old key attested (its
+/// record is deleted, it leaves the index and the published set) and is
+/// served from a refill the new key attests. Nothing the old key attested is
+/// listed or published afterwards.
+#[tokio::test]
+async fn a_signer_for_a_rotated_active_key_burns_the_old_pool_and_refills() {
+    let storage = in_memory_storage();
+    let transport = Arc::new(RecordingTransport::new());
+    let (handle, _join) = spawn_with_alice_signer(
+        alice(),
+        deps_with(real_backend(), Arc::clone(&storage), transport.clone()).await,
+    );
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("the store mints under the first key");
+    handle
+        .send(|reply| KeyPackageCommand::Publish { reply })
+        .await
+        .expect("the first pool publishes");
+    assert_eq!(transport.count(), MIN_BUFFER);
+    let old_refs: Vec<KpRef> = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds")
+        .into_iter()
+        .map(|(kp_ref, _)| kp_ref)
+        .collect();
+    assert_eq!(old_refs.len(), MIN_BUFFER);
+
+    let (_rid, public_bytes) = handle
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: alice_rotated_signer(),
+            reply,
+        })
+        .await
+        .expect("the rotated signer reserves");
+    assert!(
+        attested_by(&public_bytes, &alice_rotated_key()).await,
+        "the reserved KeyPackage is attested by the new #active key"
+    );
+    assert!(
+        !attested_by(&public_bytes, &alice_identity_key()).await,
+        "and not by the old one"
+    );
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("the refill ends");
+
+    let pooled = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds");
+    assert_eq!(pooled.len(), MIN_BUFFER - 1);
+    for (kp_ref, public) in &pooled {
+        assert!(!old_refs.contains(kp_ref), "no old-key entry is listed");
+        assert!(attested_by(public, &alice_rotated_key()).await);
+    }
+    let index = live_index(&storage, &alice()).await;
+    for kp_ref in &old_refs {
+        assert!(
+            !kp_record_present(&storage, &alice(), kp_ref).await,
+            "the old-key record is deleted"
+        );
+        assert!(!index.contains(kp_ref), "the old-key ref left the index");
+    }
+    handle
+        .send(|reply| KeyPackageCommand::Publish { reply })
+        .await
+        .expect("the new pool publishes");
+    assert_eq!(
+        transport.count(),
+        MIN_BUFFER + pooled.len(),
+        "only the new-key KeyPackages are published"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// Spec 09 §9.12: the attesting key survives a respawn in each record, so a
+/// store respawned over a pool the old `#active` key attested burns it when
+/// the rotated signer is installed, and lists none of it.
+#[tokio::test]
+async fn a_respawned_store_burns_entries_a_superseded_key_attested() {
+    let storage = in_memory_storage();
+    let (handle, join) = spawn_filled(Arc::clone(&storage)).await;
+    let old_refs = live_index(&storage, &alice()).await;
+    assert_eq!(old_refs.len(), MIN_BUFFER);
+    handle.send_shutdown().await.unwrap();
+    join.await.unwrap();
+
+    let (handle, _join) = KeyPackageStoreActor::spawn_with_signer(
+        alice(),
+        deps_with(
+            backend_with_consumed_set(&storage),
+            Arc::clone(&storage),
+            no_transport(),
+        )
+        .await,
+        alice_rotated_signer(),
+    );
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("the respawned store refills under the new key");
+    let pooled = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds");
+    assert_eq!(pooled.len(), MIN_BUFFER);
+    for (kp_ref, _) in &pooled {
+        assert!(!old_refs.contains(kp_ref), "no old-key entry is listed");
+    }
+    for kp_ref in &old_refs {
+        assert!(!kp_record_present(&storage, &alice(), kp_ref).await);
+    }
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// A mint runs off the store's command turn: with the custody sign of the
+/// refill's second mint held shut, a `ConfirmConsume` for the reservation the
+/// first mint served still joins.
+#[tokio::test]
+async fn confirm_consume_completes_while_a_mint_waits_on_custody() {
+    let storage = in_memory_storage();
+    let mls = backend_with_consumed_set(&storage);
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(Arc::clone(&mls), Arc::clone(&storage), no_transport()).await,
+    );
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let signs = Arc::new(AtomicUsize::new(0));
+    let gated = Arc::new(KeyPackageAttestationSigner::for_test(
+        alice(),
+        CommandSigner::new(Arc::new(crate::crypto::mls::test_support::GatedSigner {
+            key: alice_identity_key(),
+            permits: Arc::clone(&permits),
+            signs: Arc::clone(&signs),
+        })),
+        alice_identity_key().verifying_key(),
+    ));
+
+    let (reservation_id, public_bytes) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handle.send(|reply| KeyPackageCommand::ReserveAny {
+            signer: gated,
+            reply,
+        }),
+    )
+    .await
+    .expect("the reserve is served by the first mint")
+    .expect("the reserve succeeds");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while signs.load(Ordering::Acquire) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the refill's second mint is waiting on the custody sign");
+    assert_eq!(
+        permits.available_permits(),
+        0,
+        "the custody sign is held shut"
+    );
+
+    let welcome = real_welcome_for(&mls, &public_bytes).await;
+    let group = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handle.send(|reply| KeyPackageCommand::ConfirmConsume {
+            reservation_id,
+            welcome_bytes: welcome,
+            reply,
+        }),
+    )
+    .await
+    .expect("the confirm does not queue behind the pending mint")
+    .expect("the confirm joins");
+    drop(group);
+    assert_eq!(
+        signs.load(Ordering::Acquire),
+        2,
+        "the second mint is still waiting"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// Spec 09 §9.12 under a reserve that races a rotation: a signer resolved
+/// before Alice rotated, delivered after a signer for her new `#active` key,
+/// is refused with [`ContextError::AttestationSignerNotActiveKey`] once the
+/// store re-resolves her `#active` key. The new key's signer stays installed
+/// and its pool, records and index are untouched.
+#[tokio::test]
+async fn a_signer_resolved_before_a_rotation_neither_replaces_the_new_signer_nor_burns_its_pool() {
+    let storage = in_memory_storage();
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(real_backend(), Arc::clone(&storage), no_transport()).await,
+    );
+    let current = Arc::new(std::sync::Mutex::new(alice_identity_key().verifying_key()));
+    let resolver: KeyResolver = {
+        let current = Arc::clone(&current);
+        Arc::new(move |did: &DID, kid: scp_did::SigningKeyId| {
+            (did == &alice() && kid == scp_did::SigningKeyId::Active)
+                .then(|| *current.lock().unwrap())
+        })
+    };
+    let stale = attestation_signer(alice(), alice_identity_key(), Arc::clone(&resolver)).await;
+    *current.lock().unwrap() = alice_rotated_key().verifying_key();
+    let fresh = attestation_signer(alice(), alice_rotated_key(), resolver).await;
+
+    let (_rid, public_bytes) = handle
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: fresh,
+            reply,
+        })
+        .await
+        .expect("the new key's signer reserves");
+    assert!(attested_by(&public_bytes, &alice_rotated_key()).await);
+    handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await
+        .expect("the refill ends");
+    let before: Vec<KpRef> = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("list pooled succeeds")
+        .into_iter()
+        .map(|(kp_ref, _)| kp_ref)
+        .collect();
+    assert_eq!(before.len(), MIN_BUFFER - 1);
+    let index_before = live_index(&storage, &alice()).await;
+
+    let err = handle
+        .send(|reply| KeyPackageCommand::ReserveAny {
+            signer: stale,
+            reply,
+        })
+        .await
+        .expect_err("the stale signer is refused");
+    assert!(
+        matches!(err, ContextError::AttestationSignerNotActiveKey),
+        "got {err:?}"
+    );
+
+    let after: Vec<KpRef> = handle
+        .send(|reply| KeyPackageCommand::ListPooled { reply })
+        .await
+        .expect("the new key's signer is still installed")
+        .into_iter()
+        .map(|(kp_ref, _)| kp_ref)
+        .collect();
+    assert_eq!(after, before, "the new key's pool is untouched");
+    for kp_ref in &before {
+        assert!(kp_record_present(&storage, &alice(), kp_ref).await);
+    }
+    assert_eq!(live_index(&storage, &alice()).await, index_before);
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// Every `ReserveAny` parked on an empty pool receives a `KeyPackage`, even
+/// when more park than [`MIN_BUFFER`]: the refill keeps minting while parked
+/// reserves outnumber the pool.
+#[tokio::test]
+async fn every_reserve_parked_on_an_empty_pool_receives_a_key_package() {
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(real_backend(), in_memory_storage(), no_transport()).await,
+    );
+    let signer = alice_attestation_signer();
+    let reserves: Vec<_> = (0..MIN_BUFFER + 2)
+        .map(|_| {
+            let handle = handle.clone();
+            let signer = Arc::clone(&signer);
+            tokio::spawn(async move {
+                handle
+                    .send(|reply| KeyPackageCommand::ReserveAny { signer, reply })
+                    .await
+            })
+        })
+        .collect();
+    let mut reservations = std::collections::HashSet::new();
+    for reserve in reserves {
+        let (reservation_id, _public) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), reserve)
+                .await
+                .expect("the parked reserve is answered")
+                .expect("the reserve task completes")
+                .expect("every parked reserve receives a KeyPackage");
+        reservations.insert(reservation_id);
+    }
+    assert_eq!(
+        reservations.len(),
+        MIN_BUFFER + 2,
+        "each reservation is distinct"
+    );
 
     handle.send_shutdown().await.unwrap();
 }

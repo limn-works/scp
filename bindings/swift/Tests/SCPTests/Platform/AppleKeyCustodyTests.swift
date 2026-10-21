@@ -73,26 +73,32 @@
         }
     }
 
+    private func expectWrongKeyType(_ error: PlatformError?) {
+        guard case .wrongKeyType = error else {
+            Issue.record("expected wrongKeyType, got \(String(describing: error))")
+            return
+        }
+    }
+
     // MARK: - AppleKeyCustody Tests
 
-    struct AppleKeyCustodyTests {
-        /// Shared custody instance using default Keychain (no access group).
-        /// Suitable for unit tests and simulator.
-        private let custody = AppleKeyCustody(accessGroup: nil)
+    final class AppleKeyCustodyTests: Sendable {
+        private let keyIds = KeyIdRecorder()
+        private let custody: AppleKeyCustody
+
+        init() {
+            custody = keyIds.custody()
+        }
+
+        deinit {
+            keyIds.purge()
+        }
 
         // MARK: - generateKeypair
 
         @Test("generateKeypair returns non-empty handle for Ed25519")
         func generateEd25519Keypair() async throws {
             let handle = try await custody.generateKeypair(keyType: "ed25519")
-            #expect(!handle.isEmpty, "handle should be a non-empty UUID string")
-            // Cleanup
-            try await custody.destroyKey(handle)
-        }
-
-        @Test("generateKeypair returns non-empty handle for X25519")
-        func generateX25519Keypair() async throws {
-            let handle = try await custody.generateKeypair(keyType: "x25519")
             #expect(!handle.isEmpty, "handle should be a non-empty UUID string")
             // Cleanup
             try await custody.destroyKey(handle)
@@ -117,12 +123,12 @@
             try await custody.destroyKey(handle)
         }
 
-        @Test("sign with X25519 key throws wrongKeyType")
-        func signX25519Fails() async throws {
-            let handle = try await custody.generateKeypair(keyType: "x25519")
-            await #expect(throws: PlatformError.self) {
+        @Test("sign with an HPKE P-256 key throws wrongKeyType")
+        func signHpkeP256Fails() async throws {
+            let handle = try await custody.generateKeypair(keyType: "hpke-p256")
+            expectWrongKeyType(await #expect(throws: PlatformError.self) {
                 _ = try await custody.sign(handle, data: Data("test".utf8))
-            }
+            })
             // Cleanup
             try await custody.destroyKey(handle)
         }
@@ -160,15 +166,6 @@
             let handle = try await custody.generateKeypair(keyType: "ed25519")
             let pubKey = try await custody.publicKey(handle)
             #expect(pubKey.count == 32, "Ed25519 public key must be 32 bytes")
-            // Cleanup
-            try await custody.destroyKey(handle)
-        }
-
-        @Test("publicKey returns 32 bytes for X25519")
-        func publicKeyX25519() async throws {
-            let handle = try await custody.generateKeypair(keyType: "x25519")
-            let pubKey = try await custody.publicKey(handle)
-            #expect(pubKey.count == 32, "X25519 public key must be 32 bytes")
             // Cleanup
             try await custody.destroyKey(handle)
         }
@@ -243,10 +240,10 @@
 
         // MARK: - dhAgree
 
-        @Test("dhAgree with X25519 keys produces matching shared secrets")
+        @Test("dhAgree with HPKE P-256 keys produces matching shared secrets")
         func dhAgreeProducesMatchingSecrets() async throws {
-            let aliceHandle = try await custody.generateKeypair(keyType: "x25519")
-            let bobHandle = try await custody.generateKeypair(keyType: "x25519")
+            let aliceHandle = try await custody.generateKeypair(keyType: "hpke-p256")
+            let bobHandle = try await custody.generateKeypair(keyType: "hpke-p256")
 
             let alicePub = try await custody.publicKey(aliceHandle)
             let bobPub = try await custody.publicKey(bobHandle)
@@ -266,8 +263,13 @@
         func dhAgreeEd25519Fails() async throws {
             let handle = try await custody.generateKeypair(keyType: "ed25519")
             let peer = Data(repeating: 0, count: 32)
-            await #expect(throws: PlatformError.self) {
+            await #expect {
                 _ = try await custody.dhAgree(handle, peerPublic: peer)
+            } throws: { error in
+                if case PlatformError.wrongKeyType = error {
+                    return true
+                }
+                return false
             }
             // Cleanup
             try await custody.destroyKey(handle)
@@ -303,12 +305,12 @@
             try await custody.destroyKey(handle)
         }
 
-        @Test("derivePseudonym with X25519 key throws wrongKeyType")
-        func derivePseudonymX25519Fails() async throws {
-            let handle = try await custody.generateKeypair(keyType: "x25519")
-            await #expect(throws: PlatformError.self) {
+        @Test("derivePseudonym with an HPKE P-256 key throws wrongKeyType")
+        func derivePseudonymHpkeP256Fails() async throws {
+            let handle = try await custody.generateKeypair(keyType: "hpke-p256")
+            expectWrongKeyType(await #expect(throws: PlatformError.self) {
                 _ = try await custody.derivePseudonym(handle, contextId: Data("ctx".utf8))
-            }
+            })
             // Cleanup
             try await custody.destroyKey(handle)
         }
@@ -369,7 +371,7 @@
         @Test("each generateKeypair call returns a unique handle")
         func uniqueHandles() async throws {
             let handle1 = try await custody.generateKeypair(keyType: "ed25519")
-            let handle2 = try await custody.generateKeypair(keyType: "x25519")
+            let handle2 = try await custody.generateKeypair(keyType: "hpke-p256")
             let handle3 = try await custody.generateKeypair(keyType: "ed25519")
 
             #expect(handle1 != handle2)
@@ -386,8 +388,17 @@
     // MARK: - Store Tests
 
     /// How a key's Keychain item is stored over an existing one.
-    struct AppleKeyCustodyStoreTests {
-        private let custody = AppleKeyCustody(accessGroup: nil)
+    final class AppleKeyCustodyStoreTests: Sendable {
+        private let keyIds = KeyIdRecorder()
+        private let custody: AppleKeyCustody
+
+        init() {
+            custody = keyIds.custody()
+        }
+
+        deinit {
+            keyIds.purge()
+        }
 
         /// The `kSecAttrComment` of the generic-password item for `account`.
         private func keychainComment(_ account: String) -> String? {
@@ -415,7 +426,7 @@
 
         @Test("storing a key over an existing item replaces it")
         func storeReplacesTheExistingItem() async throws {
-            let handle = UUID().uuidString
+            let handle = keyIds.next()
             let account = "scp.key.\(handle)"
             let first = Data(repeating: 0x11, count: 32)
             let second = Data(repeating: 0x22, count: 32)
@@ -443,9 +454,17 @@
 
     /// Tests for the v2 (rotatable, epoch-bound) pseudonym derivation and the
     /// cross-platform §25.19 known-answer vectors covering both v1 and v2.
-    struct AppleKeyCustodyRotatablePseudonymTests {
-        /// Shared custody instance using default Keychain (no access group).
-        private let custody = AppleKeyCustody(accessGroup: nil)
+    final class AppleKeyCustodyRotatablePseudonymTests: Sendable {
+        private let keyIds = KeyIdRecorder()
+        private let custody: AppleKeyCustody
+
+        init() {
+            custody = keyIds.custody()
+        }
+
+        deinit {
+            keyIds.purge()
+        }
 
         @Test("deriveRotatablePseudonym is deterministic for same inputs")
         func deriveRotatablePseudonymDeterministic() async throws {
@@ -483,14 +502,14 @@
             try await custody.destroyKey(handle)
         }
 
-        @Test("deriveRotatablePseudonym with X25519 key throws wrongKeyType")
-        func deriveRotatablePseudonymX25519Fails() async throws {
-            let handle = try await custody.generateKeypair(keyType: "x25519")
-            await #expect(throws: PlatformError.self) {
+        @Test("deriveRotatablePseudonym with an HPKE P-256 key throws wrongKeyType")
+        func deriveRotatablePseudonymHpkeP256Fails() async throws {
+            let handle = try await custody.generateKeypair(keyType: "hpke-p256")
+            expectWrongKeyType(await #expect(throws: PlatformError.self) {
                 _ = try await custody.deriveRotatablePseudonym(
                     handle, contextId: Data("ctx".utf8), pseudonymEpoch: 1
                 )
-            }
+            })
             // Cleanup
             try await custody.destroyKey(handle)
         }
@@ -546,7 +565,7 @@
 
                 // Store the ikm as the Ed25519 identity seed the derivation reads.
                 let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: ikm)
-                let handle = UUID().uuidString
+                let handle = keyIds.next()
                 try custody.storePrivateKeyBytes(
                     ikm, for: handle, keyType: .ed25519, role: .identity,
                     publicKeyBytes: signingKey.publicKey.rawRepresentation
@@ -582,7 +601,13 @@
 
     // MARK: - BiometricPolicy Tests
 
-    struct AppleKeyCustodyBiometricPolicyTests {
+    final class AppleKeyCustodyBiometricPolicyTests: Sendable {
+        private let keyIds = KeyIdRecorder()
+
+        deinit {
+            keyIds.purge()
+        }
+
         // MARK: - Default behavior preserved
 
         @Test("BiometricPolicy.none preserves existing behavior")
@@ -592,7 +617,9 @@
 
             // Both should generate keys identically.
             let handle1 = try await custodyDefault.generateKeypair(keyType: "ed25519")
+            defer { KeyIdRecorder.purge([handle1]) }
             let handle2 = try await custodyExplicit.generateKeypair(keyType: "ed25519")
+            defer { KeyIdRecorder.purge([handle2]) }
 
             // Both should sign successfully.
             let data = Data("test".utf8)
@@ -611,17 +638,17 @@
 
         @Test("custodyType returns 'software' for BiometricPolicy.none")
         func custodyTypeNone() async throws {
-            let custodyNone = AppleKeyCustody(accessGroup: nil, biometricPolicy: .none)
+            let custodyNone = keyIds.custody(policy: .none)
             let handle = try await custodyNone.generateKeypair(keyType: "ed25519")
             #expect(custodyNone.custodyType(handle) == "software")
             try await custodyNone.destroyKey(handle)
         }
 
-        @Test("custodyType returns 'unknown' for an id the Keychain does not hold, under either policy")
+        @Test("custodyType returns 'in_memory', the weakest custody, for an id the Keychain does not hold, under either policy")
         func custodyTypeUnknownId() {
             let unknown = String(UInt64.random(in: .min ... .max))
-            #expect(AppleKeyCustody(accessGroup: nil, biometricPolicy: .none).custodyType(unknown) == "unknown")
-            #expect(AppleKeyCustody(accessGroup: nil, biometricPolicy: .required).custodyType(unknown) == "unknown")
+            #expect(AppleKeyCustody(accessGroup: nil, biometricPolicy: .none).custodyType(unknown) == "in_memory")
+            #expect(AppleKeyCustody(accessGroup: nil, biometricPolicy: .required).custodyType(unknown) == "in_memory")
         }
 
         // MARK: - BiometricPolicy.required creates biometric-gated keys
@@ -665,7 +692,7 @@
             .enabled(if: biometricKeychainAvailable, "Requires Keychain biometric entitlements")
         )
         func biometricRequiredStoresWithAccessControl() async throws {
-            let custodyBio = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
+            let custodyBio = keyIds.custody(policy: .required)
             let handle = try await custodyBio.generateKeypair(keyType: "ed25519")
 
             // Verify the key exists and has an access control attribute by
@@ -722,8 +749,18 @@
     /// Calls every member of the UniFFI `KeyCustodyProvider` protocol through a
     /// value typed `any KeyCustodyProvider`, so each test exercises exactly the
     /// surface the bridge calls (`crates/scp-ffi/uniffi/src/lib.rs`).
-    struct AppleKeyCustodyProviderConformanceTests {
-        private let adapter = AppleKeyCustody(accessGroup: nil)
+    final class AppleKeyCustodyProviderConformanceTests: Sendable {
+        private let keyIds = KeyIdRecorder()
+        private let adapter: AppleKeyCustody
+
+        init() {
+            adapter = keyIds.custody()
+        }
+
+        deinit {
+            keyIds.purge()
+        }
+
         private var provider: any KeyCustodyProvider {
             adapter
         }
@@ -746,7 +783,7 @@
 
         /// Stores `seed` as an identity Ed25519 key under a fresh decimal id.
         private func storeIdentitySeed(_ seed: Data) throws -> String {
-            let handle = String(UInt64.random(in: .min ... .max))
+            let handle = keyIds.next()
             let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
             try adapter.storePrivateKeyBytes(
                 seed, for: handle, keyType: .ed25519, role: .identity,
@@ -780,46 +817,34 @@
             try await provider.destroyKey(keyId: keyId)
         }
 
-        @Test("an operational X25519 key reports its role and agrees with a CryptoKit peer")
-        func operationalX25519Agreement() async throws {
-            let keyId = try await provider.generateKeypair(keyType: .x25519, role: .operational)
+        @Test("an operational HPKE P-256 key reports its role and agrees with a CryptoKit peer")
+        func operationalHpkeP256Agreement() async throws {
+            let keyId = try await provider.generateKeypair(keyType: .hpkeP256, role: .operational)
             let reported = try await provider.getPublicKey(keyId: keyId)
-            #expect(reported.keyType == .x25519)
+            #expect(reported.keyType == .hpkeP256)
             #expect(reported.role == .operational)
 
-            let peer = Curve25519.KeyAgreement.PrivateKey()
-            let shared = try await provider.dhAgree(keyId: keyId, peerPublic: peer.publicKey.rawRepresentation)
+            let peer = P256.KeyAgreement.PrivateKey()
+            let shared = try await provider.dhAgree(keyId: keyId, peerPublic: peer.publicKey.x963Representation)
             let expected = try peer.sharedSecretFromKeyAgreement(
-                with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: reported.publicKey)
+                with: P256.KeyAgreement.PublicKey(x963Representation: reported.publicKey)
             ).withUnsafeBytes { Data($0) }
             #expect(shared == expected)
             try await provider.destroyKey(keyId: keyId)
         }
 
-        /// The bridge's `ed25519_to_x25519_agree` calls `dhAgree` with an
-        /// Ed25519 key id. The seed is RFC 8032 §7.1 test 1 and the peer is
-        /// RFC 7748 §6.1 Alice; the expected secret is X25519 of Alice's
-        /// scalar and the seed's converted public key, computed independently.
-        @Test("dhAgree on an Ed25519 key uses the SHA-512(seed) X25519 scalar")
-        func ed25519AgreementMatchesConversionVector() async throws {
+        /// `dhAgree` refuses an Ed25519 key id: an Ed25519 key never agrees,
+        /// so the bridge reports the custody failure code.
+        @Test("dhAgree on an Ed25519 key id is refused")
+        func ed25519AgreementIsRefused() async throws {
             let seed = try hexToData("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
             let peerPublic = try hexToData("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
-            let expected = try hexToData("90f395580ca33f3c54390ac1d7210220b6a336de2c47a61ac90ff56e6be11f18")
             let keyId = try storeIdentitySeed(seed)
 
-            let shared = try await provider.dhAgree(keyId: keyId, peerPublic: peerPublic)
-            #expect(shared == expected)
-
-            // The peer side: Alice's scalar against the converted public key.
-            let alice = try Curve25519.KeyAgreement.PrivateKey(
-                rawRepresentation: hexToData("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
-            )
-            let convertedPublic = try Curve25519.KeyAgreement.PublicKey(
-                rawRepresentation: hexToData("d85e07ec22b0ad881537c2f44d662d1a143cf830c57aca4305d85c7a90f6b62e")
-            )
-            let peerShared = try alice.sharedSecretFromKeyAgreement(with: convertedPublic)
-                .withUnsafeBytes { Data($0) }
-            #expect(peerShared == expected)
+            let code = await cryptoCode {
+                _ = try await provider.dhAgree(keyId: keyId, peerPublic: peerPublic)
+            }
+            #expect(code == "SCP-CRYPTO-4060")
             try await provider.destroyKey(keyId: keyId)
         }
 
@@ -843,7 +868,7 @@
         @Test("every keyed member reports an unknown id as SCP-CRYPTO-4006")
         func unknownIdIsKeyNotFound() async {
             let unknown = String(UInt64.random(in: .min ... .max))
-            let peer = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+            let peer = P256.KeyAgreement.PrivateKey().publicKey.x963Representation
             let context = Data("ctx".utf8)
             let notFound = "SCP-CRYPTO-4006"
             #expect(await cryptoCode { _ = try await provider.sign(keyId: unknown, message: context) } == notFound)
@@ -854,7 +879,7 @@
             #expect(await cryptoCode {
                 _ = try await provider.deriveRotatablePseudonym(keyId: unknown, contextId: context, pseudonymEpoch: 1)
             } == notFound)
-            #expect(provider.custodyType(keyId: unknown) == "unknown")
+            #expect(provider.custodyType(keyId: unknown) == "in_memory")
         }
 
         @Test("a destroyed key is not found afterwards")
@@ -865,23 +890,15 @@
                 _ = try await provider.derivePseudonym(keyId: keyId, contextId: Data("ctx".utf8))
             }
             #expect(code == "SCP-CRYPTO-4006")
-            #expect(provider.custodyType(keyId: keyId) == "unknown")
+            #expect(provider.custodyType(keyId: keyId) == "in_memory")
         }
 
         @Test("a wrong-type operation is the custody error SCP-CRYPTO-4060")
         func wrongTypeIsCustodyError() async throws {
-            let keyId = try await provider.generateKeypair(keyType: .x25519, role: .operational)
+            let keyId = try await provider.generateKeypair(keyType: .hpkeP256, role: .operational)
             let code = await cryptoCode { _ = try await provider.sign(keyId: keyId, message: Data("m".utf8)) }
             #expect(code == "SCP-CRYPTO-4060")
             try await provider.destroyKey(keyId: keyId)
-        }
-
-        @Test("P-256 and HPKE P-256 generation fails closed with SCP-CRYPTO-4060")
-        func p256GenerationFailsClosed() async {
-            for keyType in [CustodyKeyType.p256, .hpkeP256] {
-                let code = await cryptoCode { _ = try await provider.generateKeypair(keyType: keyType, role: .operational) }
-                #expect(code == "SCP-CRYPTO-4060")
-            }
         }
 
         /// The adapter itself is the provider: `identityCreateWithCustody`
@@ -927,10 +944,10 @@
             #expect(try adapter.keyIds(cachingPublicKey: found.publicKey).isEmpty)
         }
 
-        @Test("custodyType reports unknown for an id the Keychain does not hold under a biometric policy")
+        @Test("custodyType reports in_memory for an id the Keychain does not hold under a biometric policy")
         func biometricCustodyTypeUnknownId() {
             let gated: any KeyCustodyProvider = AppleKeyCustody(accessGroup: nil, biometricPolicy: .required)
-            #expect(gated.custodyType(keyId: String(UInt64.random(in: .min ... .max))) == "unknown")
+            #expect(gated.custodyType(keyId: String(UInt64.random(in: .min ... .max))) == "in_memory")
         }
     }
 

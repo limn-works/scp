@@ -29,7 +29,7 @@ import {
   NON_CANONICAL_IDENTIFIER_CODE,
 } from "../src/types";
 import { HARNESS_IN_MEMORY_CUSTODY } from "./harness-custody";
-import { skipReasonIfAddonAbsent } from "./napi-guard";
+import { napiSuite } from "./napi-guard";
 
 /**
  * Generates a DHKEM(P-256) wrapping keypair (32-byte secret scalar + 65-byte
@@ -74,24 +74,15 @@ type NativeAddon = any;
 
 // `createNativeBridge` is resolved once at module load so `beforeEach` can
 // mint a fresh bridge/SCP pair per test without the async-import penalty.
-let createNativeBridge:
-  | ((scp: SCP) => ReturnType<typeof import("../src/internal/native").createNativeBridge>)
-  | null = null;
-let rawAddon: NativeAddon = null;
-let skipReason = "";
-let napiAvailable = false;
-
-try {
+const suite = await napiSuite(async () => {
   // Resolve the SDK bridge factory and probe the SCP class for the
   // Phase 4 surface. The probe SCP is discarded immediately — each test
   // will mint its own.
   const nativeModule = await import("../src/internal/native.js");
-  createNativeBridge = nativeModule.createNativeBridge;
   const probe = new SCP({ storage: { type: "in_memory" } });
   if (typeof (probe as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
     throw new Error("SCP missing relayStartInMemory — rebuild with the Phase 4 changes");
   }
-  napiAvailable = true;
   // Dispose of the probe so it never leaks state into the per-test
   // instances bootstrapped in `beforeEach` below.
   probe.shutdown(1).catch(() => {});
@@ -101,17 +92,11 @@ try {
   // is the SDK's one loader: resolving the platform package here instead would let
   // this file's copy of the platform map drift from the loader's, and this file
   // would then skip over an addon the loader resolves.
-  rawAddon = nativeModule.loadNativeAddon() as NativeAddon;
-} catch (e: unknown) {
-  skipReason = skipReasonIfAddonAbsent(e);
-}
+  const rawAddon = nativeModule.loadNativeAddon() as NativeAddon;
+  return { createNativeBridge: nativeModule.createNativeBridge, rawAddon };
+});
 
-// When the bridge is unavailable, define a single test that reports the skip.
-if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
-  describe("Real NAPI bridge E2E (SKIPPED)", () => {
-    test.skip(`all tests skipped: ${skipReason}`, () => {});
-  });
-} else {
+suite.describe("Real NAPI bridge E2E", ({ createNativeBridge, rawAddon }) => {
   // Capture the add-on and the bridge factory in consts for type narrowing.
   const addon = rawAddon;
   const makeBridge = createNativeBridge;
@@ -3110,4 +3095,4 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(cost).toBe(0n);
     });
   });
-}
+});

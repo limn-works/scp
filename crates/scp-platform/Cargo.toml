@@ -13,7 +13,6 @@ categories = ["os", "cryptography"]
 [features]
 software_platform = [
     "dep:ed25519-dalek",
-    "dep:x25519-dalek",
     "dep:rand",
     "dep:hmac",
     "dep:sha2",
@@ -32,7 +31,7 @@ in-memory-storage = []
 # `InMemoryDeviceAttestation`, and `InMemoryPreRotationCustody`
 # (`SCP-CAPSEL-8012`), and `InMemoryPush`, whose UUID token no push service
 # issued, so it delivers no wake. `testing` stays separate from
-# `software_platform` so crates needing crypto primitives (Ed25519, X25519)
+# `software_platform` so crates needing crypto primitives (Ed25519, P-256)
 # can enable `software_platform` without compiling these doubles.
 # `software_platform` pulls the `dep:uuid` that `InMemoryPush` uses. `testing`
 # also enables `in-memory-storage`, so test builds reach `InMemoryStorage`
@@ -129,7 +128,6 @@ argon2 = { workspace = true, optional = true }
 
 # software_platform dependencies, gated behind the `software_platform` feature flag.
 ed25519-dalek = { workspace = true, optional = true }
-x25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }

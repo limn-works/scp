@@ -4706,9 +4706,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -4804,6 +4804,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
+ "hex",
  "js-sys",
  "openmls",
  "rmp-serde",
@@ -4813,6 +4814,7 @@ dependencies = [
  "scp-crypto",
  "scp-did",
  "scp-event-log",
+ "scp-kel",
  "scp-mls",
  "scp-protocol",
  "scp-relay-client",
@@ -4878,6 +4880,7 @@ version = "0.1.0-beta.2"
 dependencies = [
  "base64",
  "bs58",
+ "data-encoding",
  "ed25519-dalek 2.2.0",
  "hex",
  "rand 0.8.8",
@@ -5112,6 +5115,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "scp-kel"
+version = "0.1.0-beta.2"
+dependencies = [
+ "hex",
+ "proptest",
+ "scp-did",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "scp-mcp"
 version = "0.1.0-beta.2"
 dependencies = [
@@ -5257,7 +5271,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "x25519-dalek 2.0.1",
  "zeroize",
 ]
 
@@ -5299,7 +5312,6 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
- "x25519-dalek 2.0.1",
  "zeroize",
 ]
 
@@ -5387,7 +5399,6 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
- "x25519-dalek 2.0.1",
  "z-base-32",
  "zeroize",
 ]
@@ -7068,18 +7079,18 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.6"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "804f18a4ac2676ffb4e8b5b5fa9ae38af06df08162314f96a68d2a363e21a8ca"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.6"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

@@ -289,6 +289,9 @@ scp/
 │   │   ├── document.rs        # Retired document types; the key state replaces them
 │   │   └── attestation.rs     # Key-custody / identity-link attestation types
 │   │
+│   ├── scp-kel/               # Key-event log codec (SCP-308, slice S1) and verifier (SCP-309, from slice S2) — wasm-safe Layer 1 crate (see "Layered Dependency Graph");
+│   │                          #   no async, no I/O; depends on scp-did, and on scp-crypto from S2 (09-security-model.md §9.7.4.2, ADR-063)
+│   │
 │   ├── scp-mls/               # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
 │   │
 │   ├── scp-client/            # Single-threaded in-browser participant driver over scp-mls (ADR-057)
@@ -691,6 +694,9 @@ Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32
            │                          imports the identity model from scp-did.
            │  scp-dht                  Retired DHT transport leaf; no resolution path reads it.
            │  scp-event-log           Merkle event log.
+           │  scp-kel                 Key-event log codec and verifier (09-security-model.md
+           │                          §9.7.4.2; ADR-063). Wasm-safe and synchronous; its one
+           │                          SCP dependency is scp-did, so it sits above Layer 0.
            │  scp-mls                 Synchronous MLS state machine (wasm-safe; ADR-057).
            │  scp-client              In-browser participant driver over scp-mls (ADR-057).
            │  scp-client-wasm         wasm-bindgen browser surface over scp-client (ADR-057).

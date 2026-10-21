@@ -18,6 +18,7 @@ pub mod custody_violation;
 pub mod identifier;
 mod language_tag;
 pub mod participation;
+pub mod participation_seed;
 pub mod renewal;
 pub mod schema_gate;
 pub mod sybil;
@@ -81,6 +82,11 @@ pub use participation::{
     ParticipationFact, ParticipationFacts, ParticipationInput, ParticipationProfile,
     ParticipationRecord, ParticipationThreshold, RequireParticipation,
     UnsignedParticipationProfile, compute_participation_record, participation_profile_unsigned,
+};
+pub use participation_seed::{
+    PARTICIPATION_SEED_LEN, PARTICIPATION_SEED_WRAP_INFO_PREFIX, ParticipationSeed,
+    ParticipationSeedError, WrappedParticipationSeed, open_participation_seed,
+    seal_participation_seed,
 };
 pub use schema_gate::{SchemaGate, SchemaVerdict};
 pub use sybil::{
@@ -675,7 +681,8 @@ pub enum TrustError {
     },
 
     /// The challenger's ledger holds no live challenge with this id, request
-    /// digest and subject (spec 07 §7.3.4 step 3).
+    /// digest and subject, or holds a closed one with no graded attempt for
+    /// the response's `D_r` (spec 07 §7.3.4 step 3.2).
     #[error("challenge {challenge_id}: unknown to this challenger")]
     UnknownChallenge {
         /// The challenge id (lowercase hex).

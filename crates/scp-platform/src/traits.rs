@@ -25,14 +25,15 @@ use crate::error::PlatformError;
 /// The type of cryptographic key managed by a [`KeyHandle`].
 ///
 /// See ADR-006 for usage. The P-256 types are the SCP key suite (ADR-063);
-/// Ed25519 and X25519 remain until every consumer has moved to P-256.
+/// Ed25519 remains until the identity key moves to P-256 (SCP-315). The set is
+/// these three types: the X25519 custody type and its `dh_agree` path were
+/// removed under SCP-307 criterion 37 (ADR-006, ADR-021 and ADR-025, each
+/// amended 2026-10-20).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum KeyType {
     /// Ed25519 signing key (identity keys, active signing keys). Pseudonym keys
     /// are P-256 (§9.10.4) and are never generated through this type.
     Ed25519,
-    /// X25519 key agreement key (HPKE wrapping keys).
-    X25519,
     /// P-256 ECDSA signing key. Signs a 32-byte digest (prehash) and returns
     /// the 64-byte low-`s` `r ‖ s`; its public key is the 33-byte compressed
     /// SEC1 point.
@@ -43,13 +44,12 @@ pub enum KeyType {
 }
 
 impl KeyType {
-    /// The type's name in a host custody contract: `"ed25519"`, `"x25519"`,
-    /// `"p256"` or `"hpke-p256"` (ADR-021, amended 2026-10-10).
+    /// The type's name in a host custody contract: `"ed25519"`, `"p256"` or
+    /// `"hpke-p256"` (ADR-021, amended 2026-10-10).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ed25519 => "ed25519",
-            Self::X25519 => "x25519",
             Self::P256Signing => "p256",
             Self::HpkeP256 => "hpke-p256",
         }
@@ -61,7 +61,6 @@ impl KeyType {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "ed25519" => Some(Self::Ed25519),
-            "x25519" => Some(Self::X25519),
             "p256" => Some(Self::P256Signing),
             "hpke-p256" => Some(Self::HpkeP256),
             _ => None,
@@ -219,7 +218,7 @@ impl PreRotationKeyHandle {
 
 /// A public key extracted from a [`KeyHandle`].
 ///
-/// Contains the raw public key bytes — Ed25519 or X25519 (32 bytes), P-256
+/// Contains the raw public key bytes — Ed25519 (32 bytes), P-256
 /// signing (33-byte compressed SEC1), or HPKE P-256 (65-byte uncompressed SEC1).
 /// The interpretation depends on the [`KeyType`] of the originating handle.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -271,7 +270,8 @@ impl Signature {
     }
 }
 
-/// A 32-byte X25519 shared secret produced by [`KeyCustody::dh_agree`].
+/// A 32-byte shared secret produced by [`KeyCustody::dh_agree`]: the P-256
+/// ECDH x-coordinate.
 ///
 /// This type intentionally does **not** implement [`Clone`] or [`Serialize`] to
 /// prevent accidental duplication or serialization of secret material. Callers
@@ -511,8 +511,6 @@ pub trait KeyCustody: Send + Sync {
     /// Generate a new keypair of the specified type.
     ///
     /// Ed25519 keys may be hardware-backed (Secure Enclave, Keystore).
-    /// X25519 wrapping keys are always software-managed but routed through
-    /// `KeyCustody` for API consistency.
     ///
     /// Returns an opaque [`KeyHandle`] that references the generated key.
     fn generate_keypair(
@@ -555,7 +553,7 @@ pub trait KeyCustody: Send + Sync {
     ///
     /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
     /// Returns [`PlatformError::WrongKeyType`] if the handle refers to a
-    /// key-agreement key ([`KeyType::X25519`] or [`KeyType::HpkeP256`]).
+    /// key-agreement key ([`KeyType::HpkeP256`]).
     /// Returns [`PlatformError::CustodyError`] if a P-256 key is given `data`
     /// that is not 32 bytes.
     fn sign(
@@ -566,7 +564,7 @@ pub trait KeyCustody: Send + Sync {
 
     /// Return the public key for a handle.
     ///
-    /// Ed25519 and X25519 handles return 32 bytes, [`KeyType::P256Signing`]
+    /// Ed25519 handles return 32 bytes, [`KeyType::P256Signing`]
     /// handles the 33-byte compressed SEC1 point, and
     /// [`KeyType::HpkeP256`] handles the 65-byte uncompressed SEC1 point.
     ///
@@ -595,14 +593,11 @@ pub trait KeyCustody: Send + Sync {
         key: &KeyHandle,
     ) -> impl Future<Output = Result<(), PlatformError>> + Send;
 
-    /// Perform Diffie-Hellman key agreement. The handle's key type selects
-    /// the curve.
-    ///
-    /// - [`KeyType::X25519`]: `peer_public` is the 32-byte X25519 key.
-    /// - [`KeyType::HpkeP256`]: `peer_public` is exactly the 65-byte
-    ///   uncompressed SEC1 point (`0x04 || x || y`, RFC 9180 §7.1.1
-    ///   `SerializePublicKey`), on the curve and not the identity; a
-    ///   compressed point is rejected. The result is the ECDH x-coordinate.
+    /// Perform Diffie-Hellman key agreement with a [`KeyType::HpkeP256`]
+    /// key. `peer_public` is exactly the 65-byte uncompressed SEC1 point
+    /// (`0x04 || x || y`, RFC 9180 §7.1.1 `SerializePublicKey`), on the
+    /// curve and not the identity; a compressed point is rejected. The
+    /// result is the ECDH x-coordinate.
     ///
     /// Returns the 32-byte shared secret. The private key never leaves the
     /// custody boundary — the scalar multiplication happens inside the adapter.
@@ -699,25 +694,6 @@ pub trait KeyCustody: Send + Sync {
         context_id: &[u8],
         pseudonym_epoch: u64,
     ) -> impl Future<Output = Result<Pseudonym, PlatformError>> + Send;
-
-    /// Performs X25519 key agreement using an Ed25519 key via birational conversion.
-    ///
-    /// Converts the Ed25519 key to X25519 internally (`SHA-512(seed)[0..32]` → clamp → scalar),
-    /// then performs X25519 DH with the peer's X25519 public key. The private key never
-    /// leaves the custody boundary.
-    ///
-    /// Used for RFC 9180 HPKE decryption of invitation bundles (spec §5.12.3.1).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::KeyNotFound`] if the handle is invalid.
-    /// Returns [`PlatformError::WrongKeyType`] if the handle refers to an X25519 key
-    /// (use [`dh_agree`](Self::dh_agree) for X25519 keys directly).
-    fn ed25519_to_x25519_agree(
-        &self,
-        ed25519_handle: &KeyHandle,
-        peer_x25519_public: &[u8; 32],
-    ) -> impl Future<Output = Result<SharedSecret, PlatformError>> + Send;
 
     /// Returns the custody type for a given key handle.
     ///
@@ -1337,25 +1313,6 @@ pub(crate) fn p256_dh_agree(
     Ok(SharedSecret::new(*shared))
 }
 
-/// Requires a 32-byte X25519 peer public key: the shared length check of every
-/// software backend's [`KeyCustody::dh_agree`] for [`KeyType::X25519`].
-///
-/// # Errors
-///
-/// [`PlatformError::CustodyError`] when `peer_public` is not 32 bytes.
-#[cfg(all(
-    feature = "software_platform",
-    any(feature = "file", feature = "sqlite", feature = "testing")
-))]
-pub(crate) fn x25519_peer(peer_public: &[u8]) -> Result<[u8; 32], PlatformError> {
-    peer_public.try_into().map_err(|_| {
-        PlatformError::CustodyError(format!(
-            "an X25519 peer public key is 32 bytes, got {}",
-            peer_public.len()
-        ))
-    })
-}
-
 /// Rebuilds a persisted P-256 key from its 32-byte scalar, rejecting zero and
 /// values `>= n`.
 ///
@@ -1426,30 +1383,6 @@ pub const fn require_derive_source(role: KeyRole, key_type: KeyType) -> Result<(
     Ok(())
 }
 
-/// Performs X25519 key agreement using an Ed25519 signing key via birational conversion.
-///
-/// Converts the Ed25519 key to X25519 using `to_scalar_bytes()` (`SHA-512(seed)[0..32]`),
-/// then performs X25519 DH with the peer's public key.
-///
-/// This helper eliminates duplication across the `InMemoryKeyCustody`, `FileKeyCustody`,
-/// and `SqliteKeyCustody` implementations.
-#[cfg(feature = "software_platform")]
-#[must_use]
-pub fn x25519_agree_from_ed25519(
-    signing_key: &ed25519_dalek::SigningKey,
-    peer_x25519_public: &[u8; 32],
-) -> SharedSecret {
-    let scalar_bytes = zeroize::Zeroizing::new(signing_key.to_scalar_bytes());
-    let x25519_secret = x25519_dalek::StaticSecret::from(*scalar_bytes);
-    let peer_key = x25519_dalek::PublicKey::from(*peer_x25519_public);
-    let shared = x25519_secret.diffie_hellman(&peer_key);
-    // x25519-dalek v2 SharedSecret implements Zeroize + zeroize(drop) when the
-    // zeroize feature is enabled (which it is). Wrapping in Zeroizing is
-    // defense-in-depth — ensures zeroing even if the feature is ever removed.
-    let shared_bytes = zeroize::Zeroizing::new(shared.to_bytes());
-    SharedSecret::new(*shared_bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{KeyRole, KeyType};
@@ -1458,12 +1391,7 @@ mod tests {
     /// back; a near miss in case or spelling parses to nothing.
     #[test]
     fn host_contract_names_round_trip() {
-        for t in [
-            KeyType::Ed25519,
-            KeyType::X25519,
-            KeyType::P256Signing,
-            KeyType::HpkeP256,
-        ] {
+        for t in [KeyType::Ed25519, KeyType::P256Signing, KeyType::HpkeP256] {
             assert_eq!(KeyType::parse(t.as_str()), Some(t));
         }
         assert_eq!(KeyType::P256Signing.as_str(), "p256");
@@ -1471,7 +1399,8 @@ mod tests {
         for r in [KeyRole::Identity, KeyRole::Operational] {
             assert_eq!(KeyRole::parse(r.as_str()), Some(r));
         }
-        for bad in ["P256", "", "hpke_p256", "Identity", "admin"] {
+        // `"x25519"` named a key type the custody contract no longer has.
+        for bad in ["P256", "", "hpke_p256", "Identity", "admin", "x25519"] {
             assert_eq!(KeyType::parse(bad), None, "{bad}");
             assert_eq!(KeyRole::parse(bad), None, "{bad}");
         }

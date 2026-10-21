@@ -142,8 +142,9 @@ export interface BrowserInvokerStreamSessionOptions {
    * key, naturally reused across many streams — the session never mutates or
    * zeroizes it (doing so would silently break a caller that reuses the same
    * buffer for a later session). Its lifecycle is the caller's responsibility.
-   * Comprehensive in-tab key protection (non-extractable WebCrypto keys) is
-   * deferred to #1980 per the ADR-057 Slice-3 as-built caveat.
+   * Comprehensive in-tab key protection (non-extractable WebCrypto keys)
+   * waits for the MLS-signing-key → WebCrypto move, per the ADR-057
+   * Slice-3 as-built caveat.
    */
   readonly invokerSigningSeed: Uint8Array;
   /**
@@ -478,7 +479,7 @@ export class BrowserInvokerStreamSession implements AsyncIterable<OutletStreamCh
         // caller and node-side reclamation (credit-stall / timeout, §5.4.5
         // "Credit-based backpressure" `stream_credit_stall_secs`) reclaims the
         // stream. Browser-initiated active cancel is deferred to a future
-        // cross-context-cancel slice (#2203). Close and throw WITHOUT yielding
+        // cross-context-cancel slice. Close and throw WITHOUT yielding
         // the offending chunk.
         const gap = new OutletError(
           `outlet stream sequence gap: expected ${this.#expectedSequence}, got ` +
