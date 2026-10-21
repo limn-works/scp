@@ -82,12 +82,14 @@ pub struct PseudonymRotationState {
     #[serde(default)]
     pub(crate) join_derivation_pending: bool,
     /// `T0`, the creation timestamp the interval boundaries `T0 + j ×
-    /// interval_secs` count from: the creator's own stamp at creation, the
-    /// creator-signed snapshot's value at import. `None` for a member that
-    /// holds no copy of the creator's `T0`: a Welcome joiner, because the
-    /// invitation bundle carries none. Without `T0` the shared schedule
-    /// cannot be computed, so under a policy that sets `interval_secs` no
-    /// rotation is admissible ([`Self::next_epoch`] is `None`).
+    /// interval_secs` count from: the `creation_timestamp_secs` the context's
+    /// `0xFF02` extension commits (spec 05 §5.13.3 rule 9), which the creator
+    /// installs at creation and a member installs at a Welcome join, at import,
+    /// and at restore. `None` only for a keyless import or restore, whose
+    /// snapshot carries no MLS group and so no committed extension. Without
+    /// `T0` the shared schedule cannot be computed, so under a policy that sets
+    /// `interval_secs` no rotation is admissible ([`Self::next_epoch`] is
+    /// `None`).
     #[serde(default)]
     pub(crate) schedule_t0_secs: Option<u64>,
 }
@@ -151,6 +153,17 @@ impl PseudonymRotationState {
         let mut state = Self::anchored(policy, t0_secs, now_secs);
         state.join_derivation_pending = policy.is_some();
         state
+    }
+
+    /// This state with `T0` replaced by `t0_secs`: a restore installs the
+    /// committed `T0` (spec 05 §5.13.3 rule 9) over the snapshot's copy, or
+    /// none on a keyless restore. Every other field is the snapshot's.
+    #[must_use]
+    pub const fn with_schedule_t0(self, t0_secs: Option<u64>) -> Self {
+        Self {
+            schedule_t0_secs: t0_secs,
+            ..self
+        }
     }
 
     /// The member's v2 rotation epoch, `None` while it holds a v1 routing ID.
@@ -612,9 +625,10 @@ mod tests {
         assert!(!cancelled.join_derivation_pending);
     }
 
-    /// A Welcome joiner holds no copy of the creator's `T0`: under an interval
-    /// policy it computes no boundary and no epoch, so nothing is due, while a
-    /// membership-only policy, whose schedule index is 0, still rotates it.
+    /// A member without `T0` (in production, only a keyless import or restore,
+    /// spec 05 §5.13.3 rule 9) computes no boundary and no epoch under an
+    /// interval policy, so nothing is due, while a membership-only policy,
+    /// whose schedule index is 0, still rotates it.
     #[test]
     fn a_member_without_t0_follows_no_interval_schedule() {
         let joined_at = T0 + 3 * I + 7;

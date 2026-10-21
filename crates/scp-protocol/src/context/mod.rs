@@ -46,7 +46,8 @@ pub use governance::{
 #[cfg(any(test, feature = "testing"))]
 pub use governance::{GovernanceEngineRawKey, sign_vote};
 pub use group_context_extension::{
-    SCP_CONTEXT_EXTENSION_TYPE_ID, ScpContextBindingError, ScpContextExtension,
+    CREATION_TIMESTAMP_FUTURE_BOUND_SECS, MAX_CREATION_TIMESTAMP_SECS,
+    SCP_CONTEXT_EXTENSION_TYPE_ID, ScpContextBindingError, ScpContextExtension, ScpContextGenesis,
 };
 pub use invitation_bundle::{
     InvitationBundle, InvitationBundleError, InvitationKeyMaterial, JoinResponse,

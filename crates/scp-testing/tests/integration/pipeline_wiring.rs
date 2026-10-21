@@ -325,7 +325,10 @@ const UNIFFI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/
 // Raised 90 -> 91 when non-committing members began rotating on a processed
 // membership Commit (spec 09 §9.10.4.1): one assertion pins the incoming-Commit
 // handler to the DID classifier, the fail-closed commit, and the rotation signal.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 91;
+// Raised 91 -> 92 when the `0xFF02` extension began committing `T0` (spec 05
+// §5.13.3 rule 9): one assertion pins the Welcome join, import, and restore to
+// the binding check that returns the committed `T0`.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 92;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -1380,6 +1383,30 @@ fn uniffi_invite_member_reaches_supervisor_seam() {
 // Pins the actor-native shape AND the absence of the deleted DashMap
 // dual-write machinery so a regression cannot reintroduce a silent
 // live-context overwrite. Additive assertion.
+// Spec 05 §5.13.3 rules 1-9: every point where an SCP context group enters a
+// member from a caller-supplied description (the Welcome join, import, and
+// restore) runs the shared binding check, which also returns the committed
+// `creation_timestamp_secs` the member installs as `T0` and as the TTL base.
+#[test]
+fn welcome_import_and_restore_run_the_committed_t0_binding_check() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "spawn_actor_from_welcome",
+            "verify_scp_context_binding("
+        ),
+        "Supervisor::spawn_actor_from_welcome must verify the joined group's 0xFF02 \
+         extension and take T0 from it"
+    );
+    for entry in ["import_context", "restore_context"] {
+        assert!(
+            fn_body_contains(MANAGER_SRC, entry, "verify_scp_context_binding("),
+            "lifecycle_helpers::{entry} must verify the rehydrated group's 0xFF02 \
+             extension and take T0 from it"
+        );
+    }
+}
+
 #[test]
 fn import_context_is_actor_native_not_dashmap_dual_write() {
     assert!(

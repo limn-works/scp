@@ -2210,23 +2210,35 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
 /// creation, so no authority is ever built for a substituted admin (the sole
 /// anchor for DID-less governance models such as `SingleAdmin`).
 ///
+/// It also enforces **rule 9**: the committed `creation_timestamp_secs` must
+/// not exceed 2^53 − 1, must not lie later than `now_secs` plus the 5-minute
+/// future bound of `09-security-model.md` §9.8.2
+/// ([`CREATION_TIMESTAMP_FUTURE_BOUND_SECS`](scp_protocol::context::CREATION_TIMESTAMP_FUTURE_BOUND_SECS)),
+/// and, on import and restore, must equal the creation timestamp the snapshot
+/// recorded (`snapshot_creation_timestamp_secs`; `None` on a Welcome join,
+/// which presents no snapshot). An extension that omits the field fails to
+/// decode, so it arrives here as an unreadable `read`.
+///
 /// `read` is the group-context-extension read outcome: `Ok(Some(ext))` =
 /// present, `Ok(None)` = absent (a rule-1 violation — not an SCP context),
 /// `Err(msg)` = the group is unreadable / the `0xFF02` payload is malformed.
 /// On rejection the returned reason is prefixed with `site` so each caller can
 /// wrap it in its site-idiomatic [`ContextError`] variant while sharing this
-/// one check. Returns `Ok(())` only when the extension is present AND every
-/// binding rule holds.
+/// one check. Returns the committed `T0`, which the caller installs as the
+/// pseudonym-rotation base and the TTL base, only when the extension is
+/// present AND every binding rule holds.
 pub(in crate::context) fn verify_scp_context_binding(
     read: Result<Option<scp_protocol::context::ScpContextExtension>, String>,
     context_id: &str,
     creator_did: &str,
     params: &scp_protocol::context::ContextParams,
+    now_secs: u64,
+    snapshot_creation_timestamp_secs: Option<u64>,
     site: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     match read {
-        Ok(Some(ext)) => ext
-            .verify_against(
+        Ok(Some(ext)) => {
+            ext.verify_against(
                 &context_id.to_owned(),
                 &scp_did::DID::from(creator_did.to_owned()),
                 params,
@@ -2236,7 +2248,22 @@ pub(in crate::context) fn verify_scp_context_binding(
                     "{site} refused: scp_context_params (0xFF02) binding mismatch \
                      (§5.13.3 rules 2-6, 8): {e}"
                 )
-            }),
+            })?;
+            let t0 = ext.committed_creation_timestamp(now_secs).map_err(|e| {
+                format!(
+                    "{site} refused: scp_context_params (0xFF02) creation timestamp \
+                     rejected (§5.13.3 rule 9): {e}"
+                )
+            })?;
+            match snapshot_creation_timestamp_secs {
+                Some(recorded) if recorded != t0 => Err(format!(
+                    "{site} refused: the snapshot records creation timestamp {recorded}, \
+                     the scp_context_params (0xFF02) extension commits {t0} \
+                     (§5.13.3 rules 7, 9)"
+                )),
+                _ => Ok(t0),
+            }
+        }
         Ok(None) => Err(format!(
             "{site} refused: the MLS group carries no scp_context_params (0xFF02) \
              group-context extension — not an SCP context (§5.13.3 rule 1)"
@@ -2306,24 +2333,26 @@ pub async fn import_context(
     // future-dated epoch could floor-reject a later LEGITIMATE import/restore of
     // the same context_id (griefing/DoS). This check only reads the (already
     // signature-validated) `creation_timestamp_secs` and the local clock, both
-    // available immediately. A small clock-skew tolerance mirrors the anti-spam
-    // snapshot validators below so a benignly-ahead exporter clock is not
-    // rejected. (Forged `TtlExtended` EXTENSION leaves beyond consent remain the
+    // available immediately. The tolerance is the §9.8.2 future bound that spec
+    // 05 §5.13.3 rule 9 applies to the committed creation timestamp, so this
+    // side-effect-free pre-check and the binding check below agree; a keyless
+    // import, which has no committed value, is bounded by this check alone. (Forged `TtlExtended` EXTENSION leaves beyond consent remain the
     // creator-trust boundary cross-member convergence catches — the
     // import-legibility follow-up, #2102.)
     {
         let now_for_future_date_gate = deps.clock.now_secs();
         if export.snapshot.creation_timestamp_secs
             > now_for_future_date_gate
-                .saturating_add(scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS)
+                .saturating_add(scp_protocol::context::CREATION_TIMESTAMP_FUTURE_BOUND_SECS)
         {
             return Err(ContextError::PersistenceFailed(format!(
                 "import: creation_timestamp_secs {} is future-dated beyond import time {} \
-                 (+{}s skew tolerance) — refusing a malformed export that could smuggle a \
-                 long TTL key-destruction deadline (ADR-049 §9)",
+                 (+{}s, the §9.8.2 future bound spec 05 §5.13.3 rule 9 applies) — refusing \
+                 a malformed export that could smuggle a long TTL key-destruction deadline \
+                 (ADR-049 §9)",
                 export.snapshot.creation_timestamp_secs,
                 now_for_future_date_gate,
-                scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+                scp_protocol::context::CREATION_TIMESTAMP_FUTURE_BOUND_SECS,
             )));
         }
     }
@@ -2519,27 +2548,41 @@ pub async fn import_context(
     // keyless (needs-reconnect) snapshot has `None` owned material and no group to
     // bind, so it is skipped — its group arrives later via a reconnect Welcome,
     // which verifies on the join path.
-    if let Some(owned) = &imported_owned
-        && let Err(reason) = verify_scp_context_binding(
-            owned
-                .mls_group
-                .group_context_extension()
-                .map_err(|e| e.to_string()),
-            &context_id,
-            export.snapshot.role_state.creator_did.as_str(),
-            &export.snapshot.context_params,
-            "context import",
-        )
-    {
-        // On rejection the `imported_owned` material is dropped here (the
-        // `SenderKey` and the `ScpMlsGroup`'s signer zeroize on drop) so no forged
-        // crypto is seeded; fail-closed by construction - the
-        // rejected crypto is never seeded onto the actor and no durable snapshot is
-        // written (there is no longer a provider `taken_context_ids` marker; #2148
-        // deleted it). Read the extension from the OWNED group (ADR-049 PR-7 C3 - no
-        // longer provider-resident).
-        return Err(ContextError::ImportRejected { reason });
-    }
+    //
+    // The check returns the committed `T0` (§5.13.3 rule 9), which becomes the
+    // pseudonym-rotation base and the TTL base below. A keyless import has no
+    // committed extension, so `committed_t0` is `None`: it runs no rotation
+    // schedule, and its local TTL close uses the deadline its snapshot records
+    // (rule 9's keyless clause).
+    let committed_t0 = match &imported_owned {
+        None => None,
+        Some(owned) => Some(
+            verify_scp_context_binding(
+                owned
+                    .mls_group
+                    .group_context_extension()
+                    .map_err(|e| e.to_string()),
+                &context_id,
+                export.snapshot.role_state.creator_did.as_str(),
+                &export.snapshot.context_params,
+                deps.clock.now_secs(),
+                Some(export.snapshot.creation_timestamp_secs),
+                "context import",
+            )
+            // On rejection the `imported_owned` material is dropped by this early
+            // return (the `SenderKey` and the `ScpMlsGroup`'s signer zeroize on
+            // drop), so no forged crypto is seeded onto an actor and no durable
+            // snapshot is written. The extension is read from the OWNED group
+            // (ADR-049 PR-7 C3 - no longer provider-resident).
+            .map_err(|reason| ContextError::ImportRejected { reason })?,
+        ),
+    };
+    // The TTL base (§5.13.3 rule 9): the committed `T0`, which the binding check
+    // above proved equal to the snapshot's `creation_timestamp_secs`. A keyless
+    // import has no committed value; its local TTL close uses the deadline its
+    // snapshot records, `creation_timestamp_secs + ttl` (rule 9's keyless
+    // clause).
+    let ttl_base_secs = committed_t0.unwrap_or(export.snapshot.creation_timestamp_secs);
 
     // 3. Import event log data if present.
     if !export.event_log_data.is_empty() {
@@ -2736,8 +2779,9 @@ pub async fn import_context(
         // top of `import_context` (the E3 future-date gate) — the durable fix that
         // replaced pass-4d's in-memory `min(genesis_ts, import_now)` genesis-leaf
         // clamp (which was reversed on the next restart). There is NO clamp on
-        // this path anymore; the reject is the whole guard.
-        creation_timestamp_secs: export.snapshot.creation_timestamp_secs,
+        // this path anymore; the reject is the whole guard. The value is the
+        // committed `T0` whenever the import carries a group (§5.13.3 rule 9).
+        creation_timestamp_secs: ttl_base_secs,
         generation: 0, // assigned by SupervisorHandle on insert.
         handle: handle.clone(),
         membership: export.snapshot.membership,
@@ -2891,11 +2935,12 @@ pub async fn import_context(
             stream_reservations: HashMap::new(),
             // §9.10.4.1: rotation state is local to the member that rotated; the
             // importer starts with its own routing ID and follows the schedule
-            // from the import time.
+            // counted from the committed `T0` (§5.13.3 rule 9), or none when the
+            // import is keyless.
             pseudonym_rotation:
                 crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
                     handle.params().pseudonym_rotation.as_ref(),
-                    Some(export.snapshot.creation_timestamp_secs),
+                    committed_t0,
                     deps.clock.now_secs(),
                 ),
         },
@@ -2974,11 +3019,14 @@ pub async fn import_context(
     // member's log carries no such leaf); durable leaf-level authz is deferred
     // with the rest of the import-legibility surface (#2102). The base-future-
     // dating + pruning vectors pass-4d listed here are CLOSED (E1/E3).
+    //
+    // The base is `ttl_base_secs`: the committed `T0`, or the snapshot's
+    // recorded creation timestamp on a keyless import (see its definition).
     let import_log_entries: Vec<scp_event_log::Event> =
         rmp_serde::from_slice(&export.event_log_data).unwrap_or_default();
     if let Some(deadline) = crate::context::ttl_close_helpers::convergent_ttl_deadline(
         &import_log_entries,
-        export.snapshot.creation_timestamp_secs,
+        ttl_base_secs,
         handle.params().ttl.map(|t| t.as_secs()),
     ) {
         deps.supervisor
@@ -3162,32 +3210,6 @@ pub async fn restore_context(
         now_for_cooldown,
         "restore",
     );
-    // Resolve the ABSOLUTE convergent TTL re-arm deadline through the partitioned
-    // single-source deadline (§5.10 / §5.10.1, ADR-049 §9). The create BASE and
-    // PROMOTION come from the PRUNE-IMMUNE snapshot (`creation_timestamp_secs` +
-    // `params.ttl`): a finite `params.ttl` ⇒ base `creation + ttl`; a promoted
-    // context has `params.ttl == None` ⇒ `None` (no re-arm), and that promotion
-    // signal survives even a fully-pruned log. The prunable event log (hydrated by
-    // `restore_event_log_best_effort` above) is read ONLY for the fail-safe
-    // `TtlExtended` extension term (losing one only shortens). This REPLACES the
-    // old trio of independent sources: the persisted `ttl_deadline_secs` scalar
-    // (now a runtime cache, re-derived here, not trusted), the `creation + ttl`
-    // `.or_else` fallback, and the `memory_scope != Full` gate at the dispatch
-    // site (H1). `creation_timestamp_secs` is captured here — before the
-    // per-context builder consumes `ctx_snapshot` fields — off the `Copy` field.
-    let restore_ctx_id_bytes = context_id_to_bytes(context_id);
-    let restore_creation_ts = ctx_snapshot.creation_timestamp_secs;
-    let restore_log_entries = deps
-        .event_log
-        .event_log_entries(&restore_ctx_id_bytes)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let restore_ttl_deadline = crate::context::ttl_close_helpers::convergent_ttl_deadline(
-        &restore_log_entries,
-        restore_creation_ts,
-        handle.params().ttl.map(|t| t.as_secs()),
-    );
 
     let governance_engine =
         restore_governance_engine_from_snapshot(&ctx_snapshot, Arc::clone(&deps.key_resolver))?;
@@ -3206,6 +3228,9 @@ pub async fn restore_context(
     // The actor is the SOLE crypto authority by construction; there is no
     // provider-resident second home to tear down first.
     let mut restored_owned: Option<crate::crypto::mls::provider::OwnedMlsCryptoState> = None;
+    // The committed `T0` (§5.13.3 rule 9) the binding check below returns;
+    // `None` for a keyless (needs-reconnect) snapshot, which carries no group.
+    let mut restore_committed_t0: Option<u64> = None;
     if !ctx_snapshot.mls_crypto_state.is_empty() {
         let ctx_id_bytes = context_id_to_bytes(context_id);
 
@@ -3267,21 +3292,55 @@ pub async fn restore_context(
         // `SenderKey` and the group's signer zeroize on drop);
         // fail-closed by construction - the rejected crypto is never seeded, so no
         // divergent crypto persists (no provider taken-marker exists post-#2148).
-        if let Err(reason) = verify_scp_context_binding(
-            owned
-                .mls_group
-                .group_context_extension()
-                .map_err(|e| e.to_string()),
-            context_id,
-            ctx_snapshot.role_state.creator_did.as_str(),
-            &ctx_snapshot.context_params,
-            "context restore",
-        ) {
-            return Err(ContextError::PersistenceFailed(reason));
-        }
+        // The check also returns the committed `T0` (§5.13.3 rule 9), refusing a
+        // snapshot whose recorded creation timestamp differs from it.
+        restore_committed_t0 = Some(
+            verify_scp_context_binding(
+                owned
+                    .mls_group
+                    .group_context_extension()
+                    .map_err(|e| e.to_string()),
+                context_id,
+                ctx_snapshot.role_state.creator_did.as_str(),
+                &ctx_snapshot.context_params,
+                deps.clock.now_secs(),
+                Some(ctx_snapshot.creation_timestamp_secs),
+                "context restore",
+            )
+            .map_err(ContextError::PersistenceFailed)?,
+        );
 
         restored_owned = Some(owned);
     }
+
+    // Resolve the ABSOLUTE convergent TTL re-arm deadline through the partitioned
+    // single-source deadline (§5.10 / §5.10.1, ADR-049 §9), AFTER the binding
+    // check above, so the base is the committed `T0` (§5.13.3 rule 9) that check
+    // proved equal to the snapshot's `creation_timestamp_secs`. A keyless
+    // snapshot has no committed value; its local TTL close uses the deadline the
+    // snapshot records, `creation_timestamp_secs + ttl` (rule 9's keyless
+    // clause). PROMOTION comes from the PRUNE-IMMUNE snapshot `params.ttl`: a
+    // finite `params.ttl` ⇒ base `T0 + ttl`; a promoted context has
+    // `params.ttl == None` ⇒ `None` (no re-arm), and that promotion signal
+    // survives even a fully-pruned log. The prunable event log (hydrated by
+    // `restore_event_log_best_effort` above) is read ONLY for the fail-safe
+    // `TtlExtended` extension term (losing one only shortens). The persisted
+    // `ttl_deadline_secs` scalar is a runtime cache, re-derived here, not
+    // trusted, and no `memory_scope != Full` gate applies at the dispatch site
+    // (H1).
+    let restore_ttl_base_secs =
+        restore_committed_t0.unwrap_or(ctx_snapshot.creation_timestamp_secs);
+    let restore_log_entries = deps
+        .event_log
+        .event_log_entries(&context_id_to_bytes(context_id))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let restore_ttl_deadline = crate::context::ttl_close_helpers::convergent_ttl_deadline(
+        &restore_log_entries,
+        restore_ttl_base_secs,
+        handle.params().ttl.map(|t| t.as_secs()),
+    );
 
     let last_members: HashSet<scp_did::DID> = ctx_snapshot
         .membership
@@ -3418,7 +3477,9 @@ pub async fn restore_context(
         // leaf stays convergent across members (§7.3.1, §9.9.3). The TTL timer is
         // re-armed below on the ABSOLUTE convergent deadline (the persisted
         // `ttl_deadline_secs`, or the `creation + ttl` fallback).
-        creation_timestamp_secs: ctx_snapshot.creation_timestamp_secs,
+        // The committed `T0`, or the snapshot's value on a keyless restore
+        // (§5.13.3 rule 9).
+        creation_timestamp_secs: restore_ttl_base_secs,
         // Placeholder — `spawn_actor_with_state` overwrites this
         // unconditionally with a fresh monotonic `spawn_generation`
         // (AtomicU64; first spawn = 1) before the state crosses into the
@@ -3579,8 +3640,12 @@ pub async fn restore_context(
             // for the persisted epoch (the actor's rotation arm signals the
             // driver until the publish succeeds), and a previous routing ID whose
             // grace ended while the node was down is discarded by the grace arm
-            // on the first actor turn.
-            pseudonym_rotation: ctx_snapshot.pseudonym_rotation,
+            // on the first actor turn. `T0` is the committed value (§5.13.3 rule
+            // 9), never the snapshot's copy; a keyless restore holds none and
+            // follows no interval schedule until reconnection.
+            pseudonym_rotation: ctx_snapshot
+                .pseudonym_rotation
+                .with_schedule_t0(restore_committed_t0),
         },
         welcome_scratchpad: None,
         lifecycle_state: ContextLifecycleState::Open,

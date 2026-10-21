@@ -61,6 +61,20 @@ use super::roles::CapabilityCeiling;
 /// `scp-mls` layer a single canonical source for the constant.
 pub const SCP_CONTEXT_EXTENSION_TYPE_ID: u16 = 0xFF02;
 
+/// The largest `creation_timestamp_secs` an `0xFF02` extension may carry.
+///
+/// The value is 2^53 − 1 (spec §5.13.3 "Serialization"). RFC 8785 writes every
+/// number as an IEEE 754 double, which holds every integer up to this value
+/// exactly.
+pub const MAX_CREATION_TIMESTAMP_SECS: u64 = (1 << 53) - 1;
+
+/// How far past a member's own clock a committed `creation_timestamp_secs`
+/// may lie.
+///
+/// This is the 5-minute future bound of `09-security-model.md` §9.8.2, which
+/// spec §5.13.3 rule 9 applies to the committed creation timestamp.
+pub const CREATION_TIMESTAMP_FUTURE_BOUND_SECS: u64 = 300;
+
 // ---------------------------------------------------------------------------
 // ScpContextBindingError
 // ---------------------------------------------------------------------------
@@ -147,6 +161,29 @@ pub enum ScpContextBindingError {
         reason: String,
     },
 
+    /// Spec §5.13.3 "Serialization": `creation_timestamp_secs` is above
+    /// [`MAX_CREATION_TIMESTAMP_SECS`] (2^53 − 1), a value RFC 8785 cannot
+    /// write exactly.
+    #[error("creation_timestamp_secs {value} exceeds 2^53 - 1")]
+    CreationTimestampOutOfRange {
+        /// The out-of-range creation timestamp.
+        value: u64,
+    },
+
+    /// Spec §5.13.3 rule 9: `creation_timestamp_secs` lies later than the
+    /// member's clock plus [`CREATION_TIMESTAMP_FUTURE_BOUND_SECS`].
+    #[error(
+        "creation_timestamp_secs {value} lies more than {bound_secs} s after the member's clock {now_secs}"
+    )]
+    CreationTimestampInFuture {
+        /// The committed creation timestamp.
+        value: u64,
+        /// The member's clock, in Unix seconds.
+        now_secs: u64,
+        /// The future bound, [`CREATION_TIMESTAMP_FUTURE_BOUND_SECS`].
+        bound_secs: u64,
+    },
+
     /// Canonical (JCS) serialization of the extension or a hash input failed.
     #[error("canonical serialization failed: {0}")]
     SerializationFailed(String),
@@ -183,6 +220,14 @@ pub struct ScpContextExtension {
     /// (e.g. the `SingleAdmin` admin). Admin transfers are NOT tracked here —
     /// they apply from the authenticated event log after join.
     pub creator_did: DID,
+    /// `T0`: the Unix-seconds `timestamp` the creator stamped on the context's
+    /// `ContextCreated` event-log leaf (spec §5.13.3 "Creation timestamp"). A
+    /// genesis fact no Commit changes. Members install it as the base of the
+    /// pseudonym rotation schedule (`09-security-model.md` §9.10.4.1) and of
+    /// the TTL deadline (§5.10) under rule 9. At most
+    /// [`MAX_CREATION_TIMESTAMP_SECS`]; required on the wire, so an extension
+    /// that omits it does not decode.
+    pub creation_timestamp_secs: u64,
     /// Context processing mode: `0` = Encrypted, `1` = Broadcast
     /// (matches [`ContextMode`] discriminants).
     pub context_mode: u8,
@@ -200,42 +245,79 @@ pub struct ScpContextExtension {
     pub parent_governance_hash: Option<[u8; 32]>,
 }
 
+/// The genesis facts every [`ScpContextExtension`] constructor commits (spec
+/// §5.13.3): the context's identity, its genesis creator, its creation
+/// timestamp, and the parameters the hashes bind.
+#[derive(Debug, Clone)]
+pub struct ScpContextGenesis<'a> {
+    /// The SCP context ID (rule 2).
+    pub context_id: ContextId,
+    /// The group's genesis creator/admin (rule 8).
+    pub creator_did: DID,
+    /// The `timestamp` of the context's `ContextCreated` leaf, `T0` (rule 9).
+    /// At most [`MAX_CREATION_TIMESTAMP_SECS`].
+    pub creation_timestamp_secs: u64,
+    /// The context mode (rule 4).
+    pub mode: ContextMode,
+    /// The governance model `governance_policy_hash` commits (rule 3).
+    pub governance: &'a GovernanceModel,
+    /// The ceiling mutability policy (rule 4).
+    pub ceiling_policy: CeilingPolicy,
+    /// The capability ceiling `ceiling_hash` commits (rule 4).
+    pub ceiling: &'a CapabilityCeiling,
+}
+
+impl ScpContextGenesis<'_> {
+    /// Builds the extension with the given parent data, after rejecting a
+    /// creation timestamp above [`MAX_CREATION_TIMESTAMP_SECS`].
+    fn into_extension(
+        self,
+        parent_context_ids: Vec<ContextId>,
+        parent_governance_hash: Option<[u8; 32]>,
+    ) -> Result<ScpContextExtension, ScpContextBindingError> {
+        check_creation_timestamp_range(self.creation_timestamp_secs)?;
+        Ok(ScpContextExtension {
+            context_id: self.context_id,
+            creator_did: self.creator_did,
+            creation_timestamp_secs: self.creation_timestamp_secs,
+            context_mode: self.mode as u8,
+            governance_policy_hash: jcs_sha256(self.governance)?,
+            ceiling_policy: self.ceiling_policy as u8,
+            ceiling_hash: jcs_sha256(self.ceiling)?,
+            parent_context_ids,
+            parent_governance_hash,
+        })
+    }
+}
+
+/// Rejects a creation timestamp above [`MAX_CREATION_TIMESTAMP_SECS`].
+const fn check_creation_timestamp_range(value: u64) -> Result<(), ScpContextBindingError> {
+    if value > MAX_CREATION_TIMESTAMP_SECS {
+        return Err(ScpContextBindingError::CreationTimestampOutOfRange { value });
+    }
+    Ok(())
+}
+
 impl ScpContextExtension {
     /// Builds the extension for a **root** context (no parents).
     ///
-    /// `creator_did` is the group's genesis creator/admin (rule 8). Per
-    /// validation rule 6, `parent_context_ids` is empty and
+    /// Per validation rule 6, `parent_context_ids` is empty and
     /// `parent_governance_hash` is `None`.
     ///
     /// # Errors
     ///
-    /// Returns [`ScpContextBindingError::SerializationFailed`] if the governance
+    /// Returns [`ScpContextBindingError::CreationTimestampOutOfRange`] if
+    /// `genesis.creation_timestamp_secs` exceeds [`MAX_CREATION_TIMESTAMP_SECS`],
+    /// or [`ScpContextBindingError::SerializationFailed`] if the governance
     /// model or capability ceiling cannot be canonically serialized.
-    pub fn for_root(
-        context_id: ContextId,
-        creator_did: DID,
-        mode: ContextMode,
-        governance: &GovernanceModel,
-        ceiling_policy: CeilingPolicy,
-        ceiling: &CapabilityCeiling,
-    ) -> Result<Self, ScpContextBindingError> {
-        Ok(Self {
-            context_id,
-            creator_did,
-            context_mode: mode as u8,
-            governance_policy_hash: jcs_sha256(governance)?,
-            ceiling_policy: ceiling_policy as u8,
-            ceiling_hash: jcs_sha256(ceiling)?,
-            parent_context_ids: Vec::new(),
-            parent_governance_hash: None,
-        })
+    pub fn for_root(genesis: ScpContextGenesis<'_>) -> Result<Self, ScpContextBindingError> {
+        genesis.into_extension(Vec::new(), None)
     }
 
     /// Builds the extension for a **child** context from already-computed parent
     /// data: the parent context IDs and the parent-governance hash (see
     /// [`Self::parent_governance_hash`]).
     ///
-    /// `creator_did` is the group's genesis creator/admin (rule 8).
     /// `parent_context_ids` is normalized (sorted lexicographically, duplicates
     /// removed) so the result always satisfies validation rule 5. A child must
     /// have at least one parent.
@@ -243,17 +325,13 @@ impl ScpContextExtension {
     /// # Errors
     ///
     /// Returns [`ScpContextBindingError::ParentStructureInvalid`] if
-    /// `parent_context_ids` is empty, or
-    /// [`ScpContextBindingError::SerializationFailed`] if the governance model
-    /// or capability ceiling cannot be canonically serialized.
-    #[allow(clippy::too_many_arguments)]
+    /// `parent_context_ids` is empty,
+    /// [`ScpContextBindingError::CreationTimestampOutOfRange`] if
+    /// `genesis.creation_timestamp_secs` exceeds [`MAX_CREATION_TIMESTAMP_SECS`],
+    /// or [`ScpContextBindingError::SerializationFailed`] if the governance
+    /// model or capability ceiling cannot be canonically serialized.
     pub fn for_child(
-        context_id: ContextId,
-        creator_did: DID,
-        mode: ContextMode,
-        governance: &GovernanceModel,
-        ceiling_policy: CeilingPolicy,
-        ceiling: &CapabilityCeiling,
+        genesis: ScpContextGenesis<'_>,
         mut parent_context_ids: Vec<ContextId>,
         parent_governance_hash: [u8; 32],
     ) -> Result<Self, ScpContextBindingError> {
@@ -264,36 +342,22 @@ impl ScpContextExtension {
                 reason: "child context requires at least one parent context id".to_owned(),
             });
         }
-        Ok(Self {
-            context_id,
-            creator_did,
-            context_mode: mode as u8,
-            governance_policy_hash: jcs_sha256(governance)?,
-            ceiling_policy: ceiling_policy as u8,
-            ceiling_hash: jcs_sha256(ceiling)?,
-            parent_context_ids,
-            parent_governance_hash: Some(parent_governance_hash),
-        })
+        genesis.into_extension(parent_context_ids, Some(parent_governance_hash))
     }
 
     /// Convenience constructor for a **child** context that derives the sorted
     /// parent context IDs and the parent-governance hash directly from the
     /// parent references.
     ///
-    /// `creator_did` is the group's genesis creator/admin (rule 8).
-    ///
     /// # Errors
     ///
     /// Returns [`ScpContextBindingError::ParentStructureInvalid`] if `parents`
-    /// is empty, or [`ScpContextBindingError::SerializationFailed`] if any hash
-    /// input cannot be canonically serialized.
+    /// is empty, [`ScpContextBindingError::CreationTimestampOutOfRange`] if
+    /// `genesis.creation_timestamp_secs` exceeds [`MAX_CREATION_TIMESTAMP_SECS`],
+    /// or [`ScpContextBindingError::SerializationFailed`] if any hash input
+    /// cannot be canonically serialized.
     pub fn for_child_from_parents(
-        context_id: ContextId,
-        creator_did: DID,
-        mode: ContextMode,
-        governance: &GovernanceModel,
-        ceiling_policy: CeilingPolicy,
-        ceiling: &CapabilityCeiling,
+        genesis: ScpContextGenesis<'_>,
         parents: &[ParentRef],
     ) -> Result<Self, ScpContextBindingError> {
         if parents.is_empty() {
@@ -303,16 +367,7 @@ impl ScpContextExtension {
         }
         let parent_governance_hash = Self::parent_governance_hash(parents)?;
         let parent_context_ids = parents.iter().map(|p| p.context_id.clone()).collect();
-        Self::for_child(
-            context_id,
-            creator_did,
-            mode,
-            governance,
-            ceiling_policy,
-            ceiling,
-            parent_context_ids,
-            parent_governance_hash,
-        )
+        Self::for_child(genesis, parent_context_ids, parent_governance_hash)
     }
 
     /// Computes `parent_governance_hash` per spec §5.13.3:
@@ -352,10 +407,40 @@ impl ScpContextExtension {
     /// # Errors
     ///
     /// Returns [`ScpContextBindingError::DeserializationFailed`] if the bytes
-    /// are not valid canonical JSON for this type.
+    /// are not valid canonical JSON for this type, including bytes that omit a
+    /// field such as `creation_timestamp_secs` (spec §5.13.3 rule 1), or
+    /// [`ScpContextBindingError::CreationTimestampOutOfRange`] if the decoded
+    /// `creation_timestamp_secs` exceeds [`MAX_CREATION_TIMESTAMP_SECS`].
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ScpContextBindingError> {
-        serde_json::from_slice(bytes)
-            .map_err(|e| ScpContextBindingError::DeserializationFailed(e.to_string()))
+        let extension: Self = serde_json::from_slice(bytes)
+            .map_err(|e| ScpContextBindingError::DeserializationFailed(e.to_string()))?;
+        check_creation_timestamp_range(extension.creation_timestamp_secs)?;
+        Ok(extension)
+    }
+
+    /// The committed `T0` a member installs under spec §5.13.3 rule 9, after
+    /// checking it against the member's clock `now_secs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScpContextBindingError::CreationTimestampOutOfRange`] for a
+    /// value above [`MAX_CREATION_TIMESTAMP_SECS`], or
+    /// [`ScpContextBindingError::CreationTimestampInFuture`] for a value later
+    /// than `now_secs` plus [`CREATION_TIMESTAMP_FUTURE_BOUND_SECS`].
+    pub fn committed_creation_timestamp(
+        &self,
+        now_secs: u64,
+    ) -> Result<u64, ScpContextBindingError> {
+        let value = self.creation_timestamp_secs;
+        check_creation_timestamp_range(value)?;
+        if value > now_secs.saturating_add(CREATION_TIMESTAMP_FUTURE_BOUND_SECS) {
+            return Err(ScpContextBindingError::CreationTimestampInFuture {
+                value,
+                now_secs,
+                bound_secs: CREATION_TIMESTAMP_FUTURE_BOUND_SECS,
+            });
+        }
+        Ok(value)
     }
 
     /// Verifies the extension against a context's declared identity, genesis
@@ -523,6 +608,9 @@ mod tests {
     use scp_did::DID;
     use std::collections::BTreeSet;
 
+    /// The creation timestamp the constructor fixtures commit.
+    const TEST_T0: u64 = 1_700_000_000;
+
     fn did(name: &str) -> DID {
         DID::from(format!("did:dht:z6Mk{name}"))
     }
@@ -564,6 +652,7 @@ mod tests {
         ScpContextExtension {
             context_id: "ctx:root".to_owned(),
             creator_did: DID("did:example:root-creator".to_owned()),
+            creation_timestamp_secs: 1_700_000_000,
             context_mode: 0,
             governance_policy_hash: [0x11; 32],
             ceiling_policy: 0,
@@ -578,6 +667,7 @@ mod tests {
         ScpContextExtension {
             context_id: "ctx:child".to_owned(),
             creator_did: DID("did:example:child-creator".to_owned()),
+            creation_timestamp_secs: 1_700_000_001,
             context_mode: 1,
             governance_policy_hash: [0x33; 32],
             ceiling_policy: 1,
@@ -607,6 +697,7 @@ mod tests {
             "\"ceiling_policy\":0,",
             "\"context_id\":\"ctx:root\",",
             "\"context_mode\":0,",
+            "\"creation_timestamp_secs\":1700000000,",
             "\"creator_did\":\"did:example:root-creator\",",
             "\"governance_policy_hash\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,",
             "17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],",
@@ -623,7 +714,7 @@ mod tests {
             hex::encode(h.finalize())
         };
         assert_eq!(
-            digest, "e97afe19159fd27cb29af7c8815d561ffd4ecca0641f9793192716f1b829b7cd",
+            digest, "1230cd6e542ed91e785362d35e9135acc87e4ed112bfecadefc54601e9e5a07b",
             "root canonical-bytes SHA-256 KAT"
         );
     }
@@ -641,6 +732,7 @@ mod tests {
             "\"ceiling_policy\":1,",
             "\"context_id\":\"ctx:child\",",
             "\"context_mode\":1,",
+            "\"creation_timestamp_secs\":1700000001,",
             "\"creator_did\":\"did:example:child-creator\",",
             "\"governance_policy_hash\":[51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,",
             "51,51,51,51,51,51,51,51,51,51,51,51,51,51,51,51],",
@@ -685,14 +777,15 @@ mod tests {
     fn governance_hash_equals_jcs_sha256() {
         let gov = governance();
         let cap = ceiling(&[Capability::MessagesRead]);
-        let ext = ScpContextExtension::for_root(
-            "ctx:r".to_owned(),
-            creator(),
-            ContextMode::Encrypted,
-            &gov,
-            CeilingPolicy::Immutable,
-            &cap,
-        )
+        let ext = ScpContextExtension::for_root(ScpContextGenesis {
+            context_id: "ctx:r".to_owned(),
+            creator_did: creator(),
+            creation_timestamp_secs: TEST_T0,
+            mode: ContextMode::Encrypted,
+            governance: &gov,
+            ceiling_policy: CeilingPolicy::Immutable,
+            ceiling: &cap,
+        })
         .unwrap();
 
         let bytes = crate::jcs::to_vec(&gov).unwrap();
@@ -708,14 +801,15 @@ mod tests {
     fn ceiling_hash_equals_jcs_sha256() {
         let gov = governance();
         let cap = ceiling(&[Capability::MessagesRead, Capability::MessagesWrite]);
-        let ext = ScpContextExtension::for_root(
-            "ctx:r".to_owned(),
-            creator(),
-            ContextMode::Encrypted,
-            &gov,
-            CeilingPolicy::Immutable,
-            &cap,
-        )
+        let ext = ScpContextExtension::for_root(ScpContextGenesis {
+            context_id: "ctx:r".to_owned(),
+            creator_did: creator(),
+            creation_timestamp_secs: TEST_T0,
+            mode: ContextMode::Encrypted,
+            governance: &gov,
+            ceiling_policy: CeilingPolicy::Immutable,
+            ceiling: &cap,
+        })
         .unwrap();
 
         let bytes = crate::jcs::to_vec(&cap).unwrap();
@@ -732,23 +826,25 @@ mod tests {
         let gov = governance();
         let cap_ab = ceiling(&[Capability::MessagesRead, Capability::MessagesWrite]);
         let cap_ba = ceiling(&[Capability::MessagesWrite, Capability::MessagesRead]);
-        let ext_ab = ScpContextExtension::for_root(
-            "ctx:r".to_owned(),
-            creator(),
-            ContextMode::Encrypted,
-            &gov,
-            CeilingPolicy::Immutable,
-            &cap_ab,
-        )
+        let ext_ab = ScpContextExtension::for_root(ScpContextGenesis {
+            context_id: "ctx:r".to_owned(),
+            creator_did: creator(),
+            creation_timestamp_secs: TEST_T0,
+            mode: ContextMode::Encrypted,
+            governance: &gov,
+            ceiling_policy: CeilingPolicy::Immutable,
+            ceiling: &cap_ab,
+        })
         .unwrap();
-        let ext_ba = ScpContextExtension::for_root(
-            "ctx:r".to_owned(),
-            creator(),
-            ContextMode::Encrypted,
-            &gov,
-            CeilingPolicy::Immutable,
-            &cap_ba,
-        )
+        let ext_ba = ScpContextExtension::for_root(ScpContextGenesis {
+            context_id: "ctx:r".to_owned(),
+            creator_did: creator(),
+            creation_timestamp_secs: TEST_T0,
+            mode: ContextMode::Encrypted,
+            governance: &gov,
+            ceiling_policy: CeilingPolicy::Immutable,
+            ceiling: &cap_ba,
+        })
         .unwrap();
         assert_eq!(ext_ab.ceiling_hash, ext_ba.ceiling_hash);
     }
@@ -759,14 +855,15 @@ mod tests {
 
     #[test]
     fn for_root_has_no_parent_data() {
-        let ext = ScpContextExtension::for_root(
-            "ctx:r".to_owned(),
-            creator(),
-            ContextMode::Broadcast,
-            &governance(),
-            CeilingPolicy::Governed,
-            &ceiling(&[Capability::MessagesRead]),
-        )
+        let ext = ScpContextExtension::for_root(ScpContextGenesis {
+            context_id: "ctx:r".to_owned(),
+            creator_did: creator(),
+            creation_timestamp_secs: TEST_T0,
+            mode: ContextMode::Broadcast,
+            governance: &governance(),
+            ceiling_policy: CeilingPolicy::Governed,
+            ceiling: &ceiling(&[Capability::MessagesRead]),
+        })
         .unwrap();
         assert_eq!(ext.creator_did, creator());
         assert_eq!(ext.context_mode, 1); // Broadcast
@@ -778,12 +875,15 @@ mod tests {
     #[test]
     fn for_child_normalizes_parent_ids_and_sets_hash() {
         let ext = ScpContextExtension::for_child(
-            "ctx:c".to_owned(),
-            creator(),
-            ContextMode::Encrypted,
-            &governance(),
-            CeilingPolicy::Immutable,
-            &ceiling(&[Capability::MessagesRead]),
+            ScpContextGenesis {
+                context_id: "ctx:c".to_owned(),
+                creator_did: creator(),
+                creation_timestamp_secs: TEST_T0,
+                mode: ContextMode::Encrypted,
+                governance: &governance(),
+                ceiling_policy: CeilingPolicy::Immutable,
+                ceiling: &ceiling(&[Capability::MessagesRead]),
+            },
             vec!["ctx:b".to_owned(), "ctx:a".to_owned(), "ctx:b".to_owned()],
             [0x99; 32],
         )
@@ -796,12 +896,15 @@ mod tests {
     #[test]
     fn for_child_rejects_empty_parents() {
         let err = ScpContextExtension::for_child(
-            "ctx:c".to_owned(),
-            creator(),
-            ContextMode::Encrypted,
-            &governance(),
-            CeilingPolicy::Immutable,
-            &ceiling(&[Capability::MessagesRead]),
+            ScpContextGenesis {
+                context_id: "ctx:c".to_owned(),
+                creator_did: creator(),
+                creation_timestamp_secs: TEST_T0,
+                mode: ContextMode::Encrypted,
+                governance: &governance(),
+                ceiling_policy: CeilingPolicy::Immutable,
+                ceiling: &ceiling(&[Capability::MessagesRead]),
+            },
             Vec::new(),
             [0x00; 32],
         )
@@ -819,12 +922,15 @@ mod tests {
             parent_ref("ctx:a", OnSeverPolicy::CascadeClose),
         ];
         let ext = ScpContextExtension::for_child_from_parents(
-            "ctx:c".to_owned(),
-            creator(),
-            ContextMode::Encrypted,
-            &governance(),
-            CeilingPolicy::Immutable,
-            &ceiling(&[Capability::MessagesRead]),
+            ScpContextGenesis {
+                context_id: "ctx:c".to_owned(),
+                creator_did: creator(),
+                creation_timestamp_secs: TEST_T0,
+                mode: ContextMode::Encrypted,
+                governance: &governance(),
+                ceiling_policy: CeilingPolicy::Immutable,
+                ceiling: &ceiling(&[Capability::MessagesRead]),
+            },
             &parents,
         )
         .unwrap();
@@ -888,14 +994,15 @@ mod tests {
     }
 
     fn extension_for(params: &ContextParams, context_id: &str) -> ScpContextExtension {
-        ScpContextExtension::for_root(
-            context_id.to_owned(),
-            creator(),
-            params.mode,
-            &params.governance,
-            params.ceiling_policy,
-            &CapabilityCeiling::new(params.ceiling.iter().cloned()),
-        )
+        ScpContextExtension::for_root(ScpContextGenesis {
+            context_id: context_id.to_owned(),
+            creator_did: creator(),
+            creation_timestamp_secs: TEST_T0,
+            mode: params.mode,
+            governance: &params.governance,
+            ceiling_policy: params.ceiling_policy,
+            ceiling: &CapabilityCeiling::new(params.ceiling.iter().cloned()),
+        })
         .unwrap()
     }
 
@@ -931,14 +1038,15 @@ mod tests {
         // other rule catches the substitution — this is the sole anchor.
         let mut params = params_for(ContextMode::Encrypted, CeilingPolicy::Immutable);
         params.governance = GovernanceModel::SingleAdmin;
-        let ext = ScpContextExtension::for_root(
-            "ctx:r".to_owned(),
-            did("Alice"),
-            params.mode,
-            &params.governance,
-            params.ceiling_policy,
-            &CapabilityCeiling::new(params.ceiling.iter().cloned()),
-        )
+        let ext = ScpContextExtension::for_root(ScpContextGenesis {
+            context_id: "ctx:r".to_owned(),
+            creator_did: did("Alice"),
+            creation_timestamp_secs: TEST_T0,
+            mode: params.mode,
+            governance: &params.governance,
+            ceiling_policy: params.ceiling_policy,
+            ceiling: &CapabilityCeiling::new(params.ceiling.iter().cloned()),
+        })
         .unwrap();
         let err = ext
             .verify_against(&"ctx:r".to_owned(), &did("Mallory"), &params)
@@ -1064,12 +1172,15 @@ mod tests {
     fn verify_against_accepts_well_formed_child() {
         let params = params_for(ContextMode::Encrypted, CeilingPolicy::Immutable);
         let ext = ScpContextExtension::for_child(
-            "ctx:c".to_owned(),
-            creator(),
-            params.mode,
-            &params.governance,
-            params.ceiling_policy,
-            &CapabilityCeiling::new(params.ceiling.iter().cloned()),
+            ScpContextGenesis {
+                context_id: "ctx:c".to_owned(),
+                creator_did: creator(),
+                creation_timestamp_secs: TEST_T0,
+                mode: params.mode,
+                governance: &params.governance,
+                ceiling_policy: params.ceiling_policy,
+                ceiling: &CapabilityCeiling::new(params.ceiling.iter().cloned()),
+            },
             vec!["ctx:a".to_owned(), "ctx:b".to_owned()],
             [0x01; 32],
         )
@@ -1077,6 +1188,168 @@ mod tests {
         assert!(
             ext.verify_against(&"ctx:c".to_owned(), &creator(), &params)
                 .is_ok()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // creation_timestamp_secs (spec §5.13.3 "Creation timestamp", rule 9)
+    // -----------------------------------------------------------------------
+
+    /// A genesis whose creation timestamp is `creation_timestamp_secs`.
+    fn genesis_at<'a>(
+        creation_timestamp_secs: u64,
+        gov: &'a GovernanceModel,
+        cap: &'a CapabilityCeiling,
+    ) -> ScpContextGenesis<'a> {
+        ScpContextGenesis {
+            context_id: "ctx:t".to_owned(),
+            creator_did: creator(),
+            creation_timestamp_secs,
+            mode: ContextMode::Encrypted,
+            governance: gov,
+            ceiling_policy: CeilingPolicy::Immutable,
+            ceiling: cap,
+        }
+    }
+
+    /// The parents the child-constructor cases use.
+    fn two_parents() -> Vec<ParentRef> {
+        vec![
+            parent_ref("ctx:a", OnSeverPolicy::CascadeClose),
+            parent_ref("ctx:b", OnSeverPolicy::CascadeClose),
+        ]
+    }
+
+    #[test]
+    fn every_constructor_commits_the_genesis_creation_timestamp() {
+        let gov = governance();
+        let cap = ceiling(&[Capability::MessagesRead]);
+        let root = ScpContextExtension::for_root(genesis_at(TEST_T0, &gov, &cap)).unwrap();
+        let child = ScpContextExtension::for_child(
+            genesis_at(TEST_T0, &gov, &cap),
+            vec!["ctx:a".to_owned()],
+            [0x01; 32],
+        )
+        .unwrap();
+        let from_parents = ScpContextExtension::for_child_from_parents(
+            genesis_at(TEST_T0, &gov, &cap),
+            &two_parents(),
+        )
+        .unwrap();
+        for ext in [root, child, from_parents] {
+            assert_eq!(ext.creation_timestamp_secs, TEST_T0);
+            let decoded =
+                ScpContextExtension::from_canonical_bytes(&ext.to_canonical_bytes().unwrap())
+                    .unwrap();
+            assert_eq!(decoded.creation_timestamp_secs, TEST_T0);
+        }
+    }
+
+    #[test]
+    fn every_constructor_accepts_two_to_the_53_minus_one() {
+        let gov = governance();
+        let cap = ceiling(&[Capability::MessagesRead]);
+        let max = MAX_CREATION_TIMESTAMP_SECS;
+        assert_eq!(max, 9_007_199_254_740_991);
+        let ext = ScpContextExtension::for_root(genesis_at(max, &gov, &cap)).unwrap();
+        let decoded =
+            ScpContextExtension::from_canonical_bytes(&ext.to_canonical_bytes().unwrap()).unwrap();
+        assert_eq!(decoded.creation_timestamp_secs, max);
+        ScpContextExtension::for_child(
+            genesis_at(max, &gov, &cap),
+            vec!["ctx:a".to_owned()],
+            [1; 32],
+        )
+        .unwrap();
+        ScpContextExtension::for_child_from_parents(genesis_at(max, &gov, &cap), &two_parents())
+            .unwrap();
+    }
+
+    #[test]
+    fn every_constructor_rejects_a_creation_timestamp_above_two_to_the_53_minus_one() {
+        let gov = governance();
+        let cap = ceiling(&[Capability::MessagesRead]);
+        let over = MAX_CREATION_TIMESTAMP_SECS + 1;
+        let expected = ScpContextBindingError::CreationTimestampOutOfRange { value: over };
+        assert_eq!(
+            ScpContextExtension::for_root(genesis_at(over, &gov, &cap)).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            ScpContextExtension::for_child(
+                genesis_at(over, &gov, &cap),
+                vec!["ctx:a".to_owned()],
+                [0x01; 32],
+            )
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            ScpContextExtension::for_child_from_parents(
+                genesis_at(over, &gov, &cap),
+                &two_parents()
+            )
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            ScpContextExtension::for_root(genesis_at(u64::MAX, &gov, &cap)).unwrap_err(),
+            ScpContextBindingError::CreationTimestampOutOfRange { value: u64::MAX }
+        );
+    }
+
+    #[test]
+    fn decoding_rejects_an_extension_without_a_creation_timestamp() {
+        let mut json = serde_json::to_value(root_fixture()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("creation_timestamp_secs")
+            .expect("the fixture carries the field");
+        let bytes = crate::jcs::to_vec(&json).unwrap();
+        let err = ScpContextExtension::from_canonical_bytes(&bytes).unwrap_err();
+        assert!(
+            matches!(&err, ScpContextBindingError::DeserializationFailed(reason)
+                if reason.contains("creation_timestamp_secs")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn decoding_rejects_a_creation_timestamp_above_two_to_the_53_minus_one() {
+        let over = MAX_CREATION_TIMESTAMP_SECS + 1;
+        let ext = ScpContextExtension {
+            creation_timestamp_secs: over,
+            ..root_fixture()
+        };
+        let bytes = serde_json::to_vec(&ext).unwrap();
+        assert_eq!(
+            ScpContextExtension::from_canonical_bytes(&bytes).unwrap_err(),
+            ScpContextBindingError::CreationTimestampOutOfRange { value: over }
+        );
+    }
+
+    #[test]
+    fn the_committed_creation_timestamp_is_bounded_by_the_members_clock() {
+        let now = 1_800_000_000;
+        let at = |value: u64| ScpContextExtension {
+            creation_timestamp_secs: value,
+            ..root_fixture()
+        };
+        assert_eq!(at(now - 1).committed_creation_timestamp(now), Ok(now - 1));
+        let edge = now + CREATION_TIMESTAMP_FUTURE_BOUND_SECS;
+        assert_eq!(at(edge).committed_creation_timestamp(now), Ok(edge));
+        assert_eq!(
+            at(edge + 1).committed_creation_timestamp(now),
+            Err(ScpContextBindingError::CreationTimestampInFuture {
+                value: edge + 1,
+                now_secs: now,
+                bound_secs: 300,
+            })
+        );
+        let over = MAX_CREATION_TIMESTAMP_SECS + 1;
+        assert_eq!(
+            at(over).committed_creation_timestamp(u64::MAX),
+            Err(ScpContextBindingError::CreationTimestampOutOfRange { value: over })
         );
     }
 }

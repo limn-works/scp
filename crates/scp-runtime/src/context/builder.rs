@@ -1055,19 +1055,21 @@ pub(crate) async fn create_context(
             // schedule (spec §5.13.3, finding FFI-02). A root context has no
             // parents. Built before the side-effect-free owned birth so a
             // canonical-encoding failure aborts with nothing to roll back.
-            let context_extension = ScpContextExtension::for_root(
-                context_id,
-                scp_did::DID::from(creator_did.to_owned()),
-                params.mode,
-                &params.governance,
-                params.ceiling_policy,
-                &CapabilityCeiling::new(params.ceiling.clone()),
-            )
-            .map_err(|e| {
-                ContextCreationError::CryptoFailed(format!(
-                    "building scp_context_params extension: {e}"
-                ))
-            })?;
+            let context_extension =
+                ScpContextExtension::for_root(scp_protocol::context::ScpContextGenesis {
+                    context_id,
+                    creator_did: scp_did::DID::from(creator_did.to_owned()),
+                    creation_timestamp_secs,
+                    mode: params.mode,
+                    governance: &params.governance,
+                    ceiling_policy: params.ceiling_policy,
+                    ceiling: &CapabilityCeiling::new(params.ceiling.clone()),
+                })
+                .map_err(|e| {
+                    ContextCreationError::CryptoFailed(format!(
+                        "building scp_context_params extension: {e}"
+                    ))
+                })?;
             // Owned birth. On `Err` the `?` drops nothing — no group / sender
             // key was installed into any provider map.
             Some(crypto.create_mls_group_with_context(&context_extension, wrapping_public_key)?)
@@ -1595,6 +1597,89 @@ mod tests {
             registered_at: 0,
             signature: Vec::new(),
         }
+    }
+
+    /// Creates an encrypted context at `creation_ts` and returns its owned
+    /// crypto (or the creation error) with its event log.
+    async fn create_at(
+        seed: u8,
+        creation_ts: u64,
+    ) -> (
+        Result<Option<crate::crypto::mls::provider::OwnedMlsCryptoState>, ContextCreationError>,
+        crate::context::providers::MerkleEventLogProvider,
+        [u8; 32],
+    ) {
+        let id = hex::encode([seed; 32]);
+        let id_bytes = context_id_bytes(&id);
+        let crypto = NodeMlsFactory::new(
+            TEST_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        );
+        let provider = crate::context::providers::MerkleEventLogProvider::new();
+        let result = create_context(
+            id,
+            ceilinged_params(),
+            &crypto,
+            &TestTransport,
+            &provider,
+            ContextCreator {
+                did: TEST_DID,
+                wrapping_public_key: scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
+            },
+            creation_ts,
+        )
+        .await
+        .map(|(_, owned)| owned);
+        (result, provider, id_bytes)
+    }
+
+    /// Spec 05 §5.13.3 "Creation timestamp": the creator's `0xFF02` extension
+    /// commits `creation_timestamp_secs` equal to the `timestamp` of its
+    /// `ContextCreated` leaf.
+    #[tokio::test]
+    async fn the_created_group_commits_the_context_created_leaf_timestamp() {
+        const CREATION_TS: u64 = 1_700_000_123;
+        let (result, provider, id_bytes) = create_at(0x3c, CREATION_TS).await;
+        let owned = result
+            .expect("create_context succeeds")
+            .expect("an encrypted context births an MLS group");
+        let committed = owned
+            .mls_group
+            .group_context_extension()
+            .expect("the extension reads")
+            .expect("the group carries the 0xFF02 extension")
+            .creation_timestamp_secs;
+        let entries = provider
+            .event_log_entries(&id_bytes)
+            .expect("entries readable")
+            .expect("log exists");
+        let created = entries
+            .iter()
+            .find(|e| e.event_type == scp_event_log::EventType::ContextCreated)
+            .expect("the log holds the ContextCreated leaf");
+        assert_eq!(committed, created.timestamp);
+        assert_eq!(committed, CREATION_TS);
+    }
+
+    /// Spec 05 §5.13.3 "Serialization": creation refuses a creation timestamp
+    /// above 2^53 − 1 and births no event log.
+    #[tokio::test]
+    async fn creation_refuses_a_creation_timestamp_above_two_to_the_53_minus_one() {
+        let (result, provider, id_bytes) =
+            create_at(0x3d, scp_protocol::context::MAX_CREATION_TIMESTAMP_SECS + 1).await;
+        let Err(ContextCreationError::CryptoFailed(reason)) = result else {
+            panic!("expected a CryptoFailed refusal");
+        };
+        assert!(reason.contains("exceeds 2^53 - 1"), "{reason}");
+        assert!(
+            provider
+                .event_log_entries(&id_bytes)
+                .expect("entries readable")
+                .is_none(),
+            "a refused creation leaves no event log"
+        );
     }
 
     /// §5.1/§5.12 (GitHub #2020): outlets declared in `ContextParams.outlets` at

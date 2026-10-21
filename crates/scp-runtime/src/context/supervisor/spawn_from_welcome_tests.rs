@@ -67,6 +67,10 @@ const BOB_DID: &str = "did:dht:z6MkBobSpawnFromWelcomeJoiner";
 /// creator-substitution regression: she forges an invitation bundle naming
 /// herself as `creator_did` and signs it with her OWN key.
 const MALLORY_DID: &str = "did:dht:z6MkMalloryCreatorSubstitution";
+/// The creation timestamp the hand-built `0xFF02` fixtures commit (spec 05
+/// §5.13.3 "Creation timestamp"); earlier than every test clock, so the
+/// §9.8.2 future bound never rejects it.
+const FIXTURE_T0: u64 = 1_700_000_000;
 
 /// Alice (creator) fixed signing key. `ALICE_DID` resolves to its verifying key
 /// via [`pair_resolver`], so a joiner can verify the creator-signed invitation
@@ -269,14 +273,15 @@ fn honest_ext(context_id: &str, params: &ContextParams) -> ScpContextExtension {
     // The honest creator committed into the group's `0xFF02` extension is
     // `ALICE_DID` (rule 8) — the same DID the honest bundle carries as
     // `creator_did`, so the join's creator binding passes.
-    ScpContextExtension::for_root(
-        context_id.to_owned(),
-        DID::from(ALICE_DID),
-        params.mode,
-        &params.governance,
-        params.ceiling_policy,
-        &CapabilityCeiling::new(params.ceiling.iter().cloned()),
-    )
+    ScpContextExtension::for_root(scp_protocol::context::ScpContextGenesis {
+        context_id: context_id.to_owned(),
+        creator_did: DID::from(ALICE_DID),
+        creation_timestamp_secs: FIXTURE_T0,
+        mode: params.mode,
+        governance: &params.governance,
+        ceiling_policy: params.ceiling_policy,
+        ceiling: &CapabilityCeiling::new(params.ceiling.iter().cloned()),
+    })
     .expect("honest context extension serializes")
 }
 
@@ -483,12 +488,26 @@ async fn run_join_with(
     run_join_with_wrapping_key_loss(
         seed,
         persistence,
-        committed,
+        committed.map_or(CreatorGroup::WrappingOnly, |p| {
+            CreatorGroup::Honest(Box::new(p))
+        }),
         request_params,
         request_ctx_id,
         None,
     )
     .await
+}
+
+/// The group Alice creates and adds Bob to in the join ladder.
+enum CreatorGroup {
+    /// A wrapping-only group with NO `0xFF02` extension (not an SCP context).
+    WrappingOnly,
+    /// An honest SCP context group whose `0xFF02` extension binds these params
+    /// under the group's `context_id` ([`honest_ext`]).
+    Honest(Box<ContextParams>),
+    /// A group whose `0xFF02` `ExtensionData` is these raw bytes: an extension
+    /// a conforming creator never writes.
+    Raw(Vec<u8>),
 }
 
 /// When a join test makes Bob's wrapping custody lose his wrapping key.
@@ -507,7 +526,7 @@ enum WrappingKeyLoss {
 async fn run_join_with_wrapping_key_loss(
     seed: u8,
     persistence: Option<Box<dyn ContextPersistence>>,
-    committed: Option<ContextParams>,
+    creator_group: CreatorGroup,
     request_params: ContextParams,
     request_ctx_id: Option<String>,
     loss: Option<WrappingKeyLoss>,
@@ -559,34 +578,27 @@ async fn run_join_with_wrapping_key_loss(
     let (reservation_id, kp_public_bytes) = reserve_bob_kp(&sup, &bob).await;
 
     // Alice (bare creator provider) creates the group and adds Bob's reserved
-    // KP, producing the real Welcome addressed to that KP's init key. When
-    // `committed` is `Some`, the group carries the honest `0xFF02` extension;
-    // otherwise it is a wrapping-only (non-SCP) group.
+    // KP, producing the real Welcome addressed to that KP's init key. The
+    // group's `0xFF02` extension is the one `creator_group` names.
     let alice_crypto = Arc::new(NodeMlsFactory::new(
         ALICE_DID.to_owned(),
         std::sync::Arc::new(scp_clock::SystemClock),
     ));
-    let alice_owned = committed.as_ref().map_or_else(
-        || {
-            alice_crypto
-                .create_bare_group_owned(
-                    scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
-                        .0
-                        .as_bytes(),
-                )
-                .expect("alice creates a wrapping-only group (no 0xFF02)")
-        },
-        |committed_params| {
-            alice_crypto
-                .create_mls_group_with_context(
-                    &honest_ext(&group_ctx_id, committed_params),
-                    scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
-                        .0
-                        .as_bytes(),
-                )
-                .expect("alice creates the SCP context group (0xFF02)")
-        },
-    );
+    let alice_wrapping = scp_protocol::crypto::sender_keys::generate_wrapping_keypair().0;
+    let alice_owned = match creator_group {
+        CreatorGroup::WrappingOnly => alice_crypto
+            .create_bare_group_owned(alice_wrapping.as_bytes())
+            .expect("alice creates a wrapping-only group (no 0xFF02)"),
+        CreatorGroup::Honest(committed_params) => alice_crypto
+            .create_mls_group_with_context(
+                &honest_ext(&group_ctx_id, &committed_params),
+                alice_wrapping.as_bytes(),
+            )
+            .expect("alice creates the SCP context group (0xFF02)"),
+        CreatorGroup::Raw(raw) => alice_crypto
+            .create_mls_group_with_raw_context_params(raw, alice_wrapping.as_bytes())
+            .expect("alice creates a group over raw 0xFF02 bytes"),
+    };
     let add_output = alice_welcome_for_bob(&group_ctx_bytes, alice_owned, &kp_public_bytes);
 
     let request_ctx_id = request_ctx_id.unwrap_or_else(|| group_ctx_id.clone());
@@ -2329,6 +2341,82 @@ async fn join_group_without_scp_context_extension_is_refused() {
         rec.store.is_empty(),
         "no snapshot may be persisted after a rule-1 refusal"
     );
+}
+
+/// Runs the join ladder over a group whose `0xFF02` extension is `raw`, under
+/// the group id `ctx_hex(seed)`, and asserts the join is refused with a reason
+/// naming `reason_part`, with no group installed, no actor registered, and no
+/// snapshot persisted (spec 05 §5.13.3 rule 9).
+async fn assert_join_refuses_creator_extension(seed: u8, raw: Vec<u8>, reason_part: &str) {
+    let rec = RecordingPersistence::default();
+    let (result, j) = run_join_with_wrapping_key_loss(
+        seed,
+        Some(Box::new(rec.clone())),
+        CreatorGroup::Raw(raw),
+        joiner_params(),
+        None,
+        None,
+    )
+    .await;
+    let reason = match &result {
+        Err(crate::context::ContextError::CryptoFailed(msg)) => msg.clone(),
+        other => panic!("expected a CryptoFailed refusal, got {other:?}"),
+    };
+    assert!(reason.contains(reason_part), "{reason}");
+    assert_binding_refused_no_side_effects(result, &j, &rec).await;
+}
+
+/// The committed extension of `ctx_hex(seed)` with `creation_timestamp_secs`
+/// set to `t0`, as JSON bytes (JCS refuses to write a value above 2^53 − 1,
+/// which is what a test of that bound needs to present).
+fn extension_bytes_with_t0(seed: u8, t0: u64) -> Vec<u8> {
+    let ext = ScpContextExtension {
+        creation_timestamp_secs: t0,
+        ..honest_ext(&ctx_hex(seed), &joiner_params())
+    };
+    serde_json::to_vec(&ext).expect("extension serializes")
+}
+
+/// §5.13.3 rule 1: an extension that omits `creation_timestamp_secs` is not a
+/// valid `0xFF02` extension, so the joiner refuses the group before install.
+#[tokio::test]
+async fn join_refuses_an_extension_without_a_creation_timestamp() {
+    let seed = 0xd1;
+    let mut json = serde_json::to_value(honest_ext(&ctx_hex(seed), &joiner_params()))
+        .expect("extension to JSON");
+    json.as_object_mut()
+        .expect("extension is a JSON object")
+        .remove("creation_timestamp_secs")
+        .expect("the honest extension carries the field");
+    let raw = scp_protocol::jcs::to_vec(&json).expect("JCS bytes");
+    assert_join_refuses_creator_extension(seed, raw, "creation_timestamp_secs").await;
+}
+
+/// §5.13.3 "Serialization": a committed `creation_timestamp_secs` above
+/// 2^53 − 1 is refused before install.
+#[tokio::test]
+async fn join_refuses_a_creation_timestamp_above_two_to_the_53_minus_one() {
+    let seed = 0xd2;
+    let over = scp_protocol::context::MAX_CREATION_TIMESTAMP_SECS + 1;
+    assert_join_refuses_creator_extension(
+        seed,
+        extension_bytes_with_t0(seed, over),
+        "exceeds 2^53 - 1",
+    )
+    .await;
+}
+
+/// §5.13.3 rule 9: a committed `creation_timestamp_secs` later than the
+/// joiner's clock plus the §9.8.2 future bound is refused before install,
+/// because it would delay the joiner's TTL deadline past the consented TTL.
+#[tokio::test]
+async fn join_refuses_a_creation_timestamp_beyond_the_future_bound() {
+    let seed = 0xd3;
+    let future = scp_clock::Clock::now_secs(&scp_clock::SystemClock)
+        + scp_protocol::context::CREATION_TIMESTAMP_FUTURE_BOUND_SECS
+        + 3_600;
+    assert_join_refuses_creator_extension(seed, extension_bytes_with_t0(seed, future), "rule 9")
+        .await;
 }
 
 // ===========================================================================
@@ -4234,49 +4322,184 @@ async fn spawn_from_welcome_application_data_round_trips_joiner_to_creator() {
     );
 }
 
-/// spec 09 §9.10.4.1 puts the interval boundaries at `T0 + j × interval_secs`,
-/// where `T0` is the creator's stamp. The invitation bundle carries no `T0`, so
-/// a Welcome joiner under an interval policy admits no rotation rather than one
-/// on boundaries counted from its own join time; under a membership-only policy,
-/// whose schedule index is 0, its next epoch is 0.
+/// Waits up to `within` for a `PseudonymRotationDue` on `events` whose epoch
+/// is at least `min` and returns that epoch; `None` on timeout. A signal for
+/// an epoch below `min` is one the actor sent before the test moved the clock.
+async fn next_rotation_due_from(
+    events: &mut tokio::sync::broadcast::Receiver<(
+        String,
+        scp_protocol::context::membership::ContextEvent,
+    )>,
+    within: std::time::Duration,
+    min: u64,
+) -> Option<u64> {
+    tokio::time::timeout(within, async {
+        loop {
+            match events.recv().await {
+                Ok((
+                    _,
+                    scp_protocol::context::membership::ContextEvent::PseudonymRotationDue {
+                        pseudonym_epoch,
+                    },
+                )) if pseudonym_epoch >= min => return pseudonym_epoch,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+/// Spec 05 §5.13.3 rule 9 and spec 09 §9.10.4.1: a Welcome joiner installs
+/// the creator's `T0` from the committed `0xFF02` extension, so it rotates on
+/// the creator's interval boundaries and its TTL counts from `T0`, not from
+/// its join time.
+///
+/// Alice creates at `T0` with a 3600 s interval and a 5 h TTL; Bob joins by
+/// Welcome at `T0 + 3.5 h`, over one shared `TestClock`. Bob's first v2 epoch
+/// is 3, the same epoch Alice's next rotation carries; both signal epoch 4 at
+/// `T0 + 4 h`; Bob's persisted TTL deadline is `T0 + 5 h`, not `T0 + 8.5 h`.
 #[tokio::test]
-async fn a_welcome_joiner_admits_no_interval_rotation_without_the_creators_t0() {
+async fn a_welcome_joiner_rotates_and_expires_on_the_creators_t0() {
+    use scp_clock::Clock as _;
     use scp_protocol::context::params::PseudonymRotationPolicy;
 
-    let with_policy = |interval_secs: Option<u64>, on_membership_change: bool| ContextParams {
+    const INTERVAL: u64 = 3_600;
+    const TTL: u64 = 5 * 3_600;
+    // A real-time `T0`, so the KeyPackage lifetimes the stores mint under the
+    // shared clock stay valid against the MLS layer's own clock.
+    let t0 = scp_clock::SystemClock.now_secs();
+    let clock = Arc::new(scp_clock::TestClock::new(t0));
+    let ctx_id = ctx_hex(0x5A);
+    let alice = DID::from(ALICE_DID);
+    let bob = DID::from(BOB_DID);
+    let params = ContextParams {
         pseudonym_rotation: Some(PseudonymRotationPolicy {
-            interval_secs,
-            on_membership_change,
+            interval_secs: Some(INTERVAL),
+            on_membership_change: false,
         }),
+        ttl: Some(std::time::Duration::from_secs(TTL)),
         ..joiner_params()
     };
 
-    let interval = with_policy(Some(3_600), true);
-    let (result, j) = run_join_with(0x5A, None, Some(interval.clone()), interval, None).await;
-    result.expect("the join under an interval policy succeeds");
-    let ids = j
-        .sup
-        .local_routing_ids(&j.ctx_id)
+    let node = |did: &str, persistence: Option<Box<dyn ContextPersistence>>| {
+        let (tx, rx) = tokio::sync::broadcast::channel(4_096);
+        let sup = Supervisor::with_providers(
+            Arc::new(NodeMlsFactory::new(
+                did.to_owned(),
+                Arc::new(scp_clock::SystemClock),
+            )),
+            Box::new(NotConfiguredTransportProvider),
+            Box::new(MerkleEventLogProvider::new()),
+            pair_resolver(),
+            persistence,
+            None,
+            Some(tx),
+            Some(Arc::clone(&clock) as Arc<dyn scp_clock::Clock>),
+            fresh_mls_storage(),
+        );
+        (sup, rx)
+    };
+    let (alice_sup, mut alice_events) = node(ALICE_DID, None);
+    let bob_store = RecordingPersistence::default();
+    let (bob_sup, mut bob_events) = node(BOB_DID, Some(Box::new(bob_store.clone())));
+
+    alice_sup
+        .create_context(
+            ctx_id.clone(),
+            params,
+            alice.clone(),
+            some_pseudonym(),
+            Vec::new(),
+        )
         .await
-        .expect("routing ids");
-    assert_eq!(ids.pseudonym_epoch, None);
+        .expect("alice creates the context at T0");
+    let (reservation_id, kp_public_bytes) = reserve_bob_kp(&bob_sup, &bob).await;
+
+    clock.set(t0 + 3 * INTERVAL + INTERVAL / 2);
+    let InviteMemberOutcome::Sealed { bundle, .. } = alice_sup
+        .invite_member(
+            ctx_id.clone(),
+            alice.clone(),
+            bob.clone(),
+            kp_public_bytes,
+            &CommandSigner::local_ed25519(alice_signing_key()),
+        )
+        .await
+        .expect("alice invites bob at T0 + 3.5 h");
+    let _ = wrapping_point(&bob_sup, &bob).await;
+    bob_sup
+        .spawn_actor_from_welcome(
+            bob.clone(),
+            WelcomeJoinRequest {
+                context_id: ctx_id.clone(),
+                creator_did: alice.clone(),
+                sealed_bundle_enc: bundle.enc,
+                sealed_bundle_ct: bundle.ciphertext,
+                reservation_id,
+                local_pseudonym: some_pseudonym(),
+            },
+        )
+        .await
+        .expect("bob joins by Welcome at T0 + 3.5 h");
+
+    let alice_ids = alice_sup
+        .local_routing_ids(&ctx_id)
+        .await
+        .expect("alice's routing ids");
+    let bob_ids = bob_sup
+        .local_routing_ids(&ctx_id)
+        .await
+        .expect("bob's routing ids");
     assert_eq!(
-        ids.next_pseudonym_epoch, None,
-        "a joiner without T0 admits no interval-schedule rotation"
+        bob_ids.next_pseudonym_epoch,
+        Some(3),
+        "bob's first v2 epoch is the schedule index floor(3.5 h / 1 h) counted from the creator's T0"
+    );
+    assert_eq!(
+        bob_ids.next_pseudonym_epoch, alice_ids.next_pseudonym_epoch,
+        "the joiner's next epoch equals the creator's"
     );
 
-    let membership = with_policy(None, true);
-    let (result, j) = run_join_with(0x5B, None, Some(membership.clone()), membership, None).await;
-    result.expect("the join under a membership-only policy succeeds");
-    let ids = j
-        .sup
-        .local_routing_ids(&j.ctx_id)
-        .await
-        .expect("routing ids");
+    // Bob's TTL deadline lands through the actor's coalesced Class-C persist.
+    let deadline = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(d) = bob_store
+                .store
+                .get(&ctx_id)
+                .and_then(|s| s.value().ttl_deadline_secs)
+            {
+                return d;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("bob persists a TTL deadline");
     assert_eq!(
-        ids.next_pseudonym_epoch,
-        Some(0),
-        "a membership-only policy needs no T0: the next epoch is 0"
+        deadline,
+        t0 + TTL,
+        "bob's TTL deadline is T0 + 5 h, not his join time + 5 h"
+    );
+
+    // From here the actors' schedule sleeps run on paused tokio time.
+    tokio::time::pause();
+    while alice_events.try_recv().is_ok() {}
+    while bob_events.try_recv().is_ok() {}
+    clock.set(t0 + 4 * INTERVAL);
+    let within = std::time::Duration::from_secs(2 * INTERVAL);
+    assert_eq!(
+        next_rotation_due_from(&mut alice_events, within, 4).await,
+        Some(4),
+        "alice signals epoch 4 at T0 + 4 h"
+    );
+    assert_eq!(
+        next_rotation_due_from(&mut bob_events, within, 4).await,
+        Some(4),
+        "bob signals epoch 4 at T0 + 4 h, on the creator's boundary"
     );
 }
 
@@ -5344,7 +5567,7 @@ async fn join_fails_closed_when_custody_cannot_agree() {
     let (result, joined) = run_join_with_wrapping_key_loss(
         0xe5,
         None,
-        Some(joiner_params()),
+        CreatorGroup::Honest(Box::new(joiner_params())),
         joiner_params(),
         None,
         Some(WrappingKeyLoss::CannotAgree),
@@ -5376,7 +5599,7 @@ async fn join_succeeds_when_custody_loses_the_wrapping_key_after_agree_and_a_rel
     let (result, joined) = run_join_with_wrapping_key_loss(
         0xe6,
         None,
-        Some(joiner_params()),
+        CreatorGroup::Honest(Box::new(joiner_params())),
         joiner_params(),
         None,
         Some(WrappingKeyLoss::AfterAgree),

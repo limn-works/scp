@@ -629,12 +629,18 @@ pub struct ContextSnapshot {
     /// — this field is moved through verbatim. Re-pinning it to importer-local
     /// `now()` would re-introduce the very divergence this field exists to close.
     ///
-    /// `#[serde(default)]` so legacy snapshots (persisted before this field
-    /// existed) deserialize as `0`. A `0` here means "no convergent creation
-    /// time recorded"; the resulting deadline `0 + ttl` is in the distant past,
-    /// so a TTL-bearing legacy context expires immediately on restore — the
-    /// fail-safe direction, consistent with the upper-bound semantics above.
-    #[serde(default)]
+    /// # Bound to the committed `T0`
+    ///
+    /// When the snapshot carries an MLS group, import and restore refuse it
+    /// unless this value equals the `creation_timestamp_secs` the group's
+    /// `0xFF02` extension commits (spec 05 §5.13.3 rules 7 and 9), and then
+    /// install the committed value as the TTL base and the pseudonym-rotation
+    /// `T0`. Import also refuses a value later than its clock plus the
+    /// §9.8.2 future bound before any side effect. Only a keyless snapshot,
+    /// which carries no group, uses this value directly, as the base of the
+    /// deadline its local TTL close applies (rule 9's keyless clause).
+    ///
+    /// The field is required: a snapshot that omits it does not decode.
     pub creation_timestamp_secs: u64,
     /// The context's lifecycle state at the time of snapshot.
     pub state: ContextState,
