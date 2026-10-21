@@ -50,7 +50,17 @@
       "status": "pending",
       "stories": [
         "SCP-339",
-        "SCP-340"
+        "SCP-340",
+        "SCP-344"
+      ]
+    },
+    {
+      "id": "gate-reachability-5",
+      "name": "Publisher-Bound Deletion",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-343"
       ]
     }
   ],
@@ -960,22 +970,18 @@
         "crates/scp-client/src/client.rs",
         "crates/scp-runtime/src/context/builder.rs",
         "crates/scp-transport/src/provider.rs",
-        "crates/scp-relay-client/src/error.rs",
-        "crates/scp-mls/src/group.rs",
-        "crates/scp-protocol/src/identity/private_state_events.rs"
+        "crates/scp-relay-client/src/error.rs"
       ],
-      "description": "Implements the self-hosted relay's side and the peer's side of `10-infrastructure-and-self-hosting.md` §10.12.4 **Sessions**, over the frames and bridge sessions of SCP-339. Today the native relay client discards every relay-side `BRIDGE_DATA` (`RelayMessage::BridgeData` falls into an empty match arm in `crates/scp-transport/src/native/client.rs` and `adapter.rs`), so a node behind a bridge handles nothing a peer sends it. This story serves each session the bridge opens as one connection of the self-hosted relay's frame handling, multiplexed over its one bridge connection, under the credit, session bound and close rules of §10.12.4, and gives a peer one call that opens a session through a bridge and exchanges ADR-004 frames over it, which the tier 3 KeyPackage fetch and the tier 3 push registrar (PUSH-035) both use. It also adds the node's KeyPackage admission (§10.7.1 **KeyPackage admission at the node**). The node's `BRIDGE_REGISTER`, which makes a bridge forward anything to a production node, is tracked by the issue in PUSH-033's `blockedByIssues`; this story's tests register the self-hosted relay with the bridge directly. Function and type names are indicators.",
+      "description": "Implements the self-hosted relay's side and the peer's side of `10-infrastructure-and-self-hosting.md` §10.12.4 **Sessions**, over the frames and bridge sessions of SCP-339. Today the native relay client discards every relay-side `BRIDGE_DATA` (`RelayMessage::BridgeData` falls into an empty match arm in `crates/scp-transport/src/native/client.rs` and `adapter.rs`), so a node behind a bridge handles nothing a peer sends it. This story serves each session the bridge opens as one connection of the self-hosted relay's frame handling, multiplexed over its one bridge connection, under the credit, session bound and close rules of §10.12.4, and gives a peer one call that opens a session through a bridge and exchanges ADR-004 frames over it, which the tier 3 KeyPackage fetch and the tier 3 push registrar (PUSH-035) both use. SCP-344 adds the node's KeyPackage admission (§10.7.1 **KeyPackage admission at the node**). The node's `BRIDGE_REGISTER`, which makes a bridge forward anything to a production node, is tracked by the issue in PUSH-033's `blockedByIssues`; this story's tests register the self-hosted relay with the bridge directly. Function and type names are indicators.",
       "acceptanceCriteria": [
         "Sessions are served as connections (§10.12.4 **Sessions**): a `BRIDGE_SESSION_OPEN` from the bridge starts a session that goes through the same frame handling a listener connection goes through, with its own subscriptions and its own per-connection limits, and with each limit ADR-004 keys on an address keyed on the session's `source_tag`, so two sessions carrying one tag share one `rate_limit_publish` allowance and two sessions carrying different tags get one each, and two listener connections from two IPv6 addresses in one /64 likewise share one allowance (ADR-004 `ipv6_source_prefix`), and every relay-to-client frame that handling writes goes back as a `BRIDGE_DATA` with the session's ID, in order. A session payload that does not decode as a client frame gets, on that session, the `ERR` `4000` a listener connection gets for it, and the bridge connection and the other sessions stay open.",
-        "Operations work unchanged over a session, each in an in-process test with a bridge whose broker role is enabled, a self-hosted relay registered with it, and a peer holding one session: a `PUBLISH` gets `OK` with `blob_id` and the blob is stored; a `QUERY` at a routing ID holding three blobs gets three `BLOB` frames and the `query_complete` `EVENT`; a `SUBSCRIBE` gets its `OK`, its backfill `BLOB` frames and `backfill_complete`, and a blob a listener client publishes at that routing ID afterwards reaches the peer as a live `BLOB` on the session; an `ACK` for that delivery gets the handling and the answer it gets on a listener connection; a `DELETE` and an `UNSUBSCRIBE` get `OK`; a `PING` gets `PONG`; a refused operation gets its `ERR`. Each inner frame echoes the inner `ref` the peer set.",
+        "Operations work unchanged over a session, each in an in-process test with a bridge whose broker role is enabled, a self-hosted relay registered with it, and a peer holding one session: a `PUBLISH` gets `OK` with `blob_id` and the blob is stored; a `QUERY` at a routing ID holding three blobs gets three `BLOB` frames and the `query_complete` `EVENT`; a `SUBSCRIBE` gets its `OK`, its backfill `BLOB` frames and `backfill_complete`, and a blob a listener client publishes at that routing ID afterwards reaches the peer as a live `BLOB` on the session; an `ACK` for that delivery gets the handling and the answer it gets on a listener connection; a `DELETE` gets the answer it gets on a listener connection and an `UNSUBSCRIBE` gets `OK`; a `PING` gets `PONG`; a refused operation gets its `ERR`. Each inner frame echoes the inner `ref` the peer set.",
         "Multiplexing (§10.12.4 **Sessions**): two peers, each holding one session to one self-hosted relay, subscribe to different routing IDs; each live delivery reaches only the session that subscribed, and closing one session ends its subscriptions and leaves the other session's intact. The self-hosted relay sends session frames only on the connection that carries its `BRIDGE_REGISTER` registration and on no listener connection.",
         "Credit at the self-hosted relay (§10.12.4 **Backpressure**): the self-hosted relay grants the bridge at least `max_blob_size` plus 1,024 bytes of credit when it receives the bridge's `BRIDGE_SESSION_OPEN`, before any other frame for the session, and grants more as it consumes frames, and it sends no `BRIDGE_DATA` beyond the credit the bridge granted it. A test in which the peer grants no credit shows the self-hosted relay's frames for that session wait while its other sessions keep flowing, and the waiting session is closed with `BRIDGE_SESSION_CLOSE` `4012` when its held frames would exceed the self-hosted relay's held-frame bound.",
         "Session bound and close (§10.12.4 **Caps**, **Closing**, **Connection loss**): the self-hosted relay's session bound and held-frame bound are named fields of its flat relay config (ADR-052), defaulting to 256 sessions and 1 MiB, held in no global; a `BRIDGE_SESSION_OPEN` beyond the session bound is answered with `BRIDGE_SESSION_CLOSE` `4012`. After a `BRIDGE_SESSION_CLOSE` from the bridge, after its own `BRIDGE_SESSION_CLOSE`, and after its bridge connection closes, the self-hosted relay holds no state for the session, which a test asserts by the session table's length, the session's subscriptions end, and a later frame naming that session ID produces no frame.",
         "Peer session call: the native relay client exposes one call that opens a session through a bridge to a target routing ID and returns a handle on which the caller sends client frames and receives the self-hosted relay's frames in order, with credit granted and honoured inside the call, including the opening grant of at least `max_blob_size` plus 1,024 bytes when the bridge's `OK` arrives (indicator name: `open_bridge_session`); dropping or closing the handle sends `BRIDGE_SESSION_CLOSE` `0`. It returns typed errors that keep apart `4030`, `4031`, `4032` and `4003` on open, a session the bridge or the self-hosted relay closed (carrying the `BRIDGE_SESSION_CLOSE` code), and a dropped connection, and it never surfaces a frame of a session ID it did not open. Unit tests cover each.",
         "KeyPackage read through a bridge (§10.7.1 **Recipient key**, **What bounds the read**): an in-process test stores 2,500 valid KeyPackages of the self-hosted relay's identity at its KeyPackage routing ID (`09-security-model.md` §9.7.4 **KeyPackage routing ID**) and reads all 2,500 on one session with three `QUERY` frames of `limit` 1,000, paged with `since` and `after_blob`, the `query_complete` counts being 1,000, 1,000 and 500 and each `BLOB` byte-for-byte equal to the stored blob; with the bridge's rate cap lowered under a paused Tokio clock, the same read completes after the clock advances and the session is never closed.",
-        "The KeyPackage publisher cites the definition of the routing ID it publishes at (`09-security-model.md` §9.7.4 **KeyPackage routing ID**): the `ContextTransportProvider` publish method doc in `crates/scp-runtime/src/context/builder.rs` and the publish comment in `crates/scp-transport/src/provider.rs`, which cite `spec §5.12.3` for `derive_key_package_routing_id` today, cite `09-security-model.md` §9.7.4 instead. A unit test in `crates/scp-transport/src/provider.rs` computes `SHA-256(BE32(len(did)) || did || \"scp-key-packages\")` with `sha2` directly for one fixture identifier and asserts that the routing ID the provider publishes a KeyPackage at equals those 32 bytes. The Welcome-delivery citation of §5.12.3 in `builder.rs` is correct and stays. Check: `git grep -n -A1 derive_key_package_routing_id -- crates/scp-runtime/src/context/builder.rs crates/scp-transport/src/provider.rs` prints no line containing `§5.12.3`.",
-        "KeyPackage admission at the node (§10.7.1 **KeyPackage admission at the node**, ADR-004 `4042`): `crates/scp-relay-client/src/error.rs` defines `4042` KEY_PACKAGE_REJECTED and the constant-value test asserts it. In an in-process test, a PUBLISH at the node identity's KeyPackage routing ID is refused with `ERR` `4042` and stores nothing in each of these cases, sent both on a listener connection and on a bridge session: a blob that does not decode as a KeyPackage; a valid KeyPackage followed by one padding byte; the ECDSA twin `(r, n − s)` of a valid KeyPackage's signature, which verifies but is high-s; a KeyPackage whose attestation names a wrapping key other than the identity's current one; a KeyPackage whose own signature under its `leaf_node.signature_key` fails (RFC 9420 §10.1), made by changing one byte of its extensions or capabilities after signing; a KeyPackage with no `scp_keypackage_attestation`; one whose attestation names another identifier; one signed by a key the identity's key state does not list `Current` in the `#active` role; one whose `expires_at` is at or before the node's clock; and one whose `issued_at` is more than 300 seconds after the node's clock. A valid KeyPackage of the identity is stored and answered with `OK` and `blob_id`. One copy per `init_key`: a second PUBLISH of a stored valid KeyPackage gets `OK` with the stored `blob_id`, and a query then returns exactly one blob for that `init_key`. After a wrapping-key rotation, a query returns no KeyPackage naming the old key. A PUBLISH of the same junk blob at any other routing ID is stored as before. A query after the refusals returns only the stored valid KeyPackages.",
-        "Low-s minting and retired init keys (§10.7.1 **Low-s**, **Retired init keys**, `03-identity.md` §3.7.1.1 `RetireInitKey`): every KeyPackage the KeyPackage minting and publish path produces carries an ECDSA signature whose `s` is at most n/2 (indicators: `generate_key_package` in `crates/scp-mls/src/group.rs`, `publish_key_package` in `crates/scp-transport/src/provider.rs`); a test mints 1,000 KeyPackages and checks every signature, and a test hands the publish path a KeyPackage re-signed into high-s form and finds it refuses to publish it with a typed error. In-process tests with the node's instance and a second device of the identity sharing its private state: after the second device consumes an `init_key` at a join, it appends a `RetireInitKey` event, and once the node's instance reads it a query no longer returns that KeyPackage and a PUBLISH of it gets `ERR` `4042` and stores nothing; the same holds after the node's own instance consumes one, and after either device deletes one; under a test clock, a retired entry is gone once its `expires_at` passes, and the set survives a restart of the node's instance. The retired-init-key set is a field of a type the node's construction receives through its initializer (ADR-052), and no global, singleton or `static` holds it."
+        "The KeyPackage publisher cites the definition of the routing ID it publishes at (`09-security-model.md` §9.7.4 **KeyPackage routing ID**): the `ContextTransportProvider` publish method doc in `crates/scp-runtime/src/context/builder.rs` and the publish comment in `crates/scp-transport/src/provider.rs`, which cite `spec §5.12.3` for `derive_key_package_routing_id` today, cite `09-security-model.md` §9.7.4 instead. A unit test in `crates/scp-transport/src/provider.rs` computes `SHA-256(BE32(len(did)) || did || \"scp-key-packages\")` with `sha2` directly for one fixture identifier and asserts that the routing ID the provider publishes a KeyPackage at equals those 32 bytes. The Welcome-delivery citation of §5.12.3 in `builder.rs` is correct and stays. Check: `git grep -n -A1 derive_key_package_routing_id -- crates/scp-runtime/src/context/builder.rs crates/scp-transport/src/provider.rs` prints no line containing `§5.12.3`."
       ],
       "actionItems": [
         "Serve each bridge session from the self-hosted relay's bridge connection as one connection of the relay's frame handling, with a per-session sink and credit.",
@@ -989,6 +995,116 @@
         {
           "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
           "section": "### 10.12.4 Tier 3: Relay Bridging"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        }
+      ],
+      "details": {
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-343",
+      "title": "A relay deletes a blob only for a DELETE that presents the token whose hash a PUBLISH of that blob carried",
+      "gate": "gate-reachability-5",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-relay-client/src/protocol.rs",
+        "crates/scp-relay-client/src/error.rs",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/native/did_slot.rs",
+        "crates/scp-transport/src/native/storage.rs",
+        "crates/scp-transport/src/native/sqlite_blob.rs",
+        "crates/scp-transport/src/native/redb_blob.rs",
+        "crates/scp-transport/src/native/postgres_blob.rs",
+        "crates/scp-transport/src/native/s3_blob.rs",
+        "crates/scp-transport/src/native/local_cache.rs",
+        "crates/scp-transport/src/native/combined.rs",
+        "crates/scp-transport/src/native/adapter.rs",
+        "crates/scp-transport/src/quic/adapter.rs",
+        "crates/scp-transport/src/quic/streams.rs",
+        "crates/scp-transport/src/webtransport/client.rs",
+        "crates/scp-transport/src/coap/adapter.rs",
+        "crates/scp-testing/src/conformance/blob_store.rs"
+      ],
+      "description": "Implements ADR-004 operations 1 and 5 as amended 2026-10-20 and `10-infrastructure-and-self-hosting.md` §10.4 **Deletion is bound to the publisher** and §10.7.1 **No DELETE at that routing ID**. Today `handle_delete` in `crates/scp-transport/src/native/server.rs` deletes any blob outside a protected DID-record slot (the gate is `DidSlotRegistry::gate_delete` in `did_slot.rs`) and always answers `OK`, so any party that sends a `QUERY` at a routing ID can delete every blob stored there: the KeyPackages a tier 3 client reads, pending Commits and Welcomes, and broadcast chunks. A PUBLISH now carries `delete_token_hash = SHA-256(\"scp-relay-delete-v1:\" || blob_id || delete_token)` (`09-security-model.md` §9.18.2), the relay keeps each hash as a delete claim on the blob, and a `DELETE` presents the token. No SDK or FFI bridge exposes a relay blob delete today (`git grep -n -i delete -- bindings crates/scp-ffi` finds storage and context deletes only), so no binding changes; the adapters that send ADR-004's `DELETE` are listed by `git grep -n 'fn delete(&self, blob_id: &BlobId)' -- crates/scp-transport/src`. File locations and type names are indicators.",
+      "acceptanceCriteria": [
+        "Wire (ADR-004 client table): `ClientMessage::Publish` carries `delete_token_hash: Option<[u8; 32]>` and `ClientMessage::Delete` carries `delete_token: [u8; 32]` (indicator: `crates/scp-relay-client/src/protocol.rs`), under the field names the table gives, and the QUIC binding's `DELETE` frame (`crates/scp-transport/src/quic/streams.rs`) carries the same field. `crates/scp-relay-client/src/error.rs` defines `4043` DELETE_UNAUTHORIZED and the constant-value test asserts it. Round-trip tests encode and decode both frames, and a `DELETE` frame without `delete_token` is answered with `4002` MISSING_FIELD.",
+        "Claims (ADR-004 operation 5): in an in-process relay test, a blob published with the hash of token t1 is deleted by a `DELETE` carrying t1, which gets `OK`, after which a `QUERY` returns nothing; the same blob published again survives a `DELETE` carrying any other 32 bytes, which gets `4043`; a `DELETE` of a `blob_id` the relay never stored gets `4043`; and a blob published without `delete_token_hash` survives every `DELETE`, each answered `4043`, until its TTL. A test computes `SHA-256(\"scp-relay-delete-v1:\" || blob_id || t1)` with `sha2` directly and asserts that the relay's stored claim equals those 32 bytes.",
+        "Copies: a second PUBLISH of the same blob with the hash of t2 adds a claim, so a `DELETE` carrying t2 gets `OK` and a `QUERY` still returns the blob, and a `DELETE` carrying t1 then gets `OK` and the blob is gone. A blob holding 16 claims answers a 17th PUBLISH with `OK` and adds no claim, shown by a `DELETE` carrying the 17th token getting `4043`. Claims survive a restart of each persistent backend (SQLite, redb, Postgres, S3), shown by claim cases added to the `blob_store_conformance!()` suite that every backend runs.",
+        "Retained kinds and the node's KeyPackage routing ID: a `DELETE` of a blob at a retained kind still gets `4041` whatever token it carries, and a `retain` write that carries `delete_token_hash` stores no claim. A node's relay, which receives its identity's KeyPackage routing ID through its flat relay config (ADR-052), answers `4043` to a `DELETE` of a blob at that routing ID that carries the blob's own token, and a `QUERY` still returns the blob; the same `DELETE` of a blob at another routing ID deletes it. The rate gate of `DidSlotRegistry::gate_delete` still runs before the token check.",
+        "Client adapters: the native relay adapter's `send` draws a fresh 32-byte token from a CSPRNG for every PUBLISH, sends its hash as `delete_token_hash`, and keeps the token by `blob_id` until the blob's TTL ends in a token store defined as a trait before its implementations (indicator name: `DeleteTokenStore`), which the adapter's construction receives through its initializer (ADR-052), whose production implementation persists in the instance's storage, and which no global, singleton or `static` holds. `delete(blob_id)` sends a `DELETE` with that token, and returns a typed error and sends nothing for a `blob_id` it holds no token for. A test with two recording relays shows one blob sent to both carries two different hashes. Every other adapter that sends ADR-004's `DELETE` (indicators: `quic/adapter.rs`, `webtransport/client.rs`, `coap/adapter.rs`) does the same, each with a test."
+      ],
+      "actionItems": [
+        "Add `delete_token_hash` and `delete_token` to the wire types and `4043` to the codes.",
+        "Store delete claims with each blob in every backend and check them in `handle_delete`.",
+        "Draw, keep and present tokens in each adapter that sends `DELETE`."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.4 Relay Architecture"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        }
+      ],
+      "details": {
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-344",
+      "title": "A node's relay admits at its identity's KeyPackage routing ID only KeyPackages that verify for the identity under a device's Current wrapping key, and retires consumed init keys",
+      "gate": "gate-reachability-4",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-relay-client/src/error.rs",
+        "crates/scp-mls/src/group.rs",
+        "crates/scp-transport/src/provider.rs",
+        "crates/scp-protocol/src/identity/private_state_events.rs"
+      ],
+      "description": "Implements `10-infrastructure-and-self-hosting.md` §10.7.1 **KeyPackage admission at the node**, **Low-s**, **What the publisher counts**, **Retired init keys** and **A republished old key**, at the node's relay that SCP-340 serves on bridge sessions. The admission was part of SCP-340 and moved here so that bridge sessions can start before its wrapping-key condition can be checked: that condition reads the per-device wrapping-key role that keri P7 adds to the identity's key state (`09-security-model.md` §9.7.4.2), which has no story ID yet, and the issue in `blockedByIssues` tracks it. Function and type names are indicators.",
+      "acceptanceCriteria": [
+        "KeyPackage admission at the node (§10.7.1 **KeyPackage admission at the node**, ADR-004 `4042`): `crates/scp-relay-client/src/error.rs` defines `4042` KEY_PACKAGE_REJECTED and the constant-value test asserts it. In an in-process test, a PUBLISH at the node identity's KeyPackage routing ID is refused with `ERR` `4042` and stores nothing in each of these cases, sent both on a listener connection and on a bridge session: a blob that does not decode as a KeyPackage; a valid KeyPackage followed by one padding byte; the ECDSA twin `(r, n − s)` of a valid KeyPackage's signature, which verifies but is high-s; a KeyPackage whose attestation names a wrapping key the identity's key state lists `Current` for no device, once for a key it lists `Superseded` and once for a key in no entry; a valid KeyPackage whose bytes differ from its own re-serialization, made by rewriting one vector length header in more bytes than it needs; a KeyPackage whose own signature under its `leaf_node.signature_key` fails (RFC 9420 §10.1), made by changing one byte of its extensions or capabilities after signing; a KeyPackage with no `scp_keypackage_attestation`; one whose attestation names another identifier; one signed by a key the identity's key state does not list `Current` in the `#active` role; one whose `expires_at` is at or before the node's clock; and one whose `issued_at` is more than 300 seconds after the node's clock. A valid KeyPackage of the identity is stored and answered with `OK` and `blob_id`. One copy per `init_key`: a second PUBLISH of a stored valid KeyPackage gets `OK` with the stored `blob_id`, and a query then returns exactly one blob for that `init_key`. Valid KeyPackages of two devices, each naming its own device's `Current` wrapping key, are both stored. After one device's wrapping-key entry stops being `Current`, a query returns no KeyPackage naming that key and still returns the other device's. A PUBLISH of the same junk blob at any other routing ID is stored as before. A query after the refusals returns only the stored valid KeyPackages. The device's publish path counts a KeyPackage the node answered with `4042` as not published: a test in which the node refuses one of ten published KeyPackages finds the device's count of published unused KeyPackages is nine (`09-security-model.md` §9.7.4).",
+        "Low-s minting and retired init keys (§10.7.1 **Low-s**, **Retired init keys**, `03-identity.md` §3.7.1.1 `RetireInitKey`): every KeyPackage the KeyPackage minting and publish path produces carries an ECDSA signature whose `s` is at most n/2 (indicators: `generate_key_package` in `crates/scp-mls/src/group.rs`, `publish_key_package` in `crates/scp-transport/src/provider.rs`); a test mints 1,000 KeyPackages and checks every signature, and a test hands the publish path a KeyPackage re-signed into high-s form and finds it refuses to publish it with a typed error. In-process tests with the node's instance and a second device of the identity sharing its private state: after the second device consumes an `init_key` at a join, it appends a `RetireInitKey` event, and once the node's instance reads it a query no longer returns that KeyPackage and a PUBLISH of it gets `ERR` `4042` and stores nothing; the same holds after the node's own instance consumes one, and after either device deletes one; under a test clock, a retired entry is gone once its `expires_at` passes, and the set survives a restart of the node's instance. The retired-init-key set is a field of a type the node's construction receives through its initializer (ADR-052), and no global, singleton or `static` holds it."
+      ],
+      "actionItems": [
+        "Add the admission check at the node identity's KeyPackage routing ID, on listener connections and bridge sessions.",
+        "Mint KeyPackages in low-s form and refuse to publish a high-s one.",
+        "Append `RetireInitKey` on consume and delete, and keep the node's retired-init-key set."
+      ],
+      "blockedBy": [
+        "SCP-340"
+      ],
+      "blockedByIssues": [
+        2874
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.7.1 Push Registration Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "## 9.5 Cryptographic Primitive Specification"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.7.1.1 Exhaustive Private State Event Types"
         },
         {
           "file": ".docs/adrs/phase-1.md",
