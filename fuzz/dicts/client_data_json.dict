@@ -1,0 +1,64 @@
+# Dictionary for clientDataJSON validation (fuzz_kel_client_data).
+# 09-security-model.md §9.7.4.2: an assertion-form indexed signature's
+# clientDataJSON must be strict RFC 8259 JSON with a top-level object whose
+# `type` and `challenge` members are strings.
+
+# Member names the verifier reads, and ones an authenticator emits
+"\"type\""
+"\"challenge\""
+"\"origin\""
+"\"crossOrigin\""
+"\"topOrigin\""
+"\"tokenBinding\""
+
+# Values
+"\"webauthn.get\""
+"\"webauthn.create\""
+"\"https://ctx.network\""
+"U0NQLUtFWS1FVkVOVC1WMT"
+
+# Structure
+"{"
+"}"
+"["
+"]"
+":"
+","
+"\"\""
+"{}"
+"[]"
+"true"
+"false"
+"null"
+
+# Numbers at the grammar's edges
+"-0"
+"0.5"
+"1e400"
+"-1E-400"
+"01"
+"1."
+
+# Escapes (each backslash doubled for the dictionary format), surrogates,
+# control bytes, and whitespace
+"\\u0063"
+"\\u0074"
+"\\ud83d"
+"\\ude00"
+"\\ud800"
+"\\udc00"
+"\\\""
+"\\\\"
+"\\/"
+"\\n"
+"\\t"
+"\x09"
+"\x0a"
+"\x0d"
+"\x00"
+"\x1f"
+
+# A byte-order mark and invalid UTF-8
+"\xef\xbb\xbf"
+"\xc0\xaf"
+"\xed\xa0\x80"

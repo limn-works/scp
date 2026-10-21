@@ -55,7 +55,7 @@ An `SCPRelay` entry declares a transport-layer relay URL where the identity's SC
   - Its value is a JSON string of exactly 64 characters, each in `[0-9a-f]`, which decodes to the 32-byte identity routing ID of `10-infrastructure-and-self-hosting.md` §10.12.4.1 that the self-hosted relay registered with `BRIDGE_REGISTER`. One target therefore has one spelling.
   - **A writer MUST NOT name a `bridgeTarget` equal to `SHA-256(0x00)`,** because §3.10.13 signs an `SCPRelay` entry's 32 trailing bytes as its `bridgeTarget` and reads `SHA-256(0x00)` there as "no target".
   - **In a form that carries `bridgeTarget` as a named key (the did:dht JSON document until SCP-315), a reader rejects the entry, and keeps the record's other entries, when the value is not a string of 64 lowercase hex digits, is `null`, equals `SHA-256(0x00)`, or sits on an entry whose `type` is not `SCPRelay`.** In every form, a reader also rejects an `SCPRelay` entry that names a `bridgeTarget` when its `serviceEndpoint`'s scheme is not `wss`, and keeps the record's other entries, because `10-infrastructure-and-self-hosting.md` §10.12.7, service-record relay URL encoding, requires a tier 3 bridge relay URL to use `wss`.
-  - A reader does not require `bridgeTarget` to equal the record subject's own identity routing ID; the value is an opaque `[u8; 32]` (`10-infrastructure-and-self-hosting.md` §10.12.4.1). A `bridgeTarget` may therefore name a routing ID the subject does not own, so a client that routes `BRIDGE_DATA` by `bridgeTarget` MUST NOT treat the value as the subject's own bridge registration.
+  - A reader does not require `bridgeTarget` to equal the record subject's own identity routing ID; the value is an opaque `[u8; 32]` (`10-infrastructure-and-self-hosting.md` §10.12.4.1). A `bridgeTarget` may therefore name a routing ID the subject does not own, so a client that opens a bridge session (`BRIDGE_SESSION_OPEN`) by `bridgeTarget` MUST NOT treat the value as the subject's own bridge registration.
   - A binding projection that drops an entry's `type` and `bridgeTarget` (the NAPI and UniFFI `service_endpoints`) cannot tell a bridge entry from a direct one, so a client MUST NOT make a routing decision from it.
 - **Signed by the designated operational key.** Relay URLs ride in the service record, which the operational key the identity's key state designates for that role signs (`03-identity.md` §3.10.13, §9.6.3). Substituting a relay URL therefore takes that key, and substituting the designation takes a threshold of the identity's standing root.
 
@@ -179,7 +179,7 @@ The `relay_config` object exposes operational parameters that agents need to eva
 |-------|------|------|-------------|
 | `max_blob_size` | integer | bytes | Maximum blob size the relay accepts. **The value is this relay's own** (`03-identity.md` §3.10.5, which states how a publisher segments against it). |
 | `max_blob_ttl` | integer | seconds | Maximum blob TTL the relay enforces. |
-| `rate_limit_publish` | integer | per minute | PUBLISH rate limit per IP address. |
+| `rate_limit_publish` | integer | per minute | PUBLISH rate limit per source prefix (ADR-004). |
 | `rate_limit_subscribe` | integer | per connection | Maximum concurrent subscriptions per connection (default: 100). |
 | `economic` | object | — | Relay economic configuration (§19.8). Optional. Absence = free relay. |
 | `economic.currency` | string | — | Currency code for all amounts in this economic config (e.g., `"USD"`). |

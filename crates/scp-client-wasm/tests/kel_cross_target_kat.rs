@@ -1,7 +1,8 @@
 //! Cross-target known-answer tests for the key-event preimage, digest,
-//! identifier, seal, commitment and routing ids (`09-security-model.md`
-//! §9.7.4.2, R13), the raw-form signatures spec 25 prints for Vectors 51, 68
-//! and 69, and the identifier's text form (`03-identity.md` §3.1).
+//! identifier, seal, commitment and routing ids, the two indexed-signature
+//! forms (`09-security-model.md` §9.7.4.2, R13), the raw-form signatures spec
+//! 25 prints for Vectors 51, 68 and 69, and the identifier's text form
+//! (`03-identity.md` §3.1).
 //!
 //! The browser client verifies a key event log in wasm32 and a native node
 //! verifies the same log, so both must compute the same bytes. Each test
@@ -16,20 +17,24 @@ mod fixtures;
 
 use fixtures::{
     TestResult, V41_ACTIVE, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V41_ROOT, V41_ROUTING_DID,
-    V41_ROUTING_SVC, V41_ROUTING_WCF, V41_ROUTING_WIT, V42_DIGEST, V42_IDENTIFIER, V42_PREIMAGE,
-    V47A_COMMITMENT, V47A_POINT, V47B_COMMITMENT, V47B_POINT, V48_ADDRESS, V48_IDENTIFIER,
-    V50_DIGEST, V50_PREIMAGE, V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST, V51_IDENTIFIER,
-    V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE, V51_KEYS, V51_PREIMAGE,
-    V51_ROUTING_DID, V68_DIGEST, V68_PREIMAGE, V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE,
-    V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array, assert_signature, assert_vector, fields,
-    identifier, v41_inception, v50_key_state, v51_inception, v51_key_state, v68_rollover,
-    v69_key_state,
+    V41_ROUTING_SVC, V41_ROUTING_WCF, V41_ROUTING_WIT, V41_SIGNATURE, V42_AUTHENTICATOR_DATA,
+    V42_CHALLENGE, V42_CHALLENGE_BYTES, V42_CLIENT_DATA_HASH, V42_CLIENT_DATA_JSON,
+    V42_CLIENT_DATA_JSON_HEX, V42_DIGEST, V42_IDENTIFIER, V42_INDEXED_SIGNATURE, V42_PREIMAGE,
+    V42_RP_ID, V42_SIGNATURE, V42_SIGNED_DIGEST, V42_SIGNED_MESSAGE, V47A_COMMITMENT, V47A_POINT,
+    V47B_COMMITMENT, V47B_POINT, V48_ADDRESS, V48_IDENTIFIER, V50_DIGEST, V50_PREIMAGE, V50_SEAL,
+    V50_SEALED_DIGEST, V51_DIGEST, V51_IDENTIFIER, V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE,
+    V51_INCEPTION_SIGNATURE, V51_KEYS, V51_PREIMAGE, V51_ROUTING_DID, V68_DIGEST, V68_PREIMAGE,
+    V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE, V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array,
+    assert_signature, assert_vector, fields, identifier, v41_inception, v50_key_state,
+    v51_inception, v51_key_state, v68_rollover, v69_key_state,
 };
 use scp_did::{Identifier, IdentifierError, KeyCondition, NonCanonicalReason};
 use scp_kel::{
-    RoutingKind, SignatureForm, decode_preimage, derive_identifier, key_event_seal,
-    prerotation_commitment, routing_id,
+    IndexedSignature, RoutingKind, SignatureForm, decode_preimage, derive_identifier,
+    key_event_challenge, key_event_seal, parse_client_data_json, prerotation_commitment,
+    routing_id, verify_indexed,
 };
+use sha2::{Digest, Sha256};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -176,5 +181,80 @@ fn vector_57_identifier_text_form() -> TestResult {
         V57_TEXT.get(..55).ok_or("short")?.parse::<Identifier>(),
         non_canonical(NonCanonicalReason::Length)
     );
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+fn vector_41_raw_indexed_signature_verifies() -> TestResult {
+    let field = fixtures::bytes(V41_SIGNATURE)?;
+    let (signature, consumed) = IndexedSignature::read(SignatureForm::Raw, &field)?;
+    assert_eq!(consumed, 64);
+    verify_indexed(
+        &array(V41_ROOT)?,
+        &array(V41_DIGEST)?,
+        SignatureForm::Raw,
+        &signature,
+    )?;
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+fn vector_42_assertion_indexed_signature_verifies() -> TestResult {
+    let field = fixtures::bytes(V42_INDEXED_SIGNATURE)?;
+    let (signature, consumed) = IndexedSignature::read(SignatureForm::WebAuthnAssertion, &field)?;
+    assert_eq!(consumed, field.len());
+    assert_eq!(signature.to_bytes(), field);
+    let IndexedSignature::WebAuthnAssertion(assertion) = &signature else {
+        return Err("Vector 42 read as the raw form".into());
+    };
+    assert_eq!(
+        assertion.authenticator_data(),
+        fixtures::bytes(V42_AUTHENTICATOR_DATA)?
+    );
+    assert_eq!(
+        assertion.client_data_json(),
+        fixtures::bytes(V42_CLIENT_DATA_JSON_HEX)?
+    );
+    assert_eq!(
+        assertion.client_data_json(),
+        V42_CLIENT_DATA_JSON.as_bytes()
+    );
+    assert_eq!(assertion.signature(), &array::<64>(V42_SIGNATURE)?);
+
+    // authenticatorData from its stated derivation: rpIdHash =
+    // SHA-256("ctx.network"), flags 0x05, signCount 0.
+    let authenticator = assertion.authenticator_data();
+    assert_eq!(
+        authenticator.get(..32).ok_or("short authenticatorData")?,
+        Sha256::digest(V42_RP_ID.as_bytes()).as_slice()
+    );
+    assert_eq!(authenticator.get(32), Some(&0x05));
+    assert_eq!(authenticator.get(33..), Some(&[0u8; 4][..]));
+
+    let digest = array::<32>(V42_DIGEST)?;
+    assert_eq!(
+        key_event_challenge(&digest).as_slice(),
+        fixtures::bytes(V42_CHALLENGE_BYTES)?
+    );
+    assert_eq!(parse_client_data_json(assertion)?.challenge, V42_CHALLENGE);
+    let client_data_hash = Sha256::digest(assertion.client_data_json());
+    assert_eq!(
+        client_data_hash.as_slice(),
+        fixtures::bytes(V42_CLIENT_DATA_HASH)?
+    );
+    let mut message = authenticator.to_vec();
+    message.extend_from_slice(&client_data_hash);
+    assert_eq!(message, fixtures::bytes(V42_SIGNED_MESSAGE)?);
+    let signed = Sha256::digest(&message);
+    assert_eq!(signed.as_slice(), fixtures::bytes(V42_SIGNED_DIGEST)?);
+
+    verify_indexed(
+        &array(V41_ROOT)?,
+        &digest,
+        SignatureForm::WebAuthnAssertion,
+        &signature,
+    )?;
     Ok(())
 }

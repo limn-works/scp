@@ -156,6 +156,12 @@ jobs:
             dict: msgpack_export.dict
             max_len: 1048576
             time: 300
+          # 09-security-model.md §9.7.4.2: an assertion signature's clientDataJSON
+          # is at most 512 bytes; 600 lets the fuzzer reach the length bound.
+          - target: fuzz_kel_client_data
+            dict: client_data_json.dict
+            max_len: 600
+            time: 300
           # ADR-057 §Prereq-4: a tampered or malformed MLS ciphertext must yield a
           # typed error, never a panic. No dictionary: the input is raw MLS wire
           # ciphertext and the target self-generates a valid frame to tamper. It
