@@ -148,12 +148,23 @@ fn handle_prepare_for_replace(
     // replacement actor after this actor is despawned; the floor merge is
     // idempotent, so running it here (gate) and there (seed) is safe, and no two
     // live copies ever seal (the dropped copy never encrypts anything).
-    match crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
-        deps,
+    // `import_context` verified this group's `0xFF02` binding (spec 05 §5.13.3)
+    // on its own rebuild of the same signed bytes before dispatching here, so a
+    // refused import never reaches this gate or the terminal claim below.
+    let gated = crate::context::lifecycle_helpers::build_restored_crypto(
         &ctx_id_bytes,
         mls_state,
-        false,
-    ) {
+        "import",
+    )
+    .and_then(|restored| {
+        crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+            deps,
+            &ctx_id_bytes,
+            restored,
+            false,
+        )
+    });
+    match gated {
         Ok(_owned) => { /* terminal actor seeds nothing — drop the owned material */ }
         Err(e) => {
             let _ = reply.send(Err(e));

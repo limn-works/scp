@@ -25010,6 +25010,13 @@ mod tests {
     /// rule-9 fixtures record.
     const RULE9_T0: u64 = 1_700_000_000;
 
+    /// The sender whose epoch floor every keyed rule-9 fixture carries, so a
+    /// replay-floor merge from it shows up in the Supervisor's registry.
+    const RULE9_FLOOR_SENDER: &str = "did:key:rule9-floor-sender";
+
+    /// The epoch floor the keyed rule-9 fixtures carry for `RULE9_FLOOR_SENDER`.
+    const RULE9_FLOOR_EPOCH: u64 = 7;
+
     /// How the rule-9 fixture's group commits `creation_timestamp_secs`.
     enum CommittedT0 {
         /// The extension commits this value.
@@ -25078,7 +25085,10 @@ mod tests {
         state.seed_encrypted_crypto_from_owned(owned);
         snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(
             state
-                .export_crypto_state(Vec::new(), Vec::new())
+                .export_crypto_state(
+                    vec![(RULE9_FLOOR_SENDER.to_owned(), RULE9_FLOOR_EPOCH)],
+                    Vec::new(),
+                )
                 .expect("export the fixture group"),
         );
         snapshot
@@ -25168,6 +25178,11 @@ mod tests {
             "no actor may be registered"
         );
         assert!(contexts.is_empty(), "no snapshot may be persisted");
+        assert!(
+            sup.export_sender_key_epochs(&crate::context::state::context_id_to_bytes(&context_id))
+                .is_empty(),
+            "a refused import must merge no replay floor into the registry"
+        );
     }
 
     #[tokio::test]
@@ -25206,6 +25221,113 @@ mod tests {
             "the snapshot records creation timestamp",
         )
         .await;
+    }
+
+    /// §5.13.3 rule 9 checked before any side effect: an import whose snapshot
+    /// records a creation timestamp other than the committed `T0` is refused
+    /// before the replay-floor merge, so the registry holds no floor for the
+    /// context afterwards although the export carries one.
+    #[tokio::test]
+    async fn a_refused_import_merges_no_replay_floor() {
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            Arc::new(TestClock::new(RULE9_T0)),
+            Box::new(MapPersistence::default()),
+        );
+        let context_id = hex::encode([0x97; 32]);
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-import-creator",
+            &rule9_params(),
+            Some(CommittedT0::Value(RULE9_T0 - 60)),
+        );
+        let (export, verifying_key) = rule9_export(snapshot).await;
+        let err = sup
+            .import_context(export, &verifying_key, None)
+            .await
+            .expect_err("a T0 mismatch must be refused");
+        assert!(
+            matches!(&err, ContextError::ImportRejected { reason }
+                if reason.contains("the snapshot records creation timestamp")),
+            "expected the rule-9 refusal, got {err:?}"
+        );
+        assert_eq!(
+            sup.export_sender_key_epochs(&ctx_id_bytes),
+            Vec::<(String, u64)>::new(),
+            "the refused import must leave the registry's replay floors unchanged"
+        );
+    }
+
+    /// §5.13.3 rule 9 checked before any side effect: an import over a
+    /// replaceable (Closing) prior actor that is refused for a `T0` mismatch
+    /// never reaches `PrepareForReplace`, so the prior actor stays registered
+    /// and keeps answering, and the registry holds no floor from the export.
+    #[tokio::test]
+    async fn a_refused_import_leaves_a_replaceable_prior_actor_live() {
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            Arc::new(TestClock::new(RULE9_T0)),
+            Box::new(MapPersistence::default()),
+        );
+        let context_id = hex::encode([0x98; 32]);
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let prior = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            RULE9_T0,
+            DID("did:example:rule9-prior-admin".to_owned()),
+        );
+        prior
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("drive the prior context to Active");
+        prior
+            .handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .expect("drive the prior context to Closing, which an import may replace");
+        let deps = test_actor_deps(&sup).await;
+        let prior_handle = sup
+            .spawn_actor_with_state(prior, deps, None)
+            .await
+            .expect("spawn registers the prior context");
+
+        let snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-import-creator",
+            &rule9_params(),
+            Some(CommittedT0::Value(RULE9_T0 - 60)),
+        );
+        let (export, verifying_key) = rule9_export(snapshot).await;
+        let err = sup
+            .import_context(export, &verifying_key, None)
+            .await
+            .expect_err("a T0 mismatch must be refused");
+        assert!(
+            matches!(&err, ContextError::ImportRejected { reason }
+                if reason.contains("the snapshot records creation timestamp")),
+            "expected the rule-9 refusal, got {err:?}"
+        );
+        assert!(
+            sup.lookup(&context_id).is_some(),
+            "the refused import must not despawn the prior actor"
+        );
+        let member_count: Result<Option<usize>, ContextError> = prior_handle
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::MemberCount {
+                    context_id: context_id.clone(),
+                    reply,
+                })
+            })
+            .await;
+        assert!(
+            member_count.is_ok(),
+            "the prior actor must not have claimed itself terminal, got {member_count:?}"
+        );
+        assert_eq!(
+            sup.export_sender_key_epochs(&ctx_id_bytes),
+            Vec::<(String, u64)>::new(),
+            "the refused import must leave the registry's replay floors unchanged"
+        );
     }
 
     /// Drops the stored snapshot of `context_id`, flushes `sup`'s live contexts,
@@ -25413,6 +25535,94 @@ mod tests {
             "the snapshot records creation timestamp",
         )
         .await;
+    }
+
+    /// Counts `restore_event_log` and `init_event_log` calls; every call is a
+    /// success no-op.
+    #[derive(Clone, Default)]
+    struct EventLogHydrationCounter {
+        hydrations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for EventLogHydrationCounter {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.hydrations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn restore_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.hydrations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// §5.13.3 rule 9 checked before any side effect: a restore whose snapshot
+    /// records a creation timestamp other than the committed `T0` is refused
+    /// before the event log is hydrated and before the replay-floor merge.
+    #[tokio::test]
+    async fn a_refused_restore_hydrates_no_event_log_and_merges_no_replay_floor() {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let counter = EventLogHydrationCounter::default();
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(RULE9_T0)),
+            Box::new(persistence),
+            Box::new(counter.clone()),
+        );
+        let context_id = hex::encode([0xA7; 32]);
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let mut snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-restore-creator",
+            &rule9_params(),
+            Some(CommittedT0::Value(RULE9_T0)),
+        );
+        snapshot.creation_timestamp_secs = RULE9_T0 + 60;
+        contexts.insert(context_id.clone(), snapshot);
+        let handle = crate::context::ContextHandle::new(context_id.clone(), rule9_params());
+        let err = sup
+            .restore_context(&context_id, &handle)
+            .await
+            .expect_err("a T0 mismatch must be refused");
+        assert!(
+            matches!(&err, ContextError::PersistenceFailed(reason)
+                if reason.contains("the snapshot records creation timestamp")),
+            "expected the rule-9 refusal, got {err:?}"
+        );
+        assert_eq!(
+            counter.hydrations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refused restore must leave the event log unhydrated"
+        );
+        assert_eq!(
+            sup.export_sender_key_epochs(&ctx_id_bytes),
+            Vec::<(String, u64)>::new(),
+            "the refused restore must leave the registry's replay floors unchanged"
+        );
     }
 
     /// §5.13.3 rule 9: a keyed restore follows the interval schedule counted
@@ -27424,7 +27634,8 @@ mod tests {
         crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &fresh_deps,
             &ctx,
-            &blob,
+            crate::context::lifecycle_helpers::build_restored_crypto(&ctx, &blob, "test")
+                .expect("the blob rebuilds"),
             true,
         )
         .expect("cold restore must SUCCEED and populate the empty registry");
@@ -27537,7 +27748,8 @@ mod tests {
         let err = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &importer_deps,
             &ctx,
-            &blob,
+            crate::context::lifecycle_helpers::build_restored_crypto(&ctx, &blob, "test")
+                .expect("the blob rebuilds"),
             false,
         )
         .expect_err("a regressing untrusted import must be rejected");
@@ -27618,7 +27830,8 @@ mod tests {
         crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &fresh_deps,
             &ctx,
-            &blob,
+            crate::context::lifecycle_helpers::build_restored_crypto(&ctx, &blob, "test")
+                .expect("the blob rebuilds"),
             true,
         )
         .expect("a high-epoch (>MAX_EPOCH_ADVANCE) context must restore under trusted-local");
@@ -27709,7 +27922,8 @@ mod tests {
         let err = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &importer_deps,
             &ctx,
-            &blob,
+            crate::context::lifecycle_helpers::build_restored_crypto(&ctx, &blob, "test")
+                .expect("the blob rebuilds"),
             false,
         )
         .expect_err("a recv-floor regression on an untrusted import must be rejected");
