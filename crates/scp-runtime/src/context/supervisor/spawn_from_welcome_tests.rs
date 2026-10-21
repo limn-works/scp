@@ -2358,11 +2358,11 @@ async fn assert_join_refuses_creator_extension(seed: u8, raw: Vec<u8>, reason_pa
         None,
     )
     .await;
-    let reason = match &result {
-        Err(crate::context::ContextError::CryptoFailed(msg)) => msg.clone(),
-        other => panic!("expected a CryptoFailed refusal, got {other:?}"),
-    };
-    assert!(reason.contains(reason_part), "{reason}");
+    assert!(
+        matches!(&result, Err(crate::context::ContextError::CryptoFailed(msg)) if msg.contains(reason_part)),
+        "expected a CryptoFailed refusal naming {reason_part:?}, got {:?}",
+        result.as_ref().err()
+    );
     assert_binding_refused_no_side_effects(result, &j, &rec).await;
 }
 
@@ -4360,8 +4360,10 @@ async fn next_rotation_due_from(
 ///
 /// Alice creates at `T0` with a 3600 s interval and a 5 h TTL; Bob joins by
 /// Welcome at `T0 + 3.5 h`, over one shared `TestClock`. Bob's first v2 epoch
-/// is 3, the same epoch Alice's next rotation carries; both signal epoch 4 at
-/// `T0 + 4 h`; Bob's persisted TTL deadline is `T0 + 5 h`, not `T0 + 8.5 h`.
+/// is 3, the same epoch Alice's next rotation carries, and both record their
+/// epoch-3 rotation. Neither signals at `T0 + 4 h − 1 s`; both signal epoch 4
+/// at `T0 + 4 h`. Bob's persisted TTL deadline is `T0 + 5 h`, not
+/// `T0 + 8.5 h`.
 #[tokio::test]
 async fn a_welcome_joiner_rotates_and_expires_on_the_creators_t0() {
     use scp_clock::Clock as _;
@@ -4385,6 +4387,9 @@ async fn a_welcome_joiner_rotates_and_expires_on_the_creators_t0() {
         ..joiner_params()
     };
 
+    // An accepting transport, so each rotation's announcement goes out and
+    // clears `announce_pending`; a pending announcement would hold the next
+    // rotation back.
     let node = |did: &str, persistence: Option<Box<dyn ContextPersistence>>| {
         let (tx, rx) = tokio::sync::broadcast::channel(4_096);
         let sup = Supervisor::with_providers(
@@ -4392,7 +4397,9 @@ async fn a_welcome_joiner_rotates_and_expires_on_the_creators_t0() {
                 did.to_owned(),
                 Arc::new(scp_clock::SystemClock),
             )),
-            Box::new(NotConfiguredTransportProvider),
+            Box::new(AcceptingSendTransport {
+                sends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
             Box::new(MerkleEventLogProvider::new()),
             pair_resolver(),
             persistence,
@@ -4403,7 +4410,9 @@ async fn a_welcome_joiner_rotates_and_expires_on_the_creators_t0() {
         );
         (sup, rx)
     };
-    let (alice_sup, mut alice_events) = node(ALICE_DID, None);
+    // Each rotation persists fail-closed, so both nodes need a store.
+    let (alice_sup, mut alice_events) =
+        node(ALICE_DID, Some(Box::new(RecordingPersistence::default())));
     let bob_store = RecordingPersistence::default();
     let (bob_sup, mut bob_events) = node(BOB_DID, Some(Box::new(bob_store.clone())));
 
@@ -4485,12 +4494,48 @@ async fn a_welcome_joiner_rotates_and_expires_on_the_creators_t0() {
         "bob's TTL deadline is T0 + 5 h, not his join time + 5 h"
     );
 
-    // From here the actors' schedule sleeps run on paused tokio time.
+    // Both nodes record their epoch-3 rotation, the one their schedule makes
+    // due at T0 + 3.5 h.
+    for (sup, did, key, rid) in [
+        (&alice_sup, &alice, alice_signing_key(), [0x3A; 32]),
+        (&bob_sup, &bob, bob_signing_key(), [0x3B; 32]),
+    ] {
+        sup.rotate_pseudonym(&ctx_id, did, &CommandSigner::local_ed25519(key), 3, rid)
+            .await
+            .expect("the epoch-3 rotation commits");
+        let ids = sup
+            .local_routing_ids(&ctx_id)
+            .await
+            .expect("routing ids after the rotation");
+        assert_eq!(ids.pseudonym_epoch, Some(3), "{did} holds epoch 3");
+        assert!(!ids.announce_pending, "{did}'s announcement went out");
+    }
+
+    // From here the actors' schedule sleeps run on paused tokio time, while
+    // the shared `TestClock` stays where the test sets it.
     tokio::time::pause();
     while alice_events.try_recv().is_ok() {}
     while bob_events.try_recv().is_ok() {}
+    // Each window spans the half interval the arms sleep after the rotation,
+    // plus a minute of re-checks. The windows run in sequence on paused tokio
+    // time, and Bob's TTL arm fires 1.5 h of tokio time after his join, so the
+    // four windows together stay under it.
+    let within = std::time::Duration::from_secs(INTERVAL / 2 + 60);
+
+    // One second before the boundary, neither node signals.
+    clock.set(t0 + 4 * INTERVAL - 1);
+    assert_eq!(
+        next_rotation_due_from(&mut alice_events, within, 4).await,
+        None,
+        "alice signals nothing at T0 + 4 h - 1 s"
+    );
+    assert_eq!(
+        next_rotation_due_from(&mut bob_events, within, 4).await,
+        None,
+        "bob signals nothing at T0 + 4 h - 1 s"
+    );
+
     clock.set(t0 + 4 * INTERVAL);
-    let within = std::time::Duration::from_secs(2 * INTERVAL);
     assert_eq!(
         next_rotation_due_from(&mut alice_events, within, 4).await,
         Some(4),
