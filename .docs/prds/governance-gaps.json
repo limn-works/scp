@@ -285,16 +285,16 @@
       "gate": "gate-governance-bans",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
-      "description": "Extend execute_governance_action() in ContextManager to handle RevokeReadAccess for broadcast contexts. Before execution, verify MemberBan capability is in the context's ceiling. Delegate to BroadcastContext::governance_ban_subscriber(). Emit ReadAccessRevoked event. Persist broadcast state snapshot. Follow existing BlockAuthor execution pattern in block_broadcast_author_internal() for structure.",
+      "description": "Extend execute_governance_action() in ContextManager to handle RevokeReadAccess for broadcast contexts. Before execution, verify MemberBan capability is in the context's ceiling. Delegate to BroadcastContext::governance_ban_subscriber(). Emit the local ReadAccessRevoked ContextEvent and append no event-log leaf for the ban (05-contexts.md section 5.14.8, ban lifecycle step 5). The execution path on main, governance_helpers.rs in scp-runtime, still appends an AccessRevoked event-log leaf after the ban, so the criterion that forbids that leaf is unmet. Persist broadcast state snapshot. Follow existing BlockAuthor execution pattern in block_broadcast_author_internal() for structure.",
       "acceptanceCriteria": [
         "execute_governance_action match arm for GovernanceAction::RevokeReadAccess exists",
         "Execution checks context ceiling for Capability::MemberBan — returns PermissionDenied if absent",
         "For broadcast contexts: delegates to governance_ban_subscriber(did)",
-        "ReadAccessRevoked event pushed to receive_buffer and appended to event log",
+        "For a broadcast context, the ReadAccessRevoked ContextEvent is pushed to receive_buffer and no event-log leaf is appended for the ban; the durable record is the per-context ban record (05-contexts.md section 5.14.8, ban lifecycle step 5)",
         "Broadcast state persisted via persist_broadcast_snapshot (same pattern as block_broadcast_author_internal)",
         "RestoreReadAccess match arm delegates to governance_unban_subscriber(did)",
         "ReadAccessRestored event emitted for RestoreReadAccess",

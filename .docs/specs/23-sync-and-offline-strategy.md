@@ -69,7 +69,7 @@ MLS requires sequential epoch processing -- each Commit depends on the previous 
 
 Tried in order:
 
-1. **Relay backfill.** MLS Commits are sent as MLS `PublicMessage` (protocol messages delivered via the transport layer). Relays store them like any other blob. If the relay's retention covers the offline period, all Commits are recoverable.
+1. **Relay backfill.** MLS Commits are sent as MLS `PrivateMessage` under the `PURE_CIPHERTEXT` wire policy (ADR-057 T3; protocol messages delivered via the transport layer). Relays store them like any other blob. If the relay's retention covers the offline period, all Commits are recoverable.
 
 2. **Peer request.** If relays have expired some Commits (blob_ttl elapsed), the reconnecting member broadcasts a `CommitRangeRequest` as an MLS application message (using their current epoch keys -- they can still encrypt at their stale epoch). Online members who have persisted the Commit messages respond with the missing Commits. This is best-effort -- members are not required to retain raw Commit messages beyond the MLS grace window.
 
