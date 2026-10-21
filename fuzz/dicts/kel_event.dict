@@ -1,0 +1,42 @@
+# Dictionary for key-event unit decoding (fuzz_kel_decode_event).
+# 09-security-model.md §9.7.4.2 and §9.10.12: a unit is BE32(len), the
+# signed preimage ("SCP-KEL-EVENT-V1:" then fields 1-12), then the
+# signature field, one indexed signature per named index.
+
+# Separators
+"SCP-KEL-EVENT-V1:"
+"SCP-KEL-ID-V1:"
+
+# Length prefixes: the separator alone, Vector 41's preimage, the cap
+"\x00\x00\x00\x11"
+"\x00\x00\x01\x10"
+"\x00\x01\x00\x00"
+"\xff\xff\xff\xff"
+
+# event_type (field 1): Inception, KeyState, CommitmentRollover,
+# RootRecovery, and the first unregistered value
+"\x01"
+"\x02"
+"\x03"
+"\x04"
+"\x05"
+
+# standing_root (field 5): absent 0x00, CoSigns 0x01, Lost 0x02, and the
+# first unregistered value 0x03. Signature forms (field 7): Raw 0x01,
+# WebAuthnAssertion 0x02, unregistered 0x03. Both reuse the bytes above,
+# plus the absent root:
+"\x00"
+
+# Counts at their caps: one, MAX_NEXT_SET_SIZE, one over
+"\x00\x00\x00\x01"
+"\x00\x00\x00\x10"
+"\x00\x00\x00\x11"
+
+# Assertion lengths: authenticatorData 37 and 256, clientDataJSON 1 and 512
+"\x00\x00\x00\x25"
+"\x00\x00\x01\x00"
+"\x00\x00\x02\x00"
+
+# clientDataJSON members
+"\"type\":\"webauthn.get\""
+"\"challenge\":\""

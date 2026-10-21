@@ -94,7 +94,7 @@ cargo fuzz list
 
 ## Target Inventory
 
-All 29 targets, grouped by tier and trust boundary.
+All 30 targets, grouped by tier and trust boundary.
 
 **Trust boundaries:**
 - **B1** — Relay wire protocol (any unauthenticated TCP connection)
@@ -129,6 +129,7 @@ Highest priority. Raw bytes + dictionary. Any of these panicking is a P0 securit
 | `fuzz_broadcast_envelope` | B2 | Raw bytes | `msgpack_broadcast_envelope.dict` | 1 MiB |
 | `fuzz_mls_decrypt` | B2 | Raw MLS ciphertext | none | 8 KiB |
 | `fuzz_kel_client_data` | B3 | Raw bytes, differential against `serde_json` | `client_data_json.dict` | 600 |
+| `fuzz_kel_decode_event` | B3 | Raw bytes, a run of key-event units, re-encoded | `kel_event.dict` | 65,540 |
 
 ### Tier 3 — Invariant & Differential Targets
 
