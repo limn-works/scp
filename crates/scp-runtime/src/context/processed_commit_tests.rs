@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
+use openmls::prelude::tls_codec::Serialize as _;
 use scp_clock::SystemClock;
 use scp_did::DID;
 use scp_protocol::context::builder::{ContextCreationError, ReceiveFloor};
@@ -305,8 +305,8 @@ async fn deliver(
 
 /// Whether `bytes` decode as an MLS message carrying a Commit.
 fn is_commit(bytes: &[u8]) -> bool {
-    use openmls::prelude::{ContentType, MlsMessageBodyIn, MlsMessageIn};
-    let Ok(message) = MlsMessageIn::tls_deserialize_exact(bytes) else {
+    use openmls::prelude::{ContentType, MlsMessageBodyIn};
+    let Ok(message) = scp_mls::wire::parse_mls_message_in(bytes) else {
         return false;
     };
     match message.extract() {
