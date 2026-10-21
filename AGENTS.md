@@ -7,7 +7,7 @@ SCP is an open protocol for the agentic Internet: DID identity, governed context
 - **Provenance everywhere.** All non-private data carries verifiable origin metadata; missing provenance is a signal.
 - **Human accountability.** Every agent traces to a human DID through attestation chains. Behavioral records are durable.
 - **Context isolation.** Every interaction happens inside a bounded context; data crosses the boundary only through an explicit, governed path. The context boundary is the security boundary.
-- **Encryption as access control.** MLS group keys enforce membership. Relays are untrusted: cryptography, never a relay, controls access, and clients verify every record. A relay MAY validate a public, self-certifying record it stores (a DID document's BEP44 signature, keeping the highest-seq copy) for availability, as defense in depth, never as a trust dependency, and never on encrypted content.
+- **Encryption as access control.** MLS group keys enforce membership. Relays are untrusted: cryptography, never a relay, controls access, and clients verify every record. Every conforming relay validates each key-event record it stores: it runs R3's check order on every event, refuses an illegal one with `4044`, and holds the chain R6 ranks first (spec 09 §9.7.4.2, §9.10.12). It does so for availability, as defense in depth, never as a trust dependency, and never on encrypted content.
 - **Legibility before opt-in.** A member reads a context's parameters before joining.
 - **The protocol requires no operator;** it survives Limn shutting down.
 - **Transport independence.** **Agents are participants, not enforcers**, bound like any human-bound participant.
