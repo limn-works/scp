@@ -20,6 +20,7 @@ mod content;
 mod defect;
 mod entry;
 mod head;
+mod replay;
 mod verdicts;
 
 use scp_did::Identifier;
@@ -34,6 +35,7 @@ pub use entry::{EntryValidation, EntryVerdict, ValidChains, validate_entry};
 pub use head::{
     HeldHead, HeldHeadMarker, HeldHeadMarkerError, MarkerMode, SigningChange, SigningRefusal,
 };
+pub use replay::{NotOnChain, ReplayedState, key_state_at, replay};
 
 use check::{InceptionFailure, Signing, check_inception, check_successor};
 use verdicts::Strict;

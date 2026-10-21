@@ -5123,7 +5123,9 @@ dependencies = [
  "proptest",
  "scp-crypto",
  "scp-did",
+ "serde",
  "sha2 0.10.9",
+ "static_assertions",
  "thiserror 2.0.18",
 ]
 
@@ -5304,6 +5306,7 @@ dependencies = [
  "scp-crypto",
  "scp-did",
  "scp-event-log",
+ "scp-kel",
  "serde",
  "serde_bytes",
  "serde_json",

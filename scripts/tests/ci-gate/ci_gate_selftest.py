@@ -2041,6 +2041,105 @@ def write_inheritance_fixture(root: Path, publish_leaf: bool) -> Path:
     return consumer
 
 
+def glob_selects(pattern: str, path: str) -> bool:
+    """Report whether one dorny/paths-filter glob selects one file path.
+
+    dorny/paths-filter matches with picomatch (`dot: true`): a `**` segment
+    matches zero or more whole path segments, `*` and `?` match within one
+    segment, and every other character matches itself. pattern_covers stays
+    the conservative two-shape reader for the checks that rely on it; this
+    reader exists for a filter whose entry is a mid-path glob such as
+    `'crates/**/Cargo.toml'`, which pattern_covers would read as selecting
+    nothing.
+    """
+    segments = pattern.split("/")
+    parts = []
+    for index, segment in enumerate(segments):
+        last = index == len(segments) - 1
+        if segment == "**":
+            parts.append(".*" if last else "(?:[^/]+/)*")
+            continue
+        piece = "".join(
+            "[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c)
+            for c in segment
+        )
+        parts.append(piece if last else f"{piece}/")
+    return re.fullmatch("".join(parts), path) is not None
+
+
+def tracked_crate_manifests() -> list[str]:
+    """Every tracked Cargo.toml below crates/, at any depth."""
+    proc = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "-z", "--", "crates/**/Cargo.toml"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return sorted(path for path in proc.stdout.split("\0") if path)
+
+
+def manifests_outside(patterns: set[str], manifests: list[str]) -> list[str]:
+    return [
+        path
+        for path in manifests
+        if not any(glob_selects(pattern, path) for pattern in patterns)
+    ]
+
+
+def check_fuzz_filter_selects_every_crate_manifest(jobs: dict) -> None:
+    """The `fuzz` filter selects every crate manifest, inside its closure or not.
+
+    CRITERION: a change to any tracked `crates/**/Cargo.toml` selects
+    fuzz-build. A manifest edit outside the fuzz closure can add the dependency
+    edge that pulls a crate into that build, and fuzz-build's
+    `cargo check --locked` is the one check that sees fuzz/Cargo.lock fall
+    behind it. A crate outside the closure has no `crates/<name>/**` entry, so
+    only a manifest-wide entry selects its Cargo.toml; deleting that entry
+    fails here. The detector half deletes every entry that is not a
+    `crates/<name>/**` closure directory, the shape the closure check above
+    requires, and asserts the reader then reports a manifest, so a reader that
+    selected everything would fail this self-test.
+    """
+    patterns = set(path_filters(jobs).get("fuzz", []))
+    manifests = tracked_crate_manifests()
+    check(
+        "the fuzz filter's manifest check reads at least one crate manifest",
+        bool(manifests),
+        "git ls-files found no crates/**/Cargo.toml, so the check below proves nothing",
+    )
+    missing = manifests_outside(patterns, manifests)
+    check(
+        "filter 'fuzz' selects every crate manifest",
+        not missing,
+        f"unselected {missing}; a manifest edit there can add an edge fuzz/Cargo.lock "
+        f"does not record while fuzz-build, the one `cargo check --locked` over it, "
+        f"skips",
+    )
+    closure_only = {
+        pattern
+        for pattern in patterns
+        if re.fullmatch(r"crates/[^/*?]+/\*\*", pattern)
+    }
+    check(
+        "dropping the fuzz filter's manifest-wide entry leaves a crate manifest unselected",
+        bool(manifests_outside(closure_only, manifests)),
+        "every crate manifest sits inside the fuzz closure, so the check above cannot "
+        "tell whether the manifest-wide entry exists",
+    )
+    for pattern, path, selects in (
+        ("crates/**/Cargo.toml", "crates/scp-node/Cargo.toml", True),
+        ("crates/**/Cargo.toml", "crates/a/b/Cargo.toml", True),
+        ("crates/**/Cargo.toml", "crates/scp-node/src/lib.rs", False),
+        ("crates/**/Cargo.toml", "fuzz/Cargo.toml", False),
+        ("fuzz/**", "fuzz/Cargo.lock", True),
+        ("crates/*/Cargo.toml", "crates/a/b/Cargo.toml", False),
+    ):
+        check(
+            f"glob_selects({pattern!r}, {path!r}) is {selects}",
+            glob_selects(pattern, path) is selects,
+        )
+
+
 def check_closure_reads_workspace_inheritance() -> None:
     """A closure covers a dependency whose `path` lives in a workspace manifest.
 
@@ -9079,6 +9178,7 @@ def run_path_closure(inputs: Inputs) -> None:
     check_closure_reads_workspace_inheritance()
     check_resolution_manifests_reach_the_workspace()
     check_path_dep_closures(jobs)
+    check_fuzz_filter_selects_every_crate_manifest(jobs)
 
 
 def run_workspace_scope(inputs: Inputs) -> None:

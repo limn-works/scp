@@ -7,8 +7,8 @@
 
 use scp_crypto::p256::{P256PublicKey, verify_prehash_strict};
 use scp_did::{
-    CommitmentEntry, CustodyType, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
-    StandingCommitment,
+    CommitmentEntry, CustodyType, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition,
+    KeyEntry, KeyRole,
 };
 use scp_kel::{
     CommitmentRolloverFields, Continuation, EventPreimage, EventUnit, InceptionFields,
@@ -591,7 +591,7 @@ pub fn v41_inception(form: SignatureForm) -> Result<EventPreimage, Box<dyn std::
             forms: vec![form],
         },
         key_state: v41_snapshot(3600)?,
-        continuation: Continuation::FixesCommitment(StandingCommitment {
+        continuation: Continuation::FixesCommitment(FixedCommitment {
             commitments: vec![CommitmentEntry {
                 commitment: array(V47A_COMMITMENT)?,
                 custody_type: CustodyType::Passkey,
@@ -658,7 +658,7 @@ pub fn v51_inception() -> Result<EventPreimage, Box<dyn std::error::Error>> {
     Ok(EventPreimage::inception(InceptionFields {
         root_group: raw_root_group(),
         key_state: v51_snapshot(3600)?,
-        continuation: Continuation::FixesCommitment(StandingCommitment {
+        continuation: Continuation::FixesCommitment(FixedCommitment {
             commitments: vec![CommitmentEntry {
                 commitment: prerotation_commitment(&array(V51_PREROTATION)?),
                 custody_type: CustodyType::Passkey,

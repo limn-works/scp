@@ -41,7 +41,7 @@ pub use signature::{
 pub use validate::{
     ChangeEffect, CheckStep, ContentDefect, Discarded, DistinctList, EntryValidation, EntryVerdict,
     EventDefect, FailureClass, HeldHead, HeldHeadMarker, HeldHeadMarkerError, InceptionDefect,
-    InceptionRefusal, MarkerMode, NamedKey, SignerGroupSpec, SigningChange, SigningRefusal,
-    ThresholdField, ValidChains, ValidatedChain, ValidatedChange, validate_entry,
-    validate_inception,
+    InceptionRefusal, MarkerMode, NamedKey, NotOnChain, ReplayedState, SignerGroupSpec,
+    SigningChange, SigningRefusal, ThresholdField, ValidChains, ValidatedChain, ValidatedChange,
+    key_state_at, replay, validate_entry, validate_inception,
 };

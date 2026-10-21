@@ -603,6 +603,11 @@ jobs:
               # reads this filter alone.
               - '.github/actions/rust-toolchain/**'
               - '.github/actions/cargo-fetch/**'
+              # Every crate manifest, inside the closure above or not: a
+              # manifest edit can add a dependency edge that pulls a crate into
+              # this build, and `cargo check --locked` is the one check that
+              # sees fuzz/Cargo.lock fall behind it.
+              - 'crates/**/Cargo.toml'
             # Every path a job compiles, executes, or feeds a gate as input, written as
             # the complement of prose rather than as `'**'` minus exclusions. A pull
             # request that changes only prose (`.docs/**` outside `.docs/migration/`,
@@ -993,6 +998,12 @@ jobs:
       - uses: ./.github/actions/cargo-fetch
       - run: bash scripts/check-protocol-deps.sh
       - run: bash scripts/check-no-shim-reexports.sh
+      # A publishable crate with a normal or build dependency on a
+      # `publish = false` crate, or a release.yml publish order that puts a
+      # crate before its dependency, breaks `cargo publish` at release time.
+      # The self-test plants each defect first and proves the gate rejects it.
+      - run: python3 scripts/check-publish-graph.py --self-test
+      - run: python3 scripts/check-publish-graph.py
 
   # ── FFI singleton enforcement (ADR-048, #1549 Phase 4) ──────────────────
   bridge-globals:
@@ -1350,9 +1361,9 @@ jobs:
 
   # `.docs/specs/25-test-vectors.md` §25 says `scripts/gen-test-vectors-p256.py`
   # produces every keyed byte it prints. This job regenerates the vectors and fails when
-  # spec 25 or a Rust vector test (`crates/scp-runtime/tests/test_vectors.rs`,
-  # `crates/scp-event-log/tests/test_vectors.rs`) holds a value the generator no longer
-  # emits, or when spec 25 lacks a value the generator emits. It runs on every pull
+  # spec 25 or a Rust vector file (every tracked `.rs` file that cites spec 25) holds a
+  # value the generator no longer emits, or when spec 25 lacks a value the generator
+  # emits. It runs on every pull
   # request, without a paths filter, because the `ci` aggregator counts a skipped job as
   # a pass.
   test-vectors:

@@ -4,8 +4,8 @@
 //! equivalence of `extend`, and `prefix`.
 
 use scp_did::{
-    CommitmentEntry, CustodyType, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
-    StandingCommitment,
+    CommitmentEntry, CustodyType, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition,
+    KeyEntry, KeyRole,
 };
 use scp_kel::{
     ChangeEffect, CheckStep, Continuation, Discarded, EntryValidation, EntryVerdict, EventKind,
@@ -36,11 +36,10 @@ pub fn valid(
     let EntryVerdict::Valid { chains } = &verdict else {
         return Err(format!("expected Valid, got {verdict:?} with {discarded:?}").into());
     };
-    let mut paths = chains.iter();
-    match (paths.next(), paths.next()) {
-        (Some(chain), None) => Ok((chain.clone(), discarded)),
-        _ => Err(format!("expected one chain, got {chains:?}").into()),
-    }
+    chains
+        .single()
+        .map(|chain| (chain.clone(), discarded))
+        .ok_or_else(|| format!("expected one chain, got {chains:?}").into())
 }
 
 /// The base chain, validated with no discard.
@@ -53,7 +52,7 @@ pub fn chain_of(base: &Base) -> Result<ValidatedChain, Error> {
 }
 
 /// [Vector 51's inception, Vector 51].
-fn v51_chain() -> Result<Base, Error> {
+pub fn v51_chain() -> Result<Base, Error> {
     Ok(Base {
         name: "V51i,V51",
         identifier: identifier(V51_IDENTIFIER)?,
@@ -194,7 +193,7 @@ fn commitment_to(point: &[u8; 33]) -> [u8; 32] {
 
 /// One `Passkey` `EcdsaP256Sha256` commitment to `point` at next threshold 1.
 fn fixes_one(point: &[u8; 33]) -> Continuation {
-    Continuation::FixesCommitment(StandingCommitment {
+    Continuation::FixesCommitment(FixedCommitment {
         commitments: vec![CommitmentEntry {
             commitment: commitment_to(point),
             custody_type: CustodyType::Passkey,

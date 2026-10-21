@@ -2815,6 +2815,7 @@ dependencies = [
  "scp-crypto",
  "scp-did",
  "scp-event-log",
+ "scp-kel",
  "serde",
  "serde_bytes",
  "serde_json",

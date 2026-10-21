@@ -10,9 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use scp_crypto::p256::P256PublicKey;
-use scp_did::{Identifier, KeyCondition, KeyEntry, KeyRole, StandingCommitment};
+use scp_did::{FixedCommitment, Identifier, KeyCondition, KeyEntry, KeyRole, StandingCommitment};
 
-use super::chain::{ChainEvent, Standing, ValidatedChain};
+use super::chain::{ChainEvent, ResolvedKeys, ValidatedChain};
 use super::change::{ChangeEffect, NamedKey, SignerGroupSpec};
 use super::defect::{ContentDefect, DistinctList, ThresholdField};
 use super::verdicts::KeySet;
@@ -42,8 +42,9 @@ impl Position<'_> {
 /// What an event that passed step 8 adds to the chain.
 pub(super) struct Applied {
     pub(super) root: Arc<InstalledRootSet>,
-    pub(super) commitment: Arc<Standing>,
+    pub(super) commitment: Arc<StandingCommitment>,
     pub(super) snapshot: Arc<KeyStateSnapshot>,
+    pub(super) resolved: ResolvedKeys,
     /// The keys the event installs, with their roles.
     pub(super) installed: Vec<([u8; 33], KeyRole)>,
     /// The commitments the event fixes.
@@ -76,12 +77,13 @@ pub(super) fn root_key_set(root: &InstalledRootSet) -> KeySet {
 /// list's member at the index, at the standing next threshold. An abandoned
 /// commitment has no key set.
 pub(super) fn reveal_key_set(
-    standing: &Standing,
+    standing: &StandingCommitment,
     group: &HeaderGroup,
     revealed_keys: &[[u8; 33]],
 ) -> Option<KeySet> {
-    let Standing::Fixed(commitment) = standing else {
-        return None;
+    let commitment = match standing {
+        StandingCommitment::Fixed(commitment) => commitment,
+        StandingCommitment::Abandoned { .. } => return None,
     };
     let mut first: BTreeMap<u8, Option<[u8; 33]>> = BTreeMap::new();
     for (signer, key) in group.signers().iter().zip(revealed_keys) {
@@ -135,14 +137,20 @@ pub(super) fn check_content(
         check_next_commitment(position, preimage, continuation, &root_after, digest)?;
     check_freshness(position, preimage, snapshot.as_ref(), continuation.as_ref())?;
 
-    let (snapshot_after, installed, dropped) = match &snapshot {
+    let (snapshot_after, resolved, installed, dropped) = match &snapshot {
         Some(applied) => (
             Arc::new(applied.snapshot.clone()),
+            applied.resolved,
             applied.installed.clone(),
             applied.dropped.clone(),
         ),
         None => match position {
-            Position::Next(chain) => (Arc::clone(&chain.head().snapshot), Vec::new(), Vec::new()),
+            Position::Next(chain) => (
+                Arc::clone(&chain.head().snapshot),
+                chain.head().resolved,
+                Vec::new(),
+                Vec::new(),
+            ),
             Position::Inception { .. } => return Err(ContentDefect::FieldAbsent { field: 10 }),
         },
     };
@@ -153,14 +161,7 @@ pub(super) fn check_content(
             return Err(ContentDefect::InceptionFixesNoCommitment);
         }
     };
-    let fixed = match continuation.as_ref() {
-        Some(Standing::Fixed(commitment)) => commitment
-            .commitments
-            .iter()
-            .map(|entry| entry.commitment)
-            .collect(),
-        Some(Standing::Abandoned { .. }) | None => Vec::new(),
-    };
+    let fixed = fixed_commitments(continuation.as_ref());
 
     let head = match position {
         Position::Next(chain) => Some(chain.head()),
@@ -203,6 +204,7 @@ pub(super) fn check_content(
         root: root_after,
         commitment: commitment_after,
         snapshot: snapshot_after,
+        resolved,
         installed,
         fixed,
         revealed: preimage.revealed_keys.clone(),
@@ -223,8 +225,9 @@ fn snapshot_entry(snapshot: &KeyStateSnapshot, key: &[u8; 33]) -> Option<KeyEntr
 /// The checks that read the chain at the predecessor alone: abandonment
 /// (R4), the kind at its position, the identifier field and the sequence.
 fn check_link(chain: &ValidatedChain, preimage: &EventPreimage) -> Result<(), ContentDefect> {
-    if matches!(*chain.head().commitment, Standing::Abandoned { .. }) {
-        return Err(ContentDefect::AfterAbandonment);
+    match *chain.head().commitment {
+        StandingCommitment::Fixed(_) => {}
+        StandingCommitment::Abandoned { .. } => return Err(ContentDefect::AfterAbandonment),
     }
     if preimage.kind == EventKind::Inception {
         return Err(ContentDefect::KindAtPosition {
@@ -384,8 +387,11 @@ fn check_groups(
         let role = group.role();
         let keys = match (role, position) {
             (SignerGroupRole::Reveal, Position::Next(chain)) => {
-                let Standing::Fixed(commitment) = &*chain.head().commitment else {
-                    return Err(ContentDefect::AfterAbandonment);
+                let commitment = match &*chain.head().commitment {
+                    StandingCommitment::Fixed(commitment) => commitment,
+                    StandingCommitment::Abandoned { .. } => {
+                        return Err(ContentDefect::AfterAbandonment);
+                    }
                 };
                 check_reveal(group, commitment, &preimage.revealed_keys)?;
                 reveal_key_set(&chain.head().commitment, group, &preimage.revealed_keys)
@@ -436,7 +442,7 @@ fn check_groups(
 /// each key's commitment the standing list's member at its index.
 fn check_reveal(
     group: &HeaderGroup,
-    commitment: &StandingCommitment,
+    commitment: &FixedCommitment,
     revealed_keys: &[[u8; 33]],
 ) -> Result<(), ContentDefect> {
     if group.signers().len() != revealed_keys.len() {
@@ -458,9 +464,17 @@ fn check_reveal(
     Ok(())
 }
 
-/// A snapshot that passed its checks, with what it installs and drops.
+/// A snapshot that passed its checks, with what it installs and drops and
+/// what the checks resolved in it.
 struct AppliedSnapshot {
     snapshot: KeyStateSnapshot,
+    installed: Vec<([u8; 33], KeyRole)>,
+    dropped: Vec<KeyEntry>,
+    resolved: ResolvedKeys,
+}
+
+/// What a snapshot's key list installs and drops against the predecessor's.
+struct KeyList {
     installed: Vec<([u8; 33], KeyRole)>,
     dropped: Vec<KeyEntry>,
 }
@@ -490,11 +504,12 @@ fn check_snapshot(
     // The size runs first: field 9 and the standing root are each bounded
     // at `MAX_ROOT_SET_SIZE`, so after either equality an oversized
     // snapshot root could only report the mismatch.
-    if u32::try_from(root.members.len()).map_or(true, |size| size > MAX_ROOT_SET_SIZE) {
-        return Err(ContentDefect::RootSetTooLarge {
+    let root_count = u32::try_from(root.members.len())
+        .ok()
+        .filter(|size| *size <= MAX_ROOT_SET_SIZE)
+        .ok_or(ContentDefect::RootSetTooLarge {
             size: root.members.len(),
-        });
-    }
+        })?;
     match (installed_root, position) {
         (Some(installed), _) if *installed != root => {
             return Err(ContentDefect::InstalledRootMismatch);
@@ -552,23 +567,35 @@ fn check_snapshot(
             });
         }
     }
-    let applied = match position {
+    let KeyList { installed, dropped } = match position {
         Position::Inception { .. } => inception_key_list(snapshot)?,
         Position::Next(chain) => successor_key_list(chain, preimage.kind, snapshot)?,
     };
     // The service role resolves after the key list: the only drop that
     // leaves no successor in its role is the `#active` key's, so run first
     // this check would report every `Superseded` drop without a successor
-    // and `SupersededWithoutSuccessor` could never be found.
-    if !operational.contains(&snapshot.service_key_role) {
-        return Err(ContentDefect::ServiceRoleUnresolved);
-    }
-    Ok(Some(applied))
+    // and `SupersededWithoutSuccessor` could never be found. The role is
+    // `#active` (checked above) and at most one key is `Current` in it
+    // (`TwoCurrentInRole`), so the key found is the one `#active` key.
+    let active = snapshot
+        .keys
+        .iter()
+        .find(|entry| {
+            entry.condition == KeyCondition::Current && entry.role == snapshot.service_key_role
+        })
+        .map(|entry| entry.key)
+        .ok_or(ContentDefect::ServiceRoleUnresolved)?;
+    Ok(Some(AppliedSnapshot {
+        snapshot: snapshot.clone(),
+        installed,
+        dropped,
+        resolved: ResolvedKeys { active, root_count },
+    }))
 }
 
 /// The inception's key list: every entry is a key the inception installs,
 /// so every entry is `Current`.
-fn inception_key_list(snapshot: &KeyStateSnapshot) -> Result<AppliedSnapshot, ContentDefect> {
+fn inception_key_list(snapshot: &KeyStateSnapshot) -> Result<KeyList, ContentDefect> {
     let mut installed = Vec::new();
     for entry in &snapshot.keys {
         if entry.condition != KeyCondition::Current {
@@ -576,8 +603,7 @@ fn inception_key_list(snapshot: &KeyStateSnapshot) -> Result<AppliedSnapshot, Co
         }
         installed.push((entry.key, entry.role));
     }
-    Ok(AppliedSnapshot {
-        snapshot: snapshot.clone(),
+    Ok(KeyList {
         installed,
         dropped: Vec::new(),
     })
@@ -589,7 +615,7 @@ fn successor_key_list(
     chain: &ValidatedChain,
     kind: EventKind,
     snapshot: &KeyStateSnapshot,
-) -> Result<AppliedSnapshot, ContentDefect> {
+) -> Result<KeyList, ContentDefect> {
     let previous = &chain.head().snapshot;
     if **previous == *snapshot {
         return Err(ContentDefect::SnapshotUnchanged);
@@ -685,11 +711,7 @@ fn successor_key_list(
             }
         }
     }
-    Ok(AppliedSnapshot {
-        snapshot: snapshot.clone(),
-        installed,
-        dropped,
-    })
+    Ok(KeyList { installed, dropped })
 }
 
 /// Field 12's commitment: a pairwise distinct list, a next threshold within
@@ -701,7 +723,7 @@ fn check_next_commitment(
     continuation: Option<&Continuation>,
     root_after: &InstalledRootSet,
     digest: [u8; 32],
-) -> Result<Option<Standing>, ContentDefect> {
+) -> Result<Option<StandingCommitment>, ContentDefect> {
     match continuation {
         None => Ok(None),
         Some(Continuation::Abandons) => {
@@ -710,7 +732,7 @@ fn check_next_commitment(
             if matches!(position, Position::Inception { .. }) {
                 return Err(ContentDefect::InceptionFixesNoCommitment);
             }
-            Ok(Some(Standing::Abandoned {
+            Ok(Some(StandingCommitment::Abandoned {
                 at_sequence: preimage.sequence,
                 event_digest: digest,
             }))
@@ -732,7 +754,7 @@ fn check_next_commitment(
                     root_threshold: root_after.threshold,
                 });
             }
-            Ok(Some(Standing::Fixed(commitment.clone())))
+            Ok(Some(StandingCommitment::Fixed(commitment.clone())))
         }
     }
 }
@@ -785,18 +807,11 @@ fn check_freshness(
     position: Position<'_>,
     preimage: &EventPreimage,
     snapshot: Option<&AppliedSnapshot>,
-    continuation: Option<&Standing>,
+    continuation: Option<&StandingCommitment>,
 ) -> Result<(), ContentDefect> {
     let installed: &[([u8; 33], KeyRole)] =
         snapshot.map_or(&[], |applied| applied.installed.as_slice());
-    let fixed: Vec<[u8; 32]> = match continuation {
-        Some(Standing::Fixed(commitment)) => commitment
-            .commitments
-            .iter()
-            .map(|entry| entry.commitment)
-            .collect(),
-        Some(Standing::Abandoned { .. }) | None => Vec::new(),
-    };
+    let fixed = fixed_commitments(continuation);
     let seen = AtOrBefore {
         chain: match position {
             Position::Next(chain) => Some(chain),
@@ -833,6 +848,19 @@ fn check_freshness(
     Ok(())
 }
 
+/// The commitments an event's continuation fixes, in list order: none when
+/// it fixes no commitment or abandons the standing one.
+fn fixed_commitments(continuation: Option<&StandingCommitment>) -> Vec<[u8; 32]> {
+    match continuation {
+        Some(StandingCommitment::Fixed(commitment)) => commitment
+            .commitments
+            .iter()
+            .map(|entry| entry.commitment)
+            .collect(),
+        Some(StandingCommitment::Abandoned { .. }) | None => Vec::new(),
+    }
+}
+
 /// The event this content adds, as a chain entry.
 pub(super) fn chain_event(
     applied: &Applied,
@@ -846,5 +874,6 @@ pub(super) fn chain_event(
         root: Arc::clone(&applied.root),
         commitment: Arc::clone(&applied.commitment),
         snapshot: Arc::clone(&applied.snapshot),
+        resolved: applied.resolved,
     }
 }

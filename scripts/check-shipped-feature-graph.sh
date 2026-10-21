@@ -258,6 +258,7 @@ scp-ffi/server
 scp-ffi/vendored-openssl
 scp-identity/default
 scp-identity/production-dht
+scp-kel/default
 scp-mcp/default
 scp-media/default
 scp-mls/default
@@ -311,6 +312,7 @@ scp-ffi-common
 scp-ffi-napi
 scp-ffi-uniffi
 scp-identity
+scp-kel
 scp-mcp
 scp-media
 scp-mls

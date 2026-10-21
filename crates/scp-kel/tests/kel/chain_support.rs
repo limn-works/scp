@@ -9,8 +9,8 @@
 
 use scp_crypto::p256::{P256SecretKey, SeedLabel, sign_prehash_rfc6979};
 use scp_did::{
-    CommitmentEntry, CustodyType, Identifier, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole,
-    StandingCommitment,
+    CommitmentEntry, CustodyType, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition,
+    KeyEntry, KeyRole,
 };
 use scp_kel::{
     Continuation, EventKind, EventPreimage, InstalledRootSet, KeyStateFields, KeyStateSnapshot,
@@ -430,7 +430,7 @@ pub fn snapshot(keys: Vec<KeyEntry>, root_threshold: u32) -> Result<KeyStateSnap
 
 /// A commitment list over `points` at `next_threshold`.
 pub fn fixes(points: &[[u8; 33]], next_threshold: u32) -> Continuation {
-    Continuation::FixesCommitment(StandingCommitment {
+    Continuation::FixesCommitment(FixedCommitment {
         commitments: points
             .iter()
             .map(|point| CommitmentEntry {

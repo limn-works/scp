@@ -291,6 +291,27 @@ fn a_fork_is_one_chain_per_event_in_served_order() -> TestResult {
     Ok(())
 }
 
+/// `ValidChains::single` names the one chain of an unforked log and no
+/// chain of a forked one, whatever order the forks are served in: picking
+/// a fork is R6's fork choice, never the validator's.
+#[test]
+fn single_is_the_chain_of_an_unforked_log_only() -> TestResult {
+    let units = Units::new()?;
+    let single_of = |list: &[&[u8]]| -> Result<Option<ValidatedChain>, Error> {
+        match validate_entry(&served()?, list).verdict {
+            EntryVerdict::Valid { chains } => Ok(chains.single().cloned()),
+            other => Err(format!("expected Valid, got {other:?}").into()),
+        }
+    };
+    assert_eq!(
+        single_of(&[&units.v41, &units.v50])?,
+        Some(chain_of(&v41_v50()?)?)
+    );
+    assert_eq!(single_of(&[&units.v41, &units.v50, &units.other])?, None);
+    assert_eq!(single_of(&[&units.v41, &units.other, &units.v50])?, None);
+    Ok(())
+}
+
 /// A fork reports a discard at the fork and one on the later branch, once
 /// each, and each chain holds its own branch.
 #[test]
