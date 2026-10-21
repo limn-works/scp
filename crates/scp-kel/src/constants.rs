@@ -32,6 +32,10 @@ pub const MAX_AUTHENTICATOR_DATA_BYTES: u32 = 256;
 /// fewest is one (§9.7.4.2, the assertion form's layout).
 pub const MAX_CLIENT_DATA_JSON_BYTES: u32 = 512;
 
+/// The bytes of the raw `r ‖ s` ECDSA P-256 signature both indexed-signature
+/// forms carry (§9.5; §9.7.4.2, "Signature form").
+pub const RAW_SIGNATURE_BYTES: u32 = 64;
+
 /// The shortest witnessing interval a key-state snapshot may carry, in
 /// seconds (§9.18.17).
 pub const MIN_WITNESSING_INTERVAL: u32 = 300;
@@ -43,7 +47,7 @@ pub const MAX_WITNESSING_INTERVAL: u32 = 604_800;
 /// Prefixes an event's preimage digest in the `WebAuthn` challenge of an
 /// assertion-form indexed signature (§9.7.4.2 definitions; §9.18.2). It is
 /// distinct from [`KEL_EVENT_SEPARATOR`], so no key-event preimage is a
-/// `WebAuthn` challenge. Its one public path is `verify_indexed`.
+/// `WebAuthn` challenge. Its one public path is `key_event_challenge`.
 pub(crate) const KEY_EVENT_CHALLENGE_SEPARATOR: &[u8] = b"SCP-KEY-EVENT-V1:";
 
 /// Prefixes the twelve field bytes in the signed preimage every event

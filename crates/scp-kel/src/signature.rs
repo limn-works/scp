@@ -13,15 +13,18 @@
 use scp_crypto::p256::{P256Error, P256PublicKey, verify_prehash_strict};
 use sha2::{Digest, Sha256};
 
-use crate::client_data::{ClientDataError, parse_client_data_json};
+use crate::client_data::{ClientDataError, parse};
 use crate::constants::{
     KEY_EVENT_CHALLENGE_SEPARATOR, MAX_AUTHENTICATOR_DATA_BYTES, MAX_CLIENT_DATA_JSON_BYTES,
-    MIN_AUTHENTICATOR_DATA_BYTES,
+    MIN_AUTHENTICATOR_DATA_BYTES, RAW_SIGNATURE_BYTES,
 };
 use crate::event::SignatureForm;
 
-/// The 64-byte raw `r ‖ s` signature both forms carry (§9.5).
-pub const RAW_SIGNATURE_BYTES: usize = 64;
+/// [`RAW_SIGNATURE_BYTES`] as an array length; 64 fits every `usize`.
+const RAW_LEN: usize = RAW_SIGNATURE_BYTES as usize;
+/// The length of `"SCP-KEY-EVENT-V1:" ‖ D`: the 17-byte separator and the
+/// 32-byte digest.
+const KEY_EVENT_CHALLENGE_LEN: usize = 49;
 
 /// The `authenticatorData` byte that carries the flags (Web Authentication
 /// Level 2 §6.1), which `MIN_AUTHENTICATOR_DATA_BYTES` guarantees exists.
@@ -48,7 +51,7 @@ pub enum IndexedSignature {
     /// the event's preimage digest `D`.
     Raw {
         /// The raw `r ‖ s` bytes.
-        signature: [u8; RAW_SIGNATURE_BYTES],
+        signature: [u8; RAW_LEN],
     },
     /// `SignatureForm::WebAuthnAssertion`: a `WebAuthn` assertion whose
     /// challenge is `"SCP-KEY-EVENT-V1:" ‖ D`.
@@ -65,7 +68,7 @@ pub enum IndexedSignature {
 pub struct AssertionSignature {
     authenticator_data: Vec<u8>,
     client_data_json: Vec<u8>,
-    signature: [u8; RAW_SIGNATURE_BYTES],
+    signature: [u8; RAW_LEN],
 }
 
 /// The part of an indexed signature a field ran out inside.
@@ -85,10 +88,10 @@ pub enum IndexedSignaturePart {
     AssertionSignature,
 }
 
-/// Why an indexed signature cannot be read or does not verify (§9.7.4.2).
-/// Each variant names one check.
+/// Why an indexed signature cannot be read off a signature field or built
+/// from its parts (§9.7.4.2; §9.18.17). Each variant names one check.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum IndexedSignatureError {
+pub enum IndexedSignatureReadError {
     /// The field ends inside an indexed signature: a declared length, or a
     /// fixed-width part, runs past it.
     #[error("the signature field ends inside the {part:?}, with {remaining} bytes left")]
@@ -107,10 +110,29 @@ pub enum IndexedSignatureError {
     },
     /// `clientDataJSON` is empty or longer than `MAX_CLIENT_DATA_JSON_BYTES`
     /// (§9.18.17).
+    ///
+    /// This is the one check of the 512-byte bound: the acceptance-set
+    /// validator runs only over an [`AssertionSignature`]'s bytes, which
+    /// have passed it.
     #[error("clientDataJSON is {len} bytes, outside 1..=512")]
     ClientDataJsonLength {
         /// The declared or carried length.
         len: usize,
+    },
+}
+
+/// Why an indexed signature does not verify (§9.7.4.2, "Signature form").
+/// Each variant names one check.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IndexedSignatureError {
+    /// The signature carries a form other than the one field 7 declares for
+    /// its index.
+    #[error("field 7 declares the {declared:?} form, and the signature carries {carried:?}")]
+    FormMismatch {
+        /// The form field 7 declares.
+        declared: SignatureForm,
+        /// The form the signature carries.
+        carried: SignatureForm,
     },
     /// The key at the signature's index is not a valid P-256 point.
     #[error("the key at the signature's index is not a valid P-256 point: {0}")]
@@ -144,14 +166,14 @@ impl AssertionSignature {
     ///
     /// # Errors
     ///
-    /// [`IndexedSignatureError::AuthenticatorDataLength`] or
-    /// [`IndexedSignatureError::ClientDataJsonLength`] when a part is
+    /// [`IndexedSignatureReadError::AuthenticatorDataLength`] or
+    /// [`IndexedSignatureReadError::ClientDataJsonLength`] when a part is
     /// outside its §9.18.17 bound.
     pub fn new(
         authenticator_data: Vec<u8>,
         client_data_json: Vec<u8>,
-        signature: [u8; RAW_SIGNATURE_BYTES],
-    ) -> Result<Self, IndexedSignatureError> {
+        signature: [u8; RAW_LEN],
+    ) -> Result<Self, IndexedSignatureReadError> {
         check_authenticator_data_length(authenticator_data.len())?;
         check_client_data_json_length(client_data_json.len())?;
         Ok(Self {
@@ -175,7 +197,7 @@ impl AssertionSignature {
 
     /// The 64-byte low-`s` `r ‖ s` signature.
     #[must_use]
-    pub const fn signature(&self) -> &[u8; RAW_SIGNATURE_BYTES] {
+    pub const fn signature(&self) -> &[u8; RAW_LEN] {
         &self.signature
     }
 }
@@ -198,11 +220,14 @@ impl IndexedSignature {
     ///
     /// # Errors
     ///
-    /// [`IndexedSignatureError::Truncated`] when a part runs past `field`;
-    /// [`IndexedSignatureError::AuthenticatorDataLength`] or
-    /// [`IndexedSignatureError::ClientDataJsonLength`] when a declared
+    /// [`IndexedSignatureReadError::Truncated`] when a part runs past
+    /// `field`; [`IndexedSignatureReadError::AuthenticatorDataLength`] or
+    /// [`IndexedSignatureReadError::ClientDataJsonLength`] when a declared
     /// length is outside its bound.
-    pub fn read(form: SignatureForm, field: &[u8]) -> Result<(Self, usize), IndexedSignatureError> {
+    pub fn read(
+        form: SignatureForm,
+        field: &[u8],
+    ) -> Result<(Self, usize), IndexedSignatureReadError> {
         let mut reader = FieldReader { field, pos: 0 };
         let signature = match form {
             SignatureForm::Raw => Self::Raw {
@@ -240,7 +265,7 @@ impl IndexedSignature {
                     2 * LENGTH_PREFIX_BYTES
                         + assertion.authenticator_data.len()
                         + assertion.client_data_json.len()
-                        + RAW_SIGNATURE_BYTES,
+                        + RAW_LEN,
                 );
                 // Both lengths are at most 512 (`AssertionSignature::new`
                 // and `read` enforce the bounds), so each fits a `u32`.
@@ -256,16 +281,19 @@ impl IndexedSignature {
     }
 }
 
-/// Verifies one indexed signature against `key`, the 33-byte SEC1 point at
-/// its index, for the event whose preimage digest is `event_digest`
-/// (§9.7.4.2, "Signature form").
+/// Verifies one indexed signature of the form field 7 declares (§9.7.4.2,
+/// "Signature form").
 ///
-/// A raw-form signature is checked with §9.5's strict verifier over `D`. An
+/// `key` is the 33-byte SEC1 point at the signature's index, `event_digest`
+/// is the event's preimage digest `D`, and `declared` is the form field 7
+/// declares for the index. A signature whose form is not `declared` is rejected first, so a value
+/// built by hand cannot verify under a form the event does not declare. A
+/// raw-form signature is checked with §9.5's strict verifier over `D`. An
 /// assertion-form signature is accepted only when both the user-presence
 /// and the user-verification flag of `authenticatorData` byte 32 are set,
 /// `clientDataJSON` is in the acceptance set, its decoded `type` is
 /// `"webauthn.get"`, its decoded `challenge` equals the unpadded base64url
-/// encoding of `"SCP-KEY-EVENT-V1:" ‖ D` as a string, and the 64-byte
+/// encoding of [`key_event_challenge`] as a string, and the 64-byte
 /// signature passes §9.5's strict verifier over
 /// `SHA-256(authenticatorData ‖ SHA-256(clientDataJSON))`, which is the
 /// message `WebAuthn` defines and not `D`.
@@ -276,8 +304,13 @@ impl IndexedSignature {
 pub fn verify_indexed(
     key: &[u8; 33],
     event_digest: &[u8; 32],
+    declared: SignatureForm,
     signature: &IndexedSignature,
 ) -> Result<(), IndexedSignatureError> {
+    let carried = signature.form();
+    if carried != declared {
+        return Err(IndexedSignatureError::FormMismatch { declared, carried });
+    }
     let key = P256PublicKey::from_sec1(key).map_err(IndexedSignatureError::InvalidKey)?;
     match signature {
         IndexedSignature::Raw { signature } => verify_prehash_strict(&key, event_digest, signature)
@@ -307,11 +340,11 @@ fn verify_assertion(
     if flags & FLAG_USER_VERIFIED == 0 {
         return Err(IndexedSignatureError::UserVerificationNotSet);
     }
-    let members = parse_client_data_json(&assertion.client_data_json)?;
+    let members = parse(&assertion.client_data_json)?;
     if members.client_data_type != ASSERTION_TYPE {
         return Err(IndexedSignatureError::ClientDataTypeMismatch);
     }
-    if members.challenge != key_event_challenge(event_digest) {
+    if members.challenge != base64url_unpadded(&key_event_challenge(event_digest)) {
         return Err(IndexedSignatureError::ChallengeMismatch);
     }
     let client_data_hash = Sha256::digest(&assertion.client_data_json);
@@ -324,19 +357,23 @@ fn verify_assertion(
         .map_err(IndexedSignatureError::Signature)
 }
 
-/// The challenge string an assertion over the event with preimage digest
-/// `event_digest` carries.
+/// The `WebAuthn` challenge bytes for the event whose preimage digest is
+/// `event_digest`: `"SCP-KEY-EVENT-V1:" ‖ D` (§9.7.4.2 definitions;
+/// §9.18.2).
 ///
-/// It is the unpadded base64url encoding of `"SCP-KEY-EVENT-V1:" ‖ D`
-/// (§9.7.4.2; §9.18.2). Comparing the decoded
-/// `challenge` against this canonical encoding as a string, and never
-/// decoding the member, rejects a non-canonical encoding of the same bytes.
+/// A signer passes these 49 bytes as the assertion request's challenge, and
+/// the client base64url-encodes them into `clientDataJSON` itself. The
+/// verifier compares the decoded `challenge` member, as a string, against
+/// the canonical unpadded base64url encoding of these bytes and never
+/// decodes the member, so a non-canonical encoding of the same bytes is
+/// rejected.
 #[must_use]
-pub fn key_event_challenge(event_digest: &[u8; 32]) -> String {
-    let mut challenge = Vec::with_capacity(KEY_EVENT_CHALLENGE_SEPARATOR.len() + 32);
-    challenge.extend_from_slice(KEY_EVENT_CHALLENGE_SEPARATOR);
-    challenge.extend_from_slice(event_digest);
-    base64url_unpadded(&challenge)
+pub const fn key_event_challenge(event_digest: &[u8; 32]) -> [u8; KEY_EVENT_CHALLENGE_LEN] {
+    let mut challenge = [0u8; KEY_EVENT_CHALLENGE_LEN];
+    let (separator, digest) = challenge.split_at_mut(KEY_EVENT_CHALLENGE_SEPARATOR.len());
+    separator.copy_from_slice(KEY_EVENT_CHALLENGE_SEPARATOR);
+    digest.copy_from_slice(event_digest);
+    challenge
 }
 
 /// RFC 4648 §5 base64url, without padding.
@@ -359,25 +396,25 @@ fn base64url_unpadded(bytes: &[u8]) -> String {
 }
 
 /// Rejects an `authenticatorData` length outside §9.18.17's bounds.
-fn check_authenticator_data_length(len: usize) -> Result<(), IndexedSignatureError> {
+fn check_authenticator_data_length(len: usize) -> Result<(), IndexedSignatureReadError> {
     let in_bounds = u32::try_from(len).is_ok_and(|len| {
         (MIN_AUTHENTICATOR_DATA_BYTES..=MAX_AUTHENTICATOR_DATA_BYTES).contains(&len)
     });
     if in_bounds {
         Ok(())
     } else {
-        Err(IndexedSignatureError::AuthenticatorDataLength { len })
+        Err(IndexedSignatureReadError::AuthenticatorDataLength { len })
     }
 }
 
 /// Rejects a `clientDataJSON` length outside §9.18.17's bounds.
-fn check_client_data_json_length(len: usize) -> Result<(), IndexedSignatureError> {
+fn check_client_data_json_length(len: usize) -> Result<(), IndexedSignatureReadError> {
     let in_bounds =
         u32::try_from(len).is_ok_and(|len| (1..=MAX_CLIENT_DATA_JSON_BYTES).contains(&len));
     if in_bounds {
         Ok(())
     } else {
-        Err(IndexedSignatureError::ClientDataJsonLength { len })
+        Err(IndexedSignatureReadError::ClientDataJsonLength { len })
     }
 }
 
@@ -393,22 +430,22 @@ impl<'a> FieldReader<'a> {
         &mut self,
         len: usize,
         part: IndexedSignaturePart,
-    ) -> Result<&'a [u8], IndexedSignatureError> {
+    ) -> Result<&'a [u8], IndexedSignatureReadError> {
         let remaining = self.field.len().saturating_sub(self.pos);
         let end = self
             .pos
             .checked_add(len)
-            .ok_or(IndexedSignatureError::Truncated { part, remaining })?;
+            .ok_or(IndexedSignatureReadError::Truncated { part, remaining })?;
         let out = self
             .field
             .get(self.pos..end)
-            .ok_or(IndexedSignatureError::Truncated { part, remaining })?;
+            .ok_or(IndexedSignatureReadError::Truncated { part, remaining })?;
         self.pos = end;
         Ok(out)
     }
 
     /// A `BE32` length prefix.
-    fn length(&mut self, part: IndexedSignaturePart) -> Result<usize, IndexedSignatureError> {
+    fn length(&mut self, part: IndexedSignaturePart) -> Result<usize, IndexedSignatureReadError> {
         let mut prefix = [0u8; LENGTH_PREFIX_BYTES];
         prefix.copy_from_slice(self.bytes(LENGTH_PREFIX_BYTES, part)?);
         // A value past `usize` on a 16-bit target is out of every bound.
@@ -419,9 +456,9 @@ impl<'a> FieldReader<'a> {
     fn signature(
         &mut self,
         part: IndexedSignaturePart,
-    ) -> Result<[u8; RAW_SIGNATURE_BYTES], IndexedSignatureError> {
-        let mut signature = [0u8; RAW_SIGNATURE_BYTES];
-        signature.copy_from_slice(self.bytes(RAW_SIGNATURE_BYTES, part)?);
+    ) -> Result<[u8; RAW_LEN], IndexedSignatureReadError> {
+        let mut signature = [0u8; RAW_LEN];
+        signature.copy_from_slice(self.bytes(RAW_LEN, part)?);
         Ok(signature)
     }
 }

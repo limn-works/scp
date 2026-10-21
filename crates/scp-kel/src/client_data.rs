@@ -15,12 +15,15 @@
 //! two RFC-conforming parsers can disagree about one document, which is the
 //! split §9.7.4.2 names.
 //!
-//! The validator is hand-written over at most `MAX_CLIENT_DATA_JSON_BYTES`
-//! bytes. Nesting is held on an explicit stack, so no recursion depth is
-//! driven by the input, and a general-purpose parser's own limits (a nesting
-//! cap, a float conversion, last-duplicate-wins) never decide acceptance.
+//! The validator is hand-written and runs only over the `clientDataJSON` of
+//! an [`AssertionSignature`], whose constructor and reader bound it at
+//! `MAX_CLIENT_DATA_JSON_BYTES`; that bound has one check and one error,
+//! `IndexedSignatureReadError::ClientDataJsonLength`. Nesting is held on an
+//! explicit stack, so no recursion depth is driven by the input, and a
+//! general-purpose parser's own limits (a nesting cap, a float conversion,
+//! last-duplicate-wins) never decide acceptance.
 
-use crate::constants::MAX_CLIENT_DATA_JSON_BYTES;
+use crate::signature::AssertionSignature;
 
 /// The two top-level members a key-event verifier reads out of an accepted
 /// `clientDataJSON`, each as its decoded JSON string value.
@@ -37,12 +40,6 @@ pub struct ClientDataMembers {
 /// which the rule failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ClientDataError {
-    /// The input is longer than `MAX_CLIENT_DATA_JSON_BYTES` (§9.18.17).
-    #[error("clientDataJSON is {len} bytes, over MAX_CLIENT_DATA_JSON_BYTES")]
-    TooLong {
-        /// The input's length.
-        len: usize,
-    },
     /// The input begins with a UTF-8 byte-order mark.
     #[error("clientDataJSON begins with a byte-order mark")]
     ByteOrderMark,
@@ -165,21 +162,25 @@ struct Validator<'a> {
     challenge: TopLevel,
 }
 
-/// Validates `bytes` against §9.7.4.2's `clientDataJSON` acceptance set and
-/// returns the decoded top-level `type` and `challenge` strings.
+/// Validates an assertion's `clientDataJSON` against §9.7.4.2's acceptance
+/// set and returns the decoded top-level `type` and `challenge` strings.
 ///
-/// Public for the `fuzz_kel_client_data` target only; a verifier reaches it
-/// through [`verify_indexed`](crate::verify_indexed).
+/// Public for the `fuzz_kel_client_data` target and the tests only; a
+/// verifier reaches it through [`verify_indexed`](crate::verify_indexed).
 ///
 /// # Errors
 ///
 /// The [`ClientDataError`] naming the first rule the bytes break.
 #[doc(hidden)]
-pub fn parse_client_data_json(bytes: &[u8]) -> Result<ClientDataMembers, ClientDataError> {
-    let max = usize::try_from(MAX_CLIENT_DATA_JSON_BYTES).unwrap_or(usize::MAX);
-    if bytes.len() > max {
-        return Err(ClientDataError::TooLong { len: bytes.len() });
-    }
+pub fn parse_client_data_json(
+    assertion: &AssertionSignature,
+) -> Result<ClientDataMembers, ClientDataError> {
+    parse(assertion.client_data_json())
+}
+
+/// [`parse_client_data_json`] over bytes an [`AssertionSignature`] holds,
+/// which are within `MAX_CLIENT_DATA_JSON_BYTES`.
+pub fn parse(bytes: &[u8]) -> Result<ClientDataMembers, ClientDataError> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return Err(ClientDataError::ByteOrderMark);
     }

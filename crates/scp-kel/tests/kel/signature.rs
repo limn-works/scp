@@ -9,16 +9,16 @@
 use scp_crypto::p256::{P256Error, P256SecretKey, SeedLabel, sign_prehash_rfc6979};
 use scp_kel::{
     AssertionSignature, ClientDataError, IndexedSignature, IndexedSignatureError,
-    IndexedSignaturePart, SignatureForm, key_event_challenge, parse_client_data_json,
-    verify_indexed,
+    IndexedSignaturePart, IndexedSignatureReadError, SignatureForm, key_event_challenge,
+    parse_client_data_json, verify_indexed,
 };
 use sha2::{Digest, Sha256};
 
 use crate::fixtures::{
     TestResult, V41_ACTIVE, V41_DIGEST, V41_ROOT, V41_SIGNATURE, V42_AUTHENTICATOR_DATA,
     V42_CHALLENGE, V42_CHALLENGE_BYTES, V42_CLIENT_DATA_HASH, V42_CLIENT_DATA_JSON,
-    V42_CLIENT_DATA_JSON_HEX, V42_DIGEST, V42_INDEXED_SIGNATURE, V42_SIGNATURE, V42_SIGNED_DIGEST,
-    array, bytes,
+    V42_CLIENT_DATA_JSON_HEX, V42_DIGEST, V42_INDEXED_SIGNATURE, V42_RP_ID, V42_SIGNATURE,
+    V42_SIGNED_DIGEST, V42_SIGNED_MESSAGE, array, bytes,
 };
 
 type Error = Box<dyn std::error::Error>;
@@ -90,9 +90,30 @@ fn assertion_wire(authenticator: &[u8], client_data_json: &[u8], signature: &[u8
     out
 }
 
-/// Verifies an assertion against Vector 42's digest under member 0.
+/// Verifies an assertion against Vector 42's digest under member 0, with
+/// the assertion form declared.
 fn verify_v42(signature: &IndexedSignature) -> Result<Result<(), IndexedSignatureError>, Error> {
-    Ok(verify_indexed(&root()?, &v42_digest()?, signature))
+    Ok(verify_indexed(
+        &root()?,
+        &v42_digest()?,
+        SignatureForm::WebAuthnAssertion,
+        signature,
+    ))
+}
+
+/// Verifies a raw-form signature under member 0, with the raw form
+/// declared.
+fn verify_raw(
+    key: &[u8; 33],
+    digest: &[u8; 32],
+    signature: [u8; 64],
+) -> Result<(), IndexedSignatureError> {
+    verify_indexed(
+        key,
+        digest,
+        SignatureForm::Raw,
+        &IndexedSignature::Raw { signature },
+    )
 }
 
 /// `n − s` for a big-endian 32-byte `s`.
@@ -129,7 +150,12 @@ fn vector_41_raw_form_reads_and_verifies() -> TestResult {
     assert_eq!(consumed, 64);
     assert_eq!(signature.form(), SignatureForm::Raw);
     assert_eq!(signature.to_bytes(), field);
-    verify_indexed(&root()?, &array(V41_DIGEST)?, &signature)?;
+    verify_indexed(
+        &root()?,
+        &array(V41_DIGEST)?,
+        SignatureForm::Raw,
+        &signature,
+    )?;
     Ok(())
 }
 
@@ -158,32 +184,39 @@ fn vector_42_assertion_form_reproduces_every_intermediate_and_verifies() -> Test
     assert_eq!(assertion.client_data_json().len(), 155);
     assert_eq!(assertion.signature(), &array::<64>(V42_SIGNATURE)?);
 
+    // authenticatorData from its stated derivation: rpIdHash =
+    // SHA-256("ctx.network"), flags 0x05 (UP and UV), signCount 0.
+    let authenticator = assertion.authenticator_data();
+    assert_eq!(
+        authenticator.get(..32).ok_or("short authenticatorData")?,
+        Sha256::digest(V42_RP_ID.as_bytes()).as_slice()
+    );
+    assert_eq!(authenticator.get(32), Some(&0x05));
+    assert_eq!(authenticator.get(33..), Some(&[0u8; 4][..]));
+
     let digest = v42_digest()?;
-    let mut challenge_bytes = b"SCP-KEY-EVENT-V1:".to_vec();
-    challenge_bytes.extend_from_slice(&digest);
-    assert_eq!(challenge_bytes, bytes(V42_CHALLENGE_BYTES)?);
-    assert_eq!(key_event_challenge(&digest), V42_CHALLENGE);
-    let members = parse_client_data_json(assertion.client_data_json())?;
+    assert_eq!(
+        key_event_challenge(&digest).as_slice(),
+        bytes(V42_CHALLENGE_BYTES)?
+    );
+    let members = parse_client_data_json(assertion)?;
     assert_eq!(members.client_data_type, "webauthn.get");
     assert_eq!(members.challenge, V42_CHALLENGE);
 
     let client_data_hash: [u8; 32] = Sha256::digest(assertion.client_data_json()).into();
     assert_eq!(client_data_hash, array::<32>(V42_CLIENT_DATA_HASH)?);
-    let signed: [u8; 32] = Sha256::new()
-        .chain_update(assertion.authenticator_data())
-        .chain_update(client_data_hash)
-        .finalize()
-        .into();
+    let mut message = authenticator.to_vec();
+    message.extend_from_slice(&client_data_hash);
+    assert_eq!(message.len(), 69);
+    assert_eq!(message, bytes(V42_SIGNED_MESSAGE)?);
+    let signed: [u8; 32] = Sha256::digest(&message).into();
     assert_eq!(signed, array::<32>(V42_SIGNED_DIGEST)?);
 
-    verify_indexed(&root()?, &digest, &signature)?;
+    verify_v42(&signature)??;
     // The assertion signs its own envelope, never D: the same 64 bytes do
     // not verify as a raw-form signature over D.
-    let raw = IndexedSignature::Raw {
-        signature: *assertion.signature(),
-    };
     assert_eq!(
-        verify_indexed(&root()?, &digest, &raw),
+        verify_raw(&root()?, &digest, *assertion.signature()),
         Err(IndexedSignatureError::Signature(
             P256Error::VerificationFailed
         ))
@@ -194,11 +227,12 @@ fn vector_42_assertion_form_reproduces_every_intermediate_and_verifies() -> Test
 /// (a) Vector 41 with s replaced by n − s.
 #[test]
 fn raw_form_rejects_high_s() -> TestResult {
-    let signature = IndexedSignature::Raw {
-        signature: high_s(&array(V41_SIGNATURE)?)?,
-    };
     assert_eq!(
-        verify_indexed(&root()?, &array(V41_DIGEST)?, &signature),
+        verify_raw(
+            &root()?,
+            &array(V41_DIGEST)?,
+            high_s(&array(V41_SIGNATURE)?)?
+        ),
         Err(IndexedSignatureError::Signature(P256Error::HighS))
     );
     Ok(())
@@ -232,11 +266,7 @@ fn raw_form_rejects_scalars_out_of_range() -> TestResult {
         .copy_from_slice(&array::<32>(ORDER)?);
     for signature in [zero_r, s_is_n] {
         assert_eq!(
-            verify_indexed(
-                &root()?,
-                &array(V41_DIGEST)?,
-                &IndexedSignature::Raw { signature }
-            ),
+            verify_raw(&root()?, &array(V41_DIGEST)?, signature),
             Err(IndexedSignatureError::Signature(
                 P256Error::SignatureScalarOutOfRange
             ))
@@ -248,19 +278,17 @@ fn raw_form_rejects_scalars_out_of_range() -> TestResult {
 /// (d) the wrong key and (e) a flipped digest bit.
 #[test]
 fn raw_form_rejects_wrong_key_and_wrong_digest() -> TestResult {
-    let signature = IndexedSignature::Raw {
-        signature: array(V41_SIGNATURE)?,
-    };
+    let signature = array(V41_SIGNATURE)?;
     let failed = Err(IndexedSignatureError::Signature(
         P256Error::VerificationFailed,
     ));
     assert_eq!(
-        verify_indexed(&array(V41_ACTIVE)?, &array(V41_DIGEST)?, &signature),
+        verify_raw(&array(V41_ACTIVE)?, &array(V41_DIGEST)?, signature),
         failed
     );
     let mut digest = array::<32>(V41_DIGEST)?;
     *digest.get_mut(31).ok_or("short")? ^= 0x01;
-    assert_eq!(verify_indexed(&root()?, &digest, &signature), failed);
+    assert_eq!(verify_raw(&root()?, &digest, signature), failed);
     Ok(())
 }
 
@@ -270,13 +298,7 @@ fn an_invalid_point_at_the_index_fails_typed() -> TestResult {
     let mut key = root()?;
     key[0] = 0x05;
     assert_eq!(
-        verify_indexed(
-            &key,
-            &array(V41_DIGEST)?,
-            &IndexedSignature::Raw {
-                signature: array(V41_SIGNATURE)?
-            }
-        ),
+        verify_raw(&key, &array(V41_DIGEST)?, array(V41_SIGNATURE)?),
         Err(IndexedSignatureError::InvalidKey(
             P256Error::InvalidPointPrefix {
                 len: 33,
@@ -327,7 +349,7 @@ fn authenticator_data_bounds_reject() -> TestResult {
         let mut authenticator = authenticator_data(0x05)?;
         authenticator.resize(len, 0);
         let signature = sign_assertion(&authenticator, &client_data_json)?;
-        let expected = IndexedSignatureError::AuthenticatorDataLength { len };
+        let expected = IndexedSignatureReadError::AuthenticatorDataLength { len };
         assert_eq!(
             AssertionSignature::new(authenticator.clone(), client_data_json.clone(), signature),
             Err(expected.clone())
@@ -350,7 +372,7 @@ fn client_data_json_bounds_reject() -> TestResult {
     for client_data_json in [Vec::new(), long] {
         let len = client_data_json.len();
         let signature = sign_assertion(&authenticator, &client_data_json)?;
-        let expected = IndexedSignatureError::ClientDataJsonLength { len };
+        let expected = IndexedSignatureReadError::ClientDataJsonLength { len };
         assert_eq!(
             AssertionSignature::new(authenticator.clone(), client_data_json.clone(), signature),
             Err(expected.clone())
@@ -405,25 +427,33 @@ fn reads_reject_a_part_running_past_the_field() -> TestResult {
     for (cut, part) in cases {
         let short = field.get(..cut).ok_or("cut")?;
         match IndexedSignature::read(SignatureForm::WebAuthnAssertion, short) {
-            Err(IndexedSignatureError::Truncated { part: found, .. }) => assert_eq!(found, part),
+            Err(IndexedSignatureReadError::Truncated { part: found, .. }) => {
+                assert_eq!(found, part);
+            }
             other => return Err(format!("cut at {cut}: {other:?}").into()),
         }
     }
     let raw = bytes(V41_SIGNATURE)?;
     assert_eq!(
         IndexedSignature::read(SignatureForm::Raw, raw.get(..63).ok_or("cut")?),
-        Err(IndexedSignatureError::Truncated {
+        Err(IndexedSignatureReadError::Truncated {
             part: IndexedSignaturePart::RawSignature,
             remaining: 63
         })
     );
     // A length prefix declaring 0xFFFFFFFF bytes is rejected on its bound
-    // before anything is sized from it.
-    let mut huge = field;
+    // before anything is read or sized from it, for each of the two parts.
+    let mut huge = field.clone();
     huge.get_mut(..4).ok_or("short")?.fill(0xFF);
     assert_eq!(
         IndexedSignature::read(SignatureForm::WebAuthnAssertion, &huge),
-        Err(IndexedSignatureError::AuthenticatorDataLength { len: 0xFFFF_FFFF })
+        Err(IndexedSignatureReadError::AuthenticatorDataLength { len: 0xFFFF_FFFF })
+    );
+    let mut huge = field;
+    huge.get_mut(4 + 37..4 + 37 + 4).ok_or("short")?.fill(0xFF);
+    assert_eq!(
+        IndexedSignature::read(SignatureForm::WebAuthnAssertion, &huge),
+        Err(IndexedSignatureReadError::ClientDataJsonLength { len: 0xFFFF_FFFF })
     );
     Ok(())
 }
@@ -438,7 +468,7 @@ fn reads_take_one_signature_and_leave_the_rest() -> TestResult {
     let (raw, consumed) =
         IndexedSignature::read(SignatureForm::Raw, field.get(264..).ok_or("short")?)?;
     assert_eq!(consumed, 64);
-    verify_indexed(&root()?, &array(V41_DIGEST)?, &raw)?;
+    verify_indexed(&root()?, &array(V41_DIGEST)?, SignatureForm::Raw, &raw)?;
     Ok(())
 }
 
@@ -460,18 +490,41 @@ fn assertion_form_rejects_a_create_type() -> TestResult {
 /// challenge over another event's D.
 #[test]
 fn assertion_form_rejects_a_challenge_for_anything_else() -> TestResult {
-    let mut wrong_prefix = b"SCP-KEL-EVENT-V1:".to_vec();
-    wrong_prefix.extend_from_slice(&v42_digest()?);
-    let wrong_prefix = base64url(&wrong_prefix);
-    let other_event = key_event_challenge(&array(V41_DIGEST)?);
+    // Unpadded base64url of "SCP-KEL-EVENT-V1:" || Vector 42's D.
+    let wrong_prefix = "U0NQLUtFTC1FVkVOVC1WMTqaQbD9uXgBRzCrfY1Wuad3RbT_SCSv_AlrvZI9FKVppg";
+    // Unpadded base64url of "SCP-KEY-EVENT-V1:" || Vector 41's D.
+    let other_event = "U0NQLUtFWS1FVkVOVC1WMTrYuk661SZXIIc29MrGdTUvX5zAqoN2IPjXQtv0Ku7b1w";
     for challenge in [wrong_prefix, other_event] {
+        let signature = resigned(
+            authenticator_data(0x05)?,
+            client_data("webauthn.get", challenge),
+        )?;
+        assert_eq!(
+            verify_v42(&signature)?,
+            Err(IndexedSignatureError::ChallengeMismatch)
+        );
+    }
+    Ok(())
+}
+
+/// A challenge carrying `=` padding, or a character outside the base64url
+/// alphabet, is rejected. Replacing `_` with `/` gives the standard
+/// alphabet's encoding of the same bytes, which a lenient decoder accepts.
+#[test]
+fn assertion_form_rejects_padding_and_characters_outside_base64url() -> TestResult {
+    let padded = format!("{V42_CHALLENGE}=");
+    let slash = V42_CHALLENGE.replacen('_', "/", 1);
+    let plus = format!("+{}", V42_CHALLENGE.get(1..).ok_or("short")?);
+    assert_ne!(slash, V42_CHALLENGE);
+    for challenge in [padded, slash, plus] {
         let signature = resigned(
             authenticator_data(0x05)?,
             client_data("webauthn.get", &challenge),
         )?;
         assert_eq!(
             verify_v42(&signature)?,
-            Err(IndexedSignatureError::ChallengeMismatch)
+            Err(IndexedSignatureError::ChallengeMismatch),
+            "{challenge}"
         );
     }
     Ok(())
@@ -524,34 +577,20 @@ fn assertion_form_compares_the_decoded_type() -> TestResult {
     Ok(())
 }
 
-/// (p)–(s): `type` or `challenge` missing, or not a string.
+/// (p)–(s) map through `verify_indexed` as `ClientData`: one row shows the
+/// mapping, and `client_data.rs` asserts each acceptance-set variant.
 #[test]
-fn assertion_form_requires_string_type_and_challenge() -> TestResult {
-    let cases: [(String, ClientDataError); 4] = [
-        (
-            format!(r#"{{"challenge":"{V42_CHALLENGE}"}}"#),
-            ClientDataError::MissingType,
-        ),
-        (
-            r#"{"type":"webauthn.get"}"#.to_owned(),
-            ClientDataError::MissingChallenge,
-        ),
-        (
-            format!(r#"{{"type":["webauthn.get"],"challenge":"{V42_CHALLENGE}"}}"#),
-            ClientDataError::TypeNotString,
-        ),
-        (
-            r#"{"type":"webauthn.get","challenge":null}"#.to_owned(),
-            ClientDataError::ChallengeNotString,
-        ),
-    ];
-    for (document, error) in cases {
-        let signature = resigned(authenticator_data(0x05)?, document.into_bytes())?;
-        assert_eq!(
-            verify_v42(&signature)?,
-            Err(IndexedSignatureError::ClientData(error))
-        );
-    }
+fn an_acceptance_set_rejection_maps_to_client_data() -> TestResult {
+    let signature = resigned(
+        authenticator_data(0x05)?,
+        format!(r#"{{"challenge":"{V42_CHALLENGE}"}}"#).into_bytes(),
+    )?;
+    assert_eq!(
+        verify_v42(&signature)?,
+        Err(IndexedSignatureError::ClientData(
+            ClientDataError::MissingType
+        ))
+    );
     Ok(())
 }
 
@@ -600,34 +639,47 @@ fn assertion_form_accepts_deep_nesting_within_the_bound() -> TestResult {
     Ok(())
 }
 
-/// The unpadded base64url encoding, for building a wrong challenge.
-fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut bits = 0u32;
-    let mut held = 0u32;
-    let mut out = String::new();
-    for &byte in bytes {
-        bits = (bits << 8) | u32::from(byte);
-        held += 8;
-        while held >= 6 {
-            held -= 6;
-            out.push(char::from(
-                ALPHABET[usize::try_from((bits >> held) & 0x3F).unwrap_or(0)],
-            ));
-        }
-    }
-    if held > 0 {
-        out.push(char::from(
-            ALPHABET[usize::try_from((bits << (6 - held)) & 0x3F).unwrap_or(0)],
-        ));
-    }
-    out
+/// Vector 42's document with the member Chrome adds to some assertions, a
+/// string holding spaces, verifies end to end.
+#[test]
+fn assertion_form_accepts_chromes_extra_member() -> TestResult {
+    let document = format!(
+        r#"{{"type":"webauthn.get","challenge":"{V42_CHALLENGE}","origin":"https://ctx.network","crossOrigin":false,"other_keys_can_be_added_here":"do not compare clientDataJSON against a template. See https://goo.gl/yabPex"}}"#
+    );
+    let signature = resigned(authenticator_data(0x05)?, document.into_bytes())?;
+    verify_v42(&signature)??;
+    Ok(())
 }
 
-/// The test's own encoder agrees with the crate's on Vector 42, so a wrong
-/// challenge it builds differs from the right one only in its input.
+/// A signature whose form differs from the declared one is rejected before
+/// any other check, in both directions.
 #[test]
-fn the_test_encoder_matches_vector_42() -> TestResult {
-    assert_eq!(base64url(&bytes(V42_CHALLENGE_BYTES)?), V42_CHALLENGE);
+fn a_signature_of_another_form_than_declared_is_rejected() -> TestResult {
+    let raw = IndexedSignature::Raw {
+        signature: array(V41_SIGNATURE)?,
+    };
+    assert_eq!(
+        verify_indexed(
+            &root()?,
+            &array(V41_DIGEST)?,
+            SignatureForm::WebAuthnAssertion,
+            &raw
+        ),
+        Err(IndexedSignatureError::FormMismatch {
+            declared: SignatureForm::WebAuthnAssertion,
+            carried: SignatureForm::Raw,
+        })
+    );
+    let (assertion, _) = IndexedSignature::read(
+        SignatureForm::WebAuthnAssertion,
+        &bytes(V42_INDEXED_SIGNATURE)?,
+    )?;
+    assert_eq!(
+        verify_indexed(&root()?, &v42_digest()?, SignatureForm::Raw, &assertion),
+        Err(IndexedSignatureError::FormMismatch {
+            declared: SignatureForm::Raw,
+            carried: SignatureForm::WebAuthnAssertion,
+        })
+    );
     Ok(())
 }

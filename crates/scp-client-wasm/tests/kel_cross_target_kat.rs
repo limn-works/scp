@@ -20,13 +20,13 @@ use fixtures::{
     V41_ROUTING_SVC, V41_ROUTING_WCF, V41_ROUTING_WIT, V41_SIGNATURE, V42_AUTHENTICATOR_DATA,
     V42_CHALLENGE, V42_CHALLENGE_BYTES, V42_CLIENT_DATA_HASH, V42_CLIENT_DATA_JSON,
     V42_CLIENT_DATA_JSON_HEX, V42_DIGEST, V42_IDENTIFIER, V42_INDEXED_SIGNATURE, V42_PREIMAGE,
-    V42_SIGNATURE, V42_SIGNED_DIGEST, V47A_COMMITMENT, V47A_POINT, V47B_COMMITMENT, V47B_POINT,
-    V48_ADDRESS, V48_IDENTIFIER, V50_DIGEST, V50_PREIMAGE, V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST,
-    V51_IDENTIFIER, V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE, V51_KEYS,
-    V51_PREIMAGE, V51_ROUTING_DID, V68_DIGEST, V68_PREIMAGE, V68_REVEAL_SIGNATURE,
-    V68_ROOT_SIGNATURE, V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array, assert_signature,
-    assert_vector, fields, identifier, v41_inception, v50_key_state, v51_inception, v51_key_state,
-    v68_rollover, v69_key_state,
+    V42_RP_ID, V42_SIGNATURE, V42_SIGNED_DIGEST, V42_SIGNED_MESSAGE, V47A_COMMITMENT, V47A_POINT,
+    V47B_COMMITMENT, V47B_POINT, V48_ADDRESS, V48_IDENTIFIER, V50_DIGEST, V50_PREIMAGE, V50_SEAL,
+    V50_SEALED_DIGEST, V51_DIGEST, V51_IDENTIFIER, V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE,
+    V51_INCEPTION_SIGNATURE, V51_KEYS, V51_PREIMAGE, V51_ROUTING_DID, V68_DIGEST, V68_PREIMAGE,
+    V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE, V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array,
+    assert_signature, assert_vector, fields, identifier, v41_inception, v50_key_state,
+    v51_inception, v51_key_state, v68_rollover, v69_key_state,
 };
 use scp_did::{Identifier, IdentifierError, KeyCondition, NonCanonicalReason};
 use scp_kel::{
@@ -190,7 +190,12 @@ fn vector_41_raw_indexed_signature_verifies() -> TestResult {
     let field = fixtures::bytes(V41_SIGNATURE)?;
     let (signature, consumed) = IndexedSignature::read(SignatureForm::Raw, &field)?;
     assert_eq!(consumed, 64);
-    verify_indexed(&array(V41_ROOT)?, &array(V41_DIGEST)?, &signature)?;
+    verify_indexed(
+        &array(V41_ROOT)?,
+        &array(V41_DIGEST)?,
+        SignatureForm::Raw,
+        &signature,
+    )?;
     Ok(())
 }
 
@@ -218,26 +223,38 @@ fn vector_42_assertion_indexed_signature_verifies() -> TestResult {
     );
     assert_eq!(assertion.signature(), &array::<64>(V42_SIGNATURE)?);
 
-    let digest = array::<32>(V42_DIGEST)?;
-    let mut challenge = b"SCP-KEY-EVENT-V1:".to_vec();
-    challenge.extend_from_slice(&digest);
-    assert_eq!(challenge, fixtures::bytes(V42_CHALLENGE_BYTES)?);
-    assert_eq!(key_event_challenge(&digest), V42_CHALLENGE);
+    // authenticatorData from its stated derivation: rpIdHash =
+    // SHA-256("ctx.network"), flags 0x05, signCount 0.
+    let authenticator = assertion.authenticator_data();
     assert_eq!(
-        parse_client_data_json(assertion.client_data_json())?.challenge,
-        V42_CHALLENGE
+        authenticator.get(..32).ok_or("short authenticatorData")?,
+        Sha256::digest(V42_RP_ID.as_bytes()).as_slice()
     );
+    assert_eq!(authenticator.get(32), Some(&0x05));
+    assert_eq!(authenticator.get(33..), Some(&[0u8; 4][..]));
+
+    let digest = array::<32>(V42_DIGEST)?;
+    assert_eq!(
+        key_event_challenge(&digest).as_slice(),
+        fixtures::bytes(V42_CHALLENGE_BYTES)?
+    );
+    assert_eq!(parse_client_data_json(assertion)?.challenge, V42_CHALLENGE);
     let client_data_hash = Sha256::digest(assertion.client_data_json());
     assert_eq!(
         client_data_hash.as_slice(),
         fixtures::bytes(V42_CLIENT_DATA_HASH)?
     );
-    let signed = Sha256::new()
-        .chain_update(assertion.authenticator_data())
-        .chain_update(client_data_hash)
-        .finalize();
+    let mut message = authenticator.to_vec();
+    message.extend_from_slice(&client_data_hash);
+    assert_eq!(message, fixtures::bytes(V42_SIGNED_MESSAGE)?);
+    let signed = Sha256::digest(&message);
     assert_eq!(signed.as_slice(), fixtures::bytes(V42_SIGNED_DIGEST)?);
 
-    verify_indexed(&array(V41_ROOT)?, &digest, &signature)?;
+    verify_indexed(
+        &array(V41_ROOT)?,
+        &digest,
+        SignatureForm::WebAuthnAssertion,
+        &signature,
+    )?;
     Ok(())
 }

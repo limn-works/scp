@@ -120,6 +120,16 @@ pub const V42_CLIENT_DATA_JSON_HEX: &str = concat!(
 /// Spec 25 Vector 42's `SHA-256(clientDataJSON)`.
 pub const V42_CLIENT_DATA_HASH: &str =
     "0b33b76a4ecb79e15753a17147ac39f6964ae20523e7e001c258e67d2562c236";
+/// Spec 25 Vector 42's relying-party identifier, whose SHA-256 is the
+/// `rpIdHash` that opens its authenticatorData.
+pub const V42_RP_ID: &str = "ctx.network";
+/// Spec 25 Vector 42's signed message (69 bytes),
+/// `authenticatorData || SHA-256(clientDataJSON)`.
+pub const V42_SIGNED_MESSAGE: &str = concat!(
+    "aee39d05bf6e1cbe288aedd7ead156f1d67399382d7a110e8f6c495d11689d76",
+    "05000000000b33b76a4ecb79e15753a17147ac39f6964ae20523e7e001c258e6",
+    "7d2562c236",
+);
 /// Spec 25 Vector 42's ECDSA message digest,
 /// `SHA-256(authenticatorData || SHA-256(clientDataJSON))`.
 pub const V42_SIGNED_DIGEST: &str =

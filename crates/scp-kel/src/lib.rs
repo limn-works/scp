@@ -10,9 +10,9 @@ mod preimage;
 mod routing;
 mod signature;
 
+pub use client_data::ClientDataError;
 #[doc(hidden)]
-pub use client_data::parse_client_data_json;
-pub use client_data::{ClientDataError, ClientDataMembers};
+pub use client_data::{ClientDataMembers, parse_client_data_json};
 pub use error::{
     DecodeError, DeriveIdentifierError, DidDiscriminatorField, EncodeError, KelDiscriminatorField,
     ListField, PreimageField,
@@ -29,5 +29,5 @@ pub use preimage::{
 pub use routing::{RoutingKind, routing_id};
 pub use signature::{
     AssertionSignature, IndexedSignature, IndexedSignatureError, IndexedSignaturePart,
-    RAW_SIGNATURE_BYTES, key_event_challenge, verify_indexed,
+    IndexedSignatureReadError, key_event_challenge, verify_indexed,
 };
