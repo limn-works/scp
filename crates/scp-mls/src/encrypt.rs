@@ -250,19 +250,34 @@ pub fn decrypt(group: &mut ScpMlsGroup, ciphertext: &[u8]) -> Result<Vec<u8>, Ml
 }
 
 /// The leaf index of the member that sent a processed message, and the DID in
-/// that leaf's credential.
+/// the credential openmls verified its signature against.
+///
+/// openmls opens a message from up to `max_past_epochs` past epochs and
+/// verifies it against the sender's leaf in the epoch it was sent in
+/// ([`ProcessedMessage::credential`]). The sender is attributed by that
+/// verified credential, never by whoever holds the leaf index now, and the
+/// message is accepted only while the same DID still holds that leaf in the
+/// current tree. A member removed since it sent the message, whose leaf is
+/// now blank or held by a member added after it, is refused (spec 07
+/// §7.3.1.1 step 3: a removed member's past-epoch message installs no state).
 ///
 /// # Errors
 ///
-/// [`MlsError::DecryptionFailed`] when the sender is not a member or its leaf
-/// is absent from the tree, and the credential errors of [`credential_to_did`].
-fn sender_member(group: &MlsGroup, sender: &Sender) -> Result<(LeafNodeIndex, String), MlsError> {
-    let Sender::Member(sender_leaf_index) = sender else {
+/// [`MlsError::DecryptionFailed`] when the sender is not a member, when the
+/// sender's leaf is absent from the current tree, or when the current leaf at
+/// that index names another DID; and the credential errors of
+/// [`credential_to_did`].
+fn sender_member(
+    group: &MlsGroup,
+    processed: &ProcessedMessage,
+) -> Result<(LeafNodeIndex, String), MlsError> {
+    let Sender::Member(sender_leaf_index) = processed.sender() else {
         return Err(MlsError::DecryptionFailed(
             "sender is not a group member".to_string(),
         ));
     };
-    let sender_credential = group
+    let sender_did = credential_to_did(processed.credential())?;
+    let current_credential = group
         .members()
         .find(|m| m.index == *sender_leaf_index)
         .map(|m| m.credential)
@@ -271,7 +286,12 @@ fn sender_member(group: &MlsGroup, sender: &Sender) -> Result<(LeafNodeIndex, St
                 "sender leaf index {sender_leaf_index:?} not found in group members"
             ))
         })?;
-    Ok((*sender_leaf_index, credential_to_did(&sender_credential)?))
+    if credential_to_did(&current_credential)? != sender_did {
+        return Err(MlsError::DecryptionFailed(format!(
+            "sender leaf index {sender_leaf_index:?} no longer holds the sender's credential"
+        )));
+    }
+    Ok((*sender_leaf_index, sender_did))
 }
 
 /// Decrypts an MLS `PrivateMessage` and returns a [`DecryptedContent`] enum
@@ -369,7 +389,7 @@ fn decrypt_protocol_message_with_sender_did(
     // Resolve the sender DID from their leaf credential before consuming the
     // ProcessedMessage.
     let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let (sender_leaf_index, sender_did) = sender_member(g, processed.sender())?;
+    let (sender_leaf_index, sender_did) = sender_member(g, &processed)?;
 
     // Dispatch based on the processed message content type.
     match processed.into_content() {
@@ -698,7 +718,7 @@ pub fn decrypt_with_membership_changes(
     // Resolve the sender DID from their leaf credential before consuming the
     // ProcessedMessage.
     let g = group.group.as_ref().ok_or(MlsError::GroupDestroyed)?;
-    let (sender_leaf_index, sender_did) = sender_member(g, processed.sender())?;
+    let (sender_leaf_index, sender_did) = sender_member(g, &processed)?;
 
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(app_msg) => {
