@@ -8,25 +8,30 @@
 //! 25 event unit. Every expected identifier, key and digest is a §25
 //! constant or a SHA-256 this file computes, never a value scp-kel returns.
 
+use std::path::Path;
+
+use scp_did::KeyCondition;
 use scp_kel::constants::MAX_EVENT_BYTES;
 use scp_kel::{
-    BodyError, DecodeError, EncodeError, EventPreimage, EventUnit, FormListLength,
-    HeaderDiscriminator, HeaderError, HeaderField, InceptionHeaderDefect, IndexedSignaturePart,
-    IndexedSignatureReadError, SignatureFieldError, SignatureForm, SignerGroup, SignerGroupRole,
-    SignerList, decode_event, decode_preimage, encode_preimage,
+    BodyError, Continuation, DecodeError, EncodeError, EventKind, EventPreimage, EventUnit,
+    FormListLength, HeaderDiscriminator, HeaderError, HeaderField, InceptionHeaderDefect,
+    IndexedSignaturePart, IndexedSignatureReadError, SignatureFieldError, SignatureForm,
+    SignerGroup, SignerGroupRole, SignerList, StandingRootDeclaration, decode_event,
+    decode_preimage, encode_preimage,
 };
 use sha2::{Digest, Sha256};
 
 use crate::fixtures::{
-    SEPARATOR_LEN, TestResult, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V41_SIGNATURE,
+    SEPARATOR_LEN, TestResult, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V41_ROOT, V41_SIGNATURE,
     V42_AUTHENTICATOR_DATA, V42_CLIENT_DATA_JSON_HEX, V42_DIGEST, V42_IDENTIFIER,
-    V42_INDEXED_SIGNATURE, V42_PREIMAGE, V50_DIGEST, V50_PREIMAGE, V50_SIGNATURE, V51_DIGEST,
-    V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE, V51_PREIMAGE,
-    V51_SIGNATURE, V53_DIGEST, V53_PREIMAGE, V53_SIGNATURE_FIELD, V54_DIGEST, V54_PREIMAGE,
-    V54_SIGNATURE_FIELD, V55_DIGEST, V55_PREIMAGE, V55_SIGNATURE_FIELD, V68_DIGEST, V68_PREIMAGE,
-    V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE, V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE,
-    assert_event_round_trip, bytes, event_unit, fields, identifier, read_unit, v41_inception,
-    v50_key_state, v51_inception, v51_key_state, v68_rollover, v69_key_state,
+    V42_INDEXED_SIGNATURE, V42_PREIMAGE, V47A_POINT, V47B_POINT, V50_DIGEST, V50_PREIMAGE,
+    V50_SIGNATURE, V51_DIGEST, V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE,
+    V51_INCEPTION_SIGNATURE, V51_PREIMAGE, V51_SIGNATURE, V53_DIGEST, V53_PREIMAGE,
+    V53_SIGNATURE_FIELD, V54_DIGEST, V54_PREIMAGE, V54_SIGNATURE_FIELD, V55_DIGEST, V55_PREIMAGE,
+    V55_SIGNATURE_FIELD, V68_DIGEST, V68_PREIMAGE, V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE,
+    V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array, assert_event_round_trip, bytes,
+    event_unit, fields, identifier, read_unit, v41_inception, v50_key_state, v51_inception,
+    v51_key_state, v68_rollover, v69_key_state,
 };
 
 type Error = Box<dyn std::error::Error>;
@@ -39,6 +44,7 @@ const FIELDS: usize = PREFIX + SEPARATOR_LEN;
 const KIND: usize = 0;
 const IDENTIFIER: usize = 1;
 const SEQUENCE: usize = 33;
+const PREDECESSOR: usize = 41;
 const STANDING_ROOT: usize = 73;
 /// The first signer group's index count, field 6.
 const FIRST_INDEX_COUNT: usize = 74;
@@ -52,6 +58,21 @@ const V41_ENTRY_0_ROLE: usize = 137 + 33;
 /// The ceilings §9.18.17 reserves for one indexed signature of each form.
 const RAW_CEILING: usize = 64;
 const ASSERTION_CEILING: usize = 840;
+
+// Spec 25 values Vectors 53 to 55 print that no shared fixture names.
+/// Vector 53's next commitment.
+const V53_NEXT_COMMITMENT: &str =
+    "bf945a74e57e4b861cdba9a78df32004adc443e983e957b9aa9749ade24be4bd";
+/// Vector 54's installed K′ member, its `#active` key and next commitment.
+const V54_ROOT: &str = "034c3e84e8da62f05b0a280d5a0426e24bde13c6fa023c567333bece3bc1497c53";
+const V54_ACTIVE: &str = "026188be77992cb98024f995da162f844f534e4a7f8fca8dc7b1d0cb4b54ce4c64";
+const V54_NEXT_COMMITMENT: &str =
+    "41def207e7438655edf2766aa2fe0c96ef5f898233fb5ba16c56a3f7765aa8bd";
+/// Vector 55's installed K′ member, its `#active` key and next commitment.
+const V55_ROOT: &str = "026bf1355bb40ab86b1f3d2e776e08da67e754a5dfeeb706b67d7483d09451c4ce";
+const V55_ACTIVE: &str = "03b7fe460356f0d94ff2bb085ed16157ae327b7769f2823ca829077110f05fb4a5";
+const V55_NEXT_COMMITMENT: &str =
+    "cb05862aec3a89bd73c5e2d10a61d6483d945c72036bdf62dd880a9ff7d4d6f0";
 
 fn max_event_bytes() -> Result<usize, Error> {
     Ok(usize::try_from(MAX_EVENT_BYTES)?)
@@ -199,16 +220,169 @@ fn vector_51_inception_and_key_state_round_trip() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn vectors_53_to_55_round_trip() -> TestResult {
-    for (preimage, digest, field) in [
-        (V53_PREIMAGE, V53_DIGEST, V53_SIGNATURE_FIELD),
-        (V54_PREIMAGE, V54_DIGEST, V54_SIGNATURE_FIELD),
-        (V55_PREIMAGE, V55_DIGEST, V55_SIGNATURE_FIELD),
-    ] {
-        assert_event_round_trip(preimage, digest, field)?;
+/// The values one of Vectors 53 to 55 prints for its header, its groups and
+/// its body.
+struct Layout {
+    kind: EventKind,
+    standing_root: Option<StandingRootDeclaration>,
+    roles: &'static [SignerGroupRole],
+    /// The installed K′ member, where the event installs one.
+    root: Option<&'static str>,
+    /// The snapshot's keys and conditions, in snapshot order.
+    keys: &'static [(&'static str, KeyCondition)],
+    next_commitment: &'static str,
+}
+
+/// Asserts a group-layout vector round-trips (`assert_event_round_trip`,
+/// which re-encodes the body), then compares its decoded values with the
+/// ones spec 25 prints: each is an event at sequence 1 after Vector 41,
+/// whose groups each name member 0 in the raw form, signed in the printed
+/// order, and which reveals §25.2's tertiary key and fixes one commitment
+/// with next threshold 1.
+fn assert_layout(
+    preimage_hex: &str,
+    digest_hex: &str,
+    field_hex: &str,
+    layout: &Layout,
+) -> TestResult {
+    let preimage = assert_event_round_trip(preimage_hex, digest_hex, field_hex)?;
+    let read = read_unit(&event_unit(preimage_hex, field_hex)?)?;
+    let header = read.header();
+    assert_eq!(header.kind(), layout.kind);
+    assert_eq!(header.identifier_field(), identifier(V41_IDENTIFIER)?);
+    assert_eq!(header.sequence(), 1);
+    assert_eq!(header.predecessor_digest(), &array::<32>(V41_DIGEST)?);
+    assert_eq!(header.standing_root(), layout.standing_root);
+    assert_eq!(
+        header.encoded_len(),
+        len64(bytes(preimage_hex)?.len() + RAW_CEILING * layout.roles.len())?
+    );
+
+    let field = read.signature_field().map_err(Clone::clone)?;
+    let printed = bytes(field_hex)?;
+    let walked: Vec<SignerGroupRole> = field
+        .groups()
+        .iter()
+        .map(scp_kel::SignerGroupSignatures::role)
+        .collect();
+    assert_eq!(walked, layout.roles);
+    for ((group, header_group), printed) in field
+        .groups()
+        .iter()
+        .zip(header.groups())
+        .zip(printed.chunks(RAW_CEILING))
+    {
+        assert_eq!(header_group.role(), group.role());
+        let [signer] = header_group.signers() else {
+            return Err("each group names one signer".into());
+        };
+        assert_eq!((signer.index(), signer.form()), (0, SignatureForm::Raw));
+        let [signature] = group.signatures() else {
+            return Err("each group carries one signature".into());
+        };
+        assert_eq!(signature.index(), 0);
+        assert_eq!(signature.signature().form(), SignatureForm::Raw);
+        assert_eq!(signature.signature().to_bytes(), printed);
     }
+
+    assert_eq!(preimage.revealed_keys, vec![array::<33>(V47A_POINT)?]);
+    match layout.root {
+        None => assert_eq!(preimage.installed_root_set, None),
+        Some(root) => {
+            let installed = preimage.installed_root_set.as_ref().ok_or("no K′")?;
+            assert_eq!(installed.members, vec![array::<33>(root)?]);
+            assert_eq!(installed.threshold, 1);
+        }
+    }
+    let keys: Vec<([u8; 33], KeyCondition)> = preimage
+        .key_state
+        .iter()
+        .flat_map(|snapshot| &snapshot.keys)
+        .map(|entry| (entry.key, entry.condition))
+        .collect();
+    let expected: Vec<([u8; 33], KeyCondition)> = layout
+        .keys
+        .iter()
+        .map(|(key, condition)| Ok((array::<33>(key)?, *condition)))
+        .collect::<Result<_, Error>>()?;
+    assert_eq!(keys, expected);
+    assert!(preimage.seals.is_empty());
+    let Some(Continuation::FixesCommitment(commitment)) = &preimage.continuation else {
+        return Err("each vector fixes a commitment".into());
+    };
+    let commitments: Vec<[u8; 32]> = commitment
+        .commitments
+        .iter()
+        .map(|entry| entry.commitment)
+        .collect();
+    assert_eq!(commitments, vec![array::<32>(layout.next_commitment)?]);
+    assert_eq!(commitment.next_threshold, 1);
     Ok(())
+}
+
+#[test]
+fn vector_53_round_trips_with_its_printed_values() -> TestResult {
+    assert_layout(
+        V53_PREIMAGE,
+        V53_DIGEST,
+        V53_SIGNATURE_FIELD,
+        &Layout {
+            kind: EventKind::CommitmentRollover,
+            standing_root: None,
+            roles: &[SignerGroupRole::Reveal, SignerGroupRole::StandingRoot],
+            root: None,
+            keys: &[],
+            next_commitment: V53_NEXT_COMMITMENT,
+        },
+    )
+}
+
+#[test]
+fn vector_54_round_trips_with_its_printed_values() -> TestResult {
+    assert_layout(
+        V54_PREIMAGE,
+        V54_DIGEST,
+        V54_SIGNATURE_FIELD,
+        &Layout {
+            kind: EventKind::RootRecovery,
+            standing_root: Some(StandingRootDeclaration::CoSigns),
+            roles: &[
+                SignerGroupRole::Reveal,
+                SignerGroupRole::ReplacementRoot,
+                SignerGroupRole::StandingRoot,
+            ],
+            root: Some(V54_ROOT),
+            keys: &[
+                (V54_ROOT, KeyCondition::Current),
+                (V54_ACTIVE, KeyCondition::Current),
+                (V41_ROOT, KeyCondition::Superseded),
+                (V47B_POINT, KeyCondition::Superseded),
+            ],
+            next_commitment: V54_NEXT_COMMITMENT,
+        },
+    )
+}
+
+#[test]
+fn vector_55_round_trips_with_its_printed_values() -> TestResult {
+    assert_layout(
+        V55_PREIMAGE,
+        V55_DIGEST,
+        V55_SIGNATURE_FIELD,
+        &Layout {
+            kind: EventKind::RootRecovery,
+            standing_root: Some(StandingRootDeclaration::Lost),
+            roles: &[SignerGroupRole::Reveal, SignerGroupRole::ReplacementRoot],
+            root: Some(V55_ROOT),
+            keys: &[
+                (V55_ROOT, KeyCondition::Current),
+                (V55_ACTIVE, KeyCondition::Current),
+                (V41_ROOT, KeyCondition::Superseded),
+                (V47B_POINT, KeyCondition::Superseded),
+            ],
+            next_commitment: V55_NEXT_COMMITMENT,
+        },
+    )
 }
 
 #[test]
@@ -243,6 +417,50 @@ fn consecutive_units_read_at_each_consumed_offset() -> TestResult {
         second.len()
     );
     assert_step_1_failed(&value, value.len());
+    Ok(())
+}
+
+/// Whether a corpus file name is one libFuzzer gives an input it found: the
+/// 40 lowercase hex digits of the input's SHA-1. A local fuzz run adds such
+/// files beside the seeds, and they need not decode.
+fn is_fuzzer_found(name: &str) -> bool {
+    name.len() == 40
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Every unit of every seed-corpus file of `fuzz_kel_decode_event` decodes
+/// its body and walks, and the units tile the file, so the fuzz target's
+/// re-encode and walk invariants run on each seed.
+#[test]
+fn every_seed_corpus_unit_decodes_its_body() -> TestResult {
+    let corpus =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/fuzz_kel_decode_event");
+    let mut seeds = 0;
+    for entry in std::fs::read_dir(corpus)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("a corpus file name is not UTF-8")?;
+        if is_fuzzer_found(name) {
+            continue;
+        }
+        let value = std::fs::read(&path)?;
+        let mut offset = 0;
+        while offset < value.len() {
+            let EventUnit::Read(read) = decode_event(&value, offset) else {
+                return Err(format!("{name} stopped at offset {offset}").into());
+            };
+            read.preimage().map_err(Clone::clone)?;
+            offset += read.signature_field().map_err(Clone::clone)?.consumed();
+        }
+        assert_eq!(offset, value.len(), "{name}");
+        seeds += 1;
+    }
+    // The nine seeds the corpus tracks; adding a seed raises this count.
+    assert_eq!(seeds, 9);
     Ok(())
 }
 
@@ -407,6 +625,100 @@ fn a_body_defect_leaves_the_header_and_the_walk() -> TestResult {
         read.signature_field().map_err(Clone::clone)?.consumed(),
         unit.len()
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Steps 4 and 5 over every group and position of Vector 54's layout.
+// ---------------------------------------------------------------------------
+
+/// Vector 54's three groups, each naming two signers in the raw form.
+const V54_ROLES: [SignerGroupRole; 3] = [
+    SignerGroupRole::Reveal,
+    SignerGroupRole::ReplacementRoot,
+    SignerGroupRole::StandingRoot,
+];
+/// Each group's two indices, distinct across the event.
+const V54_INDICES: [[u8; 2]; 3] = [[1, 4], [2, 5], [3, 6]];
+/// Where each group's form count sits in the two-signer layout's field
+/// bytes: field 6 holds three lists of 4 + 2 bytes from offset 74.
+const V54_FORM_COUNTS: [usize; 3] = [92, 98, 104];
+
+/// The field bytes of Vector 54 with each group naming its two indices.
+fn v54_two_signer_fields() -> Result<Vec<u8>, Error> {
+    let mut preimage = decode_preimage(&fields(V54_PREIMAGE)?)?.into_preimage();
+    for (group, indices) in preimage.signer_groups.iter_mut().zip(V54_INDICES) {
+        *group = SignerGroup {
+            indices: indices.to_vec(),
+            forms: vec![SignatureForm::Raw; 2],
+        };
+    }
+    let field_bytes = encode_preimage(&preimage)?.fields().to_vec();
+    for at in V54_FORM_COUNTS {
+        assert_eq!(field_bytes.get(at..at + 6), Some(&[0, 0, 0, 2, 1, 1][..]));
+    }
+    Ok(field_bytes)
+}
+
+/// Six distinct 64-byte raw signatures, one per named signer in walk order.
+fn six_signatures() -> Vec<u8> {
+    (0u8..6).flat_map(|signer| [signer + 0x10; 64]).collect()
+}
+
+/// The walk fails at whichever group and position the signature field runs
+/// out, naming that group's role, the position and the index there.
+#[test]
+fn the_walk_names_the_role_position_and_index_where_it_fails() -> TestResult {
+    let field_bytes = v54_two_signer_fields()?;
+    let signatures = six_signatures();
+    let whole = read_unit(&unit_of_fields(&field_bytes, &signatures)?)?;
+    assert_eq!(
+        whole
+            .signature_field()
+            .map_err(Clone::clone)?
+            .groups()
+            .len(),
+        3
+    );
+    for (group, (role, indices)) in V54_ROLES.iter().zip(V54_INDICES).enumerate() {
+        for (position, index) in indices.into_iter().enumerate() {
+            let walked = 2 * group + position;
+            let cut = &signatures[..RAW_CEILING * walked + 63];
+            assert_walk_failed(
+                &unit_of_fields(&field_bytes, cut)?,
+                &walk_error(
+                    *role,
+                    position,
+                    index,
+                    IndexedSignatureReadError::Truncated {
+                        part: IndexedSignaturePart::RawSignature,
+                        remaining: 63,
+                    },
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Each group's form list emptied, cut to one form, and given a third
+/// form fails the header naming that group, before any walk.
+#[test]
+fn the_form_list_check_names_each_group() -> TestResult {
+    let field_bytes = v54_two_signer_fields()?;
+    for (role, at) in V54_ROLES.iter().zip(V54_FORM_COUNTS) {
+        for forms in [&[][..], &[0x01][..], &[0x01, 0x01, 0x01][..]] {
+            let mismatched = splice_list(&field_bytes, at, 2, 1, forms)?;
+            assert_header_failed(
+                &unit_of_fields(&mismatched, &six_signatures())?,
+                &HeaderError::FormListLength(FormListLength {
+                    role: *role,
+                    indices: 2,
+                    forms: forms.len(),
+                }),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -629,6 +941,62 @@ fn the_inception_zero_checks_pass_vectors_41_42_and_51() -> TestResult {
     ] {
         zero_checks(&unit)??;
     }
+    Ok(())
+}
+
+/// Each of the 72 bytes of fields 2, 3 and 4 made nonzero alone names its
+/// field.
+#[test]
+fn the_inception_zero_checks_cover_every_header_byte() -> TestResult {
+    for at in IDENTIFIER..STANDING_ROOT {
+        let defect = match at {
+            IDENTIFIER..SEQUENCE => InceptionHeaderDefect::NonzeroIdentifier,
+            SEQUENCE..PREDECESSOR => InceptionHeaderDefect::NonzeroSequence,
+            _ => InceptionHeaderDefect::NonzeroPredecessor,
+        };
+        let mut unit = v41_unit()?;
+        set(&mut unit, FIELDS + at, 0x01)?;
+        assert_eq!(zero_checks(&unit)?, Err(defect), "byte {at}");
+    }
+    Ok(())
+}
+
+/// Two fields made nonzero name the first in field order, and a kind that
+/// is not `Inception` is named before any zero field.
+#[test]
+fn the_inception_zero_checks_name_the_first_field_in_order() -> TestResult {
+    let rows = [
+        (
+            &[IDENTIFIER + 31, SEQUENCE][..],
+            InceptionHeaderDefect::NonzeroIdentifier,
+        ),
+        (
+            &[SEQUENCE + 7, PREDECESSOR][..],
+            InceptionHeaderDefect::NonzeroSequence,
+        ),
+        (
+            &[IDENTIFIER, PREDECESSOR + 31][..],
+            InceptionHeaderDefect::NonzeroIdentifier,
+        ),
+    ];
+    for (bytes_at, defect) in rows {
+        let mut unit = v41_unit()?;
+        for at in bytes_at {
+            set(&mut unit, FIELDS + at, 0x01)?;
+        }
+        assert_eq!(zero_checks(&unit)?, Err(defect));
+    }
+    let mut unit = v41_unit()?;
+    set(&mut unit, FIELDS + KIND, 0x02)?;
+    set(&mut unit, FIELDS + IDENTIFIER, 0x01)?;
+    assert_eq!(
+        zero_checks(&unit)?,
+        Err(InceptionHeaderDefect::NotInception { value: 0x02 })
+    );
+    assert_eq!(
+        zero_checks(&event_unit(V50_PREIMAGE, V50_SIGNATURE)?)?,
+        Err(InceptionHeaderDefect::NotInception { value: 0x02 })
+    );
     Ok(())
 }
 
