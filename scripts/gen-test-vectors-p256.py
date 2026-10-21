@@ -3429,8 +3429,11 @@ def emit_push_signing_bytes() -> None:
     emit_hex("push.tier3_routing_id", tier3)
     emit_hex("push.bridge_relay_routing_id", direct)
     assert tier3 != direct
-    # Without the prefix's colon-terminated form, a printable target appended
-    # to the "scp-push-registration" form would equal another URL's ID.
+    # The two prefixes differ at their tenth byte ("b" in "scp-push-bridge:"
+    # against "r" in "scp-push-registration"), so the two hash inputs differ
+    # whatever URL and target follow. A tier 3 ID therefore never equals the
+    # "scp-push-registration" ID of the bridge URL extended by the target.
+    assert PUSH_BRIDGE_ROUTING_PREFIX[9:10] == b"b" and PUSH_ROUTING_PREFIX[9:10] == b"r"
     assert tier3 != sha256(PUSH_ROUTING_PREFIX + bridge_url.encode() + target)
 
 
