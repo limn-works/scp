@@ -497,6 +497,22 @@ pub fn decode_event(value: &[u8], offset: usize) -> EventUnit {
     let Some((prefixed, field)) = prefixed_bytes(value, offset) else {
         return EventUnit::Unframed;
     };
+    decode_prefixed(prefixed, field)
+}
+
+/// An unsigned candidate's signed preimage, separator included, read through
+/// the same stages [`decode_event`] runs past step 1, so a candidate and a
+/// signed unit of the same preimage reach every check through one decode
+/// (§9.7.4.2 R10: a device runs "the same checks" over the preimage it
+/// signs). A candidate carries no signature field: its walk runs over no
+/// bytes, and the unsigned checks never read the walk's outcome.
+pub fn decode_candidate(signed_preimage: &[u8]) -> EventUnit {
+    decode_prefixed(signed_preimage, &[])
+}
+
+/// Steps 2 and 4, then step 5 over `field` and the decode of fields 8
+/// through 12, for the bytes a unit's length prefix covers.
+fn decode_prefixed(prefixed: &[u8], field: &[u8]) -> EventUnit {
     let Some(raw) = RawSignedPreimage::new(prefixed) else {
         return EventUnit::NoSeparator;
     };

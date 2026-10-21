@@ -259,7 +259,7 @@ impl EncodedPreimage {
     ///
     /// R13 derives the identifier over an inception whose identifier,
     /// sequence and predecessor are zero. An inception carrying a nonzero
-    /// one still derives here, over its own bytes, and R3 rejects it; a
+    /// one still derives here, over its own bytes, and R3 finds it invalid; a
     /// writer that must refuse it calls [`derive_identifier`].
     #[must_use]
     pub fn inception_identifier(&self) -> Option<Identifier> {
@@ -594,6 +594,19 @@ pub fn read_event(
     let header = read_header(&mut reader, signed_len)?;
     let preimage = read_body(&mut reader, &header);
     Ok((header, preimage))
+}
+
+/// Field 8, the revealed keys, read after fields 1 through 7 where the
+/// header decodes and field 8 itself decodes, whatever fields 9 through 12
+/// hold. §9.7.4.2's sub-check 7a reads field 8 alone: "this step decodes
+/// field 8, the revealed keys, when it reads the reveal group, and a field 8
+/// that does not decode yields no matching reveal".
+pub fn read_revealed_keys(fields: &[u8], signed_len: usize) -> Option<Vec<[u8; POINT_BYTES]>> {
+    let mut reader = Reader { rest: fields };
+    read_header(&mut reader, signed_len).ok()?;
+    reader
+        .points(BodyField::RevealedKeys, BodyList::RevealedKeys)
+        .ok()
 }
 
 /// Fields 1 through 4 as bytes: the reads the header and the inception zero

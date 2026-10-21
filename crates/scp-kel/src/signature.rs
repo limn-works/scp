@@ -25,7 +25,7 @@ const RAW_LEN: usize = RAW_SIGNATURE_BYTES as usize;
 /// The length of `"SCP-KEY-EVENT-V1:" ‖ D`: the separator and the 32-byte
 /// digest. Derived from the separator, so both copies in
 /// [`key_event_challenge`] always fit.
-const KEY_EVENT_CHALLENGE_LEN: usize = KEY_EVENT_CHALLENGE_SEPARATOR.len() + 32;
+pub const KEY_EVENT_CHALLENGE_LEN: usize = KEY_EVENT_CHALLENGE_SEPARATOR.len() + 32;
 
 /// The `authenticatorData` byte that carries the flags (Web Authentication
 /// Level 2 §6.1), which `MIN_AUTHENTICATOR_DATA_BYTES` guarantees exists.

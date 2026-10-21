@@ -44,6 +44,13 @@ pub const MIN_WITNESSING_INTERVAL: u32 = 300;
 /// seconds (§9.18.17).
 pub const MAX_WITNESSING_INTERVAL: u32 = 604_800;
 
+/// The encoded width of a `HeldHeadMarker` (§9.18.17).
+///
+/// The 32-byte identifier, the 8-byte big-endian sequence, the 32-byte preimage digest of the head a
+/// device holding a key-event member last adopted, and the 1-byte mode,
+/// `0x00` for `Any` and `0x01` for `RevealOnly` (§9.18.17; §9.7.4.2 R10).
+pub const HELD_HEAD_MARKER_BYTES: u32 = 73;
+
 /// Prefixes an event's preimage digest in the `WebAuthn` challenge of an
 /// assertion-form indexed signature (§9.7.4.2 definitions; §9.18.2). It is
 /// distinct from [`KEL_EVENT_SEPARATOR`], so no key-event preimage is a

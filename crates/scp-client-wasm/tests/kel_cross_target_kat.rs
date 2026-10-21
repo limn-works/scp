@@ -306,3 +306,80 @@ fn vector_42_assertion_indexed_signature_verifies() -> TestResult {
     )?;
     Ok(())
 }
+
+/// The chain `validate_chain` returns over `units`, with every discard.
+fn chain_verdict(
+    identifier_hex: &str,
+    units: &[&[u8]],
+) -> Result<(scp_kel::ValidatedChain, Vec<scp_kel::Discarded>), Box<dyn std::error::Error>> {
+    match scp_kel::validate_chain(&identifier(identifier_hex)?, units) {
+        scp_kel::ChainValidation::Valid { chain, discarded } => Ok((chain, discarded)),
+        other => Err(format!("expected Valid, got {other:?}").into()),
+    }
+}
+
+/// `validate_chain` (§9.7.4.2 R3) accepts every spec 25 chain at the head
+/// digest spec 25 prints, on both targets.
+#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+fn spec_25_chains_validate() -> TestResult {
+    let v41 = event_unit(V41_PREIMAGE, V41_SIGNATURE)?;
+    let v68_signatures = format!("{V68_REVEAL_SIGNATURE}{V68_ROOT_SIGNATURE}");
+    let successors = [
+        (event_unit(V50_PREIMAGE, V50_SIGNATURE)?, V50_DIGEST),
+        (event_unit(V53_PREIMAGE, V53_SIGNATURE_FIELD)?, V53_DIGEST),
+        (event_unit(V54_PREIMAGE, V54_SIGNATURE_FIELD)?, V54_DIGEST),
+        (event_unit(V55_PREIMAGE, V55_SIGNATURE_FIELD)?, V55_DIGEST),
+        (event_unit(V68_PREIMAGE, &v68_signatures)?, V68_DIGEST),
+        (event_unit(V69_PREIMAGE, V69_ROOT_SIGNATURE)?, V69_DIGEST),
+    ];
+    for (unit, digest) in &successors {
+        let (chain, discarded) = chain_verdict(V41_IDENTIFIER, &[&v41, unit])?;
+        assert!(discarded.is_empty(), "{discarded:?}");
+        assert_eq!(chain.head_digest(), array::<32>(digest)?);
+        assert_eq!(chain.head_sequence(), 1);
+    }
+    let v42 = event_unit(V42_PREIMAGE, V42_INDEXED_SIGNATURE)?;
+    let (chain, discarded) = chain_verdict(V42_IDENTIFIER, &[&v42])?;
+    assert!(discarded.is_empty(), "{discarded:?}");
+    assert_eq!(chain.head_digest(), array::<32>(V42_DIGEST)?);
+    let inception = event_unit(V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE)?;
+    let key_state = event_unit(V51_PREIMAGE, V51_SIGNATURE)?;
+    let (chain, discarded) = chain_verdict(V51_IDENTIFIER, &[&inception, &key_state])?;
+    assert!(discarded.is_empty(), "{discarded:?}");
+    assert_eq!(chain.head_digest(), array::<32>(V51_DIGEST)?);
+    Ok(())
+}
+
+/// `validate_chain` discards a damaged unit at the step spec 09 names, with
+/// the digest only a unit that reached step 6 carries, on both targets.
+#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+fn damaged_units_are_discarded_at_their_step() -> TestResult {
+    let v41 = event_unit(V41_PREIMAGE, V41_SIGNATURE)?;
+    let v50 = event_unit(V50_PREIMAGE, V50_SIGNATURE)?;
+    // The length prefix, the separator, then fields 1 to 12.
+    let signature_at = 4 + 17 + fields(V50_PREIMAGE)?.len();
+    let mut forged = v50.clone();
+    *forged.get_mut(signature_at + 10).ok_or("short unit")? ^= 0x01;
+    let mut unseparated = v50.clone();
+    *unseparated.get_mut(4).ok_or("short unit")? ^= 0x01;
+    let (chain, discarded) = chain_verdict(V41_IDENTIFIER, &[&v41, &forged, &unseparated, &v50])?;
+    assert_eq!(chain.head_digest(), array::<32>(V50_DIGEST)?);
+    let verdicts: Vec<_> = discarded
+        .iter()
+        .map(|discard| (discard.at_position(), discard.stage(), discard.digest()))
+        .collect();
+    assert_eq!(
+        verdicts,
+        [
+            (
+                1,
+                scp_kel::CheckStep::VerifiedCount,
+                Some(array::<32>(V50_DIGEST)?)
+            ),
+            (1, scp_kel::CheckStep::Separator, None),
+        ]
+    );
+    Ok(())
+}

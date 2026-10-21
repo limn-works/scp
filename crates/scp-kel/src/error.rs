@@ -244,7 +244,7 @@ pub struct FormListLength {
 /// bounds, form-list check and length ceiling, so `encode_preimage`
 /// succeeding means `decode_preimage` of its bytes returns the same
 /// preimage. It does not apply the rest of R3's defect list: a writer may
-/// encode a preimage a verifier rejects, and the verifier classifies it.
+/// encode a defective preimage, and the verifier classifies it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EncodeError {
     /// A list is too long for its 4-byte count.

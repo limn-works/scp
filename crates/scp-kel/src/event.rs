@@ -3,10 +3,11 @@
 //!
 //! [`EventPreimage`] is a faithful twelve-field value: each `Option` is `None`
 //! exactly where the field carries its absent-field sentinel. It represents
-//! every preimage a well-formed byte string decodes to, including one R3
-//! rejects (a `CommitmentRollover` carrying a key state, a form list whose
-//! length differs from its index list), because classifying those defects is
-//! the verifier's job and the decoder must hand them over intact. A writer
+//! every preimage a well-formed byte string decodes to, including a defective
+//! one R3 discards (a `CommitmentRollover` carrying a key state, a form list
+//! whose length differs from its index list), because classifying those
+//! defects is the verifier's job and the decoder must hand them over
+//! intact. A writer
 //! builds a preimage through the per-kind constructors, which place every
 //! sentinel the kind carries.
 
