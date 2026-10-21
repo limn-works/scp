@@ -69,7 +69,7 @@ Each test specifies:
 | **Spec Sections** | `09-security-model.md` §9.1 invariants 1 and 4, §9.7.4.2 R3, `00-open-questions.md` |
 | **Preconditions** | A human identity and a second identity whose inception event names the human as its delegator. |
 | **Steps** | 1. Publish both chains. 2. Resolve the second identity. |
-| **Expected Outcome** | R3 rejects every chain whose delegator field is nonzero, so the second identity does not resolve and signs no autonomous action. This test asserts the fail-closed rejection that stands until the delegation model lands (`00-open-questions.md`). |
+| **Expected Outcome** | R3 returns `Invalid` for an identifier whose inception names a nonzero delegator, so the second identity does not resolve and signs no autonomous action. This test asserts the fail-closed `Invalid` verdict that stands until the delegation model lands (`00-open-questions.md`). |
 
 ### CONF-005: Multi-Device (One Identity, Different Device Leaf Keys)
 

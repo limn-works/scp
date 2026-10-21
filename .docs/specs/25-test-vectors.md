@@ -2290,7 +2290,7 @@ Signature field (128 bytes):
   3ee408b9f697d1c5ebac883cde74139dfda09c4fcba7800415bc110bcb57e8dd
 ```
 
-**Conformance procedure.** A chain of Vector 41 then Vector 68 is valid and terminal: R4 rejects any event whose predecessor chain contains Vector 68. An implementation that writes field 12's abandonment as `BE32(0)`, the absent-field sentinel, produces a 164-byte preimage and a different digest.
+**Conformance procedure.** A chain of Vector 41 then Vector 68 is valid and terminal: R4 discards any event whose predecessor chain contains Vector 68. An implementation that writes field 12's abandonment as `BE32(0)`, the absent-field sentinel, produces a 164-byte preimage and a different digest.
 
 ### Vector 69: a `KeyState` that drops a key as `Compromised{from: N}`
 
