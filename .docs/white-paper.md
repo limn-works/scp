@@ -486,7 +486,7 @@ SCP relays are:
 
 ### 9.2 Native Relay Protocol
 
-The SCP native relay protocol defines nine operations over WebSocket with MessagePack binary frames, organized in three groups: six client operations (PUBLISH, SUBSCRIBE, UNSUBSCRIBE, QUERY, DELETE, ACK), keepalive (PING), and bridge operations (BRIDGE_REGISTER, BRIDGE_DATA for relay-to-relay proxying).
+The SCP native relay protocol defines twelve frame types over WebSocket with MessagePack binary framing, organized in three groups: six client operations (PUBLISH, SUBSCRIBE, UNSUBSCRIBE, QUERY, DELETE, ACK), keepalive (PING), and five bridge frames (BRIDGE_REGISTER, and the session frames BRIDGE_SESSION_OPEN, BRIDGE_DATA, BRIDGE_SESSION_CREDIT and BRIDGE_SESSION_CLOSE, which tunnel a peer's relay traffic to a relay behind a bridge).
 
 ### 9.3 Transport Abstraction
 

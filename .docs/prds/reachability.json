@@ -42,6 +42,16 @@
         "SCP-247",
         "SCP-328"
       ]
+    },
+    {
+      "id": "gate-reachability-4",
+      "name": "Bridge Sessions",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-339",
+        "SCP-340"
+      ]
     }
   ],
   "stories": [
@@ -887,6 +897,104 @@
       ],
       "details": {},
       "result": "Service gains bridge_target (bridgeTarget, 64 lowercase hex). scp-did's RelayEndpoint (a §9.18.2 canonical URL ending in /scp/v1), BridgeEndpoint (a wss RelayEndpoint) and BridgeTarget (32 bytes other than SHA-256(0x00)) validate at construction, and RelayService::direct and RelayService::bridge build an SCPRelay entry from them without failing. DidDocument drops each service entry §18.2.1 rejects while it deserializes and keeps the record, so every typed accessor and every FFI projection reads the filtered list. The §9.18.2 canonicalizer moved from scp-protocol into scp-did with no re-export of the module. scp-node takes the bridge relay as a BridgeEndpoint, holds the advertised RelayService in its live slot, publishes the bridge relay URL with bridgeTarget = did_routing_id(did) on tier 3 (Stub — see SCP-315 for the §10.12.4.1 identifier-bytes value), clears it on a move off tier 3, keeps its relay's reserved push routing ID for a bridge entry, and shuts its relay down when Node::start fails after starting it. Node::start already rejected a non-ASCII domain on main; this story adds a test for it. scp-transport's query-string bridge parser is deleted. PyO3 services carry bridge_target. Each acceptance-criterion test named above exists, and each was seen failing with its behavior removed."
+    },
+    {
+      "id": "SCP-339",
+      "title": "Bridge relay opens per-peer sessions to a registered relay and carries their frames both ways under per-session caps",
+      "gate": "gate-reachability-4",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-relay-client/src/protocol.rs",
+        "crates/scp-relay-client/src/error.rs",
+        "crates/scp-transport/src/relay/bridge.rs",
+        "crates/scp-transport/src/native/server.rs"
+      ],
+      "description": "Implements the bridge relay's half of the sessions that `10-infrastructure-and-self-hosting.md` §10.12.4 **Sessions** defines, and the frames and codes ADR-004 lists for them. Alec chose the option \"Tunnel sessions\" on 2026-10-20 (`00-open-questions.md`, entry \"A response path from a bridged node to the peer\"), in place of the reply path he had chosen earlier that day. Today the bridge forwards a peer's `BRIDGE_DATA` with a zeroed `source_routing_id` (`handle_bridge_data` in `crates/scp-transport/src/native/server.rs`) and keeps no record of the peer, so nothing the node sends can reach the peer. This story adds `BRIDGE_SESSION_OPEN`, `BRIDGE_SESSION_CREDIT` and `BRIDGE_SESSION_CLOSE`, gives `BRIDGE_DATA` a `session_id` in both directions in place of `target_routing_id` and `source_routing_id`, adds the codes `4033` BRIDGE_SESSION_UNKNOWN and `4035` BRIDGE_FLOW_VIOLATION, and makes the bridge keep one record per session under the identifier, credit, cap, close and connection-loss rules of §10.12.4. The self-hosted relay's side and the peer's session call are SCP-340. SCP has no deployed users, so `BRIDGE_DATA` changes shape with no compatibility path. Function, type and field names in Rust are indicators; the wire field names are the spec's.",
+      "acceptanceCriteria": [
+        "Wire types (§10.12.4 **Sessions**, ADR-004 frame tables): `BRIDGE_SESSION_OPEN` carries `session_id: u64` and `target_routing_id: bin32` in both directions, and `source_tag: bin16` from the bridge to the registered connection; `BRIDGE_DATA` carries `session_id: u64` and `payload: bin` in both directions, with no `target_routing_id` and no `source_routing_id`; `BRIDGE_SESSION_CREDIT` carries `session_id: u64` and `bytes: u32`; `BRIDGE_SESSION_CLOSE` carries `session_id: u64` and `code: u16`; each carries the optional `ref`. MessagePack round-trip tests pin each field name and type in each direction, and `git grep -n -w -e source_routing_id -e forward_id -e BridgeReply -e BRIDGE_OPEN -e BRIDGE_CREDIT -e BRIDGE_CLOSE -e BridgeOpen -e BridgeCredit -e BridgeClose crates/` prints nothing.",
+        "Codes: `crates/scp-relay-client/src/error.rs` defines `4033` BRIDGE_SESSION_UNKNOWN and `4035` BRIDGE_FLOW_VIOLATION as client errors, and the constant-value test asserts both.",
+        "Opening (§10.12.4 **Opening**, **Session identifiers**): a peer's `BRIDGE_SESSION_OPEN` for a registered target reaches the registered connection as a `BRIDGE_SESSION_OPEN` with the same `target_routing_id` and a session ID the bridge chose, and the peer gets `OK` echoing its `ref`; a test opens 1,000 sessions from ten peers to one registered connection and finds the registered connection's session IDs strictly increasing, and the bridge's session table maps each to its peer connection and peer session ID. Each refusal opens nothing on the registered connection: `4030` with brokering disabled, `4032` for an unregistered target, `4003` for a `session_id` equal to and one lower than an ID the peer already used on that connection, and `4031` beyond a session cap. Sessions opened from one source address over two connections carry one `source_tag` on the registered connection, and so do sessions from two IPv6 addresses in one /64; sessions from two IPv4 addresses, or from two IPv6 /64s, carry different tags; with `ipv6_source_prefix` set to 56, two /64s in one /56 carry one tag; and the same prefix's sessions on two registered connections carry different tags. A test vector fixes `tag_key`, an IPv4 address and an IPv6 address and checks each `source_tag` against `HMAC-SHA256(tag_key, family || prefix_len || prefix)` truncated to 16 bytes. A `BRIDGE_SESSION_OPEN` sent on a registered connection gets `ERR` `4000`.",
+        "Data and order (§10.12.4 **Data**): with two peers that each hold two sessions to one registered connection, `BRIDGE_DATA` frames sent in interleaved order in both directions reach the other end of their own session only, in the order sent, with the payload byte-for-byte equal and the other leg's session ID. A payload that is not MessagePack is carried unchanged, which shows the bridge does not decode it. The bridge writes no frame in answer to a `BRIDGE_DATA`, `BRIDGE_SESSION_CREDIT` or `BRIDGE_SESSION_CLOSE` it accepts. A `BRIDGE_DATA` whose payload exceeds `max_blob_size` plus 1,024 bytes closes the session with `BRIDGE_SESSION_CLOSE` `4010` on both legs and none of its bytes reach the other end.",
+        "Backpressure (§10.12.4 **Backpressure**): a session opens with zero credit in each direction, and after opening the bridge sends the peer and the registered connection each a `BRIDGE_SESSION_CREDIT` no larger than its per-session buffer and drawn from the token buckets of the next criterion. A `BRIDGE_DATA` within its sender's credit is carried; one beyond it closes the session with `BRIDGE_SESSION_CLOSE` `4035` on both legs and none of its bytes reach the other end. A test in which the receiving end grants no credit shows the bridge holds no more buffered payload for that session and direction than the credit it granted the sender, forwards nothing to the receiving end, and keeps carrying the frames of another session on the same registered connection.",
+        "Caps as configuration (§10.12.4 **Caps**, ADR-052, `.docs/standards/construction.md`): the bridge's relay configuration carries sessions per source prefix, sessions per registered connection, payload bytes per second per session direction, payload bytes per second per source prefix direction, the per-session buffer and `ipv6_source_prefix` as named fields of its flat config object, defaulting to 8, 256, 1 MiB, 2 MiB, `max_blob_size` plus 1,024 bytes and 64; no global, singleton or `static` holds them, and `scripts/check-no-mutable-globals.sh` passes. Tests with the caps lowered show: a `BRIDGE_SESSION_OPEN` beyond the per-source-prefix cap gets `4031` and opens nothing when one address spreads its sessions over several connections, and when several IPv6 addresses in one /64 each open sessions; an open from another IPv4 address or another /64 still succeeds; a `BRIDGE_SESSION_OPEN` beyond the per-registered-connection cap gets `4031`. Under a paused Tokio clock: a sender that has used its session bucket's tokens receives no further `BRIDGE_SESSION_CREDIT` until the clock advances, and the session stays open; two sessions of one source prefix, from two IPv6 addresses in one /64, together receive no more credit per second than the per-prefix rate plus one bucket; a session left idle for an hour then receives at most `max_blob_size` plus 1,024 bytes of credit before the bucket refills, which shows no burst accrues. No per-connection rate limit applies to session frames, and the bridge reads no payload byte to enforce a cap.",
+        "Closing (§10.12.4 **Closing**): a `BRIDGE_SESSION_CLOSE` from either end frees the session and reaches the other end exactly once, with the same code and that leg's session ID; a `BRIDGE_DATA` for that session that crossed the close is dropped and answered with nothing; a `BRIDGE_DATA`, `BRIDGE_SESSION_CREDIT` or `BRIDGE_SESSION_CLOSE` naming a session ID greater than every ID opened on its connection gets `ERR` `4033` and reaches no connection. A test counts the frames written to every connection before and after each case.",
+        "Connection loss (§10.12.4 **Connection loss**): when a peer connection closes, every session it held is freed and the registered connection receives `BRIDGE_SESSION_CLOSE` with code `0` for each, carrying each session's registered-leg ID; when a registered connection closes, each of its sessions' peers receives `BRIDGE_SESSION_CLOSE` `4032` with its own session ID, and a later `BRIDGE_SESSION_OPEN` for its routing ID gets `4032` (§10.12.4 **Bridge establishment** step 5). A test asserts the session table is empty after both."
+      ],
+      "actionItems": [
+        "Add the session frames and change `BridgeData` in `scp-relay-client`.",
+        "Add the session table beside `BridgeRegistry`, keyed by connection and session ID, with credit and a buffer per direction and a per-connection index for connection loss.",
+        "Handle the session frames in the native relay server and add the cap fields to the relay configuration."
+      ],
+      "blockedBy": [
+        "SCP-236",
+        "SCP-247"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.4 Tier 3: Relay Bridging"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        }
+      ],
+      "details": {
+        "crate": "scp-transport"
+      }
+    },
+    {
+      "id": "SCP-340",
+      "title": "A bridged self-hosted relay serves each bridge session as a listener connection, and a peer opens sessions through a bridge",
+      "gate": "gate-reachability-4",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/client.rs",
+        "crates/scp-transport/src/native/adapter.rs",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-client/src/client.rs",
+        "crates/scp-runtime/src/context/builder.rs",
+        "crates/scp-transport/src/provider.rs",
+        "crates/scp-relay-client/src/error.rs"
+      ],
+      "description": "Implements the self-hosted relay's side and the peer's side of `10-infrastructure-and-self-hosting.md` §10.12.4 **Sessions**, over the frames and bridge sessions of SCP-339. Today the native relay client discards every relay-side `BRIDGE_DATA` (`RelayMessage::BridgeData` falls into an empty match arm in `crates/scp-transport/src/native/client.rs` and `adapter.rs`), so a node behind a bridge handles nothing a peer sends it. This story serves each session the bridge opens as one connection of the self-hosted relay's frame handling, multiplexed over its one bridge connection, under the credit, session bound and close rules of §10.12.4, and gives a peer one call that opens a session through a bridge and exchanges ADR-004 frames over it, which the tier 3 KeyPackage fetch and the tier 3 push registrar (PUSH-035) both use. It also adds the node's KeyPackage admission (§10.7.1 **KeyPackage admission at the node**). The node's `BRIDGE_REGISTER`, which makes a bridge forward anything to a production node, is tracked by the issue in PUSH-033's `blockedByIssues`; this story's tests register the self-hosted relay with the bridge directly. Function and type names are indicators.",
+      "acceptanceCriteria": [
+        "Sessions are served as connections (§10.12.4 **Sessions**): a `BRIDGE_SESSION_OPEN` from the bridge starts a session that goes through the same frame handling a listener connection goes through, with its own subscriptions and its own per-connection limits, and with each limit ADR-004 keys on an address keyed on the session's `source_tag`, so two sessions carrying one tag share one `rate_limit_publish` allowance and two sessions carrying different tags get one each, and two listener connections from two IPv6 addresses in one /64 likewise share one allowance (ADR-004 `ipv6_source_prefix`), and every relay-to-client frame that handling writes goes back as a `BRIDGE_DATA` with the session's ID, in order. A session payload that does not decode as a client frame gets, on that session, the `ERR` `4000` a listener connection gets for it, and the bridge connection and the other sessions stay open.",
+        "Operations work unchanged over a session, each in an in-process test with a bridge whose broker role is enabled, a self-hosted relay registered with it, and a peer holding one session: a `PUBLISH` gets `OK` with `blob_id` and the blob is stored; a `QUERY` at a routing ID holding three blobs gets three `BLOB` frames and the `query_complete` `EVENT`; a `SUBSCRIBE` gets its `OK`, its backfill `BLOB` frames and `backfill_complete`, and a blob a listener client publishes at that routing ID afterwards reaches the peer as a live `BLOB` on the session; an `ACK` for that delivery gets the handling and the answer it gets on a listener connection; a `DELETE` and an `UNSUBSCRIBE` get `OK`; a `PING` gets `PONG`; a refused operation gets its `ERR`. Each inner frame echoes the inner `ref` the peer set.",
+        "Multiplexing (§10.12.4 **Sessions**): two peers, each holding one session to one self-hosted relay, subscribe to different routing IDs; each live delivery reaches only the session that subscribed, and closing one session ends its subscriptions and leaves the other session's intact. The self-hosted relay sends session frames only on the connection that carries its `BRIDGE_REGISTER` registration and on no listener connection.",
+        "Credit at the self-hosted relay (§10.12.4 **Backpressure**): the self-hosted relay grants the bridge at least `max_blob_size` plus 1,024 bytes of credit when it receives the bridge's `BRIDGE_SESSION_OPEN`, before any other frame for the session, and grants more as it consumes frames, and it sends no `BRIDGE_DATA` beyond the credit the bridge granted it. A test in which the peer grants no credit shows the self-hosted relay's frames for that session wait while its other sessions keep flowing, and the waiting session is closed with `BRIDGE_SESSION_CLOSE` `4012` when its held frames would exceed the self-hosted relay's held-frame bound.",
+        "Session bound and close (§10.12.4 **Caps**, **Closing**, **Connection loss**): the self-hosted relay's session bound and held-frame bound are named fields of its flat relay config (ADR-052), defaulting to 256 sessions and 1 MiB, held in no global; a `BRIDGE_SESSION_OPEN` beyond the session bound is answered with `BRIDGE_SESSION_CLOSE` `4012`. After a `BRIDGE_SESSION_CLOSE` from the bridge, after its own `BRIDGE_SESSION_CLOSE`, and after its bridge connection closes, the self-hosted relay holds no state for the session, which a test asserts by the session table's length, the session's subscriptions end, and a later frame naming that session ID produces no frame.",
+        "Peer session call: the native relay client exposes one call that opens a session through a bridge to a target routing ID and returns a handle on which the caller sends client frames and receives the self-hosted relay's frames in order, with credit granted and honoured inside the call, including the opening grant of at least `max_blob_size` plus 1,024 bytes when the bridge's `OK` arrives (indicator name: `open_bridge_session`); dropping or closing the handle sends `BRIDGE_SESSION_CLOSE` `0`. It returns typed errors that keep apart `4030`, `4031`, `4032` and `4003` on open, a session the bridge or the self-hosted relay closed (carrying the `BRIDGE_SESSION_CLOSE` code), and a dropped connection, and it never surfaces a frame of a session ID it did not open. Unit tests cover each.",
+        "KeyPackage read through a bridge (§10.7.1 **Recipient key**, **What bounds the read**): an in-process test stores 2,500 valid KeyPackages of the self-hosted relay's identity at its KeyPackage routing ID (`09-security-model.md` §9.7.4 **KeyPackage routing ID**) and reads all 2,500 on one session with three `QUERY` frames of `limit` 1,000, paged with `since` and `after_blob`, the `query_complete` counts being 1,000, 1,000 and 500 and each `BLOB` byte-for-byte equal to the stored blob; with the bridge's rate cap lowered under a paused Tokio clock, the same read completes after the clock advances and the session is never closed.",
+        "The KeyPackage publisher cites the definition of the routing ID it publishes at (`09-security-model.md` §9.7.4 **KeyPackage routing ID**): the `ContextTransportProvider` publish method doc in `crates/scp-runtime/src/context/builder.rs` and the publish comment in `crates/scp-transport/src/provider.rs`, which cite `spec §5.12.3` for `derive_key_package_routing_id` today, cite `09-security-model.md` §9.7.4 instead. A unit test in `crates/scp-transport/src/provider.rs` computes `SHA-256(BE32(len(did)) || did || \"scp-key-packages\")` with `sha2` directly for one fixture identifier and asserts that the routing ID the provider publishes a KeyPackage at equals those 32 bytes. The Welcome-delivery citation of §5.12.3 in `builder.rs` is correct and stays. Check: `git grep -n -A1 derive_key_package_routing_id -- crates/scp-runtime/src/context/builder.rs crates/scp-transport/src/provider.rs` prints no line containing `§5.12.3`.",
+        "KeyPackage admission at the node (§10.7.1 **KeyPackage admission at the node**, ADR-004 `4042`): `crates/scp-relay-client/src/error.rs` defines `4042` KEY_PACKAGE_REJECTED and the constant-value test asserts it. In an in-process test, a PUBLISH at the node identity's KeyPackage routing ID is refused with `ERR` `4042` and stores nothing in each of these cases, sent both on a listener connection and on a bridge session: a blob that does not decode as a KeyPackage; a KeyPackage whose own signature under its `leaf_node.signature_key` fails (RFC 9420 §10.1), made by changing one byte of its extensions or capabilities after signing; a KeyPackage with no `scp_keypackage_attestation`; one whose attestation names another identifier; one signed by a key the identity's key state does not list `Current` in the `#active` role; one whose `expires_at` is at or before the node's clock; and one whose `issued_at` is more than 300 seconds after the node's clock. A valid KeyPackage of the identity is stored and answered with `OK` and `blob_id`. One copy per `init_key`: a second PUBLISH of a stored valid KeyPackage gets `OK` with the stored `blob_id`; so does a copy whose KeyPackage signature is replaced by its ECDSA twin `(r, n − s)`, which verifies, and so does a copy with trailing padding bytes; a query then returns exactly one blob for that `init_key`, the one stored first among copies that arrived by PUBLISH. A PUBLISH of the same junk blob at any other routing ID is stored as before. A query after the refusals returns only the stored valid KeyPackages.",
+        "Own bytes and retired init keys (§10.7.1 **The identity's own bytes win**, **Retired init keys**), in-process tests: with the ECDSA twin `(r, n − s)` of a KeyPackage published first, the identity's instance then writing its own bytes leaves a query returning exactly one blob for that `init_key`, byte-equal to the instance's, and an MLS Welcome built from the queried KeyPackage is processed by the joining instance; after the instance consumes an `init_key` at a join, a PUBLISH of that KeyPackage, of its twin, or of a padded copy gets `ERR` `4042` and stores nothing; after the instance deletes a KeyPackage, the same three PUBLISHes get `4042`; after a wrapping-key rotation, a PUBLISH of an unexpired KeyPackage naming the old wrapping key gets `4042`, both for one the node had stored and for one the instance issued and never wrote to the node; an in-process write of a KeyPackage with a retired `init_key` is refused; under a test clock, a retired entry is gone once its attestation's `expires_at` passes, and the set and the issued-attestation record survive a restart of the instance. The retired-init-key set and the issued-attestation record are fields of a type the node's construction receives through its initializer (ADR-052), and no global, singleton or `static` holds them."
+      ],
+      "actionItems": [
+        "Serve each bridge session from the self-hosted relay's bridge connection as one connection of the relay's frame handling, with a per-session sink and credit.",
+        "Add the peer-side session call to the native relay client.",
+        "Add the in-process bridge tests."
+      ],
+      "blockedBy": [
+        "SCP-339"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "### 10.12.4 Tier 3: Relay Bridging"
+        },
+        {
+          "file": ".docs/adrs/phase-1.md",
+          "section": "## ADR-004: SCP Native Relay Protocol"
+        }
+      ],
+      "details": {
+        "crate": "scp-transport"
+      }
     }
   ]
 }
