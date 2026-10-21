@@ -574,7 +574,7 @@ State:
 - Forward secrecy: SDK MUST delete old epoch keys after Commit (§9.7.2)
 - Post-compromise security: SDK MUST issue periodic MLS Updates, recommended every 24 hours (§9.7.3)
 - Key lifecycle: generation (HSM-backed), distribution (KeyPackages on relays), rotation (a key event → MLS Update in all contexts), destruction (platform-attested, §9.15)
-- Broadcast mode (§5.14) does NOT use MLS — it substitutes per-author AES-256-GCM broadcast keys with a pull-based key distribution protocol (identical to sender keys §9.16.2). Broadcast contexts have no MLS group, no forward secrecy (mitigated by epoch rotation on block events), and public routing_id = SHA-256(context_id).
+- Broadcast mode (§5.14) does NOT use MLS for content — it substitutes per-author AES-256-GCM broadcast keys with a pull-based key distribution protocol (identical to sender keys §9.16.2). Broadcast content has no MLS forward secrecy (mitigated by epoch rotation on block events) and a public routing_id = SHA-256(context_id). The owner and the authors form an MLS group that orders governance and the subscriber registry; subscribers are not members (§5.14.13, ADR-066 decision 38).
 
 **Security Module responsibilities (§9.8–§9.12):**
 - Three-layer replay prevention: MLS generation numbers + hash dedup (10K cache) + timestamp bounds (5-min tolerance)

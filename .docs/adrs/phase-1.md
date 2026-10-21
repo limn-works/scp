@@ -1166,6 +1166,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
        pub sender_did: [u8; 32],
        pub epoch: u64,
        pub signer_key_ref: SigningKeyId,  // Which VM signed: Active or Agent (ADR-039)
+       pub pushed: Vec<PushedSenderKey>,  // ADR-066 decision 37: the new key per push chain (spec 09 §9.16.9); unsigned
        pub signature: P256Signature,  // Signs context_id || sender_did || signer_key_ref || "key_epoch" || epoch
    }
 
@@ -1184,6 +1185,7 @@ Implement per-sender AES-256 symmetric keys as `scp-core/crypto/sender_keys/`. M
    pub struct SenderKeyResponse {
        pub sender_did: [u8; 32],
        pub epoch: u64,
+       pub bound_epoch: u64,           // ADR-066 decision 36: MLS epoch of the advance (spec 09 §9.16.10); in the HPKE aad
        pub hpke_sealed_key: Vec<u8>,   // HPKE(requester_wrapping_pubkey, sender_key)
        pub ephemeral_pubkey: HpkeP256PublicKey,
    }

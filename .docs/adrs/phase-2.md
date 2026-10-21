@@ -115,7 +115,7 @@ Invalid transitions (must return error):
 
    Steps:
    1. Transition state to `Creating`.
-   2. If `mode == Encrypted`: Create MLS group via ADR-001 `create_group()`. If `mode == Broadcast`: Initialize creator's broadcast key (epoch 0) — no MLS group. On failure: drop `Creating` state, return error.
+   2. If `mode == Encrypted`: Create MLS group via ADR-001 `create_group()`. If `mode == Broadcast`: Create the authors group via ADR-001 `create_group()` with `context_mode` 1 in its `0xFF02` extension, and initialize the creator's broadcast key (epoch 0) (spec 05 §5.14.13, ADR-066 decision 38). On failure: drop `Creating` state, return error.
    3. If `mode == Encrypted`: Generate creator's sender key via ADR-007 `generate_sender_key()`. If `mode == Broadcast`: Broadcast key already initialized in step 2. On failure: destroy MLS group, return error.
    4. Initialize empty event log (ADR-011). On failure: destroy sender key, destroy MLS group, return error.
    5. Publish context to transport. On failure: drop event log, destroy sender key, destroy MLS group, return error.
@@ -192,7 +192,7 @@ pub struct ContextParams {
     pub promotion_policy: PromotionPolicy, // Whether context promotion is allowed (§5.10)
     pub roles: Vec<RoleDefinition>,      // Role definitions with permission sets
     pub outlets: Vec<OutletRegistration>,    // Initial outlet registrations
-    pub outlet_registration_policy: OutletRegistrationPolicy, // ADR-066 decision 31: which outlet changes need a vote; required, no default
+    pub outlet_registration_policy: OutletRegistrationPolicy, // ADR-066 decisions 31 and 35: the rule list that sends outlet changes to a vote or a role; required, no default
     pub ttl: Option<Duration>,           // Optional TTL
     pub memory_scope: MemoryScope,       // Ephemeral, Summary, or Full
     pub governance: GovernanceModel,     // Single-admin for Phase 2
@@ -230,25 +230,28 @@ pub enum PromotionPolicy {
 /// Context processing mode. Immutable after creation.
 pub enum ContextMode {
     Encrypted,  // MLS-backed, sender-side keys, full forward secrecy (default)
-    Broadcast,  // Per-author broadcast keys, no MLS, mandatory subscriber registration (§5.14)
+    Broadcast,  // Per-author broadcast keys for content, an MLS group of authors only, mandatory subscriber registration (§5.14)
 }
 
 // Broadcast mode acceptance criteria (§5.14):
 //
 // When `mode == Broadcast`:
-// - No MLS group is created. Context uses per-author AES-256-GCM broadcast keys
+// - The owner and the authors form an MLS group, the authors group, that
+//   orders governance and the subscriber registry (§5.14.13, ADR-066
+//   decision 38). Content uses per-author AES-256-GCM broadcast keys
 //   instead of MLS group keys.
-// - Subscriber count is unlimited (no MLS group size bound).
+// - Subscriber count is unlimited (subscribers are not group members).
 // - The context's public `routing_id` is derived as `SHA-256(context_id)` —
 //   deterministic and discoverable by any agent that knows the context_id.
 // - Authors are bounded participants who hold `MessagesWrite` capability.
 //   Each author maintains their own broadcast key with independent epoch rotation.
 // - Subscribers hold `MessagesRead` capability and receive broadcast keys via
 //   HPKE-wrapped key distribution (no MLS Welcome messages).
-// - `create_context` skips MLS group creation (step 2) and instead initializes
-//   the creator's broadcast key at epoch 0.
-// - `join_context` for subscribers registers identity-authenticated subscription
-//   without MLS add_member.
+// - `create_context` creates the authors group (step 2) with `context_mode` 1
+//   in its `0xFF02` extension, and initializes the creator's broadcast key at
+//   epoch 0.
+// - `join_context` for subscribers sends a signed registration record that an
+//   author carries in a registration Commit; no MLS add_member.
 // - `send_message` encrypts with the author's current broadcast key, wraps in
 //   `BroadcastEnvelope` (§5.14.5), and publishes to the public routing_id.
 // - All other context lifecycle operations (close, expire, TTL, event log)
@@ -1173,7 +1176,7 @@ pub struct ConsistencyCheckpoint {
     pub sender_did: [u8; 32],
     pub event_count: u64,
     pub merkle_root: [u8; 32],
-    pub epoch: Option<u64>,         // Current MLS epoch (None for Broadcast contexts)
+    pub epoch: u64,                 // Current MLS epoch (the authors group's in a Broadcast context, ADR-066 decision 38)
     pub timestamp: u64,
     pub signature: P256Signature,
 }

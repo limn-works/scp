@@ -260,7 +260,7 @@ Implement TTL tracking and memory scope enforcement in `scp-core/context/`. TTL 
 
 - **Key destruction as enforcement:** Access control via key destruction is mathematically enforced, not policy-dependent. Destroying MLS tree secrets, epoch key schedules, and application key material makes all historical content physically unreadable — no trust in relay deletion compliance required.
 - **Promotion as contract change:** Moving from ephemeral to persistent changes what members opted into. Unanimous consent (not just governance majority) is required because the original scope was part of the opt-in contract visible before joining (protocol tenet: legibility before opt-in).
-- **Broadcast scope restriction:** Broadcast contexts (§5.14) use per-author keys without MLS group management. Forward secrecy depends on MLS epoch ratcheting, which broadcast mode lacks. Ephemeral/Summary scopes promise key destruction semantics that broadcast mode cannot deliver. Restricting to Full scope avoids false security guarantees.
+- **Broadcast scope restriction:** Broadcast contexts (§5.14) encrypt content under per-author keys outside MLS; only the authors group is an MLS group (§5.14.13). Forward secrecy depends on MLS epoch ratcheting, which broadcast content lacks. Ephemeral/Summary scopes promise key destruction semantics that broadcast mode cannot deliver. Restricting to Full scope avoids false security guarantees.
 - **Key destruction verification levels:** The protocol records attestation level (hardware-backed, software-only, no attestation) as metadata. It does not gate on level — the protocol works regardless, but higher assurance levels are visible to other participants.
 
 ### Implementation

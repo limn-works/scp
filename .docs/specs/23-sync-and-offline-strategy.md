@@ -327,7 +327,7 @@ Exchanged between members as MLS application messages during event log reconcili
 | `sender_did` | string | The sending member's identifier |
 | `event_count` | u64 | Number of events in the sender's local event log |
 | `merkle_root` | bytes (32) | SHA-256 Merkle root of the sender's event log |
-| `epoch` | u64 or null | MLS epoch on the sender's device; null for a Broadcast context |
+| `epoch` | u64 | MLS epoch on the sender's device; in a Broadcast context, the authors group's (`05-contexts.md` §5.14.13) |
 | `timestamp` | u64 | Unix seconds when generated |
 | `signature` | bytes (64) | P-256 signature over the canonical hash of every field above |
 
@@ -370,7 +370,7 @@ Self-contained context state at a point in time, used for the Tier 2 delta sync 
 |-------|------|-------------|
 | `context_id` | string | Context identifier |
 | `timestamp` | u64 | Unix seconds when the snapshot was taken |
-| `mls_epoch` | u64 or null | MLS epoch at snapshot time; null for a Broadcast context |
+| `mls_epoch` | u64 | MLS epoch at snapshot time; in a Broadcast context, the authors group's (`05-contexts.md` §5.14.13) |
 | `event_log_merkle_root` | bytes (32) | SHA-256 Merkle root at snapshot time |
 | `event_count` | u64 | Number of events in the log at snapshot time |
 | `members` | map | Identifier to `MembershipEntry`, ordered by key |
