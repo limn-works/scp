@@ -138,9 +138,9 @@ pub struct InstalledRootSet {
 ///
 /// It is the key state minus the standing commitment: the commitment list
 /// travels in the continuation field of the event that fixes it (field 12),
-/// and the snapshot carries no next-set list. [`into_key_state`](Self::into_key_state)
-/// composes it with the latest continuation's commitment into
-/// `scp_did::KeyState`.
+/// and the snapshot carries no next-set list. [`replay`](crate::replay)
+/// composes it with the standing commitment into `scp_did::KeyState`
+/// (R8).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KeyStateSnapshot {
     /// The signing threshold t of the root set.
@@ -187,9 +187,12 @@ impl KeyStateSnapshot {
     /// the standing commitment").
     ///
     /// The snapshot is destructured field by field, so a field added to
-    /// either type fails to compile here until it is placed.
+    /// either type fails to compile here until it is placed. It is
+    /// crate-private: [`replay`](crate::replay) and
+    /// [`key_state_at`](crate::key_state_at) are its only callers, so a key
+    /// state this crate hands out comes from a validated chain.
     #[must_use]
-    pub fn into_key_state(self, standing_commitment: StandingCommitment) -> KeyState {
+    pub(crate) fn into_key_state(self, standing_commitment: StandingCommitment) -> KeyState {
         let Self {
             root_threshold,
             keys,

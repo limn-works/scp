@@ -28,6 +28,30 @@ pub(super) struct ChainEvent {
     pub(super) snapshot: Arc<KeyStateSnapshot>,
 }
 
+/// What one position of a valid chain leaves standing, read by
+/// [`replay`](crate::replay) and [`key_state_at`](crate::key_state_at).
+pub struct StandingState<'c> {
+    /// The position's event digest.
+    pub(crate) digest: [u8; 32],
+    /// The position's sequence.
+    pub(crate) sequence: u64,
+    /// The latest snapshot at or before the position (R8).
+    pub(crate) snapshot: &'c KeyStateSnapshot,
+    /// The standing commitment at the position (R8, R4).
+    pub(crate) commitment: &'c StandingCommitment,
+}
+
+impl<'c> StandingState<'c> {
+    fn of(event: &'c ChainEvent) -> Self {
+        Self {
+            digest: event.digest,
+            sequence: event.sequence,
+            snapshot: &event.snapshot,
+            commitment: &event.commitment,
+        }
+    }
+}
+
 /// A chain every event of which passed every step of R3's check order, from
 /// an inception that recomputes to the chain's identifier (§9.7.4.2 R2, R3).
 ///
@@ -159,6 +183,22 @@ impl ValidatedChain {
 
     pub(super) fn head(&self) -> &ChainEvent {
         self.state.later.last().unwrap_or(&self.state.inception)
+    }
+
+    /// The state standing after the head: R8's latest snapshot and the
+    /// standing commitment, which [`replay`](crate::replay) composes.
+    pub(crate) fn head_state(&self) -> StandingState<'_> {
+        StandingState::of(self.head())
+    }
+
+    /// The state standing after the event whose preimage digest is
+    /// `digest`, where that event is on the chain. Digests along one chain
+    /// are distinct, because each binds its predecessor's.
+    pub(crate) fn state_at(&self, digest: &[u8; 32]) -> Option<StandingState<'_>> {
+        std::iter::once(&self.state.inception)
+            .chain(&self.state.later)
+            .find(|event| event.digest == *digest)
+            .map(StandingState::of)
     }
 
     /// The position the next event takes: the count of events held.

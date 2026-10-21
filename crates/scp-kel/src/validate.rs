@@ -24,6 +24,7 @@ mod verdicts;
 
 use scp_did::Identifier;
 
+pub use chain::StandingState;
 pub use chain::ValidatedChain;
 pub use change::{ChangeEffect, NamedKey, SignerGroupSpec, ValidatedChange};
 pub use defect::{

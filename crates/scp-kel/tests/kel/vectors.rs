@@ -7,9 +7,9 @@ use scp_did::{
     KeyEntry, KeyRole, KeyState, StandingCommitment,
 };
 use scp_kel::{
-    Continuation, DeriveIdentifierError, EventKind, InstalledRootSet, RoutingKind, SignatureForm,
+    DeriveIdentifierError, EventKind, InstalledRootSet, RoutingKind, SignatureForm,
     decode_preimage, derive_identifier, encode_preimage, key_event_seal, prerotation_commitment,
-    routing_id,
+    replay, routing_id,
 };
 
 use crate::fixtures::{
@@ -136,14 +136,10 @@ fn vector_69_compromised_key_state_preimage_digest_and_signature() -> TestResult
 
 /// The V41 inception's snapshot and its continuation's commitment compose the
 /// key state that inception installs (§9.7.4.2: "A snapshot carries every
-/// component of the key state except the standing commitment").
+/// component of the key state except the standing commitment"), read
+/// through `replay` over the validated [Vector 41].
 #[test]
 fn vector_41_snapshot_composes_its_key_state() -> TestResult {
-    let decoded = decode_preimage(&fields(V41_PREIMAGE)?)?.into_preimage();
-    let snapshot = decoded.key_state.ok_or("V41 carries a snapshot")?;
-    let Some(Continuation::FixesCommitment(commitment)) = decoded.continuation else {
-        return Err("V41 fixes a commitment".into());
-    };
     let entry = |key, role| -> Result<KeyEntry, Box<dyn std::error::Error>> {
         Ok(KeyEntry {
             key: array(key)?,
@@ -174,8 +170,8 @@ fn vector_41_snapshot_composes_its_key_state() -> TestResult {
         }),
     };
     assert_eq!(
-        snapshot.into_key_state(StandingCommitment::Fixed(commitment)),
-        expected
+        replay(&super::chain_valid::chain_of(&super::chain_support::v41()?)?).key_state(),
+        &expected
     );
     Ok(())
 }

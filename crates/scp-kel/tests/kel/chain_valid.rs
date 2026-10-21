@@ -53,7 +53,7 @@ pub fn chain_of(base: &Base) -> Result<ValidatedChain, Error> {
 }
 
 /// [Vector 51's inception, Vector 51].
-fn v51_chain() -> Result<Base, Error> {
+pub fn v51_chain() -> Result<Base, Error> {
     Ok(Base {
         name: "V51i,V51",
         identifier: identifier(V51_IDENTIFIER)?,

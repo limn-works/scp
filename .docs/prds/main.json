@@ -11041,7 +11041,7 @@
       "gate": "gate-kel",
       "priority": "P0",
       "severity": "critical",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-kel/Cargo.toml",
         "crates/scp-kel/README.md",
@@ -11074,7 +11074,12 @@
         "crates/scp-protocol/src/crypto/key_continuity.rs",
         "crates/scp-protocol/Cargo.toml",
         "crates/scp-runtime/tests/test_vectors.rs",
-        "crates/scp-testing/tests/integration/identity.rs"
+        "crates/scp-testing/tests/integration/identity.rs",
+        "crates/scp-kel/tests/kel/replay.rs",
+        "crates/scp-kel/tests/kel/construction.rs",
+        "crates/scp-kel/tests/kel/chain_valid.rs",
+        "crates/scp-kel/tests/kel/vectors.rs",
+        "crates/scp-did/README.md"
       ],
       "description": "Architecture slice S2. `decode_event` in `event_codec.rs` reads one event's signed preimage and signature field out of a §9.10.12 frame. `verify_indexed` verifies an indexed signature group in either signature form, raw or WebAuthn assertion, and the WebAuthn form needs the client-data JSON parser in `client_data.rs`, which applies the clientDataJSON acceptance set of `09-security-model.md` §9.7.4.2, because `serde_json` keeps the last duplicate. `validate_entry`, the one public reader, assembles an entry's units into paths by predecessor digest and applies R1 through R4 to every path, returning `EntryValidation { verdict, discarded }`: the verdict is `InceptionInvalid`, `NoInception` or `Valid` with at least one valid chain, and `discarded` reports each discarded served unit once, in served order, as a `Discarded` carrying its served index and the chain position it was read for, `None` where it joined no chain; no public function checks a single path; `ValidatedChain::validate_change`, `validate_inception` and `HeldHead::check_next` run the same check order over an unsigned candidate; and `replay` derives the key state under R8. A verifier discards every illegal event past the inception, whoever signed it, and only a defective inception that recomputes to the served identifier is `InceptionInvalid`. In the criteria, \"Discarded{stage}\" means the outcome `Valid` with one chain and exactly one `Discarded`, read for the fixture's position and carrying that stage, and `Discarded{i, p, d, stage}` names served index i, read-for position p, digest d and stage. `09-security-model.md` §9.7.4.2 states each rule. Ranking is SCP-310.",
       "acceptanceCriteria": [

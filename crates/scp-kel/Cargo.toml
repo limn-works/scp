@@ -25,6 +25,10 @@ thiserror = { workspace = true }
 hex = { workspace = true }
 # Round-trips encode and decode over generated preimages of all four kinds.
 proptest = "1"
+# Compile-time proof that no Default, Deserialize or From impl builds a
+# ValidatedChain or a ReplayedState (tests/kel/construction.rs).
+serde = { workspace = true }
+static_assertions = { workspace = true }
 
 [lints]
 workspace = true

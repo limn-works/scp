@@ -2,8 +2,9 @@
 //! identifier, seal, commitment and routing ids, the two indexed-signature
 //! forms (`09-security-model.md` §9.7.4.2, R13), the raw-form signatures spec
 //! 25 prints for Vectors 51, 68 and 69, the event-unit decode
-//! (`decode_event`, §9.10.12) of every spec 25 event, the raw identifier,
-//! and the identifier's text form (`03-identity.md` §3.1).
+//! (`decode_event`, §9.10.12) of every spec 25 event, chain validation and
+//! the key state each spec 25 chain replays to (§9.7.4.2 R3, R8), the raw
+//! identifier, and the identifier's text form (`03-identity.md` §3.1).
 //!
 //! The browser client verifies a key event log in wasm32 and a native node
 //! verifies the same log, so both must compute the same bytes. Each test
@@ -28,15 +29,17 @@ use fixtures::{
     V51_SIGNATURE, V53_DIGEST, V53_PREIMAGE, V53_SIGNATURE_FIELD, V54_DIGEST, V54_PREIMAGE,
     V54_SIGNATURE_FIELD, V55_DIGEST, V55_PREIMAGE, V55_SIGNATURE_FIELD, V68_DIGEST, V68_PREIMAGE,
     V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE, V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array,
-    assert_event_round_trip, assert_signature, assert_vector, event_unit, fields, identifier,
-    read_unit, v41_inception, v50_key_state, v51_inception, v51_key_state, v68_rollover,
-    v69_key_state,
+    assert_event_round_trip, assert_signature, assert_vector, bytes, event_unit, fields,
+    identifier, read_unit, v41_inception, v50_key_state, v51_inception, v51_key_state,
+    v68_rollover, v69_key_state,
 };
-use scp_did::{Identifier, IdentifierError, KeyCondition, NonCanonicalReason};
+use scp_did::{
+    Identifier, IdentifierError, KeyCondition, KeyState, NonCanonicalReason, StandingCommitment,
+};
 use scp_kel::{
-    IndexedSignature, RoutingKind, SignatureForm, decode_preimage, derive_identifier,
-    key_event_challenge, key_event_seal, parse_client_data_json, prerotation_commitment,
-    routing_id, verify_indexed,
+    Continuation, EventPreimage, IndexedSignature, KeyStateSnapshot, RoutingKind, SignatureForm,
+    decode_preimage, derive_identifier, encode_preimage, key_event_challenge, key_event_seal,
+    parse_client_data_json, prerotation_commitment, routing_id, verify_indexed,
 };
 use sha2::{Digest, Sha256};
 
@@ -399,5 +402,143 @@ fn damaged_units_are_discarded_at_their_step() -> TestResult {
     let (chain, discarded) = chain_verdict(V41_IDENTIFIER, &[&v41, &forged, &unseparated, &v50])?;
     assert_eq!(chain.head_digest(), array::<32>(V50_DIGEST)?);
     assert_eq!(discarded.len(), 1, "{discarded:?}");
+    Ok(())
+}
+
+/// Every spec 25 chain `validate_entry` accepts: its identifier, and each
+/// event's printed preimage and signature field.
+fn spec_25_chains() -> Vec<(&'static str, Vec<(&'static str, String)>)> {
+    let v41 = || (V41_PREIMAGE, V41_SIGNATURE.to_owned());
+    let on_v41 = |preimage, signature: &str| vec![v41(), (preimage, signature.to_owned())];
+    vec![
+        (V41_IDENTIFIER, vec![v41()]),
+        (V41_IDENTIFIER, on_v41(V50_PREIMAGE, V50_SIGNATURE)),
+        (V41_IDENTIFIER, on_v41(V53_PREIMAGE, V53_SIGNATURE_FIELD)),
+        (V41_IDENTIFIER, on_v41(V54_PREIMAGE, V54_SIGNATURE_FIELD)),
+        (V41_IDENTIFIER, on_v41(V55_PREIMAGE, V55_SIGNATURE_FIELD)),
+        (
+            V41_IDENTIFIER,
+            on_v41(
+                V68_PREIMAGE,
+                &format!("{V68_REVEAL_SIGNATURE}{V68_ROOT_SIGNATURE}"),
+            ),
+        ),
+        (V41_IDENTIFIER, on_v41(V69_PREIMAGE, V69_ROOT_SIGNATURE)),
+        (
+            V42_IDENTIFIER,
+            vec![(V42_PREIMAGE, V42_INDEXED_SIGNATURE.to_owned())],
+        ),
+        (
+            V51_IDENTIFIER,
+            vec![
+                (V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE.to_owned()),
+                (V51_PREIMAGE, V51_SIGNATURE.to_owned()),
+            ],
+        ),
+    ]
+}
+
+/// The latest event of `events` whose preimage `carries`, with its printed
+/// hex.
+fn latest<'e>(
+    events: &'e [(&'static str, EventPreimage)],
+    carries: impl Fn(&EventPreimage) -> bool,
+) -> Result<&'e (&'static str, EventPreimage), Box<dyn std::error::Error>> {
+    events
+        .iter()
+        .rev()
+        .find(|(_, preimage)| carries(preimage))
+        .ok_or_else(|| "no event of the chain carries the component".into())
+}
+
+/// Every spec 25 chain replays (§9.7.4.2 R8), and the replayed key state
+/// encodes to spec 25's printed bytes on both targets: its snapshot, written
+/// into the latest event that carries one, re-encodes that event's printed
+/// preimage, and its standing commitment, written into the latest event that
+/// carries a continuation, re-encodes that one's. An `Abandoned` commitment
+/// names that event's sequence and the digest of its printed bytes. Native
+/// and wasm32 each equal the spec bytes, so they equal each other.
+#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+fn spec_25_chains_replay_to_their_printed_bytes() -> TestResult {
+    for (identifier_hex, events) in spec_25_chains() {
+        let units = events
+            .iter()
+            .map(|(preimage, signature)| event_unit(preimage, signature))
+            .collect::<Result<Vec<_>, _>>()?;
+        let refs: Vec<&[u8]> = units.iter().map(Vec::as_slice).collect();
+        let (chain, discarded) = chain_verdict(identifier_hex, &refs)?;
+        assert!(discarded.is_empty(), "{discarded:?}");
+        let state = scp_kel::replay(&chain);
+        let decoded = events
+            .iter()
+            .map(|(preimage, _)| {
+                Ok((
+                    *preimage,
+                    decode_preimage(&fields(preimage)?)?.into_preimage(),
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let (head_hex, head) = decoded.last().ok_or("an empty chain")?;
+        assert_eq!(state.identifier(), identifier(identifier_hex)?);
+        assert_eq!(state.head_sequence(), head.sequence);
+        assert_eq!(
+            state.head_digest(),
+            <[u8; 32]>::from(Sha256::digest(bytes(head_hex)?))
+        );
+
+        let KeyState {
+            root_threshold,
+            keys,
+            witnesses,
+            witnessing_interval,
+            service_key_role,
+            delegator,
+            standing_commitment,
+        } = state.key_state().clone();
+        let (snapshot_hex, carrier) = latest(&decoded, |preimage| preimage.key_state.is_some())?;
+        let rebuilt = EventPreimage {
+            key_state: Some(KeyStateSnapshot {
+                root_threshold,
+                keys,
+                witnesses,
+                witnessing_interval,
+                service_key_role,
+                delegator,
+            }),
+            ..carrier.clone()
+        };
+        assert_eq!(
+            encode_preimage(&rebuilt)?.signed_preimage(),
+            bytes(snapshot_hex)?,
+            "{identifier_hex}: the snapshot of {snapshot_hex:.16}"
+        );
+
+        let (commitment_hex, carrier) =
+            latest(&decoded, |preimage| preimage.continuation.is_some())?;
+        let continuation = match standing_commitment {
+            StandingCommitment::Fixed(fixed) => Continuation::FixesCommitment(fixed),
+            StandingCommitment::Abandoned {
+                at_sequence,
+                event_digest,
+            } => {
+                assert_eq!(at_sequence, carrier.sequence);
+                assert_eq!(
+                    event_digest,
+                    <[u8; 32]>::from(Sha256::digest(bytes(commitment_hex)?))
+                );
+                Continuation::Abandons
+            }
+        };
+        let rebuilt = EventPreimage {
+            continuation: Some(continuation),
+            ..carrier.clone()
+        };
+        assert_eq!(
+            encode_preimage(&rebuilt)?.signed_preimage(),
+            bytes(commitment_hex)?,
+            "{identifier_hex}: the commitment of {commitment_hex:.16}"
+        );
+    }
     Ok(())
 }

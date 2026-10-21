@@ -61,9 +61,27 @@ This crate owns:
   `ClientDataError` — the strict `clientDataJSON` acceptance set, a
   hand-written validator with an explicit stack over an
   `AssertionSignature`'s at most 512 bytes.
+- `validate_entry` — §9.7.4.2 R3's check order over an entry's served units,
+  the one reader of them: it assembles the units by predecessor digest, runs
+  every check, and returns an `EntryValidation` whose `EntryVerdict` is
+  `Valid` with the `ValidChains`, `InceptionInvalid`, or `NoInception`, and
+  every `Discarded` unit with its `EventDefect`, `CheckStep` and
+  `FailureClass`. A defect past the inception is a discard, never a verdict
+  on the identity. `ValidatedChain` is built only here: `extend` reads one
+  more unit, `prefix` cuts it at a position, and `validate_change` checks a
+  candidate preimage into a `ValidatedChange`. `HeldHead` and `SigningChange`
+  carry the head a signer signs at.
+- `replay` and `key_state_at` — the key state a `ValidatedChain` derives at
+  its head or at one of its events (R8): that position's latest snapshot
+  with the standing commitment there, nothing diffed or merged, as a
+  `ReplayedState` carrying the identifier, the position's digest and
+  sequence. `ReplayedState` has no public constructor, so every one comes
+  from a validated chain; `key_state_at` fails with `NotOnChain` for a
+  digest the chain does not hold.
 
-The key-state value types (`Identifier`, `KeyEntry`, `CommitmentEntry`,
-`StandingCommitment` and the four name-bound enumerations) come from `scp-did`;
+The key-state value types (`Identifier`, `KeyState`, `KeyEntry`,
+`CommitmentEntry`, `StandingCommitment` (`Fixed` or `Abandoned`),
+`FixedCommitment` and the four name-bound enumerations) come from `scp-did`;
 P-256 point validation and signature verification come from `scp-crypto`.
 
 The crate is a wasm-safe Layer 1 crate (`.docs/architecture.md`, "Layered
@@ -71,8 +89,7 @@ Dependency Graph"): no async runtime, no I/O, no clock, and no pointer-width
 integer or float on the wire. It compiles to
 `wasm32-unknown-unknown`, and `crates/scp-client-wasm/tests/kel_cross_target_kat.rs`
 pins byte identity between native and wasm32 against `25-test-vectors.md`
-§25.26, §25.28 and §25.29. `scripts/check-protocol-deps.sh` rejects an async-runtime or
-platform edge in its dependency tree.
-
-Chain verification (signatures, R3's defect list, R8) is not here yet; it
-lands with the verifier story, which reads `decode_event`'s stages.
+§25.26, §25.28 and §25.29, including the validation of every spec 25 chain
+and the bytes of the key state each replays to.
+`scripts/check-protocol-deps.sh` rejects an async-runtime or platform edge in
+its dependency tree.

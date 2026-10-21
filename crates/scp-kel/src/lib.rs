@@ -8,6 +8,7 @@ mod error;
 mod event;
 mod event_codec;
 mod preimage;
+mod replay;
 mod routing;
 mod signature;
 mod validate;
@@ -33,6 +34,7 @@ pub use preimage::{
     EncodedPreimage, decode_preimage, derive_identifier, encode_preimage, key_event_seal,
     prerotation_commitment,
 };
+pub use replay::{NotOnChain, ReplayedState, key_state_at, replay};
 pub use routing::{RoutingKind, routing_id};
 pub use signature::{
     AssertionSignature, IndexedSignature, IndexedSignatureError, IndexedSignaturePart,

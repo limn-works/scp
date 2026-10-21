@@ -12,6 +12,9 @@ scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
+# The §9.11 key-continuity fingerprint reads a key state replayed from a
+# validated key event log (09-security-model.md §9.7.4.2 R8).
+scp-kel = { path = "../scp-kel", version = "=0.1.0-beta.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
