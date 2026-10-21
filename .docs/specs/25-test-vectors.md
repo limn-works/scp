@@ -1641,7 +1641,7 @@ indexed signature (raw form, 64):  6e8b92a9e7cc10d9233ab31f0465590526b1096fca872
 
 Every other one-byte discriminator of the key-event preimage is registered with its value, and `CustodyType`'s nine are too (`09-security-model.md` §9.7.4.2 definitions). The byte rides in every 45-byte key entry of the key-state snapshot, so it sits inside the inception preimage the identifier digests: two bindings numbering the nine differently derive two identifiers for one identity, and R2 then makes each binding reject every identity the other created. **This fixture identity carries a 1-of-8 root and one `#active` key, so its snapshot's nine key entries carry the nine registered values, one each, and pin every byte.** Vector 41's identity carries a 1-of-1 root and pins one value, `Passkey` `0x01`.
 
-Its private scalars are a fixture's, derived from the seeds `SHA-256("scp-25-custody-root-" ‖ index)` for the eight root members, `SHA-256("scp-25-custody-active")` for the `#active` key, and `SHA-256("scp-25-custody-prerotation")` for the pre-rotation key, each run through the §25.2 seed-to-scalar rule.
+Its private scalars are a fixture's, derived from the seeds `SHA-256("scp-25-custody-root-" ‖ index)` for the eight root members, the index being one byte, `0x00` through `0x07`, and never an ASCII digit, `SHA-256("scp-25-custody-active")` for the `#active` key, and `SHA-256("scp-25-custody-prerotation")` for the pre-rotation key, each run through the §25.2 seed-to-scalar rule.
 
 | Variant | Byte | Key (33-byte SEC1 compressed) | Role |
 |---|---|---|---|
