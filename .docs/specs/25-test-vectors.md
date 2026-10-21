@@ -2074,6 +2074,83 @@ Signature, secondary key (579 bytes on the wire):
   460eb6a8262368acefa6e0e90b93d73e019417e3a88ec63719f18341b62e7192
 ```
 
+### Vector 70: push signing bytes and push routing IDs
+
+`09-security-model.md` §9.5.2 states the `PushRegistration` and `PushDeregistration` signature preimages, and §9.18.2 states the two push routing ID derivations. A signer signs, and a relay verifies, the SHA-256 of a preimage. The registrant is the §25.1 sender fixture in its 56-byte `scp:` text form. The token is the 8 bytes `0123456789abcdef`. The registration carries the two routing IDs `SHA-256("SCP test vector push routing id 1")` and `SHA-256("SCP test vector push routing id 2")`, platform APNs (`0x01`) and timestamp 1700000000; the deregistration carries platform FCM (`0x02`) and timestamp 1700000300. Each preimage ends with the canonical relay URL under a 4-byte length and then `bridge_target`, 32 bare bytes.
+
+Relays A and B are reached at their `"scp-push-registration"` IDs, so each of their preimages ends with the absent value `SHA-256(0x00)`. The bridge entry is Vector 48's entry 3: its URL is the bridge relay's own, and its `bridgeTarget` is Vector 48's. Its preimages end with that target, and its push routing ID is the tier 3 form `SHA-256("scp-push-bridge:" || canonical bridge_url || bridge_target)`, which differs from the bridge relay's own `"scp-push-registration"` ID.
+
+```
+70a — relay A, "wss://relay.example", no target
+      PushRegistration preimage (225 bytes):
+      5343502d505553482d52454749535445522d56313a000000387363703a687636
+      61337066733471636962746868336b61656b7a68666f327878716c666e696537
+      757073366876637371736d6b6970796c6101000000080123456789abcdef0000
+      0002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1e
+      f6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725
+      356e000000006553f100000000137773733a2f2f72656c61792e6578616d706c
+      656e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa0
+      1d
+      PushDeregistration preimage (159 bytes):
+      5343502d505553482d444552454749535445522d56313a000000387363703a68
+      763661337066733471636962746868336b61656b7a68666f327878716c666e69
+      6537757073366876637371736d6b6970796c6102000000080123456789abcdef
+      000000006553f22c000000137773733a2f2f72656c61792e6578616d706c656e
+      340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
+      push routing ID, SHA-256("scp-push-registration" || url):
+      b980a702c8f9cc2504a164bde90549a079621c8306fdf64d2c3adefd2739367a
+
+70b — relay B, "wss://relay.example/scp/v1", no target
+      PushRegistration preimage (232 bytes):
+      5343502d505553482d52454749535445522d56313a000000387363703a687636
+      61337066733471636962746868336b61656b7a68666f327878716c666e696537
+      757073366876637371736d6b6970796c6101000000080123456789abcdef0000
+      0002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1e
+      f6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725
+      356e000000006553f1000000001a7773733a2f2f72656c61792e6578616d706c
+      652f7363702f76316e340b9cffb37a989ca544e6bb780a2c78901d3fb3373876
+      8511a30617afa01d
+      PushDeregistration preimage (166 bytes):
+      5343502d505553482d444552454749535445522d56313a000000387363703a68
+      763661337066733471636962746868336b61656b7a68666f327878716c666e69
+      6537757073366876637371736d6b6970796c6102000000080123456789abcdef
+      000000006553f22c0000001a7773733a2f2f72656c61792e6578616d706c652f
+      7363702f76316e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511
+      a30617afa01d
+      push routing ID, SHA-256("scp-push-registration" || url):
+      b2f96d91d7b43038f18f9d1b686a5e033f8e07635e9baa819754d6a829942fcd
+
+70c — Vector 48's entry 3, "wss://bridge.example.com/scp/v1"
+      bridgeTarget:
+      f8affd47ab024cae9489a63fa1c632914c16f7329441b8fca65b32c78d86a4eb
+      PushRegistration preimage (237 bytes):
+      5343502d505553482d52454749535445522d56313a000000387363703a687636
+      61337066733471636962746868336b61656b7a68666f327878716c666e696537
+      757073366876637371736d6b6970796c6101000000080123456789abcdef0000
+      0002f8f7da66a5b0f0d9466a2e1d8145fc72717465bb5e95638084d956dabd1e
+      f6607c6b6cbf3a3930e627c126cfe0d79a6014853588f8aa56cfef59b6ef2725
+      356e000000006553f1000000001f7773733a2f2f6272696467652e6578616d70
+      6c652e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c16f7
+      329441b8fca65b32c78d86a4eb
+      PushDeregistration preimage (171 bytes):
+      5343502d505553482d444552454749535445522d56313a000000387363703a68
+      763661337066733471636962746868336b61656b7a68666f327878716c666e69
+      6537757073366876637371736d6b6970796c6102000000080123456789abcdef
+      000000006553f22c0000001f7773733a2f2f6272696467652e6578616d706c65
+      2e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c16f73294
+      41b8fca65b32c78d86a4eb
+      tier 3 routing preimage (79 bytes = 16-byte prefix + 31-byte URL + 32-byte target):
+      7363702d707573682d6272696467653a7773733a2f2f6272696467652e657861
+      6d706c652e636f6d2f7363702f7631f8affd47ab024cae9489a63fa1c632914c
+      16f7329441b8fca65b32c78d86a4eb
+      tier 3 push routing ID:
+      733a76fce10004826ffaecd3c85ba27169282665cd64a902000275a52ba640a1
+      the bridge relay's own push routing ID, SHA-256("scp-push-registration" || url):
+      e47cce36c946ac50a2ee3dbc40f0416d7012bf82344c8f24a756c0f62242eea1
+```
+
+**Conformance procedure.** An implementation that omits `bridge_target` produces preimages 32 bytes shorter: 193 bytes for relay A's registration and 127 for its deregistration. One that signs the absent value for the bridge entry produces 70c's preimages with their last 32 bytes replaced by `SHA-256(0x00)`, and a relay holding that entry rejects the signature with `4060`. One that appends the target to the `"scp-push-registration"` form produces `SHA-256("scp-push-registration" || url || target)`, which differs from 70c's tier 3 ID, and when the target is 32 printable ASCII bytes it equals the `"scp-push-registration"` ID of a longer URL.
+
 ## 25.29 Reveal-Authorized Event, Ranking and Identifier Text-Form Vectors (§9.7.4.2 definitions, R3, R6, `03-identity.md` §3.1)
 
 Vectors 53 through 55, 68 and 69 each extend Vector 41's identity at sequence 1, so each reveal consumes the commitment Vector 41's inception fixed over §25.2's tertiary key, and the standing root at each event's predecessor is Vector 41's one-member root, §25.2's reference key. Every indexed signature takes the raw form, and each vector prints the signature field as the concatenation of its groups' indexed signatures in the kind's group order (§9.7.4.2 R3). The generator derives each fresh key from `SHA-256` of the ASCII seed string it names, under §25.2's test-vector key label.

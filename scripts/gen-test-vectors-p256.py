@@ -3336,9 +3336,10 @@ def emit_challenge_vectors() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Spec 09 §9.5.2 push signing bytes. These goldens are not §25 vectors: the
-# section heading carries no `§25`, so spec 25 does not print them, and
-# `crates/scp-runtime/tests/test_vectors.rs` asserts them.
+# §25.28 Vector 70: push signing bytes (`09-security-model.md` §9.5.2) and
+# push routing ids (§9.18.2), including a tier 3 bridge entry's. The bridge
+# entry is Vector 48's entry 3, so this emitter runs after Vector 41 sets
+# INCEPTION_IDENTIFIER.
 # ---------------------------------------------------------------------------
 
 PUSH_TOKEN = bytes.fromhex("0123456789abcdef")
@@ -3347,11 +3348,22 @@ PUSH_DEREGISTER_TIMESTAMP = 1_700_000_300
 PUSH_RELAYS = ("wss://relay.example", "wss://relay.example/scp/v1")
 PUSH_PLATFORM_APNS = 0x01
 PUSH_PLATFORM_FCM = 0x02
+PUSH_ROUTING_PREFIX = b"scp-push-registration"
+PUSH_BRIDGE_ROUTING_PREFIX = b"scp-push-bridge:"
 
 
-def push_register_bytes(relay_url: str) -> bytes:
+def push_bridge_target(bridge_target: bytes | None) -> bytes:
+    """§9.5.2 `bridge_target`: 32 bare bytes, the target or SHA-256(0x00)."""
+    if bridge_target is None:
+        return SERVICE_RECORD_ABSENT_BRIDGE_TARGET
+    assert len(bridge_target) == 32, len(bridge_target)
+    assert bridge_target != SERVICE_RECORD_ABSENT_BRIDGE_TARGET
+    return bridge_target
+
+
+def push_register_bytes(relay_url: str, bridge_target: bytes | None = None) -> bytes:
     """§9.5.2 `PushRegistration`: registrant, platform, token, routing ids,
-    timestamp, relay URL."""
+    timestamp, relay URL, bridge target."""
     assert len(ID_SENDER) == 56
     routing_ids = [
         sha256(b"SCP test vector push routing id 1"),
@@ -3366,12 +3378,13 @@ def push_register_bytes(relay_url: str) -> bytes:
         *routing_ids,
         u64(PUSH_TIMESTAMP),
         var_field(relay_url),
+        push_bridge_target(bridge_target),
     )
 
 
-def push_deregister_bytes(relay_url: str) -> bytes:
+def push_deregister_bytes(relay_url: str, bridge_target: bytes | None = None) -> bytes:
     """§9.5.2 `PushDeregistration`: registrant, platform, token, timestamp,
-    relay URL."""
+    relay URL, bridge target."""
     return canonical_preimage(
         "SCP-PUSH-DEREGISTER-V1:",
         var_field(ID_SENDER),
@@ -3379,23 +3392,46 @@ def push_deregister_bytes(relay_url: str) -> bytes:
         var_field(PUSH_TOKEN),
         u64(PUSH_DEREGISTER_TIMESTAMP),
         var_field(relay_url),
+        push_bridge_target(bridge_target),
     )
 
 
 def emit_push_signing_bytes() -> None:
-    section("spec 09 §9.5.2 push signing bytes and §9.18.2 routing ids")
+    section("§25.28 Vector 70 push signing bytes and push routing ids")
     for tag, relay in zip(("a", "b"), PUSH_RELAYS, strict=True):
         register = push_register_bytes(relay)
         deregister = push_deregister_bytes(relay)
         emit("push.relay_" + tag, relay)
         emit_hex("push.register_" + tag, register)
         emit_hex("push.deregister_" + tag, deregister)
-        emit_hex(
-            "push.routing_id_" + tag,
-            sha256(b"scp-push-registration" + relay.encode()),
-        )
-    assert len(push_register_bytes(PUSH_RELAYS[0])) == 193
-    assert len(push_deregister_bytes(PUSH_RELAYS[0])) == 127
+        emit_hex("push.routing_id_" + tag, sha256(PUSH_ROUTING_PREFIX + relay.encode()))
+    assert len(push_register_bytes(PUSH_RELAYS[0])) == 225
+    assert len(push_deregister_bytes(PUSH_RELAYS[0])) == 159
+    assert push_register_bytes(PUSH_RELAYS[0])[-32:] == SERVICE_RECORD_ABSENT_BRIDGE_TARGET
+
+    # Vector 48's entry 3, the tier 3 bridge entry.
+    _id, entry_type, bridge_url, target, _key = service_record_entries(INCEPTION_IDENTIFIER)[3]
+    assert entry_type == SERVICE_RECORD_RELAY_TYPE and target is not None
+    emit("push.bridge_url", bridge_url)
+    emit_hex("push.bridge_target", target)
+    register = push_register_bytes(bridge_url, target)
+    deregister = push_deregister_bytes(bridge_url, target)
+    emit_hex("push.register_bridge", register)
+    emit_hex("push.deregister_bridge", deregister)
+    assert register[-32:] == target and deregister[-32:] == target
+    assert register[:-32] == push_register_bytes(bridge_url)[:-32]
+    tier3_preimage = PUSH_BRIDGE_ROUTING_PREFIX + bridge_url.encode() + target
+    assert len(tier3_preimage) == 79, len(tier3_preimage)
+    tier3 = sha256(tier3_preimage)
+    direct = sha256(PUSH_ROUTING_PREFIX + bridge_url.encode())
+    emit("push.tier3_preimage_len", len(tier3_preimage))
+    emit_hex("push.tier3_preimage", tier3_preimage)
+    emit_hex("push.tier3_routing_id", tier3)
+    emit_hex("push.bridge_relay_routing_id", direct)
+    assert tier3 != direct
+    # Without the prefix's colon-terminated form, a printable target appended
+    # to the "scp-push-registration" form would equal another URL's ID.
+    assert tier3 != sha256(PUSH_ROUTING_PREFIX + bridge_url.encode() + target)
 
 
 # ---------------------------------------------------------------------------
