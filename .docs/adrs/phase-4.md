@@ -1337,7 +1337,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
    ```
    - `ctx.invokeOutlet(outletId, input, identity)` invokes a registered outlet and returns JSON output.
    - Invoking a non-existent outlet throws `OutletError` with code `SCP-OUTLET-6001`.
-   - Outlet registration: `await ctx.registerOutlet(outletDefinition)` returns an outlet ID string.
+   - Outlet registration: `await ctx.registerOutlet(outletDefinition)` returns an `OutletRegistrationOutcome`, `Registered` with the outlet ID or `Proposed` with the proposal ID, and submits an outlet Commit or a `RegisterOutlet` proposal with the caller's identity (ADR-010 criterion 2 amendment, ADR-066 decision 31).
 
 5. **UCAN API:**
    ```typescript

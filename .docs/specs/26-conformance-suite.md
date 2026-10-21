@@ -307,8 +307,8 @@ Each test specifies:
 | **Tier** | Full |
 | **Spec Sections** | §7, §9.5 |
 | **Preconditions** | Valid UCAN token exists. |
-| **Steps** | 1. Compute token CID (CIDv1, SHA-256, DAG-CBOR). 2. Add CID to context RevocationList. 3. Distribute revocation via MLS. 4. Attempt to exercise the revoked token. |
-| **Expected Outcome** | Token exercise is denied. Revocation is recorded. CID computation matches between implementations. |
+| **Steps** | 1. Compute token CID (CIDv1, SHA-256, DAG-CBOR). 2. As the token's issuer, send a Commit carrying a `TokenRevoked` leaf for the token (§7.3.1.1, ADR-066 decision 28). 3. At a second member, merge that Commit, and check that its `ucan_revocations` holds the CID. 4. Attempt to exercise the revoked token at both members in the Commit's epoch. 5. Send a revocation Commit from a member that is neither the token's issuer nor the context creator, and check that every receiver rejects it. |
+| **Expected Outcome** | Token exercise is denied at both members from the revocation Commit's epoch. The CID is in `ucan_revocations`. The unauthorized revocation Commit is rejected. CID computation matches between implementations. |
 
 ### CONF-026: Capability Attenuation (Subset Delegation)
 

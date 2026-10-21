@@ -784,6 +784,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
    - Adds the token CID to the context's revocation list.
    - Distributes the revocation as an MLS application message to all context members.
    - Appends `TokenRevoked` event to the context's event log.
+   - **Amendment (2026-10-20, ADR-066 decision 28).** Alec ruled that a Commit carries each revocation. In a context with an MLS group, `revoke_ucan` builds one Commit whose block carries a `TokenRevoked` leaf `[token_cid, token_payload]` and nothing else, and every receiver checks that the CID is the token's and that the committer is its `iss` or the committed `creator_did` before it adds the CID to `ucan_revocations` (`07-trust-validation-and-capabilities.md` §7.3.1.1 "With a revocation"). The revoker denies the token from the moment it builds the Commit and resends it until a Commit carrying the leaf merges. The two bullets above, the application-message distribution and the separately appended event, apply only to a Broadcast context, which has no MLS group.
 
 6. **`NonceTracker` (per-context):**
 
@@ -827,6 +828,7 @@ Implement comprehensive UCAN validation in `scp-core/crypto/ucan/` (Rust, buildi
 
    - Revocations are distributed as MLS application messages, so all members maintain consistent revocation lists.
    - `merge()` is union-only (revocations are append-only — a token cannot be un-revoked).
+   - **Amendment (2026-10-20, ADR-066 decision 28).** In a context with an MLS group, the list is the `ucan_revocations` governance state, which only `TokenRevoked` leaves in merged Commits add to, so every member holds the same set at each epoch and `merge()` is retired there; the ADR-030 snapshot holds the set. A token cannot be un-revoked, as before. The `RevocationPending` state and its rollback to `Active` on a failed distribution are retired with the merge: the revoker's own pending denial lasts until its Commit merges.
 
 8. **Python SDK exposure:**
 

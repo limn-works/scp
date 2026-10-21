@@ -1395,6 +1395,8 @@ A software signer under RFC 6979 reproduces these exact signature bytes on every
 
 Domain: `"SCP-OUTLET-REGISTRATION-V2:"` — supersedes the deleted pre-rename `"SCP-TOOL-REGISTRATION-V1:"` domain (ADR-049 §1, hard-break, no aliases).
 
+**Amendment (2026-10-20, ADR-066 decision 31).** §5.4.1 now signs under `"SCP-OUTLET-REGISTRATION-V3:"`, whose preimage adds `reads_context_byte` after `kind_byte`. The fixture and the vectors this section describes are V2, and no V2 signature verifies under V3. SCP-OUT-040 regenerates them as `tests/conformance/vectors/outlet_registration_v3.json`, with each of the 12 cases signed under V3 and the V2 hashes moved into the rejection corpus beside the V1 ones; until then this section describes a fixture §5.4.1 no longer accepts.
+
 The canonical conformance fixture lives at:
 
 ```

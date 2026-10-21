@@ -400,20 +400,20 @@
         "crates/scp-core/src/store/mod.rs",
         "crates/scp-core/src/context/governance/mod.rs"
       ],
-      "description": "Implement model-specific checkpoint cosignature requirements per ADR-031 \u00a79. The checkpointing system must know the governance model to determine the signature quorum for checkpoint attestation.\n\nSingleAdmin: only the admin signs checkpoints; cosignatures field is empty. Threshold: checkpoints require threshold signatures from the signer set. The checkpoint creator distributes the checkpoint hash to other signers, who verify and cosign. Majority: checkpoints require signatures from >50% of eligible voters. Unanimity: checkpoints require signatures from all eligible voters.\n\nCosignature collection follows the same voting-window pattern as governance proposals but with a shorter default window of 1 hour. If cosignature quorum is not reached within the window, the checkpoint is still valid with the creator's signature alone but is flagged as PartiallyAttested \u2014 members can decide how much weight to give it.\n\nThis depends on SCP-267 (governance model must be available in PerContextState) but is otherwise independent of the governance method exposure and action wiring stories.",
+      "description": "Implement model-specific checkpoint cosignature requirements per ADR-031 \u00a79. The checkpointing system must know the governance model to determine the signature quorum for checkpoint attestation.\n\nSingleAdmin: only the admin signs checkpoints; cosignatures field is empty. Threshold: checkpoints require threshold signatures from the signer set. The checkpoint creator distributes the checkpoint hash to other signers, who verify and cosign. Majority: checkpoints require signatures from >50% of eligible voters. Unanimity: checkpoints require signatures from all eligible voters.\n\nCosignature collection follows the same voting-window pattern as governance proposals but with a shorter default window of 1 hour. If the cosignature quorum is not reached within the window, the creator flags the checkpoint PartiallyAttested locally; no member adopts or prunes against a checkpoint short of its quorum, and in an encrypted context no Commit carries one (ADR-031 \u00a79 as ADR-066 decisions 24 and 27 amend it; SCP-337 owns that behavior).\n\nThis depends on SCP-267 (governance model must be available in PerContextState) but is otherwise independent of the governance method exposure and action wiring stories.",
       "acceptanceCriteria": [
         "SingleAdmin checkpoints are signed by admin only; cosignatures field is empty",
         "Threshold checkpoints require threshold cosignatures from the signer set",
         "Majority checkpoints require cosignatures from >50% of eligible voters",
         "Unanimity checkpoints require cosignatures from all eligible voters",
         "Cosignature collection uses a 1-hour default voting window",
-        "If cosignature quorum not reached, checkpoint is valid with creator's signature alone and flagged as PartiallyAttested",
+        "If cosignature quorum not reached, the creator flags the checkpoint PartiallyAttested, and no member adopts or prunes against it",
         "Checkpoint hash is distributed to eligible cosigners for verification",
         "Tests verify SingleAdmin checkpoint has empty cosignatures field",
         "Tests verify Threshold(2-of-3) checkpoint requires 2 cosignatures to be FullyAttested",
         "Tests verify Majority checkpoint requires >50% cosignatures to be FullyAttested",
         "Tests verify Unanimity checkpoint requires all member cosignatures to be FullyAttested",
-        "Tests verify checkpoint with insufficient cosignatures after 1-hour window is flagged PartiallyAttested (not rejected)"
+        "Tests verify checkpoint with insufficient cosignatures after 1-hour window is flagged PartiallyAttested and is neither adopted nor pruned against"
       ],
       "actionItems": [
         "Add governance model query to checkpoint creation flow",

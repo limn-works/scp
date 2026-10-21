@@ -192,6 +192,7 @@ pub struct ContextParams {
     pub promotion_policy: PromotionPolicy, // Whether context promotion is allowed (§5.10)
     pub roles: Vec<RoleDefinition>,      // Role definitions with permission sets
     pub outlets: Vec<OutletRegistration>,    // Initial outlet registrations
+    pub outlet_registration_policy: OutletRegistrationPolicy, // ADR-066 decision 31: which outlet changes need a vote; required, no default
     pub ttl: Option<Duration>,           // Optional TTL
     pub memory_scope: MemoryScope,       // Ephemeral, Summary, or Full
     pub governance: GovernanceModel,     // Single-admin for Phase 2
@@ -431,6 +432,7 @@ pub struct RoleDefinition {
    - Adds token to the context's revocation list.
    - Distributes revocation as MLS application message to all members.
    - Appends `TokenRevoked` event to event log.
+   - **Amendment (2026-10-20, ADR-066 decision 28).** In a context with an MLS group, the revocation is one Commit carrying a `TokenRevoked` leaf, whose committer is the token's issuer or the context creator; every receiver adds the CID to the context's `ucan_revocations` when it merges that Commit (`07-trust-validation-and-capabilities.md` §7.3.1.1 "With a revocation"). No MLS application message distributes it, and no member merges another's list. A Broadcast context, which has no MLS group, keeps the two bullets above.
 
 6. **`check_ceiling(ceiling: &CapabilityCeiling, capability: &Capability) -> bool`**
    - Returns true if the capability is within the ceiling.
@@ -545,6 +547,8 @@ pub struct TestVector {
    - Stores the outlet registration in the context's outlet registry.
    - Appends `OutletRegistered` event to event log with full registration metadata.
    - Returns the outlet ID.
+
+   **Amendment (2026-10-20, ADR-066 decision 31).** Registration, change, and removal are Commits, never a write to the local registry alone (`05-contexts.md` §5.4, "Registration and its policy"). `register_outlet` takes the caller's identity, never the context creator's, and checks `OutletRegister` against that caller. When the registration matches no condition of the context's outlet registration policy, it sends an outlet Commit carrying the `OutletRegistered` leaf, or `OutletUpdated` for a registered `outlet_id`, and returns once that Commit merges. When it matches one, it submits a `RegisterOutlet` governance proposal and returns the proposal's ID; the leaf appears when the executing Commit merges. It returns `OutletRegistrationOutcome::Registered { outlet_id }` or `OutletRegistrationOutcome::Proposed { proposal_id }`, the architect agent's shape, so a caller cannot read a pending proposal as a registration. `deregister_outlet` and `update_outlet` follow the same policy with `OutletRemoved` and `OutletUpdated`. The leaf carries the `OutletRegistrationHeader` of `05-contexts.md` §5.4.1, and the registrant sends the full registration as an MLS application message. Every SDK's `registerOutlet` (TypeScript, ADR-022; Swift, Kotlin, and Python alike) returns that outcome and submits through this path with the caller's identity; no SDK registers an outlet only in its local registry.
 
 3. **`invoke_outlet(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &[u8; 32]) -> Result<serde_json::Value, OutletError>`**
    - Validates context state is `Active`.
