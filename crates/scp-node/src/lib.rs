@@ -3805,7 +3805,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     tracing::info!(
         tier = ?tier,
         relay_url = %relay_url.url(),
-        bridge_target = ?relay_url.bridge_target().map(hex::encode),
+        bridge_target = ?relay_url.bridge_target().map(|t| hex::encode(t.to_bytes())),
         bound_addr = %bound_addr,
         did = %identity.did,
         nat_probe_skipped = skip_nat_probe,

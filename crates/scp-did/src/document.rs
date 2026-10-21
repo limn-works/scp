@@ -407,8 +407,8 @@ impl RelayService {
     /// The tier 3 bridge routing target, or `None` for a relay that is not a
     /// bridge.
     #[must_use]
-    pub fn bridge_target(&self) -> Option<[u8; 32]> {
-        self.bridge_target.map(BridgeTarget::to_bytes)
+    pub const fn bridge_target(&self) -> Option<BridgeTarget> {
+        self.bridge_target
     }
 
     /// Validates an `SCPRelay` entry's URL and target as a reader does.
@@ -429,7 +429,7 @@ impl RelayService {
             id: format!("{did}#scp-relay-{n}"),
             service_type: SCP_RELAY_SERVICE_TYPE.to_owned(),
             service_endpoint: self.url().to_owned(),
-            bridge_target: self.bridge_target(),
+            bridge_target: self.bridge_target.map(BridgeTarget::to_bytes),
         }
     }
 }
@@ -816,7 +816,7 @@ impl DidDocument {
         {
             Some(entry) => {
                 relay.url().clone_into(&mut entry.service_endpoint);
-                entry.bridge_target = relay.bridge_target();
+                entry.bridge_target = relay.bridge_target().map(BridgeTarget::to_bytes);
             }
             None => self.insert_preferred_relay(relay),
         }
@@ -1884,6 +1884,14 @@ mod tests {
         assert_eq!(doc.relay_service_urls(), ["wss://relay.example.com/scp/v1"]);
         // The pre-rotation entry is not a relay entry.
         assert!(doc.pre_rotation_service().is_some());
+    }
+
+    #[test]
+    fn bridge_target_returns_typed_target_for_bridge_and_none_for_direct() {
+        let target = BridgeTarget::new([0xab; 32]).unwrap();
+        let entry = RelayService::bridge(BridgeEndpoint::new(BRIDGE_URL).unwrap(), target);
+        assert_eq!(entry.bridge_target(), Some(target));
+        assert_eq!(relay(BRIDGE_URL).bridge_target(), None);
     }
 
     #[test]
