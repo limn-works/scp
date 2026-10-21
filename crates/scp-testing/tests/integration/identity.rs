@@ -10,7 +10,7 @@
 //! B2: Identity integration tests.
 //!
 //! Tests DID creation, DID document construction, agent key management,
-//! key continuity fingerprints, and `SigningKeyId` variants using real
+//! and `SigningKeyId` variants using real
 //! `InMemoryKeyCustody` and `InMemoryDhtClient` implementations.
 
 use scp_did::{DidDocument, SigningKeyId};
