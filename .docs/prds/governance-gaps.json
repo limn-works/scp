@@ -113,7 +113,7 @@
         "crates/scp-core/src/context/governance/mls_integration.rs",
         "crates/scp-core/src/sync/conflict_resolution.rs"
       ],
-      "description": "ADR-031 specifies 24 GovernanceAction variants but code only has 11. This story adds RevokeReadAccess and RestoreReadAccess (needed for governance-level bans). Also adds RevocationScope enum (Full, FutureOnly) per §5.9 content access governance table. Updates MLS impact classification and conflict detection.",
+      "description": "When this story was written, ADR-031 \u00a73 specified 24 GovernanceAction variants (30 now) and the code had 11. This story adds RevokeReadAccess and RestoreReadAccess (needed for governance-level bans). Also adds RevocationScope enum (Full, FutureOnly) per §5.9 content access governance table. Updates MLS impact classification and conflict detection.",
       "acceptanceCriteria": [
         "RevocationScope enum has variants Full and FutureOnly, derives Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize",
         "GovernanceAction::RevokeReadAccess { did: DID, scope: RevocationScope } variant exists",
@@ -243,7 +243,7 @@
       "files": [
         "crates/scp-core/src/context/broadcast.rs"
       ],
-      "description": "Add governance-directed subscriber ban to BroadcastContext. Unlike per-author blocking (which is unilateral), governance bans remove the subscriber from the registry AND add them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory KeyEpochAdvance). This mirrors RevokeReadAccess semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model. Does NOT check ceiling — that's the ContextManager's responsibility (SCP-GG-006).",
+      "description": "Add governance-directed subscriber ban to BroadcastContext. Unlike per-author blocking (which is unilateral), governance bans remove the subscriber from the registry AND add them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (a mandatory `BroadcastEpochAdvance`, ADR-066 decisions 36 and 38). This mirrors RevokeReadAccess semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model. Does NOT check ceiling — that's the ContextManager's responsibility (SCP-GG-006).",
       "acceptanceCriteria": [
         "BroadcastContext::governance_ban_subscriber(did) removes subscriber from self.subscribers",
         "governance_ban_subscriber adds the identifier to every author's block list in self.authors",
@@ -285,16 +285,16 @@
       "gate": "gate-governance-bans",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-core/src/context/manager.rs"
       ],
-      "description": "Extend execute_governance_action() in ContextManager to handle RevokeReadAccess for broadcast contexts. Before execution, verify MemberBan capability is in the context's ceiling. Delegate to BroadcastContext::governance_ban_subscriber(). Emit ReadAccessRevoked event. Persist broadcast state snapshot. Follow existing BlockAuthor execution pattern in block_broadcast_author_internal() for structure.",
+      "description": "Extend execute_governance_action() in ContextManager to handle RevokeReadAccess for broadcast contexts. Before execution, verify MemberBan capability is in the context's ceiling. Delegate to BroadcastContext::governance_ban_subscriber(). Execute the ban as an authors-group Commit whose GovernanceActionExecuted leaf records it, removes the subscriber from each author's registry, and adds it to `read_bans`, and surface the local ReadAccessRevoked ContextEvent (05-contexts.md sections 5.14.8 and 5.14.13, ADR-066 decision 38). The execution path on main, governance_helpers.rs in scp-runtime, appends an AccessRevoked event-log leaf outside any Commit, so the criterion is unmet. Persist broadcast state snapshot. Follow existing BlockAuthor execution pattern in block_broadcast_author_internal() for structure.",
       "acceptanceCriteria": [
         "execute_governance_action match arm for GovernanceAction::RevokeReadAccess exists",
         "Execution checks context ceiling for Capability::MemberBan — returns PermissionDenied if absent",
         "For broadcast contexts: delegates to governance_ban_subscriber(did)",
-        "ReadAccessRevoked event pushed to receive_buffer and appended to event log",
+        "For a broadcast context, the ban executes as an authors-group Commit whose GovernanceActionExecuted leaf removes the subscriber from each author's registry and adds it to `read_bans`, no other event-log leaf records it, and the ReadAccessRevoked ContextEvent is pushed to receive_buffer (05-contexts.md sections 5.14.8 and 5.14.13, ADR-066 decision 38)",
         "Broadcast state persisted via persist_broadcast_snapshot (same pattern as block_broadcast_author_internal)",
         "RestoreReadAccess match arm delegates to governance_unban_subscriber(did)",
         "ReadAccessRestored event emitted for RestoreReadAccess",
@@ -313,7 +313,8 @@
       ],
       "blockedBy": [
         "SCP-GG-002",
-        "SCP-GG-005"
+        "SCP-GG-005",
+        "SCP-349"
       ],
       "sources": [
         {

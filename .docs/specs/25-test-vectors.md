@@ -256,6 +256,8 @@ Domain: `"SCP-RESET-REQUEST-V1:"`
 
 ### Vector 8: Reset Request
 
+**V1 vector.** This vector shows the `"SCP-RESET-REQUEST-V1:"` preimage that the code still implements. `09-security-model.md` §9.5.2 retires that form for `"SCP-RESET-REQUEST-V2:"`, which adds `reset_counter` and `member_since`, and SCP-331 replaces this vector with the V2 form when it changes the code.
+
 ```
 Input:
   context_id:       "sync-test-context"
@@ -450,7 +452,7 @@ Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree cons
 
 Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77); the ADR-031 amendment of 2026-10-12 (`phase-6.md`) added the `ModifyPseudonymRotationPolicy` action that `PseudonymRotationPolicyModified` (tag 78) records). The events are signed with the §25.2 reference P-256 key under RFC 6979, so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
 
-**`EventType` tags.** This table is the complete closed `EventType` taxonomy and fixes the `event_type_tag` that the signed value below carries for each variant. The tags are protocol constants and never change. Tag 59 is retired: it belonged to `PseudonymAnnounced`, which is not a durable event, and no event carries it.
+**`EventType` tags.** This table is the complete closed `EventType` taxonomy and fixes the `event_type_tag` that the signed value below carries for each variant. The tags are protocol constants and never change. Tag 59 is retired: it belonged to `PseudonymAnnounced`, which is not a durable event, and no event carries it. Row 18 names `KeyEpochAdvance`, which the code carries today: no key epoch advance is a log record (ADR-066 decisions 36 and 37), so SCP-349 removes the variant from the code and retires tag 18 in this row together, as tag 59 was retired. Row 38 names `CeilingModificationPending`, the name the code carries today: ADR-066 decision 21 renames that variant `GovernanceProposalRecorded`, keeping tag 38, and SCP-335 renames it in the code and in this row together. ADR-066 decision 24 adds `Checkpoint` at tag 79, the leaf a checkpoint Commit carries, and SCP-337 adds the variant to the code and its row to this table together.
 
 | Tag | `EventType` variant |
 |-----|---------------------|
@@ -534,7 +536,7 @@ Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log
 | 77 | `CrossContextDivergenceMarker` |
 | 78 | `PseudonymRotationPolicyModified` |
 
-**MessagePack layout of a signed `Event`.** The seven fields serialize positionally, so an implementer reproduces the bytes without reading Rust: a 7-element array holding the `EventType` variant **name** as a string, the actor DID as a string, the timestamp as an unsigned integer, the sequence as an unsigned integer, the one-element `EventPayload` array holding the payload as a MessagePack binary, the 32-byte `prev_hash` as a 32-element array of unsigned integers, and the 64-byte signature as a MessagePack binary. The signed value is `SHA-256("SCP-EVENT-V1:" || BE16(event_type_tag) || BE32(len(actor_did)) || actor_did || BE64(timestamp) || BE64(sequence) || BE32(len(payload)) || payload || prev_hash)`.
+**MessagePack layout of a signed `Event`.** The seven fields serialize positionally, so an implementer reproduces the bytes without reading Rust: a 7-element array holding the `EventType` variant **name** as a string, the actor DID as a string, the timestamp as an unsigned integer, the sequence as an unsigned integer, the one-element `EventPayload` array holding the payload as a MessagePack binary, the 32-byte `prev_hash` as a 32-element array of unsigned integers, and the 64-byte signature as a MessagePack binary. The signed value is `SHA-256("SCP-EVENT-V1:" || BE16(event_type_tag) || BE32(len(actor_did)) || actor_did || BE64(timestamp) || BE64(sequence) || BE32(len(payload)) || payload || prev_hash)`. This layout and this signed value are the V1 form the code carries today. ADR-066 decision 23 adds `signing_key_id` and `key_state_head` to `Event` and moves its signature to the `"SCP-EVENT-V2:"` preimage of `09-security-model.md` §9.5.2, and SCP-336 changes the code and this vector together.
 
 **The actor and payload identifiers are fixture identifiers.** Each is `SHA-256("SCP test vector identifier <role>")` in the `scp:` text form, with the role in parentheses below (§25.1). The actor identifier is not derived from the signing key: this vector pins the typed-leaf preimage and the RFC 6962 root, not a binding between an identifier and a key.
 
@@ -712,6 +714,8 @@ An implementation that concatenates the caller's own block first computes two di
 Domain: `"SCP-PROPOSAL-V1:"`
 
 ### Vector 23: Governance Proposal ID
+
+**V1 vector.** This vector shows the `"SCP-PROPOSAL-V1:"` preimage that the code still implements, with the proposer-chosen `timestamp` in field 4. `09-security-model.md` §9.5.2 retires that form for `"SCP-PROPOSAL-V2:"`, which takes `anchor_seq` in field 4, and SCP-331 replaces this vector with the V2 form when it changes the code.
 
 ```
 Input:
@@ -1390,6 +1394,8 @@ A software signer under RFC 6979 reproduces these exact signature bytes on every
 ## 25.24 Outlet Registration V2 Vectors (§5.4.1)
 
 Domain: `"SCP-OUTLET-REGISTRATION-V2:"` — supersedes the deleted pre-rename `"SCP-TOOL-REGISTRATION-V1:"` domain (ADR-049 §1, hard-break, no aliases).
+
+**Amendment (2026-10-20, ADR-066 decision 31).** §5.4.1 now signs under `"SCP-OUTLET-REGISTRATION-V3:"`, whose preimage adds `reads_context_byte` (a `ContextReadAreas` bit set by ADR-066 decision 35) and `capabilities_hash` after `kind_byte`, and the operator's `key_state_head` after `registered_at_be` (ADR-066 decisions 33 and 35). The fixture and the vectors this section describes are V2, and no V2 signature verifies under V3. SCP-OUT-040 regenerates them as `tests/conformance/vectors/outlet_registration_v3.json`, with each of the 12 cases signed under V3 and the V2 hashes moved into the rejection corpus beside the V1 ones; until then this section describes a fixture §5.4.1 no longer accepts.
 
 The canonical conformance fixture lives at:
 

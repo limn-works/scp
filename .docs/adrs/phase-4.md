@@ -260,7 +260,7 @@ Implement TTL tracking and memory scope enforcement in `scp-core/context/`. TTL 
 
 - **Key destruction as enforcement:** Access control via key destruction is mathematically enforced, not policy-dependent. Destroying MLS tree secrets, epoch key schedules, and application key material makes all historical content physically unreadable — no trust in relay deletion compliance required.
 - **Promotion as contract change:** Moving from ephemeral to persistent changes what members opted into. Unanimous consent (not just governance majority) is required because the original scope was part of the opt-in contract visible before joining (protocol tenet: legibility before opt-in).
-- **Broadcast scope restriction:** Broadcast contexts (§5.14) use per-author keys without MLS group management. Forward secrecy depends on MLS epoch ratcheting, which broadcast mode lacks. Ephemeral/Summary scopes promise key destruction semantics that broadcast mode cannot deliver. Restricting to Full scope avoids false security guarantees.
+- **Broadcast scope restriction:** Broadcast contexts (§5.14) encrypt content under per-author keys outside MLS; only the authors group is an MLS group (§5.14.13). Forward secrecy depends on MLS epoch ratcheting, which broadcast content lacks. Ephemeral/Summary scopes promise key destruction semantics that broadcast mode cannot deliver. Restricting to Full scope avoids false security guarantees.
 - **Key destruction verification levels:** The protocol records attestation level (hardware-backed, software-only, no attestation) as metadata. It does not gate on level — the protocol works regardless, but higher assurance levels are visible to other participants.
 
 ### Implementation
@@ -329,12 +329,14 @@ pub struct RelayDeletionRequest {
    - Multi-party contexts follow governance model.
    - Extension proposal is a context event in the Merkle log (ADR-011).
    - Extension resets the TTL timer.
+   - **Amendment (2026-10-18, ADR-066).** Every context, bilateral or multi-party, extends its TTL only by an `ExtendTtl` governance action whose executing Commit carries an approval from every current member and the `TtlExtended` leaf every receiver derives (`05-contexts.md` §5.10.1, `07-trust-validation-and-capabilities.md` §7.3.1.1). The bilateral consent path is retired, the extension is recorded by the `TtlExtended` and `GovernanceActionExecuted` leaves in that Commit, never by a context event outside it, and an extension that does not gather every approval never executes and records no `TtlExtensionRejected` leaf.
 
 4. **Promotion (ephemeral to persistent):**
    - Only `promotable` contexts can be promoted. `no_promotion` contexts reject promotion proposals.
    - Requires unanimous member consent (not just governance majority).
    - On promotion: TTL removed, memory scope transitions to `Full`, existing event log and key material preserved.
    - Promotion is a context event in the Merkle log.
+   - **Amendment (2026-10-18, ADR-066).** Promotion executes as a `PromoteContext` governance action whose Commit carries an approval from every current member, in every governance model, and its `GovernanceActionExecuted` leaf, never a separate `ContextPromoted` leaf. Every receiver of the Commit, not only the proposer, rejects a `PromoteContext` in a `no_promotion` context or a context with no TTL (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6).
 
 5. **Ephemeral close:**
    - Destroy MLS group state: tree secrets, all epoch key schedules, application key material via MLS wrapper (ADR-001 `destroy_group`).
@@ -1341,7 +1343,7 @@ Rust errors from both bridge crates are mapped to these classes via the bridge l
    ```
    - `ctx.invokeOutlet(outletId, input, identity)` invokes a registered outlet and returns JSON output.
    - Invoking a non-existent outlet throws `OutletError` with code `SCP-OUTLET-6001`.
-   - Outlet registration: `await ctx.registerOutlet(outletDefinition)` returns an outlet ID string.
+   - Outlet registration: `await ctx.registerOutlet(outletDefinition)` returns an `OutletRegistrationOutcome`, `Registered` with the outlet ID or `Proposed` with the proposal ID, and submits an outlet Commit or a `RegisterOutlet` proposal with the caller's identity (ADR-010 criterion 2 amendment, ADR-066 decision 31).
 
 5. **UCAN API:**
    ```typescript

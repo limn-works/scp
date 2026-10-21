@@ -732,8 +732,9 @@ public actor SCPContext {
         return output
     }
 
-    /// Register an outlet in this context. Returns the assigned outlet ID.
-    public func registerOutlet(_ definition: OutletDefinition) async throws -> String {
+    /// Register an outlet in this context through an outlet Commit or a
+    /// RegisterOutlet proposal (ADR-010 criterion 2 amendment, ADR-066 decision 31).
+    public func registerOutlet(_ definition: OutletDefinition) async throws -> OutletRegistrationOutcome {
         try await outlet_register(handle: handle, registration: definition.toRecord())
     }
 

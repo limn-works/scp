@@ -69,11 +69,11 @@ MLS requires sequential epoch processing -- each Commit depends on the previous 
 
 Tried in order:
 
-1. **Relay backfill.** MLS Commits are sent as MLS `PublicMessage` (protocol messages delivered via the transport layer). Relays store them like any other blob. If the relay's retention covers the offline period, all Commits are recoverable.
+1. **Relay backfill.** MLS Commits are sent as MLS `PrivateMessage` under the `PURE_CIPHERTEXT` wire policy (ADR-057 T3; protocol messages delivered via the transport layer). Relays store them like any other blob. If the relay's retention covers the offline period, all Commits are recoverable.
 
 2. **Peer request.** If relays have expired some Commits (blob_ttl elapsed), the reconnecting member broadcasts a `CommitRangeRequest` as an MLS application message (using their current epoch keys -- they can still encrypt at their stale epoch). Online members who have persisted the Commit messages respond with the missing Commits. This is best-effort -- members are not required to retain raw Commit messages beyond the MLS grace window.
 
-3. **Welcome-based fast-forward.** If the epoch gap is too large (> 100 epochs or no member can provide the full Commit chain), the reconnecting member is treated as a new joiner. An online admin (or any member with `MemberInvite` capability) generates a fresh Welcome message for the reconnecting member's pre-published KeyPackage, effectively re-adding them to the group at the current epoch. The member's old leaf node is removed. This preserves membership and context continuity, but the member loses access to messages encrypted in epochs between their stale epoch and the current epoch (forward secrecy is maintained).
+3. **Welcome-based fast-forward.** If the epoch gap is too large (> 100 epochs or no member can provide the full Commit chain), the reconnecting member is treated as a new joiner. The reconnecting member asks for the re-add with a signed `ResetRequest` (§23.5.2) whose reason is `CatchUpFailed`. An online member that holds both `MemberInvite` and `MemberRemove` (typically an admin) then generates a fresh Welcome message for the member's pre-published KeyPackage, whose `0xFF03` attestation is newer than the one on the member's old leaf, effectively re-adding them to the group at the current epoch. The member's old leaf node is removed in the same Commit, which records the re-add as one `MemberReset` leaf, carries the request in its governance block for every receiver to verify, and leaves the member's join point, role, and governance state unchanged (`07-trust-validation-and-capabilities.md` §7.3.1.1 steps 1.6, 1.7, and 2). This preserves membership and context continuity, but the member loses access to messages encrypted in epochs between their stale epoch and the current epoch (forward secrecy is maintained).
 
 ### 23.4.2 Epoch Catch-Up Limits
 
@@ -106,7 +106,7 @@ Any one of the following triggers a group state reset:
 
 ### 23.5.2 Reset Protocol
 
-1. The reconnecting member publishes a `ResetRequest` via the relay (not MLS-encrypted -- the member may not be able to encrypt at the current epoch). The request includes context_id, member_did, last_known_epoch, reset reason, a 16-byte random nonce (CSPRNG), and a timestamp (Unix seconds). A responder verifies the request's signature against the key the member's key state lists `Current` in the role the message names, under the canonical hash construction (`09-security-model.md` §9.5.1) and the separator `"SCP-RESET-REQUEST-V1:"`. The signed preimage includes: `context_id || member_did || last_known_epoch || reason_tag || nonce || timestamp`.
+1. The reconnecting member publishes a `ResetRequest` via the relay (not MLS-encrypted -- the member may not be able to encrypt at the current epoch). The request carries the fields of the `ResetRequest` preimage of `09-security-model.md` §9.5.2, which defines each field and its encoding: `context_id`, `member_did`, `last_known_epoch`, `reset_counter`, `member_since`, `reason`, a 16-byte random `nonce` (CSPRNG), and `timestamp` (Unix seconds), with the member's signature over that preimage under its `#active` identity key and the separator `"SCP-RESET-REQUEST-V2:"`. The member chooses a `reset_counter` greater than every counter it signed before during its current membership, and keeps the last one it signed in durable state. A responder verifies the signature against the key the member's key state lists `Current` in the `#active` role.
 
    **Anti-replay validation.** Because the ResetRequest is transmitted as plaintext (not MLS-encrypted), it is visible to relays and network observers. An attacker who captures a valid ResetRequest could replay it to force-remove and re-add the member repeatedly, disrupting their session at low cost. To prevent this, the relay (or any recipient processing the request) MUST validate all three of the following before forwarding or acting on the request:
 
@@ -114,23 +114,23 @@ Any one of the following triggers a group state reset:
    - **(b) Timestamp freshness.** Reject requests where `|relay_clock - timestamp| > 30 seconds` (matching the freshness window used for SenderKeyRequest in section 9.16.2 and AccessKeyRequest in section 9.17).
    - **(c) Nonce uniqueness.** Maintain a deduplication cache of `(member_did, nonce)` pairs with a 60-second TTL. Reject any request whose nonce has been seen within the TTL window. The 60-second TTL is 2x the freshness window to prevent replay after nonce eviction at the window boundary. Cache capacity: bounded at 10,000 entries with oldest-first eviction.
 
-2. An online member with `MemberRemove` + `MemberInvite` capabilities (typically admin) processes the reset: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) immediately re-adds the member using a fresh KeyPackage via MLS `add_member()`, (c) distributes the new Welcome message via relay.
+2. An online member that holds both `MemberRemove` and `MemberInvite` (typically an admin) processes the reset in one Commit: (a) removes the offline member's stale leaf node via MLS `remove_member()`, (b) re-adds the member using a fresh KeyPackage whose `0xFF03` attestation is newer than the stale leaf's, via MLS `add_member()`, (c) carries the member's `ResetRequest` in the Commit's governance block, where every receiver verifies its signature under the member's `#active` key and accepts it only when its `reset_counter` is above the member's reset counter floor, its `member_since` is the member's join point, and its `last_known_epoch` is at most the Commit's sending epoch, so the request executes once (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.7), and (d) distributes the new Welcome message via relay. The relay checks in step 1 protect the relay path; the block check binds the reset to the member's own request for every member, and no member resets another without that request or an executed `ResetMember` governance action. A member that does not receive the Welcome of its executed reset signs a new request with a higher `reset_counter` and publishes it: the executed request's counter became its floor, so the new request is accepted and the old one is not.
 3. The reconnecting member processes the Welcome, joining the group at the current epoch. They request sender keys for all current members via the pull-based protocol (ADR-007).
 4. The reconnecting member's outbound queue is drained using the new epoch's key schedule.
-5. A `MemberReset` event (distinct from `MemberLeft` + `MemberJoined`) is appended to the event log, recording the reset reason, old epoch, new epoch, and the admin who processed it.
+5. A `MemberReset` event (distinct from `MemberLeft` + `MemberJoined`) is appended to the event log, recording the reset member and the request's `last_known_epoch`, `reset_counter`, and `reason`; its `actor_did` is the member that processed it, and the Commit that carries it fixes the new epoch, so the leaf holds no value the request did not sign (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6). It changes no role, join point, or conflict key (`07-trust-validation-and-capabilities.md` §7.3.1.1).
 
 ### 23.5.3 State Preservation
 
 **What the reset member loses:**
 
 - Access to messages encrypted in epochs between their last known epoch and the current epoch. Forward secrecy is preserved -- old epoch keys were destroyed per ADR-001.
-- Any pending governance proposals they initiated while offline (proposals reference specific epochs).
+- The standing of their pending governance proposals and votes until they re-sign them: the reset replaces their leaf key, so a carried proposal or vote signed under the old key no longer matches their leaf (`07-trust-validation-and-capabilities.md` §7.3.1.1). A re-signed proposal keeps its `anchor_seq` and `proposal_id` (`05-contexts.md` §5.9.1). The reset is not a departure: their join point and every governance conflict key that names them are unchanged.
 - Queue entries that reference the old epoch (re-queued messages are re-encrypted with the new epoch).
 
 **What the reset member retains:**
 
 - Their DID and identity.
-- Their role in the context (the admin re-assigns the same role during re-add).
+- Their role in the context. The reset Commit's `MemberReset` leaf leaves the role unchanged and assigns none, so the re-added member holds the role it held before.
 - Their event log history up to the last known epoch.
 - Context metadata (params, outlets, ceiling) -- this is public and queryable via the metadata routing ID (ADR-004).
 
@@ -244,7 +244,7 @@ During event log reconciliation (section 23.7, Phase 3 of the reconnection proto
 
 **Per-event signature verification:**
 
-1. During reconciliation, each received event MUST be verified against the claimed sender's signing key before being accepted into the local event log. The verification reads the `actor_did` and `signing_key_id` fields of the `Event` struct (ADR-011), derives the actor's key state by replaying that actor's key-event log (`03-identity.md` §3.10.4), and takes the key that state names in the role. An event is content, so its signature verifies against a key the state lists retired as well as one it lists `Current` (`09-security-model.md` §9.7.1). Events that fail signature verification MUST be rejected and MUST NOT be added to the local log.
+1. During reconciliation, each received event MUST be verified against the claimed sender's signing key before being accepted into the local event log. The verification reads the `actor_did`, `signing_key_id`, and `key_state_head` fields of the `Event` struct (ADR-011, as ADR-066 decision 23 amends it), replays that actor's key-event log (`03-identity.md` §3.10.4) to the position `key_state_head` names, and takes the key that held the role `signing_key_id` names at that position. An event's signature is log-anchored evidence (`09-security-model.md` §9.7.1, and the §9.5.2 Event preimage): it verifies iff that key was `Current` at that position, so a key the actor's state now lists `Superseded` or `Retired` keeps the event valid, and where the state lists the key `Compromised{from: N}` the verifier accepts the event only when first-seen holds as §9.7.1 defines it. The verifier needs no Commit history for the epoch that carried the event, which a member rebuilding from a checkpoint does not hold. Events that fail signature verification MUST be rejected and MUST NOT be added to the local log. **Amendment (2026-10-20, ADR-066 decision 27).** In an encrypted context, a member whose group context commits a `log_head_hash` accepts each event at a `sequence` that head covers by its inclusion alone, an RFC 6962 inclusion proof against the committed root or the `prev_hash` chain back from the committed head, and verifies no event signature (`05-contexts.md` §5.13.3 rule 14), because every member validated the Commit that appended the event before it merged it. The member receives every later event in the Commit that appends it, and verifies that event under the key the member resolved for its committer's epoch-`E` `0xFF03` attestation (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6). The key-state check above binds a verifier that holds no committed head for the context, such as a verifier outside the group.
 
 2. The SDK MUST log rejected events with the reason (`InvalidSignature`) and the claimed actor DID. If more than 3 events from the same peer fail verification in a single reconciliation session, the SDK MUST abort reconciliation with that peer and attempt reconciliation with a different online member.
 
@@ -327,7 +327,7 @@ Exchanged between members as MLS application messages during event log reconcili
 | `sender_did` | string | The sending member's identifier |
 | `event_count` | u64 | Number of events in the sender's local event log |
 | `merkle_root` | bytes (32) | SHA-256 Merkle root of the sender's event log |
-| `epoch` | u64 or null | MLS epoch on the sender's device; null for a Broadcast context |
+| `epoch` | u64 | MLS epoch on the sender's device; in a Broadcast context, the authors group's (`05-contexts.md` §5.14.13) |
 | `timestamp` | u64 | Unix seconds when generated |
 | `signature` | bytes (64) | P-256 signature over the canonical hash of every field above |
 
@@ -370,7 +370,7 @@ Self-contained context state at a point in time, used for the Tier 2 delta sync 
 |-------|------|-------------|
 | `context_id` | string | Context identifier |
 | `timestamp` | u64 | Unix seconds when the snapshot was taken |
-| `mls_epoch` | u64 or null | MLS epoch at snapshot time; null for a Broadcast context |
+| `mls_epoch` | u64 | MLS epoch at snapshot time; in a Broadcast context, the authors group's (`05-contexts.md` §5.14.13) |
 | `event_log_merkle_root` | bytes (32) | SHA-256 Merkle root at snapshot time |
 | `event_count` | u64 | Number of events in the log at snapshot time |
 | `members` | map | Identifier to `MembershipEntry`, ordered by key |
@@ -446,19 +446,21 @@ Raised when a member detects relay equivocation (§9.9.3, §23.7), and recordabl
 
 ### 23.16.7 ResetRequest
 
-Sent through a relay as plaintext, because the member cannot encrypt at the current epoch. §23.5.2 specifies the protocol and the canonical hash; this table states the fields.
+Sent through a relay as plaintext, because the member cannot encrypt at the current epoch. §23.5.2 specifies the protocol, and the `ResetRequest` preimage of `09-security-model.md` §9.5.2 defines the fields' order and encoding; this table states the fields.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `context_id` | string | Context identifier |
 | `member_did` | string | The requesting member's identifier |
 | `last_known_epoch` | u64 | The last MLS epoch the member holds state for |
-| `reason` | `ResetReason` | Why the reset is needed |
+| `reset_counter` | u64 | Greater than every counter the member signed before during this membership |
+| `member_since` | u64 | The member's join point (`07-trust-validation-and-capabilities.md` §7.3.1.1) |
+| `reason` | `ResetReason` | Why the reset is needed, signed as its §9.5.2 text form |
 | `nonce` | bytes (16) | Drawn from a CSPRNG, anti-replay |
 | `timestamp` | u64 | Unix seconds |
-| `signature` | bytes (64) | P-256 signature under `"SCP-RESET-REQUEST-V1:"` (§9.18.2) |
+| `signature` | bytes (64) | P-256 signature under `"SCP-RESET-REQUEST-V2:"` over the `ResetRequest` preimage of `09-security-model.md` §9.5.2 |
 
-`ResetReason` is a tagged enum: `ExtendedOffline` carrying the offline duration in seconds, `CatchUpFailed` carrying the sources attempted, and `GovernanceAction` carrying the proposal identifier.
+`ResetReason` is a tagged enum: `ExtendedOffline` carrying the offline duration in seconds, and `CatchUpFailed` carrying the non-empty set of §23.4.1 sources the member attempted: relay backfill, peer request, and Welcome-based fast-forward, named `relay-backfill`, `peer-request`, and `welcome-fast-forward` in the text form `09-security-model.md` §9.5.2 defines. A reset that governance orders is a `ResetMember` action and carries no request, so no request carries a governance reason.
 
 ### 23.16.8 Signed Context Export
 

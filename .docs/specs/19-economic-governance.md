@@ -296,9 +296,9 @@ Documented for implementers, not protocol-specified:
 
 Economic policy is a context setting governed through the context's governance model (§5.9).
 
-**Mutable by default.** Changes go through governance, are logged in the event log, visible to all members, take effect after a notification period. The minimum notification period is 86,400 seconds (24 hours) — economic policy changes MUST NOT take effect sooner than 24 hours after the `EconomicPolicyChanged` event is committed to the event log. Contexts MAY configure a longer notification period via `economic_policy_notification_period_secs` in `ContextParams` (no maximum). During the notification period, the previous policy remains in effect. This prevents surprise pricing changes that could trap agents with queued messages or active sessions. This follows the governance pattern but does NOT mirror the ceiling policy immutability default — pricing changes are normal business operations, not security boundary changes.
+**Mutable by default.** A change is a `SetEconomicPolicy` governance action (§5.9), visible to all members, and it takes two Commits, by Alec's ruling of 2026-10-19 (ADR-066 decision 21). Every member learns the proposed policy when the proposal is sent (`05-contexts.md` §5.9.1). The proposer's SDK then sends a recording Commit, which carries the proposal's block proposal record, no votes, and one `GovernanceProposalRecorded` leaf holding the proposal's `action_bytes`; it needs no approvals, only the proposer may send it, and every member that processes it holds the proposed policy whether or not the proposal message reached it (`05-contexts.md` §5.9 invariant 5, `07-trust-validation-and-capabilities.md` §7.3.1.1). Every receiver rejects a Commit that executes a `SetEconomicPolicy` no earlier Commit recorded, and the executor's SDK refuses to execute one with `GovernanceError::ProposalNotRecorded`, so every member holds the proposed policy for at least one epoch before it takes effect, under every governance model, `SingleAdmin` included. One epoch can be short, because the Commit right after the recording Commit can execute the change. Any member MAY leave the context from the proposal until the executing Commit. The new policy is in effect from the Commit that executes the action, whose `GovernanceActionExecuted` leaf records it and whose GroupContextExtensions proposal carries the new `economic_policy_hash` (`05-contexts.md` §5.13.3 rule 11), and the previous policy stays in effect until that Commit. No period runs between approval and effect, so every member applies the new policy at the same Commit, and no receiver reads a clock to decide it (ADR-066 decisions 10 and 19). An agent with queued messages or an active session sees the new pricing while the vote is open, before the pricing applies; a vote that collects its approvals quickly leaves it little time. This follows the governance pattern but does NOT mirror the ceiling policy immutability default — pricing changes are normal business operations, not security boundary changes.
 
-**Optional immutability lock.** Creator MAY lock economic policy at creation — "always free forever" or "price locked at $X forever." Voluntary commitment, not the default. The lock is itself immutable (once locked, cannot unlock). Use cases: public goods contexts, trust signals, permanent free tiers.
+**Optional immutability lock.** Creator MAY lock economic policy at creation — "always free forever" or "price locked at $X forever." Voluntary commitment, not the default. The lock is itself immutable (once locked, cannot unlock). Use cases: public goods contexts, trust signals, permanent free tiers. Every receiver enforces the lock: it rejects the recording or execution of a `SetEconomicPolicy` when the policy in effect is locked, and of one whose new policy sets `locked`, because a governance action neither sets nor clears the lock (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.3, ADR-066 decision 22).
 
 ```rust
 pub struct EconomicPolicy {
@@ -388,7 +388,7 @@ pub struct CostInsufficient {
 }
 ```
 
-**Governed changes:** Formula itself is a governed setting — governance can adjust coefficients, add/remove variables, change cap/floor. Changes logged, members notified, grace period before effect.
+**Governed changes:** Formula itself is a governed setting — governance can adjust coefficients, add/remove variables, change cap/floor. The formula is the `pricing_formula` field of the context's `EconomicPolicy` (§19.3), so a formula change is an economic policy change: members learn of it when the proposal is sent, an earlier Commit records it, and it takes effect at the later Commit that executes it, with no grace period (§19.3).
 
 **EIP-1559 analogy:** For relay pricing specifically, a utilization-targeting formula makes sense:
 - Target: 50% relay capacity
@@ -471,11 +471,11 @@ Economic governance introduces new event types for the verifiable event log (ADR
 | Event Type | Trigger | Payload |
 |---|---|---|
 | `PaymentReceived` | `adapter.capture()` succeeds | `PaymentReceipt` |
-| `EconomicPolicyChanged` | Governance updates economic policy | Old policy hash, new `EconomicPolicy`, governance justification |
+| `EconomicPolicyChanged` | Retired: no Commit carries it. The executing Commit's `GovernanceActionExecuted` leaf records a `SetEconomicPolicy` (ADR-066 decisions 14 and 19) | — |
 | `SpendingUcanGranted` | Human grants spending UCAN to agent | The agent identity's identifier, `SpendingCapability` summary (amounts, window), UCAN token ID |
 | `SpendingUcanRevoked` | Human revokes spending UCAN | UCAN token ID, revocation reason |
 
-Of these, the economic *governance/policy* events (`EconomicPolicyChanged`, `EconomicPolicyApplied`, `SpendingUcanGranted`, `SpendingUcanRevoked`) are commit-ordered and convergent, and carry the same Merkle-tree inclusion guarantees as the other convergent `EventType` variants (governance, membership, lifecycle). `PaymentReceived` / `PaymentCaptureFailed`, by contrast, are appended by the payee on `adapter.capture()` — per-author application activity, convergent and Merkle-anchored only under ADR-051 (see the ADR-011 amendment, exclusion taxonomy §2); until then they are local `ContextEvent`s. The velocity metrics below (`ContextMessageRate`, `SenderVelocity`) are **local and self-metered** — enforced at `authorize()` by the payer's own SDK against a local spending ledger. There is no convergent velocity clock (ADR-051 §6: rate-limiting is local flow control, and a durable suspension is a governance commit whose execution *is* its record); these pricing metrics are not convergent Merkle records.
+`EconomicPolicyChanged` and `EconomicPolicyApplied` keep their registry values, and no Commit carries either, because a `SetEconomicPolicy` takes effect at its executing Commit (§19.3). Of the rest, the economic *governance* events (`SpendingUcanGranted`, `SpendingUcanRevoked`) are commit-ordered and convergent, and carry the same Merkle-tree inclusion guarantees as the other convergent `EventType` variants (governance, membership, lifecycle). `PaymentReceived` / `PaymentCaptureFailed`, by contrast, are appended by the payee on `adapter.capture()` — per-author application activity, convergent and Merkle-anchored only under ADR-051 (see the ADR-011 amendment, exclusion taxonomy §2); until then they are local `ContextEvent`s. The velocity metrics below (`ContextMessageRate`, `SenderVelocity`) are **local and self-metered** — enforced at `authorize()` by the payer's own SDK against a local spending ledger. There is no convergent velocity clock (ADR-051 §6: rate-limiting is local flow control, and a durable suspension is a governance commit whose execution *is* its record); these pricing metrics are not convergent Merkle records.
 
 ## 19.7 Anti-Spam via Cost Escalation
 
@@ -724,7 +724,7 @@ This section tabulates the wire format for all economy protocol types that cross
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `locked` | `bool` | Yes | If `true`, economic policy cannot be changed by governance. |
+| `locked` | `bool` | Yes | If `true`, economic policy cannot be changed by governance. Only the creator sets it, at creation; every receiver rejects a `SetEconomicPolicy` in a locked context or one that sets it (§19.3). |
 | `cost_schedule` | `CostSchedule` | Yes | Per-action cost table. |
 | `payment_adapters` | `Vec<String>` | Yes | Accepted payment adapter IDs. |
 | `pricing_formula` | `PricingFormula` | No | Dynamic pricing. If absent, `cost_schedule` alone determines costs. |

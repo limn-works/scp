@@ -115,7 +115,7 @@ Invalid transitions (must return error):
 
    Steps:
    1. Transition state to `Creating`.
-   2. If `mode == Encrypted`: Create MLS group via ADR-001 `create_group()`. If `mode == Broadcast`: Initialize creator's broadcast key (epoch 0) — no MLS group. On failure: drop `Creating` state, return error.
+   2. If `mode == Encrypted`: Create MLS group via ADR-001 `create_group()`. If `mode == Broadcast`: Create the authors group via ADR-001 `create_group()` with `context_mode` 1 in its `0xFF02` extension, and initialize the creator's broadcast key (epoch 0) (spec 05 §5.14.13, ADR-066 decision 38). On failure: drop `Creating` state, return error.
    3. If `mode == Encrypted`: Generate creator's sender key via ADR-007 `generate_sender_key()`. If `mode == Broadcast`: Broadcast key already initialized in step 2. On failure: destroy MLS group, return error.
    4. Initialize empty event log (ADR-011). On failure: destroy sender key, destroy MLS group, return error.
    5. Publish context to transport. On failure: drop event log, destroy sender key, destroy MLS group, return error.
@@ -149,6 +149,7 @@ Invalid transitions (must return error):
    - If memory scope is `Summary`: triggers summary generation and verification window.
    - If memory scope is `Ephemeral` or `Summary`: schedules key destruction.
    - Appends `ContextClosing` event to event log.
+   - **Amendment (2026-10-18, ADR-066):** in an encrypted context the close executes as a `CloseContext` governance action, whose Commit carries its `GovernanceActionExecuted` leaf and no `ContextClosing` leaf (ADR-011 amendment below).
 
 6. **`finalize_close(handle: &ContextHandle) -> Result<(), ContextError>`**
    - Called after all members have processed the close notification.
@@ -191,6 +192,7 @@ pub struct ContextParams {
     pub promotion_policy: PromotionPolicy, // Whether context promotion is allowed (§5.10)
     pub roles: Vec<RoleDefinition>,      // Role definitions with permission sets
     pub outlets: Vec<OutletRegistration>,    // Initial outlet registrations
+    pub outlet_registration_policy: OutletRegistrationPolicy, // ADR-066 decisions 31 and 35: the rule list that sends outlet changes to a vote or a role; required, no default
     pub ttl: Option<Duration>,           // Optional TTL
     pub memory_scope: MemoryScope,       // Ephemeral, Summary, or Full
     pub governance: GovernanceModel,     // Single-admin for Phase 2
@@ -228,23 +230,26 @@ pub enum PromotionPolicy {
 /// Context processing mode. Immutable after creation.
 pub enum ContextMode {
     Encrypted,  // MLS-backed, sender-side keys, full forward secrecy (default)
-    Broadcast,  // Per-author broadcast keys, no MLS, mandatory subscriber registration (§5.14)
+    Broadcast,  // Per-author broadcast keys for content, an MLS group of authors only, mandatory subscriber registration (§5.14)
 }
 
 // Broadcast mode acceptance criteria (§5.14):
 //
 // When `mode == Broadcast`:
-// - No MLS group is created. Context uses per-author AES-256-GCM broadcast keys
+// - The owner and the authors form an MLS group, the authors group, that
+//   orders the authors' governance (§5.14.13, ADR-066
+//   decision 38). Content uses per-author AES-256-GCM broadcast keys
 //   instead of MLS group keys.
-// - Subscriber count is unlimited (no MLS group size bound).
+// - Subscriber count is unlimited (subscribers are not group members).
 // - The context's public `routing_id` is derived as `SHA-256(context_id)` —
 //   deterministic and discoverable by any agent that knows the context_id.
 // - Authors are bounded participants who hold `MessagesWrite` capability.
 //   Each author maintains their own broadcast key with independent epoch rotation.
 // - Subscribers hold `MessagesRead` capability and receive broadcast keys via
 //   HPKE-wrapped key distribution (no MLS Welcome messages).
-// - `create_context` skips MLS group creation (step 2) and instead initializes
-//   the creator's broadcast key at epoch 0.
+// - `create_context` creates the authors group (step 2) with `context_mode` 1
+//   in its `0xFF02` extension, and initializes the creator's broadcast key at
+//   epoch 0.
 // - `join_context` for subscribers registers identity-authenticated subscription
 //   without MLS add_member.
 // - `send_message` encrypts with the author's current broadcast key, wraps in
@@ -401,6 +406,7 @@ pub struct RoleDefinition {
    - Distributes tokens to the member via MLS application message.
    - Revokes any previous tokens for this member (role change).
    - Appends `RoleAssigned` event to event log.
+   - **Amendment (2026-10-18, ADR-066):** in an encrypted context a role is assigned by the `AddMember` or `ChangeRole` governance action, whose Commit carries the `MemberJoined` leaf naming the role or the `GovernanceActionExecuted` leaf, and no `RoleAssigned` leaf (ADR-011 amendment below).
    - Returns the minted tokens.
 
 4. **`validate_ucan(context: &ContextHandle, token: &UcanToken, required_capability: &Capability) -> Result<(), UcanError>`**
@@ -429,6 +435,7 @@ pub struct RoleDefinition {
    - Adds token to the context's revocation list.
    - Distributes revocation as MLS application message to all members.
    - Appends `TokenRevoked` event to event log.
+   - **Amendment (2026-10-20, ADR-066 decision 28).** In a context with an MLS group, the revocation is one Commit carrying a `TokenRevoked` leaf, whose committer is the token's issuer or the context creator; every receiver adds the CID to the context's `ucan_revocations` when it merges that Commit (`07-trust-validation-and-capabilities.md` §7.3.1.1 "With a revocation"). No MLS application message distributes it, and no member merges another's list. A Broadcast context, which has no MLS group, keeps the two bullets above.
 
 6. **`check_ceiling(ceiling: &CapabilityCeiling, capability: &Capability) -> bool`**
    - Returns true if the capability is within the ceiling.
@@ -543,6 +550,8 @@ pub struct TestVector {
    - Stores the outlet registration in the context's outlet registry.
    - Appends `OutletRegistered` event to event log with full registration metadata.
    - Returns the outlet ID.
+
+   **Amendment (2026-10-20, ADR-066 decision 31).** Registration, change, and removal are Commits, never a write to the local registry alone (`05-contexts.md` §5.4, "Registration and its policy"). `register_outlet` takes the caller's identity, never the context creator's, and checks `OutletRegister` against that caller. When the registration matches no condition of the context's outlet registration policy, it sends an outlet Commit carrying the `OutletRegistered` leaf, or `OutletUpdated` for a registered `outlet_id`, and returns once that Commit merges. When it matches one, it submits a `RegisterOutlet` governance proposal and returns the proposal's ID; the leaf appears when the executing Commit merges. It returns `OutletRegistrationOutcome::Registered { outlet_id }` or `OutletRegistrationOutcome::Proposed { proposal_id }`, the architect agent's shape, so a caller cannot read a pending proposal as a registration. `deregister_outlet` and `update_outlet` follow the same policy with `OutletRemoved` and `OutletUpdated`. The leaf carries the `OutletRegistrationHeader` of `05-contexts.md` §5.4.1, and the registrant sends the full registration as an MLS application message. Every SDK's `registerOutlet` (TypeScript, ADR-022; Swift, Kotlin, and Python alike) returns that outcome and submits through this path with the caller's identity; no SDK registers an outlet only in its local registry.
 
 3. **`invoke_outlet(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &[u8; 32]) -> Result<serde_json::Value, OutletError>`**
    - Validates context state is `Active`.
@@ -753,6 +762,16 @@ pub struct Event {
    on `generate_checkpoint` in criterion 8 is a *checkpoint*-signing argument and
    is unaffected.)
 
+   **Amendment (2026-10-20, ADR-066 decision 23).** `Event` carries two fields after
+   `signature`: `signing_key_id`, the identity-key role that signed it, such as
+   `"#active"`, which `07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6 and
+   `23-sync-and-offline-strategy.md` §23.13 read, and `key_state_head: [u8; 32]`, the
+   actor's key-state head when it signed (`09-security-model.md` §9.7.1 log-anchored
+   row). The note above that `Event` has no `signing_key_id` field no longer holds.
+   The signature is over the §9.5.2 Event preimage under `"SCP-EVENT-V2:"`, which ends
+   with both fields and is in the log-anchored evidence class, so a member that
+   rebuilds from a checkpoint verifies a leaf whose actor has since rotated that key.
+
    **Timestamp assignment (committer-assigned, copied by every member).** The
    `timestamp` field is convergent by *assignment*, parallel to `sequence`: for a
    commit-ordered event the committing member sets it to the `created_at` of the signed
@@ -797,12 +816,16 @@ pub enum EventType {
     ConsistencyCheckpoint,
     AbsenceProofRequested,
     MemberBlocked,          // ADR-007: Signed block notification recorded for auditability
-    KeyEpochAdvance,        // ADR-007: Sender key epoch rotation (shared across Encrypted and Broadcast modes)
+    // Tag 18 is retired: it belonged to KeyEpochAdvance. No key epoch advance is a
+    // log record (ADR-066 decisions 36 and 37): a governance Commit's
+    // GovernanceActionExecuted leaf records the rotation it causes, and a block's
+    // rotation is the SenderKeyEpochAdvance or BroadcastEpochAdvance application
+    // message, outside the log.
     MediaSessionStarted,    // ADR-024: media session start
     MediaSessionEnded,      // ADR-024: media session end
     PaymentReceived,        // §19.6.1: payment captured
-    EconomicPolicyChanged,  // §19.3: economic policy change proposed (24h notice start)
-    EconomicPolicyApplied,  // §19.3: pending economic policy change applied
+    EconomicPolicyChanged,  // §19.3; ADR-066 decision 19 removed the 24h notice, so no Commit carries it
+    EconomicPolicyApplied,  // §19.3; ADR-066 decision 19 removed the pending change, so no Commit carries it
     SpendingUcanGranted,    // §19.6.1: spending UCAN granted
     SpendingUcanRevoked,    // §19.6.1: spending UCAN revoked
     // Governance event types (ADR-031 §8)
@@ -822,7 +845,7 @@ pub enum EventType {
     // §19 / §5.11A / §9.9 protocol action.
     AdminTransferred,             // TransferAdmin
     CeilingModified,              // ModifyCeiling applied
-    CeilingModificationPending,   // ModifyCeiling delay-window start
+    GovernanceProposalRecorded,   // a recording Commit's one leaf: records a ModifyCeiling or SetEconomicPolicy proposal for a later Commit to execute (ADR-066 decisions 20 and 21; renamed from CeilingModificationPending, same value)
     ThresholdModified,            // ModifyThreshold §4b
     SignerAdded,                  // AddSigner §4b
     SignerRemoved,                // RemoveSigner §4b
@@ -868,7 +891,7 @@ pub enum EventType {
     CommitBroadcastSucceeded,     // §9.9.4 deferred commit broadcast succeeded; payload: operation, attempts
     CommitBroadcastFailed,        // §9.9.4 deferred commit broadcast permanently failed; payload: operation, reason, attempts
     // Compromise-recovery event type (§9.12 step 2 "MLS Update in all active
-    // contexts"). Distinct from the ADR-007 sender-key KeyEpochAdvance: this
+    // contexts"). Distinct from a sender-key epoch advance, which is no log record: this
     // records an MLS *group*-epoch advance (Update + self-Commit, broadcast to
     // members) performed during trust recovery. actor_did = "system:recovery".
     RecoveryEpochAdvanced,        // §9.12 step 2 MLS group-epoch advance; payload: old_epoch, new_epoch
@@ -878,6 +901,8 @@ pub enum EventType {
     AppUnbound,                   // §8 app unbound from context; payload: app_did
 }
 ```
+
+   **Amendment (2026-10-18, ADR-066): which leaf records an executed governance action.** The per-action variants above stay in the closed set, but the Commit that executes a governance action carries only the leaves every receiver derives from the action and the Commit (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6): `MemberJoined` for `AddMember`, `MemberLeft` for `RemoveMember`, `MemberReset` for `ResetMember`, `TtlExtended` for `ExtendTtl`, and then the `GovernanceActionExecuted` leaf, which records every action as its exact `action_bytes`. It carries no `RoleAssigned`, `AdminTransferred`, `ChildContextCreated`, `SignerAdded`, `ContextClosing`, `ContextPromoted`, or other per-action leaf, and a receiver rejects a Commit that carries one. A consumer that read a per-action variant for an executed governance action reads the `GovernanceActionExecuted` leaf's `action_type` and `action_bytes` instead (`07-trust-validation-and-capabilities.md` §7.3.2, participation facts).
 
    `EventType` is a closed set with no catch-all variant: every protocol action
    that produces a verifiable history entry in the Merkle event log is one of the
@@ -1155,7 +1180,7 @@ pub struct ConsistencyCheckpoint {
     pub sender_did: [u8; 32],
     pub event_count: u64,
     pub merkle_root: [u8; 32],
-    pub epoch: Option<u64>,         // Current MLS epoch (None for Broadcast contexts)
+    pub epoch: u64,                 // Current MLS epoch (the authors group's in a Broadcast context, ADR-066 decision 38)
     pub timestamp: u64,
     pub signature: P256Signature,
 }

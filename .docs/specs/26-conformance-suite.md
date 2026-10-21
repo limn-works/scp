@@ -123,10 +123,10 @@ Each test specifies:
 |-------|-------|
 | **Layer** | Context |
 | **Tier** | Core |
-| **Spec Sections** | §5.9, §9.5.2 |
-| **Preconditions** | Context with 3 members. Governance model: majority vote. |
-| **Steps** | 1. Member A proposes role change for Member C. 2. Proposal ID is computed per §9.5.2 (domain: `"SCP-PROPOSAL-V1:"`). 3. Member A votes approve (signed per `"SCP-VOTE-V1:"`). 4. Member B votes approve. 5. Quorum reached (2/3). 6. Role change is applied. |
-| **Expected Outcome** | Proposal passes with 2/3 votes. Member C's role is updated. Governance event recorded in event log. All vote signatures are verifiable. |
+| **Spec Sections** | §5.9, §5.9.1, §7.3.1.1, §9.5.2 |
+| **Preconditions** | Encrypted context with 3 members. Governance model: majority vote. |
+| **Steps** | 1. Member A sends a `GovernanceProposal` message proposing a role change for Member C; its proposal ID is computed per §9.5.2 (domain: `"SCP-PROPOSAL-V2:"`) over A's `anchor_seq`. 2. Member B sends a `GovernanceVote` approving (signed per `"SCP-VOTE-V2:"`). 3. Member A, now holding 2 approvals of 3 eligible voters, sends one Commit whose governance leaf block carries the proposal, both approvals, and the signed leaves. 4. Members B and C process the Commit. |
+| **Expected Outcome** | B and C each authorize the Commit from its contents alone and apply C's new role. Every member's event log ends with the same leaves. The proposal and vote signatures verify under the senders' leaf keys. |
 
 ### CONF-010: Governance — Threshold Voting (k-of-n)
 
@@ -261,7 +261,7 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | §23.5 |
 | **Preconditions** | Member was offline for > 7 days. Epoch drift > 1000. |
-| **Steps** | 1. Member sends ResetRequest (signed per `"SCP-RESET-REQUEST-V1:"`). 2. Admin processes reset request. 3. Admin sends MLS Welcome. 4. Member processes Welcome within 60s timeout (§9.18.9). 5. Member joins as fresh member. |
+| **Steps** | 1. Member sends ResetRequest (signed over the `"SCP-RESET-REQUEST-V2:"` preimage of `09-security-model.md` §9.5.2). 2. Admin processes reset request. 3. Admin sends MLS Welcome. 4. Member processes Welcome within 60s timeout (§9.18.9). 5. Member joins as fresh member. |
 | **Expected Outcome** | Member is re-admitted to the MLS group. Fresh epoch state. Historical messages not accessible (re-join, not restore). |
 
 ### CONF-022: Equivocation Detection
@@ -307,8 +307,8 @@ Each test specifies:
 | **Tier** | Full |
 | **Spec Sections** | §7, §9.5 |
 | **Preconditions** | Valid UCAN token exists. |
-| **Steps** | 1. Compute token CID (CIDv1, SHA-256, DAG-CBOR). 2. Add CID to context RevocationList. 3. Distribute revocation via MLS. 4. Attempt to exercise the revoked token. |
-| **Expected Outcome** | Token exercise is denied. Revocation is recorded. CID computation matches between implementations. |
+| **Steps** | 1. Compute token CID (CIDv1, SHA-256, DAG-CBOR). 2. As the token's issuer, send a Commit carrying a `TokenRevoked` leaf for the token (§7.3.1.1, ADR-066 decision 28). 3. At a second member, merge that Commit, and check that its `ucan_revocations` holds the CID. 4. Attempt to exercise the revoked token at both members in the Commit's epoch. 5. Send a revocation Commit from a member that is neither the token's issuer nor the context creator, and check that every receiver rejects it. |
+| **Expected Outcome** | Token exercise is denied at both members from the revocation Commit's epoch. The CID is in `ucan_revocations`. The unauthorized revocation Commit is rejected. CID computation matches between implementations. |
 
 ### CONF-026: Capability Attenuation (Subset Delegation)
 

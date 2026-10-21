@@ -767,7 +767,7 @@ Processing order (dependencies first):
     - SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse
     - GovernanceProposal, GovernanceVote, GovernanceExecution
     - WrappedContent, WrappedCek
-    - All 24 GovernanceAction variants
+    - All 30 GovernanceAction variants (ADR-031 §3)
     - All event types (MemberJoined, RoleAssigned, MessageSent, etc.)
     - Context creation parameters
     - Tool registration record
