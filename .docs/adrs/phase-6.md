@@ -3196,7 +3196,7 @@ UCAN delegation chains require a single root issuer (ADR-016 step 4). Distributi
 2. **`GovernanceProposal` struct and `GovernanceAction` enum:**
 
    - `GovernanceProposal` with `proposal_id`, `context_id`, `proposer_did`, `action`, `status`, `created_at`, `voting_deadline`, `approvals`, `rejections`, `created_at_epoch`.
-   - `GovernanceAction` with all 30 variants listed in section 3 (including content access actions: RevokeReadAccess, RestoreReadAccess, RevokeWriteAccess, RestoreWriteAccess, RotateContentKeys; broadcast action: BlockAuthor; economic actions: SetEconomicPolicy, ApproveSpend, LockEconomicPolicy; migration actions: ProposeContextMigration, AcceptContextMigration) and `RevocationScope` enum (Full, FutureOnly).
+   - `GovernanceAction` with all 30 variants listed in section 3 (including content access actions: RevokeReadAccess, RestoreReadAccess, RevokeWriteAccess, RestoreWriteAccess, RotateContentKeys; broadcast action: BlockAuthor; economic actions: SetEconomicPolicy, ApproveSpend, LockEconomicPolicy; outlet action: SetOutletRegistrationPolicy, ADR-066 decision 31; pseudonym action: ModifyPseudonymRotationPolicy) and `RevocationScope` enum (Full, FutureOnly). Section 3 lists no migration action; the migration actions of spec 05 §5.11A are not counted in the 30.
    - `ProposalStatus` with `Pending`, `Approved`, `Rejected`, `Expired`, `Cancelled`, `Invalidated`.
    - Proposals are persisted to `ProtocolRepository` on creation and on every status change.
 

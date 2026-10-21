@@ -113,7 +113,7 @@
         "crates/scp-core/src/context/governance/mls_integration.rs",
         "crates/scp-core/src/sync/conflict_resolution.rs"
       ],
-      "description": "ADR-031 specifies 24 GovernanceAction variants but code only has 11. This story adds RevokeReadAccess and RestoreReadAccess (needed for governance-level bans). Also adds RevocationScope enum (Full, FutureOnly) per §5.9 content access governance table. Updates MLS impact classification and conflict detection.",
+      "description": "When this story was written, ADR-031 \u00a73 specified 24 GovernanceAction variants (30 now) and the code had 11. This story adds RevokeReadAccess and RestoreReadAccess (needed for governance-level bans). Also adds RevocationScope enum (Full, FutureOnly) per §5.9 content access governance table. Updates MLS impact classification and conflict detection.",
       "acceptanceCriteria": [
         "RevocationScope enum has variants Full and FutureOnly, derives Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize",
         "GovernanceAction::RevokeReadAccess { did: DID, scope: RevocationScope } variant exists",

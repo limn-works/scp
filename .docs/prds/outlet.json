@@ -702,7 +702,7 @@
     },
     {
       "id": "SCP-OUT-009",
-      "title": "Regenerate test vectors under SCP-OUTLET-REGISTRATION-V2 domain separator",
+      "title": "Verify the SCP-OUTLET-REGISTRATION-V3 test vectors through the Rust core and every bridge",
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
@@ -711,16 +711,16 @@
         "crates/scp-testing/src/conformance/mod.rs",
         "crates/scp-testing/tests/integration/conformance.rs",
         ".docs/specs/25-test-vectors.md",
-        "tests/conformance/vectors/outlet_registration_v2.json"
+        "tests/conformance/vectors/outlet_registration_v3.json"
       ],
-      "description": "Regenerate the canonical outlet-registration test vectors under the new V2 domain separator (\u00a75.4.1). The V1 vectors are deleted \u2014 they are no longer valid, and keeping them risks tools accidentally validating against the wrong separator. The new vector file documents 12 test cases: minimal Query, minimal Action, Query with cost=None, Query with cost=0, Action with cost>0, registration with aggregate_schema, registration with max-size schema (64 KiB), registration with 100 test vectors, registration with LLM-backed impl hash, registration with remote-service impl hash, multi-caveat UCAN invocation, and a cross-context invocation. Each vector's signature is computed against the V2 preimage and stored alongside the input. The conformance test harness loads these vectors and validates them against every bridge (PyO3, UniFFI-Swift, UniFFI-Kotlin, NAPI).",
+      "description": "ADR-066 decision 31 moves the \u00a75.4.1 preimage to `SCP-OUTLET-REGISTRATION-V3:`, which adds `reads_context_byte` after `kind_byte`, so no V2 signature verifies and the V2 vectors are obsolete (`25-test-vectors.md` \u00a725.24 amendment). This story covers the canonical outlet-registration vectors under V3. SCP-OUT-040 regenerates the fixture as `outlet_registration_v3.json`; this story cannot finish until that file exists. The V1 and V2 vector files are deleted, and their hashes sit in the rejection corpus, because keeping them risks tools validating against the wrong separator. The new vector file documents 12 test cases: minimal Query, minimal Action, Query with cost=None, Query with cost=0, Action with cost>0, registration with aggregate_schema, registration with max-size schema (64 KiB), registration with 100 test vectors, registration with LLM-backed impl hash, registration with remote-service impl hash, multi-caveat UCAN invocation, and a cross-context invocation. Each vector's signature is computed against the V3 preimage and stored alongside the input. The conformance test harness loads these vectors and validates them against every bridge (PyO3, UniFFI-Swift, UniFFI-Kotlin, NAPI).",
       "acceptanceCriteria": [
-        "File tests/conformance/vectors/outlet_registration_v2.json contains 12 test-vector entries",
+        "File tests/conformance/vectors/outlet_registration_v3.json contains the 12 test-vector entries the description names, each signed under the SCP-OUTLET-REGISTRATION-V3 preimage (05-contexts.md \u00a75.4.1 'Header and V3', ADR-066 decision 31)",
         "Each entry has fields: name, input (registration fields), expected_preimage (hex-encoded), expected_signature (hex-encoded), operator_did, operator_public_key (hex)",
-        "The V1 vector file tests/conformance/vectors/tool_registration_v1.json does not exist",
-        "Conformance test runs through every bridge: a vector is sign-verifiable via the Rust core AND via each FFI bridge",
-        "A negative test confirms the V1 preimage (with SCP-OUTLET-REGISTRATION-V2) does NOT validate against the new code path",
-        ".docs/specs/25-test-vectors.md documents the V2 vector location and vector count",
+        "Neither tests/conformance/vectors/tool_registration_v1.json nor tests/conformance/vectors/outlet_registration_v2.json exists; the rejection corpus holds the V1 and V2 hashes",
+        "Conformance test runs through every bridge: each V3 vector is sign-verifiable via the Rust core AND via each FFI bridge",
+        "A negative test confirms that a signature over the V1 preimage and one over the V2 preimage each fail to verify on the V3 code path",
+        ".docs/specs/25-test-vectors.md documents the V3 vector location and vector count",
         "cargo test -p scp-testing --test conformance succeeds"
       ],
       "actionItems": [

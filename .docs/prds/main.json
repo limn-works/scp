@@ -3358,19 +3358,19 @@
       "gate": "gate-3",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "in-progress",
       "files": [
         "crates/scp-core/crypto/ucan/revoke.rs"
       ],
-      "description": "Implement per-context RevocationList and `revoke_ucan()` function. Revocations are distributed as MLS application messages so all members maintain consistent revocation lists. `merge()` is union-only (revocations are append-only — a token cannot be un-revoked). Revocation verification: revoker must be the token's issuer or the context creator. Appends `TokenRevoked` event to context's event log.",
+      "description": "Implement per-context RevocationList and `revoke_ucan()` function. ADR-066 decision 28 retires the original distribution: in a context with an MLS group, a revocation travels as one Commit carrying a `TokenRevoked` leaf, the list changes only when a member applies that leaf, and no member merges another member's list (`07-trust-validation-and-capabilities.md` §7.3.1.1 \"With a revocation\"; ADR-016 as amended). Criteria 3 and 6 state that behavior; SCP-329 builds the Commit, SCP-335 checks it, and SCP-330 wires the receiver. Status: in-progress, because the merged code does not meet criteria 3 and 6: `RevocationList::merge` in `crates/scp-protocol/src/crypto/ucan/revoke.rs` still unions a remote list, and `revoke_ucan` there still hands the revocation to a `RevocationDistributor`, the application-message path. Revocations are append-only — a token cannot be un-revoked. Revocation verification: revoker must be the token's issuer or the context creator. Appends `TokenRevoked` event to context's event log.",
       "acceptanceCriteria": [
         "RevocationList struct with `revoked: HashSet<String>` (set of revoked token CIDs) and `context_id: ContextId`.",
         "`is_revoked(token_cid) -> bool` checks if a token CID is in the revocation list.",
         "`revoke(token_cid)` adds a token CID to the revocation list.",
-        "`merge(remote)` merges remote revocation list (union-only, append-only — a token cannot be un-revoked).",
+        "`RevocationList` has no operation that merges another member's list; in a context with an MLS group it gains a CID only when the member applies a `TokenRevoked` leaf from a merged Commit, and nothing removes one (ADR-066 decision 28).",
         "`revoke_ucan(context, token_cid, revoker) -> Result<(), UcanError>` verifies the revoker is the token's issuer or the context creator.",
         "`revoke_ucan` adds the token CID to the context's revocation list.",
-        "`revoke_ucan` distributes the revocation as an MLS application message to all context members.",
+        "In a context with an MLS group, `revoke_ucan` distributes the revocation as one Commit whose block carries a `TokenRevoked` leaf `[token_cid, token_payload]`, and no MLS application message carries it (`07-trust-validation-and-capabilities.md` §7.3.1.1 \"With a revocation\", ADR-066 decision 28).",
         "`revoke_ucan` appends `TokenRevoked` event to the context's event log."
       ],
       "actionItems": [
