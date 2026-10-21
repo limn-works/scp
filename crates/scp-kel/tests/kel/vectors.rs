@@ -2,26 +2,23 @@
 //! expected value is a spec 25 constant from `fixtures`, and each test names
 //! its vector.
 
-use scp_did::{
-    CommitmentEntry, CustodyType, FixedCommitment, Identifier, KeyAlgorithm, KeyCondition,
-    KeyEntry, KeyRole, KeyState, StandingCommitment,
-};
+use scp_did::KeyCondition;
 use scp_kel::{
     DeriveIdentifierError, EventKind, InstalledRootSet, RoutingKind, SignatureForm,
     decode_preimage, derive_identifier, encode_preimage, key_event_seal, prerotation_commitment,
-    replay, routing_id,
+    routing_id,
 };
 
 use crate::fixtures::{
     TestResult, V41_ACTIVE, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V41_ROOT, V41_ROUTING_DID,
-    V41_ROUTING_SVC, V41_ROUTING_WCF, V41_ROUTING_WIT, V41_WITNESS, V42_DIGEST, V42_IDENTIFIER,
-    V42_PREIMAGE, V47A_COMMITMENT, V47A_POINT, V47B_COMMITMENT, V47B_POINT, V48_ADDRESS,
-    V48_IDENTIFIER, V50_DIGEST, V50_PREIMAGE, V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST,
-    V51_IDENTIFIER, V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE,
-    V51_KEYS, V51_PREIMAGE, V51_ROUTING_DID, V68_DIGEST, V68_PREIMAGE, V68_REVEAL_SIGNATURE,
-    V68_ROOT_SIGNATURE, V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array, assert_signature,
-    assert_vector, bytes, fields, identifier, v41_inception, v50_key_state, v51_inception,
-    v51_key_state, v68_rollover, v69_key_state,
+    V41_ROUTING_SVC, V41_ROUTING_WCF, V41_ROUTING_WIT, V42_DIGEST, V42_IDENTIFIER, V42_PREIMAGE,
+    V47A_COMMITMENT, V47A_POINT, V47B_COMMITMENT, V47B_POINT, V48_ADDRESS, V48_IDENTIFIER,
+    V50_DIGEST, V50_PREIMAGE, V50_SEAL, V50_SEALED_DIGEST, V51_DIGEST, V51_IDENTIFIER,
+    V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE, V51_KEYS, V51_PREIMAGE,
+    V51_ROUTING_DID, V68_DIGEST, V68_PREIMAGE, V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE,
+    V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array, assert_signature, assert_vector, bytes,
+    fields, identifier, v41_inception, v50_key_state, v51_inception, v51_key_state, v68_rollover,
+    v69_key_state,
 };
 
 #[test]
@@ -132,48 +129,6 @@ fn vector_69_compromised_key_state_preimage_digest_and_signature() -> TestResult
     assert_eq!(dropped.condition, KeyCondition::Compromised);
     assert_eq!(dropped.compromised_from, 1);
     assert_signature(V41_ROOT, V69_DIGEST, V69_ROOT_SIGNATURE)
-}
-
-/// The V41 inception's snapshot and its continuation's commitment compose the
-/// key state that inception installs (§9.7.4.2: "A snapshot carries every
-/// component of the key state except the standing commitment"), read
-/// through `replay` over the validated [Vector 41].
-#[test]
-fn vector_41_snapshot_composes_its_key_state() -> TestResult {
-    let entry = |key, role| -> Result<KeyEntry, Box<dyn std::error::Error>> {
-        Ok(KeyEntry {
-            key: array(key)?,
-            role,
-            condition: KeyCondition::Current,
-            compromised_from: 0,
-            custody_type: CustodyType::Passkey,
-            key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
-        })
-    };
-    let expected = KeyState {
-        root_threshold: 1,
-        keys: vec![
-            entry(V41_ROOT, KeyRole::RootMember)?,
-            entry(V41_ACTIVE, KeyRole::Active)?,
-        ],
-        witnesses: vec![identifier(V41_WITNESS)?],
-        witnessing_interval: 3600,
-        service_key_role: KeyRole::Active,
-        delegator: Identifier::ZERO,
-        standing_commitment: StandingCommitment::Fixed(FixedCommitment {
-            commitments: vec![CommitmentEntry {
-                commitment: array(V47A_COMMITMENT)?,
-                custody_type: CustodyType::Passkey,
-                key_algorithm: KeyAlgorithm::EcdsaP256Sha256,
-            }],
-            next_threshold: 1,
-        }),
-    };
-    assert_eq!(
-        replay(&super::chain_valid::chain_of(&super::chain_support::v41()?)?).key_state(),
-        &expected
-    );
-    Ok(())
 }
 
 #[test]

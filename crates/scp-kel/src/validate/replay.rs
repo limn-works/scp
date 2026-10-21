@@ -9,9 +9,9 @@
 //! holds both components at every position, because R3's check order reads
 //! them; replay composes them and never re-reads an event.
 
-use scp_did::{Identifier, KeyState, StandingCommitment};
+use scp_did::{Identifier, KeyCondition, KeyRole, KeyState, StandingCommitment};
 
-use crate::validate::{StandingState, ValidatedChain};
+use super::chain::{StandingState, ValidatedChain};
 
 /// The key state a validated chain derives at one of its positions
 /// (§9.7.4.2 R8), with the identifier and the position it was read at.
@@ -36,19 +36,19 @@ use crate::validate::{StandingState, ValidatedChain};
 /// let state = ReplayedState::default();
 /// ```
 ///
-/// The positive control: [`replay`] over a chain
+/// The positive control: [`replay`] over the one chain of an unforked log
 /// [`validate_entry`](crate::validate_entry) holds yields one.
 ///
 /// ```
 /// # use scp_kel::{EntryVerdict, ReplayedState, replay, validate_entry};
-/// fn replayed(verdict: EntryVerdict) -> Option<ReplayedState> {
+/// fn replayed(verdict: &EntryVerdict) -> Option<ReplayedState> {
 ///     match verdict {
-///         EntryVerdict::Valid { chains } => Some(replay(chains.first())),
+///         EntryVerdict::Valid { chains } => chains.single().map(replay),
 ///         EntryVerdict::InceptionInvalid { .. } | EntryVerdict::NoInception => None,
 ///     }
 /// }
 /// let units: [&[u8]; 0] = [];
-/// assert_eq!(replayed(validate_entry(&scp_did::Identifier::ZERO, &units).verdict), None);
+/// assert_eq!(replayed(&validate_entry(&scp_did::Identifier::ZERO, &units).verdict), None);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayedState {
@@ -58,6 +58,10 @@ pub struct ReplayedState {
     /// Carries the standing commitment as its own field, so the state and
     /// its commitment cannot disagree.
     key_state: KeyState,
+    /// The one `Current` `#active` key, which R3 resolved in the snapshot.
+    active_key: [u8; 33],
+    /// The count of `Current` root members, which R3 bounds.
+    root_count: u32,
 }
 
 impl ReplayedState {
@@ -70,6 +74,8 @@ impl ReplayedState {
                 .snapshot
                 .clone()
                 .into_key_state(standing.commitment.clone()),
+            active_key: standing.resolved.active,
+            root_count: standing.resolved.root_count,
         }
     }
 
@@ -97,6 +103,33 @@ impl ReplayedState {
         &self.key_state
     }
 
+    /// The key state's one `Current` `#active` key. R3 accepts no snapshot
+    /// with none or with two (§9.7.4.2, "more than one key `Current` in any
+    /// operational role"), so every replayed state has exactly one.
+    #[must_use]
+    pub const fn active_key(&self) -> &[u8; 33] {
+        &self.active_key
+    }
+
+    /// The key state's `Current` `RootMember` keys, in the key state's own
+    /// list order.
+    pub fn root_members(&self) -> impl Iterator<Item = &[u8; 33]> {
+        self.key_state
+            .keys
+            .iter()
+            .filter(|entry| {
+                entry.role == KeyRole::RootMember && entry.condition == KeyCondition::Current
+            })
+            .map(|entry| &entry.key)
+    }
+
+    /// How many keys [`root_members`](Self::root_members) yields. R3 bounds
+    /// a root set at `MAX_ROOT_SET_SIZE`, so the count fits a `u32`.
+    #[must_use]
+    pub const fn root_count(&self) -> u32 {
+        self.root_count
+    }
+
     /// The standing commitment: `Fixed` until an abandoning
     /// `CommitmentRollover`, `Abandoned` from that position on (R4, R8).
     #[must_use]
@@ -115,6 +148,11 @@ pub struct NotOnChain {
 
 /// The key state at the chain's head (§9.7.4.2 R8): the head's latest
 /// snapshot with the standing commitment at the head.
+///
+/// `chain` is the chain the verifier adopted. For an unforked log that is
+/// [`ValidChains::single`](crate::ValidChains::single); for a forked log it
+/// is the chain §9.7.4.2 R6's fork choice (SCP-310) picks, and the replay of
+/// any other fork is the state of a chain the verifier did not adopt.
 #[must_use]
 pub fn replay(chain: &ValidatedChain) -> ReplayedState {
     ReplayedState::compose(chain.identifier(), &chain.head_state())
@@ -123,6 +161,8 @@ pub fn replay(chain: &ValidatedChain) -> ReplayedState {
 /// The key state at the chain's event whose preimage digest is `digest`
 /// (§9.7.4.2 R8): that position's latest snapshot with the standing
 /// commitment at that position, whatever events follow it.
+///
+/// `chain` is the adopted chain, as for [`replay`].
 ///
 /// # Errors
 ///

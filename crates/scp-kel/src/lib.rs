@@ -8,7 +8,6 @@ mod error;
 mod event;
 mod event_codec;
 mod preimage;
-mod replay;
 mod routing;
 mod signature;
 mod validate;
@@ -34,7 +33,6 @@ pub use preimage::{
     EncodedPreimage, decode_preimage, derive_identifier, encode_preimage, key_event_seal,
     prerotation_commitment,
 };
-pub use replay::{NotOnChain, ReplayedState, key_state_at, replay};
 pub use routing::{RoutingKind, routing_id};
 pub use signature::{
     AssertionSignature, IndexedSignature, IndexedSignatureError, IndexedSignaturePart,
@@ -43,7 +41,7 @@ pub use signature::{
 pub use validate::{
     ChangeEffect, CheckStep, ContentDefect, Discarded, DistinctList, EntryValidation, EntryVerdict,
     EventDefect, FailureClass, HeldHead, HeldHeadMarker, HeldHeadMarkerError, InceptionDefect,
-    InceptionRefusal, MarkerMode, NamedKey, SignerGroupSpec, SigningChange, SigningRefusal,
-    ThresholdField, ValidChains, ValidatedChain, ValidatedChange, validate_entry,
-    validate_inception,
+    InceptionRefusal, MarkerMode, NamedKey, NotOnChain, ReplayedState, SignerGroupSpec,
+    SigningChange, SigningRefusal, ThresholdField, ValidChains, ValidatedChain, ValidatedChange,
+    key_state_at, replay, validate_entry, validate_inception,
 };

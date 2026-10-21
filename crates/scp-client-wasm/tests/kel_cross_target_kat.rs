@@ -319,11 +319,10 @@ fn chain_verdict(
     let scp_kel::EntryVerdict::Valid { chains } = &validation.verdict else {
         return Err(format!("expected Valid, got {:?}", validation.verdict).into());
     };
-    let mut paths = chains.iter();
-    match (paths.next(), paths.next()) {
-        (Some(chain), None) => Ok((chain.clone(), validation.discarded)),
-        _ => Err(format!("expected one chain, got {chains:?}").into()),
-    }
+    chains
+        .single()
+        .map(|chain| (chain.clone(), validation.discarded))
+        .ok_or_else(|| format!("expected one chain, got {chains:?}").into())
 }
 
 /// `validate_entry` (§9.7.4.2 R3) accepts every spec 25 chain at the head

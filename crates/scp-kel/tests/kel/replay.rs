@@ -15,13 +15,12 @@ use scp_kel::{
     CheckStep, ContentDefect, Continuation, EventDefect, KeyStateSnapshot, NotOnChain,
     ReplayedState, ValidatedChain, key_state_at, replay,
 };
-use sha2::{Digest, Sha256};
 
 use super::chain_support::{
-    Base, Error, Ring, current, digest_of, entry, key_state_on, point, sign_on, signed_of,
+    Base, Error, Ring, Wire, current, digest_of, entry, key_state_on, point, sign_on, signed_of,
     snapshot, v41, v41_changed, v41_v50, v41_v53, v41_v54, v41_v68, v41_v69, vector,
 };
-use super::chain_valid::{chain_of, v51_chain, valid};
+use super::chain_valid::{chain_of, valid};
 use super::fixtures::{
     TestResult, V41_ACTIVE, V41_DIGEST, V41_IDENTIFIER, V41_ROOT, V41_WITNESS, V47A_COMMITMENT,
     V50_DIGEST, V53_DIGEST, V53_PREIMAGE, V54_DIGEST, V54_PREIMAGE, V68_DIGEST, V69_ACTIVE,
@@ -305,51 +304,14 @@ fn key_state_at_refuses_a_digest_off_the_chain() -> TestResult {
     Ok(())
 }
 
-/// The §9.11 key-continuity fingerprint over two replayed states, built here
-/// from the spec text so the scp-kel test needs no scp-protocol edge: each
-/// party's identifier, its `Current` root members in list order with their
-/// `BE32` count, and its one `Current` `#active` key, the lower identifier
-/// first.
-fn continuity(a: &ReplayedState, b: &ReplayedState) -> Result<[u8; 32], Error> {
-    let block = |state: &ReplayedState| -> Result<Vec<u8>, Error> {
-        let current = |role| {
-            state
-                .key_state()
-                .keys
-                .iter()
-                .filter(move |entry| entry.role == role && entry.condition == KeyCondition::Current)
-                .map(|entry| entry.key)
-        };
-        let root: Vec<[u8; 33]> = current(KeyRole::RootMember).collect();
-        let [active] = current(KeyRole::Active).collect::<Vec<_>>()[..] else {
-            return Err("expected one Current #active key".into());
-        };
-        let mut out = state.identifier().as_bytes().to_vec();
-        out.extend_from_slice(&u32::try_from(root.len())?.to_be_bytes());
-        for member in &root {
-            out.extend_from_slice(member);
-        }
-        out.extend_from_slice(&active);
-        Ok(out)
-    };
-    let (lower, higher) = if a.identifier() < b.identifier() {
-        (a, b)
-    } else {
-        (b, a)
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(b"SCP-KEY-CONTINUITY-V1:");
-    hasher.update(block(lower)?);
-    hasher.update(block(higher)?);
-    Ok(hasher.finalize().into())
-}
-
-/// CONF-003 at chain level (§9.7.4.2 R8, §9.11): Vector 41 extended by a
+/// CONF-003 at chain level (§9.7.4.2 R8): Vector 41 extended by a
 /// `KeyState` that Vector 41's root re-signs, installing a new `#active` key
 /// and dropping the old one `Superseded`, replays with the old key
-/// `Superseded` and a changed continuity fingerprint.
+/// `Superseded` and the new one the state's `#active` key. The fingerprint
+/// half of CONF-003 is scp-protocol's `rotation_changes_the_fingerprint`,
+/// over the one §9.11 construction.
 #[test]
-fn conf_003_rotation_replays_superseded_and_changes_the_fingerprint() -> TestResult {
+fn conf_003_rotation_replays_the_old_active_key_superseded() -> TestResult {
     let ring = Ring::new()?;
     let base = v41()?;
     let old_active = array::<33>(V41_ACTIVE)?;
@@ -383,13 +345,95 @@ fn conf_003_rotation_replays_superseded_and_changes_the_fingerprint() -> TestRes
         Some(KeyCondition::Superseded)
     );
     assert_eq!(condition(&after, new_active), Some(KeyCondition::Current));
+    assert_eq!(before.active_key(), &old_active);
+    assert_eq!(after.active_key(), &new_active);
     assert_eq!(after.standing_commitment(), before.standing_commitment());
+    Ok(())
+}
 
-    // The other party: Vector 51's chain, under another identifier.
-    let other = replay(&chain_of(&v51_chain()?)?);
-    let fingerprint_before = continuity(&before, &other)?;
-    let fingerprint_after = continuity(&after, &other)?;
-    assert_ne!(fingerprint_before, fingerprint_after);
-    assert_eq!(fingerprint_after, continuity(&other, &after)?);
+/// Asserts every part of the state `key_state_at` read: Vector 41's
+/// identifier, the position, the composed key state and its commitment,
+/// the `#active` key and the root members with their count.
+fn assert_whole(
+    state: &ReplayedState,
+    (digest, sequence): ([u8; 32], u64),
+    key_state: &KeyState,
+    active: [u8; 33],
+    root: &[[u8; 33]],
+) -> TestResult {
+    assert_eq!(state.identifier(), identifier(V41_IDENTIFIER)?);
+    assert_eq!(state.head_digest(), digest);
+    assert_eq!(state.head_sequence(), sequence);
+    assert_eq!(state.key_state(), key_state);
+    assert_eq!(state.standing_commitment(), &key_state.standing_commitment);
+    assert_eq!(state.active_key(), &active);
+    assert_eq!(state.root_members().copied().collect::<Vec<_>>(), root);
+    assert_eq!(usize::try_from(state.root_count())?, root.len());
+    Ok(())
+}
+
+/// R8 at every position of a three-event chain: Vector 41, then a
+/// `KeyState` that rotates `#active` from A to X and lists A `Superseded`,
+/// then a `KeyState` that rotates X to Y, lists X `Superseded` and omits A.
+/// At each position `key_state_at` reads that position's own snapshot with
+/// the commitment standing there, Vector 41's: the third position does not
+/// carry A forward from the second, and the second is not the head's
+/// state. `replay` is the last position's state.
+#[test]
+fn key_state_at_reads_every_position_of_a_three_event_chain() -> TestResult {
+    let ring = Ring::new()?;
+    let root = array::<33>(V41_ROOT)?;
+    let (a, x, y) = (
+        array::<33>(V41_ACTIVE)?,
+        point("pr4-r8-table-x"),
+        point("pr4-r8-table-y"),
+    );
+    let to_x = snapshot(
+        vec![
+            current(root, KeyRole::RootMember),
+            current(x, KeyRole::Active),
+            entry(a, KeyRole::Active, KeyCondition::Superseded),
+        ],
+        1,
+    )?;
+    let to_y = snapshot(
+        vec![
+            current(root, KeyRole::RootMember),
+            current(y, KeyRole::Active),
+            entry(x, KeyRole::Active, KeyCondition::Superseded),
+        ],
+        1,
+    )?;
+    let first = v41()?;
+    let event = key_state_on(&first, to_x.clone());
+    let second = first.then(
+        &Wire::of(&event).fields(),
+        sign_on(&ring, &first, &event)?,
+        first.root.clone(),
+    );
+    let event = key_state_on(&second, to_y.clone());
+    let third = second.then(
+        &Wire::of(&event).fields(),
+        sign_on(&ring, &second, &event)?,
+        second.root.clone(),
+    );
+    let chain = chain_of(&third)?;
+    assert_eq!(chain.head_digest(), third.head);
+
+    let rows = [
+        ((first.head, 0), v41_key_state()?, a),
+        ((second.head, 1), compose(to_x, v41_commitment()?), x),
+        ((third.head, 2), compose(to_y, v41_commitment()?), y),
+    ];
+    for (position, key_state, active) in &rows {
+        assert_whole(
+            &key_state_at(&chain, &position.0)?,
+            *position,
+            key_state,
+            *active,
+            &[root],
+        )?;
+    }
+    assert_eq!(replay(&chain), key_state_at(&chain, &third.head)?);
     Ok(())
 }

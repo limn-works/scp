@@ -21,131 +21,56 @@
 //! Each party is a [`ReplayedState`]: the key state its validated key event
 //! log replays to (§9.7.4.2 R8), carrying the identifier that log's
 //! inception derives, so no caller pairs an identifier with a key state of
-//! another identity or with a hand-built one.
+//! another identity or with a hand-built one. R3 resolved the state's one
+//! `Current` `#active` key and bounded its root count, and the state carries
+//! both, so the one input §9.11 cannot fingerprint is a pair that names one
+//! identifier twice.
 
 use std::cmp::Ordering;
 
-use scp_did::{Identifier, KeyCondition, KeyRole, KeyState};
+use scp_did::Identifier;
 use scp_kel::ReplayedState;
 use sha2::{Digest, Sha256};
-
-use self::count::RootCount;
 
 /// The §9.11 domain separator, registered in §9.18.2.
 const KEY_CONTINUITY_SEPARATOR: &[u8] = b"SCP-KEY-CONTINUITY-V1:";
 
-/// A pair of inputs §9.11 cannot fingerprint.
+/// Both parties carry one identifier.
 ///
-/// Each variant names the identifier whose key state, or whose pairing, the
-/// construction cannot read; none falls back to a sentinel, because §9.11
-/// states that "no sentinel stands in for an absent operational key".
+/// §9.11 orders the two blocks by identifier, so equal identifiers leave the
+/// order to the caller and two parties could compute two values for one
+/// pair; the fingerprint is also the comparison one person cannot perform
+/// against themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum KeyContinuityError {
-    /// Both parties carry one identifier. §9.11 orders the two blocks by
-    /// identifier, so equal identifiers leave the order to the caller and two
-    /// parties could compute two values for one pair; the fingerprint is also
-    /// the comparison one person cannot perform against themselves.
-    #[error("both parties carry identifier {identifier}")]
-    SameIdentifier {
-        /// The identifier both parties carry.
-        identifier: Identifier,
-    },
-    /// The key state names no `Current` `#active` key, which §9.7.4.2 R3
-    /// rejects and §9.11 fills with no sentinel.
-    #[error("key state of {identifier} names no Current #active key")]
-    NoActiveKey {
-        /// The party whose key state is missing the key.
-        identifier: Identifier,
-    },
-    /// The key state names more than one `Current` `#active` key, which
-    /// §9.7.4.2 R3 rejects ("more than one key `Current` in any operational
-    /// role"), so the construction has no one key to take.
-    #[error("key state of {identifier} names {count} Current #active keys")]
-    MultipleActiveKeys {
-        /// The party whose key state names several keys.
-        identifier: Identifier,
-        /// How many `Current` `#active` entries the key state names.
-        count: usize,
-    },
-    /// The key state names no `Current` root member. §9.7.4.2 R3 rejects a
-    /// threshold outside one to the size of its set, so no accepted key state
-    /// has an empty root set, and §9.11's re-verification reads the current
-    /// root set.
-    #[error("key state of {identifier} names no Current root member")]
-    EmptyRootSet {
-        /// The party whose key state has no root.
-        identifier: Identifier,
-    },
-    /// The root set has more members than `BE32` can count (§9.5.1).
-    #[error("root set of {identifier} has {count} members, more than BE32 counts")]
-    RootSetCountOverflow {
-        /// The party whose root set overflows the count.
-        identifier: Identifier,
-        /// The member count.
-        count: usize,
-    },
+#[error("both parties carry identifier {identifier}")]
+pub struct SameIdentifier {
+    /// The identifier both parties carry.
+    pub identifier: Identifier,
 }
 
-/// One party's block of the §9.11 preimage, read from its key state.
+/// One party's block of the §9.11 preimage: identifier, `BE32` root count,
+/// the `Current` root members in key-state order, the `#active` key.
 struct PartyBlock<'a> {
-    identifier: &'a Identifier,
-    root_count: RootCount,
+    identifier: Identifier,
+    root_count: u32,
     root_members: Vec<&'a [u8; 33]>,
     active: &'a [u8; 33],
 }
 
 impl<'a> PartyBlock<'a> {
-    /// Reads the `Current` root members in list order and the one `Current`
-    /// `#active` key.
-    fn read(
-        (identifier, key_state): (&'a Identifier, &'a KeyState),
-    ) -> Result<Self, KeyContinuityError> {
-        let mut root_members = Vec::new();
-        let mut active = None;
-        let mut active_count = 0usize;
-        for entry in &key_state.keys {
-            if entry.condition != KeyCondition::Current {
-                continue;
-            }
-            match entry.role {
-                KeyRole::RootMember => root_members.push(&entry.key),
-                KeyRole::Active => {
-                    active_count += 1;
-                    active = Some(&entry.key);
-                }
-            }
+    /// The block of a replayed state, read from what R3 resolved in it.
+    fn replayed(state: &'a ReplayedState) -> Self {
+        Self {
+            identifier: state.identifier(),
+            root_count: state.root_count(),
+            root_members: state.root_members().collect(),
+            active: state.active_key(),
         }
-        let active = match (active, active_count) {
-            (Some(key), 1) => key,
-            (None, _) => {
-                return Err(KeyContinuityError::NoActiveKey {
-                    identifier: *identifier,
-                });
-            }
-            (Some(_), count) => {
-                return Err(KeyContinuityError::MultipleActiveKeys {
-                    identifier: *identifier,
-                    count,
-                });
-            }
-        };
-        if root_members.is_empty() {
-            return Err(KeyContinuityError::EmptyRootSet {
-                identifier: *identifier,
-            });
-        }
-        let root_count = RootCount::encode(identifier, root_members.len())?;
-        Ok(Self {
-            identifier,
-            root_count,
-            root_members,
-            active,
-        })
     }
 
     fn feed(&self, hasher: &mut Sha256) {
         hasher.update(self.identifier.as_bytes());
-        hasher.update(self.root_count.bytes());
+        hasher.update(self.root_count.to_be_bytes());
         for member in &self.root_members {
             hasher.update(member);
         }
@@ -153,39 +78,28 @@ impl<'a> PartyBlock<'a> {
     }
 }
 
-/// The root-set count field, sealed in its own module so the one checked
-/// encoder is the only way the preimage gets a count.
-mod count {
-    use scp_did::Identifier;
-
-    use super::KeyContinuityError;
-
-    /// `BE32(count)` of a root set under §9.5.1's repeated-field rule. The
-    /// field is private to this module, so no caller writes an unchecked
-    /// (truncated) count into the preimage.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) struct RootCount([u8; 4]);
-
-    impl RootCount {
-        /// Encodes `count`, refusing one past `u32::MAX` with
-        /// [`KeyContinuityError::RootSetCountOverflow`] naming `identifier`.
-        pub(super) fn encode(
-            identifier: &Identifier,
-            count: usize,
-        ) -> Result<Self, KeyContinuityError> {
-            u32::try_from(count)
-                .map(|n| Self(n.to_be_bytes()))
-                .map_err(|_| KeyContinuityError::RootSetCountOverflow {
-                    identifier: *identifier,
-                    count,
-                })
+/// The §9.11 construction over two parties' blocks: the separator, then the
+/// block of the identifier lower under unsigned byte comparison, then the
+/// other.
+///
+/// # Errors
+///
+/// [`SameIdentifier`] when both blocks carry one identifier.
+fn construction(a: &PartyBlock<'_>, b: &PartyBlock<'_>) -> Result<[u8; 32], SameIdentifier> {
+    let (lower, higher) = match a.identifier.cmp(&b.identifier) {
+        Ordering::Less => (a, b),
+        Ordering::Greater => (b, a),
+        Ordering::Equal => {
+            return Err(SameIdentifier {
+                identifier: a.identifier,
+            });
         }
-
-        /// The four big-endian bytes the preimage carries.
-        pub(super) const fn bytes(self) -> [u8; 4] {
-            self.0
-        }
-    }
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(KEY_CONTINUITY_SEPARATOR);
+    lower.feed(&mut hasher);
+    higher.feed(&mut hasher);
+    Ok(hasher.finalize().into())
 }
 
 /// Computes the §9.11 key-continuity fingerprint of two parties' replayed
@@ -202,54 +116,111 @@ mod count {
 ///
 /// # Errors
 ///
-/// As [`fingerprint_of`]: [`KeyContinuityError::SameIdentifier`] when both
-/// states replay one identity's log, and, naming the party, an error where
-/// its key state does not name exactly one `Current` `#active` key and a
-/// countable, non-empty set of `Current` root members.
+/// [`SameIdentifier`] when both states replay one identity's log. No other
+/// input fails: R3 accepts no key state without exactly one `Current`
+/// `#active` key or with a root set past `MAX_ROOT_SET_SIZE`.
 pub fn compute_key_continuity_fingerprint(
     a: &ReplayedState,
     b: &ReplayedState,
-) -> Result<[u8; 32], KeyContinuityError> {
-    let (id_a, id_b) = (a.identifier(), b.identifier());
-    fingerprint_of((&id_a, a.key_state()), (&id_b, b.key_state()))
-}
-
-/// The §9.11 construction over one identifier and key state per party, the
-/// bytes Vectors 20 and 38 pin.
-///
-/// # Errors
-///
-/// [`KeyContinuityError::SameIdentifier`] when both parties carry one
-/// identifier, and, naming the party, [`KeyContinuityError::NoActiveKey`],
-/// [`KeyContinuityError::MultipleActiveKeys`],
-/// [`KeyContinuityError::EmptyRootSet`] or
-/// [`KeyContinuityError::RootSetCountOverflow`] when its key state does not
-/// name exactly one `Current` `#active` key and a countable, non-empty set of
-/// `Current` root members.
-pub(crate) fn fingerprint_of(
-    a: (&Identifier, &KeyState),
-    b: (&Identifier, &KeyState),
-) -> Result<[u8; 32], KeyContinuityError> {
-    let (lower, higher) = match a.0.cmp(b.0) {
-        Ordering::Less => (a, b),
-        Ordering::Greater => (b, a),
-        Ordering::Equal => return Err(KeyContinuityError::SameIdentifier { identifier: *a.0 }),
-    };
-    let lower = PartyBlock::read(lower)?;
-    let higher = PartyBlock::read(higher)?;
-    let mut hasher = Sha256::new();
-    hasher.update(KEY_CONTINUITY_SEPARATOR);
-    lower.feed(&mut hasher);
-    higher.feed(&mut hasher);
-    Ok(hasher.finalize().into())
+) -> Result<[u8; 32], SameIdentifier> {
+    construction(&PartyBlock::replayed(a), &PartyBlock::replayed(b))
 }
 
 #[cfg(test)]
 mod tests {
     use scp_crypto::p256::{P256SecretKey, SeedLabel};
-    use scp_did::{CustodyType, FixedCommitment, KeyAlgorithm, KeyEntry, StandingCommitment};
+    use scp_did::{
+        CustodyType, FixedCommitment, KeyAlgorithm, KeyCondition, KeyEntry, KeyRole, KeyState,
+        StandingCommitment,
+    };
 
     use super::*;
+
+    /// Why the known-answer path cannot read a hand-built key state. A
+    /// [`ReplayedState`] reaches none of these but [`SameIdentifier`],
+    /// because R3 refuses each of the others; §25's vectors are bare key
+    /// states, so their reader checks what R3 would.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum KeyStateFault {
+        SameIdentifier(SameIdentifier),
+        NoActiveKey {
+            identifier: Identifier,
+        },
+        MultipleActiveKeys {
+            identifier: Identifier,
+            count: usize,
+        },
+        EmptyRootSet {
+            identifier: Identifier,
+        },
+        RootSetCountOverflow {
+            identifier: Identifier,
+            count: usize,
+        },
+    }
+
+    /// The block of a bare key state: its `Current` root members in list
+    /// order and its one `Current` `#active` key.
+    fn read<'a>(
+        (identifier, key_state): (&Identifier, &'a KeyState),
+    ) -> Result<PartyBlock<'a>, KeyStateFault> {
+        let identifier = *identifier;
+        let root_members: Vec<&[u8; 33]> = key_state
+            .keys
+            .iter()
+            .filter(|entry| {
+                entry.role == KeyRole::RootMember && entry.condition == KeyCondition::Current
+            })
+            .map(|entry| &entry.key)
+            .collect();
+        let active: Vec<&[u8; 33]> = key_state
+            .keys
+            .iter()
+            .filter(|entry| {
+                entry.role == KeyRole::Active && entry.condition == KeyCondition::Current
+            })
+            .map(|entry| &entry.key)
+            .collect();
+        let active = match active.as_slice() {
+            [key] => *key,
+            [] => return Err(KeyStateFault::NoActiveKey { identifier }),
+            many => {
+                return Err(KeyStateFault::MultipleActiveKeys {
+                    identifier,
+                    count: many.len(),
+                });
+            }
+        };
+        if root_members.is_empty() {
+            return Err(KeyStateFault::EmptyRootSet { identifier });
+        }
+        let root_count =
+            u32::try_from(root_members.len()).map_err(|_| KeyStateFault::RootSetCountOverflow {
+                identifier,
+                count: root_members.len(),
+            })?;
+        Ok(PartyBlock {
+            identifier,
+            root_count,
+            root_members,
+            active,
+        })
+    }
+
+    /// The §9.11 construction over one bare key state per party, the bytes
+    /// Vectors 20 and 38 pin; the same [`construction`] the public function
+    /// runs.
+    fn fingerprint_of(
+        a: (&Identifier, &KeyState),
+        b: (&Identifier, &KeyState),
+    ) -> Result<[u8; 32], KeyStateFault> {
+        if a.0 == b.0 {
+            return Err(KeyStateFault::SameIdentifier(SameIdentifier {
+                identifier: *a.0,
+            }));
+        }
+        construction(&read(a)?, &read(b)?).map_err(KeyStateFault::SameIdentifier)
+    }
 
     const ID_LOW: Identifier = Identifier::from_bytes([0x10; 32]);
     const ID_HIGH: Identifier = Identifier::from_bytes([0xe0; 32]);
@@ -378,7 +349,9 @@ mod tests {
         let state = current(&[point(1)], point(3));
         assert_eq!(
             fingerprint_of((&ID_LOW, &state), (&ID_LOW, &state)),
-            Err(KeyContinuityError::SameIdentifier { identifier: ID_LOW })
+            Err(KeyStateFault::SameIdentifier(SameIdentifier {
+                identifier: ID_LOW
+            }))
         );
     }
 
@@ -391,7 +364,7 @@ mod tests {
         ]);
         assert_eq!(
             fingerprint_of((&ID_HIGH, &other), (&ID_LOW, &no_active)),
-            Err(KeyContinuityError::NoActiveKey { identifier: ID_LOW })
+            Err(KeyStateFault::NoActiveKey { identifier: ID_LOW })
         );
     }
 
@@ -404,7 +377,7 @@ mod tests {
             .push(entry(point(6), KeyRole::Active, KeyCondition::Current));
         assert_eq!(
             fingerprint_of((&ID_LOW, &other), (&ID_HIGH, &two_active)),
-            Err(KeyContinuityError::MultipleActiveKeys {
+            Err(KeyStateFault::MultipleActiveKeys {
                 identifier: ID_HIGH,
                 count: 2
             })
@@ -420,29 +393,7 @@ mod tests {
         ]);
         assert_eq!(
             fingerprint_of((&ID_LOW, &no_root), (&ID_HIGH, &other)),
-            Err(KeyContinuityError::EmptyRootSet { identifier: ID_LOW })
-        );
-    }
-
-    /// A root set past `u32::MAX` members cannot be built in a test, so the
-    /// count encoder is checked at the boundary directly. `RootCount` has no
-    /// other constructor, so this check covers every count the preimage
-    /// carries.
-    #[cfg(target_pointer_width = "64")]
-    #[test]
-    fn root_count_rejects_count_past_be32() {
-        let past = usize::try_from(u64::from(u32::MAX) + 1).unwrap_or(usize::MAX);
-        assert_eq!(
-            RootCount::encode(&ID_LOW, past),
-            Err(KeyContinuityError::RootSetCountOverflow {
-                identifier: ID_LOW,
-                count: past
-            })
-        );
-        assert_eq!(
-            RootCount::encode(&ID_LOW, usize::try_from(u32::MAX).unwrap_or(0))
-                .map(RootCount::bytes),
-            Ok(u32::MAX.to_be_bytes())
+            Err(KeyStateFault::EmptyRootSet { identifier: ID_LOW })
         );
     }
 
@@ -519,7 +470,8 @@ mod tests {
         };
         use sha2::{Digest, Sha256};
 
-        use super::super::{compute_key_continuity_fingerprint, fingerprint_of};
+        use super::super::{SameIdentifier, compute_key_continuity_fingerprint};
+        use super::fingerprint_of;
 
         type Error = Box<dyn std::error::Error>;
 
@@ -646,7 +598,8 @@ mod tests {
                 Ok(self)
             }
 
-            /// The replay of the one chain `validate_entry` accepts.
+            /// The replay of the one chain of the unforked log
+            /// `validate_entry` accepts.
             fn replayed(&self) -> Result<ReplayedState, Error> {
                 let units: Vec<&[u8]> = self.units.iter().map(Vec::as_slice).collect();
                 let validation = validate_entry(&self.identifier, &units);
@@ -654,7 +607,10 @@ mod tests {
                     return Err(format!("discarded {:?}", validation.discarded).into());
                 }
                 match validation.verdict {
-                    EntryVerdict::Valid { chains } => Ok(replay(chains.first())),
+                    EntryVerdict::Valid { chains } => chains
+                        .single()
+                        .map(replay)
+                        .ok_or_else(|| format!("expected one chain, got {chains:?}").into()),
                     other => Err(format!("expected a valid chain, got {other:?}").into()),
                 }
             }
@@ -669,7 +625,8 @@ mod tests {
             let want = fingerprint_of(
                 (&alice.identifier(), alice.key_state()),
                 (&bob.identifier(), bob.key_state()),
-            )?;
+            )
+            .map_err(|fault| format!("{fault:?}"))?;
             assert_eq!(compute_key_continuity_fingerprint(&alice, &bob), Ok(want));
             assert_eq!(compute_key_continuity_fingerprint(&bob, &alice), Ok(want));
             Ok(())
@@ -684,6 +641,20 @@ mod tests {
             let before = alice.replayed()?;
             let after = alice.rotate(0x54)?.replayed()?;
             assert_eq!(after.head_sequence(), 1);
+            // The rotation supersedes the old `#active` key and leaves the
+            // new one the state's one `Current` `#active` key (R8).
+            let old = after
+                .key_state()
+                .keys
+                .iter()
+                .find(|entry| entry.key == point(0x52))
+                .ok_or("the old #active key is listed after the rotation")?;
+            assert_eq!(
+                (old.role, old.condition),
+                (KeyRole::Active, KeyCondition::Superseded)
+            );
+            assert_eq!(before.active_key(), &point(0x52));
+            assert_eq!(after.active_key(), &point(0x54));
             let before_fp = compute_key_continuity_fingerprint(&before, &bob)?;
             let after_fp = compute_key_continuity_fingerprint(&after, &bob)?;
             assert_ne!(before_fp, after_fp);
@@ -702,7 +673,7 @@ mod tests {
             let after = alice.rotate(0x54)?.replayed()?;
             assert_eq!(
                 compute_key_continuity_fingerprint(&before, &after),
-                Err(super::super::KeyContinuityError::SameIdentifier {
+                Err(SameIdentifier {
                     identifier: before.identifier()
                 })
             );

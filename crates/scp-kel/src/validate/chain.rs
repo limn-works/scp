@@ -26,19 +26,36 @@ pub(super) struct ChainEvent {
     pub(super) commitment: Arc<StandingCommitment>,
     /// The latest snapshot at or before the event.
     pub(super) snapshot: Arc<KeyStateSnapshot>,
+    /// What R3 resolved in that snapshot.
+    pub(super) resolved: ResolvedKeys,
+}
+
+/// What R3's snapshot checks resolve in a snapshot they accept, kept so no
+/// reader of the key state re-derives it fallibly: the one `Current` key in
+/// the service role, which must be `#active`, and the count of `Current`
+/// root members, which R3 bounds at `MAX_ROOT_SET_SIZE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResolvedKeys {
+    /// The one `Current` `#active` key.
+    pub(super) active: [u8; 33],
+    /// The count of `Current` `RootMember` entries.
+    pub(super) root_count: u32,
 }
 
 /// What one position of a valid chain leaves standing, read by
 /// [`replay`](crate::replay) and [`key_state_at`](crate::key_state_at).
-pub struct StandingState<'c> {
+/// Private to the validator: a caller reads a position through those two.
+pub(super) struct StandingState<'c> {
     /// The position's event digest.
-    pub(crate) digest: [u8; 32],
+    pub(super) digest: [u8; 32],
     /// The position's sequence.
-    pub(crate) sequence: u64,
+    pub(super) sequence: u64,
     /// The latest snapshot at or before the position (R8).
-    pub(crate) snapshot: &'c KeyStateSnapshot,
+    pub(super) snapshot: &'c KeyStateSnapshot,
     /// The standing commitment at the position (R8, R4).
-    pub(crate) commitment: &'c StandingCommitment,
+    pub(super) commitment: &'c StandingCommitment,
+    /// What R3 resolved in the snapshot.
+    pub(super) resolved: ResolvedKeys,
 }
 
 impl<'c> StandingState<'c> {
@@ -48,6 +65,7 @@ impl<'c> StandingState<'c> {
             sequence: event.sequence,
             snapshot: &event.snapshot,
             commitment: &event.commitment,
+            resolved: event.resolved,
         }
     }
 }
@@ -80,14 +98,15 @@ impl<'c> StandingState<'c> {
 ///
 /// ```
 /// # use scp_kel::{EntryVerdict, validate_entry};
-/// fn head(verdict: EntryVerdict) -> Option<[u8; 32]> {
+/// # use scp_kel::ValidatedChain;
+/// fn head(verdict: &EntryVerdict) -> Option<[u8; 32]> {
 ///     match verdict {
-///         EntryVerdict::Valid { chains } => Some(chains.first().head_digest()),
+///         EntryVerdict::Valid { chains } => chains.single().map(ValidatedChain::head_digest),
 ///         EntryVerdict::InceptionInvalid { .. } | EntryVerdict::NoInception => None,
 ///     }
 /// }
 /// let units: [&[u8]; 0] = [];
-/// assert_eq!(head(validate_entry(&scp_did::Identifier::ZERO, &units).verdict), None);
+/// assert_eq!(head(&validate_entry(&scp_did::Identifier::ZERO, &units).verdict), None);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedChain {
@@ -187,14 +206,14 @@ impl ValidatedChain {
 
     /// The state standing after the head: R8's latest snapshot and the
     /// standing commitment, which [`replay`](crate::replay) composes.
-    pub(crate) fn head_state(&self) -> StandingState<'_> {
+    pub(super) fn head_state(&self) -> StandingState<'_> {
         StandingState::of(self.head())
     }
 
     /// The state standing after the event whose preimage digest is
     /// `digest`, where that event is on the chain. Digests along one chain
     /// are distinct, because each binds its predecessor's.
-    pub(crate) fn state_at(&self, digest: &[u8; 32]) -> Option<StandingState<'_>> {
+    pub(super) fn state_at(&self, digest: &[u8; 32]) -> Option<StandingState<'_>> {
         std::iter::once(&self.state.inception)
             .chain(&self.state.later)
             .find(|event| event.digest == *digest)

@@ -36,11 +36,10 @@ pub fn valid(
     let EntryVerdict::Valid { chains } = &verdict else {
         return Err(format!("expected Valid, got {verdict:?} with {discarded:?}").into());
     };
-    let mut paths = chains.iter();
-    match (paths.next(), paths.next()) {
-        (Some(chain), None) => Ok((chain.clone(), discarded)),
-        _ => Err(format!("expected one chain, got {chains:?}").into()),
-    }
+    chains
+        .single()
+        .map(|chain| (chain.clone(), discarded))
+        .ok_or_else(|| format!("expected one chain, got {chains:?}").into())
 }
 
 /// The base chain, validated with no discard.

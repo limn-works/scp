@@ -76,11 +76,15 @@ pub struct ValidChains {
 }
 
 impl ValidChains {
-    /// The first path: the inception's first passing successor, and so on
-    /// to a leaf.
+    /// The one chain of an unforked log, or `None` when the log forks.
+    ///
+    /// A forked log has no chain this type can pick: choosing among forks
+    /// is §9.7.4.2 R6's fork choice (SCP-310), which reads more than the
+    /// chains themselves. A caller with a forked log goes through
+    /// [`iter`](Self::iter) and its own fork choice.
     #[must_use]
-    pub const fn first(&self) -> &ValidatedChain {
-        &self.first
+    pub fn single(&self) -> Option<&ValidatedChain> {
+        self.rest.is_empty().then_some(&self.first)
     }
 
     /// Every path, first included.

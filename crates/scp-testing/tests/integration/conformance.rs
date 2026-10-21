@@ -164,9 +164,11 @@ fn conf_002_did_self_certification() {
 fn conf_003_key_rotation() {
     // Stub — see SCP-008 (composing and signing the rotation) and SCP-007
     // (publishing the chain, resolving it again, and the §9.7.1 check of a
-    // message under the retired key). The chain-level part, a re-signed
-    // `KeyState` that replays with the old key `Superseded` and a changed
-    // continuity fingerprint, runs in scp-kel's `tests/kel/replay.rs`.
+    // message under the retired key). The chain-level part runs today: a
+    // re-signed `KeyState` replays with the old key `Superseded` in scp-kel's
+    // `conf_003_rotation_replays_the_old_active_key_superseded`, and the
+    // fingerprint changes across a replayed rotation in scp-protocol's
+    // `rotation_changes_the_fingerprint`.
     // 1. Generate a new P-256 `#active` keypair.
     // 2. Compose a `KeyState` carrying the new key `Current` in the `#active`
     //    role and the old key's `Superseded` drop entry.
