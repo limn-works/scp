@@ -722,7 +722,7 @@ The resolution protocol runs seven steps.
 
 On appending a key event the owner builds the chain from the inception event to the new head, hands that chain to `publish` (§3.10.10), and submits the new head to its witness set. **`publish` and `publish_service_record` each address the publication set, which is the union of the entries the identity's own accepted service record names and the fallback set** (`09-security-model.md` §9.7.4.2 definitions state the fallback set, and §3.10.13 states the record). **A publisher that holds no accepted service record of its own holds a publication set equal to the fallback set**, which is the case at an identity's first publish. **R10's self-observation cadence fetches over that same set**, and `PublishOutcome` carries one entry per member of it (§3.10.10). Without the union the first of the two relay sets §3.10.1 makes a resolver query would be empty for the life of every identity, and step 3 of §3.2.1 would name an act no method performs. **The backend segments per entry**: it reads each entry's declared `max_blob_size` through `read_policy` and splits the chain into contiguous segments each fitting one frame at that entry, then publishes those frames to that entry in sequence order. `18-addressability-and-deployment.md` §18.3.3 states that the value is the relay's own, so one segmentation for the whole publication set costs the publisher every entry that declares a smaller frame. **Where that entry's declared `max_blob_size` admits no segment of the chain** — a segment carries at least one whole event, so a ceiling below one frame's fixed prefix plus one maximal event admits none — **the publisher sends nothing to that entry and records `EntryResult::NotSent { reason: SegmentTooLarge }` for it**, because `PublishOutcome` names every entry of the publication set exactly once (§3.10.10). **`publish` sends each entry only the events that entry does not hold, starting at the first event it lacks**, which the publisher learns by querying the routing id rather than from its own memory of an acknowledgement, because `09-security-model.md` §9.7.4.2 R10's frame-admission rule refuses a frame that repeats a held event. Submission to a witness gates nothing: the event takes effect at each relying party the moment that party resolves the extended chain, and an identity that designates no witness skips that step (`09-security-model.md` §9.7.4.2 R10, §9.7.4.3). **Appending a key event is not the only publication**: `09-security-model.md` §9.7.4.2 R10's self-observation cadence re-reads every entry of the publication set and states which relation carries a publication and what each one publishes.
 
-**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, and `09-security-model.md` §9.10.12 states what a validating relay and a relay that does not validate each do with that flag. **A relay may stop holding such a record on terms its operator declares** (`09-security-model.md` §9.7.4.2 R9), and R10's self-observation cadence is what returns it.
+**A PUBLISH carrying a key-event record, a service record, a cosigned head or a conflict statement sets the wire's `retain` flag**, and `09-security-model.md` §9.10.12 states what a relay does with that flag. **A relay may stop holding such a record on terms its operator declares** (`09-security-model.md` §9.7.4.2 R9), and R10's self-observation cadence is what returns it.
 
 ### 3.10.6 Anti-Segmentation Invariant
 
@@ -773,7 +773,7 @@ impl<S: Storage> Identity<S> {
 }
 ```
 
-**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds, after it refuses a `PendingEvent` whose `chain` ends at a head other than the one this device holds (`09-security-model.md` §9.7.4.2 R10). **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
+**The write API is one method per consequential act on the identity handle, and every event that needs a root threshold goes through one collection flow**: `create`'s inception, `rotate_active` and `set_witnesses`, and the rollover, recovery and abandonment `Recovery::begin` composes. **Under `SignerPlan::ThisSdk` the composing method signs every group with the members this SDK's custody holds, publishes, and returns `EventOutcome::Published` in one call**, refusing with `IdentityError::SignatureSetIncomplete` where those members fall short of a group's threshold. **Under `SignerPlan::Groups` it returns `EventOutcome::AwaitingSignatures`** carrying the unsigned `PendingEvent`, whose preimage binds the signer index list and form list the plan names for each group the kind carries; a group the kind does not carry is empty, and an inception's one group is `installed_root`. **Each holder of a named member, the composer included, calls `Identity::cosign`**, which runs the display confirmation `09-security-model.md` §9.7.4.2 R10's device-boundary paragraph states and returns the `IndexedSignature` of the one member its custody holds, after it refuses a `PendingEvent` whose `chain` ends at a head other than the one this device holds, and refuses with `IdentityError::SignaturePending` an event at a sequence where this device's `PendingSignatureRecord` names a different event (`09-security-model.md` §9.7.4.2 R10). **`Identity::abandon_pending` clears that record** on the composing device when it abandons the `PendingEvent`, and on each cosigner when the application carries the abandonment to it. **`cosign` and `attach` each compute the event digest as SHA-256 of `PendingEvent::preimage` and refuse a `PendingEvent` whose `event_digest` differs with `IdentityError::PendingDigestMismatch`.** **`attach` verifies each signature against its group and index, refuses with `IdentityError::SignatureSetIncomplete` where a group falls short of the plan, publishes the signed event, and returns the cycle's `PublishOutcome`**; for a reveal-authorized event it runs R10's ceremony from the `Signed` write through the removal. The application carries a `PendingEvent` and each `IndexedSignature` between the holders' devices, and the protocol defines no transport for them. `Identity::create` composes the inception event and returns the handle beside the flow's outcome. `rotate_active` composes a `KeyState` that installs a fresh `#active` key, and its `RotationReason` decides the replaced key's condition: `Routine` drops it as `Superseded`, and `Compromised` drops it as `Compromised{from: N}`, where N is the rotating event's own sequence. `set_witnesses` composes a `KeyState` that names the witness set and its witnessing interval. Every composing method refuses a threshold that breaks `09-security-model.md` §9.7.4.1's quorum-overlap rule. `Recovery::begin` (R10) composes the reveal-authorized events, and a compromised root member leaves the root set under a `RootRecovery`, because a `KeyState` drops no root member (R3).
 
 ```rust
 impl<S: EncryptedStorage> Identity<S> {
@@ -801,6 +801,13 @@ impl<S: EncryptedStorage> Identity<S> {
 
     pub fn attach(&self, pending: PendingEvent, signatures: Vec<IndexedSignature>)
         -> impl Future<Output = Result<PublishOutcome, IdentityError>> + Send;
+
+    /// Called on the composing device when it abandons a `PendingEvent`, and
+    /// on a cosigner when the application carries that abandonment to it:
+    /// clears the `PendingSignatureRecord` naming `pending.event_digest`
+    /// (`09-security-model.md` §9.7.4.2 R10).
+    pub fn abandon_pending(custody: &KeyCustodySlot, pending: &PendingEvent)
+        -> Result<(), IdentityError>;
 }
 
 /// The members that sign one group, each by root-set or next-set index and
@@ -913,7 +920,7 @@ pub trait IdentityBackend: Send + Sync {
 }
 
 /// The error half of this trait's six methods and of the three recovery entry
-/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries nineteen
+/// points `09-security-model.md` §9.7.4.2 R10 declares. The type carries twenty
 /// variants and no others. A refusal the protocol mandates carries one of these
 /// variants, so four bindings mint one code rather than four and a caller tells
 /// a custody choice from a network condition. **The identity half's one refusal reaches a caller through
@@ -997,7 +1004,9 @@ pub enum IdentityError {
     /// time.
     CustodyRequired,
     /// SCP-IDENT-1117. The candidate key event fails R3's check order, or R2
-    /// for an inception, at `stage`, so no device signs it
+    /// for an inception, at `stage`, so no device signs it; or the recovery
+    /// ceremony's confirm check found the signed event's copy failing at a
+    /// step other than step 8, so the ceremony destroyed nothing
     /// (`09-security-model.md` §9.7.4.2 R10).
     IllegalKeyEvent { stage: CheckStep },
     /// SCP-IDENT-1118. The chain a signing device was handed ends at
@@ -1005,6 +1014,11 @@ pub enum IdentityError {
     /// signature would fork the identity's own chain
     /// (`09-security-model.md` §9.7.4.2 R10).
     SigningBaseStale { handed_head: [u8; 32], held_head: [u8; 32] },
+    /// SCP-IDENT-1119. The device holds a `PendingSignatureRecord` naming
+    /// `event_digest` at `sequence`, and the candidate is a different event at
+    /// that sequence, so a signature would fork the identity's own chain until
+    /// the record clears (`09-security-model.md` §9.7.4.2 R10).
+    SignaturePending { sequence: u64, event_digest: [u8; 32] },
 }
 
 /// The step of `09-security-model.md` §9.7.4.2 R3's check order at which an
@@ -1013,10 +1027,17 @@ pub enum IdentityError {
 /// second half is the verdict `Invalid` and is never a discard.
 pub enum CheckStep { Unit, Separator, InceptionBinding, Header, Walk, Threshold, Content, Signatures }
 
-/// The head a device that holds a key-event member last adopted or signed,
-/// persisted at `HELD_HEAD_MARKER_BYTES` (`09-security-model.md` §9.18.17)
-/// and read by §9.7.4.2 R10's signing rule.
+/// The head a device that holds a key-event member last adopted, and never
+/// an event it signed and has not adopted, persisted at
+/// `HELD_HEAD_MARKER_BYTES` (`09-security-model.md` §9.18.17) and read by
+/// §9.7.4.2 R10's signing rule.
 pub struct HeldHeadMarker { pub identifier: Identifier, pub sequence: u64, pub event_digest: [u8; 32] }
+
+/// An event that is not reveal-authorized, which a device signed and has not
+/// adopted, persisted at `PENDING_SIGNATURE_RECORD_BYTES`
+/// (`09-security-model.md` §9.18.17). §9.7.4.2 R10's signing rule states the
+/// four ways it clears.
+pub struct PendingSignatureRecord { pub identifier: Identifier, pub sequence: u64, pub event_digest: [u8; 32] }
 
 /// One relay entry's declared write policy, as that entry publishes it at
 /// `.well-known/scp`. **The type carries three fields and no others**, which
@@ -1229,9 +1250,15 @@ pub struct ResolutionOutcome {
 /// chain derived, and the instant of the resolution. Only the verdict
 /// classifier constructs it, on `Confirmed` or `Adopted`, so every
 /// verification decision that reads key state reads one a resolution accepted.
-pub struct ResolvedState { /* the replayed state and the resolution instant; private */ }
+pub struct ResolvedState { /* the replayed state, the identifier, the head's digest and sequence, and the resolution instant; private */ }
 
 impl ResolvedState {
+    /// The identifier the resolved chain's inception recomputes to.
+    pub fn identifier(&self) -> &Identifier;
+    /// The preimage digest of the resolved chain's head event.
+    pub fn head_digest(&self) -> [u8; 32];
+    /// The sequence of the resolved chain's head event.
+    pub fn head_sequence(&self) -> u64;
     pub fn key_state(&self) -> &KeyState;
     pub fn standing_commitment(&self) -> &StandingCommitment;
     /// False once `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`
@@ -1251,7 +1278,8 @@ pub struct FixedCommitment { pub commitments: Vec<CommitmentEntry>, pub next_thr
 
 /// The read-only record a binding returns for a `ResolvedState`. Its fields
 /// are private, and its one constructor is `From<&ResolvedState>` in
-/// `crates/scp-ffi/common`.
+/// `crates/scp-ffi/common`, which reads each field from the `ResolvedState`
+/// accessor of the same name.
 pub struct KeyStateView {
     identifier: Identifier,
     head_digest: [u8; 32],
@@ -1563,7 +1591,7 @@ signature = P256_ECDSA_sign(private_key, signed_bytes)   // nonce and low-s per 
 **Signing key and signing identity:**
 
 - `#active` — the identity's one operational signing key (`09-security-model.md` §9.7.4.2 definitions). A human identity signs an SCPID response under it, and the custody substrate holding it supplies whatever local gate it offers, such as a biometric prompt.
-- A delegated agent identity signs its own SCPID responses under its own `#active`. A relying party tells an agent from a human by the responding identifier and never by a fragment, because a delegated identity's key state names the delegator that anchors it (`09-security-model.md` §9.7.4.2 definitions). The delegation model states how a verifier checks that anchor, and it is unspecified as of 2026-09-10 (`00-open-questions.md`), so a verifier rejects every chain that claims delegation and no delegated agent identity resolves today.
+- A delegated agent identity signs its own SCPID responses under its own `#active`. A relying party tells an agent from a human by the responding identifier and never by a fragment, because a delegated identity's key state names the delegator that anchors it (`09-security-model.md` §9.7.4.2 definitions). The delegation model states how a verifier checks that anchor, and it is unspecified as of 2026-09-10 (`00-open-questions.md`), so `09-security-model.md` §9.7.4.2 R3 makes `Invalid` every identifier whose inception names a nonzero delegator, and discards every later event that names one, so no delegated agent identity resolves today.
 
 ### 3.11.4 Verification Procedure
 
