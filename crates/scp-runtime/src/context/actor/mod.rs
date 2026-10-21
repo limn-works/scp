@@ -1789,6 +1789,123 @@ mod tests {
         );
     }
 
+    /// Ingests `member`'s v2 announcement at `pseudonym_epoch` through the
+    /// real in-order ingest path.
+    async fn ingest_v2_announcement(
+        state: &mut state::PerContextState,
+        deps: &deps::ActorDeps,
+        ctx_byte: u8,
+        member: &str,
+        sequence: u64,
+        pseudonym_epoch: u64,
+        routing_id: [u8; 32],
+    ) -> Result<bool, ContextError> {
+        use scp_protocol::context::pseudonym::{
+            PSEUDONYM_ANNOUNCEMENT_V2_TAG, PseudonymAnnouncementV2,
+        };
+        let ctx = ctx_hex(ctx_byte);
+        let plaintext = rmp_serde::to_vec_named(&PseudonymAnnouncementV2 {
+            tag: PSEUDONYM_ANNOUNCEMENT_V2_TAG.to_owned(),
+            member_did: member.to_owned(),
+            pseudonym_epoch,
+            routing_id,
+        })
+        .expect("serialize v2 announcement");
+        let inner = minimal_inner(&ctx, member, sequence);
+        let mut downward_auth_applied: Option<crate::context::actor::class_s::ClassSCommitToken> =
+            None;
+        crate::context::messaging_helpers::deliver_message_and_drain_buffered(
+            &mut crate::context::actor::class_s::ClassCMut::from_state(state),
+            deps,
+            &ctx,
+            &[ctx_byte; 32],
+            member,
+            &inner,
+            &plaintext,
+            true,
+            &mut downward_auth_applied,
+        )
+        .await
+    }
+
+    /// Spec 09 §9.10.4.1 "Record lifetime": once a member processes a Commit
+    /// another member committed to remove a DID, that DID's record is gone, so
+    /// the DID's v2 announcement at a lower epoch than the one recorded before
+    /// the removal is accepted. Before the removal the same announcement is
+    /// rejected by the ordering criterion, so the deletion is what admits it.
+    #[tokio::test]
+    async fn a_processed_removal_admits_the_rejoiners_lower_epoch_announcement() {
+        use crate::context::actor::pseudonym_rotation::{ProcessedCommit, note_processed_commit};
+        use scp_protocol::context::pseudonym::CommitMembershipChange;
+        use scp_protocol::context::roles::Capability;
+
+        const LOCAL: &str = "did:dht:z6MkLocalDirect";
+        let deps = new_test_deps().await;
+        // DIRECT_BOB is the peer that leaves and rejoins.
+        let mut state = writable_encrypted_state(0x35, DIRECT_BOB);
+        state.membership.add_member(
+            scp_did::DID(LOCAL.to_owned()),
+            "member".to_owned(),
+            Vec::new(),
+        );
+        state.members.insert(scp_did::DID(LOCAL.to_owned()));
+        state.role_state.members.insert(LOCAL.to_owned());
+        state.role_state.member_capabilities.insert(
+            LOCAL.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
+
+        assert!(
+            ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 1, 1, [0x51; 32])
+                .await
+                .expect("the epoch-1 announcement is accepted")
+        );
+        let rejected =
+            ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 2, 0, [0x50; 32]).await;
+        assert!(
+            matches!(rejected, Err(ContextError::PermissionDenied(_))),
+            "a lower epoch over a recorded epoch is rejected; got {rejected:?}"
+        );
+
+        note_processed_commit(
+            &mut state,
+            LOCAL,
+            &ProcessedCommit {
+                committer_did: DIRECT_ALICE.to_owned(),
+                change: CommitMembershipChange {
+                    added_dids: Vec::new(),
+                    removed_dids: vec![DIRECT_BOB.to_owned()],
+                },
+            },
+        );
+        let registry = state.routing.peer_registry().expect("encrypted ⇒ registry");
+        assert!(!registry.contains_key(&scp_did::DID(DIRECT_BOB.to_owned())));
+        // Spec 07 §7.3.1.1 step 3: the unverified leaf diff leaves the
+        // membership and role state alone, so the DID stays a member here
+        // and only the record deletion changes what is admitted. This test
+        // is therefore no evidence for the rejoin clause of PUSH-030 AC2,
+        // which waits on the verified leaves of SCP-330.
+        assert!(state.membership.contains(DIRECT_BOB));
+        assert!(
+            state
+                .role_state
+                .member_has_capability(DIRECT_BOB, &Capability::MessagesWrite)
+        );
+        assert!(
+            ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 3, 0, [0x52; 32])
+                .await
+                .expect("the rejoiner's epoch-0 announcement is accepted")
+        );
+        let record = state
+            .routing
+            .peer_registry()
+            .expect("encrypted ⇒ registry")
+            .get(&scp_did::DID(DIRECT_BOB.to_owned()))
+            .copied()
+            .map(|r| (r.routing_id, r.epoch));
+        assert_eq!(record, Some(([0x52; 32], Some(0))));
+    }
+
     /// `ContextActor::new` constructs an actor that owns `PerContextState`
     /// + `ActorDeps` directly and routes commands through the state-owning
     /// `dispatch_state` path. This test asserts the struct is constructible

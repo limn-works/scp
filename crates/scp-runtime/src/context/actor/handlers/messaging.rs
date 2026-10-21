@@ -325,9 +325,9 @@ fn handle_inspect_incoming_inner(
     // change — only the intrinsic MLS decryption-ratchet advance.
     let (outcome, reply_result) = match cs.open(&context_id_bytes, context_id, envelope_bytes) {
         Ok(OpenResult::Application(env)) => (Outcome::ok_mutated(()), Ok(env.inner)),
-        Ok(OpenResult::Control) => {
+        Ok(OpenResult::Commit { .. } | OpenResult::Control) => {
             let err = ContextError::CryptoFailed(
-                "open_inner_envelope: blob decoded to Control, not an application envelope"
+                "open_inner_envelope: blob decoded to a Commit or Proposal, not an application envelope"
                     .to_string(),
             );
             (Outcome::ok_mutated(()), Err(err))
@@ -832,6 +832,12 @@ async fn handle_deliver_incoming(
     // Drop-guard PANIC in debug/CI, so a missed discharge cannot slip through.
     let mut downward_auth_obligation: Option<crate::context::actor::class_s::ClassSCommitToken> =
         None;
+    // Spec 09 §9.10.4.1: a Commit another member committed, with its
+    // membership changes counted by DID. `deliver_incoming` fills it; the
+    // registry deletion and rotation trigger it owes are Class-S, so they are
+    // applied below through a fail-closed commit once the view drops.
+    let mut processed_commit: Option<crate::context::actor::pseudonym_rotation::ProcessedCommit> =
+        None;
     // Coalesced Class-C mutation (the run loop persists on `mutated`); the receive
     // cascade reaches its Class-C fields through the non-persisting `class_c_view`
     // (sequence/reorder/receive buffers, membership[read], role[read], routing,
@@ -848,6 +854,7 @@ async fn handle_deliver_incoming(
                 context_id,
                 envelope_bytes,
                 &mut downward_auth_obligation,
+                &mut processed_commit,
             )
             .await
         };
@@ -891,6 +898,30 @@ async fn handle_deliver_incoming(
         )
         .await;
     }
+
+    // Spec 09 §9.10.4.1 "Membership trigger" and "Record lifetime": the merged
+    // Commit's rotation trigger and registry-record deletions reach the actor
+    // state through a fail-closed, keep-direction commit, the rule every
+    // commit-path persist follows. The MLS group has already merged the Commit,
+    // so they are never rolled back: on persist failure they stay in memory for
+    // the next persist and the durability error replaces the reply.
+    // `deliver_incoming` fills `processed_commit` only on the arm that returns
+    // `Ok(DeliverOutcome::Handled)` at once, so `reply_result` is `Ok` here and
+    // no delivery error can be lost.
+    let reply_result = if let Some(commit) = processed_commit.take() {
+        cell.commit_class_s_keep(deps, context_id, |mut v| {
+            crate::context::actor::pseudonym_rotation::note_processed_commit(
+                v.rest_mut(),
+                deps.crypto.local_did(),
+                &commit,
+            );
+            Ok(())
+        })
+        .await
+        .and(reply_result)
+    } else {
+        reply_result
+    };
 
     // Fail-closed persist of an applied downward-auth mutation (ADR-049 §9,
     // keep-direction): the mutation (suspension or `AssignRole` demotion) is

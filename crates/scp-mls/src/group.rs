@@ -1038,6 +1038,113 @@ pub fn remove_member(
     })
 }
 
+/// The result of resetting a member: one Commit that removes the member's
+/// leaf and adds a fresh leaf of the same DID, and the Welcome for that leaf.
+pub struct ResetMemberResult {
+    /// The Commit TLS-serialized before the merge. Every member but the reset
+    /// one processes it; it is the only Commit the reset produces.
+    pub commit_bytes: Vec<u8>,
+    /// The Welcome for the fresh leaf, TLS-serialized before the merge.
+    pub welcome_bytes: Vec<u8>,
+    /// The group info, TLS-serialized before the merge, when openmls made one.
+    pub group_info_bytes: Option<Vec<u8>>,
+    /// The DID both the removed and the added leaf name.
+    pub admitted_did: String,
+    /// The tree's leaves after the Commit, computed before the merge.
+    pub members: crate::admission::MemberLeaves,
+}
+
+/// Resets a member: removes the leaf at `leaf_index` and adds a leaf from
+/// `key_package` in ONE Commit.
+///
+/// Spec 07 §7.3.1.1 step 1.6: `ResetMember` for X carries one Remove of X's
+/// leaf and one Add of a leaf that binds X; ADR-066 decision 11: no action
+/// spans two Commits.
+///
+/// The key package passes the adder's checks of [`add_member`] before openmls
+/// builds anything, and its credential DID must equal the DID of the leaf it
+/// replaces, so a reset cannot swap one identity's leaf for another's. Every
+/// check runs before the Commit is staged; a refusal leaves the epoch
+/// unchanged.
+///
+/// # Errors
+///
+/// - [`MlsError::AddMemberFailed`] if the key package fails validation, or
+///   openmls cannot build the Commit;
+/// - [`MlsError::InvalidCredential`], [`MlsError::ExtensionError`] or
+///   [`MlsError::LeafAdmissionRejected`] if the key package's leaf fails SCP
+///   admission;
+/// - [`MlsError::MemberNotFound`] if no leaf occupies `leaf_index`;
+/// - [`MlsError::InvalidCredential`] if the key package names a DID other
+///   than the removed leaf's;
+/// - [`MlsError::GroupDestroyed`] if the group has been destroyed;
+/// - any admission or serialization error of the staged Commit, after which
+///   the pending Commit is cleared and the epoch is unchanged;
+/// - [`MlsError::MergePendingCommitFailed`] if committing fails.
+pub fn reset_member(
+    group: &mut ScpMlsGroup,
+    leaf_index: LeafNodeIndex,
+    key_package: KeyPackageIn,
+    clock: &dyn Clock,
+) -> Result<ResetMemberResult, MlsError> {
+    let verified_key_package = key_package
+        .validate(group.provider.crypto(), ProtocolVersion::Mls10)
+        .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
+    let admitted = crate::admission::admit_added_leaf(
+        &verified_key_package,
+        crate::admission::LifetimeCheck::Adder(clock),
+    )?;
+
+    let signer = group.signer.as_ref().ok_or(MlsError::GroupDestroyed)?;
+    let g = group.group.as_mut().ok_or(MlsError::GroupDestroyed)?;
+
+    let removed = g
+        .member_at(leaf_index)
+        .ok_or_else(|| MlsError::MemberNotFound(leaf_index.u32()))?;
+    let removed_basic = BasicCredential::try_from(removed.credential).map_err(|e| {
+        MlsError::CredentialSerializationFailed(format!("extracting BasicCredential: {e}"))
+    })?;
+    let removed_did = ScpCredential::from_bytes(removed_basic.identity())?.did;
+    if removed_did != admitted.did {
+        return Err(MlsError::InvalidCredential(format!(
+            "a reset of {removed_did} cannot add a leaf of {}",
+            admitted.did
+        )));
+    }
+
+    // One Commit holding the Remove and the Add. The Commit is pending, not
+    // merged, and may also carry proposals openmls held from earlier messages.
+    let messages = g
+        .swap_members(
+            &group.provider,
+            signer,
+            core::slice::from_ref(&leaf_index),
+            core::slice::from_ref(&verified_key_package),
+        )
+        .map_err(|e| MlsError::AddMemberFailed(e.to_string()))?;
+
+    let (admission, (commit_bytes, welcome_bytes, group_info_bytes)) =
+        admit_and_merge_own_commit(group, clock, || {
+            Ok((
+                serialize_out(&messages.commit, "reset commit")?,
+                serialize_out(&messages.welcome, "reset welcome")?,
+                messages
+                    .group_info
+                    .as_ref()
+                    .map(|gi| serialize_out(gi, "reset group info"))
+                    .transpose()?,
+            ))
+        })?;
+
+    Ok(ResetMemberResult {
+        commit_bytes,
+        welcome_bytes,
+        group_info_bytes,
+        admitted_did: admitted.did,
+        members: admission.members,
+    })
+}
+
 /// Destroys all MLS group state.
 ///
 /// After destruction, the group cannot be used for any operation. All tree

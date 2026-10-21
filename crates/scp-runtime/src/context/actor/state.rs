@@ -1526,6 +1526,37 @@ fn empty_role_state_for_test() -> ContextRoleState {
 }
 
 impl PerContextState {
+    /// Tears down every per-DID record of a member that leaves the context
+    /// (spec §5.6.1): the membership entry, all role state, the access key
+    /// (§9.17.2), the read-exclusion entry (§9.17), the pseudonym routing
+    /// record (§9.10.4), and the receive sequence tracker and reorder buffer
+    /// (§9.8.2, §9.8.5), so a rejoiner's sequence, which restarts at 1, is not
+    /// refused as a regression. The committed removal and the committed leave
+    /// both tear down through this one function, so neither can keep part of a
+    /// departed member's state. A processed peer Commit never calls it: its
+    /// MLS leaf diff is unverified, and a receiver changes membership and role
+    /// state only from the verified governance leaves of spec 07 §7.3.1.1 step
+    /// 3 (story SCP-330), so
+    /// [`note_processed_commit`](crate::context::actor::pseudonym_rotation::note_processed_commit)
+    /// deletes only the registry record. Returns whether
+    /// the membership held `did`. Call it inside the fail-closed
+    /// `commit_class_s_keep` that persists the removal (ADR-049 §9).
+    pub(crate) fn remove_member_state(&mut self, context_id: &str, did: &DID) -> bool {
+        let was_member = self.membership.remove_member(did.as_ref());
+        self.members.remove(did);
+        self.role_state.remove_member(did.as_ref());
+        self.access
+            .access_key_store
+            .remove(context_id, did.as_ref());
+        self.access.read_exclusion_list.remove(did);
+        if let Some(registry) = self.routing.peer_registry_mut() {
+            registry.remove(did);
+        }
+        self.sequence_tracker.reset_sender(context_id, did.as_ref());
+        self.reorder_buffer.clear_sender(context_id, did.as_ref());
+        was_member
+    }
+
     /// Read-only view of the staged cross-context saga slot
     /// (`ClassSState::saga_pending`). A `pub` accessor (the field itself is
     /// `pub(crate)` on the Class-S sub-struct) so the SDK-visible shape
@@ -1899,15 +1930,19 @@ impl ContextCryptoState {
                 })))
             }
             scp_mls::encrypt::DecryptedContent::Commit {
-                sender_did: _,
+                sender_did,
                 members,
+                leaf_dids,
             } => {
                 // `scp-mls` admitted the Commit on its post-commit tree and
                 // merged it. The cache follows that tree: a removed member
                 // leaves it, a rotated key replaces the cached one, and an
                 // uncached DID stays uncached.
                 self.follow_tree(&members, &[]);
-                Ok(OpenResult::Control)
+                Ok(OpenResult::Commit {
+                    committer_did: sender_did,
+                    leaf_dids,
+                })
             }
             scp_mls::encrypt::DecryptedContent::Proposal { sender_did: _ } => {
                 Ok(OpenResult::Control)
@@ -2610,31 +2645,7 @@ impl PerContextState {
             ContextError::CryptoFailed("no MLS group for this context".to_string())
         })?;
 
-        // Find the member's leaf index by matching their DID in the SCP
-        // credential embedded in each member's MLS leaf node.
-        let members = mls_group
-            .members()
-            .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
-
-        let own_index = mls_group
-            .own_leaf_index()
-            .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
-
-        let mut target_index = None;
-        for member in &members {
-            if member.index == own_index {
-                continue;
-            }
-            if let Ok(basic_cred) =
-                openmls::prelude::BasicCredential::try_from(member.credential.clone())
-                && let Ok(scp_cred) =
-                    scp_mls::credential::ScpCredential::from_bytes(basic_cred.identity())
-                && scp_cred.did == member_did
-            {
-                target_index = Some(member.index);
-                break;
-            }
-        }
+        let target_index = peer_leaf_index(mls_group, member_did)?;
 
         // If the member is not in the MLS group, treat as a no-op — the
         // membership state is authoritative elsewhere; crypto only manages MLS.
@@ -2654,6 +2665,73 @@ impl PerContextState {
         Ok(RemoveMemberOutput {
             commit_bytes: result.commit_bytes,
             group_info_bytes: result.group_info_bytes.unwrap_or_default(),
+        })
+    }
+
+    /// Resets `member_did`: one MLS Commit that removes its leaf and adds a
+    /// leaf from `key_package_bytes` (spec 07 §7.3.1.1 step 1.6; ADR-066
+    /// decision 11), built by [`scp_mls::group::reset_member`]. Returns the
+    /// Commit for the remaining members and the Welcome for the fresh leaf.
+    ///
+    /// # Errors
+    ///
+    /// Every error leaves the epoch, the tree and the wrapping-key cache
+    /// unchanged, except a failed merge:
+    ///
+    /// - [`ContextError::InvalidKeyPackage`] when no key package is supplied,
+    ///   or the supplied one is malformed or names a DID other than
+    ///   `member_did`;
+    /// - [`ContextError::MembershipFailed`] when `member_did` is the local
+    ///   member (a committer cannot remove its own leaf);
+    /// - [`ContextError::MemberNotFound`] when `member_did` holds no leaf;
+    /// - [`ContextError::CryptoFailed`] on a mode or group mismatch, an
+    ///   admission refusal, or any MLS failure.
+    pub(crate) fn reset_member(
+        &mut self,
+        local_did: &str,
+        member_did: &str,
+        key_package_bytes: Option<&[u8]>,
+        clock: &dyn Clock,
+    ) -> Result<AddMemberOutput, ContextError> {
+        use openmls::prelude::ProtocolVersion;
+
+        let bytes = key_package_bytes.ok_or_else(|| {
+            ContextError::InvalidKeyPackage(format!(
+                "a reset of {member_did} needs a key package for its new leaf"
+            ))
+        })?;
+        if member_did == local_did {
+            return Err(ContextError::MembershipFailed(
+                "a committer cannot reset its own leaf".to_owned(),
+            ));
+        }
+        let kp_in = scp_mls::wire::parse_key_package_in(bytes).map_err(|e| {
+            ContextError::InvalidKeyPackage(format!("key package deserialization: {e}"))
+        })?;
+        let credential_did =
+            scp_mls::group::key_package_in_did(&kp_in, ProtocolVersion::Mls10, clock)
+                .map_err(|e| ContextError::InvalidKeyPackage(e.to_string()))?;
+        if credential_did != member_did {
+            return Err(ContextError::InvalidKeyPackage(format!(
+                "key package credential names '{credential_did}', not the reset member '{member_did}'"
+            )));
+        }
+
+        let crypto = self.encrypted_crypto_mut()?;
+        let mls_group = crypto.mls_group.as_mut().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        let leaf_index = peer_leaf_index(mls_group, member_did)?
+            .ok_or_else(|| ContextError::MemberNotFound(member_did.to_owned()))?;
+
+        let result = scp_mls::group::reset_member(mls_group, leaf_index, kp_in, clock)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        // The merge was the last fallible step; the cache follows the tree.
+        crypto.follow_tree(&result.members, &[result.admitted_did.as_str()]);
+
+        Ok(AddMemberOutput {
+            welcome_bytes: result.welcome_bytes,
+            commit_bytes: result.commit_bytes,
         })
     }
 
@@ -3132,6 +3210,33 @@ impl PerContextState {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// The leaf index of `member_did` in `mls_group`, other than the local leaf,
+/// matched by the DID in each leaf's SCP credential; `None` when it holds no
+/// other leaf.
+fn peer_leaf_index(
+    mls_group: &scp_mls::group::ScpMlsGroup,
+    member_did: &str,
+) -> Result<Option<openmls::prelude::LeafNodeIndex>, ContextError> {
+    let members = mls_group
+        .members()
+        .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
+    let own_index = mls_group
+        .own_leaf_index()
+        .map_err(|e: scp_mls::error::MlsError| ContextError::CryptoFailed(e.to_string()))?;
+    Ok(members
+        .iter()
+        .filter(|member| member.index != own_index)
+        .find(|member| {
+            openmls::prelude::BasicCredential::try_from(member.credential.clone())
+                .ok()
+                .and_then(|basic| {
+                    scp_mls::credential::ScpCredential::from_bytes(basic.identity()).ok()
+                })
+                .is_some_and(|cred| cred.did == member_did)
+        })
+        .map(|member| member.index))
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -4339,13 +4444,13 @@ mod crypto_ops_golden {
                 .to_bytes()
                 .unwrap();
         match bob_a.open(CTX_STR, &outer).unwrap() {
-            OpenResult::Control => {}
-            other => panic!("expected Control, got {other:?}"),
+            OpenResult::Commit { committer_did, .. } => assert_eq!(committer_did, ALICE),
+            other => panic!("expected a Commit, got {other:?}"),
         }
         assert_eq!(cached_key(&bob_a, ALICE), Some(new_key));
     }
 
-    /// `open` of `commit` by `state`, which must yield a control message.
+    /// `open` of `commit` by `state`, which must yield a Commit.
     fn open_commit(state: &mut PerContextState, ctx: &[u8; 32], commit: Vec<u8>) {
         let outer =
             scp_protocol::envelope::outer::create_outer_envelope(&routing(ctx), None, 300, commit)
@@ -4353,8 +4458,8 @@ mod crypto_ops_golden {
                 .to_bytes()
                 .unwrap();
         match state.open(CTX_STR, &outer).unwrap() {
-            OpenResult::Control => {}
-            other => panic!("expected Control, got {other:?}"),
+            OpenResult::Commit { .. } => {}
+            other => panic!("expected a Commit, got {other:?}"),
         }
     }
 

@@ -506,3 +506,8 @@ mod agent_binding_pipeline_tests;
 // Runtime pseudonym-rotation tests (spec 09 §9.10.4.1), also `#![cfg(test)]`.
 #[cfg(test)]
 mod pseudonym_rotation_runtime_tests;
+
+// Receive-side and reset tests for a membership Commit (spec 07 §7.3.1.1,
+// story PUSH-030), also `#![cfg(test)]`.
+#[cfg(test)]
+mod processed_commit_tests;

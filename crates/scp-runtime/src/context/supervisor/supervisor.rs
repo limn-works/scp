@@ -27323,6 +27323,10 @@ mod tests {
                 &ctx_bytes,
                 msg,
             ))
+            .map(|dispatched| match dispatched {
+                crate::context::messaging_helpers::Dispatched::Envelope(env) => Some(*env),
+                _ => None,
+            })
         };
 
         // The gate `deliver_incoming` runs once the inner envelope verifies.
@@ -27489,7 +27493,13 @@ mod tests {
                 &blob,
             ))
             .expect("Bob merges the add-Carol Commit");
-        assert!(opened.is_none(), "a Commit surfaces no envelope");
+        assert!(
+            matches!(
+                opened,
+                crate::context::messaging_helpers::Dispatched::Commit { .. }
+            ),
+            "a Commit surfaces as a processed Commit, got {opened:?}"
+        );
         let group = bob_cs.mls_group.as_ref().expect("Bob's group");
         assert_eq!(
             group.epoch().expect("Bob's epoch"),
@@ -27616,8 +27626,10 @@ mod tests {
                 &ctx_bytes,
                 &sealed,
             ))
-            .expect("a recv at the just-advanced epoch must open")
-            .expect("an Application envelope must surface");
+            .expect("a recv at the just-advanced epoch must open");
+        let crate::context::messaging_helpers::Dispatched::Envelope(opened) = opened else {
+            panic!("an Application envelope must surface, got {opened:?}");
+        };
         assert_eq!(
             opened.receive_floor.epoch, 2,
             "the surfaced recv floor must be at the rotated epoch 2"
@@ -27702,7 +27714,13 @@ mod tests {
         )
         .await
         .expect("bob opens the KeyResponse through custody");
-        assert!(opened.is_none(), "a KeyResponse surfaces no envelope");
+        assert!(
+            matches!(
+                opened,
+                crate::context::messaging_helpers::Dispatched::Handled
+            ),
+            "a KeyResponse surfaces no envelope, got {opened:?}"
+        );
         assert_eq!(
             custody.dh_calls(),
             1,
@@ -27724,8 +27742,10 @@ mod tests {
             &app,
         )
         .await
-        .expect("the installed sender key opens alice's message")
-        .expect("an Application envelope surfaces");
+        .expect("the installed sender key opens alice's message");
+        let crate::context::messaging_helpers::Dispatched::Envelope(opened) = opened else {
+            panic!("an Application envelope must surface, got {opened:?}");
+        };
         assert_eq!(opened.receive_floor.epoch, rotated_epoch);
         assert_eq!(
             custody.dh_calls(),
@@ -28011,7 +28031,10 @@ mod tests {
         )
         .await;
         assert!(
-            !matches!(opened, Ok(Some(_))),
+            !matches!(
+                opened,
+                Ok(crate::context::messaging_helpers::Dispatched::Envelope(_))
+            ),
             "no rotated sender key was installed: {opened:?}"
         );
     }
@@ -28064,8 +28087,10 @@ mod tests {
             &app,
         )
         .await
-        .expect("the installed sender key opens alice's message")
-        .expect("an Application envelope surfaces");
+        .expect("the installed sender key opens alice's message");
+        let crate::context::messaging_helpers::Dispatched::Envelope(opened) = opened else {
+            panic!("an Application envelope must surface, got {opened:?}");
+        };
         assert_eq!(opened.receive_floor.epoch, rotated_epoch);
 
         let (second, _) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
@@ -28095,6 +28120,104 @@ mod tests {
         assert!(
             matches!(err, ContextError::WrappingKeyHandleInvalid),
             "{err:?}"
+        );
+    }
+
+    /// Spec 07 §7.3.1.1 step 3: openmls opens a message from up to two past
+    /// epochs, verified against the sender's leaf in the epoch it was sent
+    /// in. Alice seals two KeyResponses to Bob, then Bob commits her removal
+    /// and later adds Carol, who takes Alice's blank leaf. The first
+    /// KeyResponse arrives while that leaf is blank and the second after Carol
+    /// holds it. Bob refuses both: neither installs a sender key for Alice or
+    /// Carol, and his sender-epoch floors are unchanged.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn a_removed_senders_past_epoch_key_response_installs_nothing() {
+        use openmls::prelude::tls_codec::Serialize as _;
+        const CAROL: &str = "did:dht:z6MkCarolKeyLossCarolKeyLossCarolKeyLo1";
+        let ctx_str = "key-response-from-a-removed-sender";
+        let storage = Arc::new(InMemoryStorage::new());
+        let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+        let KeyResponseToBob {
+            mut alice_actor,
+            mut bob_actor,
+            bob_sup,
+            bob_deps,
+            ctx_bytes,
+            ..
+        } = key_response_to_bob(ctx_str, &storage, &custody).await;
+        let (blank_leaf, _) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+        let (reused_leaf, _) = alice_rotates_for_bob(&mut alice_actor, ctx_str);
+
+        let sender_key_ctx = hex::encode(ctx_bytes);
+        let key_of = |actor: &crate::context::actor::PerContextState, did: &str| {
+            actor
+                .mode
+                .crypto()
+                .expect("encrypted context")
+                .sender_key_store
+                .get(&sender_key_ctx, did)
+                .map(|k| *k.as_bytes())
+        };
+        let alice_key = key_of(&bob_actor, KR_ALICE);
+        assert!(alice_key.is_some(), "bob holds alice's pulled sender key");
+        let floors_before = bob_sup.export_sender_key_epochs(&ctx_bytes);
+
+        // Bob commits Alice's removal: her leaf is blank.
+        bob_actor
+            .remove_member(KR_BOB, KR_ALICE, &scp_clock::SystemClock)
+            .expect("bob removes alice's leaf");
+        let err = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            bob_actor.mode.crypto_mut(),
+            ctx_str,
+            &ctx_bytes,
+            &blank_leaf,
+        )
+        .await
+        .expect_err("a KeyResponse from a blank leaf is refused");
+        assert!(matches!(err, ContextError::CryptoFailed(_)), "{err:?}");
+
+        // Bob adds Carol, who takes the blank leaf; the KeyResponse is still
+        // within the two past epochs openmls opens.
+        let carol_credential =
+            scp_mls::ScpCredential::new(CAROL.to_owned(), None, scp_did::SigningKeyId::Active)
+                .expect("carol's credential");
+        let (carol_bundle, _signer, _provider) =
+            scp_mls::group::generate_key_package_with_context_params(
+                &carol_credential,
+                &scp_crypto::p256::testing::uncompressed_point_for(CAROL),
+                &scp_clock::SystemClock,
+            )
+            .expect("carol's key package");
+        let carol_kp = carol_bundle
+            .key_package()
+            .tls_serialize_detached()
+            .expect("serialize carol's key package");
+        bob_actor
+            .add_member(CAROL, Some(&carol_kp), &scp_clock::SystemClock)
+            .expect("bob adds carol into alice's blank leaf");
+        let err = crate::context::messaging_helpers::decrypt_and_dispatch(
+            &bob_deps,
+            bob_actor.mode.crypto_mut(),
+            ctx_str,
+            &ctx_bytes,
+            &reused_leaf,
+        )
+        .await
+        .expect_err("a KeyResponse from a leaf another member now holds is refused");
+        assert!(matches!(err, ContextError::CryptoFailed(_)), "{err:?}");
+
+        assert_eq!(key_of(&bob_actor, KR_ALICE), alice_key, "alice's key kept");
+        assert_eq!(
+            key_of(&bob_actor, CAROL),
+            None,
+            "nothing installed for carol"
+        );
+        assert_eq!(
+            bob_sup.export_sender_key_epochs(&ctx_bytes),
+            floors_before,
+            "the sender-epoch floor is unchanged"
         );
     }
 
@@ -29479,7 +29602,7 @@ mod tests {
             ))
             .expect("a well-formed request is accepted on the receive path");
         assert!(
-            ok.is_none(),
+            matches!(ok, crate::context::messaging_helpers::Dispatched::Handled),
             "a KeyRequest is consumed on the receive side (no application envelope surfaces)"
         );
         assert_eq!(

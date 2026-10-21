@@ -724,7 +724,7 @@ mod live_supervisor_send {
                         .expect("bob processes Alice's sender key");
                     bob_actor.set_sender_key_unchecked(&sender_did, key);
                 }
-                OpenResult::Control => {}
+                OpenResult::Commit { .. } | OpenResult::Control => {}
                 OpenResult::Application(_) => {
                     panic!("bootstrap blob must be management/control, not application")
                 }

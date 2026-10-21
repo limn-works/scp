@@ -16,6 +16,7 @@
 //! back.
 
 use scp_protocol::context::params::{PSEUDONYM_ROTATION_GRACE_SECS, PseudonymRotationPolicy};
+use scp_protocol::context::pseudonym::CommitMembershipChange;
 use serde::{Deserialize, Serialize};
 
 use super::state::PerContextState;
@@ -388,6 +389,78 @@ pub(crate) fn note_member_removed(state: &mut PerContextState, local_did: &str, 
     }
 }
 
+/// A Commit another member committed, which the local member processed on
+/// the `DeliverIncoming` path, with its membership changes counted by DID (spec
+/// 09 §9.10.4.1 "Membership-change criterion").
+///
+/// `deliver_incoming` produces it from
+/// [`classify_commit_membership`](scp_protocol::context::pseudonym::classify_commit_membership);
+/// the messaging handler applies it with [`note_processed_commit`] inside a
+/// fail-closed Class-S commit, because the receive view cannot reach Class-S
+/// state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a processed Commit's membership change must reach note_processed_commit, or the rotation trigger and the registry deletion are lost"]
+pub(crate) struct ProcessedCommit {
+    /// The committer's DID from its MLS credential.
+    pub(crate) committer_did: String,
+    /// The `AddMember` and `RemoveMember` DIDs the Commit applies.
+    pub(crate) change: CommitMembershipChange,
+}
+
+/// Applies a processed Commit's membership changes to the local member's
+/// state (spec 09 §9.10.4.1). Call it inside the Class-S commit that persists
+/// them.
+///
+/// It changes two things and nothing else:
+///
+/// - **Record lifetime:** it deletes the pseudonym-registry record of every
+///   DID the Commit removes, other than the local member, so a rejoining
+///   member's new epoch sequence is accepted.
+/// - **Membership trigger:** when the Commit applies at least one `AddMember` or
+///   `RemoveMember`, it records one pending rotation unless the local member is
+///   the committer (it rotates after its own commit) or is removed. A removed
+///   local member discards its grace instead ("Leave, close and expiry during a
+///   grace"). [`PseudonymRotationState::note_membership_change`] records
+///   nothing unless the policy sets `on_membership_change`.
+///
+/// It reads the membership change from the MLS leaf diff, which no
+/// governance check has verified, so it touches no membership, role, access
+/// key, read exclusion, sender key, sender-epoch floor, sequence tracker or
+/// reorder buffer for any DID, added or removed. A receiver derives role and
+/// membership changes only from the verified governance leaves the Commit
+/// carries (spec 07 §7.3.1.1 step 3 and "Fail closed", ADR-066 decision 7),
+/// which story SCP-330 applies; an unverified leaf diff that tore down a
+/// member's state would let any leaf holder delete another member's role,
+/// the sole admin's included, at every receiver. Until SCP-330 lands, an added
+/// member's messages fail authorization with `MemberNotFound`, and a removed
+/// member keeps its membership and role at this receiver.
+/// [`PerContextState::remove_member_state`] stays the teardown of the
+/// committer's own removal and of the local member's committed leave.
+pub(crate) fn note_processed_commit(
+    state: &mut PerContextState,
+    local_did: &str,
+    commit: &ProcessedCommit,
+) {
+    if let Some(registry) = state.routing.peer_registry_mut() {
+        for did in &commit.change.removed_dids {
+            if did != local_did {
+                registry.remove(&scp_did::DID::from(did.as_str()));
+            }
+        }
+    }
+    if commit.change.removed_dids.iter().any(|d| d == local_did) {
+        state.class_s.pseudonym_rotation.discard_grace();
+        return;
+    }
+    if commit.committer_did != local_did && !commit.change.is_empty() {
+        let policy = state.handle.params().pseudonym_rotation;
+        state
+            .class_s
+            .pseudonym_rotation
+            .note_membership_change(policy.as_ref());
+    }
+}
+
 /// The local member's routing IDs in one context (spec 09 §9.10.4.1), the
 /// answer to [`Supervisor::local_routing_ids`](crate::context::supervisor::supervisor::Supervisor::local_routing_ids).
 ///
@@ -751,5 +824,207 @@ mod tests {
             RotationWake::Idle
         );
         assert_eq!(at_t0().wake(None, T0 + 9 * I), RotationWake::Idle);
+    }
+
+    fn processed(committer: &str, added: &[&str], removed: &[&str]) -> ProcessedCommit {
+        ProcessedCommit {
+            committer_did: committer.to_owned(),
+            change: CommitMembershipChange {
+                added_dids: added.iter().map(|d| (*d).to_owned()).collect(),
+                removed_dids: removed.iter().map(|d| (*d).to_owned()).collect(),
+            },
+        }
+    }
+
+    fn record_peer(state: &mut PerContextState, did: &str, epoch: u64) {
+        state.routing.peer_registry_mut().unwrap().insert(
+            scp_did::DID::from(did),
+            scp_protocol::context::pseudonym::PseudonymRecord {
+                routing_id: [7; 32],
+                epoch: Some(epoch),
+            },
+        );
+    }
+
+    fn has_record(state: &PerContextState, did: &str) -> bool {
+        state
+            .routing
+            .peer_registry()
+            .unwrap()
+            .contains_key(&scp_did::DID::from(did))
+    }
+
+    const COMMITTER: &str = "did:dht:committer";
+    const CTX: &str = "ctx-push-030";
+
+    fn apply(state: &mut PerContextState, commit: &ProcessedCommit) {
+        note_processed_commit(state, LOCAL, commit);
+    }
+
+    /// "Membership trigger": a peer's Commit that adds or removes a member
+    /// records one pending rotation, and a Commit with several changes still
+    /// records one.
+    #[test]
+    fn a_peers_membership_commit_records_one_pending_rotation() {
+        let mut state = context_state(Some(membership_policy()));
+        apply(&mut state, &processed(COMMITTER, &[PEER], &[]));
+        assert!(state.class_s.pseudonym_rotation.membership_change_pending);
+
+        let mut state = context_state(Some(membership_policy()));
+        apply(
+            &mut state,
+            &processed(COMMITTER, &["did:dht:a", "did:dht:b"], &[PEER]),
+        );
+        assert!(state.class_s.pseudonym_rotation.membership_change_pending);
+        assert_eq!(
+            state
+                .class_s
+                .pseudonym_rotation
+                .due_epoch(Some(&membership_policy()), T0),
+            Some(0)
+        );
+    }
+
+    /// A Commit with no `AddMember` or `RemoveMember` (a device leaf or a key
+    /// update), the local member's own Commit, and a policy without
+    /// `on_membership_change` record nothing.
+    #[test]
+    fn no_rotation_without_a_membership_change_a_peer_committer_or_the_policy() {
+        let mut state = context_state(Some(membership_policy()));
+        apply(&mut state, &processed(COMMITTER, &[], &[]));
+        assert_eq!(state.class_s.pseudonym_rotation, at_t0());
+
+        apply(&mut state, &processed(LOCAL, &[PEER], &[]));
+        assert_eq!(state.class_s.pseudonym_rotation, at_t0());
+
+        let mut state = context_state(Some(interval_policy()));
+        apply(&mut state, &processed(COMMITTER, &[PEER], &[]));
+        assert!(!state.class_s.pseudonym_rotation.membership_change_pending);
+
+        let mut state = context_state(None);
+        apply(&mut state, &processed(COMMITTER, &[PEER], &[]));
+        assert!(!state.class_s.pseudonym_rotation.membership_change_pending);
+    }
+
+    /// Fail closed (spec 07 §7.3.1.1, ADR-066 decision 7): a processed add
+    /// records the trigger and nothing for the added DID: no membership entry,
+    /// active-member entry, role, capability, token, or access key. Only the
+    /// verified `MemberJoined` leaf of story SCP-330 may supply them.
+    #[test]
+    fn a_processed_add_records_no_membership_or_role_for_the_added_did() {
+        let mut state = context_state(Some(membership_policy()));
+        apply(&mut state, &processed(COMMITTER, &[PEER], &[]));
+        assert!(state.class_s.pseudonym_rotation.membership_change_pending);
+        assert!(!state.membership.contains(PEER));
+        assert!(!state.members.contains(&scp_did::DID::from(PEER)));
+        assert!(!state.role_state.members.contains(PEER));
+        assert!(!state.role_state.assignments.contains_key(PEER));
+        assert!(!state.role_state.member_capabilities.contains_key(PEER));
+        assert!(state.access.access_key_store.get(CTX, PEER).is_none());
+    }
+
+    /// PUSH-030 AC1 device-leaf rule (spec 09 §9.10.4.1 "Membership-change
+    /// criterion"): a Commit after which C still holds a leaf, whether a second
+    /// leaf joins C's or C's leaf is removed and re-added as a `ResetMember`
+    /// Commit does, classifies as no membership change and records no rotation.
+    #[test]
+    fn a_device_leaf_or_a_reset_leaf_of_a_held_did_records_no_rotation() {
+        use scp_protocol::context::pseudonym::{CommitLeafDids, classify_commit_membership};
+        let leaves = |before: &[&str], after: &[&str]| CommitLeafDids {
+            before: before.iter().map(|d| (*d).to_owned()).collect(),
+            after: after.iter().map(|d| (*d).to_owned()).collect(),
+        };
+        let second_device = leaves(&[LOCAL, COMMITTER, PEER], &[LOCAL, COMMITTER, PEER, PEER]);
+        // The re-added leaf takes the removed leaf's place, so each side
+        // holds one leaf for PEER.
+        let reset = leaves(&[LOCAL, PEER, COMMITTER], &[LOCAL, COMMITTER, PEER]);
+        for leaf_dids in [second_device, reset] {
+            let change = classify_commit_membership(&leaf_dids);
+            assert!(change.is_empty(), "{leaf_dids:?} -> {change:?}");
+            let mut state = context_state(Some(membership_policy()));
+            apply(
+                &mut state,
+                &ProcessedCommit {
+                    committer_did: COMMITTER.to_owned(),
+                    change,
+                },
+            );
+            assert_eq!(state.class_s.pseudonym_rotation, at_t0());
+        }
+    }
+
+    /// "Record lifetime": a processed removal deletes the removed DID's record
+    /// and keeps every other record, even when the local member is the
+    /// committer or the policy sets no rotation.
+    #[test]
+    fn a_processed_removal_deletes_the_removed_dids_record() {
+        let mut state = context_state(None);
+        record_peer(&mut state, PEER, 3);
+        record_peer(&mut state, COMMITTER, 1);
+        apply(&mut state, &processed(LOCAL, &[], &[PEER]));
+        assert!(!has_record(&state, PEER));
+        assert!(has_record(&state, COMMITTER));
+    }
+
+    fn admit(state: &mut PerContextState, did: &str) {
+        state
+            .membership
+            .add_member(scp_did::DID::from(did), "member".to_owned(), Vec::new());
+        state.members.insert(scp_did::DID::from(did));
+        state.role_state.members.insert(did.to_owned());
+        state.role_state.member_capabilities.insert(
+            did.to_owned(),
+            std::iter::once(scp_protocol::context::roles::Capability::MessagesWrite).collect(),
+        );
+        let key = scp_protocol::crypto::access_keys::generate_access_key(CTX, did);
+        state.access.access_key_store.set(CTX, did, key);
+        state
+            .access
+            .read_exclusion_list
+            .insert(scp_did::DID::from(did));
+        record_peer(state, did, 1);
+        state.sequence_tracker.advance(CTX, did, 2, 1);
+    }
+
+    fn admitted(state: &PerContextState, did: &str) -> [bool; 7] {
+        [
+            state.membership.contains(did),
+            state.members.contains(&scp_did::DID::from(did)),
+            state.role_state.member_has_capability(
+                did,
+                &scp_protocol::context::roles::Capability::MessagesWrite,
+            ),
+            state.access.access_key_store.get(CTX, did).is_some(),
+            state
+                .access
+                .read_exclusion_list
+                .contains(&scp_did::DID::from(did)),
+            has_record(state, did),
+            state.sequence_tracker.expected_sequence(CTX, did).is_some(),
+        ]
+    }
+
+    /// Fail closed (spec 07 §7.3.1.1 step 3, ADR-066 decision 7): a processed
+    /// removal deletes only the removed DID's pseudonym record. Its
+    /// membership, active-member entry, role, access key, read exclusion and
+    /// sequence tracker stay until the verified leaves of story SCP-330 apply
+    /// the removal, and every other member is untouched, the local member
+    /// included when it is the one removed.
+    #[test]
+    fn a_processed_removal_deletes_only_the_removed_dids_record() {
+        let mut state = context_state(None);
+        for did in [PEER, COMMITTER, LOCAL] {
+            admit(&mut state, did);
+        }
+        apply(&mut state, &processed(COMMITTER, &[], &[PEER]));
+        assert_eq!(
+            admitted(&state, PEER),
+            [true, true, true, true, true, false, true]
+        );
+        assert_eq!(admitted(&state, COMMITTER), [true; 7]);
+        assert_eq!(admitted(&state, LOCAL), [true; 7]);
+
+        apply(&mut state, &processed(COMMITTER, &[], &[LOCAL]));
+        assert_eq!(admitted(&state, LOCAL), [true; 7]);
     }
 }

@@ -1502,6 +1502,15 @@ pub enum DeliverOutcome {
 /// coalesced. The token carrier (vs. the prior `bool`) makes a populated-but-
 /// undischarged obligation a Drop-guard PANIC in debug/CI rather than a silently
 /// dropped flag.
+///
+/// `commit_sink` (spec 09 §9.10.4.1): when the envelope is a Commit another
+/// member committed, this function classifies its membership changes by DID
+/// with [`classify_commit_membership`](scp_protocol::context::pseudonym::classify_commit_membership)
+/// and stores the result here. The receive view cannot reach Class-S state, so
+/// the cell-holding handler applies it with
+/// [`note_processed_commit`](crate::context::actor::pseudonym_rotation::note_processed_commit)
+/// inside a fail-closed, keep-direction Class-S commit: it deletes each removed
+/// DID's registry record and records the rotation trigger.
 #[allow(clippy::too_many_lines)]
 pub async fn deliver_incoming(
     view: &mut ClassCMut<'_>,
@@ -1509,6 +1518,7 @@ pub async fn deliver_incoming(
     context_id: &str,
     encrypted_blob: &[u8],
     downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
+    commit_sink: &mut Option<crate::context::actor::pseudonym_rotation::ProcessedCommit>,
 ) -> Result<DeliverOutcome, ContextError> {
     // ADR-056: canonical digest (matches the MLS group / sender keys), not a
     // re-hash of the hex id.
@@ -1539,7 +1549,7 @@ pub async fn deliver_incoming(
     // contexts carry no crypto sub-state (`None`), matching the retained provider
     // fallback; the `&mut` view is released when the awaited call returns, so
     // `view` is free for the dispatch cascade below.
-    let Some(opened_envelope) = decrypt_and_dispatch(
+    let opened_envelope = match decrypt_and_dispatch(
         deps,
         view.mode_mut().crypto_mut(),
         context_id,
@@ -1547,10 +1557,23 @@ pub async fn deliver_incoming(
         encrypted_blob,
     )
     .await?
-    else {
-        // MLS Commit / Proposal — processed internally by the crypto layer,
-        // no inner envelope to classify.
-        return Ok(DeliverOutcome::Handled);
+    {
+        Dispatched::Envelope(env) => *env,
+        Dispatched::Commit {
+            committer_did,
+            leaf_dids,
+        } => {
+            // §9.10.4.1 "Membership-change criterion": count the merged
+            // Commit's changes by DID. The handler applies them fail-closed.
+            *commit_sink = Some(crate::context::actor::pseudonym_rotation::ProcessedCommit {
+                committer_did,
+                change: scp_protocol::context::pseudonym::classify_commit_membership(&leaf_dids),
+            });
+            return Ok(DeliverOutcome::Handled);
+        }
+        // An MLS Proposal or a management message, processed by the crypto
+        // layer; no inner envelope to classify.
+        Dispatched::Handled => return Ok(DeliverOutcome::Handled),
     };
 
     let inner = opened_envelope.inner;
@@ -3147,6 +3170,23 @@ pub(in crate::context) fn stream_reservations_snapshot(
 // 13. decrypt_and_dispatch
 // ---------------------------------------------------------------------------
 
+/// What [`decrypt_and_dispatch`] made of one inbound envelope.
+#[derive(Debug)]
+pub(super) enum Dispatched {
+    /// An application envelope for the caller to verify and classify.
+    Envelope(Box<scp_protocol::context::builder::OpenedEnvelope>),
+    /// A Commit another member committed, already admitted and merged. The
+    /// caller classifies its membership changes (spec 09 §9.10.4.1).
+    Commit {
+        /// The committer's DID from its MLS credential.
+        committer_did: String,
+        /// The DID of every occupied leaf before and after the Commit.
+        leaf_dids: scp_protocol::context::pseudonym::CommitLeafDids,
+    },
+    /// An MLS Proposal or a management message, processed here.
+    Handled,
+}
+
 /// Decrypts an incoming envelope and dispatches management/control
 /// messages.
 ///
@@ -3158,7 +3198,7 @@ pub(super) async fn decrypt_and_dispatch(
     context_id: &str,
     context_id_bytes: &[u8; 32],
     encrypted_blob: &[u8],
-) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+) -> Result<Dispatched, ContextError> {
     let decrypt_start = std::time::Instant::now();
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's OWNED
     // field-granular Class-C `&mut ContextCryptoState` (driven from
@@ -3198,9 +3238,16 @@ pub(super) async fn decrypt_and_dispatch(
                     "application message from own DID".to_owned(),
                 ));
             }
-            Ok(Some(*env))
+            Ok(Dispatched::Envelope(env))
         }
-        scp_protocol::context::builder::OpenResult::Control => Ok(None),
+        scp_protocol::context::builder::OpenResult::Commit {
+            committer_did,
+            leaf_dids,
+        } => Ok(Dispatched::Commit {
+            committer_did,
+            leaf_dids,
+        }),
+        scp_protocol::context::builder::OpenResult::Control => Ok(Dispatched::Handled),
         scp_protocol::context::builder::OpenResult::Management {
             sender_did,
             payload,
@@ -3220,42 +3267,8 @@ pub(super) async fn decrypt_and_dispatch(
                 scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyRequest(
                     request,
                 ) => {
-                    // BLACK-P7-1 (identity binding): the actor answer gates BOTH
-                    // membership (§9.16.6 Mitigation-1) and the block list on
-                    // `request.requester_did` — a PAYLOAD field. It MUST equal the
-                    // MLS-authenticated `sender_did`, or a member could request
-                    // under a DIFFERENT member's identity: e.g. a BLOCKED member
-                    // naming an unblocked one to pass the membership + block gates,
-                    // then receiving the sender key sealed to their OWN ephemeral
-                    // wrapping key. Bind the two here, before answering. The
-                    // requester public key the request signature is verified against
-                    // is ALSO resolved from `sender_did` (below), so this makes the
-                    // gated DID, the authenticated DID, and the signing key one and
-                    // the same.
-                    if request.requester_did != sender_did {
-                        return Err(ContextError::CryptoFailed(
-                            "sender-key request requester_did does not match the \
-                             MLS-authenticated sender"
-                                .to_string(),
-                        ));
-                    }
-                    // The request's Ed25519 signature is by the requester
-                    // (== MLS-authenticated `sender_did`) over its ephemeral
-                    // wrapping key. MLS already authenticated `sender_did`; the
-                    // request signature additionally binds the ephemeral key, so
-                    // resolve the requester's Active verification key to check it.
-                    let requester_pk =
-                        (deps.key_resolver)(&DID(sender_did.clone()), SigningKeyId::Active)
-                            .ok_or_else(|| {
-                                ContextError::CryptoFailed(format!(
-                                    "cannot resolve requester public key for {sender_did}"
-                                ))
-                            })?;
-                    // The actor answer takes the request as bytes (byte-identical
-                    // to the retained oracle); re-serialize the parsed request.
-                    let request_bytes = rmp_serde::to_vec_named(&request).map_err(|e| {
-                        ContextError::CryptoFailed(format!("request re-serialization: {e}"))
-                    })?;
+                    let (request_bytes, requester_pk) =
+                        bind_sender_key_request(deps, &request, &sender_did)?;
                     // No per-context sender-key block list is resident on the actor
                     // (the blocking-flow wiring into the actor answer path is a
                     // forward-only follow-up, tracked in #2146); the §9.16.6
@@ -3277,7 +3290,7 @@ pub(super) async fn decrypt_and_dispatch(
                         // returns `None` (§9.16.2 silent drop) — nothing queued.
                         cs.pending_distributions.push((sender_did.clone(), sealed));
                     }
-                    Ok(None)
+                    Ok(Dispatched::Handled)
                 }
                 scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(
                     response,
@@ -3321,7 +3334,7 @@ pub(super) async fn decrypt_and_dispatch(
                     let ctx_id_hex = hex::encode(context_id_bytes);
                     cs.sender_key_store
                         .set_unchecked(&ctx_id_hex, &sender_did, sender_key);
-                    Ok(None)
+                    Ok(Dispatched::Handled)
                 }
                 other => Err(ContextError::CryptoFailed(format!(
                     "unexpected sender-key distribution variant on the receive path: {other:?}"
@@ -3329,6 +3342,53 @@ pub(super) async fn decrypt_and_dispatch(
             }
         }
     }
+}
+
+/// Binds a received §9.16.2 sender-key PULL request to its MLS-authenticated
+/// sender for [`decrypt_and_dispatch`], and returns the request's bytes and
+/// the requester's `#active` verification key for the actor answer.
+///
+/// BLACK-P7-1 (identity binding): the actor answer gates BOTH membership
+/// (§9.16.6 Mitigation-1) and the block list on `request.requester_did`, a
+/// PAYLOAD field. It MUST equal the MLS-authenticated `sender_did`, or a
+/// member could request under a DIFFERENT member's identity: e.g. a BLOCKED
+/// member naming an unblocked one to pass the membership + block gates, then
+/// receiving the sender key sealed to their OWN ephemeral wrapping key. The
+/// requester public key the request signature is verified against is ALSO
+/// resolved from `sender_did`, so the gated DID, the authenticated DID, and the
+/// signing key are one and the same.
+///
+/// # Errors
+///
+/// [`ContextError::CryptoFailed`] when `requester_did` differs from
+/// `sender_did`, when the requester's `#active` key does not resolve, or when
+/// the request does not re-serialize.
+fn bind_sender_key_request(
+    deps: &ActorDeps,
+    request: &scp_protocol::crypto::sender_keys::SenderKeyRequest,
+    sender_did: &str,
+) -> Result<(Vec<u8>, ed25519_dalek::VerifyingKey), ContextError> {
+    if request.requester_did != sender_did {
+        return Err(ContextError::CryptoFailed(
+            "sender-key request requester_did does not match the MLS-authenticated sender"
+                .to_string(),
+        ));
+    }
+    // The request's Ed25519 signature is by the requester (== MLS-authenticated
+    // `sender_did`) over its ephemeral wrapping key. MLS already authenticated
+    // `sender_did`; the request signature additionally binds the ephemeral key,
+    // so resolve the requester's Active verification key to check it.
+    let requester_pk = (deps.key_resolver)(&DID(sender_did.to_owned()), SigningKeyId::Active)
+        .ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "cannot resolve requester public key for {sender_did}"
+            ))
+        })?;
+    // The actor answer takes the request as bytes (byte-identical to the
+    // retained oracle); re-serialize the parsed request.
+    let request_bytes = rmp_serde::to_vec_named(request)
+        .map_err(|e| ContextError::CryptoFailed(format!("request re-serialization: {e}")))?;
+    Ok((request_bytes, requester_pk))
 }
 
 /// ADR-049 PR-6 (read-authority switch): advance the LOCAL sender-key epoch

@@ -188,6 +188,12 @@ const HANDLERS_BROADCAST_SRC: &str =
 // `actor_owned_timer_arms_reconcile_from_state`.
 const ACTOR_MOD_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/actor/mod.rs");
 
+// Actor pseudonym-rotation source — owns `note_processed_commit`, which applies
+// a processed membership Commit to the registry and the rotation state (spec 09
+// §9.10.4.1). Pinned by `processed_membership_commit_reaches_rotation_and_registry`.
+const PSEUDONYM_ROTATION_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/pseudonym_rotation.rs");
+
 // Push handler source — owns `handlers::push::dispatch`, the mailbox step of
 // the PUSH-013 push routing-ID query (§10.7.1).
 const HANDLERS_PUSH_SRC: &str =
@@ -316,7 +322,10 @@ const UNIFFI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/
 // Raised 89 -> 90 when the local member's pseudonym rotation (spec 09
 // §9.10.4.1) was wired: one assertion pins the rotate command, the routing-ID
 // query, and the actor's rotation and grace arms to their helpers.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 90;
+// Raised 90 -> 91 when non-committing members began rotating on a processed
+// membership Commit (spec 09 §9.10.4.1): one assertion pins the incoming-Commit
+// handler to the DID classifier, the fail-closed commit, and the rotation signal.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 91;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -2234,6 +2243,101 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
             ),
         "on_grace_tick must drop the previous routing ID through the restore commit \
          and emit PseudonymGraceEnded"
+    );
+}
+
+/// Spec 09 §9.10.4.1 "Membership trigger" and "Record lifetime": a Commit
+/// another member committed reaches the rotation trigger and the registry
+/// deletion on the receive path. `Supervisor::deliver_commit_blob` dispatches
+/// `MessagingCommand::DeliverIncoming`, the messaging handler calls
+/// `deliver_incoming`, which counts the Commit's membership changes by DID with
+/// `classify_commit_membership`. The handler then applies them through the
+/// fail-closed keep-direction commit to `note_processed_commit`, which deletes
+/// each removed DID's registry record and records the trigger through
+/// `note_membership_change`, and changes nothing else: the leaf diff is
+/// unverified, so membership, role, sender-key and floor state change only
+/// from the verified governance leaves of spec 07 §7.3.1.1 step 3. The
+/// committed removal and leave keep `remove_member_state` as their teardown,
+/// and a reset is one Commit built by `reset_member` (step 1.6). The actor's
+/// rotation arm turns the trigger into the `PseudonymRotationDue` signal.
+#[test]
+fn processed_membership_commit_reaches_rotation_and_registry() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "deliver_commit_blob",
+            "MessagingCommand::DeliverIncoming"
+        ),
+        "Supervisor::deliver_commit_blob must dispatch MessagingCommand::DeliverIncoming"
+    );
+    let dispatch = extract_fn_body(HANDLERS_MESSAGING_SRC, "dispatch")
+        .expect("the messaging handler dispatch exists");
+    assert!(
+        dispatch.contains("MessagingCommand::DeliverIncoming")
+            && dispatch.contains("handle_deliver_incoming("),
+        "the messaging dispatch must route DeliverIncoming to handle_deliver_incoming"
+    );
+    let handler = extract_fn_body(HANDLERS_MESSAGING_SRC, "handle_deliver_incoming")
+        .expect("handle_deliver_incoming exists");
+    for step in [
+        "deliver_incoming(",
+        "&mut processed_commit",
+        "commit_class_s_keep(",
+        "note_processed_commit(",
+    ] {
+        assert!(
+            handler.contains(step),
+            "handle_deliver_incoming must contain `{step}`"
+        );
+    }
+    assert!(
+        !handler.contains(".remove_member_floors("),
+        "a processed Commit must not prune floors from an unverified leaf diff"
+    );
+    let deliver = extract_fn_body(MANAGER_SRC, "deliver_incoming")
+        .expect("messaging_helpers::deliver_incoming exists");
+    assert!(
+        deliver.contains("Dispatched::Commit") && deliver.contains("classify_commit_membership("),
+        "deliver_incoming must classify a processed Commit's membership changes by DID"
+    );
+    let note = extract_fn_body(PSEUDONYM_ROTATION_SRC, "note_processed_commit")
+        .expect("note_processed_commit exists");
+    assert!(
+        note.contains("registry.remove(") && note.contains(".note_membership_change("),
+        "note_processed_commit must delete removed DIDs' records and record the trigger"
+    );
+    for teardown in [
+        ".remove_member_state(",
+        ".remove_member_sender_key(",
+        "floors",
+    ] {
+        assert!(
+            !note.contains(teardown),
+            "note_processed_commit must not tear down state from an unverified leaf diff \
+             (`{teardown}`)"
+        );
+    }
+    for removal in ["execute_remove_member", "leave_context"] {
+        assert!(
+            fn_body_contains(MANAGER_SRC, removal, ".remove_member_state("),
+            "{removal} must tear down the departed member through remove_member_state"
+        );
+    }
+    let reset =
+        extract_fn_body(MANAGER_SRC, "execute_reset_member").expect("execute_reset_member exists");
+    assert!(
+        reset.contains(".reset_member(")
+            && !reset.contains(".remove_member(")
+            && !reset.contains("execute_add_member("),
+        "execute_reset_member must build its one remove-and-add Commit through reset_member"
+    );
+    assert!(
+        fn_body_contains(
+            ACTOR_MOD_SRC,
+            "on_rotation_tick",
+            "ContextEvent::PseudonymRotationDue"
+        ),
+        "the rotation arm must turn the trigger into PseudonymRotationDue"
     );
 }
 

@@ -45,7 +45,7 @@ pub const fn governance_action_result_name(result: &GovernanceActionResult) -> &
         GovernanceActionResult::ThresholdModified => "ThresholdModified",
         GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
         GovernanceActionResult::OutletInterfaceEstablished => "OutletInterfaceEstablished",
-        GovernanceActionResult::MemberReset => "MemberReset",
+        GovernanceActionResult::MemberReset { .. } => "MemberReset",
         GovernanceActionResult::ConflictResolved => "ConflictResolved",
         GovernanceActionResult::ContextPromoted => "ContextPromoted",
         GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
@@ -243,14 +243,7 @@ mod tests {
     /// fails compilation in `governance_action_result_name` first; a test
     /// author then adds its row here.
     fn every_variant() -> Vec<(GovernanceActionResult, &'static str)> {
-        vec![
-            (
-                GovernanceActionResult::MemberAdded {
-                    welcome_bytes: RedactedBytes(vec![1, 2, 3]),
-                    commit_bytes: RedactedBytes(vec![4, 5]),
-                },
-                "MemberAdded",
-            ),
+        let mut rows = vec![
             (GovernanceActionResult::MemberRemoved, "MemberRemoved"),
             (GovernanceActionResult::RoleChanged, "RoleChanged"),
             (GovernanceActionResult::OutletRegistered, "OutletRegistered"),
@@ -277,9 +270,39 @@ mod tests {
                 GovernanceActionResult::OutletInterfaceEstablished,
                 "OutletInterfaceEstablished",
             ),
-            (GovernanceActionResult::MemberReset, "MemberReset"),
             (GovernanceActionResult::ConflictResolved, "ConflictResolved"),
             (GovernanceActionResult::ContextPromoted, "ContextPromoted"),
+            (GovernanceActionResult::Executed, "Executed"),
+            (
+                GovernanceActionResult::MigrationCancelled,
+                "MigrationCancelled",
+            ),
+            (
+                GovernanceActionResult::ContextTombstoned,
+                "ContextTombstoned",
+            ),
+        ];
+        rows.extend(payload_variants());
+        rows
+    }
+
+    /// The rows of [`every_variant`] whose variant carries a payload.
+    fn payload_variants() -> Vec<(GovernanceActionResult, &'static str)> {
+        vec![
+            (
+                GovernanceActionResult::MemberAdded {
+                    welcome_bytes: RedactedBytes(vec![1, 2, 3]),
+                    commit_bytes: RedactedBytes(vec![4, 5]),
+                },
+                "MemberAdded",
+            ),
+            (
+                GovernanceActionResult::MemberReset {
+                    welcome_bytes: RedactedBytes(Vec::new()),
+                    commit_bytes: RedactedBytes(Vec::new()),
+                },
+                "MemberReset",
+            ),
             (
                 GovernanceActionResult::MemberSuspended(SuspendMemberResult {
                     did: did(),
@@ -326,21 +349,12 @@ mod tests {
                 GovernanceActionResult::SubscriberUnbanned { did: did() },
                 "SubscriberUnbanned",
             ),
-            (GovernanceActionResult::Executed, "Executed"),
             (
                 GovernanceActionResult::MigrationProposed(MigrationProposedResult {
                     destination_context_id: "dest".to_owned(),
                     grace_period_end: 1,
                 }),
                 "MigrationProposed",
-            ),
-            (
-                GovernanceActionResult::MigrationCancelled,
-                "MigrationCancelled",
-            ),
-            (
-                GovernanceActionResult::ContextTombstoned,
-                "ContextTombstoned",
             ),
         ]
     }
