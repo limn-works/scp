@@ -735,7 +735,7 @@ Published out-of-band (relay metadata page, a service-record entry). Relay MAY i
 | `max_blob_ttl` | 604800 | Max TTL seconds |
 | `max_subscriptions_per_connection` | 100 | Concurrent subscriptions per WebSocket |
 | `max_query_limit` | 1000 | Max QUERY limit |
-| `ipv6_source_prefix` | 64 | Leading bits of an IPv6 source address that key every per-source limit, so one host's /64 counts once; an IPv4 source address counts whole |
+| `ipv6_source_prefix` | 64 | Leading bits of an IPv6 source address that key every per-source limit, so one host's /64 counts once; an IPv4 source address counts whole, and an IPv4-mapped IPv6 address (`::ffff:0:0/96`) counts as the IPv4 address it maps |
 | `rate_limit_publish` | 6000/min | The rate per source prefix, shared across that prefix's connections: an IPv4 address whole (/32), or an IPv6 address's leading `ipv6_source_prefix` bits; operator-adjustable. Priced relays have economic DDoS resistance (§19.7). |
 | `rate_limit_subscribe` | 100 | Max concurrent subscriptions per connection. SUBSCRIBE operation rate is separately enforced at 20/min per connection but not exposed in `.well-known/scp`. |
 | `idle_timeout` | 90s | Seconds before idle connection close |
