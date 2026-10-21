@@ -4517,9 +4517,12 @@ async fn a_welcome_joiner_rotates_and_expires_on_the_creators_t0() {
     while alice_events.try_recv().is_ok() {}
     while bob_events.try_recv().is_ok() {}
     // Each window spans the half interval the arms sleep after the rotation,
-    // plus a minute of re-checks. The windows run in sequence on paused tokio
-    // time, and Bob's TTL arm fires 1.5 h of tokio time after his join, so the
-    // four windows together stay under it.
+    // plus a minute of re-checks: 1,860 s. The windows run in sequence on
+    // paused tokio time, and Bob's TTL arm fires 1.5 h (5,400 s) of tokio time
+    // after his join. Four full windows (7,440 s) would pass that arm. The test
+    // stays under it because only the two `None` windows run their full
+    // length (3,720 s); each `Some` window returns as soon as its signal
+    // arrives.
     let within = std::time::Duration::from_secs(INTERVAL / 2 + 60);
 
     // One second before the boundary, neither node signals.
