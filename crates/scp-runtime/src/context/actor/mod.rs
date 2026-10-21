@@ -1841,34 +1841,19 @@ mod tests {
 
         const LOCAL: &str = "did:dht:z6MkLocalDirect";
         let deps = new_test_deps().await;
-        // DIRECT_BOB is the peer that leaves and rejoins. The role state holds
-        // the built-in roles, as a created or joined context does, so the
-        // rejoin's processed add can assign `member`.
+        // DIRECT_BOB is the peer that leaves and rejoins.
         let mut state = writable_encrypted_state(0x35, DIRECT_BOB);
-        state.role_state = scp_protocol::context::roles::ContextRoleState::new(
-            ctx_hex(0x35),
-            DIRECT_ALICE,
-            scp_protocol::context::roles::CapabilityCeiling::new([
-                Capability::MessagesRead,
-                Capability::MessagesWrite,
-            ]),
-            Vec::new(),
-            &*deps.clock,
-        )
-        .expect("built-in roles");
         state.membership.add_member(
             scp_did::DID(LOCAL.to_owned()),
             "member".to_owned(),
             Vec::new(),
         );
         state.members.insert(scp_did::DID(LOCAL.to_owned()));
-        for member in [LOCAL, DIRECT_BOB] {
-            state.role_state.members.insert(member.to_owned());
-            state
-                .role_state
-                .system_assign_role(member, "member", &*deps.clock)
-                .expect("assign member");
-        }
+        state.role_state.members.insert(LOCAL.to_owned());
+        state.role_state.member_capabilities.insert(
+            LOCAL.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
 
         assert!(
             ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 1, 1, [0x51; 32])
@@ -1893,7 +1878,6 @@ mod tests {
                     removed_dids: vec![DIRECT_BOB.to_owned()],
                 },
             },
-            &*deps.clock,
             |did| deps.supervisor.remove_member_floors(&[0x35; 32], did),
         )
         .expect("the removal applies");
@@ -1914,23 +1898,22 @@ mod tests {
             "a removed DID is not a member; got {removed:?}"
         );
 
-        // The rejoin's AddMember Commit, processed by this non-committing
-        // member.
-        note_processed_commit(
-            &mut state,
-            &ctx_hex(0x35),
-            LOCAL,
-            &ProcessedCommit {
-                committer_did: DIRECT_ALICE.to_owned(),
-                change: CommitMembershipChange {
-                    added_dids: vec![DIRECT_BOB.to_owned()],
-                    removed_dids: Vec::new(),
-                },
-            },
-            &*deps.clock,
-            |did| deps.supervisor.remove_member_floors(&[0x35; 32], did),
-        )
-        .expect("the rejoin's add applies");
+        // The rejoin's add, built by hand. It stands in for SCP-330's apply
+        // step, under which a non-committer records a re-added member only
+        // from the verified `MemberJoined` leaf of the re-adding Commit (spec
+        // 07 §7.3.1.1 "Fail closed"). This test is therefore no evidence for
+        // the rejoin clause of PUSH-030 AC2; it shows only that the removal's
+        // record deletion admits the lower epoch once the DID is a member.
+        state.membership.add_member(
+            scp_did::DID(DIRECT_BOB.to_owned()),
+            "member".to_owned(),
+            Vec::new(),
+        );
+        state.role_state.members.insert(DIRECT_BOB.to_owned());
+        state.role_state.member_capabilities.insert(
+            DIRECT_BOB.to_owned(),
+            std::iter::once(Capability::MessagesWrite).collect(),
+        );
         assert!(
             ingest_v2_announcement(&mut state, &deps, 0x35, DIRECT_BOB, 3, 0, [0x52; 32])
                 .await

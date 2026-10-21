@@ -16,10 +16,12 @@
 //! `scp-runtime` (`pseudonym_rotation.rs`) shows an empty change records no
 //! rotation.
 //!
-//! Carol's v2 announcements reach Bob through his `DeliverIncoming` path, so
-//! Bob's record for Carol comes from her announcement, and her epoch-0
-//! announcement after she rejoins is accepted over the epoch-1 record he held
-//! before her removal.
+//! A rejoiner's announcement reaching Bob is not reachable here either. A
+//! non-committer records no member a processed Commit adds until it verifies
+//! the `MemberJoined` governance leaf that Commit carries (spec 07 §7.3.1.1
+//! "Fail closed", ADR-066 decision 7), and that receive step is story SCP-330.
+//! Until it lands Bob rejects every message from Carol as from a non-member, so
+//! the rejoin clause of PUSH-030's record-deletion criterion waits on SCP-330.
 
 use std::time::Duration;
 
@@ -132,15 +134,13 @@ async fn rotate(
     Ok(())
 }
 
-/// `node`'s persisted registry record for `member` as `(routing_id, epoch)`,
-/// once the coalesced persist that follows an announcement holds `want`;
-/// after 3 s, whatever record is persisted then.
+/// Bob's persisted registry record for `member`, once the coalesced persist
+/// that follows an announcement has landed (`None` if it never does).
 async fn persisted_record(
     node: &FullStackNode,
     ctx: &str,
     member: &str,
-    want: ([u8; 32], Option<u64>),
-) -> Option<([u8; 32], Option<u64>)> {
+) -> Option<scp_core::context::pseudonym::PseudonymRecord> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
         let record = node.persisted_snapshot(ctx).and_then(|snapshot| {
@@ -148,55 +148,17 @@ async fn persisted_record(
                 .routing
                 .peer_registry()
                 .and_then(|registry| registry.get(&DID::from(member)).copied())
-                .map(|r| (r.routing_id, r.epoch))
         });
-        if record == Some(want) || tokio::time::Instant::now() >= deadline {
+        if record.is_some() || tokio::time::Instant::now() >= deadline {
             return record;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// `from` rotates at `epoch` and `to` takes the resulting v2 announcement
-/// through its `DeliverIncoming` path, the path a relay delivery takes.
-async fn announce(
-    from: &FullStackNode,
-    to: &FullStackNode,
-    ctx: &str,
-    epoch: u64,
-    rid: [u8; 32],
-) -> TestResult {
-    drop(from.take_sent_ciphertexts());
-    from.rotate_pseudonym(ctx, epoch, rid)
-        .await
-        .map_err(|e| format!("{} rotates at epoch {epoch}: {e}", from.did.as_ref()))?;
-    let sent = from.take_sent_ciphertexts();
-    if sent.is_empty() {
-        return Err(format!(
-            "{} sent no announcement at epoch {epoch}",
-            from.did.as_ref()
-        )
-        .into());
-    }
-    for (_, ciphertext) in sent {
-        to.manager
-            .deliver_commit_blob(ctx, ciphertext)
-            .await
-            .map_err(|e| {
-                format!(
-                    "{} takes {}'s epoch-{epoch} announcement: {e}",
-                    to.did.as_ref(),
-                    from.did.as_ref()
-                )
-            })?;
-    }
-    Ok(())
-}
-
 /// PUSH-030 acceptance: one signal per membership-changing Commit on a
-/// non-committing member, the removed DID's record deleted when that member
-/// processes the removal, and the rejoiner's lower-epoch announcement accepted
-/// after the rejoin.
+/// non-committing member, and the removed DID's record deleted when that
+/// member processes the removal.
 #[tokio::test]
 async fn a_non_committer_rotates_once_per_membership_commit_and_deletes_the_removed_record()
 -> TestResult {
@@ -205,8 +167,8 @@ async fn a_non_committer_rotates_once_per_membership_commit_and_deletes_the_remo
     let network = FullStackNetwork::new();
     let alice = network.create_node(ALICE);
     let bob = network.create_observed_node(BOB);
-    let carol = network.create_node(CAROL);
-    let dave = network.create_node(DAVE);
+    let _carol = network.create_node(CAROL);
+    let _dave = network.create_node(DAVE);
     let mut bob_rx = bob.subscribe_events().ok_or("Bob is observed")?;
 
     // Alice creates the context under `on_membership_change`; Bob joins by
@@ -239,34 +201,50 @@ async fn a_non_committer_rotates_once_per_membership_commit_and_deletes_the_remo
             .rotation_due(Some(&membership_policy()), 0),
         "the trigger is persisted with the processed Commit"
     );
+    // Fail closed (spec 07 §7.3.1.1, ADR-066 decision 7): the processed add
+    // records no membership, role or capability for Carol at Bob. Only the
+    // verified `MemberJoined` leaf of SCP-330 may supply one. The snapshot is
+    // the one the processed Commit wrote, since it holds the trigger above.
+    assert!(
+        !snapshot.membership.contains(CAROL),
+        "Bob's persisted membership holds no entry for Carol"
+    );
+    assert!(
+        !snapshot.role_state.members.contains(CAROL),
+        "Bob's persisted role-state members hold no entry for Carol"
+    );
+    assert!(
+        !snapshot.role_state.assignments.contains_key(CAROL),
+        "Bob's persisted role state assigns Carol no role"
+    );
+    assert!(
+        !snapshot.role_state.member_capabilities.contains_key(CAROL),
+        "Bob's persisted role state grants Carol no capability"
+    );
     rotate(&bob, &mut bob_rx, &ctx, 1, [0xB1; 32]).await?;
 
-    // Carol joins by Welcome and announces her join-time v2 routing ID. Bob
-    // processed the Commit that added her, so he accepts her announcement as
-    // from a member and records it.
-    carol.join_from_welcome(&ctx, &ctx_bytes).await?;
-    announce(&carol, &bob, &ctx, 0, [0xC0; 32]).await?;
-    assert_eq!(
-        persisted_record(&bob, &ctx, CAROL, ([0xC0; 32], Some(0))).await,
-        Some(([0xC0; 32], Some(0))),
-        "Bob records Carol's announcement"
-    );
+    // Bob holds a record for Carol. Carol's own announcement cannot reach
+    // Bob here: he records no role for a member a processed Commit adds until
+    // SCP-330 verifies its `MemberJoined` leaf, so he rejects Carol's messages
+    // as from a non-member. The record is seeded instead; the Commit that
+    // deletes it is real.
+    bob.manager
+        .seed_peer_pseudonym(&ctx, DID::from(CAROL), [0xC0; 32])
+        .await?;
 
-    // Alice adds Dave: one more signal for Bob. Carol processes the same
-    // Commit and announces epoch 1, so Bob holds Carol at epoch 1 before her
-    // removal.
+    // Alice adds Dave: one more signal, and the persist that follows carries
+    // Bob's record for Carol.
     alice.add_member(&handle, DAVE).await?;
     bob.feed_pending_incoming(&ctx, &ctx_bytes).await?;
     assert_eq!(signals(&mut bob_rx, &ctx).await?, vec![2]);
-    rotate(&bob, &mut bob_rx, &ctx, 2, [0xB2; 32]).await?;
-    carol.feed_pending_incoming(&ctx, &ctx_bytes).await?;
-    dave.join_from_welcome(&ctx, &ctx_bytes).await?;
-    announce(&carol, &bob, &ctx, 1, [0xC1; 32]).await?;
     assert_eq!(
-        persisted_record(&bob, &ctx, CAROL, ([0xC1; 32], Some(1))).await,
-        Some(([0xC1; 32], Some(1))),
-        "Bob's record for Carol is at epoch 1 before her removal"
+        persisted_record(&bob, &ctx, CAROL)
+            .await
+            .map(|r| r.routing_id),
+        Some([0xC0; 32]),
+        "Bob's record for Carol is persisted before her removal"
     );
+    rotate(&bob, &mut bob_rx, &ctx, 2, [0xB2; 32]).await?;
 
     // Alice removes Carol: Bob processes the Commit, gets exactly one signal,
     // and holds no registry record for Carol.
@@ -291,20 +269,10 @@ async fn a_non_committer_rotates_once_per_membership_commit_and_deletes_the_remo
     rotate(&bob, &mut bob_rx, &ctx, 3, [0xB3; 32]).await?;
 
     // Carol rejoins on a fresh device: the re-add is one more AddMember.
-    // Her new epoch sequence starts at 0, below the epoch-1 record Bob held
-    // before her removal, and Bob accepts it (§9.10.4.1 Record lifetime).
-    let carol = network.create_node(CAROL);
+    let _carol = network.create_node(CAROL);
     alice.add_member(&handle, CAROL).await?;
     bob.feed_pending_incoming(&ctx, &ctx_bytes).await?;
-    dave.feed_pending_incoming(&ctx, &ctx_bytes).await?;
     assert_eq!(signals(&mut bob_rx, &ctx).await?, vec![4]);
-    carol.join_from_welcome(&ctx, &ctx_bytes).await?;
-    announce(&carol, &bob, &ctx, 0, [0xC2; 32]).await?;
-    assert_eq!(
-        persisted_record(&bob, &ctx, CAROL, ([0xC2; 32], Some(0))).await,
-        Some(([0xC2; 32], Some(0))),
-        "Bob accepts the rejoiner's epoch-0 announcement"
-    );
     Ok(())
 }
 

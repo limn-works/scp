@@ -3267,42 +3267,8 @@ pub(super) async fn decrypt_and_dispatch(
                 scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyRequest(
                     request,
                 ) => {
-                    // BLACK-P7-1 (identity binding): the actor answer gates BOTH
-                    // membership (§9.16.6 Mitigation-1) and the block list on
-                    // `request.requester_did` — a PAYLOAD field. It MUST equal the
-                    // MLS-authenticated `sender_did`, or a member could request
-                    // under a DIFFERENT member's identity: e.g. a BLOCKED member
-                    // naming an unblocked one to pass the membership + block gates,
-                    // then receiving the sender key sealed to their OWN ephemeral
-                    // wrapping key. Bind the two here, before answering. The
-                    // requester public key the request signature is verified against
-                    // is ALSO resolved from `sender_did` (below), so this makes the
-                    // gated DID, the authenticated DID, and the signing key one and
-                    // the same.
-                    if request.requester_did != sender_did {
-                        return Err(ContextError::CryptoFailed(
-                            "sender-key request requester_did does not match the \
-                             MLS-authenticated sender"
-                                .to_string(),
-                        ));
-                    }
-                    // The request's Ed25519 signature is by the requester
-                    // (== MLS-authenticated `sender_did`) over its ephemeral
-                    // wrapping key. MLS already authenticated `sender_did`; the
-                    // request signature additionally binds the ephemeral key, so
-                    // resolve the requester's Active verification key to check it.
-                    let requester_pk =
-                        (deps.key_resolver)(&DID(sender_did.clone()), SigningKeyId::Active)
-                            .ok_or_else(|| {
-                                ContextError::CryptoFailed(format!(
-                                    "cannot resolve requester public key for {sender_did}"
-                                ))
-                            })?;
-                    // The actor answer takes the request as bytes (byte-identical
-                    // to the retained oracle); re-serialize the parsed request.
-                    let request_bytes = rmp_serde::to_vec_named(&request).map_err(|e| {
-                        ContextError::CryptoFailed(format!("request re-serialization: {e}"))
-                    })?;
+                    let (request_bytes, requester_pk) =
+                        bind_sender_key_request(deps, &request, &sender_did)?;
                     // No per-context sender-key block list is resident on the actor
                     // (the blocking-flow wiring into the actor answer path is a
                     // forward-only follow-up, tracked in #2146); the §9.16.6
@@ -3376,6 +3342,53 @@ pub(super) async fn decrypt_and_dispatch(
             }
         }
     }
+}
+
+/// Binds a received §9.16.2 sender-key PULL request to its MLS-authenticated
+/// sender for [`decrypt_and_dispatch`], and returns the request's bytes and
+/// the requester's `#active` verification key for the actor answer.
+///
+/// BLACK-P7-1 (identity binding): the actor answer gates BOTH membership
+/// (§9.16.6 Mitigation-1) and the block list on `request.requester_did`, a
+/// PAYLOAD field. It MUST equal the MLS-authenticated `sender_did`, or a
+/// member could request under a DIFFERENT member's identity: e.g. a BLOCKED
+/// member naming an unblocked one to pass the membership + block gates, then
+/// receiving the sender key sealed to their OWN ephemeral wrapping key. The
+/// requester public key the request signature is verified against is ALSO
+/// resolved from `sender_did`, so the gated DID, the authenticated DID, and the
+/// signing key are one and the same.
+///
+/// # Errors
+///
+/// [`ContextError::CryptoFailed`] when `requester_did` differs from
+/// `sender_did`, when the requester's `#active` key does not resolve, or when
+/// the request does not re-serialize.
+fn bind_sender_key_request(
+    deps: &ActorDeps,
+    request: &scp_protocol::crypto::sender_keys::SenderKeyRequest,
+    sender_did: &str,
+) -> Result<(Vec<u8>, ed25519_dalek::VerifyingKey), ContextError> {
+    if request.requester_did != sender_did {
+        return Err(ContextError::CryptoFailed(
+            "sender-key request requester_did does not match the MLS-authenticated sender"
+                .to_string(),
+        ));
+    }
+    // The request's Ed25519 signature is by the requester (== MLS-authenticated
+    // `sender_did`) over its ephemeral wrapping key. MLS already authenticated
+    // `sender_did`; the request signature additionally binds the ephemeral key,
+    // so resolve the requester's Active verification key to check it.
+    let requester_pk = (deps.key_resolver)(&DID(sender_did.to_owned()), SigningKeyId::Active)
+        .ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "cannot resolve requester public key for {sender_did}"
+            ))
+        })?;
+    // The actor answer takes the request as bytes (byte-identical to the
+    // retained oracle); re-serialize the parsed request.
+    let request_bytes = rmp_serde::to_vec_named(request)
+        .map_err(|e| ContextError::CryptoFailed(format!("request re-serialization: {e}")))?;
+    Ok((request_bytes, requester_pk))
 }
 
 /// ADR-049 PR-6 (read-authority switch): advance the LOCAL sender-key epoch

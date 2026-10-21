@@ -900,7 +900,7 @@ async fn handle_deliver_incoming(
     }
 
     // Spec 09 §9.10.4.1 "Membership trigger" and "Record lifetime": the merged
-    // Commit's membership changes (removals, adds and the rotation trigger)
+    // Commit's membership changes (the removals and the rotation trigger)
     // reach the actor state through a fail-closed, keep-direction commit, the
     // rule every commit-path persist follows. The MLS group has already merged
     // the Commit, so the changes are never rolled back: on persist failure
@@ -914,7 +914,6 @@ async fn handle_deliver_incoming(
                     context_id,
                     deps.crypto.local_did(),
                     &commit,
-                    &*deps.clock,
                     |did| {
                         deps.supervisor.remove_member_floors(
                             &crate::context::state::context_id_to_bytes(context_id),

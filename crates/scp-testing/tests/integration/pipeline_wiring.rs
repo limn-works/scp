@@ -2256,8 +2256,7 @@ fn local_pseudonym_rotation_reaches_its_helpers() {
 /// down each removed DID's sender key, its floors through the handler's
 /// `remove_member_floors`, and its record, membership and role state through
 /// `remove_member_state`, the teardown the committed removal and leave share,
-/// records each added DID's membership and role state through
-/// `add_member_state`, and records the trigger through `note_membership_change`;
+/// and records the trigger through `note_membership_change`;
 /// the actor's rotation arm turns the trigger into the `PseudonymRotationDue`
 /// signal.
 #[test]
@@ -2303,9 +2302,8 @@ fn processed_membership_commit_reaches_rotation_and_registry() {
         note.contains(".remove_member_state(")
             && note.contains(".remove_member_sender_key(")
             && note.contains("remove_floors(did)")
-            && note.contains(".add_member_state(")
             && note.contains(".note_membership_change("),
-        "note_processed_commit must tear down removed DIDs' state, record added DIDs' state and record the trigger"
+        "note_processed_commit must tear down removed DIDs' state and record the trigger"
     );
     for removal in ["execute_remove_member", "leave_context"] {
         assert!(

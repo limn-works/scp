@@ -27715,7 +27715,10 @@ mod tests {
         .await
         .expect("bob opens the KeyResponse through custody");
         assert!(
-            matches!(opened, crate::context::messaging_helpers::Dispatched::Handled),
+            matches!(
+                opened,
+                crate::context::messaging_helpers::Dispatched::Handled
+            ),
             "a KeyResponse surfaces no envelope, got {opened:?}"
         );
         assert_eq!(
@@ -28028,7 +28031,10 @@ mod tests {
         )
         .await;
         assert!(
-            !matches!(opened, Ok(crate::context::messaging_helpers::Dispatched::Envelope(_))),
+            !matches!(
+                opened,
+                Ok(crate::context::messaging_helpers::Dispatched::Envelope(_))
+            ),
             "no rotated sender key was installed: {opened:?}"
         );
     }
