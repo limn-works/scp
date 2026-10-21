@@ -15,8 +15,9 @@ use scp_did::{
 use sha2::{Digest, Sha256};
 
 use crate::constants::{
-    KEL_EVENT_SEPARATOR, KEL_ID_SEPARATOR, KEL_SEAL_SEPARATOR, MAX_EVENT_BYTES, MAX_NEXT_SET_SIZE,
-    MAX_ROOT_SET_SIZE, MAX_WITNESS_SET_SIZE, PREROTATION_SEPARATOR,
+    KEL_EVENT_SEPARATOR, KEL_ID_SEPARATOR, KEL_SEAL_SEPARATOR, MAX_AUTHENTICATOR_DATA_BYTES,
+    MAX_CLIENT_DATA_JSON_BYTES, MAX_EVENT_BYTES, MAX_NEXT_SET_SIZE, MAX_ROOT_SET_SIZE,
+    MAX_WITNESS_SET_SIZE, PREROTATION_SEPARATOR, RAW_SIGNATURE_BYTES,
 };
 use crate::error::{
     DecodeError, DeriveIdentifierError, DidDiscriminatorField, EncodeError, KelDiscriminatorField,
@@ -26,6 +27,7 @@ use crate::event::{
     Continuation, EventKind, EventPreimage, InstalledRootSet, KeyStateSnapshot, SignatureForm,
     SignerGroup, SignerGroupRole, StandingRootDeclaration, signer_group_roles,
 };
+use crate::event_codec::EventHeader;
 
 /// A 33-byte SEC1 compressed point.
 const POINT_BYTES: usize = 33;
@@ -93,16 +95,50 @@ const fn count_cap(list: ListField) -> Option<u32> {
     }
 }
 
-/// Whether `len` field bytes fit `MAX_EVENT_BYTES` (§9.18.17). The constant
-/// bounds the whole event, signatures included, so this is a necessary
-/// condition the preimage codec checks; the event decoder checks the event.
-/// The encoder and the decoder both read this one check.
-fn within_event_bytes(len: usize) -> bool {
-    u32::try_from(len).is_ok_and(|len| len <= MAX_EVENT_BYTES)
+/// The ceiling §9.18.17 reserves for one `WebAuthnAssertion` indexed
+/// signature: 4 + `MAX_AUTHENTICATOR_DATA_BYTES` + 4 +
+/// `MAX_CLIENT_DATA_JSON_BYTES` + 64 = 840 bytes.
+const ASSERTION_CEILING: usize = 4
+    + MAX_AUTHENTICATOR_DATA_BYTES as usize
+    + 4
+    + MAX_CLIENT_DATA_JSON_BYTES as usize
+    + RAW_SIGNATURE_BYTES as usize;
+
+/// The ceiling §9.18.17 reserves for one named index whose form list entry
+/// is `form`: 64 bytes for `Raw` and 840 for `WebAuthnAssertion`. An index
+/// with no form, which R3 calls a defect, is counted at the larger ceiling,
+/// so a short form list never makes an event smaller.
+const fn index_ceiling(form: Option<&SignatureForm>) -> usize {
+    match form {
+        Some(SignatureForm::Raw) => RAW_SIGNATURE_BYTES as usize,
+        Some(SignatureForm::WebAuthnAssertion) | None => ASSERTION_CEILING,
+    }
+}
+
+/// An event's encoded length (§9.18.17 `MAX_EVENT_BYTES`; §9.7.4.2 R3): the
+/// length of its signed preimage, separator included, plus, for each index
+/// its signer groups name, the ceiling of that index's form. No term is a
+/// length a relay controls: the forms and indices are fields 6 and 7.
+///
+/// The one computation of that length: [`encode_preimage`] and
+/// [`decode_preimage`], which `decode_event` runs as its body stage, both
+/// call it, so the encoder cannot emit an event the decoder rejects for its
+/// length.
+pub fn encoded_event_len(signed_len: usize, signer_groups: &[SignerGroup]) -> usize {
+    signer_groups
+        .iter()
+        .flat_map(|group| (0..group.indices.len()).map(|position| group.forms.get(position)))
+        .map(index_ceiling)
+        .fold(signed_len, usize::saturating_add)
+}
+
+/// Whether an encoded length is within `MAX_EVENT_BYTES` (§9.18.17).
+fn within_event_bytes(encoded_len: usize) -> bool {
+    u32::try_from(encoded_len).is_ok_and(|len| len <= MAX_EVENT_BYTES)
 }
 
 /// The event-kind byte (§9.7.4.2 field 1). The one table it is written from.
-const fn kind_byte(kind: EventKind) -> u8 {
+pub const fn kind_byte(kind: EventKind) -> u8 {
     match kind {
         EventKind::Inception => 0x01,
         EventKind::KeyState => 0x02,
@@ -144,7 +180,7 @@ const fn form_from_byte(byte: u8) -> Option<SignatureForm> {
     }
 }
 
-fn sha256(parts: &[&[u8]]) -> [u8; 32] {
+pub fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
@@ -239,16 +275,16 @@ impl EncodedPreimage {
 ///
 /// [`EncodeError`] exactly where [`decode_preimage`] would reject the bytes
 /// or decode them to a different preimage: a list over its §9.18.17 maximum
-/// or too long for its count, field bytes over `MAX_EVENT_BYTES`, a signer
-/// group count its kind does not name, a field whose value would encode as
-/// that field's absent sentinel, or a nonzero `compromised_from` on an entry
-/// that is not `Compromised`.
+/// or too long for its count, an encoded event length over
+/// `MAX_EVENT_BYTES`, a signer group count its kind does not name, a field
+/// whose value would encode as that field's absent sentinel, or a nonzero
+/// `compromised_from` on an entry that is not `Compromised`.
 pub fn encode_preimage(preimage: &EventPreimage) -> Result<EncodedPreimage, EncodeError> {
     let mut signed = KEL_EVENT_SEPARATOR.to_vec();
     write_fields(preimage, &mut signed)?;
-    let len = signed.len().saturating_sub(KEL_EVENT_SEPARATOR.len());
-    if !within_event_bytes(len) {
-        return Err(EncodeError::PreimageTooLong { len });
+    let encoded_len = encoded_event_len(signed.len(), &preimage.signer_groups);
+    if !within_event_bytes(encoded_len) {
+        return Err(EncodeError::EventTooLong { encoded_len });
     }
     Ok(EncodedPreimage {
         preimage: preimage.clone(),
@@ -446,11 +482,14 @@ fn write_snapshot(snapshot: &KeyStateSnapshot, out: &mut Vec<u8>) -> Result<(), 
 ///
 /// Every count is checked against the bound [`count_cap`] gives it and
 /// against the bytes remaining before any element is read, and no allocation
-/// is sized from a wire count (§9.7.4.2, the count-bound rule). The slice is
-/// checked against `MAX_EVENT_BYTES`, which bounds the whole event; this is a
-/// necessary condition, and the event decoder checks the event itself. The
-/// decoder is structural: a preimage whose fields its kind does not carry, or
-/// that breaks any other R3 rule, decodes, and the verifier classifies it. It
+/// is sized from a wire count (§9.7.4.2, the count-bound rule). The event's
+/// encoded length, the signed preimage plus each named index's form ceiling,
+/// is checked against `MAX_EVENT_BYTES` (§9.18.17): the signed preimage alone
+/// before any field is read, since the encoded length is never shorter, and
+/// the whole encoded length once fields 6 and 7 are known. The decoder is
+/// otherwise structural: a preimage whose fields its kind does not carry, or
+/// that breaks any other R3 rule, a form list whose length differs from its
+/// index list among them, decodes, and the verifier classifies it. It
 /// rejects a nonzero `compromised_from` on an entry that is not
 /// `Compromised`, because the snapshot order defines that field as "zero
 /// otherwise".
@@ -462,11 +501,15 @@ fn write_snapshot(snapshot: &KeyStateSnapshot, out: &mut Vec<u8>) -> Result<(), 
 /// # Errors
 ///
 /// [`DecodeError`] naming the field or list where the bytes stop being a
-/// preimage, or [`DecodeError::SignedPreimage`] where the slice still begins
-/// with the separator.
+/// preimage, [`DecodeError::EventTooLong`] where the encoded length exceeds
+/// `MAX_EVENT_BYTES`, or [`DecodeError::SignedPreimage`] where the slice
+/// still begins with the separator.
 pub fn decode_preimage(bytes: &[u8]) -> Result<EncodedPreimage, DecodeError> {
-    if !within_event_bytes(bytes.len()) {
-        return Err(DecodeError::PreimageTooLong { len: bytes.len() });
+    let signed_len = KEL_EVENT_SEPARATOR.len().saturating_add(bytes.len());
+    if !within_event_bytes(signed_len) {
+        return Err(DecodeError::EventTooLong {
+            encoded_len: signed_len,
+        });
     }
     // No field byte string begins with the separator: its first byte, `S`,
     // is no event kind.
@@ -474,15 +517,65 @@ pub fn decode_preimage(bytes: &[u8]) -> Result<EncodedPreimage, DecodeError> {
         return Err(DecodeError::SignedPreimage);
     }
     let preimage = read_fields(bytes)?;
+    let encoded_len = encoded_event_len(signed_len, &preimage.signer_groups);
+    if !within_event_bytes(encoded_len) {
+        return Err(DecodeError::EventTooLong { encoded_len });
+    }
     let mut signed = Vec::with_capacity(KEL_EVENT_SEPARATOR.len().saturating_add(bytes.len()));
     signed.extend_from_slice(KEL_EVENT_SEPARATOR);
     signed.extend_from_slice(bytes);
     Ok(EncodedPreimage { preimage, signed })
 }
 
+/// Decodes fields 1 through 7 off the front of the field bytes, without the
+/// separator (§9.7.4.2, the check order's step 4), with the count bounds
+/// [`decode_preimage`] applies. The bytes after field 7 are not read, so
+/// fields 8 through 12 may be anything. The form lists' lengths are not
+/// checked against the index lists; `decode_event` checks them.
+pub fn decode_header(fields: &[u8]) -> Result<EventHeader, DecodeError> {
+    read_header(&mut Reader { rest: fields })
+}
+
 fn read_fields(bytes: &[u8]) -> Result<EventPreimage, DecodeError> {
     let mut reader = Reader { rest: bytes };
+    let EventHeader {
+        kind,
+        identifier,
+        sequence,
+        predecessor_digest,
+        standing_root,
+        signer_groups,
+        roles: _,
+    } = read_header(&mut reader)?;
 
+    let revealed_keys = reader.points(PreimageField::RevealedKeys, ListField::RevealedKeys)?;
+    let installed_root_set = read_installed_root_set(&mut reader)?;
+    let key_state = read_snapshot(&mut reader)?;
+    let seal_count = reader.count(PreimageField::Seals, ListField::Seals, DIGEST_BYTES)?;
+    let mut seals = Vec::new();
+    for _ in 0..seal_count {
+        seals.push(reader.array(PreimageField::Seals)?);
+    }
+    let continuation = read_continuation(&mut reader)?;
+
+    Ok(EventPreimage {
+        kind,
+        identifier,
+        sequence,
+        predecessor_digest,
+        standing_root,
+        signer_groups,
+        revealed_keys,
+        installed_root_set,
+        key_state,
+        seals,
+        continuation,
+    })
+}
+
+/// Fields 1 through 7, the one parse of them [`decode_header`] and
+/// [`read_fields`] share.
+fn read_header(reader: &mut Reader<'_>) -> Result<EventHeader, DecodeError> {
     let kind_value = reader.u8(PreimageField::EventType)?;
     let kind = kind_from_byte(kind_value).ok_or(DecodeError::UnknownKelDiscriminator {
         field: KelDiscriminatorField::EventType,
@@ -533,28 +626,14 @@ fn read_fields(bytes: &[u8]) -> Result<EventPreimage, DecodeError> {
         signer_groups.push(SignerGroup { indices, forms });
     }
 
-    let revealed_keys = reader.points(PreimageField::RevealedKeys, ListField::RevealedKeys)?;
-    let installed_root_set = read_installed_root_set(&mut reader)?;
-    let key_state = read_snapshot(&mut reader)?;
-    let seal_count = reader.count(PreimageField::Seals, ListField::Seals, DIGEST_BYTES)?;
-    let mut seals = Vec::new();
-    for _ in 0..seal_count {
-        seals.push(reader.array(PreimageField::Seals)?);
-    }
-    let continuation = read_continuation(&mut reader)?;
-
-    Ok(EventPreimage {
+    Ok(EventHeader {
         kind,
         identifier,
         sequence,
         predecessor_digest,
         standing_root,
         signer_groups,
-        revealed_keys,
-        installed_root_set,
-        key_state,
-        seals,
-        continuation,
+        roles,
     })
 }
 

@@ -1,8 +1,9 @@
 //! Cross-target known-answer tests for the key-event preimage, digest,
 //! identifier, seal, commitment and routing ids, the two indexed-signature
 //! forms (`09-security-model.md` §9.7.4.2, R13), the raw-form signatures spec
-//! 25 prints for Vectors 51, 68 and 69, and the identifier's text form
-//! (`03-identity.md` §3.1).
+//! 25 prints for Vectors 51, 68 and 69, the event-unit decode
+//! (`decode_event`, §9.10.12) of every spec 25 event, the raw identifier,
+//! and the identifier's text form (`03-identity.md` §3.1).
 //!
 //! The browser client verifies a key event log in wasm32 and a native node
 //! verifies the same log, so both must compute the same bytes. Each test
@@ -22,17 +23,19 @@ use fixtures::{
     V42_CLIENT_DATA_JSON_HEX, V42_DIGEST, V42_IDENTIFIER, V42_INDEXED_SIGNATURE, V42_PREIMAGE,
     V42_RP_ID, V42_SIGNATURE, V42_SIGNED_DIGEST, V42_SIGNED_MESSAGE, V47A_COMMITMENT, V47A_POINT,
     V47B_COMMITMENT, V47B_POINT, V48_ADDRESS, V48_IDENTIFIER, V50_DIGEST, V50_PREIMAGE, V50_SEAL,
-    V50_SEALED_DIGEST, V51_DIGEST, V51_IDENTIFIER, V51_INCEPTION_DIGEST, V51_INCEPTION_PREIMAGE,
-    V51_INCEPTION_SIGNATURE, V51_KEYS, V51_PREIMAGE, V51_ROUTING_DID, V68_DIGEST, V68_PREIMAGE,
+    V50_SEALED_DIGEST, V50_SIGNATURE, V51_DIGEST, V51_IDENTIFIER, V51_INCEPTION_DIGEST,
+    V51_INCEPTION_PREIMAGE, V51_INCEPTION_SIGNATURE, V51_KEYS, V51_PREIMAGE, V51_ROUTING_DID,
+    V51_SIGNATURE, V53_DIGEST, V53_PREIMAGE, V53_SIGNATURE_FIELD, V54_DIGEST, V54_PREIMAGE,
+    V54_SIGNATURE_FIELD, V55_DIGEST, V55_PREIMAGE, V55_SIGNATURE_FIELD, V68_DIGEST, V68_PREIMAGE,
     V68_REVEAL_SIGNATURE, V68_ROOT_SIGNATURE, V69_DIGEST, V69_PREIMAGE, V69_ROOT_SIGNATURE, array,
-    assert_signature, assert_vector, fields, identifier, v41_inception, v50_key_state,
-    v51_inception, v51_key_state, v68_rollover, v69_key_state,
+    assert_event_round_trip, assert_signature, assert_vector, bytes, fields, identifier,
+    v41_inception, v50_key_state, v51_inception, v51_key_state, v68_rollover, v69_key_state,
 };
 use scp_did::{Identifier, IdentifierError, KeyCondition, NonCanonicalReason};
 use scp_kel::{
     IndexedSignature, RoutingKind, SignatureForm, decode_preimage, derive_identifier,
     key_event_challenge, key_event_seal, parse_client_data_json, prerotation_commitment,
-    routing_id, verify_indexed,
+    raw_identifier, routing_id, verify_indexed,
 };
 use sha2::{Digest, Sha256};
 
@@ -125,6 +128,51 @@ fn vector_69_compromised_key_state() -> TestResult {
     assert_eq!(dropped.condition, KeyCondition::Compromised);
     assert_eq!(dropped.compromised_from, 1);
     assert_signature(V41_ROOT, V69_DIGEST, V69_ROOT_SIGNATURE)
+}
+
+/// Every spec 25 event's unit decodes with each stage succeeding: the
+/// header, the walked signature field, the body, the digest and `consumed`
+/// match the printed bytes, on each target.
+#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+fn every_event_unit_round_trips() -> TestResult {
+    let reveal_then_root = format!("{V68_REVEAL_SIGNATURE}{V68_ROOT_SIGNATURE}");
+    let events: [(&str, &str, &str); 10] = [
+        (V41_PREIMAGE, V41_DIGEST, V41_SIGNATURE),
+        (V42_PREIMAGE, V42_DIGEST, V42_INDEXED_SIGNATURE),
+        (V50_PREIMAGE, V50_DIGEST, V50_SIGNATURE),
+        (
+            V51_INCEPTION_PREIMAGE,
+            V51_INCEPTION_DIGEST,
+            V51_INCEPTION_SIGNATURE,
+        ),
+        (V51_PREIMAGE, V51_DIGEST, V51_SIGNATURE),
+        (V53_PREIMAGE, V53_DIGEST, V53_SIGNATURE_FIELD),
+        (V54_PREIMAGE, V54_DIGEST, V54_SIGNATURE_FIELD),
+        (V55_PREIMAGE, V55_DIGEST, V55_SIGNATURE_FIELD),
+        (V68_PREIMAGE, V68_DIGEST, &reveal_then_root),
+        (V69_PREIMAGE, V69_DIGEST, V69_ROOT_SIGNATURE),
+    ];
+    for (preimage, digest, signature_field) in events {
+        assert_event_round_trip(preimage, digest, signature_field)?;
+    }
+    Ok(())
+}
+
+/// The raw identifier of Vectors 41 and 42's received preimages is each
+/// vector's printed identifier, on each target.
+#[test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+fn vectors_41_and_42_raw_identifier() -> TestResult {
+    assert_eq!(
+        raw_identifier(&bytes(V41_PREIMAGE)?),
+        identifier(V41_IDENTIFIER)?
+    );
+    assert_eq!(
+        raw_identifier(&bytes(V42_PREIMAGE)?),
+        identifier(V42_IDENTIFIER)?
+    );
+    Ok(())
 }
 
 #[test]

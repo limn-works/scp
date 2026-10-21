@@ -14,9 +14,22 @@ This crate owns:
 - `encode_preimage` and `decode_preimage` — the only constructors of
   `EncodedPreimage`, which holds a preimage with its signed bytes
   `"SCP-KEL-EVENT-V1:" ‖ fields`. Its `event_digest` and `identifier` read
-  those bytes and cannot fail. Both directions read one count-bound table, so
-  encode succeeds exactly where decode of its output succeeds (§9.7.4.2, the
-  count-bound rule).
+  those bytes and cannot fail. Both directions read one count-bound table and
+  one encoded-length function (the signed preimage plus each named index's
+  form ceiling, at most `MAX_EVENT_BYTES`), so encode succeeds exactly where
+  decode of its output succeeds (§9.7.4.2, the count-bound rule; §9.18.17).
+- `decode_event` — reads one §9.10.12 event unit (`BE32(len)`, the signed
+  preimage, the signature field) into an `EventUnit` whose stages stay
+  apart, in §9.7.4.2's check order: the raw signed preimage (step 1), the
+  `EventHeader` of fields 1 to 7 (steps 2 and 4, failing with
+  `HeaderError`), the signature-field walk into `SignerGroupSignatures`
+  (step 5, failing with `SignatureFieldError`), the full body decode, and
+  the bytes the unit consumed. A verifier classifies a failure by the stage
+  that holds it.
+- `raw_identifier` and `inception_header_zero_checks` — the identifier
+  hashed from the received inception bytes, which exists even when the body
+  fails to decode, and the fixed-offset zero checks of an inception's
+  header (`InceptionHeaderDefect`).
 - `derive_identifier` — `SHA-256("SCP-KEL-ID-V1:" ‖ inception signed preimage)`,
   refusing any preimage that is not a zero-position inception.
 - `prerotation_commitment` and `key_event_seal` — the pre-rotation commitment
@@ -53,4 +66,4 @@ pins byte identity between native and wasm32 against `25-test-vectors.md`
 platform edge in its dependency tree.
 
 Chain verification (signatures, R3's defect list, R8) is not here yet; it
-lands with the verifier story, which wraps `decode_preimage`.
+lands with the verifier story, which reads `decode_event`'s stages.

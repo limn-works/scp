@@ -9,6 +9,7 @@ use std::fmt;
 use scp_did::{KeyCondition, UnknownDiscriminator};
 
 use crate::event::{EventKind, SignerGroupRole};
+use crate::signature::IndexedSignatureReadError;
 
 /// One of the preimage's twelve fields (§9.7.4.2), named where a decode
 /// runs out of bytes.
@@ -192,12 +193,15 @@ pub enum EncodeError {
         /// The registered maximum.
         max: u32,
     },
-    /// The twelve field bytes are longer than `MAX_EVENT_BYTES` (§9.18.17),
-    /// which bounds the whole event and so the preimage within it.
-    #[error("the preimage is {len} bytes, over MAX_EVENT_BYTES")]
-    PreimageTooLong {
-        /// The field bytes' length.
-        len: usize,
+    /// The event's encoded length exceeds `MAX_EVENT_BYTES` (§9.18.17;
+    /// §9.7.4.2 R3): the signed preimage, separator included, plus the
+    /// reserved ceiling of each named index's form, 64 bytes for `Raw` and
+    /// 840 for `WebAuthnAssertion`. An index its form list gives no form is
+    /// counted at 840, the larger ceiling.
+    #[error("the event's encoded length is {encoded_len} bytes, over MAX_EVENT_BYTES")]
+    EventTooLong {
+        /// The encoded length.
+        encoded_len: usize,
     },
     /// A `RootRecovery` carries no standing-root declaration, so its signer
     /// group count is undefined (§9.7.4.2 field 5).
@@ -241,13 +245,18 @@ pub enum EncodeError {
 /// Why bytes are not a key-event preimage (§9.7.4.2).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
-    /// The input is longer than `MAX_EVENT_BYTES` (§9.18.17). That constant
-    /// bounds the whole event, signatures included, so a preimage within it
-    /// is a necessary condition only; the event decoder checks the event.
-    #[error("the preimage is {len} bytes, over MAX_EVENT_BYTES")]
-    PreimageTooLong {
-        /// The input's length.
-        len: usize,
+    /// The event's encoded length exceeds `MAX_EVENT_BYTES` (§9.18.17;
+    /// §9.7.4.2 R3): the signed preimage, separator included, plus the
+    /// reserved ceiling of each named index's form, 64 bytes for `Raw` and
+    /// 840 for `WebAuthnAssertion`, an index with no form counted at 840.
+    /// Where the signed preimage alone exceeds the constant, the decoder
+    /// reads no field and `encoded_len` is the signed preimage's length, a
+    /// lower bound on the encoded length.
+    #[error("the event's encoded length is at least {encoded_len} bytes, over MAX_EVENT_BYTES")]
+    EventTooLong {
+        /// The encoded length, or the signed preimage's length where the
+        /// fields were not read.
+        encoded_len: usize,
     },
     /// The input begins with the `"SCP-KEL-EVENT-V1:"` separator: it is the
     /// signed preimage, and the decoder reads the twelve field bytes that
@@ -349,4 +358,77 @@ pub enum DeriveIdentifierError {
     /// The preimage cannot be encoded.
     #[error(transparent)]
     Encode(#[from] EncodeError),
+}
+
+/// Why an event unit's signed preimage yields no header (§9.7.4.2, the
+/// check order's steps 2 and 4). Each variant names the check that failed,
+/// and every one reads only bytes the event's digest binds.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HeaderError {
+    /// The prefixed bytes do not begin with `"SCP-KEL-EVENT-V1:"` (step 2:
+    /// "A decoder MUST reject an event whose prefixed bytes do not begin
+    /// with `SCP-KEL-EVENT-V1:`").
+    #[error("the prefixed bytes do not begin with the SCP-KEL-EVENT-V1: separator")]
+    Separator,
+    /// Fields 1 through 7 do not decode (step 4).
+    #[error("fields 1 through 7 do not decode: {0}")]
+    Fields(DecodeError),
+    /// A signer group's form list differs in length from its index list
+    /// (R3: "a form list whose length differs from its index list"), so the
+    /// signature-field walk has no form for some index or no index for some
+    /// form.
+    #[error("the {role} group names {indices} indices but {forms} forms")]
+    FormListLength {
+        /// The group.
+        role: SignerGroupRole,
+        /// The index list's length.
+        indices: usize,
+        /// The form list's length.
+        forms: usize,
+    },
+}
+
+/// Why an event unit's signature field does not walk under fields 6 and 7
+/// (§9.7.4.2, the check order's step 5; §9.10.12). The check reads the
+/// signature field, which the event's digest does not bind.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the {role} group's indexed signature at position {position} does not read: {error}")]
+pub struct SignatureFieldError {
+    /// The group being walked.
+    pub role: SignerGroupRole,
+    /// The signature's position in that group's index list.
+    pub position: usize,
+    /// Why it does not read.
+    pub error: IndexedSignatureReadError,
+}
+
+/// Which header field of a raw inception preimage is not the value R3 fixes
+/// for an inception.
+///
+/// §9.7.4.2 R3: "an `Inception` whose identifier, sequence or predecessor
+/// digest is not zero", and "an event other than an `Inception` at position
+/// zero".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InceptionHeaderDefect {
+    /// The bytes do not begin with `"SCP-KEL-EVENT-V1:"`.
+    #[error("the bytes do not begin with the SCP-KEL-EVENT-V1: separator")]
+    Separator,
+    /// The bytes end before field 4 does.
+    #[error("the bytes end before the predecessor digest does")]
+    Truncated,
+    /// Field 1 is not the `Inception` byte.
+    #[error("event_type is 0x{value:02x}, not Inception")]
+    NotInception {
+        /// The byte field 1 carries.
+        value: u8,
+    },
+    /// Field 2 is not zero.
+    #[error("an inception's identifier field is not zero")]
+    NonzeroIdentifier,
+    /// Field 3 is not zero.
+    #[error("an inception's sequence is not zero")]
+    NonzeroSequence,
+    /// Field 4 is not zero.
+    #[error("an inception's predecessor digest is not zero")]
+    NonzeroPredecessor,
 }

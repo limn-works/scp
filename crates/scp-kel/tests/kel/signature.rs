@@ -340,6 +340,36 @@ fn assertion_form_accepts_other_flag_bits_beside_up_and_uv() -> TestResult {
     Ok(())
 }
 
+/// Re-signs Vector 42's assertion with `flags` in byte 32 and verifies it.
+fn assert_flags_accepted(flags: u8) -> TestResult {
+    let signature = resigned(
+        authenticator_data(flags)?,
+        client_data("webauthn.get", V42_CHALLENGE),
+    )?;
+    verify_v42(&signature)??;
+    Ok(())
+}
+
+/// Flags 0x07: reserved bit 1 set beside UP and UV. §9.7.4.2: a verifier
+/// "MUST NOT reject … on any other flag bit of byte 32".
+#[test]
+fn assertion_form_accepts_reserved_bit_1() -> TestResult {
+    assert_flags_accepted(0x07)
+}
+
+/// Flags 0x25: reserved bit 5 set beside UP and UV.
+#[test]
+fn assertion_form_accepts_reserved_bit_5() -> TestResult {
+    assert_flags_accepted(0x25)
+}
+
+/// Flags 0xFF: every bit of byte 32, reserved bits 1 and 5 beside AT, ED,
+/// BE, BS, UP and UV.
+#[test]
+fn assertion_form_accepts_every_flag_bit() -> TestResult {
+    assert_flags_accepted(0xFF)
+}
+
 /// (h) 36 and (i) 257 bytes of `authenticatorData`, through the constructor
 /// and through the wire.
 #[test]

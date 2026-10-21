@@ -18,8 +18,8 @@ use scp_kel::{
 };
 
 use crate::fixtures::{
-    TestResult, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V50_PREIMAGE, array, bytes, fields,
-    identifier, v41_inception, v41_snapshot, v50_key_state,
+    SEPARATOR_LEN, TestResult, V41_DIGEST, V41_IDENTIFIER, V41_PREIMAGE, V50_PREIMAGE, array,
+    bytes, fields, identifier, v41_inception, v41_snapshot, v50_key_state,
 };
 
 // Offsets into Vector 41's 347 field bytes (its 364 printed bytes after the
@@ -436,18 +436,22 @@ fn encoder_accepts_uncapped_lists_past_every_maximum() -> TestResult {
 }
 
 #[test]
-fn encoder_refuses_field_bytes_over_max_event_bytes() -> TestResult {
+fn encoder_refuses_an_encoded_length_over_max_event_bytes() -> TestResult {
     // Vector 50's 303 field bytes carry one seal; each further seal adds 32.
-    // 2,039 seals end at 65,519 bytes, under MAX_EVENT_BYTES; 2,040 at 65,551.
+    // Its encoded length is the 17-byte separator, the field bytes and its
+    // one Raw index's 64-byte ceiling: 352 + 32 per seal. 2,037 seals reach
+    // MAX_EVENT_BYTES exactly; 2,038 reach 65,568.
     let mut preimage = v50_key_state()?;
-    preimage.seals = vec![[5; 32]; 2039];
+    preimage.seals = vec![[5; 32]; 2037];
     let encoded = encode_preimage(&preimage)?;
-    assert!(encoded.fields().len() <= n(MAX_EVENT_BYTES)?);
+    assert_eq!(encoded.signed_preimage().len() + 64, n(MAX_EVENT_BYTES)?);
     assert_decodes_identically(encoded.fields())?;
     preimage.seals.push([5; 32]);
     assert_eq!(
         encode_preimage(&preimage),
-        Err(EncodeError::PreimageTooLong { len: 65_551 })
+        Err(EncodeError::EventTooLong {
+            encoded_len: 65_568
+        })
     );
     Ok(())
 }
@@ -549,16 +553,22 @@ fn commitment_list_past_the_remaining_bytes_is_rejected() -> TestResult {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn input_over_max_event_bytes_is_rejected() -> TestResult {
-    let len = n(MAX_EVENT_BYTES)? + 1;
+fn input_whose_signed_preimage_passes_max_event_bytes_is_rejected_unread() -> TestResult {
+    // The encoded length is never shorter than the signed preimage, the
+    // 17-byte separator plus the field bytes, so 65,520 field bytes are
+    // over MAX_EVENT_BYTES before any field is read.
+    let len = n(MAX_EVENT_BYTES)? - SEPARATOR_LEN + 1;
     assert_eq!(
         decode_preimage(&vec![0x01; len]),
-        Err(DecodeError::PreimageTooLong { len })
+        Err(DecodeError::EventTooLong {
+            encoded_len: len + SEPARATOR_LEN
+        })
     );
-    // At exactly MAX_EVENT_BYTES the length rule passes and parsing runs.
+    // At a signed preimage of exactly MAX_EVENT_BYTES the pre-check passes
+    // and parsing runs.
     assert!(!matches!(
         decode_preimage(&vec![0x01; len - 1]),
-        Err(DecodeError::PreimageTooLong { .. })
+        Err(DecodeError::EventTooLong { .. })
     ));
     Ok(())
 }
