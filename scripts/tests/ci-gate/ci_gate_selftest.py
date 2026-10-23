@@ -6982,6 +6982,11 @@ LEG_COMMANDS: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]], ..
             ),
             "cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings",
             "cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings",
+            "cargo clippy -p scp-node --no-default-features --lib -- -D warnings",
+            (
+                "cargo clippy -p scp-node --no-default-features --features testing --all-targets "
+                "-- -D warnings"
+            ),
         ),
     ),
     (
@@ -8912,7 +8917,9 @@ def unlinted_features(
     step of `doc` passes `--all-features` with `-p <package>`, names it (or a
     feature of `package` that enables it, per `features`) in `--features` with
     `-p <package>`, or names `<package>/<feature>`; a feature in `targets`
-    counts only from a command whose `--target` is its target.
+    counts only from a command whose `--target` is its target. A command with
+    `-p <package>` and no `--no-default-features` enables `default`, and so
+    every feature `default` enables.
     """
     if targets is None:
         targets = {f: t for (p, f), t in TARGET_GATED_FEATURES.items() if p == package}
@@ -8928,6 +8935,8 @@ def unlinted_features(
                 own = package in [b for a, b in itertools.pairwise(tokens) if a == "-p"]
                 target = next((b for a, b in itertools.pairwise(tokens) if a == "--target"), None)
                 named: set[str] = set(features) if own and "--all-features" in tokens else set()
+                if own and "--no-default-features" not in tokens and "default" in features:
+                    named.add("default")
                 for flag, value in itertools.pairwise(tokens):
                     if flag != "--features":
                         continue
@@ -8984,6 +8993,11 @@ def run_linted_features(inputs: Inputs) -> None:
     check("a <package>/<feature> name counts for that package", missing == ["a", "b"], f"{missing}")
     missing = unlinted_features(synthetic("cargo test -p x --features a,c"), "x", toy)
     check("a command other than cargo clippy is not counted", missing == ["a", "b", "c"], f"{missing}")
+    defaulted = {"default": ["a"], "a": [], "c": []}
+    missing = unlinted_features(synthetic("cargo clippy -p x --features c"), "x", defaulted)
+    check("a command keeping default features lints `default` and what it enables", missing == [], f"{missing}")
+    missing = unlinted_features(synthetic("cargo clippy -p x --no-default-features --features c"), "x", defaulted)
+    check("a --no-default-features command does not lint `default`", missing == ["a", "default"], f"{missing}")
     wasm = {"a": "wasm32-unknown-unknown"}
     missing = unlinted_features(synthetic("cargo clippy -p x --features a"), "x", toy, wasm)
     check("a host-target command does not lint a wasm32-gated feature", missing == ["a", "c"], f"{missing}")

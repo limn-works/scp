@@ -10,9 +10,26 @@ readme = "README.md"
 keywords = ["node", "server", "relay", "identity"]
 categories = ["network-programming", "command-line-utilities"]
 
+# The binary needs the `node-bin` feature: the Prometheus exporter, the startup
+# utilities, and the redb blob backend link only into it (track A2 of the
+# crate-split plan). `node-bin` is in `default`, so `cargo build -p scp-node`
+# still emits the binary the Dockerfile copies.
 [[bin]]
 name = "scp-node"
 path = "src/main.rs"
+required-features = ["node-bin"]
+
+# Both tests spawn the `scp-node` binary through `CARGO_BIN_EXE_scp-node`, which
+# exists only when the binary builds.
+[[test]]
+name = "run_mode_selection"
+path = "tests/run_mode_selection.rs"
+required-features = ["node-bin"]
+
+[[test]]
+name = "storage_backend_selection"
+path = "tests/storage_backend_selection.rs"
+required-features = ["node-bin"]
 
 [dependencies]
 # Links the wiping global allocator every shipped artifact installs
@@ -25,9 +42,11 @@ scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2", features = ["production-dht"] }
 scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2", features = ["production-dht"] }
 scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.2", features = [
+    # Ungated: `build_host_site_node` opens `BlobStorageBackend::sqlite` on the
+    # path every `host_site()` consumer takes, and §17.17 requires a durable
+    # blob backend on every shipped relay. `redb-blob` and `startup` come
+    # from `node-bin`.
     "sqlite-blob",
-    "redb-blob",
-    "startup",
 ] }
 # Durability-only + real backends ONLY (ADR-062 §Decision 6). `testing` is NO
 # LONGER enabled here: the production `Node::start` / first-start create path
@@ -85,8 +104,10 @@ rand = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 x509-parser = "0.16"
-metrics = { workspace = true }
-metrics-exporter-prometheus = { workspace = true }
+# Only `main.rs` installs the global recorder and serves `/metrics`; the
+# library emits through `scp-runtime` and needs no exporter. Gated by `node-bin`.
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
@@ -114,11 +135,24 @@ rcgen = "0.14"
 tempfile = "3"
 
 [features]
+# `default` holds only `node-bin`, so a shipped `scp-node` binary enables
+# neither `allow_unencrypted_storage` nor `testing`, and
+# `scripts/check-shipped-feature-graph.sh` rejects a resolved set that names
+# either. A library consumer (the FFI bridges, `scp-testing`) sets
+# `default-features = false` and links none of the `node-bin` dependencies.
+default = ["node-bin"]
+# What only the `scp-node` binary needs: the Prometheus recorder and exporter,
+# the shared startup utilities (environment parsing, tracing, backend
+# selection), and the redb blob backend an operator can select with
+# `SCP_RELAY_STORAGE_BACKEND=redb`. `[[bin]]` requires it.
+node-bin = [
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
+    "scp-transport/startup",
+    "scp-transport/redb-blob",
+]
 # Gates `Node::start_for_testing` — accepts any `Storage`
-# backend without an `EncryptedStorage` bound. See issue #695. This crate has no
-# `default` feature list, so a shipped `scp-node` binary enables neither this
-# feature nor `testing`, and `scripts/check-shipped-feature-graph.sh` rejects a
-# resolved set that names either.
+# backend without an `EncryptedStorage` bound. See issue #695.
 allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
 # Test-harness-only. Carries `scp-identity/testing` so the `--ephemeral` path
 # can build `InMemorySequenceStore`, and `scp-dht/testing` so `ApplicationNode::dev`,

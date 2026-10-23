@@ -91,12 +91,15 @@ scp-identity = { path = "../../scp-identity", optional = true }
 # feature lists — the crate is always present, never feature-gated optional.
 scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-transport = { path = "../../scp-transport", features = ["redb-blob"], optional = true }
-# Default features only. `start_node_in_memory` wraps its ephemeral store in
+# No features, default ones included: `default-features = false` drops
+# scp-node's `node-bin` (the Prometheus exporter, the startup utilities, and the
+# redb blob backend only the `scp-node` binary uses); the relay this crate
+# starts opens redb through the `scp-transport` edge above. `start_node_in_memory` wraps its ephemeral store in
 # `EncryptingAdapter` and `start_node_local` receives a caller's already-encrypted
 # handle, so both reach a production `Node::start` and its sealed
 # `EncryptedStorage` bound. `scripts/check-shipped-feature-graph.sh` rejects any
 # feature added here that its allowlist omits (ADR-062 §Decision 6).
-scp-node = { path = "../../scp-node", optional = true }
+scp-node = { path = "../../scp-node", default-features = false, optional = true }
 scp-platform = { path = "../../scp-platform", features = ["encrypting", "sqlite", "in-memory-storage"], optional = true }
 # Unconditional: `error_codes::custody_failure_code` and `ucan_errors` read the
 # `CustodyFailure` the runtime carries, and `custody_parse` uses the P-256 point.

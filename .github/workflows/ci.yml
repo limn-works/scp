@@ -1783,6 +1783,13 @@ jobs:
           cargo clippy -p scp-transport --features combined,local-cache,push-store,relay-persistence,testing,upnp --all-targets -- -D warnings
           cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
           cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
+          # scp-node's library without its default `node-bin` feature, the
+          # build each FFI bridge and scp-testing resolves through their
+          # `default-features = false` edge: no Prometheus exporter, no startup
+          # utilities, no redb backend, and no binary. Every other command here
+          # leaves `node-bin` on, so only these two lint the library without it.
+          cargo clippy -p scp-node --no-default-features --lib -- -D warnings
+          cargo clippy -p scp-node --no-default-features --features testing --all-targets -- -D warnings
       # Runs scripts/check-examples-compile.sh against throwaway one- and two-crate
       # workspaces, each carrying a defect the gate must reject or a layout it must accept.
       - name: Run examples-compile cases
