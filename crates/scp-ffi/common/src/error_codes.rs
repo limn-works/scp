@@ -932,6 +932,24 @@ pub const TRANS_5094: &str = "SCP-TRANS-5094";
 /// Reconnect failed: reading a context's stored `last_relay_contact` failed,
 /// so no context was reconnected (`reconnect::ReconnectError::ContactRead`).
 pub const TRANS_5095: &str = "SCP-TRANS-5095";
+/// Push wake context failed: the context's persisted relay set is empty
+/// (`reconnect::WakePullError::NoRelays`).
+pub const TRANS_5096: &str = "SCP-TRANS-5096";
+/// Push wake context failed: a relay in the context's relay set was not
+/// dialed (`reconnect::WakePullError::RelayUnavailable`).
+pub const TRANS_5097: &str = "SCP-TRANS-5097";
+/// Push wake context failed: reading the context's stored
+/// `last_relay_contact` failed (`reconnect::WakePullError::ContactRead`).
+pub const TRANS_5098: &str = "SCP-TRANS-5098";
+/// Push wake context failed: the Phase 1 query on a relay of the context's
+/// relay set failed (`reconnect::WakePullError::Query`).
+pub const TRANS_5099: &str = "SCP-TRANS-5099";
+/// Push wake context failed: writing the context's `last_relay_contact`
+/// failed (`reconnect::WakePullError::ContactWrite`).
+pub const TRANS_5100: &str = "SCP-TRANS-5100";
+/// Push wake context failed: the actor reached no verdict on a blob of the
+/// context's buffer (`reconnect::WakePullError::Undelivered`).
+pub const TRANS_5101: &str = "SCP-TRANS-5101";
 
 // -------------------------------------------------------------------------
 // Outlet (SCP-OUTLET- 6000--6999)

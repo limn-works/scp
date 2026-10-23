@@ -748,10 +748,10 @@ export interface ContextReconnectResult {
   readonly envelopesDelivered: number;
   /**
    * Why writing the context's `last_relay_contact` failed after
-   * `needsReconnect` was cleared; `null` when the write succeeded or no write
+   * `needsReconnect` was cleared; absent when the write succeeded or no write
    * was due.
    */
-  readonly relayContactError: string | null;
+  readonly relayContactError?: string;
 }
 
 /**

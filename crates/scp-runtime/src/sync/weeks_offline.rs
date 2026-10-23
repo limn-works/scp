@@ -948,6 +948,20 @@ pub enum WeeksOfflineError {
         timeout_secs: u64,
     },
 
+    /// No shipped path can complete a Tier 3 re-join: none publishes the
+    /// member's `ResetRequest`, none has an admin process one, and none
+    /// applies a re-add Welcome to a context the member already holds
+    /// (ADR-029 reconnection-driver addendum).
+    #[error(
+        "Tier 3 re-join of context {context_id} is unavailable: no shipped path \
+         publishes a ResetRequest, has an admin process it, or applies a re-add \
+         Welcome to an existing context"
+    )]
+    ReJoinUnavailable {
+        /// The context that needs the re-join.
+        context_id: ContextId,
+    },
+
     /// No admin is online to process the reset request.
     #[error("no admin online to process reset for context {context_id}")]
     NoAdminAvailable {

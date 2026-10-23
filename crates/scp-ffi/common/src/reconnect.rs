@@ -55,9 +55,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use scp_core::context::ContextWakeTarget;
-use scp_core::context::actor::commands::DeliveryMode;
+use scp_core::context::actor::commands::{DeliverOutcome, DeliveryMode, MessagingCommand};
 use scp_core::context::supervisor::Supervisor;
+use scp_core::context::{ContextError, ContextWakeTarget};
 use scp_core::store::StoreError;
 use scp_core::store::sync::RelayContactStore;
 use scp_core::sync::days_offline::{DaysOfflineError, SnapshotTransport};
@@ -322,41 +322,64 @@ pub async fn deliver_commit_blobs_until_steady(
     fed
 }
 
+/// What one [`refeed_buffer`] pass did with the Phase 1 buffer.
+#[derive(Debug, Default)]
+pub struct RefeedTally {
+    /// Blobs the actor accepted as application messages on this pass.
+    pub delivered: u64,
+    /// Blobs whose delivery reached no verdict ([`delivery_reached_verdict`]).
+    pub unreached: u64,
+    /// The last delivery failure that reached no verdict.
+    pub last_unreached: Option<ContextError>,
+}
+
 /// Phase 4 body: re-feeds every blob of the Phase 1 buffer to the actor once,
 /// in `mode`.
 ///
 /// The re-feed processes a sender-key advance interleaved among the blobs.
-/// Returns the count of blobs the actor accepted as application messages on
-/// this pass, each also added to `tally` as it is accepted. A blob the actor
-/// already accepted is refused as a replay and is not counted.
+/// Each application message the actor accepts is counted and added to `tally`
+/// as it is accepted. A blob the actor already accepted is refused as a replay
+/// and is not counted. A blob whose delivery reached no verdict is counted in
+/// [`RefeedTally::unreached`]: this pass is each blob's last delivery, so a
+/// push-wake pull keeps the context's stored contact when any blob is
+/// unreached (ADR-029 §2 push-wake pull mode step 6).
 pub async fn refeed_buffer(
     supervisor: &Supervisor,
     context_id: &str,
     messages: &[BufferedMessage],
     mode: DeliveryMode,
     tally: &DeliveryTally,
-) -> u64 {
-    let mut delivered = 0u64;
+) -> RefeedTally {
+    let mut fed = RefeedTally::default();
     for msg in messages {
         match supervisor
             .deliver_commit_blob(context_id, msg.payload.clone(), mode)
             .await
         {
             Ok(Some(_)) => {
-                delivered += 1;
+                fed.delivered += 1;
                 tally.add(context_id, 1);
             }
             Ok(None) => {}
-            Err(e) => {
+            Err(e) if delivery_reached_verdict(&e) => {
                 tracing::debug!(
                     context_id,
                     error = %e,
-                    "refeed_buffer: deliver refused a blob; continuing"
+                    "refeed_buffer: the actor refused a blob; continuing"
                 );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "refeed_buffer: a delivery reached no verdict; continuing"
+                );
+                fed.unreached += 1;
+                fed.last_unreached = Some(e);
             }
         }
     }
-    delivered
+    fed
 }
 
 /// Relay-backed driver for the ADR-029 reconnection protocol.
@@ -825,69 +848,27 @@ impl ResetTransport for RelayActorSyncDriver<'_> {
         Ok(epoch)
     }
 
-    /// Tier 3 — poll the context routing key until the local MLS epoch
-    /// advances past the epoch read on entry, feeding each retrieved blob into
-    /// the actor (which processes the Welcome or re-add Commit and advances
-    /// the epoch), and return the new epoch.
+    /// Tier 3 — fails at once with
+    /// [`ReJoinUnavailable`](scp_core::sync::weeks_offline::WeeksOfflineError::ReJoinUnavailable).
     ///
-    /// The relay is queried about once a second until `timeout_secs` passes.
-    /// No reset is reported unless the epoch advanced: a pull that finds no
-    /// Welcome is a [`WelcomeTimeout`](scp_core::sync::weeks_offline::WeeksOfflineError::WelcomeTimeout),
-    /// which leaves `needs_reconnect` set and writes no relay contact.
+    /// No shipped path can complete a re-join: none publishes the member's
+    /// `ResetRequest`, none has an admin process one, and none applies a
+    /// re-add Welcome to a context the member already holds. An advance of the
+    /// local MLS epoch is no re-add signal, because an ordinary Commit also
+    /// advances it. The failure leaves `needs_reconnect` set and writes no
+    /// relay contact (ADR-029 reconnection-driver addendum).
     async fn subscribe_and_await_welcome(
         &self,
         context_id: &str,
-        timeout_secs: u64,
+        _timeout_secs: u64,
     ) -> Result<u64, scp_core::sync::weeks_offline::WeeksOfflineError> {
-        use scp_core::sync::weeks_offline::WeeksOfflineError;
-        let Some(entry_epoch) = self.supervisor.local_mls_epoch(context_id).await else {
-            return Err(WeeksOfflineError::ResetRequestFailed {
+        Err(
+            scp_core::sync::weeks_offline::WeeksOfflineError::ReJoinUnavailable {
                 context_id: context_id.to_owned(),
-                reason: "a broadcast context has no MLS group to re-join".to_owned(),
-            });
-        };
-        let routing_id = self.shared_routing_id(context_id).await;
-        let deadline = std::time::Duration::from_secs(timeout_secs.max(1));
-        let poll = async {
-            loop {
-                let envelopes = self.transport.query(&routing_id, None).await.map_err(|e| {
-                    WeeksOfflineError::ResetRequestFailed {
-                        context_id: context_id.to_owned(),
-                        reason: format!("await_welcome relay query failed: {e}"),
-                    }
-                })?;
-                for envelope in &envelopes {
-                    if let Ok(Some(_)) = self
-                        .supervisor
-                        .deliver_commit_blob(
-                            context_id,
-                            envelope.encrypted_blob.clone(),
-                            DeliveryMode::Live,
-                        )
-                        .await
-                    {
-                        self.tally.add(context_id, 1);
-                    }
-                }
-                if let Some(epoch) = self.supervisor.local_mls_epoch(context_id).await
-                    && epoch > entry_epoch
-                {
-                    return Ok(epoch);
-                }
-                tokio::time::sleep(WELCOME_POLL_INTERVAL).await;
-            }
-        };
-        tokio::time::timeout(deadline, poll).await.map_err(|_| {
-            WeeksOfflineError::WelcomeTimeout {
-                context_id: context_id.to_owned(),
-                timeout_secs,
-            }
-        })?
+            },
+        )
     }
 }
-
-/// Interval between the relay queries of a Tier 3 Welcome await.
-const WELCOME_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Maps a [`CatchUpStatus`] to a coarse caught-up boolean for the bridge
 /// report. Re-exported helper so each bridge classifies identically.
@@ -1403,6 +1384,20 @@ pub enum WakePullError {
         #[source]
         source: StoreError,
     },
+    /// The actor reached no verdict on `count` blobs of the context's Phase 1
+    /// buffer in their last delivery, Phase 4 ([`delivery_reached_verdict`]),
+    /// so the context keeps its stored `last_relay_contact` (ADR-029 §2
+    /// push-wake pull mode step 6).
+    #[error("{count} blob(s) of {context_id} reached no verdict: {source}")]
+    Undelivered {
+        /// The context whose blobs reached no verdict.
+        context_id: String,
+        /// How many blobs reached no verdict.
+        count: u64,
+        /// The last delivery failure.
+        #[source]
+        source: ContextError,
+    },
 }
 
 impl WakePullError {
@@ -1414,8 +1409,89 @@ impl WakePullError {
             | Self::RelayUnavailable { context_id, .. }
             | Self::ContactRead { context_id, .. }
             | Self::Query { context_id, .. }
-            | Self::ContactWrite { context_id, .. } => context_id,
+            | Self::ContactWrite { context_id, .. }
+            | Self::Undelivered { context_id, .. } => context_id,
         }
+    }
+
+    /// The bridge error code of this failure: one `SCP-TRANS` code per
+    /// variant, `SCP-TRANS-5096` to `SCP-TRANS-5101` (`sdk-common.md`).
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::NoRelays { .. } => crate::error_codes::TRANS_5096,
+            Self::RelayUnavailable { .. } => crate::error_codes::TRANS_5097,
+            Self::ContactRead { .. } => crate::error_codes::TRANS_5098,
+            Self::Query { .. } => crate::error_codes::TRANS_5099,
+            Self::ContactWrite { .. } => crate::error_codes::TRANS_5100,
+            Self::Undelivered { .. } => crate::error_codes::TRANS_5101,
+        }
+    }
+}
+
+/// Whether a delivery that returned `error` reached a verdict on its blob
+/// (ADR-029 §2 push-wake pull mode step 6).
+///
+/// `true` when the actor judged the blob and refused it as invalid for the
+/// group: a replay, an undecryptable blob, a Commit that fits no epoch, or any
+/// other refusal of the blob's content or sender. `false` when the delivery
+/// never reached a judgment: the actor is busy, crashed, poisoned,
+/// unregistered or shut down, or its key custody, transport, event log or
+/// store failed. Every variant is named, so a new `ContextError` variant is a
+/// compile error here until someone decides which side it falls on.
+#[must_use]
+pub const fn delivery_reached_verdict(error: &ContextError) -> bool {
+    match error {
+        ContextError::Custody(_)
+        | ContextError::WrappingKeyCustodyUnavailable
+        | ContextError::WrappingKeyHandleInvalid
+        | ContextError::TransportFailed(_)
+        | ContextError::EventLogFailed(_)
+        | ContextError::PersistenceFailed(_)
+        | ContextError::ContextNotRegistered(_)
+        | ContextError::RateLimited { .. }
+        | ContextError::CommitBroadcastFault { .. }
+        | ContextError::ActorBusy(_)
+        | ContextError::NotImplemented(_)
+        | ContextError::NotInitialized(_)
+        | ContextError::TransportTimeout(_)
+        | ContextError::ContextPoisoned(_)
+        | ContextError::ActorCrashed(_)
+        | ContextError::SupervisorShutDown(_) => false,
+        ContextError::InvalidTransition { .. }
+        | ContextError::CeilingImmutable
+        | ContextError::CeilingRequired(_)
+        | ContextError::ContextNotActive
+        | ContextError::ContextClosed
+        | ContextError::ContextExpired
+        | ContextError::TemplateMismatch(_)
+        | ContextError::MembershipFailed(_)
+        | ContextError::CryptoFailed(_)
+        | ContextError::SenderMismatch { .. }
+        | ContextError::AttestationSignerActiveKeyUnresolved
+        | ContextError::AttestationSignerNotActiveKey
+        | ContextError::InvitationEncMalformed(_)
+        | ContextError::PermissionDenied(_)
+        | ContextError::MemberNotFound(_)
+        | ContextError::InvalidState(_)
+        | ContextError::InvalidKeyPackage(_)
+        | ContextError::LimitExceeded(_)
+        | ContextError::InvalidMemoryScopeForBroadcast
+        | ContextError::NothingToRestore(_)
+        | ContextError::IntegrationFailed(_)
+        | ContextError::GovernanceFailed(_)
+        | ContextError::CreationFailed(_)
+        | ContextError::VersionIncompatible { .. }
+        | ContextError::SnapshotFloorRegression { .. }
+        | ContextError::ImportRejected { .. }
+        | ContextError::ExportVersionUnsupported { .. }
+        | ContextError::SnapshotSignatureInvalid { .. }
+        | ContextError::NoParticipationFacts { .. }
+        | ContextError::PseudonymRegistryEmpty { .. }
+        | ContextError::NotPseudonymousContext { .. }
+        | ContextError::KeyPackageReplay(_)
+        | ContextError::Outlet(_)
+        | ContextError::OutletContextNotActive { .. } => true,
     }
 }
 
@@ -1431,8 +1507,10 @@ impl WakePullError {
 /// the member holds) since the stored `last_relay_contact` minus
 /// [`SINCE_OVERLAP_SECS`], or 0 when none is stored; Phase 2
 /// ([`deliver_commit_blobs_until_steady`]) and Phase 4 ([`refeed_buffer`])
-/// feed the buffer to the actor in [`DeliveryMode::PullOnly`]; and only then
-/// is `now` written to `last_relay_contact`. Every application envelope the
+/// feed the buffer to the actor in [`DeliveryMode::PullOnly`]; and only when
+/// every blob's Phase 4 delivery reached a verdict is `now` written to
+/// `last_relay_contact`, else the context fails with
+/// [`WakePullError::Undelivered`]. Every application envelope the
 /// actor accepts is added to `tally` as it is accepted, so a caller whose
 /// deadline drops this future still knows what was delivered, and a context
 /// the deadline stops keeps its stored contact.
@@ -1537,7 +1615,7 @@ async fn wake_pull_context(
         tally,
     )
     .await;
-    refeed_buffer(
+    let refed = refeed_buffer(
         supervisor,
         context_id,
         &messages,
@@ -1545,6 +1623,13 @@ async fn wake_pull_context(
         tally,
     )
     .await;
+    if let Some(source) = refed.last_unreached {
+        return Err(WakePullError::Undelivered {
+            context_id: context_id.to_owned(),
+            count: refed.unreached,
+            source,
+        });
+    }
     relay_contacts
         .store_last_relay_contact(context_id, now)
         .await
@@ -1561,7 +1646,7 @@ async fn wake_pull_context(
 /// # Errors
 ///
 /// The store's [`StoreError`] when the write fails.
-pub async fn record_relay_contact(
+async fn record_relay_contact(
     relay_contacts: &dyn RelayContactStore,
     context_id: &str,
 ) -> Result<(), StoreError> {
@@ -1571,6 +1656,65 @@ pub async fn record_relay_contact(
             scp_clock::Clock::now_secs(&scp_clock::SystemClock),
         )
         .await
+}
+
+/// What [`deliver_live_envelope`] did with one envelope.
+#[derive(Debug)]
+pub struct LiveDelivery {
+    /// The actor's reply to the delivery.
+    pub delivered: Result<DeliverOutcome, ContextError>,
+    /// The failure of the `last_relay_contact` write after an accepted
+    /// delivery; `None` when the write landed or the actor refused the
+    /// envelope.
+    pub contact_error: Option<StoreError>,
+}
+
+/// Delivers one envelope a live relay subscription received.
+///
+/// Dispatches `MessagingCommand::DeliverIncoming` in [`DeliveryMode::Live`]
+/// to `context_id` through the Supervisor `supervisor` still points at,
+/// awaits the actor's reply, and applies the live-subscription contact rule
+/// (ADR-029 §2 sync-state keys): an accepted envelope writes the current
+/// local time to the context's `last_relay_contact`, and a refused one writes
+/// nothing.
+///
+/// Every bridge's live subscription delivers through this function, so none
+/// can deliver without the contact rule. The upgraded `Arc` is held only for
+/// the dispatch. Returns `None` when the Supervisor has dropped, which ends
+/// the subscription (ADR-049 Decision 16). A reply the actor drops is
+/// [`ContextError::ActorCrashed`].
+pub async fn deliver_live_envelope(
+    supervisor: &std::sync::Weak<Supervisor>,
+    relay_contacts: &dyn RelayContactStore,
+    context_id: &str,
+    encrypted_blob: Vec<u8>,
+) -> Option<LiveDelivery> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let cmd = MessagingCommand::DeliverIncoming {
+        context_id: context_id.to_owned(),
+        envelope_bytes: encrypted_blob,
+        mode: DeliveryMode::Live,
+        reply,
+    };
+    let dispatched = {
+        let live = supervisor.upgrade()?;
+        live.dispatch_command(context_id, cmd).await
+    };
+    let delivered = match dispatched {
+        Ok(_) => rx.await.unwrap_or_else(|_| {
+            Err(ContextError::ActorCrashed(format!(
+                "the actor of {context_id} dropped its delivery reply"
+            )))
+        }),
+        Err(e) => Err(e),
+    };
+    let contact_error = record_contact_after_live_delivery(relay_contacts, context_id, &delivered)
+        .await
+        .err();
+    Some(LiveDelivery {
+        delivered,
+        contact_error,
+    })
 }
 
 /// The contact rule of a live subscription (ADR-029 §2 sync-state keys).
@@ -1584,7 +1728,7 @@ pub async fn record_relay_contact(
 ///
 /// The store's [`StoreError`] when the write after an accepted delivery
 /// fails. The caller reports it and keeps delivering.
-pub async fn record_contact_after_live_delivery<T: Sync, E: Sync>(
+async fn record_contact_after_live_delivery<T: Sync, E: Sync>(
     relay_contacts: &dyn RelayContactStore,
     context_id: &str,
     delivered: &Result<T, E>,
@@ -1618,6 +1762,17 @@ mod tests {
         async fn load_last_relay_contact(&self, _: &str) -> Result<Option<u64>, StoreError> {
             Ok(None)
         }
+    }
+
+    /// A dropped Supervisor yields `None`, which ends the subscription, and
+    /// writes no contact.
+    #[tokio::test]
+    async fn a_live_delivery_to_a_dropped_supervisor_ends_the_subscription() {
+        let store = contacts();
+        let outcome =
+            deliver_live_envelope(&std::sync::Weak::new(), &store, "ctx", vec![1, 2, 3]).await;
+        assert!(outcome.is_none(), "a dropped Supervisor must end the loop");
+        assert_eq!(store.load_last_relay_contact("ctx").await.unwrap(), None);
     }
 
     /// An accepted live delivery writes the current local time; a refused one

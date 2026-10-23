@@ -11721,20 +11721,17 @@ impl Supervisor {
         })?
     }
 
-    /// Best-effort flush of every context's snapshot to the configured
-    /// persistence provider.
+    /// Flushes every context's snapshot to the configured persistence
+    /// provider (ADR-049 Decision 9).
     ///
     /// No-op if no persistence provider is configured.
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok(())` — the `Result` shape preserves
-    /// the legacy method's signature for callers that propagate with
-    /// `?`. Per-context flush failures are logged via `tracing::warn!`
-    /// inside the helper.
+    /// The first context's flush failure when any flush did not land; see
+    /// [`crate::context::lifecycle_helpers::flush_all_contexts`].
     pub async fn flush_all_contexts(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::flush_all_contexts(self).await;
-        Ok(())
+        crate::context::lifecycle_helpers::flush_all_contexts(self).await
     }
 
     /// Sync wrapper for [`Self::flush_all_contexts`].
@@ -11746,11 +11743,11 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok(())`. Per-context flush failures
-    /// are logged via `tracing::warn!` inside the helper.
+    /// The first context's flush failure, or a failure when called outside
+    /// a tokio runtime; see
+    /// [`crate::context::lifecycle_helpers::flush_all_contexts_sync`].
     pub fn flush_all_contexts_sync(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::flush_all_contexts_sync(self);
-        Ok(())
+        crate::context::lifecycle_helpers::flush_all_contexts_sync(self)
     }
 
     /// Shut down every context the supervisor owns and wait for every task

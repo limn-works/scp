@@ -1097,8 +1097,9 @@ pub enum LifecycleCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
-    /// Sweep: best-effort flush of THIS actor's snapshot to the configured
-    /// persistence provider.
+    /// Sweep: flush of THIS actor's snapshot to the configured persistence
+    /// provider. The reply carries the write's error when it did not land
+    /// (ADR-049 Decision 9).
     ///
     /// Dispatched per-actor by the supervisor's iterating sweep entry
     /// point

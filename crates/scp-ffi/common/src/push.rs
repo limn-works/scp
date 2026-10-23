@@ -133,14 +133,21 @@ impl WakeFailure {
     /// The flat view an FFI bridge returns for this failure.
     #[must_use]
     pub fn view(&self) -> WakeFailureView {
-        let context_ids = match self {
-            Self::Unrestored { context_ids } => context_ids.clone(),
-            Self::Pull(failures) => failures
-                .iter()
-                .map(|f| f.context_id().to_owned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
+        let (named, mut context_failures): (Vec<&str>, Vec<WakeContextFailureView>) = match self {
+            Self::Unrestored { context_ids } => {
+                (context_ids.iter().map(String::as_str).collect(), Vec::new())
+            }
+            Self::Pull(failures) => (
+                failures.iter().map(WakePullError::context_id).collect(),
+                failures
+                    .iter()
+                    .map(|f| WakeContextFailureView {
+                        context_id: f.context_id().to_owned(),
+                        code: f.code(),
+                        message: f.to_string(),
+                    })
+                    .collect(),
+            ),
             Self::ShutDown
             | Self::NoSupervisor
             | Self::NoLocalIdentity
@@ -148,12 +155,23 @@ impl WakeFailure {
             | Self::Restore(_)
             | Self::Targets(_)
             | Self::DialCancelled(_)
-            | Self::DeadlineExpired => Vec::new(),
+            | Self::DeadlineExpired => (Vec::new(), Vec::new()),
         };
+        // Every arm goes through one sort and deduplication, so no arm can
+        // hand a bridge its IDs in arrival order.
+        let context_ids = named
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        context_failures
+            .sort_by(|a, b| (a.context_id.as_str(), a.code).cmp(&(b.context_id.as_str(), b.code)));
         WakeFailureView {
             code: self.code(),
             message: self.to_string(),
             context_ids,
+            context_failures,
         }
     }
 }
@@ -169,6 +187,21 @@ pub struct WakeFailureView {
     /// The contexts the failure names, sorted and deduplicated; empty for a
     /// failure of the whole wake.
     pub context_ids: Vec<String>,
+    /// For [`WakeFailure::Pull`], each failed context with its own code,
+    /// sorted by context ID and then code; empty for every other variant.
+    pub context_failures: Vec<WakeContextFailureView>,
+}
+
+/// One context's failure in a [`WakeFailureView`] (ADR-029 §2 push-wake pull
+/// mode step 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeContextFailureView {
+    /// The context that failed.
+    pub context_id: String,
+    /// The failure's stable code ([`WakePullError::code`]).
+    pub code: &'static str,
+    /// The failure's `Display` text.
+    pub message: String,
 }
 
 /// A wake the device must not act on.
@@ -522,15 +555,77 @@ mod tests {
         assert_eq!(codes.len(), failures.len(), "each variant has its own code");
         let expected: BTreeSet<String> = (5085..=5094).map(|n| format!("SCP-TRANS-{n}")).collect();
         assert_eq!(codes, expected);
-        assert_eq!(
-            failures[5].view().context_ids,
-            vec!["b".to_owned(), "a".to_owned()]
-        );
+        let unrestored = failures[5].view();
+        assert_eq!(unrestored.context_ids, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(unrestored.context_failures.is_empty());
         let pull = failures[8].view();
         assert_eq!(pull.code, error_codes::TRANS_5093);
         assert_eq!(pull.context_ids, vec!["c1".to_owned(), "c2".to_owned()]);
         assert!(pull.message.contains("wss://r"), "{}", pull.message);
+        let per_context: Vec<(&str, &str)> = pull
+            .context_failures
+            .iter()
+            .map(|f| (f.context_id.as_str(), f.code))
+            .collect();
+        assert_eq!(
+            per_context,
+            vec![
+                ("c1", error_codes::TRANS_5097),
+                ("c2", error_codes::TRANS_5096),
+                ("c2", error_codes::TRANS_5096),
+            ],
+            "one entry per failure, sorted by context"
+        );
+        assert!(pull.context_failures[0].message.contains("wss://r"));
         assert!(failures[0].view().context_ids.is_empty());
+    }
+
+    /// Each per-context failure carries its own registered code.
+    #[test]
+    fn every_wake_pull_error_has_its_own_code() {
+        let err = || ContextError::ActorCrashed("x".to_owned());
+        let errors = [
+            WakePullError::NoRelays {
+                context_id: "a".to_owned(),
+            },
+            WakePullError::RelayUnavailable {
+                context_id: "a".to_owned(),
+                relay_url: "wss://r".to_owned(),
+                reason: "x".to_owned(),
+            },
+            WakePullError::ContactRead {
+                context_id: "a".to_owned(),
+                source: scp_core::store::StoreError::SerializationFailed("x".to_owned()),
+            },
+            WakePullError::Query {
+                context_id: "a".to_owned(),
+                source: scp_protocol::sync::SyncError::RelayCatchUpFailed {
+                    context_id: "a".to_owned(),
+                    reason: "x".to_owned(),
+                },
+            },
+            WakePullError::ContactWrite {
+                context_id: "a".to_owned(),
+                source: scp_core::store::StoreError::SerializationFailed("x".to_owned()),
+            },
+            WakePullError::Undelivered {
+                context_id: "a".to_owned(),
+                count: 1,
+                source: err(),
+            },
+        ];
+        let codes: BTreeSet<&str> = errors.iter().map(WakePullError::code).collect();
+        let expected: BTreeSet<&str> = [
+            error_codes::TRANS_5096,
+            error_codes::TRANS_5097,
+            error_codes::TRANS_5098,
+            error_codes::TRANS_5099,
+            error_codes::TRANS_5100,
+            error_codes::TRANS_5101,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(codes, expected);
     }
 
     /// The step 7 outcome rule: a delivery in any context gives `NewData`

@@ -649,10 +649,124 @@ async fn a_refused_refeed_is_not_counted() {
             scp_core::context::actor::commands::DeliveryMode::PullOnly,
             &tally,
         )
-        .await,
+        .await
+        .delivered,
         0
     );
     assert_eq!(tally.total(), 0);
+    relay.shutdown();
+}
+
+/// A context whose blob reached no verdict fails with its own code and keeps
+/// its stored contact, so the next wake pulls the blob again (ADR-029
+/// push-wake pull mode step 6). Bob's context is poisoned after the wake
+/// targets are read, so every delivery to it fails without a verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blob_that_reached_no_verdict_fails_the_context_and_writes_no_contact() {
+    let (relay, url) = start_relay().await;
+    let m = members("push-wake-undelivered", vec![url.clone()]).await;
+    m.publish_from_alice(&url).await;
+    let transport = TransportManager::new(url.clone(), Box::new(connect(&url).await));
+    let contacts = new_contacts();
+    let targets = m.bob.manager.wake_targets().await.unwrap();
+    m.bob.manager.test_poison_context(&m.ctx_id).await;
+    let unreachable = BTreeMap::new();
+    let policy = SyncPolicy::default();
+    let tally = DeliveryTally::default();
+    let failures = wake_pull_contexts(
+        &WakePull {
+            transport: &transport,
+            supervisor: &m.bob.manager,
+            unreachable: &unreachable,
+            relay_contacts: contacts.as_ref(),
+            policy: &policy,
+            now: now_secs(),
+            tally: &tally,
+        },
+        &targets,
+    )
+    .await;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        matches!(
+            &failures[0],
+            WakePullError::Undelivered { context_id, count, .. }
+                if *context_id == m.ctx_id && *count == 1
+        ),
+        "{failures:?}"
+    );
+    assert_eq!(failures[0].code(), "SCP-TRANS-5101");
+    assert_eq!(tally.total(), 0);
+    assert_eq!(
+        contacts.load_last_relay_contact(&m.ctx_id).await.unwrap(),
+        None,
+        "a context with an undelivered blob writes no contact"
+    );
+    relay.shutdown();
+}
+
+/// The shared live delivery path every bridge's subscription calls writes
+/// the contact after the actor accepts an envelope and writes nothing when
+/// the actor refuses a replay of it (ADR-029 §2 sync-state keys).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_delivery_writes_the_contact_only_for_an_accepted_envelope() {
+    let (relay, url) = start_relay().await;
+    let m = members("push-wake-live-contact", vec![url.clone()]).await;
+    m.publish_from_alice(&url).await;
+    let transport = TransportManager::new(url.clone(), Box::new(connect(&url).await));
+    let messages = scp_ffi_common::reconnect::pull_buffered(
+        &transport,
+        RelayScope::Installed,
+        &m.ctx_id,
+        &[RoutingId::new(m.bob_pseudonym)],
+        0,
+        now_secs(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(messages.len(), 1);
+    let supervisor = Arc::downgrade(&m.bob.manager);
+
+    let contacts = new_contacts();
+    let before = now_secs();
+    let live = scp_ffi_common::reconnect::deliver_live_envelope(
+        &supervisor,
+        contacts.as_ref(),
+        &m.ctx_id,
+        messages[0].payload.clone(),
+    )
+    .await
+    .expect("the supervisor is alive");
+    assert!(live.delivered.is_ok(), "{live:?}");
+    assert!(live.contact_error.is_none(), "{live:?}");
+    let stored = contacts
+        .load_last_relay_contact(&m.ctx_id)
+        .await
+        .unwrap()
+        .expect("an accepted envelope writes the contact");
+    assert!(stored >= before, "{stored} < {before}");
+
+    let replay_contacts = new_contacts();
+    let second = scp_ffi_common::reconnect::deliver_live_envelope(
+        &supervisor,
+        replay_contacts.as_ref(),
+        &m.ctx_id,
+        messages[0].payload.clone(),
+    )
+    .await
+    .expect("the supervisor is alive");
+    assert!(
+        second.delivered.is_err(),
+        "the actor refuses a replay: {second:?}"
+    );
+    assert_eq!(
+        replay_contacts
+            .load_last_relay_contact(&m.ctx_id)
+            .await
+            .unwrap(),
+        None,
+        "a refused envelope writes no contact"
+    );
     relay.shutdown();
 }
 
@@ -702,12 +816,11 @@ async fn a_full_reconnect_that_clears_needs_reconnect_writes_the_contact() {
     relay.shutdown();
 }
 
-/// A Tier 3 reconnection that finds no Welcome within the Welcome window
-/// reports a failure, not a reset: `needs_reconnect` stays set and the stored
-/// contact is unchanged. The window is 30 seconds, so this test takes that
-/// long.
+/// A Tier 3 reconnection fails at once with the re-join it cannot perform,
+/// not after a Welcome wait and not with a reset: `needs_reconnect` stays set
+/// and the stored contact is unchanged (ADR-029 reconnection-driver addendum).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_tier_3_reconnect_with_no_welcome_fails_and_keeps_needs_reconnect_set() {
+async fn a_tier_3_reconnect_fails_at_once_and_keeps_needs_reconnect_set() {
     let (relay, url) = start_relay().await;
     let m = members("push-wake-tier-3-timeout", vec![url.clone()]).await;
     let bob = m.restarted_bob_needing_reconnect().await;
@@ -723,6 +836,7 @@ async fn a_tier_3_reconnect_with_no_welcome_fails_and_keeps_needs_reconnect_set(
         .store_last_relay_contact(&m.ctx_id, old)
         .await
         .unwrap();
+    let started = Instant::now();
     let report = reconnect_contexts_no_drain(ReconnectRequest {
         transport: &transport,
         supervisor: &bob,
@@ -735,14 +849,41 @@ async fn a_tier_3_reconnect_with_no_welcome_fails_and_keeps_needs_reconnect_set(
     })
     .await
     .expect("the contact reads");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "Tier 3 fails at once, without a Welcome wait: {:?}",
+        started.elapsed()
+    );
     let result = &report.contexts[0];
     assert_eq!(result.tier, "long", "{result:?}");
     assert_eq!(result.outcome, "failed", "{result:?}");
     assert!(!result.needs_reconnect_cleared, "{result:?}");
     assert!(
         bob.needs_reconnect(&m.ctx_id).await,
-        "a Tier 3 pull with no Welcome leaves needs_reconnect set"
+        "a failed Tier 3 reconnection leaves needs_reconnect set"
     );
+    let tally = DeliveryTally::default();
+    let driver = scp_ffi_common::reconnect::RelayActorSyncDriver::new(
+        &transport,
+        &bob,
+        DID::from(BOB_DID),
+        m.bob_signer(),
+        &tally,
+    );
+    let rejoin = scp_core::sync::weeks_offline::ResetTransport::subscribe_and_await_welcome(
+        &driver, &m.ctx_id, 30,
+    )
+    .await;
+    assert!(
+        matches!(
+            &rejoin,
+            Err(scp_core::sync::weeks_offline::WeeksOfflineError::ReJoinUnavailable { context_id })
+                if *context_id == m.ctx_id
+        ),
+        "{rejoin:?}"
+    );
+    let message = rejoin.unwrap_err().to_string();
+    assert!(message.contains("re-join"), "{message}");
     assert_eq!(
         contacts.load_last_relay_contact(&m.ctx_id).await.unwrap(),
         Some(old),

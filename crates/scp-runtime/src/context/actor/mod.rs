@@ -278,16 +278,18 @@ pub struct ContextActor {
     /// permanently-wedged local event log is surfaced, not silently dropped.
     // read + written by on_ttl_tick
     ttl_expiry_retries: u32,
-    /// Unix-ms instant of the last successful coalesced persist. The
-    /// run-loop's persistence arm compares `now() - last_persisted_at`
-    /// against the coalescing window (50 ms — ADR-049 §Decision 9,
-    /// "Default: 50ms write-coalescing per actor") before issuing a
-    /// snapshot write. Initialized to "now" at actor construction.
+    /// Instant of the last snapshot write attempt, by a coalesce tick or a
+    /// flush, whether or not it landed. The run-loop's persistence arm writes
+    /// one coalescing window (50 ms — ADR-049 §Decision 9, "Default: 50ms
+    /// write-coalescing per actor") after it, so a failed write is retried
+    /// after that window and never in a tight loop. Initialized to "now" at
+    /// actor construction.
     // read by the run-loop's persistence coalesce arm
-    last_persisted_at: std::time::Instant,
+    last_persist_attempt_at: std::time::Instant,
     /// Dirty flag set when any handler's [`outcome::Outcome`] carries
-    /// `mutated: true`. Cleared after a successful coalesced persist.
-    /// Initialized `false` at actor construction.
+    /// `mutated: true` and when a flush's write fails. Cleared only when a
+    /// coalesced write or a flush lands (ADR-049 §Decision 9). Initialized
+    /// `false` at actor construction.
     // read by the run-loop's persistence coalesce arm
     dirty: bool,
     /// Count of consecutive inbox dispatches since a timer/persist arm last
@@ -340,7 +342,7 @@ impl ContextActor {
     ///   `None`. The run loop's [`Self::reconcile_timers`] arms them from
     ///   owned state at the top of every turn (TTL from
     ///   `state.ttl.timer.deadline_unix_secs`, governance while `Active`).
-    /// - `last_persisted_at` starts at `Instant::now()` so a fresh
+    /// - `last_persist_attempt_at` starts at `Instant::now()` so a fresh
     ///   actor's first coalescing window runs for the full duration
     ///   before the first persist.
     /// - `dirty` starts `false` — no mutations yet.
@@ -377,7 +379,7 @@ impl ContextActor {
             ttl_expiry_completed: 0,
             ttl_expiry_retry: None,
             ttl_expiry_retries: 0,
-            last_persisted_at: Instant::now(),
+            last_persist_attempt_at: Instant::now(),
             dirty: false,
             consecutive_inbox: 0,
             rotation_timer: None,
@@ -411,7 +413,7 @@ impl ContextActor {
     pub async fn run(mut self) {
         // Kick the persistence coalesce timer off the floor: the first
         // mutation will set `dirty = true`, then the `select!` arm
-        // computes the deadline as `last_persisted_at + COALESCE_INTERVAL`
+        // computes the deadline as `last_persist_attempt_at + COALESCE_INTERVAL`
         // — which is in the future relative to actor-spawn `now()`.
         loop {
             // Reconcile the ACTOR-OWNED timer arms from owned state before
@@ -459,10 +461,12 @@ impl ContextActor {
                                 )
                             );
                             // A flush writes the whole current state, the
-                            // write a pending coalesce tick would make. The
-                            // flush therefore leaves the actor clean, so no
-                            // write of the state as it stood at the flush
-                            // follows it.
+                            // write a pending coalesce tick would make. A
+                            // flush whose write lands therefore leaves the
+                            // actor clean, so no write of the state as it
+                            // stood at the flush follows it; one whose write
+                            // fails leaves it dirty, so the next coalesce
+                            // tick writes again (ADR-049 §Decision 9).
                             let is_flush = matches!(
                                 cmd,
                                 ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { .. })
@@ -472,10 +476,9 @@ impl ContextActor {
                             // run-loop future under the `clippy::large_futures`
                             // threshold (the streaming-saga seal handlers added
                             // large stack frames held across `.await`).
-                            Box::pin(self.dispatch(cmd)).await;
+                            let succeeded = Box::pin(self.dispatch(cmd)).await;
                             if is_flush {
-                                self.last_persisted_at = Instant::now();
-                                self.dirty = false;
+                                self.record_persist_attempt(succeeded);
                             }
                             if is_shutdown {
                                 break;
@@ -583,13 +586,12 @@ impl ContextActor {
                 // --- Arm 4: persistence coalesce -------------------
                 () = tokio::time::sleep_until(
                     tokio::time::Instant::from_std(
-                        self.last_persisted_at + COALESCE_INTERVAL
+                        self.last_persist_attempt_at + COALESCE_INTERVAL
                     )
                 ), if self.dirty => {
                     self.consecutive_inbox = 0;
-                    self.persist_snapshot().await;
-                    self.last_persisted_at = Instant::now();
-                    self.dirty = false;
+                    let landed = self.persist_snapshot().await.is_ok();
+                    self.record_persist_attempt(landed);
                 }
 
                 // --- Arm 5: fairness fall-through ------------------
@@ -605,19 +607,42 @@ impl ContextActor {
                 }
             }
         }
-        // Final drain: write any pending state before the actor exits. It runs
-        // after the `Shutdown` ack and after every sender dropped, so a caller
-        // that must order work after this write waits for the inbox receiver
-        // to drop (`ContextActorHandle::shutdown_and_await_exit`).
-        if self.dirty {
-            self.persist_snapshot().await;
+        self.final_drain().await;
+    }
+
+    /// Records a snapshot write attempt by a coalesce tick or a flush: the
+    /// next tick is one coalescing window away, and the actor stays dirty
+    /// unless the write `landed`, so a failed write is retried by that tick
+    /// (ADR-049 §Decision 9).
+    fn record_persist_attempt(&mut self, landed: bool) {
+        self.last_persist_attempt_at = Instant::now();
+        self.dirty = !landed;
+    }
+
+    /// Final drain: writes any pending state before the actor exits. It runs
+    /// after the `Shutdown` ack and after every sender dropped, so a caller
+    /// that must order work after this write waits for the inbox receiver to
+    /// drop (`ContextActorHandle::shutdown_and_await_exit`). No later write
+    /// can follow, so a failure is logged at error level.
+    async fn final_drain(&mut self) {
+        if self.dirty
+            && let Err(e) = self.persist_snapshot().await
+        {
+            tracing::error!(
+                context_id = %self.context_id,
+                error = %e,
+                "the final snapshot write before the actor exits failed; the store \
+                 holds the state of the last write that landed"
+            );
         }
     }
 
     /// Dispatch a single command to its matching handler: threads the
     /// actor-owned state/deps through `dispatch_state` into the
-    /// per-domain actor-shape `dispatch` entry points.
-    async fn dispatch(&mut self, cmd: ContextCommand) {
+    /// per-domain actor-shape `dispatch` entry points. Returns whether the
+    /// handler's [`Outcome`] carries `Ok`; the run loop reads it to tell
+    /// whether a flush's write landed.
+    async fn dispatch(&mut self, cmd: ContextCommand) -> bool {
         // `dispatch_state` receives the `&mut ClassSCell` directly and threads
         // it into every domain handler. Every domain mutates through the cell's
         // combinators — the fail-closed `commit_class_s_*` / `ClassSCommitToken`
@@ -634,6 +659,7 @@ impl ContextActor {
         if outcome.mutated {
             self.dirty = true;
         }
+        outcome.result.is_ok()
     }
 
     /// State-owning dispatch. Routes each `ContextCommand` variant to
@@ -1240,28 +1266,27 @@ impl ContextActor {
     /// `&mut ContextActor` is (`&mut T: Send` needs only `T: Send`). This
     /// mirrors the actor's other borrow-then-await methods (`dispatch`).
     /// Delegates to
-    /// [`persist_state_best_effort`](crate::context::messaging_helpers::persist_state_best_effort),
-    /// the same best-effort path every coalesced Class-C site uses: it
-    /// builds the owned
+    /// [`persist_state_fail_closed`](crate::context::messaging_helpers::persist_state_fail_closed):
+    /// it builds the owned
     /// [`ContextSnapshot`](crate::context::state::ContextSnapshot) in a
     /// synchronous prelude BEFORE the `.await` (Decision-7 `Send`
     /// discipline — the returned future borrows only `deps` and the
-    /// context-id, never Class-S state) and records + warns on a persist
-    /// failure internally rather than surfacing it (a ≤50 ms coalesce-
-    /// window rollback of Class-C state is acceptable per §Decision 9). No
+    /// context-id, never Class-S state), records and warns on a persist
+    /// failure, and returns it, so the run loop leaves the actor dirty and
+    /// writes again one coalescing window later (§Decision 9). No
     /// Class-S transition *depends on* this path for durability — each
     /// persists fail-closed at its own mutation site — but the coalesced
     /// snapshot still serializes the whole `PerContextState` (Class-S values
     /// included), so this write is a redundant re-persist for Class-S state
     /// and is authoritative only for Class-C.
     #[allow(clippy::needless_pass_by_ref_mut)] // `&mut self` is a `Send` requirement (see doc)
-    async fn persist_snapshot(&mut self) {
+    async fn persist_snapshot(&mut self) -> Result<(), ContextError> {
         // Read-only `Deref`; the returned future captures only `deps`/`context_id`
         // (`use<'d, 'c>`), never Class-S state.
         let state: &state::PerContextState = &self.state;
         let deps: &deps::ActorDeps = &self.deps;
         let context_id: &str = &self.context_id;
-        crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id).await;
+        crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id).await
     }
 }
 
@@ -2003,6 +2028,10 @@ mod tests {
         /// The key the last snapshot was persisted under.
         last_key: std::sync::Arc<arc_swap::ArcSwapOption<String>>,
         persisted: std::sync::Arc<tokio::sync::Notify>,
+        /// When set, every `persist_context` fails and records nothing.
+        failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Fires once per failed write.
+        failed: std::sync::Arc<tokio::sync::Notify>,
     }
 
     #[cfg(feature = "testing")]
@@ -2012,7 +2041,15 @@ mod tests {
                 last: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 last_key: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 persisted: std::sync::Arc::new(tokio::sync::Notify::new()),
+                failing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                failed: std::sync::Arc::new(tokio::sync::Notify::new()),
             }
+        }
+
+        /// Makes every later write fail (`true`) or land (`false`).
+        fn set_failing(&self, failing: bool) {
+            self.failing
+                .store(failing, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// The most-recent persisted snapshot, or `None` if nothing was
@@ -2030,6 +2067,10 @@ mod tests {
             context_id: &str,
             snapshot: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                self.failed.notify_one();
+                return Err("the test store refuses the write".into());
+            }
             self.last_key
                 .store(Some(std::sync::Arc::new(context_id.to_owned())));
             self.last.store(Some(std::sync::Arc::new(snapshot.clone())));
@@ -2164,7 +2205,7 @@ mod tests {
         let recorder = RecordingPersistence::new();
         let deps = new_test_deps_with_persistence(Box::new(recorder.clone())).await;
         // Pause AFTER building deps so `build_actor_deps` runs under real
-        // time; the actor's `last_persisted_at` is captured (in
+        // time; the actor's `last_persist_attempt_at` is captured (in
         // `ContextActor::new`) against the now-frozen clock.
         tokio::time::pause();
         let ctx = ctx_hex(0x52);
@@ -2257,6 +2298,98 @@ mod tests {
         actor_task.await.expect("actor task joins");
     }
 
+    /// A flush whose write fails replies with the error and leaves the actor
+    /// dirty, so the next coalesce tick writes the mutation once the store
+    /// accepts writes again (ADR-049 §Decision 9).
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn a_failed_flush_replies_with_the_error_and_the_next_tick_retries() {
+        let recorder = RecordingPersistence::new();
+        let deps = new_test_deps_with_persistence(Box::new(recorder.clone())).await;
+        tokio::time::pause();
+        let ctx = ctx_hex(0x55);
+        let member = "did:example:flush-fail-member";
+        let state = writable_encrypted_state(0x55, member);
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        recorder.set_failing(true);
+        install_access_key_via_mailbox(&handle, &ctx, member).await;
+        let flushed = handle
+            .send(|reply| {
+                ContextCommand::Lifecycle(
+                    crate::context::actor::commands::LifecycleCommand::FlushSnapshot { reply },
+                )
+            })
+            .await;
+        assert!(
+            matches!(flushed, Err(ContextError::PersistenceFailed(_))),
+            "a flush whose write failed must say so: {flushed:?}"
+        );
+        assert!(recorder.last_snapshot().is_none());
+
+        recorder.set_failing(false);
+        tokio::time::timeout(COALESCE_INTERVAL * 2, recorder.persisted.notified())
+            .await
+            .expect("the next coalesce tick writes what the failed flush did not");
+        assert!(
+            recorder
+                .last_snapshot()
+                .expect("the tick persisted a snapshot")
+                .access_key_store
+                .contains(&ctx, member)
+        );
+
+        handle.send_shutdown().await.expect("shutdown acks");
+        actor_task.await.expect("actor task joins");
+    }
+
+    /// A coalesced write that fails leaves the actor dirty: later ticks keep
+    /// writing, one coalescing window apart, until one lands (ADR-049
+    /// §Decision 9).
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn a_failed_coalesced_write_stays_dirty_until_a_tick_lands() {
+        let recorder = RecordingPersistence::new();
+        let deps = new_test_deps_with_persistence(Box::new(recorder.clone())).await;
+        tokio::time::pause();
+        let ctx = ctx_hex(0x56);
+        let member = "did:example:tick-fail-member";
+        let state = writable_encrypted_state(0x56, member);
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        recorder.set_failing(true);
+        install_access_key_via_mailbox(&handle, &ctx, member).await;
+        for attempt in 0..3 {
+            tokio::time::timeout(COALESCE_INTERVAL * 2, recorder.failed.notified())
+                .await
+                .unwrap_or_else(|_| panic!("failed tick {attempt} must be followed by another"));
+        }
+        assert!(recorder.last_snapshot().is_none());
+
+        recorder.set_failing(false);
+        tokio::time::timeout(COALESCE_INTERVAL * 2, recorder.persisted.notified())
+            .await
+            .expect("a tick lands once the store accepts writes");
+        assert!(
+            recorder
+                .last_snapshot()
+                .expect("the tick persisted a snapshot")
+                .access_key_store
+                .contains(&ctx, member)
+        );
+
+        handle.send_shutdown().await.expect("shutdown acks");
+        actor_task.await.expect("actor task joins");
+    }
+
     /// Regression guard for ADR-049 finding **N1** (PR-2 caller audit): a handler
     /// that mutates Class-C via `class_c_view()` but reports `Outcome::ok`
     /// (`mutated:false`) leaves `dirty` clear, so the run loop's Arm-4 coalesce
@@ -2283,7 +2416,7 @@ mod tests {
         let recorder = RecordingPersistence::new();
         let deps = new_test_deps_with_persistence(Box::new(recorder.clone())).await;
         // Pause AFTER building deps so `build_actor_deps` runs under real time and
-        // the actor's `last_persisted_at` is captured against the now-frozen clock.
+        // the actor's `last_persist_attempt_at` is captured against the now-frozen clock.
         tokio::time::pause();
         let ctx = ctx_hex(0x53);
         let member = "did:example:coalesced-seed-peer-member";

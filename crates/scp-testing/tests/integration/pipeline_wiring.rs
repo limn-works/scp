@@ -3346,8 +3346,9 @@ fn b3_heartbeat_send_receive_loop_wired() {
 /// ADR-029 §2 sync-state keys: the three writers of
 /// `sync/{context_id}/last_relay_contact`. A full reconnection writes it after
 /// it clears `needs_reconnect`, a wake writes it after Phases 2 and 4 fed the
-/// context's buffer to the actor, and napi live delivery writes it after the
-/// actor accepts an envelope.
+/// context's buffer to the actor, and live delivery writes it after the actor
+/// accepts an envelope. napi's live subscription delivers through the shared
+/// `deliver_live_envelope`, which applies the contact rule.
 #[test]
 fn last_relay_contact_writers_wired() {
     for (src, caller, callee) in [
@@ -3374,6 +3375,11 @@ fn last_relay_contact_writers_wired() {
         (
             NAPI_CONTEXT_SRC,
             "context_subscribe_on",
+            "deliver_live_envelope(",
+        ),
+        (
+            RECONNECT_DRIVER_SRC,
+            "deliver_live_envelope",
             "record_contact_after_live_delivery(",
         ),
         (

@@ -3778,40 +3778,61 @@ pub async fn restore_all_contexts(
     Ok(restored)
 }
 
-/// Sweep entry point: best-effort flush of every actor's snapshot to
-/// the configured persistence provider.
+/// Sweep entry point: flushes every actor's snapshot to the configured
+/// persistence provider.
 ///
 /// Relocates the legacy `flush_all_contexts_legacy` off the
 /// `Supervisor::contexts` `DashMap` (now deleted). Iterates the actor
 /// registry and dispatches one
 /// [`LifecycleCommand::FlushSnapshot`](crate::context::actor::commands::LifecycleCommand::FlushSnapshot)
-/// per actor.
+/// per actor. Every actor is flushed even after one fails. An actor that
+/// despawned between the listing and the lookup holds nothing to flush.
+/// No-op if no persistence provider is configured.
 ///
-/// Best-effort: per-actor flush failures log via `tracing::warn!`
-/// inside the handler. No-op if no persistence provider is configured.
-pub async fn flush_all_contexts(supervisor: &crate::context::supervisor::Supervisor) {
+/// # Errors
+///
+/// The first actor's failure, in registry order, when any flush did not land
+/// (ADR-049 Decision 9): the flush's own error, the mailbox send's error, or
+/// [`ContextError::ActorCrashed`] when the actor dropped its reply. Each
+/// failure is also logged.
+pub async fn flush_all_contexts(
+    supervisor: &crate::context::supervisor::Supervisor,
+) -> Result<(), ContextError> {
     use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
 
     if !crate::context::manager_methods::has_persistence(supervisor) {
-        return;
+        return Ok(());
     }
 
     let mut flushed = 0usize;
+    let mut first_error: Option<ContextError> = None;
     for ctx_id in supervisor.actor_ids() {
         let Some(actor) = supervisor.lookup(&ctx_id) else {
             continue;
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { reply: tx });
-        if actor
+        let flushed_one = match actor
             .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
             .await
-            .is_err()
         {
-            continue;
-        }
-        if rx.await.is_ok() {
-            flushed += 1;
+            Ok(()) => rx.await.unwrap_or_else(|_| {
+                Err(ContextError::ActorCrashed(format!(
+                    "the actor of {ctx_id} dropped its flush reply"
+                )))
+            }),
+            Err(e) => Err(e),
+        };
+        match flushed_one {
+            Ok(()) => flushed += 1,
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %ctx_id,
+                    error = %e,
+                    "flush_all_contexts: the flush did not land"
+                );
+                first_error.get_or_insert(e);
+            }
         }
     }
     tracing::debug!(
@@ -3819,6 +3840,7 @@ pub async fn flush_all_contexts(supervisor: &crate::context::supervisor::Supervi
         "flush_all_contexts: flushed {} context(s) via actor mailbox",
         flushed,
     );
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Sync wrapper for [`flush_all_contexts`].
@@ -3828,24 +3850,26 @@ pub async fn flush_all_contexts(supervisor: &crate::context::supervisor::Supervi
 /// [`tokio::task::block_in_place`] to bridge sync → async; **callers
 /// MUST be inside a multi-thread tokio runtime** (per ADR-049 §7
 /// allowlist for the FFI shutdown path). No-op if no persistence
-/// provider is configured or if called outside a runtime.
-pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervisor) {
+/// provider is configured.
+///
+/// # Errors
+///
+/// [`flush_all_contexts`]'s error, or [`ContextError::PersistenceFailed`]
+/// when called outside a tokio runtime, where nothing is flushed.
+pub fn flush_all_contexts_sync(
+    supervisor: &crate::context::supervisor::Supervisor,
+) -> Result<(), ContextError> {
     if !crate::context::manager_methods::has_persistence(supervisor) {
-        return;
+        return Ok(());
     }
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
-            tokio::task::block_in_place(|| {
-                handle.block_on(flush_all_contexts(supervisor));
-            });
+            tokio::task::block_in_place(|| handle.block_on(flush_all_contexts(supervisor)))
         }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "flush_all_contexts_sync called outside tokio runtime; \
-                 skipping flush — context state may not be persisted"
-            );
-        }
+        Err(e) => Err(ContextError::PersistenceFailed(format!(
+            "flush_all_contexts_sync was called outside a tokio runtime, so nothing \
+             was flushed: {e}"
+        ))),
     }
 }
 

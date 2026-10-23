@@ -2312,17 +2312,18 @@ pub(crate) async fn context_subscribe_on(
 
             match event {
                 scp_transport::TransportEvent::Envelope(envelope) => {
-                    // Decrypt via the ADR-049 commit-8 messaging shim.
-                    use scp_core::context::actor::commands::MessagingCommand;
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let cmd = MessagingCommand::DeliverIncoming {
-                        context_id: context_id.clone(),
-                        envelope_bytes: envelope.encrypted_blob.clone(),
-                        mode: scp_core::context::actor::commands::DeliveryMode::Live,
-                        reply: tx,
-                    };
-                    let Some(dispatch_result) =
-                        dispatch_to_live_supervisor(&supervisor, &context_id, cmd).await
+                    // ADR-029 §2: the shared live delivery path dispatches the
+                    // encrypted blob to the actor and records an accepted
+                    // envelope as a successful relay interaction. A failed
+                    // contact write reaches the callback as an error; delivery
+                    // continues.
+                    let Some(live) = scp_ffi_common::reconnect::deliver_live_envelope(
+                        &supervisor,
+                        relay_contacts.as_ref(),
+                        &context_id,
+                        envelope.encrypted_blob.clone(),
+                    )
+                    .await
                     else {
                         tracing::debug!(
                             context_id = %context_id,
@@ -2330,28 +2331,7 @@ pub(crate) async fn context_subscribe_on(
                         );
                         break;
                     };
-                    let reply_result = if dispatch_result.is_ok() {
-                        rx.await.ok()
-                    } else {
-                        None
-                    };
-                    let deliver_result = match (dispatch_result, reply_result) {
-                        (Ok(()), Some(r)) => r,
-                        (Err(e), _) => Err(e),
-                        (Ok(()), None) => Err(scp_core::context::ContextError::CryptoFailed(
-                            "deliver shim reply dropped".to_owned(),
-                        )),
-                    };
-                    // ADR-029 §2: an envelope the actor accepted is a
-                    // successful relay interaction. A failed write reaches
-                    // the callback as an error; delivery continues.
-                    if let Err(e) = scp_ffi_common::reconnect::record_contact_after_live_delivery(
-                        relay_contacts.as_ref(),
-                        &context_id,
-                        &deliver_result,
-                    )
-                    .await
-                    {
+                    if let Some(e) = live.contact_error {
                         tracing::error!(
                             context_id = %context_id,
                             error = %e,
@@ -2367,6 +2347,7 @@ pub(crate) async fn context_subscribe_on(
                             napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                         );
                     }
+                    let deliver_result = live.delivered;
                     use scp_core::context::actor::commands::DeliverOutcome;
                     match deliver_result {
                         Ok(DeliverOutcome::Application((plaintext, sender_did))) => {
@@ -5535,19 +5516,6 @@ pub(crate) fn create_context_failure(
     )
 }
 
-/// Dispatches `cmd` to `context_id` through the Supervisor `supervisor` still
-/// points at, holding the upgraded `Arc` only for the dispatch. `None` when the
-/// Supervisor has dropped, which ends the relay subscription loop (ADR-049
-/// Decision 16).
-async fn dispatch_to_live_supervisor(
-    supervisor: &std::sync::Weak<scp_core::context::supervisor::Supervisor>,
-    context_id: &str,
-    cmd: scp_core::context::actor::commands::MessagingCommand,
-) -> Option<Result<(), scp_core::context::ContextError>> {
-    let live = supervisor.upgrade()?;
-    Some(live.dispatch_command(context_id, cmd).await.map(drop))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5594,21 +5562,6 @@ mod tests {
             code_of(ContextCreationError::TransportNotConnected),
             codes::CTX_2000
         );
-    }
-
-    /// A dropped Supervisor yields `None`, which ends the subscription loop.
-    #[tokio::test]
-    async fn dispatch_to_dropped_supervisor_ends_the_subscription() {
-        use scp_core::context::actor::commands::MessagingCommand;
-        let (reply, _rx) = tokio::sync::oneshot::channel();
-        let cmd = MessagingCommand::DeliverIncoming {
-            context_id: "ctx".to_owned(),
-            envelope_bytes: vec![1, 2, 3],
-            mode: scp_core::context::actor::commands::DeliveryMode::Live,
-            reply,
-        };
-        let outcome = super::dispatch_to_live_supervisor(&std::sync::Weak::new(), "ctx", cmd).await;
-        assert!(outcome.is_none(), "a dropped Supervisor must end the loop");
     }
 
     /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
