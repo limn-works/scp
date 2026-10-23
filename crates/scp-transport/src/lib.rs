@@ -55,6 +55,7 @@ pub mod quic;
 pub mod relay;
 pub mod scoring;
 pub mod selection;
+pub mod shutdown;
 #[cfg(feature = "startup")]
 pub mod startup;
 pub mod subscription;

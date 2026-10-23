@@ -36,7 +36,8 @@ testing = [
 [dependencies]
 async-trait = { workspace = true }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage", "testing"] }
-# Optional, default features. `helpers.rs` is the only module here that names
+# Optional, no default features, because scp-node's default `node-bin` serves only
+# its binary. `helpers.rs` is the only module here that names
 # `scp_identity`, so this crate's `testing` feature turns the edge on together with
 # `scp-identity/testing`, and a build that takes this crate as a normal dependency —
 # `scp-ffi`'s `testing` feature among them — compiles no scp-identity for it. The
@@ -61,7 +62,7 @@ scp-crypto = { path = "../scp-crypto" }
 # gates `Node::start_for_testing` and `SelfSignedTlsProvider`, which no module in this
 # library names — `tests/integration/node.rs` and `tests/integration/sdk_usability.rs` are
 # the only consumers, so the feature rides on the `[dev-dependencies]` entry below.
-scp-node = { path = "../scp-node", optional = true }
+scp-node = { path = "../scp-node", default-features = false, optional = true }
 scp-transport = { path = "../scp-transport" }
 scp-event-log = { path = "../scp-event-log" }
 scp-protocol = { path = "../scp-protocol" }

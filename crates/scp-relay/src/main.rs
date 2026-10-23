@@ -51,7 +51,7 @@ use scp_alloc as _;
 
 use std::net::SocketAddr;
 
-use scp_transport::startup;
+use scp_transport::{shutdown, startup};
 
 #[tokio::main]
 async fn main() {
@@ -71,7 +71,7 @@ async fn main() {
     or_exit(startup::init_tracing());
 
     let backend = or_exit(startup::backend_choice_from_env("cloud-blobs"));
-    let shutdown = or_exit(startup::shutdown_signal());
+    let shutdown = or_exit(shutdown::shutdown_signal().map_err(startup::StartupError::from));
     let (handle, _local_addr, _storage) = or_exit(startup::start_relay_from_env(backend).await);
 
     // Start Prometheus metrics HTTP server on a separate port (#1467).

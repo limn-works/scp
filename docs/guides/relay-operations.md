@@ -50,6 +50,7 @@ The resulting binaries are at:
 
 | Feature | What it enables |
 |---------|----------------|
+| `node-bin` | On by default. The `scp-node` binary and what only the binary uses: the Prometheus `/metrics` exporter, the startup utilities that read its environment configuration, and the redb blob backend (`SCP_RELAY_STORAGE_BACKEND=redb`, section 4). `cargo build -p scp-node --no-default-features` builds the library alone and produces no binary. |
 | `http3` | HTTP/3 and QUIC-based HTTP endpoint (spec SS10.15.1) |
 | `cloud-blobs` | The PostgreSQL and S3 blob storage backends (`SCP_RELAY_STORAGE_BACKEND=postgres` or `=s3`, section 4) |
 

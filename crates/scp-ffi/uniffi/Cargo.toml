@@ -62,12 +62,15 @@ scp-identity = { path = "../../scp-identity", features = ["production-dht"] }
 scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common", features = ["custody"] }
-# Default features only. Both node front doors in `scp_ffi_common::server` reach
-# a production `Node::start`, whose sealed `EncryptedStorage` bound this
-# bridge's two storage handles satisfy, so this edge adds nothing on top.
+# No features, default ones included: `default-features = false` drops
+# scp-node's `node-bin` (the Prometheus exporter, the startup utilities, and the
+# redb blob backend only the `scp-node` binary uses). Both node front doors in
+# `scp_ffi_common::server` reach a production `Node::start`, whose sealed
+# `EncryptedStorage` bound this bridge's two storage handles satisfy, so this
+# edge adds nothing on top.
 # `scripts/check-shipped-feature-graph.sh` rejects any feature added here that
 # its allowlist omits (ADR-062 §Decision 6).
-scp-node = { path = "../../scp-node", optional = true }
+scp-node = { path = "../../scp-node", default-features = false, optional = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 rmp-serde = { workspace = true }
