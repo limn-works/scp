@@ -292,6 +292,7 @@ Sync errors are categorized by the reconnection phase in which they occur:
 - **SenderKeyTimeout** -- Phase 4 sender key re-acquisition timed out.
 - **MlsUpdateFailed** -- Phase 5 MLS Update issuance failed.
 - **QueueDrainFailed** -- Phase 6 queue drain failed.
+- **BlobsUndelivered** -- In Phase 2 or Phase 4, the member's own MLS processing reached no verdict on one or more buffered messages: it neither accepted nor rejected them, because it was busy or unavailable, or because local key storage, transport, event-log storage or state storage failed. The reconnection does not complete, so the member does not advance `last_relay_contact` past those messages, and the next catch-up retrieves them again.
 - **ContextGone** -- Context was closed or expired while the member was offline.
 - **ReorderBufferOverflow** -- Reorder buffer exceeded capacity.
 - **CommitProcessingFailed** -- A Commit in the catch-up sequence was corrupted or failed.
