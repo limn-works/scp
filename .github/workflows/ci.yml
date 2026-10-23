@@ -562,13 +562,14 @@ jobs:
               # scp-relay-client, which fuzz/Cargo.toml declares as a direct
               # dependency, and omitted scp-core, scp-identity and scp-platform,
               # which scp-runtime pulls in. A change to any of those four broke
-              # the fuzz build while job fuzz-build skipped.
+              # the fuzz build while job fuzz-build skipped. Re-read 2026-10-23,
+              # after fuzz/Cargo.toml dropped its unused scp-transport dependency:
+              # scp-transport and scp-core left the closure, so neither is listed.
               # scripts/tests/ci-gate/ci_gate_selftest.py recomputes this closure
               # from Cargo.toml path dependencies and fails when an entry is
               # missing, so a new dependency edge cannot silently shrink it.
               - 'fuzz/**'
               - 'crates/scp-clock/**'
-              - 'crates/scp-core/**'
               - 'crates/scp-crypto/**'
               - 'crates/scp-dht/**'
               - 'crates/scp-did/**'
@@ -582,7 +583,6 @@ jobs:
               - 'crates/scp-runtime/**'
               # scp-platform's sqlite and apple features pull in scp-sqlite-pools.
               - 'crates/scp-sqlite-pools/**'
-              - 'crates/scp-transport/**'
               # Every crate above is a member of the root workspace and reads
               # its dependency versions from the root manifest's
               # `[workspace.dependencies]`, so a bump that edits only that table
@@ -2841,6 +2841,58 @@ jobs:
             printf 'rsa is reachable over a normal or build edge:\n%s\n' "$out"
             exit 1
           fi
+
+  # The fuzz crate carries its own `[workspace]` table and its own fuzz/Cargo.lock, so
+  # rust-deny's `--manifest-path ./Cargo.toml` never reads that lockfile, and a crate with
+  # a RustSec advisory could sit in it with every check green. This job runs rust-deny's
+  # check against fuzz/Cargo.toml with the same deny.toml. It is a job of its own because
+  # cargo-deny's `cargo metadata` needs every package fuzz/Cargo.lock names on disk, and
+  # `./.github/actions/cargo-fetch` fails a second fetch in one job by design.
+  #
+  # It runs `check advisories bans sources`, not rust-deny's bare `check`, which adds
+  # licenses. `check licenses` fails on the fuzz graph for two reasons, and the fuzz crate
+  # builds no artifact anyone receives:
+  #   - `error[rejected]`: libfuzzer-sys is licensed `(MIT OR Apache-2.0) AND NCSA`, and
+  #     deny.toml does not allow NCSA. The remedies are a global NCSA allowance, which
+  #     widens what rust-deny accepts in the shipped graph, or a per-crate license
+  #     exception for libfuzzer-sys.
+  #   - `error[unlicensed]`: `scp-fuzz = 0.0.0 is unlicensed`. fuzz/Cargo.toml has no
+  #     `license` field, and it cannot inherit the workspace's because it sits outside the
+  #     workspace. The remedies are a `license` field in fuzz/Cargo.toml, or deny.toml's
+  #     `[licenses.private] ignore = true`, which would also skip every unpublished
+  #     workspace crate in rust-deny's audit.
+  # The `rust` output covers deny.toml and the `fuzz` output covers fuzz/Cargo.lock, so a
+  # change to either runs this job.
+  #
+  # Toolchains: the first step installs the root pin, on which cargo-deny's
+  # `cargo metadata` runs from the checkout root, as in rust-deny; the second installs the
+  # nightly fuzz/rust-toolchain.toml names, which rustup resolves for the fetch run from
+  # `fuzz/`.
+  rust-deny-fuzz:
+    needs: changes
+    if: >-
+      github.event_name != 'push' &&
+      (needs.changes.outputs.rust == 'true' || needs.changes.outputs.fuzz == 'true')
+    name: Rust / deny (fuzz)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      # The comment on rust-deny's install step says why cargo-deny comes from this action
+      # and why 0.20.2. Move both versions together.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - uses: ./.github/actions/rust-toolchain
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain-file: fuzz/rust-toolchain.toml
+      - uses: ./.github/actions/cargo-fetch
+        with:
+          working-directory: fuzz
+      - name: Fetch the advisory database
+        run: cargo deny --manifest-path ./fuzz/Cargo.toml fetch db
+      - run: cargo deny --log-level warn --manifest-path ./fuzz/Cargo.toml --all-features --offline check advisories bans sources
 
   # ── Container image ─────────────────────────────────────────────────
   # Builds the `Dockerfile` that ships `scp-relay` and `scp-node`, and that
@@ -5377,6 +5429,7 @@ jobs:
       - rust-doctest
       - rust-doc
       - rust-deny
+      - rust-deny-fuzz
       - pyo3-module
       - napi-addon
       - xcframework
