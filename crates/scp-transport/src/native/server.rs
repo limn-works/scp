@@ -136,11 +136,14 @@ pub enum DidRecordValidation {
 ///
 /// ```
 /// use scp_transport::native::server::RelayConfig;
-/// use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+/// use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl, ReservedRelayUrls};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let url = LiveRelayUrl::new(RelayUrl::new("wss://relay.example")?);
 /// let config = RelayConfig { delivery_jitter_ms: 0, ..RelayConfig::defaults(url) };
-/// assert_eq!(config.relay_url.current().canonical(), "wss://relay.example");
+/// assert_eq!(
+///     config.relay_url.current(),
+///     ReservedRelayUrls::from(RelayUrl::new("wss://relay.example")?)
+/// );
 /// # Ok(())
 /// # }
 /// ```
@@ -751,6 +754,12 @@ pub enum RelayError {
     /// step 2).
     #[error("invalid relay URL: {0}")]
     InvalidRelayUrl(#[from] scp_protocol::discovery::push::PushMessageError),
+
+    /// A caller asked the relay to reserve the push routing IDs of no relay
+    /// URL, so the relay kept its current reservation and the caller must
+    /// not publish (§10.7.1 step 2).
+    #[error(transparent)]
+    NoReservedRelayUrl(#[from] crate::relay::push_gate::NoReservedRelayUrl),
 }
 
 /// Background task that periodically purges expired blobs and reclaims stale
@@ -4298,6 +4307,53 @@ mod tests {
             let reply = publish_to(addr, rid, vec![1]).await;
             assert_eq!(err_code(&reply), code::PUSH_NOT_SUPPORTED, "{label} URL");
         }
+    }
+
+    /// §10.7.1 "Tier 3 relays" at the WebSocket listener: with the handle
+    /// reserving two bridge entries, a PUBLISH at either entry's tier 3 push
+    /// routing ID is answered with 4063 and stores nothing, and a PUBLISH at
+    /// the bridge relay's own `"scp-push-registration"` ID stores a blob.
+    #[tokio::test]
+    async fn websocket_listener_intercepts_the_tier3_id_of_a_bridge_entry() {
+        let fixture = push_gate::tier3_fixture().unwrap();
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::defaults(fixture.live.clone())
+        };
+        let server = RelayServer::new(config, Arc::clone(&storage));
+        let (_handle, addr) = server.start().await.unwrap();
+        for (label, rid) in [
+            ("entry A", fixture.entry_a.push_routing_id()),
+            ("entry B", fixture.entry_b.push_routing_id()),
+        ] {
+            let reply = publish_to(addr, rid, vec![1]).await;
+            assert_eq!(err_code(&reply), code::PUSH_NOT_SUPPORTED, "{label}");
+            assert!(
+                storage.query(&rid, None, 100).await.unwrap().is_empty(),
+                "{label}"
+            );
+        }
+        let reply = publish_to(addr, fixture.bridge_own_id, vec![1]).await;
+        assert!(
+            matches!(
+                reply,
+                RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            storage
+                .query(&fixture.bridge_own_id, None, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[cfg(feature = "push-store")]

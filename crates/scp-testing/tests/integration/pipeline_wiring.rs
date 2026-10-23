@@ -1156,6 +1156,20 @@ fn nat_tier_task_writes_the_relay_push_url_handle() {
         set < publish,
         "apply_tier_change must move the relay handle before it publishes the new URL"
     );
+    // PUSH-032 (§10.7.1 "Tier 3 relays"): the node reserves the routing ID of
+    // the entry it publishes at startup before it publishes.
+    let startup = extract_fn_body(NODE_BUILDER_SRC, "build_no_domain_inner")
+        .expect("build_no_domain_inner body");
+    let reserve = startup
+        .find("reserve_push_routing_id(&relay_config.relay_url, &relay_url)")
+        .expect("build_no_domain_inner must reserve the startup entry's routing ID");
+    let seed = startup
+        .find("seed_from_startup_publish(")
+        .expect("build_no_domain_inner must publish through seed_from_startup_publish");
+    assert!(
+        reserve < seed,
+        "build_no_domain_inner must reserve the startup entry's routing ID before it publishes"
+    );
 }
 
 // PUSH-013 (§10.7.1): the push routing-ID query runs

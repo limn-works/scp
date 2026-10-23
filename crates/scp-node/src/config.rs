@@ -1501,12 +1501,10 @@ mod tests {
         // The relay server reserves the push routing ID of the published URL
         // (§10.7.1 step 2), so a PUBLISH there is answered, never stored.
         assert_eq!(
-            node.state
-                .relay_config
-                .relay_url
-                .current()
-                .push_routing_id(),
-            RelayUrl::new(&node.relay_url()).unwrap().push_routing_id(),
+            node.state.relay_config.relay_url.current(),
+            scp_transport::relay::push_gate::ReservedRelayUrls::from(
+                RelayUrl::new(&node.relay_url()).unwrap()
+            ),
             "the domain node's relay must reserve the push routing ID of its published URL"
         );
         node.shutdown();

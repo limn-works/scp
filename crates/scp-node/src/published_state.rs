@@ -28,7 +28,9 @@ use scp_identity::DidMethod;
 use scp_identity::ScpIdentity;
 use scp_identity::republish::RepublishEntry;
 use scp_transport::nat::NatTierChange;
-use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+use scp_transport::relay::push_gate::{
+    LiveRelayUrl, NoReservedRelayUrl, RelayUrl, ReservedRelayUrls,
+};
 
 use crate::DhtMode;
 use crate::NodeError;
@@ -295,32 +297,54 @@ pub async fn seed_from_startup_publish(
     }))
 }
 
-/// Moves the relay's live URL handle to `advertised`'s URL, the URL the node
-/// is about to publish, so every relay listener reserves its push routing ID
-/// before any client reads it (§10.7.1 step 2).
+/// The `SCPRelay` entries a node is about to publish, as
+/// [`reserve_push_routing_id`] takes them: one entry, or several.
 ///
-/// A tier 3 entry is the exception. Its URL is the **bridge relay's** own URL
-/// (§18.2.1), so its push routing ID is one the bridge relay reserves, not
-/// one this node's relay may intercept. While `advertised` carries a
-/// `bridgeTarget`, the handle stays on its current URL, whose routing ID this
-/// node's relay keeps intercepting, and the caller still publishes
-/// `advertised`. `09-security-model.md` §9.18.2 **Tier 3 push routing ID**
-/// defines a tier 3 node's push routing ID; PUSH-032's second pull request
-/// (acceptance criterion 6) replaces this branch with the reservation of that
-/// tier 3 ID.
-pub fn reserve_push_routing_id(relay: &LiveRelayUrl, advertised: &RelayService) {
-    if advertised.bridge_target().is_some() {
-        // Stub — see PUSH-032
-        tracing::info!(
-            bridge_url = %advertised.url(),
-            reserved_url = %relay.current().canonical(),
-            "advertised relay entry is a tier 3 bridge entry whose URL is the bridge \
-             relay's; this node's relay keeps reserving its current URL's push routing ID"
-        );
-        return;
+/// A node publishes one entry per tier today; a node MAY publish one tier 3
+/// entry per bridge relay (§10.7.1 "Tier 3 relays", §10.12.4 "Multiple
+/// bridges"), so the reservation takes any number of entries.
+pub trait ReservedEntries {
+    /// The entries, in the order the node publishes them.
+    fn entries(&self) -> &[RelayService];
+}
+
+impl ReservedEntries for RelayService {
+    fn entries(&self) -> &[RelayService] {
+        std::slice::from_ref(self)
     }
-    let url = RelayUrl::from(advertised);
+}
+
+impl ReservedEntries for [RelayService] {
+    fn entries(&self) -> &[RelayService] {
+        self
+    }
+}
+
+/// Moves the relay's live URL handle to the entries in `advertised`, the
+/// entries the node is about to publish, so every relay listener reserves
+/// each entry's push routing ID before any client reads the entry (§10.7.1
+/// step 2, "Tier 3 relays").
+///
+/// Each entry maps to its own relay URL, keeping the entry's `bridgeTarget`:
+/// a direct entry reserves the `"scp-push-registration"` ID of its URL, and a
+/// tier 3 entry reserves its tier 3 push routing ID,
+/// `SHA-256("scp-push-bridge:" || bridge_url || bridge_target)`
+/// (`09-security-model.md` §9.18.2). The node never reserves the
+/// `"scp-push-registration"` ID of a bridge relay's URL, which belongs to the
+/// bridge relay. Every ID of the previous set that the new set lacks joins
+/// the handle's retired list, so the relay keeps refusing it without storing.
+///
+/// # Errors
+///
+/// [`NoReservedRelayUrl`] when `advertised` holds no entry. The handle then
+/// keeps its current set, and the caller must not publish.
+pub fn reserve_push_routing_id(
+    relay: &LiveRelayUrl,
+    advertised: &(impl ReservedEntries + ?Sized),
+) -> Result<(), NoReservedRelayUrl> {
+    let url = ReservedRelayUrls::new(advertised.entries().iter().map(RelayUrl::from))?;
     relay.set(url);
+    Ok(())
 }
 
 /// Handles a detected tier change: re-points the node's relay endpoint,
@@ -345,14 +369,23 @@ pub async fn apply_tier_change(
     identity: &ScpIdentity,
     event_tx: Option<&tokio::sync::mpsc::Sender<NatTierChange>>,
 ) {
-    // The relay moves first: every listener reserves the new URL's push
-    // routing ID before any client can read that URL from the document or the
-    // slot, so a registration signed for it is intercepted, never stored as a
-    // blob (§10.7.1 step 2). A bridge entry's URL is the bridge relay's, so the
-    // relay keeps its reservation and the entry is still published; see
-    // `reserve_push_routing_id`. `new_relay_url` is the new `RelayService`
-    // entry; the name stays because `pipeline_wiring.rs` pins this call text.
-    reserve_push_routing_id(relay, new_relay_url);
+    // The relay moves first: every listener reserves the new entry's push
+    // routing ID, its tier 3 ID for a bridge entry, before any client can read
+    // the entry from the document or the slot, so a registration signed for it
+    // is intercepted, never stored as a blob (§10.7.1 step 2, "Tier 3
+    // relays"). `new_relay_url` is the new `RelayService` entry; the name
+    // stays because `pipeline_wiring.rs` pins this call text.
+    if let Err(e) = reserve_push_routing_id(relay, new_relay_url) {
+        // One entry always maps to one relay URL, so this arm runs only if
+        // that mapping breaks. The node then neither publishes nor moves its
+        // slot, so it never advertises an entry its relay does not reserve.
+        tracing::error!(
+            error = %e, new_url = %new_relay_url.url(),
+            "tier change not applied: the relay could not reserve the new entry's \
+             push routing ID"
+        );
+        return;
+    }
     let new_url = new_relay_url.url();
     let current = live_state.get();
     let previous_relay_url = current.relay.url().to_owned();

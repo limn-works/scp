@@ -2183,6 +2183,62 @@ mod tests {
         handle.shutdown();
     }
 
+    /// §10.7.1 "Tier 3 relays" at the UDP/DTLS listener: with the handle
+    /// reserving two bridge entries, a PUBLISH at either entry's tier 3 push
+    /// routing ID is answered with 4063 and stores nothing, and a PUBLISH at
+    /// the bridge relay's own `"scp-push-registration"` ID stores a blob.
+    #[tokio::test]
+    async fn udp_listener_intercepts_the_tier3_id_of_a_bridge_entry() {
+        let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
+        let (handle, addr, storage) =
+            start_test_listener_with_relay_config(RelayConfig::defaults(fixture.live.clone()))
+                .await;
+        let client = create_dtls_client(addr).await;
+        let publish = |rid: [u8; 32]| ClientMessage::Publish {
+            ref_id: Some("push".to_string()),
+            routing_id: rid,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            blob: vec![0x42; 64],
+        };
+
+        for rid in [
+            fixture.entry_a.push_routing_id(),
+            fixture.entry_b.push_routing_id(),
+        ] {
+            let response = send_and_recv(&client, &publish(rid)).await;
+            assert!(
+                matches!(
+                    &response,
+                    RelayMessage::Err { code: 4063, ref_id: Some(r), .. } if r == "push"
+                ),
+                "{response:?}"
+            );
+            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+        }
+        let response = send_and_recv(&client, &publish(fixture.bridge_own_id)).await;
+        assert!(
+            matches!(
+                &response,
+                RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }
+            ),
+            "{response:?}"
+        );
+        assert_eq!(
+            storage
+                .query(&fixture.bridge_own_id, None, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        handle.shutdown();
+    }
+
     // -- Store-site wakes (§10.7.1 step 5, PUSH-008) --
     //
     // A DID record and an opaque blob reach storage through different gate
