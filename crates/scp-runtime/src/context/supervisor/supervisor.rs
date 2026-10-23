@@ -12706,6 +12706,35 @@ impl Supervisor {
         }
     }
 
+    /// Returns the local MLS epoch for `context_id` (§9.12): `Ok(Some(epoch))`
+    /// for an encrypted context, `Ok(None)` for a broadcast context, which has
+    /// no MLS group. Routes through the actor mailbox via
+    /// [`Self::dispatch_query`].
+    ///
+    /// Used by the reconnection driver (ADR-029 reconnection-driver addendum),
+    /// which must tell a broadcast context apart from a failed lookup.
+    ///
+    /// # Errors
+    ///
+    /// The [`ContextError`] from dispatch (for example
+    /// [`ContextError::ContextNotRegistered`]) or from the actor's reply, and
+    /// [`ContextError::TransportFailed`] when the reply channel closes or the
+    /// reply does not arrive in time.
+    pub async fn try_local_mls_epoch(&self, context_id: &str) -> Result<Option<u64>, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::LocalMlsEpoch {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_query(cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::try_local_mls_epoch — actor reply channel closed or timed out"
+                    .to_owned(),
+            )
+        })?
+    }
+
     /// Returns whether `context_id` is flagged `needs_reconnect`
     /// (spec §23.11). Soft `false` on unknown context or mailbox failure.
     /// Routes through the actor mailbox via [`Self::dispatch_query`].
@@ -13699,23 +13728,31 @@ impl Supervisor {
     /// [`Self::drain_events`] so that application traffic (messages,
     /// membership changes) buffered during catch-up is preserved for
     /// the SDK's normal receive polling rather than being silently
-    /// discarded. Same soft-default contract as [`Self::drain_events`]:
-    /// returns an empty `Vec` on unknown context, mailbox enqueue
-    /// failure, or dropped reply channel.
-    #[must_use]
-    pub async fn drain_equivocation_alerts(&self, context_id: &str) -> Vec<ContextEvent> {
+    /// discarded.
+    ///
+    /// # Errors
+    ///
+    /// The [`ContextError`] from dispatch (for example
+    /// [`ContextError::ContextNotRegistered`]) or from the actor's reply, and
+    /// [`ContextError::TransportFailed`] when the reply channel closes or the
+    /// reply does not arrive in time. An empty `Vec` therefore always means
+    /// the actor held no alert, never that the drain failed.
+    pub async fn drain_equivocation_alerts(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<ContextEvent>, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::DrainEquivocationAlerts {
             context_id: context_id.to_owned(),
             reply: tx,
         };
-        if self.dispatch_command(context_id, cmd).await.is_err() {
-            return Vec::new();
-        }
-        match bounded_reply_await(rx).await {
-            Ok(Ok(events)) => events,
-            Ok(Err(_)) | Err(_) => Vec::new(),
-        }
+        self.dispatch_command(context_id, cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::drain_equivocation_alerts — actor reply channel closed or timed out"
+                    .to_owned(),
+            )
+        })?
     }
 
     /// Returns the Merkle-log entries for the routing-id-hashed
@@ -16549,6 +16586,21 @@ impl Supervisor {
                          durable MLS crypto export (export failed / needs_reconnect) — a \
                          joiner cannot reconnect-derive, so the spawn fails closed BEFORE \
                          persisting rather than standing up a keyless send-capable actor"
+                        )));
+                    }
+
+                    // 3b. Create the joiner's event log FAIL-CLOSED, as `create_context`
+                    //     (builder step 4) and `restore_context` do: without it every
+                    //     event-log read the actor serves, including the Tier 1 Phase 3
+                    //     checkpoint build (ADR-029), fails with "no event log". The log
+                    //     starts empty, because the joiner holds no pre-join history.
+                    //     Nothing is persisted yet, so a failure disposes the seeded
+                    //     crypto only; this rollback builds no attestation, so the
+                    //     `DisposalOutcome` is discarded as on the other rollbacks.
+                    if let Err(e) = deps.event_log.init_event_log(&context_id_bytes).await {
+                        let _ = state.dispose_secrets();
+                        return Err(ContextError::PersistenceFailed(format!(
+                            "spawn-from-Welcome: event log creation for '{context_id}' failed: {e}"
                         )));
                     }
 

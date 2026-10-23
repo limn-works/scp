@@ -259,6 +259,12 @@ async fn reconnect_classifies_all_three_tiers() {
         result.tier, "short",
         "the relay-backed driver run must classify the live context as Short"
     );
+    assert_eq!(
+        result.outcome, "fully_caught_up",
+        "Phase 2 takes the epoch the actor reaches as the target, so an encrypted \
+         context with nothing buffered completes Tier 1: {result:?}"
+    );
+    assert!(result.needs_reconnect_cleared, "{result:?}");
 
     relay_handle.shutdown();
 }
@@ -531,7 +537,11 @@ async fn runtime_equivocation_dispatch_and_targeted_drain() {
     // Targeted drain: returns ONLY the equivocation alert, EXACTLY ONCE
     // (replay suppressed), and the unrelated DegradedMode event must survive
     // in the receive buffer for the SDK's normal polling.
-    let alerts = alice.manager.drain_equivocation_alerts(ctx_id).await;
+    let alerts = alice
+        .manager
+        .drain_equivocation_alerts(ctx_id)
+        .await
+        .expect("the actor answers the equivocation-alert drain");
     let equivocation_count = alerts
         .iter()
         .filter(|e| {

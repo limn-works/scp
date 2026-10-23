@@ -497,6 +497,18 @@ pub enum SyncError {
         /// Human-readable reason.
         reason: String,
     },
+    /// The actor reached no verdict on buffered blobs during Phase 2 or
+    /// Phase 4 (spec 23 §23.15): it neither accepted nor refused them, so the
+    /// reconnection must not record a relay contact past them.
+    #[error("{count} buffered blobs reached no verdict in context {context_id}: {reason}")]
+    BlobsUndelivered {
+        /// The context whose blobs were not judged.
+        context_id: ContextId,
+        /// How many blobs reached no verdict.
+        count: u64,
+        /// The last delivery failure.
+        reason: String,
+    },
     /// The context was closed or expired while the member was offline.
     #[error("context {context_id} is gone (closed or expired while offline)")]
     ContextGone {

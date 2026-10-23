@@ -668,18 +668,27 @@ fn truncate_log_keeping_tail(
 #[allow(clippy::significant_drop_tightening)]
 impl ContextEventLogProvider for MerkleEventLogProvider {
     async fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        {
-            let mut logs = self
-                .logs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            logs.insert(*context_id, ContextLog::new(context_id));
+        // Persist the empty event set first, to establish the context in
+        // storage and clear any stale per-event keys from a previous
+        // incarnation. Every caller (create, restore, join from a Welcome)
+        // treats an error here as fatal, so a failed write returns it and
+        // installs no log: a log that exists only in memory would accept
+        // appends that a restart loses, and stale keys would come back.
+        if let Some(ref persistence) = self.persistence {
+            persistence
+                .persist_entries(&hex::encode(context_id), &[])
+                .await
+                .map_err(|e| {
+                    ContextCreationError::EventLogFailed(format!(
+                        "persisting the new event log failed: {e}"
+                    ))
+                })?;
         }
 
-        // Persist the empty event set to establish the context in storage
-        // (clears any stale per-event keys from a previous incarnation).
-        self.persist_entries_best_effort(context_id, &[]).await;
-
+        self.logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(*context_id, ContextLog::new(context_id));
         Ok(())
     }
 
@@ -1526,6 +1535,73 @@ mod tests {
             self.store.lock().unwrap().remove(context_id);
             Ok(())
         }
+    }
+
+    /// A persistence backend whose every write fails.
+    struct FailingEventLogPersistence;
+
+    #[async_trait::async_trait]
+    impl EventLogPersistence for FailingEventLogPersistence {
+        async fn persist_entry(
+            &self,
+            _: &str,
+            _: usize,
+            _: &Event,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("disk full".into())
+        }
+
+        async fn persist_entries(
+            &self,
+            _: &str,
+            _: &[Event],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("disk full".into())
+        }
+
+        async fn load_entries(
+            &self,
+            _: &str,
+        ) -> Result<Option<Vec<Event>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+
+        async fn delete_entries(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("disk full".into())
+        }
+    }
+
+    /// A failed write of the new log returns `EventLogFailed` and installs no
+    /// log, so the create, restore or Welcome-join that called it fails rather
+    /// than running on a log a restart would lose.
+    #[tokio::test]
+    async fn init_event_log_fails_closed_when_the_write_fails() {
+        let provider = MerkleEventLogProvider::with_persistence(std::sync::Arc::new(
+            FailingEventLogPersistence,
+        ));
+        let ctx_id = [11u8; 32];
+
+        let init = provider.init_event_log(&ctx_id).await;
+        assert!(
+            matches!(init, Err(ContextCreationError::EventLogFailed(ref m)) if m.contains("disk full")),
+            "a failed write must fail init, got {init:?}"
+        );
+        let append = provider
+            .append_event(
+                &ctx_id,
+                EventType::ContextCreated,
+                "",
+                EventPayload::default(),
+                1_700_000_000,
+            )
+            .await;
+        assert!(
+            append.is_err(),
+            "no log may exist after a failed init, got {append:?}"
+        );
     }
 
     #[tokio::test]

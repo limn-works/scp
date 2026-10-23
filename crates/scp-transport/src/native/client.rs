@@ -131,19 +131,41 @@ struct SubscriptionState {
     last_local_receive: Option<Instant>,
     /// Channel for pushing subscription messages to the stream.
     tx: mpsc::Sender<SubscriptionMessage>,
-    /// When `true`, BLOB messages routed to this subscription bypass the
-    /// client-global `seen_blob_ids` dedup LRU — neither checked against it nor
-    /// committed to it.
-    ///
-    /// Set only by the one-shot raw public-record QUERY path
-    /// ([`NativeRelayClient::query_raw`], §3.10.4). The dedup LRU is a
-    /// live-subscription redelivery guard: it suppresses a blob the client has
-    /// already delivered once (e.g. after a reconnect). A one-shot DID-record
-    /// resolution needs every candidate on every call, so applying the dedup
-    /// there would drop the genuine record on the second resolution of an
-    /// unchanged DID — the bug this flag closes. Ordinary `subscribe`/`query`
-    /// leave it `false` and keep the dedup.
-    bypass_dedup: bool,
+    /// How BLOB messages routed to this subscription use the client-global
+    /// `seen_blob_ids` redelivery cache. See [`RedeliveryDedup`].
+    dedup: RedeliveryDedup,
+}
+
+/// How a subscription's BLOB deliveries use the client-global `seen_blob_ids`
+/// redelivery cache.
+///
+/// ADR-012 deduplicates the live subscription stream: a blob reaches the
+/// subscriber once. A one-shot QUERY is a request for what the relay stores,
+/// so filtering it through the cache would hide a stored blob the client saw
+/// once but never applied. Reconnection Phase 2 (ADR-029) stops feeding at
+/// its Commit budget, and the next reconnection must see the unfed blobs
+/// again; a DID record must resolve on every call (§3.10.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedeliveryDedup {
+    /// Live subscription: drop a blob the cache holds, record each delivered
+    /// blob.
+    CheckAndRecord,
+    /// One-shot envelope QUERY: deliver every stored blob, and record each
+    /// delivered blob so a later live subscription does not deliver it again.
+    RecordOnly,
+    /// One-shot raw public-record QUERY (§3.10.4): neither check nor record;
+    /// a DID record is not a stream message.
+    Ignore,
+}
+
+impl RedeliveryDedup {
+    const fn checks(self) -> bool {
+        matches!(self, Self::CheckAndRecord)
+    }
+
+    const fn records(self) -> bool {
+        !matches!(self, Self::Ignore)
+    }
 }
 
 /// Shared inner state of the WebSocket client.
@@ -496,15 +518,14 @@ impl NativeRelayClient {
                 let receive_time = Instant::now();
                 let rid = crate::traits::RoutingId::new(*routing_id);
 
-                // Peek whether this routing_id is a dedup-bypassing (one-shot raw
-                // public-record QUERY) subscription BEFORE the dedup check. This
-                // is a read-only lookup that commits nothing, so it does not
-                // perturb the commit-after-success ordering below. A missing
-                // subscription defaults to `false` (the dedup applies), matching
-                // the ordinary subscribe/query path.
-                let bypass_dedup = subscriptions
-                    .with(&rid, |sub| sub.bypass_dedup)
-                    .unwrap_or(false);
+                // Peek how this routing_id's subscription uses the dedup cache
+                // BEFORE the dedup check. This is a read-only lookup that
+                // commits nothing, so it does not perturb the
+                // commit-after-success ordering below. A missing subscription
+                // defaults to the live-stream mode, whose check applies.
+                let dedup = subscriptions
+                    .with(&rid, |sub| sub.dedup)
+                    .unwrap_or(RedeliveryDedup::CheckAndRecord);
 
                 // 1. Deduplication check (read-only, no commit yet).
                 //    Dedup-cache poisoning defense: check dedup first
@@ -517,7 +538,7 @@ impl NativeRelayClient {
                 //    redelivery for those entries. The load-bearing
                 //    invariant is the step ordering (commit-after-success),
                 //    not the lock kind.
-                if !bypass_dedup {
+                if dedup.checks() {
                     let state = inner.read().await;
                     if state.seen_blob_ids.contains(blob_id) {
                         return;
@@ -576,11 +597,10 @@ impl NativeRelayClient {
                 //    commit dedup -- a future redelivery (e.g. after
                 //    resubscribe) for this `blob_id` must remain deliverable.
                 let blob_id_copy = *blob_id;
-                if tx.send(SubscriptionMessage::Relay(msg)).await.is_ok() && !bypass_dedup {
-                    // Commit dedup only for ordinary subscriptions. A raw-query
-                    // (bypass) subscription must never seed the LRU: seeding it
-                    // would suppress the genuine record on a later live
-                    // subscription or repeat resolution (§3.10.4).
+                if tx.send(SubscriptionMessage::Relay(msg)).await.is_ok() && dedup.records() {
+                    // A raw public-record query must never seed the LRU:
+                    // seeding it would suppress the genuine record on a later
+                    // live subscription or repeat resolution (§3.10.4).
                     //
                     // Double-check guards the static dispatch_relay_message helper when
                     // invoked concurrently from tests; the production reader_loop is single-task.
@@ -751,7 +771,7 @@ impl NativeRelayClient {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx,
-                    bypass_dedup: false,
+                    dedup: RedeliveryDedup::CheckAndRecord,
                 },
             )
             .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
@@ -812,20 +832,24 @@ impl NativeRelayClient {
         }
     }
 
-    /// Sends a QUERY command and collects results.
+    /// Sends a QUERY command and returns every stored envelope at
+    /// `routing_id` newer than `since`.
     ///
-    /// When a live subscription already exists for `routing_id`, the QUERY is
-    /// sent via [`send_request`](Self::send_request) and results flow through
-    /// that subscription (this returns an empty vec). Otherwise it collects over
-    /// a temporary subscription via [`send_query_collect_blobs`](Self::send_query_collect_blobs),
-    /// terminating on the `ref_id`-correlated `query_complete` (not a deadline),
-    /// and decodes each blob as an [`OuterEnvelope`] (undecodable blobs dropped).
+    /// Collects over a temporary subscription via
+    /// [`send_query_collect_blobs`](Self::send_query_collect_blobs),
+    /// terminating on the `ref_id`-correlated `query_complete` (not a
+    /// deadline), and decodes each blob as an [`OuterEnvelope`] (undecodable
+    /// blobs dropped). The client's redelivery cache does not filter the
+    /// answer ([`RedeliveryDedup::RecordOnly`]): a blob this client received
+    /// before but never applied is still stored, so it is still returned.
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::NotConnected`] if the client is not connected.
-    /// Returns [`TransportError::SendFailed`] if the relay responds with an
-    /// error.
+    /// Returns [`TransportError::NotConnected`] if the client is not connected,
+    /// [`TransportError::SubscriptionFailed`] if a live subscription already
+    /// holds `routing_id` (its stream would carry the answer, so this call
+    /// could not return it), or [`TransportError::SendFailed`] if the relay
+    /// responds with an error.
     pub async fn query(
         &self,
         routing_id: &[u8; 32],
@@ -833,25 +857,17 @@ impl NativeRelayClient {
     ) -> Result<Vec<OuterEnvelope>, TransportError> {
         let rid = crate::traits::RoutingId::new(*routing_id);
 
-        // Check if there's already an active subscription for this `routing_id`.
         if self.subscriptions.contains(&rid) {
-            // When there's an active subscription, just send the QUERY.
-            // Results will be delivered through the existing subscription.
-            let msg = ClientMessage::Query {
-                ref_id: None,
-                routing_id: *routing_id,
-                since,
-                limit: None,
-            };
-            let _response = self.send_request(msg).await?;
-            return Ok(Vec::new());
+            return Err(TransportError::SubscriptionFailed(
+                "query: routing_id already has an active subscription".to_string(),
+            ));
         }
 
         // Temp-subscription path: collect raw blobs — terminated by the
         // ref_id-correlated `query_complete` (not a deadline) — then decode each
         // as an `OuterEnvelope`, discarding any that fail to deserialize.
         let blobs = self
-            .send_query_collect_blobs(routing_id, since, None, false)
+            .send_query_collect_blobs(routing_id, since, None, RedeliveryDedup::RecordOnly)
             .await?;
         Ok(blobs
             .iter()
@@ -941,7 +957,7 @@ impl NativeRelayClient {
             ));
         }
 
-        self.send_query_collect_blobs(routing_id, since, Some(limit), true)
+        self.send_query_collect_blobs(routing_id, since, Some(limit), RedeliveryDedup::Ignore)
             .await
     }
 
@@ -965,10 +981,9 @@ impl NativeRelayClient {
     /// both the subscription channel (blobs) and that oneshot (the terminator),
     /// breaking on the terminator.
     ///
-    /// `bypass_dedup` selects whether delivered blobs pass through the
-    /// `seen_blob_ids` LRU (`false` = normal `query` semantics; `true` = the raw
-    /// one-shot public-record path, which must observe every candidate on every
-    /// call). `limit` caps the collected blobs (defensive against a relay that
+    /// `dedup` selects how delivered blobs use the `seen_blob_ids` LRU
+    /// ([`RedeliveryDedup`]); neither one-shot mode drops a blob the cache
+    /// holds. `limit` caps the collected blobs (defensive against a relay that
     /// ignores the wire `limit`); `None` collects until the terminator.
     ///
     /// A [`QueryScopeGuard`] removes the temporary subscription and the pending
@@ -985,7 +1000,7 @@ impl NativeRelayClient {
         routing_id: &[u8; 32],
         since: Option<u64>,
         limit: Option<u32>,
-        bypass_dedup: bool,
+        dedup: RedeliveryDedup,
     ) -> Result<Vec<Vec<u8>>, TransportError> {
         let rid = crate::traits::RoutingId::new(*routing_id);
 
@@ -1016,7 +1031,7 @@ impl NativeRelayClient {
                 last_stored_at: None,
                 last_local_receive: None,
                 tx,
-                bypass_dedup,
+                dedup,
             },
         ) {
             self.inner.write().await.pending.remove(&ref_id);
@@ -1443,7 +1458,7 @@ mod tests {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx,
-                    bypass_dedup: false,
+                    dedup: RedeliveryDedup::CheckAndRecord,
                 },
             )
             .unwrap();
@@ -1451,10 +1466,10 @@ mod tests {
     }
 
     /// Helper: like [`setup_inner_with_subscription`] but registers the
-    /// subscription with `bypass_dedup: true` — the one-shot raw public-record
-    /// QUERY shape (§3.10.4).
-    fn setup_inner_with_bypass_subscription(
+    /// subscription with the one-shot QUERY `dedup` mode under test.
+    fn setup_inner_with_query_subscription(
         routing_id: [u8; 32],
+        dedup: RedeliveryDedup,
     ) -> (
         Arc<RwLock<ClientInner>>,
         Arc<TransportSubscriptionMap<SubscriptionState>>,
@@ -1477,7 +1492,7 @@ mod tests {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx,
-                    bypass_dedup: true,
+                    dedup,
                 },
             )
             .unwrap();
@@ -1497,7 +1512,8 @@ mod tests {
         let routing_id = [0xDD; 32];
         let blob_data = vec![0x0A, 0x0B, 0x0C];
         let blob_id = sha256(&blob_data);
-        let (inner, subscriptions, mut rx) = setup_inner_with_bypass_subscription(routing_id);
+        let (inner, subscriptions, mut rx) =
+            setup_inner_with_query_subscription(routing_id, RedeliveryDedup::Ignore);
 
         let make_msg = || RelayMessage::Blob {
             routing_id,
@@ -1531,6 +1547,90 @@ mod tests {
         assert!(
             !inner.read().await.seen_blob_ids.contains(&blob_id),
             "raw-query path must never seed the dedup LRU"
+        );
+    }
+
+    /// A one-shot envelope QUERY delivers a blob the redelivery cache already
+    /// holds, because the relay still stores it and the client may never have
+    /// applied it (ADR-029 Phase 2 stops at its Commit budget), and it records
+    /// the blob so a later live subscription does not deliver it again. The
+    /// live mode would drop the seeded blob, so this fails if `query` goes
+    /// back to filtering through the cache.
+    #[tokio::test]
+    async fn envelope_query_subscription_delivers_a_seen_blob_and_records_it() {
+        let routing_id = [0xDE; 32];
+        let blob_data = vec![0x0D, 0x0E, 0x0F];
+        let blob_id = sha256(&blob_data);
+        let (inner, subscriptions, mut rx) =
+            setup_inner_with_query_subscription(routing_id, RedeliveryDedup::RecordOnly);
+        inner.write().await.seen_blob_ids.put(blob_id, ());
+
+        let msg = RelayMessage::Blob {
+            routing_id,
+            blob_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: blob_data.clone(),
+        };
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, msg).await;
+
+        let received = rx
+            .try_recv()
+            .unwrap_or_else(|e| panic!("the query dropped a stored blob the cache held: {e}"));
+        assert!(
+            matches!(
+                received,
+                SubscriptionMessage::Relay(RelayMessage::Blob { blob_id: got, .. }) if got == blob_id
+            ),
+            "expected the stored blob, got {received:?}"
+        );
+        assert!(
+            inner.read().await.seen_blob_ids.contains(&blob_id),
+            "the query records what it returned"
+        );
+    }
+
+    /// A query to a routing ID that a live subscription holds fails with
+    /// `SubscriptionFailed`: the subscription's stream would carry the answer,
+    /// so an `Ok` here could only be an empty vector that claims the relay
+    /// stores nothing.
+    #[tokio::test]
+    async fn query_under_a_live_subscription_fails_instead_of_answering_empty() {
+        use crate::native::server::{Relay, RelayConfig};
+        use crate::native::storage::BlobStorageBackend;
+        use std::net::SocketAddr;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
+        };
+        let (_shutdown, addr) = Relay::start(config, BlobStorageBackend::in_memory())
+            .await
+            .unwrap();
+        let client = NativeRelayClient::connect(&format!("ws://{addr}/scp/v1"))
+            .await
+            .unwrap();
+        let routing_id = [0x33; 32];
+        let (tx, _rx) = mpsc::channel(16);
+        client
+            .subscriptions
+            .insert(
+                crate::traits::RoutingId::new(routing_id),
+                SubscriptionState {
+                    last_stored_at: None,
+                    last_local_receive: None,
+                    tx,
+                    dedup: RedeliveryDedup::CheckAndRecord,
+                },
+            )
+            .unwrap();
+
+        let answer = client.query(&routing_id, None).await;
+        assert!(
+            matches!(answer, Err(TransportError::SubscriptionFailed(_))),
+            "a query under a live subscription must fail, got {answer:?}"
         );
     }
 
@@ -1752,7 +1852,7 @@ mod tests {
                     last_stored_at: None,
                     last_local_receive: None,
                     tx: tx_a2,
-                    bypass_dedup: false,
+                    dedup: RedeliveryDedup::CheckAndRecord,
                 },
             )
             .unwrap();
@@ -2126,9 +2226,9 @@ mod tests {
         );
     }
 
-    /// Dedup-bypass end-to-end (and observability of `bypass_dedup: true` at the
-    /// `query_raw` entry point): querying the SAME unchanged DID twice returns
-    /// the record BOTH times. If `query_raw` registered `bypass_dedup: false`,
+    /// Dedup-bypass end-to-end (and observability of [`RedeliveryDedup::Ignore`]
+    /// at the `query_raw` entry point): querying the SAME unchanged DID twice
+    /// returns the record BOTH times. If `query_raw` registered the live mode,
     /// the first query would seed `seen_blob_ids` and the second would return
     /// empty. This behavioral test fails if the flag is silently flipped.
     #[tokio::test]
@@ -2164,7 +2264,7 @@ mod tests {
             second.len(),
             1,
             "second resolution of the unchanged DID must STILL return it \
-             (dedup bypassed); a bypass_dedup:false regression makes this empty"
+             (dedup bypassed); a live-mode regression makes this empty"
         );
         assert_eq!(first, second);
     }

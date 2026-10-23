@@ -62,9 +62,17 @@ pub trait SyncPhaseDriver: Send + Sync {
         last_stored_at: u64,
     ) -> Result<Vec<BufferedMessage>, SyncError>;
 
-    /// Phase 2 — MLS epoch reconciliation: compare local epoch against the
-    /// target epoch observed from relay messages and process Commits
-    /// sequentially or fall back to Welcome-based fast-forward.
+    /// Phase 2 — MLS epoch reconciliation: process the Commits between
+    /// `local_epoch` and the group's epoch sequentially, or fall back to
+    /// Welcome-based fast-forward.
+    ///
+    /// `target_epoch` is the group epoch observed from relay messages, or
+    /// `None` when no message carried one, which is every encrypted blob: its
+    /// epoch is unknown until the actor opens it. With `None` the driver feeds
+    /// `messages` until the actor accepts no more and takes the epoch the
+    /// actor then reports as the target; it never reports the state
+    /// `Complete` while a blob it did not offer at that final epoch remains
+    /// (ADR-029 reconnection-driver addendum).
     ///
     /// `messages` is the Phase-1 retrieved-and-deduplicated buffer, threaded
     /// in so the driver does not re-query the relay from zero (Phase 1
@@ -74,7 +82,7 @@ pub trait SyncPhaseDriver: Send + Sync {
         &self,
         context_id: &str,
         local_epoch: u64,
-        target_epoch: u64,
+        target_epoch: Option<u64>,
         policy: &SyncPolicy,
         messages: &[BufferedMessage],
     ) -> Result<EpochCatchUpState, SyncError>;
@@ -316,6 +324,27 @@ impl EpochCatchUpState {
         self.commits_processed = self.commits_processed.saturating_add(1);
         if self.local_epoch.saturating_add(self.commits_processed) >= self.target_epoch {
             self.status = CatchUpStatus::Complete;
+        }
+    }
+
+    /// Creates the state of a catch-up whose target epoch was unknown and that
+    /// stopped at `reached_epoch`, the epoch the actor reported once a feed
+    /// pass accepted nothing: the target is `reached_epoch`, the processed
+    /// Commit count is `reached_epoch - local_epoch`, and the status is
+    /// [`CatchUpStatus::Complete`]. A caller that stopped with blobs left
+    /// unfed marks the state failed with [`Self::transition_to_failed`].
+    #[must_use]
+    pub const fn reached_steady_state(
+        context_id: ContextId,
+        local_epoch: u64,
+        reached_epoch: u64,
+    ) -> Self {
+        Self {
+            context_id,
+            local_epoch,
+            target_epoch: reached_epoch,
+            commits_processed: reached_epoch.saturating_sub(local_epoch),
+            status: CatchUpStatus::Complete,
         }
     }
 
@@ -1065,68 +1094,51 @@ impl ReconnectionCoordinator {
         };
 
         // Phase 2: MLS epoch reconciliation.
-        let local_epoch = Self::epoch_or_warn(
-            driver.local_epoch(context_id).await,
-            context_id,
-            "local_epoch",
-        );
-        let target_epoch = Self::epoch_or_warn(
-            driver.observed_target_epoch(context_id, &messages).await,
-            context_id,
-            "observed_target_epoch",
-        );
-        let (epochs_caught_up, catch_up_outcome) = Self::reconcile_epoch(
-            context_id,
-            local_epoch,
-            target_epoch,
-            &self.policy,
-            driver,
-            &messages,
-        )
-        .await;
-
-        // If epoch reconciliation failed, return early.
+        let (epochs_caught_up, catch_up_outcome) =
+            match self.epoch_phase(context_id, driver, &messages).await {
+                Ok(result) => result,
+                Err(reason) => return Self::failed_result(context_id, tier, 0, reason),
+            };
         if let SyncOutcome::Failed { .. } = &catch_up_outcome {
             return ContextSyncResult {
-                context_id: context_id.to_owned(),
-                tier,
                 epochs_caught_up,
-                events_recovered: 0,
-                messages_unrecoverable: 0,
-                mls_update_issued: false,
-                outcome: catch_up_outcome,
-                sync_events: Vec::new(),
+                ..Self::early_result(context_id, tier, catch_up_outcome)
             };
         }
 
-        // Phase 3: Event log sync.
+        // Phase 3: Event log sync. A failure fails the context: a
+        // terminal-success outcome would claim a checkpoint comparison that
+        // never ran, and the caller would clear `needs_reconnect`.
         let (events_recovered, sync_events) = match driver.event_log_sync(context_id).await {
             Ok(result) => result,
             Err(e) => {
-                tracing::warn!(
+                return Self::failed_result(
                     context_id,
-                    error = %e,
-                    "Phase 3: event_log_sync failed, continuing with zero events recovered"
+                    tier,
+                    epochs_caught_up,
+                    format!("event log sync failed: {e}"),
                 );
-                (0, Vec::new())
             }
         };
 
         // Phase 4: Sender key re-acquisition. Re-feeds the Phase-1 buffer
         // (no fresh relay query) so a late-arriving sender-key advance is
-        // not missed.
+        // not missed. A failure, including a blob the re-feed reached no
+        // verdict on, fails the context, so the caller keeps
+        // `needs_reconnect` set and does not advance `last_relay_contact`
+        // past a blob the actor never judged.
         let messages_unrecoverable = match driver
             .sender_key_reacquire(context_id, &self.policy, &messages)
             .await
         {
             Ok(count) => count,
             Err(e) => {
-                tracing::warn!(
+                return Self::failed_result(
                     context_id,
-                    error = %e,
-                    "Phase 4: sender_key_reacquire failed, continuing with zero unrecoverable"
+                    tier,
+                    epochs_caught_up,
+                    format!("sender key re-acquisition failed: {e}"),
                 );
-                0
             }
         };
 
@@ -1157,6 +1169,39 @@ impl ReconnectionCoordinator {
         }
     }
 
+    /// Runs Phase 2: reads the local and the observed target epoch, then
+    /// reconciles. Returns `(epochs_caught_up, outcome)`.
+    ///
+    /// # Errors
+    ///
+    /// The failure reason when either epoch lookup fails. Treating a failed
+    /// lookup as "no epoch" would skip Phase 2 for an encrypted context
+    /// (local) or feed blindly (target) and report a catch-up that never ran.
+    async fn epoch_phase<D: SyncPhaseDriver>(
+        &self,
+        context_id: &str,
+        driver: &D,
+        messages: &[BufferedMessage],
+    ) -> Result<(u64, SyncOutcome), String> {
+        let local_epoch = driver
+            .local_epoch(context_id)
+            .await
+            .map_err(|e| format!("local epoch lookup failed: {e}"))?;
+        let target_epoch = driver
+            .observed_target_epoch(context_id, messages)
+            .await
+            .map_err(|e| format!("target epoch lookup failed: {e}"))?;
+        Ok(Self::reconcile_epoch(
+            context_id,
+            local_epoch,
+            target_epoch,
+            &self.policy,
+            driver,
+            messages,
+        )
+        .await)
+    }
+
     /// Builds a zero-progress [`ContextSyncResult`] for early returns
     /// (e.g., relay catch-up failure or context-gone detection).
     fn early_result(
@@ -1176,31 +1221,28 @@ impl ReconnectionCoordinator {
         }
     }
 
-    /// Converts an epoch lookup result to `Option`, logging a warning on error.
-    ///
-    /// Used by Phase 2 to make epoch retrieval failures visible without
-    /// aborting the reconnection protocol.
-    fn epoch_or_warn(
-        result: Result<Option<u64>, SyncError>,
+    /// Builds a [`SyncOutcome::Failed`] result for a context whose
+    /// reconnection stopped after `epochs_caught_up` epochs of Phase 2.
+    fn failed_result(
         context_id: &str,
-        source: &str,
-    ) -> Option<u64> {
-        match result {
-            Ok(epoch) => epoch,
-            Err(e) => {
-                tracing::warn!(
-                    context_id,
-                    source,
-                    error = %e,
-                    "Phase 2: epoch lookup failed, skipping epoch reconciliation"
-                );
-                None
-            }
+        tier: OfflineTier,
+        epochs_caught_up: u64,
+        reason: String,
+    ) -> ContextSyncResult {
+        ContextSyncResult {
+            epochs_caught_up,
+            ..Self::early_result(context_id, tier, SyncOutcome::Failed { reason })
         }
     }
 
-    /// Runs Phase 2 epoch reconciliation: compares local and target epochs,
-    /// processes Commits sequentially or falls back to Welcome-based fast-forward.
+    /// Runs Phase 2 epoch reconciliation.
+    ///
+    /// - An encrypted context (`local_epoch` is `Some`) runs the driver when
+    ///   the target is unknown (`None`, every encrypted blob) or ahead of the
+    ///   local epoch, and is already caught up when a known target is not
+    ///   ahead.
+    /// - A broadcast context (`local_epoch` is `None`) has no MLS epoch and
+    ///   skips Phase 2.
     ///
     /// Returns `(epochs_caught_up, outcome)`.
     async fn reconcile_epoch<D: SyncPhaseDriver>(
@@ -1211,47 +1253,40 @@ impl ReconnectionCoordinator {
         driver: &D,
         messages: &[BufferedMessage],
     ) -> (u64, SyncOutcome) {
-        match (local_epoch, target_epoch) {
-            (Some(local), Some(target)) if target > local => {
-                match driver
-                    .epoch_reconciliation(context_id, local, target, policy, messages)
-                    .await
-                {
-                    Ok(state) => {
-                        let caught = state.commits_processed;
-                        let outcome = match &state.status {
-                            CatchUpStatus::Complete => SyncOutcome::FullyCaughtUp,
-                            CatchUpStatus::FastForwarded {
-                                skipped_from,
-                                skipped_to,
-                            } => SyncOutcome::FastForwarded {
-                                skipped_epochs: skipped_to.saturating_sub(*skipped_from),
-                            },
-                            CatchUpStatus::Failed { reason } => SyncOutcome::Failed {
-                                reason: reason.clone(),
-                            },
-                            CatchUpStatus::Processing => SyncOutcome::Failed {
-                                reason: "epoch reconciliation did not complete".to_owned(),
-                            },
-                        };
-                        (caught, outcome)
-                    }
-                    Err(e) => (
-                        0,
-                        SyncOutcome::Failed {
-                            reason: format!("epoch reconciliation failed: {e}"),
-                        },
-                    ),
-                }
+        let local = match (local_epoch, target_epoch) {
+            (Some(local), Some(target)) if target <= local => {
+                return (0, SyncOutcome::FullyCaughtUp);
             }
-            (Some(_local), Some(_target)) => {
-                // target <= local — already caught up.
-                (0, SyncOutcome::FullyCaughtUp)
+            (Some(local), _) => local,
+            (None, _) => return (0, SyncOutcome::FullyCaughtUp),
+        };
+        match driver
+            .epoch_reconciliation(context_id, local, target_epoch, policy, messages)
+            .await
+        {
+            Ok(state) => {
+                let caught = state.commits_processed;
+                let outcome = match &state.status {
+                    CatchUpStatus::Complete => SyncOutcome::FullyCaughtUp,
+                    CatchUpStatus::FastForwarded {
+                        skipped_from,
+                        skipped_to,
+                    } => SyncOutcome::FastForwarded {
+                        skipped_epochs: skipped_to.saturating_sub(*skipped_from),
+                    },
+                    CatchUpStatus::Failed { reason } => SyncOutcome::Failed {
+                        reason: reason.clone(),
+                    },
+                    CatchUpStatus::Processing => SyncOutcome::Failed {
+                        reason: "epoch reconciliation did not complete".to_owned(),
+                    },
+                };
+                (caught, outcome)
             }
-            (None, _) | (_, None) => (
+            Err(e) => (
                 0,
                 SyncOutcome::Failed {
-                    reason: "epoch state unavailable".to_owned(),
+                    reason: format!("epoch reconciliation failed: {e}"),
                 },
             ),
         }
@@ -1517,6 +1552,8 @@ impl NetworkSimulator {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -2477,6 +2514,19 @@ mod tests {
     // SyncPhaseDriver + ReconnectionCoordinator::execute() tests
     // -----------------------------------------------------------------------
 
+    /// The `MockSyncDriver` call that returns an error.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MockFailure {
+        /// `local_epoch`.
+        LocalLookup,
+        /// `observed_target_epoch`.
+        TargetLookup,
+        /// Phase 3, `event_log_sync`.
+        EventLog,
+        /// Phase 4, `sender_key_reacquire`.
+        SenderKey,
+    }
+
     /// A mock `SyncPhaseDriver` for testing `execute()`.
     struct MockSyncDriver {
         /// Messages to return from `relay_catch_up`.
@@ -2498,6 +2548,24 @@ mod tests {
         /// and the loop terminates the first pass that merges zero — exactly
         /// the SDK's sequential epoch-processing invariant (§9.12, ADR-029 §3).
         ordered_merge: bool,
+        /// With an unknown target, the epoch the actor reports once the feed
+        /// accepts no more; `None` leaves the local epoch unchanged.
+        steady_epoch: Option<u64>,
+        /// With an unknown target, the blobs left unoffered at the final
+        /// epoch; a nonzero count makes the catch-up state `Failed`, as the
+        /// relay-backed driver does when the sequential-Commit budget stops
+        /// its feed.
+        unfed_blobs: u64,
+        /// The driver call that fails, if any.
+        fails: Option<MockFailure>,
+        /// Calls of `epoch_reconciliation` (Phase 2).
+        phase2_calls: AtomicUsize,
+        /// Calls of `event_log_sync` (Phase 3).
+        phase3_calls: AtomicUsize,
+        /// Calls of `sender_key_reacquire` (Phase 4).
+        phase4_calls: AtomicUsize,
+        /// Calls of `mls_update` (Phase 5).
+        phase5_calls: AtomicUsize,
     }
 
     impl MockSyncDriver {
@@ -2509,7 +2577,24 @@ mod tests {
                 events_recovered_val: 5,
                 fail_relay: false,
                 ordered_merge: false,
+                steady_epoch: None,
+                unfed_blobs: 0,
+                fails: None,
+                phase2_calls: AtomicUsize::new(0),
+                phase3_calls: AtomicUsize::new(0),
+                phase4_calls: AtomicUsize::new(0),
+                phase5_calls: AtomicUsize::new(0),
             }
+        }
+
+        /// The number of calls each of Phases 2, 3, 4 and 5 received.
+        fn phase_calls(&self) -> [usize; 4] {
+            [
+                self.phase2_calls.load(Ordering::SeqCst),
+                self.phase3_calls.load(Ordering::SeqCst),
+                self.phase4_calls.load(Ordering::SeqCst),
+                self.phase5_calls.load(Ordering::SeqCst),
+            ]
         }
 
         fn with_relay_failure() -> Self {
@@ -2548,10 +2633,26 @@ mod tests {
             &self,
             context_id: &str,
             local_epoch: u64,
-            target_epoch: u64,
+            target_epoch: Option<u64>,
             policy: &SyncPolicy,
             messages: &[BufferedMessage],
         ) -> Result<EpochCatchUpState, SyncError> {
+            self.phase2_calls.fetch_add(1, Ordering::SeqCst);
+            let Some(target_epoch) = target_epoch else {
+                let reached = self.steady_epoch.unwrap_or(local_epoch);
+                let mut state = EpochCatchUpState::reached_steady_state(
+                    context_id.to_owned(),
+                    local_epoch,
+                    reached,
+                );
+                if self.unfed_blobs > 0 {
+                    state.transition_to_failed(format!(
+                        "{} blobs left unfed at epoch {reached}",
+                        self.unfed_blobs
+                    ));
+                }
+                return Ok(state);
+            };
             let mut state =
                 EpochCatchUpState::new(context_id.to_owned(), local_epoch, target_epoch);
 
@@ -2617,21 +2718,37 @@ mod tests {
 
         async fn event_log_sync(
             &self,
-            _context_id: &str,
+            context_id: &str,
         ) -> Result<(u64, Vec<SyncEvent>), SyncError> {
+            self.phase3_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fails == Some(MockFailure::EventLog) {
+                return Err(SyncError::EventLogSyncFailed {
+                    context_id: context_id.to_owned(),
+                    reason: "checkpoint build refused".to_owned(),
+                });
+            }
             Ok((self.events_recovered_val, Vec::new()))
         }
 
         async fn sender_key_reacquire(
             &self,
-            _context_id: &str,
+            context_id: &str,
             _policy: &SyncPolicy,
             _messages: &[BufferedMessage],
         ) -> Result<u64, SyncError> {
+            self.phase4_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fails == Some(MockFailure::SenderKey) {
+                return Err(SyncError::BlobsUndelivered {
+                    context_id: context_id.to_owned(),
+                    count: 1,
+                    reason: "actor busy".to_owned(),
+                });
+            }
             Ok(0)
         }
 
         async fn mls_update(&self, _context_id: &str) -> Result<bool, SyncError> {
+            self.phase5_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.mls_update_success)
         }
 
@@ -2644,15 +2761,27 @@ mod tests {
             Ok((3, 1))
         }
 
-        async fn local_epoch(&self, _context_id: &str) -> Result<Option<u64>, SyncError> {
+        async fn local_epoch(&self, context_id: &str) -> Result<Option<u64>, SyncError> {
+            if self.fails == Some(MockFailure::LocalLookup) {
+                return Err(SyncError::EpochCatchUpFailed {
+                    context_id: context_id.to_owned(),
+                    reason: "actor mailbox closed".to_owned(),
+                });
+            }
             Ok(self.local_epoch_val)
         }
 
         async fn observed_target_epoch(
             &self,
-            _context_id: &str,
+            context_id: &str,
             messages: &[BufferedMessage],
         ) -> Result<Option<u64>, SyncError> {
+            if self.fails == Some(MockFailure::TargetLookup) {
+                return Err(SyncError::EpochCatchUpFailed {
+                    context_id: context_id.to_owned(),
+                    reason: "header read failed".to_owned(),
+                });
+            }
             Ok(messages.iter().filter_map(|m| m.epoch).max())
         }
 
@@ -2728,7 +2857,7 @@ mod tests {
         ];
 
         let state = driver
-            .epoch_reconciliation("ctx-merge", local, target, &policy, &messages)
+            .epoch_reconciliation("ctx-merge", local, Some(target), &policy, &messages)
             .await
             .unwrap();
 
@@ -2769,7 +2898,7 @@ mod tests {
         ];
 
         let state = driver
-            .epoch_reconciliation("ctx-merge", 0, 4, &policy, &messages)
+            .epoch_reconciliation("ctx-merge", 0, Some(4), &policy, &messages)
             .await
             .unwrap();
 
@@ -2805,7 +2934,7 @@ mod tests {
             .collect();
 
         let state = driver
-            .epoch_reconciliation("ctx-merge", 0, 10, &policy, &messages)
+            .epoch_reconciliation("ctx-merge", 0, Some(10), &policy, &messages)
             .await
             .unwrap();
 
@@ -2823,33 +2952,186 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn execute_tier1_epoch_unavailable_returns_failed() {
-        let now = 1_010_000u64;
+    /// A coordinator over one Short (Tier 1) context, `ctx-1`.
+    fn short_coordinator(now: u64) -> ReconnectionCoordinator {
         let mut contacts = std::collections::HashMap::new();
         contacts.insert("ctx-1".to_owned(), now - 3600);
-
-        let coord = ReconnectionCoordinator::new(
+        ReconnectionCoordinator::new(
             DID::from("did:dht:z6MkAlice"),
             vec!["ctx-1".to_owned()],
             contacts,
-        );
+        )
+    }
 
+    /// An encrypted blob: its epoch is unknown until the actor opens it.
+    fn opaque_msg(blob_id: &str, now: u64) -> BufferedMessage {
+        BufferedMessage {
+            blob_id: blob_id.to_owned(),
+            context_id: "ctx-1".to_owned(),
+            payload: vec![7],
+            stored_at: now - 100,
+            epoch: None,
+        }
+    }
+
+    /// No buffered blob carries an epoch, so the target is unknown: Phase 2
+    /// runs the driver, takes the epoch the actor reaches as the target, and
+    /// Phases 3, 4 and 5 run (ADR-029 reconnection-driver addendum).
+    #[tokio::test]
+    async fn execute_tier1_unknown_target_takes_the_epoch_the_actor_reaches() {
+        let now = 1_010_000u64;
         let mut driver = MockSyncDriver::new();
-        // No messages → observed_target_epoch returns None → epoch state
-        // unavailable → Failed (not silently FullyCaughtUp).
-        driver.relay_messages = Vec::new();
+        driver.local_epoch_val = Some(3);
+        driver.steady_epoch = Some(5);
+        driver.relay_messages = vec![opaque_msg("b1", now), opaque_msg("b2", now)];
+
+        let report = short_coordinator(now).execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        assert_eq!(result.outcome, SyncOutcome::FullyCaughtUp);
+        assert_eq!(result.epochs_caught_up, 2, "epoch 3 to epoch 5");
+        assert_eq!(result.events_recovered, 5);
+        assert!(result.mls_update_issued);
+        assert_eq!(driver.phase_calls(), [1, 1, 1, 1]);
+    }
+
+    /// An empty Phase 1 buffer leaves the target unknown; the actor stays at
+    /// its epoch, so the context is caught up with no epoch advanced.
+    #[tokio::test]
+    async fn execute_tier1_empty_buffer_is_caught_up_at_the_local_epoch() {
+        let now = 1_010_000u64;
+        let mut driver = MockSyncDriver::new();
         driver.local_epoch_val = Some(5);
 
-        let report = coord.execute(now, &driver).await;
+        let report = short_coordinator(now).execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        assert_eq!(result.outcome, SyncOutcome::FullyCaughtUp);
+        assert_eq!(result.epochs_caught_up, 0);
+        assert_eq!(driver.phase_calls(), [1, 1, 1, 1]);
+    }
+
+    /// A driver that stopped with blobs left unfed reports `Failed`; the
+    /// coordinator stops before Phase 3 and reports the epochs advanced.
+    #[tokio::test]
+    async fn execute_tier1_unknown_target_with_unfed_blobs_fails_before_phase_3() {
+        let now = 1_010_000u64;
+        let mut driver = MockSyncDriver::new();
+        driver.local_epoch_val = Some(3);
+        driver.steady_epoch = Some(5);
+        driver.unfed_blobs = 4;
+        driver.relay_messages = vec![opaque_msg("b1", now)];
+
+        let report = short_coordinator(now).execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        let SyncOutcome::Failed { reason } = &result.outcome else {
+            unreachable!("expected Failed, got {:?}", result.outcome);
+        };
+        assert!(reason.contains("4 blobs left unfed at epoch 5"), "{reason}");
+        assert_eq!(result.epochs_caught_up, 2);
+        assert_eq!(driver.phase_calls(), [1, 0, 0, 0]);
+    }
+
+    /// A failed target lookup fails the context; it is not read as an unknown
+    /// target, which would run Phase 2 against an epoch nobody observed.
+    #[tokio::test]
+    async fn execute_tier1_target_lookup_failure_fails_the_context() {
+        let now = 1_010_000u64;
+        let mut driver = MockSyncDriver::new();
+        driver.local_epoch_val = Some(5);
+        driver.fails = Some(MockFailure::TargetLookup);
+
+        let report = short_coordinator(now).execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        let SyncOutcome::Failed { reason } = &result.outcome else {
+            unreachable!("expected Failed, got {:?}", result.outcome);
+        };
+        assert!(reason.contains("target epoch lookup failed"), "{reason}");
+        assert!(reason.contains("header read failed"), "{reason}");
+        assert_eq!(driver.phase_calls(), [0, 0, 0, 0]);
+    }
+
+    /// A failed local-epoch lookup fails the context; it is not read as a
+    /// broadcast context, which would skip Phase 2.
+    #[tokio::test]
+    async fn execute_tier1_local_lookup_failure_fails_the_context() {
+        let now = 1_010_000u64;
+        let mut driver = MockSyncDriver::new();
+        driver.fails = Some(MockFailure::LocalLookup);
+
+        let report = short_coordinator(now).execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        let SyncOutcome::Failed { reason } = &result.outcome else {
+            unreachable!("expected Failed, got {:?}", result.outcome);
+        };
+        assert!(reason.contains("local epoch lookup failed"), "{reason}");
+        assert!(reason.contains("actor mailbox closed"), "{reason}");
+        assert_eq!(driver.phase_calls(), [0, 0, 0, 0]);
+    }
+
+    /// A broadcast context has no MLS epoch: Phase 2 is skipped and the
+    /// remaining phases run.
+    #[tokio::test]
+    async fn execute_tier1_broadcast_context_skips_phase_2() {
+        let now = 1_010_000u64;
+        let mut driver = MockSyncDriver::new();
+        driver.local_epoch_val = None;
+        driver.relay_messages = vec![opaque_msg("b1", now)];
+
+        let report = short_coordinator(now).execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        assert_eq!(result.outcome, SyncOutcome::FullyCaughtUp);
+        assert_eq!(result.epochs_caught_up, 0);
+        assert_eq!(driver.phase_calls(), [0, 1, 1, 1]);
+    }
+
+    /// A Phase 3 failure fails the context instead of reporting a catch-up
+    /// whose checkpoint comparison never ran.
+    #[tokio::test]
+    async fn execute_tier1_event_log_failure_fails_the_context() {
+        let now = 1_010_000u64;
+        let mut driver = MockSyncDriver::new();
+        driver.local_epoch_val = Some(3);
+        driver.steady_epoch = Some(4);
+        driver.fails = Some(MockFailure::EventLog);
+
+        let report = short_coordinator(now).execute(now, &driver).await;
+        let result = &report.contexts_synced[0];
+        let SyncOutcome::Failed { reason } = &result.outcome else {
+            unreachable!("expected Failed, got {:?}", result.outcome);
+        };
+        assert!(reason.contains("event log sync failed"), "{reason}");
+        assert_eq!(result.epochs_caught_up, 1);
+        assert_eq!(driver.phase_calls(), [1, 1, 0, 0]);
+    }
+
+    /// A Phase 4 failure fails the context, so the caller keeps
+    /// `needs_reconnect` set rather than skipping a blob the re-feed never
+    /// had judged.
+    #[tokio::test]
+    async fn execute_tier1_sender_key_failure_fails_the_context() {
+        let now = 1_010_000u64;
+        let mut driver = MockSyncDriver::new();
+        driver.local_epoch_val = Some(3);
+        driver.fails = Some(MockFailure::SenderKey);
+
+        let report = short_coordinator(now).execute(now, &driver).await;
         let result = &report.contexts_synced[0];
         let SyncOutcome::Failed { reason } = &result.outcome else {
             unreachable!("expected Failed, got {:?}", result.outcome);
         };
         assert!(
-            reason.contains("epoch state unavailable"),
-            "reason should mention epoch state: {reason}"
+            reason.contains("sender key re-acquisition failed"),
+            "{reason}"
         );
+        assert_eq!(driver.phase_calls(), [1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn reached_steady_state_is_complete_at_the_reached_epoch() {
+        let state = EpochCatchUpState::reached_steady_state("ctx-1".to_owned(), 3, 8);
+        assert_eq!(state.target_epoch, 8);
+        assert_eq!(state.commits_processed, 5);
+        assert_eq!(state.status, CatchUpStatus::Complete);
+        assert_eq!(state.epochs_remaining(), 0);
     }
 
     #[tokio::test]

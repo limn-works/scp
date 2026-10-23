@@ -962,13 +962,25 @@ async fn handle_deliver_incoming(
     // `deliver_incoming` fills `processed_commit` only on the arm that returns
     // `Ok(DeliverOutcome::Handled)` at once, so `reply_result` is `Ok` here and
     // no delivery error can be lost.
+    //
+    // The same commit sets the `mls_epoch` scalar that `LocalMlsEpoch`
+    // reports to the group's epoch after the merge. Without it the scalar
+    // stays at the join or last self-issued epoch, and the reconnection
+    // driver's Phase 2 (ADR-029), which takes the epoch the actor reports
+    // after feeding the relay buffer, never sees a merge. It copies the
+    // group's epoch rather than adding one, so the scalar cannot drift from
+    // the group whichever other path also writes it (governance execution
+    // and trust recovery advance it too).
     let reply_result = if let Some(commit) = processed_commit.take() {
         cell.commit_class_s_keep(deps, context_id, |mut v| {
+            let s = v.rest_mut();
+            let merged_epoch = merged_group_epoch(s)?;
             crate::context::actor::pseudonym_rotation::note_processed_commit(
-                v.rest_mut(),
+                s,
                 deps.crypto.local_did(),
                 &commit,
             );
+            s.epoch.mls_epoch = merged_epoch;
             Ok(())
         })
         .await
@@ -1487,6 +1499,38 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::ContextNotActive => ContextError::ContextNotActive,
         ContextError::SupervisorShutDown(msg) => ContextError::SupervisorShutDown(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
+    }
+}
+
+/// The epoch of the context's MLS group after `deliver_incoming` merged a
+/// received Commit.
+///
+/// # Errors
+///
+/// [`ContextError::CryptoFailed`] when the context is broadcast or holds no
+/// group, neither of which can merge a Commit, or when the group cannot report
+/// its epoch.
+fn merged_group_epoch(
+    state: &crate::context::actor::state::PerContextState,
+) -> Result<u64, ContextError> {
+    match &state.mode {
+        crate::context::actor::state::ContextModeState::Encrypted(c) => c
+            .mls_group
+            .as_ref()
+            .ok_or_else(|| {
+                ContextError::CryptoFailed(
+                    "a received Commit merged, but the context holds no MLS group".to_owned(),
+                )
+            })?
+            .epoch()
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!("MLS group epoch after a merged Commit: {e}"))
+            }),
+        crate::context::actor::state::ContextModeState::Broadcast(_) => {
+            Err(ContextError::CryptoFailed(
+                "a broadcast context reported a merged MLS Commit".to_owned(),
+            ))
+        }
     }
 }
 

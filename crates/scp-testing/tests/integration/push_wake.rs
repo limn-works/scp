@@ -775,8 +775,6 @@ async fn a_live_delivery_writes_the_contact_only_for_an_accepted_envelope() {
 /// contact 60 seconds old, so the reconnection runs Tier 1 over the live relay
 /// and the clear is real.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Tier 1 reconnection fails every encrypted context with `epoch state unavailable` \
-            (ADR-029 reconnection-driver addendum), so no full reconnection clears the flag"]
 async fn a_full_reconnect_that_clears_needs_reconnect_writes_the_contact() {
     let (relay, url) = start_relay().await;
     let m = members("push-wake-full-reconnect", vec![url.clone()]).await;
@@ -812,6 +810,102 @@ async fn a_full_reconnect_that_clears_needs_reconnect_writes_the_contact() {
     assert_eq!(
         contacts.load_last_relay_contact(&m.ctx_id).await.unwrap(),
         Some(now)
+    );
+    relay.shutdown();
+}
+
+/// Phase 2 merges at most `max_sequential_commits` Commits. Alice commits
+/// three times while Bob is away; a reconnection whose budget is one merges
+/// one, fails with `needs_reconnect` still set and the contact unchanged,
+/// and keeps the epoch it reached. The next reconnection, over the same relay
+/// buffer, spends no budget on the replayed Commit, merges the other two and
+/// completes (ADR-029 reconnection-driver addendum).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_that_exhausts_the_commit_budget_fails_and_the_next_resumes() {
+    let (relay, url) = start_relay().await;
+    let m = members("push-wake-commit-budget", vec![url.clone()]).await;
+    let bob = m.restarted_bob_needing_reconnect().await;
+    let start_epoch = bob
+        .try_local_mls_epoch(&m.ctx_id)
+        .await
+        .unwrap()
+        .expect("an encrypted context has an MLS epoch");
+
+    let adapter = connect(&url).await;
+    let routing_id = scp_protocol::context::context_routing_id(&m.ctx_id);
+    // Each raw Commit is framed as the actor's receive path opens a raw MLS
+    // message (the fixture's `wrap_raw_mls_message`): a serialized outer
+    // envelope carried as the relay envelope's `encrypted_blob`.
+    for _ in 0..3 {
+        let commit = m.alice.manager.issue_mls_update(&m.ctx_id).await.unwrap();
+        let inner =
+            scp_core::envelope::create_outer_envelope(&routing_id, None, 0, commit).unwrap();
+        let framed = rmp_serde::to_vec_named(&inner).unwrap();
+        let envelope =
+            scp_core::envelope::create_outer_envelope(&routing_id, None, 3600, framed).unwrap();
+        adapter.send(&envelope).await.unwrap();
+    }
+
+    let transport = Arc::new(TransportManager::new(
+        url.clone(),
+        Box::new(connect(&url).await),
+    ));
+    let contacts = new_contacts();
+    let now = now_secs();
+    contacts
+        .store_last_relay_contact(&m.ctx_id, now - 60)
+        .await
+        .unwrap();
+    let reconnect = |policy: SyncPolicy, at: u64| {
+        reconnect_contexts_no_drain(ReconnectRequest {
+            transport: &transport,
+            supervisor: &bob,
+            member_did: DID::from(BOB_DID),
+            signer: m.bob_signer(),
+            relay_contacts: contacts.as_ref(),
+            context_ids: vec![m.ctx_id.clone()],
+            now: at,
+            policy,
+        })
+    };
+
+    let report = reconnect(
+        SyncPolicy {
+            max_sequential_commits: 1,
+            ..SyncPolicy::default()
+        },
+        now,
+    )
+    .await
+    .expect("the contact reads");
+    let result = &report.contexts[0];
+    assert_eq!(result.tier, "short", "{result:?}");
+    assert_eq!(result.outcome, "failed", "{result:?}");
+    assert!(!result.needs_reconnect_cleared, "{result:?}");
+    assert!(bob.needs_reconnect(&m.ctx_id).await);
+    assert_eq!(
+        contacts.load_last_relay_contact(&m.ctx_id).await.unwrap(),
+        Some(now - 60),
+        "a failed reconnection writes no contact"
+    );
+    assert_eq!(
+        bob.try_local_mls_epoch(&m.ctx_id).await.unwrap(),
+        Some(start_epoch + 1),
+        "the budget of one merges exactly one Commit, and the merge persists"
+    );
+
+    let later = now + 1;
+    let report = reconnect(SyncPolicy::default(), later)
+        .await
+        .expect("the contact reads");
+    let result = &report.contexts[0];
+    assert_eq!(result.outcome, "fully_caught_up", "{result:?}");
+    assert_eq!(result.epochs_caught_up, 2, "{result:?}");
+    assert!(result.needs_reconnect_cleared, "{result:?}");
+    assert!(!bob.needs_reconnect(&m.ctx_id).await);
+    assert_eq!(
+        contacts.load_last_relay_contact(&m.ctx_id).await.unwrap(),
+        Some(later)
     );
     relay.shutdown();
 }
@@ -1033,8 +1127,6 @@ async fn a_key_request_a_wake_delivers_stays_queued_until_the_answers_are_sent()
 
 /// The full reconnection after a wake sends the answer the wake queued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Tier 1 reconnection fails every encrypted context with `epoch state unavailable` \
-            (ADR-029 reconnection-driver addendum), so no full reconnection reaches the send"]
 async fn a_full_reconnect_sends_the_answer_a_wake_queued() {
     let (relay, url) = start_relay().await;
     let m = members("push-wake-key-request-reconnect", vec![url.clone()]).await;

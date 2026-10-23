@@ -213,12 +213,16 @@ pub trait TransportAdapter: Send + Sync {
     /// Returns all stored envelopes with the given routing ID, optionally
     /// filtered to those newer than `since` (epoch seconds). Unlike
     /// [`subscribe`](TransportAdapter::subscribe), this does not establish
-    /// a live stream.
+    /// a live stream, and a redelivery cache that deduplicates the live stream
+    /// (ADR-012) does not filter the answer: a blob the caller received before
+    /// but never applied is still stored, so it is still returned.
     ///
     /// # Errors
     ///
     /// Returns [`TransportError::NotConnected`] if the adapter has no active
-    /// connection, or [`TransportError::Timeout`] if the query times out.
+    /// connection, [`TransportError::Timeout`] if the query times out, or
+    /// [`TransportError::SubscriptionFailed`] if the adapter cannot answer
+    /// because a live subscription holds `routing_id`.
     fn query(
         &self,
         routing_id: &RoutingId,

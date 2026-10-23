@@ -139,14 +139,24 @@ pub enum RelayScope<'a> {
     Only(&'a [String]),
 }
 
-/// What one feed of a Phase 1 buffer to the actor accepted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What one feed of a Phase 1 buffer to the actor accepted, and what it left.
+#[derive(Debug, Default)]
 pub struct FeedTally {
     /// Blobs the actor accepted in any form (`Ok(_)`): Commits, control
     /// messages and application messages.
     pub accepted: u64,
     /// Blobs the actor accepted as application messages (`Ok(Some(_))`).
     pub delivered: u64,
+    /// Blobs the feed did not offer the actor at the epoch it stopped at:
+    /// when the budget stopped the feed, every blob still pending. A refused
+    /// blob may apply at a later epoch, so a nonzero count means the actor may
+    /// not have reached the group's epoch.
+    pub pending_at_end: u64,
+    /// Blobs whose delivery reached no verdict ([`delivery_reached_verdict`])
+    /// on the pass that found steady state, each blob's last delivery.
+    pub unreached: u64,
+    /// The last delivery failure that reached no verdict on that pass.
+    pub last_unreached: Option<ContextError>,
 }
 
 /// Resolves the shared routing ID for a context (§9.10.4 / §5.14).
@@ -156,16 +166,25 @@ pub struct FeedTally {
 /// `context_routing_id`. Mirrors the `context_subscribe` selection so
 /// the driver pulls from the same routing key the live subscription
 /// uses (§5.14).
-async fn shared_routing_id(supervisor: &Supervisor, context_id: &str) -> RoutingId {
-    // `local_mls_epoch` returns `None` for a broadcast context — reuse
-    // that single source of truth rather than re-deriving the mode.
-    let is_broadcast = supervisor.local_mls_epoch(context_id).await.is_none();
+///
+/// # Errors
+///
+/// The [`ContextError`] from [`Supervisor::try_local_mls_epoch`]; a failed
+/// lookup never selects a routing ID, because guessing the broadcast one for
+/// an encrypted context would read and publish where no member listens.
+async fn shared_routing_id(
+    supervisor: &Supervisor,
+    context_id: &str,
+) -> Result<RoutingId, ContextError> {
+    // `Ok(None)` is a broadcast context — reuse that single source of truth
+    // rather than re-deriving the mode.
+    let is_broadcast = supervisor.try_local_mls_epoch(context_id).await?.is_none();
     let bytes = if is_broadcast {
         broadcast_routing_id(context_id)
     } else {
         context_routing_id(context_id)
     };
-    RoutingId::new(bytes)
+    Ok(RoutingId::new(bytes))
 }
 
 /// Converts a retrieved [`OuterEnvelope`] into a [`BufferedMessage`].
@@ -245,9 +264,18 @@ pub async fn pull_buffered(
     Ok(messages)
 }
 
-/// Phase 2 body: feeds the first `limit` blobs of `messages` to the actor
-/// through [`Supervisor::deliver_commit_blob`] in `mode` until a full pass
-/// accepts nothing or `limit` blobs were accepted.
+/// Phase 2 body: feeds `messages` to the actor until it accepts no more.
+///
+/// Each blob goes through [`Supervisor::deliver_commit_blob`] in `mode`. The
+/// feed stops when a full pass accepts nothing or the actor has accepted
+/// `limit` blobs that are not application messages.
+///
+/// The budget counts every accepted non-application blob (`Ok(None)`: a
+/// Commit, proposal, checkpoint, heartbeat or sender-key management message),
+/// an upper bound on the Commits merged, so the feed merges at most `limit`
+/// Commits (spec 23 §23.4.1). Application messages and refused blobs, replays
+/// included, consume none of it, so a later attempt over the same buffer
+/// spends its budget on blobs the actor has not yet accepted.
 ///
 /// Each application envelope the actor accepts is added to `tally` as it is
 /// accepted, so a caller whose deadline drops this future still counts it.
@@ -256,6 +284,11 @@ pub async fn pull_buffered(
 /// epoch. `OpenMLS` only accepts a Commit whose epoch matches the group's
 /// current epoch, so a single linear pass advances at most one epoch; each
 /// further pass retries the still-refused blobs against the advanced epoch.
+///
+/// The returned [`FeedTally`] says what the feed left:
+/// [`FeedTally::pending_at_end`] counts the blobs it never offered at the
+/// epoch it stopped at, and [`FeedTally::unreached`] the blobs whose last
+/// delivery reached no verdict ([`delivery_reached_verdict`]).
 pub async fn deliver_commit_blobs_until_steady(
     supervisor: &Supervisor,
     context_id: &str,
@@ -265,21 +298,27 @@ pub async fn deliver_commit_blobs_until_steady(
     tally: &DeliveryTally,
 ) -> FeedTally {
     let mut fed = FeedTally::default();
-    let mut pending: Vec<&[u8]> = messages
-        .iter()
-        .take(limit)
-        .map(|m| m.payload.as_slice())
-        .collect();
-    let mut total_accepted: usize = 0;
+    let mut pending: Vec<&[u8]> = messages.iter().map(|m| m.payload.as_slice()).collect();
+    let mut control_accepted: usize = 0;
 
-    while !pending.is_empty() && total_accepted < limit {
+    while !pending.is_empty() {
+        if control_accepted >= limit {
+            // Budget exhausted: every blob still pending was last offered at
+            // an earlier epoch, if at all, and may apply at this one.
+            fed.pending_at_end = fed
+                .pending_at_end
+                .saturating_add(u64::try_from(pending.len()).unwrap_or(u64::MAX));
+            break;
+        }
         let mut still_pending: Vec<&[u8]> = Vec::with_capacity(pending.len());
         let mut accepted_this_pass = 0usize;
+        let mut unreached_this_pass = 0u64;
+        let mut last_unreached = None;
 
         for payload in pending {
-            if total_accepted >= limit {
+            if control_accepted >= limit {
                 // Budget exhausted mid-pass; carry the remainder so the
-                // loop terminates without dropping blobs silently.
+                // loop counts it in `pending_at_end` instead of dropping it.
                 still_pending.push(payload);
                 continue;
             }
@@ -292,11 +331,12 @@ pub async fn deliver_commit_blobs_until_steady(
                     if delivered.is_some() {
                         fed.delivered += 1;
                         tally.add(context_id, 1);
+                    } else {
+                        control_accepted += 1;
                     }
                     accepted_this_pass += 1;
-                    total_accepted += 1;
                 }
-                Err(e) => {
+                Err(e) if delivery_reached_verdict(&e) => {
                     // Refused at the current epoch (out-of-epoch Commit,
                     // replay, or an undecryptable blob). Retained for a retry
                     // against the next epoch; a genuinely bad blob is never
@@ -308,13 +348,29 @@ pub async fn deliver_commit_blobs_until_steady(
                     );
                     still_pending.push(payload);
                 }
+                Err(e) => {
+                    // No verdict (actor busy, crashed, or a custody,
+                    // transport, event-log or store failure). Retried on the
+                    // next pass; counted only if the steady-state pass is its
+                    // last delivery.
+                    tracing::warn!(
+                        context_id,
+                        error = %e,
+                        "deliver_commit_blobs_until_steady: a delivery reached no verdict"
+                    );
+                    unreached_this_pass += 1;
+                    last_unreached = Some(e);
+                    still_pending.push(payload);
+                }
             }
         }
 
         if accepted_this_pass == 0 {
             // A full pass accepted nothing: steady state. The remaining blobs
             // apply to no reachable epoch (replays, or a gap that needs a
-            // Welcome-based fast-forward).
+            // Welcome-based fast-forward), or reached no verdict.
+            fed.unreached = unreached_this_pass;
+            fed.last_unreached = last_unreached;
             break;
         }
         pending = still_pending;
@@ -432,7 +488,7 @@ impl<'a> RelayActorSyncDriver<'a> {
     }
 
     /// The shared routing ID of `context_id` ([`shared_routing_id`]).
-    async fn shared_routing_id(&self, context_id: &str) -> RoutingId {
+    async fn shared_routing_id(&self, context_id: &str) -> Result<RoutingId, ContextError> {
         shared_routing_id(self.supervisor, context_id).await
     }
 
@@ -455,15 +511,20 @@ impl<'a> RelayActorSyncDriver<'a> {
     /// Uses [`Supervisor::drain_equivocation_alerts`] (NOT the total
     /// `drain_events`) so catch-up does not destroy buffered application
     /// traffic.
-    async fn collect_equivocation_alerts(&self, context_id: &str, now: u64) -> Vec<SyncEvent> {
+    async fn collect_equivocation_alerts(
+        &self,
+        context_id: &str,
+        now: u64,
+    ) -> Result<Vec<SyncEvent>, ContextError> {
         // Resolve the detector's local MLS epoch once for the whole batch so
-        // every alert carries forensic epoch context (§9.12). `None` for a
-        // broadcast context or on mailbox failure, matching the helper's soft
-        // semantics — the divergent roots remain the load-bearing evidence.
-        let local_epoch = self.supervisor.local_mls_epoch(context_id).await;
-        self.supervisor
+        // every alert carries forensic epoch context (§9.12); `None` for a
+        // broadcast context. The lookup runs before the drain, so a failed
+        // lookup returns its error with every alert still buffered.
+        let local_epoch = self.supervisor.try_local_mls_epoch(context_id).await?;
+        Ok(self
+            .supervisor
             .drain_equivocation_alerts(context_id)
-            .await
+            .await?
             .into_iter()
             .filter_map(|event| match event {
                 ContextEvent::EquivocationDetected {
@@ -490,7 +551,7 @@ impl<'a> RelayActorSyncDriver<'a> {
                 ))),
                 _ => None,
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -502,7 +563,12 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
         context_id: &str,
         last_stored_at: u64,
     ) -> Result<Vec<BufferedMessage>, SyncError> {
-        let routing_id = self.shared_routing_id(context_id).await;
+        let routing_id = self.shared_routing_id(context_id).await.map_err(|e| {
+            SyncError::RelayCatchUpFailed {
+                context_id: context_id.to_owned(),
+                reason: format!("routing ID lookup failed: {e}"),
+            }
+        })?;
         // 5-second overlap on re-subscribe per ADR-004 Connection Recovery.
         let since = last_stored_at.saturating_sub(SINCE_OVERLAP_SECS);
         // `since` is always <= `last_stored_at`; the local receive time
@@ -539,27 +605,43 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
     /// set against the now-advanced epoch and retries; we stop when a full
     /// pass merges nothing (steady state) or the cumulative merge count
     /// reaches the sequential-Commit budget.
+    ///
+    /// # Outcome
+    ///
+    /// An encrypted blob's epoch is unknown until the actor opens it, so the
+    /// target is usually `None`, and the epoch the actor reports after the
+    /// feed becomes the target (ADR-029 reconnection-driver addendum). The
+    /// state is `Complete` at that epoch unless the budget stopped the feed
+    /// with blobs not offered at it, or a known target was not reached; then
+    /// it is `Failed`, because no shipped path runs the Welcome-based
+    /// fast-forward. It is never `FastForwarded`.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::BlobsUndelivered`] when the actor reached no verdict on a
+    /// blob; [`SyncError::EpochCatchUpFailed`] when the epoch re-read fails or
+    /// reports no MLS group.
     async fn epoch_reconciliation(
         &self,
         context_id: &str,
         local_epoch: u64,
-        target_epoch: u64,
+        target_epoch: Option<u64>,
         policy: &SyncPolicy,
         messages: &[BufferedMessage],
     ) -> Result<EpochCatchUpState, SyncError> {
-        let mut state = EpochCatchUpState::new(context_id.to_owned(), local_epoch, target_epoch);
-
-        if local_epoch >= target_epoch {
+        let catch_up_failed = |reason: String| SyncError::EpochCatchUpFailed {
+            context_id: context_id.to_owned(),
+            reason,
+        };
+        if let Some(target) = target_epoch
+            && local_epoch >= target
+        {
             // Already current — nothing to process.
-            return Ok(state);
-        }
-
-        if state.exceeds_sequential_limit(policy) {
-            // Gap exceeds the sequential-Commit budget; the SDK falls back
-            // to Welcome-based fast-forward (Tier-2/3 reset path). Surface
-            // the decision rather than churning through bounded Commits.
-            state.transition_to_fast_forward();
-            return Ok(state);
+            return Ok(EpochCatchUpState::reached_steady_state(
+                context_id.to_owned(),
+                local_epoch,
+                local_epoch,
+            ));
         }
 
         let limit = usize::try_from(policy.max_sequential_commits).unwrap_or(usize::MAX);
@@ -575,22 +657,45 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
             self.tally,
         )
         .await;
-        for _ in 0..fed.accepted {
-            state.record_commit_processed();
+        if let Some(source) = fed.last_unreached {
+            return Err(SyncError::BlobsUndelivered {
+                context_id: context_id.to_owned(),
+                count: fed.unreached,
+                reason: source.to_string(),
+            });
         }
 
-        // Re-read the authoritative local epoch from the actor.
-        let new_local = self
+        // Re-read the authoritative local epoch from the actor. An encrypted
+        // context that answers with no MLS group cannot have caught up.
+        let reached = self
             .supervisor
-            .local_mls_epoch(context_id)
+            .try_local_mls_epoch(context_id)
             .await
-            .unwrap_or(local_epoch);
-        if new_local >= target_epoch {
-            // record_commit_processed already flips to Complete when the
-            // counter reaches the target; ensure terminal status when the
-            // actor reports caught-up even if some blobs were skipped.
-            state = EpochCatchUpState::new(context_id.to_owned(), new_local, target_epoch);
-            state.record_commit_processed();
+            .map_err(|e| catch_up_failed(format!("epoch lookup after the feed failed: {e}")))?
+            .ok_or_else(|| {
+                catch_up_failed("the context has no MLS group after the feed".to_owned())
+            })?;
+
+        let mut state =
+            EpochCatchUpState::reached_steady_state(context_id.to_owned(), local_epoch, reached);
+        if fed.pending_at_end > 0 {
+            // The budget stopped the feed with blobs never offered at the
+            // reached epoch. No shipped path runs the Welcome-based
+            // fast-forward (ADR-029 reconnection-driver addendum), so the
+            // context fails and keeps `needs_reconnect`; the epochs advanced
+            // persist and the next reconnection resumes from them.
+            state.transition_to_failed(format!(
+                "Phase 2 stopped at epoch {reached} after {} accepted blobs \
+                 (max_sequential_commits {limit}) with {} blobs not offered at that epoch; \
+                 the Welcome-based fast-forward is unavailable",
+                fed.accepted, fed.pending_at_end
+            ));
+        } else if let Some(target) = target_epoch
+            && reached < target
+        {
+            state.transition_to_failed(format!(
+                "Phase 2 reached epoch {reached}, short of the observed target epoch {target}"
+            ));
         }
         Ok(state)
     }
@@ -613,7 +718,13 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
         // compare_remote_checkpoint (fed via deliver_commit_blob in Phase
         // 2). `event_count` is the local count at checkpoint time.
         let now = checkpoint.timestamp;
-        let alerts = self.collect_equivocation_alerts(context_id, now).await;
+        let alerts = self
+            .collect_equivocation_alerts(context_id, now)
+            .await
+            .map_err(|e| SyncError::EventLogSyncFailed {
+                context_id: context_id.to_owned(),
+                reason: format!("equivocation alert collection failed: {e}"),
+            })?;
         Ok((checkpoint.event_count, alerts))
     }
 
@@ -636,7 +747,7 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
         // advance interleaved among the blobs is not missed. Re-delivery is
         // idempotent — already-merged Commits and already-processed
         // management messages are rejected without side effects.
-        refeed_buffer(
+        let refed = refeed_buffer(
             self.supervisor,
             context_id,
             messages,
@@ -644,6 +755,16 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
             self.tally,
         )
         .await;
+        // This pass is each blob's last delivery: a blob it reached no
+        // verdict on fails the phase, so the reconnection does not record a
+        // relay contact past it (spec 23 §23.15 `BlobsUndelivered`).
+        if let Some(source) = refed.last_unreached {
+            return Err(SyncError::BlobsUndelivered {
+                context_id: context_id.to_owned(),
+                count: refed.unreached,
+                reason: source.to_string(),
+            });
+        }
         // The actor surfaces unrecoverable sender keys as buffered
         // SenderKeyTimeout events; none means full recovery.
         Ok(0)
@@ -666,7 +787,13 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
         // Publish the Commit to the shared routing key so online peers
         // process the epoch advance. Best-effort: a transport failure does
         // not undo the local epoch advance (the Commit can be re-broadcast).
-        let routing_id = self.shared_routing_id(context_id).await;
+        let routing_id =
+            self.shared_routing_id(context_id)
+                .await
+                .map_err(|e| SyncError::MlsUpdateFailed {
+                    context_id: context_id.to_owned(),
+                    reason: format!("routing ID lookup failed: {e}"),
+                })?;
         let envelope = create_outer_envelope(
             routing_id.as_bytes(),
             None,
@@ -713,7 +840,13 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
 
     /// Returns the local MLS epoch (`None` for broadcast contexts).
     async fn local_epoch(&self, context_id: &str) -> Result<Option<u64>, SyncError> {
-        Ok(self.supervisor.local_mls_epoch(context_id).await)
+        self.supervisor
+            .try_local_mls_epoch(context_id)
+            .await
+            .map_err(|e| SyncError::EpochCatchUpFailed {
+                context_id: context_id.to_owned(),
+                reason: format!("local epoch lookup failed: {e}"),
+            })
     }
 
     /// Returns the highest epoch observed across retrieved messages.
@@ -741,7 +874,12 @@ impl SnapshotTransport for RelayActorSyncDriver<'_> {
     /// context's well-known routing key. Returns `None` when no snapshot
     /// blob is stored.
     async fn query_snapshot(&self, context_id: &str) -> Result<Option<Vec<u8>>, DaysOfflineError> {
-        let routing_id = self.shared_routing_id(context_id).await;
+        let routing_id = self.shared_routing_id(context_id).await.map_err(|e| {
+            DaysOfflineError::SnapshotCodecFailed {
+                context_id: context_id.to_owned(),
+                reason: format!("routing ID lookup failed: {e}"),
+            }
+        })?;
         let envelopes = self.transport.query(&routing_id, None).await.map_err(|e| {
             DaysOfflineError::SnapshotCodecFailed {
                 context_id: context_id.to_owned(),
@@ -762,7 +900,12 @@ impl SnapshotTransport for RelayActorSyncDriver<'_> {
         context_id: &str,
         data: &[u8],
     ) -> Result<(), DaysOfflineError> {
-        let routing_id = self.shared_routing_id(context_id).await;
+        let routing_id = self.shared_routing_id(context_id).await.map_err(|e| {
+            DaysOfflineError::SnapshotCodecFailed {
+                context_id: context_id.to_owned(),
+                reason: format!("routing ID lookup failed: {e}"),
+            }
+        })?;
         let envelope = create_outer_envelope(
             routing_id.as_bytes(),
             None,
@@ -794,7 +937,12 @@ impl ResetTransport for RelayActorSyncDriver<'_> {
         context_id: &str,
         data: &[u8],
     ) -> Result<(), scp_core::sync::weeks_offline::WeeksOfflineError> {
-        let routing_id = self.shared_routing_id(context_id).await;
+        let routing_id = self.shared_routing_id(context_id).await.map_err(|e| {
+            scp_core::sync::weeks_offline::WeeksOfflineError::ResetRequestFailed {
+                context_id: context_id.to_owned(),
+                reason: format!("routing ID lookup failed: {e}"),
+            }
+        })?;
         let envelope = create_outer_envelope(
             routing_id.as_bytes(),
             None,
@@ -842,9 +990,16 @@ impl ResetTransport for RelayActorSyncDriver<'_> {
         })?;
         let epoch = self
             .supervisor
-            .local_mls_epoch(context_id)
+            .try_local_mls_epoch(context_id)
             .await
-            .unwrap_or(0);
+            .map_err(|e| e.to_string())
+            .and_then(|epoch| epoch.ok_or_else(|| "the context has no MLS group".to_owned()))
+            .map_err(|reason| {
+                scp_core::sync::weeks_offline::WeeksOfflineError::ResetRequestFailed {
+                    context_id: context_id.to_owned(),
+                    reason: format!("epoch lookup after the re-add ratchet failed: {reason}"),
+                }
+            })?;
         Ok(epoch)
     }
 
