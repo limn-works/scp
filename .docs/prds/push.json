@@ -1985,7 +1985,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/discovery/push.rs",
         "crates/scp-identity/src/push_verify.rs",
@@ -2001,7 +2001,8 @@
         ".docs/specs/25-test-vectors.md",
         "crates/scp-transport/src/webtransport/server.rs",
         "crates/scp-transport/src/relay/push_dispatch.rs",
-        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs",
+        "crates/scp-node/src/config.rs"
       ],
       "description": "Implements the tier 3 push routing ID that `09-security-model.md` \u00a79.18.2 **Tier 3 push routing ID** defines, `SHA-256(\"scp-push-bridge:\" || bridge_url || bridge_target)`, for an `SCPRelay` entry that carries a `bridgeTarget` (`18-addressability-and-deployment.md` \u00a718.2.1). Alec chose the option in which \"a relay entry becomes `{url, bridge_target}`\" and the push routing ID is derived from the canonical URL plus the target. Today `reserve_push_routing_id` in `crates/scp-node/src/published_state.rs` carries `// Stub \u2014 see PUSH-032` and leaves a bridged node's relay reserving its previous URL's ID, and `relay_endpoint_push_routing_id` in `crates/scp-protocol/src/discovery/push.rs` computes only the `\"scp-push-registration\"` form; this story adds the tier 3 form beside it, so the code holds one derivation per form. The story also adds field 7 of the `PushRegistration` preimage and field 6 of the `PushDeregistration` preimage, `bridge_target`, 32 bare bytes holding the entry's target or `SHA-256(0x00)` (\u00a79.5.2, `22-human-readable-addressing.md` \u00a722.11.4), because `relay_url` alone is the bridge relay's URL and would let a message signed for the bridge relay, or for one node behind it, verify at every other node behind the same bridge. The separators stay `-V1:` (\u00a79.5.2 note). `10-infrastructure-and-self-hosting.md` \u00a710.7.1 **Tier 3 relays** states each party's role: the bridged node reserves the tier 3 ID and does not reserve the bridge relay's own ID, the bridge relay computes nothing, and the client publishes inside `BRIDGE_DATA`. Delivery of a registration that arrives inside a forwarded `BRIDGE_DATA` is PUSH-033, which needs the node's bridge registration; this story covers the derivation, the preimages, the verifier, the shared relay URL handle and every listener. A client that registers with a tier 3 relay is not in this story: a context's relay list cannot name a tier 3 relay's target, which `00-open-questions.md` records as open, and the client registrar stories take the new preimage field when they sign. Function names and file locations are indicators. The node publishes one tier 3 entry today, so a test drives `reserve_push_routing_id` with two entries to show that the reservation covers every entry the node publishes. Publishing several bridge entries at once would change the node's NAT handling, which this story does not cover.",
       "acceptanceCriteria": [
