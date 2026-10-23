@@ -339,6 +339,22 @@ SDK wrappers match:
 
 Lifecycle tests across all four SDKs converted to `#[tokio::test]` / the idiomatic async test form in each language.
 
+### `suspend()` flushes on a runtime and fails closed (amended 2026-10-23)
+
+`CoreFields::suspend` and the `BridgeInstanceCore::suspend` default are `async fn` returning `Result<(), LifecycleError>`. `suspend` sets the suspended flag, cancels the reconnect generation, awaits `Supervisor::flush_all_contexts`, and then clears transport. When the flush returns an error, `suspend` clears the suspended flag, leaves the transport connected, and returns `LifecycleError::FlushFailed`. Each bridge reports that error with `SCP-STORAGE-8014`. The unflushed actors stay dirty (ADR-049, actor per context, Decision 9 "Persistence: coalesced by default, sync for safety-critical"), so a retried `suspend` flushes them again. A poisoned transport lock returns `LifecycleError::TransportLock`, reported with `SCP-TRANS-5001`, and also leaves the instance running.
+
+Before this amendment, `suspend` was synchronous and called `flush_all_contexts_sync`, which returns an error outside a tokio runtime. A Swift, Kotlin, TypeScript or Python caller has no tokio runtime on its thread, so every SDK `suspend` skipped the flush, and `suspend` discarded the error and reported success.
+
+The bridges call `suspend` the way they call `resume`:
+
+- `PyScp::suspend(&self, py)` — waits through `actor_wait::block_on_released`, which releases the GIL.
+- `Scp::suspend` on napi — native `async fn`.
+- `Scp::suspend` on UniFFI — `pub async fn` on the tokio async runtime, surfacing as Kotlin `suspend fun` and Swift `async throws`.
+
+SDK wrappers match: Python `async def suspend(self)` through `asyncio.to_thread`, TypeScript `suspend(): Promise<void>`, Swift `func suspend() async throws`, and Kotlin `suspend fun suspendInstance()` through `CoroutineBridge.ffiCallSuspend`. Each SDK raises its storage error for `SCP-STORAGE-8014`.
+
+The synchronous `CoreFields::shutdown` is deleted, because it also flushed through `flush_all_contexts_sync` and skipped the flush outside a runtime. Every shutdown goes through `CoreFields::shutdown_core_async`, which awaits `flush_all_contexts` inside the caller's deadline.
+
 ### Multi-URL reconnect via `HashSet`
 
 `CoreFields::relay_url: Mutex<Option<String>>` is replaced with `relay_urls: Mutex<HashSet<String>>`. `TransportManager` already supports multi-adapter routing; the single-URL state was artificially narrow.
