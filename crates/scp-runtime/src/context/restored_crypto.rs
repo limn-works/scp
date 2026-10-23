@@ -146,11 +146,11 @@ pub(in crate::context) enum RestoredBinding {
 ///     }
 ///
 ///     impl VerifiedRestoredCrypto {
-///         pub fn verify_scp_context_binding(committed_t0: Option<u64>) -> Self {
+///         pub(crate) fn verify_scp_context_binding(committed_t0: Option<u64>) -> Self {
 ///             Self { committed_t0 }
 ///         }
 ///
-///         pub fn committed_t0(&self) -> Option<u64> {
+///         pub(crate) fn committed_t0(&self) -> Option<u64> {
 ///             self.committed_t0
 ///         }
 ///     }
