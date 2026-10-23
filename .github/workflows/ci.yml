@@ -562,13 +562,14 @@ jobs:
               # scp-relay-client, which fuzz/Cargo.toml declares as a direct
               # dependency, and omitted scp-core, scp-identity and scp-platform,
               # which scp-runtime pulls in. A change to any of those four broke
-              # the fuzz build while job fuzz-build skipped.
+              # the fuzz build while job fuzz-build skipped. Re-read 2026-10-23,
+              # after fuzz/Cargo.toml dropped its unused scp-transport dependency:
+              # scp-transport and scp-core left the closure, so neither is listed.
               # scripts/tests/ci-gate/ci_gate_selftest.py recomputes this closure
               # from Cargo.toml path dependencies and fails when an entry is
               # missing, so a new dependency edge cannot silently shrink it.
               - 'fuzz/**'
               - 'crates/scp-clock/**'
-              - 'crates/scp-core/**'
               - 'crates/scp-crypto/**'
               - 'crates/scp-dht/**'
               - 'crates/scp-did/**'
@@ -582,7 +583,6 @@ jobs:
               - 'crates/scp-runtime/**'
               # scp-platform's sqlite and apple features pull in scp-sqlite-pools.
               - 'crates/scp-sqlite-pools/**'
-              - 'crates/scp-transport/**'
               # Every crate above is a member of the root workspace and reads
               # its dependency versions from the root manifest's
               # `[workspace.dependencies]`, so a bump that edits only that table
