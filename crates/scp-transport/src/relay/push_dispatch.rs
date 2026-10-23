@@ -788,8 +788,6 @@ mod enabled {
         type TestResult = Result<(), Box<dyn std::error::Error>>;
 
         const RID: RoutingId = [0x11; 32];
-        /// The URL `test_relay_url()` serves, which every registration signs.
-        const RELAY_URL: &str = "ws://127.0.0.1:9000/scp/v1";
         const REGISTRANT_A: &str = "did:dht:push-a";
         const REGISTRANT_B: &str = "did:dht:push-b";
 
@@ -857,12 +855,13 @@ mod enabled {
                 timestamp: now,
                 signature: [0; 64],
             };
+            let relay_url = test_relay_url();
+            let current = relay_url.current();
             let digest: [u8; 32] =
-                Sha256::digest(push_registration_signing_bytes(&msg, RELAY_URL)?).into();
+                Sha256::digest(push_registration_signing_bytes(&msg, current.push_relay())?).into();
             msg.signature = sign_prehash_rfc6979(&signer, &digest)?;
             let blob = rmp_serde::to_vec_named(&msg)?;
-            let relay_url = test_relay_url();
-            let reserved = relay_url.current().push_routing_id();
+            let reserved = current.push_routing_id();
             let decision = gate_publish(&relay_url, push, &reserved, &blob, now).await;
             if decision != PushPublishGate::Accepted {
                 return Err(format!("registration not accepted: {decision:?}").into());
@@ -1519,8 +1518,6 @@ pub(crate) mod wake_harness {
     type Error = Box<dyn std::error::Error>;
 
     const REGISTRANT: &str = "did:dht:wake-harness";
-    /// The URL `test_relay_url()` serves.
-    const RELAY_URL: &str = "ws://127.0.0.1:9000/scp/v1";
     /// The token every harness registers.
     const TOKEN: &[u8] = b"wake-harness-token";
 
@@ -1558,11 +1555,12 @@ pub(crate) mod wake_harness {
                 timestamp: now,
                 signature: [0; 64],
             };
-            let digest: [u8; 32] =
-                Sha256::digest(push_registration_signing_bytes(&msg, RELAY_URL)?).into();
-            msg.signature = sign_prehash_rfc6979(&signer, &digest)?;
             let relay_url = test_relay_url();
-            let reserved = relay_url.current().push_routing_id();
+            let current = relay_url.current();
+            let digest: [u8; 32] =
+                Sha256::digest(push_registration_signing_bytes(&msg, current.push_relay())?).into();
+            msg.signature = sign_prehash_rfc6979(&signer, &digest)?;
+            let reserved = current.push_routing_id();
             let blob = rmp_serde::to_vec_named(&msg)?;
             let decision = gate_publish(&relay_url, &push, &reserved, &blob, now).await;
             if decision != PushPublishGate::Accepted {

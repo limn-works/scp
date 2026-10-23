@@ -841,8 +841,9 @@ mod tests {
     #[cfg(feature = "push-store")]
     async fn present(held: &RelayUrl, blob: &[u8]) -> (PushPublishGate, Option<u64>) {
         let dir = tempfile::tempdir().unwrap();
-        let service = test_service(dir.path(), GATE_REGISTRANT, &gate_key());
-        let store = service.store.clone();
+        let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key());
+        let store = config.store.clone();
+        let service = PushService::start(config).unwrap();
         let live = LiveRelayUrl::new(held.clone());
         let gate = gate_publish(
             &live,
