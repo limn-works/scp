@@ -390,7 +390,7 @@ impl From<&RelayService> for PushRelay {
     fn from(relay: &RelayService) -> Self {
         Self {
             canonical: relay.url().to_owned(),
-            bridge_target: relay_service_bridge_target(relay),
+            bridge_target: relay.bridge_target(),
         }
     }
 }
@@ -512,23 +512,6 @@ pub fn tier3_push_routing_id(endpoint: &RelayEndpoint, target: BridgeTarget) -> 
     tier3_routing_id_of_canonical(endpoint.as_str(), target)
 }
 
-/// The `bridgeTarget` of an `SCPRelay` entry, or `None` for an entry that
-/// names none (§18.2.1).
-///
-/// [`RelayService`] exposes its target as raw bytes. Those bytes come from a
-/// [`BridgeTarget`], which never holds [`ABSENT_BRIDGE_TARGET`], so
-/// [`BridgeTarget::new`] accepts them. Its one refusal is for
-/// [`ABSENT_BRIDGE_TARGET`], which `03-identity.md` §3.10.13 decodes as "no
-/// target", so the refusal maps to `None` and every reader decodes those
-/// bytes one way. Other crates read the target through
-/// [`PushRelay::bridge_target`] on `PushRelay::from(&entry)`.
-#[must_use]
-fn relay_service_bridge_target(relay: &RelayService) -> Option<BridgeTarget> {
-    relay
-        .bridge_target()
-        .and_then(|bytes| BridgeTarget::new(bytes).ok())
-}
-
 /// The push routing ID of an `SCPRelay` entry (§9.18.2).
 ///
 /// An entry that carries a `bridgeTarget` takes the tier 3 form
@@ -536,7 +519,7 @@ fn relay_service_bridge_target(relay: &RelayService) -> Option<BridgeTarget> {
 /// `"scp-push-registration"` form ([`relay_endpoint_push_routing_id`]).
 #[must_use]
 pub fn relay_service_push_routing_id(relay: &RelayService) -> [u8; 32] {
-    relay_service_bridge_target(relay).map_or_else(
+    relay.bridge_target().map_or_else(
         || relay_endpoint_push_routing_id(relay.endpoint()),
         |target| tier3_push_routing_id(relay.endpoint(), target),
     )
