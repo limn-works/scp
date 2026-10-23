@@ -183,19 +183,6 @@ const GOVERNANCE_TIMEOUT_SECS: u64 =
 /// documented bound on a security-liveness property.
 const MAX_CONSECUTIVE_INBOX: u32 = 32;
 
-/// Encode a 32-byte context ID as lowercase hex, for test fixtures whose
-/// string id is the hex of their hash.
-#[cfg(test)]
-fn hex_encode_context_id(id: &[u8; 32]) -> String {
-    let mut s = String::with_capacity(64);
-    for byte in id {
-        use std::fmt::Write;
-        // Infallible for `u8` inputs written into `String`.
-        let _ = write!(s, "{byte:02x}");
-    }
-    s
-}
-
 /// Per-context actor. Owns one [`PerContextState`] by move and processes
 /// commands from its inbox one at a time.
 ///
@@ -1318,6 +1305,18 @@ async fn despawn_self_after_ttl_exit(
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    /// Encode a 32-byte context ID as lowercase hex, for test fixtures whose
+    /// string id is the hex of their hash.
+    fn hex_encode_context_id(id: &[u8; 32]) -> String {
+        let mut s = String::with_capacity(64);
+        for byte in id {
+            use std::fmt::Write;
+            // Infallible for `u8` inputs written into `String`.
+            let _ = write!(s, "{byte:02x}");
+        }
+        s
+    }
 
     #[tokio::test]
     async fn actor_exits_on_inbox_close() {
