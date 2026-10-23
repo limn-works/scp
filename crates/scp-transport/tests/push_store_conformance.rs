@@ -341,6 +341,34 @@ async fn count_from_zero_restarts_the_run(store: PushRegistrationStore) -> Outco
     Ok(())
 }
 
+/// `clear_all_invalid_tokens` resets every token's count and keeps every
+/// registration.
+async fn clear_all_resets_every_count(store: PushRegistrationStore) -> Outcome {
+    let one = record("did:dht:alice", b"tok-1", &[A], 1);
+    let two = record("did:dht:bob", b"tok-2", &[B], 1);
+    store.upsert(one.clone()).await?;
+    store.upsert(two.clone()).await?;
+    for token in [b"tok-1".as_slice(), b"tok-2".as_slice()] {
+        for _ in 1..INVALID_TOKEN_REMOVAL_THRESHOLD {
+            store
+                .record_invalid_token(APNS, token, CountFrom::Stored)
+                .await?;
+        }
+    }
+    store.clear_all_invalid_tokens().await?;
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-1").await?, Some(0));
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-2").await?, Some(0));
+    assert!(store.get(&one.key()).await?.is_some());
+    assert!(store.get(&two.key()).await?.is_some());
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-1", CountFrom::Stored)
+            .await?,
+        InvalidTokenOutcome::Counted { failures: 1 }
+    );
+    Ok(())
+}
+
 async fn invalid_token_counter_counts_consecutive_failures(
     store: PushRegistrationStore,
 ) -> Outcome {
@@ -742,6 +770,7 @@ both_arms!(
     tokens_for_routing_id_returns_each_registration_once,
     wake_tokens_returns_each_token_once_up_to_the_limit,
     count_from_zero_restarts_the_run,
+    clear_all_resets_every_count,
     invalid_token_counter_counts_consecutive_failures,
     third_invalid_token_removes_every_registration_for_the_token,
     token_count_outlives_one_holder_but_not_the_last,

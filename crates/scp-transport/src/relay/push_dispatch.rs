@@ -29,6 +29,11 @@
 //! consecutive delivery failures for the same token". A reset the store fails
 //! to write is carried by the drain and folded into the token's next count
 //! (`CountFrom::Zero`), so a lost reset never joins two runs of failures.
+//! The drain carries that reset in memory only, so before the lookup queues
+//! its first job it clears every stored count, retrying with back-off until
+//! the clear lands. Every job comes from the lookup, so no outcome reaches
+//! the store before the clear. A restart therefore costs a token at most the
+//! failures counted before it, and never turns a stale count into a removal.
 //!
 //! # Bounds
 //!
@@ -236,6 +241,7 @@ mod enabled {
         queue_closed: RateLimitedLog,
         no_sender: RateLimitedLog,
         lookup_failed: RateLimitedLog,
+        clear_failed: RateLimitedLog,
         store_failed: RateLimitedLog,
         config_error: RateLimitedLog,
     }
@@ -444,6 +450,9 @@ mod enabled {
 
     impl Lookup {
         async fn run(mut self, mut intake: mpsc::Receiver<RoutingId>, stop: CancellationToken) {
+            if !self.clear_stale_counts(&stop).await {
+                return;
+            }
             loop {
                 let routing_id = tokio::select! {
                     biased;
@@ -460,6 +469,41 @@ mod enabled {
                     biased;
                     () = stop.cancelled() => return,
                     () = self.lookup_once(&routing_id) => {}
+                }
+            }
+        }
+
+        /// Clears every stored invalid-token count before the first job, so a
+        /// reset a drain carried before a restart cannot leave a stale count
+        /// that the next `InvalidToken` turns into a removal. Retries with
+        /// back-off until the clear lands, queuing no job meanwhile; wakes
+        /// published meanwhile wait on the intake or are dropped when it is
+        /// full. `false` when the service stopped first.
+        async fn clear_stale_counts(&self, stop: &CancellationToken) -> bool {
+            let mut backoff = ReconnectBackoff::new(TRANSIENT_BACKOFF_MIN, TRANSIENT_BACKOFF_MAX);
+            loop {
+                let cleared = tokio::select! {
+                    biased;
+                    () = stop.cancelled() => return false,
+                    cleared = self.store.clear_all_invalid_tokens() => cleared,
+                };
+                match cleared {
+                    Ok(()) => return true,
+                    Err(e) => {
+                        if let Some(line) = self.logs.clear_failed.hit() {
+                            tracing::warn!(
+                                total = line.total,
+                                suppressed = line.suppressed,
+                                error = %e,
+                                "could not clear stored invalid-token counts; push wakes held until the clear lands"
+                            );
+                        }
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    () = stop.cancelled() => return false,
+                    () = tokio::time::sleep(backoff.next_delay()) => {}
                 }
             }
         }
@@ -1194,6 +1238,93 @@ mod enabled {
                 wait_for_sends(&sender, 4).await?;
                 assert_eq!(failures_once_not(&store, b"t1", Some(2)).await?, Some(1));
                 assert_eq!(store.tokens_for_routing_id(&RID).await?.len(), 1);
+                Ok(())
+            }
+
+            /// The drain carries a failed reset in memory only, so a restart
+            /// loses it. Two `InvalidToken`, a `Delivered` whose reset fails,
+            /// a restart on the same store, then one `InvalidToken` leave the
+            /// registration in place with a count of one, because the started
+            /// service cleared the stale count of two before its first job.
+            #[tokio::test]
+            async fn a_restart_never_removes_on_a_stale_count() -> TestResult {
+                use PushSendOutcome::{Delivered, InvalidToken};
+                let sender = RecordingSender::new(
+                    PushPlatform::Apns,
+                    [InvalidToken, InvalidToken, Delivered],
+                );
+                let (config, dir) = config(vec![recording(&sender)])?;
+                let store = config.store.clone();
+                let service = PushService::start(config.clone())?;
+                let push = PushRole::Enabled(service.clone());
+                register(&push, REGISTRANT_A, PushPlatform::Apns, b"t1", &[RID]).await?;
+                for i in 1..=2 {
+                    notify(&push, &RID);
+                    wait_for_sends(&sender, i).await?;
+                }
+                assert_eq!(failures_once_not(&store, b"t1", Some(1)).await?, Some(2));
+
+                // Move the count table aside: the reset after the delivery
+                // fails, and the drain carries it in memory.
+                let beside = rusqlite::Connection::open(dir.path().join("push.db"))?;
+                beside.execute_batch("ALTER TABLE push_token_failures RENAME TO held_aside;")?;
+                notify(&push, &RID);
+                wait_for_sends(&sender, 3).await?;
+                wait_for_log(&service.inner.logs.store_failed, 1).await?;
+                beside.execute_batch("ALTER TABLE held_aside RENAME TO push_token_failures;")?;
+                assert_eq!(
+                    store
+                        .invalid_token_failures(PushPlatform::Apns, b"t1")
+                        .await?,
+                    Some(2),
+                    "the stale count is back in place"
+                );
+
+                // Restart: the carried reset is gone with the old service.
+                drop(push);
+                drop(service);
+                let after = RecordingSender::new(PushPlatform::Apns, [InvalidToken]);
+                let restarted = PushService::start(PushServiceConfig {
+                    senders: Arc::from(vec![recording(&after)]),
+                    ..config
+                })?;
+                notify(&PushRole::Enabled(restarted.clone()), &RID);
+                wait_for_sends(&after, 1).await?;
+                assert_eq!(failures_once_not(&store, b"t1", Some(0)).await?, Some(1));
+                assert_eq!(store.tokens_for_routing_id(&RID).await?.len(), 1);
+                Ok(())
+            }
+
+            /// A service whose clear of the stored counts fails queues no
+            /// job and sends no wake; it logs the failure and retries, and
+            /// the wake published meanwhile goes out once the clear lands.
+            #[tokio::test]
+            async fn a_failed_clear_holds_wakes_until_it_lands() -> TestResult {
+                use PushSendOutcome::Delivered;
+                let sender = RecordingSender::new(PushPlatform::Apns, [Delivered]);
+                let (config, dir) = config(vec![recording(&sender)])?;
+                let registering = PushRole::Enabled(PushService::start(config.clone())?);
+                register(
+                    &registering,
+                    REGISTRANT_A,
+                    PushPlatform::Apns,
+                    b"t1",
+                    &[RID],
+                )
+                .await?;
+                drop(registering);
+
+                let beside = rusqlite::Connection::open(dir.path().join("push.db"))?;
+                beside.execute_batch("ALTER TABLE push_token_failures RENAME TO held_aside;")?;
+                let service = PushService::start(config)?;
+                notify(&PushRole::Enabled(service.clone()), &RID);
+                wait_for_log(&service.inner.logs.clear_failed, 1).await?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(sender.sent().await.is_empty(), "no wake before the clear");
+
+                beside.execute_batch("ALTER TABLE held_aside RENAME TO push_token_failures;")?;
+                wait_for_sends(&sender, 1).await?;
+                assert_eq!(sender.sent().await, vec![b"t1".to_vec()]);
                 Ok(())
             }
 

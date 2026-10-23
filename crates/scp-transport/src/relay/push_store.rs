@@ -536,6 +536,29 @@ impl PushRegistrationStore {
         }
     }
 
+    /// Resets every token's consecutive invalid-token count to zero.
+    ///
+    /// A started push service calls this before it queues its first job
+    /// (PUSH-008). Its drain carries a reset the store failed to write in
+    /// memory only, so a restart loses that reset and the stored count may
+    /// be stale; clearing every count means a restart never removes a
+    /// registration on a stale count.
+    ///
+    /// # Errors
+    ///
+    /// [`PushStoreError::Storage`] when the database fails; the store then
+    /// changes nothing.
+    pub async fn clear_all_invalid_tokens(&self) -> Result<(), PushStoreError> {
+        match self {
+            Self::Sqlite(s) => s.clear_all_invalid_tokens().await,
+            #[cfg(feature = "testing")]
+            Self::InMemory(s) => {
+                s.clear_all_invalid_tokens().await;
+                Ok(())
+            }
+        }
+    }
+
     /// Returns the (`platform`, `token`) pair's consecutive invalid-token
     /// count, or `None` when no registration holds the token.
     ///
@@ -1111,6 +1134,15 @@ impl SqlitePushStore {
         .await
     }
 
+    async fn clear_all_invalid_tokens(&self) -> Result<(), PushStoreError> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM push_token_failures", [])
+                .map_err(|e| storage("clear all token failures", &e))?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn invalid_token_failures(
         &self,
         platform: PushPlatform,
@@ -1508,6 +1540,10 @@ mod in_memory {
             let held = state.holders(&id);
             drop(state);
             held
+        }
+
+        pub(super) async fn clear_all_invalid_tokens(&self) {
+            self.state.lock().await.token_failures.clear();
         }
 
         pub(super) async fn invalid_token_failures(
