@@ -1017,20 +1017,46 @@
       "status": "pending",
       "files": [
         "crates/scp-ffi/common/src/push.rs",
+        "crates/scp-ffi/common/src/lib.rs",
         "crates/scp-ffi/common/src/reconnect.rs",
         "crates/scp-ffi/common/src/bridge_instance.rs",
+        "crates/scp-ffi/common/src/bridge_runtime.rs",
+        "crates/scp-ffi/napi/src/runtime.rs",
+        "crates/scp-ffi/napi/src/context.rs",
+        "crates/scp-ffi/uniffi/src/runtime.rs",
+        "crates/scp-ffi/src/runtime.rs",
+        "crates/scp-runtime/src/store/sync.rs",
+        "crates/scp-runtime/src/store/mod.rs",
+        "crates/scp-runtime/src/crypto/mls/provider.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/context/push_helpers.rs",
+        "crates/scp-runtime/src/context/actor/commands.rs",
+        "crates/scp-runtime/src/context/actor/handlers/push.rs",
+        "crates/scp-transport/src/manager.rs",
+        "crates/scp-transport/src/native/adapter.rs",
+        "crates/scp-testing/tests/integration/push_wake.rs",
         "crates/scp-testing/tests/integration/pipeline_wiring.rs"
       ],
-      "description": "On a valid wake, calls `reconnect_transport_if_pending`, then `reconnect_contexts` (or `reconnect_contexts_no_drain`) for every standing context, feeding in the last relay contacts the bridge already stores, under a 25-second deadline (ADR-025 criterion 4). The outcome is `NewData` when catch-up delivered at least one envelope, `NoData` when it delivered none, and `Failed` on a deadline expiry or error. The wake path sends no cover traffic (\u00a79.10.6). Reuses the reconnect path the Supervisor already wires (ADR-029, offline and sync).",
+      "description": "`handle_wake(core, platform, payload)` in `scp-ffi-common` applies the \u00a710.7.1 device receipt rule for the platform, then runs the push-wake pull mode of ADR-029 \u00a72 under one 25-second deadline (ADR-025 criterion 4, ADR-027 criterion 10). An invalid payload returns `SCP-TRANS-5080` before any connection. When no context is resident, the handler restores every persisted context. It dials the union of the Active contexts' persisted relay URLs on a transient transport with cover traffic off (\u00a79.10.6), never installs that transport, and runs Phases 1, 2 and 4 for every Active context. Phase 1 queries every relay for the shared routing ID and each pseudonym routing ID the member holds, from the stored `sync/{context_id}/last_relay_contact` minus 5 seconds. The pull runs no checkpoint, Update, queue drain, or Tier 2 or Tier 3 engine, so it signs and publishes nothing, and it leaves `needs_reconnect` set. The outcome is `NewData` when the actor accepted at least one application envelope, `NoData` when it accepted none, and `Failed` on a dial or query error, a missing identity or contact store, or the deadline. The FFI exports belong to PUSH-015.",
       "acceptanceCriteria": [
-        "With one envelope buffered on a test relay, `push_handle_wake` returns `NewData`, and the envelope appears in the context's receive buffer.",
+        "With one envelope buffered on a test relay, `handle_wake` returns `NewData` and the woken member's receive buffer holds a `MessageReceived` event.",
         "With none buffered, it returns `NoData`.",
-        "With the relay unreachable, it returns `Failed` within the deadline plus 1 s.",
-        "An invalid payload returns a typed error and makes no relay connection.",
-        "`pipeline_wiring.rs` has a step assertion for `push.handle_wake` \u2192 `reconnect_contexts`."
+        "With the relay unreachable, or with a relay that accepts the WebSocket upgrade and never answers QUERY, it returns `Failed` within 26 seconds.",
+        "An invalid payload for each of APNs, FCM and WebPush returns `SCP-TRANS-5080` and opens no relay connection.",
+        "A cold start over the same storage with no prior `connect` restores the contexts and returns `NewData`.",
+        "The woken device publishes nothing to the relay, and `needs_reconnect` stays set after the wake.",
+        "A blob addressed to the woken member's pseudonym routing ID is pulled and delivered.",
+        "The wake writes `sync/{context_id}/last_relay_contact`, and a second wake queries from the stored value minus 5 seconds.",
+        "A blob the actor refuses on the Phase 4 re-feed is not counted as delivered.",
+        "A full reconnection that clears `needs_reconnect` writes `sync/{context_id}/last_relay_contact`, and so does each envelope a live subscription delivers on every bridge that has a live delivery path.",
+        "`pipeline_wiring.rs` asserts `handle_wake` \u2192 `wake_pull_contexts` \u2192 the catch-up path, and asserts that `wake_pull_contexts` calls no checkpoint or Update builder."
       ],
       "actionItems": [
-        "Write the wake handler over the reconnect path, with the deadline and the outcome mapping."
+        "Amend ADR-029, ADR-025 criterion 4 and ADR-027 criterion 10 with the push-wake pull mode.",
+        "Write `handle_wake` and `wake_pull_contexts` over signer-free Phase 1, 2 and 4 functions.",
+        "Query every adapter in `TransportManager::query`, split `dial_relays` out of the reconnect path, and add a cover-traffic override to the native adapter.",
+        "Add the `last_relay_contact` store on the runtime repository, inject it into `CoreFields` on every bridge, and write it from the three paths.",
+        "Add the real-relay integration tests and the wiring assertions."
       ],
       "blockedBy": [
         "PUSH-013"
