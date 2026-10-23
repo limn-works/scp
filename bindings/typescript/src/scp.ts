@@ -403,7 +403,7 @@ interface NativeScpCtor {
  */
 interface NativeScpInstance {
   readonly instanceId: string;
-  suspend(): void;
+  suspend(): Promise<void>;
   resume(): Promise<void>;
   shutdown(timeoutMillis: bigint): Promise<void>;
   // The full Scp class surface is reached via indexed access
@@ -1154,12 +1154,19 @@ export class SCP {
   /**
    * Suspends this bridge instance (mobile/desktop backgrounding).
    *
-   * Disconnects transport and marks the instance suspended.
-   * Transport-dependent operations fail until `resume()` is called.
+   * Flushes every context snapshot to storage, then disconnects
+   * transport and marks the instance suspended. Transport-dependent
+   * operations fail until `resume()` is called.
+   *
+   * @throws {StorageError} With `SCP-STORAGE-8014` when a context
+   *   snapshot did not persist. The instance stays running with its
+   *   transport connected, and a retried `suspend()` flushes again.
+   * @throws {TransportError} With `SCP-TRANS-5001` when transport cleanup
+   *   fails. The instance stays running.
    */
-  suspend(): void {
+  async suspend(): Promise<void> {
     try {
-      this.#native.suspend();
+      await this.#native.suspend();
     } catch (err) {
       throw mapBridgeError(err);
     }

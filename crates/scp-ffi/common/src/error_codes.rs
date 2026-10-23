@@ -1486,6 +1486,16 @@ pub const STORAGE_8008: &str = "SCP-STORAGE-8008";
 /// (`NodeError::Storage`; sdk-common.md §"Node start error codes").
 pub const STORAGE_8009: &str = "SCP-STORAGE-8009";
 
+/// A `suspend` did not suspend because a context snapshot did not persist.
+///
+/// `CoreFields::suspend` flushes every context to the persistence provider
+/// before it clears transport (ADR-049 Decision 9). When a flush fails,
+/// `suspend` leaves the instance running with its transport connected and
+/// returns `LifecycleError::FlushFailed`, which each bridge reports with this
+/// code. The unflushed actors stay dirty, so a retried `suspend` flushes them
+/// again.
+pub const STORAGE_8014: &str = "SCP-STORAGE-8014";
+
 // -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)
 // -------------------------------------------------------------------------

@@ -14,13 +14,14 @@
 //! See #1549 Phase 4 remainder plan and ADR-048.
 
 use scp_ffi_common::bridge_instance::{
-    BridgeInstanceCore as _, ShutdownError, ShutdownOutcome, sdk_shutdown_result,
+    BridgeInstanceCore as _, LifecycleError, ShutdownError, ShutdownOutcome, SuspendFailureClass,
+    classify_suspend_failure, sdk_shutdown_result,
 };
 use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bridge::ScpError;
+use crate::bridge::{ErrorClass, ScpError};
 use crate::runtime::{StorageConfig, UniffiBridgeInstance};
 use crate::{decrement_handle_count, increment_handle_count};
 
@@ -100,17 +101,20 @@ impl Scp {
 
     /// Suspends this bridge instance (mobile backgrounding).
     ///
-    /// Disconnects transport and flushes context snapshots. Transport-
-    /// dependent operations fail until [`Self::resume`] is called.
+    /// Flushes every context snapshot, then disconnects transport.
+    /// Transport-dependent operations fail until [`Self::resume`] is called.
+    ///
+    /// `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin; the
+    /// flush runs on the tokio runtime this export names.
     ///
     /// # Errors
     ///
-    /// Returns `ScpError::Transport` if the transport lock is poisoned.
-    pub fn suspend(&self) -> Result<(), ScpError> {
-        self.inner.core.suspend().map_err(|e| ScpError::Transport {
-            msg: format!("suspend failed: {e}"),
-            code: codes::TRANS_5001.to_owned(),
-        })
+    /// Returns `ScpError::Storage` with `SCP-STORAGE-8014` when a context
+    /// snapshot did not persist, and `ScpError::Transport` with
+    /// `SCP-TRANS-5001` when the transport lock is poisoned. The instance
+    /// stays running on either error.
+    pub async fn suspend(&self) -> Result<(), ScpError> {
+        sdk_suspend(self.inner.suspend().await)
     }
 
     /// Resumes a suspended bridge instance.
@@ -180,6 +184,20 @@ impl Drop for Scp {
     }
 }
 
+/// Maps a bridge suspend result to the SDK result: the class
+/// [`classify_suspend_failure`] names picks the [`ScpError`] variant.
+fn sdk_suspend(result: Result<(), LifecycleError>) -> Result<(), ScpError> {
+    result.map_err(|e| {
+        let (class, code) = classify_suspend_failure(&e);
+        let msg = format!("suspend failed: {e}");
+        match class {
+            SuspendFailureClass::Storage => ScpError::storage(code, msg),
+            SuspendFailureClass::Transport => ScpError::coded(ErrorClass::Transport, code, msg),
+            SuspendFailureClass::Lifecycle => ScpError::coded(ErrorClass::Context, code, msg),
+        }
+    })
+}
+
 /// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Opener
 /// per Durable Directory"): a durable store the shutdown left holding its
 /// advisory lock raises `SCP-STORAGE-8005`.
@@ -190,6 +208,30 @@ fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), Sc
 #[cfg(test)]
 mod sdk_shutdown_tests {
     use super::*;
+
+    #[test]
+    fn suspend_failures_map_to_their_variants() {
+        let flush = sdk_suspend(Err(LifecycleError::FlushFailed(
+            scp_core::context::ContextError::PersistenceFailed("disk full".to_owned()),
+        )));
+        assert!(
+            matches!(&flush, Err(ScpError::Storage { code, .. }) if code == codes::STORAGE_8014),
+            "{flush:?}"
+        );
+        let lock = sdk_suspend(Err(LifecycleError::TransportLock(
+            scp_ffi_common::bridge_instance::TransportLockError::Poisoned,
+        )));
+        assert!(
+            matches!(&lock, Err(ScpError::Transport { code, .. }) if code == codes::TRANS_5001),
+            "{lock:?}"
+        );
+        let gone = sdk_suspend(Err(LifecycleError::AlreadyShutDown));
+        assert!(
+            matches!(&gone, Err(ScpError::Context { code, .. }) if code == codes::CTX_2000),
+            "{gone:?}"
+        );
+        assert!(sdk_suspend(Ok(())).is_ok());
+    }
 
     #[test]
     fn store_left_locked_raises_storage_8005() {

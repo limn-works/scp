@@ -4154,10 +4154,14 @@ mod tests {
             !ran.load(Ordering::SeqCst),
             "hook must not fire before shutdown"
         );
-        bi.shutdown();
+        crate::init_runtime().expect("init_runtime");
+        crate::runtime()
+            .expect("runtime")
+            .block_on(bi.shutdown_core_async(std::time::Duration::from_secs(5), None))
+            .expect("shutdown");
         assert!(
             ran.load(Ordering::SeqCst),
-            "shutdown hook must execute during CoreFields::shutdown()"
+            "shutdown hook must execute during CoreFields::shutdown_core_async()"
         );
     }
 
@@ -4943,7 +4947,10 @@ mod tests {
             let (bi, ctx_id) =
                 live_state_fixture("role-read-resolved", creator, &["messages:read"]);
             let sup = Arc::clone(supervisor(&bi).expect("supervisor"));
-            bi.core.suspend().expect("suspend");
+            crate::init_runtime().expect("init_runtime");
+            crate::actor_wait::block_on_released(py, bi.core.suspend())
+                .expect("suspend wait")
+                .expect("suspend");
 
             let suspended = live_role_state(py, &bi, &ctx_id)
                 .expect_err("a fresh resolution on a suspended bridge must refuse");

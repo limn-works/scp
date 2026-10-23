@@ -295,7 +295,7 @@ async fn suspend_resume_preserves_pending_urls() {
     core.add_relay_url("ws://relay2.example.com/scp/v1".to_owned());
     assert_eq!(core.pending_relay_urls().len(), 2);
 
-    core.suspend().expect("suspend must succeed");
+    core.suspend().await.expect("suspend must succeed");
     // suspend() flushes transport — pending URLs remain for resume.
     assert_eq!(
         core.pending_relay_urls().len(),

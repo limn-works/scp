@@ -64,7 +64,7 @@ final class PersistenceTests: XCTestCase {
     /// backed instance.
     func testSqliteLifecycleRoundtrip() async throws {
         let scp = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
-        try scp.suspend()
+        try await scp.suspend()
         try await scp.resume()
         try await scp.shutdown(timeout: 1)
     }

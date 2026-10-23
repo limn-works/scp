@@ -75,10 +75,10 @@ def test_sqlite_lifecycle_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         scp = SCP(storage={"type": "sqlite", "path": tmpdir, "key": _SQLITE_KEY})
         try:
-            scp.suspend()
-            # `resume()` is an async coroutine on the SDK wrapper after
-            # #1549 PR 3 — we run it on a fresh event loop so this test
+            # `suspend()` and `resume()` are async coroutines on the SDK
+            # wrapper — we run each on a fresh event loop so this test
             # does not require pytest-asyncio.
+            asyncio.run(scp.suspend())
             asyncio.run(scp.resume())
         finally:
             asyncio.run(scp.shutdown(timeout=1.0))

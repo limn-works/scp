@@ -47,6 +47,8 @@ import {
   ContextError,
   IdentityError,
   ScpError,
+  StorageError,
+  TransportError,
   UcanPermissionError,
   ValidationError,
 } from "../src/errors";
@@ -513,14 +515,44 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     expect(call?.args[3]).toBeUndefined();
   });
 
-  it("suspend dispatches synchronously and does not call resume", () => {
+  it("suspend awaits the native flush and does not call resume", async () => {
     const { scp, native } = mountMockScp();
-    native.__stub("suspend", () => undefined);
+    native.__stub("suspend", () => Promise.resolve(undefined));
 
-    scp.suspend();
+    await scp.suspend();
 
     expect(native.__calls("suspend").length).toBe(1);
     expect(native.__calls("resume").length).toBe(0);
+  });
+
+  it("suspend maps a failed flush to StorageError SCP-STORAGE-8014", async () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("suspend", () =>
+      Promise.reject(
+        new Error("[SCP-STORAGE-8014] suspend failed: context flush failed: disk full"),
+      ),
+    );
+
+    const err = await scp.suspend().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(StorageError);
+    expect((err as StorageError).code).toBe("SCP-STORAGE-8014");
+  });
+
+  it("suspend maps a transport failure to TransportError SCP-TRANS-5001", async () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("suspend", () =>
+      Promise.reject(new Error("[SCP-TRANS-5001] suspend failed: transport lock poisoned")),
+    );
+
+    const err = await scp.suspend().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(TransportError);
+    expect((err as TransportError).code).toBe("SCP-TRANS-5001");
   });
 
   it("shutdown forwards a BigInt millisecond deadline to the native bridge", async () => {
@@ -582,9 +614,10 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
 
   it("strict mode leaves SAFE_DEFAULT_METHODS (suspend/resume/shutdown) as safe no-ops", async () => {
     const mock = createMockNativeScp();
-    // `suspend` is in SYNC_METHODS — returns undefined synchronously.
-    const sus = (mock as unknown as { suspend: () => unknown }).suspend();
-    expect(sus).toBeUndefined();
+    // `suspend` resolves to undefined, as the async NAPI method does.
+    expect(
+      await (mock as unknown as { suspend: () => Promise<unknown> }).suspend(),
+    ).toBeUndefined();
     // `resume` and `shutdown` return Promise<undefined> so `afterEach`
     // teardown paths that `await scp.shutdown(...)` don't force every
     // test to set up a stub for a semantically-void operation.
@@ -606,9 +639,9 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
     expect(result).toBeUndefined();
   });
 
-  it("lenient mode preserves the sync-method surface (suspend)", () => {
+  it("lenient mode resolves the async suspend to undefined", async () => {
     const mock = createMockNativeScp({ strict: false });
-    const result = (mock as unknown as { suspend: () => unknown }).suspend();
+    const result = await (mock as unknown as { suspend: () => Promise<unknown> }).suspend();
     expect(result).toBeUndefined();
   });
 
@@ -2267,7 +2300,7 @@ storageSuite.describe("SCP storage integration (real NAPI)", () => {
   it("resume-after-suspend succeeds on a fresh ephemeral instance", async () => {
     const fresh = new SCP({ storage: { type: "in_memory" } });
     try {
-      fresh.suspend();
+      await fresh.suspend();
       // resume() must resolve (post-#1678 async semantics).
       await fresh.resume();
       // An identityCreate after resume must still work.

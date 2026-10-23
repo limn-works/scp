@@ -140,20 +140,26 @@ class SCP internal constructor(
     /**
      * Suspends this bridge instance (mobile/desktop backgrounding).
      *
-     * Disconnects transport and flushes context snapshots.
-     * Transport-dependent operations fail until [resume] is called.
+     * Flushes every context snapshot to storage, then disconnects
+     * transport. Transport-dependent operations fail until [resume] is
+     * called.
      *
-     * Dispatched on [kotlinx.coroutines.Dispatchers.IO] via the supplied
-     * [CoroutineBridge].
+     * Routed through [CoroutineBridge.ffiCallSuspend] because UniFFI
+     * generates `Scp.suspend()` as a Kotlin `suspend fun`: the flush runs
+     * on the tokio runtime, and its failure reaches this caller.
      *
      * Named [suspendInstance] (not `suspend`) because `suspend` is a soft
      * Kotlin keyword that shadows the coroutine modifier in IDE refactors,
      * documentation generators, and code-gen consumers (#1693).
      *
-     * @throws uniffi.scp.ScpException.Transport if the transport lock is poisoned.
+     * @throws uniffi.scp.ScpException.Storage with `SCP-STORAGE-8014` when a
+     *   context snapshot did not persist. The instance stays running with its
+     *   transport connected, and a retried call flushes again.
+     * @throws uniffi.scp.ScpException.Transport with `SCP-TRANS-5001` if the
+     *   transport lock is poisoned. The instance stays running.
      */
     suspend fun suspendInstance(bridge: CoroutineBridge) {
-        bridge.ffiCall { inner.suspend() }
+        bridge.ffiCallSuspend { inner.suspend() }
     }
 
     /**

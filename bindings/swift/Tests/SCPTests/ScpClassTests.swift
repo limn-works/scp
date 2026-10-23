@@ -62,7 +62,7 @@ final class ScpClassTests: XCTestCase {
     /// `suspend()` followed by `resume()` must succeed on a fresh
     /// instance.
     func testSuspendResumeRoundtrip() async throws {
-        try scp.suspend()
+        try await scp.suspend()
         try await scp.resume()
     }
 

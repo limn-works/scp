@@ -9884,6 +9884,84 @@ class SlowAgreeCustody(P256Custody):
     /// whose owner's identity is not yet loaded does not restore, because the
     /// owner's wrapping key lives in that identity's custody. `restore_context`
     /// refuses with the `WrappingKeyCustodyUnavailable` text and
+    /// `PyScp::suspend` writes every context's snapshot when the calling
+    /// thread runs no tokio runtime, as a Python caller's thread does. The
+    /// test deletes the context's stored snapshot first, so only the
+    /// suspend's flush can put it back.
+    #[test]
+    #[cfg(feature = "testing")]
+    fn suspend_from_a_thread_with_no_runtime_flushes_every_context() {
+        use crate::runtime::{PyBridgeInstance, SqliteKeyMaterial, StorageConfig};
+        use scp_ffi_common::bridge_instance::{BridgeInstanceCore as _, ShutdownOutcome};
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "precondition: the test thread runs no tokio runtime"
+        );
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().expect("init_runtime");
+        let rt = crate::runtime().expect("runtime");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let scp = crate::scp::PyScp {
+            inner: Arc::new(
+                PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+                    path: tmp.path().to_path_buf(),
+                    key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x6Cu8; 32])),
+                })
+                .expect("SQLCipher open must succeed"),
+            ),
+        };
+        let did = Python::with_gil(|py| {
+            scp.identity_create(py, "in_memory", None)
+                .expect("identity_create")
+                .did()
+                .to_owned()
+        });
+        let ctx_id = format!("suspend-flush-{}", uuid::Uuid::new_v4());
+        crate::runtime::init_context_manager(&scp.inner, &did);
+        let sup = Arc::clone(crate::runtime::supervisor(&scp.inner).expect("supervisor"));
+        rt.block_on(sup.create_context(
+            ctx_id.clone(),
+            scp_core::context::ContextParams {
+                ceiling: vec![scp_core::context::roles::Capability::MessagesRead],
+                ..scp_core::context::ContextParams::default()
+            },
+            scp_did::DID(did),
+            None,
+            Vec::new(),
+        ))
+        .expect("create_context");
+        drop(sup);
+        let persistence = scp
+            .inner
+            .core
+            .persistence_arc_clone()
+            .expect("a SQLCipher instance carries persistence");
+        rt.block_on(persistence.delete_context(&ctx_id))
+            .expect("delete_context must succeed");
+        assert!(
+            rt.block_on(persistence.load_context(&ctx_id))
+                .expect("load_context must succeed")
+                .is_none(),
+            "precondition: the store holds no snapshot of the context"
+        );
+
+        Python::with_gil(|py| scp.suspend(py)).expect("suspend must flush and succeed");
+
+        assert!(
+            rt.block_on(persistence.load_context(&ctx_id))
+                .expect("load_context must succeed")
+                .is_some(),
+            "suspend must write the context's snapshot"
+        );
+        assert!(scp.inner.core.is_suspended(), "suspend must take effect");
+        drop(persistence);
+        let outcome = rt.block_on(scp.inner.shutdown(std::time::Duration::from_secs(10)));
+        assert!(
+            matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
+            "the shutdown must drain every actor and close the store: {outcome:?}"
+        );
+    }
+
     /// `restore_all_contexts` leaves the context out; once the identity is
     /// registered again, `restore_all_contexts` restores it.
     #[test]

@@ -686,7 +686,12 @@ export interface Bridge {
    * later tests/requests, causing spurious registry-miss failures.
    */
   shutdown(timeoutMillis: number): Promise<void>;
-  suspend(): void;
+  /**
+   * Suspends the bridge. `Scp::suspend` is `async fn`: the promise
+   * settles after every context snapshot is flushed, and rejects with
+   * `SCP-STORAGE-8014` when a flush fails.
+   */
+  suspend(): Promise<void>;
   /**
    * Resumes the bridge. On the NAPI path this is a real async call —
    * the bridge reconnects transport from pending relay URLs and

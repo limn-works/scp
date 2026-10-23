@@ -223,7 +223,7 @@ export { NODE_START_INVALID_CONFIG_CODE, Node, Relay } from "./server";
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-// Suspend and resume are methods on SCP itself — `scp.suspend()` / `await scp.resume()`.
+// Suspend and resume are methods on SCP itself — `await scp.suspend()` / `await scp.resume()`.
 
 // ---------------------------------------------------------------------------
 // SCP multi-instance handle (ADR-048)

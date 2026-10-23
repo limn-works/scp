@@ -44,7 +44,7 @@ async fn scp_suspend_resume_roundtrip() {
     let scp = Scp::new_in_memory_for_test();
 
     // Case 1: suspend/resume on a freshly-initialised instance.
-    scp.suspend().expect("scp.suspend must succeed");
+    scp.suspend().await.expect("scp.suspend must succeed");
     scp.resume()
         .await
         .expect("scp.resume after suspend must succeed");
@@ -52,14 +52,15 @@ async fn scp_suspend_resume_roundtrip() {
     // Case 2: a second suspend/resume cycle still succeeds — idempotent
     // by design.
     scp.suspend()
+        .await
         .expect("scp.suspend after prior resume must succeed");
     scp.resume()
         .await
         .expect("scp.resume after second suspend must succeed");
 
     // Case 3: double-suspend / double-resume are idempotent.
-    scp.suspend().expect("double suspend must succeed");
-    scp.suspend().expect("double suspend must succeed");
+    scp.suspend().await.expect("double suspend must succeed");
+    scp.suspend().await.expect("double suspend must succeed");
     scp.resume().await.expect("double resume must succeed");
     scp.resume().await.expect("double resume must succeed");
 }

@@ -6357,7 +6357,10 @@ mod tests {
         let bi = __bi();
         crate::runtime::init_context_manager_for_test(&bi);
 
-        bi.core.suspend().expect("suspend");
+        crate::runtime()
+            .expect("runtime")
+            .block_on(bi.suspend())
+            .expect("suspend");
         assert!(
             bi.core.try_supervisor().is_some(),
             "precondition: suspension keeps the supervisor attached"

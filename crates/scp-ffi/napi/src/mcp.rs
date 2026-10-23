@@ -1457,7 +1457,12 @@ mod tests {
             sleep 600; true",
             pid_file.display()
         );
-        bi.core.shutdown();
+        crate::runtime()
+            .block_on(
+                bi.core
+                    .shutdown_core_async(std::time::Duration::from_secs(5), None),
+            )
+            .expect("shutdown");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1518,7 +1523,12 @@ mod tests {
     #[test]
     fn a_serve_after_shutdown_registers_nothing_napi() {
         let bi = Arc::new(NapiBridgeInstance::new_napi());
-        bi.core.shutdown();
+        crate::runtime()
+            .block_on(
+                bi.core
+                    .shutdown_core_async(std::time::Duration::from_secs(5), None),
+            )
+            .expect("shutdown");
         let Err(error) = crate::runtime().block_on(mcp_server_create_on(
             &bi,
             NapiMcpServerConfig {
@@ -3125,7 +3135,7 @@ mod tests {
             context_ids: vec![SUB_CTX.to_owned()],
         };
 
-        bi.core.suspend().expect("suspend");
+        crate::runtime().block_on(bi.suspend()).expect("suspend");
         assert!(
             bi.core.try_supervisor().is_some(),
             "precondition: suspension keeps the supervisor attached"

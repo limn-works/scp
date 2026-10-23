@@ -24,7 +24,8 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use scp_ffi_common::bridge_instance::{
-    BridgeInstanceCore, ShutdownError, ShutdownOutcome, sdk_shutdown_result,
+    BridgeInstanceCore, LifecycleError, ShutdownError, ShutdownOutcome, SuspendFailureClass,
+    classify_suspend_failure, sdk_shutdown_result,
 };
 
 use crate::error::ScpPyError;
@@ -241,18 +242,24 @@ impl PyScp {
 
     /// Suspends the instance for mobile backgrounding.
     ///
-    /// Disconnects transport (clears relay connection) and marks the
-    /// instance as suspended. Context state is preserved. Transport-
-    /// dependent operations will fail until [`PyScp::resume`] is called.
+    /// Flushes every context snapshot, then disconnects transport (clears
+    /// the relay connection) and marks the instance as suspended. Context
+    /// state is preserved. Transport-dependent operations will fail until
+    /// [`PyScp::resume`] is called.
     ///
     /// # Errors
     ///
-    /// Raises `TransportError` if the transport lock is poisoned.
-    pub fn suspend(&self) -> PyResult<()> {
-        self.inner
-            .core
-            .suspend()
-            .map_err(|e| ScpPyError::transport(format!("suspend failed: {e}")))?;
+    /// Raises `ValidationError` with `SCP-STORAGE-8014` when a context
+    /// snapshot did not persist, and `TransportError` with `SCP-TRANS-5001`
+    /// when the transport lock is poisoned. The instance stays running on
+    /// either error.
+    pub fn suspend(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = Arc::clone(&self.inner);
+        // Release the GIL while the flush runs on the tokio runtime.
+        let result = crate::actor_wait::block_on_released(py, async move {
+            BridgeInstanceCore::suspend(&*inner).await
+        })?;
+        sdk_suspend(result)?;
         Ok(())
     }
 
@@ -362,6 +369,23 @@ impl PyScp {
     }
 }
 
+/// Maps a bridge suspend result to the SDK result: the class
+/// [`classify_suspend_failure`] names picks the [`ScpPyError`] variant. A
+/// storage code rides `ValidationError`, as `SCP-STORAGE-8005` does, and the
+/// Python SDK maps it by its prefix.
+fn sdk_suspend(result: Result<(), LifecycleError>) -> Result<(), ScpPyError> {
+    result.map_err(|e| {
+        let (class, code) = classify_suspend_failure(&e);
+        let message = format!("suspend failed: {e}");
+        let code = code.to_owned();
+        match class {
+            SuspendFailureClass::Storage => ScpPyError::ValidationError { message, code },
+            SuspendFailureClass::Transport => ScpPyError::TransportError { message, code },
+            SuspendFailureClass::Lifecycle => ScpPyError::ContextError { message, code },
+        }
+    })
+}
+
 /// Maps a bridge shutdown result to the SDK result (spec §17.6 "One Opener
 /// per Durable Directory"): a durable store the shutdown left holding its
 /// advisory lock raises `SCP-STORAGE-8005`.
@@ -376,6 +400,31 @@ fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), Sc
 mod sdk_shutdown_tests {
     use super::*;
     use scp_ffi_common::error_codes::STORAGE_8005;
+
+    #[test]
+    fn suspend_failures_map_to_their_variants() {
+        use scp_ffi_common::error_codes as codes;
+        let flush = sdk_suspend(Err(LifecycleError::FlushFailed(
+            scp_core::context::ContextError::PersistenceFailed("disk full".to_owned()),
+        )));
+        assert!(
+            matches!(&flush, Err(ScpPyError::ValidationError { code, .. }) if code == codes::STORAGE_8014),
+            "{flush:?}"
+        );
+        let lock = sdk_suspend(Err(LifecycleError::TransportLock(
+            scp_ffi_common::bridge_instance::TransportLockError::Poisoned,
+        )));
+        assert!(
+            matches!(&lock, Err(ScpPyError::TransportError { code, .. }) if code == codes::TRANS_5001),
+            "{lock:?}"
+        );
+        let gone = sdk_suspend(Err(LifecycleError::AlreadyShutDown));
+        assert!(
+            matches!(&gone, Err(ScpPyError::ContextError { code, .. }) if code == codes::CTX_2000),
+            "{gone:?}"
+        );
+        assert!(sdk_suspend(Ok(())).is_ok());
+    }
 
     #[test]
     fn store_left_locked_raises_storage_8005() {

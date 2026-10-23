@@ -1946,6 +1946,27 @@ fn restore_on_startup_runs_restore_before_replay() {
 // `restore_all_persisted_contexts` over a real persistence backend + durable saga
 // journal and asserts a persisted context was restored AND a crash-orphaned saga
 // was reconciled to terminal.
+// ADR-048 `suspend()` amendment (2026-10-23) and ADR-049 Decision 9: the
+// shared bridge `CoreFields::suspend` flushes every context on the tokio
+// runtime through the async `flush_all_contexts(`, whose failure reaches the
+// caller. The sync `flush_all_contexts_sync(` fails without a runtime on the
+// calling thread, so a suspend that called it flushed nothing from an SDK
+// thread. The first `fn suspend(` in the source is `CoreFields::suspend`; the
+// `BridgeInstanceCore` trait default that delegates to it comes later.
+#[test]
+fn bridge_suspend_flushes_on_the_runtime() {
+    assert!(
+        fn_body_contains(BRIDGE_INSTANCE_SRC, "suspend", "flush_all_contexts("),
+        "CoreFields::suspend must flush every context through the async \
+         flush_all_contexts( before it clears transport"
+    );
+    assert!(
+        !fn_body_contains(BRIDGE_INSTANCE_SRC, "suspend", "flush_all_contexts_sync("),
+        "CoreFields::suspend must NOT call flush_all_contexts_sync(, which flushes nothing \
+         when the calling thread has no tokio runtime"
+    );
+}
+
 #[test]
 fn bridge_resume_path_routes_through_restore_on_startup() {
     // 1) Shared bridge-instance core: the production startup/resume path.

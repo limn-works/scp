@@ -444,6 +444,47 @@ def test_wrapper_with_storage_sqlite_passes_config_through() -> None:
     assert wrapper.instance_id == 42
 
 
+_FLUSH_FAILED_MSG = "[SCP-STORAGE-8014] suspend failed: context flush failed: disk full"
+
+
+@pytest.mark.asyncio
+async def test_wrapper_suspend_is_async_and_delegates_to_native() -> None:
+    """`WrapperSCP.suspend()` is a coroutine that runs `_native.suspend` once."""
+    import inspect
+
+    wrapper, mock_native = _make_wrapper_with_mock()
+    coro = wrapper.suspend()
+    assert inspect.iscoroutine(coro), "WrapperSCP.suspend() must return a coroutine"
+    await coro
+    mock_native.suspend.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_suspend_translates_flush_failure_to_storage_error() -> None:
+    """A native SCP-STORAGE-8014 from `suspend` surfaces as `scp_sdk.StorageError`."""
+    from scp_sdk.errors import StorageError
+
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.suspend.side_effect = RuntimeError(_FLUSH_FAILED_MSG)
+    with pytest.raises(StorageError) as info:
+        await wrapper.suspend()
+    assert info.value.code == "SCP-STORAGE-8014"
+
+
+@pytest.mark.asyncio
+async def test_suspend_translates_transport_failure_to_transport_error() -> None:
+    """A native SCP-TRANS-5001 from `suspend` surfaces as `scp_sdk.TransportError`."""
+    from scp_sdk.errors import TransportError
+
+    wrapper, mock_native = _make_wrapper_with_mock()
+    mock_native.suspend.side_effect = RuntimeError(
+        "[SCP-TRANS-5001] suspend failed: transport lock poisoned"
+    )
+    with pytest.raises(TransportError) as info:
+        await wrapper.suspend()
+    assert info.value.code == "SCP-TRANS-5001"
+
+
 _STORE_HELD_MSG = "[SCP-STORAGE-8005] Storage error: shutdown left the durable store open"
 
 

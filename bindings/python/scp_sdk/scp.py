@@ -33,8 +33,8 @@ Example usage::
         "key": b"\\x00" * 32,
     })
 
-    # `resume` and `shutdown` are async — they await the tokio runtime.
-    scp.suspend()
+    # `suspend`, `resume` and `shutdown` are async — they await the tokio runtime.
+    await scp.suspend()
     await scp.resume()
 """
 
@@ -744,27 +744,30 @@ class SCP:
         """
         return int(self._native.instance_id)
 
-    def suspend(self) -> None:
+    async def suspend(self) -> None:
         """Suspend the bridge for mobile/desktop backgrounding.
 
-        Disconnects the transport (clears the relay connection) and marks
-        the instance as suspended. Context state is preserved;
-        transport-dependent operations will fail until :meth:`resume` is
-        called.
+        Flushes every context snapshot to storage, then disconnects the
+        transport (clears the relay connection) and marks the instance as
+        suspended. Context state is preserved; transport-dependent
+        operations will fail until :meth:`resume` is called.
 
-        :raises TransportError: If transport cleanup fails
-            (code ``SCP-TRANS-5001``).
+        This is an ``async`` coroutine because the flush runs on the tokio
+        runtime behind a blocking wait at the FFI boundary; the blocking
+        call runs on a worker thread via :func:`asyncio.to_thread`, as
+        :meth:`resume` and :meth:`shutdown` do.
+
+        :raises StorageError: With ``SCP-STORAGE-8014`` when a context
+            snapshot did not persist. The instance stays running with its
+            transport connected, and a retried ``suspend`` flushes the
+            unflushed contexts again.
+        :raises TransportError: With ``SCP-TRANS-5001`` when transport
+            cleanup fails. The instance stays running.
         """
-        # Lazy import avoids circular dep (errors -> scp -> errors).
-        from scp_sdk.errors import TransportError
-
         try:
-            self._native.suspend()
-        except Exception as exc:  # PyO3 raises ScpTransportError
-            raise TransportError(
-                f"suspend failed: {exc}",
-                code="SCP-TRANS-5001",
-            ) from exc
+            await asyncio.to_thread(self._native.suspend)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def resume(self) -> None:
         """Resume a suspended bridge instance.

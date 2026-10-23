@@ -749,9 +749,9 @@ pub struct CoreFields {
     // -----------------------------------------------------------------
     /// Optional persistence provider, forwarded from the `ContextManager`.
     ///
-    /// When `Some`, `suspend()` and `shutdown()` call
-    /// `ContextManager::flush_all_contexts_sync` to persist context state
-    /// before tearing down transport or destroying MLS groups. The provider
+    /// When `Some`, `suspend()` and `shutdown_core_async()` await
+    /// `Supervisor::flush_all_contexts` to persist context state before
+    /// tearing down transport or destroying MLS groups. The provider
     /// reference is retained here so the bridge layer can pass it through
     /// `with_persistence()` at construction time and expose it via the
     /// [`persistence`](Self::persistence) accessor for bridge-specific
@@ -788,7 +788,7 @@ pub struct CoreFields {
     /// [`Self::remove_relay_url`] (explicit disconnect). Retrieved as a
     /// deduplicated snapshot via [`Self::pending_relay_urls`]. Preserved across
     /// `suspend()` / `resume()` cycles so callers can reconnect.
-    /// Cleared in full by [`Self::shutdown`].
+    /// Cleared in full by [`Self::shutdown_core_async`].
     relay_urls: Mutex<HashSet<String>>,
 
     // -----------------------------------------------------------------
@@ -808,7 +808,7 @@ pub struct CoreFields {
     cancel: CancellationToken,
 
     /// Cancellation signal scoped to the **current reconnect generation**
-    /// — fired on [`Self::suspend`] and [`Self::shutdown`] so any in-flight
+    /// — fired on [`Self::suspend`] and [`Self::shutdown_core_async`] so any in-flight
     /// [`Self::reconnect_transport_if_pending`] dial can drop its
     /// half-connected socket instead of completing against a torn-down
     /// instance (#1696).
@@ -993,9 +993,10 @@ impl CoreFields {
     /// `Supervisor`.
     ///
     /// Attaches a [`ContextPersistence`] provider. When provided,
-    /// [`suspend`](Self::suspend) and [`shutdown`](Self::shutdown) will
-    /// flush all context snapshots via
-    /// [`Supervisor::flush_all_contexts_sync`](scp_core::context::supervisor::Supervisor::flush_all_contexts_sync)
+    /// [`suspend`](Self::suspend) and
+    /// [`shutdown_core_async`](Self::shutdown_core_async) will flush all
+    /// context snapshots via
+    /// [`Supervisor::flush_all_contexts`](scp_core::context::supervisor::Supervisor::flush_all_contexts)
     /// before tearing down transport or destroying MLS groups — but only
     /// after the supervisor itself has been set via
     /// [`set_supervisor`](Self::set_supervisor).
@@ -1157,7 +1158,7 @@ impl CoreFields {
         self.cancel.cancel();
         // Also cancel the reconnect-generation token so any in-flight
         // dial drops its half-open socket instead of completing against
-        // a torn-down instance (mirrors the sync `shutdown()` path).
+        // a torn-down instance (mirrors `shutdown_core_async`).
         if let Ok(guard) = self.reconnect_cancel.lock() {
             guard.cancel();
         }
@@ -1403,7 +1404,8 @@ impl CoreFields {
 
     /// Registers a shutdown hook for bridge-specific state cleanup.
     ///
-    /// The hook is called exactly once during [`shutdown`](Self::shutdown)
+    /// The hook is called exactly once during
+    /// [`shutdown_core_async`](Self::shutdown_core_async)
     /// and then discarded. Hooks run in registration order after all
     /// `CoreFields`-owned state has been cleared.
     ///
@@ -1675,6 +1677,8 @@ impl CoreFields {
 
     /// Suspends the bridge instance.
     ///
+    /// - Flushes every context's snapshot to the configured persistence
+    ///   provider (ADR-049 Decision 9)
     /// - Disconnects the relay (clears transport)
     /// - Keeps the instance alive but inactive (context state is preserved)
     /// - Intended for mobile app backgrounding
@@ -1683,12 +1687,21 @@ impl CoreFields {
     /// operations will fail. Call `resume()` to clear the suspended flag, then
     /// re-establish transport via `set_transport`.
     ///
+    /// The flush runs on the caller's runtime: the `PyO3` bridge drives this
+    /// method through its bridge wait, and napi-rs and `UniFFI` expose it as
+    /// `async` (ADR-048, SCP as first-class multi-instance SDK object, the
+    /// 2026-10-23 `suspend()` amendment).
+    ///
     /// No-op if already shut down.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the transport `RwLock` is poisoned.
-    pub fn suspend(&self) -> Result<(), TransportLockError> {
+    /// [`LifecycleError::FlushFailed`] when a context's snapshot did not
+    /// persist; [`LifecycleError::TransportLock`] when the transport lock is
+    /// poisoned. On either error the instance stays running: `is_suspended()`
+    /// returns `false`, and a failed flush leaves the transport connected. The
+    /// unflushed actors stay dirty, so a retried `suspend` flushes them again.
+    pub async fn suspend(&self) -> Result<(), LifecycleError> {
         if self.is_shutdown() {
             return Ok(());
         }
@@ -1702,24 +1715,21 @@ impl CoreFields {
         // a fresh token so a later `resume()` gets a clean cancellation
         // scope rather than inheriting the already-cancelled one.
         self.rotate_reconnect_cancel();
-        // Flush all context snapshots before disconnecting transport.
-        // Best-effort: errors are logged inside flush_all_contexts_sync and do
-        // not prevent suspension from completing. Skipped if the
-        // Supervisor hasn't been set yet (i.e., suspend before any
-        // context operation has run) — in that case there is no
-        // supervisor to invoke and the call is a no-op. When set, the
-        // supervisor's forwarder may itself report
-        // `Err(ContextError::NotInitialized)` if no manager is
-        // attached; we discard that to preserve the prior silent-skip
-        // behavior.
-        if let Some(supervisor) = self.supervisor.get() {
-            let _ = supervisor.flush_all_contexts_sync();
+        // Flush every context snapshot before disconnecting transport. With
+        // no Supervisor attached (suspend before any context operation ran),
+        // no context exists, so nothing needs a flush.
+        if let Some(supervisor) = self.supervisor.get()
+            && let Err(e) = supervisor.flush_all_contexts().await
+        {
+            self.suspended.store(false, Ordering::SeqCst);
+            tracing::warn!(error = %e, "suspend refused: a context snapshot did not persist");
+            return Err(LifecycleError::FlushFailed(e));
         }
         if let Err(e) = self.clear_transport() {
             // Revert the suspended flag — the instance is not cleanly
             // suspended if transport wasn't cleared.
             self.suspended.store(false, Ordering::SeqCst);
-            return Err(e);
+            return Err(LifecycleError::TransportLock(e));
         }
         tracing::debug!("bridge instance suspended");
         Ok(())
@@ -1786,63 +1796,6 @@ impl CoreFields {
         self.suspended.store(false, Ordering::SeqCst);
         tracing::debug!("bridge instance resumed");
         Ok(())
-    }
-
-    /// Shuts down the bridge instance permanently.
-    ///
-    /// - Clears transport (disconnects relay)
-    /// - Clears all registries (known contexts, rate limiters)
-    /// - Runs all registered shutdown hooks (bridge-specific cleanup)
-    /// - Marks instance as shut down (all subsequent operations fail)
-    ///
-    /// Idempotent: calling `shutdown()` on an already-shut-down instance is
-    /// a no-op. Hooks are drained on the first call and will not run again.
-    ///
-    /// Bridge-specific singleton registries (identity registry, UCAN
-    /// registry, MCP registries, custody store, etc.) are the responsibility
-    /// of the per-bridge concrete struct implementing [`BridgeInstanceCore`];
-    /// they should be cleaned up in
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`] or by calling the
-    /// async [`shutdown_core_async`](Self::shutdown_core_async) variant.
-    ///
-    /// # Hook execution
-    ///
-    /// Shutdown hooks are called in registration order after all
-    /// `CoreFields`-owned state has been cleared (registries, economy
-    /// trackers). Hooks handle bridge-specific singletons that cannot be
-    /// owned by `CoreFields` (FFI bridge state, MCP registries). Together,
-    /// these steps release key material held by custody providers
-    /// (zeroized via `Drop` when `Arc` refcount reaches zero).
-    ///
-    /// This function is infallible. Transport lock failures are logged and
-    /// cleanup continues. Shutdown must always complete regardless of
-    /// intermediate failures.
-    pub fn shutdown(&self) {
-        if self.shutdown.swap(true, Ordering::SeqCst) {
-            return; // Already shut down
-        }
-        // This path never closes the durable store.
-        self.durable_store_state
-            .send_replace(DurableStoreState::NotClosing);
-        // Stop borrowers first, so every terminal transition of `CoreFields`
-        // ends borrowed writes — not only whichever transition
-        // [`BridgeInstanceCore::shutdown`] drives. This path clears registries
-        // and flushes persistence below, and a node writing through this
-        // instance's storage during that flush would race it.
-        self.stop_borrowers();
-        // Fire the cancellation token so any tasks spawned under this
-        // instance can exit cooperatively. Pending tasks inside `self.tasks`
-        // are not drained here — the sync variant cannot await. Callers
-        // that need a bounded wait use `shutdown_core_async`.
-        self.cancel.cancel();
-        // #1696: also cancel any in-flight reconnect dial so its socket
-        // teardown fires before the instance is considered dropped.
-        // Rotation is unnecessary during shutdown (no resume will
-        // follow), so a plain cancel is enough.
-        if let Ok(guard) = self.reconnect_cancel.lock() {
-            guard.cancel();
-        }
-        self.blocking_run_shutdown_side_effects();
     }
 
     // -----------------------------------------------------------------
@@ -1994,7 +1947,7 @@ impl CoreFields {
     /// Does **not** clear the stored relay URL — the URL is preserved so
     /// that callers can retrieve it after [`Self::resume`] and reconnect to the
     /// same relay. The relay URL is only cleared explicitly in
-    /// [`Self::shutdown`] (after flush) or by the caller via an explicit
+    /// [`Self::shutdown_core_async`] (after flush) or by the caller via an explicit
     /// disconnect flow.
     ///
     /// After this, relay-based operations will fail until a new transport
@@ -2042,7 +1995,7 @@ impl CoreFields {
     /// holds an adapter for it, through [`Self::add_relay_adapter`] or an
     /// install.
     ///
-    /// No-op after [`Self::shutdown`] — [`Self::pending_relay_urls`] is cleared on
+    /// No-op after [`Self::shutdown_core_async`] — [`Self::pending_relay_urls`] is cleared on
     /// shutdown and we must not resurrect it by admitting a late writer.
     /// Without this guard, a concurrent `add_relay_url` racing with a
     /// shutdown-triggered `relay_urls.clear()` could leave a stale URL in
@@ -2094,7 +2047,7 @@ impl CoreFields {
     /// holds connects to the same relay, so a resume does not redial a relay
     /// the budget dropped. Both steps run under the transport write lock.
     ///
-    /// After [`Self::shutdown`] the adapter is still added, and the reconnect
+    /// After [`Self::shutdown_core_async`] the adapter is still added, and the reconnect
     /// set stays empty, as [`Self::add_relay_url`] keeps it.
     ///
     /// # Errors
@@ -2171,7 +2124,7 @@ impl CoreFields {
     ///
     /// After [`Self::suspend`] the set is preserved so the
     /// `BridgeInstanceCore::resume` default body can reconnect each relay. After
-    /// [`Self::shutdown`] the set is empty.
+    /// [`Self::shutdown_core_async`] the set is empty.
     ///
     /// Returns an empty set if no URLs have been stored, if the instance
     /// has been shut down, or if the internal mutex is poisoned.
@@ -3063,9 +3016,8 @@ impl CoreFields {
         timeout: Duration,
         store_closer: Option<DurableStoreCloser>,
     ) -> Result<ShutdownOutcome, ShutdownError> {
-        // Idempotent terminal transition. The sync `shutdown()` path also
-        // swaps this flag; whichever call wins is the one that runs
-        // cleanup.
+        // Idempotent terminal transition: of concurrent calls, the one
+        // whose swap wins runs cleanup.
         self.stream_registration_closed
             .store(true, Ordering::SeqCst);
         if self.shutdown.swap(true, Ordering::SeqCst) {
@@ -3096,8 +3048,7 @@ impl CoreFields {
         // Signal cooperating tasks to exit. Cheap and idempotent.
         self.cancel.cancel();
         // #1696: cancel any in-flight reconnect dial so its socket
-        // teardown fires before shutdown completes. Matches the sync
-        // `shutdown()` path.
+        // teardown fires before shutdown completes.
         if let Ok(guard) = self.reconnect_cancel.lock() {
             guard.cancel();
         }
@@ -3108,13 +3059,11 @@ impl CoreFields {
         let start = tokio::time::Instant::now();
         let outcome = drain_under_deadline(&self.tasks, timeout).await;
 
-        // Run the sync cleanup side effects inside the remaining budget so
-        // callers get a true end-to-end deadline on shutdown (including the
-        // synchronous flush step). `run_shutdown_side_effects` mirrors the
-        // body of the sync `shutdown()` path but without the AtomicBool
-        // swap (we already performed it above). Calling it is safe: it
-        // checks `is_shutdown()` for the one internal guard that matters
-        // (economy accessors), which is already true.
+        // Run the cleanup side effects inside the remaining budget so
+        // callers get a true end-to-end deadline on shutdown, flush
+        // included. The swap above already set `shutdown`, which the
+        // economy accessors' guard inside `run_shutdown_side_effects`
+        // reads.
         let elapsed = start.elapsed();
         let remaining = timeout.saturating_sub(elapsed);
         let has_durable_store = store_closer.is_some();
@@ -3124,8 +3073,7 @@ impl CoreFields {
         combine_shutdown_outcome(outcome, drain, has_durable_store, start.elapsed())
     }
 
-    /// Cleanup body of the async [`shutdown_core_async`](Self::shutdown_core_async)
-    /// path; [`Self::blocking_run_shutdown_side_effects`] is the sync sibling.
+    /// Cleanup body of [`shutdown_core_async`](Self::shutdown_core_async).
     ///
     /// Must only be called after `self.shutdown` has been swapped to `true`.
     /// Clears transport, flushes persistence, drains the Supervisor, closes
@@ -3230,50 +3178,8 @@ impl CoreFields {
         drain
     }
 
-    /// Non-async sibling of [`Self::run_shutdown_side_effects`] used by the sync
-    /// [`shutdown`](Self::shutdown) path.
-    ///
-    /// The sync path has no deadline — it is a terminal, infallible
-    /// operation called from destructors and atexit hooks. It therefore
-    /// runs the flush inline without a timeout. The async variant is
-    /// preferred; callers that can `.await` should use it.
-    fn blocking_run_shutdown_side_effects(&self) {
-        if let Err(e) = self.clear_transport() {
-            tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
-        }
-        if let Ok(mut urls) = self.relay_urls.lock() {
-            urls.clear();
-        }
-
-        if let Some(supervisor) = self.supervisor.get() {
-            // The sync path has no caller to return an error to (it runs
-            // from destructors and atexit hooks). This path never closes the
-            // durable store, so an undrained Supervisor cannot lose its
-            // storage under a live writer: the advisory lock is released when
-            // the last storage `Arc` drops.
-            if let Err(e) = supervisor.flush_all_contexts_sync() {
-                tracing::warn!(
-                    error = %e,
-                    "flush_all_contexts_sync returned an error during shutdown \
-                     (likely supervisor providers detached mid-flight) — \
-                     context state may not be persisted"
-                );
-            }
-            if let Err(e) = supervisor.shutdown_all_contexts_sync() {
-                tracing::warn!(
-                    error = %e,
-                    "shutdown_all_contexts_sync could not drain the Supervisor during \
-                     shutdown"
-                );
-            }
-        }
-
-        self.finish_shutdown_cleanup();
-    }
-
-    /// Shared tail of both shutdown paths — registry clears, hook run,
-    /// suspension reset. Split out so the sync and async variants only
-    /// differ where they actually need to (flush handling).
+    /// Tail of [`Self::run_shutdown_side_effects`]: registry clears, hook
+    /// run, suspension reset.
     fn finish_shutdown_cleanup(&self) {
         self.known_contexts.clear();
         self.rate_limiters.clear();
@@ -3622,9 +3528,11 @@ pub trait BridgeInstanceCore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`TransportLockError`] if the transport lock is poisoned.
-    fn suspend(&self) -> Result<(), TransportLockError> {
-        self.core().suspend()
+    /// [`LifecycleError::FlushFailed`] when a context's snapshot did not
+    /// persist, and [`LifecycleError::TransportLock`] when the transport lock
+    /// is poisoned; the instance stays running on either.
+    async fn suspend(&self) -> Result<(), LifecycleError> {
+        self.core().suspend().await
     }
 
     /// Resumes the instance — see [`CoreFields::resume`].
@@ -3687,7 +3595,7 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// `bridge_specific_shutdown` runs UNCONDITIONALLY — even when
     /// [`CoreFields::shutdown_core_async`] returns
     /// [`ShutdownError::AlreadyShutDown`]. That variant signals a race
-    /// between this call and a prior sync `shutdown()` / prior async call;
+    /// between this call and a prior shutdown call;
     /// without invoking the bridge-specific cleanup, typed registries
     /// would leak key material past shutdown.
     ///
@@ -3814,12 +3722,13 @@ impl std::fmt::Display for TransportLockError {
 
 impl std::error::Error for TransportLockError {}
 
-/// Error type for lifecycle operations (`resume`, `check_ready`).
+/// Error type for lifecycle operations (`suspend`, `resume`, `check_ready`).
 ///
-/// Used by [`CoreFields::resume`] and related lifecycle accessors.
-/// Bridge layers map this to their own error types (`ScpPyError`, napi `Error`,
-/// etc.).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Used by [`CoreFields::suspend`], [`CoreFields::resume`] and related
+/// lifecycle accessors. Bridge layers map this to their own error types
+/// (`ScpPyError`, napi `Error`, etc.); [`classify_suspend_failure`] names
+/// the class and code each bridge reports for a failed suspend.
+#[derive(Debug)]
 pub enum LifecycleError {
     /// The instance has been permanently shut down and cannot be resumed.
     AlreadyShutDown,
@@ -3839,6 +3748,54 @@ pub enum LifecycleError {
         /// Redacted failure reason (no internal architecture leaks).
         reason: String,
     },
+    /// `suspend()` could not persist a context's snapshot (ADR-049 Decision
+    /// 9). The instance stays running with its transport connected, and a
+    /// retried `suspend()` flushes the still-dirty actors again.
+    FlushFailed(scp_core::context::ContextError),
+    /// `suspend()` could not clear the transport because its lock is
+    /// poisoned. The instance stays running.
+    TransportLock(TransportLockError),
+}
+
+/// The error class a bridge reports for a failed `suspend`. Each bridge
+/// turns the class into its own error type, so the three bridges cannot
+/// disagree on which error family a suspend failure belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendFailureClass {
+    /// A context snapshot did not persist:
+    /// [`STORAGE_8014`](crate::error_codes::STORAGE_8014).
+    Storage,
+    /// The transport lock is poisoned:
+    /// [`TRANS_5001`](crate::error_codes::TRANS_5001).
+    Transport,
+    /// A lifecycle state error:
+    /// [`CTX_2000`](crate::error_codes::CTX_2000), the code `resume` reports.
+    Lifecycle,
+}
+
+/// The class and code a bridge reports for a `suspend` that returned `e`.
+///
+/// [`LifecycleError::FlushFailed`] is storage, and
+/// [`LifecycleError::TransportLock`] is transport. `suspend` returns no other
+/// variant; the match names each of them so a new variant does not compile
+/// until it is classified here.
+#[must_use]
+pub const fn classify_suspend_failure(e: &LifecycleError) -> (SuspendFailureClass, &'static str) {
+    match e {
+        LifecycleError::FlushFailed(_) => (
+            SuspendFailureClass::Storage,
+            crate::error_codes::STORAGE_8014,
+        ),
+        LifecycleError::TransportLock(_) => (
+            SuspendFailureClass::Transport,
+            crate::error_codes::TRANS_5001,
+        ),
+        LifecycleError::AlreadyShutDown
+        | LifecycleError::Suspended
+        | LifecycleError::ReconnectFailed { .. } => {
+            (SuspendFailureClass::Lifecycle, crate::error_codes::CTX_2000)
+        }
+    }
 }
 
 impl std::fmt::Display for LifecycleError {
@@ -3854,11 +3811,25 @@ impl std::fmt::Display for LifecycleError {
             Self::ReconnectFailed { url, reason } => {
                 write!(f, "resume transport reconnect failed for {url}: {reason}")
             }
+            Self::FlushFailed(e) => write!(
+                f,
+                "suspend refused: a context snapshot did not persist, so the instance \
+                 stays running; retry suspend: {e}"
+            ),
+            Self::TransportLock(e) => write!(f, "suspend could not clear transport: {e}"),
         }
     }
 }
 
-impl std::error::Error for LifecycleError {}
+impl std::error::Error for LifecycleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::FlushFailed(e) => Some(e),
+            Self::TransportLock(e) => Some(e),
+            Self::AlreadyShutDown | Self::Suspended | Self::ReconnectFailed { .. } => None,
+        }
+    }
+}
 
 /// Error produced when a handle is used on the wrong bridge instance.
 ///
@@ -4063,6 +4034,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// Shuts `instance` down through `shutdown_core_async`, the one shutdown
+    /// path, and accepts a repeat call's `AlreadyShutDown`.
+    pub async fn shut_down(instance: &CoreFields) {
+        let result = instance
+            .shutdown_core_async(Duration::from_secs(5), None)
+            .await;
+        assert!(
+            matches!(result, Ok(_) | Err(ShutdownError::AlreadyShutDown { .. })),
+            "shutdown failed: {result:?}"
+        );
+    }
+
     /// Builds a per-instance Supervisor with test-friendly providers.
     /// Mirrors the FFI bridges' `init_supervisor*` path:
     /// `Supervisor::with_providers` constructs the supervisor and
@@ -4235,7 +4218,7 @@ pub(crate) mod tests {
 
         let shut = CoreFields::new();
         let shut_registry: StreamRegistry<String, u8> = StreamRegistry::new(&shut);
-        shut.shutdown();
+        shut_down(&shut).await;
         assert!(!shut_registry.insert("after".to_owned(), 3));
         assert!(shut_registry.is_empty());
 
@@ -4303,27 +4286,27 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn shutdown_without_supervisor_is_safe() {
+    #[tokio::test]
+    async fn shutdown_without_supervisor_is_safe() {
         // Simulates the case where the bridge was partially initialized
         // (BridgeInstance exists but identity_create / init_supervisor
         // never ran) and then shutdown is called.
         let instance = CoreFields::new();
         assert!(!instance.has_supervisor());
-        instance.shutdown();
+        shut_down(&instance).await;
         assert!(instance.is_shutdown());
     }
 
-    #[test]
-    fn shutdown_transitions_flag_permanently() {
+    #[tokio::test]
+    async fn shutdown_transitions_flag_permanently() {
         let instance = CoreFields::with_supervisor(test_supervisor());
 
         assert!(!instance.is_shutdown());
-        instance.shutdown();
+        shut_down(&instance).await;
         assert!(instance.is_shutdown());
 
         // Calling shutdown again is a no-op — still true
-        instance.shutdown();
+        shut_down(&instance).await;
         assert!(instance.is_shutdown());
     }
 
@@ -4479,27 +4462,27 @@ pub(crate) mod tests {
     // Lifecycle tests (suspend / resume / shutdown)
     // -----------------------------------------------------------------
 
-    #[test]
-    fn suspend_clears_transport() {
+    #[tokio::test]
+    async fn suspend_clears_transport() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
         assert!(instance.has_transport());
 
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
 
         assert!(!instance.has_transport());
         assert!(instance.is_suspended());
     }
 
-    #[test]
-    fn suspend_is_noop_when_shutdown() {
+    #[tokio::test]
+    async fn suspend_is_noop_when_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.shutdown();
+        shut_down(&instance).await;
 
         // Suspending an already-shutdown instance is a no-op (not an error)
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
         assert!(instance.is_shutdown());
         assert!(!instance.is_suspended());
     }
@@ -4507,7 +4490,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn resume_clears_suspended_flag() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
         assert!(instance.is_suspended());
 
         instance.resume().await.unwrap();
@@ -4517,18 +4500,18 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_fails_after_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.shutdown();
+        shut_down(&instance).await;
 
         let err = instance.resume().await.unwrap_err();
-        assert_eq!(err, LifecycleError::AlreadyShutDown);
+        assert!(matches!(err, LifecycleError::AlreadyShutDown), "{err:?}");
         assert_eq!(
             err.to_string(),
             "bridge instance has been permanently shut down"
         );
     }
 
-    #[test]
-    fn shutdown_is_idempotent() {
+    #[tokio::test]
+    async fn shutdown_is_idempotent() {
         let instance = CoreFields::with_supervisor(test_supervisor());
 
         // Register some state
@@ -4543,18 +4526,18 @@ pub(crate) mod tests {
         );
         instance.with_rate_limit_tracker("did:dht:ztest", |_| {});
 
-        instance.shutdown();
+        shut_down(&instance).await;
         assert!(instance.is_shutdown());
         assert!(instance.known_contexts().is_empty());
         assert!(instance.rate_limiters().is_empty());
 
         // Second call is a no-op
-        instance.shutdown();
+        shut_down(&instance).await;
         assert!(instance.is_shutdown());
     }
 
-    #[test]
-    fn shutdown_clears_registries() {
+    #[tokio::test]
+    async fn shutdown_clears_registries() {
         let instance = CoreFields::with_supervisor(test_supervisor());
 
         // Populate registries
@@ -4582,19 +4565,19 @@ pub(crate) mod tests {
         assert_eq!(instance.known_contexts().len(), 2);
         assert_eq!(instance.rate_limiters().len(), 2);
 
-        instance.shutdown();
+        shut_down(&instance).await;
 
         assert!(instance.known_contexts().is_empty());
         assert!(instance.rate_limiters().is_empty());
     }
 
-    #[test]
-    fn shutdown_clears_suspended_flag() {
+    #[tokio::test]
+    async fn shutdown_clears_suspended_flag() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
         assert!(instance.is_suspended());
 
-        instance.shutdown();
+        shut_down(&instance).await;
         assert!(instance.is_shutdown());
         // Shutdown supersedes suspension
         assert!(!instance.is_suspended());
@@ -4624,26 +4607,26 @@ pub(crate) mod tests {
         assert!(instance.check_ready().is_ok());
     }
 
-    #[test]
-    fn check_ready_fails_when_shutdown() {
+    #[tokio::test]
+    async fn check_ready_fails_when_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.shutdown();
+        shut_down(&instance).await;
         let err = instance.check_ready().unwrap_err();
-        assert_eq!(err, LifecycleError::AlreadyShutDown);
+        assert!(matches!(err, LifecycleError::AlreadyShutDown), "{err:?}");
     }
 
-    #[test]
-    fn check_ready_fails_when_suspended() {
+    #[tokio::test]
+    async fn check_ready_fails_when_suspended() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
         let err = instance.check_ready().unwrap_err();
-        assert_eq!(err, LifecycleError::Suspended);
+        assert!(matches!(err, LifecycleError::Suspended), "{err:?}");
     }
 
     #[tokio::test]
     async fn check_ready_passes_after_resume() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
         assert!(instance.check_ready().is_err());
         instance.resume().await.unwrap();
         assert!(instance.check_ready().is_ok());
@@ -4708,8 +4691,8 @@ pub(crate) mod tests {
     // Shutdown hook tests
     // -----------------------------------------------------------------
 
-    #[test]
-    fn shutdown_hooks_are_called_on_shutdown() {
+    #[tokio::test]
+    async fn shutdown_hooks_are_called_on_shutdown() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let instance = CoreFields::with_supervisor(test_supervisor());
 
@@ -4727,14 +4710,14 @@ pub(crate) mod tests {
         // Before shutdown: hooks haven't run
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-        instance.shutdown();
+        shut_down(&instance).await;
 
         // Both hooks ran
         assert_eq!(counter.load(Ordering::SeqCst), 11);
     }
 
-    #[test]
-    fn shutdown_hooks_run_only_once() {
+    #[tokio::test]
+    async fn shutdown_hooks_run_only_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let instance = CoreFields::with_supervisor(test_supervisor());
 
@@ -4745,20 +4728,20 @@ pub(crate) mod tests {
             c.fetch_add(1, Ordering::SeqCst);
         }));
 
-        instance.shutdown();
+        shut_down(&instance).await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
         // Second shutdown is idempotent — hooks don't run again
-        instance.shutdown();
+        shut_down(&instance).await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn register_hook_after_shutdown_runs_immediately() {
+    #[tokio::test]
+    async fn register_hook_after_shutdown_runs_immediately() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let instance = CoreFields::with_supervisor(test_supervisor());
 
-        instance.shutdown();
+        shut_down(&instance).await;
 
         let ran = Arc::new(AtomicBool::new(false));
         let r = Arc::clone(&ran);
@@ -4780,10 +4763,10 @@ pub(crate) mod tests {
     // set_transport lifecycle guard tests
     // -----------------------------------------------------------------
 
-    #[test]
-    fn set_transport_warns_after_shutdown() {
+    #[tokio::test]
+    async fn set_transport_warns_after_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.shutdown();
+        shut_down(&instance).await;
 
         // set_transport after shutdown warns but does not error — matches
         // the bridge_instance()/context_manager() pattern where shutdown
@@ -4797,10 +4780,10 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn set_transport_rejects_when_suspended() {
+    #[tokio::test]
+    async fn set_transport_rejects_when_suspended() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
 
         let err = instance
             .set_transport(Arc::new(test_transport_manager()))
@@ -4815,7 +4798,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn set_transport_accepts_after_resume() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
         instance.resume().await.unwrap();
 
         assert!(
@@ -4830,11 +4813,11 @@ pub(crate) mod tests {
     // Post-shutdown hook panic safety
     // -----------------------------------------------------------------
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::panic)]
-    fn register_hook_after_shutdown_catches_panic() {
+    async fn register_hook_after_shutdown_catches_panic() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.shutdown();
+        shut_down(&instance).await;
 
         // A panicking hook registered after shutdown must not propagate.
         instance.register_shutdown_hook(Box::new(|| {
@@ -4845,8 +4828,8 @@ pub(crate) mod tests {
         assert!(instance.is_shutdown());
     }
 
-    #[test]
-    fn register_hook_race_with_shutdown_never_drops_hook() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_hook_race_with_shutdown_never_drops_hook() {
         // Stress test for the TOCTOU race between `is_shutdown()` and the
         // `shutdown_hooks.lock()` acquisition in `register_shutdown_hook`.
         //
@@ -4878,13 +4861,13 @@ pub(crate) mod tests {
                 }
             });
 
-            // Thread A: trigger shutdown while B is still registering.
+            // Task A: trigger shutdown while B is still registering.
             let inst_a = Arc::clone(&instance);
-            let a = std::thread::spawn(move || {
-                inst_a.shutdown();
+            let a = tokio::spawn(async move {
+                shut_down(&inst_a).await;
             });
 
-            a.join().unwrap();
+            a.await.unwrap();
             b.join().unwrap();
 
             // Every one of the 100 hooks must have fired — none may be
@@ -4902,8 +4885,8 @@ pub(crate) mod tests {
     // Shutdown hook: hooks run exactly once, modify external state
     // -----------------------------------------------------------------
 
-    #[test]
-    fn shutdown_hook_modifies_external_state() {
+    #[tokio::test]
+    async fn shutdown_hook_modifies_external_state() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let instance = CoreFields::with_supervisor(test_supervisor());
@@ -4920,7 +4903,7 @@ pub(crate) mod tests {
             "hook must not run before shutdown"
         );
 
-        instance.shutdown();
+        shut_down(&instance).await;
 
         assert!(
             state.load(Ordering::SeqCst),
@@ -4928,9 +4911,9 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::panic)]
-    fn multiple_hooks_all_run_even_if_one_panics() {
+    async fn multiple_hooks_all_run_even_if_one_panics() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let instance = CoreFields::with_supervisor(test_supervisor());
@@ -4951,7 +4934,7 @@ pub(crate) mod tests {
             c3.fetch_add(1, Ordering::SeqCst);
         }));
 
-        instance.shutdown();
+        shut_down(&instance).await;
 
         // Hooks 1 and 3 both ran despite hook 2 panicking.
         assert_eq!(
@@ -5033,8 +5016,8 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn economy_accessors_use_ephemeral_after_shutdown() {
+    #[tokio::test]
+    async fn economy_accessors_use_ephemeral_after_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         let did = scp_did::DID::from("did:dht:zalice");
 
@@ -5043,7 +5026,7 @@ pub(crate) mod tests {
             tracker.grant(&did, scp_protocol::economy::Amount::new(500));
         });
 
-        instance.shutdown();
+        shut_down(&instance).await;
 
         // Post-shutdown: budget should be empty (ephemeral), NOT re-populate the map.
         let remaining = instance.with_economy_budget("ctx-sd", |tracker| tracker.remaining(&did));
@@ -5092,8 +5075,8 @@ pub(crate) mod tests {
     // Shutdown clears new registries
     // -----------------------------------------------------------------
 
-    #[test]
-    fn shutdown_clears_economy_state() {
+    #[tokio::test]
+    async fn shutdown_clears_economy_state() {
         let instance = CoreFields::with_supervisor(test_supervisor());
 
         // Populate economy
@@ -5103,7 +5086,7 @@ pub(crate) mod tests {
         });
         instance.with_economy_antispam("ctx-sd", |_| {});
 
-        instance.shutdown();
+        shut_down(&instance).await;
 
         // Economy DashMaps should be cleared
         assert!(instance.economy_budgets.is_empty());
@@ -5419,10 +5402,10 @@ pub(crate) mod tests {
         assert!(urls.contains("wss://relay2.example.com"));
     }
 
-    #[test]
-    fn add_relay_url_after_shutdown_is_noop() {
+    #[tokio::test]
+    async fn add_relay_url_after_shutdown_is_noop() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.shutdown();
+        shut_down(&instance).await;
         instance.add_relay_url("wss://relay.example.com".to_owned());
         assert!(
             instance.pending_relay_urls().is_empty(),
@@ -5432,8 +5415,8 @@ pub(crate) mod tests {
         assert!(!instance.has_pending_relay_urls());
     }
 
-    #[test]
-    fn add_relay_url_race_with_shutdown_never_leaks_urls() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_relay_url_race_with_shutdown_never_leaks_urls() {
         // Regression: if `add_relay_url`'s `is_shutdown()` check happens
         // outside the lock, a concurrent shutdown can clear the URL set
         // between the check and the insert. The post-condition of a
@@ -5455,11 +5438,11 @@ pub(crate) mod tests {
                 }
             });
             let shutdown_instance = Arc::clone(&instance);
-            let shutter = thread::spawn(move || {
-                shutdown_instance.shutdown();
+            let shutter = tokio::spawn(async move {
+                shut_down(&shutdown_instance).await;
             });
             writer.join().unwrap();
-            shutter.join().unwrap();
+            shutter.await.unwrap();
             assert!(
                 instance.pending_relay_urls().is_empty(),
                 "trial {trial}: relay URLs leaked past shutdown — \
@@ -5487,15 +5470,15 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn suspend_preserves_relay_urls() {
+    #[tokio::test]
+    async fn suspend_preserves_relay_urls() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
         instance.add_relay_url("wss://relay.example.com".to_owned());
 
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
         assert!(
             instance
                 .pending_relay_urls()
@@ -5519,7 +5502,7 @@ pub(crate) mod tests {
     async fn reconnect_transport_if_pending_rejects_after_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         instance.add_relay_url("wss://relay.example.com".to_owned());
-        instance.shutdown();
+        shut_down(&instance).await;
         let result = instance.reconnect_transport_if_pending().await;
         assert!(
             matches!(result, Err(LifecycleError::AlreadyShutDown)),
@@ -5626,7 +5609,7 @@ pub(crate) mod tests {
 
         // Fire suspend: cancels the token the reconnect snapshotted and
         // rotates in a fresh one.
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
 
         // The collect `select!` is biased toward the cancel branch, so
         // the next poll takes it even if a dial has already finished.
@@ -5644,10 +5627,8 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_cancels_in_flight_reconnect_dial() {
-        // `shutdown()` must also cancel a pending reconnect. Same dynamics
-        // as the suspend variant. `shutdown()` reaches `block_in_place`
-        // through `shutdown_all_contexts_sync`, so this test needs the
-        // multi-thread runtime.
+        // Shutdown must also cancel a pending reconnect. Same dynamics as
+        // the suspend variant.
         use std::time::Duration;
 
         let instance = CoreFields::with_supervisor(test_supervisor());
@@ -5661,7 +5642,7 @@ pub(crate) mod tests {
         // exercising cancellation; the pending first poll rules that out.
         poll_reconnect_into_dial(&mut reconnect).await;
 
-        instance.shutdown();
+        shut_down(&instance).await;
 
         let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect)
             .await
@@ -5681,7 +5662,7 @@ pub(crate) mod tests {
         let token_before = instance.reconnect_cancel_token();
         assert!(!token_before.is_cancelled());
 
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
 
         // Old token must be cancelled — any in-flight reconnect sees it.
         assert!(
@@ -5770,7 +5751,7 @@ pub(crate) mod tests {
             .unwrap();
         instance.add_relay_url("wss://relay1.example.com".to_owned());
         instance.add_relay_url("wss://relay2.example.com".to_owned());
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
         assert_eq!(
             instance.pending_relay_urls().len(),
             2,
@@ -5784,13 +5765,13 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn shutdown_clears_relay_urls() {
+    #[tokio::test]
+    async fn shutdown_clears_relay_urls() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         instance.add_relay_url("wss://relay.example.com".to_owned());
         assert!(instance.has_pending_relay_urls());
 
-        instance.shutdown();
+        shut_down(&instance).await;
         assert!(
             instance.pending_relay_urls().is_empty(),
             "shutdown must clear relay URLs"
@@ -5801,8 +5782,8 @@ pub(crate) mod tests {
     // AC 6: two-instance independence
     // -----------------------------------------------------------------
 
-    #[test]
-    fn two_instances_are_independent() {
+    #[tokio::test]
+    async fn two_instances_are_independent() {
         // BridgeInstances are containers — they carry no DID of their own.
         // The DID belongs to the `NodeMlsFactory` inside
         // each `Supervisor`'s attached manager. Two instances with distinct
@@ -5819,7 +5800,7 @@ pub(crate) mod tests {
         ));
 
         // Shutting down one does not affect the other.
-        bi1.shutdown();
+        shut_down(&bi1).await;
         assert!(bi1.is_shutdown());
         assert!(!bi2.is_shutdown());
 
@@ -5831,76 +5812,213 @@ pub(crate) mod tests {
     // AC 8: suspend/resume with persistence
     // -----------------------------------------------------------------
 
-    // Must run on the multi-thread runtime: `CoreFields::suspend` synchronously
-    // invokes `ContextManager::flush_all_contexts_sync`, which uses
-    // `tokio::task::block_in_place`. `block_in_place` panics on the default
-    // single-thread `#[tokio::test]` runtime ("can call blocking only when
-    // running on the multi-threaded runtime"). Commit 12 of #1549 PR 2
-    // introduced the `block_in_place` path without updating this test.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn suspend_flushes_contexts_to_persistence() {
-        use scp_core::context::providers::InMemoryPersistence;
-        use std::sync::Arc;
+    /// A context persistence that keeps snapshots in memory, counts writes,
+    /// and refuses every write while `fail` is set.
+    #[derive(Default)]
+    pub struct RecordingPersistence {
+        snapshots: Mutex<HashMap<String, scp_core::context::state::ContextSnapshot>>,
+        fail: AtomicBool,
+    }
 
-        let persistence = Arc::new(InMemoryPersistence::new());
-        let persistence_for_supervisor: Box<dyn ContextPersistence> =
-            Box::new(InMemoryPersistence::new());
-        let persistence_for_instance: Box<dyn ContextPersistence + Send + Sync> =
-            Box::new(InMemoryPersistence::new());
+    impl RecordingPersistence {
+        fn stored(&self, context_id: &str) -> bool {
+            self.snapshots.lock().unwrap().contains_key(context_id)
+        }
 
-        // Build the Supervisor directly through `with_providers` (ADR-049
-        // commit 12c.9g.3.6 — the FFI layer no longer touches
-        // `ContextManager`). The supervisor populates its lifted-
-        // provider slots and the manager attachment internally.
+        fn forget(&self, context_id: &str) {
+            self.snapshots.lock().unwrap().remove(context_id);
+        }
+    }
+
+    /// The `Box<dyn ContextPersistence>` a Supervisor takes, sharing one
+    /// [`RecordingPersistence`] with the test.
+    pub struct SharedRecording(pub Arc<RecordingPersistence>);
+
+    #[async_trait::async_trait]
+    impl ContextPersistence for SharedRecording {
+        async fn persist_context(
+            &self,
+            context_id: &str,
+            snapshot: &scp_core::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if self.0.fail.load(Ordering::SeqCst) {
+                return Err("recording persistence refuses writes".into());
+            }
+            self.0
+                .snapshots
+                .lock()
+                .unwrap()
+                .insert(context_id.to_owned(), snapshot.clone());
+            Ok(())
+        }
+
+        async fn load_context(
+            &self,
+            context_id: &str,
+        ) -> Result<
+            Option<scp_core::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(self.0.snapshots.lock().unwrap().get(context_id).cloned())
+        }
+
+        async fn delete_context(
+            &self,
+            context_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.forget(context_id);
+            Ok(())
+        }
+
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.snapshots.lock().unwrap().keys().cloned().collect())
+        }
+    }
+
+    /// A bridge instance over a Supervisor that persists through `recording`
+    /// and holds one context, `context_id`, with a transport on
+    /// `wss://suspend.example` installed.
+    async fn instance_with_persisted_context(
+        recording: &Arc<RecordingPersistence>,
+        context_id: &str,
+    ) -> CoreFields {
         let key_resolver: scp_core::context::governance::KeyResolver =
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let supervisor = Supervisor::with_providers(
             Arc::new(NodeMlsFactory::new(
                 "did:test:suspend-flush".to_owned(),
-                std::sync::Arc::new(scp_clock::SystemClock),
+                Arc::new(scp_clock::SystemClock),
             )),
-            Box::new(scp_core::context::LocalTransportProvider),
+            Box::new(LocalTransportProvider),
             Box::new(NoOpEventLog),
             key_resolver,
-            Some(persistence_for_supervisor),
+            Some(Box::new(SharedRecording(Arc::clone(recording)))),
             None,
             None,
             None,
             test_mls_storage(),
         );
+        supervisor
+            .create_context(
+                context_id.to_owned(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![scp_core::context::Capability::MessagesRead],
+                    ..scp_core::context::ContextParams::default()
+                },
+                scp_did::DID::from("did:dht:zsuspendflushcreator"),
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect("create context");
+        assert!(recording.stored(context_id), "create persists the context");
+        let instance = CoreFields::with_supervisor(supervisor);
+        instance
+            .install_transport(Arc::new(manager_on("wss://suspend.example")))
+            .unwrap();
+        instance
+    }
 
-        let instance = CoreFields::with_persistence(persistence_for_instance);
-        instance.set_supervisor(supervisor);
+    /// `suspend` writes every context's snapshot before it clears transport,
+    /// on the default current-thread test runtime: the flush is awaited, not
+    /// driven through `block_in_place`, which panics on that runtime.
+    #[tokio::test]
+    async fn suspend_flushes_every_context_before_clearing_transport() {
+        let recording = Arc::new(RecordingPersistence::default());
+        let instance = instance_with_persisted_context(&recording, "suspend-flush-ctx").await;
+        recording.forget("suspend-flush-ctx");
 
-        // Verify the persistence accessor returns Some.
-        assert!(instance.persistence().is_some());
+        instance.suspend().await.unwrap();
 
-        // Suspend should complete without errors (flush is best-effort).
-        instance.suspend().unwrap();
+        assert!(
+            recording.stored("suspend-flush-ctx"),
+            "suspend wrote the context's snapshot"
+        );
         assert!(instance.is_suspended());
+        assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
+        assert!(
+            instance
+                .pending_relay_urls()
+                .contains("wss://suspend.example")
+        );
 
-        // No relay URLs were registered, so pending_relay_urls is empty.
-        assert!(instance.pending_relay_urls().is_empty());
-
-        // Resume clears the suspended flag.
         instance.resume().await.unwrap();
         assert!(!instance.is_suspended());
-
-        // Instance is ready again.
         assert!(instance.check_ready().is_ok());
+    }
 
-        // Suppress the unused `persistence` warning — it was only used to
-        // verify the Arc::new pattern compiles; the real persistence is
-        // owned by the Supervisor through the manager it holds internally.
-        let _ = persistence;
+    /// A `suspend` whose flush fails returns `FlushFailed`, leaves the
+    /// instance running with its transport connected, and a retry after the
+    /// store recovers flushes and suspends.
+    #[tokio::test]
+    async fn suspend_that_cannot_flush_stays_running_and_reports_the_failure() {
+        let recording = Arc::new(RecordingPersistence::default());
+        let instance = instance_with_persisted_context(&recording, "suspend-fail-ctx").await;
+        recording.forget("suspend-fail-ctx");
+        recording.fail.store(true, Ordering::SeqCst);
+
+        let err = instance.suspend().await.unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                LifecycleError::FlushFailed(scp_core::context::ContextError::PersistenceFailed(_))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            classify_suspend_failure(&err),
+            (
+                SuspendFailureClass::Storage,
+                crate::error_codes::STORAGE_8014
+            )
+        );
+        assert!(!instance.is_suspended(), "a failed flush does not suspend");
+        assert!(instance.check_ready().is_ok());
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec!["wss://suspend.example".to_owned()]),
+            "a failed flush keeps the transport"
+        );
+
+        recording.fail.store(false, Ordering::SeqCst);
+        instance.suspend().await.unwrap();
+        assert!(recording.stored("suspend-fail-ctx"), "the retry flushed");
+        assert!(instance.is_suspended());
+    }
+
+    /// Every `LifecycleError` maps to the class and code each bridge reports
+    /// for a failed `suspend`.
+    #[test]
+    fn suspend_failures_carry_their_codes() {
+        use crate::error_codes as codes;
+        assert_eq!(
+            classify_suspend_failure(&LifecycleError::TransportLock(TransportLockError::Poisoned)),
+            (SuspendFailureClass::Transport, codes::TRANS_5001)
+        );
+        for e in [
+            LifecycleError::AlreadyShutDown,
+            LifecycleError::Suspended,
+            LifecycleError::ReconnectFailed {
+                url: String::new(),
+                reason: String::new(),
+            },
+        ] {
+            assert_eq!(
+                classify_suspend_failure(&e),
+                (SuspendFailureClass::Lifecycle, codes::CTX_2000)
+            );
+        }
     }
 
     // -----------------------------------------------------------------
     // AC 9: two instances operate concurrently (independent state)
     // -----------------------------------------------------------------
 
-    #[test]
-    fn two_instances_operate_concurrently() {
+    #[tokio::test]
+    async fn two_instances_operate_concurrently() {
         let sup1 = test_supervisor();
         let sup2 = test_supervisor();
         let bi1 = CoreFields::with_supervisor(Arc::clone(&sup1));
@@ -5948,7 +6066,7 @@ pub(crate) mod tests {
         );
 
         // Shutdown of bi1 does not affect bi2's state.
-        bi1.shutdown();
+        shut_down(&bi1).await;
         assert!(bi1.is_shutdown());
         assert!(!bi2.is_shutdown());
         assert_eq!(bi2.known_context_count(), 1);
@@ -6246,25 +6364,6 @@ pub(crate) mod tests {
             .unwrap();
         assert!(matches!(first, ShutdownOutcome::GracefulWithin { .. }));
 
-        let err = instance
-            .shutdown_core_async(Duration::from_secs(1), None)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ShutdownError::AlreadyShutDown {
-                durable_store_open: false
-            }
-        ));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_core_async_after_sync_shutdown_errors() {
-        // The sync `shutdown()` path also flips the idempotent flag, so the
-        // async variant must report AlreadyShutDown afterwards — callers
-        // get a single source of truth for "is already terminated?"
-        let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.shutdown();
         let err = instance
             .shutdown_core_async(Duration::from_secs(1), None)
             .await
@@ -6643,17 +6742,6 @@ pub(crate) mod tests {
             }
         ));
 
-        // The sync path never closes the durable store.
-        let sync = CoreFields::new();
-        sync.shutdown();
-        let err = repeat_shutdown_with_long_timeout(&sync, &unused).await;
-        assert!(matches!(
-            err,
-            ShutdownError::AlreadyShutDown {
-                durable_store_open: true
-            }
-        ));
-
         // A winner given no closer never closes the store.
         let no_closer = CoreFields::new();
         no_closer
@@ -6994,12 +7082,12 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn restore_transport_on_a_suspended_instance_retargets_the_reconnect_set() {
+    #[tokio::test]
+    async fn restore_transport_on_a_suspended_instance_retargets_the_reconnect_set() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         let installed = Arc::new(manager_on("ws://127.0.0.1:1/scp/v1"));
         instance.install_transport(Arc::clone(&installed)).unwrap();
-        instance.suspend().unwrap();
+        instance.suspend().await.unwrap();
 
         instance.restore_transport(&installed, None);
 

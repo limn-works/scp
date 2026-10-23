@@ -3020,7 +3020,7 @@ mod tests {
             "an attached supervisor answers for a context it does not serve"
         );
 
-        bi.core.suspend().expect("suspend");
+        bi.core.suspend().await.expect("suspend");
         let err = read_live_context_state(&bi, "ctx-none").await.unwrap_err();
         assert_refusal(err, "bridge is suspended");
     }
@@ -3036,8 +3036,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shutdown_hook_runs_with_external_state() {
+    #[tokio::test]
+    async fn shutdown_hook_runs_with_external_state() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -3056,10 +3056,13 @@ mod tests {
             !ran.load(Ordering::SeqCst),
             "hook must not fire before shutdown"
         );
-        bi.core.shutdown();
+        bi.core
+            .shutdown_core_async(std::time::Duration::from_secs(5), None)
+            .await
+            .expect("shutdown");
         assert!(
             ran.load(Ordering::SeqCst),
-            "shutdown hook must execute during CoreFields::shutdown()"
+            "shutdown hook must execute during CoreFields::shutdown_core_async()"
         );
     }
 
@@ -3464,7 +3467,7 @@ mod tests {
         create_supervisor_context_for_test(&bi, &ctx_id, "did:key:z6MkNapiPreAuthzSuspend")
             .await
             .expect("test supervisor context creation must succeed");
-        bi.core.suspend().expect("suspend");
+        bi.core.suspend().await.expect("suspend");
         let err = require_active_context_before_authz(&bi, &ctx_id, "probe", caller_refusal)
             .await
             .expect_err("a suspended bridge must refuse");
@@ -3588,7 +3591,7 @@ mod tests {
 
         let bi = NapiBridgeInstance::new_napi();
         init_supervisor_for_test_on(&bi);
-        bi.core.suspend().expect("suspend");
+        bi.core.suspend().await.expect("suspend");
         let err = active_role_state_before_authz(&bi, ctx_id, "probe", caller_refusal)
             .await
             .expect_err("a suspended bridge must refuse");

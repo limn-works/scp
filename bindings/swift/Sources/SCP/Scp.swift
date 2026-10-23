@@ -153,12 +153,21 @@ public final class SCP: @unchecked Sendable {
 
     /// Suspends this bridge instance (mobile/desktop backgrounding).
     ///
-    /// Disconnects the transport and flushes context snapshots.
-    /// Transport-dependent operations fail until ``resume()`` is called.
+    /// Flushes every context snapshot to storage, then disconnects the
+    /// transport. Transport-dependent operations fail until ``resume()`` is
+    /// called.
     ///
-    /// - Throws: ``ScpError/transport`` if the transport lock is poisoned.
-    public func suspend() throws {
-        try inner.suspend()
+    /// The method is `async throws` because the underlying Rust
+    /// `Scp::suspend` is `pub async fn`: the flush runs on the shared tokio
+    /// runtime, and its failure reaches this caller.
+    ///
+    /// - Throws: ``ScpError/storage`` with `SCP-STORAGE-8014` when a context
+    ///   snapshot did not persist; the instance stays running with its
+    ///   transport connected, and a retried call flushes again.
+    ///   ``ScpError/transport`` with `SCP-TRANS-5001` if the transport lock
+    ///   is poisoned; the instance stays running.
+    public func suspend() async throws {
+        try await inner.suspend()
     }
 
     /// Resumes a suspended bridge instance.

@@ -3666,14 +3666,20 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Suspends this bridge instance (mobile backgrounding).
      *
-     * Disconnects transport and flushes context snapshots. Transport-
-     * dependent operations fail until [`Self::resume`] is called.
+     * Flushes every context snapshot, then disconnects transport.
+     * Transport-dependent operations fail until [`Self::resume`] is called.
+     *
+     * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin; the
+     * flush runs on the tokio runtime this export names.
      *
      * # Errors
      *
-     * Returns `ScpError::Transport` if the transport lock is poisoned.
+     * Returns `ScpError::Storage` with `SCP-STORAGE-8014` when a context
+     * snapshot did not persist, and `ScpError::Transport` with
+     * `SCP-TRANS-5001` when the transport lock is poisoned. The instance
+     * stays running on either error.
      */
-    func suspend() throws 
+    func suspend() async throws 
     
     /**
      * Per-instance equivalent of the free-function
@@ -7588,17 +7594,34 @@ open func shutdown(timeoutMillis: UInt64)async throws   {
     /**
      * Suspends this bridge instance (mobile backgrounding).
      *
-     * Disconnects transport and flushes context snapshots. Transport-
-     * dependent operations fail until [`Self::resume`] is called.
+     * Flushes every context snapshot, then disconnects transport.
+     * Transport-dependent operations fail until [`Self::resume`] is called.
+     *
+     * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin; the
+     * flush runs on the tokio runtime this export names.
      *
      * # Errors
      *
-     * Returns `ScpError::Transport` if the transport lock is poisoned.
+     * Returns `ScpError::Storage` with `SCP-STORAGE-8014` when a context
+     * snapshot did not persist, and `ScpError::Transport` with
+     * `SCP-TRANS-5001` when the transport lock is poisoned. The instance
+     * stays running on either error.
      */
-open func suspend()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_suspend(self.uniffiClonePointer(),$0
-    )
-}
+open func suspend()async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_suspend(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
 }
     
     /**
@@ -20062,7 +20085,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 41184) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 57088) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 36718) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_tombstone_migrated_context() != 15228) {

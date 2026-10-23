@@ -4935,10 +4935,15 @@ mod restore_reconcile_tests {
     #[derive(Default)]
     struct CapturingPersistence {
         contexts: Mutex<HashMap<String, ContextSnapshot>>,
+        /// When set, every snapshot write fails.
+        fail: std::sync::atomic::AtomicBool,
     }
     #[async_trait::async_trait]
     impl ContextPersistence for CapturingPersistence {
         async fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("fixture: snapshot write deliberately fails".into());
+            }
             self.contexts
                 .lock()
                 .unwrap()
@@ -5093,6 +5098,50 @@ mod restore_reconcile_tests {
         // from `snapshot.broadcast`, not a separate persisted broadcast row.
         let broadcast = snapshot.broadcast.clone();
         (snapshot, broadcast)
+    }
+
+    /// `persist_context_and_broadcast` returns the flush's own error when the
+    /// snapshot write fails, so the caller sees the failure instead of a
+    /// silent skip, and returns `Ok` for a context with no actor.
+    #[tokio::test]
+    async fn persist_context_and_broadcast_returns_the_flush_failure() {
+        let capture = Arc::new(CapturingPersistence::default());
+        let supervisor = build_supervisor(Box::new(SharedCapture(Arc::clone(&capture))));
+        let ctx_id = "persist-returns-failure";
+        supervisor
+            .create_context(
+                ctx_id.to_owned(),
+                ContextParams {
+                    mode: ContextMode::Encrypted,
+                    ceiling: vec![scp_protocol::context::roles::Capability::MessagesRead],
+                    ..ContextParams::default()
+                },
+                DID("did:dht:z6MkPersistFailureCreator".to_owned()),
+                Some([7u8; 32]),
+                Vec::new(),
+            )
+            .await
+            .expect("create_context should succeed");
+
+        crate::context::manager_methods::persist_context_and_broadcast(&supervisor, ctx_id)
+            .await
+            .expect("a working store persists");
+
+        capture
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err =
+            crate::context::manager_methods::persist_context_and_broadcast(&supervisor, ctx_id)
+                .await
+                .expect_err("a failed snapshot write must reach the caller");
+        assert!(
+            matches!(err, ContextError::PersistenceFailed(_)),
+            "the flush's own error must pass through: {err:?}"
+        );
+
+        crate::context::manager_methods::persist_context_and_broadcast(&supervisor, "no-such-ctx")
+            .await
+            .expect("a context with no actor holds nothing to flush");
     }
 
     /// Drives `restore_context` against a snapshot whose `routing` variant and

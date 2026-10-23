@@ -27,8 +27,8 @@
  * 3. Otherwise applies a strict-by-default policy:
  *    - For `instanceId`, returns a deterministic string.
  *    - For lifecycle methods in {@link SAFE_DEFAULT_METHODS}
- *      (`suspend`, `resume`, `shutdown`), returns a safe no-op — sync
- *      `undefined` for `suspend`, `Promise.resolve(undefined)` otherwise.
+ *      (`suspend`, `resume`, `shutdown`), returns the safe no-op
+ *      `Promise.resolve(undefined)`.
  *    - For every other unstubbed method, **throws** an explanatory
  *      `Error`. This prevents the silent-success failure mode flagged
  *      by cryptographer finding M-1 (a "verify succeeds" test passing
@@ -86,7 +86,7 @@ export type MockStub = (...args: readonly unknown[]) => unknown;
 export interface MockNativeScp {
   // ── NAPI `Scp` surface the SDK relies on ───────────────────────────
   readonly instanceId: string;
-  suspend(): void;
+  suspend(): Promise<void>;
   resume(): Promise<void>;
   shutdown(timeoutMillis: bigint): Promise<void>;
   // Every other property access is dispatched through the Proxy. We
@@ -150,9 +150,6 @@ const RUNTIME_HOOKS: ReadonlySet<string | symbol> = new Set<string | symbol>([
   Symbol.for("nodejs.util.inspect.custom"),
 ]);
 
-/** Methods on the NAPI `Scp` surface that are synchronous by contract. */
-const SYNC_METHODS: ReadonlySet<string> = new Set<string>(["suspend"]);
-
 /**
  * Methods where an unstubbed call is safe to treat as a no-op even in
  * strict mode. These are lifecycle operations whose void return is
@@ -176,19 +173,6 @@ export const SAFE_DEFAULT_METHODS: readonly string[] = Object.freeze([
 ]);
 
 const SAFE_DEFAULT_METHOD_SET: ReadonlySet<string> = new Set<string>(SAFE_DEFAULT_METHODS);
-
-/**
- * Safe default return value for an unstubbed invocation of a
- * lifecycle method. Returns `undefined` synchronously for methods
- * whose real signatures are sync (`suspend`), and `Promise.resolve(undefined)`
- * for the async lifecycle methods.
- */
-function safeDefaultReturn(method: string): unknown {
-  if (SYNC_METHODS.has(method)) {
-    return undefined;
-  }
-  return Promise.resolve(undefined);
-}
 
 /**
  * Builds the strict-mode error raised when a test invokes a method
@@ -250,8 +234,7 @@ let _nextMockInstanceId = 1;
  * (cryptographer finding M-1).
  *
  * Lenient mode (`{ strict: false }`): every unstubbed method returns
- * `Promise.resolve(undefined)` (async default) or `undefined` (sync
- * default). Provided as an explicit opt-out for tests that exercise
+ * `Promise.resolve(undefined)`. Provided as an explicit opt-out for tests that exercise
  * SDK control flow without inspecting return values.
  */
 export function createMockNativeScp(options: CreateMockNativeScpOptions = {}): MockNativeScp {
@@ -338,7 +321,8 @@ export function createMockNativeScp(options: CreateMockNativeScpOptions = {}): M
           throw err;
         }
 
-        const result = safeDefaultReturn(method);
+        // Every lifecycle method on the NAPI `Scp` surface is async.
+        const result = Promise.resolve(undefined);
         calls.push({ method, args: args.slice(), result });
         return result;
       };
