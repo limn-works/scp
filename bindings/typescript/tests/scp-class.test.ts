@@ -164,9 +164,10 @@ suite.describe("SCP class (Phase 4)", (addon) => {
 
   test("suspend / resume round-trip succeeds", async () => {
     const scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
-    // `suspend()` is async: it flushes every context snapshot on the
-    // tokio runtime before the promise settles.
-    await expect(scp.suspend()).resolves.toBeUndefined();
+    // `suspend(timeoutMillis)` is async: it flushes every context snapshot
+    // on the tokio runtime, within the BigInt millisecond deadline, before
+    // the promise settles.
+    await expect(scp.suspend(5000n)).resolves.toBeUndefined();
     // `resume()` is async since #1678 — the NAPI bridge chains
     // transport reconnect from pending relay URLs and persisted
     // context restoration before the promise settles.
