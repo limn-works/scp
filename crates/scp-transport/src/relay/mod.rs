@@ -27,8 +27,12 @@
 //!   with the APNs sender in [`push_apns`] (PUSH-010) and the FCM HTTP v1
 //!   sender in [`push_fcm`] (PUSH-011).
 //! - `push_store` -- the relay's push registration store (spec section
-//!   10.7.1 step 4), indexed by registration key and by routing ID. Behind
-//!   the `push-store` feature.
+//!   10.7.1 step 4), indexed by registration key, by routing ID and by
+//!   token. Behind the `push-store` feature.
+//! - [`push_dispatch`] -- the relay's push queue and drain task (spec
+//!   section 10.7.1 step 5 and `PushDeregistration`, PUSH-008): one job per
+//!   registered token after each stored blob, and removal after three
+//!   consecutive invalid-token responses.
 //! - [`push_gate`] -- the relay's interception of every PUBLISH to its
 //!   reserved push routing ID (spec section 10.7.1, PUSH-007): the
 //!   [`push_gate::PushRole`] selection and the verify-then-store gate.
@@ -46,12 +50,13 @@ pub mod did_record_validation;
 pub(crate) mod log_capture;
 pub mod push;
 pub mod push_apns;
+pub mod push_dispatch;
 pub mod push_fcm;
 pub mod push_gate;
 #[cfg(feature = "push-store")]
 pub mod push_store;
 #[cfg(test)]
-mod push_test_server;
+pub(crate) mod push_test_server;
 pub mod rate_limit;
 pub mod stun_service;
 pub mod subscription;

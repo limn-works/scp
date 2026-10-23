@@ -447,7 +447,7 @@
         "crates/scp-transport/src/relay/push_store.rs",
         "crates/scp-transport/src/relay/mod.rs"
       ],
-      "description": "An enum-dispatched relay store for push registrations. The shipped arm is `Sqlite` (indicator: through `scp-sqlite-pools`). The `InMemory` arm compiles only under the `testing` feature, so no shipped relay can select it. Selection has no `Default` (ADR-062, capability injection; \u00a717.17.1). The store indexes registrations by registration key (identity identifier, platform, token) and by routing ID, and keeps a consecutive invalid-token counter per key. File location `push_store.rs` is an indicator. Relay-internal, so every integration-checklist row is n/a.",
+      "description": "An enum-dispatched relay store for push registrations. The shipped arm is `Sqlite` (indicator: through `scp-sqlite-pools`). The `InMemory` arm compiles only under the `testing` feature, so no shipped relay can select it. Selection has no `Default` (ADR-062, capability injection; \u00a717.17.1). The store indexes registrations by registration key (identity identifier, platform, token) and by routing ID, and keeps a consecutive invalid-token counter per token, keyed by (platform, token) and shared by every registration key holding that token, because \u00a710.7.1 removes registrations after 3 consecutive delivery failures for the same token. File location `push_store.rs` is an indicator. Relay-internal, so every integration-checklist row is n/a.",
       "acceptanceCriteria": [
         "`upsert` with a newer timestamp replaces the stored registration and its routing-ID index entries.",
         "`upsert` with an identical token and routing-ID set leaves the index unchanged.",
@@ -578,25 +578,39 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/push_dispatch.rs",
-        "crates/scp-transport/src/native/server.rs"
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/relay/mod.rs",
+        "crates/scp-transport/src/relay/push.rs",
+        "crates/scp-transport/src/relay/push_gate.rs",
+        "crates/scp-transport/src/relay/push_store.rs",
+        "crates/scp-transport/tests/push_store_conformance.rs",
+        "crates/scp-transport/src/quic/listener.rs",
+        "crates/scp-transport/src/udp/listener.rs",
+        "crates/scp-transport/src/webtransport/session.rs",
+        "crates/scp-transport/src/startup.rs",
+        "crates/scp-transport/src/relay/push_test_server.rs"
       ],
-      "description": "The `PushSender` enum has the arms `Apns`, `Fcm` and, under `testing` only, `Recording`; a recording sender reports deliveries that never happened, so it is a nullifier and must stay out of the shipped feature graph. Each `send` returns `Delivered`, `InvalidToken`, `Transient` or `ConfigError`. After `storage.store` succeeds in `handle_publish`, the relay looks up the registrations for the publish's routing ID and queues one job per token on a bounded queue (indicator: 10,000); the publish never waits on a send. A background task drains the queue. Only `InvalidToken` counts toward the 3 consecutive failures of \u00a710.7.1; `Delivered` resets the counter, and at 3 the relay removes the registration. Tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. File location `push_dispatch.rs` is an indicator.",
+      "description": "The `PushSender` enum has the arms `Apns`, `Fcm` and, under `testing` only, `Recording`; a recording sender reports deliveries that never happened, so it is a nullifier and must stay out of the shipped feature graph. Each send returns `Delivered`, `InvalidToken`, `Transient` or `ConfigError`. A running push service comes only from `PushService::start(PushServiceConfig)` (ADR-052): the config is flat and holds no runtime state, and starting the service spawns its lookup and one drain per platform, so no relay can hold a dispatcher whose drain is not running, whichever transports it serves. Every transport's PUBLISH handler takes one path for every stored blob, DID record or opaque: deliver to subscribers, answer the publisher (the WebTransport handler returns its answer to the stream driver), then hand the routing ID to the service without waiting. The service looks up (platform, token) pairs for the routing ID off the async worker, in one query, and queues one job per token not already queued, up to a per-routing-ID bound (indicator: 1,000 live jobs) on a bounded per-platform queue (indicator: 10,000), so a slow push service stalls only its own platform and one routing ID's registrations cannot fill a queue. Both bounds and the drop of a wake beyond them are the ones \u00a710.7.1 step 5 **Best-effort delivery** allows a relay. Each push client sets HTTP/2 keep-alive so a dead connection fails fast, and a `Transient` outcome backs off that platform's next send. A drop is logged at a bounded rate, with the running drop count. Only `InvalidToken` counts toward the 3 consecutive failures of \u00a710.7.1; `Delivered` resets the counter, and a reset that fails to persist is carried so the next `InvalidToken` still counts from zero. The drain carries that reset in memory only, so a started service clears every stored invalid-token count before it queues its first job, and retries the clear until it lands; a restart therefore never lets a stale count remove a registration, and costs a token at most the 2 failures counted before it. At 3 the relay removes the registration. Tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. File location `push_dispatch.rs` is an indicator.",
       "acceptanceCriteria": [
-        "A publish to a registered routing ID enqueues exactly one job per matching token.",
-        "A full queue drops the job, increments a counter, and the publish still succeeds.",
+        "A publish to a registered routing ID enqueues exactly one job per matching token not already queued, up to the per-routing-ID bound that \u00a710.7.1 step 5 **Best-effort delivery** allows; a flood of registrations on one routing ID leaves room for another routing ID's wake.",
+        "A full queue drops the job, as \u00a710.7.1 step 5 **Best-effort delivery** allows, counts it in a log line written at a bounded rate, and the publish still succeeds.",
         "Three `InvalidToken` outcomes in a row remove the registration.",
         "`InvalidToken`, `InvalidToken`, `Delivered`, `InvalidToken` leaves the registration in place.",
         "`Transient` and `ConfigError` never change the counter.",
         "No push job carries the routing ID, the blob or the `registrant` identifier; a test inspects the job struct's fields.",
         "Every test registration goes through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`.",
-        "The `Recording` arm compiles only under `testing`, and `scripts/check-shipped-feature-graph.sh` passes."
+        "The `Recording` arm compiles only under `testing`, and `scripts/check-shipped-feature-graph.sh` passes.",
+        "Every transport that stores blobs (WebSocket, QUIC, UDP, WebTransport) wakes on a DID-record publish and on an opaque publish, after subscriber delivery and after the reply wherever the handler writes the reply itself (the WebTransport handler returns its reply to the stream driver, so its wake is queued just before that return, without waiting); each test fails when that transport's notify is removed.",
+        "A push service that never answers on one platform delays no wake on the other platform, and no publish.",
+        "A `Delivered` whose counter reset fails to persist still breaks the run of failures.",
+        "Two `InvalidToken` outcomes, a `Delivered` whose counter reset fails to persist, a restart of the push service on the same store, then one `InvalidToken` leave the registration in place with a count of one; a service whose clear of the stored counts fails sends no wake until a retry of the clear lands."
       ],
       "actionItems": [
-        "Write the sender enum, the bounded queue and the drain task.",
-        "Wire the enqueue after `storage.store` in `handle_publish`.",
+        "Write the sender enum, the push service with its per-platform queues and drains, and its start.",
+        "Run the notify after delivery and the reply in every transport's publish handler.",
         "Write the invalid-token counter rules."
       ],
       "blockedBy": [
@@ -676,10 +690,12 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/push_apns.rs",
-        "crates/scp-transport/Cargo.toml"
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/relay/push_test_server.rs"
       ],
       "description": "Sends the APNs row of the \u00a710.7.1 step 5 wake-signal table over HTTP/2 to `api.push.apple.com`, or to `api.sandbox.push.apple.com` when the configured environment is `sandbox`. Authenticates with an ES256 provider JWT signed by the .p8 key through the `p256` crate the workspace already uses, carrying the key ID and team ID, refreshed every 50 minutes (indicator). Response mapping: 200 to `Delivered`; 410, or 400 with reason `BadDeviceToken`, to `InvalidToken`; 403 `InvalidProviderToken` or `ExpiredProviderToken` refreshes the JWT once, then `ConfigError`; 429 or 5xx to `Transient`; `DeviceTokenNotForTopic` to `InvalidToken`; `TopicDisallowed` to `ConfigError`. End-to-end tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. Runs in parallel with PUSH-011. File location `push_apns.rs` is an indicator.",
       "acceptanceCriteria": [
@@ -723,10 +739,12 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "in-progress",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/relay/push_fcm.rs",
-        "crates/scp-transport/Cargo.toml"
+        "crates/scp-transport/Cargo.toml",
+        "crates/scp-transport/src/native/server.rs",
+        "crates/scp-transport/src/relay/push_test_server.rs"
       ],
       "description": "Reads the service-account JSON, mints an RS256 JWT for `https://oauth2.googleapis.com/token` with scope `https://www.googleapis.com/auth/firebase.messaging`, and caches the access token until 60 s before it expires (indicator). Sends the FCM row of the \u00a710.7.1 step 5 wake-signal table to `POST https://fcm.googleapis.com/v1/projects/{project_id}/messages:send`. Response mapping: 200 to `Delivered`; 404 `UNREGISTERED`, or 400 `INVALID_ARGUMENT` naming the token, to `InvalidToken`; 401 refreshes the token once, then `ConfigError`; 403 `SENDER_ID_MISMATCH` to `InvalidToken`; 429 `QUOTA_EXCEEDED`, 503 or 500 to `Transient`. End-to-end tests register through the signature-checking test verifier of PUSH-005, which checks a real P-256 signature against a key the test supplies and compiles only under `testing`. Runs in parallel with PUSH-010. File location `push_fcm.rs` is an indicator.",
       "acceptanceCriteria": [

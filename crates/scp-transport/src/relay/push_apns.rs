@@ -286,7 +286,7 @@ impl ApnsSender {
     /// Builds the sender against `origin` with `clock`. [`Self::new`] passes
     /// the environment's gateway and the system clock; the tests pass a local
     /// server and a test clock.
-    pub(super) fn build(
+    pub(crate) fn build(
         config: ApnsConfig,
         origin: String,
         clock: Arc<dyn Clock>,
@@ -517,7 +517,7 @@ fn require_printable(field: &'static str, value: &str) -> Result<(), PushSenderE
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub(crate) mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use scp_clock::TestClock;
@@ -540,7 +540,7 @@ mod tests {
         P256SecretKey::from_scalar_bytes(&[7u8; 32]).expect("7 repeated is a valid P-256 scalar")
     }
 
-    fn config() -> ApnsConfig {
+    pub fn config() -> ApnsConfig {
         ApnsConfig {
             signing_key: test_key(),
             key_id: "ABC123DEFG".to_owned(),
@@ -642,7 +642,8 @@ mod tests {
     #[tokio::test]
     async fn request_carries_exactly_the_table_row() {
         let (sender, server, _) = sender_with(vec![Reply::empty(200)]).await;
-        let outcome = PushSender::Apns(sender).send(&token()).await;
+        let raw = hex::decode(DEVICE_TOKEN).unwrap();
+        let outcome = PushSender::Apns(sender).send_registered(&raw).await;
         assert_eq!(outcome, PushSendOutcome::Delivered);
 
         let requests = server.requests().await;

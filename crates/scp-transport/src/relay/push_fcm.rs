@@ -259,7 +259,7 @@ impl FcmSender {
     /// Builds the sender against `fcm_origin` and `token_url` with `clock`.
     /// [`Self::new`] passes Google's endpoints and the system clock; the tests
     /// pass a local server and a test clock.
-    pub(super) fn build(
+    pub(crate) fn build(
         config: FcmConfig,
         fcm_origin: &str,
         token_url: String,
@@ -586,7 +586,7 @@ fn map_response(status: u16, error: &FcmError) -> Mapped {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub(crate) mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ring::signature::{KeyPair as _, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
@@ -615,7 +615,7 @@ mod tests {
     const ACCESS_TOKEN_1: &str = "ya29.test-access-token-one";
     const ACCESS_TOKEN_2: &str = "ya29.test-access-token-two";
     const START: u64 = 1_800_000_000;
-    const SEND_PATH: &str = "/v1/projects/scp-test-project/messages:send";
+    pub const SEND_PATH: &str = "/v1/projects/scp-test-project/messages:send";
 
     fn service_account_json() -> Vec<u8> {
         serde_json::json!({
@@ -630,14 +630,14 @@ mod tests {
         .into_bytes()
     }
 
-    fn config() -> FcmConfig {
+    pub fn config() -> FcmConfig {
         FcmConfig {
             service_account: FcmServiceAccount::from_json(&service_account_json()).unwrap(),
             project_id: "scp-test-project".to_owned(),
         }
     }
 
-    fn token_reply(access_token: &str, expires_in: u64) -> Reply {
+    pub fn token_reply(access_token: &str, expires_in: u64) -> Reply {
         json_reply(
             200,
             &serde_json::json!({
@@ -719,7 +719,9 @@ mod tests {
             vec![Reply::empty(200)],
         )
         .await;
-        let outcome = PushSender::Fcm(sender).send(&reg_token()).await;
+        let outcome = PushSender::Fcm(sender)
+            .send_registered(REG_TOKEN.as_bytes())
+            .await;
         assert_eq!(outcome, PushSendOutcome::Delivered);
 
         let requests = server.requests().await;
