@@ -718,7 +718,8 @@ pub(crate) struct Tier3Fixture {
     pub bridge_own_id: [u8; 32],
 }
 
-/// Builds the [`Tier3Fixture`] and checks it against the §9.18.2 vectors.
+/// Builds the [`Tier3Fixture`] and checks it against the §9.18.2 values that
+/// `25-test-vectors.md` §25.28 Vector 70 prints.
 ///
 /// # Errors
 ///
@@ -746,7 +747,7 @@ pub(crate) fn tier3_fixture() -> Result<Tier3Fixture, Box<dyn std::error::Error>
         || hex::encode(bridge_own_id)
             != "e47cce36c946ac50a2ee3dbc40f0416d7012bf82344c8f24a756c0f62242eea1"
     {
-        return Err("tier 3 fixture diverges from the 09-security-model.md §9.18.2 vectors".into());
+        return Err("tier 3 fixture diverges from 25-test-vectors.md §25.28 Vector 70".into());
     }
     let live = LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1")?);
     live.set(ReservedRelayUrls::new(entry_a.clone(), [entry_b.clone()]));
