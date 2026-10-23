@@ -42,7 +42,7 @@ use scp_platform::EncryptedStorage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_transport::native::server::RelayServer;
 use scp_transport::native::storage::BlobStorageBackend;
-use scp_transport::startup;
+use scp_transport::{shutdown, startup};
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -352,8 +352,8 @@ fn resolve_storage_key_or_exit(storage_dir: &std::path::Path) -> Zeroizing<[u8; 
 // Health check + shutdown signal
 // ---------------------------------------------------------------------------
 
-// `health_check` and `shutdown_signal` are provided by
-// `scp_transport::startup`.
+// `health_check` is provided by `scp_transport::startup`, and
+// `shutdown_signal` by `scp_transport::shutdown`.
 
 // ---------------------------------------------------------------------------
 // Relay blob storage from env
@@ -389,7 +389,7 @@ async fn run_relay_only() {
     startup::log_push_role(&config.push);
 
     let storage = Arc::new(or_exit(startup::storage_from_env(backend).await));
-    let shutdown = or_exit(startup::shutdown_signal());
+    let shutdown = or_exit(shutdown::shutdown_signal().map_err(startup::StartupError::from));
     let server = RelayServer::new(config, storage);
 
     let (handle, local_addr) = match server.start().await {
@@ -972,7 +972,7 @@ async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf
         })),
     };
 
-    let shutdown = or_exit(startup::shutdown_signal());
+    let shutdown = or_exit(shutdown::shutdown_signal().map_err(startup::StartupError::from));
     if let Err(e) = scp_node::host_site_until(config, shutdown).await {
         tracing::error!(error = %e, "self-host mode failed");
         std::process::exit(1);
@@ -1203,7 +1203,7 @@ async fn run_node_with<
     // Install Prometheus metrics recorder and add /metrics endpoint (#1467).
     let metrics_router = install_metrics_recorder();
 
-    let shutdown = or_exit(startup::shutdown_signal());
+    let shutdown = or_exit(shutdown::shutdown_signal().map_err(startup::StartupError::from));
     if let Err(e) = node.serve(metrics_router, shutdown).await {
         tracing::error!(error = %e, "application node exited with error");
         std::process::exit(1);

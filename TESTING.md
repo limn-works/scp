@@ -66,16 +66,24 @@ Requires Swift 6.2 or later; Xcode 26 ships it, and [swift.org](https://swift.or
 
 ## Feature Flags
 
-CI's `rust-clippy` job runs five `cargo clippy` commands. The first lints the workspace with the features that enable in-memory key custody and the test-only grants. The workspace sweep compiles scp-transport with only the features a workspace member's dependency declaration requests (`sqlite-blob`, `redb-blob` and `startup`), and leaves the optional network transports and the `postgres-blob` and `s3-blob` features off, so the other four lint the optional network transports and the PostgreSQL and S3 blob backends, which scp-node and scp-relay compile only under their off-by-default `cloud-blobs` feature. Run the commands that cover the crates your change touches; together they give CI parity:
+CI's `rust-clippy` job runs thirteen `cargo clippy` commands. The first lints the workspace with the features that enable in-memory key custody and the test-only grants. The workspace sweep compiles each crate with only the features a workspace member's dependency declaration requests, so the other twelve lint feature sets it leaves off: the optional network transports; scp-platform's and scp-testing's optional features; the PostgreSQL and S3 blob backends, which scp-node and scp-relay compile only under their off-by-default `cloud-blobs` feature; scp-transport's push, cache, SQLCipher, relay-persistence and UPnP stores; and scp-node's library without its default `node-bin` feature, the build each FFI bridge and scp-testing resolves. Run the commands that cover the crates your change touches; together they give CI parity:
 
 ```bash
 cargo clippy --workspace --all-targets \
   --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant \
   -- -D warnings
-cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
+cargo clippy -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --all-targets -- -D warnings
+cargo clippy -p scp-node --features quic,http3,udp,coap,upnp,testing --all-targets -- -D warnings
+cargo clippy -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --all-targets -- -D warnings
+cargo clippy -p scp-testing --features sync,combined --all-targets -- -D warnings
 cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
+cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings
+cargo clippy -p scp-transport --features push-store,testing --all-targets -- -D warnings
+cargo clippy -p scp-transport --features combined,local-cache,push-store,relay-persistence,testing,upnp --all-targets -- -D warnings
 cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
 cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
+cargo clippy -p scp-node --no-default-features --lib -- -D warnings
+cargo clippy -p scp-node --no-default-features --features testing --all-targets -- -D warnings
 ```
 
 Production builds for iOS and Android must **never** enable `testing`.

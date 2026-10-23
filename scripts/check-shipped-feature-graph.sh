@@ -181,7 +181,7 @@ cd "$REPO_ROOT"
 # a future dependency edge pull plaintext key-per-file storage back into a
 # shipped graph with no gate failure to announce it.
 #
-# ELEVEN ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
+# TWELVE ROWS NAME A FEATURE A ROOT PACKAGE ACTIVATES THROUGH ITS OWN `[features]`
 # TABLE. `cargo tree -e features` renders no feature EDGE for any of them (see
 # "TWO RENDERINGS" in the header), so this gate could not observe one until it
 # began reading the per-package resolved-feature rendering. Their classification:
@@ -212,11 +212,19 @@ cd "$REPO_ROOT"
 #     triple, is set; and it activates nothing when `sqlite` is off.
 #   - `scp-client-wasm/default` — an EMPTY feature list. Cargo reports `default`
 #     as enabled on that default member and it activates nothing.
+#   - `scp-node/node-bin` — what `scp-node/default` expands to, which the
+#     default-feature `scp-node` ARTIFACTS entry resolves. It is
+#     `["dep:metrics", "dep:metrics-exporter-prometheus",
+#     "scp-transport/startup", "scp-transport/redb-blob"]`: the binary's
+#     Prometheus exporter, startup utilities and redb blob backend, all real
+#     production backends, and `[[bin]]` requires it. The three bridges and
+#     `scp-testing` take scp-node with `default-features = false`, so no bridge
+#     ARTIFACTS entry resolves it.
 # The `scp-ffi|--features extension-module,vendored-openssl` ARTIFACTS entry, the
 # PyPI wheel's configuration read from `[tool.maturin]`, resolves the two
 # `scp-ffi` rows above that no other entry reaches. This gate does not read which
 # artifacts reach `openssl-src`; see `scripts/check-vendored-openssl-scope.sh`.
-# None of the eleven forwards a `testing` edge or an `allow_unencrypted_storage`
+# None of the twelve forwards a `testing` edge or an `allow_unencrypted_storage`
 # edge. The reader reports cargo's RESOLVED list, so every feature a `default`
 # row expands to appears as its own row and meets this ⊆ check on its own —
 # permitting a `default` row therefore admits nothing beyond that row.
@@ -263,6 +271,7 @@ scp-mcp/default
 scp-media/default
 scp-mls/default
 scp-node/default
+scp-node/node-bin
 scp-platform/default
 scp-platform/encrypting
 scp-platform/file
@@ -334,8 +343,8 @@ EOF
 #   - Binaries (scp-node / scp-relay): built with DEFAULT features, so the
 #     feature-arg string is EMPTY. This matches the Dockerfile
 #     `cargo build --release -p scp-relay -p scp-node` and the `cargo publish`
-#     shipping config. NEITHER binary has a `server` feature (scp-node has no
-#     `default` block wiring one; scp-relay's `[features]` table holds only the off-by-default `cloud-blobs`),
+#     shipping config. NEITHER binary has a `server` feature (scp-node's
+#     `default` block is `["node-bin"]` and wires none; scp-relay's `[features]` table holds only the off-by-default `cloud-blobs`),
 #     so passing `--features server` here would ERROR — they are correctly gated
 #     with an empty feature-arg string, not with `--features server`.
 #
