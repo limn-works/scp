@@ -1965,7 +1965,7 @@
       "gate": "gate-push-relay",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "in-progress",
       "files": [
         "crates/scp-protocol/src/discovery/push.rs",
         "crates/scp-identity/src/push_verify.rs",
@@ -2033,7 +2033,8 @@
           "sdk": "n/a",
           "pw": "n/a",
           "matrix": "n/a"
-        }
+        },
+        "split": "The story lands in two pull requests. The first carries acceptance criteria 1 to 5 and 9: the derivation, the non-collision tests, the relay URL handle, the preimage field, the verifier and push gate, and the spec 25 vector. The second carries criteria 6 to 8: the reservation that replaces the stub in `reserve_push_routing_id`, the node behavior, and the test per listener."
       }
     },
     {

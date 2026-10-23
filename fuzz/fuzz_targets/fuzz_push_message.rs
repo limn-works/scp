@@ -12,19 +12,20 @@
 
 use libfuzzer_sys::fuzz_target;
 use scp_protocol::discovery::push::{
-    PushDeregistration, PushRegistration, push_deregistration_signing_bytes,
+    PushDeregistration, PushRegistration, PushRelay, push_deregistration_signing_bytes,
     push_registration_signing_bytes,
 };
 
 fuzz_target!(|data: &[u8]| {
+    let relay = PushRelay::direct("wss://relay.example").unwrap();
     if let Ok(reg) = PushRegistration::from_msgpack(data) {
         assert!(!reg.routing_ids.is_empty());
-        push_registration_signing_bytes(&reg, "wss://relay.example").unwrap();
+        push_registration_signing_bytes(&reg, &relay).unwrap();
         let again = PushRegistration::from_msgpack(&reg.to_msgpack().unwrap()).unwrap();
         assert_eq!(again, reg);
     }
     if let Ok(dereg) = PushDeregistration::from_msgpack(data) {
-        push_deregistration_signing_bytes(&dereg, "wss://relay.example").unwrap();
+        push_deregistration_signing_bytes(&dereg, &relay).unwrap();
         let again = PushDeregistration::from_msgpack(&dereg.to_msgpack().unwrap()).unwrap();
         assert_eq!(again, dereg);
     }
