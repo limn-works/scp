@@ -741,6 +741,17 @@ export interface ContextReconnectResult {
   readonly equivocationsDetected: number;
   /** Whether `needsReconnect` was cleared on success. */
   readonly needsReconnectCleared: boolean;
+  /**
+   * Envelopes the actor accepted as application messages during this
+   * context's reconnection.
+   */
+  readonly envelopesDelivered: number;
+  /**
+   * Why writing the context's `last_relay_contact` failed after
+   * `needsReconnect` was cleared; `null` when the write succeeded or no write
+   * was due.
+   */
+  readonly relayContactError: string | null;
 }
 
 /**
@@ -2966,9 +2977,10 @@ export class SCP {
    * the `Supervisor`. On success each context's `needsReconnect` flag is
    * cleared.
    *
-   * `lastRelayContacts` maps context id to last-relay-contact Unix seconds
-   * (used to classify the offline tier); absent contexts default to the most
-   * conservative tier.
+   * Each context's offline tier is classified from the `last_relay_contact`
+   * the instance stores for it; a context with none stored takes the most
+   * conservative tier, and a store read failure rejects with
+   * `SCP-TRANS-5095`.
    *
    * Requires an active relay connection (call `transportConnect` first).
    *
@@ -2987,19 +2999,14 @@ export class SCP {
    * that keeps a member perpetually *behind* (never reaching equal count) is
    * therefore not yet detected on the catch-up path.
    */
-  async reconnect(
-    identityDid: string,
-    contextIds: readonly string[],
-    lastRelayContacts?: Readonly<Record<string, number>>,
-  ): Promise<ReconnectReport> {
+  async reconnect(identityDid: string, contextIds: readonly string[]): Promise<ReconnectReport> {
     try {
       return await (
         this.#native.contextReconnect as (
           did: string,
           ids: readonly string[],
-          contacts: Readonly<Record<string, number>> | undefined,
         ) => Promise<ReconnectReport>
-      )(identityDid, contextIds, lastRelayContacts);
+      )(identityDid, contextIds);
     } catch (err) {
       throw mapBridgeError(err);
     }

@@ -58,10 +58,10 @@ const DEFAULT_BLOB_TTL: u32 = 3600;
 /// # Construction
 ///
 /// ```rust,ignore
-/// use scp_transport::native::adapter::NativeRelayAdapter;
+/// use scp_transport::native::adapter::{CoverTraffic, NativeRelayAdapter};
 /// use scp_transport::provider::RelayTransportProvider;
 ///
-/// let adapter = NativeRelayAdapter::connect_sourced(&sourced_url, None).await?;
+/// let adapter = NativeRelayAdapter::connect_sourced(&sourced_url, None, CoverTraffic::Off).await?;
 /// let transport = RelayTransportProvider::new(adapter);
 /// let manager = ContextManager::new(
 ///     Box::new(crypto),

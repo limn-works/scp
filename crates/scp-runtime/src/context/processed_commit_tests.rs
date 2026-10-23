@@ -296,6 +296,7 @@ async fn deliver(
         crate::context::actor::commands::MessagingCommand::DeliverIncoming {
             context_id: ctx.to_owned(),
             envelope_bytes: blob,
+            mode: crate::context::actor::commands::DeliveryMode::Live,
             reply: tx,
         },
     )

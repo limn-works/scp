@@ -410,7 +410,11 @@ async fn setup_deliver(n: usize) -> Vec<Arc<DeliverInst>> {
         let probe = envelopes.remove(0);
         let delivered = bob
             .manager
-            .deliver_commit_blob(&ctx_id, probe)
+            .deliver_commit_blob(
+                &ctx_id,
+                probe,
+                scp_runtime::context::actor::commands::DeliveryMode::Live,
+            )
             .await
             .expect("probe deliver_commit_blob");
         assert!(
@@ -432,7 +436,11 @@ async fn op_deliver(inst: Arc<DeliverInst>, round: usize) -> Duration {
     let envelope = inst.envelopes[round].clone();
     let start = Instant::now();
     inst.bob
-        .deliver_commit_blob(&inst.ctx_id, envelope)
+        .deliver_commit_blob(
+            &inst.ctx_id,
+            envelope,
+            scp_runtime::context::actor::commands::DeliveryMode::Live,
+        )
         .await
         .expect("deliver_commit_blob");
     start.elapsed()

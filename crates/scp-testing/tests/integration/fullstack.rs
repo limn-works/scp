@@ -856,15 +856,23 @@ async fn full_stack_relay_encrypted_roundtrip() {
         url: relay_url,
         source: RelayUrlSource::DhtResolved,
     };
-    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .unwrap();
+    let bob_adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .unwrap();
     let bob_routing = RoutingId::new(routing_id);
     let mut stream = bob_adapter.subscribe(&bob_routing, None).await.unwrap();
 
-    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .unwrap();
+    let alice_adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .unwrap();
     let blob_id = alice_adapter.send(&outer_envelope).await.unwrap();
     assert_eq!(blob_id.as_bytes().len(), 32, "blob_id must be 32 bytes");
     println!(
@@ -994,12 +1002,20 @@ async fn full_stack_relay_multiple_messages() {
         url: relay_url,
         source: RelayUrlSource::DhtResolved,
     };
-    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .unwrap();
-    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .unwrap();
+    let bob_adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .unwrap();
+    let alice_adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .unwrap();
 
     // §9.10.4: app-data is addressed to Bob's per-member pseudonym, never the
     // shared context_routing_id. Bob subscribes to his own pseudonym — the
@@ -1180,21 +1196,33 @@ async fn full_stack_relay_three_party() {
     };
 
     // Bob and Carol each subscribe to their OWN pseudonym routing ID (§9.10.4).
-    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .unwrap();
-    let carol_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .unwrap();
+    let bob_adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .unwrap();
+    let carol_adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .unwrap();
     let bob_routing = RoutingId::new(bob_pseudonym);
     let carol_routing = RoutingId::new(carol_pseudonym);
     let mut bob_stream = bob_adapter.subscribe(&bob_routing, None).await.unwrap();
     let mut carol_stream = carol_adapter.subscribe(&carol_routing, None).await.unwrap();
 
     // Alice publishes each peer's envelope to the relay.
-    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .unwrap();
+    let alice_adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .unwrap();
     alice_adapter.send(&bob_outer).await.unwrap();
     alice_adapter.send(&carol_outer).await.unwrap();
     println!("  [2] Published per-peer envelopes to relay");

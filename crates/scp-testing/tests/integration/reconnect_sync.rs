@@ -139,9 +139,13 @@ async fn connect_transport(relay_addr: SocketAddr) -> Arc<TransportManager> {
         url: format!("ws://{relay_addr}/scp/v1"),
         source: RelayUrlSource::DhtResolved,
     };
-    let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .expect("relay adapter connect");
+    let adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .expect("relay adapter connect");
     Arc::new(TransportManager::new(sourced.url, Box::new(adapter)))
 }
 
@@ -217,22 +221,34 @@ async fn reconnect_classifies_all_three_tiers() {
         .await
         .expect("create context");
 
-    let mut short_contacts = HashMap::new();
-    short_contacts.insert(short_ctx.to_owned(), now - 60);
-    let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
-        &transport,
-        &alice.manager,
-        DID::from(ALICE_DID),
-        scp_core::context::actor::CommandSigner::local_ed25519(signing_key_for(ALICE_DID)),
-        &scp_core::store::ProtocolRepository::new_for_testing(
-            scp_platform::in_memory::InMemoryStorage::new(),
-        ),
-        vec![short_ctx.to_owned()],
-        short_contacts,
-        now,
-        policy,
+    // The driver classifies from the stored contact (ADR-029 §2), so the
+    // Short tier comes from a contact 60 s old in the repository.
+    let relay_contacts = scp_core::store::ProtocolRepository::new_for_testing(
+        scp_platform::in_memory::InMemoryStorage::new(),
+    );
+    scp_core::store::sync::RelayContactStore::store_last_relay_contact(
+        &relay_contacts,
+        short_ctx,
+        now - 60,
     )
-    .await;
+    .await
+    .expect("store the contact");
+    let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
+        scp_ffi_common::reconnect::ReconnectRequest {
+            transport: &transport,
+            supervisor: &alice.manager,
+            member_did: DID::from(ALICE_DID),
+            signer: scp_core::context::actor::CommandSigner::local_ed25519(signing_key_for(
+                ALICE_DID,
+            )),
+            relay_contacts: &relay_contacts,
+            context_ids: vec![short_ctx.to_owned()],
+            now,
+            policy,
+        },
+    )
+    .await
+    .expect("the contact reads");
 
     let result = report
         .contexts

@@ -183,10 +183,9 @@ const GOVERNANCE_TIMEOUT_SECS: u64 =
 /// documented bound on a security-liveness property.
 const MAX_CONSECUTIVE_INBOX: u32 = 32;
 
-/// Encode a 32-byte context ID as lowercase hex. Matches the string
-/// form used throughout the supervisor-side dispatch shim
-/// (`Supervisor::dispatch_*_command`) so the actor's `context_id`
-/// field is interchangeable with the shim's `ctx_id: &str` argument.
+/// Encode a 32-byte context ID as lowercase hex, for test fixtures whose
+/// string id is the hex of their hash.
+#[cfg(test)]
 fn hex_encode_context_id(id: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for byte in id {
@@ -361,11 +360,13 @@ impl ContextActor {
     ///
     /// # `context_id` derivation
     ///
-    /// The canonical context ID lives on `state.context_id` as
-    /// `[u8; 32]`. The actor's `String` copy is derived at
-    /// construction-time by hex-encoding the 32-byte hash, which
-    /// matches the string form used throughout the supervisor-side
-    /// dispatch shim. Callers therefore do not need to pass `context_id`
+    /// The actor's `String` id is the state's handle id: the key the
+    /// supervisor registers the actor under, persists its snapshot under,
+    /// and tags its events with. It is not re-derived from the 32-byte
+    /// `state.context_id`: that hash is the SHA-256 of any id that is not
+    /// lowercase hex, so its hex differs from the key, and a snapshot the
+    /// actor wrote under it would be a second persisted context that no
+    /// restore can reach. Callers therefore do not pass `context_id`
     /// separately — it is sourced from the state payload.
     #[allow(dead_code)] // production caller: Supervisor::spawn_actor_with_state
     pub(in crate::context) fn new(
@@ -373,7 +374,7 @@ impl ContextActor {
         deps: deps::ActorDeps,
         inbox: mpsc::Receiver<ContextCommand>,
     ) -> Self {
-        let context_id = hex_encode_context_id(&state.context_id);
+        let context_id = state.handle.context_id().to_owned();
         Self {
             context_id,
             inbox,
@@ -470,12 +471,25 @@ impl ContextActor {
                                     LifecycleControlCommand::PrepareForReplace { .. }
                                 )
                             );
+                            // A flush writes the whole current state, the
+                            // write a pending coalesce tick would make. The
+                            // flush therefore leaves the actor clean, so no
+                            // write of the state as it stood at the flush
+                            // follows it.
+                            let is_flush = matches!(
+                                cmd,
+                                ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { .. })
+                            );
                             // `Box::pin` the dispatch future so the large per-command
                             // handler frame lives on the heap, keeping the actor
                             // run-loop future under the `clippy::large_futures`
                             // threshold (the streaming-saga seal handlers added
                             // large stack frames held across `.await`).
                             Box::pin(self.dispatch(cmd)).await;
+                            if is_flush {
+                                self.last_persisted_at = Instant::now();
+                                self.dirty = false;
+                            }
                             if is_shutdown {
                                 break;
                             }
@@ -1987,6 +2001,8 @@ mod tests {
         // are banned in this crate): the last-written snapshot lives in an
         // `ArcSwapOption`, swapped on each write and loaded on read.
         last: std::sync::Arc<arc_swap::ArcSwapOption<crate::context::state::ContextSnapshot>>,
+        /// The key the last snapshot was persisted under.
+        last_key: std::sync::Arc<arc_swap::ArcSwapOption<String>>,
         persisted: std::sync::Arc<tokio::sync::Notify>,
     }
 
@@ -1995,6 +2011,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 last: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+                last_key: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 persisted: std::sync::Arc::new(tokio::sync::Notify::new()),
             }
         }
@@ -2011,9 +2028,11 @@ mod tests {
     impl crate::context::persistence::ContextPersistence for RecordingPersistence {
         async fn persist_context(
             &self,
-            _context_id: &str,
+            context_id: &str,
             snapshot: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.last_key
+                .store(Some(std::sync::Arc::new(context_id.to_owned())));
             self.last.store(Some(std::sync::Arc::new(snapshot.clone())));
             self.persisted.notify_one();
             Ok(())
@@ -2100,6 +2119,41 @@ mod tests {
         );
     }
 
+    /// An actor whose context id is not lowercase hex persists its snapshot
+    /// under that id, the key the supervisor restores from. The 32-byte
+    /// `state.context_id` of such an id is its SHA-256, so an actor keyed by
+    /// the hex of those bytes wrote a second snapshot that a restart listed
+    /// as a persisted context no restore could reach.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn an_actor_persists_under_its_handle_id_when_the_id_is_not_hex() {
+        let recorder = RecordingPersistence::new();
+        let deps = new_test_deps_with_persistence(Box::new(recorder.clone())).await;
+        let name = "named-context";
+        let member = "did:example:named-context-member";
+        let mut state = writable_encrypted_state(0x53, member);
+        state.context_id = crate::context::state::context_id_to_bytes(name);
+        state.handle = crate::context::ContextHandle::new(
+            name.to_owned(),
+            scp_protocol::context::ContextParams::default(),
+        );
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+        // The shutdown handler marks the actor dirty, so the final drain
+        // runs the same `persist_snapshot` as the coalesce tick.
+        handle.send_shutdown().await.expect("shutdown acks");
+        actor_task.await.expect("actor task joins");
+
+        let key = recorder
+            .last_key
+            .load_full()
+            .expect("the final drain persists a snapshot");
+        assert_eq!(key.as_str(), name);
+    }
+
     /// The run loop's **Arm-4 coalesce tick** (`dirty && deadline reached`)
     /// flushes the same pending mutation while the actor is still live —
     /// the same `persist_snapshot` the final drain uses, reached on the
@@ -2148,6 +2202,56 @@ mod tests {
         assert!(
             snapshot.access_key_store.contains(&ctx, member),
             "the coalesced access-key mutation must be durable after the Arm-4 tick"
+        );
+
+        handle.send_shutdown().await.expect("shutdown acks");
+        actor_task.await.expect("actor task joins");
+    }
+
+    /// A flush writes the pending mutation and leaves the actor clean: no
+    /// coalesce tick follows it. Without that, a write of the state as it
+    /// stood at the flush lands up to `COALESCE_INTERVAL` after the flush
+    /// returned, over anything written to the store in between.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn a_flush_leaves_no_coalesced_write_pending() {
+        let recorder = RecordingPersistence::new();
+        let deps = new_test_deps_with_persistence(Box::new(recorder.clone())).await;
+        tokio::time::pause();
+        let ctx = ctx_hex(0x54);
+        let member = "did:example:flush-clean-member";
+        let state = writable_encrypted_state(0x54, member);
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+        let handle = ContextActorHandle::from_sender(tx);
+
+        install_access_key_via_mailbox(&handle, &ctx, member).await;
+        handle
+            .send(|reply| {
+                ContextCommand::Lifecycle(
+                    crate::context::actor::commands::LifecycleCommand::FlushSnapshot { reply },
+                )
+            })
+            .await
+            .expect("the flush round-trips through the actor");
+        tokio::time::timeout(COALESCE_INTERVAL, recorder.persisted.notified())
+            .await
+            .expect("the flush persists the pending mutation");
+        assert!(
+            recorder
+                .last_snapshot()
+                .expect("the flush persisted a snapshot")
+                .access_key_store
+                .contains(&ctx, member)
+        );
+
+        assert!(
+            tokio::time::timeout(COALESCE_INTERVAL * 20, recorder.persisted.notified())
+                .await
+                .is_err(),
+            "no coalesce tick may write after a flush"
         );
 
         handle.send_shutdown().await.expect("shutdown acks");

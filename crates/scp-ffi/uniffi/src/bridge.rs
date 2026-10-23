@@ -2730,6 +2730,13 @@ pub struct ContextReconnectResult {
     pub equivocations_detected: u64,
     /// Whether `needs_reconnect` was cleared on success.
     pub needs_reconnect_cleared: bool,
+    /// Envelopes the actor accepted as application messages during this
+    /// context's reconnection.
+    pub envelopes_delivered: u64,
+    /// Why writing the context's `last_relay_contact` failed after
+    /// `needs_reconnect` was cleared; `None` when the write succeeded or no
+    /// write was due.
+    pub relay_contact_error: Option<String>,
 }
 
 /// Aggregate reconnection report (ADR-029).
@@ -2762,6 +2769,8 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for ReconnectReport {
                     mls_update_issued: c.mls_update_issued,
                     equivocations_detected: c.equivocations_detected,
                     needs_reconnect_cleared: c.needs_reconnect_cleared,
+                    envelopes_delivered: c.envelopes_delivered,
+                    relay_contact_error: c.relay_contact_error,
                 })
                 .collect(),
             messages_drained: report.messages_drained,
@@ -13139,14 +13148,14 @@ impl Scp {
     /// reconnection-driver addendum): it pulls relay-buffered messages via
     /// the `TransportManager` and reaches actor-owned reconnection state
     /// through the `Supervisor`. On success each context's `needs_reconnect`
-    /// flag is cleared. `last_relay_contacts` maps context id → last-contact
-    /// Unix seconds (tier classification); absent contexts default to the
-    /// most conservative tier.
+    /// flag is cleared. Each context's offline tier is classified from its
+    /// `last_relay_contact` in the instance's store; a context with none
+    /// stored takes the most conservative tier. A store read failure fails
+    /// the call with `SCP-TRANS-5095`.
     pub async fn context_reconnect(
         &self,
         identity: Arc<Identity>,
         context_ids: Vec<String>,
-        last_relay_contacts: std::collections::HashMap<String, u64>,
     ) -> Result<ReconnectReport, ScpError> {
         self.inner
             .core
@@ -13175,31 +13184,34 @@ impl Scp {
         // The Phase-3 consistency checkpoint signs through the identity's
         // retained custody (ADR-049 Decision 7a); no key is exported.
         let signer = resolve_identity_signer(&identity).await?;
-        // ADR-029 §2: a cleared `needs_reconnect` writes the context's
+        // ADR-029 §2: the reconnection reads and writes each context's
         // `last_relay_contact`, so a bridge without the store fails closed.
-        let relay_contacts =
-            self.inner
-                .core
-                .relay_contact_store()
-                .ok_or_else(|| ScpError::Storage {
-                    msg: "no protocol repository on this instance — the last relay \
-                          contact cannot be recorded"
-                        .to_owned(),
-                    code: codes::STORAGE_8000.to_owned(),
-                })?;
+        let relay_contacts = self.inner.core.relay_contact_store().ok_or_else(|| {
+            ScpError::storage(
+                codes::STORAGE_8000,
+                "no protocol repository on this instance — the last relay \
+                         contact cannot be read or recorded"
+                    .to_owned(),
+            )
+        })?;
 
         let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
-            &transport,
-            supervisor,
-            scp_did::DID(identity.did.clone()),
-            signer,
-            relay_contacts.as_ref(),
-            context_ids,
-            last_relay_contacts,
-            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
-            scp_core::sync::SyncPolicy::default(),
+            scp_ffi_common::reconnect::ReconnectRequest {
+                transport: &transport,
+                supervisor,
+                member_did: scp_did::DID(identity.did.clone()),
+                signer,
+                relay_contacts: relay_contacts.as_ref(),
+                context_ids,
+                now: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                policy: scp_core::sync::SyncPolicy::default(),
+            },
         )
-        .await;
+        .await
+        .map_err(|e| ScpError::Transport {
+            msg: e.to_string(),
+            code: e.code().to_owned(),
+        })?;
         Ok(report.into())
     }
 

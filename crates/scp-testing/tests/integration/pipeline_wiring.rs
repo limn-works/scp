@@ -3345,8 +3345,9 @@ fn b3_heartbeat_send_receive_loop_wired() {
 
 /// ADR-029 §2 sync-state keys: the three writers of
 /// `sync/{context_id}/last_relay_contact`. A full reconnection writes it after
-/// it clears `needs_reconnect`, a wake writes it after a successful Phase 1,
-/// and napi live delivery writes it after the actor accepts an envelope.
+/// it clears `needs_reconnect`, a wake writes it after Phases 2 and 4 fed the
+/// context's buffer to the actor, and napi live delivery writes it after the
+/// actor accepts an envelope.
 #[test]
 fn last_relay_contact_writers_wired() {
     for (src, caller, callee) in [
@@ -3373,6 +3374,11 @@ fn last_relay_contact_writers_wired() {
         (
             NAPI_CONTEXT_SRC,
             "context_subscribe_on",
+            "record_contact_after_live_delivery(",
+        ),
+        (
+            RECONNECT_DRIVER_SRC,
+            "record_contact_after_live_delivery",
             "record_relay_contact(",
         ),
     ] {
@@ -3391,6 +3397,173 @@ fn last_relay_contact_writers_wired() {
     assert!(
         clear < write,
         "clear_and_record_contact must clear needs_reconnect before it writes the contact"
+    );
+    // A wake writes only after both deliveries, so a context the deadline
+    // stops mid-delivery keeps its stored contact.
+    let body = extract_fn_body(RECONNECT_DRIVER_SRC, "wake_pull_context")
+        .expect("wake_pull_context not found in reconnect.rs");
+    let write = body
+        .find("store_last_relay_contact(")
+        .expect("no write call");
+    for delivery in ["deliver_commit_blobs_until_steady(", "refeed_buffer("] {
+        let at = body
+            .find(delivery)
+            .unwrap_or_else(|| panic!("wake_pull_context must call {delivery}"));
+        assert!(
+            at < write,
+            "wake_pull_context must call {delivery} before it writes the contact"
+        );
+    }
+}
+
+/// ADR-029 §2 push-wake pull mode step 5: a full reconnection sends the
+/// sender-key answers a wake left queued. `reconnect_contexts` passes each
+/// context's outcome through `send_queued_answers`, which calls
+/// `Supervisor::send_queued_sender_keys`, which dispatches
+/// `MessagingCommand::SendQueuedSenderKeys` to the handler that drains the
+/// queue.
+#[test]
+fn full_reconnect_sends_the_queued_sender_key_answers() {
+    for (src, caller, callee) in [
+        (
+            RECONNECT_DRIVER_SRC,
+            "reconnect_contexts",
+            "send_queued_answers(",
+        ),
+        (
+            RECONNECT_DRIVER_SRC,
+            "send_queued_answers",
+            ".send_queued_sender_keys(",
+        ),
+        (
+            SUPERVISOR_SRC,
+            "send_queued_sender_keys",
+            "MessagingCommand::SendQueuedSenderKeys",
+        ),
+        (
+            HANDLERS_MESSAGING_SRC,
+            "handle_send_queued_sender_keys",
+            "drain_and_deliver_sender_keys(",
+        ),
+    ] {
+        assert!(
+            fn_body_contains(src, caller, callee),
+            "{caller} must call {callee} (ADR-029 §2 push-wake pull mode step 5)"
+        );
+    }
+}
+
+/// ADR-029 §2 push-wake pull mode step 5: every blob a wake feeds the actor
+/// carries `DeliveryMode::PullOnly` from the pull to the handler, and the
+/// handler sends queued sender-key answers only in `DeliveryMode::Live`.
+/// `wake_pull_context` passes `DeliveryMode::PullOnly` to both feeds, each
+/// feed passes its `mode` to `Supervisor::deliver_commit_blob`, which puts it
+/// in `MessagingCommand::DeliverIncoming`; the messaging dispatch hands it to
+/// `handle_deliver_incoming`, whose `Live` arm alone calls
+/// `drain_and_deliver_sender_keys`.
+#[test]
+fn push_wake_delivers_in_pull_only_mode() {
+    let wake = extract_fn_body(RECONNECT_DRIVER_SRC, "wake_pull_context")
+        .expect("wake_pull_context not found in reconnect.rs");
+    for feed in ["deliver_commit_blobs_until_steady", "refeed_buffer"] {
+        let args =
+            call_args(&wake, feed).unwrap_or_else(|| panic!("wake_pull_context must call {feed}"));
+        assert!(
+            args.contains("DeliveryMode::PullOnly") && !args.contains("DeliveryMode::Live"),
+            "wake_pull_context must pass DeliveryMode::PullOnly to {feed}: {args}"
+        );
+    }
+    for feed in ["deliver_commit_blobs_until_steady", "refeed_buffer"] {
+        let signature = extract_fn_signature(RECONNECT_DRIVER_SRC, feed)
+            .unwrap_or_else(|| panic!("{feed} not found in reconnect.rs"));
+        assert!(
+            signature.contains("mode: DeliveryMode"),
+            "{feed} must take the delivery mode: {signature}"
+        );
+        let body = extract_fn_body(RECONNECT_DRIVER_SRC, feed)
+            .unwrap_or_else(|| panic!("{feed} not found in reconnect.rs"));
+        let args = call_args(&body, ".deliver_commit_blob")
+            .unwrap_or_else(|| panic!("{feed} must call deliver_commit_blob"));
+        assert!(
+            args.contains("mode") && !args.contains("DeliveryMode::"),
+            "{feed} must pass its own mode to deliver_commit_blob: {args}"
+        );
+    }
+    let deliver = extract_fn_body(SUPERVISOR_SRC, "deliver_commit_blob")
+        .expect("Supervisor::deliver_commit_blob exists");
+    let command = &deliver[deliver
+        .find("MessagingCommand::DeliverIncoming")
+        .expect("deliver_commit_blob must build DeliverIncoming")..];
+    assert!(
+        command[..command.find('}').expect("a struct literal")].contains("mode"),
+        "Supervisor::deliver_commit_blob must put its mode in DeliverIncoming"
+    );
+    let dispatch = extract_fn_body(HANDLERS_MESSAGING_SRC, "dispatch")
+        .expect("the messaging handler dispatch exists");
+    assert!(
+        dispatch.contains(
+            "handle_deliver_incoming(cell, deps, &context_id, &envelope_bytes, mode, reply)"
+        ),
+        "the messaging dispatch must hand the command's mode to handle_deliver_incoming"
+    );
+    let handler = extract_fn_body(HANDLERS_MESSAGING_SRC, "handle_deliver_incoming")
+        .expect("handle_deliver_incoming exists");
+    assert_eq!(
+        handler.matches("drain_and_deliver_sender_keys(").count(),
+        1,
+        "handle_deliver_incoming must send queued answers on one arm only"
+    );
+    let live = handler
+        .find("DeliveryMode::Live =>")
+        .expect("handle_deliver_incoming must match DeliveryMode::Live");
+    let drain = handler
+        .find("drain_and_deliver_sender_keys(")
+        .expect("the Live arm drains");
+    let pull_only = handler
+        .find("DeliveryMode::PullOnly => {}")
+        .expect("the PullOnly arm must do nothing");
+    assert!(
+        live < drain && drain < pull_only,
+        "only the DeliveryMode::Live arm may send queued sender-key answers"
+    );
+}
+
+/// ADR-029 §2 push-wake pull mode step 4: the wake's targets come from each
+/// resident actor. `pull_on_wake` calls `Supervisor::wake_targets`, which sends
+/// `PushCommand::WakeTarget` through `dispatch_push_command` to every known
+/// context; `handlers::push::dispatch` answers it from
+/// `push_helpers::wake_target`.
+#[test]
+fn push_wake_targets_reach_push_helpers() {
+    assert!(
+        fn_body_contains(PUSH_WAKE_SRC, "pull_on_wake", ".wake_targets()"),
+        "pull_on_wake must list its targets through Supervisor::wake_targets"
+    );
+    assert!(
+        fn_body_contains(
+            PUSH_WAKE_SRC,
+            "pull_on_wake",
+            ".restore_unrestored_contexts()"
+        ),
+        "pull_on_wake must restore every persisted Active context before it lists targets"
+    );
+    for step in [
+        "self.known_context_ids()",
+        ".dispatch_push_command(",
+        "PushCommand::WakeTarget",
+    ] {
+        assert!(
+            fn_body_contains(SUPERVISOR_SRC, "wake_targets", step),
+            "Supervisor::wake_targets must contain `{step}`"
+        );
+    }
+    assert!(
+        fn_body_contains(
+            HANDLERS_PUSH_SRC,
+            "dispatch",
+            "push_helpers::wake_target(state, now_secs)"
+        ),
+        "handlers::push::dispatch must answer PushCommand::WakeTarget from push_helpers::wake_target"
     );
 }
 

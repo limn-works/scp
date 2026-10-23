@@ -59,12 +59,16 @@ async fn main() {
         source: RelayUrlSource::DhtResolved,
     };
     let profile = scp_transport::profile::TransportProfile::platform_default();
-    let adapter = NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("connection failed: {e}");
-            std::process::exit(1);
-        });
+    let adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        Some(&profile),
+        scp_transport::native::adapter::CoverTraffic::FromProfile,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        eprintln!("connection failed: {e}");
+        std::process::exit(1);
+    });
 
     eprintln!("Subscribing to routing_id {}...", hex(&routing_id));
     let mut stream = adapter.subscribe(&rid, None).await.unwrap_or_else(|e| {

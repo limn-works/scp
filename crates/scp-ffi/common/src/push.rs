@@ -8,17 +8,29 @@
 //! (`SCP-TRANS-5080`) before any I/O. It then runs, under one
 //! [`WAKE_DEADLINE`]:
 //!
-//! 1. a restore of every persisted context when none is resident;
-//! 2. a dial of the union of the Active contexts' persisted relay URLs on a
+//! 1. the startup restore when no context is resident, and then a restore of
+//!    each persisted Active context that is still not resident, with no saga
+//!    replay ([`Supervisor::restore_unrestored_contexts`](scp_core::context::supervisor::Supervisor::restore_unrestored_contexts));
+//! 2. one dial of the union of the Active contexts' persisted relay URLs on a
 //!    transient transport with no cover traffic (`09-security-model.md`
-//!    §9.10.6), never installed on the instance and dropped on return;
-//! 3. [`wake_pull_contexts`], which runs Phases 1, 2 and 4 with no
+//!    §9.10.6) and one connection per relay ([`DialBudget::DialSet`]), never
+//!    installed on the instance and dropped on return;
+//! 3. [`wake_pull_contexts`], which runs Phases 1, 2 and 4 for each context
+//!    at that context's own relays, delivers in pull-only mode, and takes no
 //!    [`CommandSigner`](scp_core::context::actor::CommandSigner), so the
-//!    device signs and publishes nothing and `needs_reconnect` stays set.
+//!    device signs, ratchets and publishes nothing and `needs_reconnect`
+//!    stays set. A relay that failed to dial fails only the contexts that
+//!    name it.
+//!
+//! The outcome is [`WakeOutcome::NewData`] when the actor accepted an
+//! application envelope in any context, even one the deadline stopped;
+//! otherwise [`WakeOutcome::Failed`] when any step or context failed;
+//! otherwise [`WakeOutcome::NoData`]. Each [`WakeFailure`] has a stable code
+//! ([`WakeFailure::code`]) and a flat view for the FFI ([`WakeFailureView`]).
 //!
 //! The FFI exports that call [`handle_wake`] belong to story PUSH-015.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use scp_core::context::ContextError;
@@ -27,9 +39,9 @@ use scp_protocol::sync::SyncPolicy;
 use scp_transport::native::adapter::CoverTraffic;
 use serde_json::Value;
 
-use crate::bridge_instance::{CoreFields, LifecycleError};
+use crate::bridge_instance::{CoreFields, DialBudget, LifecycleError};
 use crate::error_codes;
-use crate::reconnect::{WakePullError, wake_pull_contexts};
+use crate::reconnect::{DeliveryTally, WakePull, WakePullError, wake_pull_contexts};
 
 /// The one deadline over a wake's restore, dial, queries and deliveries
 /// (ADR-029 §2 push-wake pull mode step 7). iOS gives a woken app about 30
@@ -40,15 +52,18 @@ pub const WAKE_DEADLINE: Duration = Duration::from_secs(25);
 /// 7). iOS maps the three values to `UIBackgroundFetchResult`.
 #[derive(Debug)]
 pub enum WakeOutcome {
-    /// The actor accepted at least one application envelope.
+    /// The actor accepted at least one application envelope in some context.
     NewData,
-    /// Every relay answered and the actor accepted no application envelope.
+    /// Every step and every context's pull succeeded, and the actor accepted
+    /// no application envelope.
     NoData,
-    /// The pull did not complete; the reason says which step failed.
+    /// The actor accepted no application envelope, and a step or a context's
+    /// pull failed; the reason says which.
     Failed(WakeFailure),
 }
 
-/// Why a wake returned [`WakeOutcome::Failed`].
+/// Why a wake returned [`WakeOutcome::Failed`]. Each variant is one cause
+/// ADR-029 §2 push-wake pull mode step 7 lists.
 #[derive(Debug, thiserror::Error)]
 pub enum WakeFailure {
     /// The instance was shut down.
@@ -76,18 +91,84 @@ pub enum WakeFailure {
     /// Listing the Active contexts' relay URLs and routing IDs failed.
     #[error("listing the wake targets failed: {0}")]
     Targets(#[source] ContextError),
-    /// Active contexts exist but none persists a relay URL.
-    #[error("no Active context persists a relay URL")]
-    NoRelays,
-    /// A relay dial failed or was cancelled.
-    #[error("relay dial failed: {0}")]
-    Dial(#[source] LifecycleError),
-    /// A Phase 1 query or a contact-store access failed.
-    #[error(transparent)]
-    Pull(WakePullError),
+    /// A suspend or shutdown cancelled the relay dial.
+    #[error("relay dial cancelled: {0}")]
+    DialCancelled(#[source] LifecycleError),
+    /// One or more contexts' pulls failed; each entry names its context.
+    #[error("{} context pull(s) failed: {}", .0.len(), join_failures(.0))]
+    Pull(Vec<WakePullError>),
     /// [`WAKE_DEADLINE`] expired before the pull completed.
     #[error("the wake deadline of {} seconds expired", WAKE_DEADLINE.as_secs())]
     DeadlineExpired,
+}
+
+/// The `Display` of each failure, joined by `"; "`.
+fn join_failures(failures: &[WakePullError]) -> String {
+    failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+impl WakeFailure {
+    /// The bridge error code of this failure: one `SCP-TRANS` code per
+    /// variant, `SCP-TRANS-5085` to `SCP-TRANS-5094` (`sdk-common.md`).
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::ShutDown => error_codes::TRANS_5085,
+            Self::NoSupervisor => error_codes::TRANS_5086,
+            Self::NoLocalIdentity => error_codes::TRANS_5087,
+            Self::NoContactStore => error_codes::TRANS_5088,
+            Self::Restore(_) => error_codes::TRANS_5089,
+            Self::Unrestored { .. } => error_codes::TRANS_5090,
+            Self::Targets(_) => error_codes::TRANS_5091,
+            Self::DialCancelled(_) => error_codes::TRANS_5092,
+            Self::Pull(_) => error_codes::TRANS_5093,
+            Self::DeadlineExpired => error_codes::TRANS_5094,
+        }
+    }
+
+    /// The flat view an FFI bridge returns for this failure.
+    #[must_use]
+    pub fn view(&self) -> WakeFailureView {
+        let context_ids = match self {
+            Self::Unrestored { context_ids } => context_ids.clone(),
+            Self::Pull(failures) => failures
+                .iter()
+                .map(|f| f.context_id().to_owned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            Self::ShutDown
+            | Self::NoSupervisor
+            | Self::NoLocalIdentity
+            | Self::NoContactStore
+            | Self::Restore(_)
+            | Self::Targets(_)
+            | Self::DialCancelled(_)
+            | Self::DeadlineExpired => Vec::new(),
+        };
+        WakeFailureView {
+            code: self.code(),
+            message: self.to_string(),
+            context_ids,
+        }
+    }
+}
+
+/// A [`WakeFailure`] flattened for the FFI bridges, which carry no Rust enum
+/// with payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeFailureView {
+    /// The variant's stable code ([`WakeFailure::code`]).
+    pub code: &'static str,
+    /// The failure's `Display` text.
+    pub message: String,
+    /// The contexts the failure names, sorted and deduplicated; empty for a
+    /// failure of the whole wake.
+    pub context_ids: Vec<String>,
 }
 
 /// A wake the device must not act on.
@@ -184,19 +265,49 @@ pub async fn handle_wake(
     payload: &[u8],
 ) -> Result<WakeOutcome, WakeError> {
     check_wake_payload(platform, payload)?;
-    Ok(
-        match tokio::time::timeout(WAKE_DEADLINE, pull_on_wake(core)).await {
-            Ok(Ok(0)) => WakeOutcome::NoData,
-            Ok(Ok(_)) => WakeOutcome::NewData,
-            Ok(Err(failure)) => WakeOutcome::Failed(failure),
-            Err(_elapsed) => WakeOutcome::Failed(WakeFailure::DeadlineExpired),
-        },
-    )
+    // The tally lives outside the deadline, so the envelopes a context
+    // delivered before the deadline dropped the pull still count.
+    let tally = DeliveryTally::default();
+    let result = tokio::time::timeout(WAKE_DEADLINE, pull_on_wake(core, &tally)).await;
+    Ok(wake_outcome(tally.total(), result))
 }
 
-/// The steps after the payload check; returns the count of application
-/// envelopes the actor accepted.
-async fn pull_on_wake(core: &CoreFields) -> Result<u64, WakeFailure> {
+/// The ADR-029 §2 push-wake pull mode step 7 outcome rule over the count of
+/// accepted application envelopes and the pull's result.
+fn wake_outcome(
+    delivered: u64,
+    result: Result<Result<Vec<WakePullError>, WakeFailure>, tokio::time::error::Elapsed>,
+) -> WakeOutcome {
+    let failure = match result {
+        Ok(Ok(failures)) if failures.is_empty() => None,
+        Ok(Ok(failures)) => Some(WakeFailure::Pull(failures)),
+        Ok(Err(failure)) => Some(failure),
+        Err(_elapsed) => Some(WakeFailure::DeadlineExpired),
+    };
+    match (delivered, failure) {
+        (0, None) => WakeOutcome::NoData,
+        (0, Some(failure)) => WakeOutcome::Failed(failure),
+        (_, failure) => {
+            if let Some(failure) = failure {
+                tracing::warn!(
+                    code = failure.code(),
+                    error = %failure,
+                    delivered,
+                    "push wake delivered data and a step failed"
+                );
+            }
+            WakeOutcome::NewData
+        }
+    }
+}
+
+/// The steps after the payload check. Returns the failure of each context
+/// whose pull failed; every accepted application envelope is added to
+/// `tally`.
+async fn pull_on_wake(
+    core: &CoreFields,
+    tally: &DeliveryTally,
+) -> Result<Vec<WakePullError>, WakeFailure> {
     // A suspended instance still pulls: the wake arrives while the app is
     // backgrounded, and the transient transport leaves the instance's own
     // transport untouched.
@@ -204,26 +315,29 @@ async fn pull_on_wake(core: &CoreFields) -> Result<u64, WakeFailure> {
         return Err(WakeFailure::ShutDown);
     }
     let supervisor = core.supervisor().ok_or(WakeFailure::NoSupervisor)?;
-    if supervisor.local_member_did().is_none() {
+    if supervisor.node_identity().is_err() {
         return Err(WakeFailure::NoLocalIdentity);
     }
     let relay_contacts = core
         .relay_contact_store()
         .ok_or(WakeFailure::NoContactStore)?;
 
+    // A cold process runs the startup restore, context restore then saga
+    // replay. A context still missing after it, or one whose restore failed in
+    // an earlier pass of this process, is restored alone: a saga replay in a
+    // live process would reconcile in-flight sagas as crashed.
     if !supervisor.has_known_contexts() {
         supervisor
             .restore_on_startup()
             .await
             .map_err(WakeFailure::Restore)?;
     }
-    // A context whose restore failed (here or at resume) has no actor, so
-    // `wake_targets` cannot name it; `NoData` would then report traffic the
-    // wake never pulled.
     let context_ids = supervisor
-        .unrestored_active_contexts()
+        .restore_unrestored_contexts()
         .await
         .map_err(WakeFailure::Restore)?;
+    // A context whose restore failed has no actor, so `wake_targets` cannot
+    // name it; `NoData` would then report traffic the wake never pulled.
     if !context_ids.is_empty() {
         return Err(WakeFailure::Unrestored { context_ids });
     }
@@ -232,34 +346,45 @@ async fn pull_on_wake(core: &CoreFields) -> Result<u64, WakeFailure> {
         .await
         .map_err(WakeFailure::Targets)?;
     if targets.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let urls: BTreeSet<String> = targets
         .iter()
         .flat_map(|t| t.relay_urls.iter().cloned())
         .collect();
-    if urls.is_empty() {
-        return Err(WakeFailure::NoRelays);
-    }
 
-    let dialed = core
-        .dial_relays(urls.into_iter().collect(), CoverTraffic::Off)
-        .await
-        .map_err(WakeFailure::Dial)?;
-    if let Some(failure) = dialed.first_failure {
-        return Err(WakeFailure::Dial(failure));
-    }
+    // Every failed URL fails only the contexts that name it, inside
+    // `wake_pull_contexts`.
+    let (manager, unreachable) = if urls.is_empty() {
+        (
+            scp_transport::TransportManager::with_connection_budget(1),
+            BTreeMap::new(),
+        )
+    } else {
+        let dialed = core
+            .dial_relays(
+                urls.into_iter().collect(),
+                CoverTraffic::Off,
+                DialBudget::DialSet,
+            )
+            .await
+            .map_err(WakeFailure::DialCancelled)?;
+        (dialed.manager, dialed.failed)
+    };
     let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
-    wake_pull_contexts(
-        &dialed.manager,
-        supervisor,
+    Ok(wake_pull_contexts(
+        &WakePull {
+            transport: &manager,
+            supervisor,
+            unreachable: &unreachable,
+            relay_contacts: relay_contacts.as_ref(),
+            policy: &SyncPolicy::default(),
+            now,
+            tally,
+        },
         &targets,
-        relay_contacts.as_ref(),
-        &SyncPolicy::default(),
-        now,
     )
-    .await
-    .map_err(WakeFailure::Pull)
+    .await)
 }
 
 #[cfg(test)]
@@ -361,6 +486,194 @@ mod tests {
             matches!(outcome, WakeOutcome::Failed(WakeFailure::ShutDown)),
             "{outcome:?}"
         );
+    }
+
+    /// Every `WakeFailure` variant has its own code, and each code is one the
+    /// error-code registry defines.
+    #[test]
+    fn every_wake_failure_has_a_distinct_code_and_a_flat_view() {
+        let failures = [
+            WakeFailure::ShutDown,
+            WakeFailure::NoSupervisor,
+            WakeFailure::NoLocalIdentity,
+            WakeFailure::NoContactStore,
+            WakeFailure::Restore(ContextError::PersistenceFailed("x".to_owned())),
+            WakeFailure::Unrestored {
+                context_ids: vec!["b".to_owned(), "a".to_owned()],
+            },
+            WakeFailure::Targets(ContextError::PersistenceFailed("x".to_owned())),
+            WakeFailure::DialCancelled(LifecycleError::AlreadyShutDown),
+            WakeFailure::Pull(vec![
+                WakePullError::NoRelays {
+                    context_id: "c2".to_owned(),
+                },
+                WakePullError::RelayUnavailable {
+                    context_id: "c1".to_owned(),
+                    relay_url: "wss://r".to_owned(),
+                    reason: "refused".to_owned(),
+                },
+                WakePullError::NoRelays {
+                    context_id: "c2".to_owned(),
+                },
+            ]),
+            WakeFailure::DeadlineExpired,
+        ];
+        let codes: BTreeSet<String> = failures.iter().map(|f| f.code().to_owned()).collect();
+        assert_eq!(codes.len(), failures.len(), "each variant has its own code");
+        let expected: BTreeSet<String> = (5085..=5094).map(|n| format!("SCP-TRANS-{n}")).collect();
+        assert_eq!(codes, expected);
+        assert_eq!(
+            failures[5].view().context_ids,
+            vec!["b".to_owned(), "a".to_owned()]
+        );
+        let pull = failures[8].view();
+        assert_eq!(pull.code, error_codes::TRANS_5093);
+        assert_eq!(pull.context_ids, vec!["c1".to_owned(), "c2".to_owned()]);
+        assert!(pull.message.contains("wss://r"), "{}", pull.message);
+        assert!(failures[0].view().context_ids.is_empty());
+    }
+
+    /// The step 7 outcome rule: a delivery in any context gives `NewData`
+    /// whatever failed; otherwise any failure gives `Failed`; otherwise
+    /// `NoData`.
+    #[tokio::test]
+    async fn the_outcome_rule_puts_a_delivery_before_a_failure() {
+        async fn elapsed() -> tokio::time::error::Elapsed {
+            tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+                .await
+                .unwrap_err()
+        }
+        let failed = || {
+            vec![WakePullError::NoRelays {
+                context_id: "b".to_owned(),
+            }]
+        };
+        assert!(matches!(
+            wake_outcome(0, Ok(Ok(Vec::new()))),
+            WakeOutcome::NoData
+        ));
+        assert!(matches!(
+            wake_outcome(2, Ok(Ok(Vec::new()))),
+            WakeOutcome::NewData
+        ));
+        assert!(matches!(
+            wake_outcome(1, Ok(Ok(failed()))),
+            WakeOutcome::NewData
+        ));
+        assert!(matches!(
+            wake_outcome(1, Err(elapsed().await)),
+            WakeOutcome::NewData
+        ));
+        assert!(matches!(
+            wake_outcome(0, Ok(Ok(failed()))),
+            WakeOutcome::Failed(WakeFailure::Pull(ref f)) if f.len() == 1
+        ));
+        assert!(matches!(
+            wake_outcome(0, Err(elapsed().await)),
+            WakeOutcome::Failed(WakeFailure::DeadlineExpired)
+        ));
+        assert!(matches!(
+            wake_outcome(0, Ok(Err(WakeFailure::NoContactStore))),
+            WakeOutcome::Failed(WakeFailure::NoContactStore)
+        ));
+    }
+
+    /// A supervisor with no crypto provider holds no local member DID, so the
+    /// wake fails before it opens anything.
+    #[tokio::test]
+    async fn an_instance_without_a_local_identity_fails_the_wake() {
+        let core = CoreFields::with_supervisor(std::sync::Arc::new(
+            scp_core::context::supervisor::Supervisor::for_query_shim(),
+        ));
+        let outcome = handle_wake(&core, PushPlatform::Fcm, br#"{"scp":"1"}"#)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, WakeOutcome::Failed(WakeFailure::NoLocalIdentity)),
+            "{outcome:?}"
+        );
+    }
+
+    /// An instance with an identity and no `last_relay_contact` store fails
+    /// the wake.
+    #[tokio::test]
+    async fn an_instance_without_a_contact_store_fails_the_wake() {
+        let core = CoreFields::with_supervisor(crate::bridge_instance::tests::test_supervisor());
+        let outcome = handle_wake(&core, PushPlatform::Fcm, br#"{"scp":"1"}"#)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, WakeOutcome::Failed(WakeFailure::NoContactStore)),
+            "{outcome:?}"
+        );
+    }
+
+    type Contacts = std::sync::Arc<
+        scp_core::store::ProtocolRepository<scp_platform::in_memory::InMemoryStorage>,
+    >;
+
+    fn contacts() -> Contacts {
+        std::sync::Arc::new(scp_core::store::ProtocolRepository::new_for_testing(
+            scp_platform::in_memory::InMemoryStorage::new(),
+        ))
+    }
+
+    /// A context with an empty relay set fails with `NoRelays`, a context
+    /// naming an undialed relay fails with `RelayUnavailable`, neither is
+    /// queried, and neither gets a contact.
+    #[tokio::test]
+    async fn a_context_with_no_relay_or_an_undialed_relay_fails_alone() {
+        let supervisor = crate::bridge_instance::tests::test_supervisor();
+        let manager = scp_transport::TransportManager::with_connection_budget(1);
+        let store = contacts();
+        let targets = vec![
+            scp_core::context::ContextWakeTarget {
+                context_id: "no-relay".to_owned(),
+                relay_urls: Vec::new(),
+                routing_ids: vec![[1; 32]],
+            },
+            scp_core::context::ContextWakeTarget {
+                context_id: "dead-relay".to_owned(),
+                relay_urls: vec!["wss://dead.example".to_owned()],
+                routing_ids: vec![[2; 32]],
+            },
+        ];
+        let unreachable = BTreeMap::from([(
+            "wss://dead.example".to_owned(),
+            "connection refused".to_owned(),
+        )]);
+        let tally = DeliveryTally::default();
+        let failures = wake_pull_contexts(
+            &WakePull {
+                transport: &manager,
+                supervisor: &supervisor,
+                unreachable: &unreachable,
+                relay_contacts: store.as_ref(),
+                policy: &SyncPolicy::default(),
+                now: 1_700_000_000,
+                tally: &tally,
+            },
+            &targets,
+        )
+        .await;
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            matches!(&failures[0], WakePullError::NoRelays { context_id } if context_id == "no-relay"),
+            "{failures:?}"
+        );
+        assert!(
+            matches!(&failures[1], WakePullError::RelayUnavailable { context_id, relay_url, reason }
+                if context_id == "dead-relay" && relay_url == "wss://dead.example" && reason == "connection refused"),
+            "{failures:?}"
+        );
+        assert_eq!(tally.total(), 0);
+        for id in ["no-relay", "dead-relay"] {
+            assert_eq!(
+                store.load_last_relay_contact(id).await.unwrap(),
+                None,
+                "{id}"
+            );
+        }
     }
 
     #[tokio::test]

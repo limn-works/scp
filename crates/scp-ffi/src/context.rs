@@ -2611,6 +2611,15 @@ pub struct PyContextReconnectResult {
     /// Whether `needs_reconnect` was cleared on success.
     #[pyo3(get)]
     pub needs_reconnect_cleared: bool,
+    /// Envelopes the actor accepted as application messages during this
+    /// context's reconnection.
+    #[pyo3(get)]
+    pub envelopes_delivered: u64,
+    /// Why writing the context's `last_relay_contact` failed after
+    /// `needs_reconnect` was cleared; `None` when the write succeeded or no
+    /// write was due.
+    #[pyo3(get)]
+    pub relay_contact_error: Option<String>,
 }
 
 /// Aggregate reconnection report surfaced to Python.
@@ -2648,6 +2657,8 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for PyReconnectReport {
                     mls_update_issued: c.mls_update_issued,
                     equivocations_detected: c.equivocations_detected,
                     needs_reconnect_cleared: c.needs_reconnect_cleared,
+                    envelopes_delivered: c.envelopes_delivered,
+                    relay_contact_error: c.relay_contact_error,
                 })
                 .collect(),
             messages_drained: report.messages_drained,
@@ -5616,21 +5627,21 @@ impl crate::scp::PyScp {
     ///
     /// `context_ids` is the set of contexts to consider; each is driven
     /// through the protocol only if the actor reports it `needs_reconnect`.
-    /// `last_relay_contacts` maps `context_id` → last-relay-contact Unix
-    /// seconds (used to classify the offline tier). Contexts absent from
-    /// the map default to the most conservative tier.
+    /// Each context's offline tier is classified from its
+    /// `last_relay_contact` in the instance's store; a context with none
+    /// stored takes the most conservative tier.
     ///
     /// # Errors
     ///
     /// Returns `RuntimeError` if no relay is connected, the supervisor is
-    /// not initialized, or the signing key cannot be resolved.
-    #[pyo3(signature = (identity_did, context_ids, last_relay_contacts=None))]
+    /// not initialized, the signing key cannot be resolved, or a stored
+    /// `last_relay_contact` cannot be read (`SCP-TRANS-5095`).
+    #[pyo3(signature = (identity_did, context_ids))]
     pub fn context_reconnect(
         &self,
         py: Python<'_>,
         identity_did: &str,
         context_ids: Vec<String>,
-        last_relay_contacts: Option<HashMap<String, u64>>,
     ) -> PyResult<PyReconnectReport> {
         let bi = &*self.inner;
         validate::validate_did(identity_did)?;
@@ -5646,33 +5657,38 @@ impl crate::scp::PyScp {
         // Phase-3 consistency checkpoint); the private key stays in custody
         // (ADR-049 Decision 7a).
         let signer = resolve_signer(py, bi, identity_did)?;
-        // ADR-029 §2: a cleared `needs_reconnect` writes the context's
+        // ADR-029 §2: the reconnection reads and writes each context's
         // `last_relay_contact`, so a bridge without the store fails closed.
         let relay_contacts = bi.core.relay_contact_store().ok_or_else(|| {
-            PyRuntimeError::new_err(format!(
-                "[{}] no protocol repository on this instance — the last relay \
-                 contact cannot be recorded",
-                scp_ffi_common::error_codes::STORAGE_8000
-            ))
+            crate::error::ScpPyError::ContextError {
+                message: "no protocol repository on this instance — the last relay \
+                              contact cannot be read or recorded"
+                    .to_owned(),
+                code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),
+            }
         })?;
 
-        let contacts = last_relay_contacts.unwrap_or_default();
         let now = scp_clock::SystemClock.now_secs();
 
         let report = crate::actor_wait::block_on_released(
             py,
             scp_ffi_common::reconnect::reconnect_contexts_no_drain(
-                &transport,
-                sup,
-                scp_did::DID(identity_did.to_owned()),
-                signer,
-                relay_contacts.as_ref(),
-                context_ids,
-                contacts,
-                now,
-                scp_core::sync::SyncPolicy::default(),
+                scp_ffi_common::reconnect::ReconnectRequest {
+                    transport: &transport,
+                    supervisor: sup,
+                    member_did: scp_did::DID(identity_did.to_owned()),
+                    signer,
+                    relay_contacts: relay_contacts.as_ref(),
+                    context_ids,
+                    now,
+                    policy: scp_core::sync::SyncPolicy::default(),
+                },
             ),
-        )?;
+        )?
+        .map_err(|e| crate::error::ScpPyError::TransportError {
+            message: e.to_string(),
+            code: e.code().to_owned(),
+        })?;
         Ok(report.into())
     }
 

@@ -64,12 +64,16 @@ async fn main() {
     };
     let profile = scp_transport::profile::TransportProfile::platform_default();
     let adapter = Arc::new(
-        NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("connection failed: {e}");
-                std::process::exit(1);
-            }),
+        NativeRelayAdapter::connect_sourced(
+            &sourced,
+            Some(&profile),
+            scp_transport::native::adapter::CoverTraffic::FromProfile,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("connection failed: {e}");
+            std::process::exit(1);
+        }),
     );
 
     eprintln!("Subscribing to routing_id {}...", hex(&routing_id));

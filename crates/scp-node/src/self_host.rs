@@ -828,6 +828,9 @@ where
         &sourced,
         Some(bearer),
         Some(&profile),
+        // The node's supervisor publishes over this connection like any
+        // interactive client, so it runs the profile's cover traffic.
+        scp_transport::native::adapter::CoverTraffic::FromProfile,
     )
     .await
     .map_err(|e| SelfHostError::RelayConnect(e.to_string()))?;

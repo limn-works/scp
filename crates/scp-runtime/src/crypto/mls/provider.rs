@@ -1107,12 +1107,10 @@ impl NodeMlsFactory {
 
     /// Returns this provider's local member DID — the key under which the local
     /// sender's epoch is recorded in the authoritative floor registry, and the
-    /// value the recv seam's F-3 `debug_assert_ne!` checks against. Public so
-    /// the FFI push-wake pull reads the bridge's local identity through
-    /// [`Supervisor::local_member_did`](crate::context::supervisor::Supervisor::local_member_did)
-    /// (ADR-025 criterion 4).
+    /// value the recv seam's F-3 `debug_assert_ne!` checks against. `pub(crate)` —
+    /// internal read with no FFI surface.
     #[must_use]
-    pub fn local_did(&self) -> &str {
+    pub(crate) fn local_did(&self) -> &str {
         &self.local_did
     }
 

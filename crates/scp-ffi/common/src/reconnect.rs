@@ -45,12 +45,18 @@
 //! Phase 2 and Phase 4 only, over the signer-free functions [`pull_buffered`],
 //! [`deliver_commit_blobs_until_steady`] and [`refeed_buffer`] that the Tier 1
 //! driver also calls. None of them takes a [`CommandSigner`], so the pull
-//! cannot sign a checkpoint or an Update.
+//! cannot sign a checkpoint or an Update. The pull queries each context only at
+//! the relays its own relay set names ([`RelayScope::Only`]) and delivers in
+//! [`DeliveryMode::PullOnly`], so the actor sends no sender-key answer a pulled
+//! `KeyRequest` queues; [`reconnect_contexts`] sends those answers on the next
+//! full reconnection. A context's `last_relay_contact` is written only after
+//! Phases 2 and 4 have fed every blob of its buffer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use scp_core::context::ContextWakeTarget;
+use scp_core::context::actor::commands::DeliveryMode;
 use scp_core::context::supervisor::Supervisor;
 use scp_core::store::StoreError;
 use scp_core::store::sync::RelayContactStore;
@@ -109,6 +115,28 @@ impl DeliveryTally {
             .copied()
             .unwrap_or(0)
     }
+
+    /// The count over every context.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .fold(0u64, |acc, n| acc.saturating_add(*n))
+    }
+}
+
+/// Which relays a Phase 1 pull queries.
+#[derive(Debug, Clone, Copy)]
+pub enum RelayScope<'a> {
+    /// [`TransportManager::query`] on the instance's installed transport: the
+    /// full reconnection's Tier 1 pull.
+    Installed,
+    /// [`TransportManager::query_relays`] over exactly these relays: one
+    /// context's persisted relay set in a push-wake pull (ADR-029 §2
+    /// push-wake pull mode step 4).
+    Only(&'a [String]),
 }
 
 /// What one feed of a Phase 1 buffer to the actor accepted.
@@ -170,7 +198,7 @@ fn envelope_to_buffered(
     })
 }
 
-/// Phase 1 body: QUERYs every connected relay for each of `routing_ids`.
+/// Phase 1 body: QUERYs the relays `scope` names for each of `routing_ids`.
 ///
 /// The QUERY runs since `since`. The result is deduplicated by `blob_id` and
 /// sorted by `blob_id`, so the buffer does not depend on relay timing (the
@@ -184,6 +212,7 @@ fn envelope_to_buffered(
 /// report traffic it never read as absent.
 pub async fn pull_buffered(
     transport: &TransportManager,
+    scope: RelayScope<'_>,
     context_id: &str,
     routing_ids: &[RoutingId],
     since: u64,
@@ -192,13 +221,18 @@ pub async fn pull_buffered(
     let mut seen: HashSet<String> = HashSet::new();
     let mut messages = Vec::new();
     for routing_id in routing_ids {
-        let envelopes = transport
-            .query(routing_id, Some(since))
-            .await
-            .map_err(|e| SyncError::RelayCatchUpFailed {
-                context_id: context_id.to_owned(),
-                reason: e.to_string(),
-            })?;
+        let answer = match scope {
+            RelayScope::Installed => transport.query(routing_id, Some(since)).await,
+            RelayScope::Only(relay_urls) => {
+                transport
+                    .query_relays(relay_urls, routing_id, Some(since))
+                    .await
+            }
+        };
+        let envelopes = answer.map_err(|e| SyncError::RelayCatchUpFailed {
+            context_id: context_id.to_owned(),
+            reason: e.to_string(),
+        })?;
         for envelope in &envelopes {
             if let Some(msg) = envelope_to_buffered(context_id, envelope, now)
                 && seen.insert(msg.blob_id.clone())
@@ -212,8 +246,11 @@ pub async fn pull_buffered(
 }
 
 /// Phase 2 body: feeds the first `limit` blobs of `messages` to the actor
-/// through [`Supervisor::deliver_commit_blob`] until a full pass accepts
-/// nothing or `limit` blobs were accepted.
+/// through [`Supervisor::deliver_commit_blob`] in `mode` until a full pass
+/// accepts nothing or `limit` blobs were accepted.
+///
+/// Each application envelope the actor accepts is added to `tally` as it is
+/// accepted, so a caller whose deadline drops this future still counts it.
 ///
 /// Phase 1 sorts blobs by `blob_id` (`SHA-256`, effectively random), not by
 /// epoch. `OpenMLS` only accepts a Commit whose epoch matches the group's
@@ -224,8 +261,10 @@ pub async fn deliver_commit_blobs_until_steady(
     context_id: &str,
     messages: &[BufferedMessage],
     limit: usize,
+    mode: DeliveryMode,
+    tally: &DeliveryTally,
 ) -> FeedTally {
-    let mut tally = FeedTally::default();
+    let mut fed = FeedTally::default();
     let mut pending: Vec<&[u8]> = messages
         .iter()
         .take(limit)
@@ -245,13 +284,14 @@ pub async fn deliver_commit_blobs_until_steady(
                 continue;
             }
             match supervisor
-                .deliver_commit_blob(context_id, payload.to_vec())
+                .deliver_commit_blob(context_id, payload.to_vec(), mode)
                 .await
             {
                 Ok(delivered) => {
-                    tally.accepted += 1;
+                    fed.accepted += 1;
                     if delivered.is_some() {
-                        tally.delivered += 1;
+                        fed.delivered += 1;
+                        tally.add(context_id, 1);
                     }
                     accepted_this_pass += 1;
                     total_accepted += 1;
@@ -279,27 +319,33 @@ pub async fn deliver_commit_blobs_until_steady(
         }
         pending = still_pending;
     }
-    tally
+    fed
 }
 
-/// Phase 4 body: re-feeds every blob of the Phase 1 buffer to the actor once.
+/// Phase 4 body: re-feeds every blob of the Phase 1 buffer to the actor once,
+/// in `mode`.
 ///
 /// The re-feed processes a sender-key advance interleaved among the blobs.
 /// Returns the count of blobs the actor accepted as application messages on
-/// this pass. A blob the actor already accepted is refused as a replay and is
-/// not counted.
+/// this pass, each also added to `tally` as it is accepted. A blob the actor
+/// already accepted is refused as a replay and is not counted.
 pub async fn refeed_buffer(
     supervisor: &Supervisor,
     context_id: &str,
     messages: &[BufferedMessage],
+    mode: DeliveryMode,
+    tally: &DeliveryTally,
 ) -> u64 {
     let mut delivered = 0u64;
     for msg in messages {
         match supervisor
-            .deliver_commit_blob(context_id, msg.payload.clone())
+            .deliver_commit_blob(context_id, msg.payload.clone(), mode)
             .await
         {
-            Ok(Some(_)) => delivered += 1,
+            Ok(Some(_)) => {
+                delivered += 1;
+                tally.add(context_id, 1);
+            }
             Ok(None) => {}
             Err(e) => {
                 tracing::debug!(
@@ -441,6 +487,7 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
         // `last_stored_at`.
         pull_buffered(
             self.transport,
+            RelayScope::Installed,
             context_id,
             &[routing_id],
             since,
@@ -496,12 +543,18 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
 
         // Feeds the Phase-1 buffer (capped at the budget) through
         // `Supervisor::deliver_commit_blob` until a pass accepts nothing.
-        let fed =
-            deliver_commit_blobs_until_steady(self.supervisor, context_id, messages, limit).await;
+        let fed = deliver_commit_blobs_until_steady(
+            self.supervisor,
+            context_id,
+            messages,
+            limit,
+            DeliveryMode::Live,
+            self.tally,
+        )
+        .await;
         for _ in 0..fed.accepted {
             state.record_commit_processed();
         }
-        self.tally.add(context_id, fed.delivered);
 
         // Re-read the authoritative local epoch from the actor.
         let new_local = self
@@ -560,8 +613,14 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
         // advance interleaved among the blobs is not missed. Re-delivery is
         // idempotent — already-merged Commits and already-processed
         // management messages are rejected without side effects.
-        let delivered = refeed_buffer(self.supervisor, context_id, messages).await;
-        self.tally.add(context_id, delivered);
+        refeed_buffer(
+            self.supervisor,
+            context_id,
+            messages,
+            DeliveryMode::Live,
+            self.tally,
+        )
+        .await;
         // The actor surfaces unrecoverable sender keys as buffered
         // SenderKeyTimeout events; none means full recovery.
         Ok(0)
@@ -766,53 +825,69 @@ impl ResetTransport for RelayActorSyncDriver<'_> {
         Ok(epoch)
     }
 
-    /// Tier 3 — subscribe to the context routing key and wait for a
-    /// Welcome to arrive within `timeout_secs`, feeding each retrieved
-    /// blob into the actor (which processes the Welcome and advances the
-    /// epoch). Returns the new local MLS epoch after processing.
+    /// Tier 3 — poll the context routing key until the local MLS epoch
+    /// advances past the epoch read on entry, feeding each retrieved blob into
+    /// the actor (which processes the Welcome or re-add Commit and advances
+    /// the epoch), and return the new epoch.
+    ///
+    /// The relay is queried about once a second until `timeout_secs` passes.
+    /// No reset is reported unless the epoch advanced: a pull that finds no
+    /// Welcome is a [`WelcomeTimeout`](scp_core::sync::weeks_offline::WeeksOfflineError::WelcomeTimeout),
+    /// which leaves `needs_reconnect` set and writes no relay contact.
     async fn subscribe_and_await_welcome(
         &self,
         context_id: &str,
         timeout_secs: u64,
     ) -> Result<u64, scp_core::sync::weeks_offline::WeeksOfflineError> {
+        use scp_core::sync::weeks_offline::WeeksOfflineError;
+        let Some(entry_epoch) = self.supervisor.local_mls_epoch(context_id).await else {
+            return Err(WeeksOfflineError::ResetRequestFailed {
+                context_id: context_id.to_owned(),
+                reason: "a broadcast context has no MLS group to re-join".to_owned(),
+            });
+        };
         let routing_id = self.shared_routing_id(context_id).await;
         let deadline = std::time::Duration::from_secs(timeout_secs.max(1));
-        let pull = async {
-            let envelopes = self.transport.query(&routing_id, None).await.map_err(|e| {
-                // A relay query failure during reset is surfaced as a
-                // reset-request failure (the Welcome could not be fetched).
-                scp_core::sync::weeks_offline::WeeksOfflineError::ResetRequestFailed {
-                    context_id: context_id.to_owned(),
-                    reason: format!("await_welcome relay query failed: {e}"),
+        let poll = async {
+            loop {
+                let envelopes = self.transport.query(&routing_id, None).await.map_err(|e| {
+                    WeeksOfflineError::ResetRequestFailed {
+                        context_id: context_id.to_owned(),
+                        reason: format!("await_welcome relay query failed: {e}"),
+                    }
+                })?;
+                for envelope in &envelopes {
+                    if let Ok(Some(_)) = self
+                        .supervisor
+                        .deliver_commit_blob(
+                            context_id,
+                            envelope.encrypted_blob.clone(),
+                            DeliveryMode::Live,
+                        )
+                        .await
+                    {
+                        self.tally.add(context_id, 1);
+                    }
                 }
-            })?;
-            let mut delivered = 0u64;
-            for envelope in &envelopes {
-                if let Ok(Some(_)) = self
-                    .supervisor
-                    .deliver_commit_blob(context_id, envelope.encrypted_blob.clone())
-                    .await
+                if let Some(epoch) = self.supervisor.local_mls_epoch(context_id).await
+                    && epoch > entry_epoch
                 {
-                    delivered += 1;
+                    return Ok(epoch);
                 }
+                tokio::time::sleep(WELCOME_POLL_INTERVAL).await;
             }
-            self.tally.add(context_id, delivered);
-            Ok::<(), scp_core::sync::weeks_offline::WeeksOfflineError>(())
         };
-        tokio::time::timeout(deadline, pull).await.map_err(|_| {
-            scp_core::sync::weeks_offline::WeeksOfflineError::WelcomeTimeout {
+        tokio::time::timeout(deadline, poll).await.map_err(|_| {
+            WeeksOfflineError::WelcomeTimeout {
                 context_id: context_id.to_owned(),
                 timeout_secs,
             }
-        })??;
-        let epoch = self
-            .supervisor
-            .local_mls_epoch(context_id)
-            .await
-            .unwrap_or(0);
-        Ok(epoch)
+        })?
     }
 }
+
+/// Interval between the relay queries of a Tier 3 Welcome await.
+const WELCOME_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Maps a [`CatchUpStatus`] to a coarse caught-up boolean for the bridge
 /// report. Re-exported helper so each bridge classifies identically.
@@ -907,8 +982,11 @@ fn outcome_str(outcome: &scp_protocol::sync::SyncOutcome) -> (String, bool) {
 /// Drives the full ADR-029 reconnection protocol for the given contexts at
 /// the bridge surface and returns a flat report.
 ///
-/// For each context the [`ReconnectionCoordinator`] classifies the offline
-/// tier from `last_relay_contacts` and:
+/// Each context's `sync/{context_id}/last_relay_contact` is read from
+/// `relay_contacts`, the one source of that value; a context with none stored
+/// is classified Long (ADR-029 §2 sync-state keys). For each context the
+/// [`ReconnectionCoordinator`] classifies the offline tier from that value
+/// and:
 /// - **Tier 1 (Short)** — runs the six-phase protocol via
 ///   [`ReconnectionCoordinator::execute`] against a [`RelayActorSyncDriver`].
 /// - **Tier 2 (Extended)** — fetches the relay snapshot via a
@@ -917,41 +995,50 @@ fn outcome_str(outcome: &scp_protocol::sync::SyncOutcome) -> (String, bool) {
 /// - **Tier 3 (Long)** — awaits a Welcome via a [`RelayBackedReJoinExecutor`]
 ///   (admin-side re-add + Welcome processing through the actor).
 ///
-/// On a terminal-success outcome the context's `needs_reconnect` flag is
-/// cleared via [`Supervisor::clear_needs_reconnect`]. After per-context
+/// After a reconnection that reached `FullyCaughtUp`, `FastForwarded` or
+/// `Reset`, the actor sends every sender-key answer it holds queued
+/// ([`Supervisor::send_queued_sender_keys`]), including the answers a push-wake
+/// pull left queued (ADR-029 §2 push-wake pull mode step 5); a failed send
+/// makes the outcome `Failed`. On a terminal-success outcome the context's
+/// `needs_reconnect` flag is cleared via [`Supervisor::clear_needs_reconnect`]. After per-context
 /// execution, the optional `drain` callback is invoked once per context to
 /// drain the bridge-owned outbound queue (Phase 6) — the queue lives in
 /// `ProtocolRepository` at the bridge layer, not in actor state, so the
 /// caller supplies the drain.
 ///
-/// `signer` signs for `member_did` through its custody; it signs the
-/// Phase-3 local checkpoint.
+/// `request.signer` signs for `request.member_did` through its custody; it
+/// signs the Phase-3 local checkpoint.
 ///
 /// After clearing a context's `needs_reconnect`, writes `now` to its
 /// `sync/{context_id}/last_relay_contact` through `relay_contacts` (ADR-029
 /// §2 sync-state keys); a failed write is reported on
 /// [`ContextReconnectResult::relay_contact_error`].
-// `implicit_hasher`: `last_relay_contacts` is forwarded verbatim to
-// `ReconnectionCoordinator::with_policy`, which fixes the default
-// `RandomState` hasher; generalizing here would only force every caller to
-// re-annotate the same concrete type.
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+///
+/// # Errors
+///
+/// [`ReconnectError::ContactRead`] when reading a context's
+/// `last_relay_contact` fails; no context is reconnected, because a context
+/// classified without its contact could take the wrong tier.
 pub async fn reconnect_contexts<F, Fut>(
-    transport: &Arc<TransportManager>,
-    supervisor: &Arc<Supervisor>,
-    member_did: DID,
-    signer: CommandSigner,
-    relay_contacts: &dyn RelayContactStore,
-    context_ids: Vec<String>,
-    last_relay_contacts: HashMap<String, u64>,
-    now: u64,
-    policy: SyncPolicy,
+    request: ReconnectRequest<'_>,
     mut drain: Option<F>,
-) -> ReconnectReport
+) -> Result<ReconnectReport, ReconnectError>
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = (u64, u64)>,
 {
+    let ReconnectRequest {
+        transport,
+        supervisor,
+        member_did,
+        signer,
+        relay_contacts,
+        context_ids,
+        now,
+        policy,
+    } = request;
+    let last_relay_contacts = load_relay_contacts(relay_contacts, &context_ids).await?;
+
     let tally = DeliveryTally::default();
     let driver = RelayActorSyncDriver::new(
         transport,
@@ -1013,6 +1100,7 @@ where
             }
         };
 
+        let outcome = send_queued_answers(supervisor, &context_id, outcome).await;
         let (outcome_string, terminal_success) = outcome_str(&outcome);
 
         let (needs_reconnect_cleared, relay_contact_error) = clear_and_record_contact(
@@ -1046,11 +1134,58 @@ where
         });
     }
 
-    ReconnectReport {
+    Ok(ReconnectReport {
         contexts: results,
         messages_drained,
         messages_discarded,
         total_duration_ms: report.total_duration_ms,
+    })
+}
+
+/// Why [`reconnect_contexts`] reconnected no context.
+#[derive(Debug, thiserror::Error)]
+pub enum ReconnectError {
+    /// Reading `sync/{context_id}/last_relay_contact` failed.
+    #[error("reading the last relay contact of {context_id} failed: {source}")]
+    ContactRead {
+        /// The context whose key could not be read.
+        context_id: String,
+        /// The store failure.
+        #[source]
+        source: StoreError,
+    },
+}
+
+impl ReconnectError {
+    /// The bridge error code: `SCP-TRANS-5095` (`sdk-common.md`).
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::ContactRead { .. } => crate::error_codes::TRANS_5095,
+        }
+    }
+}
+
+/// Sends the sender-key answers queued on the actor of `context_id` after a
+/// reconnection whose `outcome` is `FullyCaughtUp`, `FastForwarded` or `Reset`,
+/// and returns the outcome, made `Failed` when the send fails. Any other
+/// outcome is returned unchanged with nothing sent.
+async fn send_queued_answers(
+    supervisor: &Supervisor,
+    context_id: &str,
+    outcome: scp_protocol::sync::SyncOutcome,
+) -> scp_protocol::sync::SyncOutcome {
+    use scp_protocol::sync::SyncOutcome;
+    match outcome {
+        SyncOutcome::FullyCaughtUp | SyncOutcome::FastForwarded { .. } | SyncOutcome::Reset => {
+            match supervisor.send_queued_sender_keys(context_id).await {
+                Ok(()) => outcome,
+                Err(e) => SyncOutcome::Failed {
+                    reason: format!("sending queued sender-key answers failed: {e}"),
+                },
+            }
+        }
+        SyncOutcome::Pending | SyncOutcome::ContextGone | SyncOutcome::Failed { .. } => outcome,
     }
 }
 
@@ -1138,6 +1273,32 @@ async fn clear_and_record_contact(
     (true, error)
 }
 
+/// Reads the stored `last_relay_contact` of each of `context_ids`; a context
+/// with none stored is absent from the map.
+///
+/// # Errors
+///
+/// [`ReconnectError::ContactRead`] on the first read that fails.
+async fn load_relay_contacts(
+    relay_contacts: &dyn RelayContactStore,
+    context_ids: &[String],
+) -> Result<HashMap<String, u64>, ReconnectError> {
+    let mut contacts = HashMap::with_capacity(context_ids.len());
+    for context_id in context_ids {
+        let stored = relay_contacts
+            .load_last_relay_contact(context_id)
+            .await
+            .map_err(|source| ReconnectError::ContactRead {
+                context_id: context_id.clone(),
+                source,
+            })?;
+        if let Some(contact) = stored {
+            contacts.insert(context_id.clone(), contact);
+        }
+    }
+    Ok(contacts)
+}
+
 /// Welcome-await timeout (seconds) for Tier 3 re-join. Matches the
 /// ADR-029 §4 reset-protocol Welcome window.
 const fn policy_welcome_timeout_secs() -> u64 {
@@ -1153,44 +1314,67 @@ type NoDrainFn = fn(String) -> std::future::Ready<(u64, u64)>;
 /// For bridges whose outbound queue has no persistent enqueued entries to
 /// drain (e.g. encrypted in-memory storage), passes a typed `None` drain
 /// callback so callers do not have to spell out the closure generics.
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+///
+/// # Errors
+///
+/// The errors of [`reconnect_contexts`].
 pub async fn reconnect_contexts_no_drain(
-    transport: &Arc<TransportManager>,
-    supervisor: &Arc<Supervisor>,
-    member_did: DID,
-    signer: CommandSigner,
-    relay_contacts: &dyn RelayContactStore,
-    context_ids: Vec<String>,
-    last_relay_contacts: HashMap<String, u64>,
-    now: u64,
-    policy: SyncPolicy,
-) -> ReconnectReport {
+    request: ReconnectRequest<'_>,
+) -> Result<ReconnectReport, ReconnectError> {
     // Concrete closure type so the `None` variant's generics are inferred.
     let drain: Option<NoDrainFn> = None;
-    reconnect_contexts(
-        transport,
-        supervisor,
-        member_did,
-        signer,
-        relay_contacts,
-        context_ids,
-        last_relay_contacts,
-        now,
-        policy,
-        drain,
-    )
-    .await
+    reconnect_contexts(request, drain).await
+}
+
+/// The inputs of one [`reconnect_contexts`] call.
+pub struct ReconnectRequest<'a> {
+    /// The relay connections Phase 1 pulls through.
+    pub transport: &'a Arc<TransportManager>,
+    /// The supervisor that owns each context's actor.
+    pub supervisor: &'a Arc<Supervisor>,
+    /// The local member reconnecting.
+    pub member_did: DID,
+    /// Signs for `member_did` through its custody (the Phase-3 checkpoint).
+    pub signer: CommandSigner,
+    /// The store that holds each context's `last_relay_contact`, read for
+    /// tier classification and written after `needs_reconnect` clears.
+    pub relay_contacts: &'a dyn RelayContactStore,
+    /// The contexts to reconnect.
+    pub context_ids: Vec<String>,
+    /// The current local Unix time in seconds.
+    pub now: u64,
+    /// Catch-up limits.
+    pub policy: SyncPolicy,
 }
 
 // ---------------------------------------------------------------------------
 // Push-wake pull mode (ADR-029 §2)
 // ---------------------------------------------------------------------------
 
-/// Why [`wake_pull_contexts`] failed. Every variant fails the whole wake,
-/// because a wake that skips a context would report traffic it never pulled
-/// as absent.
+/// Why [`wake_pull_contexts`] could not pull one context.
+///
+/// The failure is that context's alone: the other contexts' pulls run on, and
+/// the context keeps its stored `last_relay_contact` (ADR-029 §2 push-wake
+/// pull mode steps 6 and 7).
 #[derive(Debug, thiserror::Error)]
 pub enum WakePullError {
+    /// The context's persisted relay set is empty.
+    #[error("context {context_id} persists no relay URL")]
+    NoRelays {
+        /// The context with no relay.
+        context_id: String,
+    },
+    /// A relay in the context's relay set was not dialed: the dial failed,
+    /// timed out or panicked.
+    #[error("relay {relay_url} of {context_id} is unreachable: {reason}")]
+    RelayUnavailable {
+        /// The context whose relay set names the relay.
+        context_id: String,
+        /// The relay that was not dialed.
+        relay_url: String,
+        /// Why the dial failed.
+        reason: String,
+    },
     /// Reading `sync/{context_id}/last_relay_contact` failed.
     #[error("reading the last relay contact of {context_id} failed: {source}")]
     ContactRead {
@@ -1200,7 +1384,7 @@ pub enum WakePullError {
         #[source]
         source: StoreError,
     },
-    /// A Phase 1 QUERY failed on some relay.
+    /// A Phase 1 QUERY failed on a relay of the context's relay set.
     #[error("relay query for {context_id} failed: {source}")]
     Query {
         /// The context whose pull failed.
@@ -1209,8 +1393,8 @@ pub enum WakePullError {
         #[source]
         source: SyncError,
     },
-    /// Writing `sync/{context_id}/last_relay_contact` after a successful
-    /// Phase 1 failed.
+    /// Writing `sync/{context_id}/last_relay_contact` after Phases 2 and 4
+    /// failed.
     #[error("writing the last relay contact of {context_id} failed: {source}")]
     ContactWrite {
         /// The context whose key could not be written.
@@ -1221,48 +1405,102 @@ pub enum WakePullError {
     },
 }
 
-/// Runs the push-wake pull mode of ADR-029 §2 for every target and returns the
-/// count of envelopes the actor accepted as application messages.
+impl WakePullError {
+    /// The context the failure belongs to.
+    #[must_use]
+    pub fn context_id(&self) -> &str {
+        match self {
+            Self::NoRelays { context_id }
+            | Self::RelayUnavailable { context_id, .. }
+            | Self::ContactRead { context_id, .. }
+            | Self::Query { context_id, .. }
+            | Self::ContactWrite { context_id, .. } => context_id,
+        }
+    }
+}
+
+/// Runs the push-wake pull mode of ADR-029 §2 for every target, concurrently
+/// and independently, and returns the failure of each context that failed.
 ///
-/// For each target, concurrently: Phase 1 ([`pull_buffered`]) over the
+/// For each target: a context with an empty relay set fails with
+/// [`WakePullError::NoRelays`], and one whose relay set names a relay in
+/// `unreachable` (relay URL to dial failure) fails with
+/// [`WakePullError::RelayUnavailable`]. Otherwise Phase 1 ([`pull_buffered`])
+/// queries only the target's own relay set ([`RelayScope::Only`]) for the
 /// target's routing IDs (the shared routing ID and each pseudonym routing ID
 /// the member holds) since the stored `last_relay_contact` minus
-/// [`SINCE_OVERLAP_SECS`], or 0 when none is stored; on success, writes `now`
-/// to `last_relay_contact`; then Phase 2
-/// ([`deliver_commit_blobs_until_steady`]) and Phase 4 ([`refeed_buffer`]).
-/// The pull takes no [`CommandSigner`], so it builds no checkpoint, issues no
-/// Update and publishes nothing, and it leaves `needs_reconnect` set.
+/// [`SINCE_OVERLAP_SECS`], or 0 when none is stored; Phase 2
+/// ([`deliver_commit_blobs_until_steady`]) and Phase 4 ([`refeed_buffer`])
+/// feed the buffer to the actor in [`DeliveryMode::PullOnly`]; and only then
+/// is `now` written to `last_relay_contact`. Every application envelope the
+/// actor accepts is added to `tally` as it is accepted, so a caller whose
+/// deadline drops this future still knows what was delivered, and a context
+/// the deadline stops keeps its stored contact.
 ///
-/// # Errors
-///
-/// The first [`WakePullError`] of any target; the other targets' pulls are
-/// dropped.
+/// The pull takes no [`CommandSigner`] and sends no queued sender-key answer,
+/// so it builds no checkpoint, issues no Update and publishes nothing, and it
+/// leaves `needs_reconnect` set.
 pub async fn wake_pull_contexts(
-    transport: &TransportManager,
-    supervisor: &Supervisor,
+    pull: &WakePull<'_>,
     targets: &[ContextWakeTarget],
-    relay_contacts: &dyn RelayContactStore,
-    policy: &SyncPolicy,
-    now: u64,
-) -> Result<u64, WakePullError> {
-    let limit = usize::try_from(policy.max_sequential_commits).unwrap_or(usize::MAX);
-    let per_context = futures::future::try_join_all(targets.iter().map(|target| {
-        wake_pull_context(transport, supervisor, target, relay_contacts, limit, now)
-    }))
-    .await?;
-    Ok(per_context.into_iter().fold(0u64, u64::saturating_add))
+) -> Vec<WakePullError> {
+    futures::future::join_all(targets.iter().map(|target| wake_pull_context(pull, target)))
+        .await
+        .into_iter()
+        .filter_map(Result::err)
+        .collect()
+}
+
+/// The inputs [`wake_pull_contexts`] shares across every target.
+pub struct WakePull<'a> {
+    /// The transient manager holding the dialed relays.
+    pub transport: &'a TransportManager,
+    /// The supervisor that owns each context's actor.
+    pub supervisor: &'a Supervisor,
+    /// Relay URL to dial failure, for each relay the wake could not dial.
+    pub unreachable: &'a BTreeMap<String, String>,
+    /// The store that holds each context's `last_relay_contact`.
+    pub relay_contacts: &'a dyn RelayContactStore,
+    /// Catch-up limits; `max_sequential_commits` bounds Phase 2.
+    pub policy: &'a SyncPolicy,
+    /// The current local Unix time in seconds, written as the new contact.
+    pub now: u64,
+    /// Counts each application envelope the actor accepts.
+    pub tally: &'a DeliveryTally,
 }
 
 /// One target of [`wake_pull_contexts`].
 async fn wake_pull_context(
-    transport: &TransportManager,
-    supervisor: &Supervisor,
+    pull: &WakePull<'_>,
     target: &ContextWakeTarget,
-    relay_contacts: &dyn RelayContactStore,
-    limit: usize,
-    now: u64,
-) -> Result<u64, WakePullError> {
+) -> Result<(), WakePullError> {
+    let WakePull {
+        transport,
+        supervisor,
+        unreachable,
+        relay_contacts,
+        policy,
+        now,
+        tally,
+    } = *pull;
+    let limit = usize::try_from(policy.max_sequential_commits).unwrap_or(usize::MAX);
     let context_id = target.context_id.as_str();
+    if target.relay_urls.is_empty() {
+        return Err(WakePullError::NoRelays {
+            context_id: context_id.to_owned(),
+        });
+    }
+    if let Some((relay_url, reason)) = target
+        .relay_urls
+        .iter()
+        .find_map(|url| unreachable.get(url).map(|reason| (url, reason)))
+    {
+        return Err(WakePullError::RelayUnavailable {
+            context_id: context_id.to_owned(),
+            relay_url: relay_url.clone(),
+            reason: reason.clone(),
+        });
+    }
     let stored = relay_contacts
         .load_last_relay_contact(context_id)
         .await
@@ -1277,22 +1515,43 @@ async fn wake_pull_context(
         .copied()
         .map(RoutingId::new)
         .collect();
-    let messages = pull_buffered(transport, context_id, &routing_ids, since, now)
-        .await
-        .map_err(|source| WakePullError::Query {
-            context_id: context_id.to_owned(),
-            source,
-        })?;
+    let messages = pull_buffered(
+        transport,
+        RelayScope::Only(&target.relay_urls),
+        context_id,
+        &routing_ids,
+        since,
+        now,
+    )
+    .await
+    .map_err(|source| WakePullError::Query {
+        context_id: context_id.to_owned(),
+        source,
+    })?;
+    deliver_commit_blobs_until_steady(
+        supervisor,
+        context_id,
+        &messages,
+        limit,
+        DeliveryMode::PullOnly,
+        tally,
+    )
+    .await;
+    refeed_buffer(
+        supervisor,
+        context_id,
+        &messages,
+        DeliveryMode::PullOnly,
+        tally,
+    )
+    .await;
     relay_contacts
         .store_last_relay_contact(context_id, now)
         .await
         .map_err(|source| WakePullError::ContactWrite {
             context_id: context_id.to_owned(),
             source,
-        })?;
-    let fed = deliver_commit_blobs_until_steady(supervisor, context_id, &messages, limit).await;
-    let refed = refeed_buffer(supervisor, context_id, &messages).await;
-    Ok(fed.delivered.saturating_add(refed))
+        })
 }
 
 /// Writes the current local Unix time to `sync/{context_id}/last_relay_contact`
@@ -1312,4 +1571,82 @@ pub async fn record_relay_contact(
             scp_clock::Clock::now_secs(&scp_clock::SystemClock),
         )
         .await
+}
+
+/// The contact rule of a live subscription (ADR-029 §2 sync-state keys).
+///
+/// An envelope the actor accepted writes the current local time to the
+/// context's `last_relay_contact` through [`record_relay_contact`]; a delivery
+/// the actor refused writes nothing, because a refused envelope proves no
+/// successful relay interaction.
+///
+/// # Errors
+///
+/// The store's [`StoreError`] when the write after an accepted delivery
+/// fails. The caller reports it and keeps delivering.
+pub async fn record_contact_after_live_delivery<T: Sync, E: Sync>(
+    relay_contacts: &dyn RelayContactStore,
+    context_id: &str,
+    delivered: &Result<T, E>,
+) -> Result<(), StoreError> {
+    if delivered.is_err() {
+        return Ok(());
+    }
+    record_relay_contact(relay_contacts, context_id).await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn contacts() -> scp_core::store::ProtocolRepository<scp_platform::in_memory::InMemoryStorage> {
+        scp_core::store::ProtocolRepository::new_for_testing(
+            scp_platform::in_memory::InMemoryStorage::new(),
+        )
+    }
+
+    /// A store whose writes fail, for the write-failure arm.
+    struct FailingStore;
+    #[async_trait::async_trait]
+    impl RelayContactStore for FailingStore {
+        async fn store_last_relay_contact(&self, _: &str, _: u64) -> Result<(), StoreError> {
+            Err(StoreError::SerializationFailed(
+                "injected write failure".to_owned(),
+            ))
+        }
+        async fn load_last_relay_contact(&self, _: &str) -> Result<Option<u64>, StoreError> {
+            Ok(None)
+        }
+    }
+
+    /// An accepted live delivery writes the current local time; a refused one
+    /// writes nothing; a failed write after an accepted delivery is returned.
+    #[tokio::test]
+    async fn a_live_delivery_writes_the_contact_only_when_the_actor_accepts() {
+        let store = contacts();
+        let refused: Result<(), &str> = Err("replay");
+        record_contact_after_live_delivery(&store, "ctx", &refused)
+            .await
+            .unwrap();
+        assert_eq!(store.load_last_relay_contact("ctx").await.unwrap(), None);
+
+        let before = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+        let accepted: Result<(), &str> = Ok(());
+        record_contact_after_live_delivery(&store, "ctx", &accepted)
+            .await
+            .unwrap();
+        let after = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+        let stored = store.load_last_relay_contact("ctx").await.unwrap();
+        assert!(
+            stored.is_some_and(|t| (before..=after).contains(&t)),
+            "{stored:?} not in {before}..={after}"
+        );
+
+        let err = record_contact_after_live_delivery(&FailingStore, "ctx", &accepted).await;
+        assert!(
+            matches!(err, Err(StoreError::SerializationFailed(_))),
+            "{err:?}"
+        );
+    }
 }

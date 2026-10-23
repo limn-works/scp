@@ -101,8 +101,55 @@ pub(crate) async fn dispatch(
         MessagingCommand::DeliverIncoming {
             context_id,
             envelope_bytes,
+            mode,
             reply,
-        } => handle_deliver_incoming(cell, deps, &context_id, &envelope_bytes, reply).await,
+        } => handle_deliver_incoming(cell, deps, &context_id, &envelope_bytes, mode, reply).await,
+        MessagingCommand::SendQueuedSenderKeys { context_id, reply } => {
+            handle_send_queued_sender_keys(cell, deps, &context_id, reply).await
+        }
+        #[cfg(feature = "testing")]
+        MessagingCommand::QueuedSenderKeyCount {
+            context_id: _,
+            reply,
+        } => {
+            let count = cell
+                .class_c_view()
+                .mode_mut()
+                .crypto_mut()
+                .map_or(0, |cs| cs.pending_distributions.len());
+            let _ = reply.send(Ok(count));
+            Outcome::ok(())
+        }
+        #[cfg(feature = "testing")]
+        MessagingCommand::TestSealManagement {
+            context_id,
+            message,
+            reply,
+        } => {
+            let routing_id = scp_protocol::context::context_routing_id(&context_id);
+            let sealed = cell
+                .class_c_view()
+                .mode_mut()
+                .crypto_mut()
+                .ok_or_else(|| {
+                    ContextError::CryptoFailed(
+                        "no MLS crypto state to seal a management message".to_owned(),
+                    )
+                })
+                .and_then(|cs| {
+                    cs.mls_encrypt_management(
+                        &message,
+                        &routing_id,
+                        crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
+                    )
+                });
+            let outcome = match &sealed {
+                Ok(_) => Outcome::ok_mutated(()),
+                Err(e) => Outcome::err(outcome_error_sketch(e)),
+            };
+            let _ = reply.send(sealed);
+            outcome
+        }
         MessagingCommand::DrainEvents { context_id, reply } => {
             handle_drain_events(cell, &context_id, reply).await
         }
@@ -819,6 +866,7 @@ async fn handle_deliver_incoming(
     deps: &ActorDeps,
     context_id: &str,
     envelope_bytes: &[u8],
+    mode: crate::context::actor::commands::DeliveryMode,
     reply: crate::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
     // ADR-049 §9 (RED-CS3): a fail-closed-persist obligation populated when the
@@ -881,22 +929,28 @@ async fn handle_deliver_incoming(
 
     // ADR-049 PR-7 §9.16.2 answer transmit: a PULL request handled inside
     // `decrypt_and_dispatch` enqueued its ephemeral-sealed answer on the actor's
-    // `pending_distributions`. The deliver view has dropped; re-acquire the
-    // Class-C crypto view and MLS-wrap + transport-send the queued answer(s)
-    // through the existing drain path (reused verbatim from the join / rotate
-    // transmit). A no-op when nothing was queued (the ordinary case). The drain
-    // is best-effort by construction (per-recipient send failures are logged, the
-    // requester recovers via a fresh request), so its `Result` — which cannot
-    // actually error for the actor's in-memory `std::mem::take` drain — is not
-    // allowed to fail the just-completed delivery ack.
-    {
-        let mut view = cell.class_c_view();
-        let _ = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            deps,
-            view.mode_mut().crypto_mut(),
-            context_id,
-        )
-        .await;
+    // `pending_distributions`. In `Live` mode the deliver view has dropped, so
+    // re-acquire the Class-C crypto view and MLS-wrap + transport-send the
+    // queued answer(s) through the existing drain path. A no-op when nothing was
+    // queued (the ordinary case). The drain is best-effort by construction
+    // (per-recipient send failures are logged, the requester recovers via a
+    // fresh request), and its `Result` cannot error for the in-memory
+    // `std::mem::take` drain, so it does not fail the delivery ack.
+    //
+    // In `PullOnly` mode (a push-wake pull, ADR-029 §2 step 4) the actor sends
+    // nothing and does not advance its MLS send ratchet: the answer stays
+    // queued until a full reconnection sends `SendQueuedSenderKeys`.
+    match mode {
+        crate::context::actor::commands::DeliveryMode::Live => {
+            let mut view = cell.class_c_view();
+            let _ = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+                deps,
+                view.mode_mut().crypto_mut(),
+                context_id,
+            )
+            .await;
+        }
+        crate::context::actor::commands::DeliveryMode::PullOnly => {}
     }
 
     // Spec 09 §9.10.4.1 "Membership trigger" and "Record lifetime": the merged
@@ -949,6 +1003,40 @@ async fn handle_deliver_incoming(
     };
 
     let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`MessagingCommand::SendQueuedSenderKeys`] (actor-shape).
+///
+/// MLS-encrypts and sends every queued sender-key answer through
+/// `drain_and_deliver_sender_keys`, the path a `Live` delivery runs. The
+/// drain logs each per-recipient failure, so the reply is `Ok` unless the
+/// drain itself fails or exceeds its budget.
+async fn handle_send_queued_sender_keys(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let result = {
+        let mut view = cell.class_c_view();
+        let drain = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            view.mode_mut().crypto_mut(),
+            context_id,
+        );
+        match tokio::time::timeout(HANDLER_TIMEOUT, drain).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ContextError::TransportTimeout(format!(
+                "send_queued_sender_keys exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ))),
+        }
+    };
+    let outcome = match &result {
+        Ok(()) => Outcome::ok_mutated(()),
+        Err(e) => Outcome::err_mutated(outcome_error_sketch(e)),
+    };
+    let _ = reply.send(result);
     outcome
 }
 

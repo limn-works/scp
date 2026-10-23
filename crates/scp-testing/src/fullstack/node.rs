@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use scp_core::context::actor::commands::DeliveryMode;
 use scp_core::context::builder::{
     ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
 };
@@ -1251,6 +1252,14 @@ impl FullStackNode {
         self.signing_key.verifying_key()
     }
 
+    /// This node's `#active` signing key, the key the network's resolver
+    /// returns for its DID. A harness signs a request this node would sign,
+    /// or builds this node's `CommandSigner`.
+    #[must_use]
+    pub fn signing_key(&self) -> ed25519_dalek::SigningKey {
+        self.signing_key.clone()
+    }
+
     /// Submits a governance proposal through the real `Supervisor`, signing the
     /// proposer's vote with this node's `#active` key. Returns the created
     /// proposal (its `proposal_id` is the engine-tracked handle for later
@@ -1419,7 +1428,7 @@ impl FullStackNode {
         // authority for its context.
         match self
             .manager
-            .deliver_commit_blob(context_id_str, ciphertext.to_vec())
+            .deliver_commit_blob(context_id_str, ciphertext.to_vec(), DeliveryMode::Live)
             .await?
         {
             Some((plaintext, _sender)) => Ok(plaintext),
@@ -1457,13 +1466,13 @@ impl FullStackNode {
             let wrapped = wrap_raw_mls_message(context_id_str, commit_bytes)?;
             let _ = self
                 .manager
-                .deliver_commit_blob(context_id_str, wrapped)
+                .deliver_commit_blob(context_id_str, wrapped, DeliveryMode::Live)
                 .await?;
         }
         for wrapped in self.crypto.take_pending_sender_key_messages(context_id) {
             let _ = self
                 .manager
-                .deliver_commit_blob(context_id_str, wrapped)
+                .deliver_commit_blob(context_id_str, wrapped, DeliveryMode::Live)
                 .await?;
         }
         Ok(())

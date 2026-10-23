@@ -1745,7 +1745,6 @@ class SCP:
         self,
         identity_did: str,
         context_ids: list[str],
-        last_relay_contacts: dict[str, int] | None = None,
     ) -> Any:
         """Reconnect ``identity_did``'s contexts after an offline period.
 
@@ -1757,9 +1756,10 @@ class SCP:
         through the ``Supervisor``. On success each context's
         ``needs_reconnect`` flag is cleared.
 
-        ``last_relay_contacts`` maps ``context_id`` to the last-relay-contact
-        Unix-seconds timestamp (used to classify the offline tier). Contexts
-        absent from the map default to the most conservative tier.
+        Each context's offline tier is classified from the
+        ``last_relay_contact`` the instance stores for it; a context with none
+        stored takes the most conservative tier, and a store read failure
+        raises with ``SCP-TRANS-5095``.
 
         Requires an active relay connection (call ``transport_connect`` first).
 
@@ -1784,7 +1784,6 @@ class SCP:
             self._native.context_reconnect,
             identity_did,
             context_ids,
-            last_relay_contacts,
         )
 
     async def context_send(

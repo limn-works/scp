@@ -94,20 +94,80 @@ pub struct DialedRelays {
     /// Whether a dial task panicked, which is a defect, not a routine dial
     /// failure.
     pub any_task_panicked: bool,
+    /// Every dialed URL the manager does not hold, with the reason: a failed
+    /// or timed-out dial, a panicked dial task, or a connection-budget
+    /// eviction. A URL is either held by `manager` or listed here.
+    pub failed: std::collections::BTreeMap<String, String>,
 }
 
-/// Registers each connected adapter of `results` in one transport manager,
-/// sorted by URL so the adapter order does not depend on network timing, and
-/// records the first dial failure in `first_failure` when none is set.
+/// The connection budget of the manager [`CoreFields::dial_relays`] builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialBudget {
+    /// The platform profile's `max_connections`; a dial set larger than it
+    /// evicts the oldest relays, each listed in [`DialedRelays::failed`]. The
+    /// installed transport of a resume reconnect.
+    Profile,
+    /// One connection per dialed URL, so no relay is evicted. The push-wake
+    /// pull's transient transport, which lives for one wake and must reach
+    /// every Active context's relays (ADR-029 §2 push-wake pull mode step 3).
+    DialSet,
+}
+
+/// Registers each connected adapter of `results` in `manager`, sorted by URL
+/// so the adapter order does not depend on network timing. Records each
+/// failed dial and each evicted relay in `failed`, and the first dial failure
+/// in `first_failure` when none is set.
+/// The dial tasks of [`CoreFields::dial_relays`]: one per URL, each bounded by
+/// `RECONNECT_PER_URL_TIMEOUT` and yielding its URL with the adapter or the
+/// failure reason.
+fn spawn_dials(
+    urls: Vec<String>,
+    cover: scp_transport::native::adapter::CoverTraffic,
+) -> tokio::task::JoinSet<(
+    String,
+    Result<scp_transport::native::adapter::NativeRelayAdapter, String>,
+)> {
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    let mut join_set = tokio::task::JoinSet::new();
+    for url in urls {
+        let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+            url: url.clone(),
+            source: scp_transport::relay::connection::RelayUrlSource::Explicit,
+        };
+        join_set.spawn(async move {
+            let outcome = match tokio::time::timeout(
+                RECONNECT_PER_URL_TIMEOUT,
+                scp_transport::native::adapter::NativeRelayAdapter::connect_sourced(
+                    &sourced,
+                    Some(&profile),
+                    cover,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(adapter)) => Ok(adapter),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_elapsed) => Err(format!(
+                    "connect timeout after {}s",
+                    RECONNECT_PER_URL_TIMEOUT.as_secs()
+                )),
+            };
+            (url, outcome)
+        });
+    }
+    join_set
+}
+
 fn register_dialed(
+    mut manager: scp_transport::TransportManager,
     mut results: Vec<(
         String,
         Result<scp_transport::native::adapter::NativeRelayAdapter, String>,
     )>,
     first_failure: &mut Option<LifecycleError>,
+    failed: &mut std::collections::BTreeMap<String, String>,
 ) -> scp_transport::TransportManager {
     results.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut manager = scp_transport::TransportManager::builder();
     for (url, outcome) in results {
         match outcome {
             Ok(adapter) => {
@@ -119,10 +179,18 @@ fn register_dialed(
                         evicted_relay_url = %eviction.evicted_relay_url,
                         "dial_relays: connection budget evicted a relay"
                     );
+                    failed.insert(
+                        eviction.evicted_relay_url,
+                        format!(
+                            "evicted by the connection budget of {}",
+                            manager.max_connections()
+                        ),
+                    );
                 }
             }
             Err(reason) => {
                 tracing::warn!(url = %url, error = %reason, "dial_relays: relay dial failed");
+                failed.insert(url.clone(), reason.clone());
                 if first_failure.is_none() {
                     *first_failure = Some(LifecycleError::ReconnectFailed { url, reason });
                 }
@@ -2187,7 +2255,10 @@ impl CoreFields {
     /// [`CoverTraffic::FromProfile`](scp_transport::native::adapter::CoverTraffic::FromProfile),
     /// and the push-wake pull passes
     /// [`CoverTraffic::Off`](scp_transport::native::adapter::CoverTraffic::Off)
-    /// because it publishes nothing (ADR-025 criterion 4).
+    /// because it publishes nothing (ADR-025 criterion 4). `budget` sizes the
+    /// manager: [`DialBudget::DialSet`] holds every URL, and
+    /// [`DialBudget::Profile`] may evict; an evicted URL is listed in
+    /// [`DialedRelays::failed`].
     ///
     /// Every dial races the current reconnect-generation cancellation token,
     /// which `suspend()` rotates and `shutdown()` cancels. A cancel
@@ -2201,44 +2272,25 @@ impl CoreFields {
     /// [`LifecycleError::ReconnectFailed`] with an empty `url` when the
     /// cancellation token fires during or after the dials. Per-URL failures
     /// and dial-task panics do not fail the call: the first one is returned
-    /// in [`DialedRelays::first_failure`].
+    /// in [`DialedRelays::first_failure`], and each URL in
+    /// [`DialedRelays::failed`].
     pub async fn dial_relays(
         &self,
         urls: Vec<String>,
         cover: scp_transport::native::adapter::CoverTraffic,
+        budget: DialBudget,
     ) -> Result<DialedRelays, LifecycleError> {
+        let manager = match budget {
+            DialBudget::Profile => scp_transport::TransportManager::builder(),
+            DialBudget::DialSet => {
+                scp_transport::TransportManager::with_connection_budget(urls.len())
+            }
+        };
+        // A panicked dial task loses its URL; every URL with no result is
+        // listed as failed after the join.
+        let mut unanswered: std::collections::BTreeSet<String> = urls.iter().cloned().collect();
         let cancel = self.reconnect_cancel_token();
-        let profile = scp_transport::profile::TransportProfile::platform_default();
-        let mut join_set: tokio::task::JoinSet<(
-            String,
-            Result<scp_transport::native::adapter::NativeRelayAdapter, String>,
-        )> = tokio::task::JoinSet::new();
-        for url in urls {
-            let sourced = scp_transport::relay::connection::SourcedRelayUrl {
-                url: url.clone(),
-                source: scp_transport::relay::connection::RelayUrlSource::Explicit,
-            };
-            join_set.spawn(async move {
-                let outcome = match tokio::time::timeout(
-                    RECONNECT_PER_URL_TIMEOUT,
-                    scp_transport::native::adapter::NativeRelayAdapter::connect_sourced_with_cover(
-                        &sourced,
-                        Some(&profile),
-                        cover,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(adapter)) => Ok(adapter),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_elapsed) => Err(format!(
-                        "connect timeout after {}s",
-                        RECONNECT_PER_URL_TIMEOUT.as_secs()
-                    )),
-                };
-                (url, outcome)
-            });
-        }
+        let mut join_set = spawn_dials(urls, cover);
         let mut results: Vec<(String, Result<_, _>)> = Vec::new();
         // The first panic seeds `first_failure`, so a set whose every dial
         // task panicked (empty `results`) is not read as a silent success.
@@ -2284,7 +2336,14 @@ impl CoreFields {
                 }
             }
         }
-        let manager = register_dialed(results, &mut first_failure);
+        for (url, _) in &results {
+            unanswered.remove(url);
+        }
+        let mut failed = std::collections::BTreeMap::new();
+        for url in unanswered {
+            failed.insert(url, "the dial task panicked".to_owned());
+        }
+        let manager = register_dialed(manager, results, &mut first_failure, &mut failed);
         // A cancel after the last dial means these adapters belong to
         // a cancelled generation. Dropping `manager` drops each adapter, whose
         // `Drop` cancels its cover-traffic and heartbeat tasks and closes the
@@ -2306,6 +2365,7 @@ impl CoreFields {
             manager,
             first_failure,
             any_task_panicked,
+            failed,
         })
     }
 
@@ -2349,10 +2409,12 @@ impl CoreFields {
             manager,
             mut first_failure,
             any_task_panicked,
+            failed: _,
         } = self
             .dial_relays(
                 urls.into_iter().collect(),
                 scp_transport::native::adapter::CoverTraffic::FromProfile,
+                DialBudget::Profile,
             )
             .await?;
         let connected_count = manager.adapter_count();

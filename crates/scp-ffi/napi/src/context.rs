@@ -2318,6 +2318,7 @@ pub(crate) async fn context_subscribe_on(
                     let cmd = MessagingCommand::DeliverIncoming {
                         context_id: context_id.clone(),
                         envelope_bytes: envelope.encrypted_blob.clone(),
+                        mode: scp_core::context::actor::commands::DeliveryMode::Live,
                         reply: tx,
                     };
                     let Some(dispatch_result) =
@@ -2344,12 +2345,12 @@ pub(crate) async fn context_subscribe_on(
                     // ADR-029 §2: an envelope the actor accepted is a
                     // successful relay interaction. A failed write reaches
                     // the callback as an error; delivery continues.
-                    if deliver_result.is_ok()
-                        && let Err(e) = scp_ffi_common::reconnect::record_relay_contact(
-                            relay_contacts.as_ref(),
-                            &context_id,
-                        )
-                        .await
+                    if let Err(e) = scp_ffi_common::reconnect::record_contact_after_live_delivery(
+                        relay_contacts.as_ref(),
+                        &context_id,
+                        &deliver_result,
+                    )
+                    .await
                     {
                         tracing::error!(
                             context_id = %context_id,
@@ -3570,6 +3571,13 @@ pub struct NapiContextReconnectResult {
     pub equivocations_detected: f64,
     /// Whether `needs_reconnect` was cleared on success.
     pub needs_reconnect_cleared: bool,
+    /// Envelopes the actor accepted as application messages during this
+    /// context's reconnection.
+    pub envelopes_delivered: f64,
+    /// Why writing the context's `last_relay_contact` failed after
+    /// `needs_reconnect` was cleared; absent when the write succeeded or no
+    /// write was due.
+    pub relay_contact_error: Option<String>,
 }
 
 /// Aggregate reconnection report surfaced to TypeScript.
@@ -3606,6 +3614,8 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for NapiReconnectReport {
                     mls_update_issued: c.mls_update_issued,
                     equivocations_detected: c.equivocations_detected as f64,
                     needs_reconnect_cleared: c.needs_reconnect_cleared,
+                    envelopes_delivered: c.envelopes_delivered as f64,
+                    relay_contact_error: c.relay_contact_error,
                 })
                 .collect(),
             messages_drained: report.messages_drained as f64,
@@ -3622,15 +3632,12 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for NapiReconnectReport {
 /// this FFI relay-client layer (ADR-029 reconnection-driver addendum): it
 /// pulls relay-buffered messages via the `TransportManager` and reaches
 /// actor-owned reconnection state through the `Supervisor`. On success
-/// each context's `needs_reconnect` flag is cleared.
-// `last_relay_contacts` arrives as JS `number` (f64) Unix seconds; the
-// truncation to u64 is the intended floor of a whole-second timestamp.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+/// each context's `needs_reconnect` flag is cleared. Each context's
+/// `last_relay_contact` is read from the instance's store (ADR-029 §2).
 pub(crate) async fn context_reconnect_on(
     bi: &NapiBridgeInstance,
     identity_did: String,
     context_ids: Vec<String>,
-    last_relay_contacts: Option<std::collections::HashMap<String, f64>>,
 ) -> napi::Result<NapiReconnectReport> {
     let supervisor = crate::runtime::supervisor(bi)?;
     let transport = crate::transport::get_transport_manager_on(bi).ok_or_else(|| {
@@ -3645,36 +3652,38 @@ pub(crate) async fn context_reconnect_on(
     // key never crosses FFI beyond this in-process driver call.
     // The Phase-3 checkpoint signs through custody (ADR-049 Decision 7a).
     let signer = crate::runtime::identity_active_signer(bi, &identity_did).await?;
-    // ADR-029 §2: a cleared `needs_reconnect` writes the context's
+    // ADR-029 §2: the reconnection reads and writes each context's
     // `last_relay_contact`, so a bridge without the store fails closed.
     let relay_contacts = bi.core.relay_contact_store().ok_or_else(|| {
         NapiError::from(ScpNapiError::Validation {
             message: "no protocol repository on this instance — the last relay contact \
-                      cannot be recorded"
+                      cannot be read or recorded"
                 .to_owned(),
             code: codes::STORAGE_8000.to_owned(),
         })
     })?;
 
-    let contacts: std::collections::HashMap<String, u64> = last_relay_contacts
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(k, v)| (k, v as u64))
-        .collect();
     let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
-        &transport,
-        supervisor,
-        DID(identity_did),
-        signer,
-        relay_contacts.as_ref(),
-        context_ids,
-        contacts,
-        now,
-        scp_core::sync::SyncPolicy::default(),
+        scp_ffi_common::reconnect::ReconnectRequest {
+            transport: &transport,
+            supervisor,
+            member_did: DID(identity_did),
+            signer,
+            relay_contacts: relay_contacts.as_ref(),
+            context_ids,
+            now,
+            policy: scp_core::sync::SyncPolicy::default(),
+        },
     )
-    .await;
+    .await
+    .map_err(|e| {
+        NapiError::from(ScpNapiError::Transport {
+            message: e.to_string(),
+            code: e.code().to_owned(),
+        })
+    })?;
     Ok(report.into())
 }
 
@@ -5595,6 +5604,7 @@ mod tests {
         let cmd = MessagingCommand::DeliverIncoming {
             context_id: "ctx".to_owned(),
             envelope_bytes: vec![1, 2, 3],
+            mode: scp_core::context::actor::commands::DeliveryMode::Live,
             reply,
         };
         let outcome = super::dispatch_to_live_supervisor(&std::sync::Weak::new(), "ctx", cmd).await;

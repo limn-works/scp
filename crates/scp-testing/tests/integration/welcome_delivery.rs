@@ -437,7 +437,11 @@ async fn join_time_sender_key_distribution_uses_management_channel() {
         .unwrap();
     let bare_open = bob
         .manager
-        .deliver_commit_blob(context_id_str, raw_distribution)
+        .deliver_commit_blob(
+            context_id_str,
+            raw_distribution,
+            scp_core::context::actor::commands::DeliveryMode::Live,
+        )
         .await;
     assert!(
         bare_open.is_err(),
