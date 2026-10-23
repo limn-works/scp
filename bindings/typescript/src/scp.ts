@@ -722,8 +722,12 @@ export type ReconnectOutcome =
 export interface ContextReconnectResult {
   /** Context that was reconnected. */
   readonly contextId: string;
-  /** Offline tier classification. */
-  readonly tier: ReconnectTier;
+  /**
+   * Offline tier classification; absent when the context's
+   * `last_relay_contact` is absent or unreadable, so no tier was classified
+   * (see {@link ContextReconnectResult.failureCode}).
+   */
+  readonly tier?: ReconnectTier;
   /** Per-context reconnection outcome. */
   readonly outcome: ReconnectOutcome;
   /** MLS epochs caught up. */
@@ -752,6 +756,13 @@ export interface ContextReconnectResult {
    * was due.
    */
   readonly relayContactError?: string;
+  /**
+   * The code of a failure that ended this context's reconnection before its
+   * tier was classified: `SCP-TRANS-5102` when no `last_relay_contact` is
+   * stored, `SCP-TRANS-5103` when reading it failed. Absent for a classified
+   * context, whose `outcome` carries the result.
+   */
+  readonly failureCode?: string;
 }
 
 /**
@@ -2978,8 +2989,10 @@ export class SCP {
    * cleared.
    *
    * Each context's offline tier is classified from the `last_relay_contact`
-   * the instance stores for it; a store read failure, or a context with none
-   * stored, rejects with `SCP-TRANS-5095` before any context is reconnected.
+   * the instance stores for it. A context whose value is absent or cannot be
+   * read is reported `failed` with no `tier` and its own `failureCode`
+   * (`SCP-TRANS-5102` absent, `SCP-TRANS-5103` unreadable) and keeps
+   * `needsReconnect` set; the other contexts reconnect.
    *
    * Requires an active relay connection (call `transportConnect` first).
    *

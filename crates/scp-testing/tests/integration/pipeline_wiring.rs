@@ -3476,6 +3476,85 @@ fn first_relay_contact_written_before_the_actor_spawns() {
     }
 }
 
+/// ADR-029 Implementation and ADR-049 Decision 9: the first contact is
+/// written before the first snapshot, each bootstrap commits its first-state
+/// guard only after the actor spawned, and the create arm and the migration
+/// refuse a running context's id before they write.
+#[test]
+fn first_state_is_ordered_guarded_and_refused_over_a_running_context() {
+    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "persist_first_state")
+        .expect("persist_first_state not found");
+    // The snapshot future is built in the synchronous prelude; its write
+    // runs where it is awaited.
+    assert!(
+        body.contains("persist_state_fail_closed("),
+        "no snapshot write"
+    );
+    let contact = body.find("write_first_contact(").expect("no contact write");
+    let snapshot = body.find("persist.await").expect("no snapshot await");
+    assert!(
+        contact < snapshot,
+        "persist_first_state must write the contact before the snapshot"
+    );
+    for (src, entry) in [
+        (LIFECYCLE_HELPERS_SRC, "create_context"),
+        (LIFECYCLE_HELPERS_SRC, "import_context"),
+        (SUPERVISOR_SRC, "spawn_actor_from_welcome"),
+    ] {
+        let body = extract_fn_body(src, entry).unwrap_or_else(|| panic!("{entry} not found"));
+        let spawn = body
+            .find("spawn_actor_with_state(")
+            .unwrap_or_else(|| panic!("{entry} must call spawn_actor_with_state"));
+        let commit = body
+            .find(".commit()")
+            .unwrap_or_else(|| panic!("{entry} must commit its first-state guard"));
+        assert!(
+            spawn < commit,
+            "{entry} must commit its first-state guard only after the spawn"
+        );
+    }
+    for (entry, owner) in [
+        ("dispatch_lifecycle_direct", SUPERVISOR_SRC),
+        ("standing_context", SUPERVISOR_SRC),
+        ("execute_propose_context_migration", MANAGER_SRC),
+    ] {
+        let body = extract_fn_body(owner, entry).unwrap_or_else(|| panic!("{entry} not found"));
+        for callee in ["FirstStateRollback::new(", ".rollback()"] {
+            assert!(
+                body.contains(callee),
+                "{entry} must own a first-state guard and roll it back ({callee})"
+            );
+        }
+    }
+    let body = extract_fn_body(SUPERVISOR_SRC, "dispatch_lifecycle_direct")
+        .expect("dispatch_lifecycle_direct not found");
+    let refusal = body
+        .find("self.lookup(&context_id).is_some()")
+        .expect("the create arm must refuse a running context's id");
+    let guard = body
+        .find("FirstStateRollback::new(")
+        .expect("the create arm must build its guard");
+    assert!(
+        refusal < guard,
+        "the create arm must refuse a running id before it builds its guard"
+    );
+    let body = extract_fn_body(MANAGER_SRC, "execute_propose_context_migration")
+        .expect("execute_propose_context_migration not found");
+    let lock = body
+        .find("lock_bootstrap_spawn()")
+        .expect("the migration must take bootstrap_spawn_lock");
+    let lookup = body
+        .find("lookup(&destination_context_id)")
+        .expect("the migration must look up its destination");
+    let create = body
+        .find("lifecycle_helpers::create_context(")
+        .expect("the migration must create its destination");
+    assert!(
+        lock < lookup && lookup < create,
+        "the migration must check its destination under the lock before it creates"
+    );
+}
+
 /// ADR-029 §2 push-wake pull mode step 5: a full reconnection sends the
 /// sender-key answers a wake left queued. `reconnect_contexts` passes each
 /// context's outcome through `send_queued_answers`, which calls

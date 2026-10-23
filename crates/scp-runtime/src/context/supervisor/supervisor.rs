@@ -1908,12 +1908,15 @@ pub struct Supervisor {
     /// from `write_lock` to avoid re-entrancy with
     /// `spawn_actor_with_state`/`despawn_actor` (which take `write_lock`).
     /// Lock order is always `bootstrap_spawn_lock` → `write_lock`, never the
-    /// reverse.
+    /// reverse. Held behind an `Arc` so the migration create, which runs in
+    /// the source context's actor turn, takes it through
+    /// [`SupervisorHandle::lock_bootstrap_spawn`](crate::context::supervisor::handle::SupervisorHandle::lock_bootstrap_spawn)
+    /// without holding the Supervisor across the wait.
     #[allow(
         clippy::disallowed_types,
         reason = "ADR-049 §Decision 12 allow-list: serializes the same-id bootstrap-spawn sequence. Cold bootstrap path (not a per-command read), so the Mutex acquire cost the ban targets does not apply."
     )]
-    pub(crate) bootstrap_spawn_lock: tokio::sync::Mutex<()>,
+    pub(crate) bootstrap_spawn_lock: Arc<tokio::sync::Mutex<()>>,
     /// Durable saga journal (plan §"Cross-context saga protocol").
     pub(in crate::context::supervisor) saga_journal: Arc<dyn SagaJournal>,
     /// Per-identity `KeyPackageStoreActor` handles.
@@ -2278,7 +2281,9 @@ impl DurableProviders {
         let saga_journal: Arc<dyn SagaJournal> = Arc::new(
             crate::context::supervisor::ProtocolRepositorySagaJournal::new(Arc::clone(&handle)),
         );
-        let relay_contacts = crate::store::sync::relay_contact_store_over(Arc::clone(&handle));
+        let relay_contacts: Arc<dyn crate::store::sync::RelayContactStore> = Arc::new(
+            crate::store::sync::StorageRelayContactStore::new(Arc::clone(&handle)),
+        );
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(handle));
         Self {
@@ -2381,9 +2386,9 @@ impl DurableProviders {
 /// supervisor constructors.
 #[cfg(any(test, feature = "testing"))]
 fn in_memory_relay_contacts() -> Arc<dyn crate::store::sync::RelayContactStore> {
-    crate::store::sync::relay_contact_store_over(Arc::new(
+    Arc::new(crate::store::sync::StorageRelayContactStore::new(Arc::new(
         scp_platform::in_memory::InMemoryStorage::new(),
-    ))
+    )))
 }
 
 /// The providers [`Supervisor::bootstrap`] installs, as named fields.
@@ -2524,7 +2529,7 @@ impl Supervisor {
             clippy::disallowed_types,
             reason = "ADR-049 §Decision 12 allow-list: same-id bootstrap-spawn serialization guard; cold bootstrap path, not a per-command read."
         )]
-        let bootstrap_spawn_lock = tokio::sync::Mutex::new(());
+        let bootstrap_spawn_lock = Arc::new(tokio::sync::Mutex::new(()));
         // Size the node-wide pump ceiling from the config knob (clamped into
         // range). Read `health_config` BEFORE it is moved into the struct
         // literal below. §5.4.5 round-8.
@@ -4159,6 +4164,24 @@ impl Supervisor {
                 // this op's crypto-init and actor registration. See
                 // `bootstrap_spawn_lock`.
                 let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+                // A create over a running context's id fails before any write
+                // (ADR-029 Implementation), so it cannot replace the running
+                // context's snapshot or contact. The check runs under the lock
+                // every bootstrap holds, so no actor registers between it and
+                // the writes.
+                if self.lookup(&context_id).is_some() {
+                    let msg = format!(
+                        "create_context refused: context '{context_id}' is running"
+                    );
+                    if let Err(_unsent) = reply.send(Err(
+                        scp_protocol::context::builder::ContextCreationError::CreationFailed(
+                            msg.clone(),
+                        ),
+                    )) {
+                        tracing::debug!(context_id, "create_context caller dropped its reply");
+                    }
+                    return Outcome::err_mutated(ContextError::CreationFailed(msg));
+                }
                 // (Re)creating this id is a fresh start: the fresh actor begins
                 // with a clean budget and does not inherit a previous
                 // instance's crash count or sticky poison (ADR-049 §10). A
@@ -4267,6 +4290,26 @@ impl Supervisor {
                         return Outcome::err_mutated(ContextError::PersistenceFailed(msg));
                     }
                 }
+                // The arm owns the first-state guard outside the timeout, so a
+                // create that fails or times out puts back what it wrote.
+                let first_state = match crate::context::lifecycle_helpers::FirstStateRollback::new(
+                    &deps,
+                    &context_id,
+                ) {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        drop(crash_window);
+                        if let Err(_unsent) = reply.send(Err(
+                            scp_protocol::context::builder::ContextCreationError::StateTransition(
+                                e,
+                            ),
+                        )) {
+                            tracing::debug!(context_id, "create_context caller dropped its reply");
+                        }
+                        return Outcome::err_mutated(sketch);
+                    }
+                };
                 let fut = crate::context::lifecycle_helpers::create_context(
                     &deps,
                     p.context_id,
@@ -4274,6 +4317,7 @@ impl Supervisor {
                     p.creator_did,
                     p.local_pseudonym,
                     p.relay_urls,
+                    &first_state,
                 );
                 // `Box::pin` the create future: owned-state spawn keeps the
                 // freshly built `PerContextState` live across the spawn
@@ -4303,6 +4347,23 @@ impl Supervisor {
                         ));
                         (Outcome::err_mutated(sketch), Err(err))
                     }
+                };
+                let (outcome, reply_result) = match reply_result {
+                    Err(e) => match first_state.rollback().await {
+                        Ok(()) => (outcome, Err(e)),
+                        Err(rollback) => {
+                            let folded =
+                                crate::context::lifecycle_helpers::fold_rollback_failure(
+                                    &e, &rollback,
+                                );
+                            let sketch = standing_outcome_error_sketch(&folded);
+                            (
+                                Outcome::err_mutated(sketch),
+                                Err(scp_protocol::context::builder::ContextCreationError::StateTransition(folded)),
+                            )
+                        }
+                    },
+                    ok => (outcome, ok),
                 };
                 drop(crash_window);
                 let _ = reply.send(reply_result);
@@ -4407,11 +4468,31 @@ impl Supervisor {
                 // clippy's 16 KB stack budget (ContextExport ~2 KB +
                 // the full PerContextState-construction locals inside
                 // the `import_context` body).
+                // The arm owns the first-state guard outside the timeout, so an
+                // import that fails or times out puts back what it replaced.
+                let first_state = match crate::context::lifecycle_helpers::FirstStateRollback::new(
+                    &deps,
+                    &context_id,
+                ) {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        if kp_store_newly_spawned {
+                            self.key_package_stores.remove(&owning_did);
+                        }
+                        let sketch = standing_outcome_error_sketch(&e);
+                        drop(crash_window);
+                        if let Err(_unsent) = reply.send(Err(e)) {
+                            tracing::debug!(context_id, "import_context caller dropped its reply");
+                        }
+                        return Outcome::err_mutated(sketch);
+                    }
+                };
                 let fut = Box::pin(crate::context::lifecycle_helpers::import_context(
                     &deps,
                     *export,
                     &verifying_key,
                     local_pseudonym,
+                    &first_state,
                 ));
                 let import_result = tokio::time::timeout(LIFECYCLE_TIMEOUT, fut).await;
                 // `import_context` marks the replace gap when it despawns a
@@ -4443,6 +4524,20 @@ impl Supervisor {
                         let sketch = standing_outcome_error_sketch(&err);
                         (Outcome::err_mutated(sketch), Err(err))
                     }
+                };
+                let (outcome, reply_result) = match reply_result {
+                    Err(e) => match first_state.rollback().await {
+                        Ok(()) => (outcome, Err(e)),
+                        Err(rollback) => {
+                            let folded =
+                                crate::context::lifecycle_helpers::fold_rollback_failure(
+                                    &e, &rollback,
+                                );
+                            let sketch = standing_outcome_error_sketch(&folded);
+                            (Outcome::err_mutated(sketch), Err(folded))
+                        }
+                    },
+                    ok => (outcome, ok),
                 };
                 drop(crash_window);
                 let _ = reply.send(reply_result);
@@ -12507,24 +12602,40 @@ impl Supervisor {
             &scp_protocol::context::TemplateId::BilateralPersistent,
         );
         let create_result = match self.build_actor_deps(local_did).await {
-            Ok(deps) => Box::pin(crate::context::lifecycle_helpers::create_context(
-                &deps,
-                context_id.clone(),
-                params,
-                local_did.clone(),
-                None,
-                // §5.12.3.1: the local identity's relays host the recreated
-                // standing context (PUSH-025).
-                relay_urls,
-            ))
-            .await
-            .map(|_handle| ())
-            .map_err(|e| match e {
-                scp_protocol::context::builder::ContextCreationError::StateTransition(
-                    inner @ ContextError::SupervisorShutDown(_),
-                ) => inner,
-                other => ContextError::TransportFailed(other.to_string()),
-            }),
+            Ok(deps) => {
+                // A recreate that fails puts back what it wrote (ADR-029
+                // Implementation).
+                let first_state =
+                    crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &context_id)?;
+                let created = Box::pin(crate::context::lifecycle_helpers::create_context(
+                    &deps,
+                    context_id.clone(),
+                    params,
+                    local_did.clone(),
+                    None,
+                    // §5.12.3.1: the local identity's relays host the recreated
+                    // standing context (PUSH-025).
+                    relay_urls,
+                    &first_state,
+                ))
+                .await
+                .map(|_handle| ())
+                .map_err(|e| match e {
+                    scp_protocol::context::builder::ContextCreationError::StateTransition(
+                        inner @ ContextError::SupervisorShutDown(_),
+                    ) => inner,
+                    other => ContextError::TransportFailed(other.to_string()),
+                });
+                match created {
+                    Err(e) => match first_state.rollback().await {
+                        Ok(()) => Err(e),
+                        Err(rollback) => Err(
+                            crate::context::lifecycle_helpers::fold_rollback_failure(&e, &rollback),
+                        ),
+                    },
+                    ok => ok,
+                }
+            }
             // A shutdown refusal keeps its typed `SCP-CTX-2138` (ADR-049
             // Decision 16 item 2), as the create, import and restore arms do.
             Err(e @ ContextError::SupervisorShutDown(_)) => Err(e),
@@ -16341,6 +16452,12 @@ impl Supervisor {
         // ADR-056: the crypto keys under the canonical 32-byte DIGEST.
         let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
 
+        // The first-state guard lives outside the timeout, so a join that fails
+        // or times out after step 4 puts back what it wrote (ADR-029
+        // Implementation).
+        let first_state =
+            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &context_id)?;
+
         // Bound the whole locked long-running region under `LIFECYCLE_TIMEOUT`,
         // exactly as the `CreateContext` / `ImportContext` / `RestoreContext`
         // dispatch arms and `respawn_from_snapshot` bound theirs. This region runs
@@ -16605,21 +16722,22 @@ impl Supervisor {
                         )));
                     }
 
-                    // 4. Persist the initial Class-S snapshot FAIL-CLOSED, BEFORE the spawn
-                    //    is acked, then write the joiner's first `last_relay_contact`
-                    //    (ADR-029 Implementation): the member's history starts at the
-                    //    Welcome. The snapshot captures the seeded actor MLS crypto state
-                    //    (`build_snapshot_for_persist` reads `state.export_crypto_state`),
-                    //    so a crash after this point rehydrates a fully-keyed context. A
-                    //    failed write deletes any partial durable snapshot and the contact
-                    //    and returns `Err`; before the early return, dispose the seeded
-                    //    `state`'s crypto — the call is equivalent to the bare drop that
-                    //    follows — never a live half-keyed actor and never an
-                    //    orphaned/clobbered durable snapshot.
+                    // 4. Write the joiner's first `last_relay_contact` (ADR-029
+                    //    Implementation), then persist the initial Class-S snapshot
+                    //    FAIL-CLOSED, both BEFORE the spawn is acked: the member's history
+                    //    starts at the Welcome. The snapshot captures the seeded actor MLS
+                    //    crypto state (`build_snapshot_for_persist` reads
+                    //    `state.export_crypto_state`), so a crash after this point
+                    //    rehydrates a fully-keyed context. A failed write returns `Err`,
+                    //    and `first_state` puts back both records after the timed region;
+                    //    before the early return, dispose the seeded `state`'s crypto — the
+                    //    call is equivalent to the bare drop that follows — never a live
+                    //    half-keyed actor and never an orphaned/clobbered durable snapshot.
                     if let Err(e) = crate::context::lifecycle_helpers::persist_first_state(
                         &state,
                         &deps,
                         &context_id,
+                        &first_state,
                     )
                     .await
                     {
@@ -16654,11 +16772,8 @@ impl Supervisor {
                     //    poison window. A failed spawn gets the prior window back.
                     let _crash_window = self.begin_bootstrap_window(&context_id);
                     let owned_deps = deps.clone_for_spawn();
-                    if let Err(e) = self.spawn_actor_with_state(state, owned_deps, None).await {
-                        crate::context::lifecycle_helpers::discard_first_state(&deps, &context_id)
-                            .await;
-                        return Err(e);
-                    }
+                    self.spawn_actor_with_state(state, owned_deps, None).await?;
+                    first_state.commit();
 
                     Ok(handle)
                 }),
@@ -16676,24 +16791,32 @@ impl Supervisor {
                     // `SecretVLBytes`), and the group's provider-storage values zeroize
                     // on drop. There
                     // is no provider-resident crypto to tear down (#2148 birth-into-actor).
-                    // Delete any persisted snapshot and first contact: an idempotent no-op
-                    // when the elapse landed before step 4 ran, so it is safe regardless
-                    // of how far the timed region progressed — no orphaned durable
-                    // snapshot or contact survives.
+                    // `first_state` below puts back any record step 4 wrote: a no-op when
+                    // the elapse landed before step 4 ran, so it is safe regardless of how
+                    // far the timed region progressed.
                     // Mirrors the `TransportTimeout` the import / restore / respawn
                     // bootstraps return on their own `LIFECYCLE_TIMEOUT` elapse. The actor
                     // is registered only by step 5's `spawn_actor_with_state`, which
                     // resolves the timed future to `Ok(..)` (never `Elapsed`) once it
                     // returns, so this arm is reached only with NO registered actor for
                     // `context_id`.
-                    crate::context::lifecycle_helpers::discard_first_state(&deps, &context_id)
-                        .await;
                     Err(ContextError::TransportTimeout(format!(
                         "spawn-from-Welcome exceeded {:?} budget for context {context_id}",
                         Self::LIFECYCLE_TIMEOUT
                     )))
                 }
             };
+        // A failed or timed-out join puts back what step 4 wrote; a no-op after
+        // the spawn committed or when step 4 never ran.
+        let spawn_outcome = match spawn_outcome {
+            Err(e) => match first_state.rollback().await {
+                Ok(()) => Err(e),
+                Err(rollback) => Err(crate::context::lifecycle_helpers::fold_rollback_failure(
+                    &e, &rollback,
+                )),
+            },
+            ok => ok,
+        };
         // Propagate a step-internal error or the timeout error; on success bind the
         // joiner handle and run the (bounded, local) post-spawn finalization OUTSIDE
         // the timeout — the actor is now registered, so the elapse rollback above
@@ -29919,6 +30042,419 @@ mod tests {
         assert!(
             persistence.load_context(&ctx).await.unwrap().is_none(),
             "the first snapshot is deleted"
+        );
+    }
+
+    /// A snapshot store over a shared map whose writes fail, wait forever, or
+    /// whose deletes fail, as each test sets. Clones share the map and the
+    /// switches, so a test keeps one clone to seed and inspect.
+    /// `close_gate_on_write` closes that Supervisor's spawn gate once a
+    /// snapshot write lands, so the spawn after it is refused.
+    #[derive(Clone, Default)]
+    struct FaultyPersistence {
+        contexts: Arc<DashMap<String, crate::context::state::ContextSnapshot>>,
+        fail_writes: Arc<std::sync::atomic::AtomicBool>,
+        hang_writes: Arc<std::sync::atomic::AtomicBool>,
+        write_started: Arc<std::sync::atomic::AtomicBool>,
+        fail_deletes: Arc<std::sync::atomic::AtomicBool>,
+        close_gate_on_write: Arc<std::sync::OnceLock<std::sync::Weak<Supervisor>>>,
+    }
+    impl FaultyPersistence {
+        /// A store wired to `sup` through `close_gate_on_write`.
+        fn closing_the_gate_of(&self, sup: &Arc<Supervisor>) {
+            assert!(
+                self.close_gate_on_write.set(Arc::downgrade(sup)).is_ok(),
+                "the gate hook is set once"
+            );
+        }
+        fn set(flag: &std::sync::atomic::AtomicBool) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn is_set(flag: &std::sync::atomic::AtomicBool) -> bool {
+            flag.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// The stored snapshot's creation time, the marker these tests seed.
+        fn created_at(&self, id: &str) -> Option<u64> {
+            self.contexts.get(id).map(|s| s.creation_timestamp_secs)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ContextPersistence for FaultyPersistence {
+        async fn persist_context(
+            &self,
+            id: &str,
+            snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Self::set(&self.write_started);
+            if Self::is_set(&self.hang_writes) {
+                std::future::pending::<()>().await;
+            }
+            if Self::is_set(&self.fail_writes) {
+                return Err("injected snapshot write failure".into());
+            }
+            self.contexts.insert(id.to_owned(), snap.clone());
+            if let Some(sup) = self
+                .close_gate_on_write
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+            {
+                sup.close_spawn_gate();
+            }
+            Ok(())
+        }
+        async fn load_context(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(self.contexts.get(id).map(|s| s.value().clone()))
+        }
+        async fn delete_context(
+            &self,
+            id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if Self::is_set(&self.fail_deletes) {
+                return Err("injected snapshot delete failure".into());
+            }
+            self.contexts.remove(id);
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.contexts.iter().map(|e| e.key().clone()).collect())
+        }
+    }
+
+    /// The creation time a seeded prior snapshot carries, which no create in
+    /// these tests writes.
+    const PRIOR_CREATED_AT: u64 = 1_234;
+    /// The `last_relay_contact` a test stores before the call under test.
+    const PRIOR_CONTACT: u64 = 42;
+
+    /// A snapshot for `ctx` in `state`, marked with [`PRIOR_CREATED_AT`].
+    fn prior_snapshot(
+        ctx: &str,
+        state: scp_protocol::context::ContextState,
+    ) -> crate::context::state::ContextSnapshot {
+        let mut snapshot = import_test_snapshot(ctx, "did:dht:z6MkPriorSnapshotCreator");
+        snapshot.state = state;
+        snapshot.creation_timestamp_secs = PRIOR_CREATED_AT;
+        snapshot
+    }
+
+    /// An import over a Tombstoned context whose first-contact write fails
+    /// keeps the tombstone: the contact is written before the snapshot, so
+    /// the failure stops the import before it replaces the snapshot, and the
+    /// rollback deletes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_over_a_tombstone_with_a_failing_contact_write_keeps_the_tombstone() {
+        let ctx = hex::encode([0xE7u8; 32]);
+        let (export, signing_key) = first_contact_export(&ctx).await;
+        let persistence = FaultyPersistence::default();
+        persistence.contexts.insert(
+            ctx.clone(),
+            prior_snapshot(&ctx, scp_protocol::context::ContextState::Tombstoned),
+        );
+        let importer = first_contact_supervisor(
+            Box::new(persistence.clone()),
+            durable_with_failing_contacts(),
+        );
+        let err = Box::pin(importer.import_context(export, &signing_key.verifying_key(), None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+        assert!(importer.lookup(&ctx).is_none(), "no actor is registered");
+        let kept = persistence.contexts.get(&ctx).map(|s| s.state.clone());
+        assert_eq!(
+            kept,
+            Some(scp_protocol::context::ContextState::Tombstoned),
+            "the tombstone is kept"
+        );
+    }
+
+    /// A create whose first-snapshot write fails over an existing snapshot
+    /// keeps that snapshot and puts back the contact stored before it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_snapshot_write_over_an_existing_snapshot_keeps_it_and_its_contact() {
+        let ctx = hex::encode([0xE8u8; 32]);
+        let persistence = FaultyPersistence::default();
+        persistence.contexts.insert(
+            ctx.clone(),
+            prior_snapshot(&ctx, scp_protocol::context::ContextState::Active),
+        );
+        FaultyPersistence::set(&persistence.fail_writes);
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        let contacts = sup.relay_contact_store();
+        contacts
+            .store_last_relay_contact(&ctx, PRIOR_CONTACT)
+            .await
+            .unwrap();
+        let identity = sup.node_identity().unwrap();
+        let err = sup
+            .create_context(
+                ctx.clone(),
+                first_contact_params(),
+                identity,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::builder::ContextCreationError::StateTransition(
+                    ContextError::PersistenceFailed(_)
+                )
+            ),
+            "{err:?}"
+        );
+        assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+        assert_eq!(persistence.created_at(&ctx), Some(PRIOR_CREATED_AT));
+        assert_eq!(
+            contacts.load_last_relay_contact(&ctx).await.unwrap(),
+            Some(PRIOR_CONTACT),
+            "the prior contact is put back"
+        );
+    }
+
+    /// A create and an import whose spawn fails after both first-state
+    /// writes landed roll back: the create puts back the snapshot and the
+    /// contact stored before it, and the import, which had none, leaves
+    /// neither. The spawn fails because the spawn gate closes as the
+    /// snapshot write lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_spawn_rolls_back_create_and_import() {
+        let persistence = FaultyPersistence::default();
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        persistence.closing_the_gate_of(&sup);
+        let contacts = sup.relay_contact_store();
+        let identity = sup.node_identity().unwrap();
+        let created = hex::encode([0xE9u8; 32]);
+        persistence.contexts.insert(
+            created.clone(),
+            prior_snapshot(&created, scp_protocol::context::ContextState::Active),
+        );
+        contacts
+            .store_last_relay_contact(&created, PRIOR_CONTACT)
+            .await
+            .unwrap();
+        let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
+
+        let guard =
+            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &created).unwrap();
+        let err = Box::pin(crate::context::lifecycle_helpers::create_context(
+            &deps,
+            created.clone(),
+            first_contact_params(),
+            identity,
+            None,
+            Vec::new(),
+            &guard,
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::builder::ContextCreationError::StateTransition(
+                    ContextError::SupervisorShutDown(_)
+                )
+            ),
+            "{err:?}"
+        );
+        assert_ne!(
+            persistence.created_at(&created),
+            Some(PRIOR_CREATED_AT),
+            "the create replaced the snapshot before the spawn"
+        );
+        assert_eq!(
+            contacts.load_last_relay_contact(&created).await.unwrap(),
+            Some(FIRST_CONTACT_NOW),
+            "the create wrote its contact before the spawn"
+        );
+        guard.rollback().await.unwrap();
+        assert!(sup.lookup(&created).is_none(), "no actor started");
+        assert_eq!(persistence.created_at(&created), Some(PRIOR_CREATED_AT));
+        assert_eq!(
+            contacts.load_last_relay_contact(&created).await.unwrap(),
+            Some(PRIOR_CONTACT)
+        );
+
+        let persistence = FaultyPersistence::default();
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        persistence.closing_the_gate_of(&sup);
+        let contacts = sup.relay_contact_store();
+        let identity = sup.node_identity().unwrap();
+        let imported = hex::encode([0xEAu8; 32]);
+        let (export, signing_key) = first_contact_export(&imported).await;
+        let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
+        let guard =
+            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &imported).unwrap();
+        let err = Box::pin(crate::context::lifecycle_helpers::import_context(
+            &deps,
+            export,
+            &signing_key.verifying_key(),
+            None,
+            &guard,
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ContextError::SupervisorShutDown(_)),
+            "{err:?}"
+        );
+        assert!(
+            persistence.contexts.contains_key(&imported),
+            "the import wrote its snapshot before the spawn"
+        );
+        assert_eq!(
+            contacts.load_last_relay_contact(&imported).await.unwrap(),
+            Some(FIRST_CONTACT_NOW),
+            "the import wrote its contact before the spawn"
+        );
+        guard.rollback().await.unwrap();
+        assert!(sup.lookup(&imported).is_none(), "no actor started");
+        assert!(!persistence.contexts.contains_key(&imported));
+        assert_eq!(
+            contacts.load_last_relay_contact(&imported).await.unwrap(),
+            None
+        );
+    }
+
+    /// When the rollback cannot delete the snapshot a failed create wrote, it
+    /// fails with `PersistenceFailed` and keeps the contact, so no path
+    /// leaves a snapshot with no contact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rollback_whose_snapshot_delete_fails_keeps_the_contact() {
+        let persistence = FaultyPersistence::default();
+        FaultyPersistence::set(&persistence.fail_deletes);
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        let contacts = sup.relay_contact_store();
+        let identity = sup.node_identity().unwrap();
+        persistence.closing_the_gate_of(&sup);
+        let ctx = hex::encode([0xEBu8; 32]);
+        let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
+
+        let guard =
+            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &ctx).unwrap();
+        Box::pin(crate::context::lifecycle_helpers::create_context(
+            &deps,
+            ctx.clone(),
+            first_contact_params(),
+            identity,
+            None,
+            Vec::new(),
+            &guard,
+        ))
+        .await
+        .unwrap_err();
+        let err = guard.rollback().await.unwrap_err();
+        assert!(matches!(err, ContextError::PersistenceFailed(_)), "{err:?}");
+        assert!(persistence.contexts.contains_key(&ctx), "the delete failed");
+        assert_eq!(
+            contacts.load_last_relay_contact(&ctx).await.unwrap(),
+            Some(FIRST_CONTACT_NOW),
+            "the contact stays while its snapshot does"
+        );
+    }
+
+    /// A create whose snapshot write outlasts `LIFECYCLE_TIMEOUT` is dropped
+    /// by the dispatch arm, which then rolls back the contact the create
+    /// wrote first, putting back the one stored before.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_create_rolls_back_its_first_contact() {
+        let persistence = FaultyPersistence::default();
+        FaultyPersistence::set(&persistence.hang_writes);
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        let contacts = sup.relay_contact_store();
+        let ctx = hex::encode([0xECu8; 32]);
+        contacts
+            .store_last_relay_contact(&ctx, PRIOR_CONTACT)
+            .await
+            .unwrap();
+        let identity = sup.node_identity().unwrap();
+        let err = sup
+            .create_context(
+                ctx.clone(),
+                first_contact_params(),
+                identity,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            FaultyPersistence::is_set(&persistence.write_started),
+            "the create reached its snapshot write before the timeout: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("exceeded"),
+            "the create timed out: {err:?}"
+        );
+        assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+        assert!(!persistence.contexts.contains_key(&ctx));
+        assert_eq!(
+            contacts.load_last_relay_contact(&ctx).await.unwrap(),
+            Some(PRIOR_CONTACT),
+            "the prior contact is put back"
+        );
+    }
+
+    /// A second create of a running context's id fails with `CreationFailed`
+    /// and leaves the first context's snapshot, contact, and actor in place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_create_over_a_running_context_keeps_its_snapshot_and_contact() {
+        let persistence = FaultyPersistence::default();
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        let contacts = sup.relay_contact_store();
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([0xEDu8; 32]);
+        sup.create_context(
+            ctx.clone(),
+            first_contact_params(),
+            identity.clone(),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        // A later contact, which a second create's first contact would
+        // replace.
+        contacts
+            .store_last_relay_contact(&ctx, FIRST_CONTACT_NOW + 60)
+            .await
+            .unwrap();
+        let err = sup
+            .create_context(
+                ctx.clone(),
+                first_contact_params(),
+                identity,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::builder::ContextCreationError::CreationFailed(ref msg)
+                    if msg.contains("is running")
+            ),
+            "{err:?}"
+        );
+        assert!(sup.lookup(&ctx).is_some(), "the first context still runs");
+        assert!(
+            persistence.contexts.contains_key(&ctx),
+            "the snapshot is kept"
+        );
+        assert_eq!(
+            contacts.load_last_relay_contact(&ctx).await.unwrap(),
+            Some(FIRST_CONTACT_NOW + 60),
+            "the contact is kept"
         );
     }
 

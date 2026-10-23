@@ -417,6 +417,7 @@ async fn pull_on_wake(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use scp_core::store::sync::RelayContactStore;
 
     fn invalid(platform: PushPlatform, payload: &[u8]) {
         assert_eq!(
@@ -685,12 +686,12 @@ mod tests {
     }
 
     type Contacts = std::sync::Arc<
-        scp_core::store::ProtocolRepository<scp_platform::in_memory::InMemoryStorage>,
+        scp_core::store::sync::StorageRelayContactStore<scp_platform::in_memory::InMemoryStorage>,
     >;
 
     fn contacts() -> Contacts {
-        std::sync::Arc::new(scp_core::store::ProtocolRepository::new_for_testing(
-            scp_platform::in_memory::InMemoryStorage::new(),
+        std::sync::Arc::new(scp_core::store::sync::StorageRelayContactStore::new(
+            std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
         ))
     }
 

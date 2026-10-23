@@ -970,6 +970,20 @@ impl SupervisorHandle {
         Ok(self.upgrade()?.lookup(context_id))
     }
 
+    /// Takes the Supervisor's `bootstrap_spawn_lock` for a bootstrap that runs
+    /// outside the Supervisor, the migration create. The Supervisor is not
+    /// held across the wait.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub(in crate::context) async fn lock_bootstrap_spawn(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ContextError> {
+        let lock = Arc::clone(&self.upgrade()?.bootstrap_spawn_lock);
+        Ok(lock.lock_owned().await)
+    }
+
     /// Install the per-context TTL timer for `context_id` by mailboxing
     /// [`TtlCloseCommand::StartTtlTimer`](crate::context::actor::commands::TtlCloseCommand::StartTtlTimer)
     /// to the owning actor. The actor handler runs the actor-shape

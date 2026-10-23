@@ -2716,8 +2716,10 @@ pub struct TrustInput {
 pub struct ContextReconnectResult {
     /// Context that was reconnected.
     pub context_id: String,
-    /// Offline tier: `"short"` / `"extended"` / `"long"`.
-    pub tier: String,
+    /// Offline tier: `"short"` / `"extended"` / `"long"`; absent when the
+    /// context's `last_relay_contact` is absent or unreadable, so no tier was
+    /// classified (see `failure_code`).
+    pub tier: Option<String>,
     /// Outcome string (`"fully_caught_up"`, `"reset"`, `"failed"`, …).
     pub outcome: String,
     /// MLS epochs caught up.
@@ -2737,6 +2739,11 @@ pub struct ContextReconnectResult {
     /// `needs_reconnect` was cleared; `None` when the write succeeded or no
     /// write was due.
     pub relay_contact_error: Option<String>,
+    /// The code of a failure that ended this context's reconnection before
+    /// its tier was classified: `SCP-TRANS-5102` when no `last_relay_contact`
+    /// is stored, `SCP-TRANS-5103` when reading it failed. Absent for a
+    /// classified context, whose `outcome` carries the result.
+    pub failure_code: Option<String>,
 }
 
 /// Aggregate reconnection report (ADR-029).
@@ -2771,6 +2778,7 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for ReconnectReport {
                     needs_reconnect_cleared: c.needs_reconnect_cleared,
                     envelopes_delivered: c.envelopes_delivered,
                     relay_contact_error: c.relay_contact_error,
+                    failure_code: c.failure_code,
                 })
                 .collect(),
             messages_drained: report.messages_drained,
@@ -13149,9 +13157,11 @@ impl Scp {
     /// the `TransportManager` and reaches actor-owned reconnection state
     /// through the `Supervisor`. On success each context's `needs_reconnect`
     /// flag is cleared. Each context's offline tier is classified from its
-    /// `last_relay_contact` in the instance's store. A store read failure, or
-    /// a context with none stored, fails the call with `SCP-TRANS-5095`
-    /// before any context is reconnected.
+    /// `last_relay_contact` in the instance's store.
+    /// A context whose `last_relay_contact` is absent or cannot be read is
+    /// reported `failed` with no tier and its own `failure_code`
+    /// (`SCP-TRANS-5102` absent, `SCP-TRANS-5103` unreadable) and keeps
+    /// `needs_reconnect` set; the other contexts reconnect.
     pub async fn context_reconnect(
         &self,
         identity: Arc<Identity>,
@@ -13207,11 +13217,7 @@ impl Scp {
                 policy: scp_core::sync::SyncPolicy::default(),
             },
         )
-        .await
-        .map_err(|e| ScpError::Transport {
-            msg: e.to_string(),
-            code: e.code().to_owned(),
-        })?;
+        .await;
         Ok(report.into())
     }
 

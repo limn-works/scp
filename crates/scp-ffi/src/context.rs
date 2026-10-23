@@ -2590,9 +2590,11 @@ pub struct PyContextReconnectResult {
     /// Context that was reconnected.
     #[pyo3(get)]
     pub context_id: String,
-    /// Offline tier: `"short"` / `"extended"` / `"long"`.
+    /// Offline tier: `"short"` / `"extended"` / `"long"`; absent when the
+    /// context's `last_relay_contact` is absent or unreadable, so no tier was
+    /// classified (see `failure_code`).
     #[pyo3(get)]
-    pub tier: String,
+    pub tier: Option<String>,
     /// Outcome string (`"fully_caught_up"`, `"reset"`, `"failed"`, …).
     #[pyo3(get)]
     pub outcome: String,
@@ -2620,6 +2622,12 @@ pub struct PyContextReconnectResult {
     /// write was due.
     #[pyo3(get)]
     pub relay_contact_error: Option<String>,
+    /// The code of a failure that ended this context's reconnection before
+    /// its tier was classified: `SCP-TRANS-5102` when no `last_relay_contact`
+    /// is stored, `SCP-TRANS-5103` when reading it failed. Absent for a
+    /// classified context, whose `outcome` carries the result.
+    #[pyo3(get)]
+    pub failure_code: Option<String>,
 }
 
 /// Aggregate reconnection report surfaced to Python.
@@ -2659,6 +2667,7 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for PyReconnectReport {
                     needs_reconnect_cleared: c.needs_reconnect_cleared,
                     envelopes_delivered: c.envelopes_delivered,
                     relay_contact_error: c.relay_contact_error,
+                    failure_code: c.failure_code,
                 })
                 .collect(),
             messages_drained: report.messages_drained,
@@ -5628,15 +5637,16 @@ impl crate::scp::PyScp {
     /// `context_ids` is the set of contexts to consider; each is driven
     /// through the protocol only if the actor reports it `needs_reconnect`.
     /// Each context's offline tier is classified from its
-    /// `last_relay_contact` in the instance's store; a store read failure, or
-    /// a context with none stored, fails the call with `SCP-TRANS-5095`
-    /// before any context is reconnected.
+    /// `last_relay_contact` in the instance's store.
+    /// A context whose `last_relay_contact` is absent or cannot be read is
+    /// reported `failed` with no tier and its own `failure_code`
+    /// (`SCP-TRANS-5102` absent, `SCP-TRANS-5103` unreadable) and keeps
+    /// `needs_reconnect` set; the other contexts reconnect.
     ///
     /// # Errors
     ///
     /// Returns `RuntimeError` if no relay is connected, the supervisor is
-    /// not initialized, the signing key cannot be resolved, or a stored
-    /// `last_relay_contact` cannot be read (`SCP-TRANS-5095`).
+    /// not initialized, or the signing key cannot be resolved.
     #[pyo3(signature = (identity_did, context_ids))]
     pub fn context_reconnect(
         &self,
@@ -5685,11 +5695,7 @@ impl crate::scp::PyScp {
                     policy: scp_core::sync::SyncPolicy::default(),
                 },
             ),
-        )?
-        .map_err(|e| crate::error::ScpPyError::TransportError {
-            message: e.to_string(),
-            code: e.code().to_owned(),
-        })?;
+        )?;
         Ok(report.into())
     }
 

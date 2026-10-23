@@ -1757,9 +1757,11 @@ class SCP:
         ``needs_reconnect`` flag is cleared.
 
         Each context's offline tier is classified from the
-        ``last_relay_contact`` the instance stores for it; a store read
-        failure, or a context with none stored, raises with
-        ``SCP-TRANS-5095`` before any context is reconnected.
+        ``last_relay_contact`` the instance stores for it. A context whose
+        value is absent or cannot be read is reported ``failed`` with
+        ``tier`` set to ``None`` and its own ``failure_code``
+        (``SCP-TRANS-5102`` absent, ``SCP-TRANS-5103`` unreadable) and keeps
+        ``needs_reconnect`` set; the other contexts reconnect.
 
         Requires an active relay connection (call ``transport_connect`` first).
 

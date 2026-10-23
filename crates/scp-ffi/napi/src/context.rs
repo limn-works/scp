@@ -3538,8 +3538,10 @@ pub(crate) async fn context_execute_governance_action_on(
 pub struct NapiContextReconnectResult {
     /// Context that was reconnected.
     pub context_id: String,
-    /// Offline tier: `"short"` / `"extended"` / `"long"`.
-    pub tier: String,
+    /// Offline tier: `"short"` / `"extended"` / `"long"`; absent when the
+    /// context's `last_relay_contact` is absent or unreadable, so no tier was
+    /// classified (see `failure_code`).
+    pub tier: Option<String>,
     /// Outcome string (`"fully_caught_up"`, `"reset"`, `"failed"`, …).
     pub outcome: String,
     /// MLS epochs caught up.
@@ -3559,6 +3561,11 @@ pub struct NapiContextReconnectResult {
     /// `needs_reconnect` was cleared; absent when the write succeeded or no
     /// write was due.
     pub relay_contact_error: Option<String>,
+    /// The code of a failure that ended this context's reconnection before
+    /// its tier was classified: `SCP-TRANS-5102` when no `last_relay_contact`
+    /// is stored, `SCP-TRANS-5103` when reading it failed. Absent for a
+    /// classified context, whose `outcome` carries the result.
+    pub failure_code: Option<String>,
 }
 
 /// Aggregate reconnection report surfaced to TypeScript.
@@ -3597,6 +3604,7 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for NapiReconnectReport {
                     needs_reconnect_cleared: c.needs_reconnect_cleared,
                     envelopes_delivered: c.envelopes_delivered as f64,
                     relay_contact_error: c.relay_contact_error,
+                    failure_code: c.failure_code,
                 })
                 .collect(),
             messages_drained: report.messages_drained as f64,
@@ -3658,13 +3666,7 @@ pub(crate) async fn context_reconnect_on(
             policy: scp_core::sync::SyncPolicy::default(),
         },
     )
-    .await
-    .map_err(|e| {
-        NapiError::from(ScpNapiError::Transport {
-            message: e.to_string(),
-            code: e.code().to_owned(),
-        })
-    })?;
+    .await;
     Ok(report.into())
 }
 

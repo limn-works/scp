@@ -4001,6 +4001,23 @@ pub fn execute_propose_context_migration<'a>(
                 )
             })?;
 
+        // The destination create is a bootstrap like every other create: it
+        // runs under `bootstrap_spawn_lock`, and it fails before any write
+        // when the destination id names a running context (ADR-029
+        // Implementation), so it cannot replace that context's snapshot or
+        // contact. A lock holder that waits on this actor's mailbox gives up at
+        // its own reply or lifecycle timeout.
+        let bootstrap_guard = deps.supervisor.lock_bootstrap_spawn().await?;
+        if deps.supervisor.lookup(&destination_context_id)?.is_some() {
+            return Err(ContextError::CreationFailed(format!(
+                "migration destination '{destination_context_id}' is running"
+            )));
+        }
+        let first_state = crate::context::lifecycle_helpers::FirstStateRollback::new(
+            deps,
+            &destination_context_id,
+        )?;
+
         cell.handle
             .transition_to(&ContextState::MigratingOut)
             .map_err(|_| {
@@ -4060,16 +4077,26 @@ pub fn execute_propose_context_migration<'a>(
             // The destination is hosted on the source context's relays
             // (§5.12.3.1, PUSH-025).
             cell.relay_urls.clone(),
+            &first_state,
         ));
         if let Err(e) = create_fut.await {
             // Roll back: revert the source handle to Active. No Class-C field
             // was written before the await, so no view is taken here and the
             // cell's `mutation_epoch` is unchanged across the failure.
             let _ = cell.handle.transition_to(&ContextState::Active);
+            // Put back the destination's first-state records; a failure to
+            // do so is the caller's to see.
+            first_state.rollback().await.map_err(|rollback| {
+                crate::context::lifecycle_helpers::fold_rollback_failure(
+                    &format!("failed to create destination context: {e}"),
+                    &rollback,
+                )
+            })?;
             return Err(ContextError::PermissionDenied(format!(
                 "failed to create destination context: {e}"
             )));
         }
+        drop(bootstrap_guard);
 
         // Coalesced Class-C staging (migration_state + buffered events) in a
         // short view borrow, now that the destination exists.

@@ -50,8 +50,8 @@ use scp_core::context::params::{ContextMode, ContextParams};
 use scp_core::context::roles::Capability;
 use scp_core::context::supervisor::Supervisor;
 use scp_core::envelope::OuterEnvelope;
-use scp_core::store::ProtocolRepository;
 use scp_core::store::sync::RelayContactStore;
+use scp_core::store::sync::StorageRelayContactStore;
 use scp_core::sync::SyncPolicy;
 use scp_did::DID;
 use scp_ffi_common::bridge_instance::CoreFields;
@@ -76,7 +76,7 @@ const BOB_DID: &str = "did:dht:z6MkBobPushWake";
 const PLAINTEXT: &[u8] = b"wake me up";
 const APNS_WAKE: &[u8] = br#"{"aps":{"content-available":1}}"#;
 
-type Contacts = Arc<ProtocolRepository<InMemoryStorage>>;
+type Contacts = Arc<StorageRelayContactStore<InMemoryStorage>>;
 
 fn encrypted_params() -> ContextParams {
     ContextParams {
@@ -108,7 +108,9 @@ fn dead_url() -> String {
 }
 
 fn new_contacts() -> Contacts {
-    Arc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new()))
+    Arc::new(StorageRelayContactStore::new(Arc::new(
+        InMemoryStorage::new(),
+    )))
 }
 
 /// Starts an ephemeral native relay; returns its handle and `ws://` URL.
@@ -816,10 +818,9 @@ async fn a_full_reconnect_that_clears_needs_reconnect_writes_the_contact() {
         now,
         policy: SyncPolicy::default(),
     })
-    .await
-    .expect("the contact reads");
+    .await;
     let result = &report.contexts[0];
-    assert_eq!(result.tier, "short", "{result:?}");
+    assert_eq!(result.tier.as_deref(), Some("short"), "{result:?}");
     assert_eq!(result.outcome, "fully_caught_up", "{result:?}");
     assert!(result.needs_reconnect_cleared, "{result:?}");
     assert!(!bob.needs_reconnect(&m.ctx_id).await);
@@ -870,10 +871,9 @@ async fn a_reconnect_after_a_welcome_join_classifies_short_from_the_joins_contac
         now: now_secs(),
         policy: SyncPolicy::default(),
     })
-    .await
-    .expect("the contact reads");
+    .await;
     let result = &report.contexts[0];
-    assert_eq!(result.tier, "short", "{result:?}");
+    assert_eq!(result.tier.as_deref(), Some("short"), "{result:?}");
     relay.shutdown();
 }
 
@@ -908,15 +908,14 @@ async fn a_tier_3_reconnect_fails_at_once_and_keeps_needs_reconnect_set() {
         now,
         policy,
     })
-    .await
-    .expect("the contact reads");
+    .await;
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "Tier 3 fails at once, without a Welcome wait: {:?}",
         started.elapsed()
     );
     let result = &report.contexts[0];
-    assert_eq!(result.tier, "long", "{result:?}");
+    assert_eq!(result.tier.as_deref(), Some("long"), "{result:?}");
     assert_eq!(result.outcome, "failed", "{result:?}");
     assert!(!result.needs_reconnect_cleared, "{result:?}");
     assert!(
@@ -1122,8 +1121,7 @@ async fn a_full_reconnect_sends_the_answer_a_wake_queued() {
         now,
         policy: SyncPolicy::default(),
     })
-    .await
-    .expect("the contact reads");
+    .await;
     assert_eq!(report.contexts[0].outcome, "fully_caught_up", "{report:?}");
     assert_eq!(
         m.bob

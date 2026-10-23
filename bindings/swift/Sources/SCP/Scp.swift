@@ -561,10 +561,11 @@ public extension SCP {
     /// `TransportManager` and reaches actor-owned reconnection state through
     /// the `Supervisor`. On success each context's `needsReconnect` flag is
     /// cleared. Each context's offline tier is classified from the
-    /// `last_relay_contact` the instance stores for it; a store read failure,
-    /// or a context with none stored, throws `SCP-TRANS-5095` before any
-    /// context is reconnected. Forwards to ``Scp/contextReconnect`` on
-    /// ``inner``.
+    /// `last_relay_contact` the instance stores for it. A context whose value
+    /// is absent or cannot be read is reported `failed` with a `nil` `tier`
+    /// and its own `failureCode` (`SCP-TRANS-5102` absent, `SCP-TRANS-5103`
+    /// unreadable) and keeps `needsReconnect` set; the other contexts
+    /// reconnect. Forwards to ``Scp/contextReconnect`` on ``inner``.
     ///
     /// Catch-up integrity (§9.9.3, §23.7): equivocation where a peer reports
     /// the **same** event count with a **different** Merkle root IS detected

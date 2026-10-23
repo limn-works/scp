@@ -223,9 +223,9 @@ async fn reconnect_classifies_all_three_tiers() {
 
     // The driver classifies from the stored contact (ADR-029 §2), so the
     // Short tier comes from a contact 60 s old in the repository.
-    let relay_contacts = scp_core::store::ProtocolRepository::new_for_testing(
+    let relay_contacts = scp_core::store::sync::StorageRelayContactStore::new(Arc::new(
         scp_platform::in_memory::InMemoryStorage::new(),
-    );
+    ));
     scp_core::store::sync::RelayContactStore::store_last_relay_contact(
         &relay_contacts,
         short_ctx,
@@ -247,8 +247,7 @@ async fn reconnect_classifies_all_three_tiers() {
             policy,
         },
     )
-    .await
-    .expect("the contact reads");
+    .await;
 
     let result = report
         .contexts
@@ -256,8 +255,137 @@ async fn reconnect_classifies_all_three_tiers() {
         .find(|c| c.context_id == short_ctx)
         .expect("short context in report");
     assert_eq!(
-        result.tier, "short",
+        result.tier.as_deref(),
+        Some("short"),
         "the relay-backed driver run must classify the live context as Short"
+    );
+
+    relay_handle.shutdown();
+}
+
+/// A contact store whose reads fail for one context and delegate otherwise.
+struct UnreadableFor {
+    inner:
+        scp_core::store::sync::StorageRelayContactStore<scp_platform::in_memory::InMemoryStorage>,
+    unreadable: &'static str,
+}
+
+#[async_trait::async_trait]
+impl scp_core::store::sync::RelayContactStore for UnreadableFor {
+    async fn store_last_relay_contact(
+        &self,
+        context_id: &str,
+        last_relay_contact: u64,
+    ) -> Result<(), scp_core::store::StoreError> {
+        self.inner
+            .store_last_relay_contact(context_id, last_relay_contact)
+            .await
+    }
+    async fn load_last_relay_contact(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<u64>, scp_core::store::StoreError> {
+        if context_id == self.unreadable {
+            return Err(scp_core::store::StoreError::SerializationFailed(
+                "injected read failure".to_owned(),
+            ));
+        }
+        self.inner.load_last_relay_contact(context_id).await
+    }
+    async fn delete_last_relay_contact(
+        &self,
+        context_id: &str,
+    ) -> Result<(), scp_core::store::StoreError> {
+        self.inner.delete_last_relay_contact(context_id).await
+    }
+}
+
+/// A context with no stored `last_relay_contact` and a context whose read
+/// fails each end only their own reconnection: each is reported `failed`
+/// with no tier and its own code (`SCP-TRANS-5102`, `SCP-TRANS-5103`) and
+/// keeps `needs_reconnect`, while the seeded context in the same call is
+/// classified and driven (ADR-029 Implementation).
+#[tokio::test]
+async fn a_missing_or_unreadable_contact_fails_only_its_own_context() {
+    use scp_core::store::sync::RelayContactStore;
+
+    let seeded = "reconnect-per-context-seeded";
+    let unseeded = "reconnect-per-context-unseeded";
+    let unreadable = "reconnect-per-context-unreadable";
+    let (relay_handle, relay_addr) = start_relay().await;
+    let transport = connect_transport(relay_addr).await;
+    let network = FullStackNetwork::new();
+    let alice = network.create_node(ALICE_DID);
+    for id in [seeded, unseeded, unreadable] {
+        alice
+            .create_context(id, encrypted_params())
+            .await
+            .expect("create context");
+    }
+    let relay_contacts = UnreadableFor {
+        inner: scp_core::store::sync::StorageRelayContactStore::new(Arc::new(
+            scp_platform::in_memory::InMemoryStorage::new(),
+        )),
+        unreadable,
+    };
+    let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+    relay_contacts
+        .store_last_relay_contact(seeded, now - 60)
+        .await
+        .expect("store the contact");
+    // The unreadable context has a stored value; only its read fails.
+    relay_contacts
+        .inner
+        .store_last_relay_contact(unreadable, now - 60)
+        .await
+        .expect("store the contact");
+
+    let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
+        scp_ffi_common::reconnect::ReconnectRequest {
+            transport: &transport,
+            supervisor: &alice.manager,
+            member_did: DID::from(ALICE_DID),
+            signer: scp_core::context::actor::CommandSigner::local_ed25519(signing_key_for(
+                ALICE_DID,
+            )),
+            relay_contacts: &relay_contacts,
+            context_ids: vec![
+                unseeded.to_owned(),
+                seeded.to_owned(),
+                unreadable.to_owned(),
+            ],
+            now,
+            policy: SyncPolicy::default(),
+        },
+    )
+    .await;
+
+    assert_eq!(report.contexts.len(), 3, "{report:?}");
+    let result = |id: &str| {
+        report
+            .contexts
+            .iter()
+            .find(|c| c.context_id == id)
+            .unwrap_or_else(|| panic!("{id} missing from {report:?}"))
+    };
+    let classified = result(seeded);
+    assert_eq!(classified.tier.as_deref(), Some("short"), "{classified:?}");
+    assert_eq!(classified.failure_code, None, "{classified:?}");
+    for (id, code) in [(unseeded, "SCP-TRANS-5102"), (unreadable, "SCP-TRANS-5103")] {
+        let failed = result(id);
+        assert_eq!(failed.failure_code.as_deref(), Some(code), "{failed:?}");
+        assert_eq!(failed.tier, None, "{failed:?}");
+        assert_eq!(failed.outcome, "failed", "{failed:?}");
+        assert!(!failed.needs_reconnect_cleared, "{failed:?}");
+    }
+    assert_eq!(
+        relay_contacts
+            .inner
+            .load_last_relay_contact(unseeded)
+            .await
+            .unwrap(),
+        None,
+        "an unclassified context gets no contact written"
     );
 
     relay_handle.shutdown();
