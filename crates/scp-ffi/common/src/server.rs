@@ -2085,7 +2085,7 @@ mod tests {
         std::fs::create_dir_all(&db_dir).unwrap();
 
         let storage = instance_sqlite_storage(&db_dir);
-        let instance = StorageOwningInstance::new(Arc::clone(&storage));
+        let instance = Arc::new(StorageOwningInstance::new(Arc::clone(&storage)));
 
         let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
             .await
@@ -2097,7 +2097,7 @@ mod tests {
             "a freshly started node must be running before its instance shuts down"
         );
 
-        instance
+        Arc::clone(&instance)
             .shutdown(std::time::Duration::from_secs(10))
             .await
             .expect("a first shutdown must not report AlreadyShutDown");
@@ -2128,7 +2128,7 @@ mod tests {
         std::fs::create_dir_all(&db_dir).unwrap();
 
         let storage = instance_sqlite_storage(&db_dir);
-        let instance = StorageOwningInstance::new(Arc::clone(&storage));
+        let instance = Arc::new(StorageOwningInstance::new(Arc::clone(&storage)));
 
         let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
             .await
@@ -2136,7 +2136,7 @@ mod tests {
         let node = register_node(instance.core(), RunningNode::Sqlite(node));
         instance.observe(&node);
 
-        instance
+        Arc::clone(&instance)
             .shutdown(std::time::Duration::from_secs(10))
             .await
             .expect("a first shutdown must not report AlreadyShutDown");

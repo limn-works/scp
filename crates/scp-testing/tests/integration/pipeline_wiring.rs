@@ -667,6 +667,35 @@ fn skip_char_literal(chars: &[char], start: usize, cleaned: &mut String) -> Opti
     }
 }
 
+/// The cleaned body of the one `fn <fn_name>(` declared directly inside the
+/// `impl <type_name> {` blocks of `source`, comments and literals blanked as
+/// [`strip_non_code`] blanks them.
+///
+/// Panics when no such block declares the function or more than one does, so
+/// a moved, renamed or duplicated method fails the caller's check instead of
+/// letting it read a trait default or another type's method of the same name.
+fn inherent_method_body(source: &str, type_name: &str, fn_name: &str) -> String {
+    let code = strip_non_code(source);
+    let header = format!("impl {type_name} {{");
+    let mut bodies = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = code[from..].find(&header) {
+        let open = from + offset + header.len() - 1;
+        let block = clean_and_extract_braced(&code[open..])
+            .unwrap_or_else(|| panic!("an `impl {type_name} {{` block never closes"));
+        from = open + block.len();
+        if let Some(body) = extract_fn_body(&block, fn_name) {
+            bodies.push(body);
+        }
+    }
+    assert_eq!(
+        bodies.len(),
+        1,
+        "expected exactly one `fn {fn_name}(` across the `impl {type_name} {{` blocks"
+    );
+    bodies.remove(0)
+}
+
 /// Returns `true` if the body of `fn_name` in `source` contains `callee`.
 fn fn_body_contains(source: &str, fn_name: &str, callee: &str) -> bool {
     extract_fn_body(source, fn_name).is_some_and(|body| body.contains(callee))
@@ -1908,6 +1937,29 @@ fn restore_on_startup_runs_restore_before_replay() {
     );
 }
 
+// ADR-048 `suspend()` amendment (2026-10-23) and ADR-049 Decision 9: the
+// shared bridge `CoreFields::suspend` flushes every context on the tokio
+// runtime through the async `flush_all_contexts(`, whose failure reaches the
+// caller. The sync `flush_all_contexts_sync(` fails without a runtime on the
+// calling thread, so a suspend that called it flushed nothing from an SDK
+// thread. The check reads the one `fn suspend(` inside the `impl CoreFields {`
+// blocks, so the `BridgeInstanceCore` trait default that delegates to it, or
+// any other type's `suspend`, cannot satisfy it.
+#[test]
+fn bridge_suspend_flushes_on_the_runtime() {
+    let body = inherent_method_body(BRIDGE_INSTANCE_SRC, "CoreFields", "suspend");
+    assert!(
+        body.contains("flush_all_contexts("),
+        "CoreFields::suspend must flush every context through the async \
+         flush_all_contexts( before it clears transport"
+    );
+    assert!(
+        !body.contains("flush_all_contexts_sync("),
+        "CoreFields::suspend must NOT call flush_all_contexts_sync(, which flushes nothing \
+         when the calling thread has no tokio runtime"
+    );
+}
+
 // Bridge level (ADR-049): every production startup/resume path SHOULD
 // route through the combined `restore_on_startup` entry point — NOT call the
 // bare `restore_all_contexts` — so the saga-journal replay can never be skipped
@@ -1946,27 +1998,6 @@ fn restore_on_startup_runs_restore_before_replay() {
 // `restore_all_persisted_contexts` over a real persistence backend + durable saga
 // journal and asserts a persisted context was restored AND a crash-orphaned saga
 // was reconciled to terminal.
-// ADR-048 `suspend()` amendment (2026-10-23) and ADR-049 Decision 9: the
-// shared bridge `CoreFields::suspend` flushes every context on the tokio
-// runtime through the async `flush_all_contexts(`, whose failure reaches the
-// caller. The sync `flush_all_contexts_sync(` fails without a runtime on the
-// calling thread, so a suspend that called it flushed nothing from an SDK
-// thread. The first `fn suspend(` in the source is `CoreFields::suspend`; the
-// `BridgeInstanceCore` trait default that delegates to it comes later.
-#[test]
-fn bridge_suspend_flushes_on_the_runtime() {
-    assert!(
-        fn_body_contains(BRIDGE_INSTANCE_SRC, "suspend", "flush_all_contexts("),
-        "CoreFields::suspend must flush every context through the async \
-         flush_all_contexts( before it clears transport"
-    );
-    assert!(
-        !fn_body_contains(BRIDGE_INSTANCE_SRC, "suspend", "flush_all_contexts_sync("),
-        "CoreFields::suspend must NOT call flush_all_contexts_sync(, which flushes nothing \
-         when the calling thread has no tokio runtime"
-    );
-}
-
 #[test]
 fn bridge_resume_path_routes_through_restore_on_startup() {
     // 1) Shared bridge-instance core: the production startup/resume path.

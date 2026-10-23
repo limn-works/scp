@@ -2118,10 +2118,12 @@ export function createNativeBridge(scp: SCP): Bridge {
       await (native.shutdown as (t: bigint) => Promise<void>)(millis);
     },
 
-    suspend(): Promise<void> {
+    suspend(timeoutMillis: number): Promise<void> {
       // `Scp::suspend` is `async fn`: the flush runs on the tokio runtime
-      // and its failure rejects this promise.
-      return (native.suspend as () => Promise<void>)();
+      // and its failure rejects this promise. The deadline crosses as a
+      // `bigint`, as `shutdown`'s does.
+      const millis = BigInt(Math.max(0, Math.trunc(timeoutMillis)));
+      return (native.suspend as (t: bigint) => Promise<void>)(millis);
     },
 
     resume(): Promise<void> {

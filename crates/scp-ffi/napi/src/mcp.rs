@@ -3135,7 +3135,9 @@ mod tests {
             context_ids: vec![SUB_CTX.to_owned()],
         };
 
-        crate::runtime().block_on(bi.suspend()).expect("suspend");
+        crate::runtime()
+            .block_on(Arc::clone(&bi).suspend(std::time::Duration::from_secs(10)))
+            .expect("suspend");
         assert!(
             bi.core.try_supervisor().is_some(),
             "precondition: suspension keeps the supervisor attached"
@@ -3145,7 +3147,9 @@ mod tests {
             "McpServerForTransport::Unwired"
         );
 
-        crate::runtime().block_on(bi.resume()).expect("resume");
+        crate::runtime()
+            .block_on(Arc::clone(&bi).resume())
+            .expect("resume");
         assert_eq!(
             format!("{:?}", mcp_server_bundle(&bi, provider())),
             "McpServerForTransport::Wired"

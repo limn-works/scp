@@ -1832,7 +1832,7 @@ mod tests {
             );
             active_ucan_role_state(py, &suspended.inner, &ctx_id, "validate a UCAN in context")
                 .expect("the gate must admit the Active context before the suspend");
-            suspended.suspend(py).expect("suspend");
+            suspended.suspend(py, 10_000).expect("suspend");
 
             let unattached = crate::scp::PyScp::new_in_memory_for_test();
             assert!(

@@ -157,17 +157,31 @@ public final class SCP: @unchecked Sendable {
     /// transport. Transport-dependent operations fail until ``resume()`` is
     /// called.
     ///
+    /// `timeout` bounds the whole call, clamped as ``shutdown(timeout:)``
+    /// clamps its deadline. A flush that misses it fails the suspend with
+    /// `SCP-STORAGE-8014` and leaves the instance running. The suspend runs
+    /// to completion, or reverts, even when the calling task is cancelled.
+    ///
+    /// On iOS, call it inside a background task: take an identifier from
+    /// `UIApplication.shared.beginBackgroundTask(expirationHandler:)` when
+    /// the scene enters the background, await `suspend(timeout:)` with a
+    /// `timeout` below `backgroundTimeRemaining`, then call
+    /// `endBackgroundTask(_:)`, so the process is not frozen mid-flush.
+    ///
     /// The method is `async throws` because the underlying Rust
     /// `Scp::suspend` is `pub async fn`: the flush runs on the shared tokio
     /// runtime, and its failure reaches this caller.
     ///
-    /// - Throws: ``ScpError/storage`` with `SCP-STORAGE-8014` when a context
-    ///   snapshot did not persist; the instance stays running with its
-    ///   transport connected, and a retried call flushes again.
-    ///   ``ScpError/transport`` with `SCP-TRANS-5001` if the transport lock
-    ///   is poisoned; the instance stays running.
-    public func suspend() async throws {
-        try await inner.suspend()
+    /// - Parameter timeout: Maximum seconds the suspend may take. Defaults
+    ///   to `5.0`, as ``shutdown(timeout:)``'s does.
+    /// - Throws: ``ScpError/Storage(msg:code:)`` with `SCP-STORAGE-8014` when
+    ///   a context snapshot did not persist or the flush missed `timeout`;
+    ///   the instance stays running with its transport connected, and a
+    ///   retried call flushes again. ``ScpError/Transport(msg:code:)`` with
+    ///   `SCP-TRANS-5001` if the transport lock is poisoned; the instance
+    ///   stays running.
+    public func suspend(timeout: TimeInterval = 5.0) async throws {
+        try await inner.suspend(timeoutMillis: Self.clampedMillis(timeout))
     }
 
     /// Resumes a suspended bridge instance.
@@ -185,9 +199,9 @@ public final class SCP: @unchecked Sendable {
     /// `async throws` method that awaits the Rust future on the shared
     /// tokio runtime.
     ///
-    /// - Throws: ``ScpError/context`` if the instance has been permanently
-    ///   shut down, or ``ScpError/transport`` if a pending relay URL
-    ///   could not be reconnected.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the instance has been
+    ///   permanently shut down, or ``ScpError/Transport(msg:code:)`` if a
+    ///   pending relay URL could not be reconnected.
     public func resume() async throws {
         try await inner.resume()
     }
@@ -195,9 +209,12 @@ public final class SCP: @unchecked Sendable {
     /// Shuts down this instance with a graceful deadline (seconds).
     ///
     /// Awaits in-flight tasks up to `timeout` seconds, aborts any
-    /// remaining tasks, then runs typed-field cleanup. Permanent. Throws `ScpError.Storage` with
-    /// `SCP-STORAGE-8005` when the durable store still holds its advisory
-    /// lock after the call.
+    /// remaining tasks, then runs typed-field cleanup. Permanent. Throws
+    /// ``ScpError/Storage(msg:code:)`` with `SCP-STORAGE-8005` when the
+    /// durable store still holds its advisory lock after the call, or with
+    /// `SCP-STORAGE-8015` when the store was released but a context snapshot
+    /// did not persist within `timeout`. The instance is shut down either
+    /// way; an unflushed context restores from its last persisted snapshot.
     ///
     /// Fractional seconds (e.g. `0.25`) are preserved to millisecond
     /// resolution before crossing the UniFFI boundary — the native
@@ -213,7 +230,13 @@ public final class SCP: @unchecked Sendable {
     ///   in-flight tasks, expressed as a ``Foundation/TimeInterval``
     ///   (`Double` seconds). Defaults to `5.0`.
     public func shutdown(timeout: TimeInterval = 5.0) async throws {
-        let millis: UInt64 = if timeout.isNaN || timeout <= 0 {
+        try await inner.shutdown(timeoutMillis: Self.clampedMillis(timeout))
+    }
+
+    /// `timeout` seconds as the `UInt64` millisecond count the UniFFI
+    /// boundary takes, clamped as ``shutdown(timeout:)`` documents.
+    static func clampedMillis(_ timeout: TimeInterval) -> UInt64 {
+        if timeout.isNaN || timeout <= 0 {
             0
         } else if timeout.isInfinite || timeout >= Double(UInt64.max) / 1000.0 {
             // `>=` (not `>`): `Double(UInt64.max) == 2^64` due to IEEE-754
@@ -227,7 +250,6 @@ public final class SCP: @unchecked Sendable {
         } else {
             UInt64((timeout * 1000).rounded())
         }
-        try await inner.shutdown(timeoutMillis: millis)
     }
 
     /// Shuts down this instance with a graceful deadline (milliseconds).

@@ -26,6 +26,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -1441,25 +1442,34 @@ class CoroutineBridge(
         }
 
     /**
-     * Execute a `suspend` FFI call on [Dispatchers.IO] with cancellation checks.
+     * Execute a UniFFI-generated `suspend fun` lifecycle transition and
+     * report its own outcome.
      *
      * The companion of [ffiCall] for UniFFI-generated async methods. UniFFI
      * compiles `async fn` Rust functions into Kotlin `suspend fun` bindings
-     * (e.g., `Scp.shutdown(timeoutMillis)`, `Scp.resume()`), which cannot be
-     * invoked from the non-suspend `() -> T` lambda accepted by [ffiCall].
+     * (`Scp.suspend(timeoutMillis)`, `Scp.resume()`,
+     * `Scp.shutdown(timeoutMillis)`), which cannot be invoked from the
+     * non-suspend `() -> T` lambda accepted by [ffiCall].
+     *
+     * A coroutine already cancelled fails fast with [CancellationException]
+     * before the call starts. Once started, the Rust transition runs to
+     * completion, or reverts, whether or not the caller is cancelled, so the
+     * block runs under [NonCancellable] and returns the transition's real
+     * result or error: a cancellation that arrives mid-call does not replace
+     * a suspend that succeeded or failed with a [CancellationException]. The
+     * caller observes its cancellation at its next suspension point. The
+     * block stays on the caller's dispatcher because a UniFFI async call
+     * polls a Rust future and blocks no thread.
      *
      * @param block The suspend FFI operation.
      * @return The FFI call result.
-     * @throws CancellationException if the coroutine was cancelled.
+     * @throws CancellationException if the coroutine was cancelled before the call.
      * @throws BridgeException if the FFI call fails.
      */
-    internal suspend fun <T> ffiCallSuspend(block: suspend () -> T): T =
-        withContext(ioDispatcher) {
-            ensureActive()
-            val result = block()
-            ensureActive()
-            result
-        }
+    internal suspend fun <T> ffiCallSuspend(block: suspend () -> T): T {
+        currentCoroutineContext().ensureActive()
+        return withContext(NonCancellable) { block() }
+    }
 
     /**
      * Execute a long-running FFI call with a [CancellationHandle] linked to the

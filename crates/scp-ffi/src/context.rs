@@ -9880,10 +9880,6 @@ class SlowAgreeCustody(P256Custody):
         }
     }
 
-    /// Spec 09 §9.16.1, fail-closed restore order: after a restart, a context
-    /// whose owner's identity is not yet loaded does not restore, because the
-    /// owner's wrapping key lives in that identity's custody. `restore_context`
-    /// refuses with the `WrappingKeyCustodyUnavailable` text and
     /// `PyScp::suspend` writes every context's snapshot when the calling
     /// thread runs no tokio runtime, as a Python caller's thread does. The
     /// test deletes the context's stored snapshot first, so only the
@@ -9945,7 +9941,7 @@ class SlowAgreeCustody(P256Custody):
             "precondition: the store holds no snapshot of the context"
         );
 
-        Python::with_gil(|py| scp.suspend(py)).expect("suspend must flush and succeed");
+        Python::with_gil(|py| scp.suspend(py, 10_000)).expect("suspend must flush and succeed");
 
         assert!(
             rt.block_on(persistence.load_context(&ctx_id))
@@ -9955,13 +9951,18 @@ class SlowAgreeCustody(P256Custody):
         );
         assert!(scp.inner.core.is_suspended(), "suspend must take effect");
         drop(persistence);
-        let outcome = rt.block_on(scp.inner.shutdown(std::time::Duration::from_secs(10)));
+        let outcome =
+            rt.block_on(Arc::clone(&scp.inner).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "the shutdown must drain every actor and close the store: {outcome:?}"
         );
     }
 
+    /// Spec 09 §9.16.1, fail-closed restore order: after a restart, a context
+    /// whose owner's identity is not yet loaded does not restore, because the
+    /// owner's wrapping key lives in that identity's custody. `restore_context`
+    /// refuses with the `WrappingKeyCustodyUnavailable` text and
     /// `restore_all_contexts` leaves the context out; once the identity is
     /// registered again, `restore_all_contexts` restores it.
     #[test]
@@ -10013,7 +10014,7 @@ class SlowAgreeCustody(P256Custody):
             .identity_registry
             .remove(&did)
             .expect("the creator is registered");
-        rt.block_on(first.inner.shutdown(std::time::Duration::from_secs(10)))
+        rt.block_on(Arc::clone(&first.inner).shutdown(std::time::Duration::from_secs(10)))
             .expect("shutdown must release the store");
         drop(first);
 

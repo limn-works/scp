@@ -141,6 +141,22 @@ const NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076";
  */
 export const CUSTODY_REQUIRED_CODE = "SCP-IDENT-1116";
 
+/**
+ * Code {@link SCP.suspend} throws, as a `StorageError`, when a context
+ * snapshot did not persist or the flush missed the deadline; the instance
+ * stays running with its transport connected (`STORAGE_8014` in
+ * `crates/scp-ffi/common/src/error_codes.rs`).
+ */
+export const SUSPEND_FLUSH_FAILED_CODE = "SCP-STORAGE-8014";
+
+/**
+ * Code {@link SCP.shutdown} throws, as a `StorageError`, when the instance
+ * shut down and released its store but a context snapshot did not persist
+ * within the deadline (`STORAGE_8015` in
+ * `crates/scp-ffi/common/src/error_codes.rs`).
+ */
+export const SHUTDOWN_FLUSH_FAILED_CODE = "SCP-STORAGE-8015";
+
 /** Remedy for a method whose custody argument is a {@link CustodyType}. */
 const CUSTODY_VALUE_REMEDY =
   'pass "encrypted_file" (an encrypted key file at $HOME/.scp/keys.bin, sealed under ' +
@@ -403,7 +419,7 @@ interface NativeScpCtor {
  */
 interface NativeScpInstance {
   readonly instanceId: string;
-  suspend(): Promise<void>;
+  suspend(timeoutMillis: bigint): Promise<void>;
   resume(): Promise<void>;
   shutdown(timeoutMillis: bigint): Promise<void>;
   // The full Scp class surface is reached via indexed access
@@ -1158,15 +1174,23 @@ export class SCP {
    * transport and marks the instance suspended. Transport-dependent
    * operations fail until `resume()` is called.
    *
-   * @throws {StorageError} With `SCP-STORAGE-8014` when a context
-   *   snapshot did not persist. The instance stays running with its
-   *   transport connected, and a retried `suspend()` flushes again.
+   * `timeoutSecs` bounds the whole call, clamped as {@link SCP.shutdown}
+   * clamps its deadline. A flush that misses it fails the suspend with
+   * `SCP-STORAGE-8014` and leaves the instance running. The suspend runs
+   * to completion, or reverts, even if the caller stops awaiting it.
+   *
+   * @param timeoutSecs Maximum seconds the suspend may take. Defaults to 5.
+   * @throws {StorageError} With `SCP-STORAGE-8014`
+   *   ({@link SUSPEND_FLUSH_FAILED_CODE}) when a context snapshot did not
+   *   persist or the flush missed `timeoutSecs`. The instance stays running
+   *   with its transport connected, and a retried `suspend()` flushes again.
    * @throws {TransportError} With `SCP-TRANS-5001` when transport cleanup
    *   fails. The instance stays running.
    */
-  async suspend(): Promise<void> {
+  async suspend(timeoutSecs: number = 5): Promise<void> {
     try {
-      await this.#native.suspend();
+      const millis = clampShutdownMillis(timeoutSecs);
+      await this.#native.suspend(BigInt(millis));
     } catch (err) {
       throw mapBridgeError(err);
     }
@@ -1189,7 +1213,11 @@ export class SCP {
    *
    * @param timeoutSecs Maximum seconds to wait. Defaults to 5.
    * @throws {StorageError} With `SCP-STORAGE-8005` when the durable store
-   *   still holds its advisory lock after the call.
+   *   still holds its advisory lock after the call, or with
+   *   `SCP-STORAGE-8015` ({@link SHUTDOWN_FLUSH_FAILED_CODE}) when the store
+   *   was released but a context snapshot did not persist within
+   *   `timeoutSecs`. The instance is shut down either way; an unflushed
+   *   context restores from its last persisted snapshot.
    */
   async shutdown(timeoutSecs: number = 5): Promise<void> {
     try {

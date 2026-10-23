@@ -53,7 +53,7 @@ import {
   ValidationError,
 } from "../src/errors";
 import { IdentityAttestation, RevocationStatus } from "../src/identity";
-import { SCP } from "../src/scp";
+import { SCP, SHUTDOWN_FLUSH_FAILED_CODE, SUSPEND_FLUSH_FAILED_CODE } from "../src/scp";
 import type { Relay } from "../src/server";
 import type { ConsequenceRule as ConsequenceRuleTypeAlias, OutletDefinition } from "../src/types";
 import {
@@ -523,6 +523,41 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
 
     expect(native.__calls("suspend").length).toBe(1);
     expect(native.__calls("resume").length).toBe(0);
+  });
+
+  it("suspend forwards a BigInt millisecond deadline, 5 s by default", async () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("suspend", () => Promise.resolve(undefined));
+
+    await scp.suspend();
+    await scp.suspend(0.25);
+    await scp.suspend(-1);
+
+    const calls = native.__calls("suspend");
+    expect(calls.map((c) => c.args[0])).toEqual([5000n, 250n, 0n]);
+  });
+
+  it("exports the suspend and shutdown flush codes", () => {
+    expect(SUSPEND_FLUSH_FAILED_CODE).toBe("SCP-STORAGE-8014");
+    expect(SHUTDOWN_FLUSH_FAILED_CODE).toBe("SCP-STORAGE-8015");
+  });
+
+  it("shutdown maps a failed flush to StorageError SCP-STORAGE-8015", async () => {
+    const { scp, native } = mountMockScp();
+    native.__stub("shutdown", () =>
+      Promise.reject(
+        new Error(
+          "[SCP-STORAGE-8015] Storage error: shutdown could not persist every context snapshot",
+        ),
+      ),
+    );
+
+    const err = await scp.shutdown(1).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(StorageError);
+    expect((err as StorageError).code).toBe("SCP-STORAGE-8015");
   });
 
   it("suspend maps a failed flush to StorageError SCP-STORAGE-8014", async () => {

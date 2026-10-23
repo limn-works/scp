@@ -244,6 +244,8 @@ export {
   p256PseudonymPoint,
   p256SoftwarePseudonymPoint,
   SCP,
+  SHUTDOWN_FLUSH_FAILED_CODE,
+  SUSPEND_FLUSH_FAILED_CODE,
 } from "./scp";
 
 // ---------------------------------------------------------------------------

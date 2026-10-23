@@ -2629,6 +2629,7 @@ mod tests {
             },
         })
         .expect("first open");
+        let bi = std::sync::Arc::new(bi);
         let second = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
             path: tmp.path().to_string_lossy().into_owned(),
             key: SqliteKeyMaterial::Raw {
@@ -2639,7 +2640,8 @@ mod tests {
             matches!(second, Err(StorageInitError::LockHeld { .. })),
             "a second open of a live store's directory must fail with LockHeld"
         );
-        let outcome = crate::runtime().block_on(bi.shutdown(std::time::Duration::from_secs(10)));
+        let outcome = crate::runtime()
+            .block_on(std::sync::Arc::clone(&bi).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "{outcome:?}"

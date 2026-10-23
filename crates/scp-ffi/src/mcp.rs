@@ -6359,7 +6359,7 @@ mod tests {
 
         crate::runtime()
             .expect("runtime")
-            .block_on(bi.suspend())
+            .block_on(std::sync::Arc::clone(&bi).suspend(std::time::Duration::from_secs(10)))
             .expect("suspend");
         assert!(
             bi.core.try_supervisor().is_some(),
@@ -6378,7 +6378,7 @@ mod tests {
 
         crate::runtime()
             .expect("runtime")
-            .block_on(bi.resume())
+            .block_on(Arc::clone(&bi).resume())
             .expect("resume");
         assert_eq!(
             format!(

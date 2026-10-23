@@ -86,7 +86,7 @@ export type MockStub = (...args: readonly unknown[]) => unknown;
 export interface MockNativeScp {
   // ── NAPI `Scp` surface the SDK relies on ───────────────────────────
   readonly instanceId: string;
-  suspend(): Promise<void>;
+  suspend(timeoutMillis: bigint): Promise<void>;
   resume(): Promise<void>;
   shutdown(timeoutMillis: bigint): Promise<void>;
   // Every other property access is dispatched through the Proxy. We

@@ -1490,11 +1490,25 @@ pub const STORAGE_8009: &str = "SCP-STORAGE-8009";
 ///
 /// `CoreFields::suspend` flushes every context to the persistence provider
 /// before it clears transport (ADR-049 Decision 9). When a flush fails,
-/// `suspend` leaves the instance running with its transport connected and
-/// returns `LifecycleError::FlushFailed`, which each bridge reports with this
-/// code. The unflushed actors stay dirty, so a retried `suspend` flushes them
-/// again.
+/// misses the caller's deadline, or is interrupted, `suspend` leaves the
+/// instance running with its transport connected and returns
+/// `SuspendError::FlushFailed`, `SuspendError::DeadlineElapsed` or
+/// `SuspendError::Interrupted`, which each bridge reports with this code. The
+/// unflushed actors stay dirty, so a retried `suspend` flushes them again.
 pub const STORAGE_8014: &str = "SCP-STORAGE-8014";
+
+/// A `shutdown` completed, but a context snapshot did not persist.
+///
+/// `CoreFields::shutdown_core_async` flushes every context inside the
+/// caller's deadline before it drains the Supervisor (ADR-049 Decision 9). A
+/// flush that failed or did not finish in time is reported in
+/// `ShutdownOutcome::flush` (`ShutdownFlush::Failed` or
+/// `ShutdownFlush::TimedOut`), and each SDK `shutdown` raises this code when
+/// the durable store was released. The instance is shut down either way; the
+/// unflushed contexts restore from their last persisted snapshot. A shutdown
+/// that also left the store holding its lock raises `SCP-STORAGE-8005`
+/// instead, naming the flush failure in its message.
+pub const STORAGE_8015: &str = "SCP-STORAGE-8015";
 
 // -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)

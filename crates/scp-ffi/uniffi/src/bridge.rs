@@ -21304,7 +21304,7 @@ mod tests {
         let scp = scp_test();
         let ctx_id = scp_ffi_common::generate_context_id();
         runtime()
-            .block_on(scp.inner.core.suspend())
+            .block_on(scp.inner.core.suspend(std::time::Duration::from_secs(10)))
             .expect("suspend");
         let result = runtime().block_on(
             scp.inner
@@ -21930,7 +21930,7 @@ mod tests {
             "precondition: the store holds no snapshot of the context"
         );
 
-        rt.block_on(scp.suspend())
+        rt.block_on(scp.suspend(10_000))
             .expect("suspend must flush and succeed");
 
         assert!(
@@ -21941,7 +21941,8 @@ mod tests {
         );
         assert!(scp.inner.core.is_suspended(), "suspend must take effect");
         drop(persistence);
-        let outcome = rt.block_on(scp.inner.shutdown(std::time::Duration::from_secs(10)));
+        let outcome =
+            rt.block_on(Arc::clone(&scp.inner).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "the shutdown must drain every actor and close the store: {outcome:?}"
@@ -22017,7 +22018,8 @@ mod tests {
         // `OPENSSL_cleanup` frees the state SQLCipher is still using, and the
         // process dies of SIGSEGV after the test reports `ok`.
         drop(sup);
-        let outcome = rt.block_on(scp.inner.shutdown(std::time::Duration::from_secs(10)));
+        let outcome =
+            rt.block_on(Arc::clone(&scp.inner).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "the shutdown must drain every actor and close the store: {outcome:?}"
@@ -22108,7 +22110,8 @@ mod tests {
             .dht_client()
             .map(Arc::clone)
             .expect("identity_create attaches A's DHT client");
-        let outcome = rt.block_on(scp.inner.shutdown(std::time::Duration::from_secs(10)));
+        let outcome =
+            rt.block_on(Arc::clone(&scp.inner).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "A's shutdown must drain every actor and close the store: {outcome:?}"
@@ -22194,7 +22197,8 @@ mod tests {
         .expect("a token nobody revoked or presented still validates after the restart");
 
         drop(handle_b);
-        let outcome = rt.block_on(reopened.inner.shutdown(std::time::Duration::from_secs(10)));
+        let outcome =
+            rt.block_on(Arc::clone(&reopened.inner).shutdown(std::time::Duration::from_secs(10)));
         assert!(
             matches!(outcome, Ok(ShutdownOutcome::GracefulWithin { .. })),
             "B's shutdown must drain every actor and close the store: {outcome:?}"
@@ -28928,7 +28932,10 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        bi.core.suspend().await.expect("suspend");
+        bi.core
+            .suspend(std::time::Duration::from_secs(10))
+            .await
+            .expect("suspend");
         assert!(
             bi.core.try_supervisor().is_some(),
             "precondition: suspension keeps the supervisor attached"
@@ -28938,7 +28945,7 @@ mod tests {
             "McpServerForTransport::Unwired"
         );
 
-        bi.resume().await.expect("resume");
+        Arc::clone(&bi).resume().await.expect("resume");
         assert_eq!(
             format!("{:?}", mcp_server_bundle(&bi, provider())),
             "McpServerForTransport::Wired"
@@ -28979,7 +28986,10 @@ mod tests {
         bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
         gates(scp_ffi_common::CONTEXT_NOT_ACTIVE_WITHHELD);
 
-        bi.core.suspend().await.expect("suspend");
+        bi.core
+            .suspend(std::time::Duration::from_secs(10))
+            .await
+            .expect("suspend");
         let resource = provider.validate_resource_access("ctx-absent", ResourceKind::Events);
         assert!(
             matches!(&resource, Err(AccessRefusal::Unreadable(m)) if m.contains("suspended")),
@@ -32343,7 +32353,11 @@ mod tests {
         );
 
         register_supervisor_context(&scp, &context_id, creator, CALLBACK_SUPERVISOR_CEILING).await;
-        scp.inner.core.suspend().await.expect("suspend");
+        scp.inner
+            .core
+            .suspend(std::time::Duration::from_secs(10))
+            .await
+            .expect("suspend");
         let suspended = scp
             .inner
             .require_active_context_before_authz(

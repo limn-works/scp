@@ -357,7 +357,8 @@ enforcement mechanism.)
 | `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
 | `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-identifier mismatch) |
 | `SCP-STORAGE-8013` | `scp-client-wasm` (browser participant) | Context poisoned — a persist failed after the in-memory ratchet advanced; reconstruct from the last durable snapshot |
-| `SCP-STORAGE-8014` | SDK `suspend` (all bridges) | `suspend` did not suspend: a context snapshot did not persist, so the instance stays running with its transport connected; a retried `suspend` flushes the unflushed contexts again (ADR-049 Decision 9) |
+| `SCP-STORAGE-8014` | SDK `suspend` (all bridges) | `suspend` did not suspend: a context snapshot did not persist, or the flush missed the caller's deadline, so the instance stays running with its transport connected; a retried `suspend` flushes the unflushed contexts again (ADR-049 Decision 9) |
+| `SCP-STORAGE-8015` | SDK `shutdown` (all bridges) | `shutdown` shut the instance down and released its store, but a context snapshot did not persist within the deadline; the unflushed contexts restore from their last persisted snapshot (ADR-048 `suspend()` amendment) |
 
 The browser participant codes (`8010-8013`) start at `8010` specifically to avoid
 colliding with the Android backend's `8001-8003`, which were allocated first.

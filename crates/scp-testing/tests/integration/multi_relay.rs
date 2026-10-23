@@ -284,18 +284,21 @@ async fn reconnect_transport_if_pending_reports_unreachable_relay() {
 // ---------------------------------------------------------------------------
 
 /// `suspend()` followed by `resume()` preserves the pending relay URLs
-/// and attempts reconnect. The core-level `resume()` does NOT drive
-/// the transport reconnect itself (that's a per-bridge override on
-/// `BridgeInstanceCore::resume`) — we verify the URL set survives and
-/// the `resume()` call itself is a successful no-op at the core level.
+/// and attempts reconnect. `CoreFields::resume` dials every pending URL;
+/// against relays that refuse the connection it reports
+/// `ReconnectFailed`, clears the suspended flag, and keeps both URLs pending
+/// for a retry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn suspend_resume_preserves_pending_urls() {
     let core = CoreFields::new();
-    core.add_relay_url("ws://relay1.example.com/scp/v1".to_owned());
-    core.add_relay_url("ws://relay2.example.com/scp/v1".to_owned());
+    // Ports 1 and 2 on loopback have no SCP relay listening.
+    core.add_relay_url("ws://127.0.0.1:1/scp/v1".to_owned());
+    core.add_relay_url("ws://127.0.0.1:2/scp/v1".to_owned());
     assert_eq!(core.pending_relay_urls().len(), 2);
 
-    core.suspend().await.expect("suspend must succeed");
+    core.suspend(std::time::Duration::from_secs(10))
+        .await
+        .expect("suspend must succeed");
     // suspend() flushes transport — pending URLs remain for resume.
     assert_eq!(
         core.pending_relay_urls().len(),
@@ -303,13 +306,22 @@ async fn suspend_resume_preserves_pending_urls() {
         "suspend must not clear the pending URL set"
     );
 
-    core.resume()
-        .await
-        .expect("core-level resume after suspend must succeed");
+    let resumed = core.resume().await;
+    assert!(
+        matches!(
+            resumed,
+            Err(scp_ffi_common::bridge_instance::LifecycleError::ReconnectFailed { .. })
+        ),
+        "a resume whose relays all refuse must report ReconnectFailed: {resumed:?}"
+    );
+    assert!(
+        !core.is_suspended(),
+        "a resume clears the suspended flag before it dials"
+    );
     assert_eq!(
         core.pending_relay_urls().len(),
         2,
-        "resume must preserve the pending URL set for the bridge-specific override to replay"
+        "resume must keep every URL that failed to reconnect pending for a retry"
     );
 }
 

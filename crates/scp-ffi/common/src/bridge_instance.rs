@@ -619,6 +619,14 @@ pub struct CoreFields {
     /// for mobile app backgrounding.
     suspended: AtomicBool,
 
+    /// Serializes the lifecycle transitions: [`Self::suspend`],
+    /// [`Self::resume`] and [`Self::shutdown_core_async`] each hold it for
+    /// their whole body. Each of them reads `suspended`, `shutdown` or the
+    /// transport and acts on what it read across an `.await`, so two of them
+    /// interleaving could leave the instance running without a transport, or
+    /// report a flush failure after a shutdown succeeded.
+    lifecycle: AsyncMutex<()>,
+
     // -----------------------------------------------------------------
     // Shared state — previously per-bridge OnceLock singletons
     // -----------------------------------------------------------------
@@ -948,6 +956,7 @@ impl CoreFields {
                 DurableStoreState::Unsettled,
             )),
             suspended: AtomicBool::new(false),
+            lifecycle: AsyncMutex::new(()),
             transport: RwLock::new(None),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
             known_contexts: DashMap::new(),
@@ -1039,6 +1048,7 @@ impl CoreFields {
                 DurableStoreState::Unsettled,
             )),
             suspended: AtomicBool::new(false),
+            lifecycle: AsyncMutex::new(()),
             transport: RwLock::new(None),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
             known_contexts: DashMap::new(),
@@ -1684,30 +1694,49 @@ impl CoreFields {
     /// - Intended for mobile app backgrounding
     ///
     /// After suspension, `is_suspended()` returns `true` and transport-dependent
-    /// operations will fail. Call `resume()` to clear the suspended flag, then
-    /// re-establish transport via `set_transport`.
+    /// operations will fail. [`Self::resume`] clears the suspended flag and
+    /// reconnects transport from the pending relay URLs.
     ///
     /// The flush runs on the caller's runtime: the `PyO3` bridge drives this
     /// method through its bridge wait, and napi-rs and `UniFFI` expose it as
     /// `async` (ADR-048, SCP as first-class multi-instance SDK object, the
     /// 2026-10-23 `suspend()` amendment).
     ///
+    /// `deadline` bounds the whole call: the wait for a lifecycle transition
+    /// already in progress, and the flush. The call holds the lifecycle lock
+    /// for its whole body, so it never interleaves with [`Self::resume`],
+    /// [`Self::shutdown_core_async`] or another `suspend`. A future dropped
+    /// mid-flush leaves the instance running with its transport, as a failed
+    /// flush does.
+    ///
     /// No-op if already shut down.
     ///
     /// # Errors
     ///
-    /// [`LifecycleError::FlushFailed`] when a context's snapshot did not
-    /// persist; [`LifecycleError::TransportLock`] when the transport lock is
-    /// poisoned. On either error the instance stays running: `is_suspended()`
-    /// returns `false`, and a failed flush leaves the transport connected. The
+    /// [`SuspendError::FlushFailed`] when a context's snapshot did not
+    /// persist; [`SuspendError::DeadlineElapsed`] when the flush, or the wait
+    /// for a transition in progress, did not finish within `deadline`;
+    /// [`SuspendError::TransportLock`] when the transport lock is poisoned. On
+    /// any error the instance stays running: `is_suspended()` returns
+    /// `false`, and a failed flush leaves the transport connected. The
     /// unflushed actors stay dirty, so a retried `suspend` flushes them again.
-    pub async fn suspend(&self) -> Result<(), LifecycleError> {
+    pub async fn suspend(&self, deadline: Duration) -> Result<(), SuspendError> {
+        let start = tokio::time::Instant::now();
+        let Ok(_transition) = tokio::time::timeout(deadline, self.lifecycle.lock()).await else {
+            return Err(SuspendError::DeadlineElapsed { deadline });
+        };
         if self.is_shutdown() {
             return Ok(());
         }
         // Set flag FIRST to prevent new operations from starting between
-        // flag check and transport teardown.
+        // flag check and transport teardown. The guard clears it again on
+        // every exit that does not reach the end: an error return, or the
+        // future dropped at an `.await`.
         self.suspended.store(true, Ordering::SeqCst);
+        let revert = RevertSuspendOnDrop {
+            suspended: &self.suspended,
+            armed: true,
+        };
         // #1696: cancel the current reconnect-generation token so any
         // in-flight `reconnect_transport_if_pending` dial wakes on the
         // cancellation branch and drops its half-connected adapter
@@ -1718,19 +1747,28 @@ impl CoreFields {
         // Flush every context snapshot before disconnecting transport. With
         // no Supervisor attached (suspend before any context operation ran),
         // no context exists, so nothing needs a flush.
-        if let Some(supervisor) = self.supervisor.get()
-            && let Err(e) = supervisor.flush_all_contexts().await
-        {
-            self.suspended.store(false, Ordering::SeqCst);
-            tracing::warn!(error = %e, "suspend refused: a context snapshot did not persist");
-            return Err(LifecycleError::FlushFailed(e));
+        if let Some(supervisor) = self.supervisor.get() {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            match tokio::time::timeout(remaining, supervisor.flush_all_contexts()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "suspend refused: a context snapshot did not persist");
+                    return Err(SuspendError::FlushFailed(e));
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        deadline_ms = deadline.as_millis(),
+                        "suspend refused: the flush did not finish within the deadline"
+                    );
+                    return Err(SuspendError::DeadlineElapsed { deadline });
+                }
+            }
         }
-        if let Err(e) = self.clear_transport() {
-            // Revert the suspended flag — the instance is not cleanly
-            // suspended if transport wasn't cleared.
-            self.suspended.store(false, Ordering::SeqCst);
-            return Err(LifecycleError::TransportLock(e));
-        }
+        // The instance is not cleanly suspended if transport wasn't
+        // cleared; the guard reverts the flag.
+        self.clear_transport()
+            .map_err(SuspendError::TransportLock)?;
+        revert.disarm();
         tracing::debug!("bridge instance suspended");
         Ok(())
     }
@@ -1771,30 +1809,29 @@ impl CoreFields {
 
     /// Resumes a suspended bridge instance.
     ///
-    /// Clears the suspended flag so bridge operations can proceed.
-    ///
-    /// `resume` is `async` so the `BridgeInstanceCore::resume` default body can
-    /// chain async work — reconnecting transport from pending relay URLs,
-    /// rehydrating persisted context state — after the core flag flip. The
-    /// core-only body below is `.await`-free and remains cheap.
+    /// Clears the suspended flag, reconnects transport from the pending relay
+    /// URLs ([`Self::reconnect_transport_if_pending`]), then rehydrates the
+    /// persisted contexts ([`Self::restore_all_persisted_contexts`]). The
+    /// call holds the lifecycle lock for all three steps, so it never
+    /// interleaves with [`Self::suspend`] or [`Self::shutdown_core_async`]:
+    /// a resume that arrives during a suspend's flush runs after the suspend
+    /// has cleared transport, and its reconnect installs the transport again.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the instance has been permanently shut down.
-    //
-    // The body is currently `.await`-free, but the `async` keyword is the
-    // contract — the `BridgeInstanceCore::resume` trait method is async
-    // (default impl delegates to this method), and per-bridge overrides
-    // chain async transport reconnect and persisted-context restoration on
-    // top. Making the core method sync would force awkward `.await`ing of
-    // a non-future in every override.
-    #[allow(clippy::unused_async)]
+    /// [`LifecycleError::AlreadyShutDown`] if the instance has been
+    /// permanently shut down; [`LifecycleError::ReconnectFailed`] when no
+    /// pending relay reconnected. The suspended flag is already cleared when
+    /// a reconnect fails.
     pub async fn resume(&self) -> Result<(), LifecycleError> {
+        let _transition = self.lifecycle.lock().await;
         if self.is_shutdown() {
             return Err(LifecycleError::AlreadyShutDown);
         }
         self.suspended.store(false, Ordering::SeqCst);
         tracing::debug!("bridge instance resumed");
+        self.reconnect_transport_if_pending().await?;
+        self.restore_all_persisted_contexts().await;
         Ok(())
     }
 
@@ -2977,8 +3014,14 @@ impl CoreFields {
     ///
     /// Behaves as follows:
     ///
-    /// 1. Idempotency: if `shutdown` has already been called (sync or async),
+    /// 0. Cancels any in-flight reconnect dial.
+    /// 1. Idempotency: if `shutdown` has already been called,
     ///    returns [`ShutdownError::AlreadyShutDown`] without side effects.
+    ///    Otherwise takes the lifecycle lock and holds it for the rest of the
+    ///    call, so the shutdown never interleaves with [`Self::suspend`] or
+    ///    [`Self::resume`]. The deadline counts from the call, so time spent
+    ///    waiting for a transition in progress comes out of the drain's
+    ///    budget.
     /// 2. Fires [`CancellationToken::cancel`] so cooperating tasks can exit.
     /// 3. Drains the task `JoinSet` inside `tokio::time::timeout(remaining, …)`.
     ///    Tasks that finish within the deadline report
@@ -2991,7 +3034,8 @@ impl CoreFields {
     ///    regardless of graceful/timeout outcome — these side effects must
     ///    happen on *every* shutdown. The flush and the Supervisor drain run
     ///    inside the remaining budget, so the caller's deadline is honored
-    ///    end-to-end.
+    ///    end-to-end. The outcome's `flush` field reports how the flush
+    ///    ended ([`ShutdownFlush`]).
     /// 6. Closes the durable store through `store_closer` only after the
     ///    Supervisor's tracked tasks have all exited (ADR-048 §5 as amended,
     ///    ADR-049 Decision 16). When the drain finishes inside the deadline,
@@ -3016,16 +3060,30 @@ impl CoreFields {
         timeout: Duration,
         store_closer: Option<DurableStoreCloser>,
     ) -> Result<ShutdownOutcome, ShutdownError> {
-        // Idempotent terminal transition: of concurrent calls, the one
-        // whose swap wins runs cleanup.
+        // One clock for the whole deadline: the runtime clock, which every
+        // `timeout` below reads. A wall-clock `elapsed` here would disagree
+        // with those timeouts whenever the runtime clock is paused.
+        let start = tokio::time::Instant::now();
         self.stream_registration_closed
             .store(true, Ordering::SeqCst);
+        // #1696: cancel any in-flight reconnect dial before taking the
+        // lifecycle lock, so a resume that holds the lock while it dials
+        // gives it up promptly instead of running out its dial budget.
+        if let Ok(guard) = self.reconnect_cancel.lock() {
+            guard.cancel();
+        }
+        // Idempotent terminal transition: of concurrent calls, the one
+        // whose swap wins runs cleanup. The swap comes before the lifecycle
+        // lock, so a losing call never queues behind the winner, which holds
+        // the lock until its store has closed: the loser waits only on the
+        // store state, within its own `timeout`. A suspend or resume that
+        // takes the lock after the swap reads the instance as shut down.
         if self.shutdown.swap(true, Ordering::SeqCst) {
             let durable_store_open = if store_closer.is_some() {
                 let mut state = self.durable_store_state.subscribe();
                 !matches!(
                     tokio::time::timeout(
-                        timeout,
+                        timeout.saturating_sub(start.elapsed()),
                         state.wait_for(|s| *s != DurableStoreState::Unsettled),
                     )
                     .await,
@@ -3036,6 +3094,10 @@ impl CoreFields {
             };
             return Err(ShutdownError::AlreadyShutDown { durable_store_open });
         }
+        // The suspend and resume that hold this lock are each bounded: a
+        // suspend by its own deadline, a resume by its per-relay dial
+        // timeout and the restore.
+        let _transition = self.lifecycle.lock().await;
         let store_closer = store_closer.map_or_else(
             || {
                 self.durable_store_state
@@ -3047,17 +3109,9 @@ impl CoreFields {
 
         // Signal cooperating tasks to exit. Cheap and idempotent.
         self.cancel.cancel();
-        // #1696: cancel any in-flight reconnect dial so its socket
-        // teardown fires before shutdown completes.
-        if let Ok(guard) = self.reconnect_cancel.lock() {
-            guard.cancel();
-        }
 
-        // One clock for the whole deadline: the runtime clock, which every
-        // `timeout` below reads. A wall-clock `elapsed` here would disagree
-        // with those timeouts whenever the runtime clock is paused.
-        let start = tokio::time::Instant::now();
-        let outcome = drain_under_deadline(&self.tasks, timeout).await;
+        let outcome =
+            drain_under_deadline(&self.tasks, timeout.saturating_sub(start.elapsed())).await;
 
         // Run the cleanup side effects inside the remaining budget so
         // callers get a true end-to-end deadline on shutdown, flush
@@ -3067,10 +3121,10 @@ impl CoreFields {
         let elapsed = start.elapsed();
         let remaining = timeout.saturating_sub(elapsed);
         let has_durable_store = store_closer.is_some();
-        let drain = self
+        let (flush, drain) = self
             .run_shutdown_side_effects(remaining, store_closer)
             .await;
-        combine_shutdown_outcome(outcome, drain, has_durable_store, start.elapsed())
+        combine_shutdown_outcome(outcome, flush, drain, has_durable_store, start.elapsed())
     }
 
     /// Cleanup body of [`shutdown_core_async`](Self::shutdown_core_async).
@@ -3079,7 +3133,7 @@ impl CoreFields {
     /// Clears transport, flushes persistence, drains the Supervisor, closes
     /// the durable store after the drain, clears bridge-owned registries, and
     /// runs any registered shutdown hooks. `budget` bounds the flush and the
-    /// drain together.
+    /// drain together. Returns how the flush ended with how the drain ended.
     ///
     /// The drain runs through `Supervisor::drain_with_deadline`, followed by
     /// `store_closer` in the same task. The task is awaited until the deadline
@@ -3091,7 +3145,7 @@ impl CoreFields {
         &self,
         budget: Duration,
         store_closer: Option<DurableStoreCloser>,
-    ) -> SupervisorDrain {
+    ) -> (ShutdownFlush, SupervisorDrain) {
         let deadline = tokio::time::Instant::now() + budget;
         if let Err(e) = self.clear_transport() {
             tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
@@ -3100,24 +3154,29 @@ impl CoreFields {
             urls.clear();
         }
 
-        let drain = if let Some(supervisor) = self.supervisor.get() {
+        let (flush, drain) = if let Some(supervisor) = self.supervisor.get() {
             // The flush honors the caller's deadline: a wedged context cannot
             // push shutdown past it. The flush is natively async (per-context
-            // bounded lock with a degraded-snapshot fallback).
-            if budget.is_zero() {
+            // bounded lock with a degraded-snapshot fallback). Its result
+            // reaches the caller through `ShutdownOutcome::flush`.
+            let flush = if budget.is_zero() {
                 tracing::warn!(
                     "shutdown flush budget exhausted before flush_all_contexts — \
                      context state may not be persisted"
                 );
+                ShutdownFlush::TimedOut
             } else {
                 match tokio::time::timeout_at(deadline, supervisor.flush_all_contexts()).await {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => ShutdownFlush::Flushed,
                     Ok(Err(e)) => {
                         tracing::warn!(
                             error = %e,
                             "flush_all_contexts returned an error during shutdown — \
                              context state may not be persisted"
                         );
+                        ShutdownFlush::Failed {
+                            message: e.to_string(),
+                        }
                     }
                     Err(_elapsed) => {
                         tracing::warn!(
@@ -3125,9 +3184,10 @@ impl CoreFields {
                             "flush_all_contexts exceeded shutdown budget — \
                              context state may not be persisted"
                         );
+                        ShutdownFlush::TimedOut
                     }
                 }
-            }
+            };
             let has_durable_store = store_closer.is_some();
             // The store closes inside the drain task, after the drain: never
             // before a tracked writer exits (ADR-049 Decision 16). A drain
@@ -3150,7 +3210,7 @@ impl CoreFields {
                     tracing::error!("late {}", drain_failed_message(failure, has_durable_store));
                 }
             };
-            match supervisor
+            let drain = match supervisor
                 .drain_with_deadline(deadline, move || close_durable_store(store_closer), on_late)
                 .await
             {
@@ -3167,15 +3227,19 @@ impl CoreFields {
                     );
                     SupervisorDrain::Pending
                 }
-            }
+            };
+            (flush, drain)
         } else {
-            // No Supervisor was ever attached, so no tracked task can write
-            // through the store.
-            SupervisorDrain::Finished(close_durable_store(store_closer))
+            // No Supervisor was ever attached, so no context exists to flush
+            // and no tracked task can write through the store.
+            (
+                ShutdownFlush::Skipped,
+                SupervisorDrain::Finished(close_durable_store(store_closer)),
+            )
         };
 
         self.finish_shutdown_cleanup();
-        drain
+        (flush, drain)
     }
 
     /// Tail of [`Self::run_shutdown_side_effects`]: registry clears, hook
@@ -3333,9 +3397,12 @@ fn close_durable_store(
 /// `aborted_tasks` and `panicked_tasks` count only bridge tasks, because no
 /// tracked task is ever aborted and a drain panic is reported in `drain`.
 /// `durable_store_open` is true only when the drain did not finish and the
-/// instance has a durable store, which then stayed open.
+/// instance has a durable store, which then stayed open. `flush` is carried
+/// into either variant unchanged: a failed flush does not change whether the
+/// tasks finished in time.
 fn combine_shutdown_outcome(
     bridge: BridgeTasksDrain,
+    flush: ShutdownFlush,
     drain: SupervisorDrain,
     has_durable_store: bool,
     elapsed: Duration,
@@ -3357,57 +3424,110 @@ fn combine_shutdown_outcome(
         (None, DrainState::Finished) => ShutdownOutcome::GracefulWithin {
             elapsed,
             panicked_tasks,
+            flush,
         },
         (aborted_tasks, drain) => ShutdownOutcome::TimedOut {
             aborted_tasks: aborted_tasks.unwrap_or(0),
             panicked_tasks,
             drain,
             durable_store_open,
+            flush,
         },
     })
+}
+
+/// What an SDK `shutdown` raises: a storage code and its message.
+///
+/// [`sdk_shutdown_result`] builds it; each bridge raises it as its storage
+/// error with `code` (`UniFFI` `ScpError::Storage`, `PyO3` and napi-rs
+/// `ValidationError` carrying the code).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkShutdownFailure {
+    /// [`crate::error_codes::STORAGE_8005`] when the durable store still
+    /// holds its advisory lock, otherwise
+    /// [`crate::error_codes::STORAGE_8015`] when the context-snapshot flush
+    /// failed or timed out.
+    pub code: &'static str,
+    /// What went wrong, for the SDK error's message.
+    pub message: String,
 }
 
 /// Reduces a [`BridgeInstanceCore::shutdown`] result to what an SDK
 /// `shutdown` reports. An SDK `shutdown` returns no [`ShutdownOutcome`], so
 /// this decides whether the caller sees success or an error.
 ///
-/// Returns `Ok(())` when no durable store is left holding its advisory lock:
-/// [`ShutdownOutcome::GracefulWithin`], and a `TimedOut` or
+/// Returns `Ok(())` when no durable store is left holding its advisory lock
+/// and the flush did not fail: a [`ShutdownOutcome`] whose
+/// `durable_store_open` is false (always so for `GracefulWithin`) and whose
+/// [`ShutdownFlush`] is `Flushed` or `Skipped`, and an
 /// [`ShutdownError::AlreadyShutDown`] whose `durable_store_open` is false.
 ///
 /// # Errors
 ///
-/// Returns the message of the [`crate::error_codes::STORAGE_8005`] error each
-/// bridge raises when the durable store still holds its advisory lock: a
-/// `TimedOut` or `AlreadyShutDown` with `durable_store_open` set, or
-/// [`ShutdownError::DurableStoreClose`].
-pub fn sdk_shutdown_result(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), String> {
+/// - [`crate::error_codes::STORAGE_8005`] when the durable store still holds
+///   its advisory lock: a `TimedOut` or `AlreadyShutDown` with
+///   `durable_store_open` set, [`ShutdownError::DurableStoreClose`], or
+///   [`ShutdownError::Interrupted`], after which the lock may be held. This
+///   code wins over a failed flush, because a reopen of the directory fails
+///   until the lock is released; the message names the flush failure too.
+/// - [`crate::error_codes::STORAGE_8015`] when the store was released but the
+///   flush ended [`ShutdownFlush::Failed`] or [`ShutdownFlush::TimedOut`]: the
+///   shutdown completed, and the unflushed contexts restore from their last
+///   persisted snapshot.
+pub fn sdk_shutdown_result(
+    result: Result<ShutdownOutcome, ShutdownError>,
+) -> Result<(), SdkShutdownFailure> {
+    const STORE_OPEN: &str = "shutdown left the durable store open: it keeps its advisory lock, \
+                              so a reopen of the same directory fails until the store is released";
+    let lock_held = |message: String| SdkShutdownFailure {
+        code: crate::error_codes::STORAGE_8005,
+        message,
+    };
     match result {
-        Ok(
-            ShutdownOutcome::GracefulWithin { .. }
-            | ShutdownOutcome::TimedOut {
-                durable_store_open: false,
-                ..
-            },
-        )
-        | Err(ShutdownError::AlreadyShutDown {
+        Ok(outcome) => {
+            let flush_failure = match outcome.flush() {
+                ShutdownFlush::Flushed | ShutdownFlush::Skipped => None,
+                ShutdownFlush::Failed { message } => Some(format!(
+                    "shutdown could not persist every context snapshot ({message}); those \
+                     contexts restore from their last persisted snapshot"
+                )),
+                ShutdownFlush::TimedOut => Some(
+                    "shutdown's context-snapshot flush did not finish within the deadline; the \
+                     unflushed contexts restore from their last persisted snapshot"
+                        .to_owned(),
+                ),
+            };
+            let store_open = matches!(
+                outcome,
+                ShutdownOutcome::TimedOut {
+                    durable_store_open: true,
+                    ..
+                }
+            );
+            match (store_open, flush_failure) {
+                (false, None) => Ok(()),
+                (true, None) => Err(lock_held(STORE_OPEN.to_owned())),
+                (true, Some(flush)) => Err(lock_held(format!("{STORE_OPEN}; {flush}"))),
+                (false, Some(flush)) => Err(SdkShutdownFailure {
+                    code: crate::error_codes::STORAGE_8015,
+                    message: flush,
+                }),
+            }
+        }
+        Err(ShutdownError::AlreadyShutDown {
             durable_store_open: false,
         }) => Ok(()),
-        Ok(ShutdownOutcome::TimedOut {
+        Err(ShutdownError::AlreadyShutDown {
             durable_store_open: true,
-            ..
-        })
-        | Err(ShutdownError::AlreadyShutDown {
-            durable_store_open: true,
-        }) => Err(
-            "shutdown left the durable store open: it keeps its advisory lock, so a reopen of \
-             the same directory fails until the store is released"
-                .to_owned(),
-        ),
-        Err(e @ ShutdownError::DurableStoreClose(_)) => Err(format!(
+        }) => Err(lock_held(STORE_OPEN.to_owned())),
+        Err(e @ ShutdownError::DurableStoreClose(_)) => Err(lock_held(format!(
             "{e} — the durable store keeps its advisory lock, so a reopen of the same \
              directory fails until the process releases it"
-        )),
+        ))),
+        Err(e @ ShutdownError::Interrupted) => Err(lock_held(format!(
+            "{e} — the durable store may still hold its advisory lock, so a reopen of the \
+             same directory may fail until the process releases it"
+        ))),
     }
 }
 
@@ -3505,7 +3625,7 @@ async fn count_and_drain_aborted(set: &mut JoinSet<()>) -> (usize, usize) {
 /// The trait is `Send + Sync`: shared helpers may take `&dyn BridgeInstanceCore`
 /// and pass it across threads or `.await` points.
 #[async_trait::async_trait]
-pub trait BridgeInstanceCore: Send + Sync {
+pub trait BridgeInstanceCore: Send + Sync + 'static {
     /// Returns a reference to the embedded bridge-agnostic core state.
     fn core(&self) -> &CoreFields;
 
@@ -3526,46 +3646,52 @@ pub trait BridgeInstanceCore: Send + Sync {
 
     /// Suspends the instance — see [`CoreFields::suspend`].
     ///
+    /// The suspend runs as its own task on the bridge's runtime, so it
+    /// finishes, or reverts to running, even when the caller drops this
+    /// future. `deadline` bounds it.
+    ///
     /// # Errors
     ///
-    /// [`LifecycleError::FlushFailed`] when a context's snapshot did not
-    /// persist, and [`LifecycleError::TransportLock`] when the transport lock
-    /// is poisoned; the instance stays running on either.
-    async fn suspend(&self) -> Result<(), LifecycleError> {
-        self.core().suspend().await
+    /// [`SuspendError::FlushFailed`] when a context's snapshot did not
+    /// persist, [`SuspendError::DeadlineElapsed`] when the flush missed
+    /// `deadline`, [`SuspendError::Interrupted`] when the runtime cancelled
+    /// the task, and [`SuspendError::TransportLock`] when the transport lock
+    /// is poisoned; the instance stays running on each.
+    async fn suspend(self: Arc<Self>, deadline: Duration) -> Result<(), SuspendError> {
+        run_to_completion(async move { self.core().suspend(deadline).await })
+            .await
+            .unwrap_or(Err(SuspendError::Interrupted))
     }
 
-    /// Resumes the instance — see [`CoreFields::resume`].
+    /// Resumes the instance — see [`CoreFields::resume`], which clears the
+    /// suspended flag, reconnects transport from the retained relay URLs
+    /// (before rehydration, so restored subscriptions attach to a live relay
+    /// connection), and rehydrates the persisted contexts, all under the
+    /// lifecycle lock.
     ///
-    /// Default implementation (extended in commit 6 of the actor-per-context
-    /// refactor, ADR-049 §11):
-    ///
-    /// 1. Flip the suspended flag via [`CoreFields::resume`].
-    /// 2. Reconnect transport if a relay URL was retained via
-    ///    [`CoreFields::reconnect_transport_if_pending`] — the reconnect
-    ///    MUST precede persisted-context rehydration so restored
-    ///    subscriptions attach to a live relay connection.
-    /// 3. Rehydrate persisted contexts via
-    ///    [`CoreFields::restore_all_persisted_contexts`].
+    /// The resume runs as its own task on the bridge's runtime, so it
+    /// finishes even when the caller drops this future.
     ///
     /// Per-bridge concrete structs (`PyBridgeInstance`,
     /// `NapiBridgeInstance`, `UniffiBridgeInstance`) MUST NOT override
     /// this default. The CI gate
     /// `scripts/check-bridge-instance-lifecycle.py` enforces the ban.
-    /// Bridges that need additional resume-time work add a
-    /// `post_resume_hook` (future extension; not yet defined because
-    /// no bridge currently requires one).
     ///
     /// # Errors
     ///
     /// Returns [`LifecycleError::AlreadyShutDown`] if the instance has
     /// been permanently shut down, or [`LifecycleError::ReconnectFailed`]
-    /// if transport reconnect raced to failure.
-    async fn resume(&self) -> Result<(), LifecycleError> {
-        self.core().resume().await?;
-        self.core().reconnect_transport_if_pending().await?;
-        self.core().restore_all_persisted_contexts().await;
-        Ok(())
+    /// if transport reconnect failed, including when the runtime cancelled
+    /// the resume task (empty `url`).
+    async fn resume(self: Arc<Self>) -> Result<(), LifecycleError> {
+        run_to_completion(async move { self.core().resume().await })
+            .await
+            .unwrap_or_else(|TransitionCancelled| {
+                Err(LifecycleError::ReconnectFailed {
+                    url: String::new(),
+                    reason: "the runtime stopped the resume before it finished".to_owned(),
+                })
+            })
     }
 
     /// Async shutdown with a graceful deadline.
@@ -3605,22 +3731,34 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// `pre_*_hook` / `post_*_hook` extension points) instead. The CI
     /// gate `scripts/check-bridge-instance-lifecycle.py` enforces this.
     ///
+    /// The shutdown runs as its own task on the bridge's runtime, so it
+    /// finishes even when the caller drops this future.
+    ///
     /// # Errors
     ///
-    /// Returns [`ShutdownError::AlreadyShutDown`] on a second call, and
-    /// [`ShutdownError::DurableStoreClose`] when the store refuses to close.
-    async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
-        // Stop every borrower BEFORE any release: the durable store closer
-        // closes this instance's `SQLCipher` handle, and a node started on
-        // that handle must not still be writing when it does.
-        self.core().stop_borrowers();
-        self.release_streams();
-        let result = self
-            .core()
-            .shutdown_core_async(timeout, self.durable_store_closer())
-            .await;
-        self.bridge_specific_shutdown();
-        result
+    /// Returns [`ShutdownError::AlreadyShutDown`] on a second call,
+    /// [`ShutdownError::DurableStoreClose`] when the store refuses to close,
+    /// and [`ShutdownError::Interrupted`] when the runtime cancelled the
+    /// shutdown task.
+    async fn shutdown(
+        self: Arc<Self>,
+        timeout: Duration,
+    ) -> Result<ShutdownOutcome, ShutdownError> {
+        run_to_completion(async move {
+            // Stop every borrower BEFORE any release: the durable store
+            // closer closes this instance's `SQLCipher` handle, and a node
+            // started on that handle must not still be writing when it does.
+            self.core().stop_borrowers();
+            self.release_streams();
+            let result = self
+                .core()
+                .shutdown_core_async(timeout, self.durable_store_closer())
+                .await;
+            self.bridge_specific_shutdown();
+            result
+        })
+        .await
+        .unwrap_or(Err(ShutdownError::Interrupted))
     }
 
     /// Returns the closer for this instance's durable store, or `None` when
@@ -3722,13 +3860,12 @@ impl std::fmt::Display for TransportLockError {
 
 impl std::error::Error for TransportLockError {}
 
-/// Error type for lifecycle operations (`suspend`, `resume`, `check_ready`).
+/// Error type for lifecycle operations (`resume`, `check_ready`).
 ///
-/// Used by [`CoreFields::suspend`], [`CoreFields::resume`] and related
-/// lifecycle accessors. Bridge layers map this to their own error types
-/// (`ScpPyError`, napi `Error`, etc.); [`classify_suspend_failure`] names
-/// the class and code each bridge reports for a failed suspend.
-#[derive(Debug)]
+/// Used by [`CoreFields::resume`] and related lifecycle accessors.
+/// Bridge layers map this to their own error types (`ScpPyError`, napi `Error`,
+/// etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleError {
     /// The instance has been permanently shut down and cannot be resumed.
     AlreadyShutDown,
@@ -3748,12 +3885,31 @@ pub enum LifecycleError {
         /// Redacted failure reason (no internal architecture leaks).
         reason: String,
     },
-    /// `suspend()` could not persist a context's snapshot (ADR-049 Decision
-    /// 9). The instance stays running with its transport connected, and a
-    /// retried `suspend()` flushes the still-dirty actors again.
+}
+
+/// Error produced by [`CoreFields::suspend`] and
+/// [`BridgeInstanceCore::suspend`].
+///
+/// On every variant the instance stays running: `is_suspended()` returns
+/// `false`. [`classify_suspend_failure`] names the class and code each bridge
+/// reports.
+#[derive(Debug)]
+pub enum SuspendError {
+    /// A context's snapshot did not persist (ADR-049 Decision 9). The
+    /// transport stays connected, and a retried `suspend()` flushes the
+    /// still-dirty actors again.
     FlushFailed(scp_core::context::ContextError),
-    /// `suspend()` could not clear the transport because its lock is
-    /// poisoned. The instance stays running.
+    /// The flush, or the wait for a lifecycle transition already in
+    /// progress, did not finish within the caller's deadline. The transport
+    /// stays connected.
+    DeadlineElapsed {
+        /// The deadline the caller gave.
+        deadline: Duration,
+    },
+    /// The runtime cancelled the suspend task before it finished, as when
+    /// the runtime shuts down. The transport stays connected.
+    Interrupted,
+    /// The transport could not be cleared because its lock is poisoned.
     TransportLock(TransportLockError),
 }
 
@@ -3762,39 +3918,112 @@ pub enum LifecycleError {
 /// disagree on which error family a suspend failure belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuspendFailureClass {
-    /// A context snapshot did not persist:
+    /// The flush did not land:
     /// [`STORAGE_8014`](crate::error_codes::STORAGE_8014).
     Storage,
     /// The transport lock is poisoned:
     /// [`TRANS_5001`](crate::error_codes::TRANS_5001).
     Transport,
-    /// A lifecycle state error:
-    /// [`CTX_2000`](crate::error_codes::CTX_2000), the code `resume` reports.
-    Lifecycle,
 }
 
 /// The class and code a bridge reports for a `suspend` that returned `e`.
 ///
-/// [`LifecycleError::FlushFailed`] is storage, and
-/// [`LifecycleError::TransportLock`] is transport. `suspend` returns no other
-/// variant; the match names each of them so a new variant does not compile
-/// until it is classified here.
+/// Every flush failure is storage, whether the flush failed, missed its
+/// deadline or was interrupted; [`SuspendError::TransportLock`] is transport.
 #[must_use]
-pub const fn classify_suspend_failure(e: &LifecycleError) -> (SuspendFailureClass, &'static str) {
+pub const fn classify_suspend_failure(e: &SuspendError) -> (SuspendFailureClass, &'static str) {
     match e {
-        LifecycleError::FlushFailed(_) => (
+        SuspendError::FlushFailed(_)
+        | SuspendError::DeadlineElapsed { .. }
+        | SuspendError::Interrupted => (
             SuspendFailureClass::Storage,
             crate::error_codes::STORAGE_8014,
         ),
-        LifecycleError::TransportLock(_) => (
+        SuspendError::TransportLock(_) => (
             SuspendFailureClass::Transport,
             crate::error_codes::TRANS_5001,
         ),
-        LifecycleError::AlreadyShutDown
-        | LifecycleError::Suspended
-        | LifecycleError::ReconnectFailed { .. } => {
-            (SuspendFailureClass::Lifecycle, crate::error_codes::CTX_2000)
+    }
+}
+
+impl std::fmt::Display for SuspendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FlushFailed(e) => write!(
+                f,
+                "suspend refused: a context snapshot did not persist, so the instance \
+                 stays running; retry suspend: {e}"
+            ),
+            Self::DeadlineElapsed { deadline } => write!(
+                f,
+                "suspend refused: the flush did not finish within {}ms, so the instance \
+                 stays running; retry suspend",
+                deadline.as_millis()
+            ),
+            Self::Interrupted => write!(
+                f,
+                "suspend refused: the runtime stopped the suspend before its flush finished, \
+                 so the instance stays running"
+            ),
+            Self::TransportLock(e) => write!(f, "suspend could not clear transport: {e}"),
         }
+    }
+}
+
+impl std::error::Error for SuspendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::FlushFailed(e) => Some(e),
+            Self::TransportLock(e) => Some(e),
+            Self::DeadlineElapsed { .. } | Self::Interrupted => None,
+        }
+    }
+}
+
+/// Clears `suspended` when dropped while armed. [`CoreFields::suspend`] arms
+/// it as it sets the flag and disarms it only once the transport is cleared,
+/// so an error return or a future dropped mid-flush leaves the instance
+/// running with its transport.
+struct RevertSuspendOnDrop<'a> {
+    suspended: &'a AtomicBool,
+    armed: bool,
+}
+
+impl RevertSuspendOnDrop<'_> {
+    /// Keeps the flag set: the suspend finished.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RevertSuspendOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.suspended.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A lifecycle transition task that ended without returning, because the
+/// runtime cancelled it.
+struct TransitionCancelled;
+
+/// Runs a lifecycle transition as its own task on the current runtime and
+/// awaits it, so the transition runs to completion even when the caller
+/// drops the returned future (a cancelled Swift `Task`, a cancelled Kotlin
+/// coroutine, a dropped JavaScript promise chain). A panic inside the
+/// transition resumes on the caller, as it would have without the task.
+async fn run_to_completion<T, F>(transition: F) -> Result<T, TransitionCancelled>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::spawn(transition).await {
+        Ok(value) => Ok(value),
+        Err(e) => match e.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(_cancelled) => Err(TransitionCancelled),
+        },
     }
 }
 
@@ -3811,25 +4040,11 @@ impl std::fmt::Display for LifecycleError {
             Self::ReconnectFailed { url, reason } => {
                 write!(f, "resume transport reconnect failed for {url}: {reason}")
             }
-            Self::FlushFailed(e) => write!(
-                f,
-                "suspend refused: a context snapshot did not persist, so the instance \
-                 stays running; retry suspend: {e}"
-            ),
-            Self::TransportLock(e) => write!(f, "suspend could not clear transport: {e}"),
         }
     }
 }
 
-impl std::error::Error for LifecycleError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::FlushFailed(e) => Some(e),
-            Self::TransportLock(e) => Some(e),
-            Self::AlreadyShutDown | Self::Suspended | Self::ReconnectFailed { .. } => None,
-        }
-    }
-}
+impl std::error::Error for LifecycleError {}
 
 /// Error produced when a handle is used on the wrong bridge instance.
 ///
@@ -3911,6 +4126,8 @@ pub enum ShutdownOutcome {
         /// Panics are logged at `tracing::error!` level; shutdown continues
         /// regardless.
         panicked_tasks: usize,
+        /// How the context-snapshot flush ended.
+        flush: ShutdownFlush,
     },
     /// The deadline expired before the bridge's own tasks or the
     /// Supervisor's tracked tasks finished, or the Supervisor drain task
@@ -3931,7 +4148,43 @@ pub enum ShutdownOutcome {
         /// a durable store: the store was not closed and keeps its advisory
         /// lock.
         durable_store_open: bool,
+        /// How the context-snapshot flush ended.
+        flush: ShutdownFlush,
     },
+}
+
+impl ShutdownOutcome {
+    /// How the shutdown's context-snapshot flush ended.
+    #[must_use]
+    pub const fn flush(&self) -> &ShutdownFlush {
+        match self {
+            Self::GracefulWithin { flush, .. } | Self::TimedOut { flush, .. } => flush,
+        }
+    }
+}
+
+/// How the context-snapshot flush of a shutdown ended (ADR-049 Decision 9).
+///
+/// [`CoreFields::shutdown_core_async`] flushes every context before the
+/// Supervisor drain, inside the caller's deadline. Each SDK `shutdown` reports
+/// [`Self::Failed`] and [`Self::TimedOut`] as `SCP-STORAGE-8015`
+/// ([`sdk_shutdown_result`]): the shutdown still completes, but the contexts
+/// restore from their last persisted snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownFlush {
+    /// Every context's snapshot persisted, or no persistence provider is
+    /// configured.
+    Flushed,
+    /// A context's snapshot did not persist.
+    Failed {
+        /// The first failing context's error, as the flush reported it.
+        message: String,
+    },
+    /// The flush did not finish inside the shutdown deadline, or the bridge's
+    /// own task drain spent the whole deadline before the flush started.
+    TimedOut,
+    /// No Supervisor was attached, so no context existed to flush.
+    Skipped,
 }
 
 /// How the Supervisor drain stood when a [`ShutdownOutcome::TimedOut`]
@@ -3967,6 +4220,11 @@ pub enum ShutdownError {
     /// of the same directory fails until the process releases it.
     #[error("durable store failed to close after shutdown: {0}")]
     DurableStoreClose(scp_platform::PlatformError),
+    /// The runtime cancelled the shutdown task before it finished, as when
+    /// the runtime itself shuts down. The durable store may still hold its
+    /// advisory lock.
+    #[error("the runtime stopped the shutdown before it finished")]
+    Interrupted,
 }
 
 #[cfg(test)]
@@ -3989,6 +4247,10 @@ pub(crate) mod tests {
             scp_platform::in_memory::InMemoryStorage::new(),
         )))
     }
+
+    /// The deadline a test passes to `suspend` when the deadline is not what
+    /// the test exercises.
+    const TEST_DEADLINE: Duration = Duration::from_secs(10);
 
     use scp_core::envelope::outer::OuterEnvelope;
     use scp_transport::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportError};
@@ -4470,7 +4732,7 @@ pub(crate) mod tests {
             .unwrap();
         assert!(instance.has_transport());
 
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
 
         assert!(!instance.has_transport());
         assert!(instance.is_suspended());
@@ -4482,7 +4744,7 @@ pub(crate) mod tests {
         shut_down(&instance).await;
 
         // Suspending an already-shutdown instance is a no-op (not an error)
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
         assert!(instance.is_shutdown());
         assert!(!instance.is_suspended());
     }
@@ -4490,7 +4752,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn resume_clears_suspended_flag() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
         assert!(instance.is_suspended());
 
         instance.resume().await.unwrap();
@@ -4503,7 +4765,7 @@ pub(crate) mod tests {
         shut_down(&instance).await;
 
         let err = instance.resume().await.unwrap_err();
-        assert!(matches!(err, LifecycleError::AlreadyShutDown), "{err:?}");
+        assert_eq!(err, LifecycleError::AlreadyShutDown);
         assert_eq!(
             err.to_string(),
             "bridge instance has been permanently shut down"
@@ -4574,7 +4836,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn shutdown_clears_suspended_flag() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
         assert!(instance.is_suspended());
 
         shut_down(&instance).await;
@@ -4612,21 +4874,21 @@ pub(crate) mod tests {
         let instance = CoreFields::with_supervisor(test_supervisor());
         shut_down(&instance).await;
         let err = instance.check_ready().unwrap_err();
-        assert!(matches!(err, LifecycleError::AlreadyShutDown), "{err:?}");
+        assert_eq!(err, LifecycleError::AlreadyShutDown);
     }
 
     #[tokio::test]
     async fn check_ready_fails_when_suspended() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
         let err = instance.check_ready().unwrap_err();
-        assert!(matches!(err, LifecycleError::Suspended), "{err:?}");
+        assert_eq!(err, LifecycleError::Suspended);
     }
 
     #[tokio::test]
     async fn check_ready_passes_after_resume() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
         assert!(instance.check_ready().is_err());
         instance.resume().await.unwrap();
         assert!(instance.check_ready().is_ok());
@@ -4783,7 +5045,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn set_transport_rejects_when_suspended() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
 
         let err = instance
             .set_transport(Arc::new(test_transport_manager()))
@@ -4798,7 +5060,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn set_transport_accepts_after_resume() {
         let instance = CoreFields::with_supervisor(test_supervisor());
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
         instance.resume().await.unwrap();
 
         assert!(
@@ -5478,7 +5740,7 @@ pub(crate) mod tests {
             .unwrap();
         instance.add_relay_url("wss://relay.example.com".to_owned());
 
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
         assert!(
             instance
                 .pending_relay_urls()
@@ -5609,7 +5871,7 @@ pub(crate) mod tests {
 
         // Fire suspend: cancels the token the reconnect snapshotted and
         // rotates in a fresh one.
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
 
         // The collect `select!` is biased toward the cancel branch, so
         // the next poll takes it even if a dial has already finished.
@@ -5662,7 +5924,7 @@ pub(crate) mod tests {
         let token_before = instance.reconnect_cancel_token();
         assert!(!token_before.is_cancelled());
 
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
 
         // Old token must be cancelled — any in-flight reconnect sees it.
         assert!(
@@ -5744,20 +6006,26 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn relay_urls_survive_suspend_resume_cycle() {
         // Multiple relay URLs must survive suspend/resume so callers can
-        // reconnect to every one of them after resume.
+        // reconnect to every one of them after resume. Nothing listens on
+        // loopback ports 1 and 2, so the resume's reconnect fails and keeps
+        // both URLs for a retry.
         let instance = CoreFields::with_supervisor(test_supervisor());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
-        instance.add_relay_url("wss://relay1.example.com".to_owned());
-        instance.add_relay_url("wss://relay2.example.com".to_owned());
-        instance.suspend().await.unwrap();
+        instance.add_relay_url("ws://127.0.0.1:1/scp/v1".to_owned());
+        instance.add_relay_url("ws://127.0.0.1:2/scp/v1".to_owned());
+        instance.suspend(TEST_DEADLINE).await.unwrap();
         assert_eq!(
             instance.pending_relay_urls().len(),
             2,
             "relay URLs must survive suspend"
         );
-        instance.resume().await.unwrap();
+        let resumed = instance.resume().await;
+        assert!(
+            matches!(resumed, Err(LifecycleError::ReconnectFailed { .. })),
+            "{resumed:?}"
+        );
         assert_eq!(
             instance.pending_relay_urls().len(),
             2,
@@ -5812,15 +6080,33 @@ pub(crate) mod tests {
     // AC 8: suspend/resume with persistence
     // -----------------------------------------------------------------
 
-    /// A context persistence that keeps snapshots in memory, counts writes,
-    /// and refuses every write while `fail` is set.
+    /// A context persistence that keeps snapshots in memory, counts the
+    /// writes that started, refuses every write while `fail` is set, and
+    /// holds every write while a test holds `hold` for writing.
     #[derive(Default)]
     pub struct RecordingPersistence {
         snapshots: Mutex<HashMap<String, scp_core::context::state::ContextSnapshot>>,
         fail: AtomicBool,
+        hold: tokio::sync::RwLock<()>,
+        started: std::sync::atomic::AtomicUsize,
     }
 
     impl RecordingPersistence {
+        fn started(&self) -> usize {
+            self.started.load(Ordering::SeqCst)
+        }
+
+        /// Waits until at least `n` writes have started.
+        async fn wait_started(&self, n: usize) {
+            tokio::time::timeout(TEST_DEADLINE, async {
+                while self.started() < n {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("a persist started");
+        }
+
         fn stored(&self, context_id: &str) -> bool {
             self.snapshots.lock().unwrap().contains_key(context_id)
         }
@@ -5841,6 +6127,8 @@ pub(crate) mod tests {
             context_id: &str,
             snapshot: &scp_core::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.started.fetch_add(1, Ordering::SeqCst);
+            let _held = self.0.hold.read().await;
             if self.0.fail.load(Ordering::SeqCst) {
                 return Err("recording persistence refuses writes".into());
             }
@@ -5884,6 +6172,15 @@ pub(crate) mod tests {
         recording: &Arc<RecordingPersistence>,
         context_id: &str,
     ) -> CoreFields {
+        instance_with_persisted_context_on(recording, context_id, "wss://suspend.example").await
+    }
+
+    /// [`instance_with_persisted_context`] with its transport on `relay_url`.
+    async fn instance_with_persisted_context_on(
+        recording: &Arc<RecordingPersistence>,
+        context_id: &str,
+        relay_url: &str,
+    ) -> CoreFields {
         let key_resolver: scp_core::context::governance::KeyResolver =
             Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let supervisor = Supervisor::with_providers(
@@ -5916,7 +6213,7 @@ pub(crate) mod tests {
         assert!(recording.stored(context_id), "create persists the context");
         let instance = CoreFields::with_supervisor(supervisor);
         instance
-            .install_transport(Arc::new(manager_on("wss://suspend.example")))
+            .install_transport(Arc::new(manager_on(relay_url)))
             .unwrap();
         instance
     }
@@ -5930,7 +6227,7 @@ pub(crate) mod tests {
         let instance = instance_with_persisted_context(&recording, "suspend-flush-ctx").await;
         recording.forget("suspend-flush-ctx");
 
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
 
         assert!(
             recording.stored("suspend-flush-ctx"),
@@ -5943,10 +6240,6 @@ pub(crate) mod tests {
                 .pending_relay_urls()
                 .contains("wss://suspend.example")
         );
-
-        instance.resume().await.unwrap();
-        assert!(!instance.is_suspended());
-        assert!(instance.check_ready().is_ok());
     }
 
     /// A `suspend` whose flush fails returns `FlushFailed`, leaves the
@@ -5959,12 +6252,12 @@ pub(crate) mod tests {
         recording.forget("suspend-fail-ctx");
         recording.fail.store(true, Ordering::SeqCst);
 
-        let err = instance.suspend().await.unwrap_err();
+        let err = instance.suspend(TEST_DEADLINE).await.unwrap_err();
 
         assert!(
             matches!(
                 err,
-                LifecycleError::FlushFailed(scp_core::context::ContextError::PersistenceFailed(_))
+                SuspendError::FlushFailed(scp_core::context::ContextError::PersistenceFailed(_))
             ),
             "{err:?}"
         );
@@ -5984,33 +6277,299 @@ pub(crate) mod tests {
         );
 
         recording.fail.store(false, Ordering::SeqCst);
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
         assert!(recording.stored("suspend-fail-ctx"), "the retry flushed");
         assert!(instance.is_suspended());
     }
 
-    /// Every `LifecycleError` maps to the class and code each bridge reports
-    /// for a failed `suspend`.
+    /// Every `SuspendError` maps to the class and code each bridge reports
+    /// for a failed `suspend`: a poisoned transport lock to `SCP-TRANS-5001`,
+    /// every way the flush did not land to `SCP-STORAGE-8014`.
     #[test]
     fn suspend_failures_carry_their_codes() {
         use crate::error_codes as codes;
         assert_eq!(
-            classify_suspend_failure(&LifecycleError::TransportLock(TransportLockError::Poisoned)),
+            classify_suspend_failure(&SuspendError::TransportLock(TransportLockError::Poisoned)),
             (SuspendFailureClass::Transport, codes::TRANS_5001)
         );
         for e in [
-            LifecycleError::AlreadyShutDown,
-            LifecycleError::Suspended,
-            LifecycleError::ReconnectFailed {
-                url: String::new(),
-                reason: String::new(),
+            SuspendError::FlushFailed(scp_core::context::ContextError::PersistenceFailed(
+                "refused".to_owned(),
+            )),
+            SuspendError::DeadlineElapsed {
+                deadline: Duration::from_secs(1),
             },
+            SuspendError::Interrupted,
         ] {
             assert_eq!(
                 classify_suspend_failure(&e),
-                (SuspendFailureClass::Lifecycle, codes::CTX_2000)
+                (SuspendFailureClass::Storage, codes::STORAGE_8014),
+                "{e}"
             );
         }
+    }
+
+    /// A WebSocket server on loopback that completes the upgrade, then reads
+    /// and discards every frame, so a resume's reconnect dial to it connects.
+    async fn accepting_relay_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use futures::StreamExt;
+                    if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                        while ws.next().await.is_some() {}
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}/scp/v1")
+    }
+
+    /// A resume that arrives while a suspend is flushing waits for the
+    /// suspend to finish, then reconnects: the instance ends running with a
+    /// transport, never running with the transport the suspend cleared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_during_a_suspend_flush_runs_after_it_and_reconnects() {
+        let relay = accepting_relay_url().await;
+        let recording = Arc::new(RecordingPersistence::default());
+        let instance = Arc::new(
+            instance_with_persisted_context_on(&recording, "resume-race-ctx", &relay).await,
+        );
+        let before = recording.started();
+        let hold = recording.hold.write().await;
+        let suspend = tokio::spawn({
+            let instance = Arc::clone(&instance);
+            async move { instance.suspend(TEST_DEADLINE).await }
+        });
+        recording.wait_started(before + 1).await;
+        let resume = tokio::spawn({
+            let instance = Arc::clone(&instance);
+            async move { instance.resume().await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !resume.is_finished(),
+            "a resume waits for the suspend that holds the lifecycle lock"
+        );
+        assert!(instance.is_suspended());
+
+        drop(hold);
+        suspend.await.unwrap().unwrap();
+        resume.await.unwrap().unwrap();
+
+        assert!(!instance.is_suspended());
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec![relay]),
+            "the resume ran after the suspend cleared transport, and installed it again"
+        );
+    }
+
+    /// Two suspends that overlap run one after the other. The first misses
+    /// its deadline and reverts to running; the second then flushes and
+    /// suspends, so the instance ends suspended with its transport cleared,
+    /// not running with no transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlapping_suspends_end_suspended_with_the_transport_cleared() {
+        let recording = Arc::new(RecordingPersistence::default());
+        let instance =
+            Arc::new(instance_with_persisted_context(&recording, "overlap-suspend-ctx").await);
+        let before = recording.started();
+        let hold = recording.hold.write().await;
+        let first = tokio::spawn({
+            let instance = Arc::clone(&instance);
+            async move { instance.suspend(Duration::from_millis(300)).await }
+        });
+        recording.wait_started(before + 1).await;
+        let second = tokio::spawn({
+            let instance = Arc::clone(&instance);
+            async move { instance.suspend(TEST_DEADLINE).await }
+        });
+
+        let first = first.await.unwrap();
+        assert!(
+            matches!(first, Err(SuspendError::DeadlineElapsed { .. })),
+            "{first:?}"
+        );
+        drop(hold);
+        second.await.unwrap().unwrap();
+
+        assert!(
+            instance.is_suspended(),
+            "the first suspend's revert ran before the second suspend set the flag"
+        );
+        assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
+    }
+
+    /// A shutdown that starts while a suspend is flushing waits for it: its
+    /// cleanup does not run, and the instance keeps its transport, until the
+    /// suspend finishes; the suspend returns `Ok` rather than a storage
+    /// failure, and the shutdown then flushes and shuts down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_a_suspend_flush_waits_and_neither_fails() {
+        let recording = Arc::new(RecordingPersistence::default());
+        let instance =
+            Arc::new(instance_with_persisted_context(&recording, "suspend-shutdown-ctx").await);
+        let before = recording.started();
+        let hold = recording.hold.write().await;
+        let suspend = tokio::spawn({
+            let instance = Arc::clone(&instance);
+            async move { instance.suspend(TEST_DEADLINE).await }
+        });
+        recording.wait_started(before + 1).await;
+        let shutdown = tokio::spawn({
+            let instance = Arc::clone(&instance);
+            async move { instance.shutdown_core_async(TEST_DEADLINE, None).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "the shutdown waits for the suspend that holds the lifecycle lock"
+        );
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec!["wss://suspend.example".to_owned()]),
+            "the shutdown has not cleared transport under the suspend's flush"
+        );
+
+        drop(hold);
+        suspend.await.unwrap().unwrap();
+        let outcome = shutdown.await.unwrap().unwrap();
+
+        assert_eq!(outcome.flush(), &ShutdownFlush::Flushed, "{outcome:?}");
+        assert!(instance.is_shutdown());
+        assert!(!instance.is_suspended(), "shutdown supersedes suspension");
+    }
+
+    /// A suspend whose future is dropped mid-flush, as a cancelled Swift
+    /// `Task` or Kotlin coroutine drops it, still runs to the end through the
+    /// trait: once the flush lands, the instance is suspended with its
+    /// transport cleared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trait_suspend_whose_future_is_dropped_still_finishes() {
+        let recording = Arc::new(RecordingPersistence::default());
+        let bridge = Arc::new(TestBridge {
+            core: instance_with_persisted_context(&recording, "dropped-trait-suspend-ctx").await,
+        });
+        let before = recording.started();
+        let hold = recording.hold.write().await;
+
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(100),
+            Arc::clone(&bridge).suspend(TEST_DEADLINE),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the suspend was still flushing when dropped"
+        );
+        recording.wait_started(before + 1).await;
+        drop(hold);
+
+        // The suspend task holds the lifecycle lock until it finishes.
+        drop(
+            tokio::time::timeout(TEST_DEADLINE, bridge.core().lifecycle.lock())
+                .await
+                .expect("the suspend task finished"),
+        );
+        assert!(bridge.core().is_suspended());
+        assert_eq!(bridge.core().context_relay_urls(), Ok(Vec::new()));
+    }
+
+    /// `CoreFields::suspend` dropped mid-flush reverts to running and keeps
+    /// its transport, as a failed flush does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_core_suspend_dropped_mid_flush_stays_running_with_its_transport() {
+        let recording = Arc::new(RecordingPersistence::default());
+        let instance =
+            instance_with_persisted_context(&recording, "dropped-core-suspend-ctx").await;
+        let before = recording.started();
+        let hold = recording.hold.write().await;
+
+        let dropped =
+            tokio::time::timeout(Duration::from_millis(200), instance.suspend(TEST_DEADLINE)).await;
+
+        assert!(
+            dropped.is_err(),
+            "the suspend was still flushing when dropped"
+        );
+        assert!(recording.started() > before, "the flush had started");
+        assert!(
+            !instance.is_suspended(),
+            "a suspend dropped mid-flush reverts to running"
+        );
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec!["wss://suspend.example".to_owned()])
+        );
+        drop(hold);
+    }
+
+    /// A suspend whose flush is wedged past its deadline returns
+    /// `DeadlineElapsed`, which bridges report as `SCP-STORAGE-8014`, and
+    /// leaves the instance running with its transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_suspend_with_a_wedged_flush_times_out_and_stays_running() {
+        let recording = Arc::new(RecordingPersistence::default());
+        let instance = instance_with_persisted_context(&recording, "wedged-suspend-ctx").await;
+        let hold = recording.hold.write().await;
+
+        let started = tokio::time::Instant::now();
+        let err = instance
+            .suspend(Duration::from_millis(300))
+            .await
+            .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            matches!(err, SuspendError::DeadlineElapsed { deadline } if deadline == Duration::from_millis(300)),
+            "{err:?}"
+        );
+        assert_eq!(
+            classify_suspend_failure(&err),
+            (
+                SuspendFailureClass::Storage,
+                crate::error_codes::STORAGE_8014
+            )
+        );
+        assert!(!instance.is_suspended());
+        assert_eq!(
+            instance.context_relay_urls(),
+            Ok(vec!["wss://suspend.example".to_owned()])
+        );
+        drop(hold);
+    }
+
+    /// A shutdown whose flush fails still shuts down, reports
+    /// `ShutdownFlush::Failed` in its outcome, and its SDK result raises
+    /// `SCP-STORAGE-8015` with the persistence error.
+    #[tokio::test]
+    async fn a_shutdown_whose_flush_fails_reports_the_failure() {
+        let recording = Arc::new(RecordingPersistence::default());
+        let instance = instance_with_persisted_context(&recording, "shutdown-fail-ctx").await;
+        recording.forget("shutdown-fail-ctx");
+        recording.fail.store(true, Ordering::SeqCst);
+
+        let outcome = instance
+            .shutdown_core_async(TEST_DEADLINE, None)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome.flush(), ShutdownFlush::Failed { .. }),
+            "{outcome:?}"
+        );
+        assert!(instance.is_shutdown());
+        let failure = sdk_shutdown_result(Ok(outcome)).unwrap_err();
+        assert_eq!(failure.code, crate::error_codes::STORAGE_8015);
+        assert!(
+            failure
+                .message
+                .contains("recording persistence refuses writes"),
+            "{failure:?}"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -6209,12 +6768,14 @@ pub(crate) mod tests {
         let ShutdownOutcome::GracefulWithin {
             elapsed,
             panicked_tasks,
+            flush,
         } = outcome
         else {
             unreachable!("expected GracefulWithin, got {outcome:?}");
         };
         assert!(elapsed < Duration::from_secs(1));
         assert_eq!(panicked_tasks, 0);
+        assert_eq!(flush, ShutdownFlush::Flushed);
         assert!(instance.is_shutdown());
     }
 
@@ -6417,10 +6978,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn trait_shutdown_delegates_to_core() {
-        let bridge = TestBridge {
+        let bridge = Arc::new(TestBridge {
             core: CoreFields::with_supervisor(test_supervisor()),
-        };
-        let outcome = bridge.shutdown(Duration::from_secs(1)).await.unwrap();
+        });
+        let outcome = Arc::clone(&bridge)
+            .shutdown(Duration::from_secs(1))
+            .await
+            .unwrap();
         assert!(matches!(outcome, ShutdownOutcome::GracefulWithin { .. }));
         assert!(bridge.core().is_shutdown());
     }
@@ -6570,10 +7134,10 @@ pub(crate) mod tests {
     async fn shutdown_releases_streams_before_the_drain() {
         let dir = unique_store_dir("release-streams");
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let bridge = StreamReleasingBridge {
+        let bridge = Arc::new(StreamReleasingBridge {
             inner: sqlite_bridge_with_context(&dir, Arc::clone(&gate)).await,
             gate,
-        };
+        });
         let outcome = bridge
             .shutdown(Duration::from_secs(5))
             .await
@@ -6596,7 +7160,7 @@ pub(crate) mod tests {
     async fn timed_out_shutdown_keeps_lock_until_drain_finishes() {
         let dir = unique_store_dir("timeout");
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let bridge = sqlite_bridge_with_context(&dir, Arc::clone(&gate)).await;
+        let bridge = Arc::new(sqlite_bridge_with_context(&dir, Arc::clone(&gate)).await);
 
         let outcome = bridge
             .shutdown(Duration::from_millis(200))
@@ -6656,7 +7220,7 @@ pub(crate) mod tests {
     async fn graceful_shutdown_closes_store_before_returning() {
         let dir = unique_store_dir("graceful");
         let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let bridge = sqlite_bridge_with_context(&dir, gate).await;
+        let bridge = Arc::new(sqlite_bridge_with_context(&dir, gate).await);
 
         let outcome = bridge
             .shutdown(Duration::from_secs(10))
@@ -6916,49 +7480,83 @@ pub(crate) mod tests {
     }
 
     /// The SDK surface reports success only when no durable store is left
-    /// holding its lock, and an error for each way the store can stay locked.
+    /// holding its lock and the flush did not fail: `SCP-STORAGE-8005` for
+    /// each way the store can stay locked, which wins over a failed flush,
+    /// and `SCP-STORAGE-8015` for a failed or timed-out flush on a released
+    /// store.
     #[test]
-    fn sdk_shutdown_result_fails_only_while_the_store_keeps_its_lock() {
-        let graceful = ShutdownOutcome::GracefulWithin {
+    fn sdk_shutdown_result_fails_while_the_store_keeps_its_lock_or_the_flush_failed() {
+        use crate::error_codes::{STORAGE_8005, STORAGE_8015};
+        let graceful = |flush| ShutdownOutcome::GracefulWithin {
             elapsed: Duration::ZERO,
             panicked_tasks: 0,
+            flush,
         };
-        assert_eq!(sdk_shutdown_result(Ok(graceful)), Ok(()));
-        let timed_out_store_closed = ShutdownOutcome::TimedOut {
+        let timed_out = |durable_store_open, flush| ShutdownOutcome::TimedOut {
             aborted_tasks: 1,
             panicked_tasks: 0,
-            drain: DrainState::Finished,
-            durable_store_open: false,
+            drain: if durable_store_open {
+                DrainState::Running
+            } else {
+                DrainState::Finished
+            },
+            durable_store_open,
+            flush,
         };
-        assert_eq!(sdk_shutdown_result(Ok(timed_out_store_closed)), Ok(()));
+        let failed = || ShutdownFlush::Failed {
+            message: "disk full".to_owned(),
+        };
+
+        for flush in [ShutdownFlush::Flushed, ShutdownFlush::Skipped] {
+            assert_eq!(sdk_shutdown_result(Ok(graceful(flush.clone()))), Ok(()));
+            assert_eq!(sdk_shutdown_result(Ok(timed_out(false, flush))), Ok(()));
+        }
         assert_eq!(
             sdk_shutdown_result(Err(ShutdownError::AlreadyShutDown {
                 durable_store_open: false
             })),
             Ok(())
         );
-        let msg = sdk_shutdown_result(Err(ShutdownError::AlreadyShutDown {
+
+        let e = sdk_shutdown_result(Err(ShutdownError::AlreadyShutDown {
             durable_store_open: true,
         }))
         .unwrap_err();
-        assert!(msg.contains("keeps its advisory lock"), "{msg}");
+        assert_eq!(e.code, STORAGE_8005);
+        assert!(e.message.contains("keeps its advisory lock"), "{e:?}");
 
-        let timed_out_store_open = ShutdownOutcome::TimedOut {
-            aborted_tasks: 0,
-            panicked_tasks: 0,
-            drain: DrainState::Running,
-            durable_store_open: true,
-        };
-        let msg = sdk_shutdown_result(Ok(timed_out_store_open)).unwrap_err();
-        assert!(msg.contains("keeps its advisory lock"), "{msg}");
-        let msg = sdk_shutdown_result(Err(ShutdownError::DurableStoreClose(
+        let e = sdk_shutdown_result(Ok(timed_out(true, ShutdownFlush::Flushed))).unwrap_err();
+        assert_eq!(e.code, STORAGE_8005);
+        assert!(e.message.contains("keeps its advisory lock"), "{e:?}");
+
+        let e = sdk_shutdown_result(Err(ShutdownError::DurableStoreClose(
             scp_platform::PlatformError::StorageError("close refused".to_owned()),
         )))
         .unwrap_err();
+        assert_eq!(e.code, STORAGE_8005);
         assert!(
-            msg.contains("close refused") && msg.contains("keeps its advisory lock"),
-            "{msg}"
+            e.message.contains("close refused") && e.message.contains("keeps its advisory lock"),
+            "{e:?}"
         );
+
+        let e = sdk_shutdown_result(Err(ShutdownError::Interrupted)).unwrap_err();
+        assert_eq!(e.code, STORAGE_8005);
+
+        // A failed flush on a store left locked: the lock's code, both reasons.
+        let e = sdk_shutdown_result(Ok(timed_out(true, failed()))).unwrap_err();
+        assert_eq!(e.code, STORAGE_8005);
+        assert!(
+            e.message.contains("keeps its advisory lock") && e.message.contains("disk full"),
+            "{e:?}"
+        );
+
+        // A failed or timed-out flush on a released store.
+        let e = sdk_shutdown_result(Ok(graceful(failed()))).unwrap_err();
+        assert_eq!(e.code, STORAGE_8015);
+        assert!(e.message.contains("disk full"), "{e:?}");
+        let e = sdk_shutdown_result(Ok(timed_out(false, ShutdownFlush::TimedOut))).unwrap_err();
+        assert_eq!(e.code, STORAGE_8015);
+        assert!(e.message.contains("deadline"), "{e:?}");
     }
 
     /// `durable_store_open` is set only when the drain did not finish and the
@@ -6974,82 +7572,59 @@ pub(crate) mod tests {
             panicked: 0,
         };
         let elapsed = Duration::from_millis(7);
+        let combine = |tasks, drain, has_store| {
+            combine_shutdown_outcome(tasks, ShutdownFlush::Flushed, drain, has_store, elapsed)
+                .unwrap()
+        };
+        let timed_out =
+            |aborted_tasks, panicked_tasks, drain, durable_store_open| ShutdownOutcome::TimedOut {
+                aborted_tasks,
+                panicked_tasks,
+                drain,
+                durable_store_open,
+                flush: ShutdownFlush::Flushed,
+            };
         assert_eq!(
-            combine_shutdown_outcome(graceful(), SupervisorDrain::Finished(Ok(())), true, elapsed)
-                .unwrap(),
+            combine(graceful(), SupervisorDrain::Finished(Ok(())), true),
             ShutdownOutcome::GracefulWithin {
                 elapsed,
                 panicked_tasks: 1,
+                flush: ShutdownFlush::Flushed,
             }
         );
         assert_eq!(
-            combine_shutdown_outcome(graceful(), SupervisorDrain::Pending, true, elapsed).unwrap(),
-            ShutdownOutcome::TimedOut {
-                aborted_tasks: 0,
-                panicked_tasks: 1,
-                drain: DrainState::Running,
-                durable_store_open: true,
-            }
+            combine(graceful(), SupervisorDrain::Pending, true),
+            timed_out(0, 1, DrainState::Running, true)
         );
         assert_eq!(
-            combine_shutdown_outcome(
+            combine(
                 graceful(),
                 SupervisorDrain::Failed(JoinFailure::Panicked),
-                true,
-                elapsed,
-            )
-            .unwrap(),
-            ShutdownOutcome::TimedOut {
-                aborted_tasks: 0,
-                panicked_tasks: 1,
-                drain: DrainState::Panicked,
-                durable_store_open: true,
-            },
+                true
+            ),
+            timed_out(0, 1, DrainState::Panicked, true),
             "a drain panic is reported in `drain` and not added to the bridge's panicked tasks"
         );
         assert_eq!(
-            combine_shutdown_outcome(
+            combine(
                 graceful(),
                 SupervisorDrain::Failed(JoinFailure::Cancelled),
-                false,
-                elapsed,
-            )
-            .unwrap(),
-            ShutdownOutcome::TimedOut {
-                aborted_tasks: 0,
-                panicked_tasks: 1,
-                drain: DrainState::Cancelled,
-                durable_store_open: false,
-            }
+                false
+            ),
+            timed_out(0, 1, DrainState::Cancelled, false)
         );
         assert_eq!(
-            combine_shutdown_outcome(bridge_timed_out(), SupervisorDrain::Pending, false, elapsed)
-                .unwrap(),
-            ShutdownOutcome::TimedOut {
-                aborted_tasks: 2,
-                panicked_tasks: 0,
-                drain: DrainState::Running,
-                durable_store_open: false,
-            }
+            combine(bridge_timed_out(), SupervisorDrain::Pending, false),
+            timed_out(2, 0, DrainState::Running, false)
         );
         assert_eq!(
-            combine_shutdown_outcome(
-                bridge_timed_out(),
-                SupervisorDrain::Finished(Ok(())),
-                true,
-                elapsed,
-            )
-            .unwrap(),
-            ShutdownOutcome::TimedOut {
-                aborted_tasks: 2,
-                panicked_tasks: 0,
-                drain: DrainState::Finished,
-                durable_store_open: false,
-            }
+            combine(bridge_timed_out(), SupervisorDrain::Finished(Ok(())), true),
+            timed_out(2, 0, DrainState::Finished, false)
         );
         assert!(matches!(
             combine_shutdown_outcome(
                 graceful(),
+                ShutdownFlush::Flushed,
                 SupervisorDrain::Finished(Err(scp_platform::PlatformError::StorageError(
                     "close refused".to_owned()
                 ))),
@@ -7058,6 +7633,28 @@ pub(crate) mod tests {
             ),
             Err(ShutdownError::DurableStoreClose(_))
         ));
+    }
+
+    /// The flush result rides the outcome unchanged: a flush that failed or
+    /// timed out does not change whether the tasks finished in time.
+    #[test]
+    fn combine_shutdown_outcome_carries_the_flush_result() {
+        let elapsed = Duration::from_millis(7);
+        assert_eq!(
+            combine_shutdown_outcome(
+                BridgeTasksDrain::Finished { panicked: 1 },
+                ShutdownFlush::TimedOut,
+                SupervisorDrain::Finished(Ok(())),
+                true,
+                elapsed
+            )
+            .unwrap(),
+            ShutdownOutcome::GracefulWithin {
+                elapsed,
+                panicked_tasks: 1,
+                flush: ShutdownFlush::TimedOut,
+            }
+        );
     }
 
     #[test]
@@ -7087,7 +7684,7 @@ pub(crate) mod tests {
         let instance = CoreFields::with_supervisor(test_supervisor());
         let installed = Arc::new(manager_on("ws://127.0.0.1:1/scp/v1"));
         instance.install_transport(Arc::clone(&installed)).unwrap();
-        instance.suspend().await.unwrap();
+        instance.suspend(TEST_DEADLINE).await.unwrap();
 
         instance.restore_transport(&installed, None);
 

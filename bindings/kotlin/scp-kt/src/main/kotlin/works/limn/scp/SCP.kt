@@ -70,6 +70,12 @@ import uniffi.scp.Scp as NativeScp
 private const val STORAGE_LOCK_HELD_CODE = "SCP-STORAGE-8005"
 
 /**
+ * The code an SDK `shutdown` raises when it released the store but a context
+ * snapshot did not persist; the instance is shut down.
+ */
+private const val SHUTDOWN_FLUSH_FAILED_CODE = "SCP-STORAGE-8015"
+
+/**
  * Caller-owned SCP instance — the SDK entry point.
  *
  * Each [SCP] wraps an independent UniFFI `Scp` opaque object. Handles
@@ -144,22 +150,39 @@ class SCP internal constructor(
      * transport. Transport-dependent operations fail until [resume] is
      * called.
      *
+     * [timeout] bounds the whole call; negative durations clamp to zero. A
+     * flush that misses it fails the suspend with `SCP-STORAGE-8014` and
+     * leaves the instance running. The suspend runs to completion, or
+     * reverts, even when the calling coroutine is cancelled, and this call
+     * reports that outcome rather than the cancellation.
+     *
+     * On Android, call it from a scope that outlives the activity, such as
+     * `ProcessLifecycleOwner.get().lifecycleScope` in `onStop`, and give
+     * [timeout] less than the time the process has before it is frozen.
+     *
      * Routed through [CoroutineBridge.ffiCallSuspend] because UniFFI
-     * generates `Scp.suspend()` as a Kotlin `suspend fun`: the flush runs
-     * on the tokio runtime, and its failure reaches this caller.
+     * generates `Scp.suspend(timeoutMillis)` as a Kotlin `suspend fun`: the
+     * flush runs on the tokio runtime, and its failure reaches this caller.
      *
      * Named [suspendInstance] (not `suspend`) because `suspend` is a soft
      * Kotlin keyword that shadows the coroutine modifier in IDE refactors,
      * documentation generators, and code-gen consumers (#1693).
      *
+     * @param timeout Maximum duration the suspend may take. Defaults to 5
+     *   seconds, as [shutdown]'s does.
      * @throws uniffi.scp.ScpException.Storage with `SCP-STORAGE-8014` when a
-     *   context snapshot did not persist. The instance stays running with its
-     *   transport connected, and a retried call flushes again.
+     *   context snapshot did not persist or the flush missed [timeout]. The
+     *   instance stays running with its transport connected, and a retried
+     *   call flushes again.
      * @throws uniffi.scp.ScpException.Transport with `SCP-TRANS-5001` if the
      *   transport lock is poisoned. The instance stays running.
      */
-    suspend fun suspendInstance(bridge: CoroutineBridge) {
-        bridge.ffiCallSuspend { inner.suspend() }
+    suspend fun suspendInstance(
+        bridge: CoroutineBridge,
+        timeout: Duration = 5.seconds,
+    ) {
+        val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
+        bridge.ffiCallSuspend { inner.suspend(timeoutMillis = millis) }
     }
 
     /**
@@ -184,7 +207,10 @@ class SCP internal constructor(
      *
      * Awaits in-flight tasks up to [timeout], aborts any remaining
      * tasks, then runs typed-field cleanup. Throws `ScpException.Storage` with `SCP-STORAGE-8005`
-     * when the durable store still holds its advisory lock after the call.
+     * when the durable store still holds its advisory lock after the call, or with
+     * `SCP-STORAGE-8015` when the store was released but a context snapshot did not persist
+     * within [timeout]. The instance is shut down either way; an unflushed context restores
+     * from its last persisted snapshot.
      *
      * Converted to unsigned milliseconds for the UniFFI boundary after
      * the #1549 Phase 4 timeout unit unification — sub-millisecond
@@ -209,16 +235,17 @@ class SCP internal constructor(
             try {
                 inner.shutdown(timeoutMillis = millis)
             } catch (e: ScpException.Storage) {
-                // `SCP-STORAGE-8005` is raised after the teardown ran, so the instance is
-                // recorded as shut down.
-                if (e.code == STORAGE_LOCK_HELD_CODE) shutdownRecorded.set(true)
+                // `SCP-STORAGE-8005` and `SCP-STORAGE-8015` are raised after the teardown
+                // ran, so the instance is recorded as shut down.
+                if (e.code == STORAGE_LOCK_HELD_CODE || e.code == SHUTDOWN_FLUSH_FAILED_CODE) {
+                    shutdownRecorded.set(true)
+                }
                 throw e
             }
             // Record shutdown as soon as the FFI call returns, inside the bridge block: an
             // engine failure throws before this line, so a failed shutdown does not silence
-            // the finalizer warning, while a cancellation the bridge raises after a finished
-            // teardown (its trailing ensureActive, or resuming a cancelled caller) cannot
-            // leave a torn-down instance recorded as live.
+            // the finalizer warning, and a caller cancelled after the teardown finished
+            // cannot leave a torn-down instance recorded as live.
             shutdownRecorded.set(true)
         }
     }

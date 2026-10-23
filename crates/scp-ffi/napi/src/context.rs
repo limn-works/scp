@@ -10511,7 +10511,7 @@ mod tests {
             "precondition: the store holds no snapshot of the context"
         );
 
-        rt.block_on(scp.suspend())
+        rt.block_on(scp.suspend(napi::bindgen_prelude::BigInt::from(10_000_u64)))
             .expect("suspend must flush and succeed");
 
         assert!(
@@ -10576,7 +10576,8 @@ mod tests {
             .identity_registry
             .remove(&did)
             .expect("the creator is registered");
-        bi.shutdown(std::time::Duration::from_secs(10))
+        std::sync::Arc::clone(&bi)
+            .shutdown(std::time::Duration::from_secs(10))
             .await
             .expect("shutdown must release the store");
         drop(bi);
@@ -10691,7 +10692,8 @@ mod tests {
             .identity_registry
             .remove(&did)
             .expect("the creator is registered");
-        bi.shutdown(std::time::Duration::from_secs(10))
+        std::sync::Arc::clone(&bi)
+            .shutdown(std::time::Duration::from_secs(10))
             .await
             .expect("shutdown must release the store");
         drop(bi);
