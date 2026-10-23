@@ -478,7 +478,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
 
         // OPTIONAL validating-relay DID-record slot gate — the SAME shared
         // chokepoint the WebSocket/QUIC/UDP transports route through (§3.10.2).
-        match self
+        let stored = match self
             .did_slots
             .gate_publish(
                 self.config.did_record_validation,
@@ -491,45 +491,35 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
             )
             .await
         {
-            DidPublishGate::Accepted(stored) => {
-                let _failed_deliveries = subscription::deliver_to_subscribers(
-                    &stored,
-                    &self.subscriptions,
-                    self.config.delivery_jitter_ms,
-                )
-                .await;
-                return Ok(RelayMessage::Ok {
-                    ref_id,
-                    blob_id: Some(blob_id),
-                });
-            }
+            DidPublishGate::Accepted(stored) => stored,
             DidPublishGate::Rejected { code, msg } => {
                 return Ok(RelayMessage::Err { ref_id, code, msg });
             }
-            DidPublishGate::FallThrough => {}
-        }
-
-        // Store the blob (opaque path — non-DID blobs, or every blob when
-        // did_record_validation is Disabled).
-        let stored = match self
-            .storage
-            .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(
-                    session_id = self.session_id.0,
-                    error = %e,
-                    "WebTransport: blob store failed"
-                );
-                return Ok(RelayMessage::Err {
-                    ref_id,
-                    code: code::STORAGE_FULL,
-                    msg: "internal error".to_owned(),
-                });
-            }
+            // Store the blob (opaque path — non-DID blobs, or every blob when
+            // did_record_validation is Disabled).
+            DidPublishGate::FallThrough => match self
+                .storage
+                .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(
+                        session_id = self.session_id.0,
+                        error = %e,
+                        "WebTransport: blob store failed"
+                    );
+                    return Ok(RelayMessage::Err {
+                        ref_id,
+                        code: code::STORAGE_FULL,
+                        msg: "internal error".to_owned(),
+                    });
+                }
+            },
         };
+
+        // Every stored blob, DID record or opaque, takes the one path below:
+        // deliver, then queue the wakes, then hand the OK to the caller.
 
         // Deliver to active subscribers with optional jitter (BLACK-001).
         let _failed_deliveries = subscription::deliver_to_subscribers(
@@ -538,6 +528,12 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
             self.config.delivery_jitter_ms,
         )
         .await;
+
+        // Queue the wakes for the stored blob after the subscribers are
+        // served. The caller writes the OK this function returns; `notify`
+        // never waits, so the reply is not held behind push work (§10.7.1
+        // step 5, PUSH-008).
+        crate::relay::push_dispatch::notify(&self.config.push, &routing_id);
 
         // Respond with OK + blob_id.
         Ok(RelayMessage::Ok {
@@ -1810,5 +1806,70 @@ mod tests {
             RelayMessage::Err { code: 4063, ref_id: Some(ref r), .. } if r == "push"
         ));
         assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+    }
+
+    // -- Store-site wakes (§10.7.1 step 5, PUSH-008) --
+    //
+    // A DID record and an opaque blob reach storage through different gate
+    // arms; both must wake. Each test fails when this transport's `notify`
+    // is removed.
+    #[cfg(all(feature = "push-store", feature = "testing"))]
+    mod wake {
+        use super::*;
+        use crate::relay::push_dispatch::wake_harness::WakeHarness;
+
+        /// Publishes `blob` to `rid` on a WebTransport session whose push role
+        /// is the harness's, and waits for one wake.
+        async fn publish_and_wake(rid: [u8; 32], blob: Vec<u8>) {
+            let harness = WakeHarness::start(&[rid]).await.unwrap();
+            let mut handler = WebTransportSessionHandler::new(
+                SessionId(1),
+                WebTransportSessionConfig {
+                    delivery_jitter_ms: 0,
+                    push: harness.push.clone(),
+                    ..WebTransportSessionConfig::defaults(push_gate::test_relay_url())
+                },
+                Arc::new(InMemoryBlobStorage::new()),
+                crate::relay::subscription::new_registry(),
+                CancellationToken::new(),
+                PublishRateLimiter::new(100),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                DidSlotRegistry::new(),
+            );
+            handler.mark_active();
+            let result = handler
+                .dispatch_message_multi(&ClientMessage::Publish {
+                    ref_id: None,
+                    routing_id: rid,
+                    recipient_hint: None,
+                    blob_ttl: 3600,
+                    blob,
+                })
+                .await
+                .unwrap();
+            let reply = unwrap_single(result);
+            assert!(
+                matches!(
+                    reply,
+                    RelayMessage::Ok {
+                        blob_id: Some(_),
+                        ..
+                    }
+                ),
+                "{reply:?}"
+            );
+            harness.wait_for_wakes(1).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn webtransport_did_record_publish_wakes() {
+            let (rid, _bid, frame) = genuine_frame(64, 1, b"did-doc");
+            publish_and_wake(rid, frame).await;
+        }
+
+        #[tokio::test]
+        async fn webtransport_plain_blob_publish_wakes() {
+            publish_and_wake([0x47; 32], vec![7; 16]).await;
+        }
     }
 }

@@ -2,20 +2,22 @@
 //!
 //! Both `scp-relay` and `scp-node` binaries use identical logic for environment
 //! variable parsing, relay configuration, blob storage backend selection,
-//! tracing initialization, health checks, and graceful shutdown. This module
-//! provides the shared implementations so changes need only be made once.
+//! tracing initialization, and health checks. This module provides the shared
+//! implementations so changes need only be made once. The shutdown signal both
+//! binaries stop on lives in the always-compiled [`crate::shutdown`] module,
+//! because `scp-node`'s library entry point `host_site` installs it too.
 //!
 //! No function in this module ends the process. Every failure returns a
 //! [`StartupError`] to the calling binary, and the binary decides the exit
 //! code.
 //!
-//! Gated behind the `startup` feature. Not used by the library or FFI bridges.
+//! Gated behind the `startup` feature, which only the `scp-relay` binary and
+//! `scp-node`'s `node-bin` feature enable. The FFI bridges do not compile it.
 //!
 //! See §10.5 of the SCP infrastructure spec.
 
 use std::env;
 use std::ffi::OsString;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,8 +27,10 @@ use tracing_subscriber::EnvFilter;
 use crate::native::server::{RelayConfig, RelayError};
 use crate::native::storage::{BlobStorageBackend, StorageError};
 use crate::relay::push::PushSender;
+use crate::relay::push_dispatch::{PushService, PushServiceError};
 use crate::relay::push_gate::{LiveRelayUrl, PushRole, PushServiceConfig, RelayUrl};
 use crate::relay::push_store::{PushRegistrationStore, PushStoreError};
+use crate::shutdown::ShutdownSignalError;
 
 /// The variable that names the relay's blob storage backend.
 const BACKEND_VAR: &str = "SCP_RELAY_STORAGE_BACKEND";
@@ -112,15 +116,10 @@ pub enum StartupError {
     /// subscriber was already installed.
     #[error("failed to install the tracing subscriber: {0}")]
     Tracing(String),
-    /// The operating system refused a handler for `signal`, so the process
+    /// The operating system refused a shutdown signal handler, so the process
     /// could not learn when to shut down.
-    #[error("failed to register a {signal} handler: {error}")]
-    SignalHandler {
-        /// The signal the handler was for.
-        signal: &'static str,
-        /// The registration failure.
-        error: std::io::Error,
-    },
+    #[error(transparent)]
+    ShutdownSignal(#[from] ShutdownSignalError),
     /// The push selection or push credentials in the environment cannot start
     /// a relay.
     #[error(transparent)]
@@ -727,65 +726,6 @@ pub async fn health_check(addr: SocketAddr) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Shutdown signal
-// ---------------------------------------------------------------------------
-
-/// Registers SIGINT and SIGTERM handlers and returns a future that resolves
-/// when either signal arrives.
-///
-/// The handlers register when this function runs, so a refused registration
-/// fails startup instead of leaving a process that cannot learn when to stop.
-/// Call it from inside a Tokio runtime.
-///
-/// # Errors
-///
-/// [`StartupError::SignalHandler`] when the operating system refuses either
-/// handler.
-#[cfg(unix)]
-pub fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, StartupError> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut interrupt =
-        signal(SignalKind::interrupt()).map_err(|error| StartupError::SignalHandler {
-            signal: "SIGINT",
-            error,
-        })?;
-    let mut terminate =
-        signal(SignalKind::terminate()).map_err(|error| StartupError::SignalHandler {
-            signal: "SIGTERM",
-            error,
-        })?;
-    Ok(async move {
-        tokio::select! {
-            _ = interrupt.recv() => {}
-            _ = terminate.recv() => {}
-        }
-    })
-}
-
-/// Registers a Ctrl-C handler and returns a future that resolves when Ctrl-C
-/// arrives.
-///
-/// The handler registers when this function runs, so a refused registration
-/// fails startup instead of leaving a process that cannot learn when to stop.
-/// Call it from inside a Tokio runtime.
-///
-/// # Errors
-///
-/// [`StartupError::SignalHandler`] when the operating system refuses the
-/// handler.
-#[cfg(windows)]
-pub fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, StartupError> {
-    let mut ctrl_c =
-        tokio::signal::windows::ctrl_c().map_err(|error| StartupError::SignalHandler {
-            signal: "Ctrl-C",
-            error,
-        })?;
-    Ok(async move {
-        ctrl_c.recv().await;
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Push selection and credentials from environment
 // ---------------------------------------------------------------------------
 
@@ -977,6 +917,14 @@ pub enum PushStartupError {
         /// The store's refusal.
         error: PushStoreError,
     },
+    /// The push service could not start on the selected backends: it ran
+    /// outside a tokio runtime, or two senders name one platform. Nothing
+    /// starts without it (SCP-CAPSEL-8001).
+    #[error("the push service cannot start: {error} (SCP-CAPSEL-8001)")]
+    ServiceStart {
+        /// The service's refusal.
+        error: PushServiceError,
+    },
 }
 
 impl PushStartupError {
@@ -1005,7 +953,8 @@ impl PushStartupError {
             | Self::CredentialPermissions { .. }
             | Self::CredentialFile { .. }
             | Self::Sender { .. }
-            | Self::StoreOpen { .. } => "SCP-CAPSEL-8001",
+            | Self::StoreOpen { .. }
+            | Self::ServiceStart { .. } => "SCP-CAPSEL-8001",
         }
     }
 }
@@ -1387,9 +1336,12 @@ fn check_owner_only(
 ///
 /// # Errors
 ///
-/// [`PushStartupError::StoreOpen`] when the store cannot be opened or its
-/// schema cannot be applied. Nothing falls back to another store
-/// (SCP-CAPSEL-8001).
+/// - [`PushStartupError::StoreOpen`] when the store cannot be opened or its
+///   schema cannot be applied. Nothing falls back to another store
+///   (SCP-CAPSEL-8001).
+/// - [`PushStartupError::ServiceStart`] when the push service cannot start,
+///   which includes a call outside a tokio runtime: the service's lookup and
+///   drains run on the caller's runtime.
 pub fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError> {
     let PushBackends { store, apns, fcm } = match selection {
         PushSelection::Disabled => return Ok(PushRole::Disabled),
@@ -1406,11 +1358,13 @@ pub fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError
         .into_iter()
         .chain(fcm.map(PushSender::Fcm))
         .collect();
-    Ok(PushRole::Enabled(PushServiceConfig {
+    let service = PushService::start(PushServiceConfig {
         store,
         verifier: Arc::new(scp_identity::push_verify::KelPushVerifier),
         senders: Arc::from(senders),
-    }))
+    })
+    .map_err(|error| PushStartupError::ServiceStart { error })?;
+    Ok(PushRole::Enabled(service))
 }
 
 /// Logs the push role a relay starts with. No field carries a credential.
@@ -1419,6 +1373,7 @@ pub fn log_push_role(role: &PushRole) {
         PushRole::Disabled => tracing::info!("push: none (SCP_RELAY_PUSH_PLATFORMS=none)"),
         PushRole::Enabled(service) => {
             let platforms: Vec<String> = service
+                .config()
                 .senders
                 .iter()
                 .map(|sender| sender.platform().to_string())
@@ -2426,6 +2381,7 @@ mod push_tests {
         let PushRole::Enabled(service) = &role else {
             panic!("expected push enabled: {role:?}");
         };
+        let service = service.config();
         assert!(
             format!("{:?}", service.verifier).contains("KelPushVerifier"),
             "{:?}",
@@ -2560,8 +2516,32 @@ mod push_tests {
     /// Criterion 8: loading credentials writes no key byte to any log line,
     /// and neither the loaded selection's `Debug` nor any refusal's `Display`
     /// or `Debug` carries one.
+    /// An enabled selection outside a tokio runtime fails with a typed
+    /// refusal instead of yielding a role whose push service never runs.
     #[test]
-    fn loading_credentials_logs_and_prints_no_key_bytes() {
+    fn enabled_push_outside_a_runtime_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::full(dir.path());
+        let error = push_role_from(env.parse().unwrap()).unwrap_err();
+        let StartupError::Push(error) = error else {
+            panic!("expected a push refusal: {error:?}");
+        };
+        assert!(
+            matches!(
+                error,
+                PushStartupError::ServiceStart {
+                    error: crate::relay::push_dispatch::PushServiceError::NoRuntime
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.rule(), "SCP-CAPSEL-8001");
+    }
+
+    // A current-thread runtime, so the per-thread log capture sees the
+    // lines `push_role_from` writes.
+    #[tokio::test]
+    async fn loading_credentials_logs_and_prints_no_key_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env::full(dir.path());
         let fragments = secret_fragments(&env);

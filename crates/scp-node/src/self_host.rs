@@ -1349,7 +1349,7 @@ pub enum HostSiteError {
     /// [`host_site_until`] never returns this variant, because its caller
     /// supplies the shutdown future.
     #[error("shutdown signal error: {0}")]
-    ShutdownSignal(scp_transport::startup::StartupError),
+    ShutdownSignal(scp_transport::shutdown::ShutdownSignalError),
 }
 
 /// Validates a [`HostSiteConfig`]'s `reach` / `tls` / `dht` triple and lowers
@@ -1492,7 +1492,7 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// create one.
 pub async fn host_site(config: HostSiteConfig) -> Result<(), HostSiteError> {
     let shutdown =
-        scp_transport::startup::shutdown_signal().map_err(HostSiteError::ShutdownSignal)?;
+        scp_transport::shutdown::shutdown_signal().map_err(HostSiteError::ShutdownSignal)?;
     host_site_until(config, shutdown).await
 }
 

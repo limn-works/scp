@@ -12,6 +12,7 @@ use std::marker::PhantomData;
 use scp_protocol::discovery::push::PushPlatform;
 use scp_relay_client::code;
 use scp_transport::relay::push_store::{
+    CountFrom, INVALID_TOKEN_REMOVAL_THRESHOLD, InvalidTokenOutcome,
     MAX_REGISTRATIONS_PER_REGISTRANT, PushRegistrationKey, PushRegistrationRecord,
     PushRegistrationStore, PushStoreError, UpsertOutcome,
 };
@@ -64,6 +65,8 @@ fn keys(records: &[PushRegistrationRecord]) -> Vec<PushRegistrationKey> {
     records.iter().map(PushRegistrationRecord::key).collect()
 }
 
+const APNS: PushPlatform = PushPlatform::Apns;
+
 async fn newer_timestamp_replaces_registration_and_index(store: PushRegistrationStore) -> Outcome {
     let first = record("did:dht:alice", b"tok-1", &[A, B], 1);
     assert_eq!(store.upsert(first.clone()).await?, UpsertOutcome::Inserted);
@@ -82,7 +85,12 @@ async fn newer_timestamp_replaces_registration_and_index(store: PushRegistration
 async fn identical_routing_set_leaves_index_unchanged(store: PushRegistrationStore) -> Outcome {
     let first = record("did:dht:alice", b"tok-1", &[A, B], 1);
     store.upsert(first.clone()).await?;
-    assert_eq!(store.record_invalid_token(&first.key()).await?, Some(1));
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-1", CountFrom::Stored)
+            .await?,
+        InvalidTokenOutcome::Counted { failures: 1 }
+    );
     let before_a = keys(&store.tokens_for_routing_id(&A).await?);
     let before_b = keys(&store.tokens_for_routing_id(&B).await?);
 
@@ -98,7 +106,7 @@ async fn identical_routing_set_leaves_index_unchanged(store: PushRegistrationSto
         Some(record("did:dht:alice", b"tok-1", &[A, B], 9))
     );
     // A re-registration says nothing about token validity.
-    assert_eq!(store.invalid_token_failures(&first.key()).await?, Some(1));
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-1").await?, Some(1));
     Ok(())
 }
 
@@ -193,13 +201,15 @@ async fn remove_deletes_registration_and_index(store: PushRegistrationStore) -> 
     let kept = record("did:dht:alice", b"tok-2", &[B], 1);
     store.upsert(gone.clone()).await?;
     store.upsert(kept.clone()).await?;
-    store.record_invalid_token(&gone.key()).await?;
+    store
+        .record_invalid_token(APNS, b"tok-1", CountFrom::Stored)
+        .await?;
 
     assert!(store.remove(&gone.key()).await?);
     assert_eq!(store.get(&gone.key()).await?, None);
     assert!(store.tokens_for_routing_id(&A).await?.is_empty());
     assert_eq!(store.tokens_for_routing_id(&B).await?, vec![kept]);
-    assert_eq!(store.invalid_token_failures(&gone.key()).await?, None);
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-1").await?, None);
     assert!(!store.remove(&gone.key()).await?);
 
     // The removed registration's timestamp stays as the key's floor, so the
@@ -217,7 +227,7 @@ async fn remove_deletes_registration_and_index(store: PushRegistrationStore) -> 
     // failure count.
     let back = record("did:dht:alice", b"tok-1", &[A, B], 2);
     assert_eq!(store.upsert(back.clone()).await?, UpsertOutcome::Inserted);
-    assert_eq!(store.invalid_token_failures(&back.key()).await?, Some(0));
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-1").await?, Some(0));
     assert_eq!(store.accepted_timestamp(&back.key()).await?, Some(2));
     Ok(())
 }
@@ -249,24 +259,281 @@ async fn tokens_for_routing_id_returns_each_registration_once(
     Ok(())
 }
 
+/// The wake lookup returns each distinct (platform, token) on the routing ID
+/// once, whoever registered it, and stops at the limit. Over the limit it
+/// samples afresh on each call, so no token that sorts first holds the slot
+/// forever.
+async fn wake_tokens_returns_each_token_once_up_to_the_limit(
+    store: PushRegistrationStore,
+) -> Outcome {
+    let one = record("did:dht:alice", b"tok-2", &[A, B], 1);
+    let shared = record("did:dht:bob", b"tok-2", &[A], 1);
+    let two = record("did:dht:bob", b"tok-1", &[A], 1);
+    let mut fcm = record("did:dht:alice", b"tok-0", &[A], 1);
+    fcm.platform = PushPlatform::Fcm;
+    let other = record("did:dht:carol", b"tok-3", &[C], 1);
+    for r in [&one, &shared, &two, &fcm, &other] {
+        store.upsert(r.clone()).await?;
+    }
+    let found = |tokens: Vec<scp_transport::relay::push_store::WakeToken>| {
+        let mut out = tokens
+            .into_iter()
+            .map(|t| (t.platform.tag_byte(), t.token.to_vec()))
+            .collect::<Vec<_>>();
+        out.sort();
+        out
+    };
+    let all = vec![
+        (APNS.tag_byte(), b"tok-1".to_vec()),
+        (APNS.tag_byte(), b"tok-2".to_vec()),
+        (PushPlatform::Fcm.tag_byte(), b"tok-0".to_vec()),
+    ];
+    let mut all_sorted = all.clone();
+    all_sorted.sort();
+    assert_eq!(found(store.wake_tokens(&A, 10).await?), all_sorted);
+    let two = found(store.wake_tokens(&A, 2).await?);
+    assert_eq!(two.len(), 2, "{two:?}");
+    assert!(
+        two[0] != two[1] && two.iter().all(|t| all.contains(t)),
+        "{two:?}"
+    );
+    assert_eq!(
+        found(store.wake_tokens(&B, 10).await?),
+        vec![(APNS.tag_byte(), b"tok-2".to_vec())]
+    );
+    assert!(store.wake_tokens(&[0; 32], 10).await?.is_empty());
+    assert!(store.wake_tokens(&A, 0).await?.is_empty());
+    // With room for one, 64 calls reach every token: a fixed order would
+    // return the same one each time (chance of a false failure: 3 * (2/3)^64).
+    let mut seen = Vec::new();
+    for _ in 0..64 {
+        seen.extend(found(store.wake_tokens(&A, 1).await?));
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen, all_sorted);
+    Ok(())
+}
+
+/// `CountFrom::Zero` resets the stored count and counts this failure in one
+/// write, so a delivery whose reset was lost still breaks the run.
+async fn count_from_zero_restarts_the_run(store: PushRegistrationStore) -> Outcome {
+    let r = record("did:dht:alice", b"tok-1", &[A], 1);
+    store.upsert(r.clone()).await?;
+    for _ in 1..INVALID_TOKEN_REMOVAL_THRESHOLD {
+        store
+            .record_invalid_token(APNS, b"tok-1", CountFrom::Stored)
+            .await?;
+    }
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-1", CountFrom::Zero)
+            .await?,
+        InvalidTokenOutcome::Counted { failures: 1 }
+    );
+    assert!(store.get(&r.key()).await?.is_some());
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-none", CountFrom::Zero)
+            .await?,
+        InvalidTokenOutcome::NotRegistered
+    );
+    Ok(())
+}
+
+/// `clear_all_invalid_tokens` resets every token's count and keeps every
+/// registration.
+async fn clear_all_resets_every_count(store: PushRegistrationStore) -> Outcome {
+    let one = record("did:dht:alice", b"tok-1", &[A], 1);
+    let two = record("did:dht:bob", b"tok-2", &[B], 1);
+    store.upsert(one.clone()).await?;
+    store.upsert(two.clone()).await?;
+    for token in [b"tok-1".as_slice(), b"tok-2".as_slice()] {
+        for _ in 1..INVALID_TOKEN_REMOVAL_THRESHOLD {
+            store
+                .record_invalid_token(APNS, token, CountFrom::Stored)
+                .await?;
+        }
+    }
+    store.clear_all_invalid_tokens().await?;
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-1").await?, Some(0));
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-2").await?, Some(0));
+    assert!(store.get(&one.key()).await?.is_some());
+    assert!(store.get(&two.key()).await?.is_some());
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-1", CountFrom::Stored)
+            .await?,
+        InvalidTokenOutcome::Counted { failures: 1 }
+    );
+    Ok(())
+}
+
 async fn invalid_token_counter_counts_consecutive_failures(
     store: PushRegistrationStore,
 ) -> Outcome {
     let r = record("did:dht:alice", b"tok-1", &[A], 1);
-    let absent = record("did:dht:alice", b"tok-none", &[A], 1).key();
     store.upsert(r.clone()).await?;
 
-    assert_eq!(store.invalid_token_failures(&r.key()).await?, Some(0));
-    for expected in 1..=3 {
-        assert_eq!(store.record_invalid_token(&r.key()).await?, Some(expected));
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-1").await?, Some(0));
+    for failures in 1..INVALID_TOKEN_REMOVAL_THRESHOLD {
+        assert_eq!(
+            store
+                .record_invalid_token(APNS, b"tok-1", CountFrom::Stored)
+                .await?,
+            InvalidTokenOutcome::Counted { failures }
+        );
     }
-    assert!(store.clear_invalid_tokens(&r.key()).await?);
-    assert_eq!(store.invalid_token_failures(&r.key()).await?, Some(0));
-    assert_eq!(store.record_invalid_token(&r.key()).await?, Some(1));
+    // A delivery the push service accepted resets the run.
+    assert!(store.clear_invalid_tokens(APNS, b"tok-1").await?);
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-1").await?, Some(0));
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-1", CountFrom::Stored)
+            .await?,
+        InvalidTokenOutcome::Counted { failures: 1 }
+    );
+    assert!(store.get(&r.key()).await?.is_some());
 
-    assert_eq!(store.record_invalid_token(&absent).await?, None);
-    assert!(!store.clear_invalid_tokens(&absent).await?);
-    assert_eq!(store.invalid_token_failures(&absent).await?, None);
+    // The count belongs to (platform, token): the same bytes on FCM are a
+    // different token, and an unregistered token counts nothing.
+    assert_eq!(
+        store
+            .record_invalid_token(PushPlatform::Fcm, b"tok-1", CountFrom::Stored)
+            .await?,
+        InvalidTokenOutcome::NotRegistered
+    );
+    assert_eq!(
+        store
+            .invalid_token_failures(PushPlatform::Fcm, b"tok-1")
+            .await?,
+        None
+    );
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-none", CountFrom::Stored)
+            .await?,
+        InvalidTokenOutcome::NotRegistered
+    );
+    assert!(!store.clear_invalid_tokens(APNS, b"tok-none").await?);
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-none").await?, None);
+    Ok(())
+}
+
+/// Three consecutive invalid-token responses for one token remove every
+/// registration holding it, whoever registered it, and leave each key's
+/// registration timestamp as its deregistration floor (§10.7.1
+/// `PushDeregistration`).
+async fn third_invalid_token_removes_every_registration_for_the_token(
+    store: PushRegistrationStore,
+) -> Outcome {
+    let alice = record("did:dht:alice", b"tok-shared", &[A, B], 4);
+    let bob = record("did:dht:bob", b"tok-shared", &[B], 6);
+    let other = record("did:dht:alice", b"tok-other", &[A], 4);
+    let mut same_bytes_fcm = record("did:dht:carol", b"tok-shared", &[C], 4);
+    same_bytes_fcm.platform = PushPlatform::Fcm;
+    for r in [&alice, &bob, &other, &same_bytes_fcm] {
+        store.upsert(r.clone()).await?;
+    }
+
+    // The count is per token, not per registrant: alternating which key the
+    // response is attributed to does not matter, because the call names only
+    // the token.
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-shared", CountFrom::Stored)
+            .await?,
+        InvalidTokenOutcome::Counted { failures: 1 }
+    );
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-shared", CountFrom::Stored)
+            .await?,
+        InvalidTokenOutcome::Counted { failures: 2 }
+    );
+    assert!(store.get(&alice.key()).await?.is_some());
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-shared", CountFrom::Stored)
+            .await?,
+        InvalidTokenOutcome::Removed { registrations: 2 }
+    );
+
+    assert_eq!(store.get(&alice.key()).await?, None);
+    assert_eq!(store.get(&bob.key()).await?, None);
+    assert_eq!(
+        keys(&store.tokens_for_routing_id(&A).await?),
+        vec![other.key()]
+    );
+    assert!(store.tokens_for_routing_id(&B).await?.is_empty());
+    assert_eq!(
+        keys(&store.tokens_for_routing_id(&C).await?),
+        vec![same_bytes_fcm.key()],
+        "the same bytes on another platform are another token"
+    );
+    assert_eq!(
+        store.invalid_token_failures(APNS, b"tok-shared").await?,
+        None
+    );
+    assert_eq!(store.accepted_timestamp(&alice.key()).await?, Some(4));
+    assert_eq!(store.accepted_timestamp(&bob.key()).await?, Some(6));
+    assert_eq!(
+        store.upsert(bob.clone()).await,
+        Err(PushStoreError::Stale {
+            last_accepted: 6,
+            offered: 6
+        }),
+        "the removed registration replayed is stale"
+    );
+
+    // A newer registration of the token starts a fresh count.
+    let back = record("did:dht:bob", b"tok-shared", &[B], 7);
+    assert_eq!(store.upsert(back).await?, UpsertOutcome::Inserted);
+    assert_eq!(
+        store.invalid_token_failures(APNS, b"tok-shared").await?,
+        Some(0)
+    );
+    Ok(())
+}
+
+/// The count survives one registrant's removal while another registrant still
+/// holds the token, and is dropped once none does.
+async fn token_count_outlives_one_holder_but_not_the_last(store: PushRegistrationStore) -> Outcome {
+    let alice = record("did:dht:alice", b"tok-shared", &[A], 1);
+    let bob = record("did:dht:bob", b"tok-shared", &[A], 1);
+    store.upsert(alice.clone()).await?;
+    store.upsert(bob.clone()).await?;
+    store
+        .record_invalid_token(APNS, b"tok-shared", CountFrom::Stored)
+        .await?;
+    store
+        .record_invalid_token(APNS, b"tok-shared", CountFrom::Stored)
+        .await?;
+
+    assert!(store.deregister(&alice.key(), 2).await?);
+    assert_eq!(
+        store.invalid_token_failures(APNS, b"tok-shared").await?,
+        Some(2)
+    );
+    assert_eq!(
+        store
+            .record_invalid_token(APNS, b"tok-shared", CountFrom::Stored)
+            .await?,
+        InvalidTokenOutcome::Removed { registrations: 1 }
+    );
+    assert_eq!(store.get(&bob.key()).await?, None);
+
+    let carol = record("did:dht:carol", b"tok-shared", &[A], 1);
+    store.upsert(carol.clone()).await?;
+    assert_eq!(
+        store.invalid_token_failures(APNS, b"tok-shared").await?,
+        Some(0)
+    );
+    assert!(store.remove(&carol.key()).await?);
+    assert_eq!(
+        store.invalid_token_failures(APNS, b"tok-shared").await?,
+        None
+    );
     Ok(())
 }
 
@@ -501,7 +768,12 @@ both_arms!(
     new_key_past_per_registrant_cap_is_refused,
     remove_deletes_registration_and_index,
     tokens_for_routing_id_returns_each_registration_once,
+    wake_tokens_returns_each_token_once_up_to_the_limit,
+    count_from_zero_restarts_the_run,
+    clear_all_resets_every_count,
     invalid_token_counter_counts_consecutive_failures,
+    third_invalid_token_removes_every_registration_for_the_token,
+    token_count_outlives_one_holder_but_not_the_last,
     malformed_records_are_refused,
     each_device_on_one_platform_holds_its_own_registration,
     deregister_removes_only_its_own_key,
@@ -520,8 +792,12 @@ async fn sqlite_arm_keeps_registrations_across_reopen() -> Result<(), Box<dyn st
         let store = PushRegistrationStore::open_sqlite(&path)?;
         store.upsert(one.clone()).await?;
         store.upsert(two.clone()).await?;
-        store.record_invalid_token(&two.key()).await?;
-        store.record_invalid_token(&two.key()).await?;
+        store
+            .record_invalid_token(APNS, b"tok-2", CountFrom::Stored)
+            .await?;
+        store
+            .record_invalid_token(APNS, b"tok-2", CountFrom::Stored)
+            .await?;
         let gone = record("did:dht:carol", b"tok-3", &[C], 5);
         store.upsert(gone.clone()).await?;
         store.deregister(&gone.key(), 7).await?;
@@ -536,7 +812,7 @@ async fn sqlite_arm_keeps_registrations_across_reopen() -> Result<(), Box<dyn st
         store.tokens_for_routing_id(&B).await?,
         vec![one, two.clone()]
     );
-    assert_eq!(store.invalid_token_failures(&two.key()).await?, Some(2));
+    assert_eq!(store.invalid_token_failures(APNS, b"tok-2").await?, Some(2));
     assert_eq!(
         store
             .upsert(record("did:dht:alice", b"tok-1", &[C], 3))

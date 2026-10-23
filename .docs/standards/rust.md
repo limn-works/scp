@@ -383,7 +383,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant -- -D warnings
 
 # Lint the optional network transports, which --workspace leaves off.
-cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
+cargo clippy -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --all-targets -- -D warnings
+cargo clippy -p scp-node --features quic,http3,udp,coap,upnp,testing --all-targets -- -D warnings
+
+# Lint scp-platform's and scp-testing's optional features.
+cargo clippy -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing --all-targets -- -D warnings
+cargo clippy -p scp-testing --features sync,combined --all-targets -- -D warnings
 
 # Lint the PostgreSQL and S3 blob backends. scp-node and scp-relay compile them
 # only under their off-by-default `cloud-blobs` feature, so the --workspace
@@ -393,6 +398,18 @@ cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D
 cargo clippy -p scp-transport --features sqlite-blob,redb-blob,postgres-blob,s3-blob,startup --all-targets -- -D warnings
 cargo clippy -p scp-node --features cloud-blobs,testing --all-targets -- -D warnings
 cargo clippy -p scp-relay --features cloud-blobs --all-targets -- -D warnings
+
+# Lint scp-transport's push, cache, SQLCipher, relay-persistence and UPnP
+# stores, which compile only under their own features.
+cargo clippy -p scp-transport --features push-store --all-targets -- -D warnings
+cargo clippy -p scp-transport --features push-store,testing --all-targets -- -D warnings
+cargo clippy -p scp-transport --features combined,local-cache,push-store,relay-persistence,testing,upnp --all-targets -- -D warnings
+
+# Lint scp-node's library without its default `node-bin` feature, the build
+# each FFI bridge and scp-testing resolves: no Prometheus exporter, no startup
+# utilities, no redb backend, and no binary.
+cargo clippy -p scp-node --no-default-features --lib -- -D warnings
+cargo clippy -p scp-node --no-default-features --features testing --all-targets -- -D warnings
 
 # Build (all crates)
 cargo build --workspace
