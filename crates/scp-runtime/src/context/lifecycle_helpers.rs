@@ -1996,7 +1996,7 @@ pub async fn create_context(
 /// The `&PerContextState` is consumed in the synchronous prelude, as in
 /// [`crate::context::messaging_helpers::persist_state_fail_closed`], so the
 /// returned future is `Send`.
-pub fn persist_first_state<'d, 'c>(
+pub(in crate::context) fn persist_first_state<'d, 'c>(
     state: &PerContextState,
     deps: &'d ActorDeps,
     context_id: &'c str,
@@ -2046,7 +2046,7 @@ async fn write_first_contact(deps: &ActorDeps, context_id: &str) -> Result<(), C
 /// The operation already failed with its own error, which the caller
 /// returns; a failed delete here is logged and counted, because it leaves a
 /// snapshot or contact for a context with no actor.
-pub async fn discard_first_state(deps: &ActorDeps, context_id: &str) {
+pub(in crate::context) async fn discard_first_state(deps: &ActorDeps, context_id: &str) {
     if let Err(error) = deps.persistence.delete_context(context_id).await {
         crate::metrics::record_persistence_failure();
         tracing::warn!(
