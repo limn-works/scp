@@ -126,10 +126,16 @@ pub fn has_persistence(supervisor: &Supervisor) -> bool {
 /// to each actor (the handler reads `state.receive_buffer.len()` from
 /// owned state — no cross-actor lock).
 ///
-/// Called after mutations that change context count or buffer state.
-/// Best-effort: if no metrics recorder is installed, these are no-ops
-/// (#1467); actors that fail to reply within the send timeout are skipped
-/// (metrics are approximate, exactly as the legacy `try_lock` skip was).
+/// Called after mutations that change context count or buffer state, from a
+/// tracked task that no caller awaits
+/// ([`SupervisorHandle::update_context_gauges`](crate::context::supervisor::handle::SupervisorHandle::update_context_gauges)):
+/// the sweep waits on every actor's mailbox, so a caller inside an actor's
+/// turn or under `bootstrap_spawn_lock` that awaited it would wait on itself
+/// or on an actor waiting for that lock. Best-effort: if no metrics recorder
+/// is installed, these are no-ops (#1467); an actor that does not take the
+/// command within [`SEND_TIMEOUT`](crate::context::actor::SEND_TIMEOUT), or
+/// does not reply within the same bound, is skipped (metrics are
+/// approximate, exactly as the legacy `try_lock` skip was).
 pub async fn update_context_gauges(supervisor: &Supervisor) {
     use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
 
@@ -153,7 +159,7 @@ pub async fn update_context_gauges(supervisor: &Supervisor) {
         {
             continue;
         }
-        if let Ok(len) = rx.await {
+        if let Ok(Ok(len)) = tokio::time::timeout(crate::context::actor::SEND_TIMEOUT, rx).await {
             total_buffered += len;
         }
     }

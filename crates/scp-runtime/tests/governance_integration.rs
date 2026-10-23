@@ -4428,3 +4428,69 @@ async fn export_fails_when_the_event_log_cannot_export() {
         "an unreadable event log must fail the export, got {result:?}"
     );
 }
+
+/// A migration that succeeds creates its destination inside the source
+/// actor's turn, under `bootstrap_spawn_lock`, while a create of another
+/// context runs alongside it. No bootstrap waits on a mailbox under that
+/// lock, and the destination's gauge refresh runs as a task nobody awaits,
+/// so neither the source's turn nor the create waits on the source's
+/// mailbox; both finish well before the 30 s handler and lifecycle timeouts
+/// that would otherwise end the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_migration_alongside_a_create_finishes_without_waiting_on_its_own_turn() {
+    let manager = new_manager();
+    let params = || ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    let source = "ctx-migration-source";
+    manager
+        .create_context(source.into(), params(), alice(), None, Vec::new())
+        .await
+        .unwrap();
+    let signer =
+        scp_runtime::context::actor::CommandSigner::local_ed25519(signing_key_for_did(&alice()));
+    let migrate = GovernanceAction::ProposeContextMigration {
+        new_context_params: Box::new(params()),
+        reason: "move to a new context".to_owned(),
+        grace_period_secs: 60,
+        auto_invite: false,
+    };
+
+    let admin = alice();
+    let started = std::time::Instant::now();
+    let (migrated, created) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            manager.propose_governance_action(source, &admin, migrate, &signer),
+            manager.create_context(
+                "ctx-created-alongside".into(),
+                params(),
+                alice(),
+                None,
+                Vec::new()
+            ),
+        )
+    })
+    .await
+    .expect("the migration and the create must not wait on each other");
+
+    let (_proposal, _events, result) = migrated.unwrap();
+    let Some(GovernanceActionResult::MigrationProposed(proposed)) = result else {
+        panic!("the migration must execute: {result:?}");
+    };
+    assert_eq!(
+        manager
+            .read_context_state_checked(&proposed.destination_context_id)
+            .await
+            .unwrap(),
+        Some(ContextState::Active),
+        "the destination runs"
+    );
+    assert_eq!(created.unwrap().state(), ContextState::Active);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "both finished in {:?}",
+        started.elapsed()
+    );
+}

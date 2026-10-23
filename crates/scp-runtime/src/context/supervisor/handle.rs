@@ -682,20 +682,35 @@ impl SupervisorHandle {
         )
     }
 
-    /// Update operational gauges (active contexts, buffer occupancy).
+    /// Starts a refresh of the operational gauges (active contexts, buffer
+    /// occupancy) as a tracked task and returns without waiting for it.
     /// Best-effort: skipped if no metrics recorder is installed.
     ///
-    /// Async because the gauge sweep mailboxes each per-context actor for
-    /// its receive-buffer length (ADR-049 Phase 2A finalization — DashMap
-    /// removal).
+    /// The sweep mailboxes each per-context actor for its receive-buffer
+    /// length (ADR-049 Phase 2A finalization — DashMap removal), so no caller
+    /// waits on it: a caller inside an actor's turn, or one holding
+    /// `bootstrap_spawn_lock` while an actor's turn waits for that lock, would
+    /// wait on itself until a timeout fired. The task spawns on the
+    /// Supervisor's tracker (ADR-049 Decision 16), so shutdown waits for it.
     ///
     /// # Errors
     ///
-    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
-    pub(crate) async fn update_context_gauges(&self) -> Result<(), ContextError> {
-        let supervisor = self.upgrade()?;
-        crate::context::manager_methods::update_context_gauges(&supervisor).await;
-        Ok(())
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped or
+    /// shutdown has begun.
+    pub(crate) fn update_context_gauges(&self) -> Result<(), ContextError> {
+        let handle = self.clone();
+        let sweep = async move {
+            match handle.upgrade() {
+                Ok(supervisor) => {
+                    crate::context::manager_methods::update_context_gauges(&supervisor).await;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "context gauge refresh skipped: supervisor gone");
+                }
+            }
+        };
+        self.spawn_tracked("refresh context gauges", sweep)
+            .map(drop)
     }
 
     /// The supervisor's store of each context's last successful relay
@@ -991,8 +1006,8 @@ impl SupervisorHandle {
     /// its `state.ttl.timer` bookkeeping are installed by the actor that
     /// owns the state — no `&Supervisor` / DashMap reach.
     ///
-    /// Used by the lifecycle bootstrap paths (`finalize_create`,
-    /// `restore_context`, `import_context`) which run AFTER actor spawn
+    /// Used by the lifecycle bootstrap paths (`SpawnedContext::finalize`
+    /// for create, import and the Welcome join, and `restore_context`) which run AFTER actor spawn
     /// and hold only `&ActorDeps` (no `&mut state`). They delegate timer
     /// installation to the actor through this mailbox dispatch.
     ///
@@ -1215,7 +1230,7 @@ mod tests {
         shut_down(handle.seed_context_floors(&[7u8; 32]));
         shut_down(handle.is_context_poisoned("ctx").map(drop));
         shut_down(handle.find_shared_context("a", "b").await.map(drop));
-        shut_down(handle.update_context_gauges().await);
+        shut_down(handle.update_context_gauges());
         shut_down(handle.relay_contact_store().map(drop));
         shut_down(handle.spawn_tracked("probe", async {}).map(drop));
     }

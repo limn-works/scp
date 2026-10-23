@@ -4005,8 +4005,10 @@ pub fn execute_propose_context_migration<'a>(
         // runs under `bootstrap_spawn_lock`, and it fails before any write
         // when the destination id names a running context (ADR-029
         // Implementation), so it cannot replace that context's snapshot or
-        // contact. A lock holder that waits on this actor's mailbox gives up at
-        // its own reply or lifecycle timeout.
+        // contact. This turn waits for the lock, so no wait on another actor
+        // runs while it holds it: the destination's post-spawn wiring, which
+        // waits on the destination's mailbox, runs after the guard drops, and
+        // every other bootstrap runs its own wiring after releasing the lock.
         let bootstrap_guard = deps.supervisor.lock_bootstrap_spawn().await?;
         if deps.supervisor.lookup(&destination_context_id)?.is_some() {
             return Err(ContextError::CreationFailed(format!(
@@ -4063,7 +4065,7 @@ pub fn execute_propose_context_migration<'a>(
             Box<
                 dyn std::future::Future<
                         Output = Result<
-                            crate::context::ContextHandle,
+                            crate::context::lifecycle_helpers::SpawnedContext,
                             scp_protocol::context::builder::ContextCreationError,
                         >,
                     > + Send,
@@ -4079,24 +4081,43 @@ pub fn execute_propose_context_migration<'a>(
             cell.relay_urls.clone(),
             &first_state,
         ));
-        if let Err(e) = create_fut.await {
-            // Roll back: revert the source handle to Active. No Class-C field
-            // was written before the await, so no view is taken here and the
-            // cell's `mutation_epoch` is unchanged across the failure.
-            let _ = cell.handle.transition_to(&ContextState::Active);
-            // Put back the destination's first-state records; a failure to
-            // do so is the caller's to see.
-            first_state.rollback().await.map_err(|rollback| {
-                crate::context::lifecycle_helpers::fold_rollback_failure(
-                    &format!("failed to create destination context: {e}"),
-                    &rollback,
-                )
-            })?;
-            return Err(ContextError::PermissionDenied(format!(
-                "failed to create destination context: {e}"
-            )));
-        }
+        let spawned = match create_fut.await {
+            Ok(spawned) => spawned,
+            Err(e) => {
+                // Roll back: revert the source handle to Active. No Class-C
+                // field was written before the await, so no view is taken here
+                // and the cell's `mutation_epoch` is unchanged across the
+                // failure.
+                let _ = cell.handle.transition_to(&ContextState::Active);
+                // Put back the destination's first-state records; a failure to
+                // do so is the caller's to see.
+                first_state.rollback().await.map_err(|rollback| {
+                    crate::context::lifecycle_helpers::fold_rollback_failure(
+                        &format!("failed to create destination context: {e}"),
+                        &rollback,
+                    )
+                })?;
+                return Err(ContextError::PermissionDenied(format!(
+                    "failed to create destination context: {e}"
+                )));
+            }
+        };
         drop(bootstrap_guard);
+        // The destination's gauge refresh and TTL timer, after the lock is
+        // released. A failure here leaves the destination running, as a
+        // failure after its spawn always has, and nothing staged on this
+        // context, which returns to `Active`.
+        if let Err(e) = spawned.finalize(deps).await {
+            if let Err(revert) = cell.handle.transition_to(&ContextState::Active) {
+                tracing::warn!(
+                    context_id,
+                    error = %revert,
+                    "migration source could not return to Active after its destination's \
+                     post-spawn wiring failed"
+                );
+            }
+            return Err(e);
+        }
 
         // Coalesced Class-C staging (migration_state + buffered events) in a
         // short view borrow, now that the destination exists.

@@ -4162,8 +4162,9 @@ impl Supervisor {
                 // every other same-id bootstrap so a concurrent import/restore
                 // for the same id cannot interleave its crypto write between
                 // this op's crypto-init and actor registration. See
-                // `bootstrap_spawn_lock`.
-                let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+                // `bootstrap_spawn_lock`. The guard drops before the post-spawn
+                // wiring, which waits on the new actor's mailbox.
+                let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
                 // A create over a running context's id fails before any write
                 // (ADR-029 Implementation), so it cannot replace the running
                 // context's snapshot or contact. The check runs under the lock
@@ -4330,7 +4331,7 @@ impl Supervisor {
                 )
                 .await
                 {
-                    Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
+                    Ok(Ok(spawned)) => (Outcome::ok_mutated(()), Ok(spawned)),
                     Ok(Err(e)) => {
                         let sketch = ContextError::CryptoFailed(format!("create_context: {e}"));
                         (Outcome::err_mutated(sketch), Err(e))
@@ -4366,6 +4367,22 @@ impl Supervisor {
                     ok => (outcome, ok),
                 };
                 drop(crash_window);
+                // No mailbox wait runs under the lock: the TTL install waits on
+                // the new actor, whose turn may wait for this lock.
+                drop(bootstrap_guard);
+                let (outcome, reply_result) = match reply_result {
+                    Ok(spawned) => match spawned.finalize(&deps).await {
+                        Ok(handle) => (outcome, Ok(handle)),
+                        Err(e) => {
+                            let sketch = standing_outcome_error_sketch(&e);
+                            (
+                                Outcome::err_mutated(sketch),
+                                Err(scp_protocol::context::builder::ContextCreationError::StateTransition(e)),
+                            )
+                        }
+                    },
+                    Err(e) => (outcome, Err(e)),
+                };
                 let _ = reply.send(reply_result);
                 outcome
             }
@@ -4434,7 +4451,7 @@ impl Supervisor {
                     let _ = reply.send(Err(e));
                     return Outcome::err_mutated(sketch);
                 }
-                let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+                let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
                 // Importing (re-establishing) this id is a fresh start: the
                 // imported actor begins with a clean budget, free of stale
                 // crash history and a stale poison (ADR-049 §10); a failed
@@ -4502,7 +4519,7 @@ impl Supervisor {
                 // `read_context_state_checked` relies on, and a failed import
                 // gets the id's prior crash window back.
                 let (outcome, reply_result) = match import_result {
-                    Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
+                    Ok(Ok(spawned)) => (Outcome::ok_mutated(()), Ok(spawned)),
                     Ok(Err(e)) => {
                         // Import failed after deps were built (e.g. epoch-floor
                         // rejection, refusing to overwrite a live context).
@@ -4540,6 +4557,19 @@ impl Supervisor {
                     ok => (outcome, ok),
                 };
                 drop(crash_window);
+                // No mailbox wait runs under the lock: the TTL install waits on
+                // the imported actor, whose turn may wait for this lock.
+                drop(bootstrap_guard);
+                let (outcome, reply_result) = match reply_result {
+                    Ok(spawned) => match spawned.finalize(&deps).await {
+                        Ok(handle) => (outcome, Ok(handle)),
+                        Err(e) => {
+                            let sketch = standing_outcome_error_sketch(&e);
+                            (Outcome::err_mutated(sketch), Err(e))
+                        }
+                    },
+                    Err(e) => (outcome, Err(e)),
+                };
                 let _ = reply.send(reply_result);
                 outcome
             }
@@ -12532,7 +12562,7 @@ impl Supervisor {
         // identity's wrapping key loads first, outside both locks, so no
         // custody call runs under either.
         self.load_wrapping_key(local_did).await?;
-        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
 
         // Step 1/2: existence + liveness probe. The decision to create turns
         // on absence, so this reads the checked form (ADR-049 §10). Only
@@ -12597,7 +12627,7 @@ impl Supervisor {
         // standing id more than N times in a window, forcing operator
         // intervention on a persistently-flapping pair) is a future hardening;
         // today the recreate is unconditional but now observable.
-        let _crash_window = self.begin_bootstrap_window(&context_id);
+        let crash_window = self.begin_bootstrap_window(&context_id);
         let params = scp_protocol::context::templates::template_params(
             &scp_protocol::context::TemplateId::BilateralPersistent,
         );
@@ -12619,7 +12649,7 @@ impl Supervisor {
                     &first_state,
                 ))
                 .await
-                .map(|_handle| ())
+                .map(|spawned| (deps.clone_for_spawn(), spawned))
                 .map_err(|e| match e {
                     scp_protocol::context::builder::ContextCreationError::StateTransition(
                         inner @ ContextError::SupervisorShutDown(_),
@@ -12657,17 +12687,28 @@ impl Supervisor {
         // the context between our step-2 probe and the step-3 create. If
         // the context is now Active/Creating, treat the create as
         // idempotently successful; otherwise surface the create error. A
-        // checked-read error also surfaces the create error: `_crash_window`
+        // checked-read error also surfaces the create error: `crash_window`
         // still holds the respawn marker here, so an id with a prior crash
         // window reads `ActorCrashed` until the guard drops, and that answer
         // describes this bootstrap rather than why the create failed.
-        if let Err(create_err) = create_result
-            && !matches!(
-                self.read_context_state_checked(&context_id).await,
-                Ok(Some(ContextState::Active | ContextState::Creating))
-            )
-        {
-            return Err(create_err);
+        let spawned = match create_result {
+            Ok(spawned) => Some(spawned),
+            Err(create_err)
+                if !matches!(
+                    self.read_context_state_checked(&context_id).await,
+                    Ok(Some(ContextState::Active | ContextState::Creating))
+                ) =>
+            {
+                return Err(create_err);
+            }
+            Err(_) => None,
+        };
+        drop(crash_window);
+        // The post-spawn wiring waits on the new actor's mailbox, so it runs
+        // after the lock is released.
+        drop(bootstrap_guard);
+        if let Some((deps, spawned)) = spawned {
+            spawned.finalize(&deps).await?;
         }
 
         // Step 5: track the standing peer and return.
@@ -16265,7 +16306,7 @@ impl Supervisor {
         // the crypto ops, nor `spawn_actor_with_state` re-acquires
         // `bootstrap_spawn_lock`, so this is re-entrancy- and deadlock-free. No
         // custody call for the wrapping key runs under either lock.
-        let _bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
+        let bootstrap_guard = self.bootstrap_spawn_lock.lock().await;
         let bundle = scp_protocol::context::InvitationBundle::from_wire_bytes(&bundle_wire)
             .map_err(|e| {
                 ContextError::CryptoFailed(format!(
@@ -16824,23 +16865,16 @@ impl Supervisor {
         // a LIVE actor.
         let handle = spawn_outcome?;
 
-        // Finalization: gauges + TTL timer — the same post-spawn wiring
-        // `finalize_create` installs, reached through the supervisor registry
-        // (the snapshot was already persisted fail-closed above, so no
-        // additional persist is needed here). The governance-timeout interval
-        // is ACTOR-OWNED (ADR-049 Decision-1 / finding A3): the spawned actor's
-        // `reconcile_timers` arms it while `Active` — no bootstrap install.
-        deps.supervisor.update_context_gauges().await?;
-        if params.ttl.is_some() {
-            // Joiner arms with no explicit deadline — the actor handler derives
-            // the convergent expiry deadline on the same creator-assigned
-            // `creation_timestamp_secs + params.ttl` basis the creator used.
-            deps.supervisor
-                .dispatch_start_ttl_timer(&context_id, params.clone(), None)
-                .await?;
-        }
-
-        Ok(handle)
+        // Finalization: the gauge refresh and the TTL timer, the same
+        // post-spawn wiring a create runs, after the lock is released because
+        // the TTL install waits on the new actor's mailbox. The joiner arms
+        // with no explicit deadline: the actor derives the convergent expiry
+        // deadline on the same creator-assigned `creation_timestamp_secs +
+        // params.ttl` basis the creator used.
+        drop(bootstrap_guard);
+        crate::context::lifecycle_helpers::SpawnedContext::at_create_base(handle)
+            .finalize(&deps)
+            .await
     }
 
     /// Build the Welcome-derived [`PerContextState`](crate::context::actor::state::PerContextState)
@@ -30045,16 +30079,19 @@ mod tests {
         );
     }
 
-    /// A snapshot store over a shared map whose writes fail, wait forever, or
-    /// whose deletes fail, as each test sets. Clones share the map and the
-    /// switches, so a test keeps one clone to seed and inspect.
+    /// A snapshot store over a shared map whose writes fail, wait forever,
+    /// land late, or whose deletes fail, as each test sets. Clones share the
+    /// map and the switches, so a test keeps one clone to seed and inspect.
     /// `close_gate_on_write` closes that Supervisor's spawn gate once a
-    /// snapshot write lands, so the spawn after it is refused.
+    /// snapshot write lands, so the spawn after it is refused. A write under
+    /// `delay_writes` runs on its own task, as a `spawn_blocking` or
+    /// host-callback store's does, so dropping its future does not stop it.
     #[derive(Clone, Default)]
     struct FaultyPersistence {
         contexts: Arc<DashMap<String, crate::context::state::ContextSnapshot>>,
         fail_writes: Arc<std::sync::atomic::AtomicBool>,
         hang_writes: Arc<std::sync::atomic::AtomicBool>,
+        delay_writes: Arc<std::sync::OnceLock<std::time::Duration>>,
         write_started: Arc<std::sync::atomic::AtomicBool>,
         fail_deletes: Arc<std::sync::atomic::AtomicBool>,
         close_gate_on_write: Arc<std::sync::OnceLock<std::sync::Weak<Supervisor>>>,
@@ -30088,6 +30125,16 @@ mod tests {
             Self::set(&self.write_started);
             if Self::is_set(&self.hang_writes) {
                 std::future::pending::<()>().await;
+            }
+            if let Some(delay) = self.delay_writes.get().copied() {
+                let contexts = Arc::clone(&self.contexts);
+                let (id, snap) = (id.to_owned(), snap.clone());
+                return tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    contexts.insert(id, snap);
+                })
+                .await
+                .map_err(|e| e.to_string().into());
             }
             if Self::is_set(&self.fail_writes) {
                 return Err("injected snapshot write failure".into());
@@ -30362,13 +30409,18 @@ mod tests {
         );
     }
 
-    /// A create whose snapshot write outlasts `LIFECYCLE_TIMEOUT` is dropped
-    /// by the dispatch arm, which then rolls back the contact the create
-    /// wrote first, putting back the one stored before.
+    /// A create whose snapshot write outlasts `LIFECYCLE_TIMEOUT` and then
+    /// lands is dropped by the dispatch arm, whose rollback waits for that
+    /// write before it reads which records were touched: the late snapshot
+    /// is deleted and the contact stored before is put back. The write runs
+    /// on its own task, so dropping the create's future does not stop it.
     #[tokio::test(start_paused = true)]
-    async fn a_timed_out_create_rolls_back_its_first_contact() {
+    async fn a_timed_out_create_whose_write_lands_late_rolls_back_both_records() {
         let persistence = FaultyPersistence::default();
-        FaultyPersistence::set(&persistence.hang_writes);
+        persistence
+            .delay_writes
+            .set(Supervisor::LIFECYCLE_TIMEOUT + std::time::Duration::from_secs(5))
+            .unwrap();
         let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
         let contacts = sup.relay_contact_store();
         let ctx = hex::encode([0xECu8; 32]);
@@ -30395,13 +30447,124 @@ mod tests {
             err.to_string().contains("exceeded"),
             "the create timed out: {err:?}"
         );
+        // Long past the late write, which has landed by now if it ever will.
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
-        assert!(!persistence.contexts.contains_key(&ctx));
+        assert!(
+            !persistence.contexts.contains_key(&ctx),
+            "the late snapshot is deleted"
+        );
         assert_eq!(
             contacts.load_last_relay_contact(&ctx).await.unwrap(),
             Some(PRIOR_CONTACT),
             "the prior contact is put back"
         );
+    }
+
+    /// A create whose snapshot write never finishes cannot be rolled back,
+    /// because the write could still land: the rollback waits for it, then
+    /// keeps the records, and the create's error says so.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_create_whose_write_never_finishes_keeps_its_records_and_says_so() {
+        let persistence = FaultyPersistence::default();
+        FaultyPersistence::set(&persistence.hang_writes);
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        let contacts = sup.relay_contact_store();
+        let ctx = hex::encode([0xEEu8; 32]);
+        contacts
+            .store_last_relay_contact(&ctx, PRIOR_CONTACT)
+            .await
+            .unwrap();
+        let identity = sup.node_identity().unwrap();
+        let err = sup
+            .create_context(
+                ctx.clone(),
+                first_contact_params(),
+                identity,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::builder::ContextCreationError::StateTransition(
+                    ContextError::PersistenceFailed(ref msg)
+                ) if msg.contains("exceeded") && msg.contains("did not finish")
+            ),
+            "{err:?}"
+        );
+        assert!(sup.lookup(&ctx).is_none(), "no actor is registered");
+        assert_eq!(
+            contacts.load_last_relay_contact(&ctx).await.unwrap(),
+            Some(FIRST_CONTACT_NOW),
+            "the contact written before the hung snapshot write is kept"
+        );
+    }
+
+    /// A guard dropped with a touched record rolls back on a tracked task
+    /// that takes `bootstrap_spawn_lock` before it reads anything: while
+    /// another bootstrap holds the lock the records stay, and the undo runs
+    /// once the lock is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_guard_rolls_back_only_under_the_bootstrap_lock() {
+        let persistence = FaultyPersistence::default();
+        FaultyPersistence::set(&persistence.fail_writes);
+        let sup = first_contact_supervisor(Box::new(persistence.clone()), durable_over_one_store());
+        let contacts = sup.relay_contact_store();
+        let identity = sup.node_identity().unwrap();
+        let ctx = hex::encode([0xEFu8; 32]);
+        contacts
+            .store_last_relay_contact(&ctx, PRIOR_CONTACT)
+            .await
+            .unwrap();
+        let deps = sup.build_actor_deps_loaded(&identity).await.unwrap();
+        let guard =
+            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &ctx).unwrap();
+        let err = Box::pin(crate::context::lifecycle_helpers::create_context(
+            &deps,
+            ctx.clone(),
+            first_contact_params(),
+            identity,
+            None,
+            Vec::new(),
+            &guard,
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                scp_protocol::context::builder::ContextCreationError::StateTransition(
+                    ContextError::PersistenceFailed(_)
+                )
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            contacts.load_last_relay_contact(&ctx).await.unwrap(),
+            Some(FIRST_CONTACT_NOW),
+            "the create wrote its contact before the failed snapshot write"
+        );
+
+        let held = sup.bootstrap_spawn_lock.lock().await;
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            contacts.load_last_relay_contact(&ctx).await.unwrap(),
+            Some(FIRST_CONTACT_NOW),
+            "the undo waits for the bootstrap lock"
+        );
+        drop(held);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while contacts.load_last_relay_contact(&ctx).await.unwrap() != Some(PRIOR_CONTACT) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the undo puts back the prior contact once the lock is free"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// A second create of a running context's id fails with `CreationFailed`
@@ -31782,7 +31945,7 @@ mod tests {
         // longer seals through the supervisor-scoped provider — it respawns the
         // target actor from its persisted Active snapshot and seals through the
         // actor's owned `ContextCryptoState`. Stand up a REAL context under the
-        // 64-hex id via the production create path (`finalize_create` durably
+        // 64-hex id via the production create path (`persist_first_state` durably
         // persists the initial Active snapshot, and the created group commits its
         // `scp_context_params` `0xFF02` extension under the DIGEST via the ADR-056
         // chokepoint) so the direct path's `respawn_from_snapshot` finds state and

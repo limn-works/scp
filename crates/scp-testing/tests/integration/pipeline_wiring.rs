@@ -3433,17 +3433,17 @@ fn first_relay_contact_written_before_the_actor_spawns() {
         (
             LIFECYCLE_HELPERS_SRC,
             "persist_first_state",
-            "persist_state_fail_closed(",
+            "write_first_state(",
         ),
         (
             LIFECYCLE_HELPERS_SRC,
-            "persist_first_state",
-            "write_first_contact(",
-        ),
-        (
-            LIFECYCLE_HELPERS_SRC,
-            "write_first_contact",
+            "write_first_state",
             "store_last_relay_contact(",
+        ),
+        (
+            LIFECYCLE_HELPERS_SRC,
+            "write_first_state",
+            "persist_context(",
         ),
     ] {
         assert!(
@@ -3482,19 +3482,15 @@ fn first_relay_contact_written_before_the_actor_spawns() {
 /// refuse a running context's id before they write.
 #[test]
 fn first_state_is_ordered_guarded_and_refused_over_a_running_context() {
-    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "persist_first_state")
-        .expect("persist_first_state not found");
-    // The snapshot future is built in the synchronous prelude; its write
-    // runs where it is awaited.
-    assert!(
-        body.contains("persist_state_fail_closed("),
-        "no snapshot write"
-    );
-    let contact = body.find("write_first_contact(").expect("no contact write");
-    let snapshot = body.find("persist.await").expect("no snapshot await");
+    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "write_first_state")
+        .expect("write_first_state not found");
+    let contact = body
+        .find("store_last_relay_contact(")
+        .expect("no contact write");
+    let snapshot = body.find("persist_context(").expect("no snapshot write");
     assert!(
         contact < snapshot,
-        "persist_first_state must write the contact before the snapshot"
+        "write_first_state must write the contact before the snapshot"
     );
     for (src, entry) in [
         (LIFECYCLE_HELPERS_SRC, "create_context"),
@@ -3553,6 +3549,86 @@ fn first_state_is_ordered_guarded_and_refused_over_a_running_context() {
         lock < lookup && lookup < create,
         "the migration must check its destination under the lock before it creates"
     );
+}
+
+/// ADR-049 Decision 9 and ADR-029 Implementation: the first-state writes run
+/// on a tracked task the rollback waits for before it reads what was touched,
+/// a dropped guard undoes under `bootstrap_spawn_lock`, and each bootstrap
+/// refreshes its gauges and arms its TTL timer only after it releases that
+/// lock.
+#[test]
+fn first_state_writes_are_drained_and_finalize_runs_after_the_bootstrap_lock() {
+    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "persist_first_state")
+        .expect("persist_first_state not found");
+    let busy = body
+        .find("writes_idle.send_replace(false)")
+        .expect("persist_first_state must mark its writes running");
+    let spawn = body
+        .find("spawn_tracked(")
+        .expect("persist_first_state must run its writes on a tracked task");
+    assert!(
+        busy < spawn,
+        "persist_first_state must mark its writes running before the task can start"
+    );
+    assert!(
+        body.contains("WritesIdleOnDrop("),
+        "the writes task must mark itself idle however it ends"
+    );
+    let body = extract_fn_body(LIFECYCLE_HELPERS_SRC, "undo").expect("undo not found");
+    let drain = body
+        .find("drain_writes()")
+        .expect("undo must wait for the writes task");
+    let touched = body
+        .find("touched()")
+        .expect("undo must read what was touched");
+    assert!(
+        drain < touched,
+        "undo must wait for the writes task before it reads what was touched"
+    );
+    let guard_drop = LIFECYCLE_HELPERS_SRC
+        .find("impl Drop for FirstStateRollback ")
+        .expect("FirstStateRollback must implement Drop");
+    let body = extract_fn_body(&LIFECYCLE_HELPERS_SRC[guard_drop..], "drop")
+        .expect("FirstStateRollback::drop not found");
+    let lock = body
+        .find("lock_bootstrap_spawn()")
+        .expect("the dropped guard's undo must take bootstrap_spawn_lock");
+    let undo = body.find(".undo()").expect("the dropped guard must undo");
+    assert!(
+        lock < undo,
+        "the dropped guard must take bootstrap_spawn_lock before it undoes"
+    );
+    for (owner, entry) in [
+        (SUPERVISOR_SRC, "dispatch_lifecycle_direct"),
+        (SUPERVISOR_SRC, "standing_context"),
+        (SUPERVISOR_SRC, "spawn_actor_from_welcome"),
+        (MANAGER_SRC, "execute_propose_context_migration"),
+    ] {
+        let body = extract_fn_body(owner, entry).unwrap_or_else(|| panic!("{entry} not found"));
+        let release = body
+            .find("drop(bootstrap_guard)")
+            .unwrap_or_else(|| panic!("{entry} must release bootstrap_spawn_lock"));
+        // Anchored on the `deps` argument: the migration also hashes with
+        // a `finalize()` before it takes the lock.
+        let finalize = body
+            .find(".finalize(&deps")
+            .or_else(|| body.find(".finalize(deps"))
+            .unwrap_or_else(|| panic!("{entry} must finalize its spawned context"));
+        assert!(
+            release < finalize,
+            "{entry} must finalize only after it releases bootstrap_spawn_lock"
+        );
+    }
+    for (src, entry) in [
+        (LIFECYCLE_HELPERS_SRC, "create_context"),
+        (LIFECYCLE_HELPERS_SRC, "import_context"),
+    ] {
+        let body = extract_fn_body(src, entry).unwrap_or_else(|| panic!("{entry} not found"));
+        assert!(
+            !body.contains("update_context_gauges(") && !body.contains("dispatch_start_ttl_timer("),
+            "{entry} must leave the gauge refresh and TTL timer to SpawnedContext::finalize"
+        );
+    }
 }
 
 /// ADR-029 §2 push-wake pull mode step 5: a full reconnection sends the
