@@ -26,6 +26,8 @@ classify_offline_duration(last_relay_contact, now) -> OfflineTier:
     else:                             return Long       // > 7 days
 ```
 
+`last_relay_contact` is the member's last successful relay interaction for the context. Creating a context, joining it by Welcome, and importing it record the current time as the first value; restoring a context from local storage records nothing, because the value measures how long the member was offline. A reconnection over a context with no recorded value fails instead of classifying it.
+
 All tiers use the Merkle event log (ADR-011) as the authoritative state reconciliation mechanism and the relay's store-and-forward capability (ADR-004) as the primary message recovery path.
 
 ## 23.2 Client-Side Outbound Queue
