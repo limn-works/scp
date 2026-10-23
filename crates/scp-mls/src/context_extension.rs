@@ -225,14 +225,15 @@ mod tests {
             ],
         };
         let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
-        ScpContextExtension::for_root(
-            context_id.to_owned(),
-            DID::from("did:dht:z6MkAlice".to_owned()),
-            ContextMode::Encrypted,
-            &governance,
-            CeilingPolicy::Immutable,
-            &ceiling,
-        )
+        ScpContextExtension::for_root(scp_protocol::context::ScpContextGenesis {
+            context_id: context_id.to_owned(),
+            creator_did: DID::from("did:dht:z6MkAlice".to_owned()),
+            creation_timestamp_secs: 1_700_000_000,
+            mode: ContextMode::Encrypted,
+            governance: &governance,
+            ceiling_policy: CeilingPolicy::Immutable,
+            ceiling: &ceiling,
+        })
         .unwrap()
     }
 
@@ -528,8 +529,66 @@ mod tests {
         );
         assert_eq!(
             bob_group.group_context_extension().unwrap(),
-            Some(ctx_ext),
+            Some(ctx_ext.clone()),
             "joiner's context extension must survive later commits it processed"
+        );
+        // Spec §5.13.3 "Creation timestamp": `T0` is a genesis fact no AddMember
+        // Commit changes.
+        for group in [&alice_group, &bob_group] {
+            assert_eq!(
+                group
+                    .group_context_extension()
+                    .unwrap()
+                    .map(|e| e.creation_timestamp_secs),
+                Some(ctx_ext.creation_timestamp_secs),
+            );
+        }
+    }
+
+    /// Spec §5.13.3 rule 1: a `0xFF02` payload that omits
+    /// `creation_timestamp_secs` is not a valid extension, so reading the
+    /// group's extension fails instead of returning a value.
+    #[test]
+    fn a_group_whose_extension_omits_the_creation_timestamp_does_not_read() {
+        let mut json = serde_json::to_value(sample_context_extension("ctx:no-t0")).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("creation_timestamp_secs")
+            .expect("the fixture carries the field");
+        let group = crate::group::create_group_with_raw_context_params(
+            &test_credential("alice"),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0xAA),
+            serde_json::to_vec(&json).unwrap(),
+            &SystemClock,
+        )
+        .unwrap();
+        let read = group.group_context_extension();
+        assert!(
+            matches!(&read, Err(MlsError::ExtensionError(reason)) if reason.contains("creation_timestamp_secs")),
+            "{read:?}"
+        );
+    }
+
+    /// Spec §5.13.3 "Serialization": a member rejects an extension whose
+    /// `creation_timestamp_secs` exceeds 2^53 − 1.
+    #[test]
+    fn a_group_whose_creation_timestamp_exceeds_two_to_the_53_minus_one_does_not_read() {
+        let over = scp_protocol::context::MAX_CREATION_TIMESTAMP_SECS + 1;
+        let ext = ScpContextExtension {
+            creation_timestamp_secs: over,
+            ..sample_context_extension("ctx:big-t0")
+        };
+        let group = crate::group::create_group_with_raw_context_params(
+            &test_credential("alice"),
+            &scp_crypto::p256::testing::valid_uncompressed_point(0xAA),
+            serde_json::to_vec(&ext).unwrap(),
+            &SystemClock,
+        )
+        .unwrap();
+        let read = group.group_context_extension();
+        assert!(
+            matches!(&read, Err(MlsError::ExtensionError(reason)) if reason.contains("exceeds 2^53 - 1")),
+            "{read:?}"
         );
     }
 }

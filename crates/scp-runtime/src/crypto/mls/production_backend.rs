@@ -2197,12 +2197,15 @@ mod tests {
         };
         let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
         scp_protocol::context::ScpContextExtension::for_root(
-            context_id.to_owned(),
-            DID::from("did:dht:z6MkAlice".to_owned()),
-            ContextMode::Encrypted,
-            &governance,
-            CeilingPolicy::Immutable,
-            &ceiling,
+            scp_protocol::context::ScpContextGenesis {
+                context_id: context_id.to_owned(),
+                creator_did: DID::from("did:dht:z6MkAlice".to_owned()),
+                creation_timestamp_secs: 1_700_000_000,
+                mode: ContextMode::Encrypted,
+                governance: &governance,
+                ceiling_policy: CeilingPolicy::Immutable,
+                ceiling: &ceiling,
+            },
         )
         .unwrap()
     }

@@ -3170,30 +3170,22 @@ mod tests {
         );
     }
 
-    /// A legacy snapshot persisted before this field existed (its JSON omits
-    /// `creation_timestamp_secs`) deserializes with the field defaulted to `0`
-    /// via `#[serde(default)]`, never failing the import.
+    /// `creation_timestamp_secs` is a required snapshot field: a snapshot whose
+    /// JSON omits it fails to decode instead of defaulting to a value that
+    /// would become a TTL base (spec 05 §5.13.3 rule 9).
     #[test]
-    fn creation_timestamp_secs_defaults_to_zero_for_legacy_snapshot() {
-        let snapshot = test_snapshot("ctx-creation-ts-legacy");
+    fn a_snapshot_without_creation_timestamp_secs_does_not_decode() {
+        let snapshot = test_snapshot("ctx-creation-ts-missing");
         let mut value = serde_json::to_value(&snapshot).expect("to_value");
-
-        // Simulate a pre-field snapshot: strip the key entirely.
         value
             .as_object_mut()
             .expect("snapshot serializes to a JSON object")
-            .remove("creation_timestamp_secs");
-        assert!(
-            value.get("creation_timestamp_secs").is_none(),
-            "the legacy snapshot JSON must not carry the field"
-        );
+            .remove("creation_timestamp_secs")
+            .expect("the snapshot carries the field");
 
-        let restored: ContextSnapshot =
-            serde_json::from_value(value).expect("legacy snapshot must deserialize");
-        assert_eq!(
-            restored.creation_timestamp_secs, 0,
-            "a legacy snapshot without the field must default to 0"
-        );
+        let err = serde_json::from_value::<ContextSnapshot>(value)
+            .expect_err("a snapshot without creation_timestamp_secs must not decode");
+        assert!(err.to_string().contains("creation_timestamp_secs"), "{err}");
     }
 
     /// `strip_snapshot_for_public` carries the convergent creation time through

@@ -614,6 +614,32 @@ impl NodeMlsFactory {
         Ok(OwnedMlsCryptoState::fresh_birth(mls_group))
     }
 
+    /// Test-only: [`Self::create_mls_group_with_context`] over raw `0xFF02`
+    /// `ExtensionData` (see
+    /// [`scp_mls::group::create_group_with_raw_context_params`]), for a test
+    /// that presents an extension a conforming creator never writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::CryptoFailed`] if the credential or the
+    /// group cannot be built.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn create_mls_group_with_raw_context_params(
+        &self,
+        raw_context_params: Vec<u8>,
+        wrapping_public_key: &[u8; 65],
+    ) -> Result<OwnedMlsCryptoState, ContextCreationError> {
+        let credential = self.make_credential()?;
+        let mls_group = scp_mls::group::create_group_with_raw_context_params(
+            &credential,
+            wrapping_public_key,
+            raw_context_params,
+            self.clock.as_ref(),
+        )
+        .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
+        Ok(OwnedMlsCryptoState::fresh_birth(mls_group))
+    }
+
     /// Births the joiner's crypto from an already-joined `OpenMLS` group and
     /// returns it as OWNED material (#2148 ADR-049 birth-into-actor,
     /// spawn-from-Welcome).
@@ -3090,12 +3116,15 @@ mod tests {
         };
         let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
         scp_protocol::context::ScpContextExtension::for_root(
-            context_id.to_owned(),
-            DID::from("did:dht:z6MkAlice".to_owned()),
-            ContextMode::Encrypted,
-            &governance,
-            CeilingPolicy::Immutable,
-            &ceiling,
+            scp_protocol::context::ScpContextGenesis {
+                context_id: context_id.to_owned(),
+                creator_did: DID::from("did:dht:z6MkAlice".to_owned()),
+                creation_timestamp_secs: 1_700_000_000,
+                mode: ContextMode::Encrypted,
+                governance: &governance,
+                ceiling_policy: CeilingPolicy::Immutable,
+                ceiling: &ceiling,
+            },
         )
         .unwrap()
     }

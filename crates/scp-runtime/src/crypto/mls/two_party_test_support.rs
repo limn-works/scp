@@ -133,14 +133,15 @@ fn joiner_params() -> ContextParams {
 /// ROOT context from `params`, committing `creator_did` (rule 8) exactly the way
 /// the creator write path does — so a matching-`params` join verifies.
 fn honest_ext(context_id: &str, creator_did: &str, params: &ContextParams) -> ScpContextExtension {
-    ScpContextExtension::for_root(
-        context_id.to_owned(),
-        DID::from(creator_did),
-        params.mode,
-        &params.governance,
-        params.ceiling_policy,
-        &CapabilityCeiling::new(params.ceiling.iter().cloned()),
-    )
+    ScpContextExtension::for_root(scp_protocol::context::ScpContextGenesis {
+        context_id: context_id.to_owned(),
+        creator_did: DID::from(creator_did),
+        creation_timestamp_secs: 1_700_000_000,
+        mode: params.mode,
+        governance: &params.governance,
+        ceiling_policy: params.ceiling_policy,
+        ceiling: &CapabilityCeiling::new(params.ceiling.iter().cloned()),
+    })
     .expect("honest context extension serializes")
 }
 

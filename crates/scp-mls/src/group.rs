@@ -506,6 +506,43 @@ pub fn create_group_with_context(
     )
 }
 
+/// Test-only: creates a group carrying `raw_context_params` as its `0xFF02` data.
+///
+/// The bytes go into the `group_context` verbatim, so a test can present a
+/// group whose extension a conforming creator never writes (one that omits a
+/// field, or one with an out-of-range value) to a receiver's spec §5.13.3
+/// checks.
+///
+/// # Errors
+///
+/// Returns [`MlsError::ExtensionError`] if the single-element extension set
+/// cannot be built, or the errors of [`create_group_with_context`].
+#[cfg(any(test, feature = "testing"))]
+pub fn create_group_with_raw_context_params(
+    credential: &ScpCredential,
+    wrapping_pubkey: &[u8; 65],
+    raw_context_params: Vec<u8>,
+    clock: &dyn Clock,
+) -> Result<ScpMlsGroup, MlsError> {
+    let extension = Extension::Unknown(
+        scp_protocol::context::SCP_CONTEXT_EXTENSION_TYPE_ID,
+        UnknownExtension(raw_context_params),
+    );
+    let group_context_extensions = Extensions::<GroupContext>::single(extension).map_err(|e| {
+        MlsError::ExtensionError(format!("building group_context extension set: {e}"))
+    })?;
+    let leaf_ext = crate::wrapping_extension::make_wrapping_key_extension(wrapping_pubkey);
+    let leaf_extensions = Extensions::<LeafNode>::single(leaf_ext)
+        .map_err(|e| MlsError::GroupCreationFailed(format!("wrapping key extension: {e}")))?;
+    create_group_inner(
+        credential,
+        crate::context_extension::scp_capabilities_with_context_params(),
+        Some(group_context_extensions),
+        leaf_extensions,
+        clock,
+    )
+}
+
 /// Shared single-member group-creation core for [`create_group`] and
 /// [`create_group_with_context`].
 ///

@@ -49,8 +49,10 @@ type Events = Receiver<(String, ContextEvent)>;
 /// A test or helper outcome; a harness or channel failure is an error.
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-/// A Welcome joiner holds no copy of the creator's `T0`, so the policy is
-/// membership-only (spec 09 §9.10.4.1 "First v2 derivation").
+/// A membership-only policy, so every rotation these tests observe comes from
+/// the membership trigger (spec 09 §9.10.4.1 "Membership trigger"), never from
+/// an interval boundary. A Welcome joiner installs the creator's `T0` from the
+/// committed `0xFF02` extension (spec 05 §5.13.3 rule 9).
 const fn membership_policy() -> PseudonymRotationPolicy {
     PseudonymRotationPolicy {
         interval_secs: None,

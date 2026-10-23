@@ -16286,17 +16286,24 @@ impl Supervisor {
                     //     that `build_welcome_joiner_state` below only ever builds
                     //     authority the group itself attests. A group with no `0xFF02`
                     //     (not an SCP context) or any rule 2-6 mismatch is refused
-                    //     (§5.13.3 rule 1 + rules 2-6).
-                    crate::context::lifecycle_helpers::verify_scp_context_binding(
-                        joined_group
-                            .group_context_extension()
-                            .map_err(|e| e.to_string()),
-                        &context_id,
-                        creator_did.as_ref(),
-                        &params,
-                        "spawn-from-Welcome",
-                    )
-                    .map_err(ContextError::CryptoFailed)?;
+                    //     (§5.13.3 rule 1 + rules 2-6). So is a group whose
+                    //     committed `creation_timestamp_secs` is missing, above
+                    //     2^53 − 1, or later than this joiner's clock plus the §9.8.2
+                    //     future bound (rule 9). The returned committed `T0` is the
+                    //     joiner's pseudonym-rotation base and TTL base (rule 9).
+                    let committed_t0 =
+                        crate::context::lifecycle_helpers::verify_scp_context_binding(
+                            joined_group
+                                .group_context_extension()
+                                .map_err(|e| e.to_string()),
+                            &context_id,
+                            creator_did.as_ref(),
+                            &params,
+                            deps.clock.now_secs(),
+                            None,
+                            "spawn-from-Welcome",
+                        )
+                        .map_err(ContextError::CryptoFailed)?;
 
                     // 2. #2148 (ADR-049 birth-into-actor) WELCOME seam: BIRTH the
                     //    joiner's crypto as OWNED material — the joined group (moved in
@@ -16339,6 +16346,7 @@ impl Supervisor {
                             creator_did: &creator_did,
                             relay_urls: &relay_urls,
                         },
+                        committed_t0,
                         &owning_did,
                         local_pseudonym,
                         joined_epoch,
@@ -16581,12 +16589,17 @@ impl Supervisor {
     /// create path leaves it. The per-member access-key store starts empty: a
     /// joiner's access key is minted by the inviter with a random key (§9.17.2)
     /// and delivered out-of-band, not regenerable locally.
+    ///
+    /// `committed_t0` is the `creation_timestamp_secs` the joined group's
+    /// `0xFF02` extension commits, as `verify_scp_context_binding` returned it:
+    /// the joiner's `T0` and TTL base (spec 05 §5.13.3 rule 9).
     // Called only from `spawn_actor_from_welcome`, which the FFI slice (pull
     // request #2036) wired to production bridge consumers.
     #[allow(clippy::too_many_lines)]
     fn build_welcome_joiner_state(
         deps: &crate::context::actor::deps::ActorDeps,
         bundle: WelcomeBundleFacts<'_>,
+        committed_t0: u64,
         joiner_did: &DID,
         local_pseudonym: [u8; 32],
         joined_epoch: u64,
@@ -16607,7 +16620,10 @@ impl Supervisor {
         // KeyPackage consume (BLACK-2J-02) — not here, after the group is already
         // joined and installed.
 
-        let creation_timestamp_secs = deps.clock.now_secs();
+        // §5.13.3 rule 9: the TTL base is the committed `T0`, never this
+        // joiner's clock, so the joiner's convergent deadline
+        // (`creation_timestamp_secs + params.ttl`) equals the creator's.
+        let creation_timestamp_secs = committed_t0;
 
         let governance_engine = crate::context::state::create_governance_engine(
             &params.governance,
@@ -16739,15 +16755,13 @@ impl Supervisor {
                 // Fix-D streaming reservation recovery: a fresh joiner carries none.
                 stream_reservations: HashMap::new(),
                 // §9.10.4.1 "First v2 derivation": under a policy a joiner's
-                // first rotation, to v2 at the schedule index, is due at once.
-                // The invitation bundle carries no copy of the creator's T0, and
-                // `creation_timestamp_secs` above is this joiner's clock, so the
-                // joiner holds no T0: under an interval policy no rotation is
-                // admissible rather than one off the members' shared boundaries.
+                // first rotation, to v2 at the schedule index counted from the
+                // committed T0 (§5.13.3 rule 9), is due at once, so the joiner
+                // follows the members' shared interval boundaries.
                 pseudonym_rotation:
                     crate::context::actor::pseudonym_rotation::PseudonymRotationState::joined(
                         params.pseudonym_rotation.as_ref(),
-                        None,
+                        Some(committed_t0),
                         deps.clock.now_secs(),
                     ),
             },
@@ -20605,14 +20619,41 @@ mod tests {
     fn test_ctx_ext(ctx: &[u8; 32]) -> scp_protocol::context::ScpContextExtension {
         let params = scp_protocol::context::ContextParams::default();
         scp_protocol::context::ScpContextExtension::for_root(
-            hex::encode(ctx),
-            DID(String::new()),
-            params.mode,
-            &params.governance,
-            params.ceiling_policy,
-            &scp_protocol::context::roles::CapabilityCeiling::new(params.ceiling.clone()),
+            scp_protocol::context::ScpContextGenesis {
+                context_id: hex::encode(ctx),
+                creator_did: DID(String::new()),
+                creation_timestamp_secs: 1_700_000_000,
+                mode: params.mode,
+                governance: &params.governance,
+                ceiling_policy: params.ceiling_policy,
+                ceiling: &scp_protocol::context::roles::CapabilityCeiling::new(
+                    params.ceiling.clone(),
+                ),
+            },
         )
         .expect("build test 0xFF02 extension")
+    }
+
+    /// The floors of `blob` (an [`actor_export`] of a [`test_ctx_ext`] group, or
+    /// empty for a keyless snapshot) after the real `0xFF02` binding check, the
+    /// only source of a `VerifiedFloors`.
+    fn verified_test_floors(
+        ctx: &[u8; 32],
+        blob: &[u8],
+    ) -> crate::context::restored_crypto::VerifiedFloors {
+        let restored = crate::context::restored_crypto::build_restored_crypto(ctx, blob, "test")
+            .expect("the blob rebuilds");
+        crate::context::restored_crypto::VerifiedRestoredCrypto::verify_scp_context_binding(
+            restored,
+            &hex::encode(ctx),
+            "",
+            &scp_protocol::context::ContextParams::default(),
+            1_700_000_000,
+            1_700_000_000,
+            "test",
+        )
+        .expect("the test_ctx_ext binding verifies")
+        .replace_floors()
     }
 
     /// #2148 (ADR-049 birth-into-actor): BIRTH an owned context group on `crypto`
@@ -23540,7 +23581,7 @@ mod tests {
         let result: Result<(), ContextError> = handle
             .send(|reply| {
                 ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
-                    mls_state: zeroize::Zeroizing::default(),
+                    floors: verified_test_floors(&ctx_id_bytes, &[]),
                     reply,
                 })
             })
@@ -23602,7 +23643,7 @@ mod tests {
         let result: Result<(), ContextError> = handle
             .send(|reply| {
                 ContextCommand::LifecycleControl(LifecycleControlCommand::PrepareForReplace {
-                    mls_state: zeroize::Zeroizing::default(),
+                    floors: verified_test_floors(&ctx_id_bytes, &[]),
                     reply,
                 })
             })
@@ -24980,6 +25021,693 @@ mod tests {
         assert!(
             persisted_log.is_none_or(|entries| entries.is_empty()),
             "a rejected future-dated import must not persist the foreign event log (F2)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Spec 05 §5.13.3 rule 9: import and restore install the committed T0.
+    // -----------------------------------------------------------------
+
+    /// The importer's and restorer's clock, and the creation timestamp the
+    /// rule-9 fixtures record.
+    const RULE9_T0: u64 = 1_700_000_000;
+
+    /// The sender whose epoch floor every keyed rule-9 fixture carries, so a
+    /// replay-floor merge from it shows up in the Supervisor's registry.
+    const RULE9_FLOOR_SENDER: &str = "did:key:rule9-floor-sender";
+
+    /// The epoch floor the keyed rule-9 fixtures carry for `RULE9_FLOOR_SENDER`.
+    const RULE9_FLOOR_EPOCH: u64 = 7;
+
+    /// How the rule-9 fixture's group commits `creation_timestamp_secs`.
+    enum CommittedT0 {
+        /// The extension commits this value.
+        Value(u64),
+        /// The extension omits the field.
+        Omitted,
+    }
+
+    /// A rule-9 snapshot of `context_id`, created by `creator` at `RULE9_T0`
+    /// under `params`, whose `mls_crypto_state` (when `committed` is `Some`) is
+    /// a group born on `sup`'s crypto with an `0xFF02` extension committing
+    /// `committed`. `None` yields a keyless (needs-reconnect) snapshot.
+    fn rule9_snapshot(
+        sup: &Arc<Supervisor>,
+        context_id: &str,
+        creator: &str,
+        params: &scp_protocol::context::ContextParams,
+        committed: Option<CommittedT0>,
+    ) -> crate::context::state::ContextSnapshot {
+        let mut snapshot = import_test_snapshot(context_id, creator);
+        snapshot.context_params = params.clone();
+        snapshot.creation_timestamp_secs = RULE9_T0;
+        snapshot.routing =
+            crate::context::actor::state::ContextRouting::for_mode(false, [0x5a; 32]);
+        let Some(committed) = committed else {
+            return snapshot;
+        };
+        let honest = scp_protocol::context::ScpContextExtension::for_root(
+            scp_protocol::context::ScpContextGenesis {
+                context_id: context_id.to_owned(),
+                creator_did: DID(creator.to_owned()),
+                creation_timestamp_secs: RULE9_T0,
+                mode: params.mode,
+                governance: &params.governance,
+                ceiling_policy: params.ceiling_policy,
+                ceiling: &scp_protocol::context::roles::CapabilityCeiling::new(
+                    params.ceiling.clone(),
+                ),
+            },
+        )
+        .expect("honest extension");
+        let mut json = serde_json::to_value(&honest).expect("extension to JSON");
+        let fields = json.as_object_mut().expect("extension is a JSON object");
+        match committed {
+            CommittedT0::Value(t0) => {
+                fields.insert("creation_timestamp_secs".to_owned(), t0.into());
+            }
+            CommittedT0::Omitted => {
+                fields.remove("creation_timestamp_secs");
+            }
+        }
+        let crypto = sup.crypto_ref().expect("test supervisor has crypto");
+        let owned = crypto
+            .create_mls_group_with_raw_context_params(
+                serde_json::to_vec(&json).expect("extension bytes"),
+                scp_protocol::crypto::sender_keys::generate_wrapping_keypair()
+                    .0
+                    .as_bytes(),
+            )
+            .expect("birth the fixture group");
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            crate::context::state::context_id_to_bytes(context_id),
+            RULE9_T0,
+            DID::from(crypto.local_did().to_owned()),
+        );
+        state.seed_encrypted_crypto_from_owned(owned);
+        snapshot.mls_crypto_state = crate::context::state::MlsCryptoState(
+            state
+                .export_crypto_state(
+                    vec![(RULE9_FLOOR_SENDER.to_owned(), RULE9_FLOOR_EPOCH)],
+                    Vec::new(),
+                )
+                .expect("export the fixture group"),
+        );
+        snapshot
+    }
+
+    /// A signed full export of `snapshot`, with a one-leaf event log, and the
+    /// key that verifies it.
+    async fn rule9_export(
+        snapshot: crate::context::state::ContextSnapshot,
+    ) -> (
+        crate::context::export_import::ContextExport,
+        ed25519_dalek::VerifyingKey,
+    ) {
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&snapshot.context_id);
+        let creator = snapshot.role_state.creator_did.clone();
+        let event_log_data =
+            create_event_log_data(&ctx_id_bytes, &[scp_event_log::EventType::ContextCreated]).await;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[19u8; 32]);
+        let export = crate::context::export_import::create_export(
+            snapshot,
+            event_log_data,
+            DID(creator),
+            crate::context::export_import::ExportScope::Full,
+            &scp_clock::SystemClock,
+            |hash: &[u8; 32]| {
+                use ed25519_dalek::Signer;
+                Ok::<_, scp_crypto::CustodyFailure>(signing_key.sign(hash).to_bytes())
+            },
+        )
+        .expect("build a valid signed full export");
+        (export, signing_key.verifying_key())
+    }
+
+    /// The rule-9 context parameters: an hourly interval policy and a five-hour
+    /// TTL, so a deadline counted from `RULE9_T0` still lies ahead of a clock at
+    /// `RULE9_T0 + 9_000`.
+    fn rule9_params() -> scp_protocol::context::ContextParams {
+        scp_protocol::context::ContextParams {
+            pseudonym_rotation: Some(scp_protocol::context::params::PseudonymRotationPolicy {
+                interval_secs: Some(3_600),
+                on_membership_change: false,
+            }),
+            ttl: Some(std::time::Duration::from_secs(RULE9_TTL_SECS)),
+            ..Default::default()
+        }
+    }
+
+    /// The rule-9 TTL.
+    const RULE9_TTL_SECS: u64 = 18_000;
+
+    /// Imports a rule-9 export whose group commits `committed`, and asserts the
+    /// import is refused with a reason naming `reason_part`, leaving no actor
+    /// and no persisted snapshot.
+    async fn assert_import_refuses_committed_t0(
+        seed: u8,
+        committed: CommittedT0,
+        reason_part: &str,
+    ) {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            Arc::new(TestClock::new(RULE9_T0)),
+            Box::new(persistence),
+        );
+        let context_id = hex::encode([seed; 32]);
+        let snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-import-creator",
+            &rule9_params(),
+            Some(committed),
+        );
+        let (export, verifying_key) = rule9_export(snapshot).await;
+        let err = sup
+            .import_context(export, &verifying_key, None)
+            .await
+            .expect_err("the import must be refused");
+        let ContextError::ImportRejected { reason } = &err else {
+            panic!("expected ImportRejected, got {err:?}");
+        };
+        assert!(
+            reason.contains("context import refused") && reason.contains(reason_part),
+            "{reason}"
+        );
+        assert!(
+            sup.lookup(&context_id).is_none(),
+            "no actor may be registered"
+        );
+        assert!(contexts.is_empty(), "no snapshot may be persisted");
+        assert!(
+            sup.export_sender_key_epochs(&crate::context::state::context_id_to_bytes(&context_id))
+                .is_empty(),
+            "a refused import must merge no replay floor into the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_refuses_an_extension_without_a_creation_timestamp() {
+        assert_import_refuses_committed_t0(0x91, CommittedT0::Omitted, "creation_timestamp_secs")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn import_refuses_a_committed_creation_timestamp_above_two_to_the_53_minus_one() {
+        assert_import_refuses_committed_t0(
+            0x92,
+            CommittedT0::Value(scp_protocol::context::MAX_CREATION_TIMESTAMP_SECS + 1),
+            "exceeds 2^53 - 1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn import_refuses_a_committed_creation_timestamp_beyond_the_future_bound() {
+        assert_import_refuses_committed_t0(
+            0x93,
+            CommittedT0::Value(
+                RULE9_T0 + scp_protocol::context::CREATION_TIMESTAMP_FUTURE_BOUND_SECS + 1,
+            ),
+            "lies more than 300 s",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn import_refuses_a_snapshot_whose_creation_timestamp_differs_from_the_committed_one() {
+        assert_import_refuses_committed_t0(
+            0x94,
+            CommittedT0::Value(RULE9_T0 - 60),
+            "the snapshot records creation timestamp",
+        )
+        .await;
+    }
+
+    /// §5.13.3 rule 9 checked before any side effect: an import whose snapshot
+    /// records a creation timestamp other than the committed `T0` is refused
+    /// before the replay-floor merge, so the registry holds no floor for the
+    /// context afterwards although the export carries one.
+    #[tokio::test]
+    async fn a_refused_import_merges_no_replay_floor() {
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            Arc::new(TestClock::new(RULE9_T0)),
+            Box::new(MapPersistence::default()),
+        );
+        let context_id = hex::encode([0x97; 32]);
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-import-creator",
+            &rule9_params(),
+            Some(CommittedT0::Value(RULE9_T0 - 60)),
+        );
+        let (export, verifying_key) = rule9_export(snapshot).await;
+        let err = sup
+            .import_context(export, &verifying_key, None)
+            .await
+            .expect_err("a T0 mismatch must be refused");
+        assert!(
+            matches!(&err, ContextError::ImportRejected { reason }
+                if reason.contains("the snapshot records creation timestamp")),
+            "expected the rule-9 refusal, got {err:?}"
+        );
+        assert_eq!(
+            sup.export_sender_key_epochs(&ctx_id_bytes),
+            Vec::<(String, u64)>::new(),
+            "the refused import must leave the registry's replay floors unchanged"
+        );
+    }
+
+    /// §5.13.3 rule 9 checked before any side effect: an import over a
+    /// replaceable (Closing) prior actor that is refused for a `T0` mismatch
+    /// never reaches `PrepareForReplace`, so the prior actor stays registered
+    /// and keeps answering, and the registry holds no floor from the export.
+    #[tokio::test]
+    async fn a_refused_import_leaves_a_replaceable_prior_actor_live() {
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            Arc::new(TestClock::new(RULE9_T0)),
+            Box::new(MapPersistence::default()),
+        );
+        let context_id = hex::encode([0x98; 32]);
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let prior = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            RULE9_T0,
+            DID("did:example:rule9-prior-admin".to_owned()),
+        );
+        prior
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .expect("drive the prior context to Active");
+        prior
+            .handle
+            .transition_to(&crate::context::ContextState::Closing)
+            .expect("drive the prior context to Closing, which an import may replace");
+        let deps = test_actor_deps(&sup).await;
+        let prior_handle = sup
+            .spawn_actor_with_state(prior, deps, None)
+            .await
+            .expect("spawn registers the prior context");
+
+        let snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-import-creator",
+            &rule9_params(),
+            Some(CommittedT0::Value(RULE9_T0 - 60)),
+        );
+        let (export, verifying_key) = rule9_export(snapshot).await;
+        let err = sup
+            .import_context(export, &verifying_key, None)
+            .await
+            .expect_err("a T0 mismatch must be refused");
+        assert!(
+            matches!(&err, ContextError::ImportRejected { reason }
+                if reason.contains("the snapshot records creation timestamp")),
+            "expected the rule-9 refusal, got {err:?}"
+        );
+        assert!(
+            sup.lookup(&context_id).is_some(),
+            "the refused import must not despawn the prior actor"
+        );
+        let member_count: Result<Option<usize>, ContextError> = prior_handle
+            .send(|reply| {
+                ContextCommand::Queries(QueriesCommand::MemberCount {
+                    context_id: context_id.clone(),
+                    reply,
+                })
+            })
+            .await;
+        assert!(
+            member_count.is_ok(),
+            "the prior actor must not have claimed itself terminal, got {member_count:?}"
+        );
+        assert_eq!(
+            sup.export_sender_key_epochs(&ctx_id_bytes),
+            Vec::<(String, u64)>::new(),
+            "the refused import must leave the registry's replay floors unchanged"
+        );
+    }
+
+    /// Drops the stored snapshot of `context_id`, flushes `sup`'s live contexts,
+    /// and returns the TTL deadline the fresh snapshot records.
+    async fn persisted_ttl_deadline(
+        sup: &Supervisor,
+        contexts: &DashMap<String, crate::context::state::ContextSnapshot>,
+        context_id: &str,
+    ) -> u64 {
+        contexts.remove(context_id);
+        sup.flush_all_contexts().await.expect("flush");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(deadline) = contexts
+                    .get(context_id)
+                    .and_then(|s| s.value().ttl_deadline_secs)
+                {
+                    return deadline;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the TTL deadline is persisted")
+    }
+
+    /// §5.13.3 rule 9: a keyed import follows the interval schedule counted from
+    /// the committed `T0` and arms its TTL at `T0 + ttl`. The importer's clock
+    /// sits 2.5 intervals after `T0`, so the first v2 epoch is 2.
+    #[tokio::test]
+    async fn a_keyed_import_installs_the_committed_creation_timestamp() {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            Arc::new(TestClock::new(RULE9_T0 + 9_000)),
+            Box::new(persistence),
+        );
+        let context_id = hex::encode([0x95; 32]);
+        let snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-import-creator",
+            &rule9_params(),
+            Some(CommittedT0::Value(RULE9_T0)),
+        );
+        let (export, verifying_key) = rule9_export(snapshot).await;
+        sup.import_context(export, &verifying_key, None)
+            .await
+            .expect("an honest keyed export imports");
+        let ids = sup
+            .local_routing_ids(&context_id)
+            .await
+            .expect("the imported context's routing ids");
+        assert_eq!(ids.next_pseudonym_epoch, Some(2));
+        assert_eq!(
+            persisted_ttl_deadline(&sup, &contexts, &context_id).await,
+            RULE9_T0 + RULE9_TTL_SECS
+        );
+    }
+
+    /// §5.13.3 rule 9, keyless clause: a keyless import installs no `T0`, so
+    /// under an interval policy no rotation is admissible, and its local TTL
+    /// close uses the deadline its snapshot records (`creation + ttl`).
+    #[tokio::test]
+    async fn a_keyless_import_installs_no_creation_timestamp_and_keeps_its_snapshot_deadline() {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_persistence_and_merkle_log(
+            Arc::new(TestClock::new(RULE9_T0 + 9_000)),
+            Box::new(persistence),
+        );
+        let context_id = hex::encode([0x96; 32]);
+        let snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-import-creator",
+            &rule9_params(),
+            None,
+        );
+        let (export, verifying_key) = rule9_export(snapshot).await;
+        sup.import_context(export, &verifying_key, None)
+            .await
+            .expect("a keyless export imports");
+        let ids = sup
+            .local_routing_ids(&context_id)
+            .await
+            .expect("the imported context's routing ids");
+        assert_eq!(ids.next_pseudonym_epoch, None);
+        assert_eq!(
+            persisted_ttl_deadline(&sup, &contexts, &context_id).await,
+            RULE9_T0 + RULE9_TTL_SECS
+        );
+    }
+
+    /// Persists a rule-9 snapshot of a fresh context whose group commits
+    /// `committed` (keyless when `None`), restores it, and returns the restore
+    /// outcome with the supervisor, the persisted map, the context id, and the
+    /// JSON of the snapshot as stored before the restore.
+    async fn rule9_restore(
+        seed: u8,
+        committed: Option<CommittedT0>,
+        snapshot_t0: u64,
+        clock_secs: u64,
+    ) -> (
+        Result<(), ContextError>,
+        Arc<Supervisor>,
+        Arc<DashMap<String, crate::context::state::ContextSnapshot>>,
+        String,
+        serde_json::Value,
+    ) {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(clock_secs)),
+            Box::new(persistence),
+        );
+        let context_id = hex::encode([seed; 32]);
+        let mut snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-restore-creator",
+            &rule9_params(),
+            committed,
+        );
+        snapshot.creation_timestamp_secs = snapshot_t0;
+        let stored = serde_json::to_value(&snapshot).expect("snapshot to JSON");
+        contexts.insert(context_id.clone(), snapshot);
+        let handle = crate::context::ContextHandle::new(context_id.clone(), rule9_params());
+        let result = sup.restore_context(&context_id, &handle).await;
+        (result, sup, contexts, context_id, stored)
+    }
+
+    /// Restores a rule-9 snapshot whose group commits `committed`, and asserts
+    /// the restore is refused with a reason naming `reason_part`, leaving no
+    /// actor and the stored snapshot unchanged.
+    async fn assert_restore_refuses_committed_t0(
+        seed: u8,
+        committed: CommittedT0,
+        snapshot_t0: u64,
+        reason_part: &str,
+    ) {
+        let (result, sup, contexts, context_id, stored) =
+            rule9_restore(seed, Some(committed), snapshot_t0, RULE9_T0).await;
+        let err = result.expect_err("the restore must be refused");
+        let ContextError::PersistenceFailed(reason) = &err else {
+            panic!("expected PersistenceFailed, got {err:?}");
+        };
+        assert!(
+            reason.contains("context restore refused") && reason.contains(reason_part),
+            "{reason}"
+        );
+        assert!(
+            sup.lookup(&context_id).is_none(),
+            "no actor may be registered"
+        );
+        assert_eq!(contexts.len(), 1, "no other snapshot may be persisted");
+        assert_eq!(
+            serde_json::to_value(contexts.get(&context_id).expect("stored snapshot").value())
+                .expect("snapshot to JSON"),
+            stored,
+            "the refused restore must not rewrite the stored snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_an_extension_without_a_creation_timestamp() {
+        assert_restore_refuses_committed_t0(
+            0xA1,
+            CommittedT0::Omitted,
+            RULE9_T0,
+            "creation_timestamp_secs",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_committed_creation_timestamp_above_two_to_the_53_minus_one() {
+        assert_restore_refuses_committed_t0(
+            0xA2,
+            CommittedT0::Value(scp_protocol::context::MAX_CREATION_TIMESTAMP_SECS + 1),
+            RULE9_T0,
+            "exceeds 2^53 - 1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_committed_creation_timestamp_beyond_the_future_bound() {
+        let future = RULE9_T0 + scp_protocol::context::CREATION_TIMESTAMP_FUTURE_BOUND_SECS + 1;
+        assert_restore_refuses_committed_t0(
+            0xA3,
+            CommittedT0::Value(future),
+            future,
+            "lies more than 300 s",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_snapshot_whose_creation_timestamp_differs_from_the_committed_one() {
+        assert_restore_refuses_committed_t0(
+            0xA4,
+            CommittedT0::Value(RULE9_T0),
+            RULE9_T0 + 60,
+            "the snapshot records creation timestamp",
+        )
+        .await;
+    }
+
+    /// Counts `restore_event_log` and `init_event_log` calls; every call is a
+    /// success no-op.
+    #[derive(Clone, Default)]
+    struct EventLogHydrationCounter {
+        hydrations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for EventLogHydrationCounter {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.hydrations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn restore_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            self.hydrations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// §5.13.3 rule 9 checked before any side effect: a restore whose snapshot
+    /// records a creation timestamp other than the committed `T0` is refused
+    /// before the event log is hydrated and before the replay-floor merge.
+    #[tokio::test]
+    async fn a_refused_restore_hydrates_no_event_log_and_merges_no_replay_floor() {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let counter = EventLogHydrationCounter::default();
+        let sup = supervisor_with_clock_persistence_and_event_log(
+            Arc::new(TestClock::new(RULE9_T0)),
+            Box::new(persistence),
+            Box::new(counter.clone()),
+        );
+        let context_id = hex::encode([0xA7; 32]);
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
+        let mut snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-restore-creator",
+            &rule9_params(),
+            Some(CommittedT0::Value(RULE9_T0)),
+        );
+        snapshot.creation_timestamp_secs = RULE9_T0 + 60;
+        contexts.insert(context_id.clone(), snapshot);
+        let handle = crate::context::ContextHandle::new(context_id.clone(), rule9_params());
+        let err = sup
+            .restore_context(&context_id, &handle)
+            .await
+            .expect_err("a T0 mismatch must be refused");
+        assert!(
+            matches!(&err, ContextError::PersistenceFailed(reason)
+                if reason.contains("the snapshot records creation timestamp")),
+            "expected the rule-9 refusal, got {err:?}"
+        );
+        assert_eq!(
+            counter.hydrations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refused restore must leave the event log unhydrated"
+        );
+        assert_eq!(
+            sup.export_sender_key_epochs(&ctx_id_bytes),
+            Vec::<(String, u64)>::new(),
+            "the refused restore must leave the registry's replay floors unchanged"
+        );
+    }
+
+    /// §5.13.3 rule 9: a keyed restore follows the interval schedule counted
+    /// from the committed `T0` and arms its TTL at `T0 + ttl`.
+    #[tokio::test]
+    async fn a_keyed_restore_installs_the_committed_creation_timestamp() {
+        let (result, sup, contexts, context_id, _) = rule9_restore(
+            0xA5,
+            Some(CommittedT0::Value(RULE9_T0)),
+            RULE9_T0,
+            RULE9_T0 + 9_000,
+        )
+        .await;
+        result.expect("an honest keyed snapshot restores");
+        let ids = sup
+            .local_routing_ids(&context_id)
+            .await
+            .expect("the restored context's routing ids");
+        assert_eq!(ids.next_pseudonym_epoch, Some(2));
+        assert_eq!(
+            persisted_ttl_deadline(&sup, &contexts, &context_id).await,
+            RULE9_T0 + RULE9_TTL_SECS
+        );
+    }
+
+    /// §5.13.3 rule 9, keyless clause: a keyless restore installs no `T0`, even
+    /// when its persisted rotation state holds one, and its local TTL close
+    /// uses the deadline its snapshot records.
+    #[tokio::test]
+    async fn a_keyless_restore_installs_no_creation_timestamp_and_keeps_its_snapshot_deadline() {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(RULE9_T0 + 9_000)),
+            Box::new(persistence),
+        );
+        let context_id = hex::encode([0xA6; 32]);
+        let mut snapshot = rule9_snapshot(
+            &sup,
+            &context_id,
+            "did:key:rule9-restore-creator",
+            &rule9_params(),
+            None,
+        );
+        snapshot.pseudonym_rotation =
+            crate::context::actor::pseudonym_rotation::PseudonymRotationState::anchored(
+                rule9_params().pseudonym_rotation.as_ref(),
+                Some(RULE9_T0),
+                RULE9_T0,
+            );
+        contexts.insert(context_id.clone(), snapshot);
+        let handle = crate::context::ContextHandle::new(context_id.clone(), rule9_params());
+        sup.restore_context(&context_id, &handle)
+            .await
+            .expect("a keyless snapshot restores");
+        let ids = sup
+            .local_routing_ids(&context_id)
+            .await
+            .expect("the restored context's routing ids");
+        assert_eq!(ids.next_pseudonym_epoch, None);
+        assert_eq!(
+            persisted_ttl_deadline(&sup, &contexts, &context_id).await,
+            RULE9_T0 + RULE9_TTL_SECS
         );
     }
 
@@ -26743,20 +27471,27 @@ mod tests {
         // (see `new_for_test_encrypted`), and its `context_id` is `ctx_key`, so
         // the extension is bound to precisely those values.
         let ctx_params = scp_protocol::context::ContextParams::default();
+        // The committed genesis creator must equal the snapshot's
+        // `role_state.creator_did` so the restore-time §5.13.3 rule-8 creator
+        // binding passes on this legitimate self-respawn. The state below is
+        // built via `new_for_test_encrypted`, whose `role_state` is the empty
+        // test role state (`ContextRoleState::empty_for_test`, `creator_did =
+        // ""`) — so the honest committed creator here is the same empty DID
+        // the snapshot carries. The committed creation timestamp equals the
+        // `created_at` the state is built with, which the snapshot records
+        // (§5.13.3 rule 9).
+        let ctx_ceiling =
+            scp_protocol::context::roles::CapabilityCeiling::new(ctx_params.ceiling.clone());
         let ctx_extension = scp_protocol::context::ScpContextExtension::for_root(
-            ctx_key.clone(),
-            // The committed genesis creator must equal the snapshot's
-            // `role_state.creator_did` so the restore-time §5.13.3 rule-8 creator
-            // binding passes on this legitimate self-respawn. The state below is
-            // built via `new_for_test_encrypted`, whose `role_state` is the empty
-            // test role state (`ContextRoleState::empty_for_test`, `creator_did =
-            // ""`) — so the honest committed creator here is the same empty DID
-            // the snapshot carries.
-            DID(String::new()),
-            ctx_params.mode,
-            &ctx_params.governance,
-            ctx_params.ceiling_policy,
-            &scp_protocol::context::roles::CapabilityCeiling::new(ctx_params.ceiling.clone()),
+            scp_protocol::context::ScpContextGenesis {
+                context_id: ctx_key.clone(),
+                creator_did: DID(String::new()),
+                creation_timestamp_secs: 1_700_000_000,
+                mode: ctx_params.mode,
+                governance: &ctx_params.governance,
+                ceiling_policy: ctx_params.ceiling_policy,
+                ceiling: &ctx_ceiling,
+            },
         )
         .expect("build scp_context_params (0xFF02) extension for respawn fixture");
 
@@ -26921,7 +27656,7 @@ mod tests {
         crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &fresh_deps,
             &ctx,
-            &blob,
+            &verified_test_floors(&ctx, &blob),
             true,
         )
         .expect("cold restore must SUCCEED and populate the empty registry");
@@ -27034,7 +27769,7 @@ mod tests {
         let err = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &importer_deps,
             &ctx,
-            &blob,
+            &verified_test_floors(&ctx, &blob),
             false,
         )
         .expect_err("a regressing untrusted import must be rejected");
@@ -27115,7 +27850,7 @@ mod tests {
         crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &fresh_deps,
             &ctx,
-            &blob,
+            &verified_test_floors(&ctx, &blob),
             true,
         )
         .expect("a high-epoch (>MAX_EPOCH_ADVANCE) context must restore under trusted-local");
@@ -27206,7 +27941,7 @@ mod tests {
         let err = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
             &importer_deps,
             &ctx,
-            &blob,
+            &verified_test_floors(&ctx, &blob),
             false,
         )
         .expect_err("a recv-floor regression on an untrusted import must be rejected");

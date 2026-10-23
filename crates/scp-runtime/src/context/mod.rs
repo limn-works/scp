@@ -55,6 +55,7 @@ pub mod policy;
 pub mod providers;
 pub(crate) mod push_helpers;
 pub(crate) mod queries_helpers;
+pub mod restored_crypto;
 pub(crate) mod standing_helpers;
 pub mod state;
 pub mod supervisor;
