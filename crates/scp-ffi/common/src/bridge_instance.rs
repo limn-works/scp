@@ -83,6 +83,55 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+/// The result of [`CoreFields::dial_relays`]: a transport manager holding
+/// every relay that connected, not yet installed on the bridge.
+pub struct DialedRelays {
+    /// The relays that connected, registered sorted by URL. Empty when every
+    /// dial failed. Dropping it closes every socket.
+    pub manager: scp_transport::TransportManager,
+    /// The first per-URL dial failure or dial-task panic, if any.
+    pub first_failure: Option<LifecycleError>,
+    /// Whether a dial task panicked, which is a defect, not a routine dial
+    /// failure.
+    pub any_task_panicked: bool,
+}
+
+/// Registers each connected adapter of `results` in one transport manager,
+/// sorted by URL so the adapter order does not depend on network timing, and
+/// records the first dial failure in `first_failure` when none is set.
+fn register_dialed(
+    mut results: Vec<(
+        String,
+        Result<scp_transport::native::adapter::NativeRelayAdapter, String>,
+    )>,
+    first_failure: &mut Option<LifecycleError>,
+) -> scp_transport::TransportManager {
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut manager = scp_transport::TransportManager::builder();
+    for (url, outcome) in results {
+        match outcome {
+            Ok(adapter) => {
+                // The manager records `url` with the adapter, so a budget
+                // eviction here removes the evicted relay from the set
+                // `context_relay_urls` reads in the same operation.
+                if let Some(eviction) = manager.add_adapter(url, Box::new(adapter)) {
+                    tracing::info!(
+                        evicted_relay_url = %eviction.evicted_relay_url,
+                        "dial_relays: connection budget evicted a relay"
+                    );
+                }
+            }
+            Err(reason) => {
+                tracing::warn!(url = %url, error = %reason, "dial_relays: relay dial failed");
+                if first_failure.is_none() {
+                    *first_failure = Some(LifecycleError::ReconnectFailed { url, reason });
+                }
+            }
+        }
+    }
+    manager
+}
+
 /// Per-URL timeout for the parallel relay reconnect pass in
 /// [`CoreFields::reconnect_transport_if_pending`]. Bounds the worst case
 /// when a single slow (or attacker-controlled) relay would otherwise
@@ -654,6 +703,16 @@ pub struct CoreFields {
     /// bridge-level suspend/resume coordination without separate storage.
     persistence: Option<Arc<dyn ContextPersistence + Send + Sync>>,
 
+    /// The store of each context's last successful relay contact (ADR-029
+    /// key `sync/{context_id}/last_relay_contact`): a view of the bridge's
+    /// own protocol repository, so the key lands in the backend the caller
+    /// chose (spec §17.6). Set at construction by
+    /// [`Self::with_persistence_arc`], or once by
+    /// [`Self::set_relay_contact_store`] for a bridge that builds its
+    /// repository after `CoreFields`. Unset on a bridge with no repository,
+    /// where every reader fails closed.
+    relay_contacts: OnceLock<Arc<dyn scp_core::store::sync::RelayContactStore>>,
+
     // -----------------------------------------------------------------
     // Relay URLs — for resume after suspend (multi-URL since #1678)
     // -----------------------------------------------------------------
@@ -842,6 +901,7 @@ impl CoreFields {
             resolver_cache: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: None,
+            relay_contacts: OnceLock::new(),
             relay_urls: Mutex::new(HashSet::new()),
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
@@ -895,9 +955,14 @@ impl CoreFields {
     ///   `Arc` internally so
     ///   [`persistence_arc_clone`](Self::persistence_arc_clone) can hand
     ///   the same provider to downstream consumers.
+    /// - `relay_contacts` — the last-relay-contact store over the same
+    ///   repository (see [`Self::relay_contact_store`]).
     #[must_use]
-    pub fn with_persistence(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
-        Self::with_persistence_arc(Arc::from(persistence))
+    pub fn with_persistence(
+        persistence: Box<dyn ContextPersistence + Send + Sync>,
+        relay_contacts: Arc<dyn scp_core::store::sync::RelayContactStore>,
+    ) -> Self {
+        Self::with_persistence_arc(Arc::from(persistence), relay_contacts)
     }
 
     /// Creates a new `CoreFields` with a shared persistence provider.
@@ -912,8 +977,13 @@ impl CoreFields {
     /// # Arguments
     ///
     /// - `persistence` — shared persistence provider.
+    /// - `relay_contacts` — the last-relay-contact store over the same
+    ///   repository (see [`Self::relay_contact_store`]).
     #[must_use]
-    pub fn with_persistence_arc(persistence: Arc<dyn ContextPersistence + Send + Sync>) -> Self {
+    pub fn with_persistence_arc(
+        persistence: Arc<dyn ContextPersistence + Send + Sync>,
+        relay_contacts: Arc<dyn scp_core::store::sync::RelayContactStore>,
+    ) -> Self {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
@@ -932,6 +1002,7 @@ impl CoreFields {
             resolver_cache: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: Some(persistence),
+            relay_contacts: OnceLock::from(relay_contacts),
             relay_urls: Mutex::new(HashSet::new()),
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
@@ -946,6 +1017,29 @@ impl CoreFields {
             node_binding: Mutex::new(None),
             stream_registration_closed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Installs the last-relay-contact store on a bridge that built its
+    /// protocol repository after `CoreFields` (the `PyO3` in-memory path).
+    ///
+    /// # Errors
+    ///
+    /// Returns the rejected store when one is already installed, so a second
+    /// repository cannot replace the first.
+    pub fn set_relay_contact_store(
+        &self,
+        store: Arc<dyn scp_core::store::sync::RelayContactStore>,
+    ) -> Result<(), Arc<dyn scp_core::store::sync::RelayContactStore>> {
+        self.relay_contacts.set(store)
+    }
+
+    /// The store of each context's last successful relay contact (ADR-029
+    /// key `sync/{context_id}/last_relay_contact`), or `None` on a bridge
+    /// with no protocol repository. A caller that needs the key treats
+    /// `None` as a failure and never substitutes a store.
+    #[must_use]
+    pub fn relay_contact_store(&self) -> Option<Arc<dyn scp_core::store::sync::RelayContactStore>> {
+        self.relay_contacts.get().cloned()
     }
 
     /// Returns the monotonic identifier assigned to this instance at
@@ -2082,76 +2176,39 @@ impl CoreFields {
         self.relay_urls.lock().is_ok_and(|guard| !guard.is_empty())
     }
 
-    /// Reconnects every pending relay URL registered via [`Self::add_relay_url`].
+    /// Dials every URL in `urls` on its own [`scp_transport::TransportManager`]
+    /// and returns it without installing it, with the first dial failure.
     ///
-    /// Iterates the deduplicated snapshot from [`Self::pending_relay_urls`], calls
-    /// `NativeRelayAdapter::connect_sourced` (source = `Explicit`) for each
-    /// URL, registers each adapter with its URL in one
-    /// [`scp_transport::TransportManager`], and installs it, leaving the
-    /// reconnect set as it was. Called from the
-    /// `BridgeInstanceCore::resume` default body after the core flag flip.
+    /// Each URL is dialed in parallel with source `Explicit`, the
+    /// platform-default transport profile, and a 5-second per-URL bound
+    /// (`RECONNECT_PER_URL_TIMEOUT`, red-hat RED-1003), so one slow or
+    /// attacker-controlled relay cannot stall the others. `cover` selects
+    /// whether each adapter starts cover traffic: the resume reconnect passes
+    /// [`CoverTraffic::FromProfile`](scp_transport::native::adapter::CoverTraffic::FromProfile),
+    /// and the push-wake pull passes
+    /// [`CoverTraffic::Off`](scp_transport::native::adapter::CoverTraffic::Off)
+    /// because it publishes nothing (ADR-025 criterion 4).
     ///
-    /// Collects every failure and returns the first as
-    /// [`LifecycleError::ReconnectFailed`] so the caller sees a real error.
-    /// Successfully-reconnected URLs remain in the pending set — the caller
-    /// is free to retry a failing URL directly via `transport_connect`.
-    ///
-    /// No-ops when the pending set is empty (e.g. a bridge that never
-    /// connected a relay in the first place, or a test-only resume cycle).
-    /// No-ops when the instance is shut down.
-    ///
-    /// Each reconnect uses the platform-default transport profile so that
-    /// cover traffic, heartbeat, and suppression monitoring auto-start with
-    /// matching behaviour to the original `transport_connect` call.
+    /// Every dial races the current reconnect-generation cancellation token,
+    /// which `suspend()` rotates and `shutdown()` cancels. A cancel
+    /// mid-dial aborts every in-flight connect, so no half-open socket
+    /// outlives the call; a cancel after the last dial drops the connected
+    /// adapters. Adapters are registered sorted by URL, so the manager's
+    /// adapter order does not depend on network timing.
     ///
     /// # Errors
     ///
-    /// Returns [`LifecycleError::ReconnectFailed`] carrying the first URL
-    /// that failed plus a redacted reason. Shutdown state short-circuits
-    /// with [`LifecycleError::AlreadyShutDown`] rather than attempting
-    /// reconnects against a torn-down instance.
-    ///
-    /// When reconnect was cancelled by a concurrent `suspend()` /
-    /// `shutdown()`, the `reason` field explicitly states "suspended
-    /// during reconnect" (empty `url`) so callers can distinguish a
-    /// suspend race from a dial / TLS / handshake failure. Non-cancel
-    /// failures carry the underlying connect error verbatim.
-    // Line-count waiver: dial spawn + cancel-aware collect + deterministic
-    // install phase form a single atomic operation. Splitting it across
-    // helpers (simplifier #1) lost the linear reading of the suspend/cancel
-    // invariants — keep it inline instead.
-    #[allow(clippy::too_many_lines)]
-    pub async fn reconnect_transport_if_pending(&self) -> Result<(), LifecycleError> {
-        if self.is_shutdown() {
-            return Err(LifecycleError::AlreadyShutDown);
-        }
-        let urls = self.pending_relay_urls();
-        if urls.is_empty() {
-            return Ok(());
-        }
-        // #1696: snapshot the current reconnect-generation cancellation
-        // token once, at entry, and race every dial against it. If
-        // `suspend()` fires mid-dial, `token.cancelled()` wakes and we
-        // abort the whole reconnect — any in-flight
-        // `NativeRelayAdapter::connect_sourced` future is dropped, so
-        // its socket teardown happens before we return instead of
-        // leaking an unowned adapter.
+    /// [`LifecycleError::ReconnectFailed`] with an empty `url` when the
+    /// cancellation token fires during or after the dials. Per-URL failures
+    /// and dial-task panics do not fail the call: the first one is returned
+    /// in [`DialedRelays::first_failure`].
+    pub async fn dial_relays(
+        &self,
+        urls: Vec<String>,
+        cover: scp_transport::native::adapter::CoverTraffic,
+    ) -> Result<DialedRelays, LifecycleError> {
         let cancel = self.reconnect_cancel_token();
         let profile = scp_transport::profile::TransportProfile::platform_default();
-        // Build ONE TransportManager and register every successful adapter
-        // in it. `TransportManager::new(relay_url, adapter)` creates a
-        // manager holding a single relay URL and its adapter, so calling it
-        // in a loop and set_transport'ing each time would keep only the last
-        // URL's adapter. Using `builder()` + `add_adapter(relay_url, adapter)`
-        // preserves multi-relay semantics.
-        //
-        // Dial every URL in parallel with a per-URL timeout. A serial loop
-        // would let a single slow (or attacker-controlled) relay stall
-        // reconnect against every remaining relay in the pending set —
-        // reducing the multi-relay tolerance the caller paid for to the
-        // slowest link. A 5s ceiling per URL bounds the worst case while
-        // still accommodating real-world TLS + relay handshake overhead.
-        // See red-hat RED-1003.
         let mut join_set: tokio::task::JoinSet<(
             String,
             Result<scp_transport::native::adapter::NativeRelayAdapter, String>,
@@ -2161,14 +2218,13 @@ impl CoreFields {
                 url: url.clone(),
                 source: scp_transport::relay::connection::RelayUrlSource::Explicit,
             };
-            let profile_for_task = profile; // TransportProfile is Copy
-            let url_for_task = url.clone();
             join_set.spawn(async move {
                 let outcome = match tokio::time::timeout(
                     RECONNECT_PER_URL_TIMEOUT,
-                    scp_transport::native::adapter::NativeRelayAdapter::connect_sourced(
+                    scp_transport::native::adapter::NativeRelayAdapter::connect_sourced_with_cover(
                         &sourced,
-                        Some(&profile_for_task),
+                        Some(&profile),
+                        cover,
                     ),
                 )
                 .await
@@ -2180,34 +2236,20 @@ impl CoreFields {
                         RECONNECT_PER_URL_TIMEOUT.as_secs()
                     )),
                 };
-                (url_for_task, outcome)
+                (url, outcome)
             });
         }
-        // Collect every result, racing against the reconnect-generation
-        // cancel token. If `suspend()` / `shutdown()` fires while dials are
-        // outstanding, abort the whole set so in-flight
-        // `NativeRelayAdapter::connect_sourced` futures are dropped and
-        // their partial sockets torn down (#1696) rather than ending up
-        // as unowned `NativeRelayAdapter` instances.
         let mut results: Vec<(String, Result<_, _>)> = Vec::new();
-        // Track the first panic so callers don't see a silent success when
-        // every spawned dial task panicked (leaving `results` empty).
-        // Without this, the install phase below would return `Ok(())`
-        // despite no adapters being installed — a split-brain where
-        // `resume()` reports success but transport is broken.
-        let mut first_panic_failure: Option<LifecycleError> = None;
-        // Separate boolean so the partial-success log emission downstream
-        // can flag `panicked = true` without having to parse
-        // `first_failure`'s reason string. Used for log-based alerting
-        // (bug-catcher L1): a panic inside a `tokio::spawn` is a defect,
-        // not an expected dial failure, and should page.
+        // The first panic seeds `first_failure`, so a set whose every dial
+        // task panicked (empty `results`) is not read as a silent success.
+        let mut first_failure: Option<LifecycleError> = None;
         let mut any_task_panicked = false;
         loop {
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     tracing::debug!(
-                        "reconnect_transport_if_pending: cancelled mid-dial — aborting in-flight connects"
+                        "dial_relays: cancelled mid-dial — aborting in-flight connects"
                     );
                     join_set.abort_all();
                     while join_set.join_next().await.is_some() {}
@@ -2226,11 +2268,11 @@ impl CoreFields {
                             any_task_panicked = true;
                             tracing::warn!(
                                 error = %join_err,
-                                "reconnect_transport_if_pending: spawned task panicked — \
-                                 ignoring this URL for this reconnect cycle"
+                                "dial_relays: spawned task panicked — \
+                                 ignoring this URL for this dial"
                             );
-                            if first_panic_failure.is_none() {
-                                first_panic_failure = Some(LifecycleError::ReconnectFailed {
+                            if first_failure.is_none() {
+                                first_failure = Some(LifecycleError::ReconnectFailed {
                                     url: String::new(),
                                     reason: format!(
                                         "spawned reconnect task panicked: {join_err}"
@@ -2242,64 +2284,16 @@ impl CoreFields {
                 }
             }
         }
-        // --- install phase (re-inlined from the previous
-        // `install_reconnected_adapters` helper so the suspend/cancel
-        // invariants read linearly alongside the dial phase) ---
-        //
-        // Sort by URL before registering adapters so the adapter ordering
-        // inside `TransportManager` is deterministic regardless of
-        // network-timing jitter across the spawned tasks.
-        results.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut manager = scp_transport::TransportManager::builder();
-        // Seed `first_failure` with any panic the outer loop captured so
-        // a silent-success path can't swallow the case where every
-        // spawned task panicked (empty `results`, no per-URL failure).
-        let mut first_failure: Option<LifecycleError> = first_panic_failure;
-        for (url, outcome) in results {
-            match outcome {
-                Ok(adapter) => {
-                    // The manager records `url` with the adapter, so a budget
-                    // eviction here removes the evicted relay from the set
-                    // `context_relay_urls` reads in the same operation.
-                    if let Some(eviction) = manager.add_adapter(url, Box::new(adapter)) {
-                        tracing::info!(
-                            evicted_relay_url = %eviction.evicted_relay_url,
-                            "reconnect_transport_if_pending: connection budget evicted a relay"
-                        );
-                    }
-                }
-                Err(reason) => {
-                    tracing::warn!(
-                        url = %url,
-                        error = %reason,
-                        "reconnect_transport_if_pending: relay reconnect failed — leaving URL in pending set for retry"
-                    );
-                    if first_failure.is_none() {
-                        first_failure = Some(LifecycleError::ReconnectFailed {
-                            url: url.clone(),
-                            reason,
-                        });
-                    }
-                }
-            }
-        }
-        let connected_count = manager.adapter_count();
-        // #1696: one more cancellation check between the dial loop and
-        // the install. If suspend fired *after* the last successful
-        // dial but *before* we install the manager, installing it now
-        // would immediately fail the suspended-state guard — but more
-        // importantly, the adapters we just connected belong to a
-        // cancelled generation and should be dropped rather than
-        // installed.
+        let manager = register_dialed(results, &mut first_failure);
+        // A cancel after the last dial means these adapters belong to
+        // a cancelled generation. Dropping `manager` drops each adapter, whose
+        // `Drop` cancels its cover-traffic and heartbeat tasks and closes the
+        // socket.
         if cancel.is_cancelled() {
             tracing::debug!(
-                "reconnect_transport_if_pending: cancelled before install — dropping {connected_count} connected adapter(s)"
+                "dial_relays: cancelled after dialing — dropping {} connected adapter(s)",
+                manager.adapter_count()
             );
-            // `manager` (and its adapters) are dropped at the end of
-            // this block. Each adapter's Drop fires `cover_traffic_cancel`
-            // and `heartbeat_cancel`, and the relay client's background
-            // tasks exit — so the socket closes cleanly rather than
-            // leaking.
             drop(manager);
             return Err(LifecycleError::ReconnectFailed {
                 url: String::new(),
@@ -2308,6 +2302,60 @@ impl CoreFields {
                         .to_owned(),
             });
         }
+        Ok(DialedRelays {
+            manager,
+            first_failure,
+            any_task_panicked,
+        })
+    }
+
+    /// Reconnects every pending relay URL registered via [`Self::add_relay_url`].
+    ///
+    /// Dials the deduplicated snapshot from [`Self::pending_relay_urls`]
+    /// through [`Self::dial_relays`] with cover traffic from the profile, and
+    /// installs the resulting manager, leaving the reconnect set as it was.
+    /// Called from the `BridgeInstanceCore::resume` default body after the
+    /// core flag flip.
+    ///
+    /// Collects every failure and returns the first as
+    /// [`LifecycleError::ReconnectFailed`] so the caller sees a real error.
+    /// Successfully-reconnected URLs remain in the pending set — the caller
+    /// is free to retry a failing URL directly via `transport_connect`.
+    ///
+    /// No-ops when the pending set is empty (e.g. a bridge that never
+    /// connected a relay in the first place, or a test-only resume cycle).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::ReconnectFailed`] carrying the first URL
+    /// that failed plus a redacted reason. Shutdown state short-circuits
+    /// with [`LifecycleError::AlreadyShutDown`] rather than attempting
+    /// reconnects against a torn-down instance.
+    ///
+    /// When reconnect was cancelled by a concurrent `suspend()` /
+    /// `shutdown()`, the `reason` field explicitly states "suspended
+    /// during reconnect" (empty `url`) so callers can distinguish a
+    /// suspend race from a dial / TLS / handshake failure. Non-cancel
+    /// failures carry the underlying connect error verbatim.
+    pub async fn reconnect_transport_if_pending(&self) -> Result<(), LifecycleError> {
+        if self.is_shutdown() {
+            return Err(LifecycleError::AlreadyShutDown);
+        }
+        let urls = self.pending_relay_urls();
+        if urls.is_empty() {
+            return Ok(());
+        }
+        let DialedRelays {
+            manager,
+            mut first_failure,
+            any_task_panicked,
+        } = self
+            .dial_relays(
+                urls.into_iter().collect(),
+                scp_transport::native::adapter::CoverTraffic::FromProfile,
+            )
+            .await?;
+        let connected_count = manager.adapter_count();
         // Only install the manager if at least one adapter is registered —
         // installing an empty manager would make later relay operations fail
         // with a confusing "no adapters" error instead of the clearer
@@ -5035,6 +5083,38 @@ pub(crate) mod tests {
     // AC 2: persistence field and accessor
     // -----------------------------------------------------------------
 
+    /// A last-relay-contact store over the encrypted in-memory repository
+    /// the bridges build in production.
+    fn test_relay_contacts() -> Arc<dyn scp_core::store::sync::RelayContactStore> {
+        let (_event_log, repo, _handle) = crate::bridge_runtime::build_event_log_provider();
+        repo
+    }
+
+    /// `with_persistence` installs the store it is given, `new` has none, and
+    /// `set_relay_contact_store` installs once and refuses a second store.
+    #[tokio::test]
+    async fn relay_contact_store_is_injected_once() {
+        use scp_core::context::providers::InMemoryPersistence;
+
+        let store = test_relay_contacts();
+        let instance =
+            CoreFields::with_persistence(Box::new(InMemoryPersistence::new()), Arc::clone(&store));
+        let installed = instance.relay_contact_store().expect("store installed");
+        installed.store_last_relay_contact("ctx", 7).await.unwrap();
+        assert_eq!(store.load_last_relay_contact("ctx").await.unwrap(), Some(7));
+        assert!(
+            instance
+                .set_relay_contact_store(test_relay_contacts())
+                .is_err()
+        );
+
+        let bare = CoreFields::new();
+        assert!(bare.relay_contact_store().is_none());
+        assert!(bare.set_relay_contact_store(test_relay_contacts()).is_ok());
+        assert!(bare.relay_contact_store().is_some());
+        assert!(bare.set_relay_contact_store(test_relay_contacts()).is_err());
+    }
+
     #[test]
     fn new_instance_has_no_persistence() {
         let instance = CoreFields::with_supervisor(test_supervisor());
@@ -5049,7 +5129,7 @@ pub(crate) mod tests {
         use scp_core::context::providers::InMemoryPersistence;
 
         let persistence = Box::new(InMemoryPersistence::new());
-        let instance = CoreFields::with_persistence(persistence);
+        let instance = CoreFields::with_persistence(persistence, test_relay_contacts());
         instance.set_supervisor(test_supervisor());
         assert!(
             instance.persistence().is_some(),
@@ -5765,7 +5845,8 @@ pub(crate) mod tests {
             test_mls_storage(),
         );
 
-        let instance = CoreFields::with_persistence(persistence_for_instance);
+        let instance =
+            CoreFields::with_persistence(persistence_for_instance, test_relay_contacts());
         instance.set_supervisor(supervisor);
 
         // Verify the persistence accessor returns Some.

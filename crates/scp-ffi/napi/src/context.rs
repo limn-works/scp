@@ -2070,6 +2070,16 @@ pub(crate) async fn context_subscribe_on(
             code: codes::CTX_2000.to_owned(),
         }));
     }
+    // ADR-029 §2: each envelope the actor accepts writes the context's
+    // `last_relay_contact`, so a bridge without the store fails closed.
+    let relay_contacts = bi.core.relay_contact_store().ok_or_else(|| {
+        NapiError::from(ScpNapiError::Validation {
+            message: "no protocol repository on this instance — the last relay contact \
+                      cannot be recorded"
+                .to_owned(),
+            code: codes::STORAGE_8000.to_owned(),
+        })
+    })?;
     let bi_core: &crate::runtime::CoreFields = &bi.core;
     let bridge_cancel = bi_core.cancel_token();
 
@@ -2331,6 +2341,31 @@ pub(crate) async fn context_subscribe_on(
                             "deliver shim reply dropped".to_owned(),
                         )),
                     };
+                    // ADR-029 §2: an envelope the actor accepted is a
+                    // successful relay interaction. A failed write reaches
+                    // the callback as an error; delivery continues.
+                    if deliver_result.is_ok()
+                        && let Err(e) = scp_ffi_common::reconnect::record_relay_contact(
+                            relay_contacts.as_ref(),
+                            &context_id,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            context_id = %context_id,
+                            error = %e,
+                            "last_relay_contact write failed on live delivery"
+                        );
+                        on_message.call(
+                            Err(NapiError::from(ScpNapiError::Context {
+                                message: format!(
+                                    "recording the last relay contact of {context_id} failed: {e}"
+                                ),
+                                code: codes::CTX_2001.to_owned(),
+                            })),
+                            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
                     use scp_core::context::actor::commands::DeliverOutcome;
                     match deliver_result {
                         Ok(DeliverOutcome::Application((plaintext, sender_did))) => {
@@ -3610,6 +3645,16 @@ pub(crate) async fn context_reconnect_on(
     // key never crosses FFI beyond this in-process driver call.
     // The Phase-3 checkpoint signs through custody (ADR-049 Decision 7a).
     let signer = crate::runtime::identity_active_signer(bi, &identity_did).await?;
+    // ADR-029 §2: a cleared `needs_reconnect` writes the context's
+    // `last_relay_contact`, so a bridge without the store fails closed.
+    let relay_contacts = bi.core.relay_contact_store().ok_or_else(|| {
+        NapiError::from(ScpNapiError::Validation {
+            message: "no protocol repository on this instance — the last relay contact \
+                      cannot be recorded"
+                .to_owned(),
+            code: codes::STORAGE_8000.to_owned(),
+        })
+    })?;
 
     let contacts: std::collections::HashMap<String, u64> = last_relay_contacts
         .unwrap_or_default()
@@ -3623,6 +3668,7 @@ pub(crate) async fn context_reconnect_on(
         supervisor,
         DID(identity_did),
         signer,
+        relay_contacts.as_ref(),
         context_ids,
         contacts,
         now,

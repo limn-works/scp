@@ -286,6 +286,13 @@ pub mod discovery;
 #[cfg(feature = "resolvers")]
 pub mod reconnect;
 
+// Device wake handling (ADR-029 §2 push-wake pull mode; ADR-025 criterion 4,
+// ADR-027 criterion 10): the §10.7.1 device receipt rule, then a signer-free
+// pull over a transient transport. Requires scp-core + scp-transport (behind
+// `resolvers`).
+#[cfg(feature = "resolvers")]
+pub mod push;
+
 // Shared periodic suppression-detection heartbeat scheduler (§9.9.2). Spawned
 // alongside the relay subscribe loop at the FFI/SDK boundary, where the signing
 // key lives; routes sends through Supervisor::send_heartbeat. Same layer and

@@ -224,6 +224,9 @@ async fn reconnect_classifies_all_three_tiers() {
         &alice.manager,
         DID::from(ALICE_DID),
         scp_core::context::actor::CommandSigner::local_ed25519(signing_key_for(ALICE_DID)),
+        &scp_core::store::ProtocolRepository::new_for_testing(
+            scp_platform::in_memory::InMemoryStorage::new(),
+        ),
         vec![short_ctx.to_owned()],
         short_contacts,
         now,

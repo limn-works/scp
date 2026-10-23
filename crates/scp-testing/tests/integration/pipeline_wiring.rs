@@ -163,6 +163,11 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 const RECONNECT_DRIVER_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/reconnect.rs");
 
+// Push-wake handler source (ADR-029 §2 push-wake pull mode). The
+// push_wake_pulls_without_signing assertion below pins `handle_wake` to the
+// signer-free pull in `reconnect.rs`.
+const PUSH_WAKE_SRC: &str = include_str!("../../../../crates/scp-ffi/common/src/push.rs");
+
 // Actor messaging-handler source — owns `handle_build_local_checkpoint`,
 // the actor-turn body that builds AND broadcasts the Phase-3 checkpoint so
 // the FFI driver never needs the `pub(crate)` `send_checkpoint` across the
@@ -3336,6 +3341,133 @@ fn b3_heartbeat_send_receive_loop_wired() {
          heartbeat scheduler tears down in lockstep (no orphaned scheduler on a dead \
          subscription)"
     );
+}
+
+/// ADR-029 §2 sync-state keys: the three writers of
+/// `sync/{context_id}/last_relay_contact`. A full reconnection writes it after
+/// it clears `needs_reconnect`, a wake writes it after a successful Phase 1,
+/// and napi live delivery writes it after the actor accepts an envelope.
+#[test]
+fn last_relay_contact_writers_wired() {
+    for (src, caller, callee) in [
+        (
+            RECONNECT_DRIVER_SRC,
+            "reconnect_contexts",
+            "clear_and_record_contact(",
+        ),
+        (
+            RECONNECT_DRIVER_SRC,
+            "clear_and_record_contact",
+            "store_last_relay_contact(",
+        ),
+        (
+            RECONNECT_DRIVER_SRC,
+            "wake_pull_context",
+            "store_last_relay_contact(",
+        ),
+        (
+            RECONNECT_DRIVER_SRC,
+            "record_relay_contact",
+            "store_last_relay_contact(",
+        ),
+        (
+            NAPI_CONTEXT_SRC,
+            "context_subscribe_on",
+            "record_relay_contact(",
+        ),
+    ] {
+        assert!(
+            fn_body_contains(src, caller, callee),
+            "{caller} must call {callee} (ADR-029 §2 last_relay_contact writers)"
+        );
+    }
+    // The reconnection writes only after the flag is cleared.
+    let body = extract_fn_body(RECONNECT_DRIVER_SRC, "clear_and_record_contact")
+        .expect("clear_and_record_contact not found in reconnect.rs");
+    let clear = body.find("clear_needs_reconnect(").expect("no clear call");
+    let write = body
+        .find("store_last_relay_contact(")
+        .expect("no write call");
+    assert!(
+        clear < write,
+        "clear_and_record_contact must clear needs_reconnect before it writes the contact"
+    );
+}
+
+/// ADR-029 §2 push-wake pull mode: a silent push reaches the relay
+/// catch-up path (Phase 1 pull, Phase 2 commit replay, Phase 4 re-feed) and
+/// nothing that signs or publishes. `handle_wake` → `pull_on_wake` →
+/// `wake_pull_contexts` → `wake_pull_context` → `pull_buffered`,
+/// `deliver_commit_blobs_until_steady`, `refeed_buffer`; none of the pull
+/// functions builds a checkpoint or issues an MLS Update, and neither wake
+/// pull signature accepts a `CommandSigner`.
+#[test]
+fn push_wake_pulls_without_signing() {
+    for (src, caller, callee) in [
+        (PUSH_WAKE_SRC, "handle_wake", "pull_on_wake("),
+        (PUSH_WAKE_SRC, "pull_on_wake", "wake_pull_contexts("),
+        (PUSH_WAKE_SRC, "pull_on_wake", "dial_relays("),
+        (
+            RECONNECT_DRIVER_SRC,
+            "wake_pull_contexts",
+            "wake_pull_context(",
+        ),
+        (RECONNECT_DRIVER_SRC, "wake_pull_context", "pull_buffered("),
+        (
+            RECONNECT_DRIVER_SRC,
+            "wake_pull_context",
+            "store_last_relay_contact(",
+        ),
+        (
+            RECONNECT_DRIVER_SRC,
+            "wake_pull_context",
+            "deliver_commit_blobs_until_steady(",
+        ),
+        (RECONNECT_DRIVER_SRC, "wake_pull_context", "refeed_buffer("),
+        (
+            RECONNECT_DRIVER_SRC,
+            "deliver_commit_blobs_until_steady",
+            ".deliver_commit_blob(",
+        ),
+        (
+            RECONNECT_DRIVER_SRC,
+            "refeed_buffer",
+            ".deliver_commit_blob(",
+        ),
+    ] {
+        assert!(
+            fn_body_contains(src, caller, callee),
+            "{caller} must call {callee} (ADR-029 §2 push-wake pull mode)"
+        );
+    }
+
+    for fn_name in [
+        "wake_pull_contexts",
+        "wake_pull_context",
+        "pull_buffered",
+        "deliver_commit_blobs_until_steady",
+        "refeed_buffer",
+    ] {
+        for forbidden in [
+            "build_local_checkpoint",
+            "issue_mls_update",
+            "CommandSigner",
+        ] {
+            assert!(
+                !fn_body_contains(RECONNECT_DRIVER_SRC, fn_name, forbidden),
+                "{fn_name} must not reach {forbidden}: a wake pulls and \
+                 publishes nothing (ADR-029 §2)"
+            );
+        }
+    }
+    for fn_name in ["wake_pull_contexts", "wake_pull_context"] {
+        let signature = extract_fn_signature(RECONNECT_DRIVER_SRC, fn_name)
+            .unwrap_or_else(|| panic!("{fn_name} not found in reconnect.rs"));
+        assert!(
+            !signature.contains("CommandSigner"),
+            "{fn_name} must take no CommandSigner (ADR-029 §2): {signature}"
+        );
+    }
 }
 
 /// The FFI/SDK reconnection driver must DRIVE the checkpoint exchange, not

@@ -22,5 +22,9 @@ pub(crate) fn dispatch(state: &PerContextState, cmd: PushCommand) -> Outcome<()>
             let _ = reply.send(push_helpers::push_routes(state));
             Outcome::ok(())
         }
+        PushCommand::WakeTarget { now_secs, reply } => {
+            let _ = reply.send(push_helpers::wake_target(state, now_secs));
+            Outcome::ok(())
+        }
     }
 }

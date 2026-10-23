@@ -3703,6 +3703,17 @@ impl Supervisor {
             })
     }
 
+    /// The bridge's local member DID: the DID of this node's crypto provider,
+    /// the credential identity its MLS groups carry. The push-wake pull uses
+    /// it as the member DID (ADR-025 criterion 4, ADR-027 criterion 10).
+    ///
+    /// Returns `None` when no crypto provider is wired, so a caller fails
+    /// closed instead of substituting a DID.
+    #[must_use]
+    pub fn local_member_did(&self) -> Option<DID> {
+        self.node_identity().ok()
+    }
+
     /// [`Self::build_actor_deps`] after [`Self::load_wrapping_key`], for tests
     /// that build deps without going through an entry point.
     ///
@@ -17754,6 +17765,116 @@ impl Supervisor {
         Ok(by_relay)
     }
 
+    /// Returns the push-wake pull target of every `Active` context (ADR-029
+    /// §2, push-wake pull mode): its ID, persisted relay set, and every
+    /// routing ID at which a blob for this device arrives, including the
+    /// previous pseudonym while its grace runs.
+    ///
+    /// Asks every context in [`Self::known_context_ids`] concurrently through
+    /// [`Self::dispatch_push_command`]. A context that is not `Active`, or
+    /// whose actor was removed with no crash record after the IDs were read,
+    /// yields no target.
+    ///
+    /// # Errors
+    ///
+    /// Fails rather than return a partial set, because a wake that skips a
+    /// context reports `NoData` for traffic it never pulled:
+    /// - [`ContextError::NotInitialized`] when no clock is wired;
+    /// - [`ContextError::ContextPoisoned`] or [`ContextError::ActorCrashed`]
+    ///   when a context's actor is down;
+    /// - [`ContextError::ActorBusy`] from a mailbox send;
+    /// - [`ContextError::TransportFailed`] when an actor drops its reply or
+    ///   does not answer within the reply bound.
+    pub async fn wake_targets(
+        &self,
+    ) -> Result<Vec<crate::context::push_helpers::ContextWakeTarget>, ContextError> {
+        let now_secs = self
+            .clock_ref()
+            .ok_or_else(|| {
+                ContextError::NotInitialized(
+                    "Supervisor::wake_targets — clock not configured".to_owned(),
+                )
+            })?
+            .now_secs();
+        let replies = futures::future::join_all(self.known_context_ids().into_iter().map(
+            |ctx_id| async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                match self
+                    .dispatch_push_command(
+                        &ctx_id,
+                        PushCommand::WakeTarget {
+                            now_secs,
+                            reply: tx,
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(ContextError::ContextNotRegistered(_)) => return Ok(None),
+                    Err(err) => return Err(err),
+                }
+                bounded_reply_await(rx).await.map_err(|_| {
+                    ContextError::TransportFailed(format!(
+                        "Supervisor::wake_targets — no reply from the actor of `{ctx_id}`"
+                    ))
+                })
+            },
+        ))
+        .await;
+        let mut targets = Vec::new();
+        for reply in replies {
+            if let Some(target) = reply? {
+                targets.push(target);
+            }
+        }
+        Ok(targets)
+    }
+
+    /// Whether any context is resident or down with a crash record
+    /// ([`Self::known_context_ids`]). A push wake that finds none restores the
+    /// persisted contexts first (ADR-029 §2 push-wake pull mode, step 2).
+    #[must_use]
+    pub fn has_known_contexts(&self) -> bool {
+        !self.known_context_ids().is_empty()
+    }
+
+    /// The persisted contexts whose snapshot is `Active` and that are neither
+    /// resident nor down with a crash record ([`Self::known_context_ids`]):
+    /// the contexts whose restore failed. A push wake fails when this is not
+    /// empty, because its pull cannot reach them (ADR-029 §2 push-wake pull
+    /// mode, step 2).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::PersistenceFailed`] when no persistence provider is
+    /// configured, or when listing the persisted contexts or loading one of
+    /// their snapshots fails.
+    pub async fn unrestored_active_contexts(&self) -> Result<Vec<String>, ContextError> {
+        let persistence = self.persistence_ref().ok_or_else(|| {
+            ContextError::PersistenceFailed("no persistence provider configured".to_owned())
+        })?;
+        let known: std::collections::BTreeSet<String> =
+            self.known_context_ids().into_iter().collect();
+        let persisted = persistence.list_persisted_contexts().await.map_err(|e| {
+            ContextError::PersistenceFailed(format!("failed to list persisted contexts: {e}"))
+        })?;
+        let mut unrestored = Vec::new();
+        for context_id in persisted {
+            if known.contains(&context_id) {
+                continue;
+            }
+            let snapshot = persistence.load_context(&context_id).await.map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "failed to load the snapshot of `{context_id}`: {e}"
+                ))
+            })?;
+            if snapshot.is_some_and(|s| s.state == scp_protocol::context::ContextState::Active) {
+                unrestored.push(context_id);
+            }
+        }
+        Ok(unrestored)
+    }
+
     /// Returns the local member's routing IDs and rotation state (spec 09
     /// §9.10.4.1) for `context_id`: the current routing ID, the previous one
     /// while its grace runs, the epoch, the epoch the next rotation must
@@ -19691,6 +19812,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `wake_targets` returns each `Active` context's ID, persisted relay set,
+    /// shared routing ID and local pseudonym, and fails closed when a context
+    /// actor is down (ADR-029 §2, push-wake pull mode).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wake_targets_list_active_contexts_and_fail_when_an_actor_is_down() {
+        let sup = supervisor_with_providers();
+        assert!(sup.wake_targets().await.unwrap().is_empty());
+        assert!(!sup.has_known_contexts());
+        let a = hex::encode([0xC0u8; 32]);
+        let b = hex::encode([0xC1u8; 32]);
+        create_push_context(&sup, &a, &["wss://relay-a.example"]).await;
+        create_push_context(&sup, &b, &["wss://relay-b.example"]).await;
+        assert!(sup.has_known_contexts());
+        let mut targets = sup.wake_targets().await.unwrap();
+        targets.sort_by(|x, y| x.context_id.cmp(&y.context_id));
+        assert_eq!(
+            targets,
+            vec![
+                crate::context::push_helpers::ContextWakeTarget {
+                    context_id: a.clone(),
+                    relay_urls: vec!["wss://relay-a.example".to_owned()],
+                    routing_ids: vec![scp_protocol::context::context_routing_id(&a), [0x5A; 32]],
+                },
+                crate::context::push_helpers::ContextWakeTarget {
+                    context_id: b.clone(),
+                    relay_urls: vec!["wss://relay-b.example".to_owned()],
+                    routing_ids: vec![scp_protocol::context::context_routing_id(&b), [0x5A; 32]],
+                },
+            ]
+        );
+        sup.test_poison_context(&b).await;
+        let result = sup.wake_targets().await;
+        assert!(
+            matches!(result, Err(ContextError::ContextPoisoned(ref id)) if *id == b),
+            "a poisoned context fails the wake targets: {result:?}"
+        );
+    }
+
+    /// `local_member_did` is the crypto provider's DID, and `None` on a
+    /// supervisor with no crypto provider wired.
+    #[tokio::test]
+    async fn local_member_did_reads_the_crypto_provider() {
+        let sup = supervisor_with_providers();
+        assert_eq!(sup.local_member_did(), Some(sup.node_identity().unwrap()));
+        assert_eq!(test_supervisor().local_member_did(), None);
     }
 
     /// `known_context_ids` lists registered actors and contexts whose actor is

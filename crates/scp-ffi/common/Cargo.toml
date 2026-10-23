@@ -11,7 +11,7 @@ publish = false
 default = ["resolvers"]
 # Full resolver implementations (BridgeDidResolver, IdentityBackedDidResolver, etc.).
 # Requires scp-core, scp-identity, tokio, scp-mcp.
-resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
+resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:futures", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
 # BridgeDidResolver delegates decoding to `scp_did::extract_public_key_from_did`,
@@ -102,6 +102,8 @@ scp-platform = { path = "../../scp-platform", features = ["encrypting", "sqlite"
 # `CustodyFailure` the runtime carries, and `custody_parse` uses the P-256 point.
 scp-crypto = { path = "../../scp-crypto" }
 async-trait = { workspace = true, optional = true }
+# `reconnect::wake_pull_contexts` pulls every woken context concurrently.
+futures = { workspace = true, optional = true }
 dashmap = { workspace = true }
 zeroize = { workspace = true }
 serde = { workspace = true, optional = true }

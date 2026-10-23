@@ -123,6 +123,33 @@ pub struct NativeRelayAdapter {
     suppression_rx: Option<tokio::sync::mpsc::Receiver<crate::heartbeat::SuppressionSuspected>>,
 }
 
+/// Whether a new [`NativeRelayAdapter`] starts cover traffic (spec §9.10.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverTraffic {
+    /// Start cover traffic at the tier the [`TransportProfile`] names, or none
+    /// when no profile is given.
+    FromProfile,
+    /// Start no cover traffic, whatever the profile says. For a connection
+    /// that must publish nothing, such as the push-wake pull's transient dial
+    /// (ADR-025 criterion 4).
+    Off,
+}
+
+/// The cover traffic a new adapter starts: the profile's tier under
+/// [`CoverTraffic::FromProfile`], and none under [`CoverTraffic::Off`] or
+/// without a profile.
+const fn cover_traffic_config(
+    profile: Option<&TransportProfile>,
+    cover: CoverTraffic,
+) -> Option<CoverTrafficConfig> {
+    match (profile, cover) {
+        (Some(profile), CoverTraffic::FromProfile) => {
+            Some(CoverTrafficConfig::from_profile(*profile))
+        }
+        (None, _) | (_, CoverTraffic::Off) => None,
+    }
+}
+
 impl std::fmt::Debug for NativeRelayAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeRelayAdapter").finish_non_exhaustive()
@@ -176,9 +203,33 @@ impl NativeRelayAdapter {
         sourced: &SourcedRelayUrl,
         profile: Option<&TransportProfile>,
     ) -> Result<Self, TransportError> {
+        Self::connect_sourced_with_cover(sourced, profile, CoverTraffic::FromProfile).await
+    }
+
+    /// [`connect_sourced`](Self::connect_sourced) with an explicit
+    /// [`CoverTraffic`] choice.
+    ///
+    /// [`CoverTraffic::Off`] starts no cover traffic whatever `profile` says,
+    /// for a connection that must publish nothing: the push-wake pull's
+    /// transient dial (ADR-025 criterion 4, ADR-029 §2 push-wake pull mode).
+    /// Heartbeat monitoring still follows `profile`, because it only reads.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`connect_sourced`](Self::connect_sourced).
+    pub async fn connect_sourced_with_cover(
+        sourced: &SourcedRelayUrl,
+        profile: Option<&TransportProfile>,
+        cover: CoverTraffic,
+    ) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect(&sourced.url).await?;
-        Ok(Self::finalize_connection(client, profile, &sourced.url))
+        Ok(Self::finalize_connection(
+            client,
+            profile,
+            &sourced.url,
+            cover,
+        ))
     }
 
     /// Creates a new adapter connected to a relay URL with provenance-based
@@ -207,14 +258,21 @@ impl NativeRelayAdapter {
     ) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect_with_bearer(&sourced.url, bearer_token).await?;
-        Ok(Self::finalize_connection(client, profile, &sourced.url))
+        Ok(Self::finalize_connection(
+            client,
+            profile,
+            &sourced.url,
+            CoverTraffic::FromProfile,
+        ))
     }
 
-    /// Common post-connection setup: heartbeat monitor, cover traffic auto-start.
+    /// Common post-connection setup: heartbeat monitor, and cover traffic
+    /// when `cover` is [`CoverTraffic::FromProfile`] and a profile is given.
     fn finalize_connection(
         client: NativeRelayClient,
         profile: Option<&TransportProfile>,
         relay_url: &str,
+        cover: CoverTraffic,
     ) -> Self {
         let heartbeat_cancel = CancellationToken::new();
         let (heartbeat_monitor, suppression_rx) =
@@ -226,8 +284,7 @@ impl NativeRelayAdapter {
             heartbeat_monitor,
             suppression_rx,
         };
-        if let Some(profile) = profile {
-            let config = CoverTrafficConfig::from_profile(*profile);
+        if let Some(config) = cover_traffic_config(profile, cover) {
             // JoinHandle intentionally dropped — the task is cancelled via the
             // CancellationToken in the adapter's Drop impl, not by awaiting/
             // aborting the handle.
@@ -1102,6 +1159,32 @@ mod tests {
         // The adapter should have been constructed successfully with
         // cover traffic running. Dropping it cancels the task.
         drop(adapter);
+    }
+
+    /// `CoverTraffic::Off` starts no cover traffic for any profile, and
+    /// `FromProfile` starts the profile's tier (ADR-025 criterion 4).
+    #[test]
+    fn cover_off_starts_no_cover_traffic_for_any_profile() {
+        use crate::profile::TransportProfile;
+        for profile in [
+            TransportProfile::Server,
+            TransportProfile::Desktop,
+            TransportProfile::Mobile,
+            TransportProfile::Constrained,
+        ] {
+            assert!(
+                cover_traffic_config(Some(&profile), CoverTraffic::Off).is_none(),
+                "Off starts nothing for {profile:?}"
+            );
+            let from_profile =
+                cover_traffic_config(Some(&profile), CoverTraffic::FromProfile).map(|c| c.tier);
+            assert_eq!(
+                from_profile,
+                Some(CoverTrafficConfig::from_profile(profile).tier),
+                "FromProfile starts the profile tier for {profile:?}"
+            );
+        }
+        assert!(cover_traffic_config(None, CoverTraffic::FromProfile).is_none());
     }
 
     /// Verifies that `connect_sourced` with `None` profile does NOT start

@@ -13175,12 +13175,25 @@ impl Scp {
         // The Phase-3 consistency checkpoint signs through the identity's
         // retained custody (ADR-049 Decision 7a); no key is exported.
         let signer = resolve_identity_signer(&identity).await?;
+        // ADR-029 §2: a cleared `needs_reconnect` writes the context's
+        // `last_relay_contact`, so a bridge without the store fails closed.
+        let relay_contacts =
+            self.inner
+                .core
+                .relay_contact_store()
+                .ok_or_else(|| ScpError::Storage {
+                    msg: "no protocol repository on this instance — the last relay \
+                          contact cannot be recorded"
+                        .to_owned(),
+                    code: codes::STORAGE_8000.to_owned(),
+                })?;
 
         let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
             &transport,
             supervisor,
             scp_did::DID(identity.did.clone()),
             signer,
+            relay_contacts.as_ref(),
             context_ids,
             last_relay_contacts,
             scp_clock::Clock::now_secs(&scp_clock::SystemClock),

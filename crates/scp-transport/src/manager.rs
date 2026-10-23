@@ -761,22 +761,43 @@ impl TransportManager {
 
     /// One-shot query for stored envelopes across all adapters.
     ///
-    /// **Phase 1:** Queries the first adapter only.
-    /// **Phase 2+:** Queries all adapters and merges results with
-    /// deduplication.
+    /// Queries every registered adapter concurrently, because each relay in a
+    /// context's relay set stores its own copy and a blob may reach only one
+    /// of them (ADR-029 Phase 1, push-wake pull mode). The merged result holds
+    /// each blob once, keyed by [`BlobId`] (the SHA-256 of its encrypted
+    /// blob), in the order of the first adapter that returned it.
     ///
     /// # Errors
     ///
     /// Returns [`TransportError::NotConnected`] if no adapters are registered.
-    /// Propagates errors from the underlying adapter.
+    /// Returns the first adapter error, in adapter order, when any adapter
+    /// fails, because a merge that silently drops a relay's answer would let a
+    /// caller report no new data for blobs it never read.
     pub async fn query(
         &self,
         routing_id: &RoutingId,
         since: Option<u64>,
     ) -> Result<Vec<OuterEnvelope>, TransportError> {
-        let held = self.adapters.first().ok_or(TransportError::NotConnected)?;
-        self.touch_adapter(0);
-        held.adapter.query(routing_id, since).await
+        if self.adapters.is_empty() {
+            return Err(TransportError::NotConnected);
+        }
+        let answers = futures::future::join_all(self.adapters.iter().enumerate().map(
+            |(idx, held)| async move {
+                self.touch_adapter(idx);
+                held.adapter.query(routing_id, since).await
+            },
+        ))
+        .await;
+        let mut seen = std::collections::HashSet::<BlobId>::new();
+        let mut merged = Vec::new();
+        for answer in answers {
+            for envelope in answer? {
+                if seen.insert(BlobId::from_sha256(&envelope.encrypted_blob)) {
+                    merged.push(envelope);
+                }
+            }
+        }
+        Ok(merged)
     }
 
     /// Request deletion of a blob across all adapters.
@@ -1743,6 +1764,47 @@ mod tests {
         let routing_id = RoutingId::new([0xAA; 32]);
         let envelopes = manager.query(&routing_id, None).await.unwrap();
         assert_eq!(envelopes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn manager_query_merges_every_adapter_and_dedups_by_blob() {
+        let shared = test_envelope_with_blob(vec![0x01]);
+        let only_first = test_envelope_with_blob(vec![0x02]);
+        let only_second = test_envelope_with_blob(vec![0x03]);
+        let mut first = MockAdapter::succeeding();
+        first.query_result = Ok(vec![shared.clone(), only_first.clone()]);
+        let mut second = MockAdapter::succeeding();
+        second.query_result = Ok(vec![shared.clone(), only_second.clone()]);
+        let mut manager = TransportManager::new(MOCK_RELAY.to_owned(), Box::new(first));
+        manager.add_adapter("wss://second.example".to_owned(), Box::new(second));
+        let envelopes = manager
+            .query(&RoutingId::new([0xAA; 32]), None)
+            .await
+            .unwrap();
+        let blobs: Vec<Vec<u8>> = envelopes.into_iter().map(|e| e.encrypted_blob).collect();
+        assert_eq!(
+            blobs,
+            vec![
+                shared.encrypted_blob,
+                only_first.encrypted_blob,
+                only_second.encrypted_blob
+            ],
+            "a blob only the second relay stores is returned, and a blob both store appears once"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_query_fails_when_any_adapter_fails() {
+        let mut first = MockAdapter::succeeding();
+        first.query_result = Ok(vec![test_envelope()]);
+        let second = MockAdapter::failing(TransportError::NotConnected);
+        let mut manager = TransportManager::new(MOCK_RELAY.to_owned(), Box::new(first));
+        manager.add_adapter("wss://second.example".to_owned(), Box::new(second));
+        let result = manager.query(&RoutingId::new([0xAA; 32]), None).await;
+        assert!(
+            matches!(result, Err(TransportError::NotConnected)),
+            "one failed relay fails the merged query: {result:?}"
+        );
     }
 
     #[tokio::test]

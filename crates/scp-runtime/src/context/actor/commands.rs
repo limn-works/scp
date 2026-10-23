@@ -2196,6 +2196,16 @@ pub enum PushCommand {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Option<crate::context::push_helpers::ContextPushRoutes>>,
     },
+    /// This context's push-wake pull target (ADR-029 §2, push-wake pull
+    /// mode): its ID, relay set, and every routing ID a blob for this device
+    /// arrives at, including the previous pseudonym while its grace runs at
+    /// `now_secs`. `None` unless the context is `Active`.
+    WakeTarget {
+        /// Wall-clock second the grace check reads.
+        now_secs: u64,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Option<crate::context::push_helpers::ContextWakeTarget>>,
+    },
 }
 
 /// See [`ContextCommand::Outlets`]. Real variants cover every public

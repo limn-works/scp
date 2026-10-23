@@ -82,6 +82,9 @@ pub use outlets_helpers::InvocationCaveatBinding;
 // §10.7.1: the per-context reply `PushCommand::Routes` carries. The enclosing
 // `push_helpers` module is `pub(crate)`; the public command enum names this type.
 pub use push_helpers::ContextPushRoutes;
+// ADR-029 §2 push-wake pull mode: the per-context reply
+// `PushCommand::WakeTarget` carries.
+pub use push_helpers::ContextWakeTarget;
 
 // ---------------------------------------------------------------------------
 // ContextHandle

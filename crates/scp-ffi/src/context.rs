@@ -5646,6 +5646,15 @@ impl crate::scp::PyScp {
         // Phase-3 consistency checkpoint); the private key stays in custody
         // (ADR-049 Decision 7a).
         let signer = resolve_signer(py, bi, identity_did)?;
+        // ADR-029 §2: a cleared `needs_reconnect` writes the context's
+        // `last_relay_contact`, so a bridge without the store fails closed.
+        let relay_contacts = bi.core.relay_contact_store().ok_or_else(|| {
+            PyRuntimeError::new_err(format!(
+                "[{}] no protocol repository on this instance — the last relay \
+                 contact cannot be recorded",
+                scp_ffi_common::error_codes::STORAGE_8000
+            ))
+        })?;
 
         let contacts = last_relay_contacts.unwrap_or_default();
         let now = scp_clock::SystemClock.now_secs();
@@ -5657,6 +5666,7 @@ impl crate::scp::PyScp {
                 sup,
                 scp_did::DID(identity_did.to_owned()),
                 signer,
+                relay_contacts.as_ref(),
                 context_ids,
                 contacts,
                 now,

@@ -26,6 +26,7 @@ pub mod identity;
 pub mod nonce;
 pub mod outlets;
 pub mod queue;
+pub mod sync;
 pub mod tls;
 pub mod tofu;
 pub mod transport;
