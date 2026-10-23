@@ -19,17 +19,16 @@
 //!   send to that service. Each drain applies the outcome to the
 //!   registration store:
 //!   - `Delivered` resets the token's consecutive invalid-token count.
-//!   - `InvalidToken` adds one to it; at
-//!     [`INVALID_TOKEN_REMOVAL_THRESHOLD`](super::push_store::INVALID_TOKEN_REMOVAL_THRESHOLD)
-//!     the store removes every registration holding the token, in the same
+//!   - `InvalidToken` adds one to it; at `INVALID_TOKEN_REMOVAL_THRESHOLD`
+//!     (in `push_store`, a module the `push-store` feature compiles) the
+//!     store removes every registration holding the token, in the same
 //!     transaction.
 //!   - `Transient` and `ConfigError` leave the count unchanged.
 //!
 //! The count is per token, because §10.7.1 removes registrations "after 3
 //! consecutive delivery failures for the same token". A reset the store fails
 //! to write is carried by the drain and folded into the token's next count
-//! ([`CountFrom::Zero`](super::push_store::CountFrom::Zero)), so a lost reset
-//! never joins two runs of failures.
+//! (`CountFrom::Zero`), so a lost reset never joins two runs of failures.
 //!
 //! # Bounds
 //!
