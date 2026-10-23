@@ -1111,11 +1111,12 @@
         "When the deadline stops a wake during delivery, the context's `last_relay_contact` is unchanged and the next wake delivers the blobs the first did not.",
         "With two contexts on disjoint relays, each relay sees queries only for its own context's routing IDs, and a dead relay that serves only one context fails that context while the other still gives `NewData`.",
         "A wake over more relays than the Mobile connection budget (10) queries every relay and evicts none.",
-        "A full reconnection takes no caller-supplied contact map on any bridge or SDK, and every bridge reconnect result carries `envelopes_delivered` and `relay_contact_error`.",
+        "A full reconnection takes no caller-supplied contact map on any bridge or SDK, and every bridge reconnect result carries `envelopes_delivered`, `relay_contact_error` and `failure_code`.",
         "A Tier 3 reconnection that receives no Welcome reports `failed`, leaves `needs_reconnect` set and writes no contact.",
         "Creating, joining by Welcome, and importing a context each write `last_relay_contact` before the operation returns, and a failed write fails the operation without starting the actor; restoring writes nothing.",
         "Create and import persist the context's snapshot before they start its actor, and a failed write fails the operation without starting the actor.",
-        "A full reconnection over a context with no stored `last_relay_contact` fails with a typed error and classifies no tier.",
+        "Create, Welcome join and import write `last_relay_contact` before the snapshot; when the operation fails or times out after a write, the snapshot and contact stored before it began are back in place, or absent where none was, and a contact is never removed while its snapshot remains. A create over the id of a running context fails and leaves that context's snapshot and contact unchanged.",
+        "A full reconnection reports a context with no stored `last_relay_contact`, or whose stored value cannot be read, as `Failed` with its own typed code, classifies no tier for it, keeps its `needs_reconnect` set, and reconnects every other context.",
         "`WakeFailure` and each per-context pull failure carry a stable `SCP-` error code, and every failure has a unit test."
       ],
       "actionItems": [
