@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpSocket};
@@ -172,6 +173,60 @@ impl ClosedOrigin {
     /// `http://127.0.0.1:<port>`.
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+}
+
+/// An h2c server on `127.0.0.1` that completes the HTTP/2 handshake, accepts
+/// the first request, and then stops reading the connection while holding it
+/// open: it answers nothing and acknowledges no PING, as a push service whose
+/// path died mid-connection does.
+pub struct FrozenServer {
+    origin: String,
+    took: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for FrozenServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FrozenServer {
+    /// Starts the server.
+    pub async fn start() -> std::io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let took = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let took = took.clone();
+            async move {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut connection) = h2::server::handshake(socket).await else {
+                    return;
+                };
+                if let Some(Ok(held)) = connection.accept().await {
+                    took.store(true, Ordering::SeqCst);
+                    // Hold the connection and the stream, never polling
+                    // either again, until the test drops the server.
+                    let _held = (connection, held);
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        Ok(Self { origin, took, task })
+    }
+
+    /// `http://127.0.0.1:<port>`.
+    pub fn origin(&self) -> String {
+        self.origin.clone()
+    }
+
+    /// Whether the first request's headers arrived.
+    pub fn took_a_request(&self) -> bool {
+        self.took.load(Ordering::SeqCst)
     }
 }
 

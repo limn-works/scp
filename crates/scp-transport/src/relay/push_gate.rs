@@ -40,7 +40,7 @@ use scp_relay_client::{RelayMessage, code};
 #[cfg(feature = "push-store")]
 use super::push::PushSender;
 #[cfg(feature = "push-store")]
-use super::push_dispatch::PushDispatcher;
+use super::push_dispatch::PushService;
 #[cfg(feature = "push-store")]
 use super::push_store::{PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore};
 
@@ -142,19 +142,20 @@ pub enum PushRole {
     /// routing ID with `4063` `PUSH_NOT_SUPPORTED`.
     #[default]
     Disabled,
-    /// The relay verifies and stores push registrations. Compiled only with
-    /// the `push-store` feature, which carries the registration store.
+    /// The relay verifies and stores push registrations and wakes the
+    /// registered devices through its running push service (PUSH-008).
+    /// Compiled only with the `push-store` feature, which carries the
+    /// registration store.
     #[cfg(feature = "push-store")]
-    Enabled(PushServiceConfig),
+    Enabled(PushService),
 }
 
-/// What a push-enabled relay needs: the registration store, the signature
-/// verifier, and the configured senders. Every field is required and none has
-/// a default (ADR-062, capability injection).
+/// What a push-enabled relay needs: the store, the verifier, and the senders.
 ///
-/// [`Self::new`] is the only constructor: it also builds the relay's push
-/// queue (PUSH-008), which every clone of the config shares, so every
-/// listener holding a clone queues to one drain.
+/// Every field is required and none has a default (ADR-062, capability
+/// injection). It holds no runtime state: [`PushService::start`] takes it and
+/// starts the queues and tasks that wake devices (ADR-052, configuration in,
+/// runtime object out).
 #[cfg(feature = "push-store")]
 #[derive(Debug, Clone)]
 pub struct PushServiceConfig {
@@ -166,52 +167,10 @@ pub struct PushServiceConfig {
     /// One sender per platform the relay wakes (PUSH-010, PUSH-011). A
     /// message for a platform with no sender here is refused with `4061`.
     pub senders: Arc<[PushSender]>,
-    dispatcher: PushDispatcher,
 }
 
 #[cfg(feature = "push-store")]
 impl PushServiceConfig {
-    /// A push service over `store`, `verifier` and `senders`, with a fresh
-    /// push queue of
-    /// [`PUSH_QUEUE_CAPACITY`](super::push_dispatch::PUSH_QUEUE_CAPACITY)
-    /// jobs.
-    #[must_use]
-    pub fn new(
-        store: PushRegistrationStore,
-        verifier: Arc<dyn PushSignatureVerifier>,
-        senders: Arc<[PushSender]>,
-    ) -> Self {
-        Self {
-            store,
-            verifier,
-            senders,
-            dispatcher: PushDispatcher::new(),
-        }
-    }
-
-    /// As [`Self::new`], with a queue of `capacity` jobs, so a test can fill
-    /// it.
-    #[cfg(test)]
-    pub(crate) fn with_queue_capacity(
-        store: PushRegistrationStore,
-        verifier: Arc<dyn PushSignatureVerifier>,
-        senders: Arc<[PushSender]>,
-        capacity: usize,
-    ) -> Self {
-        Self {
-            store,
-            verifier,
-            senders,
-            dispatcher: PushDispatcher::with_capacity(capacity),
-        }
-    }
-
-    /// The relay's push queue (PUSH-008).
-    #[must_use]
-    pub const fn dispatcher(&self) -> &PushDispatcher {
-        &self.dispatcher
-    }
-
     /// The configured sender for `platform`, if any.
     #[must_use]
     pub fn sender_for(&self, platform: PushPlatform) -> Option<&PushSender> {
@@ -408,7 +367,7 @@ pub async fn gate_publish(
         (PushRole::Disabled, _) => not_supported(),
         (PushRole::Enabled(_), Reservation::Retired) => retired_url(),
         (PushRole::Enabled(service), Reservation::Current(url)) => {
-            match handle(service, &url, blob, now).await {
+            match handle(service.config(), &url, blob, now).await {
                 Ok(()) => PushPublishGate::Accepted,
                 Err(rejection) => rejection,
             }
@@ -590,17 +549,18 @@ async fn handle(
     written.map_err(|e| PushPublishGate::rejected(e.wire_code(), e.to_string()))
 }
 
-/// A push-enabled service with a SQLite store under `dir`, the production
+/// A running push service with a SQLite store under `dir`, the production
 /// `KelPushVerifier`, and no senders, for transport tests that need a valid
-/// `PushRole::Enabled`.
+/// `PushRole::Enabled`. Call it inside a tokio runtime.
 #[cfg(all(test, feature = "push-store"))]
 #[allow(clippy::unwrap_used)]
-pub(crate) fn kel_service_for_tests(dir: &std::path::Path) -> PushServiceConfig {
-    PushServiceConfig::new(
-        PushRegistrationStore::open_sqlite(&dir.join("push.db")).unwrap(),
-        Arc::new(scp_identity::push_verify::KelPushVerifier),
-        Arc::from(Vec::new()),
-    )
+pub(crate) fn kel_service_for_tests(dir: &std::path::Path) -> PushService {
+    PushService::start(PushServiceConfig {
+        store: PushRegistrationStore::open_sqlite(&dir.join("push.db")).unwrap(),
+        verifier: Arc::new(scp_identity::push_verify::KelPushVerifier),
+        senders: Arc::from(Vec::new()),
+    })
+    .unwrap()
 }
 
 /// A live handle on `ws://127.0.0.1:9000/scp/v1`, the URL of the default bind

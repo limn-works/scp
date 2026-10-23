@@ -909,7 +909,7 @@ async fn handle_publish<S: BlobStorage>(
     // OPTIONAL validating-relay DID-record slot gate — the SAME shared chokepoint
     // the WebSocket/UDP/WebTransport transports route through (§3.10.2). This
     // handler only emits the wire response and delivers to subscribers on Accepted.
-    match did_slots
+    let stored = match did_slots
         .gate_publish(
             config.did_record_validation,
             storage.as_ref(),
@@ -921,50 +921,32 @@ async fn handle_publish<S: BlobStorage>(
         )
         .await
     {
-        DidPublishGate::Accepted(stored) => {
-            // Queue the wakes for the stored blob without waiting on a send (§10.7.1
-            // step 5, PUSH-008).
-            crate::relay::push_dispatch::notify(&config.push, &routing_id).await;
-            let _failed_deliveries = subscription::deliver_to_subscribers(
-                &stored,
-                subscriptions,
-                config.delivery_jitter_ms,
-            )
-            .await;
-            let ok = RelayMessage::Ok {
-                ref_id,
-                blob_id: Some(blob_id),
-            };
-            return write_and_finish(send, &ok).await;
-        }
+        DidPublishGate::Accepted(stored) => stored,
         DidPublishGate::Rejected { code, msg } => {
             let err = RelayMessage::Err { ref_id, code, msg };
             return write_and_finish(send, &err).await;
         }
-        DidPublishGate::FallThrough => {}
-    }
-
-    // Store the blob (opaque path — non-DID blobs, or every blob when
-    // did_record_validation is Disabled).
-    let stored = match storage
-        .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::debug!(error = %e, "QUIC: blob store failed");
-            let err = RelayMessage::Err {
-                ref_id,
-                code: code::STORAGE_FULL,
-                msg: "internal error".to_owned(),
-            };
-            return write_and_finish(send, &err).await;
-        }
+        // Store the blob (opaque path — non-DID blobs, or every blob when
+        // did_record_validation is Disabled).
+        DidPublishGate::FallThrough => match storage
+            .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "QUIC: blob store failed");
+                let err = RelayMessage::Err {
+                    ref_id,
+                    code: code::STORAGE_FULL,
+                    msg: "internal error".to_owned(),
+                };
+                return write_and_finish(send, &err).await;
+            }
+        },
     };
 
-    // Queue the wakes for the stored blob without waiting on a send (§10.7.1
-    // step 5, PUSH-008).
-    crate::relay::push_dispatch::notify(&config.push, &routing_id).await;
+    // Every stored blob, DID record or opaque, takes the one path below:
+    // deliver, answer, then queue the wakes.
 
     // Deliver to active subscribers with optional jitter (BLACK-001).
     let _failed_deliveries =
@@ -976,7 +958,13 @@ async fn handle_publish<S: BlobStorage>(
         ref_id,
         blob_id: Some(blob_id),
     };
-    write_and_finish(send, &ok).await
+    let answered = write_and_finish(send, &ok).await;
+
+    // Queue the wakes for the stored blob after the subscribers and the
+    // publisher are served, whether or not the reply reached the publisher;
+    // it never waits (§10.7.1 step 5, PUSH-008).
+    crate::relay::push_dispatch::notify(&config.push, &routing_id);
+    answered
 }
 
 /// Handles a SUBSCRIBE operation on a QUIC stream.
@@ -2365,5 +2353,75 @@ mod tests {
 
         connection.close(0u32.into(), b"done");
         handle.shutdown();
+    }
+
+    // -- Store-site wakes (§10.7.1 step 5, PUSH-008) --
+    //
+    // A DID record and an opaque blob reach storage through different gate
+    // arms; both must wake. Each test fails when this transport's `notify`
+    // is removed.
+    #[cfg(all(feature = "push-store", feature = "testing"))]
+    mod wake {
+        use super::*;
+        use crate::relay::push_dispatch::wake_harness::WakeHarness;
+
+        /// Publishes `blob` to `rid` on a QUIC-only relay (no WebSocket relay
+        /// runs) whose push role is the harness's, and waits for one wake.
+        async fn publish_and_wake(rid: [u8; 32], blob: Vec<u8>) {
+            let harness = WakeHarness::start(&[rid]).await.unwrap();
+            let (server_config, certs) = test_server_config();
+            let listener = QuicListener::new(
+                QuicListenerConfig {
+                    bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    delivery_jitter_ms: 0,
+                    push: harness.push.clone(),
+                    ..QuicListenerConfig::defaults(push_gate::test_relay_url())
+                },
+                Arc::new(InMemoryBlobStorage::new()),
+                subscription::new_registry(),
+                PublishRateLimiter::new(100),
+                rate_limit::new_connection_tracker(),
+                DidSlotRegistry::new(),
+            );
+            let (handle, addr) = listener.start(server_config).unwrap();
+            let connection = connect_client(addr, &certs).await;
+            let responses = send_and_recv(
+                &connection,
+                &ClientMessage::Publish {
+                    ref_id: None,
+                    routing_id: rid,
+                    recipient_hint: None,
+                    blob_ttl: 3600,
+                    blob,
+                },
+            )
+            .await;
+            assert!(
+                matches!(
+                    responses.as_slice(),
+                    [RelayMessage::Ok {
+                        blob_id: Some(_),
+                        ..
+                    }]
+                ),
+                "{responses:?}"
+            );
+            harness.wait_for_wakes(1).await.unwrap();
+            connection.close(0u32.into(), b"done");
+            handle.shutdown();
+        }
+
+        #[tokio::test]
+        async fn quic_did_record_publish_wakes() {
+            let (rid, _bid, frame) = genuine_frame(62, 1, b"did-doc");
+            publish_and_wake(rid, frame).await;
+        }
+
+        /// Also the QUIC-only relay with push enabled: the drain runs with
+        /// no WebSocket relay started.
+        #[tokio::test]
+        async fn quic_plain_blob_publish_wakes() {
+            publish_and_wake([0x45; 32], vec![7; 16]).await;
+        }
     }
 }

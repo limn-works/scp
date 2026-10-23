@@ -112,22 +112,10 @@ impl PushSender {
         }
     }
 
-    /// Sends one wake signal to `token` and reports the outcome.
-    ///
-    /// Never fails: every network, credential, and response condition maps to
-    /// a [`PushSendOutcome`].
-    pub async fn send(&self, token: &PushDeviceToken) -> PushSendOutcome {
-        match self {
-            Self::Apns(sender) => sender.send(token).await,
-            Self::Fcm(sender) => sender.send(token).await,
-            #[cfg(feature = "testing")]
-            Self::Recording(sender) => sender.record(token.expose().as_bytes()).await,
-        }
-    }
-
     /// Sends one wake signal to a token as a registration carries it, the
     /// raw `token` bytes of `PushRegistration` (§22.11.4), and reports the
-    /// outcome.
+    /// outcome. Never fails: every network, credential, and response
+    /// condition maps to a [`PushSendOutcome`].
     ///
     /// - APNs: the bytes are the device token, which iOS hands the app as
     ///   raw bytes; the request path carries their lowercase hex (§10.7.1
@@ -161,13 +149,33 @@ impl PushSender {
 /// returns the next scripted outcome, or `ConfigError` once the script runs
 /// out, so an unscripted send never passes for a delivery.
 ///
+/// A gated sender (see [`Self::gated`]) records the token and then holds the
+/// send until its [`RecordingGate`] admits it, so a test can keep a send in
+/// flight for as long as it needs, as a push service that stops answering
+/// does.
+///
 /// It reports deliveries that never happened, so it is a nullifier (§17.17.2)
-/// and compiles only under `testing`. Clones share the script and the record.
+/// and compiles only under `testing`. Clones share the script, the record and
+/// the gate.
 #[cfg(feature = "testing")]
 #[derive(Clone)]
 pub struct RecordingSender {
     platform: PushPlatform,
     state: std::sync::Arc<tokio::sync::Mutex<RecordingState>>,
+    gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+}
+
+/// Admits the sends of a gated [`RecordingSender`], one permit per send.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug)]
+pub struct RecordingGate(std::sync::Arc<tokio::sync::Semaphore>);
+
+#[cfg(feature = "testing")]
+impl RecordingGate {
+    /// Admits `sends` more sends.
+    pub fn admit(&self, sends: usize) {
+        self.0.add_permits(sends);
+    }
 }
 
 /// The script still to play and the tokens handed over so far.
@@ -190,7 +198,22 @@ impl RecordingSender {
                 script: outcomes.into_iter().collect(),
                 sent: Vec::new(),
             })),
+            gate: None,
         }
+    }
+
+    /// As [`Self::new`], with every send held until the returned gate admits
+    /// it. The gate starts closed.
+    pub fn gated(
+        platform: PushPlatform,
+        outcomes: impl IntoIterator<Item = PushSendOutcome>,
+    ) -> (Self, RecordingGate) {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let sender = Self {
+            gate: Some(gate.clone()),
+            ..Self::new(platform, outcomes)
+        };
+        (sender, RecordingGate(gate))
     }
 
     /// Every token handed to this sender so far, in order.
@@ -205,12 +228,23 @@ impl RecordingSender {
     }
 
     async fn record(&self, token: &[u8]) -> PushSendOutcome {
-        let mut state = self.state.lock().await;
-        state.sent.push(Zeroizing::new(token.to_vec()));
-        state
-            .script
-            .pop_front()
-            .unwrap_or(PushSendOutcome::ConfigError)
+        let outcome = {
+            let mut state = self.state.lock().await;
+            state.sent.push(Zeroizing::new(token.to_vec()));
+            state
+                .script
+                .pop_front()
+                .unwrap_or(PushSendOutcome::ConfigError)
+        };
+        if let Some(gate) = &self.gate {
+            match gate.acquire().await {
+                Ok(permit) => permit.forget(),
+                // No code closes the semaphore; a closed gate answers
+                // `ConfigError` so it never passes for a delivery.
+                Err(_) => return PushSendOutcome::ConfigError,
+            }
+        }
+        outcome
     }
 }
 
@@ -251,13 +285,42 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// a few hundred bytes, and a longer body is truncated, never buffered whole.
 const MAX_RESPONSE_BODY: usize = 16 * 1024;
 
+/// The HTTP/2 keep-alive a sender's client runs.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct KeepAlive {
+    /// Time from the last frame read to the next PING.
+    pub(super) interval: Duration,
+    /// Time a PING may go unacknowledged before the connection is closed.
+    pub(super) timeout: Duration,
+}
+
+/// The keep-alive every production sender runs (indicators: a PING 5 s after
+/// the last frame read, 3 s to acknowledge it). The two sum to less than
+/// [`REQUEST_TIMEOUT`], so a send on a connection whose path died fails on
+/// the keep-alive before the request deadline, and the next send opens a new
+/// connection.
+pub(super) const PRODUCTION_KEEP_ALIVE: KeepAlive = KeepAlive {
+    interval: Duration::from_secs(5),
+    timeout: Duration::from_secs(3),
+};
+
 /// Builds the HTTP/2 client a sender uses.
 ///
 /// Both senders speak HTTP/2 only: APNs requires it, and the Google endpoints
-/// FCM uses serve it. Over TLS the client offers only `h2` in ALPN.
+/// FCM uses serve it. Over TLS the client offers only `h2` in ALPN. The
+/// client runs [`PRODUCTION_KEEP_ALIVE`] on every connection, idle or not.
 pub(super) fn http2_client() -> Result<reqwest::Client, PushSenderError> {
+    http2_client_with(PRODUCTION_KEEP_ALIVE)
+}
+
+/// [`http2_client`] with `keep_alive` in place of the production values, so
+/// a test can watch a dead connection close without waiting seconds.
+pub(super) fn http2_client_with(keep_alive: KeepAlive) -> Result<reqwest::Client, PushSenderError> {
     reqwest::Client::builder()
         .http2_prior_knowledge()
+        .http2_keep_alive_interval(keep_alive.interval)
+        .http2_keep_alive_timeout(keep_alive.timeout)
+        .http2_keep_alive_while_idle(true)
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -396,7 +459,7 @@ mod tests {
             PushSendOutcome::Delivered
         );
         assert_eq!(
-            sender.send(&PushDeviceToken::new("tok-b")).await,
+            sender.send_registered(b"tok-b").await,
             PushSendOutcome::ConfigError
         );
         assert_eq!(
@@ -406,6 +469,121 @@ mod tests {
         let shown = format!("{sender:?}");
         assert!(!shown.contains("tok-a"), "{shown}");
         assert!(shown.contains("Fcm"), "{shown}");
+    }
+
+    /// A gated recording sender records the token at once and answers only
+    /// after its gate admits the send.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn gated_recording_sender_waits_for_its_gate() -> Result<(), Box<dyn std::error::Error>> {
+        let (recorder, gate) =
+            RecordingSender::gated(PushPlatform::Apns, [PushSendOutcome::Delivered]);
+        let sender = PushSender::Recording(recorder.clone());
+        let mut send = tokio::spawn(async move { sender.send_registered(b"tok").await });
+        for _ in 0..500 {
+            if !recorder.sent().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(recorder.sent().await, vec![b"tok".to_vec()]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut send)
+                .await
+                .is_err(),
+            "the send answered before its gate opened"
+        );
+        gate.admit(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), send).await??,
+            PushSendOutcome::Delivered
+        );
+        Ok(())
+    }
+
+    /// An empty APNs device token is `InvalidToken`, and the sender makes no
+    /// request for it.
+    #[tokio::test]
+    async fn empty_apns_token_is_invalid_and_sends_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::push_test_server::TestServer;
+        let server = TestServer::start(Vec::new()).await;
+        let sender = PushSender::Apns(ApnsSender::build(
+            super::super::push_apns::tests::config(),
+            server.origin(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )?);
+        assert_eq!(
+            sender.send_registered(b"").await,
+            PushSendOutcome::InvalidToken
+        );
+        assert!(server.requests().await.is_empty(), "a request was made");
+        Ok(())
+    }
+
+    /// FCM token bytes that are not UTF-8 are `InvalidToken`, and the sender
+    /// makes no request for them, not even for an access token.
+    #[tokio::test]
+    async fn non_utf8_fcm_token_is_invalid_and_sends_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::push_test_server::TestServer;
+        let server = TestServer::start(Vec::new()).await;
+        let origin = server.origin();
+        let sender = PushSender::Fcm(FcmSender::build(
+            super::super::push_fcm::tests::config(),
+            &origin,
+            format!("{origin}/token"),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )?);
+        assert_eq!(
+            sender.send_registered(&[0xff, 0xfe, 0x41]).await,
+            PushSendOutcome::InvalidToken
+        );
+        assert!(server.requests().await.is_empty(), "a request was made");
+        Ok(())
+    }
+
+    /// The production keep-alive detects a dead connection before the
+    /// request deadline runs out.
+    #[test]
+    fn production_keep_alive_fits_inside_the_request_deadline() {
+        let KeepAlive { interval, timeout } = PRODUCTION_KEEP_ALIVE;
+        assert!(
+            interval + timeout < REQUEST_TIMEOUT,
+            "{interval:?} + {timeout:?} >= {REQUEST_TIMEOUT:?}"
+        );
+    }
+
+    /// A push service that stops reading its connection (it answers nothing
+    /// and acknowledges no PING) costs a send one keep-alive interval plus
+    /// one timeout, not the request deadline: the client closes the dead
+    /// connection and the send fails.
+    #[tokio::test]
+    async fn keep_alive_closes_a_connection_whose_peer_stopped_reading()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::push_test_server::FrozenServer;
+        let server = FrozenServer::start().await?;
+        let client = http2_client_with(KeepAlive {
+            interval: Duration::from_millis(100),
+            timeout: Duration::from_millis(200),
+        })?;
+        let started = std::time::Instant::now();
+        let result = client
+            .post(format!("{}/3/device/ab", server.origin()))
+            .body("{}")
+            .send()
+            .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "a frozen peer answered: {result:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the send waited {elapsed:?}, close to the request deadline"
+        );
+        assert!(
+            server.took_a_request(),
+            "the request never reached the peer"
+        );
+        Ok(())
     }
 
     #[test]

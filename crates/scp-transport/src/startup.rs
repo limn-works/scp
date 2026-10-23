@@ -25,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 use crate::native::server::{RelayConfig, RelayError};
 use crate::native::storage::{BlobStorageBackend, StorageError};
 use crate::relay::push::PushSender;
+use crate::relay::push_dispatch::{PushService, PushServiceError};
 use crate::relay::push_gate::{LiveRelayUrl, PushRole, PushServiceConfig, RelayUrl};
 use crate::relay::push_store::{PushRegistrationStore, PushStoreError};
 
@@ -977,6 +978,14 @@ pub enum PushStartupError {
         /// The store's refusal.
         error: PushStoreError,
     },
+    /// The push service could not start on the selected backends: it ran
+    /// outside a tokio runtime, or two senders name one platform. Nothing
+    /// starts without it (SCP-CAPSEL-8001).
+    #[error("the push service cannot start: {error} (SCP-CAPSEL-8001)")]
+    ServiceStart {
+        /// The service's refusal.
+        error: PushServiceError,
+    },
 }
 
 impl PushStartupError {
@@ -1005,7 +1014,8 @@ impl PushStartupError {
             | Self::CredentialPermissions { .. }
             | Self::CredentialFile { .. }
             | Self::Sender { .. }
-            | Self::StoreOpen { .. } => "SCP-CAPSEL-8001",
+            | Self::StoreOpen { .. }
+            | Self::ServiceStart { .. } => "SCP-CAPSEL-8001",
         }
     }
 }
@@ -1387,9 +1397,12 @@ fn check_owner_only(
 ///
 /// # Errors
 ///
-/// [`PushStartupError::StoreOpen`] when the store cannot be opened or its
-/// schema cannot be applied. Nothing falls back to another store
-/// (SCP-CAPSEL-8001).
+/// - [`PushStartupError::StoreOpen`] when the store cannot be opened or its
+///   schema cannot be applied. Nothing falls back to another store
+///   (SCP-CAPSEL-8001).
+/// - [`PushStartupError::ServiceStart`] when the push service cannot start,
+///   which includes a call outside a tokio runtime: the service's lookup and
+///   drains run on the caller's runtime.
 pub fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError> {
     let PushBackends { store, apns, fcm } = match selection {
         PushSelection::Disabled => return Ok(PushRole::Disabled),
@@ -1406,11 +1419,13 @@ pub fn push_role_from(selection: PushSelection) -> Result<PushRole, StartupError
         .into_iter()
         .chain(fcm.map(PushSender::Fcm))
         .collect();
-    Ok(PushRole::Enabled(PushServiceConfig::new(
+    let service = PushService::start(PushServiceConfig {
         store,
-        Arc::new(scp_identity::push_verify::KelPushVerifier),
-        Arc::from(senders),
-    )))
+        verifier: Arc::new(scp_identity::push_verify::KelPushVerifier),
+        senders: Arc::from(senders),
+    })
+    .map_err(|error| PushStartupError::ServiceStart { error })?;
+    Ok(PushRole::Enabled(service))
 }
 
 /// Logs the push role a relay starts with. No field carries a credential.
@@ -1419,6 +1434,7 @@ pub fn log_push_role(role: &PushRole) {
         PushRole::Disabled => tracing::info!("push: none (SCP_RELAY_PUSH_PLATFORMS=none)"),
         PushRole::Enabled(service) => {
             let platforms: Vec<String> = service
+                .config()
                 .senders
                 .iter()
                 .map(|sender| sender.platform().to_string())
@@ -2426,6 +2442,7 @@ mod push_tests {
         let PushRole::Enabled(service) = &role else {
             panic!("expected push enabled: {role:?}");
         };
+        let service = service.config();
         assert!(
             format!("{:?}", service.verifier).contains("KelPushVerifier"),
             "{:?}",
@@ -2560,8 +2577,32 @@ mod push_tests {
     /// Criterion 8: loading credentials writes no key byte to any log line,
     /// and neither the loaded selection's `Debug` nor any refusal's `Display`
     /// or `Debug` carries one.
+    /// An enabled selection outside a tokio runtime fails with a typed
+    /// refusal instead of yielding a role whose push service never runs.
     #[test]
-    fn loading_credentials_logs_and_prints_no_key_bytes() {
+    fn enabled_push_outside_a_runtime_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::full(dir.path());
+        let error = push_role_from(env.parse().unwrap()).unwrap_err();
+        let StartupError::Push(error) = error else {
+            panic!("expected a push refusal: {error:?}");
+        };
+        assert!(
+            matches!(
+                error,
+                PushStartupError::ServiceStart {
+                    error: crate::relay::push_dispatch::PushServiceError::NoRuntime
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.rule(), "SCP-CAPSEL-8001");
+    }
+
+    // A current-thread runtime, so the per-thread log capture sees the
+    // lines `push_role_from` writes.
+    #[tokio::test]
+    async fn loading_credentials_logs_and_prints_no_key_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env::full(dir.path());
         let fragments = secret_fragments(&env);

@@ -972,7 +972,7 @@ async fn handle_udp_publish<S: BlobStorage>(
     // OPTIONAL validating-relay DID-record slot gate — the SAME shared chokepoint
     // the WebSocket/QUIC/WebTransport transports route through (§3.10.2). UDP/DTLS
     // has no subscriptions, so `Accepted` just emits Ok (no subscriber delivery).
-    match did_slots
+    let _stored = match did_slots
         .gate_publish(
             config.did_record_validation,
             storage.as_ref(),
@@ -984,49 +984,41 @@ async fn handle_udp_publish<S: BlobStorage>(
         )
         .await
     {
-        DidPublishGate::Accepted(_stored) => {
-            // Queue the wakes for the stored blob without waiting on a send (§10.7.1
-            // step 5, PUSH-008).
-            crate::relay::push_dispatch::notify(&config.push, &routing_id).await;
-            let ok = RelayMessage::Ok {
-                ref_id,
-                blob_id: Some(blob_id),
-            };
-            send_dtls_response(sessions, remote_addr, &ok).await;
-            return;
-        }
+        DidPublishGate::Accepted(stored) => stored,
         DidPublishGate::Rejected { code, msg } => {
             let err = RelayMessage::Err { ref_id, code, msg };
             send_dtls_response(sessions, remote_addr, &err).await;
             return;
         }
-        DidPublishGate::FallThrough => {}
-    }
+        DidPublishGate::FallThrough => match storage
+            .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
+            .await
+        {
+            Ok(stored) => stored,
+            Err(e) => {
+                debug!(remote = %remote_addr, error = %e, "UDP: blob store failed");
+                let err = RelayMessage::Err {
+                    ref_id,
+                    code: 507,
+                    msg: "internal error".to_owned(),
+                };
+                send_dtls_response(sessions, remote_addr, &err).await;
+                return;
+            }
+        },
+    };
 
-    match storage
-        .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
-        .await
-    {
-        Ok(_stored) => {
-            // Queue the wakes for the stored blob without waiting on a send (§10.7.1
-            // step 5, PUSH-008).
-            crate::relay::push_dispatch::notify(&config.push, &routing_id).await;
-            let ok = RelayMessage::Ok {
-                ref_id,
-                blob_id: Some(blob_id),
-            };
-            send_dtls_response(sessions, remote_addr, &ok).await;
-        }
-        Err(e) => {
-            debug!(remote = %remote_addr, error = %e, "UDP: blob store failed");
-            let err = RelayMessage::Err {
-                ref_id,
-                code: 507,
-                msg: "internal error".to_owned(),
-            };
-            send_dtls_response(sessions, remote_addr, &err).await;
-        }
-    }
+    // Every stored blob, DID record or opaque, takes the one path below:
+    // answer, then queue the wakes. UDP has no subscribers to deliver to.
+    let ok = RelayMessage::Ok {
+        ref_id,
+        blob_id: Some(blob_id),
+    };
+    send_dtls_response(sessions, remote_addr, &ok).await;
+
+    // Queue the wakes for the stored blob after the publisher is answered; it
+    // never waits (§10.7.1 step 5, PUSH-008).
+    crate::relay::push_dispatch::notify(&config.push, &routing_id);
 }
 
 /// Handles a QUERY operation over UDP/DTLS.
@@ -2189,5 +2181,62 @@ mod tests {
         }
 
         handle.shutdown();
+    }
+
+    // -- Store-site wakes (§10.7.1 step 5, PUSH-008) --
+    //
+    // A DID record and an opaque blob reach storage through different gate
+    // arms; both must wake. Each test fails when this transport's `notify`
+    // is removed.
+    #[cfg(all(feature = "push-store", feature = "testing"))]
+    mod wake {
+        use super::*;
+        use crate::relay::push_dispatch::wake_harness::WakeHarness;
+
+        /// Publishes `blob` to `rid` on a UDP-only relay whose push role is
+        /// the harness's, and waits for one wake.
+        async fn publish_and_wake(rid: [u8; 32], blob: Vec<u8>) {
+            let harness = WakeHarness::start(&[rid]).await.unwrap();
+            let (handle, addr, _storage) = start_test_listener_with_relay_config(RelayConfig {
+                push: harness.push.clone(),
+                ..RelayConfig::defaults(crate::relay::push_gate::test_relay_url())
+            })
+            .await;
+            let client = create_dtls_client(addr).await;
+            let response = send_and_recv(
+                &client,
+                &ClientMessage::Publish {
+                    ref_id: None,
+                    routing_id: rid,
+                    recipient_hint: None,
+                    blob_ttl: 3600,
+                    blob,
+                },
+            )
+            .await;
+            assert!(
+                matches!(
+                    response,
+                    RelayMessage::Ok {
+                        blob_id: Some(_),
+                        ..
+                    }
+                ),
+                "{response:?}"
+            );
+            harness.wait_for_wakes(1).await.unwrap();
+            handle.shutdown();
+        }
+
+        #[tokio::test]
+        async fn udp_did_record_publish_wakes() {
+            let (rid, _bid, frame) = genuine_frame(63, 1, b"did-doc");
+            publish_and_wake(rid, frame).await;
+        }
+
+        #[tokio::test]
+        async fn udp_plain_blob_publish_wakes() {
+            publish_and_wake([0x46; 32], vec![7; 16]).await;
+        }
     }
 }

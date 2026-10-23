@@ -492,12 +492,6 @@ impl RelayServer {
             ttl_expiry_task(storage_for_ttl, did_slots_for_ttl, ttl_interval).await;
         });
 
-        // The push drain (PUSH-008) runs while this accept loop does: the
-        // guard cancels it when `run` returns or its future is dropped.
-        let push_shutdown = CancellationToken::new();
-        let _push_drain_guard = push_shutdown.clone().drop_guard();
-        let _push_drain = push_dispatch::spawn_drain(&self.config.push, push_shutdown);
-
         loop {
             let (stream, addr) = listener
                 .accept()
@@ -564,11 +558,8 @@ impl RelayServer {
     /// binding and spawns the accept loop in a background task. The returned
     /// [`ShutdownHandle`] can be used to gracefully stop the server.
     ///
-    /// Spawns background maintenance tasks (TTL expiry, rate limiter cleanup,
-    /// and the push drain of PUSH-008), each stopped by `token`.
+    /// Spawns background maintenance tasks (TTL expiry, rate limiter cleanup).
     fn spawn_background_tasks(&self, token: &CancellationToken) {
-        let _push_drain = push_dispatch::spawn_drain(&self.config.push, token.clone());
-
         let storage_for_ttl = Arc::clone(&self.storage);
         let did_slots_for_ttl = self.did_slots.clone();
         let ttl_interval = self.config.ttl_check_interval;
@@ -1358,7 +1349,7 @@ async fn handle_publish(
     // Accepted. NEVER a trust dependency: with validation Disabled the gate falls
     // through and the frame is stored opaquely (RELAYRES-002). Behind the per-IP
     // PUBLISH rate limit above.
-    match did_slots
+    let stored = match did_slots
         .gate_publish(
             config.did_record_validation,
             storage.as_ref(),
@@ -1370,52 +1361,32 @@ async fn handle_publish(
         )
         .await
     {
-        DidPublishGate::Accepted(stored) => {
-            // Queue the wakes for the stored blob without waiting on a send
-            // (§10.7.1 step 5, PUSH-008).
-            push_dispatch::notify(&config.push, &routing_id).await;
-            let _failed_deliveries = subscription::deliver_to_subscribers(
-                &stored,
-                subscriptions,
-                config.delivery_jitter_ms,
-            )
-            .await;
-            let _ = tx
-                .send(RelayMessage::Ok {
-                    ref_id,
-                    blob_id: Some(blob_id),
-                })
-                .await;
-            return;
-        }
+        DidPublishGate::Accepted(stored) => stored,
         DidPublishGate::Rejected { code, msg } => {
             let _ = tx.send(RelayMessage::Err { ref_id, code, msg }).await;
             return;
         }
-        DidPublishGate::FallThrough => {}
-    }
-
-    // Store the blob (opaque path — non-DID blobs, or every blob when
-    // did_record_validation is Disabled).
-    let stored = match storage
-        .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            let err = RelayMessage::Err {
-                ref_id,
-                code: code::STORAGE_FULL,
-                msg: e.to_string(),
-            };
-            let _ = tx.send(err).await;
-            return;
-        }
+        // Store the blob (opaque path — non-DID blobs, or every blob when
+        // did_record_validation is Disabled).
+        DidPublishGate::FallThrough => match storage
+            .store(routing_id, blob_id, recipient_hint, blob_ttl, blob.to_vec())
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let err = RelayMessage::Err {
+                    ref_id,
+                    code: code::STORAGE_FULL,
+                    msg: e.to_string(),
+                };
+                let _ = tx.send(err).await;
+                return;
+            }
+        },
     };
 
-    // Queue the wakes for the stored blob without waiting on a send (§10.7.1
-    // step 5, PUSH-008).
-    push_dispatch::notify(&config.push, &routing_id).await;
+    // Every stored blob, DID record or opaque, takes the one path below:
+    // deliver, answer, then queue the wakes.
 
     // Deliver to active subscribers with optional jitter (BLACK-001).
     // The return value tracks failed sends (logged inside the function)
@@ -1430,6 +1401,10 @@ async fn handle_publish(
         blob_id: Some(blob_id),
     };
     let _ = tx.send(ok).await;
+
+    // Queue the wakes for the stored blob after the subscribers and the
+    // publisher are served; it never waits (§10.7.1 step 5, PUSH-008).
+    push_dispatch::notify(&config.push, &routing_id);
 }
 
 /// Delivers a stored blob to matching subscribers with optional delivery jitter.
@@ -4340,6 +4315,7 @@ mod tests {
 
         use super::*;
         use crate::relay::push::{ApnsConfig, ApnsEnvironment, ApnsSender, PushSender};
+        use crate::relay::push_dispatch::PushService;
         use crate::relay::push_gate::{PUSH_TIMESTAMP_SKEW_SECS, PushServiceConfig};
         use crate::relay::push_store::{PushRegistrationKey, PushRegistrationStore};
 
@@ -4436,11 +4412,14 @@ mod tests {
         ) -> (SocketAddr, PushRegistrationStore, tempfile::TempDir) {
             let dir = tempfile::tempdir().unwrap();
             let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db")).unwrap();
-            let push = PushRole::Enabled(PushServiceConfig::new(
-                store.clone(),
-                verifier,
-                Arc::from(vec![apns_sender()]),
-            ));
+            let push = PushRole::Enabled(
+                PushService::start(PushServiceConfig {
+                    store: store.clone(),
+                    verifier,
+                    senders: Arc::from(vec![apns_sender()]),
+                })
+                .unwrap(),
+            );
             (start_push_server(push).await, store, dir)
         }
 
@@ -4672,20 +4651,17 @@ mod tests {
         // to the local h2c server standing in for Apple or Google.
 
         /// A relay with `senders`, `test_verifier()`, and a fresh SQLite store.
-        async fn start_waking(
-            senders: Vec<PushSender>,
-            capacity: usize,
-        ) -> (SocketAddr, PushServiceConfig, tempfile::TempDir) {
+        async fn start_waking(senders: Vec<PushSender>) -> (SocketAddr, tempfile::TempDir) {
             let dir = tempfile::tempdir().unwrap();
             let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db")).unwrap();
-            let config = PushServiceConfig::with_queue_capacity(
+            let service = PushService::start(PushServiceConfig {
                 store,
-                test_verifier(),
-                Arc::from(senders),
-                capacity,
-            );
-            let addr = start_push_server(PushRole::Enabled(config.clone())).await;
-            (addr, config, dir)
+                verifier: test_verifier(),
+                senders: Arc::from(senders),
+            })
+            .unwrap();
+            let addr = start_push_server(PushRole::Enabled(service)).await;
+            (addr, dir)
         }
 
         /// Registers `token` on `platform` for `[0x11; 32]` and `[0x22; 32]`.
@@ -4745,11 +4721,7 @@ mod tests {
                 Arc::new(scp_clock::SystemClock),
             )
             .unwrap();
-            let (addr, config, _dir) = start_waking(
-                vec![PushSender::Apns(sender)],
-                crate::relay::push_dispatch::PUSH_QUEUE_CAPACITY,
-            )
-            .await;
+            let (addr, _dir) = start_waking(vec![PushSender::Apns(sender)]).await;
             let token = [0xA1, 0xB2, 0xC3, 0xD4, 0x05];
             register(addr, PushPlatform::Apns, &token).await;
             assert!(
@@ -4763,8 +4735,6 @@ mod tests {
             assert_eq!(request.method, "POST");
             assert_eq!(request.header("apns-push-type"), Some("background"));
             assert_eq!(server.requests().await.len(), 1, "one job per stored blob");
-            let stats = config.dispatcher().stats();
-            assert_eq!((stats.enqueued, stats.dropped_full), (1, 0));
         }
 
         #[tokio::test]
@@ -4784,11 +4754,7 @@ mod tests {
                 Arc::new(scp_clock::SystemClock),
             )
             .unwrap();
-            let (addr, _config, _dir) = start_waking(
-                vec![PushSender::Fcm(sender)],
-                crate::relay::push_dispatch::PUSH_QUEUE_CAPACITY,
-            )
-            .await;
+            let (addr, _dir) = start_waking(vec![PushSender::Fcm(sender)]).await;
             let token = b"fcm-reg-token:e2e";
             register(addr, PushPlatform::Fcm, token).await;
 
@@ -4800,39 +4766,88 @@ mod tests {
             assert_eq!(body["message"]["token"], "fcm-reg-token:e2e");
         }
 
+        /// A sender that admits no send leaves every publish answered: the
+        /// publisher never waits on push work (§10.7.1 step 5). Once the
+        /// sender is let through, the queued wake goes out.
+        #[cfg(feature = "testing")]
         #[tokio::test]
-        async fn a_full_push_queue_drops_the_job_and_the_publish_still_succeeds() {
-            // An origin that accepts connections and never answers: the drain
-            // blocks on its first job, so a one-slot queue fills.
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin = format!("http://{}", listener.local_addr().unwrap());
-            let _stall = tokio::spawn(async move {
-                while let Ok((socket, _)) = listener.accept().await {
-                    // Hold the connection open and silent until the test ends.
-                    tokio::spawn(async move {
-                        let _socket = socket;
-                        std::future::pending::<()>().await;
-                    });
-                }
-            });
-            let sender = ApnsSender::build(
-                crate::relay::push_apns::tests::config(),
-                origin,
-                Arc::new(scp_clock::SystemClock),
-            )
-            .unwrap();
-            let (addr, config, _dir) = start_waking(vec![PushSender::Apns(sender)], 1).await;
-            register(addr, PushPlatform::Apns, &[0xAB; 8]).await;
+        async fn a_hung_sender_never_holds_a_publish() {
+            use crate::relay::push::{PushSendOutcome, RecordingSender};
+            let (sender, gate) =
+                RecordingSender::gated(PushPlatform::Apns, [PushSendOutcome::Delivered; 8]);
+            let (addr, _dir) = start_waking(vec![PushSender::Recording(sender.clone())]).await;
+            register(addr, PushPlatform::Apns, b"hung").await;
 
-            // At most one job is in the sender and at most one in the queue,
-            // so the third publish finds the queue full whatever the timing.
             for i in 0..3u8 {
-                publish_blob(addr, vec![i; 16]).await;
+                tokio::time::timeout(Duration::from_secs(5), publish_blob(addr, vec![i; 16]))
+                    .await
+                    .expect("a publish waited on a hung push sender");
+            }
+            assert!(
+                sender.sent().await.len() <= 1,
+                "the gate let a send through"
+            );
+
+            gate.admit(8);
+            for _ in 0..500 {
+                if !sender.sent().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                sender.sent().await.first().map(Vec::as_slice),
+                Some(b"hung".as_slice())
+            );
+        }
+
+        // -- Store-site wakes (§10.7.1 step 5, PUSH-008) --
+        //
+        // A DID record and an opaque blob reach storage through different
+        // gate arms; both must wake. Each test fails when the WebSocket
+        // handler's `notify` is removed.
+        #[cfg(feature = "testing")]
+        mod wake {
+            use super::*;
+            use crate::relay::push_dispatch::wake_harness::WakeHarness;
+
+            #[tokio::test]
+            async fn websocket_did_record_publish_wakes() {
+                let (rid, _bid, frame) = genuine_did_frame(61, 1, b"did-doc");
+                let harness = WakeHarness::start(&[rid]).await.unwrap();
+                let addr = start_push_server(harness.push.clone()).await;
+                let reply = publish_to(addr, rid, frame).await;
+                assert!(
+                    matches!(
+                        reply,
+                        RelayMessage::Ok {
+                            blob_id: Some(_),
+                            ..
+                        }
+                    ),
+                    "{reply:?}"
+                );
+                harness.wait_for_wakes(1).await.unwrap();
             }
 
-            let stats = config.dispatcher().stats();
-            assert!(stats.dropped_full >= 1, "no job dropped: {stats:?}");
-            assert_eq!(stats.enqueued + stats.dropped_full, 3, "{stats:?}");
+            #[tokio::test]
+            async fn websocket_plain_blob_publish_wakes() {
+                let rid = [0x44; 32];
+                let harness = WakeHarness::start(&[rid]).await.unwrap();
+                let addr = start_push_server(harness.push.clone()).await;
+                let reply = publish_to(addr, rid, vec![7; 16]).await;
+                assert!(
+                    matches!(
+                        reply,
+                        RelayMessage::Ok {
+                            blob_id: Some(_),
+                            ..
+                        }
+                    ),
+                    "{reply:?}"
+                );
+                harness.wait_for_wakes(1).await.unwrap();
+            }
         }
     }
 }

@@ -642,7 +642,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn request_carries_exactly_the_table_row() {
         let (sender, server, _) = sender_with(vec![Reply::empty(200)]).await;
-        let outcome = PushSender::Apns(sender).send(&token()).await;
+        let raw = hex::decode(DEVICE_TOKEN).unwrap();
+        let outcome = PushSender::Apns(sender).send_registered(&raw).await;
         assert_eq!(outcome, PushSendOutcome::Delivered);
 
         let requests = server.requests().await;

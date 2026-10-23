@@ -719,7 +719,9 @@ pub(crate) mod tests {
             vec![Reply::empty(200)],
         )
         .await;
-        let outcome = PushSender::Fcm(sender).send(&reg_token()).await;
+        let outcome = PushSender::Fcm(sender)
+            .send_registered(REG_TOKEN.as_bytes())
+            .await;
         assert_eq!(outcome, PushSendOutcome::Delivered);
 
         let requests = server.requests().await;
