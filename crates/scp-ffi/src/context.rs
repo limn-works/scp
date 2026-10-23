@@ -9835,7 +9835,9 @@ class SlowAgreeCustody(P256Custody):
                 .expect("wait on agree_started")
         });
         assert!(started, "alice's actor calls the Python dh_agree");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let deadline =
+            scp_ffi_common::deadline::deadline_after(std::time::Duration::from_secs(120))
+                .into_std();
         while alice_sup.test_queued_commands(&ctx_id).unwrap_or(0) == 0 {
             assert!(
                 std::time::Instant::now() < deadline,

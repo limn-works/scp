@@ -2142,7 +2142,8 @@ mod tests {
         listener
             .set_nonblocking(true)
             .expect("nonblocking listener");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            scp_ffi_common::deadline::deadline_after(std::time::Duration::from_secs(5)).into_std();
         loop {
             match listener.accept() {
                 Ok((conn, _)) => {

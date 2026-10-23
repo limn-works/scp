@@ -292,20 +292,20 @@ impl Scp {
     /// Flushes every context snapshot, then disconnects transport.
     /// Transport-dependent operations fail until `resume()` is called.
     /// `timeout_millis` bounds the call, in milliseconds, as a `BigInt`
-    /// (`suspend(5000n)`) like `shutdown`; values beyond `u64::MAX` clamp.
-    /// The suspend runs to completion, or reverts, even if the caller stops
-    /// awaiting it.
+    /// (`suspend(5000n)`) like `shutdown`. The suspend runs to completion, or
+    /// reverts, even if the caller stops awaiting it.
     ///
     /// # Errors
     ///
+    /// Throws a validation error with `SCP-VALID-7001` when `timeout_millis`
+    /// is negative or exceeds `u64::MAX`, before the instance is touched.
     /// Throws a validation error with `SCP-STORAGE-8014` when a context
     /// snapshot did not persist or the flush missed the deadline, and a
     /// transport error with `SCP-TRANS-5001` when the transport lock is
     /// poisoned. The instance stays running on either error.
     #[napi]
     pub async fn suspend(&self, timeout_millis: napi::bindgen_prelude::BigInt) -> napi::Result<()> {
-        let (_sign, value, _lossless) = timeout_millis.get_u64();
-        let deadline = Duration::from_millis(value);
+        let deadline = timeout_from_bigint(&timeout_millis).map_err(napi::Error::from)?;
         sdk_suspend(Arc::clone(&self.inner).suspend(deadline).await).map_err(napi::Error::from)
     }
 
@@ -333,14 +333,13 @@ impl Scp {
     /// The width is `u64` so the NAPI / `UniFFI` / `PyO3` bridges share
     /// a single canonical shutdown-timeout surface (#1692). NAPI
     /// exposes `u64` as JS `BigInt` on the wire — TypeScript callers
-    /// must pass a `bigint` (`shutdown(5000n)`). Negative /
-    /// out-of-range values saturate at `u64::MAX` per `BigInt::get_u64`
-    /// semantics (last tuple element flags lossless conversion, which
-    /// we intentionally ignore — any bigint beyond `u64::MAX` is
-    /// clamped to "effectively unbounded").
+    /// must pass a `bigint` (`shutdown(5000n)`).
     ///
     /// # Errors
     ///
+    /// Throws a validation error with `SCP-VALID-7001` when `timeout_millis`
+    /// is negative or exceeds `u64::MAX`, before the instance is touched: the
+    /// sign is never dropped and the value never truncated.
     /// Throws a validation error with `SCP-STORAGE-8005` when the durable
     /// store still holds its advisory lock after the call, and with
     /// `SCP-STORAGE-8015` when the store was released but a context snapshot
@@ -351,8 +350,7 @@ impl Scp {
         &self,
         timeout_millis: napi::bindgen_prelude::BigInt,
     ) -> napi::Result<()> {
-        let (_sign, value, _lossless) = timeout_millis.get_u64();
-        let timeout = Duration::from_millis(value);
+        let timeout = timeout_from_bigint(&timeout_millis).map_err(napi::Error::from)?;
         sdk_shutdown(Arc::clone(&self.inner).shutdown(timeout).await).map_err(Into::into)
     }
 
@@ -5102,6 +5100,29 @@ mod concurrency_cap_tests {
     }
 }
 
+/// Converts a lifecycle call's `timeout_millis` `BigInt` to a [`Duration`].
+///
+/// # Errors
+///
+/// A validation error with `SCP-VALID-7001` when the value is negative or
+/// does not fit in a `u64`: `BigInt::get_u64` would otherwise drop the sign
+/// and truncate to the low 64 bits, so `-5000n` would read as `5000` ms and
+/// `2n ** 64n` as zero.
+fn timeout_from_bigint(
+    timeout_millis: &napi::bindgen_prelude::BigInt,
+) -> Result<Duration, ScpNapiError> {
+    let (signed, millis, lossless) = timeout_millis.get_u64();
+    if signed || !lossless {
+        return Err(ScpNapiError::Validation {
+            message: "timeout_millis must be a non-negative integer that fits in an unsigned \
+                      64-bit integer"
+                .to_owned(),
+            code: codes::VALID_7001.to_owned(),
+        });
+    }
+    Ok(Duration::from_millis(millis))
+}
+
 /// Maps a bridge suspend result to the SDK result: the class
 /// [`classify_suspend_failure`] names picks the [`ScpNapiError`] variant. A
 /// storage code rides the validation variant, as `SCP-STORAGE-8005` does, and
@@ -5134,6 +5155,37 @@ fn sdk_shutdown(result: Result<ShutdownOutcome, ShutdownError>) -> Result<(), Sc
 mod sdk_shutdown_tests {
     use super::*;
     use scp_ffi_common::bridge_instance::ShutdownFlush;
+
+    /// A negative timeout and one above `u64::MAX` are refused with
+    /// `SCP-VALID-7001`, never read with the sign dropped or truncated; one
+    /// that fits converts exactly, `u64::MAX` included.
+    #[test]
+    fn a_timeout_bigint_out_of_u64_range_is_refused() {
+        use napi::bindgen_prelude::BigInt;
+        let big = |sign_bit, words: &[u64]| BigInt {
+            sign_bit,
+            words: words.to_vec(),
+        };
+        for (value, what) in [
+            (big(true, &[5000]), "-5000n"),
+            (big(false, &[0, 1]), "2n ** 64n"),
+            (big(false, &[5000, 1]), "2n ** 64n + 5000n"),
+        ] {
+            let refused = timeout_from_bigint(&value);
+            assert!(
+                matches!(&refused, Err(ScpNapiError::Validation { code, .. }) if code == codes::VALID_7001),
+                "{what}: {refused:?}"
+            );
+        }
+        assert_eq!(
+            timeout_from_bigint(&big(false, &[5000])).ok(),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            timeout_from_bigint(&big(false, &[u64::MAX])).ok(),
+            Some(Duration::from_millis(u64::MAX))
+        );
+    }
 
     #[test]
     fn suspend_failures_map_to_their_variants() {
@@ -5176,9 +5228,10 @@ mod sdk_shutdown_tests {
         .map(NapiError::from)
         .expect("a store left holding its lock must not report success");
         assert!(err.reason.contains(codes::STORAGE_8005), "{}", err.reason);
-        let err = sdk_shutdown(Err(ShutdownError::DurableStoreClose(
-            scp_platform::PlatformError::StorageError("close refused".to_owned()),
-        )))
+        let err = sdk_shutdown(Err(ShutdownError::DurableStoreClose {
+            error: scp_platform::PlatformError::StorageError("close refused".to_owned()),
+            flush: scp_ffi_common::bridge_instance::ShutdownFlush::Flushed,
+        }))
         .err()
         .map(NapiError::from)
         .expect("a store that refused to close must not report success");
@@ -5232,7 +5285,7 @@ mod sdk_shutdown_tests {
             matches!(&locked, Err(ScpNapiError::Validation { code, .. }) if code == codes::STORAGE_8005),
             "{locked:?}"
         );
-        let cut = sdk_shutdown(Err(ShutdownError::Interrupted));
+        let cut = sdk_shutdown(Err(ShutdownError::Interrupted { flush: None }));
         assert!(
             matches!(&cut, Err(ScpNapiError::Validation { code, .. }) if code == codes::STORAGE_8005),
             "{cut:?}"

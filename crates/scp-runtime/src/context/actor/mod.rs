@@ -203,6 +203,9 @@ pub struct ContextActor {
     /// Command inbox. Paired with the `Sender` held by
     /// [`ContextActorHandle`].
     inbox: mpsc::Receiver<ContextCommand>,
+    /// Shared with the paired [`ContextActorHandle`]: `run()` records why it
+    /// ended on purpose here before the inbox drops.
+    exit: handle::ExitRecord,
     /// Owned per-context state, wrapped in the Class-S fail-closed-persist
     /// cell. Every actor is constructed via [`Self::new`] with a full state
     /// payload — the sole spawn path
@@ -362,11 +365,13 @@ impl ContextActor {
         state: state::PerContextState,
         deps: deps::ActorDeps,
         inbox: mpsc::Receiver<ContextCommand>,
+        exit: handle::ExitRecord,
     ) -> Self {
         let context_id = state.handle.context_id().to_owned();
         Self {
             context_id,
             inbox,
+            exit,
             // Wrap the owned state in the Class-S fail-closed-persist cell. The
             // cell hands out no whole `&mut PerContextState` (no `DerefMut`, no
             // `state_mut`); every handler mutates through the cell's persist-on-
@@ -481,6 +486,7 @@ impl ContextActor {
                                 self.record_persist_attempt(succeeded);
                             }
                             if is_shutdown {
+                                self.exit.record(handle::DeliberateExit::Shutdown);
                                 break;
                             }
                             if is_prepare_replace {
@@ -491,6 +497,7 @@ impl ContextActor {
                                     state::ContextLifecycleState::Closed
                                 );
                                 if claimed {
+                                    self.exit.record(handle::DeliberateExit::Replaced);
                                     break;
                                 }
                             }
@@ -527,6 +534,7 @@ impl ContextActor {
                         // safe to call from here — the actor holds no lock, and
                         // the removal has no `.await` while the lock is held.
                         despawn_self_after_ttl_exit(&self.deps.supervisor, &self.context_id).await;
+                        self.exit.record(handle::DeliberateExit::Expired);
                         break;
                     }
                 }
@@ -551,6 +559,7 @@ impl ContextActor {
                         // Same internal-TTL-exit despawn as Arm 2: no external
                         // despawner for a timer-driven terminal exit.
                         despawn_self_after_ttl_exit(&self.deps.supervisor, &self.context_id).await;
+                        self.exit.record(handle::DeliberateExit::Expired);
                         break;
                     }
                 }
@@ -1355,7 +1364,7 @@ mod tests {
             scp_did::DID("did:example:admin".to_owned()),
         );
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_handle = tokio::spawn(actor.run());
 
         // Drop every sender; actor should observe `None` on recv and
@@ -1381,7 +1390,7 @@ mod tests {
             scp_did::DID("did:example:admin".to_owned()),
         );
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_handle = tokio::spawn(actor.run());
 
         let handle = ContextActorHandle::from_sender(tx);
@@ -1415,7 +1424,7 @@ mod tests {
             scp_did::DID("did:example:admin".to_owned()),
         );
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_handle = tokio::spawn(actor.run());
 
         let handle = ContextActorHandle::from_sender(tx);
@@ -1966,7 +1975,7 @@ mod tests {
         );
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
 
         let handle = ContextActorHandle::from_sender(tx);
@@ -2138,7 +2147,7 @@ mod tests {
         let state = writable_encrypted_state(0x51, member);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 
@@ -2179,7 +2188,7 @@ mod tests {
         );
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
         // The shutdown handler marks the actor dirty, so the final drain
@@ -2213,7 +2222,7 @@ mod tests {
         let state = writable_encrypted_state(0x52, member);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 
@@ -2263,7 +2272,7 @@ mod tests {
         let state = writable_encrypted_state(0x54, member);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 
@@ -2312,7 +2321,7 @@ mod tests {
         let state = writable_encrypted_state(0x55, member);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 
@@ -2361,7 +2370,7 @@ mod tests {
         let state = writable_encrypted_state(0x56, member);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 
@@ -2424,7 +2433,7 @@ mod tests {
         let state = writable_encrypted_state(0x53, member);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 
@@ -2510,7 +2519,7 @@ mod tests {
         }
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 
@@ -2765,7 +2774,7 @@ mod tests {
         let ctx = hex_encode_context_id(&[0x71u8; 32]);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 
@@ -2881,7 +2890,7 @@ mod tests {
         let state = active_state_with_past_ttl(0x72, now);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 
@@ -2964,7 +2973,7 @@ mod tests {
             .expect("transition to Active");
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 
@@ -3146,7 +3155,7 @@ mod tests {
         let state = active_state_with_past_ttl(0x77, now);
 
         let (tx, rx) = mpsc::channel::<ContextCommand>(4);
-        let actor = ContextActor::new(state, deps, rx);
+        let actor = ContextActor::new(state, deps, rx, handle::ExitRecord::default());
         let actor_task = tokio::spawn(actor.run());
         let handle = ContextActorHandle::from_sender(tx);
 

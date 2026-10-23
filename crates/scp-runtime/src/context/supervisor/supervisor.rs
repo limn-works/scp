@@ -5786,8 +5786,10 @@ impl Supervisor {
         // (ADR-049 finding A3), reconciled inside the actor's own `run()`
         // loop — no separate supervisor timer JoinSet exists.
         let inbox = rx;
+        let exit = handle.exit_record();
         let join = permit.spawn(async move {
-            Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox).run()).await;
+            Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox, exit).run())
+                .await;
         });
 
         // Spawn the watchdog: it awaits the actor's completion and, on a

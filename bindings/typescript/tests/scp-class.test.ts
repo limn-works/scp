@@ -174,6 +174,21 @@ suite.describe("SCP class (Phase 4)", (addon) => {
     await expect(scp.resume()).resolves.toBeUndefined();
   });
 
+  test("suspend and shutdown refuse a timeout outside u64 with SCP-VALID-7001", async () => {
+    // `BigInt::get_u64` drops the sign and keeps the low 64 bits, so without
+    // the range check `-5000n` would read as 5000 ms and `2n ** 64n` as zero.
+    const scp = new addon.SCP(JSON.stringify({ type: "in_memory" }));
+    for (const bad of [-5000n, 2n ** 64n]) {
+      await expect(scp.suspend(bad)).rejects.toThrow(/SCP-VALID-7001/);
+      await expect(scp.shutdown(bad)).rejects.toThrow(/SCP-VALID-7001/);
+    }
+    // Neither refused call touched the instance: it still suspends, resumes
+    // and shuts down.
+    await expect(scp.suspend(5000n)).resolves.toBeUndefined();
+    await expect(scp.resume()).resolves.toBeUndefined();
+    await expect(scp.shutdown(1000n)).resolves.toBeUndefined();
+  });
+
   test("handle minted by one SCP is rejected by another (SCP-PERM-3030)", async () => {
     // Round-2 black-hat finding: the TS parity tests must mint a handle
     // on one SCP and call a method on a DIFFERENT SCP with it so the

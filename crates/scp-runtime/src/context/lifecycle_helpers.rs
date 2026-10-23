@@ -4288,17 +4288,20 @@ pub async fn restore_all_contexts(
 /// [`LifecycleCommand::FlushSnapshot`](crate::context::actor::commands::LifecycleCommand::FlushSnapshot)
 /// per actor. Every actor is flushed even after one fails. An actor that
 /// despawned between the listing and the lookup holds nothing to flush, and
-/// neither does one whose task exited between the lookup and its reply (the
-/// context closed, expired or was replaced): its inbox reads closed, so the
-/// flush skips it. No-op if no persistence provider is configured.
+/// neither does one that left its `run()` loop on purpose between the lookup
+/// and its reply: it recorded a Shutdown, a claimed `PrepareForReplace` or a
+/// TTL expiry on its handle ([`ContextActorHandle::exited_deliberately`]),
+/// so the flush skips it. No-op if no persistence provider is configured.
 ///
 /// # Errors
 ///
 /// The first actor's failure, in registry order, when any flush did not land
-/// (ADR-049 Decision 9): the flush's own error, the mailbox send's error on
-/// an inbox that is still open (a full mailbox), or
-/// [`ContextError::ActorCrashed`] when a still-running actor dropped its
-/// reply. Each failure is also logged.
+/// (ADR-049 Decision 9): the flush's own error; the mailbox send's error
+/// (a full mailbox, or an inbox that closed without a deliberate exit); or
+/// [`ContextError::ActorCrashed`] when the actor dropped its reply without a
+/// deliberate exit, as a panic does. Each failure is also logged.
+///
+/// [`ContextActorHandle::exited_deliberately`]: crate::context::actor::ContextActorHandle
 pub async fn flush_all_contexts(
     supervisor: &crate::context::supervisor::Supervisor,
 ) -> Result<(), ContextError> {
@@ -4316,30 +4319,42 @@ pub async fn flush_all_contexts(
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { reply: tx });
+        // An unanswered flush is skipped only when the actor recorded a
+        // deliberate exit: a closed, replaced or expired context holds
+        // nothing this sweep must persist. A reply the actor dropped for any
+        // other reason, a panic included, is a flush that did not land.
+        let unanswered = |e: ContextError| match actor.exited_deliberately() {
+            Some(exit) => {
+                tracing::debug!(
+                    context_id = %ctx_id,
+                    ?exit,
+                    error = %e,
+                    "flush_all_contexts: the actor exited on purpose before it flushed; skipped"
+                );
+                None
+            }
+            None => Some(e),
+        };
         let flushed_one = match actor
             .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
             .await
         {
-            Ok(()) => rx.await.unwrap_or_else(|_| {
-                Err(ContextError::ActorCrashed(format!(
+            Ok(()) => match rx.await {
+                Ok(result) => result,
+                Err(_dropped) => match unanswered(ContextError::ActorCrashed(format!(
                     "the actor of {ctx_id} dropped its flush reply"
-                )))
-            }),
-            Err(e) => Err(e),
+                ))) {
+                    Some(e) => Err(e),
+                    None => continue,
+                },
+            },
+            Err(e) => match unanswered(e) {
+                Some(e) => Err(e),
+                None => continue,
+            },
         };
         match flushed_one {
             Ok(()) => flushed += 1,
-            // The actor's task exited after the lookup: a Shutdown, a
-            // claimed PrepareForReplace, or a despawn closed its inbox and
-            // dropped the queued flush. A closed or replaced context holds
-            // nothing this sweep must persist.
-            Err(e) if actor.is_closed() => {
-                tracing::debug!(
-                    context_id = %ctx_id,
-                    error = %e,
-                    "flush_all_contexts: the actor exited before it flushed; skipped"
-                );
-            }
             Err(e) => {
                 tracing::warn!(
                     context_id = %ctx_id,
@@ -6622,14 +6637,15 @@ mod relay_url_storage_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod flush_sweep_tests {
-    //! ADR-049 Decision 9: `flush_all_contexts` skips an actor whose task
-    //! exited before it flushed, and fails on an actor that is still running
-    //! but cannot take the flush.
+    //! ADR-049 Decision 9: `flush_all_contexts` skips an actor that exited on
+    //! purpose before it flushed, and fails on one that crashed or is still
+    //! running but cannot take the flush.
 
     use std::sync::Arc;
 
     use super::flush_all_contexts;
     use crate::context::actor::commands::LifecycleCommand;
+    use crate::context::actor::handle::DeliberateExit;
     use crate::context::actor::{ContextActorHandle, ContextCommand};
     use crate::context::supervisor::Supervisor;
 
@@ -6660,23 +6676,27 @@ mod flush_sweep_tests {
         )
     }
 
-    /// One actor's inbox closed before the sweep sent to it, and another's
-    /// task took the flush and exited without replying. Neither holds state
-    /// the sweep must persist, so the sweep succeeds.
+    /// One actor recorded a Shutdown and closed its inbox before the sweep
+    /// sent to it, and another took the flush, then recorded a claimed
+    /// `PrepareForReplace` and exited without replying. Both left on purpose and
+    /// hold no state the sweep must persist, so the sweep succeeds.
     #[tokio::test]
-    async fn an_actor_that_exited_before_it_flushed_is_skipped() {
+    async fn an_actor_that_exited_on_purpose_before_it_flushed_is_skipped() {
         let sup = persisting_supervisor();
         let (tx_gone, rx_gone) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        let gone = ContextActorHandle::from_sender(tx_gone);
+        gone.exit_record().record(DeliberateExit::Shutdown);
         drop(rx_gone);
-        sup.register_actor_handle_for_test("ctx-gone", ContextActorHandle::from_sender(tx_gone));
+        sup.register_actor_handle_for_test("ctx-gone", gone);
         let (tx_exiting, mut rx_exiting) = tokio::sync::mpsc::channel::<ContextCommand>(1);
-        sup.register_actor_handle_for_test(
-            "ctx-exiting",
-            ContextActorHandle::from_sender(tx_exiting),
-        );
+        let exiting_handle = ContextActorHandle::from_sender(tx_exiting);
+        let exit = exiting_handle.exit_record();
+        sup.register_actor_handle_for_test("ctx-exiting", exiting_handle);
         let exiting = tokio::spawn(async move {
             let cmd = rx_exiting.recv().await;
-            // The task exits: its inbox closes, then the unanswered reply drops.
+            // The actor records its exit before its inbox and the unanswered
+            // reply drop, as `ContextActor::run` does.
+            exit.record(DeliberateExit::Replaced);
             drop(rx_exiting);
             drop(cmd);
         });
@@ -6686,10 +6706,67 @@ mod flush_sweep_tests {
         exiting.await.unwrap();
         assert!(
             result.is_ok(),
-            "an actor that exited before it flushed is skipped: {result:?}"
+            "an actor that exited on purpose before it flushed is skipped: {result:?}"
         );
     }
 
+    /// An actor that took the flush and panicked dropped its reply without a
+    /// deliberate exit: its state may be unpersisted, so the sweep fails with
+    /// `ActorCrashed`. An actor whose inbox closed with no deliberate exit
+    /// fails it too.
+    #[tokio::test]
+    async fn an_actor_that_panicked_or_vanished_before_it_flushed_fails_the_sweep() {
+        let sup = persisting_supervisor();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        sup.register_actor_handle_for_test("ctx-panicked", ContextActorHandle::from_sender(tx));
+        let panicked = tokio::spawn(async move {
+            let cmd = rx.recv().await;
+            assert!(cmd.is_some(), "the sweep sent the flush");
+            panic!("the actor panicked mid-flush");
+        });
+
+        let result = flush_all_contexts(&sup).await;
+
+        assert!(panicked.await.unwrap_err().is_panic());
+        assert!(
+            matches!(result, Err(crate::context::ContextError::ActorCrashed(_))),
+            "a panicked actor fails the sweep: {result:?}"
+        );
+
+        let sup = persisting_supervisor();
+        let (tx_closed, rx_closed) = tokio::sync::mpsc::channel::<ContextCommand>(1);
+        drop(rx_closed);
+        sup.register_actor_handle_for_test(
+            "ctx-closed",
+            ContextActorHandle::from_sender(tx_closed),
+        );
+        let result = flush_all_contexts(&sup).await;
+        assert!(
+            result.is_err(),
+            "an inbox closed without a deliberate exit fails the sweep: {result:?}"
+        );
+    }
+
+    /// The production spawn wires the actor's exit record to the handle the
+    /// registry holds: a Supervisor-spawned actor reads as running, then as
+    /// shut down on purpose once it dispatched `Shutdown`.
+    #[tokio::test]
+    async fn a_spawned_actor_records_its_shutdown_on_its_handle() {
+        let sup = persisting_supervisor();
+        let did = scp_did::DID("did:dht:z6MkFlushSweep".to_owned());
+        let deps = sup.build_actor_deps_loaded(&did).await.unwrap();
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            [0x5a; 32],
+            1_700_000_000,
+            did,
+        );
+        let handle = sup.spawn_actor_with_state(state, deps, None).await.unwrap();
+        assert_eq!(handle.exited_deliberately(), None);
+
+        handle.shutdown_and_await_exit().await.unwrap();
+
+        assert_eq!(handle.exited_deliberately(), Some(DeliberateExit::Shutdown));
+    }
     /// An actor whose task still runs but whose mailbox stays full past the
     /// send timeout did not flush, and its state is still live, so the sweep
     /// fails.

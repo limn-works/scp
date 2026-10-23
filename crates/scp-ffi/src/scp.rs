@@ -450,9 +450,10 @@ mod sdk_shutdown_tests {
             matches!(&timed_out, Err(ScpPyError::ValidationError { code, .. }) if code == STORAGE_8005),
             "{timed_out:?}"
         );
-        let refused = sdk_shutdown(Err(ShutdownError::DurableStoreClose(
-            scp_platform::PlatformError::StorageError("close refused".to_owned()),
-        )));
+        let refused = sdk_shutdown(Err(ShutdownError::DurableStoreClose {
+            error: scp_platform::PlatformError::StorageError("close refused".to_owned()),
+            flush: scp_ffi_common::bridge_instance::ShutdownFlush::Flushed,
+        }));
         assert!(
             matches!(&refused, Err(ScpPyError::ValidationError { code, .. }) if code == STORAGE_8005),
             "{refused:?}"
@@ -506,7 +507,7 @@ mod sdk_shutdown_tests {
             matches!(&locked, Err(ScpPyError::ValidationError { code, .. }) if code == codes::STORAGE_8005),
             "{locked:?}"
         );
-        let cut = sdk_shutdown(Err(ShutdownError::Interrupted));
+        let cut = sdk_shutdown(Err(ShutdownError::Interrupted { flush: None }));
         assert!(
             matches!(&cut, Err(ScpPyError::ValidationError { code, .. }) if code == codes::STORAGE_8005),
             "{cut:?}"

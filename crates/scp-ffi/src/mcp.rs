@@ -4579,7 +4579,8 @@ mod tests {
         });
         // Nothing but the call locks the client once connect has returned,
         // so a failed `try_lock` means the call is inside `list_tools`.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            scp_ffi_common::deadline::deadline_after(std::time::Duration::from_secs(10)).into_std();
         while probe.try_lock().is_ok() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -4943,7 +4944,8 @@ mod tests {
     /// Polls `condition` every 5 ms for up to 10 seconds.
     #[cfg(unix)]
     fn wait_for(what: &str, condition: impl Fn() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            scp_ffi_common::deadline::deadline_after(std::time::Duration::from_secs(10)).into_std();
         while !condition() {
             assert!(std::time::Instant::now() < deadline, "timed out: {what}");
             std::thread::sleep(std::time::Duration::from_millis(5));

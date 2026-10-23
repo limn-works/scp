@@ -627,6 +627,19 @@ pub struct CoreFields {
     /// report a flush failure after a shutdown succeeded.
     lifecycle: AsyncMutex<()>,
 
+    /// Cancelled once, by the shutdown whose swap wins, before it waits for
+    /// [`Self::lifecycle`]. A suspend or resume that holds or waits for the
+    /// lock selects on it at every await, so it yields to the shutdown at
+    /// once instead of running out its own deadline: the shutdown then never
+    /// waits past its caller's deadline for a transition that the shutdown
+    /// supersedes. Never rotated, because shutdown is terminal.
+    transition_cancel: CancellationToken,
+
+    /// How the shutdown's context-snapshot flush ended, set once the flush
+    /// ends, so a shutdown the runtime interrupts after its flush still
+    /// reports the flush ([`ShutdownError::Interrupted`]).
+    shutdown_flush: OnceLock<ShutdownFlush>,
+
     // -----------------------------------------------------------------
     // Shared state — previously per-bridge OnceLock singletons
     // -----------------------------------------------------------------
@@ -957,6 +970,8 @@ impl CoreFields {
             )),
             suspended: AtomicBool::new(false),
             lifecycle: AsyncMutex::new(()),
+            transition_cancel: CancellationToken::new(),
+            shutdown_flush: OnceLock::new(),
             transport: RwLock::new(None),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
             known_contexts: DashMap::new(),
@@ -1049,6 +1064,8 @@ impl CoreFields {
             )),
             suspended: AtomicBool::new(false),
             lifecycle: AsyncMutex::new(()),
+            transition_cancel: CancellationToken::new(),
+            shutdown_flush: OnceLock::new(),
             transport: RwLock::new(None),
             transport_selector: Arc::new(scp_transport::TransportSelector::new()),
             known_contexts: DashMap::new(),
@@ -1709,21 +1726,36 @@ impl CoreFields {
     /// mid-flush leaves the instance running with its transport, as a failed
     /// flush does.
     ///
-    /// No-op if already shut down.
+    /// Returns `Ok(())` without suspending once a shutdown has started: when
+    /// the instance is already shut down, when a shutdown starts while this
+    /// call waits for the lifecycle lock (including a wait that runs out its
+    /// deadline after the shutdown started), and when a shutdown starts
+    /// mid-flush, which cancels the flush. The shutdown supersedes the
+    /// suspend and runs its own flush, so no storage failure is reported for
+    /// the suspend.
     ///
     /// # Errors
     ///
     /// [`SuspendError::FlushFailed`] when a context's snapshot did not
     /// persist; [`SuspendError::DeadlineElapsed`] when the flush, or the wait
-    /// for a transition in progress, did not finish within `deadline`;
+    /// for a transition in progress, did not finish within `deadline` and no
+    /// shutdown had started;
     /// [`SuspendError::TransportLock`] when the transport lock is poisoned. On
     /// any error the instance stays running: `is_suspended()` returns
     /// `false`, and a failed flush leaves the transport connected. The
     /// unflushed actors stay dirty, so a retried `suspend` flushes them again.
     pub async fn suspend(&self, deadline: Duration) -> Result<(), SuspendError> {
         let start = tokio::time::Instant::now();
-        let Ok(_transition) = tokio::time::timeout(deadline, self.lifecycle.lock()).await else {
-            return Err(SuspendError::DeadlineElapsed { deadline });
+        let _transition = tokio::select! {
+            biased;
+            () = self.transition_cancel.cancelled() => return Ok(()),
+            locked = tokio::time::timeout(deadline, self.lifecycle.lock()) => match locked {
+                Ok(guard) => guard,
+                // The shutdown swap precedes its cancel, so a wait that
+                // expires between the two still reads the shutdown here.
+                Err(_elapsed) if self.is_shutdown() => return Ok(()),
+                Err(_elapsed) => return Err(SuspendError::DeadlineElapsed { deadline }),
+            },
         };
         if self.is_shutdown() {
             return Ok(());
@@ -1749,7 +1781,19 @@ impl CoreFields {
         // no context exists, so nothing needs a flush.
         if let Some(supervisor) = self.supervisor.get() {
             let remaining = deadline.saturating_sub(start.elapsed());
-            match tokio::time::timeout(remaining, supervisor.flush_all_contexts()).await {
+            let flushed = tokio::select! {
+                biased;
+                () = self.transition_cancel.cancelled() => {
+                    // A shutdown started mid-flush and waits for this lock.
+                    // It flushes every context itself, so the suspend yields:
+                    // the guard reverts the flag and the shutdown clears the
+                    // transport.
+                    tracing::debug!("suspend yielded to a shutdown mid-flush");
+                    return Ok(());
+                }
+                flushed = tokio::time::timeout(remaining, supervisor.flush_all_contexts()) => flushed,
+            };
+            match flushed {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "suspend refused: a context snapshot did not persist");
@@ -1816,23 +1860,38 @@ impl CoreFields {
     /// interleaves with [`Self::suspend`] or [`Self::shutdown_core_async`]:
     /// a resume that arrives during a suspend's flush runs after the suspend
     /// has cleared transport, and its reconnect installs the transport again.
+    /// A shutdown that starts while the resume waits for the lock, reconnects
+    /// or restores cancels it at that await, so the shutdown never waits on
+    /// the resume past its own deadline.
     ///
     /// # Errors
     ///
     /// [`LifecycleError::AlreadyShutDown`] if the instance has been
-    /// permanently shut down; [`LifecycleError::ReconnectFailed`] when no
+    /// permanently shut down, or a shutdown started before the resume
+    /// finished; [`LifecycleError::ReconnectFailed`] when no
     /// pending relay reconnected. The suspended flag is already cleared when
     /// a reconnect fails.
     pub async fn resume(&self) -> Result<(), LifecycleError> {
-        let _transition = self.lifecycle.lock().await;
+        let _transition = tokio::select! {
+            biased;
+            () = self.transition_cancel.cancelled() => return Err(LifecycleError::AlreadyShutDown),
+            guard = self.lifecycle.lock() => guard,
+        };
         if self.is_shutdown() {
             return Err(LifecycleError::AlreadyShutDown);
         }
         self.suspended.store(false, Ordering::SeqCst);
         tracing::debug!("bridge instance resumed");
-        self.reconnect_transport_if_pending().await?;
-        self.restore_all_persisted_contexts().await;
-        Ok(())
+        tokio::select! {
+            biased;
+            () = self.transition_cancel.cancelled() => return Err(LifecycleError::AlreadyShutDown),
+            reconnected = self.reconnect_transport_if_pending() => reconnected?,
+        }
+        tokio::select! {
+            biased;
+            () = self.transition_cancel.cancelled() => Err(LifecycleError::AlreadyShutDown),
+            () = self.restore_all_persisted_contexts() => Ok(()),
+        }
     }
 
     // -----------------------------------------------------------------
@@ -3017,11 +3076,15 @@ impl CoreFields {
     /// 0. Cancels any in-flight reconnect dial.
     /// 1. Idempotency: if `shutdown` has already been called,
     ///    returns [`ShutdownError::AlreadyShutDown`] without side effects.
-    ///    Otherwise takes the lifecycle lock and holds it for the rest of the
-    ///    call, so the shutdown never interleaves with [`Self::suspend`] or
-    ///    [`Self::resume`]. The deadline counts from the call, so time spent
-    ///    waiting for a transition in progress comes out of the drain's
-    ///    budget.
+    ///    Otherwise cancels any [`Self::suspend`] or [`Self::resume`] in
+    ///    progress, which then yields at its next await, and takes the
+    ///    lifecycle lock for the rest of the call, so the shutdown never
+    ///    interleaves with either. The deadline counts from the call, so time
+    ///    spent waiting for the lock comes out of the drain's budget, and the
+    ///    wait itself is bounded by `timeout`: when it expires, the cleanup
+    ///    still runs, without the lock and with no budget left, and the
+    ///    outcome is [`ShutdownOutcome::TimedOut`] with
+    ///    [`ShutdownFlush::TimedOut`].
     /// 2. Fires [`CancellationToken::cancel`] so cooperating tasks can exit.
     /// 3. Drains the task `JoinSet` inside `tokio::time::timeout(remaining, …)`.
     ///    Tasks that finish within the deadline report
@@ -3094,10 +3157,27 @@ impl CoreFields {
             };
             return Err(ShutdownError::AlreadyShutDown { durable_store_open });
         }
-        // The suspend and resume that hold this lock are each bounded: a
-        // suspend by its own deadline, a resume by its per-relay dial
-        // timeout and the restore.
-        let _transition = self.lifecycle.lock().await;
+        // A suspend or resume that holds the lock selects on this token at
+        // every await, so it gives the lock up at once. The wait is still
+        // bounded by the caller's deadline: a holder that does not yield in
+        // time does not hold the shutdown past it. Its cleanup then runs
+        // without the lock and with no budget left, so the flush reports
+        // TimedOut and the drain, if it has tracked tasks, keeps running
+        // detached and closes the store when they exit.
+        self.transition_cancel.cancel();
+        let transition = tokio::time::timeout(
+            timeout.saturating_sub(start.elapsed()),
+            self.lifecycle.lock(),
+        )
+        .await
+        .ok();
+        if transition.is_none() {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis(),
+                "shutdown: a suspend or resume did not yield the lifecycle lock within the \
+                 deadline; cleaning up without it"
+            );
+        }
         let store_closer = store_closer.map_or_else(
             || {
                 self.durable_store_state
@@ -3112,6 +3192,15 @@ impl CoreFields {
 
         let outcome =
             drain_under_deadline(&self.tasks, timeout.saturating_sub(start.elapsed())).await;
+        // A lock wait that ran out the deadline is a missed deadline even
+        // when every task then finished.
+        let outcome = match (transition.is_some(), outcome) {
+            (false, BridgeTasksDrain::Finished { panicked }) => BridgeTasksDrain::TimedOut {
+                aborted: 0,
+                panicked,
+            },
+            (_, outcome) => outcome,
+        };
 
         // Run the cleanup side effects inside the remaining budget so
         // callers get a true end-to-end deadline on shutdown, flush
@@ -3124,7 +3213,13 @@ impl CoreFields {
         let (flush, drain) = self
             .run_shutdown_side_effects(remaining, store_closer)
             .await;
-        combine_shutdown_outcome(outcome, flush, drain, has_durable_store, start.elapsed())
+        let result =
+            combine_shutdown_outcome(outcome, flush, drain, has_durable_store, start.elapsed());
+        // The lifecycle lock, when the wait above won it, is held until the
+        // store's close has settled, so a suspend or resume queued behind it
+        // reads the instance as shut down.
+        drop(transition);
+        result
     }
 
     /// Cleanup body of [`shutdown_core_async`](Self::shutdown_core_async).
@@ -3146,7 +3241,7 @@ impl CoreFields {
         budget: Duration,
         store_closer: Option<DurableStoreCloser>,
     ) -> (ShutdownFlush, SupervisorDrain) {
-        let deadline = tokio::time::Instant::now() + budget;
+        let deadline = crate::deadline::deadline_after(budget);
         if let Err(e) = self.clear_transport() {
             tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
         }
@@ -3188,6 +3283,10 @@ impl CoreFields {
                     }
                 }
             };
+            if self.shutdown_flush.set(flush.clone()).is_err() {
+                // Only the shutdown whose swap won reaches this point.
+                tracing::error!("a second shutdown flush ran on one instance");
+            }
             let has_durable_store = store_closer.is_some();
             // The store closes inside the drain task, after the drain: never
             // before a tracked writer exits (ADR-049 Decision 16). A drain
@@ -3412,7 +3511,9 @@ fn combine_shutdown_outcome(
         BridgeTasksDrain::TimedOut { aborted, panicked } => (Some(aborted), panicked),
     };
     let (drain, durable_store_open) = match drain {
-        SupervisorDrain::Finished(Err(e)) => return Err(ShutdownError::DurableStoreClose(e)),
+        SupervisorDrain::Finished(Err(error)) => {
+            return Err(ShutdownError::DurableStoreClose { error, flush });
+        }
         SupervisorDrain::Finished(Ok(())) => (DrainState::Finished, false),
         SupervisorDrain::Pending => (DrainState::Running, has_durable_store),
         SupervisorDrain::Failed(JoinFailure::Panicked) => (DrainState::Panicked, has_durable_store),
@@ -3520,11 +3621,11 @@ pub fn sdk_shutdown_result(
         Err(ShutdownError::AlreadyShutDown {
             durable_store_open: true,
         }) => Err(lock_held(STORE_OPEN.to_owned())),
-        Err(e @ ShutdownError::DurableStoreClose(_)) => Err(lock_held(format!(
+        Err(e @ ShutdownError::DurableStoreClose { .. }) => Err(lock_held(format!(
             "{e} — the durable store keeps its advisory lock, so a reopen of the same \
              directory fails until the process releases it"
         ))),
-        Err(e @ ShutdownError::Interrupted) => Err(lock_held(format!(
+        Err(e @ ShutdownError::Interrupted { .. }) => Err(lock_held(format!(
             "{e} — the durable store may still hold its advisory lock, so a reopen of the \
              same directory may fail until the process releases it"
         ))),
@@ -3744,6 +3845,7 @@ pub trait BridgeInstanceCore: Send + Sync + 'static {
         self: Arc<Self>,
         timeout: Duration,
     ) -> Result<ShutdownOutcome, ShutdownError> {
+        let interrupted = Arc::clone(&self);
         run_to_completion(async move {
             // Stop every borrower BEFORE any release: the durable store
             // closer closes this instance's `SQLCipher` handle, and a node
@@ -3758,7 +3860,11 @@ pub trait BridgeInstanceCore: Send + Sync + 'static {
             result
         })
         .await
-        .unwrap_or(Err(ShutdownError::Interrupted))
+        .unwrap_or_else(|TransitionCancelled| {
+            Err(ShutdownError::Interrupted {
+                flush: interrupted.core().shutdown_flush.get().cloned(),
+            })
+        })
     }
 
     /// Returns the closer for this instance's durable store, or `None` when
@@ -4130,8 +4236,9 @@ pub enum ShutdownOutcome {
         flush: ShutdownFlush,
     },
     /// The deadline expired before the bridge's own tasks or the
-    /// Supervisor's tracked tasks finished, or the Supervisor drain task
-    /// panicked or was cancelled; `drain` says which.
+    /// Supervisor's tracked tasks finished, or before a suspend or resume
+    /// gave up the lifecycle lock, or the Supervisor drain task panicked or
+    /// was cancelled; `drain` says which part of the drain did not finish.
     TimedOut {
         /// Number of the bridge's own `JoinSet` tasks that were aborted
         /// because the shutdown deadline was reached (tasks that had already
@@ -4192,7 +4299,9 @@ pub enum ShutdownFlush {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainState {
     /// Every tracked task exited before the deadline and the durable store
-    /// close ran; only the bridge's own `JoinSet` missed the deadline.
+    /// close ran; the deadline was missed elsewhere: by the bridge's own
+    /// `JoinSet`, or by the wait for a suspend or resume to give up the
+    /// lifecycle lock.
     Finished,
     /// The deadline passed first. The drain keeps running detached and
     /// closes the durable store when the last tracked task exits.
@@ -4218,13 +4327,43 @@ pub enum ShutdownError {
     /// The Supervisor drained in time, but the durable store refused to
     /// close. The store keeps its connection and advisory lock, so a reopen
     /// of the same directory fails until the process releases it.
-    #[error("durable store failed to close after shutdown: {0}")]
-    DurableStoreClose(scp_platform::PlatformError),
+    #[error("durable store failed to close after shutdown: {error}{}", flush_note(Some(.flush)))]
+    DurableStoreClose {
+        /// Why the store refused to close.
+        error: scp_platform::PlatformError,
+        /// How the context-snapshot flush, which ran before the close,
+        /// ended.
+        flush: ShutdownFlush,
+    },
     /// The runtime cancelled the shutdown task before it finished, as when
     /// the runtime itself shuts down. The durable store may still hold its
     /// advisory lock.
-    #[error("the runtime stopped the shutdown before it finished")]
-    Interrupted,
+    #[error("the runtime stopped the shutdown before it finished{}", flush_note(.flush.as_ref()))]
+    Interrupted {
+        /// How the context-snapshot flush ended, or `None` when the runtime
+        /// stopped the shutdown before its flush ended.
+        flush: Option<ShutdownFlush>,
+    },
+}
+
+/// The clause a [`ShutdownError`] message appends for its flush: nothing for
+/// a flush that persisted every snapshot or had none to persist, and what
+/// went wrong otherwise.
+fn flush_note(flush: Option<&ShutdownFlush>) -> String {
+    match flush {
+        Some(ShutdownFlush::Flushed | ShutdownFlush::Skipped) => String::new(),
+        Some(ShutdownFlush::Failed { message }) => format!(
+            "; the context-snapshot flush also failed ({message}), so those contexts restore \
+             from their last persisted snapshot"
+        ),
+        Some(ShutdownFlush::TimedOut) => "; the context-snapshot flush did not finish within \
+                                          the deadline, so the unflushed contexts restore from \
+                                          their last persisted snapshot"
+            .to_owned(),
+        None => "; the context-snapshot flush had not finished, so the unflushed contexts \
+                 restore from their last persisted snapshot"
+            .to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -4251,6 +4390,10 @@ pub(crate) mod tests {
     /// The deadline a test passes to `suspend` when the deadline is not what
     /// the test exercises.
     const TEST_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Outer bound on a lifecycle test, so a regression that hangs a
+    /// transition fails the test instead of hanging the run.
+    const HANG_LIMIT: Duration = Duration::from_secs(60);
 
     use scp_core::envelope::outer::OuterEnvelope;
     use scp_transport::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportError};
@@ -6373,74 +6516,196 @@ pub(crate) mod tests {
     /// not running with no transport.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn overlapping_suspends_end_suspended_with_the_transport_cleared() {
-        let recording = Arc::new(RecordingPersistence::default());
-        let instance =
-            Arc::new(instance_with_persisted_context(&recording, "overlap-suspend-ctx").await);
-        let before = recording.started();
-        let hold = recording.hold.write().await;
-        let first = tokio::spawn({
-            let instance = Arc::clone(&instance);
-            async move { instance.suspend(Duration::from_millis(300)).await }
-        });
-        recording.wait_started(before + 1).await;
-        let second = tokio::spawn({
-            let instance = Arc::clone(&instance);
-            async move { instance.suspend(TEST_DEADLINE).await }
-        });
+        tokio::time::timeout(HANG_LIMIT, async {
+            let recording = Arc::new(RecordingPersistence::default());
+            let instance =
+                Arc::new(instance_with_persisted_context(&recording, "overlap-suspend-ctx").await);
+            let before = recording.started();
+            let hold = recording.hold.write().await;
+            let first = tokio::spawn({
+                let instance = Arc::clone(&instance);
+                async move { instance.suspend(Duration::from_millis(300)).await }
+            });
+            recording.wait_started(before + 1).await;
+            let second = tokio::spawn({
+                let instance = Arc::clone(&instance);
+                async move { instance.suspend(TEST_DEADLINE).await }
+            });
 
-        let first = first.await.unwrap();
-        assert!(
-            matches!(first, Err(SuspendError::DeadlineElapsed { .. })),
-            "{first:?}"
-        );
-        drop(hold);
-        second.await.unwrap().unwrap();
+            let first = first.await.unwrap();
+            assert!(
+                matches!(first, Err(SuspendError::DeadlineElapsed { .. })),
+                "{first:?}"
+            );
+            drop(hold);
+            second.await.unwrap().unwrap();
 
-        assert!(
-            instance.is_suspended(),
-            "the first suspend's revert ran before the second suspend set the flag"
-        );
-        assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
+            assert!(
+                instance.is_suspended(),
+                "the first suspend's revert ran before the second suspend set the flag"
+            );
+            assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
+        })
+        .await
+        .expect("a suspend hung past the test's limit");
     }
 
-    /// A shutdown that starts while a suspend is flushing waits for it: its
-    /// cleanup does not run, and the instance keeps its transport, until the
-    /// suspend finishes; the suspend returns `Ok` rather than a storage
-    /// failure, and the shutdown then flushes and shuts down.
+    /// A shutdown that starts while a suspend is flushing cancels the
+    /// suspend: the suspend returns `Ok` at once, rather than a storage
+    /// failure, while its flush is still wedged; the shutdown then runs its
+    /// own flush and shuts down.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_during_a_suspend_flush_waits_and_neither_fails() {
-        let recording = Arc::new(RecordingPersistence::default());
-        let instance =
-            Arc::new(instance_with_persisted_context(&recording, "suspend-shutdown-ctx").await);
-        let before = recording.started();
-        let hold = recording.hold.write().await;
-        let suspend = tokio::spawn({
-            let instance = Arc::clone(&instance);
-            async move { instance.suspend(TEST_DEADLINE).await }
-        });
-        recording.wait_started(before + 1).await;
-        let shutdown = tokio::spawn({
-            let instance = Arc::clone(&instance);
-            async move { instance.shutdown_core_async(TEST_DEADLINE, None).await }
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !shutdown.is_finished(),
-            "the shutdown waits for the suspend that holds the lifecycle lock"
-        );
-        assert_eq!(
-            instance.context_relay_urls(),
-            Ok(vec!["wss://suspend.example".to_owned()]),
-            "the shutdown has not cleared transport under the suspend's flush"
-        );
+    async fn shutdown_during_a_suspend_flush_cancels_it_and_neither_fails() {
+        tokio::time::timeout(HANG_LIMIT, async {
+            let recording = Arc::new(RecordingPersistence::default());
+            let instance =
+                Arc::new(instance_with_persisted_context(&recording, "suspend-shutdown-ctx").await);
+            let before = recording.started();
+            let hold = recording.hold.write().await;
+            let suspend = tokio::spawn({
+                let instance = Arc::clone(&instance);
+                async move { instance.suspend(TEST_DEADLINE).await }
+            });
+            recording.wait_started(before + 1).await;
+            let shutdown = tokio::spawn({
+                let instance = Arc::clone(&instance);
+                async move { instance.shutdown_core_async(TEST_DEADLINE, None).await }
+            });
 
-        drop(hold);
-        suspend.await.unwrap().unwrap();
-        let outcome = shutdown.await.unwrap().unwrap();
+            suspend
+                .await
+                .unwrap()
+                .expect("a suspend that a shutdown supersedes returns Ok");
+            assert!(
+                !shutdown.is_finished(),
+                "the shutdown's own flush is still wedged"
+            );
+            drop(hold);
+            let outcome = shutdown.await.unwrap().unwrap();
 
-        assert_eq!(outcome.flush(), &ShutdownFlush::Flushed, "{outcome:?}");
-        assert!(instance.is_shutdown());
-        assert!(!instance.is_suspended(), "shutdown supersedes suspension");
+            assert_eq!(outcome.flush(), &ShutdownFlush::Flushed, "{outcome:?}");
+            assert!(instance.is_shutdown());
+            assert!(!instance.is_suspended(), "shutdown supersedes suspension");
+            assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
+        })
+        .await
+        .expect("a lifecycle transition hung past the test's limit");
+    }
+
+    /// A shutdown never waits on a suspend past its own deadline: behind a
+    /// `suspend(30 s)` whose flush is wedged, `shutdown(1 s)` returns within
+    /// about one second, reporting its own wedged flush as timed out, and
+    /// the suspend returns `Ok`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_behind_a_wedged_suspend_returns_within_its_deadline() {
+        tokio::time::timeout(HANG_LIMIT, async {
+            let recording = Arc::new(RecordingPersistence::default());
+            let instance = Arc::new(
+                instance_with_persisted_context(&recording, "wedged-suspend-shutdown-ctx").await,
+            );
+            let before = recording.started();
+            let hold = recording.hold.write().await;
+            let suspend = tokio::spawn({
+                let instance = Arc::clone(&instance);
+                async move { instance.suspend(Duration::from_secs(30)).await }
+            });
+            recording.wait_started(before + 1).await;
+
+            let started = tokio::time::Instant::now();
+            let outcome = instance
+                .shutdown_core_async(Duration::from_secs(1), None)
+                .await
+                .unwrap();
+            let took = started.elapsed();
+
+            assert!(took < Duration::from_secs(3), "shutdown(1 s) took {took:?}");
+            assert!(
+                matches!(
+                    &outcome,
+                    ShutdownOutcome::TimedOut {
+                        flush: ShutdownFlush::TimedOut,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            suspend
+                .await
+                .unwrap()
+                .expect("the superseded suspend returns Ok");
+            assert!(instance.is_shutdown());
+            drop(hold);
+        })
+        .await
+        .expect("a shutdown waited on a wedged suspend past the test's limit");
+    }
+
+    /// A shutdown whose wait for the lifecycle lock runs out its deadline
+    /// still runs its cleanup, clearing the transport, and reports
+    /// `TimedOut` with a timed-out flush, even though every task then
+    /// finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_whose_lock_wait_expires_cleans_up_and_reports_timed_out() {
+        tokio::time::timeout(HANG_LIMIT, async {
+            let recording = Arc::new(RecordingPersistence::default());
+            let instance =
+                instance_with_persisted_context(&recording, "lock-wait-shutdown-ctx").await;
+            // A holder that never yields, as a transition stuck outside an
+            // await would be.
+            let held = instance.lifecycle.lock().await;
+
+            let started = tokio::time::Instant::now();
+            let outcome = instance
+                .shutdown_core_async(Duration::from_millis(200), None)
+                .await
+                .unwrap();
+
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(
+                matches!(
+                    &outcome,
+                    ShutdownOutcome::TimedOut {
+                        flush: ShutdownFlush::TimedOut,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert!(instance.is_shutdown());
+            assert_eq!(instance.context_relay_urls(), Ok(Vec::new()));
+            drop(held);
+        })
+        .await
+        .expect("a shutdown waited on the lifecycle lock past the test's limit");
+    }
+
+    /// A suspend that arrives while a shutdown holds the lifecycle lock
+    /// returns `Ok`, not a storage failure: the shutdown supersedes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_suspend_behind_a_shutdown_that_holds_the_lock_returns_ok() {
+        tokio::time::timeout(HANG_LIMIT, async {
+            let recording = Arc::new(RecordingPersistence::default());
+            let instance =
+                Arc::new(instance_with_persisted_context(&recording, "shutdown-first-ctx").await);
+            let before = recording.started();
+            let hold = recording.hold.write().await;
+            let shutdown = tokio::spawn({
+                let instance = Arc::clone(&instance);
+                async move { instance.shutdown_core_async(TEST_DEADLINE, None).await }
+            });
+            // The shutdown holds the lock and is flushing.
+            recording.wait_started(before + 1).await;
+
+            let suspended = instance.suspend(Duration::from_millis(200)).await;
+
+            assert!(matches!(suspended, Ok(())), "{suspended:?}");
+            assert!(!instance.is_suspended());
+            drop(hold);
+            shutdown.await.unwrap().unwrap();
+            assert!(instance.is_shutdown());
+        })
+        .await
+        .expect("a suspend or shutdown hung past the test's limit");
     }
 
     /// A suspend whose future is dropped mid-flush, as a cancelled Swift
@@ -6512,34 +6777,38 @@ pub(crate) mod tests {
     /// leaves the instance running with its transport.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_suspend_with_a_wedged_flush_times_out_and_stays_running() {
-        let recording = Arc::new(RecordingPersistence::default());
-        let instance = instance_with_persisted_context(&recording, "wedged-suspend-ctx").await;
-        let hold = recording.hold.write().await;
+        tokio::time::timeout(HANG_LIMIT, async {
+            let recording = Arc::new(RecordingPersistence::default());
+            let instance = instance_with_persisted_context(&recording, "wedged-suspend-ctx").await;
+            let hold = recording.hold.write().await;
 
-        let started = tokio::time::Instant::now();
-        let err = instance
-            .suspend(Duration::from_millis(300))
-            .await
-            .unwrap_err();
+            let started = tokio::time::Instant::now();
+            let err = instance
+                .suspend(Duration::from_millis(300))
+                .await
+                .unwrap_err();
 
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(
-            matches!(err, SuspendError::DeadlineElapsed { deadline } if deadline == Duration::from_millis(300)),
-            "{err:?}"
-        );
-        assert_eq!(
-            classify_suspend_failure(&err),
-            (
-                SuspendFailureClass::Storage,
-                crate::error_codes::STORAGE_8014
-            )
-        );
-        assert!(!instance.is_suspended());
-        assert_eq!(
-            instance.context_relay_urls(),
-            Ok(vec!["wss://suspend.example".to_owned()])
-        );
-        drop(hold);
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(
+                matches!(err, SuspendError::DeadlineElapsed { deadline } if deadline == Duration::from_millis(300)),
+                "{err:?}"
+            );
+            assert_eq!(
+                classify_suspend_failure(&err),
+                (
+                    SuspendFailureClass::Storage,
+                    crate::error_codes::STORAGE_8014
+                )
+            );
+            assert!(!instance.is_suspended());
+            assert_eq!(
+                instance.context_relay_urls(),
+                Ok(vec!["wss://suspend.example".to_owned()])
+            );
+            drop(hold);
+        })
+        .await
+        .expect("a wedged suspend hung past the test's limit");
     }
 
     /// A shutdown whose flush fails still shuts down, reports
@@ -6562,6 +6831,11 @@ pub(crate) mod tests {
             "{outcome:?}"
         );
         assert!(instance.is_shutdown());
+        assert_eq!(
+            instance.shutdown_flush.get(),
+            Some(outcome.flush()),
+            "the flush result is kept for a shutdown the runtime interrupts later"
+        );
         let failure = sdk_shutdown_result(Ok(outcome)).unwrap_err();
         assert_eq!(failure.code, crate::error_codes::STORAGE_8015);
         assert!(
@@ -7195,7 +7469,7 @@ pub(crate) mod tests {
 
         // Release the wedged writer; the detached drain then closes the store.
         gate.add_permits(1);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = crate::deadline::deadline_after(Duration::from_secs(10));
         let reopen = loop {
             match scp_platform::sqlite::SqliteStorage::new(&dir, &SQLITE_TEST_KEY) {
                 Err(scp_platform::PlatformError::StorageLockHeld { .. })
@@ -7297,7 +7571,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(first, ShutdownError::DurableStoreClose(_)));
+        assert!(matches!(first, ShutdownError::DurableStoreClose { .. }));
         let err = repeat_shutdown_with_long_timeout(&refused, &unused).await;
         assert!(matches!(
             err,
@@ -7529,9 +7803,10 @@ pub(crate) mod tests {
         assert_eq!(e.code, STORAGE_8005);
         assert!(e.message.contains("keeps its advisory lock"), "{e:?}");
 
-        let e = sdk_shutdown_result(Err(ShutdownError::DurableStoreClose(
-            scp_platform::PlatformError::StorageError("close refused".to_owned()),
-        )))
+        let e = sdk_shutdown_result(Err(ShutdownError::DurableStoreClose {
+            error: scp_platform::PlatformError::StorageError("close refused".to_owned()),
+            flush: ShutdownFlush::Flushed,
+        }))
         .unwrap_err();
         assert_eq!(e.code, STORAGE_8005);
         assert!(
@@ -7539,7 +7814,7 @@ pub(crate) mod tests {
             "{e:?}"
         );
 
-        let e = sdk_shutdown_result(Err(ShutdownError::Interrupted)).unwrap_err();
+        let e = sdk_shutdown_result(Err(ShutdownError::Interrupted { flush: None })).unwrap_err();
         assert_eq!(e.code, STORAGE_8005);
 
         // A failed flush on a store left locked: the lock's code, both reasons.
@@ -7631,8 +7906,65 @@ pub(crate) mod tests {
                 true,
                 elapsed,
             ),
-            Err(ShutdownError::DurableStoreClose(_))
+            Err(ShutdownError::DurableStoreClose { .. })
         ));
+    }
+
+    /// A store that refuses to close, and a shutdown the runtime interrupts,
+    /// carry the flush result, and their message names a flush that failed,
+    /// timed out or had not finished; a flush that landed adds nothing.
+    #[test]
+    fn shutdown_errors_carry_and_name_the_flush_result() {
+        let refused = || scp_platform::PlatformError::StorageError("close refused".to_owned());
+        let failed = || ShutdownFlush::Failed {
+            message: "disk full".to_owned(),
+        };
+        let err = combine_shutdown_outcome(
+            BridgeTasksDrain::Finished { panicked: 0 },
+            failed(),
+            SupervisorDrain::Finished(Err(refused())),
+            true,
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ShutdownError::DurableStoreClose { flush, .. } if *flush == failed()),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("close refused") && message.contains("flush also failed (disk full)"),
+            "{message}"
+        );
+        let sdk = sdk_shutdown_result(Err(err)).unwrap_err();
+        assert_eq!(sdk.code, crate::error_codes::STORAGE_8005);
+        assert!(sdk.message.contains("disk full"), "{sdk:?}");
+
+        let clean = ShutdownError::DurableStoreClose {
+            error: refused(),
+            flush: ShutdownFlush::Flushed,
+        };
+        assert!(!clean.to_string().contains("flush"), "{clean}");
+
+        for (flush, names) in [
+            (
+                Some(ShutdownFlush::TimedOut),
+                Some("did not finish within the deadline"),
+            ),
+            (Some(failed()), Some("flush also failed (disk full)")),
+            (None, Some("flush had not finished")),
+            (Some(ShutdownFlush::Flushed), None),
+            (Some(ShutdownFlush::Skipped), None),
+        ] {
+            let message = ShutdownError::Interrupted {
+                flush: flush.clone(),
+            }
+            .to_string();
+            match names {
+                Some(names) => assert!(message.contains(names), "{flush:?}: {message}"),
+                None => assert!(!message.contains("flush"), "{flush:?}: {message}"),
+            }
+        }
     }
 
     /// The flush result rides the outcome unchanged: a flush that failed or
