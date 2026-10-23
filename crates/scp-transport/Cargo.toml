@@ -36,7 +36,9 @@ nostr = ["dep:k256"]
 webrtc = []
 upnp = ["dep:igd-next", "dep:natpmp"]
 # Shared startup utilities for relay/node binaries: env_or, config_from_env,
-# storage_from_env, init_tracing, health_check, shutdown_signal. It pulls
+# storage_from_env, init_tracing, health_check. `shutdown_signal` is not here:
+# it lives in the always-compiled `shutdown` module because scp-node's library
+# `host_site` installs it. It pulls
 # `push-store` because `push_role_from` opens the SQLite push registration store
 # a push-enabled relay hands to its push role (PUSH-012, spec §17.17.1), so every
 # binary that starts a relay through this module ships the real store arm.

@@ -2,20 +2,22 @@
 //!
 //! Both `scp-relay` and `scp-node` binaries use identical logic for environment
 //! variable parsing, relay configuration, blob storage backend selection,
-//! tracing initialization, health checks, and graceful shutdown. This module
-//! provides the shared implementations so changes need only be made once.
+//! tracing initialization, and health checks. This module provides the shared
+//! implementations so changes need only be made once. The shutdown signal both
+//! binaries stop on lives in the always-compiled [`crate::shutdown`] module,
+//! because `scp-node`'s library entry point `host_site` installs it too.
 //!
 //! No function in this module ends the process. Every failure returns a
 //! [`StartupError`] to the calling binary, and the binary decides the exit
 //! code.
 //!
-//! Gated behind the `startup` feature. Not used by the library or FFI bridges.
+//! Gated behind the `startup` feature, which only the `scp-relay` binary and
+//! `scp-node`'s `node-bin` feature enable. The FFI bridges do not compile it.
 //!
 //! See §10.5 of the SCP infrastructure spec.
 
 use std::env;
 use std::ffi::OsString;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +29,7 @@ use crate::native::storage::{BlobStorageBackend, StorageError};
 use crate::relay::push::PushSender;
 use crate::relay::push_gate::{LiveRelayUrl, PushRole, PushServiceConfig, RelayUrl};
 use crate::relay::push_store::{PushRegistrationStore, PushStoreError};
+use crate::shutdown::ShutdownSignalError;
 
 /// The variable that names the relay's blob storage backend.
 const BACKEND_VAR: &str = "SCP_RELAY_STORAGE_BACKEND";
@@ -112,15 +115,10 @@ pub enum StartupError {
     /// subscriber was already installed.
     #[error("failed to install the tracing subscriber: {0}")]
     Tracing(String),
-    /// The operating system refused a handler for `signal`, so the process
+    /// The operating system refused a shutdown signal handler, so the process
     /// could not learn when to shut down.
-    #[error("failed to register a {signal} handler: {error}")]
-    SignalHandler {
-        /// The signal the handler was for.
-        signal: &'static str,
-        /// The registration failure.
-        error: std::io::Error,
-    },
+    #[error(transparent)]
+    ShutdownSignal(#[from] ShutdownSignalError),
     /// The push selection or push credentials in the environment cannot start
     /// a relay.
     #[error(transparent)]
@@ -724,65 +722,6 @@ pub fn init_tracing() -> Result<(), StartupError> {
 /// turns `false` into exit code 1.
 pub async fn health_check(addr: SocketAddr) -> bool {
     tokio::net::TcpStream::connect(addr).await.is_ok()
-}
-
-// ---------------------------------------------------------------------------
-// Shutdown signal
-// ---------------------------------------------------------------------------
-
-/// Registers SIGINT and SIGTERM handlers and returns a future that resolves
-/// when either signal arrives.
-///
-/// The handlers register when this function runs, so a refused registration
-/// fails startup instead of leaving a process that cannot learn when to stop.
-/// Call it from inside a Tokio runtime.
-///
-/// # Errors
-///
-/// [`StartupError::SignalHandler`] when the operating system refuses either
-/// handler.
-#[cfg(unix)]
-pub fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, StartupError> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut interrupt =
-        signal(SignalKind::interrupt()).map_err(|error| StartupError::SignalHandler {
-            signal: "SIGINT",
-            error,
-        })?;
-    let mut terminate =
-        signal(SignalKind::terminate()).map_err(|error| StartupError::SignalHandler {
-            signal: "SIGTERM",
-            error,
-        })?;
-    Ok(async move {
-        tokio::select! {
-            _ = interrupt.recv() => {}
-            _ = terminate.recv() => {}
-        }
-    })
-}
-
-/// Registers a Ctrl-C handler and returns a future that resolves when Ctrl-C
-/// arrives.
-///
-/// The handler registers when this function runs, so a refused registration
-/// fails startup instead of leaving a process that cannot learn when to stop.
-/// Call it from inside a Tokio runtime.
-///
-/// # Errors
-///
-/// [`StartupError::SignalHandler`] when the operating system refuses the
-/// handler.
-#[cfg(windows)]
-pub fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, StartupError> {
-    let mut ctrl_c =
-        tokio::signal::windows::ctrl_c().map_err(|error| StartupError::SignalHandler {
-            signal: "Ctrl-C",
-            error,
-        })?;
-    Ok(async move {
-        ctrl_c.recv().await;
-    })
 }
 
 // ---------------------------------------------------------------------------
