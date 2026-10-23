@@ -2361,9 +2361,9 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * the `TransportManager` and reaches actor-owned reconnection state
      * through the `Supervisor`. On success each context's `needs_reconnect`
      * flag is cleared. Each context's offline tier is classified from its
-     * `last_relay_contact` in the instance's store; a context with none
-     * stored takes the most conservative tier. A store read failure fails
-     * the call with `SCP-TRANS-5095`.
+     * `last_relay_contact` in the instance's store. A store read failure, or
+     * a context with none stored, fails the call with `SCP-TRANS-5095`
+     * before any context is reconnected.
      */
     func contextReconnect(identity: Identity, contextIds: [String]) async throws  -> ReconnectReport
     
@@ -4929,9 +4929,9 @@ open func contextProposeTtlExtension(handle: ContextHandle, memberDid: String, p
      * the `TransportManager` and reaches actor-owned reconnection state
      * through the `Supervisor`. On success each context's `needs_reconnect`
      * flag is cleared. Each context's offline tier is classified from its
-     * `last_relay_contact` in the instance's store; a context with none
-     * stored takes the most conservative tier. A store read failure fails
-     * the call with `SCP-TRANS-5095`.
+     * `last_relay_contact` in the instance's store. A store read failure, or
+     * a context with none stored, fails the call with `SCP-TRANS-5095`
+     * before any context is reconnected.
      */
 open func contextReconnect(identity: Identity, contextIds: [String])async throws  -> ReconnectReport  {
     return

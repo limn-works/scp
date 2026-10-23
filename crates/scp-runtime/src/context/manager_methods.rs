@@ -55,9 +55,6 @@
 //!
 //! Persistence shortcuts:
 //! - [`has_persistence`] — predicate for skipping snapshot work.
-//! - [`persist_context_and_broadcast`] — best-effort flush of the whole
-//!   [`ContextSnapshot`] (context state + crypto export + embedded broadcast)
-//!   via the target actor's `FlushSnapshot` command.
 //!
 //! Broadcast bootstrapping:
 //! - [`init_broadcast_context`] — create + persist initial broadcast state.
@@ -208,46 +205,6 @@ pub fn init_broadcast_context(
     // write. The `supervisor` handle is unused now that the eager persist is gone.
     let _ = supervisor;
     Ok(Some(bc))
-}
-
-// ---------------------------------------------------------------------------
-// 12. persist_context_and_broadcast
-// ---------------------------------------------------------------------------
-
-/// Persists context and broadcast state for a single context if a
-/// persistence provider is configured.
-///
-/// ADR-049 Phase 2A finalization (`DashMap` removal): the snapshot is no
-/// longer read from the legacy `contexts` `DashMap`. Instead this mailboxes
-/// [`LifecycleCommand::FlushSnapshot`](crate::context::actor::commands::LifecycleCommand::FlushSnapshot)
-/// to the single target context's actor — the actor builds the snapshot
-/// (context + crypto export + broadcast) from its owned
-/// [`PerContextState`] and persists it via `deps.persistence`. The
-/// per-context body is identical to the per-actor slice
-/// [`flush_all_contexts`](crate::context::lifecycle_helpers::flush_all_contexts)
-/// fans out to.
-///
-/// Best-effort: a missing actor, a closed mailbox, or a send timeout is a
-/// silent skip (the actor persists on its own lifecycle paths too).
-pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: &str) {
-    use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
-
-    if !has_persistence(supervisor) {
-        return;
-    }
-    let Some(actor) = supervisor.lookup(context_id) else {
-        return;
-    };
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { reply: tx });
-    if actor
-        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
-        .await
-        .is_err()
-    {
-        return;
-    }
-    let _ = rx.await;
 }
 
 // ---------------------------------------------------------------------------

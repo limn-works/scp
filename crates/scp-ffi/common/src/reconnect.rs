@@ -964,10 +964,11 @@ fn outcome_str(outcome: &scp_protocol::sync::SyncOutcome) -> (String, bool) {
 /// the bridge surface and returns a flat report.
 ///
 /// Each context's `sync/{context_id}/last_relay_contact` is read from
-/// `relay_contacts`, the one source of that value; a context with none stored
-/// is classified Long (ADR-029 §2 sync-state keys). For each context the
-/// [`ReconnectionCoordinator`] classifies the offline tier from that value
-/// and:
+/// `relay_contacts`, which every bridge takes from the supervisor's one store
+/// ([`Supervisor::relay_contact_store`]). A context with none stored fails the
+/// whole call before any context is reconnected (ADR-029 Implementation). For
+/// each context the [`ReconnectionCoordinator`] classifies the offline tier
+/// from that value and:
 /// - **Tier 1 (Short)** — runs the six-phase protocol via
 ///   [`ReconnectionCoordinator::execute`] against a [`RelayActorSyncDriver`].
 /// - **Tier 2 (Extended)** — fetches the relay snapshot via a
@@ -998,8 +999,9 @@ fn outcome_str(outcome: &scp_protocol::sync::SyncOutcome) -> (String, bool) {
 /// # Errors
 ///
 /// [`ReconnectError::ContactRead`] when reading a context's
-/// `last_relay_contact` fails; no context is reconnected, because a context
-/// classified without its contact could take the wrong tier.
+/// `last_relay_contact` fails, and [`ReconnectError::Unclassifiable`] when a
+/// context has none stored; in both cases no context is reconnected, because
+/// a context classified without its contact could take the wrong tier.
 pub async fn reconnect_contexts<F, Fut>(
     request: ReconnectRequest<'_>,
     mut drain: Option<F>,
@@ -1039,7 +1041,10 @@ where
     // Tier 1 contexts are executed by the coordinator's six-phase loop;
     // Tier 2 / Tier 3 contexts are reported with their classification and
     // driven through the tier engines below.
-    let report = coordinator.execute(now, &driver).await;
+    let report = coordinator
+        .execute(now, &driver)
+        .await
+        .map_err(|source| ReconnectError::Unclassifiable { source })?;
 
     let mut results = Vec::with_capacity(report.contexts_synced.len());
     let mut messages_drained = report.messages_drained;
@@ -1135,6 +1140,15 @@ pub enum ReconnectError {
         #[source]
         source: StoreError,
     },
+    /// A context's offline tier could not be classified, because no
+    /// `sync/{context_id}/last_relay_contact` is stored for it
+    /// ([`SyncError::NoRelayContact`](scp_protocol::sync::SyncError::NoRelayContact)).
+    #[error("a context's offline tier could not be classified: {source}")]
+    Unclassifiable {
+        /// The classification failure, naming the context.
+        #[source]
+        source: scp_protocol::sync::SyncError,
+    },
 }
 
 impl ReconnectError {
@@ -1142,7 +1156,9 @@ impl ReconnectError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
-            Self::ContactRead { .. } => crate::error_codes::TRANS_5095,
+            Self::ContactRead { .. } | Self::Unclassifiable { .. } => {
+                crate::error_codes::TRANS_5095
+            }
         }
     }
 }
@@ -1255,7 +1271,8 @@ async fn clear_and_record_contact(
 }
 
 /// Reads the stored `last_relay_contact` of each of `context_ids`; a context
-/// with none stored is absent from the map.
+/// with none stored is absent from the map, and the coordinator fails the
+/// reconnection on it ([`ReconnectError::Unclassifiable`]).
 ///
 /// # Errors
 ///
@@ -1761,6 +1778,11 @@ mod tests {
         }
         async fn load_last_relay_contact(&self, _: &str) -> Result<Option<u64>, StoreError> {
             Ok(None)
+        }
+        async fn delete_last_relay_contact(&self, _: &str) -> Result<(), StoreError> {
+            Err(StoreError::SerializationFailed(
+                "injected delete failure".to_owned(),
+            ))
         }
     }
 

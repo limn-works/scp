@@ -3422,6 +3422,60 @@ fn last_relay_contact_writers_wired() {
     }
 }
 
+/// ADR-029 Implementation and ADR-049 Decision 9: create, Welcome join, and
+/// import write the context's first `last_relay_contact` through
+/// `persist_first_state`, which persists the first snapshot fail-closed, and
+/// each calls it before it spawns the actor. Restore writes nothing, so the
+/// stored contact keeps measuring the time offline.
+#[test]
+fn first_relay_contact_written_before_the_actor_spawns() {
+    for (src, caller, callee) in [
+        (
+            LIFECYCLE_HELPERS_SRC,
+            "persist_first_state",
+            "persist_state_fail_closed(",
+        ),
+        (
+            LIFECYCLE_HELPERS_SRC,
+            "persist_first_state",
+            "write_first_contact(",
+        ),
+        (
+            LIFECYCLE_HELPERS_SRC,
+            "write_first_contact",
+            "store_last_relay_contact(",
+        ),
+    ] {
+        assert!(
+            fn_body_contains(src, caller, callee),
+            "{caller} must call {callee} (ADR-029 first last_relay_contact)"
+        );
+    }
+    for (src, entry) in [
+        (LIFECYCLE_HELPERS_SRC, "create_context"),
+        (LIFECYCLE_HELPERS_SRC, "import_context"),
+        (SUPERVISOR_SRC, "spawn_actor_from_welcome"),
+    ] {
+        let body = extract_fn_body(src, entry).unwrap_or_else(|| panic!("{entry} not found"));
+        let persist = body
+            .find("persist_first_state(")
+            .unwrap_or_else(|| panic!("{entry} must call persist_first_state"));
+        let spawn = body
+            .find("spawn_actor_with_state(")
+            .unwrap_or_else(|| panic!("{entry} must call spawn_actor_with_state"));
+        assert!(
+            persist < spawn,
+            "{entry} must persist its first state before it spawns the actor"
+        );
+    }
+    for callee in ["persist_first_state(", "store_last_relay_contact("] {
+        assert!(
+            !fn_body_contains(LIFECYCLE_HELPERS_SRC, "restore_context", callee),
+            "restore_context must not call {callee}"
+        );
+    }
+}
+
 /// ADR-029 §2 push-wake pull mode step 5: a full reconnection sends the
 /// sender-key answers a wake left queued. `reconnect_contexts` passes each
 /// context's outcome through `send_queued_answers`, which calls

@@ -749,8 +749,8 @@ class SCP internal constructor(
      * `TransportManager` and reaches actor-owned reconnection state through the
      * `Supervisor`. On success each context's `needsReconnect` flag is cleared.
      * Each context's offline tier is classified from the `last_relay_contact`
-     * the instance stores for it; a context with none stored takes the most
-     * conservative tier, and a store read failure throws `SCP-TRANS-5095`.
+     * the instance stores for it; a store read failure, or a context with none
+     * stored, throws `SCP-TRANS-5095` before any context is reconnected.
      * Forwards to [NativeScp.contextReconnect] on [inner].
      *
      * Catch-up integrity (§9.9.3, §23.7): equivocation where a peer reports the

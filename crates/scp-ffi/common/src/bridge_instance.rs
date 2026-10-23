@@ -771,16 +771,6 @@ pub struct CoreFields {
     /// bridge-level suspend/resume coordination without separate storage.
     persistence: Option<Arc<dyn ContextPersistence + Send + Sync>>,
 
-    /// The store of each context's last successful relay contact (ADR-029
-    /// key `sync/{context_id}/last_relay_contact`): a view of the bridge's
-    /// own protocol repository, so the key lands in the backend the caller
-    /// chose (spec §17.6). Set at construction by
-    /// [`Self::with_persistence_arc`], or once by
-    /// [`Self::set_relay_contact_store`] for a bridge that builds its
-    /// repository after `CoreFields`. Unset on a bridge with no repository,
-    /// where every reader fails closed.
-    relay_contacts: OnceLock<Arc<dyn scp_core::store::sync::RelayContactStore>>,
-
     // -----------------------------------------------------------------
     // Relay URLs — for resume after suspend (multi-URL since #1678)
     // -----------------------------------------------------------------
@@ -969,7 +959,6 @@ impl CoreFields {
             resolver_cache: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: None,
-            relay_contacts: OnceLock::new(),
             relay_urls: Mutex::new(HashSet::new()),
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
@@ -1023,14 +1012,9 @@ impl CoreFields {
     ///   `Arc` internally so
     ///   [`persistence_arc_clone`](Self::persistence_arc_clone) can hand
     ///   the same provider to downstream consumers.
-    /// - `relay_contacts` — the last-relay-contact store over the same
-    ///   repository (see [`Self::relay_contact_store`]).
     #[must_use]
-    pub fn with_persistence(
-        persistence: Box<dyn ContextPersistence + Send + Sync>,
-        relay_contacts: Arc<dyn scp_core::store::sync::RelayContactStore>,
-    ) -> Self {
-        Self::with_persistence_arc(Arc::from(persistence), relay_contacts)
+    pub fn with_persistence(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
+        Self::with_persistence_arc(Arc::from(persistence))
     }
 
     /// Creates a new `CoreFields` with a shared persistence provider.
@@ -1045,13 +1029,8 @@ impl CoreFields {
     /// # Arguments
     ///
     /// - `persistence` — shared persistence provider.
-    /// - `relay_contacts` — the last-relay-contact store over the same
-    ///   repository (see [`Self::relay_contact_store`]).
     #[must_use]
-    pub fn with_persistence_arc(
-        persistence: Arc<dyn ContextPersistence + Send + Sync>,
-        relay_contacts: Arc<dyn scp_core::store::sync::RelayContactStore>,
-    ) -> Self {
+    pub fn with_persistence_arc(persistence: Arc<dyn ContextPersistence + Send + Sync>) -> Self {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
@@ -1070,7 +1049,6 @@ impl CoreFields {
             resolver_cache: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: Some(persistence),
-            relay_contacts: OnceLock::from(relay_contacts),
             relay_urls: Mutex::new(HashSet::new()),
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
@@ -1087,27 +1065,18 @@ impl CoreFields {
         }
     }
 
-    /// Installs the last-relay-contact store on a bridge that built its
-    /// protocol repository after `CoreFields` (the `PyO3` in-memory path).
-    ///
-    /// # Errors
-    ///
-    /// Returns the rejected store when one is already installed, so a second
-    /// repository cannot replace the first.
-    pub fn set_relay_contact_store(
-        &self,
-        store: Arc<dyn scp_core::store::sync::RelayContactStore>,
-    ) -> Result<(), Arc<dyn scp_core::store::sync::RelayContactStore>> {
-        self.relay_contacts.set(store)
-    }
-
     /// The store of each context's last successful relay contact (ADR-029
-    /// key `sync/{context_id}/last_relay_contact`), or `None` on a bridge
-    /// with no protocol repository. A caller that needs the key treats
+    /// key `sync/{context_id}/last_relay_contact`): the installed
+    /// supervisor's one store ([`Supervisor::relay_contact_store`]), which
+    /// its durable providers derive from the instance's storage handle, so
+    /// the bridge and the supervisor read and write one backend. `None`
+    /// before a supervisor is installed; a caller that needs the key treats
     /// `None` as a failure and never substitutes a store.
     #[must_use]
     pub fn relay_contact_store(&self) -> Option<Arc<dyn scp_core::store::sync::RelayContactStore>> {
-        self.relay_contacts.get().cloned()
+        self.supervisor
+            .get()
+            .map(|supervisor| supervisor.relay_contact_store())
     }
 
     /// Returns the monotonic identifier assigned to this instance at
@@ -5145,36 +5114,29 @@ pub(crate) mod tests {
     // AC 2: persistence field and accessor
     // -----------------------------------------------------------------
 
-    /// A last-relay-contact store over the encrypted in-memory repository
-    /// the bridges build in production.
-    fn test_relay_contacts() -> Arc<dyn scp_core::store::sync::RelayContactStore> {
-        let (_event_log, repo, _handle) = crate::bridge_runtime::build_event_log_provider();
-        repo
-    }
-
-    /// `with_persistence` installs the store it is given, `new` has none, and
-    /// `set_relay_contact_store` installs once and refuses a second store.
+    /// The bridge's relay-contact store is the supervisor's: a contact the
+    /// supervisor's store records is the one the bridge reads, and a bridge
+    /// with no supervisor has no store.
     #[tokio::test]
-    async fn relay_contact_store_is_injected_once() {
+    async fn relay_contact_store_is_the_supervisors() {
         use scp_core::context::providers::InMemoryPersistence;
 
-        let store = test_relay_contacts();
-        let instance =
-            CoreFields::with_persistence(Box::new(InMemoryPersistence::new()), Arc::clone(&store));
-        let installed = instance.relay_contact_store().expect("store installed");
-        installed.store_last_relay_contact("ctx", 7).await.unwrap();
-        assert_eq!(store.load_last_relay_contact("ctx").await.unwrap(), Some(7));
-        assert!(
-            instance
-                .set_relay_contact_store(test_relay_contacts())
-                .is_err()
+        let instance = CoreFields::with_persistence(Box::new(InMemoryPersistence::new()));
+        assert!(instance.relay_contact_store().is_none());
+        let supervisor = test_supervisor();
+        instance.set_supervisor(Arc::clone(&supervisor));
+        supervisor
+            .relay_contact_store()
+            .store_last_relay_contact("ctx", 7)
+            .await
+            .unwrap();
+        let bridge_store = instance
+            .relay_contact_store()
+            .expect("supervisor installed");
+        assert_eq!(
+            bridge_store.load_last_relay_contact("ctx").await.unwrap(),
+            Some(7)
         );
-
-        let bare = CoreFields::new();
-        assert!(bare.relay_contact_store().is_none());
-        assert!(bare.set_relay_contact_store(test_relay_contacts()).is_ok());
-        assert!(bare.relay_contact_store().is_some());
-        assert!(bare.set_relay_contact_store(test_relay_contacts()).is_err());
     }
 
     #[test]
@@ -5191,7 +5153,7 @@ pub(crate) mod tests {
         use scp_core::context::providers::InMemoryPersistence;
 
         let persistence = Box::new(InMemoryPersistence::new());
-        let instance = CoreFields::with_persistence(persistence, test_relay_contacts());
+        let instance = CoreFields::with_persistence(persistence);
         instance.set_supervisor(test_supervisor());
         assert!(
             instance.persistence().is_some(),
@@ -5907,8 +5869,7 @@ pub(crate) mod tests {
             test_mls_storage(),
         );
 
-        let instance =
-            CoreFields::with_persistence(persistence_for_instance, test_relay_contacts());
+        let instance = CoreFields::with_persistence(persistence_for_instance);
         instance.set_supervisor(supervisor);
 
         // Verify the persistence accessor returns Some.

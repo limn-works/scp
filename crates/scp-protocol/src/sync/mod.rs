@@ -497,6 +497,15 @@ pub enum SyncError {
         /// Human-readable reason.
         reason: String,
     },
+    /// No `last_relay_contact` is stored for the context, so its offline tier
+    /// cannot be classified (ADR-029 Implementation). Creating, joining by
+    /// Welcome, and importing a context each store one, so a missing value is
+    /// a store fault, and no tier is inferred from it.
+    #[error("no last relay contact is stored for context {context_id}")]
+    NoRelayContact {
+        /// The context with no stored contact.
+        context_id: ContextId,
+    },
     /// The context was closed or expired while the member was offline.
     #[error("context {context_id} is gone (closed or expired while offline)")]
     ContextGone {

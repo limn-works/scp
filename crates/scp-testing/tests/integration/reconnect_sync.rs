@@ -196,17 +196,17 @@ async fn reconnect_classifies_all_three_tiers() {
         policy.clone(),
     );
     assert_eq!(
-        coordinator.classify_context(short_ctx, now),
+        coordinator.classify_context(short_ctx, now).unwrap(),
         OfflineTier::Short,
         "Short tier must be reachable"
     );
     assert_eq!(
-        coordinator.classify_context(extended_ctx, now),
+        coordinator.classify_context(extended_ctx, now).unwrap(),
         OfflineTier::Extended,
         "Extended (Tier 2) must be reachable"
     );
     assert_eq!(
-        coordinator.classify_context(long_ctx, now),
+        coordinator.classify_context(long_ctx, now).unwrap(),
         OfflineTier::Long,
         "Long (Tier 3) must be reachable"
     );

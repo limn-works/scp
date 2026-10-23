@@ -489,9 +489,7 @@ impl UniffiBridgeInstance {
                     &protocol_repository,
                 )),
             );
-        let relay_contacts: Arc<dyn scp_core::store::sync::RelayContactStore> =
-            Arc::clone(&protocol_repository) as _;
-        let core = CoreFields::with_persistence_arc(persistence, relay_contacts);
+        let core = CoreFields::with_persistence_arc(persistence);
         let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
         let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {
@@ -638,10 +636,7 @@ impl UniffiBridgeInstance {
         protocol_repository: ProtocolRepoVariant,
         durable_providers: scp_core::context::supervisor::DurableProviders,
     ) -> Self {
-        let core = CoreFields::with_persistence_arc(
-            persistence,
-            protocol_repository.relay_contact_store(),
-        );
+        let core = CoreFields::with_persistence_arc(persistence);
         let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
         let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
         Self {

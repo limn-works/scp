@@ -3,14 +3,22 @@
 //! Stores the last successful relay contact per context under the ADR-029
 //! key `sync/{context_id}/last_relay_contact`, as local Unix seconds. The
 //! push-wake pull (ADR-029 §2, push-wake pull mode) reads it to set the
-//! relay QUERY `since`. Three paths write it: a full reconnection after it
-//! clears `needs_reconnect`, a push-wake pull after a context's Phase 1 query
-//! succeeds, and a live subscription after the actor accepts a delivered
-//! envelope (ADR-029 Implementation).
+//! relay QUERY `since`, and a full reconnection reads it to classify the
+//! offline tier. Creating a context, joining it by Welcome, and importing it
+//! write the first value before the actor starts; after that, three paths
+//! advance it: a full reconnection after it clears `needs_reconnect`, a
+//! push-wake pull after Phases 2 and 4 have fed every blob of the context's
+//! Phase 1 buffer to the actor and the actor reached a verdict on each, and a
+//! live subscription after the actor accepts a delivered envelope. Restoring
+//! a context writes nothing (ADR-029 Implementation).
 //!
-//! [`RelayContactStore`] is the dyn-compatible view the FFI bridge layer
-//! holds, because `ProtocolRepository<S>` is generic over a storage backend
-//! that is not dyn-compatible.
+//! [`RelayContactStore`] is the dyn-compatible view, because
+//! `ProtocolRepository<S>` is generic over a storage backend that is not
+//! dyn-compatible. The supervisor holds the one instance, built by
+//! [`relay_contact_store_over`] from the storage handle its other durable
+//! providers derive from.
+
+use std::sync::Arc;
 
 use scp_platform::traits::Storage;
 
@@ -64,15 +72,40 @@ impl<S: Storage> ProtocolRepository<S> {
         let key = last_relay_contact_key(context_id)?;
         self.load_value(&key).await
     }
+
+    /// Deletes the last relay contact of `context_id`; deleting an absent
+    /// value succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SerializationFailed`] for a `context_id` the key
+    /// convention rejects, and [`StoreError::Storage`] when the delete fails.
+    pub async fn delete_last_relay_contact(&self, context_id: &str) -> Result<(), StoreError> {
+        let key = last_relay_contact_key(context_id)?;
+        self.storage.delete(&key).await?;
+        Ok(())
+    }
+}
+
+/// Builds the relay-contact store over `handle`, the storage handle the
+/// supervisor's saga journal and MLS storage derive from, so the key lands in
+/// the backend the caller chose (spec §17.6).
+///
+/// The handle is the one `DurableProviders::from_handle` receives; that
+/// constructor is the only production caller.
+pub(crate) fn relay_contact_store_over<S: Storage + 'static>(
+    handle: Arc<S>,
+) -> Arc<dyn RelayContactStore> {
+    Arc::new(ProtocolRepository { storage: handle })
 }
 
 /// Dyn-compatible store of each context's last successful relay contact
 /// (ADR-029 key `sync/{context_id}/last_relay_contact`).
 ///
-/// The FFI bridge layer holds it as `Arc<dyn RelayContactStore>`, injected at
-/// each bridge's repository construction. The only implementation is
-/// [`ProtocolRepository`], so every write lands in the backend the caller
-/// chose (spec §17.6).
+/// The supervisor holds it as `Arc<dyn RelayContactStore>`, built from its
+/// storage handle, and every bridge reads the supervisor's instance. The only
+/// production implementation is [`ProtocolRepository`], so every write lands
+/// in the backend the caller chose (spec §17.6).
 #[async_trait::async_trait]
 pub trait RelayContactStore: Send + Sync {
     /// Stores the last successful relay contact for `context_id`.
@@ -95,6 +128,15 @@ pub trait RelayContactStore: Send + Sync {
     /// Returns the [`StoreError`] of
     /// [`ProtocolRepository::load_last_relay_contact`].
     async fn load_last_relay_contact(&self, context_id: &str) -> Result<Option<u64>, StoreError>;
+
+    /// Deletes the last relay contact of `context_id`, which rolls back the
+    /// first write of a create, Welcome join or import that then fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`StoreError`] of
+    /// [`ProtocolRepository::delete_last_relay_contact`].
+    async fn delete_last_relay_contact(&self, context_id: &str) -> Result<(), StoreError>;
 }
 
 #[async_trait::async_trait]
@@ -109,6 +151,10 @@ impl<S: Storage + 'static> RelayContactStore for ProtocolRepository<S> {
 
     async fn load_last_relay_contact(&self, context_id: &str) -> Result<Option<u64>, StoreError> {
         Self::load_last_relay_contact(self, context_id).await
+    }
+
+    async fn delete_last_relay_contact(&self, context_id: &str) -> Result<(), StoreError> {
+        Self::delete_last_relay_contact(self, context_id).await
     }
 }
 
@@ -178,5 +224,33 @@ mod tests {
         let repo = make_store();
         assert!(repo.store_last_relay_contact("a/b", 1).await.is_err());
         assert!(repo.load_last_relay_contact("a/b").await.is_err());
+        assert!(repo.delete_last_relay_contact("a/b").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_only_that_contact() {
+        let repo = make_store();
+        repo.store_last_relay_contact("ctx", 7).await.unwrap();
+        repo.store_last_relay_contact("other", 8).await.unwrap();
+        repo.delete_last_relay_contact("ctx").await.unwrap();
+        assert_eq!(repo.load_last_relay_contact("ctx").await.unwrap(), None);
+        assert_eq!(
+            repo.load_last_relay_contact("other").await.unwrap(),
+            Some(8)
+        );
+        repo.delete_last_relay_contact("ctx").await.unwrap();
+    }
+
+    /// The store over a shared handle writes into that handle's backend, so a
+    /// repository over the same storage reads what it wrote.
+    #[tokio::test]
+    async fn store_over_a_handle_writes_into_that_backend() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let store = relay_contact_store_over(Arc::clone(&storage));
+        store.store_last_relay_contact("ctx", 99).await.unwrap();
+        let view = ProtocolRepository::new_for_testing(Arc::clone(&storage));
+        assert_eq!(view.load_last_relay_contact("ctx").await.unwrap(), Some(99));
+        store.delete_last_relay_contact("ctx").await.unwrap();
+        assert_eq!(view.load_last_relay_contact("ctx").await.unwrap(), None);
     }
 }

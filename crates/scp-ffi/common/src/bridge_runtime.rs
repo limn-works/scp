@@ -277,17 +277,6 @@ impl ProtocolRepoVariant {
         }
     }
 
-    /// This repository's view as the store of each context's last relay
-    /// contact (ADR-029 key `sync/{context_id}/last_relay_contact`), so the
-    /// key lands in the backend the caller chose (spec §17.6).
-    #[must_use]
-    pub fn relay_contact_store(&self) -> Arc<dyn scp_core::store::sync::RelayContactStore> {
-        match self {
-            Self::InMemory(repo) => Arc::clone(repo) as Arc<_>,
-            Self::Sqlite(repo) => Arc::clone(repo) as Arc<_>,
-        }
-    }
-
     /// Constructs a [`ContextEventLogProvider`] backed by this repository.
     ///
     /// The bridge is retained by `Arc` inside

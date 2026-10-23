@@ -2071,10 +2071,10 @@ pub(crate) async fn context_subscribe_on(
         }));
     }
     // ADR-029 §2: each envelope the actor accepts writes the context's
-    // `last_relay_contact`, so a bridge without the store fails closed.
+    // `last_relay_contact`, so a bridge without the supervisor's store fails closed.
     let relay_contacts = bi.core.relay_contact_store().ok_or_else(|| {
         NapiError::from(ScpNapiError::Validation {
-            message: "no protocol repository on this instance — the last relay contact \
+            message: "no supervisor on this instance — the last relay contact \
                       cannot be recorded"
                 .to_owned(),
             code: codes::STORAGE_8000.to_owned(),
@@ -3634,10 +3634,10 @@ pub(crate) async fn context_reconnect_on(
     // The Phase-3 checkpoint signs through custody (ADR-049 Decision 7a).
     let signer = crate::runtime::identity_active_signer(bi, &identity_did).await?;
     // ADR-029 §2: the reconnection reads and writes each context's
-    // `last_relay_contact`, so a bridge without the store fails closed.
+    // `last_relay_contact`, so a bridge without the supervisor's store fails closed.
     let relay_contacts = bi.core.relay_contact_store().ok_or_else(|| {
         NapiError::from(ScpNapiError::Validation {
-            message: "no protocol repository on this instance — the last relay contact \
+            message: "no supervisor on this instance — the last relay contact \
                       cannot be read or recorded"
                 .to_owned(),
             code: codes::STORAGE_8000.to_owned(),

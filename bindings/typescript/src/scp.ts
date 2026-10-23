@@ -2978,9 +2978,8 @@ export class SCP {
    * cleared.
    *
    * Each context's offline tier is classified from the `last_relay_contact`
-   * the instance stores for it; a context with none stored takes the most
-   * conservative tier, and a store read failure rejects with
-   * `SCP-TRANS-5095`.
+   * the instance stores for it; a store read failure, or a context with none
+   * stored, rejects with `SCP-TRANS-5095` before any context is reconnected.
    *
    * Requires an active relay connection (call `transportConnect` first).
    *

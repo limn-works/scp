@@ -909,9 +909,6 @@ pub const TRANS_5086: &str = "SCP-TRANS-5086";
 /// Push wake failed: the instance holds no local member DID
 /// (`WakeFailure::NoLocalIdentity`).
 pub const TRANS_5087: &str = "SCP-TRANS-5087";
-/// Push wake failed: the instance holds no `last_relay_contact` store
-/// (`WakeFailure::NoContactStore`).
-pub const TRANS_5088: &str = "SCP-TRANS-5088";
 /// Push wake failed: restoring or reading the persisted contexts failed
 /// (`WakeFailure::Restore`).
 pub const TRANS_5089: &str = "SCP-TRANS-5089";
@@ -929,8 +926,10 @@ pub const TRANS_5093: &str = "SCP-TRANS-5093";
 /// Push wake failed: the 25-second wake deadline expired with nothing
 /// delivered (`WakeFailure::DeadlineExpired`).
 pub const TRANS_5094: &str = "SCP-TRANS-5094";
-/// Reconnect failed: reading a context's stored `last_relay_contact` failed,
-/// so no context was reconnected (`reconnect::ReconnectError::ContactRead`).
+/// Reconnect failed: a context's `last_relay_contact` is unreadable or absent.
+///
+/// No context was reconnected (`reconnect::ReconnectError::ContactRead`,
+/// `reconnect::ReconnectError::Unclassifiable`).
 pub const TRANS_5095: &str = "SCP-TRANS-5095";
 /// Push wake context failed: the context's persisted relay set is empty
 /// (`reconnect::WakePullError::NoRelays`).

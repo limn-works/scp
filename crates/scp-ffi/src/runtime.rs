@@ -596,23 +596,14 @@ impl PyBridgeInstance {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_in_memory_for_test() -> Self {
-        let instance = Self::new_py();
-        instance.install_in_memory_storage();
-        instance
+        Self::new_py().with_in_memory_storage()
     }
 
-    /// Installs a fresh encrypted in-memory storage provider and, over the
-    /// same storage, the last-relay-contact store (ADR-029 key
-    /// `sync/{context_id}/last_relay_contact`, spec §17.6). Called once, on a
-    /// `new_py()` instance whose two slots are both unset, so both sets
-    /// succeed.
-    fn install_in_memory_storage(&self) {
-        let provider = StorageProvider::new_in_memory_encrypted();
-        if let StorageProvider::InMemoryEncrypted(storage) = &provider {
-            let repo = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
-            let _ = self.core.set_relay_contact_store(repo);
-        }
-        let _ = self.storage_provider.set(provider);
+    /// This instance with a fresh encrypted in-memory storage provider in its
+    /// storage slot.
+    fn with_in_memory_storage(mut self) -> Self {
+        self.storage_provider = OnceLock::from(StorageProvider::new_in_memory_encrypted());
+        self
     }
 
     /// Constructs a new `PyBridgeInstance` configured per the given
@@ -645,11 +636,7 @@ impl PyBridgeInstance {
     /// advisory lock.
     pub fn with_storage_py(cfg: StorageConfig) -> Result<Self, StorageInitError> {
         match cfg {
-            StorageConfig::InMemory => {
-                let instance = Self::new_py();
-                instance.install_in_memory_storage();
-                Ok(instance)
-            }
+            StorageConfig::InMemory => Ok(Self::new_py().with_in_memory_storage()),
             StorageConfig::Sqlite { path, key } => {
                 // Open the database once — `SqliteStorage` owns a single
                 // `rusqlite::Connection` that every downstream consumer
@@ -685,7 +672,7 @@ impl PyBridgeInstance {
                 let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                 let persistence: Arc<dyn ContextPersistence + Send + Sync> =
                     Arc::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo)));
-                let core = CoreFields::with_persistence_arc(persistence, repo);
+                let core = CoreFields::with_persistence_arc(persistence);
                 let outlet_stream_registry = Arc::new(StreamRegistry::new(&core));
                 let outlet_streaming_saga_registry = Arc::new(StreamRegistry::new(&core));
                 let instance = Self {

@@ -5628,8 +5628,9 @@ impl crate::scp::PyScp {
     /// `context_ids` is the set of contexts to consider; each is driven
     /// through the protocol only if the actor reports it `needs_reconnect`.
     /// Each context's offline tier is classified from its
-    /// `last_relay_contact` in the instance's store; a context with none
-    /// stored takes the most conservative tier.
+    /// `last_relay_contact` in the instance's store; a store read failure, or
+    /// a context with none stored, fails the call with `SCP-TRANS-5095`
+    /// before any context is reconnected.
     ///
     /// # Errors
     ///
@@ -5658,10 +5659,10 @@ impl crate::scp::PyScp {
         // (ADR-049 Decision 7a).
         let signer = resolve_signer(py, bi, identity_did)?;
         // ADR-029 §2: the reconnection reads and writes each context's
-        // `last_relay_contact`, so a bridge without the store fails closed.
+        // `last_relay_contact`, so a bridge without the supervisor's store fails closed.
         let relay_contacts = bi.core.relay_contact_store().ok_or_else(|| {
             crate::error::ScpPyError::ContextError {
-                message: "no protocol repository on this instance — the last relay \
+                message: "no supervisor on this instance — the last relay \
                               contact cannot be read or recorded"
                     .to_owned(),
                 code: scp_ffi_common::error_codes::STORAGE_8000.to_owned(),

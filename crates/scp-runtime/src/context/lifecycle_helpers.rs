@@ -1949,25 +1949,135 @@ pub async fn create_context(
     // Bootstrap keeps its `&ActorDeps` borrow alive for `finalize_create`
     // below; `clone_for_spawn` hands the actor task an owned bundle
     // without disturbing that borrow.
+    //
+    // The first snapshot and the first `last_relay_contact` land before the
+    // spawn (ADR-049 Decision 9; ADR-029 Implementation): a failed write
+    // fails the create with no actor started.
+    persist_first_state(&per_context, deps, &context_id)
+        .await
+        .map_err(ContextCreationError::StateTransition)?;
     let owned_deps = deps.clone_for_spawn();
-    deps.supervisor
+    if let Err(e) = deps
+        .supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)
         .await
-        .map_err(|e| match e {
+    {
+        discard_first_state(deps, &context_id).await;
+        return Err(match e {
             ContextError::SupervisorShutDown(_) => ContextCreationError::StateTransition(e),
             other => ContextCreationError::CreationFailed(other.to_string()),
-        })?;
+        });
+    }
 
     finalize_create(deps, &context_id, params.ttl, &handle).await?;
     Ok(handle)
+}
+
+/// Persists the first snapshot of a context whose actor is about to start,
+/// then writes its first `last_relay_contact` as the current time, both
+/// before the spawn.
+///
+/// Create, Welcome join and import call it. The snapshot is Class S state
+/// (ADR-049 Decision 9), and the contact is the value a later full
+/// reconnection classifies the offline tier from (ADR-029 Implementation),
+/// so neither may be missing once the operation reports success. When either
+/// write fails, [`discard_first_state`] deletes the snapshot and the contact,
+/// as the Welcome join always did for a failed snapshot write, so a failed
+/// birth leaves neither behind.
+///
+/// # Errors
+///
+/// - [`ContextError::PersistenceFailed`] when the snapshot write or the
+///   contact write fails.
+/// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+///
+/// # Not `async fn`
+///
+/// The `&PerContextState` is consumed in the synchronous prelude, as in
+/// [`crate::context::messaging_helpers::persist_state_fail_closed`], so the
+/// returned future is `Send`.
+pub fn persist_first_state<'d, 'c>(
+    state: &PerContextState,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
+) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c> {
+    let persist =
+        crate::context::messaging_helpers::persist_state_fail_closed(state, deps, context_id);
+    async move {
+        let written = match persist.await {
+            Ok(()) => write_first_contact(deps, context_id).await,
+            Err(e) => Err(e),
+        };
+        if written.is_err() {
+            discard_first_state(deps, context_id).await;
+        }
+        written
+    }
+}
+
+/// Writes the current time as the first `last_relay_contact` of `context_id`.
+///
+/// # Errors
+///
+/// [`ContextError::PersistenceFailed`] when the write fails, and
+/// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+async fn write_first_contact(deps: &ActorDeps, context_id: &str) -> Result<(), ContextError> {
+    let store = deps.supervisor.relay_contact_store()?;
+    store
+        .store_last_relay_contact(context_id, deps.clock.now_secs())
+        .await
+        .map_err(|e| {
+            crate::metrics::record_persistence_failure();
+            tracing::error!(
+                context_id,
+                error = %e,
+                "first last_relay_contact write failed; the context is not started"
+            );
+            ContextError::PersistenceFailed(format!(
+                "writing the first last_relay_contact of '{context_id}' failed: {e}"
+            ))
+        })
+}
+
+/// Deletes the snapshot and the `last_relay_contact` of a context whose
+/// birth failed: a failed [`persist_first_state`], or a spawn that fails
+/// after it.
+///
+/// The operation already failed with its own error, which the caller
+/// returns; a failed delete here is logged and counted, because it leaves a
+/// snapshot or contact for a context with no actor.
+pub async fn discard_first_state(deps: &ActorDeps, context_id: &str) {
+    if let Err(error) = deps.persistence.delete_context(context_id).await {
+        crate::metrics::record_persistence_failure();
+        tracing::warn!(
+            context_id,
+            %error,
+            "rollback of a failed context birth left its snapshot behind"
+        );
+    }
+    let deleted = match deps.supervisor.relay_contact_store() {
+        Ok(store) => store
+            .delete_last_relay_contact(context_id)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(error) = deleted {
+        crate::metrics::record_persistence_failure();
+        tracing::warn!(
+            context_id,
+            %error,
+            "rollback of a failed context birth left its last_relay_contact behind"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 10. finalize_create (transitive of create_context / restore_context / import_context)
 // ---------------------------------------------------------------------------
 
-/// Post-creation finalization: gauges, governance timeout, persistence,
-/// TTL timer.
+/// Post-creation finalization: gauges, governance timeout, TTL timer. The
+/// first snapshot was persisted before the spawn ([`persist_first_state`]).
 ///
 /// Runs after a context actor has been spawned and registered. The
 /// `create`/`restore` bootstrap paths register through
@@ -1979,9 +2089,9 @@ pub async fn create_context(
 /// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state).
 /// Every surface
 /// `finalize_create` touches is mailbox-based — gauges, the
-/// governance-timeout interval task, persistence/broadcast, and the TTL
-/// timer all reach the freshly-spawned actor through the supervisor
-/// registry, never the `DashMap`.
+/// governance-timeout interval task, and the TTL timer all reach the
+/// freshly-spawned actor through the supervisor registry, never the
+/// `DashMap`.
 ///
 /// # Errors
 ///
@@ -1998,9 +2108,6 @@ pub async fn finalize_create(
     // finding A3): the freshly-spawned actor's `reconcile_timers` arms a
     // 60 s interval while the context is `Active` — no bootstrap mailbox
     // install is needed.
-    deps.supervisor
-        .persist_context_and_broadcast(context_id)
-        .await;
     if ttl_duration.is_some() {
         // Install the TTL timer by mailboxing StartTtlTimer to the
         // freshly-spawned actor: the actor owns `state.ttl.timer` and
@@ -2939,14 +3046,26 @@ pub async fn import_context(
     // a concurrent operation raced into the slot — surfaced as a typed
     // error rather than a silent overwrite. The actor OWNS the imported
     // state; no legacy contexts DashMap write, no `Arc<Mutex<>>` proxy.
+    //
+    // The first snapshot and the first `last_relay_contact` land before the
+    // spawn (ADR-049 Decision 9; ADR-029 Implementation), and a failed write
+    // fails the import with no actor started. Deleting them on a failure is
+    // sound: `PrepareForReplace` above already tore down and despawned any
+    // prior actor for this id and claimed it terminal, so nothing else owns
+    // the snapshot or the contact.
+    persist_first_state(&per_context, deps, &context_id).await?;
     let owned_deps = deps.clone_for_spawn();
-    deps.supervisor
+    if let Err(e) = deps
+        .supervisor
         .spawn_actor_with_state(per_context, owned_deps, None)
         .await
-        .map_err(|e| match e {
+    {
+        discard_first_state(deps, &context_id).await;
+        return Err(match e {
             ContextError::SupervisorShutDown(_) => e,
             other => ContextError::MembershipFailed(other.to_string()),
-        })?;
+        });
+    }
 
     deps.supervisor.update_context_gauges().await?;
 
@@ -2954,12 +3073,7 @@ pub async fn import_context(
     // Decision-1 / finding A3): the spawned actor's `reconcile_timers`
     // arms the 60 s interval while `Active` — no bootstrap install needed.
 
-    // 8. Persist if persistence is configured.
-    deps.supervisor
-        .persist_context_and_broadcast(&context_id)
-        .await;
-
-    // 9. Re-arm the TTL timer through the partitioned single-source deadline
+    // 8. Re-arm the TTL timer through the partitioned single-source deadline
     // (ADR-049 §9). The create BASE + PROMOTION come from the PRUNE-IMMUNE,
     // creator-signed snapshot: the base is `export.snapshot.creation_timestamp_secs
     // + params.ttl`, and a promoted import has `params.ttl == None` ⇒ `None` (no
