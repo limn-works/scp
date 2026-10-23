@@ -943,6 +943,14 @@ WASM_ONLY = DOCS_ONLY | {"typescript-wasm": "true", "code": "true"}
 WASM_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromkeys(
     ("scaffold-typescript-web-check", "typescript-wasm-check"), True
 )
+# A change confined to `fuzz/**`, such as a fuzz/Cargo.lock bump: of the `changes`
+# filters, only `fuzz` and `code` list `fuzz/**`. fuzz-build and rust-deny-fuzz run on
+# their `fuzz` clause alone here, so dropping that clause from either `if:` changes
+# this scenario's answer.
+FUZZ_ONLY = DOCS_ONLY | {"fuzz": "true", "code": "true"}
+FUZZ_ONLY_RUNS = DOCS_ONLY_RUNS | dict.fromkeys(CODE_JOBS, True) | dict.fromkeys(
+    ("fuzz-build", "rust-deny-fuzz"), True
+)
 
 SCENARIOS = {
     "rust-only, pull_request": Scenario(
@@ -999,6 +1007,14 @@ SCENARIOS = {
         ("typescript-wasm-only", WASM_ONLY, WASM_ONLY_RUNS),
     )
     for event in ("pull_request", "merge_group")
+} | {
+    f"fuzz-only, {event}": Scenario(
+        name=f"fuzz-only, {event}",
+        filters=FUZZ_ONLY,
+        event=event,
+        runs=on_event(FUZZ_ONLY_RUNS, event),
+    )
+    for event in ("pull_request", "merge_group", "push")
 }
 
 failures: list[str] = []

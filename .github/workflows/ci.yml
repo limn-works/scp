@@ -2843,11 +2843,19 @@ jobs:
   # `./.github/actions/cargo-fetch` fails a second fetch in one job by design.
   #
   # It runs `check advisories bans sources`, not rust-deny's bare `check`, which adds
-  # licenses. libfuzzer-sys is licensed `(MIT OR Apache-2.0) AND NCSA`, deny.toml does not
-  # allow NCSA, and the fuzz crate builds no artifact anyone receives. Admitting it would
-  # take a global NCSA allowance, which widens what rust-deny accepts in the shipped graph,
-  # or a per-crate license exception. The `rust` output covers deny.toml and the `fuzz`
-  # output covers fuzz/Cargo.lock, so a change to either runs this job.
+  # licenses. `check licenses` fails on the fuzz graph for two reasons, and the fuzz crate
+  # builds no artifact anyone receives:
+  #   - `error[rejected]`: libfuzzer-sys is licensed `(MIT OR Apache-2.0) AND NCSA`, and
+  #     deny.toml does not allow NCSA. The remedies are a global NCSA allowance, which
+  #     widens what rust-deny accepts in the shipped graph, or a per-crate license
+  #     exception for libfuzzer-sys.
+  #   - `error[unlicensed]`: `scp-fuzz = 0.0.0 is unlicensed`. fuzz/Cargo.toml has no
+  #     `license` field, and it cannot inherit the workspace's because it sits outside the
+  #     workspace. The remedies are a `license` field in fuzz/Cargo.toml, or deny.toml's
+  #     `[licenses.private] ignore = true`, which would also skip every unpublished
+  #     workspace crate in rust-deny's audit.
+  # The `rust` output covers deny.toml and the `fuzz` output covers fuzz/Cargo.lock, so a
+  # change to either runs this job.
   #
   # Toolchains: the first step installs the root pin, on which cargo-deny's
   # `cargo metadata` runs from the checkout root, as in rust-deny; the second installs the
