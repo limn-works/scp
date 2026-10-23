@@ -351,4 +351,167 @@ mod tests {
             assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
         }
     }
+
+    /// §10.7.1 "No blob storage" at the WebTransport listener: a blob stored
+    /// at a routing ID while the relay did not reserve it is returned by
+    /// neither a QUERY nor a SUBSCRIBE backfill once the handle reserves that
+    /// ID as a tier 3 entry's, nor after the handle releases it. Each read
+    /// runs in a fresh session.
+    #[tokio::test]
+    async fn webtransport_listener_reads_no_blob_at_a_current_or_released_reserved_id() {
+        use super::super::session::DispatchResult;
+        use crate::relay::push_gate::RelayUrl;
+        use scp_relay_client::{ClientMessage, RelayMessage};
+        let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
+        let direct = RelayUrl::new("wss://relay.webtransport.test").unwrap();
+        let live = LiveRelayUrl::new(direct.clone());
+        let mut config = WebTransportListenerConfig::defaults(live.clone());
+        config.session_config.delivery_jitter_ms = 0;
+        let listener = WebTransportListener::new(
+            config,
+            Arc::new(InMemoryBlobStorage::new()),
+            crate::relay::subscription::new_registry(),
+            PublishRateLimiter::new(100),
+            crate::relay::rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
+        );
+        let rid = fixture.entry_a.push_routing_id();
+        let blobs = |messages: &[RelayMessage]| {
+            messages
+                .iter()
+                .filter(|m| matches!(m, RelayMessage::Blob { .. }))
+                .count()
+        };
+        let read_blob_counts = || async {
+            let mut session =
+                listener.create_session(IpAddr::V4(Ipv4Addr::LOCALHOST), CancellationToken::new());
+            session.mark_active();
+            let queried = match session
+                .dispatch_message_multi(&ClientMessage::Query {
+                    ref_id: Some("q".to_owned()),
+                    routing_id: rid,
+                    since: None,
+                    limit: None,
+                })
+                .await
+                .unwrap()
+            {
+                DispatchResult::Multi(messages) => blobs(&messages),
+                other => panic!("QUERY returned {other:?}"),
+            };
+            let backfilled = match session
+                .dispatch_message_multi(&ClientMessage::Subscribe {
+                    ref_id: Some("s".to_owned()),
+                    routing_id: rid,
+                    since: Some(0),
+                })
+                .await
+                .unwrap()
+            {
+                DispatchResult::Subscription { messages, .. } => blobs(&messages),
+                other => panic!("SUBSCRIBE returned {other:?}"),
+            };
+            (queried, backfilled)
+        };
+
+        let mut session =
+            listener.create_session(IpAddr::V4(Ipv4Addr::LOCALHOST), CancellationToken::new());
+        session.mark_active();
+        let reply = session
+            .dispatch_message_multi(&ClientMessage::Publish {
+                ref_id: Some("p".to_owned()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 60,
+                blob: vec![0x42; 64],
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &reply,
+                DispatchResult::Single(RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                })
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(read_blob_counts().await, (1, 1), "ordinary ID");
+
+        live.set(fixture.live.current());
+        assert_eq!(read_blob_counts().await, (0, 0), "current tier 3 ID");
+
+        live.set(direct);
+        assert_eq!(read_blob_counts().await, (0, 0), "released tier 3 ID");
+    }
+
+    /// §10.7.1 "Tier 3 relays" at the WebTransport listener: with the handle
+    /// reserving two bridge entries, a session answers a PUBLISH at either
+    /// entry's tier 3 push routing ID with 4063 and stores nothing, and stores
+    /// a PUBLISH at the bridge relay's own `"scp-push-registration"` ID.
+    #[tokio::test]
+    async fn webtransport_listener_intercepts_the_tier3_id_of_a_bridge_entry() {
+        use super::super::session::DispatchResult;
+        use scp_relay_client::{ClientMessage, RelayMessage};
+        let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
+        let storage = Arc::new(InMemoryBlobStorage::new());
+        let mut config = WebTransportListenerConfig::defaults(fixture.live.clone());
+        config.session_config.delivery_jitter_ms = 0;
+        let listener = WebTransportListener::new(
+            config,
+            Arc::clone(&storage),
+            crate::relay::subscription::new_registry(),
+            PublishRateLimiter::new(100),
+            crate::relay::rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
+        );
+        let mut session =
+            listener.create_session(IpAddr::V4(Ipv4Addr::LOCALHOST), CancellationToken::new());
+        session.mark_active();
+        let publish = |rid: [u8; 32]| ClientMessage::Publish {
+            ref_id: Some("push".to_owned()),
+            routing_id: rid,
+            recipient_hint: None,
+            blob_ttl: 60,
+            blob: vec![0x42; 64],
+        };
+
+        for rid in [
+            fixture.entry_a.push_routing_id(),
+            fixture.entry_b.push_routing_id(),
+        ] {
+            let reply = session.dispatch_message_multi(&publish(rid)).await.unwrap();
+            assert!(
+                matches!(
+                    &reply,
+                    DispatchResult::Single(RelayMessage::Err { code: 4063, .. })
+                ),
+                "{reply:?}"
+            );
+            assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+        }
+        let reply = session
+            .dispatch_message_multi(&publish(fixture.bridge_own_id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &reply,
+                DispatchResult::Single(RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                })
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            storage
+                .query(&fixture.bridge_own_id, None, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

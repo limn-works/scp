@@ -856,7 +856,10 @@ mod enabled {
                 signature: [0; 64],
             };
             let relay_url = test_relay_url();
-            let current = relay_url.current();
+            let reserved_urls = relay_url.current();
+            let [current] = reserved_urls.as_slice() else {
+                return Err("the test relay reserves one URL".into());
+            };
             let digest: [u8; 32] =
                 Sha256::digest(push_registration_signing_bytes(&msg, current.push_relay())?).into();
             msg.signature = sign_prehash_rfc6979(&signer, &digest)?;
@@ -1556,7 +1559,10 @@ pub(crate) mod wake_harness {
                 signature: [0; 64],
             };
             let relay_url = test_relay_url();
-            let current = relay_url.current();
+            let reserved_urls = relay_url.current();
+            let [current] = reserved_urls.as_slice() else {
+                return Err("the test relay reserves one URL".into());
+            };
             let digest: [u8; 32] =
                 Sha256::digest(push_registration_signing_bytes(&msg, current.push_relay())?).into();
             msg.signature = sign_prehash_rfc6979(&signer, &digest)?;

@@ -126,12 +126,14 @@ pub struct WebTransportSessionConfig {
     /// [`DidRecordValidation::Enabled`](crate::native::server::DidRecordValidation::Enabled),
     /// the canonical SCP-native behavior. Never a trust dependency (RELAYRES-002).
     pub did_record_validation: DidRecordValidation,
-    /// The relay's live URL, from which the reserved push routing ID derives
-    /// (§10.7.1 step 2). When this listener shares a relay's blob store, it
-    /// MUST be a clone of that relay's
+    /// The relay's live reserved entries, from which each reserved push
+    /// routing ID derives (§10.7.1 step 2, "Tier 3 relays"). When this
+    /// listener shares a relay's blob store, it MUST be a clone of that
+    /// relay's
     /// [`RelayConfig::relay_url`](crate::native::server::RelayConfig::relay_url)
-    /// handle, so a push message is intercepted whichever transport carries it
-    /// and a URL change moves every transport at once.
+    /// handle, so whichever transport carries it, a push message is
+    /// intercepted and a QUERY at a reserved ID returns no blob, and a change
+    /// of the reserved entries moves every transport at once.
     pub relay_url: LiveRelayUrl,
     /// Whether this listener offers push (§10.7.1). It MUST equal the shared
     /// relay's [`RelayConfig::push`](crate::native::server::RelayConfig::push);
@@ -631,6 +633,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
             if let Ok(blobs) = self
                 .did_slots
                 .gate_query(
+                    &self.config.relay_url,
                     self.config.did_record_validation,
                     self.storage.as_ref(),
                     routing_id,
@@ -729,6 +732,7 @@ impl<S: BlobStorage + 'static> WebTransportSessionHandler<S> {
         let blobs = match self
             .did_slots
             .gate_query(
+                &self.config.relay_url,
                 self.config.did_record_validation,
                 self.storage.as_ref(),
                 routing_id,

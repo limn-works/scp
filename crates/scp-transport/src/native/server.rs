@@ -136,11 +136,14 @@ pub enum DidRecordValidation {
 ///
 /// ```
 /// use scp_transport::native::server::RelayConfig;
-/// use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl};
+/// use scp_transport::relay::push_gate::{LiveRelayUrl, RelayUrl, ReservedRelayUrls};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let url = LiveRelayUrl::new(RelayUrl::new("wss://relay.example")?);
 /// let config = RelayConfig { delivery_jitter_ms: 0, ..RelayConfig::defaults(url) };
-/// assert_eq!(config.relay_url.current().canonical(), "wss://relay.example");
+/// assert_eq!(
+///     config.relay_url.current(),
+///     ReservedRelayUrls::from(RelayUrl::new("wss://relay.example")?)
+/// );
 /// # Ok(())
 /// # }
 /// ```
@@ -204,12 +207,14 @@ pub struct RelayConfig {
     /// always re-verifies); set [`DidRecordValidation::Disabled`] to store DID
     /// frames opaquely like a foreign transport.
     pub did_record_validation: DidRecordValidation,
-    /// The relay's own URL, from which every listener sharing this handle
-    /// derives the reserved push routing ID (§10.7.1 step 2). Required: a
-    /// relay always knows its URL, so push interception always runs. The
-    /// QUIC, UDP and WebTransport listeners of the same relay take clones of
-    /// this handle, and [`LiveRelayUrl::set`] moves all of them at once when
-    /// the URL changes.
+    /// The relay entries whose push routing IDs every listener sharing this
+    /// handle reserves (§10.7.1 step 2, "Tier 3 relays"): the relay's own URL,
+    /// or, for a node, its own `SCPRelay` entry and every tier 3 entry it
+    /// publishes with its `bridgeTarget`. Required, so push interception and
+    /// the read filter of §10.7.1 "No blob storage" always run. The QUIC, UDP
+    /// and WebTransport listeners of the same relay take clones of this
+    /// handle, and [`LiveRelayUrl::set`] moves all of them at once when the
+    /// reserved entries change.
     pub relay_url: LiveRelayUrl,
     /// Whether the relay offers push (§10.7.1, ADR-004 "Push registration
     /// interception"). Defaults to [`PushRole::Disabled`].
@@ -1513,6 +1518,7 @@ async fn handle_subscribe(
     if let Some(since_ts) = since {
         if let Ok(blobs) = did_slots
             .gate_query(
+                &config.relay_url,
                 config.did_record_validation,
                 storage.as_ref(),
                 routing_id,
@@ -1633,6 +1639,7 @@ async fn handle_query(
     // pass through unchanged. See `DidSlotRegistry::gate_query`.
     let blobs = match did_slots
         .gate_query(
+            &config.relay_url,
             config.did_record_validation,
             storage.as_ref(),
             routing_id,
@@ -4300,6 +4307,148 @@ mod tests {
         }
     }
 
+    /// The BLOBs a QUERY at `routing_id` returns and the BLOBs a SUBSCRIBE with
+    /// backfill from 0 returns, each read up to its completion event, on a
+    /// fresh connection.
+    async fn read_blob_counts(addr: SocketAddr, routing_id: [u8; 32]) -> (usize, usize) {
+        let (mut sink, mut stream) = connect_client(addr).await;
+        send_msg(
+            &mut sink,
+            &ClientMessage::Query {
+                ref_id: Some("q".to_string()),
+                routing_id,
+                since: None,
+                limit: None,
+            },
+        )
+        .await;
+        let mut queried = 0;
+        loop {
+            match recv_msg(&mut stream).await {
+                RelayMessage::Blob { .. } => queried += 1,
+                RelayMessage::Event { event_type, .. } if event_type == "query_complete" => break,
+                other => panic!("QUERY returned {other:?}"),
+            }
+        }
+        send_msg(
+            &mut sink,
+            &ClientMessage::Subscribe {
+                ref_id: Some("s".to_string()),
+                routing_id,
+                since: Some(0),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_msg(&mut stream).await,
+            RelayMessage::Ok { .. }
+        ));
+        let mut backfilled = 0;
+        loop {
+            match recv_msg(&mut stream).await {
+                RelayMessage::Blob { .. } => backfilled += 1,
+                RelayMessage::Event { event_type, .. } if event_type == "backfill_complete" => {
+                    break;
+                }
+                other => panic!("SUBSCRIBE backfill returned {other:?}"),
+            }
+        }
+        (queried, backfilled)
+    }
+
+    /// §10.7.1 "No blob storage" at the WebSocket listener: a blob stored at a
+    /// routing ID while the relay did not reserve it is returned by neither a
+    /// QUERY nor a SUBSCRIBE backfill once the handle reserves that ID as a
+    /// tier 3 entry's, nor after the handle releases it.
+    #[tokio::test]
+    async fn websocket_listener_reads_no_blob_at_a_current_or_released_reserved_id() {
+        let fixture = push_gate::tier3_fixture().unwrap();
+        let direct = RelayUrl::new(PUSH_RELAY_URL).unwrap();
+        let live = LiveRelayUrl::new(direct.clone());
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::defaults(live.clone())
+        };
+        let server = RelayServer::new(config, Arc::new(BlobStorageBackend::in_memory()));
+        let (_handle, addr) = server.start().await.unwrap();
+        let rid = fixture.entry_a.push_routing_id();
+
+        let reply = publish_to(addr, rid, vec![1]).await;
+        assert!(
+            matches!(
+                reply,
+                RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(read_blob_counts(addr, rid).await, (1, 1), "ordinary ID");
+
+        live.set(fixture.live.current());
+        assert_eq!(
+            read_blob_counts(addr, rid).await,
+            (0, 0),
+            "current tier 3 ID"
+        );
+
+        live.set(direct);
+        assert_eq!(
+            read_blob_counts(addr, rid).await,
+            (0, 0),
+            "released tier 3 ID"
+        );
+    }
+
+    /// §10.7.1 "Tier 3 relays" at the WebSocket listener: with the handle
+    /// reserving two bridge entries, a PUBLISH at either entry's tier 3 push
+    /// routing ID is answered with 4063 and stores nothing, and a PUBLISH at
+    /// the bridge relay's own `"scp-push-registration"` ID stores a blob.
+    #[tokio::test]
+    async fn websocket_listener_intercepts_the_tier3_id_of_a_bridge_entry() {
+        let fixture = push_gate::tier3_fixture().unwrap();
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::defaults(fixture.live.clone())
+        };
+        let server = RelayServer::new(config, Arc::clone(&storage));
+        let (_handle, addr) = server.start().await.unwrap();
+        for (label, rid) in [
+            ("entry A", fixture.entry_a.push_routing_id()),
+            ("entry B", fixture.entry_b.push_routing_id()),
+        ] {
+            let reply = publish_to(addr, rid, vec![1]).await;
+            assert_eq!(err_code(&reply), code::PUSH_NOT_SUPPORTED, "{label}");
+            assert!(
+                storage.query(&rid, None, 100).await.unwrap().is_empty(),
+                "{label}"
+            );
+        }
+        let reply = publish_to(addr, fixture.bridge_own_id, vec![1]).await;
+        assert!(
+            matches!(
+                reply,
+                RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(
+            storage
+                .query(&fixture.bridge_own_id, None, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[cfg(feature = "push-store")]
     mod enabled {
         use std::sync::Arc;
@@ -4429,6 +4578,69 @@ mod tests {
                 DID::from(REGISTRANT),
                 key(7).public_key(),
             )]))
+        }
+
+        /// §10.7.1 "Tier 3 relays" at a push-enabled WebSocket listener: the
+        /// relay opens a PUBLISH at a reserved tier 3 ID as a Tier 3 envelope
+        /// before any other rule and has no opener yet (PUSH-033), so a
+        /// registration correctly signed for a tier 3 entry but sent unsealed
+        /// is answered with `4060`, and neither the registration store nor
+        /// the blob store changes. The handle gains the tier 3 entries after
+        /// the relay starts, the path a node's tier change takes.
+        #[tokio::test]
+        async fn enabled_relay_rejects_an_unsealed_registration_at_a_tier3_id_with_4060() {
+            let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let store = PushRegistrationStore::open_sqlite(&dir.path().join("push.db")).unwrap();
+            let push = PushRole::Enabled(
+                PushService::start(PushServiceConfig {
+                    store: store.clone(),
+                    verifier: test_verifier(),
+                    senders: Arc::from(vec![apns_sender()]),
+                })
+                .unwrap(),
+            );
+            let live = LiveRelayUrl::new(RelayUrl::new(PUSH_RELAY_URL).unwrap());
+            let storage = Arc::new(BlobStorageBackend::in_memory());
+            let config = RelayConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                delivery_jitter_ms: 0,
+                push,
+                ..RelayConfig::defaults(live.clone())
+            };
+            let (_handle, addr) = RelayServer::new(config, Arc::clone(&storage))
+                .start()
+                .await
+                .unwrap();
+            live.set(fixture.live.current());
+
+            for entry in [&fixture.entry_a, &fixture.entry_b] {
+                let mut msg = PushRegistration {
+                    registrant: DID::from(REGISTRANT),
+                    platform: PushPlatform::Apns,
+                    token: b"tok".to_vec(),
+                    routing_ids: vec![[0x11; 32]],
+                    timestamp: now(),
+                    signature: [0; 64],
+                };
+                msg.signature = sign(
+                    &key(7),
+                    &push_registration_signing_bytes(&msg, entry.push_relay()).unwrap(),
+                );
+                let rid = entry.push_routing_id();
+                let reply = publish_to(addr, rid, reg_blob(&msg)).await;
+                assert_eq!(
+                    err_code(&reply),
+                    code::PUSH_REGISTRATION_REJECTED,
+                    "{}",
+                    entry.canonical()
+                );
+                assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
+                assert_eq!(
+                    store.accepted_timestamp(&apns_key(b"tok")).await.unwrap(),
+                    None
+                );
+            }
         }
 
         #[tokio::test]

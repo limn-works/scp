@@ -2856,10 +2856,13 @@ fn spawn_tier_reevaluation(
                 &live_state,
                 &relay_url,
                 &new_relay,
-                trigger_reason,
+                bridge_target,
                 &publisher,
                 &identity,
-                event_tx.as_ref(),
+                published_state::TierChangeReport {
+                    reason: trigger_reason,
+                    events: event_tx.as_ref(),
+                },
             )
             .await;
         }
@@ -3449,6 +3452,17 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         scp_did::RelayEndpoint::new(&domain_relay_url(&domain)).map_err(IdentityError::from)?,
     );
     document.add_relay_service(&relay);
+    // The relay reserves the push routing ID of every entry the node is about
+    // to publish before the publish (§10.7.1 step 2, "Tier 3 relays"): the
+    // domain entry, which carries no `bridgeTarget` and so reserves its
+    // `"scp-push-registration"` ID, and every tier 3 entry of an
+    // `IdentitySource::Explicit` document with the node's `bridgeTarget`.
+    // `seed_from_startup_publish` takes only the value this returns.
+    let bridge_target = node_bridge_target(&identity.did)?;
+    let reserved = published_state::reserve_push_routing_id(
+        &relay_config.relay_url,
+        &published_state::PublishedEntries::new(&relay, &document, bridge_target),
+    );
     // Publish the domain→DID binding per the configured `DhtMode` (NOT
     // unconditionally). `DhtMode::Disabled` — the fail-safe default, and a
     // LEGITIMATE more-private `Domain + Disabled` config per construction.md M2
@@ -3477,7 +3491,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // at `seq = 1` (SCP-RELAYRES-004). This MUST precede `seed_from_startup_publish`.
     initialize_sequence_for_mode(dht_mode, did_method.as_ref(), &identity).await?;
     let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode);
-    let live_state = seed_from_startup_publish(&publisher, &identity, document, &relay).await?;
+    let live_state = seed_from_startup_publish(&publisher, &identity, reserved).await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
@@ -3761,21 +3775,27 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         Some(nat_strategy.select_tier(http_port).await?)
     };
 
-    // The binding is an `scp_did::RelayService`; it keeps the `relay_url`
-    // name because `pipeline_wiring.rs` pins the reservation call's text.
     let bridge_target = node_bridge_target(&identity.did)?;
     let relay_url = no_domain_relay_service(tier.as_ref(), http_port, bridge_target)?;
-    // The relay reserves the push routing ID of the URL the node is about to
-    // publish before the publish, so no client reads a URL whose routing ID the
-    // relay does not yet intercept (§10.7.1 step 2). A tier 3 entry's URL is
-    // the bridge relay's, so the relay keeps its reservation and the node
-    // still publishes the entry.
-    published_state::reserve_push_routing_id(&relay_config.relay_url, &relay_url);
 
     // Inserted ahead of any relay a caller's `IdentitySource::Explicit`
     // document names, so the first `SCPRelay` entry, which a tier change
     // rewrites through `set_preferred_relay`, is the node's own.
     document.insert_preferred_relay(&relay_url);
+
+    // The relay reserves the push routing ID of every entry the node is about
+    // to publish before the publish, so no client reads an entry whose routing
+    // ID the relay does not yet intercept (§10.7.1 step 2): the node's own
+    // entry and every tier 3 entry of `document` with the node's
+    // `bridgeTarget`. A tier 3 entry reserves its tier 3 push routing ID,
+    // never the bridge relay's own `"scp-push-registration"` ID (§10.7.1
+    // "Tier 3 relays"). The inner `relay_url` names the reserved entries; the
+    // name stays because `pipeline_wiring.rs` pins the call's text.
+    let reserved = {
+        let relay_url =
+            published_state::PublishedEntries::new(&relay_url, &document, bridge_target);
+        published_state::reserve_push_routing_id(&relay_config.relay_url, &relay_url)
+    };
 
     // 4. Publish the DID document through the node's SINGLE publish seam AND seed
     //    the live slot in ONE step. `seed_from_startup_publish` performs the
@@ -3800,7 +3820,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     //    precede `seed_from_startup_publish` — the publish is inside it.
     initialize_sequence_for_mode(dht_mode, did_method.as_ref(), &identity).await?;
     let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode);
-    let live_state = seed_from_startup_publish(&publisher, &identity, document, &relay_url).await?;
+    let live_state = seed_from_startup_publish(&publisher, &identity, reserved).await?;
 
     tracing::info!(
         tier = ?tier,
@@ -7800,6 +7820,507 @@ mod tests {
         );
     }
 
+    type NodeRelayWs = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Opens a WebSocket to the node's internal relay with the bridge token.
+    async fn connect_node_relay<S: scp_platform::traits::Storage>(
+        node: &ApplicationNode<S>,
+    ) -> NodeRelayWs {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let mut request = format!("ws://{}/scp/v1", node.relay().bound_addr())
+            .into_client_request()
+            .expect("the relay address forms a request");
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", node.bridge_token_hex().as_str())
+                .parse()
+                .expect("the bridge token is a valid header value"),
+        );
+        tokio_tungstenite::connect_async(request)
+            .await
+            .expect("the internal relay accepts the bridge token")
+            .0
+    }
+
+    /// Sends `msg` over `ws` without waiting for a reply.
+    async fn send_node_relay(ws: &mut NodeRelayWs, msg: &scp_relay_client::ClientMessage) {
+        use futures::SinkExt as _;
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+            msg.to_bytes().expect("the client message encodes"),
+        ))
+        .await
+        .expect("the client message is sent");
+    }
+
+    /// Reads the next relay message from `ws`.
+    async fn recv_node_relay(ws: &mut NodeRelayWs) -> scp_relay_client::RelayMessage {
+        use futures::StreamExt as _;
+        let frame = tokio::time::timeout(TEST_EVENT_TIMEOUT, ws.next())
+            .await
+            .expect("the relay answers in time")
+            .expect("the relay keeps the connection open")
+            .expect("the relay frame is readable");
+        match frame {
+            tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                scp_relay_client::RelayMessage::from_bytes(&bytes).expect("the reply decodes")
+            }
+            other => panic!("expected a binary relay frame, got {other:?}"),
+        }
+    }
+
+    /// Publishes a one-byte blob at `routing_id` on the node's internal relay
+    /// and returns the reply.
+    async fn publish_at<S: scp_platform::traits::Storage>(
+        node: &ApplicationNode<S>,
+        routing_id: [u8; 32],
+    ) -> scp_relay_client::RelayMessage {
+        let mut ws = connect_node_relay(node).await;
+        send_node_relay(
+            &mut ws,
+            &scp_relay_client::ClientMessage::Publish {
+                ref_id: None,
+                routing_id,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: vec![1],
+            },
+        )
+        .await;
+        recv_node_relay(&mut ws).await
+    }
+
+    /// The number of BLOBs a QUERY at `routing_id` returns before
+    /// `query_complete`.
+    async fn query_blob_count<S: scp_platform::traits::Storage>(
+        node: &ApplicationNode<S>,
+        routing_id: [u8; 32],
+    ) -> usize {
+        let mut ws = connect_node_relay(node).await;
+        send_node_relay(
+            &mut ws,
+            &scp_relay_client::ClientMessage::Query {
+                ref_id: None,
+                routing_id,
+                since: None,
+                limit: None,
+            },
+        )
+        .await;
+        let mut blobs = 0;
+        loop {
+            match recv_node_relay(&mut ws).await {
+                scp_relay_client::RelayMessage::Blob { .. } => blobs += 1,
+                scp_relay_client::RelayMessage::Event { event_type, .. }
+                    if event_type == "query_complete" =>
+                {
+                    return blobs;
+                }
+                other => panic!("QUERY answered {other:?}"),
+            }
+        }
+    }
+
+    /// The number of BLOBs a SUBSCRIBE with backfill at `routing_id` returns
+    /// before `backfill_complete`.
+    async fn subscribe_backfill_count<S: scp_platform::traits::Storage>(
+        node: &ApplicationNode<S>,
+        routing_id: [u8; 32],
+    ) -> usize {
+        let mut ws = connect_node_relay(node).await;
+        send_node_relay(
+            &mut ws,
+            &scp_relay_client::ClientMessage::Subscribe {
+                ref_id: None,
+                routing_id,
+                since: Some(0),
+            },
+        )
+        .await;
+        let mut blobs = 0;
+        loop {
+            match recv_node_relay(&mut ws).await {
+                scp_relay_client::RelayMessage::Ok { .. } => {}
+                scp_relay_client::RelayMessage::Blob { .. } => blobs += 1,
+                scp_relay_client::RelayMessage::Event { event_type, .. }
+                    if event_type == "backfill_complete" =>
+                {
+                    return blobs;
+                }
+                other => panic!("SUBSCRIBE answered {other:?}"),
+            }
+        }
+    }
+
+    /// The node's tier 3 entry for `bridge_url`, as `tier_to_relay_service`
+    /// builds it from the node's own DID.
+    fn node_tier3_entry<S: scp_platform::traits::Storage>(
+        node: &ApplicationNode<S>,
+        bridge_url: &str,
+    ) -> scp_did::RelayService {
+        scp_did::RelayService::bridge(
+            scp_did::BridgeEndpoint::new(bridge_url).expect("a wss bridge URL"),
+            node_bridge_target(node.identity().did()).expect("not the absent value"),
+        )
+    }
+
+    /// The `"scp-push-registration"` ID of `url`, which a node relay holding
+    /// a tier 3 entry for `url` does not reserve.
+    fn registration_id(url: &str) -> [u8; 32] {
+        RelayUrl::new(url).expect("canonical URL").push_routing_id()
+    }
+
+    /// §10.7.1 "Tier 3 relays" at the node's listener: a PUBLISH at the
+    /// entry's tier 3 ID is answered with `4063`, and a QUERY and a SUBSCRIBE
+    /// there return nothing; a PUBLISH at the bridge relay's own
+    /// `"scp-push-registration"` ID is stored as a blob that a QUERY returns.
+    async fn assert_tier3_id_intercepted<S: scp_platform::traits::Storage>(
+        node: &ApplicationNode<S>,
+        entry: &scp_did::RelayService,
+        when: &str,
+    ) {
+        let tier3 = RelayUrl::from(entry).push_routing_id();
+        let bridge_own = registration_id(entry.url());
+        assert_ne!(tier3, bridge_own, "{when}: the tier 3 ID is its own");
+        assert_push_not_supported(&publish_at(node, tier3).await, when);
+        assert_eq!(query_blob_count(node, tier3).await, 0, "{when}: QUERY");
+        assert_eq!(
+            subscribe_backfill_count(node, tier3).await,
+            0,
+            "{when}: SUBSCRIBE"
+        );
+        let reply = publish_at(node, bridge_own).await;
+        assert!(
+            matches!(
+                reply,
+                scp_relay_client::RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }
+            ),
+            "{when}: the bridge relay's own ID stores, got {reply:?}"
+        );
+        assert_eq!(
+            query_blob_count(node, bridge_own).await,
+            1,
+            "{when}: QUERY at the bridge relay's own ID"
+        );
+    }
+
+    /// Criterion 6 at startup: a no-domain node whose startup tier is a
+    /// bridge reserves the tier 3 push routing ID of the entry it publishes,
+    /// never the bridge relay's own ID, before its first publish.
+    #[tokio::test]
+    async fn no_domain_node_reserves_its_tier3_id_at_startup() {
+        let (mut config, _net_change_tx) = tier_change_config(DhtMode::Disabled);
+        config.nat = NatSlot::Custom(Arc::new(SequenceNatStrategy::new(vec![
+            ReachabilityTier::Bridge {
+                bridge_url: scp_did::BridgeEndpoint::new(SLOT_BRIDGE_URL).unwrap(),
+            },
+        ])));
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("the no-domain node starts");
+        let entry = node_tier3_entry(&node, SLOT_BRIDGE_URL);
+        assert_eq!(
+            node.identity().document().relay_services(),
+            vec![entry.clone()]
+        );
+        assert_tier3_id_intercepted(&node, &entry, "at startup").await;
+        assert_eq!(
+            node.state.relay_config.relay_url.current(),
+            scp_transport::relay::push_gate::ReservedRelayUrls::from(RelayUrl::from(&entry))
+        );
+        node.shutdown();
+    }
+
+    /// Criterion 6 for several entries: a node whose `IdentitySource::Explicit`
+    /// document carries a second tier 3 entry with the node's `bridgeTarget`
+    /// reserves that entry's tier 3 ID beside its own entry's ID at startup,
+    /// and again after a tier change moves its own entry to a bridge. An
+    /// entry for another target is never reserved.
+    #[tokio::test]
+    async fn explicit_node_reserves_its_documents_second_tier3_entry_at_startup_and_after_a_tier_change()
+     {
+        const SECOND_BRIDGE_URL: &str = "wss://bridge-two.example.net/scp/v1";
+        let (identity, mut document, custody) = create_test_identity().await;
+        let target = node_bridge_target(&identity.did).expect("not the absent value");
+        let second = scp_did::RelayService::bridge(
+            scp_did::BridgeEndpoint::new(SECOND_BRIDGE_URL).expect("a wss bridge URL"),
+            target,
+        );
+        let foreign = scp_did::RelayService::bridge(
+            scp_did::BridgeEndpoint::new("wss://bridge-three.example.org/scp/v1")
+                .expect("a wss bridge URL"),
+            scp_did::BridgeTarget::new([0x5a; 32]).expect("not the absent value"),
+        );
+        document.add_relay_service(&second);
+        document.add_relay_service(&foreign);
+
+        let (mut config, net_change_tx) = tier_change_config(DhtMode::Disabled);
+        config.identity = IdentitySource::Explicit(Box::new(ExplicitIdentity {
+            identity,
+            document,
+            did_method: Arc::new(make_test_dht(&custody)),
+        }));
+        config.nat = NatSlot::Custom(Arc::new(SequenceNatStrategy::new(vec![
+            ReachabilityTier::Stun {
+                external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+            },
+            ReachabilityTier::Bridge {
+                bridge_url: scp_did::BridgeEndpoint::new(SLOT_BRIDGE_URL).unwrap(),
+            },
+        ])));
+        let mut node = Node::start_for_testing(config)
+            .await
+            .expect("the explicit no-domain node starts");
+        let relay = node.state.relay_config.relay_url.clone();
+        let second_id = RelayUrl::from(&second).push_routing_id();
+        let foreign_id = RelayUrl::from(&foreign).push_routing_id();
+
+        assert_eq!(
+            relay.current(),
+            scp_transport::relay::push_gate::ReservedRelayUrls::new(
+                RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap(),
+                [RelayUrl::from(&second)],
+            ),
+            "at startup: the own direct entry and the document's tier 3 entry"
+        );
+        assert_tier3_id_intercepted(&node, &second, "at startup").await;
+        assert!(
+            matches!(
+                publish_at(&node, foreign_id).await,
+                scp_relay_client::RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }
+            ),
+            "another target's tier 3 ID is an ordinary routing ID"
+        );
+
+        await_tier_change(
+            &mut node,
+            &net_change_tx,
+            TIER_CHANGE_OLD_URL,
+            SLOT_BRIDGE_URL,
+        )
+        .await;
+        let own = node_tier3_entry(&node, SLOT_BRIDGE_URL);
+        assert_eq!(
+            relay.current(),
+            scp_transport::relay::push_gate::ReservedRelayUrls::new(
+                RelayUrl::from(&own),
+                [RelayUrl::from(&second)],
+            ),
+            "after the tier change: both tier 3 entries"
+        );
+        for (label, id) in [
+            ("own tier 3 entry", RelayUrl::from(&own).push_routing_id()),
+            ("second tier 3 entry", second_id),
+        ] {
+            assert_push_not_supported(&publish_at(&node, id).await, label);
+            assert_eq!(query_blob_count(&node, id).await, 0, "{label}: QUERY");
+        }
+        node.shutdown();
+    }
+
+    /// §10.7.1 "Tier 3 relays" on the domain builder: a domain node whose
+    /// `IdentitySource::Explicit` document carries a tier 3 entry with the
+    /// node's `bridgeTarget` reserves that entry's tier 3 ID beside the domain
+    /// entry's `"scp-push-registration"` ID before its startup publish, so a
+    /// plaintext PUBLISH there gets `4063` and a QUERY returns nothing. An
+    /// entry for another target stays an ordinary routing ID.
+    #[tokio::test]
+    async fn domain_node_reserves_its_explicit_documents_tier3_entry_at_startup() {
+        let (identity, mut document, custody) = create_test_identity().await;
+        let target = node_bridge_target(&identity.did).expect("not the absent value");
+        let tier3 = scp_did::RelayService::bridge(
+            scp_did::BridgeEndpoint::new(SLOT_BRIDGE_URL).expect("a wss bridge URL"),
+            target,
+        );
+        let foreign = scp_did::RelayService::bridge(
+            scp_did::BridgeEndpoint::new("wss://bridge-three.example.org/scp/v1")
+                .expect("a wss bridge URL"),
+            scp_did::BridgeTarget::new([0x5a; 32]).expect("not the absent value"),
+        );
+        document.add_relay_service(&tier3);
+        document.add_relay_service(&foreign);
+        let mut config = domain_config();
+        config.identity = IdentitySource::Explicit(Box::new(ExplicitIdentity {
+            identity,
+            document,
+            did_method: Arc::new(make_test_dht(&custody)),
+        }));
+
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("the explicit domain node starts");
+
+        assert!(
+            node.identity().document().relay_services().contains(&tier3),
+            "the domain node publishes the Explicit document's tier 3 entry"
+        );
+        assert_eq!(
+            node.state.relay_config.relay_url.current(),
+            scp_transport::relay::push_gate::ReservedRelayUrls::new(
+                RelayUrl::new(&domain_relay_url("test.example.com")).unwrap(),
+                [RelayUrl::from(&tier3)],
+            ),
+            "the domain entry and the document's tier 3 entry with this node's target"
+        );
+        let tier3_id = RelayUrl::from(&tier3).push_routing_id();
+        assert_push_not_supported(&publish_at(&node, tier3_id).await, "tier 3 entry");
+        assert_eq!(
+            query_blob_count(&node, tier3_id).await,
+            0,
+            "tier 3 entry: QUERY"
+        );
+        assert!(
+            matches!(
+                publish_at(&node, RelayUrl::from(&foreign).push_routing_id()).await,
+                scp_relay_client::RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }
+            ),
+            "another target's tier 3 ID is an ordinary routing ID"
+        );
+        node.shutdown();
+    }
+
+    /// Waits for the next `TierChanged` event and checks its URLs.
+    async fn await_tier_change<S: scp_platform::traits::Storage>(
+        node: &mut ApplicationNode<S>,
+        net_change_tx: &tokio::sync::mpsc::Sender<()>,
+        previous: &str,
+        new: &str,
+    ) {
+        net_change_tx
+            .send(())
+            .await
+            .expect("the network-change detector is listening");
+        let event = tokio::time::timeout(
+            TEST_EVENT_TIMEOUT,
+            node.tier_change_rx()
+                .expect("a no-domain node streams tier changes")
+                .recv(),
+        )
+        .await
+        .expect("timed out waiting for the tier change")
+        .expect("the tier-change channel closed unexpectedly");
+        match event {
+            NatTierChange::TierChanged {
+                previous_relay_url,
+                new_relay_url,
+                ..
+            } => {
+                assert_eq!(previous_relay_url, previous);
+                assert_eq!(new_relay_url, new);
+            }
+            other => panic!("expected TierChanged, got {other:?}"),
+        }
+    }
+
+    /// Criterion 7 at the node's listener: a tier change to a bridge entry
+    /// reserves the entry's tier 3 ID, and a later change to a direct entry
+    /// moves the reservation to that entry's `"scp-push-registration"` ID
+    /// while the tier 3 ID stays refused.
+    #[tokio::test]
+    async fn tier_change_to_a_bridge_entry_intercepts_its_tier3_id_at_the_node_listener() {
+        let (mut config, net_change_tx) = tier_change_config(DhtMode::Disabled);
+        config.nat = NatSlot::Custom(Arc::new(SequenceNatStrategy::new(vec![
+            ReachabilityTier::Stun {
+                external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+            },
+            ReachabilityTier::Bridge {
+                bridge_url: scp_did::BridgeEndpoint::new(SLOT_BRIDGE_URL).unwrap(),
+            },
+            ReachabilityTier::Upnp {
+                external_addr: SocketAddr::from(([203, 0, 113, 42], 8443)),
+            },
+        ])));
+        let mut node = Node::start_for_testing(config)
+            .await
+            .expect("the no-domain node starts");
+        let entry = node_tier3_entry(&node, SLOT_BRIDGE_URL);
+
+        await_tier_change(
+            &mut node,
+            &net_change_tx,
+            TIER_CHANGE_OLD_URL,
+            SLOT_BRIDGE_URL,
+        )
+        .await;
+        assert_tier3_id_intercepted(&node, &entry, "after the change to the bridge entry").await;
+
+        await_tier_change(
+            &mut node,
+            &net_change_tx,
+            SLOT_BRIDGE_URL,
+            TIER_CHANGE_NEW_URL,
+        )
+        .await;
+        assert_eq!(
+            node.state.relay_config.relay_url.current(),
+            scp_transport::relay::push_gate::ReservedRelayUrls::from(
+                RelayUrl::new(TIER_CHANGE_NEW_URL).unwrap()
+            )
+        );
+        assert_push_not_supported(
+            &publish_at(&node, registration_id(TIER_CHANGE_NEW_URL)).await,
+            "the direct entry after the change back",
+        );
+        let tier3 = RelayUrl::from(&entry).push_routing_id();
+        assert_push_not_supported(
+            &publish_at(&node, tier3).await,
+            "the released tier 3 ID after the change back",
+        );
+        assert_eq!(query_blob_count(&node, tier3).await, 0);
+        node.shutdown();
+    }
+
+    /// A node relay given two tier 3 entries with different bridge URLs and
+    /// the same target, its own and one its document carries, intercepts both
+    /// tier 3 IDs; a later reservation from a document without the second
+    /// entry releases it, and the relay keeps refusing its ID.
+    #[tokio::test]
+    async fn node_relay_reserving_two_bridge_entries_intercepts_both_and_one_entry_releases_the_other()
+     {
+        let (config, _net_change_tx) = tier_change_config(DhtMode::Disabled);
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("the no-domain node starts");
+        let a = node_tier3_entry(&node, SLOT_BRIDGE_URL);
+        let b = node_tier3_entry(&node, "wss://bridge-two.example.net/scp/v1");
+        let relay = &node.state.relay_config.relay_url;
+        let target = node_bridge_target(node.identity().did()).expect("not the absent value");
+        let single = node.identity().document();
+        let mut both = single.clone();
+        both.add_relay_service(&b);
+
+        let _reserved = published_state::reserve_push_routing_id(
+            relay,
+            &published_state::PublishedEntries::new(&a, &both, target),
+        );
+        for (label, entry) in [("entry A", &a), ("entry B", &b)] {
+            assert_tier3_id_intercepted(&node, entry, label).await;
+        }
+
+        let _reserved = published_state::reserve_push_routing_id(
+            relay,
+            &published_state::PublishedEntries::new(&a, &single, target),
+        );
+        assert_eq!(
+            relay.current(),
+            scp_transport::relay::push_gate::ReservedRelayUrls::from(RelayUrl::from(&a))
+        );
+        let released = RelayUrl::from(&b).push_routing_id();
+        assert_push_not_supported(&publish_at(&node, released).await, "released entry B");
+        assert_eq!(query_blob_count(&node, released).await, 0);
+        node.shutdown();
+    }
+
     /// A no-domain node's relay reserves the push routing ID of the URL the node
     /// advertises at startup, so a PUBLISH there never becomes a stored blob.
     #[tokio::test]
@@ -7935,6 +8456,11 @@ mod tests {
         }
     }
 
+    /// The `bridgeTarget` the slot-test node publishes in a tier 3 entry.
+    fn slot_test_target() -> scp_did::BridgeTarget {
+        node_bridge_target(&slot_test_identity().did).expect("not the absent value")
+    }
+
     fn slot_test_document(relay_endpoints: &[&str]) -> DidDocument {
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
@@ -8028,10 +8554,14 @@ mod tests {
             &live_state,
             &LiveRelayUrl::new(RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
             &crate::published_state::test_relay(TIER_CHANGE_NEW_URL),
-            "test",
+            slot_test_target(),
             &NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             &slot_test_identity(),
-            None,
+            crate::published_state::TierChangeReport {
+                reason: "test",
+
+                events: None,
+            },
         )
         .await;
 
@@ -8067,12 +8597,16 @@ mod tests {
             &live_state,
             &LiveRelayUrl::new(RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
             &crate::published_state::test_relay(TIER_CHANGE_NEW_URL),
-            "test",
+            slot_test_target(),
             &NodePublisher::from_dyn(
                 Arc::new(ScriptedPublisher::new(false)) as Arc<dyn DidPublisher>
             ),
             &slot_test_identity(),
-            None,
+            crate::published_state::TierChangeReport {
+                reason: "test",
+
+                events: None,
+            },
         )
         .await;
 
@@ -8092,12 +8626,11 @@ mod tests {
         )
     }
 
-    /// A tier change to a bridge entry publishes its URL and `bridgeTarget`.
-    /// The entry's URL is the bridge relay's, whose push routing ID belongs to
-    /// the bridge relay, so this node's relay keeps reserving the previous
-    /// URL's routing ID.
+    /// A tier change to a bridge entry publishes its URL and `bridgeTarget`,
+    /// and the relay reserves the entry's tier 3 push routing ID in place of
+    /// the previous URL's ID (§10.7.1 "Tier 3 relays").
     #[tokio::test]
-    async fn tier_change_to_a_bridge_entry_publishes_it_and_keeps_the_reserved_id() {
+    async fn tier_change_to_a_bridge_entry_publishes_it_and_reserves_its_tier3_id() {
         let live_state = LiveSlot::new(NodePublishedState {
             document: slot_test_document(&[TIER_CHANGE_OLD_URL]),
             relay: crate::published_state::test_relay(TIER_CHANGE_OLD_URL),
@@ -8112,10 +8645,14 @@ mod tests {
             &live_state,
             &relay,
             &bridge,
-            "test",
+            slot_test_target(),
             &NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             &slot_test_identity(),
-            None,
+            crate::published_state::TierChangeReport {
+                reason: "test",
+
+                events: None,
+            },
         )
         .await;
 
@@ -8124,10 +8661,115 @@ mod tests {
         assert_eq!(state.document.relay_services(), vec![bridge.clone()]);
         assert_eq!(
             publisher.seen.lock().expect("lock")[0].relay_services(),
-            vec![bridge],
+            vec![bridge.clone()],
             "the published document carries the bridge URL and bridgeTarget"
         );
-        assert_eq!(relay.current(), old, "the relay keeps its reserved URL");
+        assert_eq!(
+            relay.current(),
+            scp_transport::relay::push_gate::ReservedRelayUrls::from(RelayUrl::from(&bridge)),
+            "the relay reserves the entry's tier 3 ID"
+        );
+        assert_ne!(
+            RelayUrl::from(&bridge).push_routing_id(),
+            registration_id(SLOT_BRIDGE_URL),
+            "never the bridge relay's own ID"
+        );
+        assert!(matches!(
+            scp_transport::relay::push_gate::gate_publish(
+                &relay,
+                &scp_transport::relay::push_gate::PushRole::Disabled,
+                &old.push_routing_id(),
+                &[1],
+                0,
+            )
+            .await,
+            scp_transport::relay::push_gate::PushPublishGate::Rejected { code: 4063, .. }
+        ));
+    }
+
+    /// Criterion 6: `reserve_push_routing_id` maps every entry to its own
+    /// routing ID, the tier 3 form for a bridge entry, and a later set of
+    /// fewer entries releases the rest into the refused previous IDs.
+    #[tokio::test]
+    async fn reserve_push_routing_id_reserves_the_tier3_id_of_every_entry() {
+        use crate::published_state::{PublishedEntries, reserve_push_routing_id};
+        use scp_transport::relay::push_gate::{
+            PushPublishGate, PushRole, ReservedRelayUrls, gate_publish,
+        };
+        async fn gate(relay: &LiveRelayUrl, id: [u8; 32]) -> PushPublishGate {
+            gate_publish(relay, &PushRole::Disabled, &id, &[1], 0).await
+        }
+        let old = RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap();
+        let relay = LiveRelayUrl::new(old.clone());
+        let target = slot_test_target();
+        let entry = |url: &str| {
+            scp_did::RelayService::bridge(scp_did::BridgeEndpoint::new(url).unwrap(), target)
+        };
+        let a = entry(SLOT_BRIDGE_URL);
+        let b = entry("wss://bridge-two.example.net/scp/v1");
+        // An entry for another target, which this node's relay never reserves.
+        let foreign = scp_did::RelayService::bridge(
+            scp_did::BridgeEndpoint::new("wss://bridge-three.example.org/scp/v1").unwrap(),
+            scp_did::BridgeTarget::new([0x5a; 32]).unwrap(),
+        );
+        let mut document = slot_test_document(&[TIER_CHANGE_OLD_URL]);
+        document.add_relay_service(&b);
+        document.add_relay_service(&foreign);
+        document.insert_preferred_relay(&a);
+
+        let _reserved =
+            reserve_push_routing_id(&relay, &PublishedEntries::new(&a, &document, target));
+        let current = relay.current();
+        assert_eq!(
+            current,
+            ReservedRelayUrls::new(RelayUrl::from(&a), [RelayUrl::from(&b)]),
+            "the own entry and the document's entry with this node's target, \
+             never the direct entry or another target's entry"
+        );
+        for (held, entry) in current.as_slice().iter().zip([&a, &b]) {
+            assert_eq!(
+                held.canonical(),
+                RelayUrl::new(entry.url()).unwrap().canonical()
+            );
+            assert_eq!(held.bridge_target(), Some(target));
+            assert_ne!(held.push_routing_id(), registration_id(entry.url()));
+            assert!(
+                !matches!(
+                    gate(&relay, held.push_routing_id()).await,
+                    PushPublishGate::NotPush
+                ),
+                "{} is reserved",
+                entry.url()
+            );
+        }
+        assert!(matches!(
+            gate(&relay, old.push_routing_id()).await,
+            PushPublishGate::Rejected { code: 4063, .. }
+        ));
+        for url in [SLOT_BRIDGE_URL, "wss://bridge-two.example.net/scp/v1"] {
+            assert_eq!(
+                gate(&relay, registration_id(url)).await,
+                PushPublishGate::NotPush,
+                "the bridge relay's own ID is not this relay's"
+            );
+        }
+
+        let only_own = slot_test_document(&[]);
+        let _reserved =
+            reserve_push_routing_id(&relay, &PublishedEntries::new(&a, &only_own, target));
+        assert_eq!(relay.current(), ReservedRelayUrls::from(RelayUrl::from(&a)));
+        assert!(matches!(
+            gate(&relay, RelayUrl::from(&b).push_routing_id()).await,
+            PushPublishGate::Rejected { code: 4063, .. }
+        ));
+
+        let direct = crate::published_state::test_relay(TIER_CHANGE_NEW_URL);
+        let _reserved =
+            reserve_push_routing_id(&relay, &PublishedEntries::new(&direct, &only_own, target));
+        assert_eq!(
+            relay.current(),
+            ReservedRelayUrls::from(RelayUrl::new(TIER_CHANGE_NEW_URL).unwrap())
+        );
     }
 
     /// Moving from tier 3 back to a direct tier clears `bridgeTarget`: the
@@ -8142,19 +8784,24 @@ mod tests {
             relay: slot_bridge_entry(),
             record: None,
         });
-        let relay = LiveRelayUrl::new(RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap());
+        let relay = LiveRelayUrl::new(RelayUrl::from(&slot_bridge_entry()));
+        let tier3 = RelayUrl::from(&slot_bridge_entry()).push_routing_id();
         let stun = crate::published_state::test_relay(TIER_CHANGE_NEW_URL);
 
         apply_tier_change(
             &live_state,
             &relay,
             &stun,
-            "test",
+            slot_test_target(),
             &NodePublisher::from_dyn(
                 Arc::new(ScriptedPublisher::new(false)) as Arc<dyn DidPublisher>
             ),
             &slot_test_identity(),
-            None,
+            crate::published_state::TierChangeReport {
+                reason: "test",
+
+                events: None,
+            },
         )
         .await;
 
@@ -8171,8 +8818,24 @@ mod tests {
         assert_eq!(raw[0].bridge_target, None, "the bridgeTarget is cleared");
         assert_eq!(
             relay.current(),
-            RelayUrl::new(TIER_CHANGE_NEW_URL).unwrap(),
+            scp_transport::relay::push_gate::ReservedRelayUrls::from(
+                RelayUrl::new(TIER_CHANGE_NEW_URL).unwrap()
+            ),
             "a direct tier's URL is this node's, so the relay reserves it"
+        );
+        assert!(
+            matches!(
+                scp_transport::relay::push_gate::gate_publish(
+                    &relay,
+                    &scp_transport::relay::push_gate::PushRole::Disabled,
+                    &tier3,
+                    &[1],
+                    0,
+                )
+                .await,
+                scp_transport::relay::push_gate::PushPublishGate::Rejected { code: 4063, .. }
+            ),
+            "the released tier 3 ID stays refused"
         );
     }
 
@@ -8273,12 +8936,16 @@ mod tests {
             &live_state,
             &LiveRelayUrl::new(RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
             &crate::published_state::test_relay(TIER_CHANGE_NEW_URL),
-            "test",
+            slot_test_target(),
             &NodePublisher::from_dyn(
                 Arc::new(ScriptedPublisher::new(true)) as Arc<dyn DidPublisher>
             ),
             &slot_test_identity(),
-            Some(&event_tx),
+            crate::published_state::TierChangeReport {
+                reason: "test",
+
+                events: Some(&event_tx),
+            },
         )
         .await;
 
@@ -8313,12 +8980,15 @@ mod tests {
             &live_state,
             &LiveRelayUrl::new(RelayUrl::new(TIER_CHANGE_OLD_URL).unwrap()),
             &crate::published_state::test_relay(TIER_CHANGE_NEW_URL),
-            "retry",
+            slot_test_target(),
             &NodePublisher::from_dyn(
                 Arc::new(ScriptedPublisher::new(false)) as Arc<dyn DidPublisher>
             ),
             &slot_test_identity(),
-            Some(&event_tx),
+            crate::published_state::TierChangeReport {
+                reason: "retry",
+                events: Some(&event_tx),
+            },
         )
         .await;
         let state = live_state.get();

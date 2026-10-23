@@ -1161,6 +1161,88 @@ fn nat_tier_task_writes_the_relay_push_url_handle() {
         set < publish,
         "apply_tier_change must move the relay handle before it publishes the new URL"
     );
+    // PUSH-032 (§10.7.1 "Tier 3 relays"): the node reserves the routing ID of
+    // the entry it publishes at startup before it publishes.
+    let startup = extract_fn_body(NODE_BUILDER_SRC, "build_no_domain_inner")
+        .expect("build_no_domain_inner body");
+    let reserve = startup
+        .find("reserve_push_routing_id(&relay_config.relay_url, &relay_url)")
+        .expect("build_no_domain_inner must reserve the startup entry's routing ID");
+    let seed = startup
+        .find("seed_from_startup_publish(")
+        .expect("build_no_domain_inner must publish through seed_from_startup_publish");
+    assert!(
+        reserve < seed,
+        "build_no_domain_inner must reserve the startup entry's routing ID before it publishes"
+    );
+    // PUSH-032 (§10.7.1 "Tier 3 relays"): both callers reserve the node's own
+    // entry and every tier 3 entry of the document they publish that carries
+    // the node's `bridgeTarget`, built from that document before the
+    // reservation.
+    let startup_entries = startup
+        .find("PublishedEntries::new(&relay_url, &document, bridge_target)")
+        .expect("build_no_domain_inner must reserve every entry of the document it publishes");
+    assert!(
+        startup_entries < reserve,
+        "build_no_domain_inner must build the reserved entries before it reserves them"
+    );
+    let tier_entries = body
+        .find("PublishedEntries::new(new_relay_url, &next_document, bridge_target)")
+        .expect("apply_tier_change must reserve every entry of the document it publishes");
+    assert!(
+        tier_entries < set,
+        "apply_tier_change must build the reserved entries before it reserves them"
+    );
+}
+
+// §10.7.1 "Tier 3 relays": every publish of the node's DID document goes
+// through a reservation of every entry of that document the node publishes.
+// The domain builder reserves before its startup publish, like the no-domain
+// builder, and the one `PublishAuthorization` constructor is
+// `ReservedDocument::authorize`, whose value only `reserve_push_routing_id`
+// builds.
+#[test]
+fn every_node_document_publish_reserves_the_published_entries() {
+    let domain =
+        extract_fn_body(NODE_BUILDER_SRC, "build_domain_inner").expect("build_domain_inner body");
+    let domain_reserve = domain
+        .find("reserve_push_routing_id(\n        &relay_config.relay_url,")
+        .expect("build_domain_inner must reserve the entries of the document it publishes");
+    let domain_entries = domain
+        .find("PublishedEntries::new(&relay, &document, bridge_target)")
+        .expect("build_domain_inner must reserve every entry of the document it publishes");
+    let domain_seed = domain
+        .find("seed_from_startup_publish(&publisher, &identity, reserved)")
+        .expect("build_domain_inner must publish the reserved document");
+    assert!(
+        domain_reserve < domain_entries && domain_entries < domain_seed,
+        "build_domain_inner must reserve the document's entries before it publishes"
+    );
+    // Every publish of the node's document needs a `PublishAuthorization`,
+    // and the one constructor sits in `ReservedDocument::authorize`, whose
+    // value only `reserve_push_routing_id` builds.
+    assert_eq!(
+        NODE_PUBLISHED_STATE_SRC
+            .matches("struct PublishAuthorization(());")
+            .count(),
+        1,
+        "PublishAuthorization must have exactly one definition"
+    );
+    assert_eq!(
+        NODE_PUBLISHED_STATE_SRC
+            .matches("PublishAuthorization(())")
+            .count(),
+        2,
+        "PublishAuthorization must have its definition and exactly one constructor"
+    );
+    assert!(
+        fn_body_contains(
+            NODE_PUBLISHED_STATE_SRC,
+            "authorize",
+            "PublishAuthorization(())"
+        ),
+        "the one PublishAuthorization constructor must be ReservedDocument::authorize"
+    );
 }
 
 // PUSH-013 (§10.7.1): the push routing-ID query runs
