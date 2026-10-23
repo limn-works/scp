@@ -4088,7 +4088,14 @@ pub fn execute_propose_context_migration<'a>(
                 // field was written before the await, so no view is taken here
                 // and the cell's `mutation_epoch` is unchanged across the
                 // failure.
-                let _ = cell.handle.transition_to(&ContextState::Active);
+                if let Err(revert) = cell.handle.transition_to(&ContextState::Active) {
+                    tracing::warn!(
+                        context_id,
+                        error = %revert,
+                        "migration source could not return to Active after its \
+                         destination's create failed"
+                    );
+                }
                 // Put back the destination's first-state records; a failure to
                 // do so is the caller's to see.
                 first_state.rollback().await.map_err(|rollback| {
