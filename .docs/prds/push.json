@@ -1035,7 +1035,15 @@
         "crates/scp-transport/src/manager.rs",
         "crates/scp-transport/src/native/adapter.rs",
         "crates/scp-testing/tests/integration/push_wake.rs",
-        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs",
+        "crates/scp-testing/tests/integration/reconnect_sync.rs",
+        "crates/scp-testing/src/fullstack/node.rs",
+        "crates/scp-testing/Cargo.toml",
+        "crates/scp-ffi/common/Cargo.toml",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-core/src/lib.rs",
+        "crates/scp-runtime/src/context/mod.rs"
       ],
       "description": "`handle_wake(core, platform, payload)` in `scp-ffi-common` applies the \u00a710.7.1 device receipt rule for the platform, then runs the push-wake pull mode of ADR-029 \u00a72 under one 25-second deadline (ADR-025 criterion 4, ADR-027 criterion 10). An invalid payload returns `SCP-TRANS-5080` before any connection. When no context is resident, the handler restores every persisted context. It dials the union of the Active contexts' persisted relay URLs on a transient transport with cover traffic off (\u00a79.10.6), never installs that transport, and runs Phases 1, 2 and 4 for every Active context. Phase 1 queries every relay for the shared routing ID and each pseudonym routing ID the member holds, from the stored `sync/{context_id}/last_relay_contact` minus 5 seconds. The pull runs no checkpoint, Update, queue drain, or Tier 2 or Tier 3 engine, so it signs and publishes nothing, and it leaves `needs_reconnect` set. The outcome is `NewData` when the actor accepted at least one application envelope, `NoData` when it accepted none, and `Failed` on a dial or query error, a persisted Active context that is not resident (a failed restore), a missing identity or contact store, or the deadline. The FFI exports belong to PUSH-015.",
       "acceptanceCriteria": [
