@@ -898,6 +898,59 @@ pub const TRANS_5083: &str = "SCP-TRANS-5083";
 /// as a failed token registration (`PushFailureKind::ProviderFailed`).
 pub const TRANS_5084: &str = "SCP-TRANS-5084";
 
+// Push wake (ADR-029 §2 push-wake pull mode step 7): one code per
+// `push::WakeFailure` variant, assigned by `WakeFailure::code`.
+
+/// Push wake failed: the instance is shut down (`WakeFailure::ShutDown`).
+pub const TRANS_5085: &str = "SCP-TRANS-5085";
+/// Push wake failed: the instance holds no supervisor
+/// (`WakeFailure::NoSupervisor`).
+pub const TRANS_5086: &str = "SCP-TRANS-5086";
+/// Push wake failed: the instance holds no local member DID
+/// (`WakeFailure::NoLocalIdentity`).
+pub const TRANS_5087: &str = "SCP-TRANS-5087";
+/// Push wake failed: the instance holds no `last_relay_contact` store
+/// (`WakeFailure::NoContactStore`).
+pub const TRANS_5088: &str = "SCP-TRANS-5088";
+/// Push wake failed: restoring or reading the persisted contexts failed
+/// (`WakeFailure::Restore`).
+pub const TRANS_5089: &str = "SCP-TRANS-5089";
+/// Push wake failed: a persisted Active context is not resident after the
+/// restore (`WakeFailure::Unrestored`).
+pub const TRANS_5090: &str = "SCP-TRANS-5090";
+/// Push wake failed: listing the Active contexts' relays and routing IDs
+/// failed (`WakeFailure::Targets`).
+pub const TRANS_5091: &str = "SCP-TRANS-5091";
+/// Push wake failed: a suspend or shutdown cancelled the relay dial
+/// (`WakeFailure::DialCancelled`).
+pub const TRANS_5092: &str = "SCP-TRANS-5092";
+/// Push wake failed: one or more contexts' pulls failed (`WakeFailure::Pull`).
+pub const TRANS_5093: &str = "SCP-TRANS-5093";
+/// Push wake failed: the 25-second wake deadline expired with nothing
+/// delivered (`WakeFailure::DeadlineExpired`).
+pub const TRANS_5094: &str = "SCP-TRANS-5094";
+/// Reconnect failed: reading a context's stored `last_relay_contact` failed,
+/// so no context was reconnected (`reconnect::ReconnectError::ContactRead`).
+pub const TRANS_5095: &str = "SCP-TRANS-5095";
+/// Push wake context failed: the context's persisted relay set is empty
+/// (`reconnect::WakePullError::NoRelays`).
+pub const TRANS_5096: &str = "SCP-TRANS-5096";
+/// Push wake context failed: a relay in the context's relay set was not
+/// dialed (`reconnect::WakePullError::RelayUnavailable`).
+pub const TRANS_5097: &str = "SCP-TRANS-5097";
+/// Push wake context failed: reading the context's stored
+/// `last_relay_contact` failed (`reconnect::WakePullError::ContactRead`).
+pub const TRANS_5098: &str = "SCP-TRANS-5098";
+/// Push wake context failed: the Phase 1 query on a relay of the context's
+/// relay set failed (`reconnect::WakePullError::Query`).
+pub const TRANS_5099: &str = "SCP-TRANS-5099";
+/// Push wake context failed: writing the context's `last_relay_contact`
+/// failed (`reconnect::WakePullError::ContactWrite`).
+pub const TRANS_5100: &str = "SCP-TRANS-5100";
+/// Push wake context failed: the actor reached no verdict on a blob of the
+/// context's buffer (`reconnect::WakePullError::Undelivered`).
+pub const TRANS_5101: &str = "SCP-TRANS-5101";
+
 // -------------------------------------------------------------------------
 // Outlet (SCP-OUTLET- 6000--6999)
 // -------------------------------------------------------------------------

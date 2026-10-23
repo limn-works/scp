@@ -80,6 +80,9 @@ pub mod context {
         MAX_MANAGEMENT_PAYLOAD_SIZE, RemoveMemberOutput,
     };
     pub use scp_runtime::context::ContextHandle;
+    /// ADR-029 §2 push-wake pull mode: one Active context's relay URLs and
+    /// routing IDs, which the FFI wake handler pulls.
+    pub use scp_runtime::context::ContextWakeTarget;
     /// Actor module — re-exported from `scp-runtime` so the FFI bridges
     /// can name the [`QueriesCommand`](actor::commands::QueriesCommand)
     /// variants they dispatch through

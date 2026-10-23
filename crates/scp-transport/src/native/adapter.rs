@@ -85,7 +85,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// # Examples
 ///
 /// ```rust,ignore
-/// use scp_transport::native::adapter::NativeRelayAdapter;
+/// use scp_transport::native::adapter::{CoverTraffic, NativeRelayAdapter};
 /// use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 ///
 /// // Production: validate ws:// vs wss:// based on discovery source.
@@ -95,14 +95,16 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///     source: RelayUrlSource::WellKnown,
 /// };
 /// let profile = TransportProfile::platform_default();
-/// let adapter = NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await?;
+/// let adapter =
+///     NativeRelayAdapter::connect_sourced(&sourced, Some(&profile), CoverTraffic::FromProfile)
+///         .await?;
 ///
 /// // Test: local ws:// relay with DhtResolved source, no cover traffic.
 /// let sourced = SourcedRelayUrl {
 ///     url: "ws://127.0.0.1:9000/scp/v1".to_owned(),
 ///     source: RelayUrlSource::DhtResolved,
 /// };
-/// let adapter = NativeRelayAdapter::connect_sourced(&sourced, None).await?;
+/// let adapter = NativeRelayAdapter::connect_sourced(&sourced, None, CoverTraffic::Off).await?;
 /// ```
 pub struct NativeRelayAdapter {
     /// The underlying WebSocket client.
@@ -121,6 +123,33 @@ pub struct NativeRelayAdapter {
     /// Callers should drain this receiver to observe suppression alerts
     /// (spec §9.9.4: "The SDK MUST NOT silently discard the suspicion").
     suppression_rx: Option<tokio::sync::mpsc::Receiver<crate::heartbeat::SuppressionSuspected>>,
+}
+
+/// Whether a new [`NativeRelayAdapter`] starts cover traffic (spec §9.10.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverTraffic {
+    /// Start cover traffic at the tier the [`TransportProfile`] names, or none
+    /// when no profile is given.
+    FromProfile,
+    /// Start no cover traffic, whatever the profile says. For a connection
+    /// that must publish nothing, such as the push-wake pull's transient dial
+    /// (ADR-025 criterion 4).
+    Off,
+}
+
+/// The cover traffic a new adapter starts: the profile's tier under
+/// [`CoverTraffic::FromProfile`], and none under [`CoverTraffic::Off`] or
+/// without a profile.
+const fn cover_traffic_config(
+    profile: Option<&TransportProfile>,
+    cover: CoverTraffic,
+) -> Option<CoverTrafficConfig> {
+    match (profile, cover) {
+        (Some(profile), CoverTraffic::FromProfile) => {
+            Some(CoverTrafficConfig::from_profile(*profile))
+        }
+        (None, _) | (_, CoverTraffic::Off) => None,
+    }
 }
 
 impl std::fmt::Debug for NativeRelayAdapter {
@@ -156,11 +185,14 @@ impl NativeRelayAdapter {
     /// All relay URLs must go through this path — there is no unvalidated
     /// connection method.
     ///
-    /// When a [`TransportProfile`] is provided, cover traffic is auto-started
-    /// based on the profile's tier (spec §9.10.6): Full for Server/Desktop,
-    /// Reduced for Mobile, Off (no-op) for Constrained. Heartbeat monitoring
-    /// is also started for relay suppression detection (spec §9.9.2). Pass
-    /// `None` to skip both (e.g., in tests).
+    /// `cover` decides cover traffic (spec §9.10.6), and every caller names
+    /// it: [`CoverTraffic::FromProfile`] starts the tier `profile` names (Full
+    /// for Server and Desktop, Reduced for Mobile, none for Constrained or
+    /// without a profile); [`CoverTraffic::Off`] starts none whatever
+    /// `profile` says, for a connection that must publish nothing, such as
+    /// the push-wake pull's transient dial (ADR-025 criterion 4, ADR-029 §2
+    /// push-wake pull mode). Heartbeat monitoring (spec §9.9.2) follows
+    /// `profile` alone, because it only reads; pass `None` to skip it.
     ///
     /// [`RelayUrlSource::DhtResolved`]: crate::relay::connection::RelayUrlSource::DhtResolved
     ///
@@ -175,10 +207,16 @@ impl NativeRelayAdapter {
     pub async fn connect_sourced(
         sourced: &SourcedRelayUrl,
         profile: Option<&TransportProfile>,
+        cover: CoverTraffic,
     ) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect(&sourced.url).await?;
-        Ok(Self::finalize_connection(client, profile, &sourced.url))
+        Ok(Self::finalize_connection(
+            client,
+            profile,
+            &sourced.url,
+            cover,
+        ))
     }
 
     /// Creates a new adapter connected to a relay URL with provenance-based
@@ -190,8 +228,8 @@ impl NativeRelayAdapter {
     /// connecting to relay endpoints that enforce bridge token authentication
     /// (e.g., `ApplicationNode` relays).
     ///
-    /// When a [`TransportProfile`] is provided, cover traffic and heartbeat
-    /// monitoring are auto-started (spec §9.10.6, §9.9.2).
+    /// `cover` and `profile` decide cover traffic and heartbeat monitoring as
+    /// in [`connect_sourced`](Self::connect_sourced).
     ///
     /// # Errors
     ///
@@ -204,17 +242,25 @@ impl NativeRelayAdapter {
         sourced: &SourcedRelayUrl,
         bearer_token: Option<Zeroizing<String>>,
         profile: Option<&TransportProfile>,
+        cover: CoverTraffic,
     ) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect_with_bearer(&sourced.url, bearer_token).await?;
-        Ok(Self::finalize_connection(client, profile, &sourced.url))
+        Ok(Self::finalize_connection(
+            client,
+            profile,
+            &sourced.url,
+            cover,
+        ))
     }
 
-    /// Common post-connection setup: heartbeat monitor, cover traffic auto-start.
+    /// Common post-connection setup: heartbeat monitor, and cover traffic
+    /// when `cover` is [`CoverTraffic::FromProfile`] and a profile is given.
     fn finalize_connection(
         client: NativeRelayClient,
         profile: Option<&TransportProfile>,
         relay_url: &str,
+        cover: CoverTraffic,
     ) -> Self {
         let heartbeat_cancel = CancellationToken::new();
         let (heartbeat_monitor, suppression_rx) =
@@ -226,8 +272,7 @@ impl NativeRelayAdapter {
             heartbeat_monitor,
             suppression_rx,
         };
-        if let Some(profile) = profile {
-            let config = CoverTrafficConfig::from_profile(*profile);
+        if let Some(config) = cover_traffic_config(profile, cover) {
             // JoinHandle intentionally dropped — the task is cancelled via the
             // CancellationToken in the adapter's Drop impl, not by awaiting/
             // aborting the handle.
@@ -896,9 +941,13 @@ mod tests {
             url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
             source: RelayUrlSource::WellKnown,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .expect_err("ws:// from WellKnown must be rejected");
+        let err = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            crate::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .expect_err("ws:// from WellKnown must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("ws://"),
@@ -919,9 +968,13 @@ mod tests {
             url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
             source: RelayUrlSource::Explicit,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .expect_err("ws:// from Explicit must be rejected");
+        let err = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            crate::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .expect_err("ws:// from Explicit must be rejected");
         assert!(err.to_string().contains("Explicit"));
     }
 
@@ -934,9 +987,13 @@ mod tests {
             url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
             source: RelayUrlSource::PeerDiscovered,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .expect_err("ws:// from PeerDiscovered must be rejected");
+        let err = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            crate::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .expect_err("ws:// from PeerDiscovered must be rejected");
         assert!(err.to_string().contains("PeerDiscovered"));
     }
 
@@ -949,9 +1006,13 @@ mod tests {
             url: "http://relay.example.com/scp/v1".to_owned(),
             source: RelayUrlSource::DhtResolved,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .expect_err("http:// scheme must be rejected");
+        let err = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            crate::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .expect_err("http:// scheme must be rejected");
         assert!(err.to_string().contains("ws:// or wss://"));
     }
 
@@ -988,9 +1049,13 @@ mod tests {
             url,
             source: RelayUrlSource::DhtResolved,
         };
-        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            crate::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .unwrap();
 
         // Build a cover traffic payload: DUMMY_FLAG + padding to bucket boundary.
         let payload = pad_to_bucket(&[DUMMY_FLAG]);
@@ -1038,9 +1103,13 @@ mod tests {
 
         let handle;
         {
-            let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-                .await
-                .unwrap();
+            let adapter = NativeRelayAdapter::connect_sourced(
+                &sourced,
+                None,
+                crate::native::adapter::CoverTraffic::Off,
+            )
+            .await
+            .unwrap();
             // Start cover traffic with a short custom interval for testing.
             let ct_config = CoverTrafficConfig {
                 tier: CoverTrafficTier::Custom {
@@ -1094,14 +1163,43 @@ mod tests {
         };
 
         // Server profile → Full tier → cover traffic auto-started.
-        let adapter =
-            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Server))
-                .await
-                .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            Some(&TransportProfile::Server),
+            crate::native::adapter::CoverTraffic::FromProfile,
+        )
+        .await
+        .unwrap();
 
         // The adapter should have been constructed successfully with
         // cover traffic running. Dropping it cancels the task.
         drop(adapter);
+    }
+
+    /// `CoverTraffic::Off` starts no cover traffic for any profile, and
+    /// `FromProfile` starts the profile's tier (ADR-025 criterion 4).
+    #[test]
+    fn cover_off_starts_no_cover_traffic_for_any_profile() {
+        use crate::profile::TransportProfile;
+        for profile in [
+            TransportProfile::Server,
+            TransportProfile::Desktop,
+            TransportProfile::Mobile,
+            TransportProfile::Constrained,
+        ] {
+            assert!(
+                cover_traffic_config(Some(&profile), CoverTraffic::Off).is_none(),
+                "Off starts nothing for {profile:?}"
+            );
+            let from_profile =
+                cover_traffic_config(Some(&profile), CoverTraffic::FromProfile).map(|c| c.tier);
+            assert_eq!(
+                from_profile,
+                Some(CoverTrafficConfig::from_profile(profile).tier),
+                "FromProfile starts the profile tier for {profile:?}"
+            );
+        }
+        assert!(cover_traffic_config(None, CoverTraffic::FromProfile).is_none());
     }
 
     /// Verifies that `connect_sourced` with `None` profile does NOT start
@@ -1132,9 +1230,13 @@ mod tests {
         };
 
         // No profile → no cover traffic started.
-        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            crate::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .unwrap();
 
         // Adapter should connect fine without cover traffic.
         drop(adapter);
@@ -1170,10 +1272,13 @@ mod tests {
 
         // Constrained profile → Off tier → cover traffic task spawns but
         // exits immediately (generator.interval() returns None for Off).
-        let adapter =
-            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Constrained))
-                .await
-                .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            Some(&TransportProfile::Constrained),
+            crate::native::adapter::CoverTraffic::FromProfile,
+        )
+        .await
+        .unwrap();
 
         // The spawned task should have already exited. Give it a moment.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1215,9 +1320,13 @@ mod tests {
             url,
             source: RelayUrlSource::DhtResolved,
         };
-        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            crate::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .unwrap();
 
         // Explicitly start cover traffic with a short 50ms interval and no
         // budget cap, so dummies emit continuously.
@@ -1280,9 +1389,13 @@ mod tests {
             url,
             source: RelayUrlSource::DhtResolved,
         };
-        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            crate::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .unwrap();
 
         // 256-byte/min budget with 256-byte dummies: the first dummy exhausts
         // the budget, degrading the effective tier to Off for the rest of the
@@ -1352,10 +1465,13 @@ mod tests {
             source: RelayUrlSource::DhtResolved,
         };
 
-        let adapter =
-            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Server))
-                .await
-                .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            Some(&TransportProfile::Server),
+            crate::native::adapter::CoverTraffic::FromProfile,
+        )
+        .await
+        .unwrap();
 
         assert!(
             adapter.has_heartbeat_monitor(),
@@ -1390,9 +1506,13 @@ mod tests {
             source: RelayUrlSource::DhtResolved,
         };
 
-        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            crate::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .unwrap();
 
         assert!(
             !adapter.has_heartbeat_monitor(),
@@ -1434,10 +1554,13 @@ mod tests {
             source: RelayUrlSource::DhtResolved,
         };
 
-        let adapter =
-            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Desktop))
-                .await
-                .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            Some(&TransportProfile::Desktop),
+            crate::native::adapter::CoverTraffic::FromProfile,
+        )
+        .await
+        .unwrap();
 
         let monitor = adapter
             .heartbeat_monitor_handle()
@@ -1507,9 +1630,13 @@ mod tests {
             source: RelayUrlSource::DhtResolved,
         };
 
-        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            crate::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .unwrap();
 
         // Should not panic — no-op when monitor is None.
         adapter.record_heartbeat_received().await;
@@ -1543,10 +1670,13 @@ mod tests {
             source: RelayUrlSource::DhtResolved,
         };
 
-        let adapter =
-            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Constrained))
-                .await
-                .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            Some(&TransportProfile::Constrained),
+            crate::native::adapter::CoverTraffic::FromProfile,
+        )
+        .await
+        .unwrap();
 
         assert!(
             !adapter.has_heartbeat_monitor(),
@@ -1595,10 +1725,13 @@ mod tests {
         // suppression threshold is the UNIFORM 240s (sized to the slowest
         // honest sender, Mobile's 120s × 2), so a receiver never out-runs an
         // honest slower sender.
-        let mut adapter =
-            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Server))
-                .await
-                .unwrap();
+        let mut adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            Some(&TransportProfile::Server),
+            crate::native::adapter::CoverTraffic::FromProfile,
+        )
+        .await
+        .unwrap();
 
         assert!(
             adapter.has_heartbeat_monitor(),
@@ -1679,10 +1812,13 @@ mod tests {
             source: RelayUrlSource::DhtResolved,
         };
 
-        let adapter =
-            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Mobile))
-                .await
-                .unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(
+            &sourced,
+            Some(&TransportProfile::Mobile),
+            crate::native::adapter::CoverTraffic::FromProfile,
+        )
+        .await
+        .unwrap();
 
         assert!(
             adapter.has_heartbeat_monitor(),
@@ -1718,10 +1854,13 @@ mod tests {
         };
 
         {
-            let adapter =
-                NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Server))
-                    .await
-                    .unwrap();
+            let adapter = NativeRelayAdapter::connect_sourced(
+                &sourced,
+                Some(&TransportProfile::Server),
+                crate::native::adapter::CoverTraffic::FromProfile,
+            )
+            .await
+            .unwrap();
 
             assert!(adapter.has_heartbeat_monitor());
             // Let the heartbeat task tick at least once.

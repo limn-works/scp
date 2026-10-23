@@ -748,9 +748,10 @@ class SCP internal constructor(
      * reconnection-driver addendum): it pulls relay-buffered messages via the
      * `TransportManager` and reaches actor-owned reconnection state through the
      * `Supervisor`. On success each context's `needsReconnect` flag is cleared.
-     * [lastRelayContacts] maps context id to last-relay-contact Unix seconds
-     * (tier classification); absent contexts default to the most conservative
-     * tier. Forwards to [NativeScp.contextReconnect] on [inner].
+     * Each context's offline tier is classified from the `last_relay_contact`
+     * the instance stores for it; a context with none stored takes the most
+     * conservative tier, and a store read failure throws `SCP-TRANS-5095`.
+     * Forwards to [NativeScp.contextReconnect] on [inner].
      *
      * Catch-up integrity (§9.9.3, §23.7): equivocation where a peer reports the
      * **same** event count with a **different** Merkle root IS detected and
@@ -764,12 +765,10 @@ class SCP internal constructor(
     suspend fun reconnect(
         identity: Identity,
         contextIds: List<String>,
-        lastRelayContacts: Map<String, ULong> = emptyMap(),
     ): ReconnectReport =
         inner.contextReconnect(
             identity = identity,
             contextIds = contextIds,
-            lastRelayContacts = lastRelayContacts,
         )
 
     /**

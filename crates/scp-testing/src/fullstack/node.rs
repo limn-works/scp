@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use scp_core::context::actor::commands::DeliveryMode;
 use scp_core::context::builder::{
     ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
 };
@@ -239,6 +240,9 @@ struct NodeObservation {
     events: tokio::sync::broadcast::Sender<(String, ContextEvent)>,
     /// The supervisor's persistence.
     store: Arc<SnapshotStore>,
+    /// The supervisor's `OpenMLS` storage. A restarted supervisor reads the
+    /// group state from it, as a host's storage outlives a process.
+    mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
 }
 
 // ---------------------------------------------------------------------------
@@ -383,9 +387,16 @@ impl FullStackNode {
                 None,
                 Some(events.clone()),
                 None,
-                mls_storage,
+                Arc::clone(&mls_storage),
             );
-            (manager, Some(NodeObservation { events, store }))
+            (
+                manager,
+                Some(NodeObservation {
+                    events,
+                    store,
+                    mls_storage,
+                }),
+            )
         } else {
             let manager = scp_core::context::test_supervisor(
                 Arc::clone(&crypto.provider),
@@ -426,6 +437,69 @@ impl FullStackNode {
         self.observation
             .as_ref()
             .and_then(|o| o.store.lock().get(context_id).cloned())
+    }
+
+    /// Applies `edit` to the snapshot this node's supervisor persisted for
+    /// `context_id`, as a host whose stored state changed while the process
+    /// was down. Returns `false` for a plain node or a context never
+    /// persisted.
+    pub fn edit_persisted_snapshot(
+        &self,
+        context_id: &str,
+        edit: impl FnOnce(&mut ContextSnapshot),
+    ) -> bool {
+        let Some(observation) = self.observation.as_ref() else {
+            return false;
+        };
+        let mut snapshots = observation.store.lock();
+        let Some(snapshot) = snapshots.get_mut(context_id) else {
+            return false;
+        };
+        edit(snapshot);
+        drop(snapshots);
+        true
+    }
+
+    /// A fresh supervisor over this node's crypto provider, `OpenMLS` storage,
+    /// wrapping-key custody, event log, persisted snapshots, and capture
+    /// buffer, holding no
+    /// resident context: the state a process starts in after the old one
+    /// exited. The caller restores contexts through
+    /// [`Supervisor::restore_on_startup`]. `None` for a plain node, which
+    /// persists nothing.
+    #[must_use]
+    pub fn restarted_supervisor(&self) -> Option<Arc<Supervisor>> {
+        // The wrapping keys live in custody, which outlives the process as the
+        // platform keystore does.
+        self.restarted_supervisor_over(self.manager.testing_wrapping_custody()?)
+    }
+
+    /// [`Self::restarted_supervisor`] over an empty wrapping-key custody, as
+    /// on a device whose keystore was wiped while the process was down: the
+    /// restore of every persisted encrypted context fails with
+    /// `WrappingKeyHandleInvalid`.
+    #[must_use]
+    pub fn restarted_supervisor_with_lost_keys(&self) -> Option<Arc<Supervisor>> {
+        self.restarted_supervisor_over(Arc::new(scp_platform::testing::InMemoryKeyCustody::new()))
+    }
+
+    fn restarted_supervisor_over(
+        &self,
+        custody: Arc<scp_platform::testing::InMemoryKeyCustody>,
+    ) -> Option<Arc<Supervisor>> {
+        let observation = self.observation.as_ref()?;
+        Some(Supervisor::with_providers_and_wrapping_custody(
+            Arc::clone(&self.crypto.provider),
+            Box::new(CapturingTransport::new(Arc::clone(&self.sent))),
+            Box::new(ArcEventLogProvider(Arc::clone(&self.event_log))),
+            Arc::clone(&self.key_resolver),
+            Some(Box::new(StorePersistence(Arc::clone(&observation.store)))),
+            None,
+            Some(observation.events.clone()),
+            None,
+            Arc::clone(&observation.mls_storage),
+            scp_core::context::supervisor::single_custody_source(custody),
+        ))
     }
 
     /// Makes every later persistence write of this node fail (`true`) or
@@ -487,11 +561,34 @@ impl FullStackNode {
         // the harness never registered its own DID; in production the FFI bridge
         // registers each identity via `identity_add`. Mirror that here (idempotent,
         // supervisor-wide) so this node can identify itself as the local member.
+        // The in-process harness has no relay (module docs), so no relay
+        // hosts the context.
+        self.create_context_hosted(context_id, params, Vec::new())
+            .await
+    }
+
+    /// [`Self::create_context`] for a context that `relay_urls` host
+    /// (§5.12.3.1). A member who joins it stores the same set from the
+    /// invitation bundle.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextCreationError`] from the supervisor.
+    pub async fn create_context_hosted(
+        &self,
+        context_id: &str,
+        params: ContextParams,
+        relay_urls: Vec<String>,
+    ) -> Result<ContextHandle, ContextCreationError> {
         self.manager.register_local_did(self.did.clone()).await;
         self.manager
-            // The in-process harness has no relay (module docs), so no relay
-            // hosts the context.
-            .create_context(context_id.to_owned(), params, self.did.clone(), None, Vec::new())
+            .create_context(
+                context_id.to_owned(),
+                params,
+                self.did.clone(),
+                None,
+                relay_urls,
+            )
             .await
     }
 
@@ -1155,6 +1252,14 @@ impl FullStackNode {
         self.signing_key.verifying_key()
     }
 
+    /// This node's `#active` signing key, the key the network's resolver
+    /// returns for its DID. A harness signs a request this node would sign,
+    /// or builds this node's `CommandSigner`.
+    #[must_use]
+    pub fn signing_key(&self) -> ed25519_dalek::SigningKey {
+        self.signing_key.clone()
+    }
+
     /// Submits a governance proposal through the real `Supervisor`, signing the
     /// proposer's vote with this node's `#active` key. Returns the created
     /// proposal (its `proposal_id` is the engine-tracked handle for later
@@ -1323,7 +1428,7 @@ impl FullStackNode {
         // authority for its context.
         match self
             .manager
-            .deliver_commit_blob(context_id_str, ciphertext.to_vec())
+            .deliver_commit_blob(context_id_str, ciphertext.to_vec(), DeliveryMode::Live)
             .await?
         {
             Some((plaintext, _sender)) => Ok(plaintext),
@@ -1361,13 +1466,13 @@ impl FullStackNode {
             let wrapped = wrap_raw_mls_message(context_id_str, commit_bytes)?;
             let _ = self
                 .manager
-                .deliver_commit_blob(context_id_str, wrapped)
+                .deliver_commit_blob(context_id_str, wrapped, DeliveryMode::Live)
                 .await?;
         }
         for wrapped in self.crypto.take_pending_sender_key_messages(context_id) {
             let _ = self
                 .manager
-                .deliver_commit_blob(context_id_str, wrapped)
+                .deliver_commit_blob(context_id_str, wrapped, DeliveryMode::Live)
                 .await?;
         }
         Ok(())

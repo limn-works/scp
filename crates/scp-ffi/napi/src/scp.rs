@@ -2001,23 +2001,16 @@ impl Scp {
     /// reconnection-driver addendum): it pulls relay-buffered messages via
     /// the `TransportManager` and reaches actor-owned reconnection state
     /// through the `Supervisor`. On success each context's `needs_reconnect`
-    /// flag is cleared. `lastRelayContacts` maps context id → last-contact
-    /// Unix seconds (tier classification); absent contexts default to the
-    /// most conservative tier.
+    /// flag is cleared. Each context's offline tier is classified from its
+    /// `last_relay_contact` in the instance's store; a context with none
+    /// stored takes the most conservative tier.
     #[napi(js_name = "contextReconnect")]
     pub async fn context_reconnect(
         &self,
         identity_did: String,
         context_ids: Vec<String>,
-        last_relay_contacts: Option<std::collections::HashMap<String, f64>>,
     ) -> napi::Result<crate::context::NapiReconnectReport> {
-        crate::context::context_reconnect_on(
-            &self.inner,
-            identity_did,
-            context_ids,
-            last_relay_contacts,
-        )
-        .await
+        crate::context::context_reconnect_on(&self.inner, identity_did, context_ids).await
     }
 
     /// Per-instance equivalent of the free-function `context_is_member`.

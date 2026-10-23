@@ -2070,6 +2070,16 @@ pub(crate) async fn context_subscribe_on(
             code: codes::CTX_2000.to_owned(),
         }));
     }
+    // ADR-029 §2: each envelope the actor accepts writes the context's
+    // `last_relay_contact`, so a bridge without the store fails closed.
+    let relay_contacts = bi.core.relay_contact_store().ok_or_else(|| {
+        NapiError::from(ScpNapiError::Validation {
+            message: "no protocol repository on this instance — the last relay contact \
+                      cannot be recorded"
+                .to_owned(),
+            code: codes::STORAGE_8000.to_owned(),
+        })
+    })?;
     let bi_core: &crate::runtime::CoreFields = &bi.core;
     let bridge_cancel = bi_core.cancel_token();
 
@@ -2302,16 +2312,18 @@ pub(crate) async fn context_subscribe_on(
 
             match event {
                 scp_transport::TransportEvent::Envelope(envelope) => {
-                    // Decrypt via the ADR-049 commit-8 messaging shim.
-                    use scp_core::context::actor::commands::MessagingCommand;
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let cmd = MessagingCommand::DeliverIncoming {
-                        context_id: context_id.clone(),
-                        envelope_bytes: envelope.encrypted_blob.clone(),
-                        reply: tx,
-                    };
-                    let Some(dispatch_result) =
-                        dispatch_to_live_supervisor(&supervisor, &context_id, cmd).await
+                    // ADR-029 §2: the shared live delivery path dispatches the
+                    // encrypted blob to the actor and records an accepted
+                    // envelope as a successful relay interaction. A failed
+                    // contact write reaches the callback as an error; delivery
+                    // continues.
+                    let Some(live) = scp_ffi_common::reconnect::deliver_live_envelope(
+                        &supervisor,
+                        relay_contacts.as_ref(),
+                        &context_id,
+                        envelope.encrypted_blob.clone(),
+                    )
+                    .await
                     else {
                         tracing::debug!(
                             context_id = %context_id,
@@ -2319,18 +2331,23 @@ pub(crate) async fn context_subscribe_on(
                         );
                         break;
                     };
-                    let reply_result = if dispatch_result.is_ok() {
-                        rx.await.ok()
-                    } else {
-                        None
-                    };
-                    let deliver_result = match (dispatch_result, reply_result) {
-                        (Ok(()), Some(r)) => r,
-                        (Err(e), _) => Err(e),
-                        (Ok(()), None) => Err(scp_core::context::ContextError::CryptoFailed(
-                            "deliver shim reply dropped".to_owned(),
-                        )),
-                    };
+                    if let Some(e) = live.contact_error {
+                        tracing::error!(
+                            context_id = %context_id,
+                            error = %e,
+                            "last_relay_contact write failed on live delivery"
+                        );
+                        on_message.call(
+                            Err(NapiError::from(ScpNapiError::Context {
+                                message: format!(
+                                    "recording the last relay contact of {context_id} failed: {e}"
+                                ),
+                                code: codes::CTX_2001.to_owned(),
+                            })),
+                            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
+                    let deliver_result = live.delivered;
                     use scp_core::context::actor::commands::DeliverOutcome;
                     match deliver_result {
                         Ok(DeliverOutcome::Application((plaintext, sender_did))) => {
@@ -3535,6 +3552,13 @@ pub struct NapiContextReconnectResult {
     pub equivocations_detected: f64,
     /// Whether `needs_reconnect` was cleared on success.
     pub needs_reconnect_cleared: bool,
+    /// Envelopes the actor accepted as application messages during this
+    /// context's reconnection.
+    pub envelopes_delivered: f64,
+    /// Why writing the context's `last_relay_contact` failed after
+    /// `needs_reconnect` was cleared; absent when the write succeeded or no
+    /// write was due.
+    pub relay_contact_error: Option<String>,
 }
 
 /// Aggregate reconnection report surfaced to TypeScript.
@@ -3571,6 +3595,8 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for NapiReconnectReport {
                     mls_update_issued: c.mls_update_issued,
                     equivocations_detected: c.equivocations_detected as f64,
                     needs_reconnect_cleared: c.needs_reconnect_cleared,
+                    envelopes_delivered: c.envelopes_delivered as f64,
+                    relay_contact_error: c.relay_contact_error,
                 })
                 .collect(),
             messages_drained: report.messages_drained as f64,
@@ -3587,15 +3613,12 @@ impl From<scp_ffi_common::reconnect::ReconnectReport> for NapiReconnectReport {
 /// this FFI relay-client layer (ADR-029 reconnection-driver addendum): it
 /// pulls relay-buffered messages via the `TransportManager` and reaches
 /// actor-owned reconnection state through the `Supervisor`. On success
-/// each context's `needs_reconnect` flag is cleared.
-// `last_relay_contacts` arrives as JS `number` (f64) Unix seconds; the
-// truncation to u64 is the intended floor of a whole-second timestamp.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+/// each context's `needs_reconnect` flag is cleared. Each context's
+/// `last_relay_contact` is read from the instance's store (ADR-029 §2).
 pub(crate) async fn context_reconnect_on(
     bi: &NapiBridgeInstance,
     identity_did: String,
     context_ids: Vec<String>,
-    last_relay_contacts: Option<std::collections::HashMap<String, f64>>,
 ) -> napi::Result<NapiReconnectReport> {
     let supervisor = crate::runtime::supervisor(bi)?;
     let transport = crate::transport::get_transport_manager_on(bi).ok_or_else(|| {
@@ -3610,25 +3633,38 @@ pub(crate) async fn context_reconnect_on(
     // key never crosses FFI beyond this in-process driver call.
     // The Phase-3 checkpoint signs through custody (ADR-049 Decision 7a).
     let signer = crate::runtime::identity_active_signer(bi, &identity_did).await?;
+    // ADR-029 §2: the reconnection reads and writes each context's
+    // `last_relay_contact`, so a bridge without the store fails closed.
+    let relay_contacts = bi.core.relay_contact_store().ok_or_else(|| {
+        NapiError::from(ScpNapiError::Validation {
+            message: "no protocol repository on this instance — the last relay contact \
+                      cannot be read or recorded"
+                .to_owned(),
+            code: codes::STORAGE_8000.to_owned(),
+        })
+    })?;
 
-    let contacts: std::collections::HashMap<String, u64> = last_relay_contacts
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(k, v)| (k, v as u64))
-        .collect();
     let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     let report = scp_ffi_common::reconnect::reconnect_contexts_no_drain(
-        &transport,
-        supervisor,
-        DID(identity_did),
-        signer,
-        context_ids,
-        contacts,
-        now,
-        scp_core::sync::SyncPolicy::default(),
+        scp_ffi_common::reconnect::ReconnectRequest {
+            transport: &transport,
+            supervisor,
+            member_did: DID(identity_did),
+            signer,
+            relay_contacts: relay_contacts.as_ref(),
+            context_ids,
+            now,
+            policy: scp_core::sync::SyncPolicy::default(),
+        },
     )
-    .await;
+    .await
+    .map_err(|e| {
+        NapiError::from(ScpNapiError::Transport {
+            message: e.to_string(),
+            code: e.code().to_owned(),
+        })
+    })?;
     Ok(report.into())
 }
 
@@ -5480,19 +5516,6 @@ pub(crate) fn create_context_failure(
     )
 }
 
-/// Dispatches `cmd` to `context_id` through the Supervisor `supervisor` still
-/// points at, holding the upgraded `Arc` only for the dispatch. `None` when the
-/// Supervisor has dropped, which ends the relay subscription loop (ADR-049
-/// Decision 16).
-async fn dispatch_to_live_supervisor(
-    supervisor: &std::sync::Weak<scp_core::context::supervisor::Supervisor>,
-    context_id: &str,
-    cmd: scp_core::context::actor::commands::MessagingCommand,
-) -> Option<Result<(), scp_core::context::ContextError>> {
-    let live = supervisor.upgrade()?;
-    Some(live.dispatch_command(context_id, cmd).await.map(drop))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5539,20 +5562,6 @@ mod tests {
             code_of(ContextCreationError::TransportNotConnected),
             codes::CTX_2000
         );
-    }
-
-    /// A dropped Supervisor yields `None`, which ends the subscription loop.
-    #[tokio::test]
-    async fn dispatch_to_dropped_supervisor_ends_the_subscription() {
-        use scp_core::context::actor::commands::MessagingCommand;
-        let (reply, _rx) = tokio::sync::oneshot::channel();
-        let cmd = MessagingCommand::DeliverIncoming {
-            context_id: "ctx".to_owned(),
-            envelope_bytes: vec![1, 2, 3],
-            reply,
-        };
-        let outcome = super::dispatch_to_live_supervisor(&std::sync::Weak::new(), "ctx", cmd).await;
-        assert!(outcome.is_none(), "a dropped Supervisor must end the loop");
     }
 
     /// Test helper: dispatch `LifecycleCommand::CreateContext` through the

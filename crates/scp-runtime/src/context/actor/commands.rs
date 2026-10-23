@@ -54,6 +54,24 @@ type BroadcastKeyReply = oneshot::Sender<Result<(zeroize::Zeroizing<[u8; 32]>, u
 /// `scp_core::context::actor::commands::DeliverOutcome`.
 pub use crate::context::messaging_helpers::DeliverOutcome;
 
+/// Whether handling a delivered envelope may send (ADR-029 §2, push-wake pull
+/// mode, step 4).
+///
+/// Every [`MessagingCommand::DeliverIncoming`] names one; there is no default,
+/// so a caller cannot reach the sending path by omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryMode {
+    /// A live subscription or a full reconnection: after the envelope is
+    /// handled, the actor MLS-encrypts and sends every queued sender-key
+    /// answer (§9.16.2).
+    Live,
+    /// A push-wake pull: the actor applies the envelope's receive-side effects
+    /// and sends nothing. A sender-key answer the envelope queues stays queued
+    /// until [`MessagingCommand::SendQueuedSenderKeys`] sends it on the next
+    /// full reconnection.
+    PullOnly,
+}
+
 /// Reply-channel type alias for
 /// [`MessagingCommand::DeliverIncoming`]. The reply carries a
 /// [`DeliverOutcome`] classifying the message: [`DeliverOutcome::Application`]
@@ -242,8 +260,46 @@ pub enum MessagingCommand {
         /// Encrypted envelope bytes (outer blob as received from the
         /// relay).
         envelope_bytes: Vec<u8>,
+        /// Whether handling this envelope may send queued sender-key
+        /// answers.
+        mode: DeliveryMode,
         /// Oneshot reply channel. See [`DeliverIncomingReply`].
         reply: DeliverIncomingReply,
+    },
+
+    /// MLS-encrypts and sends every sender-key answer queued on the actor
+    /// (§9.16.2). A full reconnection sends it for each context, because a
+    /// push-wake pull delivers in [`DeliveryMode::PullOnly`] and leaves its
+    /// answers queued (ADR-029 §2, push-wake pull mode, step 5).
+    SendQueuedSenderKeys {
+        /// Context identifier.
+        context_id: String,
+        /// Oneshot reply channel. `Ok(())` once every queued answer was
+        /// handed to the transport or logged as failed.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// The number of sender-key answers queued on the actor (testing).
+    #[cfg(feature = "testing")]
+    QueuedSenderKeyCount {
+        /// Context identifier.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<usize, ContextError>>,
+    },
+
+    /// MLS-encrypts `message` as a §9.16.2 management message through the
+    /// actor's group, without sending it (testing). The harness posts the
+    /// sealed bytes to a relay itself, as a peer's `SenderKeyRequest` would
+    /// arrive.
+    #[cfg(feature = "testing")]
+    TestSealManagement {
+        /// Context identifier.
+        context_id: String,
+        /// The serialized `SenderKeyDistributionMessage`.
+        message: Vec<u8>,
+        /// Oneshot reply channel carrying the sealed outer-envelope bytes.
+        reply: oneshot::Sender<Result<Vec<u8>, ContextError>>,
     },
 
     /// Drain the per-context receive buffer.
@@ -1041,8 +1097,9 @@ pub enum LifecycleCommand {
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
-    /// Sweep: best-effort flush of THIS actor's snapshot to the configured
-    /// persistence provider.
+    /// Sweep: flush of THIS actor's snapshot to the configured persistence
+    /// provider. The reply carries the write's error when it did not land
+    /// (ADR-049 Decision 9).
     ///
     /// Dispatched per-actor by the supervisor's iterating sweep entry
     /// point
@@ -2195,6 +2252,16 @@ pub enum PushCommand {
     Routes {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Option<crate::context::push_helpers::ContextPushRoutes>>,
+    },
+    /// This context's push-wake pull target (ADR-029 §2, push-wake pull
+    /// mode): its ID, relay set, and every routing ID a blob for this device
+    /// arrives at, including the previous pseudonym while its grace runs at
+    /// `now_secs`. `None` unless the context is `Active`.
+    WakeTarget {
+        /// Wall-clock second the grace check reads.
+        now_secs: u64,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Option<crate::context::push_helpers::ContextWakeTarget>>,
     },
 }
 

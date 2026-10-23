@@ -149,6 +149,7 @@ impl Supervisor {
         let deliver = MessagingCommand::DeliverIncoming {
             context_id: context_id.to_owned(),
             envelope_bytes,
+            mode: crate::context::actor::commands::DeliveryMode::Live,
             reply,
         };
         self.dispatch_command(context_id, deliver).await?;

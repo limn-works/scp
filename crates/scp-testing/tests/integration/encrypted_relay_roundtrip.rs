@@ -83,12 +83,20 @@ async fn native_relay_adapter_send_receive_roundtrip() {
         url: relay_url,
         source: RelayUrlSource::DhtResolved,
     };
-    let send_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .unwrap();
-    let recv_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .unwrap();
+    let send_adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .unwrap();
+    let recv_adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .unwrap();
 
     // Subscribe first, then send.
     let routing = RoutingId::new(routing_id);
@@ -126,12 +134,20 @@ async fn ws_relay_connect_sourced_validation_scp234() {
         source: RelayUrlSource::DhtResolved,
     };
 
-    let send_adapter = NativeRelayAdapter::connect_sourced(&dht_sourced, None)
-        .await
-        .expect("ws:// from DhtResolved should be permitted");
-    let recv_adapter = NativeRelayAdapter::connect_sourced(&dht_sourced, None)
-        .await
-        .expect("ws:// from DhtResolved should be permitted");
+    let send_adapter = NativeRelayAdapter::connect_sourced(
+        &dht_sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .expect("ws:// from DhtResolved should be permitted");
+    let recv_adapter = NativeRelayAdapter::connect_sourced(
+        &dht_sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .expect("ws:// from DhtResolved should be permitted");
 
     // Create a minimal outer envelope for transport testing.
     let routing_id = [0xBB; 32];
@@ -166,11 +182,17 @@ async fn ws_relay_connect_sourced_validation_scp234() {
             url: relay_url.clone(),
             source,
         };
-        NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .unwrap_or_else(|e| {
-                panic!("ws:// to loopback from {label} should be permitted (loopback exemption), got: {e}")
-            });
+        NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            scp_transport::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "ws:// to loopback from {label} should be permitted (loopback exemption), got: {e}"
+            )
+        });
     }
 
     // --- 3. ws:// to non-loopback from non-DHT sources is still rejected ---

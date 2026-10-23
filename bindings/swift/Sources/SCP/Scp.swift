@@ -560,9 +560,11 @@ public extension SCP {
     /// reconnection-driver addendum): it pulls relay-buffered messages via the
     /// `TransportManager` and reaches actor-owned reconnection state through
     /// the `Supervisor`. On success each context's `needsReconnect` flag is
-    /// cleared. `lastRelayContacts` maps context id to last-relay-contact Unix
-    /// seconds (tier classification); absent contexts default to the most
-    /// conservative tier. Forwards to ``Scp/contextReconnect`` on ``inner``.
+    /// cleared. Each context's offline tier is classified from the
+    /// `last_relay_contact` the instance stores for it; a context with none
+    /// stored takes the most conservative tier, and a store read failure
+    /// throws `SCP-TRANS-5095`. Forwards to ``Scp/contextReconnect`` on
+    /// ``inner``.
     ///
     /// Catch-up integrity (§9.9.3, §23.7): equivocation where a peer reports
     /// the **same** event count with a **different** Merkle root IS detected
@@ -573,8 +575,8 @@ public extension SCP {
     /// equivocating relay that keeps a member perpetually *behind* (never
     /// reaching equal count) is therefore not yet detected on the catch-up
     /// path.
-    func reconnect(identity: Identity, contextIds: [String], lastRelayContacts: [String: UInt64] = [:]) async throws -> ReconnectReport {
-        try await inner.contextReconnect(identity: identity, contextIds: contextIds, lastRelayContacts: lastRelayContacts)
+    func reconnect(identity: Identity, contextIds: [String]) async throws -> ReconnectReport {
+        try await inner.contextReconnect(identity: identity, contextIds: contextIds)
     }
 
     /// Forwards to ``Scp/contextSubscribe`` on ``inner``.

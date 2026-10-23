@@ -530,12 +530,14 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 /// snapshot via `deps.persistence`. Mirrors the per-context body of
 /// `flush_all_contexts_legacy` (which iterated `Supervisor::contexts`).
 ///
-/// Best-effort: persist failures log via `tracing::warn!` and
-/// increment `crate::metrics::record_persistence_failure()`; the
-/// reply carries `Ok(())` after a persist attempt. When the Supervisor
-/// has dropped, nothing is persisted; the failure is logged and counted
-/// the same way and the reply carries `Ok(())` (ADR-049 Decision 16
-/// item 4).
+/// The reply and the returned [`Outcome`] carry whether the write landed
+/// (ADR-049 Decision 9): `Ok(())` when it did, and the typed error when it
+/// did not, which the actor reads to leave itself dirty so its next coalesce
+/// tick writes again. A failed write replies with
+/// [`ContextError::PersistenceFailed`]. When the Supervisor has dropped,
+/// nothing is persisted and the reply carries the floor export's error
+/// (ADR-049 Decision 16 item 4). Every failure is also logged and counted
+/// through `crate::metrics::record_persistence_failure()`.
 // `Send` discipline (ADR-049 Decision 7): SYNC fn returning a future. The
 // snapshot is built from `&PerContextState` in the synchronous prelude; the
 // returned future captures only the owned `context_id` / `snapshot` / `reply`
@@ -567,7 +569,8 @@ fn handle_flush_snapshot_actor<'d>(
     // Decision 16), no floor export exists, and persisting a snapshot with
     // empty floors would durably regress them (re-admitting replays after
     // restore), so the flush persists nothing. Decision 16 item 4 makes that
-    // a Class C persist failure: logged, counted, and acknowledged with `Ok(())`.
+    // a persist failure, logged and counted, and the flush returns it to its
+    // caller (Decision 9).
     let floors = deps
         .supervisor
         .export_sender_key_epochs(&ctx_id_bytes)
@@ -586,8 +589,11 @@ fn handle_flush_snapshot_actor<'d>(
                 error = %e,
                 "flush snapshot skipped: the supervisor holds no floor export"
             );
-            let _ = reply.send(Ok(()));
-            return futures::future::Either::Left(std::future::ready(Outcome::ok(())));
+            let outcome = Outcome::err(outcome_error_sketch(&e));
+            // A dropped receiver means the caller stopped waiting; the
+            // outcome still tells the actor the write did not land.
+            let _ = reply.send(Err(e));
+            return futures::future::Either::Left(std::future::ready(outcome));
         }
     };
     match state.export_crypto_state(sender_epochs, recv_floors) {
@@ -611,20 +617,29 @@ fn handle_flush_snapshot_actor<'d>(
     // covers it atomically — the prior separate best-effort `persist_broadcast`
     // write is gone (ADR-049 §9 / §5.14.8 block-before-serve).
     futures::future::Either::Right(async move {
-        if let Err(e) = deps
+        let persisted = deps
             .persistence
             .persist_context(&context_id, &snapshot)
             .await
-        {
-            crate::metrics::record_persistence_failure();
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to persist context snapshot"
-            );
-        }
-        let _ = reply.send(Ok(()));
-        Outcome::ok(())
+            .map_err(|e| {
+                crate::metrics::record_persistence_failure();
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to persist context snapshot"
+                );
+                ContextError::PersistenceFailed(format!(
+                    "flushing the snapshot of {context_id} failed: {e}"
+                ))
+            });
+        let outcome = match &persisted {
+            Ok(()) => Outcome::ok(()),
+            Err(e) => Outcome::err(outcome_error_sketch(e)),
+        };
+        // A dropped receiver means the caller stopped waiting; the outcome
+        // still tells the actor whether the write landed.
+        let _ = reply.send(persisted);
+        outcome
     })
 }
 
@@ -844,21 +859,23 @@ mod tests {
         assert_eq!(f.persists.load(Ordering::SeqCst), 1);
     }
 
-    /// ADR-049 Decision 16 item 4: a failed upgrade in this Class C
-    /// best-effort persist is a persist failure, acknowledged with `Ok(())`.
+    /// ADR-049 Decision 16 item 4 and Decision 9: a failed upgrade is a
+    /// persist failure, and the flush returns it in its reply and its
+    /// `Outcome`, so the actor stays dirty.
     #[tokio::test]
-    async fn flush_snapshot_acknowledges_and_persists_nothing_after_supervisor_drops() {
+    async fn flush_snapshot_reports_the_failure_and_persists_nothing_after_supervisor_drops() {
         let f = Fixture::new().await.drop_supervisor();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let out = super::handle_flush_snapshot_actor(&state(), &f.deps, tx).await;
         assert!(
-            out.result.is_ok(),
-            "a Class C persist failure records no error: {:?}",
-            out.result
+            out.result.is_err(),
+            "a flush that wrote nothing must not report success"
         );
-        rx.await
-            .unwrap()
-            .expect("a Class C persist failure is acknowledged");
+        let reply = rx.await.unwrap();
+        assert!(
+            reply.is_err(),
+            "the flush reply carries the failure: {reply:?}"
+        );
         assert_eq!(
             f.persists.load(Ordering::SeqCst),
             0,

@@ -153,9 +153,13 @@ async fn transport_relay_querier_fails_closed_after_its_relay_dies() {
         source: RelayUrlSource::DhtResolved,
     };
     let adapter = Arc::new(
-        NativeRelayAdapter::connect_sourced(&sourced, None)
-            .await
-            .expect("connect the real adapter to the live relay"),
+        NativeRelayAdapter::connect_sourced(
+            &sourced,
+            None,
+            scp_transport::native::adapter::CoverTraffic::Off,
+        )
+        .await
+        .expect("connect the real adapter to the live relay"),
     );
     assert!(
         adapter.is_connected().await,

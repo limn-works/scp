@@ -3690,10 +3690,13 @@ impl Supervisor {
     /// `0xFF01` and opens sender keys with, so it is never a roster member
     /// chosen by position or a DID derived from the context id.
     ///
+    /// The push-wake pull fails closed with this error rather than substitute
+    /// a DID (ADR-029 §2 push-wake pull mode, step 7).
+    ///
     /// # Errors
     ///
     /// [`ContextError::NotInitialized`] if no crypto provider is wired.
-    fn node_identity(&self) -> Result<DID, ContextError> {
+    pub fn node_identity(&self) -> Result<DID, ContextError> {
         self.crypto_ref()
             .map(|crypto| DID(crypto.local_did().to_owned()))
             .ok_or_else(|| {
@@ -11718,20 +11721,17 @@ impl Supervisor {
         })?
     }
 
-    /// Best-effort flush of every context's snapshot to the configured
-    /// persistence provider.
+    /// Flushes every context's snapshot to the configured persistence
+    /// provider (ADR-049 Decision 9).
     ///
     /// No-op if no persistence provider is configured.
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok(())` — the `Result` shape preserves
-    /// the legacy method's signature for callers that propagate with
-    /// `?`. Per-context flush failures are logged via `tracing::warn!`
-    /// inside the helper.
+    /// The first context's flush failure when any flush did not land; see
+    /// [`crate::context::lifecycle_helpers::flush_all_contexts`].
     pub async fn flush_all_contexts(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::flush_all_contexts(self).await;
-        Ok(())
+        crate::context::lifecycle_helpers::flush_all_contexts(self).await
     }
 
     /// Sync wrapper for [`Self::flush_all_contexts`].
@@ -11743,11 +11743,11 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Currently always returns `Ok(())`. Per-context flush failures
-    /// are logged via `tracing::warn!` inside the helper.
+    /// The first context's flush failure, or a failure when called outside
+    /// a tokio runtime; see
+    /// [`crate::context::lifecycle_helpers::flush_all_contexts_sync`].
     pub fn flush_all_contexts_sync(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::flush_all_contexts_sync(self);
-        Ok(())
+        crate::context::lifecycle_helpers::flush_all_contexts_sync(self)
     }
 
     /// Shut down every context the supervisor owns and wait for every task
@@ -12944,6 +12944,11 @@ impl Supervisor {
     /// heartbeat monitoring is the subscribe-loop's responsibility, not the
     /// reconnection driver's).
     ///
+    /// `mode` decides whether the actor may send the sender-key answers the
+    /// envelope queues: a push-wake pull passes
+    /// [`DeliveryMode::PullOnly`](crate::context::actor::commands::DeliveryMode::PullOnly)
+    /// (ADR-029 §2, push-wake pull mode, step 4).
+    ///
     /// # Errors
     ///
     /// Propagates [`ContextError`] from the handler (decrypt / signature /
@@ -12953,12 +12958,14 @@ impl Supervisor {
         &self,
         context_id: &str,
         envelope_bytes: Vec<u8>,
+        mode: crate::context::actor::commands::DeliveryMode,
     ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
         use crate::context::messaging_helpers::DeliverOutcome;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::DeliverIncoming {
             context_id: context_id.to_owned(),
             envelope_bytes,
+            mode,
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -12971,6 +12978,84 @@ impl Supervisor {
             DeliverOutcome::Application(msg) => Some(msg),
             DeliverOutcome::Heartbeat | DeliverOutcome::Handled => None,
         })
+    }
+
+    /// MLS-encrypts and sends every sender-key answer queued on the actor of
+    /// `context_id` (§9.16.2). A full reconnection calls it for each context,
+    /// because a push-wake pull leaves its answers queued (ADR-029 §2,
+    /// push-wake pull mode, step 5). Routes through the actor mailbox via
+    /// [`Self::dispatch_command`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] (or the poison error) for an
+    ///   unknown context; [`ContextError::ActorBusy`] from the mailbox send.
+    /// - [`ContextError::TransportTimeout`] when the drain exceeds the handler
+    ///   budget.
+    /// - [`ContextError::TransportFailed`] if the reply channel is dropped.
+    pub async fn send_queued_sender_keys(&self, context_id: &str) -> Result<(), ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::SendQueuedSenderKeys {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::send_queued_sender_keys — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// The number of sender-key answers queued on the actor of `context_id`
+    /// (testing).
+    ///
+    /// # Errors
+    ///
+    /// The mailbox errors of [`Self::send_queued_sender_keys`].
+    #[cfg(feature = "testing")]
+    pub async fn queued_sender_key_count(&self, context_id: &str) -> Result<usize, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::QueuedSenderKeyCount {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::queued_sender_key_count — actor reply channel closed".to_owned(),
+            )
+        })?
+    }
+
+    /// MLS-encrypts `message` as a §9.16.2 management message through the
+    /// actor's group and returns the sealed bytes without sending them
+    /// (testing). A harness posts them to a relay as a peer's
+    /// `SenderKeyRequest` would arrive.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::CryptoFailed`] for a context with no MLS group or a
+    /// failed encrypt, and the mailbox errors of
+    /// [`Self::send_queued_sender_keys`].
+    #[cfg(feature = "testing")]
+    pub async fn test_seal_management(
+        &self,
+        context_id: &str,
+        message: Vec<u8>,
+    ) -> Result<Vec<u8>, ContextError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::TestSealManagement {
+            context_id: context_id.to_owned(),
+            message,
+            reply: tx,
+        };
+        self.dispatch_command(context_id, cmd).await?;
+        bounded_reply_await(rx).await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::test_seal_management — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
     /// Returns the current member count for `context_id`, or `None` if
@@ -17754,6 +17839,155 @@ impl Supervisor {
         Ok(by_relay)
     }
 
+    /// Returns the push-wake pull target of every `Active` context (ADR-029
+    /// §2, push-wake pull mode): its ID, persisted relay set, and every
+    /// routing ID at which a blob for this device arrives, including the
+    /// previous pseudonym while its grace runs.
+    ///
+    /// Asks every context in [`Self::known_context_ids`] concurrently through
+    /// [`Self::dispatch_push_command`]. A context that is not `Active`, or
+    /// whose actor was removed with no crash record after the IDs were read,
+    /// yields no target.
+    ///
+    /// # Errors
+    ///
+    /// Fails rather than return a partial set, because a wake that skips a
+    /// context reports `NoData` for traffic it never pulled:
+    /// - [`ContextError::NotInitialized`] when no clock is wired;
+    /// - [`ContextError::ContextPoisoned`] or [`ContextError::ActorCrashed`]
+    ///   when a context's actor is down;
+    /// - [`ContextError::ActorBusy`] from a mailbox send;
+    /// - [`ContextError::TransportFailed`] when an actor drops its reply or
+    ///   does not answer within the reply bound.
+    pub async fn wake_targets(
+        &self,
+    ) -> Result<Vec<crate::context::push_helpers::ContextWakeTarget>, ContextError> {
+        let now_secs = self
+            .clock_ref()
+            .ok_or_else(|| {
+                ContextError::NotInitialized(
+                    "Supervisor::wake_targets — clock not configured".to_owned(),
+                )
+            })?
+            .now_secs();
+        let replies = futures::future::join_all(self.known_context_ids().into_iter().map(
+            |ctx_id| async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                match self
+                    .dispatch_push_command(
+                        &ctx_id,
+                        PushCommand::WakeTarget {
+                            now_secs,
+                            reply: tx,
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(ContextError::ContextNotRegistered(_)) => return Ok(None),
+                    Err(err) => return Err(err),
+                }
+                bounded_reply_await(rx).await.map_err(|_| {
+                    ContextError::TransportFailed(format!(
+                        "Supervisor::wake_targets — no reply from the actor of `{ctx_id}`"
+                    ))
+                })
+            },
+        ))
+        .await;
+        let mut targets = Vec::new();
+        for reply in replies {
+            if let Some(target) = reply? {
+                targets.push(target);
+            }
+        }
+        Ok(targets)
+    }
+
+    /// Whether any context is resident or down with a crash record
+    /// ([`Self::known_context_ids`]). A push wake that finds none restores the
+    /// persisted contexts first (ADR-029 §2 push-wake pull mode, step 2).
+    #[must_use]
+    pub fn has_known_contexts(&self) -> bool {
+        !self.known_context_ids().is_empty()
+    }
+
+    /// The persisted contexts whose snapshot is `Active` and that are neither
+    /// resident nor down with a crash record ([`Self::known_context_ids`]):
+    /// the contexts whose restore failed. A push wake fails when this is not
+    /// empty, because its pull cannot reach them (ADR-029 §2 push-wake pull
+    /// mode, step 2).
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::PersistenceFailed`] when no persistence provider is
+    /// configured, or when listing the persisted contexts or loading one of
+    /// their snapshots fails.
+    pub async fn unrestored_active_contexts(&self) -> Result<Vec<String>, ContextError> {
+        let persistence = self.persistence_ref().ok_or_else(|| {
+            ContextError::PersistenceFailed("no persistence provider configured".to_owned())
+        })?;
+        let known: std::collections::BTreeSet<String> =
+            self.known_context_ids().into_iter().collect();
+        let persisted = persistence.list_persisted_contexts().await.map_err(|e| {
+            ContextError::PersistenceFailed(format!("failed to list persisted contexts: {e}"))
+        })?;
+        let mut unrestored = Vec::new();
+        for context_id in persisted {
+            if known.contains(&context_id) {
+                continue;
+            }
+            let snapshot = persistence.load_context(&context_id).await.map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "failed to load the snapshot of `{context_id}`: {e}"
+                ))
+            })?;
+            if snapshot.is_some_and(|s| s.state == scp_protocol::context::ContextState::Active) {
+                unrestored.push(context_id);
+            }
+        }
+        Ok(unrestored)
+    }
+
+    /// Restores every context [`Self::unrestored_active_contexts`] lists, one
+    /// [`Self::restore_context`] each, and returns the contexts that are still
+    /// unrestored afterwards (ADR-029 §2 push-wake pull mode step 2).
+    ///
+    /// The restore runs no saga-journal replay. This entry is for a live
+    /// process whose startup pass ([`Self::restore_on_startup`]) already ran:
+    /// a replay here would reconcile sagas that are in flight as if a crash
+    /// had orphaned them. A reversal that a failed restore left undeliverable
+    /// stays non-terminal until the next process start, as
+    /// [`Self::restore_on_startup`] documents.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::unrestored_active_contexts`]. A failure to
+    /// restore one context is not an error; that context is returned.
+    pub async fn restore_unrestored_contexts(
+        self: &Arc<Self>,
+    ) -> Result<Vec<String>, ContextError> {
+        let persistence = self.persistence_ref().ok_or_else(|| {
+            ContextError::PersistenceFailed("no persistence provider configured".to_owned())
+        })?;
+        for context_id in self.unrestored_active_contexts().await? {
+            let snapshot = match persistence.load_context(&context_id).await {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(context_id = %context_id, error = %e, "loading an unrestored context failed");
+                    continue;
+                }
+            };
+            let handle =
+                crate::context::ContextHandle::new(context_id.clone(), snapshot.context_params);
+            if let Err(e) = self.restore_context(&context_id, &handle).await {
+                tracing::warn!(context_id = %context_id, error = %e, "restoring an unrestored context failed");
+            }
+        }
+        self.unrestored_active_contexts().await
+    }
+
     /// Returns the local member's routing IDs and rotation state (spec 09
     /// §9.10.4.1) for `context_id`: the current routing ID, the previous one
     /// while its grace runs, the epoch, the epoch the next rotation must
@@ -19691,6 +19925,206 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `wake_targets` returns each `Active` context's ID, persisted relay set,
+    /// shared routing ID and local pseudonym, and fails closed when a context
+    /// actor is down (ADR-029 §2, push-wake pull mode).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wake_targets_list_active_contexts_and_fail_when_an_actor_is_down() {
+        let sup = supervisor_with_providers();
+        assert!(sup.wake_targets().await.unwrap().is_empty());
+        assert!(!sup.has_known_contexts());
+        let a = hex::encode([0xC0u8; 32]);
+        let b = hex::encode([0xC1u8; 32]);
+        create_push_context(&sup, &a, &["wss://relay-a.example"]).await;
+        create_push_context(&sup, &b, &["wss://relay-b.example"]).await;
+        assert!(sup.has_known_contexts());
+        let mut targets = sup.wake_targets().await.unwrap();
+        targets.sort_by(|x, y| x.context_id.cmp(&y.context_id));
+        assert_eq!(
+            targets,
+            vec![
+                crate::context::push_helpers::ContextWakeTarget {
+                    context_id: a.clone(),
+                    relay_urls: vec!["wss://relay-a.example".to_owned()],
+                    routing_ids: vec![scp_protocol::context::context_routing_id(&a), [0x5A; 32]],
+                },
+                crate::context::push_helpers::ContextWakeTarget {
+                    context_id: b.clone(),
+                    relay_urls: vec!["wss://relay-b.example".to_owned()],
+                    routing_ids: vec![scp_protocol::context::context_routing_id(&b), [0x5A; 32]],
+                },
+            ]
+        );
+        sup.test_poison_context(&b).await;
+        let result = sup.wake_targets().await;
+        assert!(
+            matches!(result, Err(ContextError::ContextPoisoned(ref id)) if *id == b),
+            "a poisoned context fails the wake targets: {result:?}"
+        );
+    }
+
+    /// A [`MapPersistence`] whose `load_context` fails for one id, for the
+    /// load-error arm of `unrestored_active_contexts`.
+    struct FailingLoadPersistence {
+        inner: MapPersistence,
+        failing_id: String,
+    }
+    #[async_trait::async_trait]
+    impl ContextPersistence for FailingLoadPersistence {
+        async fn persist_context(
+            &self,
+            id: &str,
+            snap: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.persist_context(id, snap).await
+        }
+        async fn load_context(
+            &self,
+            id: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            if id == self.failing_id {
+                return Err("injected load failure".into());
+            }
+            self.inner.load_context(id).await
+        }
+        async fn delete_context(
+            &self,
+            id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.delete_context(id).await
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            self.inner.list_persisted_contexts().await
+        }
+    }
+
+    /// `unrestored_active_contexts` lists a persisted `Active` context with no
+    /// actor, and skips a resident context and a persisted non-`Active` one
+    /// (ADR-029 §2 push-wake pull mode, step 2).
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrestored_active_contexts_skip_resident_and_non_active_contexts() {
+        let persistence = MapPersistence::default();
+        let contexts = Arc::clone(&persistence.contexts);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(persistence),
+        );
+        let resident = hex::encode([0xD0u8; 32]);
+        create_push_context(&sup, &resident, &["wss://relay.example"]).await;
+        let snapshot = contexts.get(&resident).unwrap().value().clone();
+        assert_eq!(
+            sup.unrestored_active_contexts().await.unwrap(),
+            Vec::<String>::new()
+        );
+
+        let unrestored = hex::encode([0xD1u8; 32]);
+        contexts.insert(unrestored.clone(), snapshot.clone());
+        let mut closed_snapshot = snapshot;
+        closed_snapshot.state = scp_protocol::context::ContextState::Closed;
+        contexts.insert(hex::encode([0xD2u8; 32]), closed_snapshot);
+        assert_eq!(
+            sup.unrestored_active_contexts().await.unwrap(),
+            vec![unrestored],
+            "only the persisted Active context with no actor is listed"
+        );
+    }
+
+    /// `unrestored_active_contexts` fails on a snapshot load error instead of
+    /// skipping the context, because the wake would then report `NoData` for a
+    /// context it never pulled.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrestored_active_contexts_fail_on_a_load_error() {
+        let inner = MapPersistence::default();
+        let contexts = Arc::clone(&inner.contexts);
+        let failing_id = hex::encode([0xD3u8; 32]);
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(FailingLoadPersistence {
+                inner,
+                failing_id: failing_id.clone(),
+            }),
+        );
+        let resident = hex::encode([0xD4u8; 32]);
+        create_push_context(&sup, &resident, &["wss://relay.example"]).await;
+        let snapshot = contexts.get(&resident).unwrap().value().clone();
+        contexts.insert(failing_id.clone(), snapshot);
+        let result = sup.unrestored_active_contexts().await;
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(ref m)) if m.contains(&failing_id)),
+            "{result:?}"
+        );
+    }
+
+    /// `restore_unrestored_contexts` restores a persisted `Active` context that
+    /// has no actor, in a supervisor that already holds a live one, and leaves
+    /// the live actor in place.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_unrestored_contexts_restores_only_the_missing_context() {
+        let sup = supervisor_with_clock_and_persistence(
+            Arc::new(TestClock::new(1_700_000_000)),
+            Box::new(MapPersistence::default()),
+        );
+        let resident = hex::encode([0xD5u8; 32]);
+        create_push_context(&sup, &resident, &["wss://relay.example"]).await;
+        // A second real context whose actor goes away while its snapshot
+        // stays persisted: the state a failed restore leaves.
+        let missing = hex::encode([0xD6u8; 32]);
+        create_push_context(&sup, &missing, &["wss://relay.example"]).await;
+        sup.flush_all_contexts().await.unwrap();
+        assert!(sup.despawn_actor(&missing).await);
+        assert_eq!(
+            sup.unrestored_active_contexts().await.unwrap(),
+            vec![missing.clone()]
+        );
+
+        assert_eq!(
+            sup.restore_unrestored_contexts().await.unwrap(),
+            Vec::<String>::new()
+        );
+        let mut answering: Vec<String> = sup
+            .wake_targets()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.context_id)
+            .collect();
+        answering.sort();
+        assert_eq!(answering, vec![resident, missing], "both actors answer");
+    }
+
+    /// `unrestored_active_contexts` fails with `PersistenceFailed` on a
+    /// supervisor with no persistence provider.
+    #[tokio::test]
+    async fn unrestored_active_contexts_fail_without_persistence() {
+        let result = test_supervisor().unrestored_active_contexts().await;
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "{result:?}"
+        );
+    }
+
+    /// `node_identity` is the crypto provider's DID, and `NotInitialized` on
+    /// a supervisor with no crypto provider wired.
+    #[tokio::test]
+    async fn node_identity_reads_the_crypto_provider() {
+        let sup = supervisor_with_providers();
+        let crypto_did = sup.crypto_ref().unwrap().local_did().to_owned();
+        assert_eq!(sup.node_identity().unwrap().0, crypto_did);
+        assert!(matches!(
+            test_supervisor().node_identity(),
+            Err(ContextError::NotInitialized(_))
+        ));
     }
 
     /// `known_context_ids` lists registered actors and contexts whose actor is
@@ -29742,6 +30176,7 @@ mod tests {
                     MessagingCommand::DeliverIncoming {
                         context_id: ctx_str.to_owned(),
                         envelope_bytes: blob,
+                        mode: crate::context::actor::commands::DeliveryMode::Live,
                         reply: tx,
                     },
                 )

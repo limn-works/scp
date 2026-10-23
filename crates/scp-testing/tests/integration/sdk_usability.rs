@@ -323,9 +323,13 @@ async fn native_relay_adapter_roundtrip_through_relay() {
         url: format!("ws://{relay_addr}/scp/v1"),
         source: RelayUrlSource::DhtResolved,
     };
-    let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .expect("NativeRelayAdapter should connect");
+    let adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .expect("NativeRelayAdapter should connect");
     println!("  Adapter connected");
 
     let routing_id = RoutingId::new([0xBBu8; 32]);
@@ -392,9 +396,13 @@ async fn sender_key_encrypt_relay_decrypt_roundtrip() {
         url: format!("ws://{relay_addr}/scp/v1"),
         source: RelayUrlSource::DhtResolved,
     };
-    let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
-        .await
-        .expect("connect");
+    let adapter = NativeRelayAdapter::connect_sourced(
+        &sourced,
+        None,
+        scp_transport::native::adapter::CoverTraffic::Off,
+    )
+    .await
+    .expect("connect");
 
     // Subscribe.
     let routing_id = RoutingId::new([0xCCu8; 32]);

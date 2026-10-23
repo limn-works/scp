@@ -2360,11 +2360,12 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * reconnection-driver addendum): it pulls relay-buffered messages via
      * the `TransportManager` and reaches actor-owned reconnection state
      * through the `Supervisor`. On success each context's `needs_reconnect`
-     * flag is cleared. `last_relay_contacts` maps context id → last-contact
-     * Unix seconds (tier classification); absent contexts default to the
-     * most conservative tier.
+     * flag is cleared. Each context's offline tier is classified from its
+     * `last_relay_contact` in the instance's store; a context with none
+     * stored takes the most conservative tier. A store read failure fails
+     * the call with `SCP-TRANS-5095`.
      */
-    func contextReconnect(identity: Identity, contextIds: [String], lastRelayContacts: [String: UInt64]) async throws  -> ReconnectReport
+    func contextReconnect(identity: Identity, contextIds: [String]) async throws  -> ReconnectReport
     
     /**
      * Resets the TTL timer after a successful unanimous extension.
@@ -4927,17 +4928,18 @@ open func contextProposeTtlExtension(handle: ContextHandle, memberDid: String, p
      * reconnection-driver addendum): it pulls relay-buffered messages via
      * the `TransportManager` and reaches actor-owned reconnection state
      * through the `Supervisor`. On success each context's `needs_reconnect`
-     * flag is cleared. `last_relay_contacts` maps context id → last-contact
-     * Unix seconds (tier classification); absent contexts default to the
-     * most conservative tier.
+     * flag is cleared. Each context's offline tier is classified from its
+     * `last_relay_contact` in the instance's store; a context with none
+     * stored takes the most conservative tier. A store read failure fails
+     * the call with `SCP-TRANS-5095`.
      */
-open func contextReconnect(identity: Identity, contextIds: [String], lastRelayContacts: [String: UInt64])async throws  -> ReconnectReport  {
+open func contextReconnect(identity: Identity, contextIds: [String])async throws  -> ReconnectReport  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_context_reconnect(
                     self.uniffiClonePointer(),
-                    FfiConverterTypeIdentity_lower(identity),FfiConverterSequenceString.lower(contextIds),FfiConverterDictionaryStringUInt64.lower(lastRelayContacts)
+                    FfiConverterTypeIdentity_lower(identity),FfiConverterSequenceString.lower(contextIds)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -9874,6 +9876,17 @@ public struct ContextReconnectResult {
      * Whether `needs_reconnect` was cleared on success.
      */
     public var needsReconnectCleared: Bool
+    /**
+     * Envelopes the actor accepted as application messages during this
+     * context's reconnection.
+     */
+    public var envelopesDelivered: UInt64
+    /**
+     * Why writing the context's `last_relay_contact` failed after
+     * `needs_reconnect` was cleared; `None` when the write succeeded or no
+     * write was due.
+     */
+    public var relayContactError: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -9901,7 +9914,16 @@ public struct ContextReconnectResult {
          */equivocationsDetected: UInt64, 
         /**
          * Whether `needs_reconnect` was cleared on success.
-         */needsReconnectCleared: Bool) {
+         */needsReconnectCleared: Bool, 
+        /**
+         * Envelopes the actor accepted as application messages during this
+         * context's reconnection.
+         */envelopesDelivered: UInt64, 
+        /**
+         * Why writing the context's `last_relay_contact` failed after
+         * `needs_reconnect` was cleared; `None` when the write succeeded or no
+         * write was due.
+         */relayContactError: String?) {
         self.contextId = contextId
         self.tier = tier
         self.outcome = outcome
@@ -9910,6 +9932,8 @@ public struct ContextReconnectResult {
         self.mlsUpdateIssued = mlsUpdateIssued
         self.equivocationsDetected = equivocationsDetected
         self.needsReconnectCleared = needsReconnectCleared
+        self.envelopesDelivered = envelopesDelivered
+        self.relayContactError = relayContactError
     }
 }
 
@@ -9944,6 +9968,12 @@ extension ContextReconnectResult: Equatable, Hashable {
         if lhs.needsReconnectCleared != rhs.needsReconnectCleared {
             return false
         }
+        if lhs.envelopesDelivered != rhs.envelopesDelivered {
+            return false
+        }
+        if lhs.relayContactError != rhs.relayContactError {
+            return false
+        }
         return true
     }
 
@@ -9956,6 +9986,8 @@ extension ContextReconnectResult: Equatable, Hashable {
         hasher.combine(mlsUpdateIssued)
         hasher.combine(equivocationsDetected)
         hasher.combine(needsReconnectCleared)
+        hasher.combine(envelopesDelivered)
+        hasher.combine(relayContactError)
     }
 }
 
@@ -9975,7 +10007,9 @@ public struct FfiConverterTypeContextReconnectResult: FfiConverterRustBuffer {
                 eventsRecovered: FfiConverterUInt64.read(from: &buf), 
                 mlsUpdateIssued: FfiConverterBool.read(from: &buf), 
                 equivocationsDetected: FfiConverterUInt64.read(from: &buf), 
-                needsReconnectCleared: FfiConverterBool.read(from: &buf)
+                needsReconnectCleared: FfiConverterBool.read(from: &buf), 
+                envelopesDelivered: FfiConverterUInt64.read(from: &buf), 
+                relayContactError: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -9988,6 +10022,8 @@ public struct FfiConverterTypeContextReconnectResult: FfiConverterRustBuffer {
         FfiConverterBool.write(value.mlsUpdateIssued, into: &buf)
         FfiConverterUInt64.write(value.equivocationsDetected, into: &buf)
         FfiConverterBool.write(value.needsReconnectCleared, into: &buf)
+        FfiConverterUInt64.write(value.envelopesDelivered, into: &buf)
+        FfiConverterOptionString.write(value.relayContactError, into: &buf)
     }
 }
 
@@ -18466,32 +18502,6 @@ fileprivate struct FfiConverterSequenceTypePublishResult: FfiConverterRustBuffer
         return seq
     }
 }
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterDictionaryStringUInt64: FfiConverterRustBuffer {
-    public static func write(_ value: [String: UInt64], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for (key, value) in value {
-            FfiConverterString.write(key, into: &buf)
-            FfiConverterUInt64.write(value, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String: UInt64] {
-        let len: Int32 = try readInt(&buf)
-        var dict = [String: UInt64]()
-        dict.reserveCapacity(Int(len))
-        for _ in 0..<len {
-            let key = try FfiConverterString.read(from: &buf)
-            let value = try FfiConverterUInt64.read(from: &buf)
-            dict[key] = value
-        }
-        return dict
-    }
-}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_MAYBE_READY: Int8 = 1
 
@@ -19688,7 +19698,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_propose_ttl_extension() != 10308) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reconnect() != 23606) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reconnect() != 4997) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reset_ttl_timer() != 21393) {

@@ -221,7 +221,13 @@ impl TransportSelector {
         // suppression so we skip QUIC next time for this relay, spec §10.14.3
         // item 4). Either way, fall through to the WebSocket baseline.
 
-        let mut ws = NativeRelayAdapter::connect_sourced(sourced, profile).await?;
+        // An interactive connect runs the profile's cover traffic (§9.10.6).
+        let mut ws = NativeRelayAdapter::connect_sourced(
+            sourced,
+            profile,
+            crate::native::adapter::CoverTraffic::FromProfile,
+        )
+        .await?;
         let suppression = ws.take_suppression_receiver();
         Ok((Box::new(ws), suppression))
     }
@@ -317,8 +323,14 @@ impl TransportSelector {
         bearer_token: Option<Zeroizing<String>>,
         profile: Option<&TransportProfile>,
     ) -> Result<Box<dyn TransportAdapter>, TransportError> {
-        let ws =
-            NativeRelayAdapter::connect_sourced_with_bearer(sourced, bearer_token, profile).await?;
+        // An interactive connect runs the profile's cover traffic (§9.10.6).
+        let ws = NativeRelayAdapter::connect_sourced_with_bearer(
+            sourced,
+            bearer_token,
+            profile,
+            crate::native::adapter::CoverTraffic::FromProfile,
+        )
+        .await?;
         Ok(Box::new(ws))
     }
 

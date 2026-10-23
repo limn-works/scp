@@ -279,6 +279,20 @@ impl TransportManager {
         }
     }
 
+    /// Creates a new `TransportManager` with no adapters whose connection
+    /// budget is `max_connections` (at least 1) instead of the profile's.
+    ///
+    /// A caller that dials a fixed relay set and must hold every relay of it,
+    /// such as the push-wake pull (ADR-029 §2 push-wake pull mode step 3),
+    /// sizes the budget to the set, so [`Self::add_adapter`] evicts none of
+    /// them.
+    #[must_use]
+    pub fn with_connection_budget(max_connections: usize) -> Self {
+        let mut manager = Self::builder();
+        manager.max_connections = max_connections.max(1);
+        manager
+    }
+
     /// Creates a new `TransportManager` with the given configuration.
     ///
     /// Uses the dedup cache size and TTL from the [`TransportConfig`],
@@ -759,11 +773,14 @@ impl TransportManager {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// One-shot query for stored envelopes across all adapters.
+    /// One-shot query for stored envelopes.
     ///
     /// **Phase 1:** Queries the first adapter only.
     /// **Phase 2+:** Queries all adapters and merges results with
     /// deduplication.
+    ///
+    /// A caller that must read every relay of one relay set calls
+    /// [`Self::query_relays`].
     ///
     /// # Errors
     ///
@@ -777,6 +794,58 @@ impl TransportManager {
         let held = self.adapters.first().ok_or(TransportError::NotConnected)?;
         self.touch_adapter(0);
         held.adapter.query(routing_id, since).await
+    }
+
+    /// One-shot query for stored envelopes at exactly the relays in
+    /// `relay_urls`.
+    ///
+    /// Each relay of a context's relay set stores its own copy, and a blob may
+    /// reach only one of them, so a push-wake pull queries every relay the
+    /// context names and no other (ADR-029 §2 push-wake pull mode step 4).
+    /// The relays are queried concurrently. The merged result holds each blob
+    /// once, keyed by [`BlobId`] (the SHA-256 of its encrypted blob), in the
+    /// order of `relay_urls` and then of each relay's answer.
+    ///
+    /// # Errors
+    ///
+    /// - [`TransportError::NotConnected`] when `relay_urls` is empty or names
+    ///   a relay this manager holds no adapter for.
+    /// - The first adapter error, in `relay_urls` order, when any relay fails,
+    ///   because a merge that drops a relay's answer would let a caller report
+    ///   no new data for blobs it never read.
+    pub async fn query_relays(
+        &self,
+        relay_urls: &[String],
+        routing_id: &RoutingId,
+        since: Option<u64>,
+    ) -> Result<Vec<OuterEnvelope>, TransportError> {
+        if relay_urls.is_empty() {
+            return Err(TransportError::NotConnected);
+        }
+        let mut indices = Vec::with_capacity(relay_urls.len());
+        for url in relay_urls {
+            let idx = self
+                .adapters
+                .iter()
+                .position(|held| &held.relay_url == url)
+                .ok_or(TransportError::NotConnected)?;
+            indices.push(idx);
+        }
+        let answers = futures::future::join_all(indices.into_iter().map(|idx| async move {
+            self.touch_adapter(idx);
+            self.adapters[idx].adapter.query(routing_id, since).await
+        }))
+        .await;
+        let mut seen = std::collections::HashSet::<BlobId>::new();
+        let mut merged = Vec::new();
+        for answer in answers {
+            for envelope in answer? {
+                if seen.insert(BlobId::from_sha256(&envelope.encrypted_blob)) {
+                    merged.push(envelope);
+                }
+            }
+        }
+        Ok(merged)
     }
 
     /// Request deletion of a blob across all adapters.
@@ -1743,6 +1812,124 @@ mod tests {
         let routing_id = RoutingId::new([0xAA; 32]);
         let envelopes = manager.query(&routing_id, None).await.unwrap();
         assert_eq!(envelopes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn manager_query_relays_merges_the_named_relays_and_dedups_by_blob() {
+        let shared = test_envelope_with_blob(vec![0x01]);
+        let only_first = test_envelope_with_blob(vec![0x02]);
+        let only_second = test_envelope_with_blob(vec![0x03]);
+        let mut first = MockAdapter::succeeding();
+        first.query_result = Ok(vec![shared.clone(), only_first.clone()]);
+        let mut second = MockAdapter::succeeding();
+        second.query_result = Ok(vec![shared.clone(), only_second.clone()]);
+        let mut manager = TransportManager::new(MOCK_RELAY.to_owned(), Box::new(first));
+        manager.add_adapter("wss://second.example".to_owned(), Box::new(second));
+        let mut unnamed = MockAdapter::succeeding();
+        unnamed.query_result = Ok(vec![test_envelope_with_blob(vec![0x04])]);
+        manager.add_adapter("wss://unnamed.example".to_owned(), Box::new(unnamed));
+        let envelopes = manager
+            .query_relays(
+                &[MOCK_RELAY.to_owned(), "wss://second.example".to_owned()],
+                &RoutingId::new([0xAA; 32]),
+                None,
+            )
+            .await
+            .unwrap();
+        let blobs: Vec<Vec<u8>> = envelopes.into_iter().map(|e| e.encrypted_blob).collect();
+        assert_eq!(
+            blobs,
+            vec![
+                shared.encrypted_blob,
+                only_first.encrypted_blob,
+                only_second.encrypted_blob
+            ],
+            "a blob only the second relay stores is returned, a blob both store appears once, \
+             and the relay outside the named set is not read"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_query_relays_fails_when_a_named_relay_fails() {
+        let mut first = MockAdapter::succeeding();
+        first.query_result = Ok(vec![test_envelope()]);
+        let second = MockAdapter::failing(TransportError::NotConnected);
+        let mut manager = TransportManager::new(MOCK_RELAY.to_owned(), Box::new(first));
+        manager.add_adapter("wss://second.example".to_owned(), Box::new(second));
+        let both = [MOCK_RELAY.to_owned(), "wss://second.example".to_owned()];
+        let result = manager
+            .query_relays(&both, &RoutingId::new([0xAA; 32]), None)
+            .await;
+        assert!(
+            matches!(result, Err(TransportError::NotConnected)),
+            "one failed relay fails the merged query: {result:?}"
+        );
+        let only_first = manager
+            .query_relays(&[MOCK_RELAY.to_owned()], &RoutingId::new([0xAA; 32]), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            only_first.len(),
+            1,
+            "a failed relay outside the named set does not fail the query"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_query_relays_refuses_an_empty_set_and_an_unheld_relay() {
+        let manager =
+            TransportManager::new(MOCK_RELAY.to_owned(), Box::new(MockAdapter::succeeding()));
+        let routing_id = RoutingId::new([0xAA; 32]);
+        assert!(matches!(
+            manager.query_relays(&[], &routing_id, None).await,
+            Err(TransportError::NotConnected)
+        ));
+        assert!(matches!(
+            manager
+                .query_relays(&["wss://unheld.example".to_owned()], &routing_id, None)
+                .await,
+            Err(TransportError::NotConnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn manager_query_reads_only_the_first_adapter() {
+        let mut first = MockAdapter::succeeding();
+        first.query_result = Ok(vec![test_envelope_with_blob(vec![0x01])]);
+        let mut second = MockAdapter::succeeding();
+        second.query_result = Ok(vec![test_envelope_with_blob(vec![0x02])]);
+        let mut manager = TransportManager::new(MOCK_RELAY.to_owned(), Box::new(first));
+        manager.add_adapter("wss://second.example".to_owned(), Box::new(second));
+        let blobs: Vec<Vec<u8>> = manager
+            .query(&RoutingId::new([0xAA; 32]), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.encrypted_blob)
+            .collect();
+        assert_eq!(blobs, vec![vec![0x01]]);
+    }
+
+    #[test]
+    fn a_manager_sized_for_its_relays_evicts_none() {
+        let mut manager = TransportManager::with_connection_budget(12);
+        assert_eq!(manager.max_connections(), 12);
+        for i in 0..12 {
+            assert!(
+                manager
+                    .add_adapter(
+                        format!("wss://relay-{i}.example"),
+                        Box::new(MockAdapter::succeeding())
+                    )
+                    .is_none(),
+                "relay {i} of 12 must not evict"
+            );
+        }
+        assert_eq!(manager.relay_urls().len(), 12);
+        assert_eq!(
+            TransportManager::with_connection_budget(0).max_connections(),
+            1
+        );
     }
 
     #[tokio::test]
