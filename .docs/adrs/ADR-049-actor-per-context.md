@@ -208,7 +208,7 @@ Sequence numbers are reserved by a `SequenceReservation` guard. Rollback fires o
 
 ### 9. Persistence: coalesced by default, sync for safety-critical
 
-Default: 50ms write-coalescing per actor. Synchronously persisted (no coalescing) before the mutation is visible to any observer:
+Default: 50ms write-coalescing per actor. An explicit flush (`LifecycleCommand::FlushSnapshot`) writes the whole current state, which is the write a pending coalesce tick would make. The flush therefore leaves the actor clean: no coalesced write of the state as it stood at the flush lands after the flush returns. (Added 2026-10-23 for story PUSH-016. Before, a flush left the actor dirty, and the coalesced write that followed it overwrote anything written to the store in between.) Synchronously persisted (no coalescing) before the mutation is visible to any observer:
 
 - MLS epoch advance, sender-key rotation, event log append (chain integrity)
 - `execute_revoke`, **UCAN issuance/attenuation/revocation**, **role assignment/demotion/blocklist updates**, wrapping-key rotation (forward-secrecy class: any downward authorization transition)
