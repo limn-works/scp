@@ -9,13 +9,17 @@
 //! whatever the result (§10.7.1 "No blob storage"):
 //!
 //! - [`PushRole::Disabled`] answers `4063` `PUSH_NOT_SUPPORTED`.
-//! - `PushRole::Enabled` (built with the `push-store` feature) decodes the blob as a `PushRegistration` or a
-//!   `PushDeregistration` (§22.11.4), refuses a platform with no configured
-//!   sender (`4061`), applies the §10.7.1 freshness checks (`4062`), verifies
-//!   the signature through the injected
+//! - `PushRole::Enabled` (built with the `push-store` feature) answers
+//!   `4060` at a current tier 3 ID: §10.7.1 "Tier 3 relays" has the relay
+//!   open a Tier 3 envelope before any other rule, and this relay has no
+//!   opener until PUSH-033, so it rejects every message there unread. It
+//!   also answers `4060` at a retired ID. At a current direct ID it decodes
+//!   the blob as a `PushRegistration` or a `PushDeregistration` (§22.11.4),
+//!   refuses a platform with no configured sender (`4061`), applies the
+//!   §10.7.1 freshness checks (`4062`), verifies the signature through the
+//!   injected
 //!   [`PushSignatureVerifier`](scp_identity::push_verify::PushSignatureVerifier)
-//!   with the canonical URL and the `bridge_target` of the reserved entry
-//!   whose routing ID the PUBLISH arrived at (`4060`, `5003`, `5004`), and only then
+//!   with that entry's canonical URL (`4060`, `5003`, `5004`), and only then
 //!   changes the registration store. Any rejection leaves the store unchanged.
 //!
 //! A PUBLISH to any other routing ID passes through as
@@ -61,8 +65,10 @@ pub const PUSH_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// no target, so the ID is the `"scp-push-registration"` form. The conversion
 /// from an `SCPRelay` entry goes through `PushRelay::from`, which keeps the
 /// entry's target, so the ID is the tier 3 form when a target is present.
-/// Either way the relay hands the verifier the one [`PushRelay`] its reserved
-/// routing ID came from (§10.7.1 step 3), and no conversion drops the target.
+/// No conversion drops the target, so a tier 3 entry always yields its tier 3
+/// ID, which a push-enabled relay answers with `4060` until PUSH-033 builds
+/// the Tier 3 envelope opener. At a direct entry's ID the relay hands the
+/// verifier that entry's [`PushRelay`] (§10.7.1 step 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayUrl {
     relay: PushRelay,

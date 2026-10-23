@@ -1146,14 +1146,18 @@ mod tests {
         document: DidDocument,
         relay_url: String,
     ) -> LiveSlot<NodePublishedState> {
-        seed_from_startup_publish(
-            publisher,
-            identity,
-            document,
-            &crate::published_state::test_relay(&relay_url),
-        )
-        .await
-        .expect("startup publish succeeds")
+        let relay = crate::published_state::test_relay(&relay_url);
+        let handle = scp_transport::relay::push_gate::LiveRelayUrl::new(
+            scp_transport::relay::push_gate::RelayUrl::from(&relay),
+        );
+        let target = scp_did::BridgeTarget::new([0x5a; 32]).expect("a non-zero target");
+        let reserved = crate::published_state::reserve_push_routing_id(
+            &handle,
+            &crate::published_state::PublishedEntries::new(&relay, &document, target),
+        );
+        seed_from_startup_publish(publisher, identity, reserved)
+            .await
+            .expect("startup publish succeeds")
     }
 
     /// Drives ONE real tier change through the real writer, alternating the

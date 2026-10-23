@@ -3452,6 +3452,17 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         scp_did::RelayEndpoint::new(&domain_relay_url(&domain)).map_err(IdentityError::from)?,
     );
     document.add_relay_service(&relay);
+    // The relay reserves the push routing ID of every entry the node is about
+    // to publish before the publish (§10.7.1 step 2, "Tier 3 relays"): the
+    // domain entry, which carries no `bridgeTarget` and so reserves its
+    // `"scp-push-registration"` ID, and every tier 3 entry of an
+    // `IdentitySource::Explicit` document with the node's `bridgeTarget`.
+    // `seed_from_startup_publish` takes only the value this returns.
+    let bridge_target = node_bridge_target(&identity.did)?;
+    let reserved = published_state::reserve_push_routing_id(
+        &relay_config.relay_url,
+        &published_state::PublishedEntries::new(&relay, &document, bridge_target),
+    );
     // Publish the domain→DID binding per the configured `DhtMode` (NOT
     // unconditionally). `DhtMode::Disabled` — the fail-safe default, and a
     // LEGITIMATE more-private `Domain + Disabled` config per construction.md M2
@@ -3480,7 +3491,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // at `seq = 1` (SCP-RELAYRES-004). This MUST precede `seed_from_startup_publish`.
     initialize_sequence_for_mode(dht_mode, did_method.as_ref(), &identity).await?;
     let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode);
-    let live_state = seed_from_startup_publish(&publisher, &identity, document, &relay).await?;
+    let live_state = seed_from_startup_publish(&publisher, &identity, reserved).await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
@@ -3780,11 +3791,11 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     // never the bridge relay's own `"scp-push-registration"` ID (§10.7.1
     // "Tier 3 relays"). The inner `relay_url` names the reserved entries; the
     // name stays because `pipeline_wiring.rs` pins the call's text.
-    {
+    let reserved = {
         let relay_url =
             published_state::PublishedEntries::new(&relay_url, &document, bridge_target);
-        published_state::reserve_push_routing_id(&relay_config.relay_url, &relay_url);
-    }
+        published_state::reserve_push_routing_id(&relay_config.relay_url, &relay_url)
+    };
 
     // 4. Publish the DID document through the node's SINGLE publish seam AND seed
     //    the live slot in ONE step. `seed_from_startup_publish` performs the
@@ -3809,7 +3820,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     //    precede `seed_from_startup_publish` — the publish is inside it.
     initialize_sequence_for_mode(dht_mode, did_method.as_ref(), &identity).await?;
     let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode);
-    let live_state = seed_from_startup_publish(&publisher, &identity, document, &relay_url).await?;
+    let live_state = seed_from_startup_publish(&publisher, &identity, reserved).await?;
 
     tracing::info!(
         tier = ?tier,
@@ -8114,6 +8125,70 @@ mod tests {
         node.shutdown();
     }
 
+    /// §10.7.1 "Tier 3 relays" on the domain builder: a domain node whose
+    /// `IdentitySource::Explicit` document carries a tier 3 entry with the
+    /// node's `bridgeTarget` reserves that entry's tier 3 ID beside the domain
+    /// entry's `"scp-push-registration"` ID before its startup publish, so a
+    /// plaintext PUBLISH there gets `4063` and a QUERY returns nothing. An
+    /// entry for another target stays an ordinary routing ID.
+    #[tokio::test]
+    async fn domain_node_reserves_its_explicit_documents_tier3_entry_at_startup() {
+        let (identity, mut document, custody) = create_test_identity().await;
+        let target = node_bridge_target(&identity.did).expect("not the absent value");
+        let tier3 = scp_did::RelayService::bridge(
+            scp_did::BridgeEndpoint::new(SLOT_BRIDGE_URL).expect("a wss bridge URL"),
+            target,
+        );
+        let foreign = scp_did::RelayService::bridge(
+            scp_did::BridgeEndpoint::new("wss://bridge-three.example.org/scp/v1")
+                .expect("a wss bridge URL"),
+            scp_did::BridgeTarget::new([0x5a; 32]).expect("not the absent value"),
+        );
+        document.add_relay_service(&tier3);
+        document.add_relay_service(&foreign);
+        let mut config = domain_config();
+        config.identity = IdentitySource::Explicit(Box::new(ExplicitIdentity {
+            identity,
+            document,
+            did_method: Arc::new(make_test_dht(&custody)),
+        }));
+
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("the explicit domain node starts");
+
+        assert!(
+            node.identity().document().relay_services().contains(&tier3),
+            "the domain node publishes the Explicit document's tier 3 entry"
+        );
+        assert_eq!(
+            node.state.relay_config.relay_url.current(),
+            scp_transport::relay::push_gate::ReservedRelayUrls::new(
+                RelayUrl::new(&domain_relay_url("test.example.com")).unwrap(),
+                [RelayUrl::from(&tier3)],
+            ),
+            "the domain entry and the document's tier 3 entry with this node's target"
+        );
+        let tier3_id = RelayUrl::from(&tier3).push_routing_id();
+        assert_push_not_supported(&publish_at(&node, tier3_id).await, "tier 3 entry");
+        assert_eq!(
+            query_blob_count(&node, tier3_id).await,
+            0,
+            "tier 3 entry: QUERY"
+        );
+        assert!(
+            matches!(
+                publish_at(&node, RelayUrl::from(&foreign).push_routing_id()).await,
+                scp_relay_client::RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }
+            ),
+            "another target's tier 3 ID is an ordinary routing ID"
+        );
+        node.shutdown();
+    }
+
     /// Waits for the next `TierChanged` event and checks its URLs.
     async fn await_tier_change<S: scp_platform::traits::Storage>(
         node: &mut ApplicationNode<S>,
@@ -8224,7 +8299,7 @@ mod tests {
         let mut both = single.clone();
         both.add_relay_service(&b);
 
-        published_state::reserve_push_routing_id(
+        let _reserved = published_state::reserve_push_routing_id(
             relay,
             &published_state::PublishedEntries::new(&a, &both, target),
         );
@@ -8232,7 +8307,7 @@ mod tests {
             assert_tier3_id_intercepted(&node, entry, label).await;
         }
 
-        published_state::reserve_push_routing_id(
+        let _reserved = published_state::reserve_push_routing_id(
             relay,
             &published_state::PublishedEntries::new(&a, &single, target),
         );
@@ -8642,7 +8717,8 @@ mod tests {
         document.add_relay_service(&foreign);
         document.insert_preferred_relay(&a);
 
-        reserve_push_routing_id(&relay, &PublishedEntries::new(&a, &document, target));
+        let _reserved =
+            reserve_push_routing_id(&relay, &PublishedEntries::new(&a, &document, target));
         let current = relay.current();
         assert_eq!(
             current,
@@ -8679,7 +8755,8 @@ mod tests {
         }
 
         let only_own = slot_test_document(&[]);
-        reserve_push_routing_id(&relay, &PublishedEntries::new(&a, &only_own, target));
+        let _reserved =
+            reserve_push_routing_id(&relay, &PublishedEntries::new(&a, &only_own, target));
         assert_eq!(relay.current(), ReservedRelayUrls::from(RelayUrl::from(&a)));
         assert!(matches!(
             gate(&relay, RelayUrl::from(&b).push_routing_id()).await,
@@ -8687,7 +8764,8 @@ mod tests {
         ));
 
         let direct = crate::published_state::test_relay(TIER_CHANGE_NEW_URL);
-        reserve_push_routing_id(&relay, &PublishedEntries::new(&direct, &only_own, target));
+        let _reserved =
+            reserve_push_routing_id(&relay, &PublishedEntries::new(&direct, &only_own, target));
         assert_eq!(
             relay.current(),
             ReservedRelayUrls::from(RelayUrl::new(TIER_CHANGE_NEW_URL).unwrap())
