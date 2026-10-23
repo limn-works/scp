@@ -1057,6 +1057,7 @@ async fn handle_udp_query<S: BlobStorage>(
     // a cold index); ordinary routing_ids pass through unchanged.
     let blobs = match did_slots
         .gate_query(
+            &config.relay_url,
             config.did_record_validation,
             storage.as_ref(),
             routing_id,
@@ -2180,6 +2181,77 @@ mod tests {
             assert!(storage.query(&rid, None, 100).await.unwrap().is_empty());
         }
 
+        handle.shutdown();
+    }
+
+    /// The BLOBs a QUERY at `routing_id` returns, read up to `query_complete`.
+    async fn query_blob_count(client: &AsyncDtlsSession, routing_id: [u8; 32]) -> usize {
+        let data = rmp_serde::to_vec_named(&ClientMessage::Query {
+            ref_id: Some("q".to_string()),
+            routing_id,
+            since: None,
+            limit: None,
+        })
+        .unwrap();
+        client.send(data).await.unwrap();
+        let mut queried = 0;
+        loop {
+            match recv_msg(client).await {
+                RelayMessage::Blob { .. } => queried += 1,
+                RelayMessage::Event { event_type, .. } if event_type == "query_complete" => {
+                    return queried;
+                }
+                other => panic!("QUERY returned {other:?}"),
+            }
+        }
+    }
+
+    /// §10.7.1 "No blob storage" at the UDP/DTLS listener, which takes no
+    /// SUBSCRIBE: a blob stored at a routing ID while the relay did not
+    /// reserve it is not returned by a QUERY once the handle reserves that ID
+    /// as a tier 3 entry's, nor after the handle releases it.
+    #[tokio::test]
+    async fn udp_listener_reads_no_blob_at_a_current_or_released_reserved_id() {
+        let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
+        let direct = crate::relay::push_gate::RelayUrl::new("wss://relay.udp.test").unwrap();
+        let live = crate::relay::push_gate::LiveRelayUrl::new(direct.clone());
+        let (handle, addr, _storage) =
+            start_test_listener_with_relay_config(RelayConfig::defaults(live.clone())).await;
+        let client = create_dtls_client(addr).await;
+        let rid = fixture.entry_a.push_routing_id();
+
+        let response = send_and_recv(
+            &client,
+            &ClientMessage::Publish {
+                ref_id: Some("p".to_string()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: vec![0x42; 64],
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                &response,
+                RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }
+            ),
+            "{response:?}"
+        );
+        assert_eq!(query_blob_count(&client, rid).await, 1, "ordinary ID");
+
+        live.set(fixture.live.current());
+        assert_eq!(query_blob_count(&client, rid).await, 0, "current tier 3 ID");
+
+        live.set(direct);
+        assert_eq!(
+            query_blob_count(&client, rid).await,
+            0,
+            "released tier 3 ID"
+        );
         handle.shutdown();
     }
 

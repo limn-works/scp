@@ -1170,6 +1170,24 @@ fn nat_tier_task_writes_the_relay_push_url_handle() {
         reserve < seed,
         "build_no_domain_inner must reserve the startup entry's routing ID before it publishes"
     );
+    // PUSH-032 (§10.7.1 "Tier 3 relays"): both callers reserve the node's own
+    // entry and every tier 3 entry of the document they publish that carries
+    // the node's `bridgeTarget`, built from that document before the
+    // reservation.
+    let startup_entries = startup
+        .find("PublishedEntries::new(&relay_url, &document, bridge_target)")
+        .expect("build_no_domain_inner must reserve every entry of the document it publishes");
+    assert!(
+        startup_entries < reserve,
+        "build_no_domain_inner must build the reserved entries before it reserves them"
+    );
+    let tier_entries = body
+        .find("PublishedEntries::new(new_relay_url, &next_document, bridge_target)")
+        .expect("apply_tier_change must reserve every entry of the document it publishes");
+    assert!(
+        tier_entries < set,
+        "apply_tier_change must build the reserved entries before it reserves them"
+    );
 }
 
 // PUSH-013 (§10.7.1): the push routing-ID query runs

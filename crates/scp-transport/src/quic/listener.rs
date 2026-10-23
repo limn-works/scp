@@ -135,12 +135,14 @@ pub struct QuicListenerConfig {
     /// opaquely like a foreign transport. Never a trust dependency (the client
     /// always re-verifies, RELAYRES-002).
     pub did_record_validation: DidRecordValidation,
-    /// The relay's live URL, from which the reserved push routing ID derives
-    /// (§10.7.1 step 2). When this listener shares a relay's blob store, it
-    /// MUST be a clone of that relay's
+    /// The relay's live reserved entries, from which each reserved push
+    /// routing ID derives (§10.7.1 step 2, "Tier 3 relays"). When this
+    /// listener shares a relay's blob store, it MUST be a clone of that
+    /// relay's
     /// [`RelayConfig::relay_url`](crate::native::server::RelayConfig::relay_url)
-    /// handle, so a push message is intercepted whichever transport carries it
-    /// and a URL change moves every transport at once.
+    /// handle, so whichever transport carries it, a push message is
+    /// intercepted and a QUERY at a reserved ID returns no blob, and a change
+    /// of the reserved entries moves every transport at once.
     pub relay_url: LiveRelayUrl,
     /// Whether this listener offers push (§10.7.1). It MUST equal the shared
     /// relay's [`RelayConfig::push`](crate::native::server::RelayConfig::push);
@@ -1062,6 +1064,7 @@ async fn handle_subscribe<S: BlobStorage>(
     if let Some(since_ts) = since {
         if let Ok(blobs) = did_slots
             .gate_query(
+                &config.relay_url,
                 config.did_record_validation,
                 storage.as_ref(),
                 routing_id,
@@ -1167,6 +1170,7 @@ async fn handle_query<S: BlobStorage>(
     // a cold index); ordinary routing_ids pass through unchanged.
     let blobs = match did_slots
         .gate_query(
+            &config.relay_url,
             config.did_record_validation,
             storage.as_ref(),
             routing_id,
@@ -2352,6 +2356,146 @@ mod tests {
         }
 
         connection.close(0u32.into(), b"done");
+        handle.shutdown();
+    }
+
+    /// Reads one length-prefixed relay message from `recv` within 5 s.
+    async fn read_one(recv: &mut quinn::RecvStream) -> RelayMessage {
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut len_buf))
+            .await
+            .expect("a relay message within 5 s")
+            .unwrap();
+        let mut buf = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+        recv.read_exact(&mut buf).await.unwrap();
+        RelayMessage::from_bytes(&buf).unwrap()
+    }
+
+    /// The BLOBs a QUERY at `routing_id` returns and the BLOBs a SUBSCRIBE with
+    /// backfill from 0 returns, each read up to its completion event, on a
+    /// fresh connection.
+    async fn read_blob_counts(
+        addr: SocketAddr,
+        certs: &[CertificateDer<'static>],
+        routing_id: [u8; 32],
+    ) -> (usize, usize) {
+        let connection = connect_client(addr, certs).await;
+        let queried = send_and_recv(
+            &connection,
+            &ClientMessage::Query {
+                ref_id: Some("q".into()),
+                routing_id,
+                since: None,
+                limit: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                queried.last(),
+                Some(RelayMessage::Event { event_type, .. }) if event_type == "query_complete"
+            ),
+            "{queried:?}"
+        );
+        let queried = queried
+            .iter()
+            .filter(|m| matches!(m, RelayMessage::Blob { .. }))
+            .count();
+
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        let payload = ClientMessage::Subscribe {
+            ref_id: Some("s".into()),
+            routing_id,
+            since: Some(0),
+        }
+        .to_bytes()
+        .unwrap();
+        send.write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        send.write_all(&payload).await.unwrap();
+        assert!(matches!(read_one(&mut recv).await, RelayMessage::Ok { .. }));
+        let mut backfilled = 0;
+        loop {
+            match read_one(&mut recv).await {
+                RelayMessage::Blob { .. } => backfilled += 1,
+                RelayMessage::Event { event_type, .. } if event_type == "backfill_complete" => {
+                    break;
+                }
+                other => panic!("SUBSCRIBE backfill returned {other:?}"),
+            }
+        }
+        connection.close(0u32.into(), b"done");
+        (queried, backfilled)
+    }
+
+    /// §10.7.1 "No blob storage" at the QUIC listener: a blob stored at a
+    /// routing ID while the relay did not reserve it is returned by neither a
+    /// QUERY nor a SUBSCRIBE backfill once the handle reserves that ID as a
+    /// tier 3 entry's, nor after the handle releases it.
+    #[tokio::test]
+    async fn quic_listener_reads_no_blob_at_a_current_or_released_reserved_id() {
+        let fixture = crate::relay::push_gate::tier3_fixture().unwrap();
+        let direct = crate::relay::push_gate::RelayUrl::new("wss://relay.quic.test").unwrap();
+        let live = LiveRelayUrl::new(direct.clone());
+        let (server_config, certs) = test_server_config();
+        let listener = QuicListener::new(
+            QuicListenerConfig {
+                bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                delivery_jitter_ms: 0,
+                ..QuicListenerConfig::defaults(live.clone())
+            },
+            Arc::new(InMemoryBlobStorage::new()),
+            subscription::new_registry(),
+            PublishRateLimiter::new(100),
+            rate_limit::new_connection_tracker(),
+            DidSlotRegistry::new(),
+        );
+        let (handle, addr) = listener.start(server_config).unwrap();
+        let rid = fixture.entry_a.push_routing_id();
+
+        let connection = connect_client(addr, &certs).await;
+        let responses = send_and_recv(
+            &connection,
+            &ClientMessage::Publish {
+                ref_id: Some("p".into()),
+                routing_id: rid,
+                recipient_hint: None,
+                blob_ttl: 3600,
+                blob: vec![0x42; 64],
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                responses.as_slice(),
+                [RelayMessage::Ok {
+                    blob_id: Some(_),
+                    ..
+                }]
+            ),
+            "{responses:?}"
+        );
+        connection.close(0u32.into(), b"done");
+        assert_eq!(
+            read_blob_counts(addr, &certs, rid).await,
+            (1, 1),
+            "ordinary ID"
+        );
+
+        live.set(fixture.live.current());
+        assert_eq!(
+            read_blob_counts(addr, &certs, rid).await,
+            (0, 0),
+            "current tier 3 ID"
+        );
+
+        live.set(direct);
+        assert_eq!(
+            read_blob_counts(addr, &certs, rid).await,
+            (0, 0),
+            "released tier 3 ID"
+        );
         handle.shutdown();
     }
 

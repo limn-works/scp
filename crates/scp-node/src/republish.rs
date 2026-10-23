@@ -1173,10 +1173,13 @@ mod tests {
                     .expect("canonical test URL"),
             ),
             &crate::published_state::test_relay(&next_url),
-            "test tier change",
+            scp_did::BridgeTarget::new([0x5a; 32]).expect("not the absent value"),
             publisher,
             identity,
-            None,
+            crate::published_state::TierChangeReport {
+                reason: "test tier change",
+                events: None,
+            },
         )
         .await;
     }
@@ -1274,10 +1277,13 @@ mod tests {
                     .expect("canonical test URL"),
             ),
             &crate::published_state::test_relay(new_relay_url),
-            "test tier change",
+            scp_did::BridgeTarget::new([0x5a; 32]).expect("not the absent value"),
             &publisher,
             &identity,
-            None,
+            crate::published_state::TierChangeReport {
+                reason: "test tier change",
+                events: None,
+            },
         )
         .await;
         // `apply_tier_change` returns nothing: success is observable only where

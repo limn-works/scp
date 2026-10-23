@@ -131,32 +131,25 @@ impl From<&scp_did::RelayService> for RelayUrl {
     }
 }
 
-/// The error of building a [`ReservedRelayUrls`] from no relay URL: a relay
-/// reserves at least one push routing ID (§10.7.1 step 2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("a relay reserves the push routing ID of at least one relay URL; none was given")]
-pub struct NoReservedRelayUrl;
-
 /// The relay URLs whose push routing IDs a relay currently reserves.
 ///
 /// The set holds one URL per entry the node publishes (§10.7.1 "Tier 3
 /// relays": a node MAY publish one tier 3 entry per bridge relay, and its
-/// relay reserves each entry's ID). It is never empty, because no constructor
-/// accepts zero URLs, and it holds each push routing ID once: a URL whose
-/// routing ID an earlier URL already holds is dropped. Two sets are equal when they hold the same URLs,
-/// whatever their order.
+/// relay reserves each entry's ID). It is never empty, because every
+/// constructor takes a first URL, and it holds each push routing ID once: a
+/// URL whose routing ID an earlier URL already holds is dropped. Two sets are
+/// equal when they hold the same URLs, whatever their order.
 #[derive(Debug, Clone)]
 pub struct ReservedRelayUrls(Vec<RelayUrl>);
 
 impl ReservedRelayUrls {
-    /// The set of `urls`, keeping the first URL for each push routing ID.
-    ///
-    /// # Errors
-    ///
-    /// [`NoReservedRelayUrl`] when `urls` yields nothing.
-    pub fn new(urls: impl IntoIterator<Item = RelayUrl>) -> Result<Self, NoReservedRelayUrl> {
-        let mut held: Vec<RelayUrl> = Vec::new();
-        for url in urls {
+    /// The set of `first` and `rest`, keeping the first URL for each push
+    /// routing ID. Taking `first` apart from `rest` makes an empty set
+    /// unrepresentable, so building a set cannot fail.
+    #[must_use]
+    pub fn new(first: RelayUrl, rest: impl IntoIterator<Item = RelayUrl>) -> Self {
+        let mut held = vec![first];
+        for url in rest {
             if !held
                 .iter()
                 .any(|h| h.push_routing_id == url.push_routing_id)
@@ -164,10 +157,7 @@ impl ReservedRelayUrls {
                 held.push(url);
             }
         }
-        if held.is_empty() {
-            return Err(NoReservedRelayUrl);
-        }
-        Ok(Self(held))
+        Self(held)
     }
 
     /// The URLs, in the order they were given, one per push routing ID.
@@ -339,10 +329,17 @@ pub struct LiveRelayUrl(Arc<watch::Sender<UrlState>>);
 
 /// Where a PUBLISH routing ID falls against the relay's URL history.
 enum Reservation {
-    /// A current entry's reserved routing ID, with that entry's URL, from
-    /// which the relay rebuilds the message's preimage (§10.7.1 step 3).
+    /// The reserved routing ID of a current entry with no `bridgeTarget`,
+    /// with that entry's URL, from which the relay rebuilds the message's
+    /// preimage (§10.7.1 step 3). Only this variant reaches [`handle`].
     #[cfg(feature = "push-store")]
-    Current(RelayUrl),
+    Direct(RelayUrl),
+    /// The tier 3 push routing ID of a current entry that carries a
+    /// `bridgeTarget`. §10.7.1 "Tier 3 relays" has the relay open the
+    /// PUBLISH payload as a Tier 3 envelope before any other rule, so this
+    /// variant carries no URL to verify an unopened message with.
+    #[cfg(feature = "push-store")]
+    Tier3,
     /// A current entry's reserved routing ID. A build without push rebuilds
     /// no preimage, so it carries no URL.
     #[cfg(not(feature = "push-store"))]
@@ -367,6 +364,20 @@ impl LiveRelayUrl {
     #[must_use]
     pub fn current(&self) -> ReservedRelayUrls {
         self.0.borrow().current.clone()
+    }
+
+    /// Whether `routing_id` is the push routing ID of a current entry or of
+    /// one of the last [`MAX_RETIRED_PUSH_ROUTING_IDS`] released entries.
+    ///
+    /// §10.7.1 "No blob storage": the relay never delivers a message published
+    /// to its reserved push routing ID to a subscriber or in a QUERY response,
+    /// so every QUERY and SUBSCRIBE backfill reads this before storage. A
+    /// blob stored at an ID before the relay reserved it, such as at an ID that
+    /// left the retired list and later became current again, stays unread.
+    #[must_use]
+    pub fn reserves(&self, routing_id: &[u8; 32]) -> bool {
+        let state = self.0.borrow();
+        state.current.contains(routing_id) || state.retired.contains(routing_id)
     }
 
     /// Makes `urls` the current reserved set of every listener holding this
@@ -399,10 +410,16 @@ impl LiveRelayUrl {
     fn reservation(&self, routing_id: &[u8; 32]) -> Reservation {
         let state = self.0.borrow();
         // The entry whose ID matched, never the first entry: the gate rebuilds
-        // the preimage with that entry's URL and target (§10.7.1 step 3).
+        // the preimage with that entry's URL (§10.7.1 step 3). A tier 3 entry
+        // classifies as `Tier3`, which carries no URL, so no path verifies an
+        // unopened message at a tier 3 ID.
         #[cfg(feature = "push-store")]
         if let Some(entry) = state.current.get(routing_id) {
-            return Reservation::Current(entry.clone());
+            return if entry.bridge_target().is_some() {
+                Reservation::Tier3
+            } else {
+                Reservation::Direct(entry.clone())
+            };
         }
         #[cfg(not(feature = "push-store"))]
         if state.current.contains(routing_id) {
@@ -424,20 +441,39 @@ fn not_supported() -> PushPublishGate {
     )
 }
 
-/// The answer of a push-enabled relay to a previous URL's routing ID.
+/// The answer of a push-enabled relay to a routing ID it reserved before and
+/// no longer reserves.
 #[cfg(feature = "push-store")]
 fn retired_url() -> PushPublishGate {
     PushPublishGate::rejected(
         code::PUSH_REGISTRATION_REJECTED,
-        "push message is addressed to a previous URL of this relay",
+        "push message is addressed to a push routing ID this relay no longer reserves",
+    )
+}
+
+/// The answer of a push-enabled relay to a PUBLISH at a current tier 3 push
+/// routing ID. §10.7.1 "Tier 3 relays" has the relay open the payload as a
+/// Tier 3 envelope before any other rule, and this relay holds no envelope
+/// opener, so it verifies nothing and stores nothing.
+// Stub — see PUSH-033
+#[cfg(feature = "push-store")]
+fn tier3_envelope_unopened() -> PushPublishGate {
+    PushPublishGate::rejected(
+        code::PUSH_REGISTRATION_REJECTED,
+        "push message at a tier 3 push routing ID must arrive in a Tier 3 envelope, \
+         which this relay cannot open",
     )
 }
 
 /// Decides a PUBLISH of `blob` to `routing_id` (§10.7.1, ADR-004).
 ///
-/// `relay_url` is the relay's live URL, read once for this PUBLISH. `now` is
-/// the relay's clock in Unix seconds. A previous URL's routing ID is refused
-/// as [`LiveRelayUrl`] describes.
+/// `relay_url` is the relay's live set of reserved entries, read once for this
+/// PUBLISH. `now` is the relay's clock in Unix seconds. A routing ID the relay
+/// reserved before and no longer reserves is refused as [`LiveRelayUrl`]
+/// describes. A push-enabled relay answers `4060` to every PUBLISH at a
+/// current tier 3 entry's ID, because it cannot open the Tier 3 envelope
+/// §10.7.1 "Tier 3 relays" requires there; only a current entry with no
+/// `bridgeTarget` reaches verification.
 ///
 /// The caller runs it after the rate-limit, size and TTL checks and before any
 /// blob store, and stores nothing and delivers nothing unless it returns
@@ -454,7 +490,8 @@ pub async fn gate_publish(
         (_, Reservation::Other) => PushPublishGate::NotPush,
         (PushRole::Disabled, _) => not_supported(),
         (PushRole::Enabled(_), Reservation::Retired) => retired_url(),
-        (PushRole::Enabled(service), Reservation::Current(url)) => {
+        (PushRole::Enabled(_), Reservation::Tier3) => tier3_envelope_unopened(),
+        (PushRole::Enabled(service), Reservation::Direct(url)) => {
             match handle(service.config(), &url, blob, now).await {
                 Ok(()) => PushPublishGate::Accepted,
                 Err(rejection) => rejection,
@@ -467,8 +504,9 @@ pub async fn gate_publish(
 ///
 /// A build without the `push-store` feature offers no push service: its only
 /// [`PushRole`] is `Disabled`, so the decision needs no I/O and the returned
-/// future is already complete. The reserved push routing ID gets `4063` and
-/// every other routing ID is [`PushPublishGate::NotPush`]. The signature
+/// future is already complete. Every routing ID the handle reserves now or
+/// reserved before, tier 3 IDs among them, gets `4063`, and every other
+/// routing ID is [`PushPublishGate::NotPush`]. The signature
 /// matches the `push-store` build so every transport calls it the same way.
 ///
 /// The caller runs it after the rate-limit, size and TTL checks and before any
@@ -550,6 +588,11 @@ impl Decoded {
 
 /// The enabled arm of [`gate_publish`]: decode, platform, freshness, verify,
 /// then the one store write.
+///
+/// `relay_url` is the entry whose push routing ID the PUBLISH arrived at, and
+/// the preimage is rebuilt with its URL and target (§10.7.1 step 3). The gate
+/// passes only an entry with no `bridgeTarget`, because a message at a tier 3
+/// ID arrives in a Tier 3 envelope it cannot yet open (PUSH-033).
 #[cfg(feature = "push-store")]
 async fn handle(
     service: &PushServiceConfig,
@@ -706,7 +749,7 @@ pub(crate) fn tier3_fixture() -> Result<Tier3Fixture, Box<dyn std::error::Error>
         return Err("tier 3 fixture diverges from the 09-security-model.md §9.18.2 vectors".into());
     }
     let live = LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1")?);
-    live.set(ReservedRelayUrls::new([entry_a.clone(), entry_b.clone()])?);
+    live.set(ReservedRelayUrls::new(entry_a.clone(), [entry_b.clone()]));
     Ok(Tier3Fixture {
         live,
         entry_a,
@@ -987,10 +1030,12 @@ mod tests {
         }
     }
 
-    /// Presents `blob` at the reserved routing ID of a fresh push-enabled
-    /// relay whose handle holds `held`, and returns the gate's answer and the
-    /// timestamp the store then holds for the token (`None` when the store
-    /// is unchanged).
+    /// Runs the push handler of a fresh push-enabled relay whose handle holds
+    /// `held` on `blob`, with the entry the handle holds for `held`'s routing
+    /// ID, and returns its answer and the timestamp the store then holds for
+    /// the token (`None` when the store is unchanged). It calls the handler,
+    /// not [`gate_publish`], because the gate rejects every message at a tier
+    /// 3 ID until it can open the Tier 3 envelope (PUSH-033).
     #[cfg(feature = "push-store")]
     async fn present(held: &RelayUrl, blob: &[u8]) -> (PushPublishGate, Option<u64>) {
         let dir = tempfile::tempdir().unwrap();
@@ -998,14 +1043,15 @@ mod tests {
         let store = config.store.clone();
         let service = PushService::start(config).unwrap();
         let live = LiveRelayUrl::new(held.clone());
-        let gate = gate_publish(
-            &live,
-            &PushRole::Enabled(service),
-            &held.push_routing_id(),
-            blob,
-            GATE_NOW,
-        )
-        .await;
+        let entry = live
+            .current()
+            .get(&held.push_routing_id())
+            .cloned()
+            .unwrap();
+        let gate = match handle(service.config(), &entry, blob, GATE_NOW).await {
+            Ok(()) => PushPublishGate::Accepted,
+            Err(rejection) => rejection,
+        };
         let key = PushRegistrationKey {
             registrant: GATE_REGISTRANT.to_owned(),
             platform: PushPlatform::Apns,
@@ -1014,11 +1060,11 @@ mod tests {
         (gate, store.accepted_timestamp(&key).await.unwrap())
     }
 
-    /// §10.7.1 step 3: the relay rebuilds the preimage with the target of the
-    /// entry it holds, never one the client chose. A message signed for
-    /// (bridge URL, target A) is accepted at a relay holding that entry, and
-    /// rejected with `4060`, storing nothing, at a relay holding (bridge URL,
-    /// target B) and at one holding the bridge URL with no target. A message
+    /// §10.7.1 step 3: the push handler rebuilds the preimage with the target
+    /// of the entry the handle holds, never one the client chose. A message
+    /// signed for (bridge URL, target A) is accepted given that entry, and
+    /// rejected with `4060`, storing nothing, given (bridge URL, target B) and
+    /// given the bridge URL with no target. A message
     /// signed with the absent sentinel is rejected with `4060` at the relay
     /// holding (bridge URL, target A). Each holds for a registration and a
     /// deregistration.
@@ -1068,19 +1114,20 @@ mod tests {
         )
     }
 
-    /// The set holds each routing ID once, compares as a set, and has no
-    /// empty value.
+    /// The set holds each routing ID once, keeps the first URL first, and
+    /// compares as a set. It has no empty value, because `new` takes a first
+    /// URL.
     #[test]
-    fn reserved_relay_urls_drop_duplicate_ids_and_refuse_none() {
+    fn reserved_relay_urls_drop_duplicate_ids() {
         let (a, b) = two_bridge_entries();
-        let set = ReservedRelayUrls::new([a.clone(), b.clone(), a.clone()]).unwrap();
+        let set = ReservedRelayUrls::new(a.clone(), [b.clone(), a.clone(), b.clone()]);
         assert_eq!(set.as_slice(), &[a.clone(), b.clone()]);
-        assert_eq!(set, ReservedRelayUrls::new([b.clone(), a.clone()]).unwrap());
-        assert_ne!(set, ReservedRelayUrls::from(a));
+        assert_eq!(set, ReservedRelayUrls::new(b.clone(), [a.clone()]));
+        assert_ne!(set, ReservedRelayUrls::from(a.clone()));
         assert_eq!(set.get(&b.push_routing_id()), Some(&b));
         assert_eq!(
-            ReservedRelayUrls::new(std::iter::empty()),
-            Err(NoReservedRelayUrl)
+            ReservedRelayUrls::new(a.clone(), std::iter::empty()),
+            ReservedRelayUrls::from(a)
         );
     }
 
@@ -1092,7 +1139,7 @@ mod tests {
         let old = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
         let (a, b) = two_bridge_entries();
         let live = LiveRelayUrl::new(old.clone());
-        live.set(ReservedRelayUrls::new([a.clone(), b.clone()]).unwrap());
+        live.set(ReservedRelayUrls::new(a.clone(), [b.clone()]));
         for entry in [&a, &b] {
             assert!(
                 !matches!(
@@ -1119,7 +1166,7 @@ mod tests {
             VecDeque::from([old.push_routing_id(), b.push_routing_id()])
         );
 
-        live.set(ReservedRelayUrls::new([a, b]).unwrap());
+        live.set(ReservedRelayUrls::new(a, [b]));
         assert_eq!(
             live.0.borrow().retired,
             VecDeque::from([old.push_routing_id()]),
@@ -1134,22 +1181,24 @@ mod tests {
             |n: usize| RelayUrl::new(&format!("ws://198.51.100.7:{}/scp/v1", 1000 + n)).unwrap();
         let live = LiveRelayUrl::new(url(0));
         for n in 1..=MAX_RETIRED_PUSH_ROUTING_IDS {
-            live.set(ReservedRelayUrls::new([url(2 * n), url(2 * n + 1)]).unwrap());
+            live.set(ReservedRelayUrls::new(url(2 * n), [url(2 * n + 1)]));
         }
         assert_eq!(live.0.borrow().retired.len(), MAX_RETIRED_PUSH_ROUTING_IDS);
     }
 
-    /// §10.7.1 step 3 per entry: a push-enabled relay whose handle holds two
-    /// bridge entries verifies a message at each entry's ID with that entry's
-    /// URL and target. A message signed for A is accepted at A's ID and
-    /// rejected with `4060` at B's ID; one signed for B is accepted at B's ID,
-    /// and rejected with `4060` once the handle holds A alone. Each holds for
-    /// a registration and a deregistration, and every rejection leaves the
-    /// store unchanged.
+    /// §10.7.1 "Tier 3 relays": the relay opens a PUBLISH at a reserved tier
+    /// 3 ID as a Tier 3 envelope before any other rule, and it has no opener
+    /// yet (PUSH-033), so a push-enabled relay answers `4060` to a correctly
+    /// signed but unsealed registration or deregistration at either entry's
+    /// ID and stores nothing. The same holds for a handle that held a direct
+    /// entry when the relay started and gains the tier 3 entries at runtime,
+    /// the path a node's tier change takes, and for an entry's ID after the
+    /// handle releases it.
     #[cfg(feature = "push-store")]
     #[tokio::test]
-    async fn enabled_verifies_each_reserved_bridge_entry_with_its_own_url_and_target() {
+    async fn enabled_rejects_an_unsealed_message_at_each_reserved_tier3_id_with_4060() {
         let (a, b) = two_bridge_entries();
+        let direct = RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap();
         let key = PushRegistrationKey {
             registrant: GATE_REGISTRANT.to_owned(),
             platform: PushPlatform::Apns,
@@ -1160,8 +1209,82 @@ mod tests {
             let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key());
             let store = config.store.clone();
             let push = PushRole::Enabled(PushService::start(config).unwrap());
+            let live = LiveRelayUrl::new(direct.clone());
+
+            // Positive control: the direct entry the relay started with
+            // reaches verification and stores the registration.
+            let blob = signed_at(deregister, direct.push_relay(), GATE_NOW);
+            let gate = gate_publish(&live, &push, &direct.push_routing_id(), &blob, GATE_NOW).await;
+            assert_eq!(
+                gate,
+                PushPublishGate::Accepted,
+                "direct, deregister {deregister}"
+            );
+            let stored = store.accepted_timestamp(&key).await.unwrap();
+            assert_eq!(stored, Some(GATE_NOW));
+
+            // The runtime change a tier change makes.
+            live.set(ReservedRelayUrls::new(a.clone(), [b.clone()]));
+            for (label, signed, at, timestamp) in [
+                ("A-signed at A", &a, &a, GATE_NOW + 1),
+                ("B-signed at B", &b, &b, GATE_NOW + 2),
+                ("A-signed at B", &a, &b, GATE_NOW + 3),
+            ] {
+                let blob = signed_at(deregister, signed.push_relay(), timestamp);
+                let gate = gate_publish(&live, &push, &at.push_routing_id(), &blob, GATE_NOW).await;
+                assert!(
+                    matches!(
+                        &gate,
+                        PushPublishGate::Rejected { code: 4060, msg } if msg.contains("Tier 3 envelope")
+                    ),
+                    "{label}, deregister {deregister}: {gate:?}"
+                );
+                assert_eq!(
+                    store.accepted_timestamp(&key).await.unwrap(),
+                    stored,
+                    "{label}, deregister {deregister}"
+                );
+            }
+
+            // A reservation of A alone releases B's ID, which the relay
+            // refuses as a released ID.
+            live.set(a.clone());
+            let blob = signed_at(deregister, b.push_relay(), GATE_NOW + 4);
+            let gate = gate_publish(&live, &push, &b.push_routing_id(), &blob, GATE_NOW).await;
+            assert!(
+                matches!(
+                    &gate,
+                    PushPublishGate::Rejected { code: 4060, msg } if msg.contains("no longer reserves")
+                ),
+                "B-signed at released B, deregister {deregister}: {gate:?}"
+            );
+            assert_eq!(store.accepted_timestamp(&key).await.unwrap(), stored);
+        }
+    }
+
+    /// §10.7.1 step 3 per entry: given the entry a handle holding two bridge
+    /// entries holds for an ID, the push handler verifies with that entry's
+    /// URL and target. A message signed for A is accepted given A's entry and
+    /// rejected with `4060` given B's; one signed for B is accepted given B's.
+    /// Once the handle holds A alone it holds no entry for B's ID. Each holds
+    /// for a registration and a deregistration, and every rejection leaves
+    /// the store unchanged.
+    #[cfg(feature = "push-store")]
+    #[tokio::test]
+    async fn handler_verifies_each_reserved_bridge_entry_with_its_own_url_and_target() {
+        let (a, b) = two_bridge_entries();
+        let key = PushRegistrationKey {
+            registrant: GATE_REGISTRANT.to_owned(),
+            platform: PushPlatform::Apns,
+            token: b"tok".to_vec(),
+        };
+        for deregister in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = test_service(dir.path(), GATE_REGISTRANT, &gate_key());
+            let store = config.store.clone();
+            let service = PushService::start(config).unwrap();
             let live = LiveRelayUrl::new(RelayUrl::new("ws://198.51.100.7:32891/scp/v1").unwrap());
-            live.set(ReservedRelayUrls::new([a.clone(), b.clone()]).unwrap());
+            live.set(ReservedRelayUrls::new(a.clone(), [b.clone()]));
 
             // Each step: (label, signed for, presented at, timestamp, accepted).
             let steps = [
@@ -1172,14 +1295,16 @@ mod tests {
             let mut stored = None;
             for (label, signed, at, timestamp, accepted) in steps {
                 let blob = signed_at(deregister, signed.push_relay(), timestamp);
-                let gate = gate_publish(&live, &push, &at.push_routing_id(), &blob, GATE_NOW).await;
+                let entry = live.current().get(&at.push_routing_id()).cloned().unwrap();
+                assert_eq!(&entry, at, "{label}: the matched entry, never the first");
+                let answer = handle(service.config(), &entry, &blob, GATE_NOW).await;
                 if accepted {
-                    assert_eq!(gate, PushPublishGate::Accepted, "{label}, {deregister}");
+                    assert_eq!(answer, Ok(()), "{label}, deregister {deregister}");
                     stored = Some(timestamp);
                 } else {
                     assert!(
-                        matches!(gate, PushPublishGate::Rejected { code: 4060, .. }),
-                        "{label}, deregister {deregister}: {gate:?}"
+                        matches!(answer, Err(PushPublishGate::Rejected { code: 4060, .. })),
+                        "{label}, deregister {deregister}: {answer:?}"
                     );
                 }
                 assert_eq!(
@@ -1189,15 +1314,8 @@ mod tests {
                 );
             }
 
-            // A reservation of A alone releases B's ID.
             live.set(a.clone());
-            let blob = signed_at(deregister, b.push_relay(), GATE_NOW + 3);
-            let gate = gate_publish(&live, &push, &b.push_routing_id(), &blob, GATE_NOW).await;
-            assert!(
-                matches!(gate, PushPublishGate::Rejected { code: 4060, .. }),
-                "B-signed at released B, deregister {deregister}: {gate:?}"
-            );
-            assert_eq!(store.accepted_timestamp(&key).await.unwrap(), stored);
+            assert_eq!(live.current().get(&b.push_routing_id()), None);
         }
     }
 

@@ -105,6 +105,7 @@ use super::storage::{BlobStorage, StorageError, StoredBlob};
 use crate::relay::did_record_validation::{
     DidRecordClass, DidRecordRejection, classify_did_record_frame, slot_publish_error_response,
 };
+use crate::relay::push_gate::LiveRelayUrl;
 use crate::relay::rate_limit::PublishRateLimiter;
 
 /// A claimed DID-record slot: the single blob currently occupying a DID-domain
@@ -618,18 +619,29 @@ impl DidSlotRegistry {
     /// for an ordinary encrypted-context `routing_id` they are all `NotAFrame`
     /// (a one-byte decode reject), so no signature work and no slot-only filtering.
     ///
-    /// When `validation` is `Disabled`, this is a plain `storage.query`.
+    /// Before any of that, a `routing_id` that `reserved` holds, current or
+    /// released, returns no blob and reads no storage (§10.7.1 "No blob
+    /// storage"). Every listener's QUERY and SUBSCRIBE backfill comes through
+    /// this function, and the handle is a required argument, so no read path
+    /// skips the check.
+    ///
+    /// When `validation` is `Disabled` and `reserved` does not hold
+    /// `routing_id`, this is a plain `storage.query`.
     ///
     /// # Errors
     /// Propagates a [`StorageError`] from the underlying `storage.query`.
     pub async fn gate_query<S: BlobStorage + ?Sized>(
         &self,
+        reserved: &LiveRelayUrl,
         validation: DidRecordValidation,
         storage: &S,
         routing_id: [u8; 32],
         since: Option<u64>,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
+        if reserved.reserves(&routing_id) {
+            return Ok(Vec::new());
+        }
         if validation == DidRecordValidation::Enabled
             && let Some(slot) = self.slot_blob(storage, &routing_id).await
         {
@@ -944,6 +956,65 @@ mod tests {
     /// payload), returning `(routing_id, blob_id, frame_bytes)`. Used by the
     /// cold-index reconciliation tests to plant *binding-valid* frames in
     /// storage that `classify_did_record_frame` accepts.
+    /// A relay URL handle whose reserved push routing ID no test routing ID
+    /// equals, so `gate_query` reaches storage.
+    fn unreserved() -> LiveRelayUrl {
+        let url = crate::relay::push_gate::RelayUrl::new("wss://did-slot-test.example.com")
+            .expect("canonical test URL");
+        LiveRelayUrl::new(url)
+    }
+
+    /// §10.7.1 "No blob storage": a QUERY at a routing ID the handle reserves,
+    /// now or before, returns no blob even when storage holds one there.
+    #[tokio::test]
+    async fn gate_query_returns_nothing_at_a_current_or_released_reserved_id() {
+        let storage = BlobStorageBackend::in_memory();
+        let reg = DidSlotRegistry::new();
+        let reserved = crate::relay::push_gate::RelayUrl::new("wss://reserved.example.com")
+            .expect("canonical test URL");
+        let other = crate::relay::push_gate::RelayUrl::new("wss://other.example.com")
+            .expect("canonical test URL");
+        let rid = reserved.push_routing_id();
+        store_opaque(&storage, rid, b"stored-before-reservation").await;
+
+        let ordinary = unreserved();
+        let before = reg
+            .gate_query(
+                &ordinary,
+                DidRecordValidation::Disabled,
+                &storage,
+                rid,
+                None,
+                100,
+            )
+            .await
+            .expect("query");
+        assert_eq!(before.len(), 1, "an unreserved ID reads storage");
+
+        let live = LiveRelayUrl::new(reserved);
+        for validation in [DidRecordValidation::Disabled, DidRecordValidation::Enabled] {
+            let out = reg
+                .gate_query(&live, validation, &storage, rid, None, 100)
+                .await
+                .expect("query");
+            assert!(out.is_empty(), "a current reserved ID returns no blob");
+        }
+
+        live.set(other);
+        let out = reg
+            .gate_query(
+                &live,
+                DidRecordValidation::Disabled,
+                &storage,
+                rid,
+                Some(0),
+                100,
+            )
+            .await
+            .expect("query");
+        assert!(out.is_empty(), "a released reserved ID returns no blob");
+    }
+
     fn genuine_frame(seed: u8, seq: u64, value: &[u8]) -> ([u8; 32], [u8; 32], Vec<u8>) {
         let sk = SigningKey::from_bytes(&[seed; 32]);
         let vk: VerifyingKey = sk.verifying_key();
@@ -1423,7 +1494,14 @@ mod tests {
 
         // The storage-authoritative QUERY gate returns ONLY the genuine frame.
         let out = reg
-            .gate_query(DidRecordValidation::Enabled, &storage, rid, None, 100)
+            .gate_query(
+                &unreserved(),
+                DidRecordValidation::Enabled,
+                &storage,
+                rid,
+                None,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 1, "cold-index QUERY must filter co-located junk");
@@ -1446,7 +1524,14 @@ mod tests {
         store_opaque(&storage, rid, b"ctx-2").await;
 
         let out = reg
-            .gate_query(DidRecordValidation::Enabled, &storage, rid, None, 100)
+            .gate_query(
+                &unreserved(),
+                DidRecordValidation::Enabled,
+                &storage,
+                rid,
+                None,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 2, "no frame present → all blobs returned");
@@ -1497,7 +1582,14 @@ mod tests {
         // no-warm invariant below (index stays cold on ANY partial scan) would still
         // hold regardless of which in-window frame is returned.
         let out = reg
-            .gate_query(DidRecordValidation::Enabled, &storage, rid, None, 1)
+            .gate_query(
+                &unreserved(),
+                DidRecordValidation::Enabled,
+                &storage,
+                rid,
+                None,
+                1,
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -1512,7 +1604,14 @@ mod tests {
 
         // A `since`-narrowed query likewise must not warm, even if untruncated.
         let out = reg
-            .gate_query(DidRecordValidation::Enabled, &storage, rid, Some(0), 100)
+            .gate_query(
+                &unreserved(),
+                DidRecordValidation::Enabled,
+                &storage,
+                rid,
+                Some(0),
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1527,7 +1626,14 @@ mod tests {
         // A COMPLETE scan (untruncated, since=None) returns the true newest AND
         // warms to it — never to the older frame.
         let out = reg
-            .gate_query(DidRecordValidation::Enabled, &storage, rid, None, 100)
+            .gate_query(
+                &unreserved(),
+                DidRecordValidation::Enabled,
+                &storage,
+                rid,
+                None,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 1);

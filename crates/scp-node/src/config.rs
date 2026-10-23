@@ -1115,10 +1115,11 @@ where
     let bind_addr = bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
     let bridge_secret = generate_bridge_secret();
     // The listener binds first so the relay starts on the URL of the address it
-    // actually serves, even for a port-0 bind. `build_no_domain_inner` then sets
-    // the advertised URL on this shared handle before the node publishes any
-    // URL, and the tier task moves it on each tier change to a URL with a
-    // §9.18.2 canonical form (§10.7.1 step 2).
+    // actually serves, even for a port-0 bind. `build_no_domain_inner` then
+    // sets on this shared handle the entries the node publishes, its own
+    // `SCPRelay` entry and every tier 3 entry of its document with its
+    // `bridgeTarget`, before the node publishes any, and `apply_tier_change`
+    // sets them again on each tier change (§10.7.1 step 2, "Tier 3 relays").
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .map_err(|e| RelayError::BindFailed(e.to_string()))?;
