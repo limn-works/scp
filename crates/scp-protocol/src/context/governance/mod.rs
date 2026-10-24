@@ -1806,6 +1806,12 @@ pub trait GovernanceEngine: Send + Sync {
         ))
     }
 
+    /// A copy of this engine, proposals included, on which a caller runs a
+    /// call to learn what it would record before recording anything: a
+    /// migration's executor decides whether the call executes it before the
+    /// first record (ADR-049 Decision 9).
+    fn boxed_clone(&self) -> Box<dyn GovernanceEngine>;
+
     /// Return the governance model configuration for metadata publication.
     fn model_config(&self) -> GovernanceModelConfig;
 
@@ -2010,6 +2016,7 @@ impl<E: GovernanceEngine + ?Sized> GovernanceEngineRawKey for E {}
 ///
 /// This preserves backward compatibility with Phase 2 behavior -- single-admin
 /// governance is immediate and serialized through one DID.
+#[derive(Clone)]
 pub struct SingleAdminEngine {
     /// The admin DID.
     admin_did: DID,
@@ -2214,6 +2221,10 @@ impl GovernanceEngine for SingleAdminEngine {
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
         self.refuse_signed_vote(proposal_id, voter)
     }
+    fn boxed_clone(&self) -> Box<dyn GovernanceEngine> {
+        Box::new(self.clone())
+    }
+
     fn model_config(&self) -> GovernanceModelConfig {
         GovernanceModelConfig::SingleAdmin {
             admin_did: self.admin_did.clone(),

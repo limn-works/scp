@@ -1980,12 +1980,15 @@ const fn record_touched(state: u8) -> bool {
     matches!(state, RECORD_IN_FLIGHT | RECORD_WRITTEN)
 }
 
-/// Sets a first-state guard's `writes_idle` when the writes task ends.
-struct WritesIdleOnDrop<'a>(&'a tokio::sync::watch::Sender<bool>);
+/// Sets a first-state guard's `writes_idle` when the writes future is
+/// dropped: when it returns, panics, is cancelled, or is dropped before its
+/// first poll. [`first_state_writes`] builds it before the future, so the
+/// last case holds too.
+struct WritesIdleOnDrop(Arc<FirstStateRollbackInner>);
 
-impl Drop for WritesIdleOnDrop<'_> {
+impl Drop for WritesIdleOnDrop {
     fn drop(&mut self) {
-        self.0.send_replace(true);
+        self.0.writes_idle.send_replace(true);
     }
 }
 
@@ -2006,17 +2009,27 @@ struct FirstStateRollbackInner {
     snapshot: std::sync::atomic::AtomicU8,
     /// `true` while no first-state writes task is running. The tracked task
     /// [`persist_first_state`] starts sets it `false` before the task can run
-    /// and back to `true` when the task ends, by return, panic or runtime
-    /// shutdown. A write the operation's timeout abandoned keeps running, and
-    /// [`Self::undo`] waits for this flag before it reads what was touched.
+    /// and back to `true` when the task ends, by return, panic, runtime
+    /// shutdown or a drop before its first poll. A write the operation's
+    /// timeout abandoned keeps running, and [`Self::drain_writes`] waits for
+    /// this flag before a rollback reads what was touched.
     writes_idle: tokio::sync::watch::Sender<bool>,
+    /// Set when Supervisor shutdown abandoned the writes before they
+    /// finished, so a write may still land and no rollback reads the
+    /// records.
+    abandoned: std::sync::atomic::AtomicBool,
+    /// `true` while this guard holds the `pending_first_state` claim of its
+    /// context id, which keeps every other bootstrap, restore and respawn of
+    /// the id out until the guard commits or rolls back.
+    claimed: std::sync::atomic::AtomicBool,
     /// Set by [`FirstStateRollback::commit`] or by the first rollback, so a
     /// guard rolls back at most once and never after its actor started.
     settled: std::sync::atomic::AtomicBool,
 }
 
 /// How long a rollback waits for first-state writes its operation abandoned
-/// before it gives up and keeps the records.
+/// before it gives up and keeps the records, and how long the writes run
+/// after Supervisor shutdown begins before they are abandoned.
 const FIRST_STATE_WRITES_DRAIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl FirstStateRollbackInner {
@@ -2031,10 +2044,20 @@ impl FirstStateRollbackInner {
         )
     }
 
+    /// Releases the claim [`FirstStateRollback::new`] made, once.
+    fn release_claim(&self) {
+        if self
+            .claimed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.supervisor.release_first_state(&self.context_id);
+        }
+    }
+
     /// Writes the first `last_relay_contact`, then the first snapshot, and
-    /// records each write's progress. Runs as the tracked task
-    /// [`persist_first_state`] starts, so it finishes even when the
-    /// operation's future is dropped.
+    /// records each write's progress. Runs inside [`first_state_writes`], the
+    /// tracked task [`persist_first_state`] starts, so it finishes even when
+    /// the operation's future is dropped.
     async fn write_first_state(
         &self,
         now: u64,
@@ -2078,45 +2101,60 @@ impl FirstStateRollbackInner {
 
     /// Waits for a first-state writes task the operation abandoned, so no
     /// write lands after the rollback reads the records' progress.
+    /// [`FirstStateRollback::rollback`] runs it with `bootstrap_spawn_lock`
+    /// released, because the wait can last [`FIRST_STATE_WRITES_DRAIN`] and
+    /// every other bootstrap waits on that lock.
+    /// [`FirstStateRollback::rollback_with_guard`] runs it
+    /// under the guard its actor turn already holds, because releasing that
+    /// guard in a turn could not be undone without waiting on the lock.
     ///
     /// # Errors
     ///
     /// [`ContextError::PersistenceFailed`] when the writes have not finished
-    /// within [`FIRST_STATE_WRITES_DRAIN`]: a write that may still land cannot
-    /// be undone, so the records are kept.
+    /// within [`FIRST_STATE_WRITES_DRAIN`], or Supervisor shutdown abandoned
+    /// them: a write that may still land cannot be undone, so the records
+    /// are kept.
     async fn drain_writes(&self) -> Result<(), ContextError> {
         let context_id = self.context_id.as_str();
         let mut idle = self.writes_idle.subscribe();
         match tokio::time::timeout(FIRST_STATE_WRITES_DRAIN, idle.wait_for(|idle| *idle)).await {
             // The writes' own result is in the record states read next. The
             // sender lives in `self`, so the wait cannot see it closed.
-            Ok(Ok(_) | Err(_)) => Ok(()),
+            Ok(Ok(_) | Err(_)) => {}
             Err(_elapsed) => {
                 crate::metrics::record_persistence_failure();
-                Err(ContextError::PersistenceFailed(format!(
+                return Err(ContextError::PersistenceFailed(format!(
                     "the first-state writes of '{context_id}' did not finish within \
                      {FIRST_STATE_WRITES_DRAIN:?}; their records are kept"
-                )))
+                )));
             }
         }
+        if self.abandoned.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ContextError::PersistenceFailed(format!(
+                "shutdown abandoned the first-state writes of '{context_id}' before they \
+                 finished; their records are kept"
+            )));
+        }
+        Ok(())
     }
 
     /// Puts back every touched record: the snapshot first, then the contact,
     /// and the contact only once the snapshot step returned `Ok`, so no
     /// stored snapshot is ever left without a contact (ADR-029
-    /// Implementation). It first waits for writes still running, so it reads
-    /// their final progress.
-    async fn undo(&self) -> Result<(), ContextError> {
+    /// Implementation). The caller has drained the writes
+    /// ([`Self::drain_writes`]) and holds `bootstrap_spawn_lock`, so no
+    /// bootstrap writes between this `lookup` and the restores.
+    async fn undo_locked(&self) -> Result<(), ContextError> {
         let context_id = self.context_id.as_str();
-        self.drain_writes().await?;
         let (snapshot_touched, contact_touched) = self.touched();
         if !snapshot_touched && !contact_touched {
             return Ok(());
         }
-        // The writes ran under `bootstrap_spawn_lock` after
-        // `persist_first_state` saw no registered actor, so an actor
-        // registered now is the one this operation spawned, and the records
-        // are its state. A dropped Supervisor runs no actor.
+        // `persist_first_state` saw no registered actor before the writes,
+        // and the claim this guard holds keeps every other bootstrap,
+        // restore and respawn of the id out, so an actor registered now is
+        // the one this operation spawned, and the records are its state. A
+        // dropped Supervisor runs no actor.
         if let Ok(Some(_)) = self.supervisor.lookup(context_id) {
             tracing::warn!(
                 context_id,
@@ -2172,6 +2210,29 @@ impl FirstStateRollbackInner {
         }
         Ok(())
     }
+
+    /// The undo of a rollback that could not take `bootstrap_spawn_lock` in
+    /// its own turn, run by a tracked task that holds the lock: it logs a
+    /// failure, since no caller waits for it, then releases the claim.
+    async fn finish_deferred_undo(self: Arc<Self>) {
+        if let Err(error) = self.undo_locked().await {
+            tracing::error!(
+                context_id = self.context_id.as_str(),
+                %error,
+                "deferred first-state rollback failed; its records stay"
+            );
+        }
+        self.release_claim();
+    }
+}
+
+impl Drop for FirstStateRollbackInner {
+    /// A guard whose rollback did not finish, because its writes did not
+    /// drain, keeps the claim until the writes task and every rollback task
+    /// holding this state end; the last of them releases it here.
+    fn drop(&mut self) {
+        self.release_claim();
+    }
 }
 
 /// Puts back the first-state records of a create, Welcome join, import,
@@ -2180,32 +2241,42 @@ impl FirstStateRollbackInner {
 ///
 /// The operation's owner builds it before the operation's future and keeps
 /// it outside any timeout, so a `LIFECYCLE_TIMEOUT` that drops the future
-/// still reaches it. [`persist_first_state`] records the snapshot and
-/// contact stored before it writes and each write's progress; the owner
-/// calls [`Self::commit`] once the actor is registered, or
-/// [`Self::rollback`] on failure. A guard dropped unsettled with a touched
-/// record spawns its rollback as a tracked task, which takes
-/// `bootstrap_spawn_lock` as the owner's rollback holds it.
+/// still reaches it. [`Self::new`] claims the context id, and
+/// [`persist_first_state`] records the snapshot and contact stored before it
+/// writes and each write's progress. The owner calls [`Self::commit`] once the actor is
+/// registered, or on failure releases `bootstrap_spawn_lock` and calls
+/// [`Self::rollback`], which waits for the writes with the lock released and
+/// retakes it for the restores; the migration create, which runs in an
+/// actor turn that already holds the lock, calls
+/// [`Self::rollback_with_guard`]. A guard dropped unsettled with a touched
+/// record runs its rollback on a tracked task.
 ///
-/// The writes run in a tracked task whose handle the guard keeps, and a
-/// rollback waits for that task before it reads which records were
-/// touched, so a write an operation's timeout abandoned, on a blocking
-/// thread or in a host callback, cannot land after the rollback.
+/// The writes run in a tracked task, and a rollback waits for that task
+/// before it reads which records were touched, so a write an operation's
+/// timeout abandoned, on a blocking thread or in a host callback, cannot
+/// land after the rollback. The claim keeps every other bootstrap, restore
+/// and respawn of the id out while the lock is released.
 pub(in crate::context) struct FirstStateRollback {
     inner: Arc<FirstStateRollbackInner>,
 }
 
 impl FirstStateRollback {
     /// A guard for the first-state writes of `context_id`, over the stores
-    /// `deps` writes to.
+    /// `deps` writes to. It claims `context_id` in `pending_first_state`
+    /// until it commits or rolls back, so an operation over an id whose
+    /// earlier rollback is still running fails here, before any write.
     ///
     /// # Errors
     ///
-    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    /// - [`ContextError::ActorBusy`] while another operation's first state of
+    ///   `context_id` is unsettled; it is retryable.
+    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has
+    ///   dropped.
     pub(in crate::context) fn new(
         deps: &ActorDeps,
         context_id: &str,
     ) -> Result<Self, ContextError> {
+        deps.supervisor.claim_first_state(context_id)?;
         Ok(Self {
             inner: Arc::new(FirstStateRollbackInner {
                 persistence: Arc::clone(&deps.persistence),
@@ -2216,26 +2287,39 @@ impl FirstStateRollback {
                 contact: std::sync::atomic::AtomicU8::new(RECORD_NOT_WRITTEN),
                 snapshot: std::sync::atomic::AtomicU8::new(RECORD_NOT_WRITTEN),
                 writes_idle: tokio::sync::watch::Sender::new(true),
+                abandoned: std::sync::atomic::AtomicBool::new(false),
+                claimed: std::sync::atomic::AtomicBool::new(true),
                 settled: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
 
-    /// Keeps the written records: the operation's actor is registered.
+    /// Keeps the written records and releases the claim: the operation's
+    /// actor is registered.
     pub(in crate::context) fn commit(&self) {
         self.inner
             .settled
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.release_claim();
     }
 
     /// Puts back the records the operation touched; a no-op after
     /// [`Self::commit`] or an earlier rollback.
     ///
+    /// The owner calls it with `bootstrap_spawn_lock` released and passes
+    /// the lock's acquire as `relock`: the rollback waits for the writes
+    /// first, which can take [`FIRST_STATE_WRITES_DRAIN`], then awaits
+    /// `relock` and holds its guard through the `lookup` and the restores.
+    ///
     /// # Errors
     ///
-    /// [`ContextError::PersistenceFailed`] when putting back a record fails;
-    /// a failed snapshot step keeps the contact.
-    pub(in crate::context) async fn rollback(&self) -> Result<(), ContextError> {
+    /// [`ContextError::PersistenceFailed`] when the writes did not finish or
+    /// putting back a record fails; a failed snapshot step keeps the
+    /// contact.
+    pub(in crate::context) async fn rollback<G>(
+        &self,
+        relock: impl std::future::Future<Output = G>,
+    ) -> Result<(), ContextError> {
         if self
             .inner
             .settled
@@ -2243,7 +2327,52 @@ impl FirstStateRollback {
         {
             return Ok(());
         }
-        self.inner.undo().await
+        // A failed drain keeps the claim: the writes may still land, and the
+        // writes task's drop of the state releases it.
+        self.inner.drain_writes().await?;
+        let result = if self.inner.touched() == (false, false) {
+            Ok(())
+        } else {
+            let _bootstrap_guard = relock.await;
+            self.inner.undo_locked().await
+        };
+        self.inner.release_claim();
+        result
+    }
+
+    /// The rollback of the migration create, which runs in the source
+    /// context's actor turn under the `bootstrap_spawn_lock` guard its
+    /// governance call reserved before its first record. It waits for the
+    /// writes, reads what was touched and puts it back while still holding
+    /// `guard`, then releases it, so it never waits for the lock and never
+    /// returns a retryable `ActorBusy` after the call recorded its proposal
+    /// or vote. The migration awaits its writes task to the end, so the wait
+    /// returns at once unless shutdown abandoned the writes.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::rollback`].
+    pub(in crate::context) async fn rollback_with_guard(
+        &self,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), ContextError> {
+        if self
+            .inner
+            .settled
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        // A failed drain keeps the claim, as in `rollback`.
+        self.inner.drain_writes().await?;
+        let result = if self.inner.touched() == (false, false) {
+            Ok(())
+        } else {
+            self.inner.undo_locked().await
+        };
+        drop(guard);
+        self.inner.release_claim();
+        result
     }
 
     /// Reads the snapshot and contact stored before the first write.
@@ -2283,10 +2412,6 @@ impl FirstStateRollback {
 
 impl Drop for FirstStateRollback {
     fn drop(&mut self) {
-        let (snapshot_touched, contact_touched) = self.inner.touched();
-        if !snapshot_touched && !contact_touched {
-            return;
-        }
         if self
             .inner
             .settled
@@ -2294,40 +2419,39 @@ impl Drop for FirstStateRollback {
         {
             return;
         }
-        let inner = Arc::clone(&self.inner);
-        let context_id = inner.context_id.clone();
-        // The owner's rollback runs under `bootstrap_spawn_lock`; this one
-        // takes it too, before its `lookup`, and holds it through both
-        // restores, so a later bootstrap of the same id cannot write between
-        // them and lose its records to this undo.
-        let undo = async move {
-            let context_id = inner.context_id.as_str();
-            let _bootstrap_guard = match inner.supervisor.lock_bootstrap_spawn().await {
-                Ok(guard) => guard,
-                Err(error) => {
-                    crate::metrics::record_persistence_failure();
-                    tracing::error!(
-                        context_id,
-                        %error,
-                        "first-state rollback of a dropped operation could not take the \
-                         bootstrap lock; its records stay"
-                    );
-                    return;
+        let (snapshot_touched, contact_touched) = self.inner.touched();
+        if !snapshot_touched && !contact_touched {
+            self.inner.release_claim();
+            return;
+        }
+        let context_id = self.inner.context_id.clone();
+        // The task waits for the writes with the lock released, then takes
+        // `bootstrap_spawn_lock` before its `lookup` and holds it through both
+        // restores. The claim keeps every other bootstrap of the id out
+        // meanwhile.
+        let drained = {
+            let inner = Arc::clone(&self.inner);
+            async move {
+                match inner.drain_writes().await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::error!(
+                            context_id = inner.context_id.as_str(),
+                            %error,
+                            "first-state rollback of a dropped operation did not run; its \
+                             records stay"
+                        );
+                        false
+                    }
                 }
-            };
-            if let Err(error) = inner.undo().await {
-                tracing::error!(
-                    context_id,
-                    %error,
-                    "first-state rollback of a dropped operation failed"
-                );
             }
         };
-        if let Err(error) = self
-            .inner
-            .supervisor
-            .spawn_tracked("first_state_rollback", undo)
-        {
+        let inner = Arc::clone(&self.inner);
+        if let Err(error) = self.inner.supervisor.spawn_under_bootstrap_spawn_lock(
+            "first_state_rollback",
+            drained,
+            move || inner.finish_deferred_undo(),
+        ) {
             crate::metrics::record_persistence_failure();
             tracing::error!(
                 context_id,
@@ -2347,6 +2471,45 @@ pub(in crate::context) fn fold_rollback_failure(
     ContextError::PersistenceFailed(format!("{failure}; {rollback}"))
 }
 
+/// The first-state writes task. Its [`WritesIdleOnDrop`] is built before the
+/// future, so a future dropped before its first poll still marks the writes
+/// idle. Once Supervisor shutdown begins the writes run at most
+/// [`FIRST_STATE_WRITES_DRAIN`] longer and are then abandoned, so shutdown,
+/// which awaits every tracked task, ends.
+fn first_state_writes(
+    inner: Arc<FirstStateRollbackInner>,
+    now: u64,
+    snapshot: Box<crate::context::state::ContextSnapshot>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + 'static {
+    let idle_on_exit = WritesIdleOnDrop(Arc::clone(&inner));
+    async move {
+        let _idle_on_exit = idle_on_exit;
+        tokio::select! {
+            written = inner.write_first_state(now, &snapshot) => written,
+            () = async {
+                shutdown.cancelled().await;
+                tokio::time::sleep(FIRST_STATE_WRITES_DRAIN).await;
+            } => {
+                let context_id = inner.context_id.as_str();
+                inner
+                    .abandoned
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                crate::metrics::record_persistence_failure();
+                tracing::error!(
+                    context_id,
+                    "shutdown abandoned the first-state writes before they finished; their \
+                     records are kept"
+                );
+                Err(ContextError::PersistenceFailed(format!(
+                    "shutdown abandoned the first-state writes of '{context_id}' before they \
+                     finished"
+                )))
+            }
+        }
+    }
+}
+
 /// Writes the first `last_relay_contact` of a context whose actor is about
 /// to start, as the current time, then its first snapshot, both before the
 /// spawn.
@@ -2357,9 +2520,9 @@ pub(in crate::context) fn fold_rollback_failure(
 /// full reconnection classifies the offline tier from (ADR-029
 /// Implementation). The contact goes first, so no stored snapshot lacks a
 /// contact. `rollback` records the values stored before and each write's
-/// progress; the caller rolls back on failure. The writes run in a tracked
-/// task `rollback` keeps, so a rollback after this future is dropped waits
-/// for them.
+/// progress; the caller rolls back on failure. The
+/// writes run in a tracked task `rollback` keeps, so a rollback after this
+/// future is dropped waits for them.
 ///
 /// # Errors
 ///
@@ -2402,24 +2565,20 @@ pub(in crate::context) fn persist_first_state<'d, 'c, 'r>(
         }
         let snapshot = snapshot?;
         rollback.capture_priors().await?;
+        let shutdown = deps.supervisor.shutdown_signal()?;
         let now = deps.clock.now_secs();
-        let task_inner = Arc::clone(inner);
-        let writes = async move {
-            // Marks the writes idle however the task ends, so a rollback
-            // waiting on them sees a panicked or cancelled task as finished.
-            let _idle_on_exit = WritesIdleOnDrop(&task_inner.writes_idle);
-            task_inner.write_first_state(now, &snapshot).await
-        };
         // The writes and the contact count as started from before the task
         // can run, so a guard dropped before its first poll still waits for
         // it and rolls back the write it goes on to make.
         inner.writes_idle.send_replace(false);
         FirstStateRollbackInner::mark(&inner.contact, RECORD_IN_FLIGHT);
+        let writes = first_state_writes(Arc::clone(inner), now, snapshot, shutdown);
+        // A refused spawn drops `writes`, whose idle guard marks the writes
+        // idle again.
         let running = match deps.supervisor.spawn_tracked("first-state writes", writes) {
             Ok(handle) => handle,
             Err(e) => {
                 FirstStateRollbackInner::mark(&inner.contact, RECORD_NOT_WRITTEN);
-                inner.writes_idle.send_replace(true);
                 return Err(e);
             }
         };
@@ -5011,6 +5170,74 @@ mod restore_reconcile_tests {
             .expect("build_actor_deps");
         let handle = ContextHandle::new(restore_ctx_id.to_owned(), ContextParams::default());
         lifecycle_helpers::restore_context(&deps, restore_ctx_id, &handle, None).await
+    }
+
+    /// A first-state writes future dropped before its first poll, as a task
+    /// cancelled before it ran drops it, marks the writes idle, so a rollback
+    /// does not wait out `FIRST_STATE_WRITES_DRAIN` for writes that never
+    /// ran.
+    #[tokio::test]
+    async fn a_writes_future_dropped_before_its_first_poll_marks_the_writes_idle() {
+        let supervisor = build_supervisor(Box::new(SharedCapture(Arc::new(
+            CapturingPersistence::default(),
+        ))));
+        let owner = DID("did:dht:z6MkUnpolledFirstStateWrites".to_owned());
+        let deps = supervisor
+            .build_actor_deps_loaded(&owner)
+            .await
+            .expect("build_actor_deps");
+        let ctx_id = hex::encode([0x4Du8; 32]);
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            [0x4Du8; 32],
+            1_700_000_000,
+            owner,
+        );
+        let snapshot =
+            crate::context::messaging_helpers::build_snapshot_for_persist(&state, &deps, &ctx_id)
+                .expect("snapshot");
+        let guard = lifecycle_helpers::FirstStateRollback::new(&deps, &ctx_id).expect("guard");
+        guard.inner.writes_idle.send_replace(false);
+        let writes = lifecycle_helpers::first_state_writes(
+            Arc::clone(&guard.inner),
+            1_700_000_000,
+            Box::new(snapshot),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        drop(writes);
+        assert!(
+            *guard.inner.writes_idle.borrow(),
+            "an unpolled writes future marks the writes idle when dropped"
+        );
+    }
+
+    /// `FirstStateRollback::new` claims its context id until the guard
+    /// settles: a second guard of the id, which a second create, import or
+    /// join builds, is refused with a retryable `ActorBusy`, and the id is
+    /// free again once the first guard commits.
+    #[tokio::test]
+    async fn a_first_state_guard_claims_its_id_until_it_settles() {
+        let supervisor = build_supervisor(Box::new(SharedCapture(Arc::new(
+            CapturingPersistence::default(),
+        ))));
+        let deps = supervisor
+            .build_actor_deps_loaded(&DID("did:dht:z6MkFirstStateClaim".to_owned()))
+            .await
+            .expect("build_actor_deps");
+        let first = lifecycle_helpers::FirstStateRollback::new(&deps, "claimed").expect("guard");
+        let second = lifecycle_helpers::FirstStateRollback::new(&deps, "claimed");
+        assert!(
+            matches!(&second, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
+            "a second guard of a claimed id is refused"
+        );
+        first.commit();
+        drop(
+            lifecycle_helpers::FirstStateRollback::new(&deps, "claimed")
+                .expect("the id is free once the first guard commits"),
+        );
+        drop(
+            lifecycle_helpers::FirstStateRollback::new(&deps, "claimed")
+                .expect("an untouched guard releases its claim when dropped"),
+        );
     }
 
     /// ADR-049 Decision 16: a create or a restore that reaches the actor spawn

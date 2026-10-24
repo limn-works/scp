@@ -587,8 +587,6 @@ pub fn detect_and_handle_conflicts(
     deps: &ActorDeps,
     new_proposal: &GovernanceProposal,
 ) -> Vec<GovernanceEvent> {
-    use scp_protocol::context::governance::actions_conflict;
-
     let mut events = Vec::new();
     // Wall-clock timestamp — used ONLY for the local audit slot of
     // `approved_proposals`. NOT used for the freeze start time (that is
@@ -609,24 +607,18 @@ pub fn detect_and_handle_conflicts(
 
     // Check for conflicts with existing approved proposals (read via the
     // cell's `Deref`).
-    let mut conflicts = Vec::new();
-    for (existing_id, (existing_proposal, existing_seq, existing_timestamp)) in
-        &cell.governance.approved_proposals
-    {
-        if actions_conflict(
-            &new_proposal.action,
-            &new_proposal.proposer_did,
-            &existing_proposal.action,
-            &existing_proposal.proposer_did,
-        ) {
-            conflicts.push((
-                *existing_id,
-                *existing_seq,
-                *existing_timestamp,
-                existing_proposal.clone(),
-            ));
-        }
-    }
+    let conflicts: Vec<_> = conflicting_approved(cell, new_proposal)
+        .map(
+            |(existing_id, (existing_proposal, existing_seq, existing_timestamp))| {
+                (
+                    *existing_id,
+                    *existing_seq,
+                    *existing_timestamp,
+                    existing_proposal.clone(),
+                )
+            },
+        )
+        .collect();
 
     for (conflicting_id, conflicting_seq, _conflicting_timestamp, conflicting_proposal) in conflicts
     {
@@ -702,15 +694,22 @@ pub fn detect_and_handle_conflicts(
 // check_and_resolve_expired_freezes (transitive helper, actor-shape)
 // ---------------------------------------------------------------------------
 
-/// Checks for and resolves expired governance freezes (ADR-031 §7).
+/// Whether the standing governance freeze has passed its timeout at `now`
+/// (ADR-031 §7), so [`check_and_resolve_expired_freezes`] at `now` clears it.
+fn freeze_has_expired(cell: &crate::context::actor::class_s::ClassSCell, now: u64) -> bool {
+    cell.governance.freeze.is_some_and(|(_, _, freeze_start)| {
+        now.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
+    })
+}
+
+/// Checks for and resolves the governance freeze expired at `now` (ADR-031
+/// §7).
 pub fn check_and_resolve_expired_freezes(
     cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
+    now: u64,
 ) -> Vec<GovernanceEvent> {
-    let current_timestamp = deps.clock.now_secs();
-
-    if let Some((proposal_a, proposal_b, freeze_start)) = cell.governance.freeze
-        && current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
+    if freeze_has_expired(cell, now)
+        && let Some((proposal_a, proposal_b, _)) = cell.governance.freeze
     {
         let mut view = cell.class_c_view();
         let gov = view.governance_class_c_mut();
@@ -3950,6 +3949,10 @@ pub fn execute_propose_context_migration<'a>(
     grace_period_secs: u64,
     auto_invite: bool,
     meta: CommitMeta<'a>,
+    // `bootstrap_spawn_lock` and the destination's first-state claim, which
+    // the executing call reserved before its first record. The destination
+    // create and its rollback run under that guard.
+    bootstrap: MigrationBootstrap,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<Output = Result<MigrationProposedResult, ContextError>> + Send + 'a,
@@ -3963,14 +3966,19 @@ pub fn execute_propose_context_migration<'a>(
     Box::pin(async move {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let destination_context_id = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(b"SCP-MIGRATION-DEST:");
-            hasher.update(context_id.as_bytes());
-            hasher.update(proposal_id);
-            hex::encode(hasher.finalize())
-        };
+        let destination_context_id = migration_destination_id(context_id, &proposal_id);
+        let MigrationBootstrap {
+            guard: bootstrap_guard,
+            first_state,
+            destination_context_id: reserved,
+        } = bootstrap;
+        if reserved != destination_context_id {
+            return Err(ContextError::InvalidState(format!(
+                "the migration of proposal {} was handed the bootstrap of destination \
+                 '{reserved}'",
+                hex::encode(proposal_id)
+            )));
+        }
 
         let now = deps.clock.now_secs();
         let grace_period_end = now.saturating_add(grace_period_secs);
@@ -4002,23 +4010,19 @@ pub fn execute_propose_context_migration<'a>(
             })?;
 
         // The destination create is a bootstrap like every other create: it
-        // runs under `bootstrap_spawn_lock`, and it fails before any write
-        // when the destination id names a running context (ADR-029
-        // Implementation), so it cannot replace that context's snapshot or
-        // contact. This turn waits for the lock, so no wait on another actor
-        // runs while it holds it: the destination's post-spawn wiring, which
-        // waits on the destination's mailbox, runs after the guard drops, and
-        // every other bootstrap runs its own wiring after releasing the lock.
-        let bootstrap_guard = deps.supervisor.lock_bootstrap_spawn().await?;
+        // runs under `bootstrap_spawn_lock`, held here as `bootstrap_guard`,
+        // and it fails before any write when the destination id names a
+        // running context (ADR-029 Implementation), so it cannot replace that
+        // context's snapshot or contact. The executing call reserved the lock
+        // and the destination's first-state claim before its first record
+        // (`MigrationBootstrap::reserve`), so nothing from here on returns a
+        // retryable `ActorBusy`. The destination's post-spawn wiring, which
+        // waits on the destination's mailbox, runs after the guard drops.
         if deps.supervisor.lookup(&destination_context_id)?.is_some() {
             return Err(ContextError::CreationFailed(format!(
                 "migration destination '{destination_context_id}' is running"
             )));
         }
-        let first_state = crate::context::lifecycle_helpers::FirstStateRollback::new(
-            deps,
-            &destination_context_id,
-        )?;
 
         cell.handle
             .transition_to(&ContextState::MigratingOut)
@@ -4096,14 +4100,18 @@ pub fn execute_propose_context_migration<'a>(
                          destination's create failed"
                     );
                 }
-                // Put back the destination's first-state records; a failure to
-                // do so is the caller's to see.
-                first_state.rollback().await.map_err(|rollback| {
-                    crate::context::lifecycle_helpers::fold_rollback_failure(
-                        &format!("failed to create destination context: {e}"),
-                        &rollback,
-                    )
-                })?;
+                // Put back the destination's first-state records under the
+                // guard this turn still holds, which the rollback releases; a
+                // failure to do so is the caller's to see.
+                first_state
+                    .rollback_with_guard(bootstrap_guard)
+                    .await
+                    .map_err(|rollback| {
+                        crate::context::lifecycle_helpers::fold_rollback_failure(
+                            &format!("failed to create destination context: {e}"),
+                            &rollback,
+                        )
+                    })?;
                 return Err(ContextError::PermissionDenied(format!(
                     "failed to create destination context: {e}"
                 )));
@@ -4326,37 +4334,13 @@ pub async fn propose_governance_action_inner(
     // limit) runs against actor-owned state via `actor_check_proposer_eligibility`.
     actor_check_proposer_eligibility(cell, proposer_did, deps.clock.now_secs(), &*deps.event_log)?;
 
-    // SCP-272: Check and auto-resolve expired governance freezes.
-    // Timer-triggered expiry: capture the pre-computed freeze deadline
-    // (freeze_start + timeout) BEFORE resolution clears the freeze, so the
-    // GovernanceFreezeExpired leaf carries that convergent deadline rather than
-    // a per-member local `now()` (§7.3.1, §9.9.3).
-    let freeze_expiry_deadline = cell
-        .governance
-        .freeze
-        .map(|(_, _, freeze_start)| freeze_start.saturating_add(FREEZE_TIMEOUT_SECONDS));
-    let freeze_events = check_and_resolve_expired_freezes(cell, deps);
-    if !freeze_events.is_empty() {
-        let cid_bytes = context_id_to_bytes(context_id);
-        // The freeze was present when `freeze_events` is non-empty (expiry just
-        // fired), so the deadline is always `Some` here.
-        let freeze_ts = freeze_expiry_deadline.unwrap_or(0);
-        for event in &freeze_events {
-            if let GovernanceEvent::ConflictResolved { .. } = event {
-                deps.event_log
-                    .append_context_event(
-                        &cid_bytes,
-                        scp_event_log::EventType::GovernanceFreezeExpired,
-                        proposer_did.as_ref(),
-                        freeze_ts,
-                    )
-                    .await?;
-                *cell.class_c_view().checkpoint_events_since_mut() += 1;
-            }
-        }
-    }
-
+    // SCP-272 freeze gate, read before anything is recorded: a freeze past its
+    // timeout is resolved below, after the migration reservation, so it does
+    // not refuse the proposal.
+    let freeze_now = deps.clock.now_secs();
+    let freeze_expires = freeze_has_expired(cell, freeze_now);
     if cell.governance.freeze.is_some()
+        && !freeze_expires
         && !matches!(action, GovernanceAction::ResolveConflict { .. })
     {
         return Err(ContextError::GovernanceFailed(
@@ -4412,6 +4396,57 @@ pub async fn propose_governance_action_inner(
         }
         ProposeIntent::NoSignature { .. } => None,
     };
+    // ADR-049 Decision 9: a migration this propose executes reserves its
+    // bootstrap before the first record, decided on a copy of the engine, so
+    // a busy lock or claim fails the propose with a retryable `ActorBusy`
+    // that left no freeze resolution, proposal or rate-limit timestamp
+    // behind. No await separates the reservation from the records.
+    let bootstrap = if matches!(action, GovernanceAction::ProposeContextMigration { .. }) {
+        let (previewed, _) = cell
+            .governance
+            .engine
+            .boxed_clone()
+            .propose_signed(
+                proposer_did,
+                action.clone(),
+                &gov_ctx,
+                proposer_vote.clone(),
+            )
+            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+        MigrationBootstrap::if_executed(cell, deps, context_id, &previewed, freeze_expires)?
+    } else {
+        None
+    };
+    // SCP-272: Check and auto-resolve expired governance freezes.
+    // Timer-triggered expiry: capture the pre-computed freeze deadline
+    // (freeze_start + timeout) BEFORE resolution clears the freeze, so the
+    // GovernanceFreezeExpired leaf carries that convergent deadline rather than
+    // a per-member local `now()` (§7.3.1, §9.9.3).
+    let freeze_expiry_deadline = cell
+        .governance
+        .freeze
+        .map(|(_, _, freeze_start)| freeze_start.saturating_add(FREEZE_TIMEOUT_SECONDS));
+    let freeze_events = check_and_resolve_expired_freezes(cell, freeze_now);
+    if !freeze_events.is_empty() {
+        let cid_bytes = context_id_to_bytes(context_id);
+        // The freeze was present when `freeze_events` is non-empty (expiry just
+        // fired), so the deadline is always `Some` here.
+        let freeze_ts = freeze_expiry_deadline.unwrap_or(0);
+        for event in &freeze_events {
+            if let GovernanceEvent::ConflictResolved { .. } = event {
+                deps.event_log
+                    .append_context_event(
+                        &cid_bytes,
+                        scp_event_log::EventType::GovernanceFreezeExpired,
+                        proposer_did.as_ref(),
+                        freeze_ts,
+                    )
+                    .await?;
+                *cell.class_c_view().checkpoint_events_since_mut() += 1;
+            }
+        }
+    }
+
     let (proposal, events) = cell
         .class_c_view()
         .governance_class_c_mut()
@@ -4496,10 +4531,12 @@ pub async fn propose_governance_action_inner(
                 &proposal.proposal_id,
                 Some(proposer_did),
                 key_package,
+                bootstrap,
             ))
             .await?,
         )
     } else {
+        drop(bootstrap);
         None
     };
 
@@ -4694,6 +4731,156 @@ pub async fn propose_governance_action_checked(
     })
 }
 
+/// The destination context id of the migration that `proposal_id` proposes
+/// for `context_id`: the hex SHA-256 of `"SCP-MIGRATION-DEST:"`, the source
+/// context id and the proposal id.
+pub(in crate::context) fn migration_destination_id(
+    context_id: &str,
+    proposal_id: &ProposalId,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"SCP-MIGRATION-DEST:");
+    hasher.update(context_id.as_bytes());
+    hasher.update(proposal_id);
+    hex::encode(hasher.finalize())
+}
+
+/// What a context migration's destination create runs under:
+/// `bootstrap_spawn_lock` and the first-state claim of the destination id
+/// (ADR-049 Decision 9).
+///
+/// The governance call that executes the migration reserves both before its
+/// first record, so their retryable [`ContextError::ActorBusy`] leaves
+/// nothing behind and a retry of the same call can succeed. After that first
+/// record the call never returns `ActorBusy`: the migration holds the guard
+/// through its destination create and its rollback
+/// ([`execute_propose_context_migration`] takes this as a required argument).
+pub struct MigrationBootstrap {
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    first_state: crate::context::lifecycle_helpers::FirstStateRollback,
+    destination_context_id: String,
+}
+
+impl MigrationBootstrap {
+    /// Try-locks `bootstrap_spawn_lock`, then claims the destination id of
+    /// `proposal_id`'s migration. The caller is an actor turn, and the
+    /// lock's holders wait on actor mailboxes, so it never waits for the
+    /// lock.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] while another bootstrap holds the lock,
+    ///   or another operation's first state of the destination is unsettled;
+    ///   both are retryable.
+    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub(in crate::context) fn reserve(
+        deps: &ActorDeps,
+        context_id: &str,
+        proposal_id: &ProposalId,
+    ) -> Result<Self, ContextError> {
+        let destination_context_id = migration_destination_id(context_id, proposal_id);
+        let guard = deps.supervisor.try_lock_bootstrap_spawn()?;
+        let first_state = crate::context::lifecycle_helpers::FirstStateRollback::new(
+            deps,
+            &destination_context_id,
+        )?;
+        Ok(Self {
+            guard,
+            first_state,
+            destination_context_id,
+        })
+    }
+
+    /// The bootstrap of `proposal`: `reserved` when the caller already
+    /// reserved it, else a new reservation when `proposal` is a context
+    /// migration, else `None`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::reserve`].
+    fn for_migration(
+        reserved: Option<Self>,
+        deps: &ActorDeps,
+        context_id: &str,
+        proposal: &GovernanceProposal,
+    ) -> Result<Option<Self>, ContextError> {
+        if reserved.is_some() {
+            Ok(reserved)
+        } else if matches!(
+            proposal.action,
+            GovernanceAction::ProposeContextMigration { .. }
+        ) {
+            Self::reserve(deps, context_id, &proposal.proposal_id).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The bootstrap of `proposal`, as the propose or vote call about to
+    /// record it would leave it, when that call goes on to execute it: the
+    /// action is a migration, the proposal is `Approved` and not yet
+    /// executed, no governance freeze stands, and no approved conflicting
+    /// proposal makes it lose or freezes governance
+    /// ([`detect_and_handle_conflicts`]). Decided with reads only, before
+    /// the call's first record. `freeze_expires` says the call clears the
+    /// standing freeze as expired before it records the proposal.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::reserve`].
+    fn if_executed(
+        cell: &crate::context::actor::class_s::ClassSCell,
+        deps: &ActorDeps,
+        context_id: &str,
+        proposal: &GovernanceProposal,
+        freeze_expires: bool,
+    ) -> Result<Option<Self>, ContextError> {
+        let governance = &cell.governance;
+        let cleared = governance
+            .freeze
+            .filter(|_| freeze_expires)
+            .map(|(a, b, _)| [a, b]);
+        let executes = proposal.status == ProposalStatus::Approved
+            && !governance
+                .class_s
+                .executed_proposals
+                .contains_key(&proposal.proposal_id)
+            && (governance.freeze.is_none() || freeze_expires)
+            // The new proposal takes `next_proposal_seq`: an equal sequence
+            // freezes governance and a greater one loses, so either skips the
+            // execution.
+            && !conflicting_approved(cell, proposal).any(|(id, (_, seq, _))| {
+                !cleared.is_some_and(|pair| pair.contains(id))
+                    && governance.next_proposal_seq >= *seq
+            });
+        if executes {
+            Self::for_migration(None, deps, context_id, proposal)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// The approved proposals whose actions conflict with `proposal`'s
+/// (ADR-031 §7).
+fn conflicting_approved<'c>(
+    cell: &'c crate::context::actor::class_s::ClassSCell,
+    proposal: &'c GovernanceProposal,
+) -> impl Iterator<Item = (&'c ProposalId, &'c (GovernanceProposal, u64, u64))> + 'c {
+    cell.governance
+        .approved_proposals
+        .iter()
+        .filter(move |(_, (existing, _, _))| {
+            scp_protocol::context::governance::actions_conflict(
+                &proposal.action,
+                &proposal.proposer_did,
+                &existing.action,
+                &existing.proposer_did,
+            )
+        })
+}
+
 // ---------------------------------------------------------------------------
 // vote_on_proposal_inner (entry point — internal)
 // ---------------------------------------------------------------------------
@@ -4754,28 +4941,76 @@ pub async fn vote_on_proposal_inner(
     } else {
         VoteType::Reject
     };
+    // ADR-049 Decision 9: a vote that executes a migration reserves its
+    // bootstrap before the first record, so a busy lock or claim fails the
+    // vote with a retryable `ActorBusy` that recorded nothing. Whether it
+    // executes is decided on a copy of the engine: the precheck itself
+    // resolves a majority proposal past its deadline, and only the recorded
+    // vote shows whether it crosses quorum. No await separates a
+    // reservation from the record it precedes.
+    let mut preview = cell
+        .governance
+        .engine
+        .get_proposal(proposal_id)
+        .is_some_and(|p| matches!(p.action, GovernanceAction::ProposeContextMigration { .. }))
+        .then(|| cell.governance.engine.boxed_clone());
+    let resolved_bootstrap = match preview.as_mut() {
+        Some(engine) => match engine.precheck_vote(proposal_id, voter_did, &vote_type, &gov_ctx) {
+            Ok(VoteIntent::Resolved(..) | VoteIntent::NoOp(..)) => {
+                match engine.get_proposal(proposal_id) {
+                    Some(previewed) => {
+                        MigrationBootstrap::if_executed(cell, deps, context_id, previewed, false)?
+                    }
+                    None => None,
+                }
+            }
+            // A refusal is the precheck's own, returned by it below.
+            Ok(VoteIntent::Sign { .. }) | Err(_) => None,
+        },
+        None => None,
+    };
     let intent = cell
         .class_c_view()
         .governance_class_c_mut()
         .engine_mut()
         .precheck_vote(proposal_id, voter_did, &vote_type, &gov_ctx)
         .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
-    let (status, events) = match intent {
+    let (status, events, bootstrap) = match intent {
         VoteIntent::Sign { timestamp, digest } => {
             debug_assert_eq!(timestamp, gov_ctx.now);
             let signature = signer.sign_bounded_ed25519(&digest).await?;
             let vote = signed_vote(&vote_type, voter_did, timestamp, signature);
+            let bootstrap = match preview.as_mut() {
+                Some(engine) => {
+                    if approve {
+                        engine.approve_signed(proposal_id, voter_did, &gov_ctx, vote.clone())
+                    } else {
+                        engine.reject_signed(proposal_id, voter_did, &gov_ctx, vote.clone())
+                    }
+                    .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+                    match engine.get_proposal(proposal_id) {
+                        Some(previewed) => MigrationBootstrap::if_executed(
+                            cell, deps, context_id, previewed, false,
+                        )?,
+                        None => None,
+                    }
+                }
+                None => None,
+            };
             let mut view = cell.class_c_view();
             let engine = view.governance_class_c_mut().engine_mut();
-            if approve {
+            let (status, events) = if approve {
                 engine.approve_signed(proposal_id, voter_did, &gov_ctx, vote)
             } else {
                 engine.reject_signed(proposal_id, voter_did, &gov_ctx, vote)
             }
-            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
+            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+            (status, events, bootstrap)
         }
-        VoteIntent::Resolved(status, events) => (status, events),
-        VoteIntent::NoOp(status) => (status, Vec::new()),
+        // The precheck resolved the proposal (a majority vote past its
+        // deadline) or the vote changes nothing; the reservation preceded it.
+        VoteIntent::Resolved(status, events) => (status, events, resolved_bootstrap),
+        VoteIntent::NoOp(status) => (status, Vec::new(), resolved_bootstrap),
     };
 
     let proposal_for_execution = if status == ProposalStatus::Approved {
@@ -4834,30 +5069,35 @@ pub async fn vote_on_proposal_inner(
         matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == *proposal_id)
     });
 
-    if let Some(proposal) = proposal_for_execution {
-        let in_freeze = cell.governance.freeze.is_some();
-        if !in_freeze && !invalidated_by_conflict {
-            // The top `state` borrow has ended (NLL); hand the cell to the execute
-            // path so the governance leaves it reaches can later migrate.
-            //
-            // Quorum-approval path: the executor is THIS voter — the member
-            // whose approval crossed quorum and therefore committed the action
-            // (ADR-031 §7.3.1 "committing member"). This is the divergence-
-            // causing path: stamping the proposer here (the old behavior) made
-            // the leaf diverge whenever proposer != quorum-crossing
-            // voter.
-            Box::pin(execute_governance_action(
-                cell,
-                deps,
-                context_id,
-                &proposal.proposal_id,
-                Some(voter_did),
-                // The quorum-approval path never carries an invitee KeyPackage
-                // (deferred governed invite is issue #2027).
-                None,
-            ))
-            .await?;
-        }
+    // A freeze, standing or set by the conflict detection above, holds the
+    // execution back.
+    let in_freeze = cell.governance.freeze.is_some();
+    if let Some(proposal) =
+        proposal_for_execution.filter(|_| !in_freeze && !invalidated_by_conflict)
+    {
+        // The top `state` borrow has ended (NLL); hand the cell to the execute
+        // path so the governance leaves it reaches can later migrate.
+        //
+        // Quorum-approval path: the executor is THIS voter — the member
+        // whose approval crossed quorum and therefore committed the action
+        // (ADR-031 §7.3.1 "committing member"). This is the divergence-
+        // causing path: stamping the proposer here (the old behavior) made
+        // the leaf diverge whenever proposer != quorum-crossing
+        // voter.
+        Box::pin(execute_governance_action(
+            cell,
+            deps,
+            context_id,
+            &proposal.proposal_id,
+            Some(voter_did),
+            // The quorum-approval path never carries an invitee KeyPackage
+            // (deferred governed invite is issue #2027).
+            None,
+            bootstrap,
+        ))
+        .await?;
+    } else {
+        drop(bootstrap);
     }
 
     crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
@@ -5164,6 +5404,9 @@ pub async fn dispatch_context_governance_action(
     // never carried a real add (issue #2029).
     key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
+    // The migration's bootstrap, which `execute_governance_action` reserved
+    // before its first record; `None` for every other action.
+    bootstrap: Option<MigrationBootstrap>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let CommitMeta {
         pid,
@@ -5355,6 +5598,13 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
+                bootstrap.ok_or_else(|| {
+                    ContextError::InvalidState(
+                        "a context migration executes only under the bootstrap its executor \
+                         reserved"
+                            .to_owned(),
+                    )
+                })?,
             )
             .await?;
             Ok(GovernanceActionResult::MigrationProposed(result))
@@ -5442,6 +5692,9 @@ pub async fn dispatch_governance_action(
     // on the actor command envelope by `Supervisor::invite_member` and threaded
     // to `execute_add_member`. `None` on every non-invite execute path.
     key_package: Option<&[u8]>,
+    // The migration's bootstrap, which `execute_governance_action` reserved
+    // before its first record; `None` for every other action.
+    bootstrap: Option<MigrationBootstrap>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let pid = proposal.proposal_id;
     let actor = executor_did.as_ref();
@@ -5723,6 +5976,7 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
+                bootstrap,
             )
             .await
         }
@@ -6014,6 +6268,9 @@ pub async fn finalize_governance_action(
 /// - [`ContextError::PermissionDenied`] if the proposal targets a
 ///   different context than the one provided.
 /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+// The migration reservation is moved into the dispatch; the nursery lint
+// misreads that move as a guard held to the end of the function.
+#[allow(clippy::significant_drop_tightening)]
 #[instrument(skip_all, fields(context_id))]
 pub async fn execute_governance_action(
     cell: &mut crate::context::actor::class_s::ClassSCell,
@@ -6047,6 +6304,11 @@ pub async fn execute_governance_action(
     // paths — those never carry a real KeyPackage (governed-context invite is
     // issue #2027).
     key_package: Option<&[u8]>,
+    // The migration's bootstrap, reserved by the propose or vote path before
+    // its first record (`MigrationBootstrap::if_executed`). `None` on the
+    // direct-execute path and for every other action; a migration executed
+    // without one reserves it here, before the replay marker.
+    bootstrap: Option<MigrationBootstrap>,
 ) -> Result<GovernanceActionResult, ContextError> {
     // ADR-049 §9 Class-S cell seam: this entry holds the cell. The pre-dispatch
     // gate is READ-ONLY (commit-fault gate, authoritative-proposal resolution,
@@ -6112,6 +6374,10 @@ pub async fn execute_governance_action(
             "governance proposal has already been executed".into(),
         ));
     }
+    // ADR-049 Decision 9: the replay marker below is this call's first
+    // record, so a migration's bootstrap is reserved before it and a busy
+    // lock or claim leaves the proposal executable by a retry.
+    let reserved = MigrationBootstrap::for_migration(bootstrap, deps, context_id, proposal)?;
     let now = deps.clock.now_secs();
 
     // Governance action costing: no PaidActionType::GovernanceAction
@@ -6169,16 +6435,17 @@ pub async fn execute_governance_action(
     // The marker's own `begin_class_s` above already advanced the epoch, so the
     // baseline is read after it.
     let epoch_before_dispatch = cell.mutation_epoch();
-    let dispatch_outcome = match dispatch_governance_action(
+    let dispatched = dispatch_governance_action(
         cell,
         deps,
         context_id,
         proposal,
         executor_did,
         key_package,
+        reserved,
     )
-    .await
-    {
+    .await;
+    let dispatch_outcome = match dispatched {
         Ok(r) => Ok(r),
         Err(e) if cell.mutation_epoch() == epoch_before_dispatch => {
             // Roll back the executed marker: the dispatch applied no effect, so
@@ -8094,6 +8361,193 @@ mod commit_broadcast_retry_tests {
                 persists.load(Ordering::SeqCst) > persists_before,
                 "the vote path persists"
             );
+        }
+
+        /// A majority migration proposed by A, which records no vote for A.
+        async fn propose_migration(cell: &mut ClassSCell, deps: &ActorDeps) -> ProposalId {
+            let migrate = GovernanceAction::ProposeContextMigration {
+                new_context_params: Box::new(ContextParams {
+                    ceiling: ceiling(),
+                    governance: GovernanceModel::SingleAdmin,
+                    ..ContextParams::default()
+                }),
+                reason: "fixture".to_owned(),
+                grace_period_secs: 60,
+                auto_invite: false,
+            };
+            let (proposal, _, _) =
+                crate::context::governance_helpers::propose_governance_action_inner(
+                    cell,
+                    deps,
+                    &ctx_hex(),
+                    &did(A),
+                    migrate,
+                    &local(A),
+                    false,
+                    None,
+                )
+                .await
+                .expect("propose the migration");
+            assert_eq!(proposal.status, ProposalStatus::Pending);
+            proposal.proposal_id
+        }
+
+        fn assert_busy(
+            result: &Result<
+                (ProposalStatus, Vec<GovernanceEvent>),
+                scp_protocol::context::ContextError,
+            >,
+        ) {
+            assert!(
+                matches!(
+                    result,
+                    Err(scp_protocol::context::ContextError::ActorBusy(msg)) if msg.contains("retry")
+                ),
+                "{result:?}"
+            );
+        }
+
+        /// The migration ran: its destination exists and the source is
+        /// migrating out.
+        fn assert_migrated(
+            cell: &ClassSCell,
+            result: &Result<
+                (ProposalStatus, Vec<GovernanceEvent>),
+                scp_protocol::context::ContextError,
+            >,
+        ) {
+            assert!(
+                matches!(result, Ok((ProposalStatus::Approved, _))),
+                "the retried vote executes the migration; got {result:?}"
+            );
+            assert!(
+                cell.migration_state.is_some(),
+                "the retried vote started the migration"
+            );
+            assert_eq!(cell.handle.state(), ContextState::MigratingOut);
+        }
+
+        /// The approval that carries a migration past quorum, cast while
+        /// another bootstrap holds `bootstrap_spawn_lock`, fails with a
+        /// retryable `ActorBusy` before the vote is recorded, so the same
+        /// vote cast again once the lock is free is counted and executes the
+        /// migration instead of being refused as a duplicate.
+        #[tokio::test]
+        async fn a_busy_migration_vote_records_nothing_and_its_retry_counts() {
+            let (deps, clock, _) = deps_and_clock().await;
+            let mut cell = majority_cell(&clock);
+            let pid = propose_migration(&mut cell, &deps).await;
+            for voter in [B, C] {
+                let (status, _) = vote(&mut cell, &deps, &pid, voter, &local(voter))
+                    .await
+                    .expect("an approval short of quorum");
+                assert_eq!(status, ProposalStatus::Pending);
+            }
+
+            let held = deps
+                .supervisor
+                .try_lock_bootstrap_spawn()
+                .expect("the bootstrap lock is free");
+            let busy = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                vote(&mut cell, &deps, &pid, D, &local(D)),
+            )
+            .await
+            .expect("the vote turn must not wait for the bootstrap lock");
+            assert_busy(&busy);
+            let tracked = cell.governance.engine.get_proposal(&pid).expect("proposal");
+            assert_eq!(
+                tracked.status,
+                ProposalStatus::Pending,
+                "nothing was approved"
+            );
+            assert!(
+                tracked.approvals.iter().all(|v| v.voter_did != did(D)),
+                "a busy vote must not be recorded"
+            );
+            drop(held);
+
+            let retried = vote(&mut cell, &deps, &pid, D, &local(D)).await;
+            assert_migrated(&cell, &retried);
+        }
+
+        /// A majority vote past the migration proposal's deadline resolves it
+        /// to `Approved` and executes it. Cast while another bootstrap holds
+        /// `bootstrap_spawn_lock`, it fails with a retryable `ActorBusy`
+        /// before the resolution is recorded, so the proposal stays `Pending`
+        /// and the same vote cast once the lock is free executes the
+        /// migration instead of failing as no longer pending.
+        #[tokio::test]
+        async fn a_busy_vote_past_a_migrations_deadline_leaves_it_pending_and_its_retry_executes() {
+            let (deps, clock, _) = deps_and_clock().await;
+            let mut cell = majority_cell(&clock);
+            let pid = propose_migration(&mut cell, &deps).await;
+            let (status, _) = vote(&mut cell, &deps, &pid, B, &local(B))
+                .await
+                .expect("B approves");
+            assert_eq!(status, ProposalStatus::Pending);
+            clock.advance(WINDOW + 1);
+
+            let held = deps
+                .supervisor
+                .try_lock_bootstrap_spawn()
+                .expect("the bootstrap lock is free");
+            let busy = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                vote(&mut cell, &deps, &pid, C, &local(C)),
+            )
+            .await
+            .expect("the vote turn must not wait for the bootstrap lock");
+            assert_busy(&busy);
+            assert_eq!(
+                cell.governance
+                    .engine
+                    .get_proposal(&pid)
+                    .expect("proposal")
+                    .status,
+                ProposalStatus::Pending,
+                "a busy vote resolves nothing"
+            );
+            assert!(cell.migration_state.is_none());
+            drop(held);
+
+            let retried = vote(&mut cell, &deps, &pid, C, &local(C)).await;
+            assert_migrated(&cell, &retried);
+        }
+
+        /// An approval of a migration proposal that leaves it short of
+        /// quorum executes nothing, so it is recorded while another
+        /// bootstrap holds `bootstrap_spawn_lock`.
+        #[tokio::test]
+        async fn a_migration_vote_short_of_quorum_counts_while_the_lock_is_held() {
+            let (deps, clock, _) = deps_and_clock().await;
+            let mut cell = majority_cell(&clock);
+            let pid = propose_migration(&mut cell, &deps).await;
+            let held = deps
+                .supervisor
+                .try_lock_bootstrap_spawn()
+                .expect("the bootstrap lock is free");
+
+            let (status, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                vote(&mut cell, &deps, &pid, B, &local(B)),
+            )
+            .await
+            .expect("the vote turn must not wait for the bootstrap lock")
+            .expect("a vote that executes nothing never fails busy");
+
+            assert_eq!(status, ProposalStatus::Pending);
+            assert!(
+                cell.governance
+                    .engine
+                    .get_proposal(&pid)
+                    .expect("proposal")
+                    .approvals
+                    .iter()
+                    .any(|v| v.voter_did == did(B)),
+                "the vote is recorded"
+            );
+            drop(held);
         }
 
         /// The signed vote carries the `gov_ctx.now` read before the sign. A

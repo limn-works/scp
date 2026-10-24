@@ -708,6 +708,7 @@ async fn handle_execute_governance_action_actor(
                 // Direct-execute never carries an invitee KeyPackage (deferred
                 // governed invite is issue #2027).
                 None,
+                None,
             ),
         )
         .await

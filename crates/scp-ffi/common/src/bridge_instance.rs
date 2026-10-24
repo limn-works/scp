@@ -605,6 +605,12 @@ pub struct CoreFields {
     /// A shut-down instance cannot be resumed.
     shutdown: AtomicBool,
 
+    /// Signalled by [`Self::restore_transport`] just before it takes the
+    /// transport write lock, so a test can begin shutdown while the restore
+    /// is past every check made before that lock.
+    #[cfg(test)]
+    restore_transport_lock_hook: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+
     /// Whether a shutdown closed the durable store, will never close it, or
     /// has not settled it yet, so a later shutdown call can report whether
     /// the store still holds its advisory lock without waiting on a close
@@ -965,6 +971,8 @@ impl CoreFields {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
+            #[cfg(test)]
+            restore_transport_lock_hook: Mutex::new(None),
             durable_store_state: Arc::new(tokio::sync::watch::Sender::new(
                 DurableStoreState::Unsettled,
             )),
@@ -1059,6 +1067,8 @@ impl CoreFields {
         Self {
             supervisor: OnceLock::new(),
             shutdown: AtomicBool::new(false),
+            #[cfg(test)]
+            restore_transport_lock_hook: Mutex::new(None),
             durable_store_state: Arc::new(tokio::sync::watch::Sender::new(
                 DurableStoreState::Unsettled,
             )),
@@ -1907,15 +1917,14 @@ impl CoreFields {
     ///
     /// Replaces any previous transport manager.
     ///
-    /// If the instance is shut down, logs a warning but still sets the
-    /// transport — matching the `bridge_instance()` / `context_manager()`
-    /// pattern where shutdown operations fail naturally at the MLS/transport
-    /// layer rather than being hard-rejected.
-    ///
     /// # Errors
     ///
-    /// Returns `Err` if the `RwLock` is poisoned, or if the instance is
-    /// suspended (lifecycle violation — call `resume()` first).
+    /// Returns `Err` if the `RwLock` is poisoned, if the instance is
+    /// suspended (lifecycle violation — call `resume()` first), or if the
+    /// instance is shut down. The shutdown check runs under the transport
+    /// write lock, and shutdown sets its flag before it clears the transport
+    /// under that lock, so no manager stays installed on a shut-down
+    /// instance.
     ///
     /// The reconnect set ([`Self::pending_relay_urls`]) is left as it is.
     pub fn set_transport(
@@ -1975,13 +1984,26 @@ impl CoreFields {
         installed: &Arc<scp_transport::TransportManager>,
         previous: Option<Arc<scp_transport::TransportManager>>,
     ) {
-        if self.is_shutdown() {
-            return;
+        #[cfg(test)]
+        {
+            let hook = self
+                .restore_transport_lock_hook
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            // A test that installed the hook waits on it; none that did not.
+            if let Some(hook) = hook {
+                hook.send(()).ok();
+            }
         }
         let mut slot = self
             .transport
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        // Under the write lock, as in `install_transport_inner`.
+        if self.is_shutdown() {
+            return;
+        }
         let mut pending = self
             .relay_urls
             .lock()
@@ -2009,14 +2031,6 @@ impl CoreFields {
         manager: Arc<scp_transport::TransportManager>,
         replace_pending: bool,
     ) -> Result<Option<Arc<scp_transport::TransportManager>>, TransportLockError> {
-        // Shutdown: warn only — matches bridge_instance()/context_manager()
-        // behavior where shutdown is a terminal state and operations fail
-        // naturally at the MLS/transport layer. This avoids hard failures
-        // in test teardown when afterAll calls shutdown() and a later test
-        // file tries to set transport.
-        if self.is_shutdown() {
-            tracing::warn!("set_transport called after shutdown — transport will not be usable");
-        }
         if self.is_suspended() {
             return Err(TransportLockError::Rejected(
                 "bridge instance is suspended — call resume() before setting transport".to_owned(),
@@ -2026,9 +2040,15 @@ impl CoreFields {
             .transport
             .write()
             .map_err(|_| TransportLockError::Poisoned)?;
-        // After shutdown the reconnect set stays empty, as `add_relay_url`
-        // keeps it.
-        if replace_pending && !self.is_shutdown() {
+        // Checked under the write lock: shutdown sets its flag before it
+        // clears the transport under this lock, so either this install sees
+        // the flag or the shutdown's clear removes the manager it installed.
+        if self.is_shutdown() {
+            return Err(TransportLockError::Rejected(
+                "bridge instance is shut down — a transport cannot be installed".to_owned(),
+            ));
+        }
+        if replace_pending {
             let mut pending = self
                 .relay_urls
                 .lock()
@@ -3249,18 +3269,22 @@ impl CoreFields {
             urls.clear();
         }
 
-        let (flush, drain) = if let Some(supervisor) = self.supervisor.get() {
-            // The flush honors the caller's deadline: a wedged context cannot
-            // push shutdown past it. The flush is natively async (per-context
-            // bounded lock with a degraded-snapshot fallback). Its result
-            // reaches the caller through `ShutdownOutcome::flush`.
-            let flush = if budget.is_zero() {
+        let supervisor = self.supervisor.get();
+        // The flush honors the caller's deadline: a wedged context cannot
+        // push shutdown past it. The flush is natively async (per-context
+        // bounded lock with a degraded-snapshot fallback). Its result
+        // reaches the caller through `ShutdownOutcome::flush`. With no
+        // Supervisor attached, no context exists to flush.
+        let flush = match supervisor {
+            None => ShutdownFlush::Skipped,
+            Some(_) if budget.is_zero() => {
                 tracing::warn!(
                     "shutdown flush budget exhausted before flush_all_contexts — \
                      context state may not be persisted"
                 );
                 ShutdownFlush::TimedOut
-            } else {
+            }
+            Some(supervisor) => {
                 match tokio::time::timeout_at(deadline, supervisor.flush_all_contexts()).await {
                     Ok(Ok(())) => ShutdownFlush::Flushed,
                     Ok(Err(e)) => {
@@ -3282,11 +3306,16 @@ impl CoreFields {
                         ShutdownFlush::TimedOut
                     }
                 }
-            };
-            if self.shutdown_flush.set(flush.clone()).is_err() {
-                // Only the shutdown whose swap won reaches this point.
-                tracing::error!("a second shutdown flush ran on one instance");
             }
+        };
+        // Recorded before the drain, on every path, so a shutdown that is
+        // interrupted during the drain reports how its flush ended.
+        if self.shutdown_flush.set(flush.clone()).is_err() {
+            // Only the shutdown whose swap won reaches this point.
+            tracing::error!("a second shutdown flush ran on one instance");
+        }
+
+        let drain = if let Some(supervisor) = supervisor {
             let has_durable_store = store_closer.is_some();
             // The store closes inside the drain task, after the drain: never
             // before a tracked writer exits (ADR-049 Decision 16). A drain
@@ -3309,7 +3338,7 @@ impl CoreFields {
                     tracing::error!("late {}", drain_failed_message(failure, has_durable_store));
                 }
             };
-            let drain = match supervisor
+            match supervisor
                 .drain_with_deadline(deadline, move || close_durable_store(store_closer), on_late)
                 .await
             {
@@ -3326,15 +3355,11 @@ impl CoreFields {
                     );
                     SupervisorDrain::Pending
                 }
-            };
-            (flush, drain)
+            }
         } else {
-            // No Supervisor was ever attached, so no context exists to flush
-            // and no tracked task can write through the store.
-            (
-                ShutdownFlush::Skipped,
-                SupervisorDrain::Finished(close_durable_store(store_closer)),
-            )
+            // No Supervisor was ever attached, so no tracked task can write
+            // through the store.
+            SupervisorDrain::Finished(close_durable_store(store_closer))
         };
 
         self.finish_shutdown_cleanup();
@@ -5168,20 +5193,55 @@ pub(crate) mod tests {
     // set_transport lifecycle guard tests
     // -----------------------------------------------------------------
 
+    /// Every install path refuses a shut-down instance and leaves it with no
+    /// transport, so a resume that races a shutdown cannot leave a live
+    /// transport behind.
     #[tokio::test]
-    async fn set_transport_warns_after_shutdown() {
+    async fn every_transport_install_rejects_after_shutdown() {
         let instance = CoreFields::with_supervisor(test_supervisor());
         shut_down(&instance).await;
 
-        // set_transport after shutdown warns but does not error — matches
-        // the bridge_instance()/context_manager() pattern where shutdown
-        // is a terminal state and operations fail naturally at the
-        // MLS/transport layer.
-        assert!(
-            instance
-                .set_transport(Arc::new(test_transport_manager()))
-                .is_ok(),
-            "set_transport should warn, not reject, after shutdown"
+        let installs: [(&str, Result<(), TransportLockError>); 3] = [
+            (
+                "set_transport",
+                instance.set_transport(Arc::new(test_transport_manager())),
+            ),
+            (
+                "install_transport",
+                instance.install_transport(Arc::new(test_transport_manager())),
+            ),
+            (
+                "swap_transport",
+                instance
+                    .swap_transport(Arc::new(test_transport_manager()))
+                    .map(drop),
+            ),
+        ];
+        for (install, result) in installs {
+            assert!(
+                matches!(&result, Err(TransportLockError::Rejected(msg)) if msg.contains("shut down")),
+                "{install} after shutdown: {result:?}"
+            );
+        }
+        assert!(!instance.has_transport());
+        assert!(instance.pending_relay_urls().is_empty());
+    }
+
+    /// A shutdown of an instance with no Supervisor records its flush as
+    /// `Skipped` before the store closes, so a shutdown interrupted after
+    /// that point reports no unflushed context.
+    #[tokio::test]
+    async fn a_shutdown_without_a_supervisor_records_a_skipped_flush() {
+        let instance = CoreFields::new();
+        let outcome = instance
+            .shutdown_core_async(TEST_DEADLINE, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.flush(), &ShutdownFlush::Skipped);
+        assert_eq!(
+            instance.shutdown_flush.get(),
+            Some(&ShutdownFlush::Skipped),
+            "the Skipped flush is kept for a shutdown the runtime interrupts later"
         );
     }
 
@@ -8027,6 +8087,52 @@ pub(crate) mod tests {
         assert_eq!(
             instance.with_transport(|_| ()),
             Err(TransportLockError::NotInitialized)
+        );
+    }
+
+    /// A restore that waits for the transport write lock while shutdown
+    /// begins installs nothing once it gets the lock: it reads the shutdown
+    /// flag under the lock, as an install does, so shutdown's clear of the
+    /// transport is never undone by a restore that started before it. The
+    /// restore signals just before it takes the lock, so shutdown begins
+    /// only after every check made before the lock has run.
+    #[test]
+    fn restore_transport_waiting_on_the_lock_while_shutdown_begins_restores_nothing() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        let previous = Arc::new(manager_on("wss://previous.example"));
+        let installed = Arc::new(manager_on("ws://127.0.0.1:1/scp/v1"));
+        instance.install_transport(Arc::clone(&installed)).unwrap();
+
+        let (at_lock, reached_lock) = tokio::sync::oneshot::channel();
+        *instance
+            .restore_transport_lock_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(at_lock);
+        std::thread::scope(|scope| {
+            let held = instance
+                .transport
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let restore = scope.spawn(|| {
+                instance.restore_transport(&installed, Some(Arc::clone(&previous)));
+            });
+            reached_lock
+                .blocking_recv()
+                .expect("the restore signals before it takes the lock");
+            instance.shutdown.store(true, Ordering::SeqCst);
+            drop(held);
+            restore.join().unwrap();
+        });
+
+        assert_eq!(
+            instance.with_transport(scp_transport::TransportManager::relay_urls),
+            Ok(vec!["ws://127.0.0.1:1/scp/v1".to_owned()]),
+            "a restore that got the lock after shutdown began must not install a manager"
+        );
+        assert_eq!(
+            instance.pending_relay_urls(),
+            HashSet::from(["ws://127.0.0.1:1/scp/v1".to_owned()]),
+            "nor retarget the reconnect set"
         );
     }
 

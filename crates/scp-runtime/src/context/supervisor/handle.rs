@@ -416,21 +416,18 @@ impl SupervisorHandle {
     /// trust-recovery's cross-context `notify_contact` path after the
     /// shared context has been found via [`Self::find_shared_context`].
     ///
-    /// Routes through
-    /// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command),
+    /// Routes through `Supervisor::dispatch_recovery_send_notification_in_turn`,
     /// which dispatches via the per-context actor mailbox when one is
-    /// registered or falls through to the legacy lock-shaped fallback
-    /// otherwise. The reply is awaited inline — bounded by
+    /// registered and otherwise respawns the target actor only if it can
+    /// take `bootstrap_spawn_lock` without waiting. The reply is awaited inline — bounded by
     /// [`REPLY_TIMEOUT`](crate::context::actor::REPLY_TIMEOUT) — so the
     /// caller observes the full per-actor outcome without a wedged actor
     /// pinning it forever.
     ///
     /// # Errors
     ///
-    /// - Any [`ContextError`] surfaced through the dispatched
-    ///   [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command)
-    ///   call (e.g. [`ContextError::NotInitialized`] if no providers
-    ///   attached).
+    /// - Any [`ContextError`] surfaced through the mailbox dispatch (e.g.
+    ///   [`ContextError::NotInitialized`] if no providers attached).
     /// - Any [`ContextError`] surfaced via the per-actor reply on the
     ///   embedded oneshot channel.
     /// - [`ContextError::TransportFailed`] if the reply channel is
@@ -441,17 +438,21 @@ impl SupervisorHandle {
     ///   — a wedged/deadlocked actor never terminates, so the watchdog never
     ///   drops the reply sender; this backstop fail-closes instead of
     ///   hanging the caller.
+    /// - [`ContextError::ActorBusy`] (retryable) when the target context has
+    ///   no registered actor and another bootstrap holds
+    ///   `bootstrap_spawn_lock`: an actor turn never waits for that lock, so
+    ///   the respawn is not attempted and nothing is sent.
     pub async fn dispatch_recovery_send_notification(
         &self,
         payload: crate::context::actor::commands::RecoverySendNotificationPayload,
     ) -> Result<(), ContextError> {
-        use crate::context::actor::commands::TrustRecoveryCommand;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let cmd = TrustRecoveryCommand::RecoverySendNotification {
-            payload: Box::new(payload),
-            reply: reply_tx,
-        };
-        self.upgrade()?.dispatch_trust_recovery_command(cmd).await?;
+        // The in-turn dispatch: a respawn of an unregistered target
+        // try-locks `bootstrap_spawn_lock` and returns a retryable
+        // `ActorBusy` on the reply while another bootstrap holds it.
+        self.upgrade()?
+            .dispatch_recovery_send_notification_in_turn(Box::new(payload), reply_tx)
+            .await?;
         // Bounded by REPLY_TIMEOUT: the result is load-bearing (propagated
         // via `?` into trust-recovery `recovery_notify_contact`, §9.12) and a
         // wedged/deadlocked actor never terminates (so the watchdog never
@@ -905,38 +906,12 @@ impl SupervisorHandle {
         Ok(self.upgrade()?.is_context_poisoned(context_id))
     }
 
-    /// Operator recovery action (ADR-049 §10): clear a poisoned context's
-    /// crash window and attempt ONE respawn from the persisted snapshot.
-    ///
-    /// This is the explicit, operator-driven recovery path for a poisoned
-    /// context. It is deliberately surfaced on the `SupervisorHandle` (the
-    /// operator-facing capability) rather than on any per-context dispatch
-    /// path, so ordinary context callers cannot un-poison a context — only
-    /// an operator action (or a process restart that re-runs
-    /// `crate::context::lifecycle_helpers::restore_all_contexts`) can.
-    ///
-    /// `owning_did` scopes the rebuilt [`ActorDeps`](crate::context::actor::deps::ActorDeps);
-    /// callers pass the local DID performing the recovery.
-    ///
-    /// # Errors
-    ///
-    /// Surfaces any error from the respawn (e.g.
-    /// [`ContextError::ActorCrashed`]
-    /// when no snapshot exists to rehydrate).
-    pub async fn clear_poison(
-        &self,
-        context_id: &str,
-        owning_did: &DID,
-    ) -> Result<(), ContextError> {
-        self.upgrade()?.clear_poison(context_id, owning_did).await
-    }
-
     /// Operator recovery action (ADR-049 §10) for a poisoned per-identity
     /// `KeyPackageStoreActor`: clear its `kp::{did}` crash window and
     /// re-resolve the actor, which reconciles its pool from the durable
     /// `mls_storage` journal on spawn.
     ///
-    /// This is the KeyPackage-actor twin of [`Self::clear_poison`]. It is a
+    /// This is the KeyPackage-actor twin of `Supervisor::clear_poison`. It is a
     /// SEPARATE surface because a KP actor has no context-snapshot to
     /// rehydrate — routing it through the per-context snapshot respawn would
     /// fail and re-dirty the crash window. Surfaced on the operator-facing
@@ -985,18 +960,121 @@ impl SupervisorHandle {
         Ok(self.upgrade()?.lookup(context_id))
     }
 
-    /// Takes the Supervisor's `bootstrap_spawn_lock` for a bootstrap that runs
-    /// outside the Supervisor, the migration create. The Supervisor is not
-    /// held across the wait.
+    /// Try-locks the Supervisor's `bootstrap_spawn_lock` for a bootstrap that
+    /// runs in an actor turn, the migration create.
+    ///
+    /// An actor turn never waits for this lock: its holders wait on actor
+    /// mailboxes (a create's post-spawn wiring, a discard's teardown), so a
+    /// turn that waited could deadlock with them. Work that must wait for
+    /// the lock goes through [`Self::spawn_under_bootstrap_spawn_lock`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] while another bootstrap holds the lock;
+    ///   the caller retries.
+    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub(in crate::context) fn try_lock_bootstrap_spawn(
+        &self,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ContextError> {
+        Arc::clone(&self.upgrade()?.bootstrap_spawn_lock)
+            .try_lock_owned()
+            .map_err(|_| {
+                ContextError::ActorBusy(
+                    "another create, import, restore, join or rollback holds the bootstrap \
+                     lock; retry"
+                        .to_owned(),
+                )
+            })
+    }
+
+    /// Runs `before_lock`, then `under_lock` while holding
+    /// `bootstrap_spawn_lock`, on a tracked task, so the caller, which may be
+    /// an actor turn, never waits for the lock. `under_lock` is skipped when
+    /// `before_lock` returns `false`. The task holds the Supervisor only to
+    /// clone the lock, never across the wait.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped
+    /// or shutdown has begun; neither future runs.
+    pub(in crate::context) fn spawn_under_bootstrap_spawn_lock<B, F, U>(
+        &self,
+        operation: &'static str,
+        before_lock: B,
+        under_lock: F,
+    ) -> Result<(), ContextError>
+    where
+        B: std::future::Future<Output = bool> + Send + 'static,
+        F: FnOnce() -> U + Send + 'static,
+        U: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let supervisor = self.supervisor.clone();
+        self.spawn_tracked(operation, async move {
+            if !before_lock.await {
+                return;
+            }
+            let Some(lock) = supervisor
+                .upgrade()
+                .map(|supervisor| Arc::clone(&supervisor.bootstrap_spawn_lock))
+            else {
+                tracing::error!(
+                    operation,
+                    "the supervisor dropped before the task took the bootstrap lock; its \
+                     work did not run"
+                );
+                return;
+            };
+            let _bootstrap_guard = lock.lock_owned().await;
+            under_lock().await;
+        })
+        .map(|_detached| ())
+    }
+
+    /// Claims `context_id` for one operation's first-state writes
+    /// (`Supervisor::pending_first_state`) until
+    /// [`Self::release_first_state`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] while another operation's first state of
+    ///   the id is unsettled; it is retryable.
+    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
+    pub(in crate::context) fn claim_first_state(
+        &self,
+        context_id: &str,
+    ) -> Result<(), ContextError> {
+        if self
+            .upgrade()?
+            .pending_first_state
+            .insert(context_id.to_owned())
+        {
+            return Ok(());
+        }
+        Err(ContextError::ActorBusy(format!(
+            "{context_id}: another create, import or join of this context has not committed or \
+             rolled back its first state; retry"
+        )))
+    }
+
+    /// Releases a claim [`Self::claim_first_state`] made. A dropped Supervisor
+    /// holds no claim.
+    pub(in crate::context) fn release_first_state(&self, context_id: &str) {
+        if let Some(supervisor) = self.supervisor.upgrade() {
+            supervisor.pending_first_state.remove(context_id);
+            supervisor.first_state_settled.notify_waiters();
+        }
+    }
+
+    /// The token cancelled when Supervisor shutdown begins
+    /// (`Supervisor::shutdown_signal`).
     ///
     /// # Errors
     ///
     /// [`ContextError::SupervisorShutDown`] when the Supervisor has dropped.
-    pub(in crate::context) async fn lock_bootstrap_spawn(
+    pub(in crate::context) fn shutdown_signal(
         &self,
-    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ContextError> {
-        let lock = Arc::clone(&self.upgrade()?.bootstrap_spawn_lock);
-        Ok(lock.lock_owned().await)
+    ) -> Result<tokio_util::sync::CancellationToken, ContextError> {
+        Ok(self.upgrade()?.shutdown_signal())
     }
 
     /// Install the per-context TTL timer for `context_id` by mailboxing
