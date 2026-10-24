@@ -2934,6 +2934,7 @@ impl ContextTransportProvider for BroadcastWatchTransport {
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), crate::context::ContextError> {
         if *context_id == self.expected_routing && !encrypted_payload.is_empty() {
             self.saw_broadcast
@@ -3194,6 +3195,7 @@ impl ContextTransportProvider for FatalDeliveryTransport {
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), crate::context::ContextError> {
         Ok(())
     }
@@ -4042,6 +4044,7 @@ impl ContextTransportProvider for AcceptingSendTransport {
         &self,
         _context_id: &[u8; 32],
         encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), crate::context::ContextError> {
         if !encrypted_payload.is_empty() {
             self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4588,6 +4591,7 @@ impl ContextTransportProvider for InvitationDeliveryCounter {
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), crate::context::ContextError> {
         Ok(())
     }

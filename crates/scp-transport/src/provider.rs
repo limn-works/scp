@@ -37,7 +37,7 @@ use scp_core::context::builder::{ContextCreationError, ContextTransportProvider}
 use scp_core::context::{ContextError, ContextParams};
 use scp_core::crypto::envelope_seal::derive_key_package_routing_id;
 use scp_core::envelope::OuterEnvelope;
-use scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS;
+use scp_protocol::envelope::outer::BlobTtl;
 
 use crate::traits::{BlobId, TransportAdapter};
 
@@ -45,8 +45,9 @@ use crate::traits::{BlobId, TransportAdapter};
 /// the context-announcement placeholder (`publish_context`) and a published
 /// `KeyPackage` (`publish_key_package`).
 ///
-/// MLS messages to a context do not use it: [`send_message`] requests
-/// [`DEFAULT_APP_DATA_BLOB_TTL_SECS`] (`09-security-model.md` §9.10.2).
+/// MLS messages to a context do not use it: [`send_message`] requests the
+/// [`BlobTtl`] the runtime chose from the message's type
+/// (`09-security-model.md` §9.10.2 "Blob TTL by message type").
 ///
 /// [`send_message`]: ContextTransportProvider::send_message
 const DEFAULT_BLOB_TTL: u32 = 3600;
@@ -182,16 +183,17 @@ impl<A: TransportAdapter + Send + Sync + 'static> ContextTransportProvider
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
+        ttl: BlobTtl,
     ) -> Result<(), ContextError> {
         // The one framing of a member publish (ADR-002, spec 23 §23.4.1): the
         // payload is the serialized MLS message, and this envelope is the only
-        // one around it. Every MLS message — application data, Commits, sealed
-        // management messages — requests the 7-day relay maximum
-        // (`09-security-model.md` §9.10.2 "Application-data blob TTL").
+        // one around it. The `blob_ttl` is the one the runtime chose from the
+        // message's type (`09-security-model.md` §9.10.2 "Blob TTL by message
+        // type"); the provider never picks its own.
         let envelope = scp_core::envelope::OuterEnvelope::frame_mls_message(
             context_id,
             None,
-            DEFAULT_APP_DATA_BLOB_TTL_SECS,
+            ttl,
             encrypted_payload.to_vec(),
         )
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
@@ -370,30 +372,39 @@ mod tests {
         let provider = RelayTransportProvider::new(adapter);
         let ctx_id = [4u8; 32];
 
-        let result = provider.send_message(&ctx_id, b"encrypted-payload").await;
+        let result = provider
+            .send_message(
+                &ctx_id,
+                b"encrypted-payload",
+                BlobTtl::fresh(scp_protocol::envelope::outer::BlobClass::Message),
+            )
+            .await;
         assert!(result.is_ok());
 
         let count = provider.adapter.send_count.load(Ordering::Relaxed);
         assert_eq!(count, 1);
     }
 
-    /// Every MLS message the native runtime publishes (application data,
-    /// Commits, sealed management messages) goes through `send_message`, and
-    /// requests the 7-day relay maximum (`09-security-model.md` §9.10.2
-    /// "Application-data blob TTL").
+    /// Every MLS message the native runtime publishes goes through
+    /// `send_message`, and the frame carries the `BlobTtl` the runtime chose
+    /// (`09-security-model.md` §9.10.2 "Blob TTL by message type").
     #[tokio::test]
-    async fn send_message_requests_the_relay_maximum_blob_ttl() {
+    async fn send_message_frames_the_requested_blob_ttl() {
+        use scp_protocol::envelope::outer::BlobClass;
         let provider = RelayTransportProvider::new(TestAdapter::new());
 
-        provider
-            .send_message(&[6u8; 32], b"mls-message")
-            .await
-            .unwrap();
-
-        let ttl = provider.adapter.last_blob_ttl.load(Ordering::Relaxed);
-        assert_eq!(ttl, scp_relay_client::MAX_BLOB_TTL);
-        assert_eq!(ttl, DEFAULT_APP_DATA_BLOB_TTL_SECS);
-        assert_eq!(ttl, 604_800);
+        for (class, want) in [
+            (BlobClass::Message, scp_relay_client::MAX_BLOB_TTL),
+            (BlobClass::Heartbeat, 240),
+            (BlobClass::ConsistencyCheckpoint, 1_200),
+        ] {
+            provider
+                .send_message(&[6u8; 32], b"mls-message", BlobTtl::fresh(class))
+                .await
+                .unwrap();
+            let ttl = provider.adapter.last_blob_ttl.load(Ordering::Relaxed);
+            assert_eq!(ttl, want, "{class:?}");
+        }
     }
 
     /// The two non-message publishes keep their own one-hour TTL.
@@ -421,7 +432,15 @@ mod tests {
         let provider = RelayTransportProvider::new(adapter);
         let ctx_id = [5u8; 32];
 
-        let result = provider.send_message(&ctx_id, b"data").await;
+        let result = provider
+            .send_message(
+                &ctx_id,
+                b"data",
+                scp_protocol::envelope::outer::BlobTtl::fresh(
+                    scp_protocol::envelope::outer::BlobClass::Message,
+                ),
+            )
+            .await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),

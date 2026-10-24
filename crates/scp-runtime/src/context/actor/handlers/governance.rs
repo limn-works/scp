@@ -944,6 +944,28 @@ async fn compute_commit_retry_outcomes(
             });
             continue;
         }
+        // A retry requests the TTL that remains of the first attempt, and a
+        // Commit with none left is not republished (spec 09 §9.10.2
+        // "Republish rule"), so no relay holds a copy past the first
+        // attempt's expiry, which the KeyPackage minimum lifetime covers.
+        let ttl = match scp_protocol::envelope::outer::BlobTtl::republish(
+            scp_protocol::envelope::outer::BlobClass::Message,
+            pending.first_attempt_at,
+            now,
+        ) {
+            Ok(ttl) => ttl,
+            Err(expired) => {
+                outcomes.push(CommitRetryOutcome {
+                    index: idx,
+                    kind: CommitRetryOutcomeKind::Failed {
+                        reason: expired.to_string(),
+                        attempts: pending.retry_count,
+                        operation: pending.operation.clone(),
+                    },
+                });
+                continue;
+            }
+        };
         // Every Commit publish, first attempt and retry, goes through
         // `publish_commit`, which hands the transport the serialized MLS
         // Commit to frame once (ADR-002, spec 23 §23.4.1).
@@ -951,6 +973,7 @@ async fn compute_commit_retry_outcomes(
             transport,
             pending.routing_id,
             &pending.commit_bytes,
+            ttl,
         )
         .await
         {
@@ -1651,10 +1674,10 @@ mod consequence_fail_closed_tests {
         use crate::context::builder::ContextTransportProvider;
         use crate::context::state::{CommitOperation, PendingCommit};
 
-        /// Records every `send_message` call (routing ID and payload) on a
-        /// channel and accepts it.
+        /// Records every `send_message` call (routing ID, payload and blob
+        /// TTL in seconds) on a channel and accepts it.
         struct PayloadTransport {
-            payloads: mpsc::Sender<([u8; 32], Vec<u8>)>,
+            payloads: mpsc::Sender<([u8; 32], Vec<u8>, u32)>,
         }
 
         #[async_trait::async_trait]
@@ -1676,11 +1699,47 @@ mod consequence_fail_closed_tests {
                 &self,
                 routing_id: &[u8; 32],
                 payload: &[u8],
+                ttl: scp_protocol::envelope::outer::BlobTtl,
             ) -> Result<(), ContextError> {
                 self.payloads
-                    .send((*routing_id, payload.to_vec()))
+                    .send((*routing_id, payload.to_vec(), ttl.secs()))
                     .map_err(|e| ContextError::TransportFailed(e.to_string()))
             }
+        }
+
+        /// Spec 09 §9.10.2 "Republish rule": a retry 3,000 s after the first
+        /// attempt requests the 7-day TTL minus those 3,000 s, so the retried
+        /// copy expires with the first one and never outlives the KeyPackage
+        /// minimum lifetime.
+        #[tokio::test]
+        async fn a_commit_retry_requests_the_ttl_left_from_its_first_attempt() {
+            let routing_id = [0x3f; 32];
+            let pending = PendingCommit {
+                commit_bytes: b"late-commit".to_vec(),
+                routing_id,
+                operation: CommitOperation::RecoveryAdvanceEpoch,
+                first_attempt_at: 1_000,
+                retry_count: 3,
+                last_error: Some("relay unreachable".into()),
+                next_attempt_at: 4_000,
+            };
+            let (payloads, sent) = mpsc::channel();
+            let transport = PayloadTransport { payloads };
+
+            let outcomes = compute_commit_retry_outcomes(&[pending], 4_000, &transport).await;
+
+            assert!(
+                matches!(
+                    outcomes.as_slice(),
+                    [o] if matches!(o.kind, CommitRetryOutcomeKind::Success { .. })
+                ),
+                "a retry inside the age bound succeeds"
+            );
+            assert_eq!(
+                sent.try_iter().map(|(_, _, ttl)| ttl).collect::<Vec<_>>(),
+                vec![scp_relay_client::MAX_BLOB_TTL - 3_000],
+                "the retry requests the TTL that remains of the first attempt"
+            );
         }
 
         #[tokio::test]
@@ -1711,7 +1770,7 @@ mod consequence_fail_closed_tests {
             );
             assert_eq!(
                 sent.try_iter().collect::<Vec<_>>(),
-                vec![(routing_id, commit)],
+                vec![(routing_id, commit, scp_relay_client::MAX_BLOB_TTL - 10)],
                 "the retry hands the transport the MLS Commit with no envelope of its own"
             );
         }

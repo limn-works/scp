@@ -90,6 +90,7 @@ impl ContextTransportProvider for RecordingTransport {
         &self,
         id: &[u8; 32],
         _encrypted_payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
     ) -> Result<(), ContextError> {
         self.routing_ids.lock().expect("lock").push(*id);
         Ok(())
@@ -179,8 +180,13 @@ impl ContextTransportProvider for TransportShim {
     async fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.delete_published(id).await
     }
-    async fn send_message(&self, id: &[u8; 32], payload: &[u8]) -> Result<(), ContextError> {
-        self.0.send_message(id, payload).await
+    async fn send_message(
+        &self,
+        id: &[u8; 32],
+        payload: &[u8],
+        ttl: scp_protocol::envelope::outer::BlobTtl,
+    ) -> Result<(), ContextError> {
+        self.0.send_message(id, payload, ttl).await
     }
 }
 

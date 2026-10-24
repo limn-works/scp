@@ -927,14 +927,15 @@ impl ContextActor {
             && self.state.membership.contains(self.deps.crypto.local_did());
         if eligible {
             let key: RotationArmKey = (
-                self.state.class_s.pseudonym_rotation,
+                self.state.class_s.pseudonym_rotation.clone(),
                 self.state.handle.params().pseudonym_rotation,
             );
-            if self.rotation_armed_key != Some(key) {
+            if self.rotation_armed_key.as_ref() != Some(&key) {
+                let now_secs = self.deps.clock.now_secs();
+                let wake = key.0.wake(key.1.as_ref(), now_secs);
                 self.rotation_armed_key = Some(key);
                 self.rotation_signals = 0;
-                let now_secs = self.deps.clock.now_secs();
-                self.rotation_timer = match key.0.wake(key.1.as_ref(), now_secs) {
+                self.rotation_timer = match wake {
                     pseudonym_rotation::RotationWake::AnnouncementPending { .. }
                     | pseudonym_rotation::RotationWake::RotationDue { .. } => {
                         Some(Box::pin(tokio::time::sleep(Duration::ZERO)))

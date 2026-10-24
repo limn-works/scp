@@ -1204,7 +1204,12 @@ mod tests {
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        async fn send_message(&self, _cid: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
+        async fn send_message(
+            &self,
+            _cid: &[u8; 32],
+            _payload: &[u8],
+            _ttl: scp_protocol::envelope::outer::BlobTtl,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
     }
@@ -1349,7 +1354,12 @@ mod tests {
             tokio::time::sleep(Duration::from_hours(1)).await;
             Ok(())
         }
-        async fn send_message(&self, _cid: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
+        async fn send_message(
+            &self,
+            _cid: &[u8; 32],
+            _payload: &[u8],
+            _ttl: scp_protocol::envelope::outer::BlobTtl,
+        ) -> Result<(), ContextError> {
             Ok(())
         }
     }

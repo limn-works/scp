@@ -838,9 +838,9 @@ async fn full_stack_relay_encrypted_roundtrip() {
     //    outer envelope wrapping) and CapturingTransport captures the bytes.
     let plaintext = b"Hello Bob! Real MLS + real relay, full stack.";
     alice.send_message(&handle, plaintext).await.unwrap();
-    let sent = alice.take_sent_ciphertexts();
+    let sent = alice.take_sent_publishes();
     assert_eq!(sent.len(), 1, "exactly one ciphertext captured");
-    let (sent_routing_id, ciphertext) = &sent[0];
+    let (sent_routing_id, ciphertext, ttl) = &sent[0];
     // §9.10.4: app-data is addressed to Bob's per-member pseudonym routing ID,
     // NEVER the shared context_routing_id.
     assert_eq!(
@@ -901,6 +901,7 @@ async fn full_stack_relay_encrypted_roundtrip() {
         &alice_provider,
         &routing_id,
         ciphertext,
+        *ttl,
     )
     .await
     .unwrap();
@@ -991,6 +992,188 @@ async fn full_stack_relay_encrypted_roundtrip() {
     );
 }
 
+/// Relays every send the runtime made since the last call and returns the
+/// blob TTL the relay delivered for each.
+async fn relayed_ttls(
+    alice: &scp_testing::fullstack::FullStackNode,
+    provider: &scp_transport::RelayTransportProvider<NativeRelayAdapter>,
+    streams: &mut std::collections::HashMap<[u8; 32], scp_transport::traits::SubscriptionStream>,
+) -> Vec<u32> {
+    use scp_core::context::builder::ContextTransportProvider;
+    let sent = alice.take_sent_publishes();
+    assert!(!sent.is_empty(), "the runtime sent nothing");
+    let mut ttls = Vec::new();
+    for (routing_id, bytes, ttl) in sent {
+        provider
+            .send_message(&routing_id, &bytes, ttl)
+            .await
+            .unwrap();
+        let stream = streams
+            .get_mut(&routing_id)
+            .expect("every send addresses Bob's pseudonym or the context");
+        let envelope = receive_envelope(stream).await;
+        assert_eq!(envelope.encrypted_blob, bytes);
+        ttls.push(envelope.blob_ttl);
+    }
+    ttls
+}
+
+/// Spec 09 §9.10.2 "Blob TTL by message type": a broadcast post requests the
+/// relay maximum, the delivery lifetime every other message to a context gets.
+/// The post goes out through the real `Supervisor::dispatch_broadcast_command`
+/// and the production `RelayTransportProvider`, and the relay delivers it with
+/// `blob_ttl` = `MAX_BLOB_TTL`.
+#[tokio::test]
+async fn a_broadcast_post_reaches_the_relay_with_the_relay_maximum_ttl() {
+    use scp_core::context::MemoryScope;
+    use scp_core::context::actor::CommandSigner;
+    use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastPayload};
+    use scp_core::context::builder::ContextTransportProvider;
+
+    let (relay_handle, relay_addr) = start_relay().await;
+    let url = format!("ws://{relay_addr}/scp/v1");
+
+    let network = FullStackNetwork::new();
+    let alice = network.create_node(ALICE_DID);
+    let ctx_id = "relay-broadcast-ttl-ctx";
+    alice
+        .create_context(
+            ctx_id,
+            ContextParams {
+                mode: ContextMode::Broadcast,
+                memory_scope: MemoryScope::Full,
+                ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
+                ..ContextParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    drop(alice.take_sent_publishes());
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    alice
+        .manager
+        .dispatch_broadcast_command(BroadcastCommand::PublishBroadcast {
+            payload: Box::new(PublishBroadcastPayload {
+                context_id: ctx_id.to_owned(),
+                author_did: DID::from(ALICE_DID),
+                payload: b"a broadcast post".to_vec(),
+                signer: CommandSigner::local_ed25519(alice.signing_key()),
+            }),
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+
+    let sent = alice.take_sent_publishes();
+    assert_eq!(sent.len(), 1, "one post, one send");
+    let subscriber = connect_relay(&url).await;
+    let provider = scp_transport::RelayTransportProvider::new(connect_relay(&url).await);
+    let (routing_id, bytes, ttl) = sent.into_iter().next().unwrap();
+    let mut stream = subscriber
+        .subscribe(&RoutingId::new(routing_id), None)
+        .await
+        .unwrap();
+    provider
+        .send_message(&routing_id, &bytes, ttl)
+        .await
+        .unwrap();
+    let envelope = receive_envelope(&mut stream).await;
+    assert_eq!(envelope.encrypted_blob, bytes);
+    assert_eq!(
+        envelope.blob_ttl,
+        scp_relay_client::MAX_BLOB_TTL,
+        "a broadcast post is stored for the relay maximum"
+    );
+
+    relay_handle.shutdown();
+}
+
+/// Spec 09 §9.10.2 "Blob TTL by message type": the runtime chooses each
+/// blob's relay TTL from its message type, and the relay stores it with that
+/// TTL. An application message and a Commit request the relay maximum, a
+/// heartbeat 240 s and a consistency checkpoint 1,200 s. Every blob goes out
+/// through the runtime's real send helpers and the production
+/// `RelayTransportProvider`.
+#[tokio::test]
+async fn each_message_type_reaches_the_relay_with_its_blob_ttl() {
+    let (relay_handle, relay_addr) = start_relay().await;
+    let url = format!("ws://{relay_addr}/scp/v1");
+
+    let network = FullStackNetwork::new();
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
+    let ctx_id = "relay-blob-ttl-ctx";
+    let ctx_bytes = context_id_bytes(ctx_id);
+    let handle = alice
+        .create_context(ctx_id, encrypted_params())
+        .await
+        .unwrap();
+    alice.add_member(&handle, BOB_DID).await.unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
+    let bob_pseudonym = [0x42u8; 32];
+    alice
+        .manager
+        .seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
+        .await
+        .unwrap();
+
+    let subscriber = connect_relay(&url).await;
+    let mut streams = std::collections::HashMap::new();
+    for routing_id in [bob_pseudonym, context_routing_id(ctx_id)] {
+        streams.insert(
+            routing_id,
+            subscriber
+                .subscribe(&RoutingId::new(routing_id), None)
+                .await
+                .unwrap(),
+        );
+    }
+    let provider = scp_transport::RelayTransportProvider::new(connect_relay(&url).await);
+    drop(alice.take_sent_publishes());
+
+    let max = scp_relay_client::MAX_BLOB_TTL;
+    alice.send_message(&handle, b"hello").await.unwrap();
+    assert_eq!(
+        relayed_ttls(&alice, &provider, &mut streams).await,
+        vec![max],
+        "an application message is stored for the relay maximum"
+    );
+
+    alice.send_heartbeat(ctx_id).await.unwrap();
+    assert_eq!(
+        relayed_ttls(&alice, &provider, &mut streams).await,
+        vec![240],
+        "a heartbeat is stored for 240 s"
+    );
+
+    alice.build_local_checkpoint(ctx_id).await.unwrap();
+    assert_eq!(
+        relayed_ttls(&alice, &provider, &mut streams).await,
+        vec![1_200],
+        "a consistency checkpoint is stored for 1,200 s"
+    );
+
+    let (routing_id, commit, ttl) = take_removal_commit(&alice, &handle, BOB_DID).await;
+    {
+        use scp_core::context::builder::ContextTransportProvider;
+        provider
+            .send_message(&routing_id, &commit, ttl)
+            .await
+            .unwrap();
+    }
+    let stream = streams.get_mut(&routing_id).expect("context routing ID");
+    let envelope = receive_envelope(stream).await;
+    assert_eq!(envelope.encrypted_blob, commit);
+    assert_eq!(
+        envelope.blob_ttl, max,
+        "a Commit is stored for the relay maximum"
+    );
+
+    relay_handle.shutdown();
+}
+
 /// Multi-message variant: sends 3 messages through the relay and verifies each.
 ///
 /// Extends `full_stack_relay_encrypted_roundtrip` by verifying that multiple
@@ -1057,9 +1240,9 @@ async fn full_stack_relay_multiple_messages() {
 
         // Encrypt via ContextManager (real MLS + sender keys + envelope).
         alice.send_message(&handle, msg.as_bytes()).await.unwrap();
-        let sent = alice.take_sent_ciphertexts();
+        let sent = alice.take_sent_publishes();
         assert_eq!(sent.len(), 1);
-        let (sent_routing_id, ciphertext) = (&sent[0].0, &sent[0].1);
+        let (sent_routing_id, ciphertext, ttl) = (&sent[0].0, &sent[0].1, sent[0].2);
         // Each message addresses Bob's pseudonym, never the shared RID.
         assert_eq!(
             sent_routing_id, &bob_pseudonym,
@@ -1077,6 +1260,7 @@ async fn full_stack_relay_multiple_messages() {
             &alice_provider,
             &routing_id,
             ciphertext,
+            ttl,
         )
         .await
         .unwrap();
@@ -1086,6 +1270,13 @@ async fn full_stack_relay_multiple_messages() {
         assert_eq!(
             &received.encrypted_blob, ciphertext,
             "the relayed encrypted_blob is the MLS message"
+        );
+        // Spec 09 §9.10.2 "Blob TTL by message type": an application message
+        // is stored for the relay maximum.
+        assert_eq!(
+            received.blob_ttl,
+            scp_relay_client::MAX_BLOB_TTL,
+            "message {i} must reach the relay with the maximum blob TTL"
         );
         let decrypted = bob
             .decrypt_message(ctx_id, &ctx_bytes, &received.encrypted_blob, ALICE_DID)
@@ -1235,6 +1426,9 @@ async fn full_stack_relay_three_party() {
             &alice_provider,
             pseudonym,
             ct,
+            scp_protocol::envelope::outer::BlobTtl::fresh(
+                scp_protocol::envelope::outer::BlobClass::Message,
+            ),
         )
         .await
         .unwrap();
@@ -1433,7 +1627,7 @@ async fn take_removal_commit(
     alice: &scp_testing::fullstack::FullStackNode,
     handle: &scp_core::context::ContextHandle,
     member_did: &str,
-) -> ([u8; 32], Vec<u8>) {
+) -> ([u8; 32], Vec<u8>, scp_protocol::envelope::outer::BlobTtl) {
     drop(alice.take_sent_ciphertexts());
     alice
         .manager
@@ -1442,13 +1636,13 @@ async fn take_removal_commit(
         .unwrap();
     // `execute_remove_member` broadcasts the Commit before it pushes the
     // rotated sender keys, so the first send is the Commit.
-    let (routing_id, commit) = alice
-        .take_sent_ciphertexts()
+    let (routing_id, commit, ttl) = alice
+        .take_sent_publishes()
         .into_iter()
         .next()
         .expect("removing a member sends its Commit");
     assert_eq!(routing_id, context_routing_id(handle.context_id()));
-    (routing_id, commit)
+    (routing_id, commit, ttl)
 }
 
 /// Alice removes `member_did`, and the bytes her actor handed its transport
@@ -1463,9 +1657,20 @@ async fn relay_removal_commit(
     stream: &mut scp_transport::traits::SubscriptionStream,
 ) -> scp_core::envelope::OuterEnvelope {
     use scp_core::context::builder::ContextTransportProvider;
-    let (routing_id, commit) = take_removal_commit(alice, handle, member_did).await;
-    provider.send_message(&routing_id, &commit).await.unwrap();
-    receive_envelope(stream).await
+    let (routing_id, commit, ttl) = take_removal_commit(alice, handle, member_did).await;
+    provider
+        .send_message(&routing_id, &commit, ttl)
+        .await
+        .unwrap();
+    let envelope = receive_envelope(stream).await;
+    // Spec 09 §9.10.2 "Blob TTL by message type": a Commit is stored for the
+    // relay maximum, so a member offline for up to 7 days can still apply it.
+    assert_eq!(
+        envelope.blob_ttl,
+        scp_relay_client::MAX_BLOB_TTL,
+        "a removal Commit must reach the relay with the maximum blob TTL"
+    );
+    envelope
 }
 
 /// Alice's encrypted context `ctx_id` with Bob, Carol and Dave as members,
@@ -1667,7 +1872,13 @@ async fn a_failed_phase_5_update_stays_queued_and_a_peer_opens_it_over_the_relay
         .unwrap();
     let provider = scp_transport::RelayTransportProvider::new(connect_relay(&url).await);
     provider
-        .send_message(&queued[0].routing_id, &queued[0].commit_bytes)
+        .send_message(
+            &queued[0].routing_id,
+            &queued[0].commit_bytes,
+            scp_protocol::envelope::outer::BlobTtl::fresh(
+                scp_protocol::envelope::outer::BlobClass::Message,
+            ),
+        )
         .await
         .unwrap();
     let envelope = receive_envelope(&mut stream).await;

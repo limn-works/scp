@@ -196,7 +196,12 @@ impl ContextTransportProvider for RecordingTransport {
     async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    async fn send_message(&self, id: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        id: &[u8; 32],
+        _payload: &[u8],
+        _ttl: scp_protocol::envelope::outer::BlobTtl,
+    ) -> Result<(), ContextError> {
         if self.0.fail_sends.load(Ordering::SeqCst) {
             return Err(ContextError::TransportFailed(
                 "fixture: transport send fails".to_owned(),

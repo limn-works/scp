@@ -151,6 +151,7 @@ pub(super) fn local_routing_ids(
     Ok(crate::context::actor::pseudonym_rotation::LocalRoutingIds {
         current,
         previous: rotation.previous().filter(|p| p.in_grace(now_secs)),
+        query_only: rotation.live_query_only(now_secs),
         pseudonym_epoch: rotation.epoch(),
         next_pseudonym_epoch: rotation.next_epoch(policy.as_ref(), now_secs),
         announce_pending: rotation.announce_pending(),
