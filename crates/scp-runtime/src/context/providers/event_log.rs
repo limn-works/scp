@@ -14,9 +14,10 @@
 //! provider persists [`scp_event_log::Event`] values to an
 //! [`EventLogPersistence`] backend after each append operation and loads them
 //! during [`restore_event_log`](MerkleEventLogProvider::restore_event_log).
-//! This ensures events survive process restarts. Each event is persisted
-//! individually (O(1) per append); bulk operations (prune, import) rewrite all
-//! events.
+//! This ensures events survive process restarts. An append persists one unit
+//! (O(1) per append); bulk operations (init, prune, import) replace the whole
+//! stored log in one commit. A per-context write gate serializes the writes to
+//! one context, so storage receives them in the order memory applied them.
 //!
 //! # Integrity model
 //!
@@ -124,38 +125,42 @@ impl ContextLog {
 /// All methods use `context_id` as a hex string (matching `ProtocolRepository` key
 /// conventions).
 ///
-/// # Per-event storage
+/// # Atomicity
 ///
-/// Each event is stored under its own key (`merkle_event_log/{seq:020d}`)
-/// rather than as a single serialized blob. This makes `append_event` O(1)
-/// instead of O(n) per persist. Bulk operations (prune, import) use
-/// [`persist_entries`](Self::persist_entries) which rewrites all keys.
+/// Each method either takes full effect or none (spec section 17.3, "Merkle
+/// event log entries"). [`persist_unit`](Self::persist_unit) stores a unit of
+/// one or more events in one write, and [`replace`](Self::replace) swaps the
+/// whole stored log at one commit point, so a failure never leaves a prefix of
+/// a unit or of a replacement log loadable.
 #[async_trait::async_trait]
 pub trait EventLogPersistence: Send + Sync {
-    /// Persists a single event at the given sequence index.
+    /// Persists one unit of events: `entries[0]` has sequence `base_seq` and
+    /// the rest follow it in order.
     ///
-    /// Called after each append operation. O(1) serialization + I/O.
+    /// Called after each append. After an error, a load returns either every
+    /// entry of the unit or none of them.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying storage write fails.
-    async fn persist_entry(
+    /// Returns an error if `entries` is empty, if `base_seq` cannot start a
+    /// unit of the stored log, or if the underlying storage write fails.
+    async fn persist_unit(
         &self,
         context_id: &str,
-        seq: usize,
-        entry: &Event,
+        base_seq: u64,
+        entries: &[Event],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Persists all events for a context, replacing any previously stored
-    /// events.
+    /// Replaces a context's whole stored log with `entries`.
     ///
-    /// Called after bulk operations (prune, import) that rewrite the full
-    /// event set. Deletes existing per-event keys before writing.
+    /// Called by init, prune, and import. After an error, a load returns
+    /// either exactly the old log or exactly `entries`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying storage write fails.
-    async fn persist_entries(
+    /// Returns an error if the underlying storage write fails before the
+    /// replacement commits.
+    async fn replace(
         &self,
         context_id: &str,
         entries: &[Event],
@@ -176,7 +181,8 @@ pub trait EventLogPersistence: Send + Sync {
 
     /// Deletes persisted events for a context.
     ///
-    /// Called on `destroy_event_log`. Removes all per-event keys by prefix.
+    /// Called on `destroy_event_log`. After it returns `Ok`, a load returns
+    /// `None`.
     ///
     /// # Errors
     ///
@@ -209,9 +215,20 @@ pub struct MerkleEventLogProvider {
         reason = "`std::sync::Mutex` guards only synchronous in-memory Merkle-tree operations; every lock is scoped and dropped BEFORE any `.await` on the async `EventLogPersistence` backend (ADR-049 Decision 7), so the guard is never held across a suspension point and a `tokio::sync::Mutex` would add unnecessary overhead."
     )]
     logs: Mutex<HashMap<[u8; 32], ContextLog>>,
+    /// Per-context write gates. Each write to a context holds its gate's one
+    /// permit from the in-memory change through the persist, so writes to one
+    /// context never interleave and storage applies them in memory's order.
+    /// [`MerkleEventLogProvider::release_write_gate`] removes a gate only
+    /// when no writer holds or waits on it.
+    write_gates: dashmap::DashMap<[u8; 32], WriteGate>,
     /// Optional persistence backend for surviving process restarts (#636).
     persistence: Option<std::sync::Arc<dyn EventLogPersistence>>,
 }
+
+/// A context's write gate: a semaphore with one permit. A writer that holds
+/// or awaits the permit holds a clone of the `Arc`, which
+/// [`MerkleEventLogProvider::release_write_gate`] counts.
+type WriteGate = std::sync::Arc<tokio::sync::Semaphore>;
 
 #[allow(clippy::significant_drop_tightening)]
 #[allow(
@@ -224,6 +241,7 @@ impl MerkleEventLogProvider {
     pub fn new() -> Self {
         Self {
             logs: Mutex::new(HashMap::new()),
+            write_gates: dashmap::DashMap::new(),
             persistence: None,
         }
     }
@@ -236,6 +254,7 @@ impl MerkleEventLogProvider {
     pub fn with_persistence(persistence: std::sync::Arc<dyn EventLogPersistence>) -> Self {
         Self {
             logs: Mutex::new(HashMap::new()),
+            write_gates: dashmap::DashMap::new(),
             persistence: Some(persistence),
         }
     }
@@ -328,8 +347,9 @@ impl MerkleEventLogProvider {
 
         let log = rebuild_log_from_events(context_id, &entries)?;
 
-        // Persist the imported events (bulk rewrite).
-        self.persist_entries_best_effort(context_id, &entries).await;
+        let _write = self.lock_write_gate(context_id).await?;
+        // Persist the imported events (one replace).
+        self.replace_best_effort(context_id, &entries).await;
 
         let mut logs = self
             .logs
@@ -357,6 +377,7 @@ impl MerkleEventLogProvider {
         context_id: &[u8; 32],
     ) -> Result<(), ContextCreationError> {
         let context_id_hex = hex::encode(context_id);
+        let _write = self.lock_write_gate(context_id).await?;
 
         let entries = match self.persistence.as_ref() {
             None => Vec::new(),
@@ -428,6 +449,18 @@ impl MerkleEventLogProvider {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        let _write = match self.lock_write_gate(context_id).await {
+            Ok(permit) => permit,
+            Err(e) => {
+                tracing::error!(
+                    context_id = %hex::encode(context_id),
+                    error = %e,
+                    "event log prune could not take the write gate; skipping prune"
+                );
+                return None;
+            }
+        };
 
         let (prune_count, entries_snapshot) = {
             let mut logs = self
@@ -523,43 +556,99 @@ impl MerkleEventLogProvider {
 
             context_log.log = pruned_log;
 
-            // Persist the pruned state (bulk rewrite with renumbered keys).
+            // Persist the pruned state (one replace with renumbered sequences).
             let entries_snapshot = context_log.log.events().to_vec();
             (prune_count, entries_snapshot)
         };
-        self.persist_entries_best_effort(context_id, &entries_snapshot)
+        self.replace_best_effort(context_id, &entries_snapshot)
             .await;
 
         Some(prune_count)
     }
 
-    /// Best-effort O(1) persistence of a single event at a given sequence.
+    /// Returns the write gate for a context, creating it on first use.
+    fn write_gate(&self, context_id: &[u8; 32]) -> WriteGate {
+        // The shard guard drops at the end of this statement, before any
+        // caller awaits the gate.
+        std::sync::Arc::clone(
+            self.write_gates
+                .entry(*context_id)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+                .value(),
+        )
+    }
+
+    /// Waits for and takes a context's write gate. The returned permit holds
+    /// a clone of the gate until it drops.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::EventLogFailed`] if the gate's
+    /// semaphore is closed. No code closes it, so this error marks a bug.
+    async fn lock_write_gate(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ContextCreationError> {
+        self.write_gate(context_id)
+            .acquire_owned()
+            .await
+            .map_err(|e| {
+                ContextCreationError::EventLogFailed(format!(
+                    "event log write gate for context {} is closed: {e}",
+                    hex::encode(context_id)
+                ))
+            })
+    }
+
+    /// Removes a context's write gate when no writer holds or waits on it.
+    ///
+    /// Every writer clones the gate inside [`Self::write_gate`] under the
+    /// map's shard lock, and `remove_if` reads the clone count under that same
+    /// lock. A count of 1 (the map's own reference) therefore means no writer
+    /// holds the gate and none can take it before the removal. A gate that a
+    /// waiter still holds stays in the map, so a later writer reuses it rather
+    /// than creating a second gate for the context.
+    fn release_write_gate(&self, context_id: &[u8; 32]) {
+        self.write_gates.remove_if(context_id, |_, gate| {
+            std::sync::Arc::strong_count(gate) == 1
+        });
+    }
+
+    /// Best-effort persistence of one unit that starts at `base_seq`.
     ///
     /// Used by `append_event` to persist only the newly appended event.
-    async fn persist_entry_best_effort(&self, context_id: &[u8; 32], seq: usize, entry: &Event) {
+    async fn persist_unit_best_effort(
+        &self,
+        context_id: &[u8; 32],
+        base_seq: u64,
+        entries: &[Event],
+    ) {
         if let Some(ref persistence) = self.persistence {
             let context_id_hex = hex::encode(context_id);
-            if let Err(e) = persistence.persist_entry(&context_id_hex, seq, entry).await {
+            if let Err(e) = persistence
+                .persist_unit(&context_id_hex, base_seq, entries)
+                .await
+            {
                 tracing::warn!(
                     context_id = %context_id_hex,
                     error = %e,
-                    "failed to persist event log entry (best-effort)"
+                    "failed to persist event log unit (best-effort)"
                 );
             }
         }
     }
 
-    /// Best-effort bulk persistence: replaces all stored events.
+    /// Best-effort replace of the whole stored log.
     ///
-    /// Used by prune and import operations that rewrite the full event set.
-    async fn persist_entries_best_effort(&self, context_id: &[u8; 32], entries: &[Event]) {
+    /// Used by init, prune, and import, which rewrite the full event set.
+    async fn replace_best_effort(&self, context_id: &[u8; 32], entries: &[Event]) {
         if let Some(ref persistence) = self.persistence {
             let context_id_hex = hex::encode(context_id);
-            if let Err(e) = persistence.persist_entries(&context_id_hex, entries).await {
+            if let Err(e) = persistence.replace(&context_id_hex, entries).await {
                 tracing::warn!(
                     context_id = %context_id_hex,
                     error = %e,
-                    "failed to persist event log entries (best-effort)"
+                    "failed to replace persisted event log (best-effort)"
                 );
             }
         }
@@ -668,6 +757,7 @@ fn truncate_log_keeping_tail(
 #[allow(clippy::significant_drop_tightening)]
 impl ContextEventLogProvider for MerkleEventLogProvider {
     async fn init_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        let _write = self.lock_write_gate(context_id).await?;
         {
             let mut logs = self
                 .logs
@@ -677,8 +767,8 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         }
 
         // Persist the empty event set to establish the context in storage
-        // (clears any stale per-event keys from a previous incarnation).
-        self.persist_entries_best_effort(context_id, &[]).await;
+        // (replaces any stored log from a previous incarnation).
+        self.replace_best_effort(context_id, &[]).await;
 
         Ok(())
     }
@@ -723,7 +813,8 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
             )?;
         }
 
-        let (seq, event) = {
+        let _write = self.lock_write_gate(context_id).await?;
+        let event = {
             let mut logs = self
                 .logs
                 .lock()
@@ -734,14 +825,11 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                     hex::encode(context_id)
                 ))
             })?;
-            let event = log.append(event_type, actor_did, payload, timestamp_secs)?;
-            #[allow(clippy::cast_possible_truncation)]
-            let seq = event.sequence as usize;
-            (seq, event)
+            log.append(event_type, actor_did, payload, timestamp_secs)?
         };
 
-        // O(1) persist: only the newly appended event.
-        self.persist_entry_best_effort(context_id, seq, &event)
+        // O(1) persist: a one-entry unit holding only the new event.
+        self.persist_unit_best_effort(context_id, event.sequence, std::slice::from_ref(&event))
             .await;
 
         Ok(())
@@ -749,15 +837,21 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
 
     async fn destroy_event_log(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         {
-            let mut logs = self
-                .logs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            logs.remove(context_id);
-        }
+            let _write = self.lock_write_gate(context_id).await?;
+            {
+                let mut logs = self
+                    .logs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                logs.remove(context_id);
+            }
 
-        // Remove persisted entries.
-        self.delete_persisted_best_effort(context_id).await;
+            // Remove persisted entries.
+            self.delete_persisted_best_effort(context_id).await;
+        }
+        // The permit above dropped, so this provider's own clone of the gate
+        // no longer counts.
+        self.release_write_gate(context_id);
 
         Ok(())
     }
@@ -1475,32 +1569,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl EventLogPersistence for MockEventLogPersistence {
-        async fn persist_entry(
+        async fn persist_unit(
             &self,
             context_id: &str,
-            seq: usize,
-            entry: &Event,
+            base_seq: u64,
+            entries: &[Event],
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let base = usize::try_from(base_seq)?;
             let mut store = self.store.lock().unwrap();
-            let entries = store.entry(context_id.to_owned()).or_default();
-            if seq >= entries.len() {
-                while entries.len() <= seq {
-                    entries.push(Event {
-                        event_type: EventType::MessageSent,
-                        actor_did: DID::from(String::new()),
-                        timestamp: 0,
-                        sequence: entries.len() as u64,
-                        payload: EventPayload::default(),
-                        prev_hash: [0u8; 32],
-                        signature: Vec::new(),
-                    });
-                }
+            let stored = store.entry(context_id.to_owned()).or_default();
+            if base != stored.len() {
+                return Err(format!(
+                    "unit at {base} does not follow {} stored entries",
+                    stored.len()
+                )
+                .into());
             }
-            entries[seq] = entry.clone();
+            stored.extend_from_slice(entries);
             Ok(())
         }
 
-        async fn persist_entries(
+        async fn replace(
             &self,
             context_id: &str,
             entries: &[Event],
@@ -1781,6 +1870,309 @@ mod tests {
 
         assert!(persistence.load_entries(&ctx_hex).await.unwrap().is_none());
         assert!(provider.entries(&ctx_id).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Write gate and atomic storage (spec section 17.3, "Merkle event log
+    // entries")
+    // -----------------------------------------------------------------------
+
+    /// Persistence that counts calls in flight and parks each call until the
+    /// test adds a permit to `park`.
+    struct ParkingPersistence {
+        park: tokio::sync::Semaphore,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ParkingPersistence {
+        const fn new() -> Self {
+            Self {
+                park: tokio::sync::Semaphore::const_new(0),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        async fn enter_and_park(&self) {
+            use std::sync::atomic::Ordering;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            self.park.acquire().await.unwrap().forget();
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        fn in_flight(&self) -> usize {
+            self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventLogPersistence for ParkingPersistence {
+        async fn persist_unit(
+            &self,
+            _context_id: &str,
+            _base_seq: u64,
+            _entries: &[Event],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.enter_and_park().await;
+            Ok(())
+        }
+
+        async fn replace(
+            &self,
+            _context_id: &str,
+            _entries: &[Event],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.enter_and_park().await;
+            Ok(())
+        }
+
+        async fn load_entries(
+            &self,
+            _context_id: &str,
+        ) -> Result<Option<Vec<Event>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(None)
+        }
+
+        async fn delete_entries(
+            &self,
+            _context_id: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.enter_and_park().await;
+            Ok(())
+        }
+    }
+
+    /// Lets every runnable task on the current-thread runtime run until it
+    /// blocks.
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A destroy that releases the write gate while another writer waits on
+    /// it must not let a later writer take a second gate: at most one write to
+    /// a context is ever in its persist call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_gate_admits_one_writer_across_destroy() {
+        let persistence = std::sync::Arc::new(ParkingPersistence::new());
+        let provider = std::sync::Arc::new(MerkleEventLogProvider::with_persistence(
+            persistence.clone(),
+        ));
+        let ctx_id = [30u8; 32];
+
+        persistence.park.add_permits(1);
+        provider.init_event_log(&ctx_id).await.unwrap();
+        persistence
+            .max_in_flight
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let append = |provider: std::sync::Arc<MerkleEventLogProvider>| async move {
+            provider
+                .append_event(
+                    &ctx_id,
+                    EventType::MessageSent,
+                    "",
+                    EventPayload::default(),
+                    1_700_000_000,
+                )
+                .await
+        };
+
+        // A holds the gate, parked in its persist.
+        let a = tokio::spawn(append(provider.clone()));
+        settle().await;
+        assert_eq!(persistence.in_flight(), 1, "A parks in persist_unit");
+
+        // D (destroy) and E (init) wait on the gate, in that order.
+        let d = tokio::spawn({
+            let provider = provider.clone();
+            async move { provider.destroy_event_log(&ctx_id).await }
+        });
+        settle().await;
+        let e = tokio::spawn({
+            let provider = provider.clone();
+            async move { provider.init_event_log(&ctx_id).await }
+        });
+        settle().await;
+
+        // A finishes; D takes the gate and parks in delete_entries.
+        persistence.park.add_permits(1);
+        settle().await;
+        assert!(a.is_finished(), "A finished");
+        assert_eq!(persistence.in_flight(), 1, "D parks in delete_entries");
+
+        // D finishes and releases the gate while E still waits on it; E takes
+        // the gate and parks in replace.
+        persistence.park.add_permits(1);
+        settle().await;
+        assert!(d.is_finished(), "D finished");
+        assert_eq!(persistence.in_flight(), 1, "E parks in replace");
+
+        // F must queue behind E on the same gate.
+        let f = tokio::spawn(append(provider.clone()));
+        settle().await;
+        let max = persistence
+            .max_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        persistence.park.add_permits(16);
+        a.await.unwrap().unwrap();
+        d.await.unwrap().unwrap();
+        e.await.unwrap().unwrap();
+        f.await.unwrap().unwrap();
+
+        assert_eq!(
+            max, 1,
+            "two writes to one context were in persistence at once: the write gate admitted two holders"
+        );
+        assert_eq!(provider.entries(&ctx_id).unwrap().len(), 1);
+    }
+
+    /// A destroy with no waiting writer removes the context's gate, so gates
+    /// do not accumulate for destroyed contexts.
+    #[tokio::test]
+    async fn destroy_releases_an_idle_write_gate() {
+        let provider = MerkleEventLogProvider::with_persistence(std::sync::Arc::new(
+            MockEventLogPersistence::new(),
+        ));
+        let ctx_id = [31u8; 32];
+        provider.init_event_log(&ctx_id).await.unwrap();
+        assert_eq!(provider.write_gates.len(), 1);
+        provider.destroy_event_log(&ctx_id).await.unwrap();
+        assert!(provider.write_gates.is_empty());
+    }
+
+    type Faulty = crate::context::supervisor::faulty_storage::FaultyStorage;
+
+    fn faulty_provider(faulty: &std::sync::Arc<Faulty>) -> MerkleEventLogProvider {
+        let repo = std::sync::Arc::new(crate::store::ProtocolRepository::new_for_testing(
+            std::sync::Arc::clone(faulty),
+        ));
+        MerkleEventLogProvider::with_persistence(std::sync::Arc::new(
+            crate::store::context::ProtocolRepositoryEventLogBridge::new(repo),
+        ))
+    }
+
+    fn log_bytes(entries: &[Event]) -> Vec<u8> {
+        rmp_serde::to_vec(entries).unwrap()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReplaceOp {
+        Prune,
+        Import,
+        InitOverExisting,
+    }
+
+    /// Prune, import, and init over an existing log each replace the stored
+    /// log. For a crash at every put N, a fresh provider restores exactly the
+    /// old log or exactly the new one.
+    #[tokio::test]
+    async fn replace_crashing_at_any_put_restores_old_or_new_log() {
+        let ctx_id = [32u8; 32];
+
+        // Import source: a log long enough to need several stored units.
+        let source = MerkleEventLogProvider::new();
+        source.init_event_log(&ctx_id).await.unwrap();
+        for i in 0..300u64 {
+            source
+                .append_event(
+                    &ctx_id,
+                    EventType::MessageSent,
+                    "",
+                    payload_bytes(&i.to_be_bytes()),
+                    1_700_000_000 + i,
+                )
+                .await
+                .unwrap();
+        }
+        let import_data = source.export_event_log_entries(&ctx_id).unwrap();
+
+        let prune_policy = scp_protocol::context::governance::PruningPolicy {
+            size_based: Some(scp_protocol::context::governance::SizeBasedPolicy {
+                max_event_count: 2,
+                max_storage_bytes: u64::MAX,
+            }),
+            ..Default::default()
+        };
+
+        for op in [
+            ReplaceOp::Prune,
+            ReplaceOp::Import,
+            ReplaceOp::InitOverExisting,
+        ] {
+            let mut saw_old = false;
+            let mut saw_new = false;
+            // Prune puts 2 keys, import 3, init 1; N = 4 lets every put land.
+            for n in 1..=4u64 {
+                let faulty = std::sync::Arc::new(Faulty::new(std::sync::Arc::new(
+                    scp_platform::in_memory::InMemoryStorage::new(),
+                )));
+                let provider = faulty_provider(&faulty);
+                provider.init_event_log(&ctx_id).await.unwrap();
+                for i in 0..5u64 {
+                    provider
+                        .append_event(
+                            &ctx_id,
+                            EventType::MemberJoined,
+                            "",
+                            payload_bytes(&[0xA0, u8::try_from(i).unwrap()]),
+                            1_600_000_000 + i,
+                        )
+                        .await
+                        .unwrap();
+                }
+                let old = provider.entries(&ctx_id).unwrap();
+
+                faulty.fail_nth_store(n);
+                match op {
+                    ReplaceOp::Prune => {
+                        assert_eq!(
+                            provider
+                                .prune_before_checkpoint(&ctx_id, 5, &prune_policy)
+                                .await,
+                            Some(3)
+                        );
+                    }
+                    ReplaceOp::Import => provider
+                        .import_event_log_entries(&ctx_id, &import_data)
+                        .await
+                        .unwrap(),
+                    ReplaceOp::InitOverExisting => provider.init_event_log(&ctx_id).await.unwrap(),
+                }
+                faulty.clear_fail();
+                let new = provider.entries(&ctx_id).unwrap();
+
+                let restored = faulty_provider(&faulty);
+                restored
+                    .restore_event_log(&ctx_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("{op:?} N={n}: restore rejected the stored log: {e}")
+                    });
+                let got = restored.entries(&ctx_id).unwrap();
+                if log_bytes(&got) == log_bytes(&old) {
+                    saw_old = true;
+                } else {
+                    assert_eq!(
+                        log_bytes(&got),
+                        log_bytes(&new),
+                        "{op:?} N={n}: restored {} entries, neither the old log ({}) nor the new one ({})",
+                        got.len(),
+                        old.len(),
+                        new.len()
+                    );
+                    saw_new = true;
+                }
+            }
+            assert!(
+                saw_old && saw_new,
+                "{op:?}: the sweep must reach both outcomes"
+            );
+        }
     }
 
     #[tokio::test]

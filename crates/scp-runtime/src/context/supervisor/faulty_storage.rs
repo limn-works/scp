@@ -1,9 +1,10 @@
 //! A `Storage` wrapper that fails writes and deletes on a configured key
-//! prefix, or fails only writes, before or after they commit, for tests of
-//! fail-closed storage branches. The faults sit behind `std::sync::RwLock`s
+//! prefix, or fails only writes, before or after they commit, or fails every
+//! write from the Nth on, for tests of fail-closed storage branches. The faults sit behind `std::sync::RwLock`s
 //! never held across an `.await` (`clippy.toml` bans `std::sync::Mutex` in
 //! this crate).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use scp_platform::PlatformError;
@@ -25,6 +26,14 @@ pub struct FaultyStorage {
     /// Fails only `store` for keys under this prefix, without writing;
     /// `delete` and `retrieve` pass.
     fail_store_prefix: RwLock<Option<String>>,
+    /// Fails `delete_prefix` calls whose prefix argument starts with this
+    /// prefix. `delete` is not affected.
+    fail_delete_prefix_calls: RwLock<Option<String>>,
+    /// When nonzero, the Nth `store` call after arming (1-based) and every
+    /// later one fail without writing: a crash at the Nth put.
+    fail_from_store: AtomicU64,
+    /// Counts `store` calls since [`FaultyStorage::fail_nth_store`] armed.
+    stores_seen: AtomicU64,
 }
 
 impl FaultyStorage {
@@ -35,7 +44,25 @@ impl FaultyStorage {
             fail_delete_prefix: RwLock::new(None),
             fail_after_commit_prefix: RwLock::new(None),
             fail_store_prefix: RwLock::new(None),
+            fail_delete_prefix_calls: RwLock::new(None),
+            fail_from_store: AtomicU64::new(0),
+            stores_seen: AtomicU64::new(0),
         }
+    }
+
+    /// Fails the `n`th `store` call from now (1-based) and every later one,
+    /// without writing, as a crash at that put would. `n == 0` disarms.
+    pub fn fail_nth_store(&self, n: u64) {
+        self.stores_seen.store(0, Ordering::SeqCst);
+        self.fail_from_store.store(n, Ordering::SeqCst);
+    }
+
+    /// Fails later `delete_prefix` calls whose prefix starts with `prefix`.
+    pub fn fail_delete_prefix_calls(&self, prefix: &str) {
+        *self
+            .fail_delete_prefix_calls
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(prefix.to_owned());
     }
 
     /// Fails later `store` calls for keys under `prefix` without writing,
@@ -75,6 +102,11 @@ impl FaultyStorage {
 
     /// Clears every fault.
     pub fn clear_fail(&self) {
+        self.fail_from_store.store(0, Ordering::SeqCst);
+        *self
+            .fail_delete_prefix_calls
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         *self
             .fail_store_prefix
             .write()
@@ -116,6 +148,12 @@ impl FaultyStorage {
 
 impl Storage for FaultyStorage {
     async fn store(&self, key: &str, data: &[u8]) -> Result<(), PlatformError> {
+        let fail_from = self.fail_from_store.load(Ordering::SeqCst);
+        if fail_from != 0 && self.stores_seen.fetch_add(1, Ordering::SeqCst) + 1 >= fail_from {
+            return Err(PlatformError::StorageError(
+                "injected store fault at the nth put".to_owned(),
+            ));
+        }
         let store_only = self
             .fail_store_prefix
             .read()
@@ -160,6 +198,17 @@ impl Storage for FaultyStorage {
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<u64, PlatformError> {
+        let fail = self
+            .fail_delete_prefix_calls
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            .is_some_and(|p| prefix.starts_with(p));
+        if fail {
+            return Err(PlatformError::StorageError(
+                "injected delete_prefix fault".to_owned(),
+            ));
+        }
         self.inner.delete_prefix(prefix).await
     }
 

@@ -878,25 +878,25 @@ impl<S: Storage> ProtocolRepositoryEventLogBridge<S> {
 impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersistence
     for ProtocolRepositoryEventLogBridge<S>
 {
-    async fn persist_entry(
+    async fn persist_unit(
         &self,
         context_id: &str,
-        seq: usize,
-        entry: &scp_event_log::Event,
+        base_seq: u64,
+        entries: &[scp_event_log::Event],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.store
-            .store_merkle_event_log_entry(context_id, seq, entry)
+            .store_merkle_event_log_unit(context_id, base_seq, entries)
             .await?;
         Ok(())
     }
 
-    async fn persist_entries(
+    async fn replace(
         &self,
         context_id: &str,
         entries: &[scp_event_log::Event],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.store
-            .store_merkle_event_log_entries(context_id, entries)
+            .replace_merkle_event_log_entries(context_id, entries)
             .await?;
         Ok(())
     }
@@ -1542,13 +1542,13 @@ mod tests {
             signature: Vec::new(),
         };
 
-        // O(1) per-entry persist.
+        // O(1) per-unit persist.
         bridge
-            .persist_entry("ctx-bridge-el", 0, &entry0)
+            .persist_unit("ctx-bridge-el", 0, std::slice::from_ref(&entry0))
             .await
             .unwrap();
         bridge
-            .persist_entry("ctx-bridge-el", 1, &entry1)
+            .persist_unit("ctx-bridge-el", 1, std::slice::from_ref(&entry1))
             .await
             .unwrap();
 
@@ -1598,10 +1598,7 @@ mod tests {
             },
         ];
 
-        bridge
-            .persist_entries("ctx-bridge-bulk", &entries)
-            .await
-            .unwrap();
+        bridge.replace("ctx-bridge-bulk", &entries).await.unwrap();
 
         let loaded = bridge
             .load_entries("ctx-bridge-bulk")
