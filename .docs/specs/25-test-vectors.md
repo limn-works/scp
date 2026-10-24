@@ -2793,3 +2793,213 @@ ciphertext (48 bytes, the 32-byte sealed seed and the 16-byte tag):
 ```
 
 Opening `enc` and `ciphertext` with the reference private scalar under the same `info` and the empty AAD yields the Vector 66 seed, and deriving under Vector 66 from that seed yields Vector 66's `signer_public_key`, which is the comparison §7.3.2.1 requires of every opener. Opening under the `info` of any other `context_id` fails the AEAD tag check.
+
+## 25.33 Concurrent-Commit Fork-Merge Vectors (`09-security-model.md` §9.5.2, §9.7.2, `07-trust-validation-and-capabilities.md` §7.3.1.1 "Concurrent Commits and fork merge")
+
+ADR-067 (Concurrent Commits and fork merge) lets two members commit at one epoch and merges the losing branch into the canonical one. These vectors fix its byte encodings and its deterministic rules. None of them carries a signature, so the generator of §25.1 emits none of their bytes. Python's standard-library `hashlib`, `hmac`, `struct` and `base64` computed every hexadecimal value below, and the `cryptography` package's `HKDFExpand` recomputed the Vector 75 node expansion. Where a vector depends on an encoding that its source defines only in part, it states the derivation and the verdicts and prints no bytes.
+
+The vectors share these inputs:
+
+- `context_id`: `context-alpha`, whose 13 UTF-8 bytes are `636f6e746578742d616c706861`;
+- the fixture identifiers of §25.1, in `scp:` text form:
+  - alice: `scp:nog6fhpyfhhmerfnq7ggtjk4m7hme7rkfovqrce2jnecf7tdu54q`;
+  - bob: `scp:gnv52mckv7p7qq5zgbetmtpnglpjrtr5nurq66dxczjzqs3f2k2a`;
+  - carol: `scp:mu3leerpopwlqi4da5g65wgpv5cp4lmvxfpebotmnyugveds37qa`;
+- two Commit hashes H, each the SHA-256 of an ASCII label that stands in for a Commit's `MLSMessage` bytes:
+  - `own` = SHA-256("SCP test vector commit own") = `81f41c0ba7a8a59f192449ecb70102989b5d08f5c9cdd19b0c365cff813431a9`;
+  - `other` = SHA-256("SCP test vector commit other") = `a993c7551f74778b6a4587c0f85a7d2678b0aaf422e7788792d84e532b90e26a`.
+
+### Vector 71: a `ForkNotice` preimage
+
+alice refuses a Commit at epoch 7 and reports it. Inputs: `member_did` alice, `member_since` 3, `reset_counter` 2, `epoch` 7, `own_child` `own`, `other_child` `other`, `kind` 0 (refused). The preimage is the separator `"SCP-FORK-NOTICE-V1:"` followed by the eight fields of `09-security-model.md` §9.5.2 in order.
+
+```
+preimage (185 bytes):
+  5343502d464f524b2d4e4f544943452d56313a0000000d636f6e746578742d61
+  6c706861000000387363703a6e6f6736666870796668686d6572666e71376767
+  746a6b346d37686d6537726b666f7671726365326a6e65636637746475353471
+  00000000000000030000000000000002000000000000000781f41c0ba7a8a59f
+  192449ecb70102989b5d08f5c9cdd19b0c365cff813431a9a993c7551f74778b
+  6a4587c0f85a7d2678b0aaf422e7788792d84e532b90e26a00
+canonical hash:
+  72c90123887bde133ecdc6b2abaa2d79927fd102db1e2b7839b139e9cc93439f
+canonical hash with kind 1 (diverged), every other field unchanged:
+  25c2a749101c8a1482aaa2165c8288696f9a34691c4175df0bfbcd817eafc3bb
+```
+
+alice's `#active` key signs the canonical hash as a prehashed digest. The intake checks of §9.9.3 give these verdicts at a receiver r that holds `member_since[alice]` = 3 and a reset floor of 2 for alice: the notice passes; a copy whose `member_since` is 4 is dropped; a copy whose `reset_counter` is 1 is dropped; a second copy of the passing notice is dropped as a repeat of (alice, 7, `own`, `other`).
+
+### Vector 72: a `DepartureRequest` preimage
+
+bob leaves `context-alpha`. Inputs: `member_did` bob, `member_since` 4, and `leaf_key_hash`, the SHA-256 of the 65-byte uncompressed reference public key of §25.2, standing in for bob's leaf `signature_key`.
+
+```
+leaf_key_hash:
+  c97cd5c4beb89d01e46bcbff6f8dc519c6ea18ded0045d71a612dd6ced2ad218
+preimage (134 bytes):
+  5343502d4445504152545552452d56313a0000000d636f6e746578742d616c70
+  6861000000387363703a676e7635326d636b763770377171357a676265746d74
+  706e676c706a727472356e75727136366478637a6a7a71733366326b32610000
+  000000000004c97cd5c4beb89d01e46bcbff6f8dc519c6ea18ded0045d71a612
+  dd6ced2ad218
+canonical hash, the departure's change identity:
+  546bd077f8281342e1d65db412459135b2a4d5117c65f4ea56190b7b3c62afcb
+```
+
+A receiver verifies the signature under the leaf key whose SHA-256 is `leaf_key_hash`, read from its ratchet tree or its key ledger. A request whose `leaf_key_hash` matches neither is rejected.
+
+### Vector 73: a fork record and its admission
+
+`end_leaf_hash` = SHA-256("SCP test vector leaf L end") = `f39e669195079d79f968fe2bdd0613efc9369daf5be5d1ca5a840c94c5add1db`. Each item takes the shortest MessagePack header that holds it.
+
+```
+record (F = 5, end_count = 9), 37 bytes:
+  930509c420f39e669195079d79f968fe2bdd0613efc9369daf5be5d1ca5a840c
+  94c5add1db
+record (F = 300, end_count = 305), 41 bytes:
+  93cd012ccd0131c420f39e669195079d79f968fe2bdd0613efc9369daf5be5d1
+  ca5a840c94c5add1db
+```
+
+`0x93` is a three-item array, `0x05` and `0x09` are positive fixints, `0xcd 0x012c` and `0xcd 0x0131` are uint16 300 and 305, and `0xc4 0x20` is a 32-byte bin 8 header. A receiver rejects `92 05 09` (two items), `93 cc 05 …` (F in a uint8 header that a fixint holds), and `93 00 …` (F = 0).
+
+Admission at depth, for a record with F = 5 that a child of S_c carries, where the epoch table row with log count 5 is epoch e_F = 10 and n_10 = 3, so K(10) = 2·3 + 8 = 14:
+
+| c | Depth c − e_F | Verdict |
+|---|---|---|
+| 24 | 14 | Admitted |
+| 25 | 15 | Rejected at every device; L's changes go to X |
+
+A record whose F is the log count of no epoch table row is refused. The bound on `end_count` − F is K(e_F) · `MERGE_CARRY_ITEMS`, so it takes the value `00-open-questions.md` "Fork-merge carry cap" sets: with that value written m, the record (F = 5, `end_count` = 9) is admitted when 4 ≤ 14·m.
+
+### Vector 74: the `merge_state_hash` derivation
+
+`merge_state_hash` is the SHA-256 of the RFC 8785 form of one object with five members, which RFC 8785 orders by their UTF-16 code units: `epoch_table`, `imports`, `journal`, `pending_joiners`, `records`. `journal` holds the journal entries in canonical order with the key-ledger fields; `imports` holds each import with its received leaves and its deadline. `05-contexts.md` §5.13.3 rule 16 fixes each entry's member names, so this vector fixes the rules every implementation applies to them and prints no hash:
+
+1. A set-valued fact is an array in ascending byte order with no duplicates. An `approvers` set {carol, alice, bob} encodes as `[bob, carol, alice]`, the order of their `scp:` text forms' bytes (`scp:gnv…`, `scp:mu3…`, `scp:nog…`). An array that repeats an element, or holds two elements out of that order, does not reproduce the hash.
+2. A hash is lowercase hexadecimal. `own` above encodes as the 64-character string `"81f41c0ba7a8a59f192449ecb70102989b5d08f5c9cdd19b0c365cff813431a9"`.
+3. An integer is at most 2^53 − 1 = 9,007,199,254,740,991. A state that holds a larger integer, such as an epoch of 2^53, has no `merge_state_hash`, and a receiver rejects the Commit that would create it.
+4. A list whose order the state fixes, such as the journal, keeps that order and is not sorted.
+
+### Vector 75: the PPRF node expansion
+
+The child-secret PPRF of `09-security-model.md` §9.7.2 is a binary tree of depth 256 over SHA-256 (Nh = 32). Each node expands by `ExpandWithLabel(node, "tree", "left" | "right", 32)` of RFC 9420 §8, which is HKDF-Expand with the info `KDFLabel` = `uint16 length ‖ opaque label<V> = "MLS 1.0 tree" ‖ opaque context<V>`. The root is the 32 bytes `00` through `1f`, and the evaluation input x is SHA-256("SCP test vector pprf input"), read most significant bit first.
+
+```
+root:
+  000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+KDFLabel for "left" (20 bytes):
+  00200c4d4c5320312e302074726565046c656674
+left child of the root:
+  8d7bf3c806adfa012983124e573a1ee23e9bd86ad6b846031f24556a31f0810f
+right child of the root:
+  62413002711c3f4b73a2d13d32172efdebe65c62ac1dc33867e2208af989854d
+x:
+  07501ef3541359ebdba2cd5b81e2b694c759237bed0a750fbb1b86a329a7cd55
+x's first byte, bits MSB first: 00000111
+node after two steps (left, left):
+  4d6027d3b30f5c6bb39ebcf58378e9494dbaf27fb246fc2e31fe4de8ec18213c
+leaf at x, after 256 steps:
+  d0c81b82417c930e9f5948de83253abb0b3a9af829a773bf866a992b2e4f04f8
+first copath node kept after puncturing x (the root's right child):
+  62413002711c3f4b73a2d13d32172efdebe65c62ac1dc33867e2208af989854d
+last copath node kept after puncturing x (the leaf's sibling):
+  8289e1363dd6403cd30f54a0925c8c22a0bbf7583c2bc4e6955b813a48ea40a4
+```
+
+Puncturing x deletes the root and every node on x's path, and keeps the 256 copath nodes, so the punctured tree still evaluates every input other than x and cannot evaluate x. An implementation that reads x least significant bit first, labels the expansion without `"MLS 1.0 "`, or expands 64 bytes per node derives a different leaf. The vector stops at the PPRF leaf: `DeriveChildSecret`'s use of the label `"child_init"`, `commit_confirmation` and `GroupContext_[n]` follows draft-kohbrok-mls-dmls-03 §4.
+
+### Vector 76: a signed-leaf import with a carried `LeafNode`
+
+Fixture: members alice, bob and carol at fork point F = 5, so canonical and L share leaves 0 to 4. On L, carol's Commit adds a device leaf for carol at leaf 5, and that device commits leaf 6. The record is (F = 5, `end_count` = 7, hash of L's leaf 6). The carrier's run holds L's leaves 5 and 6 and the `LeafNode`, with its `0xFF03` attestation, of the device that leaf 5 added, because that device's identity committed a later leaf on L.
+
+| Case | Run | Verdict |
+|---|---|---|
+| a | Leaf 5 with `sequence` 5 and `prev_hash` = hash of canonical leaf 4; leaf 6 with `prev_hash` = hash of leaf 5; leaf 5's signature verifies under carol's key from the key ledger, leaf 6's under the carried `LeafNode`'s key, whose attestation verifies as an Add's does; leaf 6's hash equals `end_leaf_hash` | Accepted; the import completes |
+| b | As a, with the carried `LeafNode` omitted | Rejected: leaf 6's key resolves from neither source |
+| c | As a, with leaf 5's `prev_hash` = hash of canonical leaf 5 | Rejected: the chain does not start at F − 1 |
+| d | As a, with leaf 6's hash ≠ `end_leaf_hash` | Not complete; the import stays open until its deadline |
+| e | As a, with the carried `LeafNode`'s `0xFF03` attestation signed by a key other than carol's `#active` | Rejected, as step 1 rejects such an Add |
+
+Two devices of carol sign leaves with one identity key, so case a's two leaves can carry one `actor_did`; the import checks never compare `actor_did`s.
+
+### Vector 77: the re-check in L's state
+
+Fixture: a `SingleAdmin` context, admin alice, members bob and carol, fork point F = 5. On canonical, leaf 5 is alice's `ChangeRole` demoting bob to a role without `member:invite`; its journal entry records `prior` = bob's role before it. On L, leaf 5 is bob's `AddMember` for a new member, executed under bob's `member:invite` at F.
+
+1. The receiver starts from its current state and undoes the journal entries after F, newest first, restoring each written key's `prior` value; bob's role returns to the role he held at F.
+2. It applies L's changes in L order. Before bob's `AddMember`, it runs steps 1.3 to 1.5 and the "Conflicts" gate on that state: bob holds `member:invite` at F, so the re-check passes, and the Add goes to G.
+3. G then judges the Add against the canonical changes after F. The demotion is restrictive-only, is concurrent with the Add, and takes (bob, `member:invite`), the capability the Add used, so the Add is in D by rule D-a. The Commit carries a `ConcurrentDrop` leaf naming the Add's `proposal_id` and rule D-a, and the reconciliation Remove of the added leaf (pair table row 9).
+
+In a variant where bob held no `member:invite` at F, step 2 fails: the receiver drops the Add with a `ConcurrentDrop` leaf and accepts the Commit that carries it.
+
+### Vector 78: G over the pair table
+
+Each case is one row of the pair table of `07-trust-validation-and-capabilities.md` §7.3.1.1, "The merge function G". Fixture: alice, bob, carol and dave are members at F, under the governance model each action needs, and every change has the approvals its requirement asks for unless the case says otherwise; X is dave, Y is bob and Z is carol. P is the canonical branch's change, L the losing branch's, and P ∥ L in every case. The expected state is the same whichever of P and L is canonical, which is what each case checks by running G with the branches swapped.
+
+| Row | P | L | Expected after G |
+|---|---|---|---|
+| 1 | Change with identity i | The same identity i | Executes once |
+| 2 | `AddMember` X, role r1 | `AddMember` X, role r2 ⊂ r1 | X added with r2 |
+| 3 | `AddMember` X | `RemoveMember` X | X absent; the Add is dropped |
+| 4 | Device Add for X | `RemoveMember` X | X absent; reconciliation removes the device leaf |
+| 5 | Device Add, device δ | Remove of δ | δ absent |
+| 6 | Device Add making X's 11th device | Any change | The Add is dropped |
+| 7 | `RemoveMember` X | `ChangeRole` X | X absent; the role change is dropped |
+| 7b | `RemoveMember` X | `TransferAdmin` to X | X absent; the transfer is dropped (D-c) |
+| 8 | `RemoveMember` bob | bob's `AddMember` of a new member and bob's `RevokeAccess` | bob absent; the Add is dropped (D-a) with its reconciliation Remove; the revocation holds |
+| 9 | `RemoveMember` alice, admin | alice's `AddMember` X | X absent; reconciliation removes X's leaf |
+| 9a | alice's `RemoveMember` bob | bob's `RemoveMember` alice | Both absent; nobody is re-added |
+| 9b | `RemoveMember` carol | A change carol's approval was needed for | Re-tallied without carol; dropped when short (D-b) |
+| 10 | `ChangeRole` X to r1 | `ChangeRole` X to r2 ⊂ r1 | X holds r2 |
+| 11 | Demotion of X | `TransferAdmin` to X | The demotion holds; the transfer is dropped |
+| 12 | `TransferAdmin` to Y | `TransferAdmin` to Z | The admin at F; both dropped |
+| 13 | `ModifyCeiling` c1 | `ModifyCeiling` c2 ⊂ c1 | c2 |
+| 14 | `RevokeAccess` X | `RestoreAccess` X | Revoked |
+| 15 | `RevokeAccess` scope s1 | `RevokeAccess` scope s2 | s1 ∪ s2 revoked |
+| 16 | Suspension of X | Restoration of X | Suspended |
+| 17 | `ResetMember` X | `ResetMember` X | Both execute while X is a member |
+| 18 | Reset request (X, 4) | Reset request (X, 6) | Counter 6 |
+| 19 | Departure of X | `ChangeRole` X | Departed |
+| 20 | `TokenRevoked` t | Any change | t revoked; the other change as G finds it |
+| 21 | Registration of outlet O | Registration of outlet O | The state at F; both dropped |
+| 22 | Update of outlet O | `RemoveOutlet` O | Removed; the update is dropped |
+| 23 | `SetOutletRegistrationPolicy` p1 | `SetOutletRegistrationPolicy` p2 | The policy at F |
+| 24 | `CloseContext` | `AddMember` X | Closed; the Add is dropped (D-a) |
+| 25 | `ExtendTtl` to t1 | `ExtendTtl` to t2 > t1 | t2 |
+| 26 | `ExtendTtl` | `PromoteContext` | `ExtendTtl` |
+| 27 | `CreateChildContext` c1 | `CreateChildContext` c2 | Both |
+| 28 | `AddSigner` Y | `RemoveSigner` Y | Y not a signer |
+| 29 | `ModifyThreshold` 2 | `ModifyThreshold` 3, with 3 signers | 3 |
+| 30 | `ReconfigureGovernance` | `ModifyThreshold` higher | The reconfiguration is dropped; the restrictive-only threshold change holds |
+| 31 | `SetEconomicPolicy` e1 | `SetEconomicPolicy` e2 | The policy at F |
+| 32 | `LockEconomicPolicy` | `SetEconomicPolicy` | Locked; the set is dropped |
+| 33 | `ApproveSpend` | `ApproveSpend` | Both dropped |
+| 34 | `ProposeContextMigration` | `CancelContextMigration` | Cancelled |
+| 35 | `ProposeContextMigration` m1 | `ProposeContextMigration` m2 | Both dropped |
+| 36 | `ModifyPruningPolicy` p1 | `ModifyPruningPolicy` p2 | The policy at F |
+| 37 | `ModifyHardRateLimit` 10 | `ModifyHardRateLimit` 5 | 5 |
+| 38 | `ModifyCapabilityRequirements` R1 | `ModifyCapabilityRequirements` R2, incomparable with R1 | The requirements at F |
+| 39 | `ModifyPseudonymRotationPolicy` 3,600 s | `ModifyPseudonymRotationPolicy` 1,800 s | 1,800 s |
+| 40 | `RotateContentKeys` | `RotateContentKeys` | Both |
+| 41 | Recording by bob of kind k | Recording by bob of kind k | The state at F; both dropped |
+| 42 | Checkpoint | Any change | The checkpoint is not re-applied |
+| 43 | Update | Any change | Not re-applied; its author re-commits it |
+| 44 | External join by X | `RemoveMember` X | X absent |
+| 45 | `0xFF03` re-seat with `key_package_hash` k | The same re-seat | Executes once |
+| 46 | `ResolveConflict` | — | Rejected |
+| 47 | A change in X (expired import) | — | Not re-applied; its author gets `ConcurrentChangeExpired` |
+
+Every dropped change adds one `ConcurrentDrop` leaf naming its `change_id` and the rule that dropped it, and a dropped change's dependents are dropped by D-d.
+
+### Vector 79: rank and the choice by (rank, cth)
+
+ids(S_e) sorts the three fixture identifiers by the bytes of their `scp:` text forms: bob (`scp:gnv…`) at position 0, carol (`scp:mu3…`) at 1, alice (`scp:nog…`) at 2. n_e = 3, and rank(C) = (pos(I) − e) mod n_e for C by identity I.
+
+| e | rank of bob's child | rank of carol's child | rank of alice's child |
+|---|---|---|---|
+| 7 | 2 | 0 | 1 |
+| 8 | 1 | 2 | 0 |
+| 9 | 0 | 1 | 2 |
+
+An External Commit by a non-member at any of these epochs has rank 3. At S_7, children by carol and alice: carol's has rank 0 and is canonical whatever the cths. At S_7, two children by bob from two of his devices, with cth1 = SHA-256("SCP test vector cth one") = `15a9feb7bc8b0fb5d4f16c5607d5e71bd7477ff69d5af42de352bdbd31054416` and cth2 = SHA-256("SCP test vector cth two") = `6ca435b3e2f29c3dad106999a0ff78f31c1c1aedadf673d9fcdc9a772f74b4af`: both have rank 2, and the child with cth1 is canonical, because cth1 is less than cth2 as unsigned bytes. Two children of one parent from one MLS sender leaf are equivocation (`09-security-model.md` §9.9.3), and the choice still picks the cth1 child. At S_7, children by alice and bob: alice's has rank 1 and bob's rank 2, so alice's is canonical. An implementation that computes (e − pos(I)) mod n_e gives alice rank 2 and bob rank 1, and picks bob's.

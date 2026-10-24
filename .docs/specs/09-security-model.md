@@ -549,7 +549,7 @@ Changing any field's encoding, adding a field, or removing a field requires incr
 
 ### 9.5.2 Signed Structure Definitions
 
-**A preimage that takes an identifier as UTF-8 bytes takes the identifier's text form**, which `03-identity.md` §3.1 fixes. Every derivation the protocol performs consumes the identifier's 32 raw digest bytes instead: the routing derivations, the continuity fingerprint of §9.11, and the `derived_context_id` of `05-contexts.md` §5.15.8. The preimages that take it sit below in this section: `InnerEnvelope`, `BroadcastEnvelope`, `SenderKeyRequest`, `SenderKeyEpochAdvance`, `AccessKeyRequest`, `Attestation`, `KeyPackageAttestation`, `KeyDestructionAttestation`, `BlockNotification`, the governance-proposal id, `GovernanceProposal`, `SignedVote`, `ParticipationProfile`, `ScpCustodyViolationAttestation`, `CounterAttestation`, `PushRegistration` and `PushDeregistration`. The two push preimages take their `registrant` field as the 56-byte `scp:` text form under §9.5.1's length-prefixed rule, so the field is `BE32(56)` followed by those 56 bytes. Four further preimages sit outside this section: the `"SCP-DID-AUTH-V1:"` challenge of `03-identity.md` §3.11.3, the challenge request and the challenge verification record of `07-trust-validation-and-capabilities.md` §7.3.4, whose `verifier` and `subject`, and the definer inside an identifier-scoped `capability_uri`, take the text form, and the payment receipt's signed payload of `19-economic-governance.md` §19.15.5, whose payer signs `payer_did` and `payee` as UTF-8 bytes.
+**A preimage that takes an identifier as UTF-8 bytes takes the identifier's text form**, which `03-identity.md` §3.1 fixes. Every derivation the protocol performs consumes the identifier's 32 raw digest bytes instead: the routing derivations, the continuity fingerprint of §9.11, and the `derived_context_id` of `05-contexts.md` §5.15.8. The preimages that take it sit below in this section: `InnerEnvelope`, `BroadcastEnvelope`, `SenderKeyRequest`, `SenderKeyEpochAdvance`, `AccessKeyRequest`, `Attestation`, `KeyPackageAttestation`, `KeyDestructionAttestation`, `BlockNotification`, the governance-proposal id, `GovernanceProposal`, `SignedVote`, `ParticipationProfile`, `ScpCustodyViolationAttestation`, `CounterAttestation`, `PushRegistration`, `PushDeregistration`, `ForkNotice` and `DepartureRequest`. The two push preimages take their `registrant` field as the 56-byte `scp:` text form under §9.5.1's length-prefixed rule, so the field is `BE32(56)` followed by those 56 bytes. Four further preimages sit outside this section: the `"SCP-DID-AUTH-V1:"` challenge of `03-identity.md` §3.11.3, the challenge request and the challenge verification record of `07-trust-validation-and-capabilities.md` §7.3.4, whose `verifier` and `subject`, and the definer inside an identifier-scoped `capability_uri`, take the text form, and the payment receipt's signed payload of `19-economic-governance.md` §19.15.5, whose payer signs `payer_did` and `payee` as UTF-8 bytes.
 
 **InnerEnvelope** — domain: `"SCP-INNER-ENVELOPE-V1:"`
 
@@ -712,6 +712,44 @@ The variable-length fields (`did`, `signing_key_id`) carry a 4-byte big-endian l
 | 8 | `timestamp` | 8-byte BE u64 (Unix seconds) |
 
 Note: The member's identity key for the `#active` role signs, and the signature is the 64-byte raw `r ‖ s` P-256 form over the canonical hash as a prehashed digest. This table is the one definition of the preimage; `23-sync-and-offline-strategy.md` §23.5.2 and §23.16.7, the governance block's reset-request record (§7.3.1.1), and ADR-029 §4 point to it. The `reason` text form is `extended offline (D days)` for `ExtendedOffline`, where D is the offline duration in whole days (seconds divided by 86,400, rounded down) in decimal with no leading zeros, and `catch-up failed (tried: S)` for `CatchUpFailed`, where S is the names of the `23-sync-and-offline-strategy.md` §23.4.1 sources the member attempted, at least one, each at most once and in §23.4.1 order, from `relay-backfill`, `peer-request`, and `welcome-fast-forward`, joined by `, `. The longest text form is 75 bytes. A request carries no other reason, and a receiver rejects a `reason` that is not one of these text forms (§7.3.1.1 step 1.7): a reset that a `ResetMember` governance action orders has no request. A member never signs a reason longer than 256 bytes. Every value the governance block's `MemberReset` leaf repeats from a request, `last_known_epoch`, `reset_counter`, and `reason`, is a field of this preimage. `reset_counter` makes each request executable once and voids every request with an equal or lower counter once one executes; `member_since` voids every request the member signed during an earlier membership (§7.3.1.1 step 1.7). Vector 8 of `25-test-vectors.md` §25.6 fixes the preimage, its hash, and a signature.
+
+**ForkNotice** — domain: `"SCP-FORK-NOTICE-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `member_did` | 4-byte BE length + UTF-8 bytes (the sender's identifier in text form) |
+| 3 | `member_since` | 8-byte BE u64 (the sender's join point, `07-trust-validation-and-capabilities.md` §7.3.1.1) |
+| 4 | `reset_counter` | 8-byte BE u64 (the last `ResetRequest` counter the sender signed) |
+| 5 | `epoch` | 8-byte BE u64 (the epoch e whose state S_e has the two children) |
+| 6 | `own_child` | 32 bytes (H, the SHA-256 of the `MLSMessage` bytes, of the sender's canonical child of S_e) |
+| 7 | `other_child` | 32 bytes (H of the other child of S_e the notice reports) |
+| 8 | `kind` | 1-byte U8 (0x00=refused, 0x01=diverged) |
+
+Note: The member's identity key for the `#active` role signs, and the signature is the 64-byte raw `r ‖ s` P-256 form over the canonical hash as a prehashed digest. §9.7.1 lists no class for the separator, so its signature verifies under the default, the attestation class. A notice travels as a plaintext relay blob, stored like a `ResetRequest`. It is not a Commit verdict, so ADR-066 decision 27 does not apply to it. A device sends a `refused` notice when it refuses a Commit under receipt rule 2 of `23-sync-and-offline-strategy.md` §23.4.1, and a `diverged` notice under §9.9.3. §9.9.3 states the receiver's drop rules and the notice's only effects. ADR-067 (Concurrent Commits and fork merge), M15, defines it. Vector 71 of `25-test-vectors.md` §25.33 fixes the preimage and its hash.
+
+**DepartureRequest** — domain: `"SCP-DEPARTURE-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `context_id` | 4-byte BE length + UTF-8 bytes |
+| 2 | `member_did` | 4-byte BE length + UTF-8 bytes (the departing member's identifier in text form) |
+| 3 | `member_since` | 8-byte BE u64 (the member's join point) |
+| 4 | `leaf_key_hash` | 32 bytes (SHA-256 of the member's 65-byte SEC1 leaf `signature_key`) |
+
+Note: The member's MLS leaf `signature_key` signs, not an identity key, so §9.7.1 assigns the separator no identity-key class. The signature is the 64-byte raw `r ‖ s` form over the canonical hash as a prehashed digest. A receiver verifies it under a leaf key whose hash is in its ratchet tree or its key ledger (`07-trust-validation-and-capabilities.md` §7.3.1.1, "Concurrent Commits and fork merge"). `leave_context` emits it. The request's hash is the change identity of the departure, so a departure executes natively at most once across the branches of a fork. ADR-067 (Concurrent Commits and fork merge), M10, defines it. Vector 72 of `25-test-vectors.md` §25.33 fixes the preimage and its hash.
+
+**Fork record** (MessagePack, not signed)
+
+A fork record names a losing branch L of a concurrent-Commit fork. The governance block's body item 5, `merge`, holds up to four records and one run of import leaves (`07-trust-validation-and-capabilities.md` §7.3.1.1, "Concurrent Commits and fork merge"). A record is a MessagePack array of three items, each with the shortest header that holds it:
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `fork_count` F | unsigned integer, at least 1: the leaf count the canonical log and L share, so L's first leaf has `sequence` F |
+| 2 | `end_count` | unsigned integer: L's leaf count at the end the recorder processed |
+| 3 | `end_leaf_hash` | binary, 32 bytes: the hash of L's leaf at `sequence` `end_count` − 1, its last leaf |
+
+Note: A record carries no signature and no recorder field, because admission ignores who the recorder is: the import leaves the record names carry their committers' own signatures over `prev_hash`, and the receiver admits a record by its depth alone. The admission rule, the import checks and the re-check in L's state are in `07-trust-validation-and-capabilities.md` §7.3.1.1, "Concurrent Commits and fork merge". ADR-067 (Concurrent Commits and fork merge), M5, defines it. Vector 73 of `25-test-vectors.md` §25.33 fixes the encoding.
 
 **GovernanceProposal ID** — domain: `"SCP-PROPOSAL-V2:"` (hash, not signature)
 
@@ -1045,9 +1083,37 @@ MLS provides forward secrecy through epoch-based key ratcheting. After a Commit 
 
 **SDK requirements:**
 
-- The SDK MUST delete old epoch key material after processing a Commit, subject to a **grace window** for in-flight messages. Old epoch keys are retained in volatile memory only (never persisted) for the shorter of: (a) all members have sent at least one message in the new epoch, or (b) 30 seconds from local Commit processing time. After the grace window closes, old epoch secrets, application key schedules, and ratchet tree states for past epochs are destroyed and MUST NOT be recoverable. See ADR-001 criterion 6 for the full grace window specification.
+- The SDK MUST delete old epoch key material after processing a Commit, subject to a **grace window** for in-flight messages. Outside the retained parent states below, old epoch keys are retained in volatile memory only (never persisted) for the shorter of: (a) all members have sent at least one message in the new epoch, or (b) 30 seconds from local Commit processing time. After the grace window closes, old epoch secrets, application key schedules, and ratchet tree states for past epochs are destroyed and MUST NOT be recoverable. See ADR-001 criterion 6 for the full grace window specification.
 - Historical epoch keys MUST be treated as equivalent to ephemeral Diffie-Hellman parameters: used once, then destroyed.
 - Members who want to re-read historical messages must retain the decrypted plaintext locally. They cannot re-derive old epoch keys from current state.
+
+**Retained parent states (ADR-067, Concurrent Commits and fork merge, M1 and M12).** Two members can commit at one epoch, and each Commit is a valid child of one parent state S_e (`07-trust-validation-and-capabilities.md` §7.3.1.1, "Concurrent Commits and fork merge"). To process a sibling that arrives after the device moved on, a device retains every parent state it leaves, not only the parent of a fork it has seen. The in-memory grace window above still governs late messages inside one branch, and its 30-second ceiling bounds that window, not this retention. A retained state is persisted encrypted, under the rules below.
+
+- **Deletion runs on two clocks.** The device deletes a non-tip state S_x at the earlier of two moments: when S_x's non-tip age, the device's connected time since it first held a child of S_x, passes W = `FORK_RETAIN_SECS` = 600 seconds; or when `FORK_RETAIN_WALL_SECS` = 604,800 seconds (7 days) of the device's local time have passed since it first held a child of S_x, whether or not it reconnects. Connected time is the seconds during which the device is current, as spec 07's "Concurrent Commits and fork merge" defines current. The tip is never deleted under this rule.
+- **Deletion is local and is not a verdict.** No Commit verdict reads whether a device still holds a state, so deletion does not affect determinism. A device that stays offline for more than 7 days runs the `23-sync-and-offline-strategy.md` §23.5.1 reset on reconnect.
+- **What a retained state holds.** A retained state holds only what processing a sibling Commit, or a sibling's governance block, reads:
+
+| Retained | Use |
+|---|---|
+| The punctured PPRF | Deriving the child `init_secret` of each sibling not yet seen |
+| The device's own tree private keys, the public tree and the GroupContext | Processing a sibling's UpdatePath |
+| `sender_data_secret` | Decrypting a sibling `PrivateMessage`'s sender data (RFC 9420 §6.3.2) |
+| The unconsumed secret-tree nodes and the handshake ratchet tail | Decrypting a sibling's content |
+| `confirmation_key` | Checking a sibling's confirmation tag |
+| `membership_key`, only in a group that uses `PublicMessage` | Checking a sibling's membership tag |
+| Every exporter-derived key ADR-066 reads at the epoch, including the governance block key `MLS-Exporter("SCP-GOVERNANCE-LEAF-V1", context_id, 16)`, each derived before `exporter_secret` is dropped | Decrypting a sibling's governance block |
+| The external HPKE private key | Processing a sibling External Commit |
+
+- **What no retained state and no copy of one holds:** `epoch_secret`; `init_secret`; the unpunctured PPRF seed; the resumption PSK; `exporter_secret`; `epoch_authenticator`; `external_secret`; `encryption_secret` once the secret tree is expanded; the application ratchets; and the parent's own `confirmation_key`, which checks the tag of the Commit the device already processed. No sibling's processing reads any of them.
+- **The child `init_secret` comes from a puncturable PRF.** The key schedule is that of draft-kohbrok-mls-dmls-03 §4:
+  - `parent_init_secret = DeriveSecret(epoch_secret, "parent_init")`;
+  - `commit_confirmation = DeriveSecret(path_secret[n], "conf")`;
+  - `init_secret_[n] = DeriveChildSecret(PPRF, "child_init", commit_confirmation, GroupContext_[n])`.
+
+  The PPRF is a binary tree of depth 8·Nh = 256 for this ciphersuite's Nh = 32, rooted at `parent_init_secret`. The evaluation input is read most significant bit first, and each node expands to its two children by `ExpandWithLabel(node, "tree", "left" | "right", Nh)`. The device punctures each child as soon as it derives it, so a retained state cannot re-derive the `init_secret` of a child the device already processed. Vector 75 of `25-test-vectors.md` §25.33 fixes the tree expansion.
+- **The External Commit gap.** An External Commit's child is not reached through the PPRF, so its keys stay derivable from the retained parent until the device deletes that parent. This is the one exception to the rule that no consumed key is recoverable from retained material.
+- **Storage (`BranchStore`).** Every key of a retained state is stored under the prefix `state_id = SHA-256(group_id ‖ BE64 epoch ‖ cth)`, where `cth` is the state's `confirmed_transcript_hash`, in the device's SQLCipher store with `PRAGMA secure_delete = ON`. Every deletion is followed by `PRAGMA wal_checkpoint(TRUNCATE)`, so neither the database file nor its `-wal` file keeps a deleted key.
+- **The path index.** For each epoch the device keeps, for 7 days of local time, the hash H (SHA-256 of the `MLSMessage` bytes) and the `cth` of every valid child it processed, and H of every Commit it refused. The index decides only what the device sends and shows, never a verdict.
 
 **Interaction with memory scope:**
 
@@ -1065,7 +1131,7 @@ MLS provides PCS through the Update proposal mechanism. After a member sends an 
 
 **SDK requirements:**
 
-- The SDK MUST periodically issue MLS Update proposals. Recommended interval: every 24 hours for active contexts, or immediately after any suspected compromise. Because an Update generates a fresh ephemeral leaf key and ratchets the path, the updated leaf MUST carry a fresh **KeyPackage attestation** binding the new leaf `signature_key` to the DID (§9.7.1).
+- The SDK MUST periodically issue MLS Update proposals. Recommended interval: every 24 hours for active contexts, or immediately after any suspected compromise. Because an Update generates a fresh ephemeral leaf key and ratchets the path, the updated leaf MUST carry a fresh **KeyPackage attestation** binding the new leaf `signature_key` to the DID (§9.7.1). **Not implemented:** no Update rotates the leaf `signature_key` today. `propose_update` (`crates/scp-mls/src/ratchet.rs`) passes `LeafNodeParameters::default()` to openmls, so an Update replaces the leaf's HPKE `encryption_key` and keeps its `signature_key` and its attestation. ADR-067 (Concurrent Commits and fork merge) builds nothing on leaf-key rotation.
 - The SDK SHOULD issue an Update after re-establishing connectivity following an offline period.
 - When an Active Signing Key rotates by a `KeyState` event (§9.7.4.2 R3), the SDK MUST issue an MLS Update in every active context with a new credential AND a **KeyPackage attestation re-issued under the new `#active` key** (a fresh `#active` signature over the leaf's ephemeral MLS key). This synchronizes key rotation with MLS-level post-compromise security. The MLS leaf `signature_key` is ephemeral and never equals the rotated identity key — only the attestation over it is re-signed.
 - When a delegated agent identity rotates its own Active Signing Key, that identity runs the bullet above on its own key-event log, because it holds its own keys and the human's log holds none of them (§9.1 invariant 1).
@@ -1973,12 +2039,34 @@ Checkpoints are sent as regular MLS application messages (encrypted, authenticat
 
 **Divergence resolution:** If Merkle roots diverge, members exchange event log proofs to identify the first divergent event. This reveals which relay served which version. The context's governance model handles the response.
 
+**A concurrent-Commit fork is not equivocation (ADR-067, Concurrent Commits and fork merge, M16).** Two honest members can commit at one epoch, and devices that processed different children of one parent hold logs that differ from the fork point on, until the losing branch is merged (`07-trust-validation-and-capabilities.md` §7.3.1.1, "Concurrent Commits and fork merge"). A log disagreement is two logs that agree through some leaf and differ at the next position s. Device d excuses a log disagreement only when both of these hold:
+
+- d confirms that the other log's leaf F−1 equals its own leaf F−1, either directly or by an RFC 6962 consistency proof from its own root at count F into the other log's root;
+- s equals a fork point F that d authenticated by one of two kinds of evidence:
+  - (i) d processed two valid children of one parent state whose log count is F, the two children append different leaves at F, and the MLS sender leaf indices of the two children differ;
+  - (ii) d truncated its own log at F when it switched to another child.
+
+A leaf at `sequence` F that a member signed, other than d's own leaf F, is not evidence: it only starts a fetch of that epoch's children. The excuse lapses, and the disagreement gets the full response below, when a fetch from every listed relay completes without giving d evidence (i) or (ii), or when d deletes the parent state S_e under §9.7.2.
+
+- **What excusing means.** d fetches the children at that epoch. It raises no tier (a) alert, sends no `EquivocationAlert`, applies no `equivocation_policy` and flags no relay (ADR-012). Every disagreement at any other position gets the response it gets without a fork.
+- **Limits of the predicate.** A Commit d refused is unauthenticated, so it excuses nothing. A relay cannot produce (i) or (ii), because (i) needs two Commits that verify in d's own processing and (ii) is d's own act. The predicate never compares `actor_did`s, because two devices of one identity sign leaves with one identity key (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6), so an honest fork can show one `actor_did` at F.
+- **Two children of one parent from one leaf.** No honest path produces two children of one parent from one MLS sender leaf. Both enter the choice of canonical child, so devices still converge, and this section handles them as equivocation by that leaf's member (step 5 below).
+- **Where the predicate is checked.** Six entry points check it before they respond: `07-trust-validation-and-capabilities.md` §7.3.1.1 "Deduplication with replication" and "The members a Commit adds"; `23-sync-and-offline-strategy.md` §23.7 steps 3 and 4; tier (a), tier (b) and the intake of a received `EquivocationAlert` below; and §9.9.4.
+- **Trial decryption.** A frame that fails to decrypt under the canonical state is tried against the retained states (§9.7.2) at its epoch before any response.
+
+**`ForkNotice` intake.** A `ForkNotice` (§9.5.2) tells other members that its sender saw a second child at an epoch. Receiver r drops a notice when any of these holds: the signature fails; `member_since` differs from r's `member_since` for the sender; `reset_counter` is below r's floor for the sender; the sender joined after S_e; or the notice repeats an earlier (sender, e, `own_child`, `other_child`). A notice that passes has these effects and no others:
+
+- (a) it starts one fetch of epoch e's children;
+- (b) it adds the sender to r's `GroupSplit` list when `kind` is refused, r processed both children, and `own_child` is not r's canonical child; or when `kind` is diverged, `own_child` is a Commit r refused, and `other_child` is r's canonical child.
+
+A notice never changes state, never counts as fork evidence, and never picks a reset target. r publishes its own `diverged` notice once per (context, e), when effect (b) first holds.
+
 **Sybil-amplified equivocation defense:** The Relay Consistency Protocol is NOT a majority vote. ANY divergence between ANY two honest members detects equivocation. An attacker who controls Sybil members and a relay can make the Sybil members confirm the attacker's version, but this is irrelevant — two honest members comparing checkpoints will detect the equivocation regardless of how many Sybils agree with the attacker. The defense requires only two honest members in the context.
 
 **Two-tier equivocation response.** The response to detected equivocation has two distinct tiers, and they are specified — and may be implemented — separately:
 
-- **(a) Local detection alert (detect-and-surface).** On observing two checkpoints with the same `eventCount` but different Merkle roots, an honest member raises a *local, SDK-surfaced* `EquivocationDetected` alert (the runtime/SDK event; see §23.7). This is the minimum conformant equivocation-detection behavior: a conformant member MUST detect the divergence and surface it to the application layer and event log. Tier (a) does NOT require constructing or distributing the signed, proof-bearing `EquivocationAlert` MLS message described below — an implementation of the detection step alone is complete without it.
-- **(b) Signed governance alert (the equivocation governance response).** The publication of a signed, proof-bearing, MLS-distributed `EquivocationAlert` (with `proof: Vec<MerkleProof>` inclusion proofs and `conflicting_hashes`) and the `equivocation_policy` enforcement that follows are a *separate, subsequent governance flow*, specified separately. Tier (a) always precedes tier (b): detection is what triggers the governance response.
+- **(a) Local detection alert (detect-and-surface).** On observing two checkpoints with the same `eventCount` but different Merkle roots, an honest member raises a *local, SDK-surfaced* `EquivocationDetected` alert, unless the fork predicate above excuses the disagreement (the runtime/SDK event; see §23.7). This is the minimum conformant equivocation-detection behavior: a conformant member MUST detect the divergence and surface it to the application layer and event log. Tier (a) does NOT require constructing or distributing the signed, proof-bearing `EquivocationAlert` MLS message described below — an implementation of the detection step alone is complete without it.
+- **(b) Signed governance alert (the equivocation governance response).** The publication of a signed, proof-bearing, MLS-distributed `EquivocationAlert` (with `proof: Vec<MerkleProof>` inclusion proofs and `conflicting_hashes`) and the `equivocation_policy` enforcement that follows are a *separate, subsequent governance flow*, specified separately. Tier (a) always precedes tier (b): detection is what triggers the governance response. A member that receives an `EquivocationAlert` checks the fork predicate against the alert's divergence first, and applies no `equivocation_policy` to a divergence it excuses.
 
 The numbered steps below specify tier (b), the equivocation governance response. They build on — and are gated by — the tier (a) detection above.
 
@@ -2012,7 +2100,7 @@ The signature covers `context_id || detector_did || relay_url || local_checkpoin
 
 4. **Trust score impact.** The equivocating relay's trust score (§9.3) is reduced. Members who operate relay infrastructure and whose relay is implicated in equivocation receive a `RelayEquivocationViolation` record in the `ViolationStore` (ADR-039). This violation is durable and affects the operator's trust score across all contexts where other members observe the violation record.
 
-5. **Member-initiated equivocation.** If equivocation is attributed to a member (e.g., a member publishes conflicting events to different relays intentionally), the governance engine processes it as a member violation. The configurable response is: `warn` (log only), `suspend_write` (suspend the equivocating member's write access pending admin review — this is the default), or `remove` (remove the member from the context via MLS Remove proposal). Write suspension is implemented by the governance engine adding the member's identifier to a `write_suspended` set; the SDK checks this set before accepting application messages from that member and rejects messages from suspended members with an `EquivocationSuspension` error. The suspension is recorded as an `EventType::MemberWriteSuspended { did, reason: "equivocation" }` in the context event log.
+5. **Member-initiated equivocation.** If equivocation is attributed to a member (e.g., a member publishes conflicting events to different relays intentionally), the governance engine processes it as a member violation. The configurable response is: `warn` (log only), `suspend_write` (suspend the equivocating member's write access pending admin review — this is the default), or `remove` (remove the member from the context via MLS Remove proposal). Write suspension is implemented by the governance engine adding the member's identifier to a `write_suspended` set; the SDK checks this set before accepting application messages from that member and rejects messages from suspended members with an `EquivocationSuspension` error. The suspension is recorded as an `EventType::MemberWriteSuspended { did, reason: "equivocation" }` in the context event log. Two valid children of one parent state from one MLS sender leaf are member equivocation by that leaf's member.
 
 ### 9.9.4 Selective Suppression of MLS Commits
 
@@ -2023,6 +2111,8 @@ A specific relay attack: suppress an MLS Remove Commit to keep an excluded membe
 **Actual risk:** Suppressing the Commit from OTHER members. Members who don't receive the Commit stay in the old epoch and cannot decrypt new-epoch messages. This is a denial-of-service attack (group state divergence), not a confidentiality breach.
 
 **Mitigation:** MLS Commits are high-priority messages that SHOULD be published to all relays with delivery confirmation. "Delivery confirmation" means relay-level storage ACK — the relay confirms it received and stored the blob. This is NOT recipient-level ACK, which would leak metadata about recipient online status. The actual assurance mechanism is the recovery path: if any member detects they are behind on epochs (they receive a message for epoch N+1 but are on epoch N, or a Relay Consistency Protocol checkpoint (§9.9.3) reveals epoch divergence), they MUST request the missing Commit from other members via directed MLS application messages or from alternative relays in the context's relay set. Multi-relay publication (§9.9.2, recommended: 3 relays) ensures the Commit is available from at least one honest relay even if others suppress it.
+
+**A suppressed Commit and a concurrent Commit look alike.** A member that finds another member at a different epoch, or a log that disagrees with its own, checks the fork predicate of §9.9.3 before it treats the gap as suppression. When the predicate excuses the disagreement, the member fetches every child of the parent state from every listed relay and flags no relay (ADR-067, Concurrent Commits and fork merge, M16).
 
 ## 9.10 Metadata Privacy Architecture
 
@@ -2051,8 +2141,10 @@ This section specifies what the protocol protects, how it protects it, and what 
 - Context-internal state: roles, outlets, governance actions, event log content (all encrypted within the MLS group)
 - Identity private state (encrypted to owner's key, §3.7)
 - UCAN token contents (within encrypted envelopes)
-- Sender identity, timestamps, sequence numbers, epoch, generation (all inside encrypted payload)
+- Sender identity, timestamps, sequence numbers, generation (all inside encrypted payload)
 - Payment data for context-level economics: payment authorizations, receipts, spending UCANs, adapter proofs (all inside encrypted payload, §19.6). Relays never see context-level payment metadata. Relay-level payments (§19.8) are visible to the relay by necessity but not to other parties.
+
+**The epoch is not confidential.** An MLS `PrivateMessage` carries `group_id`, `epoch` and `content_type` in the clear (RFC 9420 §6.3), so a relay that stores a frame reads its epoch.
 
 **Broadcast mode confidentiality differences:** In broadcast contexts, the following are NOT confidential (by design): author identifier (visible in BroadcastEnvelope), routing_id (publicly derived from context_id via SHA-256), key epoch number. These are acceptable because broadcast authors are public figures and the routing_id must be discoverable for subscribers to subscribe. Message content, subscriber identities (in key request/response exchanges), and block lists remain confidential.
 
@@ -2504,6 +2596,8 @@ This PCS bound is **in-group only**, and it does NOT bound a second vector: the 
 **Authoritative ordering:** The Merkle event log order is authoritative. Timestamps inform real-time ordering in the SDK. Once events are committed to the log, the log order is the permanent record.
 
 **Causal ordering:** MLS epoch boundaries serve as synchronization points. Within an epoch, sender generation numbers provide per-sender total ordering. Cross-sender ordering within an epoch relies on timestamps (best-effort) and the Merkle log (authoritative after the fact).
+
+**A Commit verdict reads no clock (ADR-067, Concurrent Commits and fork merge).** A member's verdict on a Commit reads the Commit's bytes, the parent state it holds, and its committed `log_head_hash`, and nothing else, so a late processor and a joiner reach the verdict every other member reached. A receiver stages a Commit under the openmls `LeafNodeLifetimePolicy::Skip`, so the KeyPackage `Lifetime` check, which reads the system clock, does not run on receipt; the adder applies it under its own clock when it prepares the Add (§9.7.1 check 13). Check 13's clock parts on an Update reach no case today, because no Update carries a new leaf `signature_key` or a new attestation (§9.7.3). How late a losing branch of a concurrent-Commit fork may be recorded is counted in canonical Commits, not in seconds, because the protocol has no convergent clock (`07-trust-validation-and-capabilities.md` §7.3.7, "Convergent emission"). A device's two retention clocks (§9.7.2) decide only what that device keeps, never a verdict.
 
 ## 9.15 Ephemeral Key Destruction Verification
 
@@ -2995,6 +3089,8 @@ All domain separators are UTF-8 strings used as prefixes (or, where a row says s
 | `"scp:wit:"` | Cosigned-head routing derivation — `SHA-256("scp:wit:" \|\| subject_identifier_bytes)`; an id-derivation domain, NOT a §9.5.1 signature-preimage separator | §9.7.4.2 R13, §9.7.4.3 |
 | `"scp:wcf:"` | Conflict-statement routing derivation — `SHA-256("scp:wcf:" \|\| subject_identifier_bytes)`; an id-derivation domain, NOT a §9.5.1 signature-preimage separator | §9.7.4.2 R13, §9.7.4.3 |
 | `"SCP-RESET-REQUEST-V2:"` | Sync reset request signing; replaces `"SCP-RESET-REQUEST-V1:"`, which had no `reset_counter` or `member_since` | §9.5.2, §23.5.2 |
+| `"SCP-FORK-NOTICE-V1:"` | Fork notice signing under the sender's `#active` key: a refused or diverged child of one parent state (ADR-067, Concurrent Commits and fork merge, M15) | §9.5.2, §9.9.3, §23.4.1 |
+| `"SCP-DEPARTURE-V1:"` | Departure request signing under the departing member's MLS leaf `signature_key`; its hash is the departure's change identity (ADR-067, Concurrent Commits and fork merge, M10) | §9.5.2 |
 | `"SCP-KEY-CONTINUITY-V1:"` | Key continuity fingerprint hash | §9.11 |
 | `"SCP-CHECKPOINT-V1:"` | Event log checkpoint hash — **content class** (§9.7.1): a member accepts a checkpoint through MLS inside the context, so the context epoch orders it | §11 |
 | `"SCP-STATE-CHECKPOINT-V1:"` | ADR-030 state checkpoint signature, made by the checkpoint creator and by each cosigner, each over `SHA-256("SCP-STATE-CHECKPOINT-V1:" \|\| BE32(len(context_id)) \|\| context_id \|\| BE64(checkpoint_seq) \|\| merkle_root \|\| BE64(event_count) \|\| last_event_hash \|\| SHA-256(serialize(state_snapshot)) \|\| BE64(created_at) \|\| key_state_head)` with its own `key_state_head`, — **log-anchored evidence class** (§9.7.1) for a verifier outside the group, which holds no committed log head. A member that processes the Commit carrying the `Checkpoint` leaf verifies each signature under the key it resolved from the `0xFF03` attestation on the signer's epoch-`E` leaf, a key that members can disagree on at the Commit where that leaf enters their trees and that a Welcome joiner, an importer, or a restorer does not hold, until SCP-315 closes that gap (§9.7.1, "Known gap: members can resolve different keys for one attestation"), and a joiner, an importer, or a restorer accepts the leaf by its inclusion under the committed `log_head_hash` (`07-trust-validation-and-capabilities.md` §7.3.1.1 step 1.6, `05-contexts.md` §5.13.3 rule 14, ADR-066 decision 27) | ADR-030 §1, as ADR-066 amends it |
