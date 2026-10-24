@@ -1061,6 +1061,7 @@ impl SupervisorHandle {
     pub(in crate::context) fn release_first_state(&self, context_id: &str) {
         if let Some(supervisor) = self.supervisor.upgrade() {
             supervisor.pending_first_state.remove(context_id);
+            supervisor.first_state_settled.notify_waiters();
         }
     }
 

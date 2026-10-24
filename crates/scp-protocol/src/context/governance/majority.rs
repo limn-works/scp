@@ -55,6 +55,7 @@ use scp_did::{DID, SigningKeyId};
 /// - `min_participation_bps`: Minimum participation in basis points (1–10000),
 ///   where 10000 = 100%. Per ADR-031: u32 basis points so `GovernanceModelConfig`
 ///   derives `Eq`.
+#[derive(Clone)]
 pub struct MajorityVoteEngine {
     /// The set of DIDs eligible to vote on proposals.
     eligible_voter_dids: Vec<DID>,
@@ -606,6 +607,10 @@ impl GovernanceEngine for MajorityVoteEngine {
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
         self.resolve(proposal_id, context)
+    }
+
+    fn boxed_clone(&self) -> Box<dyn GovernanceEngine> {
+        Box::new(self.clone())
     }
 
     fn model_config(&self) -> GovernanceModelConfig {

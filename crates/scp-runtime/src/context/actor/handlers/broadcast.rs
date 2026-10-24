@@ -2761,7 +2761,12 @@ mod tests {
                 actor_did: CREATOR_DID,
                 timestamp_secs: 1_700_000_000,
             },
-            None,
+            crate::context::governance_helpers::MigrationBootstrap::reserve(
+                &deps,
+                &ctx_hex,
+                &[0x77; 32],
+            )
+            .expect("reserve the migration's bootstrap"),
         )
         .await;
 
@@ -2839,7 +2844,8 @@ mod tests {
                 actor_did: CREATOR_DID,
                 timestamp_secs: 1_700_000_000,
             },
-            None,
+            crate::context::governance_helpers::MigrationBootstrap::reserve(&deps, &ctx_hex, &pid)
+                .expect("reserve the migration's bootstrap"),
         )
         .await;
 
@@ -2863,51 +2869,64 @@ mod tests {
         );
     }
 
-    /// A migration proposal executed while another bootstrap holds
-    /// `bootstrap_spawn_lock` fails at once with a retryable `ActorBusy` and
-    /// changes nothing: the turn runs on the source context's actor, and the
-    /// lock's holders wait on actor mailboxes, so it must not wait for the
-    /// lock.
+    /// A migration's bootstrap reserved while another bootstrap holds
+    /// `bootstrap_spawn_lock`, or while another operation's first state of
+    /// the destination is unsettled, fails at once with a retryable
+    /// `ActorBusy` and leaves neither the lock nor the claim held: the
+    /// reservation runs in the source context's actor turn, and the lock's
+    /// holders wait on actor mailboxes, so it must not wait for the lock.
+    /// The migration itself takes the reservation as an argument, so it
+    /// cannot run without the lock.
     #[tokio::test]
-    async fn migration_while_the_bootstrap_lock_is_held_is_busy_and_changes_nothing() {
-        let (supervisor, deps, appends, _recorded) = build_supervisor_and_deps().await;
-        let (state, ctx_hex) =
-            build_broadcast_state_with_authors(BroadcastAdmission::Open, &[CREATOR_DID]);
-        let mut cell = ClassSCell::new(state);
-        appends.store(0, Ordering::SeqCst);
-        let epoch_before = cell.mutation_epoch();
+    async fn a_busy_migration_bootstrap_fails_at_once_and_holds_nothing() {
+        use crate::context::governance_helpers::MigrationBootstrap;
+
+        let (supervisor, deps, _appends, _recorded) = build_supervisor_and_deps().await;
+        let ctx_hex = "ab".repeat(32);
+        let pid = [0x79; 32];
+        let destination =
+            crate::context::governance_helpers::migration_destination_id(&ctx_hex, &pid);
+        // Whether some operation holds the first-state claim of `destination`.
+        let claimed = |deps: &ActorDeps| {
+            let free = deps.supervisor.claim_first_state(&destination).is_ok();
+            if free {
+                deps.supervisor.release_first_state(&destination);
+            }
+            !free
+        };
         let held = supervisor.bootstrap_spawn_lock.lock().await;
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            crate::context::governance_helpers::execute_propose_context_migration(
-                &mut cell,
-                &deps,
-                &ctx_hex,
-                &undeliverable_destination_params(),
-                "fixture",
-                60,
-                false,
-                crate::context::governance_helpers::CommitMeta {
-                    pid: [0x79; 32],
-                    actor_did: CREATOR_DID,
-                    timestamp_secs: 1_700_000_000,
-                },
-                None,
-            ),
-        )
-        .await
-        .expect("the migration turn must not wait for the bootstrap lock");
-
+        let busy = MigrationBootstrap::reserve(&deps, &ctx_hex, &pid).map(|_| ());
         assert!(
-            matches!(&result, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
-            "{result:?}"
+            matches!(&busy, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
+            "{busy:?}"
         );
-        assert_eq!(cell.mutation_epoch(), epoch_before);
-        assert_eq!(cell.handle.state(), ContextState::Active);
-        assert!(cell.migration_state.is_none());
-        assert_eq!(appends.load(Ordering::SeqCst), 0, "no event was appended");
+        assert!(!claimed(&deps), "a busy lock claims no destination");
         drop(held);
+
+        let reserved = MigrationBootstrap::reserve(&deps, &ctx_hex, &pid)
+            .expect("the reservation succeeds once the lock is free");
+        let second = MigrationBootstrap::reserve(&deps, &ctx_hex, &[0x7a; 32]).map(|_| ());
+        assert!(
+            matches!(&second, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
+            "a held reservation keeps the lock: {second:?}"
+        );
+        assert!(claimed(&deps), "a reservation claims its destination");
+        drop(reserved);
+        assert!(!claimed(&deps), "a dropped reservation releases its claim");
+
+        deps.supervisor
+            .claim_first_state(&destination)
+            .expect("another operation claims the destination");
+        let unsettled = MigrationBootstrap::reserve(&deps, &ctx_hex, &pid).map(|_| ());
+        assert!(
+            matches!(&unsettled, Err(ContextError::ActorBusy(msg)) if msg.contains("retry")),
+            "{unsettled:?}"
+        );
+        assert!(
+            supervisor.bootstrap_spawn_lock.try_lock().is_ok(),
+            "a refused claim releases the lock it took"
+        );
+        deps.supervisor.release_first_state(&destination);
     }
 
     /// A single-admin migration proposal made while another bootstrap holds

@@ -40,6 +40,7 @@ use scp_did::{DID, SigningKeyId};
 /// A fixed set of designated signers; a proposal passes when at least
 /// `threshold` of them approve. Implements [`GovernanceEngine`] for use
 /// via `Box<dyn GovernanceEngine>`.
+#[derive(Clone)]
 pub struct ThresholdEngine {
     /// The set of DIDs authorized to vote.
     signers: Vec<DID>,
@@ -548,6 +549,10 @@ impl GovernanceEngine for ThresholdEngine {
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
         self.resolve_proposal(proposal_id, context.now)
+    }
+
+    fn boxed_clone(&self) -> Box<dyn GovernanceEngine> {
+        Box::new(self.clone())
     }
 
     fn model_config(&self) -> GovernanceModelConfig {

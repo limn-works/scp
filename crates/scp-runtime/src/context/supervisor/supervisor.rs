@@ -2079,6 +2079,10 @@ pub struct Supervisor {
     /// respawn (`refuse_pending_first_state`), which would otherwise start an
     /// actor from the failed operation's snapshot.
     pub(in crate::context::supervisor) pending_first_state: dashmap::DashSet<String>,
+    /// Notified each time a `pending_first_state` claim is released, so the
+    /// crash watchdog, whose respawn a standing claim refuses, respawns once
+    /// the claim's operation commits or rolls back.
+    pub(in crate::context::supervisor) first_state_settled: tokio::sync::Notify,
     /// Wall-clock source. Populated by [`Self::with_providers_and_journal`] (or
     /// defaulted to [`scp_clock::SystemClock`] when the caller
     /// passes `None`).
@@ -2567,6 +2571,7 @@ impl Supervisor {
             bootstrap_spawn_lock,
             pending_discards: dashmap::DashSet::new(),
             pending_first_state: dashmap::DashSet::new(),
+            first_state_settled: tokio::sync::Notify::new(),
             saga_journal,
             key_package_stores: DashMap::new(),
             challenger_ledgers: DashMap::new(),
@@ -5987,7 +5992,10 @@ impl Supervisor {
         // intentionally NOT respawned (anti-resurrection) and surfaces
         // `ContextClosed` — that is an expected dormancy, not a respawn
         // failure, so it logs at info.
-        match self.respawn_crashed_actor(&ctx_id, &owning_did).await {
+        match self
+            .respawn_after_first_state_settles(&ctx_id, &owning_did)
+            .await
+        {
             Ok(()) => {}
             Err(e @ ContextError::ContextNotRegistered(_)) => {
                 tracing::info!(
@@ -6018,6 +6026,56 @@ impl Supervisor {
                     error = %e,
                     "context actor respawn failed"
                 );
+            }
+        }
+    }
+
+    /// [`Self::respawn_crashed_actor`], repeated each time a first-state
+    /// claim is released while a claim on `ctx_id` refuses it: an actor that
+    /// crashed while a create, import or join of its id had not committed or
+    /// rolled back its first state is respawned once that operation settles,
+    /// from the snapshot it left. Returns early when shutdown begins.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::respawn_crashed_actor`];
+    /// [`ContextError::SupervisorShutDown`] when shutdown begins while the
+    /// claim stands.
+    async fn respawn_after_first_state_settles(
+        self: &Arc<Self>,
+        ctx_id: &str,
+        owning_did: &DID,
+    ) -> Result<(), ContextError> {
+        loop {
+            // Enabled before the respawn reads the claim, so a release after
+            // that read wakes it.
+            let settled = self.first_state_settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            let busy = match self.respawn_crashed_actor(ctx_id, owning_did).await {
+                Err(e @ ContextError::ActorBusy(_)) => e,
+                other => return other,
+            };
+            if !self.pending_first_state.contains(ctx_id) {
+                // A claim released since the respawn read it notified
+                // `settled`; otherwise the busy is not the claim's.
+                if futures::FutureExt::now_or_never(settled.as_mut()).is_some() {
+                    continue;
+                }
+                return Err(busy);
+            }
+            tracing::info!(
+                actor_kind = "context_actor",
+                context_id = %ctx_id,
+                "context actor respawn waits for an unsettled first state of its id"
+            );
+            tokio::select! {
+                () = settled => {}
+                () = self.shutdown_token.cancelled() => {
+                    return Err(ContextError::SupervisorShutDown(format!(
+                        "{ctx_id}: shutdown began while the respawn waited for its first state"
+                    )));
+                }
             }
         }
     }
@@ -28238,6 +28296,63 @@ mod tests {
         );
     }
 
+    /// An actor that crashes while a create, import or join of its id holds
+    /// the id's first-state claim is not respawned while the claim stands,
+    /// since its snapshot may be the one the operation's rollback puts back,
+    /// and is respawned from the snapshot once the operation rolls back.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_crash_under_an_unsettled_first_state_is_respawned_after_the_rollback() {
+        let clock = Arc::new(TestClock::new(1_700_000_000));
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let persistence = MapPersistence::default();
+        let sup = supervisor_with_clock_and_persistence(clock_dyn, Box::new(persistence.clone()));
+        let ctx_id_bytes = [0xC9u8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        let snap = crate::context::manager_methods::snapshot_context(&state);
+        persistence.persist_context(&ctx_key, &snap).await.unwrap();
+        let deps = test_actor_deps(&sup).await;
+        let claim =
+            crate::context::lifecycle_helpers::FirstStateRollback::new(&deps, &ctx_key).unwrap();
+        let handle = sup
+            .spawn_actor_with_state(state, deps, None)
+            .await
+            .expect("spawn registers");
+
+        induce_panic(&handle, "SECRET_SENTINEL_claimed").await;
+        let respawned_early = wait_until_async(std::time::Duration::from_millis(500), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+        })
+        .await;
+        assert!(
+            !respawned_early,
+            "no actor is respawned while the first state is unsettled"
+        );
+
+        claim
+            .rollback(sup.bootstrap_spawn_lock.lock())
+            .await
+            .expect("the operation rolls back");
+        let respawned = wait_until_async(std::time::Duration::from_secs(5), || async {
+            sup.read_context_state(&ctx_key).await == Some(crate::context::ContextState::Active)
+                && !sup.is_context_poisoned(&ctx_key)
+        })
+        .await;
+        assert!(
+            respawned,
+            "the crashed actor is respawned once the first state settles"
+        );
+    }
+
     /// §23.17.2 Invariant 2 (the round-2 HIGH-bug regression test): a respawn
     /// from a COALESCE-LAGGED snapshot — one whose per-sender epoch floor is
     /// BELOW the live floor because the epoch advanced in the ≤50ms window
@@ -30173,6 +30288,116 @@ mod tests {
         for id in [&ctx, &imported] {
             assert_eq!(contacts.load_last_relay_contact(id).await.unwrap(), None);
         }
+    }
+
+    /// A migration whose destination create fails after its first contact
+    /// was written returns the create's error, never a retryable
+    /// `ActorBusy`, even with another bootstrap parked on
+    /// `bootstrap_spawn_lock`: the governance call recorded its proposal or
+    /// vote before the create, so ADR-049 Decision 9 forbids a busy error
+    /// from here on. The rollback runs under the guard the call reserved, so
+    /// the contact is gone and the destination unclaimed when the call
+    /// returns, and only then does the parked bootstrap get the lock.
+    // The reservation is moved into the migration; the nursery lint misreads
+    // that move as a guard held to the end of the test.
+    #[allow(clippy::significant_drop_tightening)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_migration_create_rolls_back_under_its_reserved_lock_and_is_never_busy() {
+        use crate::context::governance_helpers::{
+            CommitMeta, MigrationBootstrap, execute_propose_context_migration,
+            migration_destination_id,
+        };
+
+        let sup =
+            first_contact_supervisor(Box::new(FailingSnapshotWrites), durable_over_one_store());
+        let admin = sup.node_identity().unwrap();
+        let deps = sup.build_actor_deps_loaded(&admin).await.unwrap();
+        let source = [0xE7u8; 32];
+        let ctx = hex::encode(source);
+        let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            source,
+            FIRST_CONTACT_NOW,
+            admin.clone(),
+        );
+        state
+            .handle
+            .transition_to(&crate::context::ContextState::Active)
+            .unwrap();
+        state
+            .membership
+            .add_member(admin.clone(), "admin".to_owned(), vec![]);
+        let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
+        let pid = [0xE8u8; 32];
+        let destination = migration_destination_id(&ctx, &pid);
+
+        let bootstrap = MigrationBootstrap::reserve(&deps, &ctx, &pid).unwrap();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
+        let lock = Arc::clone(&sup.bootstrap_spawn_lock);
+        let waiter = tokio::spawn(async move {
+            let acquire = lock.lock_owned();
+            tokio::pin!(acquire);
+            // Poll once so the waiter is queued before the migration runs.
+            assert!(
+                futures::poll!(acquire.as_mut()).is_pending(),
+                "the reservation holds the lock"
+            );
+            parked_tx.send(()).unwrap();
+            let guard = acquire.await;
+            acquired_tx.send(()).unwrap();
+            drop(guard);
+        });
+        parked_rx.await.unwrap();
+
+        let result = execute_propose_context_migration(
+            &mut cell,
+            &deps,
+            &ctx,
+            &first_contact_params(),
+            "fixture",
+            60,
+            false,
+            CommitMeta {
+                pid,
+                actor_did: admin.as_ref(),
+                timestamp_secs: FIRST_CONTACT_NOW,
+            },
+            bootstrap,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(ContextError::PermissionDenied(msg))
+                    if msg.starts_with("failed to create destination context")
+                        && msg.contains("injected snapshot write failure")
+            ),
+            "the create's own error, not ActorBusy: {result:?}"
+        );
+        assert_eq!(
+            sup.relay_contact_store()
+                .load_last_relay_contact(&destination)
+                .await
+                .unwrap(),
+            None,
+            "the destination's first contact is removed before the call returns"
+        );
+        assert!(sup.lookup(&destination).is_none(), "no destination runs");
+        assert_eq!(
+            cell.handle.state(),
+            crate::context::ContextState::Active,
+            "the source returns to Active"
+        );
+        deps.supervisor
+            .claim_first_state(&destination)
+            .expect("the rollback released the destination's claim");
+        deps.supervisor.release_first_state(&destination);
+        tokio::time::timeout(std::time::Duration::from_secs(5), acquired_rx)
+            .await
+            .expect("the parked bootstrap gets the lock once the call returns")
+            .unwrap();
+        waiter.await.unwrap();
     }
 
     /// Import stores the context's first `last_relay_contact` at the

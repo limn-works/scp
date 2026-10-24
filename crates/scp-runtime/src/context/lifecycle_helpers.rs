@@ -2100,10 +2100,12 @@ impl FirstStateRollbackInner {
     }
 
     /// Waits for a first-state writes task the operation abandoned, so no
-    /// write lands after the rollback reads the records' progress. Runs with
-    /// `bootstrap_spawn_lock` released: the wait can last
-    /// [`FIRST_STATE_WRITES_DRAIN`], and every other bootstrap waits on that
-    /// lock.
+    /// write lands after the rollback reads the records' progress.
+    /// [`Self::rollback`] runs it with `bootstrap_spawn_lock` released, because
+    /// the wait can last [`FIRST_STATE_WRITES_DRAIN`] and every other
+    /// bootstrap waits on that lock. [`Self::rollback_with_guard`] runs it
+    /// under the guard its actor turn already holds, because releasing that
+    /// guard in a turn could not be undone without waiting on the lock.
     ///
     /// # Errors
     ///
@@ -2244,8 +2246,9 @@ impl Drop for FirstStateRollbackInner {
 /// registered, or on failure releases `bootstrap_spawn_lock` and calls
 /// [`Self::rollback`], which waits for the writes with the lock released and
 /// retakes it for the restores; the migration create, which runs in an
-/// actor turn, calls [`Self::rollback_in_turn`]. A guard dropped unsettled
-/// with a touched record runs its rollback on a tracked task.
+/// actor turn that already holds the lock, calls
+/// [`Self::rollback_with_guard`]. A guard dropped unsettled with a touched
+/// record runs its rollback on a tracked task.
 ///
 /// The writes run in a tracked task, and a rollback waits for that task
 /// before it reads which records were touched, so a write an operation's
@@ -2337,20 +2340,21 @@ impl FirstStateRollback {
     }
 
     /// The rollback of the migration create, which runs in the source
-    /// context's actor turn and so never waits for `bootstrap_spawn_lock`.
-    /// It waits for the writes, then try-locks; while another bootstrap
-    /// holds the lock, the undo runs on a tracked task once the lock is
-    /// free.
+    /// context's actor turn under the `bootstrap_spawn_lock` guard its
+    /// governance call reserved before its first record. It waits for the
+    /// writes, reads what was touched and puts it back while still holding
+    /// `guard`, then releases it, so it never waits for the lock and never
+    /// returns a retryable `ActorBusy` after the call recorded its proposal
+    /// or vote. The migration awaits its writes task to the end, so the wait
+    /// returns at once unless shutdown abandoned the writes.
     ///
     /// # Errors
     ///
-    /// - [`ContextError::ActorBusy`] when the undo was handed to that task;
-    ///   the records are put back once it holds the lock, and the caller
-    ///   retries the operation after that.
-    /// - [`ContextError::PersistenceFailed`] as for [`Self::rollback`].
-    /// - [`ContextError::SupervisorShutDown`] when the Supervisor has dropped
-    ///   or shutdown has begun.
-    pub(in crate::context) async fn rollback_in_turn(&self) -> Result<(), ContextError> {
+    /// As for [`Self::rollback`].
+    pub(in crate::context) async fn rollback_with_guard(
+        &self,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), ContextError> {
         if self
             .inner
             .settled
@@ -2358,28 +2362,14 @@ impl FirstStateRollback {
         {
             return Ok(());
         }
+        // A failed drain keeps the claim, as in `rollback`.
         self.inner.drain_writes().await?;
-        if self.inner.touched() == (false, false) {
-            self.inner.release_claim();
-            return Ok(());
-        }
-        let result = match self.inner.supervisor.try_lock_bootstrap_spawn() {
-            Ok(_bootstrap_guard) => self.inner.undo_locked().await,
-            Err(ContextError::ActorBusy(_)) => {
-                let inner = Arc::clone(&self.inner);
-                self.inner.supervisor.spawn_under_bootstrap_spawn_lock(
-                    "first_state_rollback",
-                    std::future::ready(true),
-                    move || inner.finish_deferred_undo(),
-                )?;
-                return Err(ContextError::ActorBusy(format!(
-                    "the first-state rollback of '{}' waits for the bootstrap lock on a \
-                     background task; retry",
-                    self.inner.context_id
-                )));
-            }
-            Err(e) => Err(e),
+        let result = if self.inner.touched() == (false, false) {
+            Ok(())
+        } else {
+            self.inner.undo_locked().await
         };
+        drop(guard);
         self.inner.release_claim();
         result
     }

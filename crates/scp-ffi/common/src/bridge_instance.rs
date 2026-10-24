@@ -8068,6 +8068,44 @@ pub(crate) mod tests {
         );
     }
 
+    /// A restore that waits for the transport write lock while shutdown
+    /// begins installs nothing once it gets the lock: it reads the shutdown
+    /// flag under the lock, as an install does, so shutdown's clear of the
+    /// transport is never undone by a restore that started before it.
+    #[test]
+    fn restore_transport_waiting_on_the_lock_while_shutdown_begins_restores_nothing() {
+        let instance = CoreFields::with_supervisor(test_supervisor());
+        let previous = Arc::new(manager_on("wss://previous.example"));
+        let installed = Arc::new(manager_on("ws://127.0.0.1:1/scp/v1"));
+        instance.install_transport(Arc::clone(&installed)).unwrap();
+
+        std::thread::scope(|scope| {
+            let held = instance
+                .transport
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let restore = scope.spawn(|| {
+                instance.restore_transport(&installed, Some(Arc::clone(&previous)));
+            });
+            // Let the restore reach the lock before shutdown begins.
+            std::thread::sleep(Duration::from_millis(200));
+            instance.shutdown.store(true, Ordering::SeqCst);
+            drop(held);
+            restore.join().unwrap();
+        });
+
+        assert_eq!(
+            instance.with_transport(scp_transport::TransportManager::relay_urls),
+            Ok(vec!["ws://127.0.0.1:1/scp/v1".to_owned()]),
+            "a restore that got the lock after shutdown began must not install a manager"
+        );
+        assert_eq!(
+            instance.pending_relay_urls(),
+            HashSet::from(["ws://127.0.0.1:1/scp/v1".to_owned()]),
+            "nor retarget the reconnect set"
+        );
+    }
+
     #[test]
     fn restore_transport_leaves_a_manager_another_call_installed() {
         let instance = CoreFields::with_supervisor(test_supervisor());

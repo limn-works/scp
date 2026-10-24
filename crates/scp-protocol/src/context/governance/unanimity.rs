@@ -44,6 +44,7 @@ use scp_did::{DID, SigningKeyId};
 /// A fixed set of required voters; a proposal passes only when **every** one
 /// of them approves. A single rejection vetoes the proposal immediately.
 /// Implements [`GovernanceEngine`] for use via `Box<dyn GovernanceEngine>`.
+#[derive(Clone)]
 pub struct UnanimityEngine {
     /// The set of DIDs required to vote (all must approve).
     voters: Vec<DID>,
@@ -530,6 +531,10 @@ impl GovernanceEngine for UnanimityEngine {
         context: &GovernanceContext,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), GovernanceError> {
         self.resolve_proposal(proposal_id, context.now)
+    }
+
+    fn boxed_clone(&self) -> Box<dyn GovernanceEngine> {
+        Box::new(self.clone())
     }
 
     fn model_config(&self) -> GovernanceModelConfig {
