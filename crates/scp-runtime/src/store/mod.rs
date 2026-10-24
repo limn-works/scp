@@ -25,6 +25,7 @@ pub mod event_log;
 pub mod identity;
 pub mod nonce;
 pub mod outlets;
+pub mod push;
 pub mod queue;
 pub mod sync;
 pub mod tls;

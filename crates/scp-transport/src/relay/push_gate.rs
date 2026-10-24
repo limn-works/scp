@@ -37,7 +37,9 @@ use scp_did::BridgeTarget;
 #[cfg(feature = "push-store")]
 use scp_identity::push_verify::{PushMessage, PushSignatureVerifier};
 #[cfg(feature = "push-store")]
-use scp_protocol::discovery::push::{PushDeregistration, PushPlatform, PushRegistration};
+use scp_protocol::discovery::push::{
+    PUSH_TIMESTAMP_SKEW_SECS, PushDeregistration, PushPlatform, PushRegistration,
+};
 use scp_protocol::discovery::push::{PushMessageError, PushRelay};
 use scp_relay_client::{RelayMessage, code};
 
@@ -47,10 +49,6 @@ use super::push::PushSender;
 use super::push_dispatch::PushService;
 #[cfg(feature = "push-store")]
 use super::push_store::{PushRegistrationKey, PushRegistrationRecord, PushRegistrationStore};
-
-/// The push timestamp skew window, in seconds (§9.18.13): a relay rejects a
-/// push message whose `timestamp` differs from its clock by more than this.
-pub const PUSH_TIMESTAMP_SKEW_SECS: u64 = 300;
 
 /// How long the relay waits for one verifier call before answering `5004`
 /// `PUSH_KEY_STATE_UNAVAILABLE` (ADR-004; indicator: 10 s).

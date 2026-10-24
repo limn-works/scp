@@ -14,7 +14,7 @@
 //! - [`Storage`] — Persistent key-value byte storage
 
 use serde::{Deserialize, Serialize};
-use zeroize::ZeroizeOnDrop;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::error::PlatformError;
 
@@ -401,14 +401,18 @@ impl DeviceAttestationToken {
 ///
 /// The token format is platform-specific (e.g., APNs device token, FCM
 /// registration token). The testing adapter returns a synthetic UUID. See ADR-006.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PushToken(Vec<u8>);
+///
+/// The token addresses this device at its push platform, so it is handled as
+/// a secret: the bytes are wiped when the value drops, and `Debug` prints
+/// their length only.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushToken(Zeroizing<Vec<u8>>);
 
 impl PushToken {
     /// Creates a new push token from raw bytes.
     #[must_use]
-    pub const fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
     }
 
     /// Returns a reference to the raw token bytes.
@@ -417,10 +421,23 @@ impl PushToken {
         &self.0
     }
 
-    /// Consumes this value and returns the raw token bytes.
+    /// Whether the token holds no bytes.
     #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Consumes this value and returns the raw token bytes, still wiped on
+    /// drop.
+    #[must_use]
+    pub fn into_bytes(self) -> Zeroizing<Vec<u8>> {
         self.0
+    }
+}
+
+impl std::fmt::Debug for PushToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PushToken(<{} bytes redacted>)", self.0.len())
     }
 }
 
@@ -982,7 +999,7 @@ pub trait PreRotationCustody: Send + Sync {
     /// Store a pre-generated pre-rotation keypair in cold custody.
     ///
     /// The `private_key` argument is consumed
-    /// ([`zeroize::Zeroizing`](::zeroize::Zeroizing) — wipes on drop, so
+    /// ([`zeroize::Zeroizing`] — wipes on drop, so
     /// partial failure does not leak). The `public_key` is retained
     /// alongside for verification on retrieval (`reveal_public_key`'s
     /// internal commitment-mismatch check, if implemented).
@@ -1385,7 +1402,18 @@ pub const fn require_derive_source(role: KeyRole, key_type: KeyType) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyRole, KeyType};
+    use super::{KeyRole, KeyType, PushToken};
+
+    /// `Debug` of a push token prints its length and none of its bytes, in
+    /// text or in the decimal list a derived `Debug` would print.
+    #[test]
+    fn push_token_debug_prints_no_token_bytes() {
+        let token = PushToken::new(b"secret-apns-token".to_vec());
+        let printed = format!("{token:?} {token:#?}");
+        assert!(!printed.contains("secret"), "{printed}");
+        assert!(!printed.contains("115, 101, 99"), "{printed}");
+        assert!(printed.contains("17 bytes redacted"), "{printed}");
+    }
 
     /// Every key type and role names itself in the host contract and parses
     /// back; a near miss in case or spelling parses to nothing.

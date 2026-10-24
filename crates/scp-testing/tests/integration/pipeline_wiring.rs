@@ -203,6 +203,14 @@ const PSEUDONYM_ROTATION_SRC: &str =
 // the PUSH-013 push routing-ID query (§10.7.1).
 const HANDLERS_PUSH_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/push.rs");
+// Push registrar source — owns `PushRegistrar::register`, which signs one
+// `PushRegistration` per relay and publishes it at that relay's push routing ID
+// (PUSH-014, §10.7.1). Pinned by `push_registrar_register_reaches_relay_publish`.
+const PUSH_REGISTRAR_SRC: &str = include_str!("../../../../crates/scp-runtime/src/push/mod.rs");
+// Push publisher source — owns `TransportPushPublisher::publish`, the relay
+// PUBLISH the registrar's messages leave through (PUSH-014).
+const PUSH_PUBLISHER_SRC: &str =
+    include_str!("../../../../crates/scp-transport/src/native/push_publisher.rs");
 // Actor queries-handler source — owns the `QueriesCommand::LocalRoutingIds`
 // arm that answers through `queries_helpers::local_routing_ids` (spec 09
 // §9.10.4.1). Pinned by `local_pseudonym_rotation_reaches_its_helpers`.
@@ -9082,4 +9090,52 @@ fn bootstrap_lock_scan_flags_a_waiting_handle_method() {
             "stream_settlement_adapter.rs::dispatch -> restore_y",
         ]
     );
+}
+
+/// PUSH-014 criterion 4 (§10.7.1, ADR-004 **Push registration interception**):
+/// `PushRegistrar::register` reaches a relay PUBLISH at the relay's own push
+/// routing ID. `register` → `prepare_registration`, which refuses a tier 3
+/// relay, signs the preimage from `push_registration_signing_bytes` and
+/// addresses the message to `push_routing_id()` → `publish_all` →
+/// `PushRelayPublisher::publish` → `TransportPushPublisher::publish` →
+/// `publish_raw` at that routing ID. The trigger task reaches `register`
+/// through `reconcile`, which reads `push_routing_ids`.
+#[test]
+fn push_registrar_register_reaches_relay_publish() {
+    for (src, caller, callee) in [
+        (PUSH_REGISTRAR_SRC, "register", "self.prepare_registration("),
+        (PUSH_REGISTRAR_SRC, "register", "self.publish_all("),
+        (PUSH_REGISTRAR_SRC, "prepare_registration", "refuse_tier3("),
+        (
+            PUSH_REGISTRAR_SRC,
+            "prepare_registration",
+            "push_registration_signing_bytes(",
+        ),
+        (
+            PUSH_REGISTRAR_SRC,
+            "prepare_registration",
+            ".sign_preimage(",
+        ),
+        (
+            PUSH_REGISTRAR_SRC,
+            "prepare_registration",
+            "push_routing_id: target.relay.push_routing_id()",
+        ),
+        (
+            PUSH_REGISTRAR_SRC,
+            "publish_all",
+            ".publish(&relay_url, push_routing_id, blob)",
+        ),
+        (PUSH_REGISTRAR_SRC, "reconcile", ".push_routing_ids()"),
+        (PUSH_REGISTRAR_SRC, "reconcile", "self.register(&changed)"),
+        (PUSH_REGISTRAR_SRC, "reconcile_and_log", "self.reconcile("),
+        (PUSH_REGISTRAR_SRC, "spawn_trigger", "self.run("),
+        (PUSH_PUBLISHER_SRC, "publish", ".publish_raw("),
+        (PUSH_PUBLISHER_SRC, "publish", "RoutingId::new(routing_id)"),
+    ] {
+        assert!(
+            fn_body_contains(src, caller, callee),
+            "`{caller}` must contain `{callee}`"
+        );
+    }
 }

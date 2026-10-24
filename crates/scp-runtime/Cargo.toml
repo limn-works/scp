@@ -73,6 +73,8 @@ scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
 scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+# The push registrar maps relay `ERR` codes through `scp_relay_client::code`.
+scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
 scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
 scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }

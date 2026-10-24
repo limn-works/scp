@@ -22,6 +22,21 @@ pub enum TransportError {
     #[error("send failed: {0}")]
     SendFailed(String),
 
+    /// The relay answered a request with `ERR` (ADR-004). `code` is the
+    /// relay's error code, kept as a number so a caller can act on it: a
+    /// `4xxx` code means the same request will fail again, and a `5xxx` code
+    /// means a retry or another relay may succeed (ADR-004 client rules).
+    /// `msg` is the relay's text after
+    /// [`sanitize_relay_text`](scp_relay_client::sanitize_relay_text), because
+    /// the relay is untrusted and chooses it.
+    #[error("relay error {code}: {msg}")]
+    RelayRejected {
+        /// The relay's ADR-004 error code.
+        code: u16,
+        /// The relay's error text, sanitized.
+        msg: String,
+    },
+
     /// A subscription request could not be fulfilled.
     #[error("subscription failed: {0}")]
     SubscriptionFailed(String),

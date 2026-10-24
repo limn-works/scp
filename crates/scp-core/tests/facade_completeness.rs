@@ -28,6 +28,7 @@ use scp_core::trust::TrustError;
 // ─── Runtime types (from scp-runtime) ───
 
 use scp_core::crypto::mls::NodeMlsFactory;
+use scp_core::push::PushError;
 
 #[test]
 fn facade_exposes_protocol_types() {
@@ -57,4 +58,5 @@ fn facade_exposes_protocol_types() {
 #[test]
 fn facade_exposes_runtime_types() {
     let _ = std::any::type_name::<NodeMlsFactory>();
+    let _ = std::any::type_name::<PushError>();
 }

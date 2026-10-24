@@ -41,6 +41,7 @@ pub mod did_slot;
 pub mod local_cache;
 #[cfg(feature = "postgres-blob")]
 pub mod postgres_blob;
+pub mod push_publisher;
 #[cfg(feature = "redb-blob")]
 pub mod redb_blob;
 pub mod relay_persistence;
@@ -63,6 +64,7 @@ pub mod storage;
 // the ADR-057 Amendment — see `scripts/check-no-shim-reexports.sh`).
 pub use adapter::NativeRelayAdapter;
 pub use cert_pin::{CertPinResult, CertificatePin};
+pub use push_publisher::TransportPushPublisher;
 pub use relay_publisher::TransportRelayPublisher;
 pub use relay_querier::TransportRelayQuerier;
 

@@ -39,7 +39,7 @@ use scp_core::envelope::OuterEnvelope;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
-use scp_relay_client::relay_error_text;
+use scp_relay_client::{relay_error_text, sanitize_relay_text};
 
 use zeroize::Zeroizing;
 
@@ -877,8 +877,13 @@ impl NativeRelayClient {
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::NotConnected`] if the client is not connected,
-    /// or [`TransportError::SendFailed`] if the relay responds with an error.
+    /// - [`TransportError::NotConnected`] if the client is not connected.
+    /// - [`TransportError::SendFailed`] if `blob_ttl` exceeds the `u32` wire
+    ///   field.
+    /// - [`TransportError::RelayRejected`] with the relay's code if the relay
+    ///   answers `ERR`, so a caller such as the push registrar can tell a
+    ///   `4xxx` refusal from a retryable `5xxx` failure (ADR-004).
+    /// - [`TransportError::ProtocolError`] for any other answer.
     pub async fn publish_raw(
         &self,
         routing_id: &[u8; 32],
@@ -905,9 +910,10 @@ impl NativeRelayClient {
 
         match response {
             RelayMessage::Ok { .. } => Ok(()),
-            RelayMessage::Err { code, msg, .. } => {
-                Err(TransportError::SendFailed(relay_error_text(code, &msg)))
-            }
+            RelayMessage::Err { code, msg, .. } => Err(TransportError::RelayRejected {
+                code,
+                msg: sanitize_relay_text(&msg),
+            }),
             _ => Err(TransportError::ProtocolError(
                 "unexpected response to PUBLISH (raw)".to_string(),
             )),
@@ -2379,14 +2385,16 @@ mod tests {
         );
     }
 
-    /// `publish_raw` maps a relay `ERR` response to `SendFailed`.
+    /// `publish_raw` returns a relay `ERR` as `RelayRejected` with the relay's
+    /// code intact and its text sanitized, so the push registrar can map the
+    /// code (spec 10 §10.7.1, ADR-004).
     #[tokio::test]
-    async fn publish_raw_maps_relay_err() {
+    async fn publish_raw_preserves_relay_err_code() {
         let url = start_scripted_relay(|msg| match msg {
             ClientMessage::Publish { ref_id, .. } => vec![RelayMessage::Err {
                 ref_id: ref_id.clone(),
-                code: 4001,
-                msg: "rejected".to_string(),
+                code: 4060,
+                msg: "rejected\nforged line".to_string(),
             }],
             _ => Vec::new(),
         })
@@ -2397,10 +2405,12 @@ mod tests {
             .publish_raw(&[0x66; 32], 3600, vec![9, 9, 9])
             .await
             .expect_err("relay ERR must surface");
-        assert!(
-            matches!(err, TransportError::SendFailed(_)),
-            "expected SendFailed, got {err:?}"
-        );
+        let TransportError::RelayRejected { code, msg } = err else {
+            panic!("expected RelayRejected {{ code: 4060 }}, got {err:?}");
+        };
+        assert_eq!(code, 4060, "the relay's code is kept");
+        assert_eq!(msg, sanitize_relay_text("rejected\nforged line"));
+        assert!(!msg.contains('\n'), "the relay's text is sanitized");
     }
 
     /// `publish_raw` maps an unexpected (non-Ok/non-Err) relay response to

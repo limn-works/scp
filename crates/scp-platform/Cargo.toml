@@ -112,7 +112,7 @@ serde = { workspace = true }
 tokio.workspace = true
 thiserror.workspace = true
 tracing = { workspace = true }
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 
 # Named-`MessagePack` envelope serialization for the shared `store_value` module
 # (the canonical `StoredValue` on-disk format, spec §17.5). Unconditional because

@@ -39,6 +39,7 @@ pub mod envelope;
 pub mod identity;
 pub mod metrics;
 pub mod provenance;
+pub mod push;
 pub mod store;
 pub mod sync;
 pub mod trust;

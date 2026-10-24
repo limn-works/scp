@@ -537,6 +537,105 @@ async fn push_routing_ids_follow_a_rotation() {
     assert_eq!(after, routes(RID_1), "the rotated routing ID after it");
 }
 
+/// Records every push message the registrar publishes and accepts it.
+struct PushRecorder(tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>);
+
+impl crate::push::PushRelayPublisher for PushRecorder {
+    fn publish<'a>(
+        &'a self,
+        relay_url: &'a str,
+        _routing_id: [u8; 32],
+        blob: Vec<u8>,
+    ) -> futures::future::BoxFuture<'a, Result<(), crate::push::PushPublishError>> {
+        let sent = self.0.send((relay_url.to_owned(), blob));
+        Box::pin(async move {
+            sent.map_err(|_| crate::push::PushPublishError::Unreachable {
+                reason: "test receiver closed".to_owned(),
+            })
+        })
+    }
+}
+
+/// A rotation after the push registrar's task started reaches the registrar
+/// through the supervisor's route watch (`10-infrastructure-and-self-hosting.md`
+/// §10.7.1 **Re-registration**): the relay gets exactly one registration,
+/// holding the new routing ID and not the old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_after_start_reregisters_once_with_the_new_routing_id() {
+    use scp_protocol::discovery::push::{PushPlatform, PushRegistration};
+
+    const RELAY: &str = "wss://relay.example/scp/v1";
+    let n = node();
+    let ctx = &cid("rotation-push-registrar");
+    n.supervisor
+        .create_context(
+            ctx.clone(),
+            params(Some(interval_policy())),
+            local(),
+            Some(V1_RID),
+            vec![RELAY.to_owned()],
+        )
+        .await
+        .expect("create_context");
+
+    let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+    let handle = scp_platform::KeyCustody::generate_keypair(
+        custody.as_ref(),
+        scp_platform::KeyType::P256Signing,
+    )
+    .await
+    .expect("P-256 key");
+    let signing_key = crate::push::PushSigningKey::for_testing(local(), custody, handle)
+        .await
+        .expect("signing key");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let registrar = crate::push::PushRegistrar::new(crate::push::PushRegistrarConfig {
+        signing_key,
+        publisher: Arc::new(PushRecorder(tx)),
+        clock: Arc::clone(&n.clock) as Arc<dyn scp_clock::Clock>,
+        platform: PushPlatform::Apns,
+        token: scp_platform::PushToken::new(b"rotation-device-token".to_vec()),
+        storage: Arc::new(crate::store::ProtocolRepository::new_for_testing(
+            InMemoryStorage::new(),
+        )),
+    })
+    .await
+    .expect("registrar");
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = registrar.spawn_trigger(Arc::clone(&n.supervisor), shutdown.clone());
+
+    let (_, blob) = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("the start registration")
+        .expect("publisher alive");
+    let start = PushRegistration::from_msgpack(&blob).expect("a registration");
+    assert!(start.routing_ids.contains(&V1_RID));
+
+    n.clock.set(T0 + INTERVAL);
+    n.rotate(ctx, 1, RID_1).await.expect("the rotation commits");
+
+    let (url, blob) = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("a registration after the rotation")
+        .expect("publisher alive");
+    assert_eq!(url, scp_did::canonical_relay_url(RELAY).expect("canonical"));
+    let after = PushRegistration::from_msgpack(&blob).expect("a registration");
+    assert!(after.routing_ids.contains(&RID_1), "the new routing ID");
+    assert!(!after.routing_ids.contains(&V1_RID), "not the old one");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(700), rx.recv())
+            .await
+            .is_err(),
+        "exactly one registration follows the rotation"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(20), task.into_join_handle())
+        .await
+        .expect("the task stops")
+        .expect("the task ends cleanly");
+}
+
 /// §25.19 Vector 58: the announcement plaintext a v2 member sends is
 /// byte-equal to both golden encodings; a v1 member sends the v1 form.
 #[test]

@@ -320,6 +320,19 @@ impl SupervisorHandle {
         }
     }
 
+    /// Wakes every [`Supervisor::push_routes_changed`] receiver, because this
+    /// actor's push routes changed (`10-infrastructure-and-self-hosting.md`
+    /// §10.7.1 **Re-registration**). A dropped Supervisor has no receiver to
+    /// wake; that case logs at debug and returns.
+    pub(in crate::context) fn note_push_routes_changed(&self) {
+        match self.upgrade() {
+            Ok(supervisor) => supervisor.note_push_routes_changed(),
+            Err(e) => {
+                tracing::debug!(error = %e, "note_push_routes_changed: supervisor dropped, no receiver to wake");
+            }
+        }
+    }
+
     /// Permanent-teardown drop of the per-context outlet-stream admission
     /// registry entry for `context_id` (spec §5.4.5) — the streaming twin of
     /// [`Self::remove_context_floors`]. See

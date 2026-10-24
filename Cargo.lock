@@ -5512,6 +5512,7 @@ dependencies = [
  "scp-mls",
  "scp-platform",
  "scp-protocol",
+ "scp-relay-client",
  "scp-testing",
  "serde",
  "serde_bytes",
