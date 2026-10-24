@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use super::state::PerContextState;
 
 /// The routing ID a member held before its latest rotation, kept for the
-/// rotation grace (spec 09 §9.10.4.1 "Transition protocol and grace").
+/// rotation grace (spec 09 §9.10.4.1 "Transition protocol: query-only until expiry").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraceRoutingId {
     /// The previous routing ID.

@@ -1071,7 +1071,7 @@ async fn enabling_rotation_anchors_the_schedule_at_the_commit() {
 // Grace
 // ---------------------------------------------------------------------------
 
-/// §9.10.4.1 "Transition protocol and grace": at `grace_until` the arm drops
+/// §9.10.4.1 "Transition protocol: query-only until expiry": at `grace_until` the arm drops
 /// the previous routing ID, persists that, and emits `PseudonymGraceEnded`.
 #[tokio::test(start_paused = true)]
 async fn the_grace_end_drops_the_previous_routing_id_and_emits_its_event() {

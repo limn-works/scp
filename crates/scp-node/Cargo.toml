@@ -104,6 +104,9 @@ rand = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 x509-parser = "0.16"
+# Relay wire types and the protocol ceiling `MAX_BLOB_TTL` the node advertises in
+# `.well-known` (spec 09 §9.18.11); the wasm-safe leaf (ADR-057 Slice 3, D5).
+scp-relay-client = { path = "../scp-relay-client" }
 # Only `main.rs` installs the global recorder and serves `/metrics`; the
 # library emits through `scp-runtime` and needs no exporter. Gated by `node-bin`.
 metrics = { workspace = true, optional = true }
@@ -111,9 +114,6 @@ metrics-exporter-prometheus = { workspace = true, optional = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
-# The cross-transport integration tests build relay wire messages directly; the
-# types live in the wasm-safe scp-relay-client leaf (ADR-057 Slice 3, D5).
-scp-relay-client = { path = "../scp-relay-client" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage"] }

@@ -854,7 +854,7 @@ pub enum ContextEvent {
         pseudonym_epoch: u64,
     },
     /// The local member's rotation grace ended and it discarded its previous
-    /// routing ID (spec 09 §9.10.4.1 "Transition protocol and grace").
+    /// routing ID (spec 09 §9.10.4.1 "Transition protocol: query-only until expiry").
     /// Carries no routing ID.
     PseudonymGraceEnded,
 }

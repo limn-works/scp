@@ -675,7 +675,7 @@ impl ProjectedContext {
     /// - Even hundreds of epochs per context is negligible memory
     ///
     /// If pruning becomes necessary, add a `prune_before(epoch)` method
-    /// keyed to the relay's `max_blob_ttl`.
+    /// keyed to `MAX_BLOB_TTL`, the relay ceiling.
     ///
     /// **Important:** After a governance ban (`Revoke` /
     /// `governance_ban_subscriber`), all author keys are rotated in the

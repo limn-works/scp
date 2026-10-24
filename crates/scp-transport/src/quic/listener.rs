@@ -100,8 +100,6 @@ pub struct QuicListenerConfig {
     pub bind_addr: SocketAddr,
     /// Maximum blob size in bytes (default: 262144 / 256 KB).
     pub max_blob_size: usize,
-    /// Maximum blob TTL in seconds (default: 604800 / 7 days).
-    pub max_blob_ttl: u32,
     /// Maximum concurrent subscriptions per QUIC connection (default: 100).
     pub max_subscriptions_per_connection: usize,
     /// Maximum QUERY limit (default: 1000).
@@ -157,7 +155,6 @@ impl QuicListenerConfig {
         Self {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 9443)),
             max_blob_size: MAX_BLOB_SIZE,
-            max_blob_ttl: MAX_BLOB_TTL,
             max_subscriptions_per_connection: DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION,
             max_query_limit: MAX_QUERY_LIMIT,
             max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
@@ -877,14 +874,11 @@ async fn handle_publish<S: BlobStorage>(
     }
 
     // Validate TTL.
-    if blob_ttl < MIN_BLOB_TTL || blob_ttl > config.max_blob_ttl {
+    if !(MIN_BLOB_TTL..=MAX_BLOB_TTL).contains(&blob_ttl) {
         let err = RelayMessage::Err {
             ref_id,
             code: code::TTL_TOO_LONG,
-            msg: format!(
-                "blob_ttl must be {}-{}, got {}",
-                MIN_BLOB_TTL, config.max_blob_ttl, blob_ttl
-            ),
+            msg: format!("blob_ttl must be {MIN_BLOB_TTL}-{MAX_BLOB_TTL}, got {blob_ttl}"),
         };
         return write_and_finish(send, &err).await;
     }
@@ -1448,7 +1442,6 @@ mod tests {
         let config = QuicListenerConfig::defaults(push_gate::test_relay_url());
         assert_eq!(config.bind_addr, SocketAddr::from(([127, 0, 0, 1], 9443)));
         assert_eq!(config.max_blob_size, MAX_BLOB_SIZE);
-        assert_eq!(config.max_blob_ttl, MAX_BLOB_TTL);
         assert_eq!(config.max_subscriptions_per_connection, 100);
         assert_eq!(config.max_query_limit, MAX_QUERY_LIMIT);
         assert_eq!(config.max_connections_per_ip, 10);
