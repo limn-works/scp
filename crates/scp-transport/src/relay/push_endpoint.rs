@@ -11,14 +11,18 @@
 //!   IPv4 and IPv6 Special-Purpose Address Registries (both as last updated
 //!   2025-10-09) mark not globally reachable, N/A or blank, every IPv6
 //!   address outside `2000::/3`, multicast, unspecified, 6to4, and the
-//!   relay's [`OwnAddresses`]. It judges an IPv4-mapped and a NAT64
-//!   (`64:ff9b::/96`) address by the IPv4 address it embeds.
+//!   relay's [`OwnAddresses`]. It judges an IPv4-mapped address, a NAT64
+//!   address under the well-known prefix (`64:ff9b::/96`), and an address
+//!   under one of the operator's [`Nat64Prefixes`] by the IPv4 address it
+//!   embeds.
 //! - [`CheckedResolver`] resolves a host name and refuses the whole lookup
 //!   when any address it returns is refused. The `WebPush` sender's HTTP client
 //!   resolves through it, so a request connects only to addresses that
 //!   passed, at the moment of the send. The client never consults a resolver
 //!   for an IP-literal host, so [`CheckedResolver::check_literal`] judges a
-//!   literal before any request.
+//!   literal before any request. Every system lookup holds a permit from one
+//!   bounded pool until the lookup itself ends, so lookups that outlive their
+//!   deadline cannot pile up blocking threads.
 //!
 //! No error or log line in this module carries the endpoint, its host or an
 //! address: the endpoint is a per-device capability URL.
@@ -28,11 +32,22 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::{Host, Url};
 
 /// The longest a registration-time or send-time DNS lookup may take
 /// (indicator: 5 s, the connect deadline of every push sender).
 pub(crate) const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The system lookups one [`CheckedResolver`] and its clones run at once
+/// (indicator: 16). A lookup that outlives [`RESOLVE_TIMEOUT`] keeps its
+/// blocking thread, and its permit, until the operating system answers, so
+/// this bounds the blocking threads hostile endpoints can hold.
+pub(crate) const DNS_LOOKUP_PERMITS: usize = 16;
+
+/// The share of [`DNS_LOOKUP_PERMITS`] registration-time lookups may hold
+/// (indicator: 4), so registrations cannot starve wakes of lookups.
+pub(crate) const REGISTRATION_LOOKUP_PERMITS: usize = 4;
 
 /// Why [`check_address`] refused an address. No variant carries the address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -93,7 +108,8 @@ pub enum EndpointError {
     /// The endpoint's host name resolves to no address.
     #[error("the WebPush endpoint host resolves to no address")]
     DoesNotResolve,
-    /// The lookup took longer than [`RESOLVE_TIMEOUT`].
+    /// The lookup took longer than [`RESOLVE_TIMEOUT`], or found every
+    /// lookup permit taken and did not start.
     #[error("the WebPush endpoint host lookup timed out")]
     ResolveTimeout,
     /// The lookup failed.
@@ -103,10 +119,15 @@ pub enum EndpointError {
 
 impl EndpointError {
     /// Whether the endpoint itself is refused, as opposed to a lookup that
-    /// failed or timed out, which a later attempt may pass.
+    /// found no address, failed or timed out, which a later attempt may pass.
+    /// A send counts only a refusal toward removal (spec 10 §10.7.1
+    /// **Unreachable `WebPush` push service** keeps DNS failure transient).
     #[must_use]
     pub const fn is_refusal(self) -> bool {
-        !matches!(self, Self::ResolveTimeout | Self::Resolve(_))
+        !matches!(
+            self,
+            Self::ResolveTimeout | Self::Resolve(_) | Self::DoesNotResolve
+        )
     }
 }
 
@@ -114,8 +135,9 @@ impl EndpointError {
 ///
 /// They are each address the host of the relay's canonical URL resolves to,
 /// and each specific address a relay listener binds to. Relay startup
-/// (PUSH-023) builds the set.
-#[derive(Clone, Default, PartialEq, Eq)]
+/// (PUSH-023) builds the set. No `Default`: an empty set is a choice the
+/// caller makes by name.
+#[derive(Clone, PartialEq, Eq)]
 pub struct OwnAddresses(Arc<[IpAddr]>);
 
 impl OwnAddresses {
@@ -137,6 +159,133 @@ impl fmt::Debug for OwnAddresses {
         f.debug_struct("OwnAddresses")
             .field("count", &self.0.len())
             .finish()
+    }
+}
+
+/// The length of an RFC 6052 §2.2 NAT64 prefix, which fixes where the
+/// embedded IPv4 address sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nat64PrefixLen {
+    /// A `/32` prefix.
+    Bits32,
+    /// A `/40` prefix.
+    Bits40,
+    /// A `/48` prefix.
+    Bits48,
+    /// A `/56` prefix.
+    Bits56,
+    /// A `/64` prefix.
+    Bits64,
+    /// A `/96` prefix.
+    Bits96,
+}
+
+impl Nat64PrefixLen {
+    const fn bits(self) -> u8 {
+        match self {
+            Self::Bits32 => 32,
+            Self::Bits40 => 40,
+            Self::Bits48 => 48,
+            Self::Bits56 => 56,
+            Self::Bits64 => 64,
+            Self::Bits96 => 96,
+        }
+    }
+
+    /// The indexes of the four IPv4 octets in the IPv6 address (RFC 6052
+    /// §2.2 figure 1). Octet 8, bits 64 to 71, is the `u` octet, which never
+    /// carries IPv4 bits.
+    const fn octets(self) -> [usize; 4] {
+        match self {
+            Self::Bits32 => [4, 5, 6, 7],
+            Self::Bits40 => [5, 6, 7, 9],
+            Self::Bits48 => [6, 7, 9, 10],
+            Self::Bits56 => [7, 9, 10, 11],
+            Self::Bits64 => [9, 10, 11, 12],
+            Self::Bits96 => [12, 13, 14, 15],
+        }
+    }
+}
+
+/// Why [`Nat64Prefix::new`] refused a prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum Nat64PrefixError {
+    /// RFC 6052 §2.2 allows only lengths 32, 40, 48, 56, 64 and 96.
+    #[error("a NAT64 prefix length must be 32, 40, 48, 56, 64 or 96, not {0}")]
+    Length(u8),
+    /// The network address sets bits past the prefix length.
+    #[error("the NAT64 prefix sets bits past its length")]
+    HostBits,
+}
+
+/// One NAT64 network-specific prefix the relay's network translates (RFC 6052
+/// §2.2).
+///
+/// ADR-004 **Endpoint refusal** judges an address under it by the IPv4
+/// address it embeds, because the translator delivers the packet there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nat64Prefix {
+    network: u128,
+    len: Nat64PrefixLen,
+}
+
+impl Nat64Prefix {
+    /// The prefix `network/len`.
+    ///
+    /// # Errors
+    ///
+    /// [`Nat64PrefixError::Length`] for a length RFC 6052 does not allow, and
+    /// [`Nat64PrefixError::HostBits`] when `network` sets a bit past `len`.
+    pub const fn new(network: Ipv6Addr, len: u8) -> Result<Self, Nat64PrefixError> {
+        let len = match len {
+            32 => Nat64PrefixLen::Bits32,
+            40 => Nat64PrefixLen::Bits40,
+            48 => Nat64PrefixLen::Bits48,
+            56 => Nat64PrefixLen::Bits56,
+            64 => Nat64PrefixLen::Bits64,
+            96 => Nat64PrefixLen::Bits96,
+            other => return Err(Nat64PrefixError::Length(other)),
+        };
+        let network = network.to_bits();
+        if network << len.bits() != 0 {
+            return Err(Nat64PrefixError::HostBits);
+        }
+        Ok(Self { network, len })
+    }
+
+    /// The IPv4 address `ip` embeds when it lies under this prefix. The `u`
+    /// octet is not checked: a translator that ignores it still delivers the
+    /// packet to the embedded address.
+    const fn embedded(self, ip: Ipv6Addr) -> Option<Ipv4Addr> {
+        if !prefix_matches(ip.to_bits(), self.network, self.len.bits()) {
+            return None;
+        }
+        let octets = ip.octets();
+        let [a, b, c, d] = self.len.octets();
+        Some(Ipv4Addr::new(octets[a], octets[b], octets[c], octets[d]))
+    }
+}
+
+/// The NAT64 network-specific prefixes the relay operator lists (ADR-004
+/// **Endpoint refusal**, PUSH-023).
+///
+/// The list is empty when the relay's network has no NAT64 translator. No
+/// `Default`: the empty list is a choice the operator
+/// makes by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nat64Prefixes(Arc<[Nat64Prefix]>);
+
+impl Nat64Prefixes {
+    /// The list `prefixes`.
+    pub fn new(prefixes: impl IntoIterator<Item = Nat64Prefix>) -> Self {
+        Self(prefixes.into_iter().collect())
+    }
+
+    /// The IPv4 address `ip` embeds under the first listed prefix that
+    /// contains it.
+    fn embedded(&self, ip: Ipv6Addr) -> Option<Ipv4Addr> {
+        self.0.iter().find_map(|prefix| prefix.embedded(ip))
     }
 }
 
@@ -343,7 +492,11 @@ fn check_ipv4(ip: Ipv4Addr, own: &OwnAddresses) -> Result<(), AddressRefusal> {
     ))
 }
 
-fn check_ipv6(ip: Ipv6Addr, own: &OwnAddresses) -> Result<(), AddressRefusal> {
+fn check_ipv6(
+    ip: Ipv6Addr,
+    own: &OwnAddresses,
+    nat64: &Nat64Prefixes,
+) -> Result<(), AddressRefusal> {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return check_ipv4(v4, own);
     }
@@ -353,6 +506,9 @@ fn check_ipv6(ip: Ipv6Addr, own: &OwnAddresses) -> Result<(), AddressRefusal> {
         // conversion lossless.
         let embedded = u32::try_from(bits & u128::from(u32::MAX)).unwrap_or(u32::MAX);
         return check_ipv4(Ipv4Addr::from_bits(embedded), own);
+    }
+    if let Some(v4) = nat64.embedded(ip) {
+        return check_ipv4(v4, own);
     }
     if own.contains(IpAddr::V6(ip)) {
         return Err(AddressRefusal::OwnAddress);
@@ -373,16 +529,21 @@ fn check_ipv6(ip: Ipv6Addr, own: &OwnAddresses) -> Result<(), AddressRefusal> {
     Ok(())
 }
 
-/// Applies the ADR-004 address rule to `ip`.
+/// Applies the ADR-004 address rule to `ip`, with the relay's own addresses
+/// `own` and its network's NAT64 prefixes `nat64`.
 ///
 /// # Errors
 ///
 /// The [`AddressRefusal`] naming why `ip` is not a global unicast address the
 /// relay may send to.
-pub fn check_address(ip: IpAddr, own: &OwnAddresses) -> Result<(), AddressRefusal> {
+pub fn check_address(
+    ip: IpAddr,
+    own: &OwnAddresses,
+    nat64: &Nat64Prefixes,
+) -> Result<(), AddressRefusal> {
     match ip {
         IpAddr::V4(v4) => check_ipv4(v4, own),
-        IpAddr::V6(v6) => check_ipv6(v6, own),
+        IpAddr::V6(v6) => check_ipv6(v6, own, nat64),
     }
 }
 
@@ -460,26 +621,104 @@ pub fn parse_endpoint(endpoint: &str) -> Result<ParsedEndpoint, EndpointError> {
     Ok(ParsedEndpoint { url, aud })
 }
 
+/// Who asked for a lookup, which decides the permits it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LookupPurpose {
+    /// A wake's connection.
+    Send,
+    /// A registration-time check, which may hold only
+    /// [`REGISTRATION_LOOKUP_PERMITS`] of the pool.
+    Registration,
+}
+
+/// The permits one lookup holds until the lookup itself ends, even after its
+/// caller stopped waiting.
+struct LookupPermit {
+    _all: OwnedSemaphorePermit,
+    _registration: Option<OwnedSemaphorePermit>,
+}
+
+/// The bounded lookup pool a [`CheckedResolver`] and its clones share.
+#[derive(Clone)]
+struct LookupPermits {
+    all: Arc<Semaphore>,
+    registration: Arc<Semaphore>,
+}
+
+impl LookupPermits {
+    fn new() -> Self {
+        Self {
+            all: Arc::new(Semaphore::new(DNS_LOOKUP_PERMITS)),
+            registration: Arc::new(Semaphore::new(REGISTRATION_LOOKUP_PERMITS)),
+        }
+    }
+
+    /// Takes the permits a lookup for `purpose` needs, or fails fast with
+    /// [`EndpointError::ResolveTimeout`] when the pool is full, before any
+    /// lookup starts.
+    fn try_acquire(&self, purpose: LookupPurpose) -> Result<LookupPermit, EndpointError> {
+        let registration = match purpose {
+            LookupPurpose::Send => None,
+            LookupPurpose::Registration => Some(
+                Arc::clone(&self.registration)
+                    .try_acquire_owned()
+                    .map_err(|_| EndpointError::ResolveTimeout)?,
+            ),
+        };
+        let all = Arc::clone(&self.all)
+            .try_acquire_owned()
+            .map_err(|_| EndpointError::ResolveTimeout)?;
+        Ok(LookupPermit {
+            _all: all,
+            _registration: registration,
+        })
+    }
+}
+
 /// How a [`CheckedResolver`] looks a name up.
 #[derive(Clone)]
 enum Lookup {
     /// The operating system's resolver.
     System,
-    /// A fixed table, so a test can point a name at any address.
+    /// A fixed table, so a test can point a name at any address. A name the
+    /// table lacks fails as the system resolver fails for NXDOMAIN; a name
+    /// mapped to no address resolves to none. `started` counts the lookups
+    /// that ran.
     #[cfg(test)]
-    Fixed(Arc<std::collections::HashMap<String, Vec<IpAddr>>>),
+    Fixed {
+        table: Arc<std::collections::HashMap<String, Vec<IpAddr>>>,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+    },
 }
 
 impl Lookup {
-    async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, EndpointError> {
+    /// Looks `host` up while holding `permit`. The system lookup runs on a
+    /// blocking thread that keeps the permit until the operating system
+    /// answers, however long the caller waits.
+    async fn lookup(&self, host: &str, permit: LookupPermit) -> Result<Vec<IpAddr>, EndpointError> {
         match self {
-            Self::System => Ok(tokio::net::lookup_host((host, 0))
+            Self::System => {
+                let host = host.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    let found = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), 0))
+                        .map(|addrs| addrs.map(|addr| addr.ip()).collect::<Vec<_>>())
+                        .map_err(|e| EndpointError::Resolve(e.kind()));
+                    drop(permit);
+                    found
+                })
                 .await
-                .map_err(|e| EndpointError::Resolve(e.kind()))?
-                .map(|addr| addr.ip())
-                .collect()),
+                // The blocking task panicked or the runtime is shutting down.
+                .map_err(|_| EndpointError::Resolve(std::io::ErrorKind::Other))?
+            }
             #[cfg(test)]
-            Self::Fixed(table) => Ok(table.get(host).cloned().unwrap_or_default()),
+            Self::Fixed { table, started } => {
+                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(permit);
+                table
+                    .get(host)
+                    .cloned()
+                    .ok_or(EndpointError::Resolve(std::io::ErrorKind::NotFound))
+            }
         }
     }
 }
@@ -495,7 +734,9 @@ impl Lookup {
 #[derive(Clone)]
 pub struct CheckedResolver {
     own: OwnAddresses,
+    nat64: Nat64Prefixes,
     lookup: Lookup,
+    permits: LookupPermits,
     /// Lets a test reach its loopback server. Absent from every non-test
     /// build.
     #[cfg(test)]
@@ -506,18 +747,22 @@ impl fmt::Debug for CheckedResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CheckedResolver")
             .field("own", &self.own)
+            .field("nat64", &self.nat64)
             .finish_non_exhaustive()
     }
 }
 
 impl CheckedResolver {
-    /// A resolver that looks names up through the operating system and
-    /// refuses `own` along with every other refused address.
+    /// A resolver that looks names up through the operating system, refuses
+    /// `own` along with every other refused address, and judges an address
+    /// under one of `nat64` by the IPv4 address it embeds.
     #[must_use]
-    pub const fn new(own: OwnAddresses) -> Self {
+    pub fn new(own: OwnAddresses, nat64: Nat64Prefixes) -> Self {
         Self {
             own,
+            nat64,
             lookup: Lookup::System,
+            permits: LookupPermits::new(),
             #[cfg(test)]
             allow_loopback: false,
         }
@@ -533,9 +778,31 @@ impl CheckedResolver {
     ) -> Self {
         Self {
             own,
-            lookup: Lookup::Fixed(Arc::new(table)),
+            nat64: Nat64Prefixes::new([]),
+            lookup: Lookup::Fixed {
+                table: Arc::new(table),
+                started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            permits: LookupPermits::new(),
             allow_loopback,
         }
+    }
+
+    /// How many table lookups this resolver and its clones started.
+    #[cfg(test)]
+    pub(crate) fn lookups_started(&self) -> usize {
+        match &self.lookup {
+            Lookup::Fixed { started, .. } => started.load(std::sync::atomic::Ordering::SeqCst),
+            Lookup::System => 0,
+        }
+    }
+
+    /// Takes every lookup permit, as lookups stuck past their deadline would.
+    #[cfg(test)]
+    fn exhaust_permits(&self) -> Result<Vec<LookupPermit>, EndpointError> {
+        (0..DNS_LOOKUP_PERMITS)
+            .map(|_| self.permits.try_acquire(LookupPurpose::Send))
+            .collect()
     }
 
     fn check(&self, ip: IpAddr) -> Result<(), EndpointError> {
@@ -543,7 +810,7 @@ impl CheckedResolver {
         if self.allow_loopback && ip.to_canonical().is_loopback() {
             return Ok(());
         }
-        check_address(ip, &self.own).map_err(EndpointError::Refused)
+        check_address(ip, &self.own, &self.nat64).map_err(EndpointError::Refused)
     }
 
     /// Judges an IP-literal host, which the HTTP client connects to without
@@ -557,17 +824,28 @@ impl CheckedResolver {
         endpoint.ip_literal().map_or(Ok(()), |ip| self.check(ip))
     }
 
-    /// Resolves `host` within [`RESOLVE_TIMEOUT`] and returns its addresses
-    /// when every one of them passes.
+    /// Resolves `host` for a wake within [`RESOLVE_TIMEOUT`] and returns its
+    /// addresses when every one of them passes.
     ///
     /// # Errors
     ///
     /// [`EndpointError::Refused`] when any address is refused,
     /// [`EndpointError::DoesNotResolve`] when there is none, and
     /// [`EndpointError::ResolveTimeout`] or [`EndpointError::Resolve`] when
-    /// the lookup fails.
+    /// the lookup fails, times out, or finds the lookup pool full.
     pub async fn resolve_checked(&self, host: &str) -> Result<Vec<IpAddr>, EndpointError> {
-        let addresses = tokio::time::timeout(RESOLVE_TIMEOUT, self.lookup.lookup(host))
+        self.resolve_for(host, LookupPurpose::Send).await
+    }
+
+    async fn resolve_for(
+        &self,
+        host: &str,
+        purpose: LookupPurpose,
+    ) -> Result<Vec<IpAddr>, EndpointError> {
+        // The permit moves into the lookup, which holds it until the lookup
+        // itself ends, even past the timeout below.
+        let lookup = self.lookup.lookup(host, self.permits.try_acquire(purpose)?);
+        let addresses = tokio::time::timeout(RESOLVE_TIMEOUT, lookup)
             .await
             .map_err(|_| EndpointError::ResolveTimeout)??;
         if addresses.is_empty() {
@@ -590,7 +868,8 @@ impl CheckedResolver {
         let parsed = parse_endpoint(endpoint)?;
         self.check_literal(&parsed)?;
         if let Some(domain) = parsed.domain() {
-            self.resolve_checked(domain).await?;
+            self.resolve_for(domain, LookupPurpose::Registration)
+                .await?;
         }
         Ok(())
     }
@@ -718,10 +997,122 @@ mod tests {
             ("64:ff9b::a9fe:a9fe", Err(Not)),
             ("64:ff9b::808:808", Ok(())),
         ];
-        let own = OwnAddresses::default();
+        let own = OwnAddresses::new([]);
+        let nat64 = Nat64Prefixes::new([]);
         for (text, want) in cases {
-            assert_eq!(check_address(ip(text)?, &own), *want, "{text}");
+            assert_eq!(check_address(ip(text)?, &own, &nat64), *want, "{text}");
         }
+        Ok(())
+    }
+
+    /// An address under an operator-listed NAT64 network-specific prefix is
+    /// judged by the IPv4 address RFC 6052 §2.2 places under it, at every
+    /// allowed prefix length.
+    #[test]
+    fn an_address_under_a_listed_nat64_prefix_is_judged_by_its_ipv4() -> TestResult {
+        let own = OwnAddresses::new([ip("203.0.114.7")?]);
+        let none = Nat64Prefixes::new([]);
+        // (prefix, length, 127.0.0.1 embedded, 8.8.8.8 embedded, 203.0.114.7 embedded)
+        let cases: &[(&str, u8, &str, &str, &str)] = &[
+            (
+                "2001:db8::",
+                32,
+                "2001:db8:7f00:1::",
+                "2001:db8:808:808::",
+                "2001:db8:cb00:7207::",
+            ),
+            (
+                "2001:db8:100::",
+                40,
+                "2001:db8:17f:0:1::",
+                "2001:db8:108:808:8::",
+                "2001:db8:1cb:72:7::",
+            ),
+            (
+                "2001:db8:122::",
+                48,
+                "2001:db8:122:7f00:0:100::",
+                "2001:db8:122:808:8:800::",
+                "2001:db8:122:cb00:72:700::",
+            ),
+            (
+                "2001:db8:122:300::",
+                56,
+                "2001:db8:122:37f:0:1::",
+                "2001:db8:122:308:8:808::",
+                "2001:db8:122:3cb:0:7207::",
+            ),
+            (
+                "2001:db8:122:344::",
+                64,
+                "2001:db8:122:344:7f:0:100:0",
+                "2001:db8:122:344:8:808:800:0",
+                "2001:db8:122:344:cb:72:700:0",
+            ),
+            (
+                "2001:db8:122:344::",
+                96,
+                "2001:db8:122:344::7f00:1",
+                "2001:db8:122:344::808:808",
+                "2001:db8:122:344::cb00:7207",
+            ),
+        ];
+        for (prefix, len, loopback, public, own_v4) in cases {
+            let listed = Nat64Prefixes::new([Nat64Prefix::new(Ipv6Addr::from_str(prefix)?, *len)?]);
+            assert_eq!(
+                check_address(ip(loopback)?, &own, &listed),
+                Err(AddressRefusal::NotGloballyReachable),
+                "/{len} {loopback}"
+            );
+            assert_eq!(
+                check_address(ip(own_v4)?, &own, &listed),
+                Err(AddressRefusal::OwnAddress),
+                "/{len} {own_v4}"
+            );
+            assert_eq!(
+                check_address(ip(public)?, &own, &listed),
+                Ok(()),
+                "/{len} {public}"
+            );
+            // Unlisted, the documentation prefix is refused as such.
+            assert_eq!(
+                check_address(ip(public)?, &own, &none),
+                Err(AddressRefusal::NotGloballyReachable),
+                "/{len} {public} unlisted"
+            );
+        }
+        // A listed prefix inside global unicast space makes a public-looking
+        // address carrying a loopback IPv4 refused.
+        let global =
+            Nat64Prefixes::new([Nat64Prefix::new(Ipv6Addr::from_str("2606:4700:64::")?, 96)?]);
+        assert_eq!(
+            check_address(ip("2606:4700:64::808:808")?, &own, &none),
+            Ok(())
+        );
+        assert_eq!(
+            check_address(ip("2606:4700:64::7f00:1")?, &own, &global),
+            Err(AddressRefusal::NotGloballyReachable)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nat64_prefix_new_refuses_bad_lengths_and_host_bits() -> TestResult {
+        let net = Ipv6Addr::from_str("2001:db8::")?;
+        for len in [0, 8, 33, 63, 95, 128] {
+            assert_eq!(
+                Nat64Prefix::new(net, len),
+                Err(Nat64PrefixError::Length(len))
+            );
+        }
+        assert_eq!(
+            Nat64Prefix::new(Ipv6Addr::from_str("2001:db8::1")?, 96),
+            Err(Nat64PrefixError::HostBits)
+        );
+        assert_eq!(
+            Nat64Prefix::new(Ipv6Addr::from_str("2001:db8:0:1::")?, 48),
+            Err(Nat64PrefixError::HostBits)
+        );
         Ok(())
     }
 
@@ -736,16 +1127,19 @@ mod tests {
             "2001:4860::7",
         ] {
             assert_eq!(
-                check_address(ip(text)?, &own),
+                check_address(ip(text)?, &own, &Nat64Prefixes::new([])),
                 Err(AddressRefusal::OwnAddress),
                 "{text}"
             );
         }
-        assert_eq!(check_address(ip("203.0.114.8")?, &own), Ok(()));
+        assert_eq!(
+            check_address(ip("203.0.114.8")?, &own, &Nat64Prefixes::new([])),
+            Ok(())
+        );
         // An own address given in mapped form matches its IPv4 address.
         let mapped = OwnAddresses::new([ip("::ffff:203.0.114.9")?]);
         assert_eq!(
-            check_address(ip("203.0.114.9")?, &mapped),
+            check_address(ip("203.0.114.9")?, &mapped, &Nat64Prefixes::new([])),
             Err(AddressRefusal::OwnAddress)
         );
         Ok(())
@@ -805,7 +1199,7 @@ mod tests {
 
     #[test]
     fn check_literal_judges_only_literals() -> TestResult {
-        let resolver = CheckedResolver::new(OwnAddresses::default());
+        let resolver = CheckedResolver::new(OwnAddresses::new([]), Nat64Prefixes::new([]));
         assert_eq!(
             resolver.check_literal(&parse_endpoint("https://127.0.0.1/p")?),
             Err(EndpointError::Refused(AddressRefusal::NotGloballyReachable))
@@ -831,8 +1225,9 @@ mod tests {
                 vec![ip("8.8.8.8")?, ip("10.0.0.1")?],
             ),
             ("loop.example".to_owned(), vec![ip("::1")?]),
+            ("empty.example".to_owned(), vec![]),
         ]);
-        let resolver = CheckedResolver::for_tests(OwnAddresses::default(), table, false);
+        let resolver = CheckedResolver::for_tests(OwnAddresses::new([]), table, false);
         assert_eq!(resolver.resolve_checked("public.example").await?.len(), 2);
         assert_eq!(
             resolver.resolve_checked("mixed.example").await,
@@ -842,8 +1237,14 @@ mod tests {
             resolver.resolve_checked("loop.example").await,
             Err(EndpointError::Refused(AddressRefusal::NotGloballyReachable))
         );
+        // A name the table lacks fails as NXDOMAIN does through the system
+        // resolver; a name with no address resolves to none.
         assert_eq!(
             resolver.resolve_checked("absent.example").await,
+            Err(EndpointError::Resolve(std::io::ErrorKind::NotFound))
+        );
+        assert_eq!(
+            resolver.resolve_checked("empty.example").await,
             Err(EndpointError::DoesNotResolve)
         );
         resolver
@@ -864,11 +1265,78 @@ mod tests {
         Ok(())
     }
 
+    /// With every lookup permit taken, a lookup fails fast as a resolve
+    /// timeout and starts no lookup.
+    #[tokio::test]
+    async fn a_full_lookup_pool_refuses_without_starting_a_lookup() -> TestResult {
+        let table = HashMap::from([("public.example".to_owned(), vec![ip("8.8.8.8")?])]);
+        let resolver = CheckedResolver::for_tests(OwnAddresses::new([]), table, false);
+        let held = resolver.exhaust_permits()?;
+        assert_eq!(
+            resolver.resolve_checked("public.example").await,
+            Err(EndpointError::ResolveTimeout)
+        );
+        assert_eq!(
+            resolver
+                .check_registration_endpoint("https://public.example/p")
+                .await,
+            Err(EndpointError::ResolveTimeout)
+        );
+        // A clone shares the pool.
+        assert_eq!(
+            resolver.clone().resolve_checked("public.example").await,
+            Err(EndpointError::ResolveTimeout)
+        );
+        assert_eq!(resolver.lookups_started(), 0);
+        drop(held);
+        assert_eq!(resolver.resolve_checked("public.example").await?.len(), 1);
+        assert_eq!(resolver.lookups_started(), 1);
+        Ok(())
+    }
+
+    /// Registration lookups hold at most their share of the pool, so the
+    /// rest stays free for wakes.
+    #[test]
+    fn registration_lookups_hold_only_their_share() -> TestResult {
+        let permits = LookupPermits::new();
+        let held: Vec<LookupPermit> = (0..REGISTRATION_LOOKUP_PERMITS)
+            .map(|_| permits.try_acquire(LookupPurpose::Registration))
+            .collect::<Result<_, _>>()?;
+        assert!(matches!(
+            permits.try_acquire(LookupPurpose::Registration),
+            Err(EndpointError::ResolveTimeout)
+        ));
+        let sends: Vec<LookupPermit> = (0..DNS_LOOKUP_PERMITS - REGISTRATION_LOOKUP_PERMITS)
+            .map(|_| permits.try_acquire(LookupPurpose::Send))
+            .collect::<Result<_, _>>()?;
+        assert!(matches!(
+            permits.try_acquire(LookupPurpose::Send),
+            Err(EndpointError::ResolveTimeout)
+        ));
+        drop((held, sends));
+        Ok(())
+    }
+
+    /// The system resolver also fails fast when the pool is full.
+    #[tokio::test]
+    async fn a_full_pool_refuses_a_system_lookup_at_once() -> TestResult {
+        let resolver = CheckedResolver::new(OwnAddresses::new([]), Nat64Prefixes::new([]));
+        let held = resolver.exhaust_permits()?;
+        let started = std::time::Instant::now();
+        assert_eq!(
+            resolver.resolve_checked("localhost").await,
+            Err(EndpointError::ResolveTimeout)
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(held);
+        Ok(())
+    }
+
     /// The production resolver refuses `localhost`, which every system
     /// resolver maps to loopback.
     #[tokio::test]
     async fn the_system_resolver_refuses_localhost() {
-        let resolver = CheckedResolver::new(OwnAddresses::default());
+        let resolver = CheckedResolver::new(OwnAddresses::new([]), Nat64Prefixes::new([]));
         assert_eq!(
             resolver.resolve_checked("localhost").await,
             Err(EndpointError::Refused(AddressRefusal::NotGloballyReachable))

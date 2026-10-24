@@ -62,17 +62,20 @@ const WEBPUSH_INFO: &[u8] = b"WebPush: info\0";
 const CEK_INFO: &[u8] = b"Content-Encoding: aes128gcm\0";
 const NONCE_INFO: &[u8] = b"Content-Encoding: nonce\0";
 
-/// The largest plaintext one record holds: the record carries the plaintext,
-/// the delimiter and the tag.
-pub const MAX_PLAINTEXT_LEN: usize = RECORD_SIZE - 1 - TAG_LEN;
+/// The largest plaintext one body holds, 3,993 bytes.
+///
+/// RFC 8291 §4 limits the whole body, header included, to the 4,096-byte
+/// record size, and the body carries the header, the plaintext, the
+/// delimiter and the tag.
+pub const MAX_PLAINTEXT_LEN: usize = RECORD_SIZE - HEADER_LEN - 1 - TAG_LEN;
 
 /// A `WebPush` encryption failure. Each variant names one rejected input or one
 /// failed step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum WebPushError {
-    /// The plaintext plus the delimiter and the tag exceed one 4,096-byte
-    /// record.
+    /// The header, the plaintext, the delimiter and the tag exceed one
+    /// 4,096-byte record (RFC 8291 §4).
     #[error("plaintext of {len} bytes exceeds one record (at most {MAX_PLAINTEXT_LEN} bytes)")]
     RecordTooLarge {
         /// The rejected plaintext length.
@@ -96,9 +99,10 @@ struct RecordKeys {
 /// Encrypts `plaintext` to a subscription's `p256dh` key `ua_public` and its
 /// `auth` secret, as one `aes128gcm` record with `rs` 4,096.
 ///
-/// Draws a fresh ephemeral P-256 key pair and a fresh 16-byte salt from `rng`
-/// on every call, so no two bodies share either (RFC 8291 §3.4, RFC 8188
-/// §2.1). Callers pass `rand::rngs::OsRng`.
+/// Draws a fresh ephemeral P-256 key pair and a fresh 16-byte salt from the
+/// operating system's RNG on every call, so no two bodies share either
+/// (RFC 8291 §3.4, RFC 8188 §2.1). No caller supplies the randomness, so no
+/// caller can pass a weak or repeating source.
 ///
 /// # Errors
 ///
@@ -109,12 +113,12 @@ pub fn seal(
     ua_public: &P256PublicKey,
     auth: &[u8; AUTH_SECRET_LEN],
     plaintext: &[u8],
-    rng: &mut impl rand_core::CryptoRngCore,
 ) -> Result<Vec<u8>, WebPushError> {
     check_len(plaintext)?;
-    let ephemeral = P256SecretKey::random(rng);
+    let mut rng = rand_core::OsRng;
+    let ephemeral = P256SecretKey::random(&mut rng);
     let mut salt = [0u8; SALT_LEN];
-    rng.fill_bytes(&mut salt);
+    rand_core::RngCore::fill_bytes(&mut rng, &mut salt);
     seal_with(&ephemeral, &salt, ua_public, auth, plaintext)
 }
 
@@ -446,9 +450,8 @@ mod tests {
     #[test]
     fn seal_draws_a_fresh_ephemeral_key_and_salt_per_call() -> TestResult {
         let a = appendix_a()?;
-        let mut rng = rand::rngs::OsRng;
-        let one = seal(&a.ua_public, &a.auth, b"x", &mut rng)?;
-        let two = seal(&a.ua_public, &a.auth, b"x", &mut rng)?;
+        let one = seal(&a.ua_public, &a.auth, b"x")?;
+        let two = seal(&a.ua_public, &a.auth, b"x")?;
         assert_ne!(one[..SALT_LEN], two[..SALT_LEN], "salt");
         assert_ne!(
             one[SALT_LEN + 5..HEADER_LEN],
@@ -461,19 +464,22 @@ mod tests {
     }
 
     #[test]
-    fn seal_rejects_a_plaintext_over_one_record() -> TestResult {
+    fn seal_accepts_3993_bytes_and_rejects_3994() -> TestResult {
         let a = appendix_a()?;
-        let mut rng = rand::rngs::OsRng;
-        let largest = vec![0x61; MAX_PLAINTEXT_LEN];
-        let body = seal(&a.ua_public, &a.auth, &largest, &mut rng)?;
-        assert_eq!(body.len(), HEADER_LEN + RECORD_SIZE);
+        let ephemeral = P256SecretKey::random(&mut rand::rngs::OsRng);
+        let salt = [7u8; SALT_LEN];
+        let largest = vec![0x61; 3993];
+        let body = seal_with(&ephemeral, &salt, &a.ua_public, &a.auth, &largest)?;
+        assert_eq!(body.len(), RECORD_SIZE, "the whole body fills one record");
         assert_eq!(open(&a.ua_private, &a.auth, &body)?, largest);
-        let over = vec![0x61; MAX_PLAINTEXT_LEN + 1];
+        let over = vec![0x61; 3994];
         assert_eq!(
-            seal(&a.ua_public, &a.auth, &over, &mut rng),
-            Err(WebPushError::RecordTooLarge {
-                len: MAX_PLAINTEXT_LEN + 1
-            })
+            seal_with(&ephemeral, &salt, &a.ua_public, &a.auth, &over),
+            Err(WebPushError::RecordTooLarge { len: 3994 })
+        );
+        assert_eq!(
+            seal(&a.ua_public, &a.auth, &over),
+            Err(WebPushError::RecordTooLarge { len: 3994 })
         );
         Ok(())
     }
@@ -509,8 +515,7 @@ mod tests {
             seed in any::<[u8; 32]>(),
         ) {
             let ua_private = P256SecretKey::from_seed(crate::p256::SeedLabel::TestVectorKey, &seed);
-            let mut rng = rand::rngs::OsRng;
-            let body = seal(&ua_private.public_key(), &auth, &plaintext, &mut rng)
+            let body = seal(&ua_private.public_key(), &auth, &plaintext)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
             prop_assert_eq!(body.len(), HEADER_LEN + plaintext.len() + 1 + TAG_LEN);
             let opened = open(&ua_private, &auth, &body)

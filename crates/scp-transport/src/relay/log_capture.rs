@@ -32,10 +32,20 @@ impl Write for SharedBuffer {
     }
 }
 
-/// Runs `f` on this thread's active capture buffer slot.
-fn with_active<R>(f: impl FnOnce(&RefCell<Option<SharedBuffer>>) -> R) -> R {
+/// Which events a capture keeps, by their metadata.
+type Admits = fn(&Metadata<'_>) -> bool;
+
+/// A thread's active capture: its buffer and the events it keeps.
+#[derive(Clone)]
+struct Active {
+    buffer: SharedBuffer,
+    admits: Admits,
+}
+
+/// Runs `f` on this thread's active capture slot.
+fn with_active<R>(f: impl FnOnce(&RefCell<Option<Active>>) -> R) -> R {
     thread_local! {
-        static ACTIVE: RefCell<Option<SharedBuffer>> = const { RefCell::new(None) };
+        static ACTIVE: RefCell<Option<Active>> = const { RefCell::new(None) };
     }
     ACTIVE.with(f)
 }
@@ -48,22 +58,28 @@ impl<'a> MakeWriter<'a> for ThreadRouted {
 
     fn make_writer(&'a self) -> Self::Writer {
         with_active(|active| match active.borrow().clone() {
-            Some(buffer) => Box::new(buffer) as Box<dyn Write>,
+            Some(active) => Box::new(active.buffer) as Box<dyn Write>,
             None => Box::new(std::io::sink()),
         })
     }
 }
 
-/// Enables an event only on a thread with an active capture, and holds the
-/// global level filter at `OFF` until the global dispatcher is readable.
+/// Enables an event only on a thread with an active capture that admits it,
+/// and holds the global level filter at `OFF` until the global dispatcher is
+/// readable.
 struct CaptureFilter {
     /// Set once `set_global_default` has returned.
     armed: Arc<AtomicBool>,
 }
 
 impl<S> Filter<S> for CaptureFilter {
-    fn enabled(&self, _: &Metadata<'_>, _: &Context<'_, S>) -> bool {
-        with_active(|active| active.borrow().is_some())
+    fn enabled(&self, metadata: &Metadata<'_>, _: &Context<'_, S>) -> bool {
+        with_active(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .is_some_and(|active| (active.admits)(metadata))
+        })
     }
 
     /// `sometimes`, so each event is checked against the current thread.
@@ -119,18 +135,25 @@ fn install_global() {
     });
 }
 
-/// Captures every tracing event, at every level and from every target, on the
-/// current thread while it lives. The tests run on tokio's current-thread
-/// runtime, so the senders' events, and hyper's and h2's, land here.
+/// Captures every tracing event `admits` keeps, at every level and from
+/// every target, on the current thread while it lives. The tests run on
+/// tokio's current-thread runtime, so the senders' events, and hyper's and
+/// h2's, land here. A lib test passes the relay's own log predicate, so the
+/// capture keeps what the relay's log keeps.
 pub struct LogCapture {
     buffer: SharedBuffer,
 }
 
 impl LogCapture {
-    pub fn install() -> Self {
+    pub fn install(admits: Admits) -> Self {
         install_global();
         let buffer = SharedBuffer::default();
-        with_active(|active| *active.borrow_mut() = Some(buffer.clone()));
+        with_active(|active| {
+            *active.borrow_mut() = Some(Active {
+                buffer: buffer.clone(),
+                admits,
+            });
+        });
         Self { buffer }
     }
 

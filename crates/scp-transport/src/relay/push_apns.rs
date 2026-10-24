@@ -843,7 +843,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn no_log_line_carries_the_key_jwt_or_device_token() {
-        let capture = LogCapture::install();
+        let capture = LogCapture::install(crate::relay::push_webpush::admits_log_event);
         let (sender, server, _) = sender_with(vec![
             Reply::empty(200),
             reason(400, "TopicDisallowed"),

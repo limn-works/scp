@@ -3,7 +3,7 @@
 
 //! B1, relay wire protocol: the `token` of a WebPush `PushRegistration`, which
 //! a relay decodes as a `WebPushSubscription` before it verifies the
-//! registration's signature (`22-discovery-and-addressing.md` §22.11.4
+//! registration's signature (`22-human-readable-addressing.md` §22.11.4
 //! **WebPush token encoding**, ADR-004).
 //!
 //! I1: no input panics the decoder. A token that decodes is at most 2,133

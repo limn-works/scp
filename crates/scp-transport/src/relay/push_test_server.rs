@@ -280,8 +280,17 @@ where
 /// endpoint origins on one server.
 pub const TLS_TEST_HOSTS: [&str; 2] = ["push.example.net", "hung.example.net"];
 
+/// How many [`hung_host`] names a `WebPush` test resolver maps.
+pub const HUNG_HOSTS: usize = 40;
+
+/// The `n`th of [`HUNG_HOSTS`] further endpoint origins a [`TlsTestServer`]
+/// certificate covers, through its `*.hung.example.net` name.
+pub fn hung_host(n: usize) -> String {
+    format!("h{n}.hung.example.net")
+}
+
 /// An HTTP/2-over-TLS server on `127.0.0.1` with a fresh self-signed
-/// certificate for [`TLS_TEST_HOSTS`], offering only `h2` in ALPN. Replies
+/// certificate for [`TLS_TEST_HOSTS`] and every [`hung_host`], offering only `h2` in ALPN. Replies
 /// are chosen by path prefix as for [`TestServer`].
 pub struct TlsTestServer {
     server: TestServer,
@@ -296,6 +305,7 @@ impl TlsTestServer {
             TLS_TEST_HOSTS
                 .iter()
                 .map(|h| (*h).to_owned())
+                .chain(["*.hung.example.net".to_owned()])
                 .collect::<Vec<_>>(),
         )
         .unwrap();

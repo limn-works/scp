@@ -683,12 +683,47 @@ fn log_format_is_json(raw: Option<OsString>) -> Result<bool, StartupError> {
     }
 }
 
+/// The relay's subscriber: `filter`, then the relay's fixed cap
+/// (`push_webpush::admits_log_event`, which holds hyper-util at INFO so no
+/// line names a `WebPush` endpoint's host), formatted as JSON when `json`,
+/// written to `writer`.
+fn relay_subscriber<W>(
+    filter: EnvFilter,
+    json: bool,
+    writer: W,
+) -> Box<dyn tracing::Subscriber + Send + Sync>
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let cap = tracing_subscriber::filter::filter_fn(crate::relay::push_webpush::admits_log_event);
+    if json {
+        Box::new(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(writer)
+                .with_env_filter(filter)
+                .finish()
+                .with(cap),
+        )
+    } else {
+        Box::new(
+            tracing_subscriber::fmt()
+                .with_writer(writer)
+                .with_env_filter(filter)
+                .finish()
+                .with(cap),
+        )
+    }
+}
+
 /// Installs the global `tracing` subscriber.
 ///
 /// Log level is determined by `RUST_LOG` (takes precedence) or
 /// `SCP_RELAY_LOG_LEVEL` (default: `info`). Output format is controlled
 /// by `SCP_RELAY_LOG_FORMAT`: `json` for structured JSON, `pretty` (the
-/// default) for human-readable output.
+/// default) for human-readable output. hyper-util logs at INFO at most,
+/// whatever those variables ask for.
 ///
 /// # Errors
 ///
@@ -696,20 +731,12 @@ fn log_format_is_json(raw: Option<OsString>) -> Result<bool, StartupError> {
 /// that does not parse, and [`StartupError::Tracing`] when another global
 /// subscriber is already installed.
 pub fn init_tracing() -> Result<(), StartupError> {
+    use tracing_subscriber::util::SubscriberInitExt as _;
     let filter = log_filter(env::var_os("RUST_LOG"), env::var_os("SCP_RELAY_LOG_LEVEL"))?;
-    let installed = if log_format_is_json(env::var_os("SCP_RELAY_LOG_FORMAT"))? {
-        tracing_subscriber::fmt()
-            .json()
-            .with_writer(std::io::stderr)
-            .with_env_filter(filter)
-            .try_init()
-    } else {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(filter)
-            .try_init()
-    };
-    installed.map_err(|e| StartupError::Tracing(e.to_string()))
+    let json = log_format_is_json(env::var_os("SCP_RELAY_LOG_FORMAT"))?;
+    relay_subscriber(filter, json, std::io::stderr)
+        .try_init()
+        .map_err(|e| StartupError::Tracing(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1437,7 +1464,8 @@ mod tests {
 
     use super::{
         BackendChoice, BackendSelectionError, StartupError, backend_choice_from_value, log_filter,
-        log_format_is_json, parse_or, parse_relay_url, rejection_message, valid_backends,
+        log_format_is_json, parse_or, parse_relay_url, rejection_message, relay_subscriber,
+        valid_backends,
     };
     use crate::relay::push_gate::RelayUrl;
 
@@ -1666,6 +1694,52 @@ mod tests {
                 "{bad:?}: {result:?}"
             );
         }
+    }
+
+    /// G2: the relay's subscriber drops hyper-util's DEBUG lines, which name
+    /// the host a connection goes to, even under `RUST_LOG=trace`, in both
+    /// formats, and keeps everything else the filter admits.
+    #[test]
+    fn the_relay_log_holds_hyper_util_at_info() -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for json in [false, true] {
+            let buffer = Buffer::default();
+            let writer = buffer.clone();
+            let filter = log_filter(Some(OsString::from("trace")), None)?;
+            let subscriber = relay_subscriber(filter, json, move || writer.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug!(
+                    target: "hyper_util::client::legacy::connect::http",
+                    "connecting to push.example.net:443"
+                );
+                tracing::info!(target: "hyper_util::client::legacy::pool", "pool marker");
+                tracing::debug!(target: "scp_transport::relay::push_webpush", "own marker");
+            });
+            let logs = String::from_utf8_lossy(
+                &buffer
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .into_owned();
+            assert!(!logs.contains("push.example.net"), "{logs}");
+            assert!(logs.contains("pool marker"), "{logs}");
+            assert!(logs.contains("own marker"), "{logs}");
+        }
+        Ok(())
     }
 
     /// The log filter and format accept their documented values and defaults,
@@ -2545,7 +2619,7 @@ mod push_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env::full(dir.path());
         let fragments = secret_fragments(&env);
-        let capture = LogCapture::install();
+        let capture = LogCapture::install(crate::relay::push_webpush::admits_log_event);
 
         let selection = env.parse().unwrap();
         let printed = format!("{selection:?} {selection:#?}");

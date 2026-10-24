@@ -38,9 +38,10 @@ pub use super::push_webpush::{VapidSubject, WebPushConfig, WebPushSender};
 
 /// The result of one wake-signal send.
 ///
-/// The PUSH-008 dispatcher counts only [`InvalidToken`](Self::InvalidToken)
-/// toward the §10.7.1 three-failure removal rule, resets the count on
-/// [`Delivered`](Self::Delivered), and leaves it unchanged on the other two.
+/// The PUSH-008 dispatcher counts [`InvalidToken`](Self::InvalidToken) and
+/// [`Unreachable`](Self::Unreachable) toward the §10.7.1 three-failure removal
+/// rule, resets the count on [`Delivered`](Self::Delivered), and leaves it
+/// unchanged on the other two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PushSendOutcome {
     /// The push service accepted the wake signal for delivery.
@@ -48,8 +49,15 @@ pub enum PushSendOutcome {
     /// The push service reports that the device token is not valid for this
     /// sender: unregistered, malformed, or issued for another app or project.
     InvalidToken,
-    /// The push service is unavailable, throttling, or unreachable; a later
-    /// send may succeed.
+    /// A `WebPush` push service gave no answer before the request deadline,
+    /// or refused or reset the connection before it answered. Spec 10
+    /// §10.7.1 **Unreachable `WebPush` push service** counts it as a delivery
+    /// failure, so the dispatcher counts it toward removal exactly as it
+    /// counts [`InvalidToken`](Self::InvalidToken). APNs and FCM never
+    /// return it.
+    Unreachable,
+    /// The push service is unavailable or throttling, or its name did not
+    /// resolve; a later send may succeed.
     Transient,
     /// The relay's own push credentials or configuration are rejected; no send
     /// succeeds until the operator fixes them. The registration is kept.
@@ -157,6 +165,29 @@ impl PushSender {
             },
             #[cfg(feature = "testing")]
             Self::Recording(sender) => sender.record(token).await,
+        }
+    }
+
+    /// The endpoint origin a `WebPush` token's wakes go to, which keys the
+    /// dispatcher's per-origin cap and back-off wait. `None` for another
+    /// platform, and for a token or endpoint that does not decode, whose send
+    /// sends nothing.
+    #[cfg(feature = "push-store")]
+    pub(crate) fn origin_of(&self, token: &[u8]) -> Option<String> {
+        if self.platform() == PushPlatform::WebPush {
+            super::push_webpush::token_origin(token)
+        } else {
+            None
+        }
+    }
+
+    /// When `origin`'s back-off ends, while the `WebPush` sender is backing
+    /// it off; `None` for every other sender.
+    #[cfg(feature = "push-store")]
+    pub(crate) fn origin_retry_at(&self, origin: &str) -> Option<tokio::time::Instant> {
+        match self {
+            Self::WebPush(sender) => sender.retry_at(origin),
+            _ => None,
         }
     }
 }

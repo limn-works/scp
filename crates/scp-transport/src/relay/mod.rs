@@ -36,7 +36,8 @@
 //! - [`push_dispatch`] -- the relay's push queue and drain task (spec
 //!   section 10.7.1 step 5 and `PushDeregistration`, PUSH-008): one job per
 //!   registered token after each stored blob, and removal after three
-//!   consecutive invalid-token responses.
+//!   consecutive delivery failures (an invalid token, or an unreachable
+//!   `WebPush` push service).
 //! - [`push_gate`] -- the relay's interception of every PUBLISH to its
 //!   reserved push routing ID (spec section 10.7.1, PUSH-007): the
 //!   [`push_gate::PushRole`] selection and the verify-then-store gate.

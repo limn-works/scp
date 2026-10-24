@@ -18,18 +18,22 @@
 //!   platform. The APNs and FCM drains send one job at a time, and after a
 //!   `Transient` outcome back off before their next send to that service.
 //!   The `WebPush` drain differs, because each registrant chooses its own
-//!   endpoint (PUSH-022 lane rule): it runs up to
-//!   `WEBPUSH_CONCURRENT_SENDS` sends at once, and the `WebPush` sender
-//!   backs off per endpoint origin, so one origin that stops answering
-//!   delays no wake to another. A token with a send in flight holds at most
-//!   one more job, which starts when that send's outcome is applied, so one
-//!   token's outcomes reach the store in order. Each drain applies the
-//!   outcome to the registration store:
-//!   - `Delivered` resets the token's consecutive invalid-token count.
-//!   - `InvalidToken` adds one to it; at `INVALID_TOKEN_REMOVAL_THRESHOLD`
-//!     (in `push_store`, a module the `push-store` feature compiles) the
-//!     store removes every registration holding the token, in the same
-//!     transaction.
+//!   endpoint (PUSH-022 lane rule). It runs up to
+//!   `WEBPUSH_CONCURRENT_SENDS` sends at once, of which at most
+//!   `WEBPUSH_SENDS_PER_ORIGIN` go to one endpoint origin and at most
+//!   `WEBPUSH_SENDS_PER_TICKET` wake one routing ID, and at most one sends to
+//!   one token. A job that a cap holds back, or whose origin the `WebPush`
+//!   sender is backing off, waits in the drain until it may start; it is
+//!   never dropped and never consumed by the back-off. So origins that stop
+//!   answering, or one routing ID's many tokens, hold at most their caps'
+//!   share of the sends and delay no wake to another origin or routing ID,
+//!   and one token's outcomes reach the store in order. Each drain applies
+//!   the outcome to the registration store:
+//!   - `Delivered` resets the token's consecutive failure count.
+//!   - `InvalidToken` and `Unreachable` add one to it; at
+//!     `INVALID_TOKEN_REMOVAL_THRESHOLD` (in `push_store`, a module the
+//!     `push-store` feature compiles) the store removes every registration
+//!     holding the token, in the same transaction.
 //!   - `Transient` and `ConfigError` leave the count unchanged.
 //!
 //! The count is per token, because §10.7.1 removes registrations "after 3
@@ -45,7 +49,8 @@
 //! # Bounds
 //!
 //! The intake and every platform queue hold at most `PUSH_QUEUE_CAPACITY`
-//! entries. A wake that does not fit is dropped, and the publish still
+//! entries; a `WebPush` job waiting in its drain still counts against its
+//! queue. A wake that does not fit is dropped, and the publish still
 //! succeeds (PUSH-008 AC2): a wake is advisory, and a device whose wake was
 //! dropped pulls on its next wake or connection (§10.7).
 //! The intake holds each routing ID at most once, and
@@ -89,7 +94,7 @@ pub const fn notify(push: &super::push_gate::PushRole, _routing_id: &[u8; 32]) {
 
 #[cfg(feature = "push-store")]
 mod enabled {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::fmt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -131,11 +136,17 @@ mod enabled {
 
     /// The most `WebPush` sends the `WebPush` drain runs at once (indicator:
     /// 32).
-    ///
-    /// PUSH-022 lane rule: an origin that stops answering holds one of them
-    /// per wake to it for at most the sender's request timeout, after which
-    /// the sender backs that origin off.
     pub const WEBPUSH_CONCURRENT_SENDS: usize = 32;
+
+    /// The most `WebPush` sends in flight to one endpoint origin (PUSH-022
+    /// lane rule; indicator: 4). An origin that stops answering holds at most
+    /// these, each for at most the sender's request deadline.
+    pub const WEBPUSH_SENDS_PER_ORIGIN: usize = 4;
+
+    /// The most `WebPush` sends in flight that wake one routing ID (PUSH-022
+    /// lane rule; indicator: 2). The tokens registered on one routing ID,
+    /// whatever origins they name, hold at most these.
+    pub const WEBPUSH_SENDS_PER_TICKET: usize = 2;
 
     /// A push service that could not start.
     #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -571,21 +582,29 @@ mod enabled {
             };
             let key = token_key(platform, &token);
             let mut queued = lock(&lane.queued);
-            if !queued.insert(key) {
-                // Already on the queue; that job wakes the device.
+            if queued.contains(&key) {
+                // Already queued; that job wakes the device.
                 return;
             }
-            let job = PushJob {
-                platform,
-                token,
-                ticket: Arc::clone(ticket),
+            // `queued` also holds the jobs a `WebPush` drain keeps waiting,
+            // so this bounds them with the queue.
+            let refused = if queued.len() >= lane.tx.max_capacity() {
+                &self.logs.queue_full
+            } else {
+                let job = PushJob {
+                    platform,
+                    token,
+                    ticket: Arc::clone(ticket),
+                };
+                match lane.tx.try_send(job) {
+                    Ok(()) => {
+                        queued.insert(key);
+                        return;
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => &self.logs.queue_full,
+                    Err(mpsc::error::TrySendError::Closed(_)) => &self.logs.queue_closed,
+                }
             };
-            let refused = match lane.tx.try_send(job) {
-                Ok(()) => return,
-                Err(mpsc::error::TrySendError::Full(_)) => &self.logs.queue_full,
-                Err(mpsc::error::TrySendError::Closed(_)) => &self.logs.queue_closed,
-            };
-            queued.remove(&key);
             drop(queued);
             if let Some(line) = refused.hit() {
                 tracing::warn!(
@@ -618,6 +637,8 @@ mod enabled {
         senders: Arc<[PushSender]>,
         index: usize,
         store: PushRegistrationStore,
+        /// The tokens on this platform's queue or, for `WebPush`, waiting in
+        /// the drain; a token leaves when its send starts.
         queued: Arc<Mutex<HashSet<TokenKey>>>,
         logs: Arc<Logs>,
         stop: CancellationToken,
@@ -626,19 +647,102 @@ mod enabled {
         pending_resets: HashSet<TokenKey>,
     }
 
-    /// A finished `WebPush` send: the token's key, its job, and the outcome.
-    type Sent = (TokenKey, PushJob, PushSendOutcome);
+    /// A `WebPush` job in the drain, with what its caps are keyed by.
+    struct Held {
+        key: TokenKey,
+        job: PushJob,
+        /// The endpoint origin; `None` when the token does not decode, whose
+        /// send sends nothing.
+        origin: Option<String>,
+    }
 
-    /// Sends `job` through `sender`.
-    async fn send_job(sender: &PushSender, key: TokenKey, job: PushJob) -> Sent {
-        let outcome = sender.send_registered(&job.token).await;
-        (key, job, outcome)
+    impl Held {
+        /// The routing ID's ticket, by address: one per routing ID while any
+        /// of its jobs lives.
+        fn ticket(&self) -> usize {
+            Arc::as_ptr(&self.job.ticket).addr()
+        }
+    }
+
+    /// Whether a held `WebPush` job may start now.
+    enum Admission {
+        Start,
+        /// A cap or the token's own send in flight holds it; a finished send
+        /// may free it.
+        Wait,
+        /// Its origin is backing off until then.
+        BackoffUntil(tokio::time::Instant),
+    }
+
+    /// The `WebPush` drain's sends in flight, counted by what caps them.
+    #[derive(Default)]
+    struct InFlight {
+        sends: usize,
+        tokens: HashSet<TokenKey>,
+        origins: HashMap<String, usize>,
+        tickets: HashMap<usize, usize>,
+    }
+
+    impl InFlight {
+        fn admission(&self, held: &Held, sender: &PushSender) -> Admission {
+            let origin_full = held.origin.as_ref().is_some_and(|origin| {
+                self.origins.get(origin).copied().unwrap_or(0) >= WEBPUSH_SENDS_PER_ORIGIN
+            });
+            if self.sends >= WEBPUSH_CONCURRENT_SENDS
+                || self.tokens.contains(&held.key)
+                || self.tickets.get(&held.ticket()).copied().unwrap_or(0)
+                    >= WEBPUSH_SENDS_PER_TICKET
+                || origin_full
+            {
+                return Admission::Wait;
+            }
+            held.origin
+                .as_ref()
+                .and_then(|origin| sender.origin_retry_at(origin))
+                .map_or(Admission::Start, Admission::BackoffUntil)
+        }
+
+        fn add(&mut self, held: &Held) {
+            self.sends += 1;
+            self.tokens.insert(held.key);
+            *self.tickets.entry(held.ticket()).or_default() += 1;
+            if let Some(origin) = &held.origin {
+                *self.origins.entry(origin.clone()).or_default() += 1;
+            }
+        }
+
+        fn remove(&mut self, held: &Held) {
+            self.sends = self.sends.saturating_sub(1);
+            self.tokens.remove(&held.key);
+            let ticket = held.ticket();
+            if let Some(count) = self.tickets.get_mut(&ticket) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.tickets.remove(&ticket);
+                }
+            }
+            if let Some(origin) = &held.origin
+                && let Some(count) = self.origins.get_mut(origin)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.origins.remove(origin);
+                }
+            }
+        }
+    }
+
+    /// Sends `held`'s job through `sender`.
+    async fn send_held(sender: &PushSender, held: Held) -> (Held, PushSendOutcome) {
+        let outcome = sender.send_registered(&held.job.token).await;
+        (held, outcome)
     }
 
     /// What the `WebPush` drain does next.
     enum Step {
         Job(Option<PushJob>),
-        Sent(Sent),
+        Sent(Held, PushSendOutcome),
+        BackoffEnded,
     }
 
     impl Drain {
@@ -698,53 +802,123 @@ mod enabled {
         }
 
         /// The `WebPush` drain: up to [`WEBPUSH_CONCURRENT_SENDS`] sends at
-        /// once, with no drain-wide back-off; the sender backs off per
-        /// endpoint origin.
+        /// once, at most [`WEBPUSH_SENDS_PER_ORIGIN`] to one endpoint origin,
+        /// at most [`WEBPUSH_SENDS_PER_TICKET`] for one routing ID, and one
+        /// per token, with no drain-wide back-off.
         ///
-        /// Outcomes are applied on this task, one at a time. A job for a
-        /// token whose send is in flight waits in that token's slot and
-        /// starts once the in-flight outcome is applied; a further job for
-        /// the same token while one waits is dropped, because the waiting
-        /// job wakes the same device. So one token's outcomes reach the store
-        /// in send order, and the waiting jobs number at most the sends.
+        /// The drain reads every job as it arrives. A job a cap holds back,
+        /// or whose origin the sender is backing off, waits in `held`, in
+        /// arrival order, and keeps its token in `queued`, so the lookup
+        /// still coalesces a further wake for that token into it and counts
+        /// it against the queue's capacity. Held jobs are tried again when a
+        /// send finishes and when the earliest back-off they wait on ends.
+        /// Outcomes are applied on this task, one at a time, and a token
+        /// never has two sends in flight, so one token's outcomes reach the
+        /// store in send order.
         async fn run_concurrent(&mut self, sender: &PushSender, mut rx: mpsc::Receiver<PushJob>) {
             let mut sends = FuturesUnordered::new();
-            let mut in_flight: HashMap<TokenKey, Option<PushJob>> = HashMap::new();
+            let mut in_flight = InFlight::default();
+            let mut held: VecDeque<Held> = VecDeque::new();
+            let mut wake_at: Option<tokio::time::Instant> = None;
             loop {
                 let step = tokio::select! {
                     biased;
                     () = self.stop.cancelled() => return,
-                    Some(sent) = sends.next(), if !sends.is_empty() => Step::Sent(sent),
-                    job = rx.recv(), if sends.len() < WEBPUSH_CONCURRENT_SENDS => Step::Job(job),
+                    Some((done, outcome)) = sends.next(), if !sends.is_empty() => {
+                        Step::Sent(done, outcome)
+                    }
+                    job = rx.recv() => Step::Job(job),
+                    () = tokio::time::sleep_until(
+                        wake_at.unwrap_or_else(tokio::time::Instant::now)
+                    ), if wake_at.is_some() => Step::BackoffEnded,
                 };
+                let rescan = !matches!(step, Step::Job(_));
                 match step {
                     // The lookup holds the queue's sender until it stops, so
                     // `None` means the service is gone.
                     Step::Job(None) => return,
                     Step::Job(Some(job)) => {
-                        let key = token_key(job.platform, &job.token);
-                        lock(&self.queued).remove(&key);
-                        match in_flight.get_mut(&key) {
-                            Some(waiting @ None) => *waiting = Some(job),
-                            Some(Some(_)) => drop(job),
-                            None => {
-                                in_flight.insert(key, None);
-                                sends.push(send_job(sender, key, job));
+                        let job = Held {
+                            key: token_key(job.platform, &job.token),
+                            origin: sender.origin_of(&job.token),
+                            job,
+                        };
+                        match in_flight.admission(&job, sender) {
+                            Admission::Start => {
+                                self.begin(&job, &mut in_flight);
+                                sends.push(send_held(sender, job));
+                            }
+                            Admission::Wait => held.push_back(job),
+                            Admission::BackoffUntil(until) => {
+                                wake_at = Some(wake_at.map_or(until, |at| at.min(until)));
+                                held.push_back(job);
                             }
                         }
                     }
-                    Step::Sent((key, job, outcome)) => {
-                        if !self.apply(job.platform, key, &job.token, outcome).await {
+                    Step::Sent(done, outcome) => {
+                        in_flight.remove(&done);
+                        if !self
+                            .apply(done.job.platform, done.key, &done.job.token, outcome)
+                            .await
+                        {
                             return;
                         }
-                        drop(job);
-                        if let Some(Some(next)) = in_flight.remove(&key) {
-                            in_flight.insert(key, None);
-                            sends.push(send_job(sender, key, next));
-                        }
+                        drop(done);
+                    }
+                    Step::BackoffEnded => {}
+                }
+                if rescan {
+                    let ready;
+                    (ready, wake_at) = self.take_ready(sender, &mut held, &mut in_flight);
+                    for job in ready {
+                        sends.push(send_held(sender, job));
                     }
                 }
             }
+        }
+
+        /// Counts `job` as in flight and takes its token out of `queued`, so
+        /// a wake for the token from now on queues another job. The caller
+        /// starts its send.
+        fn begin(&self, job: &Held, in_flight: &mut InFlight) {
+            lock(&self.queued).remove(&job.key);
+            in_flight.add(job);
+        }
+
+        /// Takes every held job that may start, in arrival order, counted as
+        /// in flight, and returns them with when the earliest back-off a
+        /// still-held job waits on ends.
+        fn take_ready(
+            &self,
+            sender: &PushSender,
+            held: &mut VecDeque<Held>,
+            in_flight: &mut InFlight,
+        ) -> (Vec<Held>, Option<tokio::time::Instant>) {
+            let mut ready = Vec::new();
+            let mut wake_at: Option<tokio::time::Instant> = None;
+            let mut still = VecDeque::with_capacity(held.len());
+            while let Some(job) = held.pop_front() {
+                if in_flight.sends >= WEBPUSH_CONCURRENT_SENDS {
+                    // No job can start until a send finishes, which runs
+                    // this again.
+                    still.push_back(job);
+                    still.append(held);
+                    break;
+                }
+                match in_flight.admission(&job, sender) {
+                    Admission::Start => {
+                        self.begin(&job, in_flight);
+                        ready.push(job);
+                    }
+                    Admission::Wait => still.push_back(job),
+                    Admission::BackoffUntil(until) => {
+                        wake_at = Some(wake_at.map_or(until, |at| at.min(until)));
+                        still.push_back(job);
+                    }
+                }
+            }
+            *held = still;
+            (ready, wake_at)
         }
 
         /// Sleeps for `delay`; `false` when the service stopped meanwhile.
@@ -795,7 +969,9 @@ mod enabled {
                         }
                     }
                 }
-                PushSendOutcome::InvalidToken => {
+                // Spec 10 §10.7.1 counts an unreachable `WebPush` push
+                // service as it counts an invalid token.
+                PushSendOutcome::InvalidToken | PushSendOutcome::Unreachable => {
                     let count_from = if self.pending_resets.contains(&key) {
                         CountFrom::Zero
                     } else {
@@ -817,12 +993,24 @@ mod enabled {
                 PushSendOutcome::Transient => {}
                 PushSendOutcome::ConfigError => {
                     if let Some(line) = self.logs.config_error.hit() {
-                        tracing::warn!(
-                            platform = ?platform,
-                            total = line.total,
-                            suppressed = line.suppressed,
-                            "push service refused the relay's credentials; registration kept"
-                        );
+                        if platform == PushPlatform::WebPush {
+                            // The registrant chooses a `WebPush` endpoint, so
+                            // its 400, 401 or 413 says nothing about the
+                            // relay's credentials.
+                            tracing::warn!(
+                                platform = ?platform,
+                                total = line.total,
+                                suppressed = line.suppressed,
+                                "an endpoint refused the request; registration kept"
+                            );
+                        } else {
+                            tracing::warn!(
+                                platform = ?platform,
+                                total = line.total,
+                                suppressed = line.suppressed,
+                                "push service refused the relay's credentials; registration kept"
+                            );
+                        }
                     }
                 }
             }
@@ -850,14 +1038,14 @@ mod enabled {
             InvalidTokenOutcome::Removed { registrations } => tracing::info!(
                 platform = ?platform,
                 registrations,
-                "removed push registrations after consecutive invalid-token responses"
+                "removed push registrations after consecutive delivery failures"
             ),
             InvalidTokenOutcome::Counted { failures } => {
-                tracing::debug!(platform = ?platform, failures, "push token answered invalid");
+                tracing::debug!(platform = ?platform, failures, "push delivery failure counted");
             }
             InvalidTokenOutcome::NotRegistered => tracing::debug!(
                 platform = ?platform,
-                "push token answered invalid after its registrations were removed"
+                "push delivery failed after the token's registrations were removed"
             ),
         }
     }
@@ -874,9 +1062,12 @@ mod enabled {
 
         use super::super::super::push::ApnsSender;
         use super::super::super::push_gate::{PushPublishGate, gate_publish, test_relay_url};
+        use super::super::super::push_store::MAX_REGISTRATIONS_PER_REGISTRANT;
+        use super::super::super::push_test_server::hung_host;
         use super::super::super::push_test_server::{Reply, TestServer, TlsTestServer};
         use super::super::super::push_webpush::tests::{
-            sender_for as webpush_sender_for, subscribe,
+            sender_for as webpush_sender_for, sender_with_deadline as webpush_sender_with_deadline,
+            subscribe,
         };
         use super::*;
 
@@ -885,18 +1076,27 @@ mod enabled {
         const RID: RoutingId = [0x11; 32];
         const REGISTRANT_A: &str = "did:dht:push-a";
         const REGISTRANT_B: &str = "did:dht:push-b";
+        /// Every registrant the test verifier holds; registrant `i` signs
+        /// with `key(i + 1)`.
+        const REGISTRANTS: [&str; 4] = [
+            REGISTRANT_A,
+            REGISTRANT_B,
+            "did:dht:push-c",
+            "did:dht:push-d",
+        ];
 
         fn key(seed: u8) -> Result<P256SecretKey, Box<dyn std::error::Error>> {
             Ok(P256SecretKey::from_scalar_bytes(&[seed; 32])?)
         }
 
-        /// The signature-checking test verifier of PUSH-005, holding `key(1)`
-        /// for registrant A and `key(2)` for registrant B.
+        /// The signature-checking test verifier of PUSH-005, holding
+        /// `key(i + 1)` for `REGISTRANTS[i]`.
         fn verifier() -> Result<Arc<TestPushVerifier>, Box<dyn std::error::Error>> {
-            Ok(Arc::new(TestPushVerifier::new([
-                (DID::from(REGISTRANT_A), key(1)?.public_key()),
-                (DID::from(REGISTRANT_B), key(2)?.public_key()),
-            ])))
+            let mut keys = Vec::with_capacity(REGISTRANTS.len());
+            for (seed, registrant) in (1..).zip(REGISTRANTS) {
+                keys.push((DID::from(registrant), key(seed)?.public_key()));
+            }
+            Ok(Arc::new(TestPushVerifier::new(keys)))
         }
 
         /// A configuration over a fresh SQLite store (the shipped arm) with
@@ -936,11 +1136,11 @@ mod enabled {
             token: &[u8],
             routing_ids: &[RoutingId],
         ) -> TestResult {
-            let signer = if registrant == REGISTRANT_A {
-                key(1)?
-            } else {
-                key(2)?
-            };
+            let seed = (1..)
+                .zip(REGISTRANTS)
+                .find_map(|(seed, known)| (known == registrant).then_some(seed))
+                .ok_or("the test verifier does not hold this registrant")?;
+            let signer = key(seed)?;
             let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
             let mut msg = PushRegistration {
                 registrant: DID::from(registrant),
@@ -1209,6 +1409,311 @@ mod enabled {
                 .map(|r| r.path)
                 .collect();
             assert_eq!(paths, ["/hung", "/ok"]);
+            Ok(())
+        }
+
+        /// A push service whose one sender is a real `WebPush` sender reaching
+        /// `server`, with `deadline` as its request deadline.
+        fn webpush_service(
+            server: &TlsTestServer,
+            deadline: Duration,
+        ) -> Result<(PushRole, PushService, TempDir), Box<dyn std::error::Error>> {
+            let sender = webpush_sender_with_deadline(
+                server,
+                true,
+                Arc::new(scp_clock::SystemClock),
+                deadline,
+            )?;
+            let (config, dir) = config(vec![PushSender::WebPush(sender)])?;
+            let service = PushService::start(config)?;
+            Ok((PushRole::Enabled(service.clone()), service, dir))
+        }
+
+        /// The `n`th of the routing IDs the many-token tests register on.
+        fn routing_id(n: u8) -> RoutingId {
+            let mut id = [0x60; 32];
+            id[0] = n;
+            id
+        }
+
+        /// Registers each `(token, routing ID)` on `WebPush`, filling each
+        /// registrant up to its cap before the next.
+        async fn register_webpush(push: &PushRole, tokens: &[(Vec<u8>, RoutingId)]) -> TestResult {
+            for (i, (token, id)) in tokens.iter().enumerate() {
+                let registrant = REGISTRANTS
+                    .get(i / MAX_REGISTRATIONS_PER_REGISTRANT)
+                    .ok_or("more tokens than the test registrants may hold")?;
+                register(push, registrant, PushPlatform::WebPush, token, &[*id]).await?;
+            }
+            Ok(())
+        }
+
+        /// Waits up to 10 s until `token`'s stored failure count is `want`.
+        async fn webpush_count_reaches(
+            store: &PushRegistrationStore,
+            token: &[u8],
+            want: Option<u32>,
+        ) -> TestResult {
+            let mut now = None;
+            for _ in 0..2000 {
+                now = store
+                    .invalid_token_failures(PushPlatform::WebPush, token)
+                    .await?;
+                if now == want {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(format!("the count stayed {now:?}, not {want:?}").into())
+        }
+
+        /// The paths `server` has seen, in arrival order.
+        async fn paths(server: &TlsTestServer) -> Vec<String> {
+            server
+                .requests()
+                .await
+                .into_iter()
+                .map(|r| r.path)
+                .collect()
+        }
+
+        /// One `WebPush` token two registrants hold on `RID`, aimed at
+        /// `server`'s `/x`.
+        async fn shared_webpush_token(
+            push: &PushRole,
+            server: &TlsTestServer,
+        ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let (_, subscription) = subscribe(server.endpoint("push.example.net", "/x"))?;
+            let token = subscription.encode();
+            register(push, REGISTRANT_A, PushPlatform::WebPush, &token, &[RID]).await?;
+            register(push, REGISTRANT_B, PushPlatform::WebPush, &token, &[RID]).await?;
+            Ok(token)
+        }
+
+        /// R2, spec 10 §10.7.1: three sends in a row that the push service
+        /// leaves unanswered past the deadline remove every registration
+        /// holding the token, through the real `WebPush` sender. Each wake
+        /// after the first waits out the origin's back-off and is then sent.
+        #[tokio::test]
+        async fn three_webpush_timeouts_remove_the_registrations() -> TestResult {
+            let server =
+                TlsTestServer::start_routed(vec![("/x", (0..3).map(|_| Reply::hang()).collect())])
+                    .await;
+            let (push, service, _dir) = webpush_service(&server, Duration::from_millis(300))?;
+            let token = shared_webpush_token(&push, &server).await?;
+            let store = &service.config().store;
+            for count in [Some(1), Some(2)] {
+                notify(&push, &RID);
+                webpush_count_reaches(store, &token, count).await?;
+            }
+            assert_eq!(store.tokens_for_routing_id(&RID).await?.len(), 2);
+            notify(&push, &RID);
+            webpush_count_reaches(store, &token, None).await?;
+            assert!(store.tokens_for_routing_id(&RID).await?.is_empty());
+            assert_eq!(server.requests().await.len(), 3);
+            Ok(())
+        }
+
+        /// R2: a 201 between two timeouts resets the count, so the second
+        /// timeout leaves it at one, not two.
+        #[tokio::test]
+        async fn a_webpush_delivery_resets_the_timeout_count() -> TestResult {
+            let server = TlsTestServer::start_routed(vec![(
+                "/x",
+                vec![Reply::hang(), Reply::empty(201), Reply::hang()],
+            )])
+            .await;
+            let (push, service, _dir) = webpush_service(&server, Duration::from_millis(300))?;
+            let token = shared_webpush_token(&push, &server).await?;
+            let store = &service.config().store;
+            notify(&push, &RID);
+            webpush_count_reaches(store, &token, Some(1)).await?;
+            notify(&push, &RID);
+            wait_for_requests(&server, 2, Duration::from_secs(5)).await?;
+            notify(&push, &RID);
+            wait_for_requests(&server, 3, Duration::from_secs(5)).await?;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert_eq!(
+                store
+                    .invalid_token_failures(PushPlatform::WebPush, &token)
+                    .await?,
+                Some(1)
+            );
+            assert_eq!(store.tokens_for_routing_id(&RID).await?.len(), 2);
+            Ok(())
+        }
+
+        /// R2: a 429 and a 5xx neither add to the count nor reset it: after
+        /// two timeouts they leave it at two, and the registrations stay.
+        #[tokio::test]
+        async fn webpush_throttling_and_server_errors_never_remove() -> TestResult {
+            let server = TlsTestServer::start_routed(vec![(
+                "/x",
+                vec![
+                    Reply::hang(),
+                    Reply::hang(),
+                    Reply::empty(429),
+                    Reply::empty(503),
+                ],
+            )])
+            .await;
+            let (push, service, _dir) = webpush_service(&server, Duration::from_millis(300))?;
+            let token = shared_webpush_token(&push, &server).await?;
+            let store = &service.config().store;
+            for count in [Some(1), Some(2)] {
+                notify(&push, &RID);
+                webpush_count_reaches(store, &token, count).await?;
+            }
+            for sent in [3, 4] {
+                notify(&push, &RID);
+                wait_for_requests(&server, sent, Duration::from_secs(10)).await?;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                store
+                    .invalid_token_failures(PushPlatform::WebPush, &token)
+                    .await?,
+                Some(2)
+            );
+            assert_eq!(store.tokens_for_routing_id(&RID).await?.len(), 2);
+            Ok(())
+        }
+
+        /// L3: 36 tokens on one hung origin, each on its own routing ID, hold
+        /// at most `WEBPUSH_SENDS_PER_ORIGIN` sends, and a wake to another
+        /// origin is delivered well inside the 5 s request deadline.
+        #[tokio::test]
+        async fn hung_tokens_on_one_origin_leave_room_for_another() -> TestResult {
+            const GOOD: RoutingId = [0x47; 32];
+            let server = TlsTestServer::start_routed(vec![
+                ("/hung", (0..40).map(|_| Reply::hang()).collect()),
+                ("/ok", vec![Reply::empty(201)]),
+            ])
+            .await;
+            let sender = webpush_sender_for(&server, true, Arc::new(scp_clock::SystemClock))?;
+            let (config, _dir) = config(vec![PushSender::WebPush(sender)])?;
+            let push = PushRole::Enabled(PushService::start(config)?);
+            let mut tokens = Vec::new();
+            for n in 0..36 {
+                let (_, hung) = subscribe(server.endpoint("hung.example.net", "/hung"))?;
+                tokens.push((hung.encode(), routing_id(n)));
+            }
+            let (_, good) = subscribe(server.endpoint("push.example.net", "/ok"))?;
+            tokens.push((good.encode(), GOOD));
+            register_webpush(&push, &tokens).await?;
+
+            for n in 0..36 {
+                notify(&push, &routing_id(n));
+            }
+            wait_for_requests(&server, WEBPUSH_SENDS_PER_ORIGIN, Duration::from_secs(5)).await?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(paths(&server).await, ["/hung"; WEBPUSH_SENDS_PER_ORIGIN]);
+
+            notify(&push, &GOOD);
+            wait_for_requests(
+                &server,
+                WEBPUSH_SENDS_PER_ORIGIN + 1,
+                Duration::from_secs(2),
+            )
+            .await?;
+            assert_eq!(paths(&server).await.last().map(String::as_str), Some("/ok"));
+            Ok(())
+        }
+
+        /// L3: 36 tokens on one routing ID, each on its own hung origin and
+        /// held by three registrants, hold at most `WEBPUSH_SENDS_PER_TICKET`
+        /// sends, and another routing ID's wake is delivered well inside the
+        /// 5 s request deadline.
+        #[tokio::test]
+        async fn hung_tokens_on_one_routing_id_leave_room_for_another() -> TestResult {
+            const HUNG: RoutingId = [0x48; 32];
+            const GOOD: RoutingId = [0x47; 32];
+            let server = TlsTestServer::start_routed(vec![
+                ("/hung", (0..40).map(|_| Reply::hang()).collect()),
+                ("/ok", vec![Reply::empty(201)]),
+            ])
+            .await;
+            let sender = webpush_sender_for(&server, true, Arc::new(scp_clock::SystemClock))?;
+            let (config, _dir) = config(vec![PushSender::WebPush(sender)])?;
+            let push = PushRole::Enabled(PushService::start(config)?);
+            let mut tokens = Vec::new();
+            for n in 0..36 {
+                let (_, hung) = subscribe(server.endpoint(&hung_host(n), "/hung"))?;
+                tokens.push((hung.encode(), HUNG));
+            }
+            let (_, good) = subscribe(server.endpoint("push.example.net", "/ok"))?;
+            tokens.push((good.encode(), GOOD));
+            register_webpush(&push, &tokens).await?;
+
+            notify(&push, &HUNG);
+            wait_for_requests(&server, WEBPUSH_SENDS_PER_TICKET, Duration::from_secs(5)).await?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(paths(&server).await, ["/hung"; WEBPUSH_SENDS_PER_TICKET]);
+
+            notify(&push, &GOOD);
+            wait_for_requests(
+                &server,
+                WEBPUSH_SENDS_PER_TICKET + 1,
+                Duration::from_secs(2),
+            )
+            .await?;
+            assert_eq!(paths(&server).await.last().map(String::as_str), Some("/ok"));
+            Ok(())
+        }
+
+        /// B2: wakes to origins that are backing off wait in the drain and
+        /// hold no send. Eight origins answer 429 and back off; a wake to
+        /// each of their 32 tokens then fills no send slot, so a wake to a
+        /// ninth origin is sent before any of them, and all 32 are sent once
+        /// the back-offs end.
+        #[tokio::test]
+        async fn wakes_during_a_backoff_hold_no_send() -> TestResult {
+            const ORIGINS: usize = 8;
+            const PER_ORIGIN: usize = WEBPUSH_CONCURRENT_SENDS / ORIGINS;
+            const GOOD: RoutingId = [0x47; 32];
+            let busy = (0..ORIGINS)
+                .map(|_| Reply::empty(429))
+                .chain((0..WEBPUSH_CONCURRENT_SENDS).map(|_| Reply::empty(201)))
+                .collect();
+            let server = TlsTestServer::start_routed(vec![
+                ("/busy", busy),
+                ("/ok", vec![Reply::empty(201)]),
+            ])
+            .await;
+            let sender = webpush_sender_for(&server, true, Arc::new(scp_clock::SystemClock))?;
+            let (config, _dir) = config(vec![PushSender::WebPush(sender)])?;
+            let push = PushRole::Enabled(PushService::start(config)?);
+            let mut tokens = Vec::new();
+            for n in 0..u8::try_from(WEBPUSH_CONCURRENT_SENDS)? {
+                let origin = hung_host(usize::from(n) / PER_ORIGIN);
+                let (_, busy) = subscribe(server.endpoint(&origin, "/busy"))?;
+                tokens.push((busy.encode(), routing_id(n)));
+            }
+            let (_, good) = subscribe(server.endpoint("push.example.net", "/ok"))?;
+            tokens.push((good.encode(), GOOD));
+            register_webpush(&push, &tokens).await?;
+
+            // One 429 per origin starts each origin's back-off.
+            for origin in 0..u8::try_from(ORIGINS)? {
+                notify(&push, &routing_id(origin * u8::try_from(PER_ORIGIN)?));
+            }
+            wait_for_requests(&server, ORIGINS, Duration::from_secs(5)).await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            for n in 0..u8::try_from(WEBPUSH_CONCURRENT_SENDS)? {
+                notify(&push, &routing_id(n));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            notify(&push, &GOOD);
+            let all = ORIGINS + 1 + WEBPUSH_CONCURRENT_SENDS;
+            wait_for_requests(&server, all, Duration::from_secs(10)).await?;
+            let seen = paths(&server).await;
+            let good_at = seen.iter().position(|path| path == "/ok");
+            assert_eq!(
+                good_at,
+                Some(ORIGINS),
+                "a backing-off wake held a send: {seen:?}"
+            );
             Ok(())
         }
 
